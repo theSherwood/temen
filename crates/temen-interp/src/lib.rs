@@ -5626,15 +5626,16 @@ struct Sched {
     /// twin-completion point (after the exit hooks retire the personality entry, so the
     /// re-executed op reaps), by the EINTR sweep, and at teardown.
     posix_reap_waiters: BTreeMap<TaskId, VecDeque<Box<VCpu>>>,
-    /// #802 rung 3 — pending any-child transitions, keyed by the [`REAP_ANY_BASE`] wildcard key.
-    /// Closes the park-vs-transition race for [`ParkEvent::TaskExitAny`]: a child transition that
-    /// finds **no** benched wildcard waiter marks the parent's key here (level-triggered), and a
-    /// wildcard bench insert that finds its key marked consumes the mark and re-admits instead of
-    /// parking — the rewound op re-executes and reports the transition it would have slept
-    /// through. A mark the parent already consumed by other means costs one spurious re-admit
-    /// (the re-executed op finds nothing fresh and re-benches, mark now clear) — never a spin:
-    /// each transition sets at most one mark.
-    reap_any_pending: BTreeSet<TaskId>,
+    /// #802 rung 3, #1340 — pending child transitions, keyed like `posix_reap_waiters`: a child's
+    /// task id, or a parent's [`REAP_ANY_BASE`] wildcard key. Closes the park-vs-transition race
+    /// for every blocking `waitpid` bench ([`Blocked::ReapWait`]): a transition that finds **no**
+    /// benched waiter under a key marks it here ([`wake_posix_reap_locked`]), and a bench insert
+    /// that finds its key marked consumes the mark and re-admits instead of parking — the rewound
+    /// op re-executes and reports the transition it would have slept through. A mark the parent
+    /// already consumed by other means costs one spurious re-admit (the re-executed op finds
+    /// nothing fresh and re-benches, mark now clear) — never a spin: each transition sets at most
+    /// one mark. A child's exit is covered by `results` instead, and clears the child's mark.
+    reap_pending: BTreeSet<TaskId>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -5926,8 +5927,12 @@ impl Scheduler {
         // re-executes and the personality reports the fresh continue (`cont_fresh`).
         let mut reap_hits: Vec<Box<VCpu>> = Vec::new();
         for v in &woken {
-            if let Some(ws) = s.posix_reap_waiters.remove(&v.id) {
-                reap_hits.extend(ws);
+            match s.posix_reap_waiters.remove(&v.id) {
+                Some(ws) => reap_hits.extend(ws),
+                // #1340 — no bencher yet: mark it, as the stop-park wake does.
+                None => {
+                    s.reap_pending.insert(v.id);
+                }
             }
             // #802 rung 3 — a CONTINUE is an any-child transition too: wake (or mark for) the
             // continued twin's parent's wildcard benchers.
@@ -6751,13 +6756,61 @@ fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
 
 /// #802 rung 3 — a child of `parent` (a domain key) just transitioned (exit, stop, or continue):
 /// wake any [`ParkEvent::TaskExitAny`] bencher parked under the parent's wildcard key, or mark
-/// the key pending (see [`Sched::reap_any_pending`]) so a bench racing this drain re-admits at
+/// the key pending (see [`Sched::reap_pending`]) so a bench racing this drain re-admits at
 /// its insert instead of sleeping through the transition. Returns whether waiters were woken
 /// (callers notify the worker pool). Distinct from [`wake_reap_any`] — that is the core
 /// servicer-reap lane (`Pending::ReapPid` completion); this is the #799 personality bench lane
 /// (rewound op, no pending value).
 fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
-    let key = REAP_ANY_BASE | parent as TaskId;
+    wake_posix_reap_locked(s, REAP_ANY_BASE | parent as TaskId)
+}
+
+/// #1340 — the other half of [`wake_posix_reap_locked`]: whether a `waitpid` about to bench under
+/// `key` already missed what it waits for — a stop/continue mark, or (`exits`) that child's exit —
+/// and must re-admit instead. Consumes the mark.
+fn reap_bench_missed(s: &mut Sched, key: TaskId, exits: Option<TaskId>) -> bool {
+    s.reap_pending.remove(&key) || exits.is_some_and(|c| s.results.contains_key(&c))
+}
+
+#[cfg(test)]
+mod reap_bench_tests {
+    //! #1340 — the park-vs-transition protocol for a blocking `waitpid` on one child, in the order
+    //! the tree-walker's real worker threads can run it: the parent's op finds nothing fresh, the
+    //! child SIGTTIN-stops (its stop-park wake finds no bencher yet), then the parent benches.
+    use super::*;
+
+    #[test]
+    fn a_stop_that_beats_the_bench_readmits_it_once() {
+        let mut s = Sched::default();
+        assert!(!wake_posix_reap_locked(&mut s, 7), "no parent benched yet");
+        assert!(
+            reap_bench_missed(&mut s, 7, Some(7)),
+            "the late bench re-runs its waitpid"
+        );
+        assert!(
+            !reap_bench_missed(&mut s, 7, Some(7)),
+            "once: the next bench sleeps"
+        );
+    }
+
+    #[test]
+    fn a_mark_is_per_child() {
+        let mut s = Sched::default();
+        assert!(!wake_posix_reap_locked(&mut s, 7));
+        assert!(
+            !reap_bench_missed(&mut s, 8, Some(8)),
+            "another child's stop is not ours"
+        );
+        assert!(reap_bench_missed(&mut s, 7, Some(7)));
+    }
+}
+
+/// #1340 — a child transition (stop or continue) for the benchers under `key` — the child's own
+/// task id, or a parent's wildcard key: wake them, or mark the key pending (see
+/// [`Sched::reap_pending`]) so a `waitpid` whose op ran before the transition, and is on its way
+/// to the bench, re-admits instead of sleeping through it. Returns whether waiters were woken
+/// (callers notify the worker pool).
+fn wake_posix_reap_locked(s: &mut Sched, key: TaskId) -> bool {
     match s.posix_reap_waiters.remove(&key) {
         Some(ws) => {
             let woke = !ws.is_empty();
@@ -6767,7 +6820,7 @@ fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
             woke
         }
         None => {
-            s.reap_any_pending.insert(key);
+            s.reap_pending.insert(key);
             false
         }
     }
@@ -7090,7 +7143,7 @@ fn teardown_run(s: &mut Sched) {
             .into_values()
             .flatten(),
     );
-    s.reap_any_pending.clear();
+    s.reap_pending.clear();
     for v in victims {
         let reason = s
             .dead
@@ -8093,6 +8146,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                     sched.work.notify_all();
                 }
+                // #1340 — `results` answers every later bench on this child; drop its stop/continue mark.
+                s.reap_pending.remove(&id);
                 // #802 rung 3 — and any-child benchers of this twin's PARENT (the wildcard key),
                 // or mark the transition pending for a bench racing this drain.
                 if let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) {
@@ -8256,25 +8311,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                if child == REAP_ANY_CHILD {
-                    // #802 rung 3 — the any-child bench: park under the caller's per-parent
-                    // wildcard key, which every child-transition drain point wakes. The race
-                    // check is the pending mark (`reap_any_pending`), not `results` — a
-                    // personality-lane twin's outcome lingers in `results` after the guest
-                    // reaps it from the personality table, so a `results` scan would re-admit
-                    // (and spin) forever once any child had ever exited.
-                    let key = REAP_ANY_BASE | domain_key_of(&v) as TaskId;
-                    if s.reap_any_pending.remove(&key) {
-                        s.runnable.push_back(v);
-                        sched.work.notify_one();
-                    } else {
-                        s.posix_reap_waiters.entry(key).or_default().push_back(v);
-                    }
-                } else if s.results.contains_key(&child) {
+                // #802 rung 3 — the any-child bench parks under the caller's per-parent wildcard
+                // key, which every child-transition drain point wakes. Its race check is the
+                // pending mark alone, not `results` — a personality-lane twin's outcome lingers in
+                // `results` after the guest reaps it from the personality table, so a `results`
+                // scan would re-admit (and spin) forever once any child had ever exited.
+                //
+                // #1340 — a specific-child bench checks the mark too: a STOP or CONTINUE is as
+                // reportable as the exit `results` covers, and the child can make that transition
+                // between this op finding nothing fresh and this insert (the tree-walker's workers
+                // are real threads). Without the mark the parent slept through a SIGTTIN stop and
+                // the child waited forever for the SIGCONT only that parent would send.
+                let (key, exits) = if child == REAP_ANY_CHILD {
+                    (REAP_ANY_BASE | domain_key_of(&v) as TaskId, None)
+                } else {
+                    (child, Some(child))
+                };
+                if reap_bench_missed(&mut s, key, exits) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
-                    s.posix_reap_waiters.entry(child).or_default().push_back(v);
+                    s.posix_reap_waiters.entry(key).or_default().push_back(v);
                 }
             }
             Step::Park(Blocked::Stopped) => {
@@ -8318,10 +8375,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // twin-completion point does — the rewound op re-executes and the
                     // personality reports the fresh stop (`stop_fresh`).
                     let id = v.id;
-                    if let Some(ws) = s.posix_reap_waiters.remove(&id) {
-                        for w in ws {
-                            s.runnable.push_back(w);
-                        }
+                    if wake_posix_reap_locked(&mut s, id) {
                         sched.work.notify_all();
                     }
                     // #802 rung 3 — a STOP is an any-child transition too: wake (or mark for)
@@ -12220,33 +12274,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 OutOfFuel,
                             }
                             let adm_ = {
-                                let mut guard_ = match state_.try_lock() {
-                                    Ok(g) => g,
-                                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                                    // Held only by the 3a fallback (durable providers) or a
-                                    // wiring/introspection API; the animated path releases it and
-                                    // guards with `busy`.
-                                    Err(std::sync::TryLockError::WouldBlock) => {
-                                        // CALLS.md increment 7 (§10.1) — a `Threaded` provider
-                                        // promises **no admission gate**, so contention on this
-                                        // brief snapshot lock must NOT read as busy. The threaded
-                                        // critical section holds `state_` only to fork the window
-                                        // and clone the powerbox cell, and drops it before the
-                                        // handler runs (it never spans a sub-run — a threaded offer
-                                        // is never durable, so the long-holding 3a fallback cannot
-                                        // apply). Blocking to acquire it is therefore bounded, and
-                                        // it closes I69's lost-caller window: two concurrent callers
-                                        // colliding here used to hand the loser a spurious `-EAGAIN`,
-                                        // silently dropping its dispatch. Every other tier keeps the
-                                        // 3a semantics — a held lock reads as busy: `-EAGAIN`.
-                                        if entry_.policy == OfferPolicy::Threaded {
-                                            state_.lock_unpoisoned()
-                                        } else {
-                                            frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                            continue;
-                                        }
-                                    }
-                                };
+                                // The instance's brief snapshot lock — held only for short critical
+                                // sections: another caller's admission, a settle, a waiter's
+                                // `admit_parked` bookkeeping, the host-side tier's checkout and
+                                // check-in (6c released it across that tier's sub-run). So waiting
+                                // for it is bounded, and a held lock must NOT read as busy: that
+                                // handed the loser of two colliding callers a spurious `-EAGAIN`
+                                // instead of the park-and-retry below (I69 for `Threaded`; #1606
+                                // for `single`, whose 3a-era `try_lock` outlived the long holder
+                                // it guarded against). Admission is decided by `busy`, under it.
+                                let mut guard_ = state_.lock_unpoisoned();
                                 let st_ = &mut *guard_;
                                 if entry_.policy == OfferPolicy::Threaded {
                                     // CALLS.md increment 7 (§10.1) — **no admission gate**: the
@@ -19784,9 +19821,10 @@ pub struct ProviderState {
     /// instance's world checked out (its `mem`/`host` swapped onto the animating vCPU). A
     /// concurrent caller observing it answers a probeable `-EAGAIN`, exactly as 3a's held
     /// `try_lock` did — the animated path cannot hold the state guard across the handler's many
-    /// loop iterations, so this flag serializes admission in its place. The 3a `drive_arc`
-    /// fallback (durable providers) still admits under the held guard and never sets this. (The
-    /// full §10.3 closed bit — freeze/teardown — rides 4b.)
+    /// loop iterations, so this flag serializes admission in its place. Since 6c the host-side
+    /// `drive_arc` tier sets it too (owner `0`) and releases the guard across its sub-run, so the
+    /// guard itself is only ever held briefly. (The full §10.3 closed bit — freeze/teardown —
+    /// rides 4b.)
     busy: bool,
     /// CALLS.md 4c.1 — count of **admission-waiters** parked on this busy instance
     /// ([`Sched::admit_waiters`]). Incremented under the state lock when a distinct-vCPU caller
@@ -24774,9 +24812,11 @@ impl Host {
     /// **Lock invariant (CALLS.md increment 3, slice 1; narrowed by 6b):** this is now the one
     /// blocking `state.lock()` accessor (the provider-pays metering pair left with 6b). It takes
     /// the provider `state` mutex *while the caller holds `&mut Host`* — an `hg → state`
-    /// acquisition order; every dispatch-path acquisition is a non-blocking `state.try_lock()`,
-    /// so no cycle can form **during a live run**. Pre-run wiring only (as today); the caveat
-    /// dissolves entirely when `ProviderState` retires (the 6d binding-merge residue).
+    /// acquisition order, the reverse of the dispatch paths' `state → hg`. Safe because it runs
+    /// **pre-run only**: during a live run the eval-loop admission blocks on `state` (#1606 — every
+    /// holder is brief, and the admitter holds no other lock while it waits) and the host-side
+    /// tier `try_lock`s it. The caveat dissolves entirely when `ProviderState` retires (the 6d
+    /// binding-merge residue).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let st = state.lock_unpoisoned();

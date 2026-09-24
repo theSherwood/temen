@@ -366,6 +366,50 @@ fn busy_loop_provider() -> temen_ir::Module {
     )
 }
 
+/// **#1606 — a caller that meets the instance's brief state lock waits for it.** The lock guards
+/// only short critical sections (another caller's admission, a settle, a waiter's bookkeeping), so
+/// finding it held says nothing about whether the instance is busy — `busy`, read under it, does.
+/// The eval-loop admission used to `try_lock` it and answer a `single` provider's collision with
+/// `-EAGAIN`, never parking: two concurrent callers of `concurrent_callers_park_and_retry_instead_of_eagain`
+/// hit that on the aarch64 runner. Holding the lock across the guest's one call pins it
+/// deterministically: the call must wait and return the real result.
+#[test]
+fn a_caller_meeting_the_held_state_lock_waits_instead_of_eagain() {
+    let provider = busy_loop_provider();
+    let mut h = Host::new();
+    let offer = h.wire_offer_proc(&provider, &[0]).expect("instanced offer");
+    let tid = h.resolve_offer(offer).unwrap().type_id;
+    let state = h
+        .resolve_offer(offer)
+        .unwrap()
+        .state
+        .clone()
+        .expect("an instanced offer has provider state");
+    let src = format!(
+        "memory 16\n\
+         func () -> (i64) {{\n\
+         block 0 () {{\n\
+           vh = i32.const {offer}\n\
+           vr = call.cap {tid} 0 () -> (i64) vh ()\n\
+           return vr\n\
+           }}\n\
+         }}\n"
+    );
+    let m = module(&src);
+    let held = state.lock().unwrap_or_else(|e| e.into_inner());
+    let caller = std::thread::spawn(move || {
+        let mut fuel = 1_000_000_000u64;
+        run_with_host(&m, 0, &[], &mut fuel, &mut h)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(held);
+    assert_eq!(
+        caller.join().expect("caller thread"),
+        Ok(vec![Value::I64(1)]),
+        "the call waited out the held lock and ran — not a spurious -EAGAIN"
+    );
+}
+
 /// **4c.1 — distinct-vCPU contention.** Two threads of one domain call the same `single` instance;
 /// while one holds it `busy` (a compute loop), the other must **park + wake-retry** rather than
 /// receive `-EAGAIN`. Each thread makes a *single* call (no `-EAGAIN` retry loop), so a `-11`
