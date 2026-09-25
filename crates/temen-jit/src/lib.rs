@@ -168,7 +168,7 @@ pub unsafe fn fiber_park_current() {
     let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
     // #1631 — a bare host-thunk park carries no deadline: nothing wakes it on its own, so it
     // counts as parked.
-    fiber_rt::fiber_event_park(&slot, false);
+    fiber_rt::fiber_event_park(&slot, false, None);
 }
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
@@ -580,38 +580,40 @@ pub struct FrozenNested {
 /// page, so protecting it protects (at most) its host page — exact on a 4 KiB-page host.
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
 
-/// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
-/// match the codes the lowered checks / the host thunk store into the trap cell.
+/// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered by the one trap
+/// wire code ([`temen_ir::trap_code`]) — what the lowered checks and the host thunks store into the
+/// trap cell, and what the interpreters' `Trap::code` returns, so `Trap` ↔ `TrapKind` is
+/// `Trap::from_code(k.code())` / `TrapKind::from_code(t.code())`, never a hand-written map (#1735).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum TrapKind {
-    DivByZero = 1,
-    IntOverflow = 2,
-    BadConversion = 3,
-    Unreachable = 4,
-    IndirectCallType = 5,
+    DivByZero = temen_ir::trap_code::DIV_BY_ZERO as u32,
+    IntOverflow = temen_ir::trap_code::INT_OVERFLOW as u32,
+    BadConversion = temen_ir::trap_code::BAD_CONVERSION as u32,
+    Unreachable = temen_ir::trap_code::UNREACHABLE as u32,
+    IndirectCallType = temen_ir::trap_code::INDIRECT_CALL_TYPE as u32,
     /// Forged / closed / wrong-type capability handle (§3c).
-    CapFault = 6,
+    CapFault = temen_ir::trap_code::CAP_FAULT as u32,
     /// A guest memory access faulted into the window's guard region (§4/§5) — caught by
     /// the signal handler and turned into detect-and-kill. The masking lowering confines
     /// every access to `[0, size)`, so in practice this is a width-overrun at the very top
     /// of the window, or (defense-in-depth) a masking/elision bug that the guard caught.
-    MemoryFault = 8,
+    MemoryFault = temen_ir::trap_code::MEMORY_FAULT as u32,
     /// Forged / out-of-range / already-running / finished fiber handle, a bad fiber-entry funcref, a
     /// `suspend` with no running fiber, or a fiber-bomb (§12). Matches `Trap::FiberFault`.
-    FiberFault = 9,
+    FiberFault = temen_ir::trap_code::FIBER_FAULT as u32,
     /// Forged / out-of-range / already-joined thread handle, or a thread-bomb (§12). Matches
     /// `Trap::ThreadFault`.
-    ThreadFault = 10,
+    ThreadFault = temen_ir::trap_code::THREAD_FAULT as u32,
     /// The host **interrupted** a runaway guest (§5 the fuel/epoch kill-path): a non-terminating
     /// guest is stopped because the host set the interrupt cell (e.g. a watchdog timer). The
     /// lowering polls that cell at loop back-edges and function entries and traps here. Matches the
     /// interpreter's `Trap::OutOfFuel` — both report "the host bounded this run".
-    OutOfFuel = 11,
+    OutOfFuel = temen_ir::trap_code::OUT_OF_FUEL as u32,
     /// A `longjmp` to a `jmp_buf` that was never `setjmp`'d (a stale/forged token) — caught by the
     /// host `setjmp` table's lookup before the (skipped) `_longjmp` (§3b totality). Matches the
     /// interpreters' `Trap::Malformed` for the same condition (LLVM.md §"JIT `longjmp`").
-    SetjmpFault = 12,
+    SetjmpFault = temen_ir::trap_code::MALFORMED as u32,
     /// A guest **control-stack overflow** caught by the software stack-limit check the JIT emits in
     /// each prologue when `feature = "stack-check"` (the arena/software-guard fiber model, which drops
     /// the per-fiber hardware guard page). A function whose frame would grow the native stack past the
@@ -622,18 +624,18 @@ pub enum TrapKind {
     /// in-window memory faults (handler has ample stack) surface as `MemoryFault`. The software check
     /// here traps through `trap_out` with no signal, so it is the only path that catches fiber overflow
     /// survivably (see `temen-jit/STACK_GUARD_FLIP.md`, "sigaltstack finding").
-    StackOverflow = 13,
+    StackOverflow = temen_ir::trap_code::STACK_OVERFLOW as u32,
 }
 
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
 /// 32 bits of the `i64` cell). Distinct from every [`TrapKind`].
-pub const EXIT_CODE: u32 = 7;
+pub const EXIT_CODE: u32 = temen_ir::trap_code::EXIT as u32;
 
 /// #1768 — trap-cell code a host thunk stores to **unwind the whole run on the host's behalf**, with
 /// the guest's continuation discarded: an `execve` image-replace, which never returns to its caller.
 /// The run unwinds exactly as it does for an `Exit` and ends [`JitOutcome::HostUnwound`]. Distinct
 /// from every [`TrapKind`], from [`EXIT_CODE`] and from the internal `DOMAIN_DONE_CODE`.
-pub const HOST_UNWIND_CODE: u32 = 15;
+pub const HOST_UNWIND_CODE: u32 = temen_ir::trap_code::HOST_UNWIND as u32;
 
 /// Trap-cell code `run_inner` stores at **domain teardown** when the root vCPU completed cleanly
 /// (owner decision 2026-07-24: "root completion ends the activation; the owner's departure ends the
@@ -643,25 +645,33 @@ pub const HOST_UNWIND_CODE: u32 = 15;
 /// [`JitOutcome::Returned`] — the run result stays the root's own return, uncontaminated. Distinct
 /// from every [`TrapKind`] and from [`EXIT_CODE`], mirroring how the freeze unwind keeps its
 /// sentinel (the `UNWINDING` state word) out of the trap namespace.
-pub(crate) const DOMAIN_DONE_CODE: u32 = 14;
+pub(crate) const DOMAIN_DONE_CODE: u32 = temen_ir::trap_code::DOMAIN_DONE as u32;
 
 impl TrapKind {
-    fn from_code(c: u32) -> Option<TrapKind> {
-        Some(match c {
-            1 => TrapKind::DivByZero,
-            2 => TrapKind::IntOverflow,
-            3 => TrapKind::BadConversion,
-            4 => TrapKind::Unreachable,
-            5 => TrapKind::IndirectCallType,
-            6 => TrapKind::CapFault,
-            8 => TrapKind::MemoryFault,
-            9 => TrapKind::FiberFault,
-            10 => TrapKind::ThreadFault,
-            11 => TrapKind::OutOfFuel,
-            12 => TrapKind::SetjmpFault,
-            13 => TrapKind::StackOverflow,
+    /// The kind a trap-cell code names (its low 32 bits), if it is a trap — not `0`, [`EXIT_CODE`] or
+    /// a JIT-internal sentinel.
+    pub fn from_code(c: u32) -> Option<TrapKind> {
+        use temen_ir::trap_code as t;
+        Some(match c as i64 {
+            t::DIV_BY_ZERO => TrapKind::DivByZero,
+            t::INT_OVERFLOW => TrapKind::IntOverflow,
+            t::BAD_CONVERSION => TrapKind::BadConversion,
+            t::UNREACHABLE => TrapKind::Unreachable,
+            t::INDIRECT_CALL_TYPE => TrapKind::IndirectCallType,
+            t::CAP_FAULT => TrapKind::CapFault,
+            t::MEMORY_FAULT => TrapKind::MemoryFault,
+            t::FIBER_FAULT => TrapKind::FiberFault,
+            t::THREAD_FAULT => TrapKind::ThreadFault,
+            t::OUT_OF_FUEL => TrapKind::OutOfFuel,
+            t::MALFORMED => TrapKind::SetjmpFault,
+            t::STACK_OVERFLOW => TrapKind::StackOverflow,
             _ => return None,
         })
+    }
+
+    /// This kind's trap wire code ([`temen_ir::trap_code`]).
+    pub fn code(self) -> i64 {
+        self as u32 as i64
     }
 }
 

@@ -192,12 +192,8 @@ fn interp_trap(t: SpecTrap) -> Trap {
 }
 
 fn jit_trap(t: SpecTrap) -> TrapKind {
-    match t {
-        SpecTrap::DivByZero => TrapKind::DivByZero,
-        SpecTrap::IntOverflow => TrapKind::IntOverflow,
-        SpecTrap::BadConversion => TrapKind::BadConversion,
-        SpecTrap::MemoryFault => TrapKind::MemoryFault,
-    }
+    // The same trap on the shared wire code (#1735), not a second table.
+    TrapKind::from_code(interp_trap(t).code() as u32).expect("a trap kind")
 }
 
 #[test]

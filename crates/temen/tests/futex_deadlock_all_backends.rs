@@ -191,3 +191,172 @@ fn a_finite_wait_with_no_notifier_still_times_out_on_every_backend() {
         );
     }
 }
+
+/// Assert every backend runs `src` to an ordinary result containing `want`.
+fn pin_all_completes(src: &str, want: &str, what: &str) {
+    for backend in ALL {
+        let (r, dt) = run_on(src, backend);
+        let out = r.unwrap_or_else(|e| panic!("{backend:?}: {what} must complete: {e} in {dt:?}"));
+        assert!(
+            out.contains(want),
+            "{backend:?}: {what}: expected {want}, got {out} in {dt:?}"
+        );
+    }
+}
+
+/// **A joiner whose child has finished is not blocked.** Each round the root spawns C, which naps
+/// 20 µs so the root is parked in `thread.join` when it ends, and W, which waits indefinitely for
+/// the store the root makes after the join. A finishing vCPU drops `live` *before* it publishes
+/// its result (so a joiner that sees the result also sees the spawn slot freed), and the JIT's
+/// joiner used to stay counted in `parked` until it woke and dropped its guard. W, woken by the
+/// same exit, could read `live(2) == parked(2)` in between — root and W — and trap `ThreadFault`
+/// although the root was about to notify it: #1625's "a woken waiter still counted", on a join.
+const JOIN_THEN_NOTIFY: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vz1 = i64.const 0
+  vc = thread.spawn 1 vz1 vz1
+  vw = thread.spawn 2 vz1 vi
+  vrc = thread.join vc
+  vk = i64.const 16392
+  vone = i64.const 1
+  vnext = i64.add vi vone
+  vn32 = i32.wrap_i64 vnext
+  i32.atomic.store vk vn32
+  vcnt = i32.const 1
+  vwoke = atomic.notify vk vcnt
+  vrw = thread.join vw
+  vrounds = i64.const 300
+  vmore = i64.lt_u vnext vrounds
+  br_if vmore 1(vnext) 2(vnext)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const 20000
+  vst = i32.atomic.wait vaddr vexp vto
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vk = i64.const 16392
+  vexp = i32.wrap_i64 varg
+  vinf = i64.const -1
+  vst = i32.atomic.wait vk vexp vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
+
+#[test]
+fn a_joiner_whose_child_finished_is_not_counted_blocked() {
+    pin_all_completes(
+        JOIN_THEN_NOTIFY,
+        "I64(300)",
+        "join, then notify a waiting sibling",
+    );
+}
+
+/// **A vCPU driving a fiber whose wait was just claimed is not blocked.** V drives, with
+/// `cont.resume.block`, a fiber that waits indefinitely on K1 and then stores and notifies K2. The
+/// root notifies K1 and at once waits indefinitely on K2, for 300 rounds. The JIT counts V as
+/// parked while it idles on the fiber, and a `notify` claiming the *fiber's* wait used to leave that
+/// count alone until V woke and re-polled. The root, parking right after its notify, could read
+/// `live(2) == parked(2)` — V and itself — and trap `ThreadFault` against a fiber that was already
+/// runnable.
+const NOTIFY_A_BLOCK_DRIVEN_FIBER_THEN_WAIT: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vone = i64.const 1
+  br 1(vt, vone)
+}
+block 1 (vt1: i32, vi: i64) {
+  vk1 = i64.const 16384
+  vi32 = i32.wrap_i64 vi
+  i32.atomic.store vk1 vi32
+  vcnt = i32.const 1
+  vwoke = atomic.notify vk1 vcnt
+  vk2 = i64.const 16392
+  vone1 = i64.const 1
+  vprev = i64.sub vi vone1
+  vp32 = i32.wrap_i64 vprev
+  vinf = i64.const -1
+  vst = i32.atomic.wait vk2 vp32 vinf
+  vnext = i64.add vi vone1
+  vlast = i64.const 300
+  vmore = i64.le_u vnext vlast
+  br_if vmore 1(vt1, vnext) 2(vt1)
+}
+block 2 (vt2: i32) {
+  vr = thread.join vt2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vone = i64.const 1
+  br 1(vone)
+}
+block 1 (vi: i64) {
+  vf = ref.func 2
+  vz = i64.const 0
+  vk = cont.new vf vz
+  br 2(vk, vi)
+}
+block 2 (vk2: i64, vi2: i64) {
+  vs, vv = cont.resume.block vk2 vi2
+  vdone = i32.const 1
+  visdone = i32.eq vs vdone
+  br_if visdone 3(vi2) 2(vk2, vi2)
+}
+block 3 (vi3: i64) {
+  vone3 = i64.const 1
+  vnext = i64.add vi3 vone3
+  vlast = i64.const 300
+  vmore = i64.le_u vnext vlast
+  br_if vmore 1(vnext) 4(vi3)
+}
+block 4 (vr: i64) {
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vk1 = i64.const 16384
+  vone = i64.const 1
+  vprev = i64.sub varg vone
+  vp32 = i32.wrap_i64 vprev
+  vinf = i64.const -1
+  vst = i32.atomic.wait vk1 vp32 vinf
+  vk2 = i64.const 16392
+  vi32 = i32.wrap_i64 varg
+  i32.atomic.store vk2 vi32
+  vcnt = i32.const 1
+  vwoke = atomic.notify vk2 vcnt
+  return varg
+  }
+}
+"#;
+
+#[test]
+fn a_vcpu_driving_a_just_notified_fiber_is_not_counted_blocked() {
+    pin_all_completes(
+        NOTIFY_A_BLOCK_DRIVEN_FIBER_THEN_WAIT,
+        "I64(300)",
+        "notify a block-driven fiber, then wait for its reply",
+    );
+}

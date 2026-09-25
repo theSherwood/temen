@@ -1251,17 +1251,6 @@ mod pal {
 mod tests {
     use super::*;
 
-    // These PAL tests each reserve a window in the *same* process. On Windows the no-leak check
-    // (`pal_release_frees_all_placeholder_fragments_no_leak`) releases its reservation and then walks
-    // that VA range asserting every byte is `MEM_FREE` — but a *sibling* test's fresh reservation can
-    // land in the just-freed range during the walk (cargo runs unit tests in parallel), reading as a
-    // false "leak" (the intermittent `windows-latest` failure). Serialize the reserving tests so no
-    // two hold overlapping-lifetime reservations across that walk. (Harmless on unix.)
-    static PAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn pal_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        PAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     // Entry-shaped probes (the trampoline ABI). They do a single volatile read at a fixed window
     // offset; if it faults inside the guarded range the guard unwinds and `run_guarded` reports it.
     extern "C" fn read_at_0(
@@ -1311,7 +1300,6 @@ mod tests {
 
     #[test]
     fn pal_guard_catches_tail_fault_not_in_window() {
-        let _serial = pal_test_guard();
         // 64 KiB committed inside a 1 MiB reservation: offset 0 is live, 512 KiB is in the tail.
         let win = GuestWindow::new(64 << 10, 1 << 20);
         assert!(
@@ -1363,7 +1351,6 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn a_guard_fault_with_a_wild_frame_pointer_is_caught_not_fatal() {
-        let _serial = pal_test_guard();
         let win = GuestWindow::new(64 << 10, 1 << 20);
         let elsewhere = GuestWindow::new(64 << 10, 1 << 20);
         WILD_RBP.store(
@@ -1446,7 +1433,6 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn a_guarded_fault_returns_the_callers_nonvolatile_registers() {
-        let _serial = pal_test_guard();
         const S: u64 = 0x5a5a_0000_0000_0000;
         let (mut r12, mut r13, mut r14, mut r15, mut rsi, mut rdi) =
             (S | 12, S | 13, S | 14, S | 15, S | 6, S | 7);
@@ -1516,7 +1502,6 @@ mod tests {
 
     #[test]
     fn pal_window_is_writable_and_released() {
-        let _serial = pal_test_guard();
         let mut win = GuestWindow::new(8 << 10, 64 << 10);
         let w = win.rw_mut();
         w[0] = 0xAB;
@@ -1535,6 +1520,11 @@ mod tests {
     // reservation the way production does, release it, then `VirtualQuery` the original range and
     // assert not one byte remains mapped/committed/reserved. (Non-vacuous: the pre-fix single-release
     // leaks all-but-the-first fragment here.)
+    //
+    // That walk reads the address map of the whole process. Any allocation another thread makes
+    // after the release can land in the freed range and read as a leak, and `cargo test` runs the
+    // other tests on other threads meanwhile (#1793). So the check runs alone: the test re-runs
+    // itself as the only test in a child process of this binary.
     #[cfg(windows)]
     #[test]
     fn pal_release_frees_all_placeholder_fragments_no_leak() {
@@ -1542,7 +1532,24 @@ mod tests {
             VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE,
         };
 
-        let _serial = pal_test_guard();
+        const ALONE: &str = "TEMEN_PAL_RELEASE_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let name = "mem::tests::pal_release_frees_all_placeholder_fragments_no_leak";
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", name, "--test-threads=1"])
+                .env(ALONE, "1")
+                .output()
+                .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // "1 passed", not just a zero exit: a filter that matched nothing would exit 0 too.
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the no-leak check failed in its own process:\n{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
         let page = pal::page_size();
         let total = 64 * page; // room for several disjoint fragments
                                // SAFETY: a fresh placeholder reservation, released below.
@@ -1560,8 +1567,8 @@ mod tests {
         // SAFETY: release exactly the reservation created above.
         unsafe { pal::release(base, total) };
 
-        // Walk the original range: every region must now be `MEM_FREE` (nothing leaked). Nothing
-        // allocates between the release and this walk, so the freed VA is not reused under us.
+        // Walk the original range: every region must now be `MEM_FREE` (nothing leaked). This process
+        // runs no other test, so nothing allocates into the freed VA before the walk reads it.
         let lo = base as usize;
         let hi = lo + total;
         let mut addr = lo;

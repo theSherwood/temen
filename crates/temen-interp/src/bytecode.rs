@@ -11891,6 +11891,9 @@ struct CoopSched {
     /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
     /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
     hooked_twins: std::collections::BTreeSet<usize>,
+    /// FORK.md §8.6 / #1807 — child envs (§14 children and fork twins) whose pipe ends were released at
+    /// their domain's finish. Released once: the release decrements the shared end counts.
+    released_envs: std::collections::BTreeSet<usize>,
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
@@ -12076,6 +12079,7 @@ impl CoopSched {
         // `-ECHILD`, never a park that hangs); an id is retired when reaped.
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let released_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
         // #1122 — an armed external-wake doorbell: wire the personality's pipe-wake door to ring
         // it (the cooperative twin of the tree-walker's `set_pipe_wake` → scheduler wiring). The
@@ -12104,6 +12108,7 @@ impl CoopSched {
             dead_envs,
             forked_twins,
             hooked_twins,
+            released_envs,
             clock,
             eligible,
             page_checked,
@@ -12142,6 +12147,7 @@ impl CoopSched {
             dead_envs,
             forked_twins,
             hooked_twins,
+            released_envs,
             clock,
             eligible,
             page_checked,
@@ -12161,6 +12167,16 @@ impl CoopSched {
         // long-Runnable high-index one).
         let mut last_pick: usize = 0;
         loop {
+            // #1122 — the external-wake generation, snapshotted FIRST, before any of this settle's
+            // reads: the all-parked block below waits for a ring newer than this, so every fact an
+            // embedder door raises and then rings for — bytes fed to a pipe, a deliverable signal,
+            // a child transition, a kill — is either seen by the settle or wakes the block. Taken
+            // after the kill sweep, a terminate landing between the two had its ring folded into
+            // the snapshot and the pump slept through a dead domain until the next unrelated ring.
+            // `0` when unarmed.
+            let bell_gen = host
+                .external_wake()
+                .map_or(0, |bell| *bell.0.lock().unwrap_or_else(|e| e.into_inner()));
             // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24): a
             // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
             // before reading the root's state, so a sibling's trap that killed the root domain
@@ -12253,6 +12269,23 @@ impl CoopSched {
             for ti2 in killed {
                 complete(tasks, ti2, Err(Trap::ThreadFault));
             }
+            // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its env done, cleanly
+            // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
+            // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
+            // parked producer to `-EPIPE`.
+            let mut live = vec![false; extra_envs.len()];
+            let mut seen = vec![false; extra_envs.len()];
+            for t in tasks.iter() {
+                if let Some(k) = t.env {
+                    seen[k] = true;
+                    live[k] |= !matches!(t.state, TaskState::Done(_));
+                }
+            }
+            for k in 0..extra_envs.len() {
+                if seen[k] && !live[k] && released_envs.insert(k) {
+                    extra_envs[k].host.lock_unpoisoned().release_pipe_ends();
+                }
+            }
             // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
             // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
             // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
@@ -12271,14 +12304,8 @@ impl CoopSched {
                 })
                 .collect();
             for (ti2, status, k) in to_hook {
-                let hooks = {
-                    let g = extra_envs[k].host.lock_unpoisoned();
-                    // #1080 rung 4 — release this task's pipe ends at exit (the tree-walker's exit-time
-                    // `drop_all_pipe_*`) so a peer reader sees EOF / a peer writer `-EPIPE`: its settle
-                    // poll then re-admits. Polling needs no explicit wake, so the zeroed ids are dropped.
-                    let _ = (g.drop_all_pipe_writers(), g.drop_all_pipe_readers());
-                    g.exit_hooks.clone()
-                };
+                // Its pipe ends were released above, with every finished domain's.
+                let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
                 for h in hooks {
                     h(status);
                 }
@@ -12333,13 +12360,6 @@ impl CoopSched {
             for ci in reap_p_wakes {
                 tasks[ci].state = TaskState::Runnable;
             }
-            // #1122 — the external-wake generation, snapshotted BEFORE the pipe-readiness poll so
-            // the all-parked block below cannot lose a wake: a feed that lands before this read has
-            // already deposited its bytes (the poll sees them); one that lands after it bumps the
-            // generation past this snapshot (the block returns immediately). `0` when unarmed.
-            let bell_gen = host
-                .external_wake()
-                .map_or(0, |bell| *bell.0.lock().unwrap_or_else(|e| e.into_inner()));
             // #1080 rung 4 — pipe wakes: the cooperative driver has no scheduler-side `pipe_waiters`, so
             // it POLLS each parked reader/writer's shared FIFO here and re-admits (the rewound read/write
             // re-executes) once ready. A reader/writer is usually a forked command (`env: Some`); a root
@@ -15088,6 +15108,12 @@ impl Futex {
     ) -> i32 {
         let waiter = {
             let mut buckets = self.buckets.lock().unwrap();
+            // A domain that died since this vCPU's last safepoint: its kill scanned the buckets
+            // before this waiter was in them ([`ParDomain::kill`] records the death, *then* takes
+            // this lock to wake), so ask here, under the lock, and return as its wake would have.
+            if domain.dead().is_some() {
+                return super::WAIT_WOKEN;
+            }
             // Compare-under-lock: the futex word lives in the shared backing (`atomic_value` reads it).
             if mem.atomic_value(base, width) != expected {
                 return super::WAIT_NOT_EQUAL;
@@ -15159,6 +15185,31 @@ impl Futex {
     }
 }
 
+#[cfg(test)]
+mod par_futex_tests {
+    use super::*;
+
+    /// A domain that died between a member's loop-top `dead()` check and its futex enqueue: the
+    /// kill's wake scanned the buckets before the waiter was in them. The waiter must see the death
+    /// under the bucket lock, not sleep out its timeout (`MAX_WAIT`, 10 s, for an infinite wait).
+    #[test]
+    fn a_wait_in_a_domain_that_died_before_it_enqueued_returns_at_once() {
+        let mem = Mem::with_reservation(temen_ir::DEFAULT_RESERVED_LOG2, 16, None);
+        let base = mem.prepare_wait(16384, IntTy::I32).expect("in bounds");
+        let reg = ThreadRegistry::new();
+        let dom = ParDomain::default();
+        dom.kill(&Trap::ThreadFault, &reg);
+        let t0 = std::time::Instant::now();
+        let r = reg.futex.wait(&dom, &mem, base, 0, 4, None);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "slept {:?} in a dead domain",
+            t0.elapsed()
+        );
+        assert_eq!(r, super::super::WAIT_WOKEN);
+    }
+}
+
 /// One **domain** of the parallel driver (DESIGN.md §12): the root and its `thread.spawn` threads,
 /// or a §14 confined child or fork twin and its threads — the world that shares one window and
 /// powerbox. It holds the domain's fiber registry (#1761) and its death: a member's trap is
@@ -15188,8 +15239,11 @@ impl ParDomain {
             *d = Some(*t);
         }
         reg.futex.wake_domain(self);
-        let _g = reg.done.lock().unwrap_or_else(|e| e.into_inner());
-        reg.woken.notify_all();
+        {
+            let _g = reg.done.lock().unwrap_or_else(|e| e.into_inner());
+            reg.woken.notify_all();
+        }
+        reg.wake_fork_waiters();
     }
 }
 
@@ -15219,11 +15273,14 @@ struct ThreadRegistry {
     /// The next personality twin pid. Starts at 2: the root personality is pid 1 (the same
     /// no-collision shape as the cooperative driver's `task index + 1`).
     next_fork_pid: std::sync::atomic::AtomicI64,
+    /// This registry, for the personality doors [`wire_parallel_doors`] installs: they outlive the
+    /// run on the host's signal source, so they hold it weakly.
+    me: std::sync::Weak<ThreadRegistry>,
 }
 
 impl ThreadRegistry {
-    fn new() -> ThreadRegistry {
-        ThreadRegistry {
+    fn new() -> std::sync::Arc<ThreadRegistry> {
+        std::sync::Arc::new_cyclic(|me| ThreadRegistry {
             done: std::sync::Mutex::new(std::collections::HashMap::new()),
             woken: std::sync::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(0),
@@ -15232,7 +15289,8 @@ impl ThreadRegistry {
             fork_exits: std::sync::Mutex::new((std::collections::HashSet::new(), 0)),
             fork_woken: std::sync::Condvar::new(),
             next_fork_pid: std::sync::atomic::AtomicI64::new(2),
-        }
+            me: me.clone(),
+        })
     }
 
     /// #748 — a fork twin's OS thread finished (its exit hooks have already fired, so the
@@ -15244,20 +15302,38 @@ impl ThreadRegistry {
         self.fork_woken.notify_all();
     }
 
+    /// Something other than an exit a reap waiter must re-check (a kill, a raise, a child
+    /// stop/continue): wake them all under the table lock, so a waiter between its check and its
+    /// wait cannot miss it.
+    fn wake_fork_waiters(&self) {
+        let _g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
+        self.fork_woken.notify_all();
+    }
+
     /// #748 — block this vCPU's OS thread until `child` (`Some(pid)`) has published its exit, or
     /// (`None`, the any-child wait) until the exit generation exceeds `last_gen`. Returns the
     /// current generation for the caller to carry into its next wait; either way the caller's
     /// rewound `waitpid` re-executes against the updated personality table.
-    fn wait_fork_exit(&self, child: Option<i64>, last_gen: u64) -> u64 {
+    ///
+    /// `interrupted` asks, under the table lock, whether anything else this park must not sleep
+    /// through has happened (see the `ReapWait` arm); each such event rings
+    /// [`Self::wake_fork_waiters`] after raising its fact, so the pair cannot lose it.
+    fn wait_fork_exit(
+        &self,
+        child: Option<i64>,
+        last_gen: u64,
+        interrupted: impl Fn() -> bool,
+    ) -> u64 {
         let mut g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let ready = match child {
                 Some(pid) => g.0.contains(&pid),
                 None => g.1 > last_gen,
             };
-            if ready {
+            if ready || interrupted() {
                 return g.1;
             }
+
             g = self.fork_woken.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -15288,10 +15364,20 @@ impl ThreadRegistry {
 
 /// #1246 — wire a parallel domain's default-action TERMINATE door: the personality's `set_kill`
 /// closure stores into this host's `term_flag`, the atomic every vCPU of the domain polls per op in
-/// [`Vm::resume`] and traps on. No scheduler wake is needed (the OS-thread vCPU polls it itself, unlike
-/// the cooperative driver which finalizes a killed domain at its loop top, #1215). Called on the root
-/// host and on each fork twin's freshly-minted host; a host with no signal personality is a no-op.
-fn wire_kill_flag(host: &std::sync::Arc<std::sync::Mutex<Host>>) {
+/// [`Vm::resume`] and traps on. Called on the root host and on each fork twin's freshly-minted host;
+/// a host with no signal personality is a no-op.
+///
+/// A running vCPU needs nothing more, but a **blocked** one polls nothing: one parked in a futex
+/// `wait` slept out its timeout (10 s for an infinite wait), and one parked in a blocking `waitpid`
+/// until a child exited — forever, if that child was parked too. So the deferred doors wake them:
+/// a terminate is this domain's death, the same `ThreadFault` the per-op poll raises
+/// ([`ParDomain::kill`] wakes its futex waiters, joiners and reap waiters), and a deliverable raise
+/// or a child's stop/continue re-checks every reap waiter (the `ReapWait` arm's predicate).
+fn wire_parallel_doors(
+    host: &std::sync::Arc<std::sync::Mutex<Host>>,
+    reg: &ThreadRegistry,
+    domain: &std::sync::Arc<ParDomain>,
+) {
     let (term_flag, source) = {
         let hg = host.lock_unpoisoned();
         (hg.term_flag.clone(), hg.signal_poll().map(|(_, s)| s))
@@ -15303,6 +15389,21 @@ fn wire_kill_flag(host: &std::sync::Arc<std::sync::Mutex<Host>>) {
         source.set_kill_apply(std::sync::Arc::new(move || {
             term_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
+        let (r, d) = (reg.me.clone(), std::sync::Arc::downgrade(domain));
+        source.set_kill(std::sync::Arc::new(move || {
+            if let (Some(r), Some(d)) = (r.upgrade(), d.upgrade()) {
+                d.kill(&Trap::ThreadFault, &r);
+            }
+        }));
+        let ring = |r: std::sync::Weak<ThreadRegistry>| -> std::sync::Arc<dyn Fn() + Send + Sync> {
+            std::sync::Arc::new(move || {
+                if let Some(r) = r.upgrade() {
+                    r.wake_fork_waiters();
+                }
+            })
+        };
+        source.set_wake(ring(reg.me.clone()));
+        source.set_chld_wake(ring(reg.me.clone()));
     }
 }
 
@@ -15336,14 +15437,15 @@ fn drive_parallel(
     let shared = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(host)));
     // #1246 — wire the root domain's terminate door (a guest that kills its own group, or is killed
     // by an embedder, dies at its next per-op poll). Fork twins get theirs at mint (the `ForkSelf` arm).
-    wire_kill_flag(&shared);
+    let root_domain = std::sync::Arc::new(ParDomain::default());
+    wire_parallel_doors(&shared, &reg, &root_domain);
     let out = std::thread::scope(|scope| {
         run_vcpu_parallel(
             scope,
             &dom,
             &reg,
             std::sync::Arc::clone(&shared),
-            std::sync::Arc::new(ParDomain::default()),
+            root_domain,
             None,
             root_vt,
             mem,
@@ -15631,7 +15733,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         // #1246 — wire the twin's terminate door so a SIGKILL/SIGTERM to it sets its
                         // `term_flag` and its resume loop traps at the next op (the parent's `waitpid`
                         // then reaps the WIFSIGNALED death via the exit hook fired at thread return).
-                        wire_kill_flag(&twin_host);
+                        let twin_domain = std::sync::Arc::new(ParDomain::default());
+                        wire_parallel_doors(&twin_host, reg, &twin_domain);
                         let hooks_host = std::sync::Arc::clone(&twin_host);
                         // The twin continues the SAME image as its parent, so it dispatches over the
                         // same table (post-exec parents included — cf. the coop arm's fresh primary
@@ -15643,7 +15746,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                                 dom,
                                 reg,
                                 twin_host,
-                                std::sync::Arc::new(ParDomain::default()),
+                                twin_domain,
                                 twin_tbl,
                                 twin_vt,
                                 twin_mem,
@@ -15656,7 +15759,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             let status = super::reap_status(&r);
                             let hooks = {
                                 let g = hooks_host.lock_unpoisoned();
-                                let _ = (g.drop_all_pipe_writers(), g.drop_all_pipe_readers());
+                                g.release_pipe_ends();
                                 g.exit_hooks.clone()
                             };
                             for h in hooks {
@@ -15676,7 +15779,27 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 // record; `None` (any-child) waits for an exit generation newer than the last one
                 // this vCPU consumed — see [`ThreadRegistry::wait_fork_exit`] for why neither can
                 // livelock on a stale exit nor lose a wake.
-                fork_gen = reg.wait_fork_exit(child.map(|p| p as i64), fork_gen);
+                //
+                // Not only an exit ends the wait: a kill of this domain (its `term_flag`, or a
+                // sibling's trap), a deliverable signal (`-EINTR`, as the stdin park does), or a
+                // child's stop/continue (the personality's one-shot `reap_pending` edge — what the
+                // other two drivers wake a `WUNTRACED` wait on). Each is raised before its door
+                // rings the table (`wire_parallel_doors`), so asking under the table lock cannot miss
+                // one. The rewound `waitpid` then re-runs into the right outcome.
+                let term_flag = host.lock_unpoisoned().term_flag.clone();
+                fork_gen = reg.wait_fork_exit(child.map(|p| p as i64), fork_gen, || {
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        || domain.dead().is_some()
+                    {
+                        return true;
+                    }
+                    let mut h = host.lock_unpoisoned();
+                    if h.park_interrupted() {
+                        h.set_sig_interrupt();
+                        return true;
+                    }
+                    h.signal_poll().is_some_and(|(_, s)| s.reap_pending())
+                });
             }
             Ok(VcpuStop::Exec {
                 mh,
@@ -16049,6 +16172,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             child_fuel,
                         )
                     });
+                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+                    child_host.lock_unpoisoned().release_pipe_ends();
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -16141,6 +16266,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             child_fuel,
                         )
                     });
+                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+                    child_host.lock_unpoisoned().release_pipe_ends();
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -16336,6 +16463,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             child_fuel,
                         )
                     });
+                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+                    child_host.lock_unpoisoned().release_pipe_ends();
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -16720,7 +16849,7 @@ impl Vm {
             budget -= 1;
             // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
             // domain set its `term_flag` (via the personality's `set_kill` closure, wired on the
-            // parallel driver by `wire_kill_flag`). Die at this op — the vCPU's thread returns the trap,
+            // parallel driver by `wire_parallel_doors`). Die at this op — the vCPU's thread returns the trap,
             // and the driver's exit hook reports term-by-signal from the personality's `term_sig`
             // bookkeeping (WIFSIGNALED), exactly like the tree-walker. Checked before the async-signal
             // redirect (death beats a caught delivery).

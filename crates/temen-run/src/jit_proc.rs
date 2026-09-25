@@ -796,22 +796,9 @@ fn interp_result(
     }
 }
 
-/// The interpreters' [`Trap`] for a JIT trap kind.
+/// The interpreters' [`Trap`] for a JIT trap kind: the same trap wire code (#1735).
 fn trap_of(kind: TrapKind) -> Trap {
-    match kind {
-        TrapKind::DivByZero => Trap::DivByZero,
-        TrapKind::IntOverflow => Trap::IntOverflow,
-        TrapKind::BadConversion => Trap::BadConversion,
-        TrapKind::Unreachable => Trap::Unreachable,
-        TrapKind::IndirectCallType => Trap::IndirectCallType,
-        TrapKind::CapFault => Trap::CapFault,
-        TrapKind::MemoryFault => Trap::MemoryFault,
-        TrapKind::FiberFault => Trap::FiberFault,
-        TrapKind::ThreadFault => Trap::ThreadFault,
-        TrapKind::OutOfFuel => Trap::OutOfFuel,
-        TrapKind::SetjmpFault => Trap::Malformed,
-        TrapKind::StackOverflow => Trap::StackOverflow,
-    }
+    Trap::from_code(kind.code()).expect("every trap kind is a trap")
 }
 
 /// Run `m`'s `func` as the root of a process tree — process 1 over the embedder's `host` — then end

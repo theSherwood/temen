@@ -87,15 +87,19 @@ fn sig_of(types: &[TypeEntry], t: u32) -> &FuncType {
     }
 }
 
+// The codes `env.trap` delivers are the one trap wire code ([`temen_ir::trap_code`]), so a host maps
+// one straight to its trap (`Trap::from_code`) and a code means the same trap on every engine. They
+// were 1/2/3 before #1735 — DivByZero/IntOverflow/BadConversion to every other engine.
+
 /// Trap code delivered through `env.trap` when the per-dispatch fuel counter goes negative.
-pub const TRAP_OUT_OF_FUEL: i32 = 1;
+pub const TRAP_OUT_OF_FUEL: i32 = temen_ir::trap_code::OUT_OF_FUEL as i32;
 /// Trap code delivered through `env.trap` when an access fails the trap-confinement bounds
 /// check (`addr + offset + width > mapped` — the §4 `MemoryFault` at the offending access).
-pub const TRAP_MEMORY_FAULT: i32 = 2;
+pub const TRAP_MEMORY_FAULT: i32 = temen_ir::trap_code::MEMORY_FAULT as i32;
 /// Trap code delivered through `env.trap` when a #1627 spill push would run past the host's spill
 /// region (`[ENV_SPILL_SP_OFF] + bytes > [ENV_SPILL_END_OFF]`) — the spill-mode analogue of the
 /// interpreter's call-depth `StackOverflow`, which is how the host reports it.
-pub const TRAP_SPILL_OVERFLOW: i32 = 3;
+pub const TRAP_SPILL_OVERFLOW: i32 = temen_ir::trap_code::STACK_OVERFLOW as i32;
 
 /// Why a module was refused. Fail-closed: the caller runs the module on the interpreter tier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Prepare the runner's apt for an install, then (optionally) install packages:
 #   bash scripts/ci/apt-prep.sh [package…]
-# With packages: scrub, `apt-get update`, install them. With none: scrub only — for a step whose
-# installer runs its own update (`playwright install --with-deps`) or that adds a repo first
-# (`install-llvm.sh`).
+# With packages: scrub, `apt-get update`, install them. With none: scrub only — for a script that adds
+# a repo first and runs its own update (`install-llvm.sh`).
 #
 # THE ONE PLACE THE SCRUB LIVES. `apt-get update` fails hard when *any* configured index is
 # inconsistent, and the `ubuntu-latest` image preconfigures third-party repos we never install from —
@@ -24,6 +23,17 @@ sudo rm -f /etc/apt/sources.list.d/microsoft* \
 # one. Best-effort: the files differ across image revisions, so a miss here is not an error.
 sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
   /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
+# Fetch only the indices an install reads. The image's apt also pulls AppStream metadata (DEP-11
+# `Components`) and `Translation` files on every `apt-get update`, which no job reads but any of which
+# fails the update when a mirror is mid-sync — #1788's red run was two DEP-11 files served that way.
+sudo tee /etc/apt/apt.conf.d/99temen-index-targets >/dev/null <<'CONF'
+Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons-small::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons-hidpi::DefaultEnabled "false";
+Acquire::Languages "none";
+CONF
 
 if [ "$#" -gt 0 ]; then
   sudo apt-get update

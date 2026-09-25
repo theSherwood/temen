@@ -247,46 +247,48 @@ impl Trap {
         }
     }
 
-    /// The trap's stable numeric code: the JIT's trap-cell numbering (`TrapKind`, with `Exit` as
-    /// `7 | code << 32`), which is also what the snapshot codec writes for a trap that rides an
-    /// artifact (#1674). One numbering for both, so a trap crosses engines and artifacts unchanged.
+    /// The trap's wire code ([`temen_ir::trap_code`]): the one numbering every engine, thunk, artifact
+    /// (#1674) and embedder status shares, so a trap crosses any of them unchanged (#1735).
     pub fn code(self) -> i64 {
+        use temen_ir::trap_code as c;
         match self {
-            Trap::DivByZero => 1,
-            Trap::IntOverflow => 2,
-            Trap::BadConversion => 3,
-            Trap::Unreachable => 4,
-            Trap::IndirectCallType => 5,
-            Trap::CapFault => 6,
-            Trap::Exit(k) => 7 | ((k as u32 as i64) << 32),
-            Trap::MemoryFault => 8,
-            Trap::FiberFault => 9,
-            Trap::ThreadFault => 10,
-            Trap::OutOfFuel => 11,
-            Trap::Malformed => 12,
-            Trap::StackOverflow => 13,
+            Trap::DivByZero => c::DIV_BY_ZERO,
+            Trap::IntOverflow => c::INT_OVERFLOW,
+            Trap::BadConversion => c::BAD_CONVERSION,
+            Trap::Unreachable => c::UNREACHABLE,
+            Trap::IndirectCallType => c::INDIRECT_CALL_TYPE,
+            Trap::CapFault => c::CAP_FAULT,
+            Trap::Exit(k) => c::exit(k),
+            Trap::MemoryFault => c::MEMORY_FAULT,
+            Trap::FiberFault => c::FIBER_FAULT,
+            Trap::ThreadFault => c::THREAD_FAULT,
+            Trap::OutOfFuel => c::OUT_OF_FUEL,
+            Trap::Malformed => c::MALFORMED,
+            Trap::StackOverflow => c::STACK_OVERFLOW,
         }
     }
 
-    /// The trap a [`Self::code`] names, if any.
-    pub fn from_code(c: i64) -> Option<Trap> {
-        Some(match c & 0xffff_ffff {
-            1 => Trap::DivByZero,
-            2 => Trap::IntOverflow,
-            3 => Trap::BadConversion,
-            4 => Trap::Unreachable,
-            5 => Trap::IndirectCallType,
-            6 => Trap::CapFault,
-            7 => Trap::Exit((c >> 32) as i32),
-            8 => Trap::MemoryFault,
-            9 => Trap::FiberFault,
-            10 => Trap::ThreadFault,
-            11 => Trap::OutOfFuel,
-            12 => Trap::Malformed,
-            13 => Trap::StackOverflow,
+    /// The trap a [`Self::code`] names, if any — exact: a code no trap encodes (a reserved
+    /// JIT-internal sentinel, or stray high bits on a non-`Exit` kind) is `None`.
+    pub fn from_code(code: i64) -> Option<Trap> {
+        use temen_ir::trap_code as c;
+        Some(match code & 0xffff_ffff {
+            c::DIV_BY_ZERO => Trap::DivByZero,
+            c::INT_OVERFLOW => Trap::IntOverflow,
+            c::BAD_CONVERSION => Trap::BadConversion,
+            c::UNREACHABLE => Trap::Unreachable,
+            c::INDIRECT_CALL_TYPE => Trap::IndirectCallType,
+            c::CAP_FAULT => Trap::CapFault,
+            c::EXIT => Trap::Exit((code >> 32) as i32),
+            c::MEMORY_FAULT => Trap::MemoryFault,
+            c::FIBER_FAULT => Trap::FiberFault,
+            c::THREAD_FAULT => Trap::ThreadFault,
+            c::OUT_OF_FUEL => Trap::OutOfFuel,
+            c::MALFORMED => Trap::Malformed,
+            c::STACK_OVERFLOW => Trap::StackOverflow,
             _ => return None,
         })
-        .filter(|t| t.code() == c)
+        .filter(|t| t.code() == code)
     }
 }
 
@@ -6908,6 +6910,24 @@ fn reap_bench_missed(s: &mut Sched, key: TaskId, exits: Option<TaskId>) -> bool 
     s.reap_pending.remove(&key) || exits.is_some_and(|c| s.results.contains_key(&c))
 }
 
+/// Everything a blocking `waitpid` about to bench under `key` may have missed since its op ran:
+/// the scheduler's own marks ([`reap_bench_missed`]), a kill or deliverable signal
+/// ([`interrupt_before_park`]), and a child transition the personality reported only as its
+/// one-shot re-check edge ([`SignalSource::reap_pending`]).
+///
+/// That last one is the child that stops or continues **without** entering the core stop park —
+/// parked on a pipe or stream read when its SIGTSTP lands. Its parent's clean re-scan
+/// ([`Scheduler::rescan_reap_parks`]) drains the parent's benches, but a specific-child bench not
+/// filed yet was neither there nor marked, so the parent slept through a `WUNTRACED` stop no other
+/// event would repeat. The personality raises the edge under the parent's lock *before* firing
+/// that re-scan, so reading it here, under the scheduler lock the re-scan also takes, cannot miss
+/// it. It is the edge the cooperative driver's sweep consumes; a stale one costs one re-run.
+fn reap_bench_must_wake(s: &mut Sched, key: TaskId, exits: Option<TaskId>, hg: &mut Host) -> bool {
+    reap_bench_missed(s, key, exits)
+        || interrupt_before_park(hg)
+        || hg.signal_poll().is_some_and(|(_, src)| src.reap_pending())
+}
+
 #[cfg(test)]
 mod reap_bench_tests {
     //! #1340 — the park-vs-transition protocol for a blocking `waitpid` on one child, in the order
@@ -6927,6 +6947,29 @@ mod reap_bench_tests {
             !reap_bench_missed(&mut s, 7, Some(7)),
             "once: the next bench sleeps"
         );
+    }
+
+    /// A child that stops parked on a read reports only the personality's edge (and a re-scan
+    /// that finds no bench): the late bench re-runs, once.
+    #[test]
+    fn a_personality_edge_that_beats_the_bench_readmits_it_once() {
+        struct Edge(AtomicBool);
+        impl SignalSource for Edge {
+            fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+                None
+            }
+            fn reap_pending(&self) -> bool {
+                self.0.swap(false, Ordering::SeqCst)
+            }
+        }
+        let mut s = Sched::default();
+        let mut h = Host::new();
+        h.set_signal_source(
+            Arc::new(Edge(AtomicBool::new(true))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(reap_bench_must_wake(&mut s, 7, Some(7), &mut h));
+        assert!(!reap_bench_must_wake(&mut s, 7, Some(7), &mut h), "once");
     }
 
     #[test]
@@ -7296,6 +7339,68 @@ fn teardown_run(s: &mut Sched) {
 /// touch it while it ran; the park arms are exactly the "next safepoint"). Checked under the same
 /// lock as the park insert, so a teardown can never slip between the check and the park. Returns
 /// the vCPU back when its world is still alive.
+/// The pipe and `waitpid` park arms' half of [`Host::park_must_wake`]: a kill or a deliverable
+/// signal that landed before this park was filed wakes it here exactly as the sweep would have —
+/// the host's EINTR flag, and a re-admit whose rewound op re-executes (and the per-op poll traps a
+/// killed domain). Returns whether the park must not sleep.
+fn interrupt_before_park(hg: &mut Host) -> bool {
+    let wake = hg.park_must_wake();
+    if wake {
+        hg.set_sig_interrupt();
+    }
+    wake
+}
+
+#[cfg(test)]
+mod park_before_wake_tests {
+    //! The park-vs-interrupt protocol for the pipe, `waitpid` and stream-read parks, in the order
+    //! the tree-walker's real worker threads can run it: the vCPU passes its last per-op poll and
+    //! its op decides to park, a kill or a deliverable raise lands and its door sweeps the parked
+    //! set (finding nothing — the vCPU is not filed yet), then the park arm runs. The arm must see
+    //! what the door raised, or the vCPU sleeps through it: a killed `cat` on an idle pipe waited
+    //! for bytes that never came, and its shell waited on the `cat`.
+    use super::*;
+
+    struct Pending;
+    impl SignalSource for Pending {
+        fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+            None
+        }
+        fn interrupt_pending(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_kill_that_beats_the_park_wakes_it() {
+        let mut h = Host::new();
+        h.term_flag.store(true, Ordering::SeqCst); // the kill door's inline apply
+        assert!(
+            interrupt_before_park(&mut h),
+            "the late park re-runs its op"
+        );
+        assert!(
+            h.take_sig_interrupt(),
+            "as the sweep would have: the EINTR flag"
+        );
+    }
+
+    #[test]
+    fn a_raise_that_beats_the_park_wakes_it() {
+        let mut h = Host::new();
+        h.set_signal_source(Arc::new(Pending), Arc::new(AtomicBool::new(true)));
+        assert!(interrupt_before_park(&mut h));
+        assert!(h.take_sig_interrupt());
+    }
+
+    #[test]
+    fn a_quiet_park_sleeps() {
+        let mut h = Host::new();
+        assert!(!interrupt_before_park(&mut h));
+        assert!(!h.take_sig_interrupt());
+    }
+}
+
 fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
     let key = domain_key_of(&v);
     if !s.shutdown && !s.dead.contains_key(&key) {
@@ -8507,7 +8612,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // re-check beside it: a deliverable raise that landed after this vCPU's last
                     // per-op poll ran its sweep against a map we were not yet in; complete the
                     // read `-EINTR` instead of blocking through the signal.
-                    (hg.handle_live(handle), hg.park_interrupted())
+                    (hg.handle_live(handle), hg.park_must_wake())
                 };
                 if live && !interrupted {
                     s.cap_waiters
@@ -8564,7 +8669,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else {
                     (child, Some(child))
                 };
-                if reap_bench_missed(&mut s, key, exits) {
+                if reap_bench_must_wake(&mut s, key, exits, &mut v.host.lock_unpoisoned()) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
@@ -8642,15 +8747,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
                 // so a wake from another image of the pipe (fork twin, exec carry) finds them.
                 let (ready, gid) = {
-                    let hg = v.host.lock_unpoisoned();
-                    match hg.pipes.get(pipe as usize) {
+                    let mut hg = v.host.lock_unpoisoned();
+                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
                         Some((fifo, writers, _, gid, _)) => (
                             !fifo.lock_unpoisoned().is_empty()
                                 || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
                         ),
                         None => (true, u32::MAX), // vanished — re-run to fail closed
-                    }
+                    };
+                    (ready || interrupt_before_park(&mut hg), gid)
                 };
                 if ready {
                     s.runnable.push_back(v);
@@ -8673,15 +8779,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // Same global-id keying as the read park above.
                 let (ready, gid) = {
-                    let hg = v.host.lock_unpoisoned();
-                    match hg.pipes.get(pipe as usize) {
+                    let mut hg = v.host.lock_unpoisoned();
+                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
                         Some((fifo, _, readers, gid, _)) => (
                             fifo.lock_unpoisoned().len() < PIPE_CAP
                                 || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
                         ),
                         None => (true, u32::MAX), // vanished — re-run to fail closed
-                    }
+                    };
+                    (ready || interrupt_before_park(&mut hg), gid)
                 };
                 if ready {
                     s.runnable.push_back(v);
@@ -22460,6 +22567,16 @@ impl Host {
             .unwrap_or(false)
     }
 
+    /// Must an interruptible park (a pipe read/write, a blocking `waitpid`, a stream read) not
+    /// sleep? True when a deliverable signal is pending ([`Self::park_interrupted`]) or this domain
+    /// was terminated (`term_flag`). Both are raised by a door that *then* sweeps the parked set
+    /// ([`Scheduler::interrupt_interruptible_parks`]), and a vCPU past its last per-op poll but not
+    /// yet filed was missed by that sweep — so each park arm asks this under the scheduler lock,
+    /// after the sweep's lock-ordered point, and wakes itself the way the sweep would have.
+    fn park_must_wake(&self) -> bool {
+        self.term_flag.load(Ordering::SeqCst) || self.park_interrupted()
+    }
+
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
     /// holder exited). Returns `true` if the count reached `0` — the caller must then wake that pipe's
     /// parked readers (they re-issue their read, see writers == 0, and get EOF).
@@ -22528,6 +22645,13 @@ impl Host {
     /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
     /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
     /// by crashing — releases its write ends and never wedges a downstream consumer.
+    /// FORK.md §8.6 — a domain finishing releases every pipe end it holds, so a peer reader sees EOF
+    /// and a peer writer `-EPIPE`. For a driver whose parked peers poll, so the zeroed pipes need no
+    /// wake. Call it once per domain: each call decrements the shared end counts again.
+    pub(crate) fn release_pipe_ends(&self) {
+        let _ = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+    }
+
     fn drop_all_pipe_writers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {

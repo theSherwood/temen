@@ -7,6 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../../temen/tests/support/cache_lock.rs"]
+mod cache_lock;
+
 use temen_interp::Value;
 use temen_ir::ValType;
 use temen_jit::JitOutcome;
@@ -1689,7 +1692,7 @@ fn check_demo_vs_native(name: &str, rel: &str, stdin: &[u8]) {
 fn fetch_lmdb() -> Option<PathBuf> {
     const BASE: &str = "https://raw.githubusercontent.com/LMDB/lmdb/mdb.master/libraries/liblmdb";
     let cache = std::env::temp_dir().join("temen_lmdb_cache");
-    let _ = std::fs::create_dir_all(&cache);
+    let _lock = cache_lock::lock(&cache);
     for f in ["mdb.c", "midl.c", "lmdb.h", "midl.h"] {
         let dst = cache.join(f);
         if dst.exists() {
@@ -1720,11 +1723,11 @@ fn fetch_sqlite_amalgamation() -> Option<PathBuf> {
     const VERSION_DIR: &str = "sqlite-amalgamation-3500200";
     const URL: &str = "https://sqlite.org/2025/sqlite-amalgamation-3500200.zip";
     let cache = std::env::temp_dir().join("temen_sqlite_cache");
+    let _lock = cache_lock::lock(&cache);
     let dir = cache.join(VERSION_DIR);
     if dir.join("sqlite3.c").exists() {
         return Some(dir);
     }
-    std::fs::create_dir_all(&cache).ok()?;
     let zip = cache.join("amalgamation.zip");
     let fetched = Command::new("curl")
         .args(["-sfL", "--max-time", "120", "-o"])
@@ -1761,11 +1764,11 @@ fn fetch_sqlite_amalgamation() -> Option<PathBuf> {
 fn fetch_openlibm() -> Option<PathBuf> {
     const VER: &str = "0.8.5";
     let cache = std::env::temp_dir().join("temen_openlibm_cache");
+    let _lock = cache_lock::lock(&cache);
     let dir = cache.join(format!("openlibm-{VER}"));
     if dir.join("src/e_log.c").exists() {
         return Some(dir);
     }
-    std::fs::create_dir_all(&cache).ok()?;
     let tgz = cache.join("openlibm.tar.gz");
     let url = format!("https://github.com/JuliaMath/openlibm/archive/refs/tags/v{VER}.tar.gz");
     let ok = Command::new("curl")
@@ -1972,11 +1975,11 @@ fn libm_bundled_vs_native() {
 fn fetch_quickjs() -> Option<PathBuf> {
     const VER: &str = "2024-01-13";
     let cache = std::env::temp_dir().join("temen_quickjs_cache");
+    let _lock = cache_lock::lock(&cache);
     let dir = cache.join(format!("quickjs-{VER}"));
     if dir.join("quickjs.c").exists() {
         return Some(dir);
     }
-    std::fs::create_dir_all(&cache).ok()?;
     let txz = cache.join(format!("quickjs-{VER}.tar.xz"));
     let url = format!("https://bellard.org/quickjs/quickjs-{VER}.tar.xz");
     let ok = Command::new("curl")
@@ -3651,7 +3654,7 @@ fn fetch_sqllogictest_scripts() -> Vec<(&'static str, PathBuf)> {
         ("random_select_0", "random/select/slt_good_0.test"),
     ];
     let cache = std::env::temp_dir().join("temen_sqllogictest_cache");
-    let _ = std::fs::create_dir_all(&cache);
+    let _lock = cache_lock::lock(&cache);
     let mut out = Vec::new();
     for (name, rel) in FILES {
         let dst = cache.join(format!("{name}.test"));
@@ -12484,19 +12487,24 @@ fn tcl_demo_dir() -> PathBuf {
 /// Run the faithful `build_bitcode.sh` (fetch + configure + native oracle + per-TU bitcode + link)
 /// with `openlibm` staged (its dir threaded in via `OPENLIBM_DIR` so Tcl's address-taken `expr` math
 /// table — `&acos`/`&sin`/… — resolves; that constexpr-funcref is not trap-stubbable, so openlibm is
-/// required just to translate). Returns `(linked_ll, tcl_src_dir)` or `None` (skip) when unavailable.
-fn build_tcl(openlibm: &Path) -> Option<(PathBuf, PathBuf)> {
+/// required just to translate). Returns `(linked_ll, tcl_src_dir, lock)` or `None` (skip) when
+/// unavailable. Keep `lock` for as long as the build's outputs are read: every run of the script
+/// deletes and rewrites them (`rm -f bc/*.ll`, relink), so two Tcl tests sharing the cache must not
+/// overlap. Unlocked, one test linked 3 of the 162 translation units while the other rebuilt them.
+fn build_tcl(openlibm: &Path) -> Option<(PathBuf, PathBuf, std::fs::File)> {
     let cache = std::env::temp_dir().join("temen_tcl_cache");
+    let lock = cache_lock::lock(&cache);
     let linked = cache.join("tcl_linked.ll");
     let src = cache.join("tcl8.6.14");
     let script = tcl_demo_dir().join("build_bitcode.sh");
     let status = Command::new("bash")
         .arg(&script)
+        .env("TEMEN_TCL_CACHE", &cache)
         .env("OPENLIBM_DIR", openlibm)
         .status();
     match status {
         Ok(s) if s.success() && linked.exists() && src.join("unix/libtcl8.6.a").exists() => {
-            Some((linked, src))
+            Some((linked, src, lock))
         }
         _ => {
             eprintln!("note: skipping tcl (build_bitcode.sh failed — offline or no clang/make?)");
@@ -12541,7 +12549,7 @@ fn demo_tcl_repl_stdin() {
         );
         return;
     };
-    let Some((linked, src)) = build_tcl(&ol) else {
+    let Some((linked, src, _cache)) = build_tcl(&ol) else {
         return;
     };
     let Some(oracle) = build_tcl_native_oracle(&src) else {
@@ -12633,7 +12641,7 @@ fn demo_tcl_init_stdin() {
         return;
     };
     // build_tcl runs build_bitcode.sh, which also produces tcl_init_linked.ll + drivers/tcl_library.h.
-    let Some((_repl_linked, src)) = build_tcl(&ol) else {
+    let Some((_repl_linked, src, _cache)) = build_tcl(&ol) else {
         return;
     };
     let init_linked = std::env::temp_dir().join("temen_tcl_cache/tcl_init_linked.ll");
@@ -12719,8 +12727,15 @@ fn build_micropython() -> Option<(PathBuf, PathBuf)> {
     let linked = cache.join("mp_linked.ll");
     let oracle = cache.join("micropython_native");
     let script = micropython_demo_dir().join("build_bitcode.sh");
+    // Staged by `fetch_openlibm`, the shared cache's one writer: left unset, the script clones into
+    // that same cache itself, racing the Tcl, libm and QuickJS tests' fetch of it.
+    let Some(openlibm) = fetch_openlibm() else {
+        eprintln!("note: skipping micropython (openlibm unavailable)");
+        return None;
+    };
     let ok = Command::new("bash")
         .arg(&script)
+        .env("OPENLIBM_DIR", openlibm)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -13184,8 +13199,8 @@ fn py_escape(bytes: &[u8]) -> String {
 /// **The interactive oracle** (#802 rung 3): native `bash --norc --noprofile -i` under a real pty,
 /// driven by `demos/bash/pty_oracle.py` with the prompt-wait protocol (type the next chunk only once a
 /// fresh prompt arrived), returning the pty master's byte stream — prompt, echo, and output
-/// interleaved in arrival order. `None` when `python3` is unavailable or the oracle fails; the caller
-/// skips loudly.
+/// interleaved in arrival order. `None` when `python3` is unavailable (the caller skips loudly); an
+/// oracle that runs and fails is a test failure, never a skip.
 fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("python3");
     cmd.arg(bash_demo_dir().join("pty_oracle.py")).arg(oracle);
@@ -13196,13 +13211,12 @@ fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Opti
         cmd.arg(py_escape(c.as_bytes()));
     }
     let out = cmd.output().ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "note: pty_oracle.py failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
+    assert!(
+        out.status.success(),
+        "pty_oracle.py failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     Some(out.stdout)
 }
 

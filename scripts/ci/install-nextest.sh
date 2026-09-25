@@ -41,28 +41,28 @@ if command -v cygpath >/dev/null 2>&1; then
   dest="$(cygpath -u "$dest")"
 fi
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-
-# Retries for the same reason the other fetch steps carry them (I34): a transient CDN hiccup should
-# cost seconds, not a red run.
-#
-# **Exponential, not fixed.** `--retry-delay 2` pinned every gap at 2s, so five retries spent their
-# whole budget inside ~11 seconds — which is shorter than a real outage. A windows-latest run lost
-# exactly that way (six consecutive 504s from `get.nexte.st`, red before a line was compiled).
-# Dropping `--retry-delay` restores curl's own backoff (1s, 2s, 4s, …) and `--retry-max-time` bounds
-# the whole attempt, so a blip of up to ~2 minutes costs seconds of waiting instead of a red run and
-# a manual re-run. A genuinely down endpoint still fails, just later and for a real reason.
-curl -sSLf --retry 8 --retry-max-time 150 --connect-timeout 20 \
-  "https://get.nexte.st/${NEXTEST_VERSION}/${platform}" -o "$tmp/nextest.tar.gz"
+# The verified archive lives in `~/.cache/temen-ci`, which CI restores with `actions/cache` keyed on
+# this script, so every run after the first per version and platform extracts it from there. Fetching
+# it from get.nexte.st on every job was the flake (#1605): the CDN's outages turned jobs red before a
+# line was compiled, and no retry budget outlasts an outage longer than itself. The checksum below is
+# checked on every run whichever way the archive arrived, so the pin stays the trust anchor.
+cache="$HOME/.cache/temen-ci"
+archive="$cache/cargo-nextest-${NEXTEST_VERSION}-${platform}.tar.gz"
+if [ ! -f "$archive" ]; then
+  mkdir -p "$cache"
+  curl -sSLf --connect-timeout 20 --max-time 120 \
+    "https://get.nexte.st/${NEXTEST_VERSION}/${platform}" -o "$archive.part"
+  mv "$archive.part" "$archive"
+fi
 
 # macOS ships `shasum`, not GNU coreutils' `sha256sum`.
 if command -v sha256sum >/dev/null 2>&1; then
-  actual="$(sha256sum "$tmp/nextest.tar.gz" | cut -d' ' -f1)"
+  actual="$(sha256sum "$archive" | cut -d' ' -f1)"
 else
-  actual="$(shasum -a 256 "$tmp/nextest.tar.gz" | cut -d' ' -f1)"
+  actual="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
 fi
 if [ "$actual" != "$want" ]; then
+  rm -f "$archive"
   echo "install-nextest: checksum mismatch for cargo-nextest ${NEXTEST_VERSION} (${platform})" >&2
   echo "  expected $want" >&2
   echo "  got      $actual" >&2
@@ -70,5 +70,5 @@ if [ "$actual" != "$want" ]; then
 fi
 
 mkdir -p "$dest"
-tar xzf "$tmp/nextest.tar.gz" -C "$dest" "$bin"
+tar xzf "$archive" -C "$dest" "$bin"
 "$dest/$bin" --version

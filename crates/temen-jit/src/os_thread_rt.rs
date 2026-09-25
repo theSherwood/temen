@@ -149,6 +149,10 @@ unsafe impl Sync for Env {}
 struct Done {
     state: Mutex<Option<(i64, i64)>>,
     cv: Condvar,
+    /// `true` while this cell's joiner is counted in [`Domain::parked`] — the join half of
+    /// [`WaitCell::parked`], settled the same way ([`cell_unpark`]): by the joiner leaving, or by
+    /// [`Done::publish`] before the child's `live` slot is dropped.
+    joiner_parked: AtomicBool,
     /// Set by the `thread.join` that claims this cell, whichever table it resolved in — so a freeze
     /// carries only the finished children nobody has joined yet (#1685).
     joined: AtomicBool,
@@ -158,13 +162,37 @@ struct Done {
 }
 
 impl Done {
-    fn new(state: Option<(i64, i64)>) -> std::sync::Arc<Done> {
+    fn new(result: Option<(i64, i64)>) -> std::sync::Arc<Done> {
         std::sync::Arc::new(Done {
-            state: Mutex::new(state),
+            state: Mutex::new(result),
             cv: Condvar::new(),
+            joiner_parked: AtomicBool::new(false),
             joined: AtomicBool::new(false),
             unwound: AtomicBool::new(false),
         })
+    }
+
+    /// The child's computation has ended: free its concurrent-live slot, then publish the result so
+    /// a `thread.join` resolves it (a joiner that sees the result already sees the slot freed, so a
+    /// spawn-join loop can't transiently false-trap its quota).
+    ///
+    /// **A parked joiner stops counting first**, under this cell's lock, so no deadlock check can
+    /// see the dropped `live` alongside a joiner that is already runnable. It used to stay counted
+    /// until it woke, and a sibling's infinite wait, woken by this same exit, could read
+    /// `live == parked` in between and trap `ThreadFault` although the joiner was about to notify
+    /// it — #1625's "a woken waiter still counted", on a join. Lock order: this cell, then
+    /// `threads`; nothing takes a cell's lock while holding `threads`.
+    fn publish(&self, dom: &Domain, result: i64, trap: i64) {
+        let hub = dom.hub();
+        let mut st = lock(&self.state);
+        cell_unpark(&self.joiner_parked, &hub.parked);
+        lock(&dom.threads).live -= 1;
+        // A §14 child's vCPU also held a slot of the run-wide count (see `thread_spawn`).
+        if !std::ptr::eq(hub, dom) {
+            lock(&hub.threads).live -= 1;
+        }
+        *st = Some((result, trap));
+        self.cv.notify_all();
     }
 }
 
@@ -328,7 +356,7 @@ struct FutexEntry {
 /// lock; read by its waiter — at each `cont.resume` poll for a fiber, at each condvar wakeup for an
 /// OS-thread vCPU. The cell owns the wake decision on both paths; the condvar is only how an OS
 /// waiter sleeps between re-checks.
-struct WaitCell {
+pub(crate) struct WaitCell {
     /// [`PENDING_WAIT`] while queued; a `WAIT_*` status once the event fired.
     status: AtomicI32,
     /// `true` while this waiter is counted in [`Domain::parked`] — an **indefinite** OS-vCPU futex
@@ -363,8 +391,8 @@ fn wait_cell_new(parked: bool) -> std::sync::Arc<WaitCell> {
 /// against threads that were already on their way back to it. A claimed waiter is runnable, so the
 /// claim is what ends its park — settled under the same futex lock that stores the status, so no
 /// observer sees a claimed cell still counted.
-fn cell_unpark(cell: &WaitCell, parked: &AtomicUsize) {
-    if cell.parked.swap(false, Ordering::AcqRel) {
+fn cell_unpark(flag: &AtomicBool, parked: &AtomicUsize) {
+    if flag.swap(false, Ordering::AcqRel) {
         parked.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -696,11 +724,24 @@ impl Domain {
         lock(&self.lane_chain).clone()
     }
 
-    /// D66 — take every lane in `chain` if all of them have room, without waiting. Takes only the
-    /// lane lock, so a caller may hold its own scheduler lock across it (the child-domain executor
-    /// does, while picking); nothing in this file takes a scheduler lock while holding this one.
-    pub(crate) fn lane_try_enter(&self, chain: &[(usize, i64)]) -> bool {
-        temen_ir::lanes::enter(&mut lock(&self.hub().lanes), chain)
+    /// D66 — admit the first chain of `queue`, in order, whose every lane has room: take its lanes
+    /// and return its position, without waiting. `None` entries never fit. The lanes are the run's,
+    /// on the hub. Takes only the lane lock, so a caller may hold its own scheduler lock across it
+    /// (the child-domain executor does, while picking); nothing in this file takes a scheduler lock
+    /// while holding this one.
+    ///
+    /// **One lock hold for the whole scan.** The executor's queue is FIFO — a task refused a lane
+    /// keeps its place — and that order holds only if every entry is judged against the same lane
+    /// counts. Probing entry by entry let a lane given back by a 1:1 vCPU *between* two probes (a
+    /// parent parking in `join`) admit the second task ahead of the first it had just refused.
+    pub(crate) fn lane_try_enter_first<'a>(
+        &self,
+        queue: impl IntoIterator<Item = Option<&'a [(usize, i64)]>>,
+    ) -> Option<usize> {
+        let mut g = lock(&self.hub().lanes);
+        queue
+            .into_iter()
+            .position(|c| c.is_some_and(|c| temen_ir::lanes::enter(&mut g, c)))
     }
 
     /// D66 — give every lane in `chain` back (the vCPU parked, or finished) and wake **both** kinds
@@ -1361,23 +1402,10 @@ fn run_child(a: SpawnArgs) {
             unsafe { (*a.dom).hub().publish_trap_capture(cap) };
         }
     }
-    // §15: this vCPU's computation has ended — free its concurrent-live slot *before* publishing the
-    // result, so a `thread.join` that then observes completion already sees the quota slot freed (a
-    // spawn-join loop can't transiently false-trap). The domain outlives all spawned threads, so the
-    // pointer is live. SAFETY: `a.dom` is the run's `Domain` (joined at run end).
-    unsafe {
-        lock(&(*a.dom).threads).live -= 1;
-        // A §14 child's vCPU also held a slot of the run-wide count (see `thread_spawn`).
-        let hub = (*a.dom).hub();
-        if !std::ptr::eq(hub, a.dom) {
-            lock(&hub.threads).live -= 1;
-        }
-    }
-    {
-        let mut st = lock(&a.done.state);
-        *st = Some((result, trap));
-        a.done.cv.notify_all();
-    }
+    // §15: free this vCPU's concurrent-live slot (and a §14 child's run-wide one) and publish its
+    // result. The domain outlives all spawned threads, so the pointer is live. SAFETY: `a.dom` is the
+    // run's `Domain` (joined at run end).
+    a.done.publish(unsafe { &*a.dom }, result, trap);
     // A finished vCPU re-wakes the whole domain (owner decision 2026-07-24; DESIGN.md §12): parked
     // futex waiters re-evaluate the deadlock predicate against the dropped `live`, and — when this
     // vCPU carried a trap (any trap is domain teardown) — every parked sibling observes the shared
@@ -1794,15 +1822,7 @@ impl Domain {
                     }
                 }
 
-                // The child's computation has ended: free its concurrent-live slot, then publish the
-                // result so a `thread.join` resolves it.
-                {
-                    let mut t = lock(&self.threads);
-                    t.live -= 1;
-                }
-                let mut st = lock(&p.done.state);
-                *st = Some((result, trap));
-                p.done.cv.notify_all();
+                p.done.publish(self, result, trap);
             }
         }
     }
@@ -1939,12 +1959,10 @@ impl Domain {
                     // and answer the child's join with the trap a live spawn that can't get a thread
                     // raises (#1693) — else its spawner's rewound `join` waits forever on a cell no
                     // thread will fill.
-                    lock(&self.threads).live -= 1;
                     if let Some(table) = self.fiber_table() {
                         table.free_vcpu_context(r.ctx);
                     }
-                    *lock(&r.done.state) = Some((0, TrapKind::ThreadFault as i64));
-                    r.done.cv.notify_all();
+                    r.done.publish(self, 0, TrapKind::ThreadFault as i64);
                 }
             }
         }
@@ -2065,7 +2083,14 @@ pub(crate) unsafe extern "C" fn thread_join(
         let mut st = lock(&done.state);
         // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
         // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
-        let _pg = ParkGuard::new(&dom.hub().parked);
+        // Set under the cell's lock, so the child's [`Done::publish`] settles it before dropping `live`.
+        let parked = &dom.hub().parked;
+        parked.fetch_add(1, Ordering::AcqRel);
+        done.joiner_parked.store(true, Ordering::Release);
+        let _pg = CellParkGuard {
+            flag: &done.joiner_parked,
+            parked,
+        };
         loop {
             if let Some((result, trap)) = *st {
                 if trap != 0 {
@@ -2144,7 +2169,7 @@ unsafe fn task_join(
         if epoch_fired(epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
             return 0;
         }
-        fiber_rt::fiber_event_park(slot, false);
+        fiber_rt::fiber_event_park(slot, false, None);
     }
 }
 
@@ -2344,7 +2369,7 @@ unsafe fn fiber_futex_wait_loop(
         // #1631 — a park with its own deadline comes back by itself, so it is a potential
         // notifier and must not count toward `Domain::parked`. Same rule the OS park applies to a
         // timed `futex_wait` (#1625); this is the task half of it.
-        fiber_rt::fiber_event_park(slot, deadline.is_some());
+        fiber_rt::fiber_event_park(slot, deadline.is_some(), Some(cell));
         // Re-entered: a `cont.resume` polled this fiber. Completed?
         let st = cell.status.load(Ordering::Acquire);
         if st != PENDING_WAIT {
@@ -2456,7 +2481,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         if fiber_rt::in_task() {
             match fiber_rt::current_fiber_slot() {
                 Some(s) if s.is_platform() => {
-                    fiber_rt::fiber_event_park(&s, fiber_rt::park_is_self_resolving(handle));
+                    fiber_rt::fiber_event_park(&s, fiber_rt::park_is_self_resolving(handle), None);
                     continue;
                 }
                 _ => {
@@ -2488,8 +2513,29 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // correct program. Same rule as the OS park (#1625) and the task park, asked of the
                 // one park this vCPU is actually waiting on.
                 let self_resolving = fiber_rt::park_is_self_resolving(handle);
+                let cell = fiber_rt::park_cell(handle);
                 let g = lock(&hub.futex);
-                let _pg = (!self_resolving).then(|| ParkGuard::new(&hub.parked));
+                // A `notify` that claimed the fiber's wait since the poll above: re-poll at once
+                // rather than idle on a wake already delivered.
+                let claimed = cell
+                    .as_ref()
+                    .is_some_and(|c| c.status.load(Ordering::Acquire) != PENDING_WAIT);
+                // Counted through the fiber's own wait cell, so the `notify` that claims it ends
+                // this park under this lock (`cell_unpark`), as it does an OS waiter's (#1625).
+                // Left to this vCPU to settle on waking, the count outlived the wake: a notifier
+                // that went straight on to its own indefinite wait read `live == parked` — this
+                // vCPU and itself — and trapped a correct ping-pong. A host-thunk park has no cell
+                // and nothing claims it; a local flag stands in.
+                let local = AtomicBool::new(false);
+                let flag = cell.as_deref().map_or(&local, |c| &c.parked);
+                let _pg = (!self_resolving && !claimed).then(|| {
+                    hub.parked.fetch_add(1, Ordering::AcqRel);
+                    flag.store(true, Ordering::Release);
+                    CellParkGuard {
+                        flag,
+                        parked: &hub.parked,
+                    }
+                });
                 // #1639 — an indefinite fiber wait that no live vCPU can ever notify is
                 // unsatisfiable, and idling on it is a hang with no error anywhere (INVARIANTS #5).
                 // Same predicate `futex_wait` breaks `WAIT_DEADLOCK` on, asked here because this
@@ -2512,6 +2558,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // next `fiber_resume` and leaves this loop, while a genuine deadlock — nothing live
                 // to change the answer — still reads quiescent and fails closed, 20 ms later.
                 let quiescent = !self_resolving
+                    && !claimed
                     && lock(&hub.threads).live <= hub.parked.load(Ordering::Acquire);
                 if quiescent && confirming {
                     drop(g);
@@ -2519,7 +2566,9 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                     return value;
                 }
                 confirming = quiescent;
-                let _ = hub.futex_cv.wait_timeout(g, KILL_RECHECK);
+                if !claimed {
+                    let _ = hub.futex_cv.wait_timeout(g, KILL_RECHECK);
+                }
             }
             if !dom.lane_acquire(&lane, || {
                 // SAFETY: the run's live interrupt cell / trap cell.
@@ -2585,12 +2634,12 @@ impl Drop for ParkGuard<'_> {
 /// A `notify` that claimed the cell first has already settled it; the `swap` inside makes the loser a
 /// no-op.
 struct CellParkGuard<'a> {
-    cell: &'a WaitCell,
+    flag: &'a AtomicBool,
     parked: &'a AtomicUsize,
 }
 impl Drop for CellParkGuard<'_> {
     fn drop(&mut self) {
-        cell_unpark(self.cell, self.parked);
+        cell_unpark(self.flag, self.parked);
     }
 }
 
@@ -2643,7 +2692,7 @@ fn futex_wait(
     let cell = wait_cell_new(counts);
     g.entry(key).or_default().waiters.push(cell.clone());
     let _pg = CellParkGuard {
-        cell: &cell,
+        flag: &cell.parked,
         parked,
     };
     let status = loop {
@@ -2778,7 +2827,7 @@ fn futex_notify(
                     c.status.store(WAIT_WOKEN, Ordering::Release);
                     // Runnable as of this store, so it stops counting as parked *now* — under this
                     // same lock, before any deadlock check can observe the pair (#1625).
-                    cell_unpark(&c, parked);
+                    cell_unpark(&c.parked, parked);
                 }
                 if e.waiters.is_empty() {
                     g.remove(&key);
@@ -3063,6 +3112,32 @@ mod loom_tests {
                 (WAIT_DEADLOCK, WAIT_DEADLOCK),
                 "both halves of a mutual deadlock must resolve, not just the one that parked last",
             );
+        });
+    }
+
+    /// **The executor's lane scan is one instant's.** A parent holds its cap-1 lane; two queued
+    /// child tasks draw on it. The parent gives the lane back (parking in `join`) while the
+    /// child-domain executor scans its queue. Under every interleaving the scan admits the *first*
+    /// task or neither — never the second ahead of the first it has just refused. Probing the queue
+    /// entry by entry, with the lane lock re-taken per entry, let the release land between the two
+    /// probes: `child_exec_jit`'s notifier then ran before its waiter parked.
+    #[test]
+    fn loom_a_lane_released_mid_scan_never_reorders_the_queue() {
+        loom::model(|| {
+            let dom = Arc::new(Domain::new(MAX_VCPUS));
+            let parent: &[(usize, i64)] = &[(1, 1)];
+            let (a, b): (&[(usize, i64)], &[(usize, i64)]) =
+                (&[(1, 1), (2, -1)], &[(1, 1), (3, -1)]);
+            assert_eq!(
+                dom.lane_try_enter_first([Some(parent)]),
+                Some(0),
+                "the parent runs"
+            );
+            let d = Arc::clone(&dom);
+            let releaser = loom::thread::spawn(move || d.lane_give_back(&[(1, 1)]));
+            let admitted = dom.lane_try_enter_first([Some(a), Some(b)]);
+            releaser.join().unwrap();
+            assert_ne!(admitted, Some(1), "the second task overtook the first");
         });
     }
 
