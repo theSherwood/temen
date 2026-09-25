@@ -3460,7 +3460,14 @@ fn drive_over_cell(
         // Present even when the root never finished on its own: a §12 teardown (owner 2026-07-24)
         // synthesizes the root's outcome — the domain's ending trap, with its `mem`/`fuel`
         // residue — when a sibling's trap/exit killed it while parked or running.
-        let out = s.results.remove(&root_id).expect("root vCPU finished");
+        let mut out = s.results.remove(&root_id).expect("root vCPU finished");
+        // #1689 — a freeze is all-or-nothing (INVARIANTS #9c): a vCPU that failed once the freeze
+        // was in flight — a §14 child's backstop refusal, say — fails the run, though the root
+        // itself unwound `Ok` before it. Otherwise the residue already recorded looks like a whole
+        // freeze.
+        if let (Ok(_), Some(t)) = (&out.result, s.freeze_fault) {
+            out.result = Err(t);
+        }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
     };
     LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = twin_traps);
@@ -5880,6 +5887,9 @@ struct Sched {
     /// #1685 — the vCPUs that finished by unwinding for the freeze: their results are placeholders,
     /// so a `join` that takes one is re-issued on thaw rather than reloaded.
     unwound: std::collections::BTreeSet<TaskId>,
+    /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
+    /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
+    freeze_fault: Option<Trap>,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
     /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
     /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
@@ -8292,6 +8302,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 s.froze |= froze;
                 if froze {
                     s.unwound.insert(id);
+                }
+                if s.froze && !s.forked_twins.contains_key(&id) {
+                    if let Err(t) = &outcome.result {
+                        s.freeze_fault.get_or_insert(*t);
+                    }
                 }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
                 if !froze {
