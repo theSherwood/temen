@@ -5473,6 +5473,29 @@ where
     victims
 }
 
+/// Why a vCPU is filed in [`Sched::svc_waiters`] (#1815). The map is shared by the `svc.wait`
+/// consumers of a domain and the resumers idling under the same key — a promoted-offer caller
+/// ([`Blocked::OfferPark`]) or a `cont.resume.block` ([`Blocked::ContResumeBlock`]) — because one
+/// block-wake must re-admit both. Only a consumer is waiting for *requests*, so only a consumer
+/// takes a client's death ([`client_gone_locked`]) or a direct handoff
+/// ([`Scheduler::take_parked_serve_loop`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SvcPark {
+    /// Parked in `svc.wait` ([`Blocked::SvcWait`]).
+    Consumer,
+    /// Parked as the resumer of a blocked handler or fiber.
+    Resumer,
+}
+
+impl DomainMember for (SvcPark, Box<VCpu>) {
+    fn domain_key(&self) -> usize {
+        domain_key_of(&self.1)
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        Some(self.1)
+    }
+}
+
 /// §3.6 slice 5b — wake a domain's `svc.wait`-parked serve loop from inside a wake path that
 /// already holds the scheduler lock (the locked half of [`Scheduler::svc_wake`]). Idempotent:
 /// a domain not parked in `svc.wait` is a no-op. Returns whether a vCPU was re-admitted (the
@@ -5484,7 +5507,7 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
             // owner of a woken handler can resume it, and admission is race-free under the
             // powerbox lock — the others re-park on their re-executed `svc.wait`.
             let woke = !vs.is_empty();
-            for v in vs {
+            for (_, v) in vs {
                 s.runnable.push_back(v);
             }
             woke
@@ -5500,18 +5523,27 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
 /// answer) and can return, so its `join` raises the outcome. With no consumer parked yet, a
 /// one-shot token is left for the domain's next `svc.wait` park ([`Sched::client_gone`]). A
 /// server with other live clients sees a spurious `0` and simply waits again — the wake-all
-/// contract of [`Sched::svc_waiters`].
+/// contract of [`Sched::svc_waiters`]. A resumer parked under the same key ([`SvcPark::Resumer`])
+/// is waiting for its fiber, not for requests: it is left parked, and it neither takes the `0`
+/// nor stands in for the consumer the token is kept for (#1815).
 fn client_gone_locked(s: &mut Sched, service: usize) {
-    match s.svc_waiters.remove(&service) {
-        Some(vs) => {
-            for mut v in vs {
-                v.pending = Some(Pending::SvcTimeout);
-                s.runnable.push_back(v);
-            }
+    let mut woke = false;
+    if let Some(q) = s.svc_waiters.get_mut(&service) {
+        let (consumers, resumers) = std::mem::take(q)
+            .into_iter()
+            .partition(|(k, _)| *k == SvcPark::Consumer);
+        *q = resumers;
+        for (_, mut v) in consumers {
+            v.pending = Some(Pending::SvcTimeout);
+            s.runnable.push_back(v);
+            woke = true;
         }
-        None => {
-            s.client_gone.insert(service);
+        if q.is_empty() {
+            s.svc_waiters.remove(&service);
         }
+    }
+    if !woke {
+        s.client_gone.insert(service);
     }
 }
 
@@ -5624,11 +5656,13 @@ struct Sched {
     /// vCPUs parked in `wait`, keyed by canonical futex key (S1b); each tagged with a waiter id.
     wait_waiters: BTreeMap<FutexKey, Vec<(u64, Waiter)>>,
     /// vCPUs parked inside a capability call, **keyed by the handle they are parked through**
-    /// (§3.6 slice 1 — the handle → parked-fibers index revocation-unparks needs). Woken only by
+    /// (§3.6 slice 1 — the handle → parked-fibers index revocation-unparks needs), qualified by the
+    /// domain whose table numbers it: handle numbers are domain-local, so the same number names
+    /// another connection in a §14 child or a fork twin (#1817). Woken only by
     /// [`Scheduler::cap_revoke`] with a negative errno; the wait_waiters/notify pair is the template.
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — a `VCpu` is large and moves
     /// between this map and `runnable` as a pointer, never by value.)
-    cap_waiters: BTreeMap<i32, Vec<Waiter>>,
+    cap_waiters: BTreeMap<(usize, i32), Vec<Waiter>>,
     /// #798 slice 2 — vCPUs parked **stopped** ([`Blocked::Stopped`]), keyed by domain. Pushed when
     /// a vCPU observes its domain's stop flag; drained wholesale by [`Scheduler::wake_stopped`]
     /// (the personality's SIGCONT). Swept like every waiter map at teardown.
@@ -5662,7 +5696,10 @@ struct Sched {
     pipe_write_waiters: BTreeMap<u32, Vec<Waiter>>,
     /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
     /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
-    /// cell runs at most one sub-run at a time — the `busy` gate). Drained smallest-id-first by
+    /// cell runs at most one sub-run at a time — the `busy` gate). Per host is per run: only the
+    /// run's root host can punt, because the punting caps (offloadable host procs, `Blocking`) are
+    /// neither re-grantable nor forkable, so no child, twin or instance powerbox ever holds one
+    /// (#1817), and only the root host carries the drain hook. Drained smallest-id-first by
     /// [`Scheduler::completion_drain`], which stops at the first waiter whose result has not
     /// arrived — so delivery is in submission order (§18) and a later completion never overtakes
     /// an earlier parked caller.
@@ -5697,9 +5734,10 @@ struct Sched {
     /// under the powerbox lock (each dispatch admitted exactly once), and a woken vCPU that
     /// finds nothing runnable simply re-parks.
     /// (`Box<VCpu>` deliberately, like every other parked-vCPU store — the box moves between
-    /// this map and `runnable` as a pointer, never by value.)
-    #[allow(clippy::vec_box)]
-    svc_waiters: BTreeMap<usize, Vec<Box<VCpu>>>,
+    /// this map and `runnable` as a pointer, never by value.) Each entry is tagged with why it is
+    /// here ([`SvcPark`]): the block-wake re-admits every entry, but only a consumer answers a
+    /// client's death or a direct handoff (#1815).
+    svc_waiters: BTreeMap<usize, Vec<(SvcPark, Box<VCpu>)>>,
     /// CALLS.md 4c.1 — **admission-waiters** on a busy `single` instanced offer, keyed by the
     /// `ProviderState` identity (its `Arc` pointer; see [`Blocked::OfferAdmit`]). A distinct-vCPU
     /// caller that lost the busy race parks here (its offer op rewound) instead of spinning on
@@ -5875,13 +5913,13 @@ impl Scheduler {
     }
 
     /// §3.6 revocation-unparks: wake **every** fiber parked in a capability call through
-    /// `handle`, completing each one's call with the negative errno `status` (probeable on the
-    /// fiber's own error path — never a trap, never a kill). Called at the revocation act
-    /// (`Stream.close` from a sibling fiber); returns how many were woken. Granularity is
-    /// per-connection by design: all fibers parked through the handle wake together.
-    fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
+    /// `handle` of `domain`'s table, completing each one's call with the negative errno `status`
+    /// (probeable on the fiber's own error path — never a trap, never a kill). Called at the
+    /// revocation act (`Stream.close` from a sibling fiber); returns how many were woken.
+    /// Granularity is per-connection by design: all fibers parked through the handle wake together.
+    fn cap_revoke(&self, domain: usize, handle: i32, status: i64) -> u32 {
         let mut s = self.lock();
-        let woken = s.cap_waiters.remove(&handle).unwrap_or_default();
+        let woken = s.cap_waiters.remove(&(domain, handle)).unwrap_or_default();
         let n = woken.len() as u32;
         for w in woken {
             match w {
@@ -6312,17 +6350,18 @@ impl Scheduler {
     }
 
     /// CALLS.md 4d — direct handoff: if domain `callee_id`'s **own serve loop** is currently parked
-    /// at `svc.wait` (filed in `svc_waiters[callee_id]` with its own domain id == `callee_id`),
-    /// remove and return it so a caller can serve a just-enqueued dispatch inline by donating its
-    /// thread ([`dispatch`]). `None` when no such serve loop is parked — busy mid-handler, running,
-    /// or only cross-domain resumers (whose own domain differs) are filed here — and the caller falls
+    /// at `svc.wait` (filed in `svc_waiters[callee_id]` as a [`SvcPark::Consumer`]), remove and
+    /// return it so a caller can serve a just-enqueued dispatch inline by donating its thread
+    /// ([`dispatch`]). `None` when no such serve loop is parked — busy mid-handler, running, or only
+    /// resumers are filed here (#1815: a same-domain `cont.resume.block` resumer shares the domain
+    /// id, so the domain is no test of a serve loop) — and the caller falls
     /// back to the enqueue + `svc_wake` + park transport, byte-identical. Takes exactly one serve-loop
     /// vCPU; a second parked consumer (multi-consumer serve) is left for the wake path.
     fn take_parked_serve_loop(&self, callee_id: usize) -> Option<Box<VCpu>> {
         let mut s = self.lock();
         let q = s.svc_waiters.get_mut(&callee_id)?;
-        let pos = q.iter().position(|v| domain_key_of(v) == callee_id)?;
-        let v = q.remove(pos);
+        let pos = q.iter().position(|(k, _)| *k == SvcPark::Consumer)?;
+        let (_, v) = q.remove(pos);
         if q.is_empty() {
             s.svc_waiters.remove(&callee_id);
         }
@@ -6583,7 +6622,8 @@ impl Scheduler {
     ///   * the twin already finished → [`ReapOutcome::Replied`] with the status, delivered now.
     ///   * the twin is still running → [`ReapOutcome::Replied(0)`] after moving the caller into
     ///     `join_waiters[pid]` with [`Pending::ReapPid`], so the twin's completion (the generic
-    ///     join-wake) resumes it with the status.
+    ///     join-wake) resumes it with the status — or [`ReapOutcome::NoChild`] when another
+    ///     blocking `wait` already holds that slot (#1816).
     ///
     /// `Replied` means the caller's reply is handled here (the dispatch marks the ticket replied);
     /// the other two leave the caller in place for the handler's own errno reply. Real scheduler only.
@@ -6605,6 +6645,12 @@ impl Scheduler {
             Some(Waiter::VCpu(v)) if domain_key_of(v) == parent => {}
             Some(Waiter::VCpu(_)) => return ReapOutcome::NoChild,
             _ => return ReapOutcome::Retry,
+        }
+        // #1816 — a still-running twin another blocking `wait` is already parked on is claimed:
+        // POSIX has exactly one waiter reap it and the other see `-ECHILD`. (Parking this one too
+        // would overwrite that waiter in its `join_waiters` slot, dropping a live vCPU.)
+        if !nohang && !s.results.contains_key(&pid) && s.join_waiters.contains_key(&pid) {
+            return ReapOutcome::NoChild;
         }
         // Claim the parked caller — the same shape `fork_parked_caller` removes. A miss means the
         // caller's `CapReply` waiter is not registered yet (the serve/park race) — the twin is real
@@ -6901,8 +6947,8 @@ fn process_timers(s: &mut Sched) {
         }
         s.svc_timers.pop();
         if let Some(q) = s.svc_waiters.get_mut(&key) {
-            if let Some(pos) = q.iter().position(|v| v.id == tid) {
-                let mut v = q.remove(pos);
+            if let Some(pos) = q.iter().position(|(_, v)| v.id == tid) {
+                let (_, mut v) = q.remove(pos);
                 v.pending = Some(Pending::SvcTimeout);
                 s.runnable.push_back(v);
             }
@@ -6949,6 +6995,47 @@ fn domain_key_of(v: &VCpu) -> usize {
     v.host.lock_unpoisoned().domain_id() as usize
 }
 
+/// A fork twin's main vCPU `id` has finished with `result` — returned, trapped, or killed at a
+/// teardown ([`reap`], #1816). A no-op for any other vCPU: a thread sibling completing on a
+/// *shared* host must not fire the domain's hooks. Returns whether a `waitpid` bench was woken (the
+/// caller notifies the worker pool).
+///
+/// - #863 hygiene: the exit hooks its fork factories rode in on ([`Host::exit_hooks`]) fire with
+///   the raw exit status ([`reap_status`] — the same value a servicer-side reap hands a `wait`), so
+///   each personality retires the process in its own table (Live → Zombie). Safe under the
+///   scheduler lock: hooks take personality locks, and the established order is scheduler →
+///   personality (the fork factory). The caller must not hold `host`'s lock.
+/// - #799: then wake blocking-`waitpid` benchers of this child ([`Blocked::ReapWait`]) —
+///   deliberately after the hooks, since the woken op re-executes and must find the entry already
+///   retired. No pending value: the op was rewound, the personality answers.
+/// - #1340: `results` answers every later bench on this child, so drop its stop/continue mark.
+/// - #802 rung 3: wake any-child benchers of the twin's parent (the wildcard key), or mark the
+///   transition pending for a bench racing this drain.
+fn twin_finished_locked(
+    s: &mut Sched,
+    id: TaskId,
+    host: &Arc<Mutex<Host>>,
+    result: &Result<Vec<Value>, Trap>,
+) -> bool {
+    let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) else {
+        return false;
+    };
+    let hooks = host.lock_unpoisoned().exit_hooks.clone();
+    if !hooks.is_empty() {
+        let status = reap_status(result);
+        for h in hooks {
+            h(status);
+        }
+    }
+    let mut woke = false;
+    if let Some(ws) = s.posix_reap_waiters.remove(&id) {
+        woke = !ws.is_empty();
+        s.runnable.extend(ws);
+    }
+    s.reap_pending.remove(&id);
+    woke | wake_posix_reap_any_locked(s, parent)
+}
+
 /// Kill one vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24):
 /// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` re-raises
 /// (I37 supervision mechanics) — keeping `mem`/`fuel` residue (the root's is read back by
@@ -6993,6 +7080,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         trap_fault: None,
     };
     let id = v.id;
+    // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
+    // its personalities and its `waitpid` benchers hear it the same way.
+    twin_finished_locked(s, id, &v.host, &outcome.result);
     // #1217 — a reaped client child releases its services' parked `svc.wait` too.
     let gone = client_gone_targets(&v);
     drop(v);
@@ -7171,7 +7261,7 @@ fn teardown_run(s: &mut Sched) {
             .filter_map(|w| w.into_victim()),
     );
     for (_, vs) in std::mem::take(&mut s.svc_waiters) {
-        victims.extend(vs);
+        victims.extend(vs.into_iter().map(|(_, v)| v));
     }
     // CALLS.md 4c.1 — abandon every parked admission-waiter too (reap drops its `admit_parked`).
     for (_, q) in std::mem::take(&mut s.admit_waiters) {
@@ -7385,7 +7475,7 @@ fn quiesced_parks_only(s: &Sched) -> bool {
 fn freeze_in_flight(s: &Sched) -> bool {
     let unwinding = |v: &VCpu| v.dstate == STATE_UNWINDING;
     s.froze
-        || s.svc_waiters.values().flatten().any(|v| unwinding(v))
+        || s.svc_waiters.values().flatten().any(|(_, v)| unwinding(v))
         || s.join_waiters.values().any(|v| unwinding(v))
         || s.lane_waiters.iter().any(|v| unwinding(v))
         || s.wait_waiters
@@ -7446,7 +7536,7 @@ fn freeze_can_admit(s: &Sched) -> bool {
 /// owner's `freeze_drive` purges and flattens it (§13.4 step 2), and the thaw re-issues its wait.
 fn admit_parks_for_freeze(s: &mut Sched) {
     for (_, q) in std::mem::take(&mut s.svc_waiters) {
-        for mut v in q {
+        for (_, mut v) in q {
             v.dstate = STATE_UNWINDING;
             s.runnable.push_back(v);
         }
@@ -7564,7 +7654,7 @@ fn scheduled_vcpus(s: &Sched) -> Vec<&VCpu> {
     out.extend(s.cap_waiters.values().flatten().filter_map(waiter));
     out.extend(s.ticket_waiters.values().filter_map(waiter));
     out.extend(s.completion_waiters.values().filter_map(waiter));
-    out.extend(s.svc_waiters.values().flatten().map(|v| &**v));
+    out.extend(s.svc_waiters.values().flatten().map(|(_, v)| &**v));
     out.extend(s.admit_waiters.values().flatten().map(|v| &**v));
     out.extend(s.pipe_waiters.values().flatten().filter_map(waiter));
     out.extend(s.pipe_write_waiters.values().flatten().filter_map(waiter));
@@ -8283,41 +8373,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         fault: outcome.trap_fault,
                     });
                 }
-                // #863 hygiene — a **fork twin** finishing notifies its personalities: the exit
-                // hooks its fork factories rode in on ([`Host::exit_hooks`]) fire with the raw
-                // exit status ([`reap_status`] — the same value a servicer-side reap hands a
-                // `wait`), so each retires the process in its own table (Live → Zombie). Gated on
-                // the twin registry: a thread sibling completing on a *shared* host must not fire
-                // the domain's hooks. Safe under the scheduler lock: hooks take personality locks,
-                // and the established order is scheduler → personality (the fork factory); the
-                // host lock is free (this very thread just dropped the vCPU).
-                if s.forked_twins.contains_key(&id) {
-                    let hooks = dying_host.lock_unpoisoned().exit_hooks.clone();
-                    if !hooks.is_empty() {
-                        let status = reap_status(&outcome.result);
-                        for h in hooks {
-                            h(status);
-                        }
-                    }
-                }
-                // #799 — wake blocking-`waitpid` benchers of this child ([`Blocked::ReapWait`]).
-                // Deliberately AFTER the exit hooks: the woken op re-executes and must find the
-                // personality's table entry already retired (Live → Zombie). No pending value —
-                // the op was rewound, the personality's own answer machinery serves the reply.
-                if let Some(ws) = s.posix_reap_waiters.remove(&id) {
-                    for w in ws {
-                        s.runnable.push_back(w);
-                    }
+                // (The host lock is free: this very thread just dropped the vCPU.)
+                if twin_finished_locked(&mut s, id, &dying_host, &outcome.result) {
                     sched.work.notify_all();
-                }
-                // #1340 — `results` answers every later bench on this child; drop its stop/continue mark.
-                s.reap_pending.remove(&id);
-                // #802 rung 3 — and any-child benchers of this twin's PARENT (the wildcard key),
-                // or mark the transition pending for a bench racing this drain.
-                if let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) {
-                    if wake_posix_reap_any_locked(&mut s, parent) {
-                        sched.work.notify_all();
-                    }
                 }
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
@@ -8428,17 +8486,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let (live, interrupted) = {
+                let (domain, live, interrupted) = {
                     let hg = v.host.lock_unpoisoned();
                     // #796 slice D — the pre-park pending check, same shape as the revoke
                     // re-check beside it: a deliverable raise that landed after this vCPU's last
                     // per-op poll ran its sweep against a map we were not yet in; complete the
                     // read `-EINTR` instead of blocking through the signal.
-                    (hg.handle_live(handle), hg.park_must_wake())
+                    (
+                        hg.domain_id() as usize,
+                        hg.handle_live(handle),
+                        hg.park_must_wake(),
+                    )
                 };
                 if live && !interrupted {
                     s.cap_waiters
-                        .entry(handle)
+                        .entry((domain, handle))
                         .or_default()
                         .push(Waiter::VCpu(v));
                 } else {
@@ -8648,9 +8710,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
             // its pager binding (op 16): synthesize `pager.page(addr)` on the provider's cell. With
             // direct handoff and the pager parked at `svc.wait`, the handler runs inline on this
-            // thread (the §10.2 shape) — supply the page and requeue; otherwise park exactly as a
-            // live-offer caller does (`park_cap_reply`), with `page_fault` marking the wake to
-            // supply instead of pushing a reply.
+            // thread (the §10.2 shape) — supply the page and requeue; otherwise wake the pager and
+            // park exactly as a live-offer caller does (`park_cap_reply`), with `page_fault`
+            // marking the wake to supply instead of pushing a reply.
             Step::PageFault(addr) => {
                 let Some(pb) = v.pager.clone() else {
                     // Unreachable by construction (`fault_pager` is set only with `pager`), but never
@@ -8699,6 +8761,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         // replies via `t` when it completes.
                     }
                 }
+                // Not served inline: wake the pager's `svc.wait` for the queued request, exactly
+                // as a `call.cap` does (#1815 — without it a parked pager slept through the fault).
+                sched.svc_wake(pager_id as usize);
                 v.page_fault = Some(addr);
                 park_cap_reply(sched, v, t, pb.cell);
             }
@@ -8746,7 +8811,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             v.id,
                         )));
                     }
-                    s.svc_waiters.entry(key).or_default().push(v);
+                    s.svc_waiters
+                        .entry(key)
+                        .or_default()
+                        .push((SvcPark::Consumer, v));
                 } else {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -8774,7 +8842,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
-                    s.svc_waiters.entry(key).or_default().push(v);
+                    s.svc_waiters
+                        .entry(key)
+                        .or_default()
+                        .push((SvcPark::Resumer, v));
                 }
             }
             Step::Park(Blocked::ContResumeBlock { key, slot }) => {
@@ -8795,7 +8866,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
-                    s.svc_waiters.entry(key).or_default().push(v);
+                    s.svc_waiters
+                        .entry(key)
+                        .or_default()
+                        .push((SvcPark::Resumer, v));
                 }
             }
             Step::Park(Blocked::OfferAdmit { key }) => {
@@ -8929,12 +9003,12 @@ impl SchedRef {
             SchedRef::Det(d) => d.notify(key, count),
         }
     }
-    /// §3.6 revocation-unparks: wake every fiber parked in a capability call through `handle`
-    /// with the negative errno `status` ([`Scheduler::cap_revoke`]). The explorer has no
-    /// cap-call parks (a `Blocked::CapRead` there fails closed at the park), so it is a no-op.
-    fn cap_revoke(&self, handle: i32, status: i64) -> u32 {
+    /// §3.6 revocation-unparks: wake every fiber parked in a capability call through `handle` of
+    /// `domain`'s table with the negative errno `status` ([`Scheduler::cap_revoke`]). The explorer
+    /// has no cap-call parks (a `Blocked::CapRead` there fails closed at the park), so it is a no-op.
+    fn cap_revoke(&self, domain: usize, handle: i32, status: i64) -> u32 {
         match self {
-            SchedRef::Real(s) => s.cap_revoke(handle, status),
+            SchedRef::Real(s) => s.cap_revoke(domain, handle, status),
             SchedRef::Det(_) => 0,
         }
     }
@@ -15159,11 +15233,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let svck = hostc.lock_unpoisoned().domain_id() as usize;
                                 fiber_park!(|slot: usize| {
                                     let mut sg = sr.lock();
-                                    sg.cap_waiters.entry(h).or_default().push(Waiter::fiber(
-                                        Arc::clone(&regc),
-                                        slot,
-                                        svck,
-                                    ));
+                                    sg.cap_waiters
+                                        .entry((svck, h))
+                                        .or_default()
+                                        .push(Waiter::fiber(Arc::clone(&regc), slot, svck));
                                     drop(sg);
                                     let live = hostc.lock_unpoisoned().handle_live(h);
                                     if !live {
@@ -15184,9 +15257,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // (backpressure), and a write / last-close flags the other side's wake. Drained
                     // with the #799 caller request and the #796 interrupt flag in one place (#1647).
                     let t = ParkTransients::drain(&mut hg, ParkPosture::ParksOnPipes);
+                    let domain = hg.domain_id() as usize;
                     drop(hg);
                     if closed {
-                        sched.cap_revoke(h, CAP_REVOKED);
+                        sched.cap_revoke(domain, h, CAP_REVOKED);
                     }
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
@@ -15767,11 +15841,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         None,
                     )?;
                     let status = *results.first().ok_or(Trap::Malformed)?;
+                    let domain = hg.domain_id() as usize;
                     drop(hg);
                     if status == 0 {
                         if let Some(old) = old {
                             if old != h {
-                                sched.cap_revoke(old, CAP_REVOKED);
+                                sched.cap_revoke(domain, old, CAP_REVOKED);
                             }
                         }
                     }

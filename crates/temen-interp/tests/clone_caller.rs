@@ -1103,3 +1103,92 @@ fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
     let status = i64::from_le_bytes(bytes[..8].try_into().unwrap());
     assert_eq!(status, 0, "WNOHANG on a running child is 0");
 }
+
+/// #1816 — **two waiters on one twin.** [`SRC_FORK_WAIT`]'s parent, but it also spawns a thread that
+/// `wait(pid)`s the same twin, and the twin sleeps 200 ms before `exit(42)` so both waits find it
+/// running. A blocking `reap` parks its caller in the scheduler's per-child joiner slot, and the
+/// second waiter's park used to *overwrite* the first: that vCPU was dropped, never finished, and the
+/// run never ended. POSIX: exactly one waiter reaps the status, the other gets `-ECHILD`. Both loops
+/// retry only `-EAGAIN` (the serve/park race), so the parent returns its status + the thread's:
+/// `42 + -10 = 32`, whichever of the two wins.
+#[test]
+fn a_second_wait_on_a_twin_already_waited_gets_echild() {
+    let at = SRC_FORK_WAIT
+        .find("block 3 (vpid: i64) {")
+        .expect("the parent block");
+    let src = SRC_FORK_WAIT[..at].replace("br_if vparent 3(vpid) 5()", "br_if vparent 3(vpid) 6()")
+        + "block 3 (vpid: i64) {
+  vtz = i64.const 0
+  vth = thread.spawn 5 vtz vpid
+  br 4(vpid, vth)
+  }
+block 4 (vpid: i64, vth: i32) {
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vh = self.resolve vp0 vl3
+  vstatus = call.cap 268435456 1 (i64) -> (i64) vh (vpid)
+  veagain = i64.const -11
+  vretry = i64.eq vstatus veagain
+  br_if vretry 4(vpid, vth) 5(vstatus, vth)
+  }
+block 5 (vstatus: i64, vth: i32) {
+  vts = thread.join vth
+  vsum = i64.add vstatus vts
+  return vsum
+  }
+block 6 () {
+  vwa = i64.const 64
+  vwe = i32.const 0
+  vwt = i64.const 200000000
+  vww = i32.atomic.wait vwa vwe vwt
+  v42 = i64.const 42
+  return v42
+  }
+}
+" + r#"func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vpid: i64) {
+  br 1(vpid)
+  }
+block 1 (vpid: i64) {
+  vp0 = i64.const 0
+  vl3 = i64.const 3
+  vh = self.resolve vp0 vl3
+  vs = call.cap 268435456 1 (i64) -> (i64) vh (vpid)
+  veagain = i64.const -11
+  vretry = i64.eq vs veagain
+  br_if vretry 1(vpid) 2(vs)
+  }
+block 2 (vs: i64) {
+  return vs
+  }
+}
+"#;
+    assert!(
+        src.contains("3(vpid) 6()"),
+        "the fork branch must be rewired"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let m = module(&src);
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        let ih = host.grant_instantiator(0, 1u64 << 18);
+        let out_h = host.grant_stream(StreamRole::Out);
+        let mut fuel = 60_000_000u64;
+        let _ = tx.send(run_with_host(
+            &m,
+            0,
+            &[Value::I32(ih), Value::I32(out_h)],
+            &mut fuel,
+            &mut host,
+        ));
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the run hung: a waiter was dropped");
+    assert_eq!(
+        r.expect("run"),
+        vec![Value::I64(32)],
+        "one waiter reaps exit(42), the other gets -ECHILD"
+    );
+}
