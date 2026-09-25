@@ -13,7 +13,7 @@
 //   node build-pg-assets.mjs && node pg-reload-test.mjs
 import { startServer } from './serve.mjs';
 import { benignAssetMiss } from './play-test-errors.mjs';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -49,6 +49,39 @@ const browser = await chromium.launch({ args: ['--no-sandbox'] });
 let failed = false;
 const ok = (m) => console.log(`  ok: ${m}`);
 const fail = (m) => { failed = true; console.log(`  FAIL: ${m}`); };
+
+// #1135 diagnostics (no effect unless the reload stalls): say WHICH Chromium component is wedged. A
+// renderer whose main (or IO) thread is merely stuck in JS/wasm or a user-space wait is SIGTERMed by
+// Chromium's shutdown, so it cannot explain the CI signature (`browser.close()` taking exactly
+// Playwright's 30 s kill); only a browser process that stops answering, or a child that is stopped /
+// in uninterruptible sleep, can. So: did the new document commit, does the browser still answer CDP,
+// does the page, and which Chromium threads are stopped (T/t) or in D state — with their wait channel.
+async function describeStall(page, navigations) {
+  try { await describeStallOn(page, navigations); } catch (e) { console.log(`  stall: diagnostics failed: ${e.message}`); }
+}
+async function describeStallOn(page, navigations) {
+  const within = (p, ms) => Promise.race([
+    p.then(() => 'answers', (e) => `error ${String(e.message).split('\n')[0]}`),
+    new Promise((r) => setTimeout(() => r(`silent for ${ms} ms`), ms)),
+  ]);
+  const cdp = await within(browser.newBrowserCDPSession().then((s) => s.send('Browser.getVersion')), 5000);
+  const eva = await within(page.evaluate(() => document.readyState), 5000);
+  console.log(`  stall: new-document commits=${navigations} · browser CDP ${cdp} · page ${eva}`);
+  const rd = (p) => { try { return readFileSync(p, 'utf8'); } catch { return ''; } };
+  for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+    const cmd = rd(`/proc/${pid}/cmdline`).replace(/\0/g, ' ');
+    if (!/headless_shell|chrom/.test(cmd.split(' ')[0])) continue;
+    const odd = [];
+    for (const tid of (() => { try { return readdirSync(`/proc/${pid}/task`); } catch { return []; } })()) {
+      const st = rd(`/proc/${pid}/task/${tid}/stat`);
+      const state = st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3);
+      if (/[DTt]/.test(state)) odd.push(`${st.slice(st.indexOf('(') + 1, st.lastIndexOf(')'))}:${state}:${rd(`/proc/${pid}/task/${tid}/wchan`)}`);
+    }
+    const type = (/--type=([\w-]+)/.exec(cmd) || [, 'browser'])[1];
+    console.log(`  stall: ${type} ${pid} rss=${(/VmRSS:\s+(\d+)/.exec(rd(`/proc/${pid}/status`)) || [, '?'])[1]}kB ${odd.join(' ') || 'no stopped/D threads'}`);
+  }
+  for (const f of ['cpu', 'memory', 'io']) console.log(`  stall: pressure ${f}: ${rd(`/proc/pressure/${f}`).split('\n')[0]}`);
+}
 
 // Read the byte length stored under the session key (null if absent). Never *creates* the DB/store —
 // it opens the existing one play.js made, so probing can't race play.js into a storeless database.
@@ -128,6 +161,8 @@ try {
   // (ISSUES.md I56). The engine's own readiness is the real gate — `waitEngine` below waits for
   // `engine-state=ready`, and the persistence assertions (SELECT 919191, "restored") still must pass —
   // so relaxing the navigation wait hardens the flake without masking any real regression.
+  let commits = 0;
+  page.on('framenavigated', (f) => { if (f === page.mainFrame()) commits++; });
   try {
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
   } catch (e) {
@@ -136,7 +171,13 @@ try {
     // so a second reload loses nothing — and the real gates below (`waitEngine` + the SELECT 919191 /
     // "restored" assertions) still must pass, so the retry cannot mask a genuine regression.
     console.log(`  reload timed out once (I56) — retrying: ${String(e.message).split('\n')[0]}`);
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await describeStall(page, commits);
+    try {
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } catch (e2) {
+      await describeStall(page, commits);
+      throw e2;
+    }
   }
   await waitEngine(page);
   const r2 = await runSql(page, 'SELECT x FROM reload_probe;');

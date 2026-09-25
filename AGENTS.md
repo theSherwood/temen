@@ -50,7 +50,39 @@ implementation that exists to be differentialled against the first).
   early and watch it over time; we are measured *relative to wasm/Wasmtime*
   (`DESIGN.md` §1a). Catch regressions when they're one commit old, not one
   release old.
-  **Log any flaky CI as a `kind:flaky-ci` GitHub issue** (see `ISSUE_TRACKING.md`). Catch and log flakiness early so that we have visibility and can track a fix.
+
+## Flaky CI: find the cause, fix the cause
+
+A flake is a bug whose trigger is timing: in the product, in a test, or in CI plumbing. It is never
+noise, and a green re-run proves nothing.
+
+- **First make sure it is a flake.** A failure that follows the PR's own diff, or that main shares
+  (two PRs merged together and clashed), is an ordinary bug. Check the same commit's re-run and
+  unrelated PRs before calling it timing.
+- **No workarounds.** Don't add retries, re-run loops, longer timeouts, sleeps, `#[ignore]`,
+  skip-on-failure branches, or `continue-on-error` to quiet a flake. Each one hides a real race or a
+  fragile dependency, and the next failure is harder to read. The ones already in the tree are debt
+  to remove, not precedent.
+- **Reproduce it.** Loop the test under CPU contention (a few `while :; do :; done` busy loops). If
+  the window is narrow, force it: put a temporary delay at the suspected interleaving point until it
+  fails every time with CI's exact signature. Then trace what really happened. Several obvious
+  causes in this tree turned out wrong once a trace or a probe showed the real one.
+- **Fix the cause, then prove it.** The same forced interleaving must pass after the fix. When the
+  race is in a primitive, pin it with a test that fails on the old code: a loom model for lock or
+  scheduler ordering, a unit test for a protocol.
+- **External dependencies count.** A job that fetches from a third-party CDN or runs `apt-get update`
+  against a live mirror on every run is flaky by construction. Remove the per-run dependency: cache
+  the pinned, checksummed artifact, and don't install what the image already has. Don't retry it.
+- **Tests that share disk state race.** Tests run as parallel threads (`cargo test`) and parallel
+  processes (nextest). A `OnceLock` serialises only threads, so any cache or build tree that two
+  tests populate goes through `crates/temen/tests/support/cache_lock.rs`.
+- **A harness must fail, never hang.** A wait with no bound turns one flake into a job-timeout
+  cancellation with no diagnosis. A driver that gives up says why, including what it saw, and the
+  test fails.
+- **Log it.** Every flake gets a `kind:flaky-ci` issue (`ISSUE_TRACKING.md`) with the CI signature
+  and, once known, the root cause and the proof. If a closed flake recurs, the fix was wrong: reopen
+  it. If you can't reproduce one, record what you tried in the issue and leave it open. Don't mask
+  the test.
 
 ## Performance philosophy: data-oriented design
 

@@ -706,11 +706,24 @@ impl Domain {
         lock(&self.lane_chain).clone()
     }
 
-    /// D66 — take every lane in `chain` if all of them have room, without waiting. Takes only the
-    /// lane lock, so a caller may hold its own scheduler lock across it (the child-domain executor
-    /// does, while picking); nothing in this file takes a scheduler lock while holding this one.
-    pub(crate) fn lane_try_enter(&self, chain: &[(usize, i64)]) -> bool {
-        temen_ir::lanes::enter(&mut lock(&self.hub().lanes), chain)
+    /// D66 — admit the first chain of `queue`, in order, whose every lane has room: take its lanes
+    /// and return its position, without waiting. `None` entries never fit. The lanes are the run's,
+    /// on the hub. Takes only the lane lock, so a caller may hold its own scheduler lock across it
+    /// (the child-domain executor does, while picking); nothing in this file takes a scheduler lock
+    /// while holding this one.
+    ///
+    /// **One lock hold for the whole scan.** The executor's queue is FIFO — a task refused a lane
+    /// keeps its place — and that order holds only if every entry is judged against the same lane
+    /// counts. Probing entry by entry let a lane given back by a 1:1 vCPU *between* two probes (a
+    /// parent parking in `join`) admit the second task ahead of the first it had just refused.
+    pub(crate) fn lane_try_enter_first<'a>(
+        &self,
+        queue: impl IntoIterator<Item = Option<&'a [(usize, i64)]>>,
+    ) -> Option<usize> {
+        let mut g = lock(&self.hub().lanes);
+        queue
+            .into_iter()
+            .position(|c| c.is_some_and(|c| temen_ir::lanes::enter(&mut g, c)))
     }
 
     /// D66 — give every lane in `chain` back (the vCPU parked, or finished) and wake **both** kinds
@@ -3037,6 +3050,32 @@ mod loom_tests {
                 (WAIT_DEADLOCK, WAIT_DEADLOCK),
                 "both halves of a mutual deadlock must resolve, not just the one that parked last",
             );
+        });
+    }
+
+    /// **The executor's lane scan is one instant's.** A parent holds its cap-1 lane; two queued
+    /// child tasks draw on it. The parent gives the lane back (parking in `join`) while the
+    /// child-domain executor scans its queue. Under every interleaving the scan admits the *first*
+    /// task or neither — never the second ahead of the first it has just refused. Probing the queue
+    /// entry by entry, with the lane lock re-taken per entry, let the release land between the two
+    /// probes: `child_exec_jit`'s notifier then ran before its waiter parked.
+    #[test]
+    fn loom_a_lane_released_mid_scan_never_reorders_the_queue() {
+        loom::model(|| {
+            let dom = Arc::new(Domain::new(MAX_VCPUS));
+            let parent: &[(usize, i64)] = &[(1, 1)];
+            let (a, b): (&[(usize, i64)], &[(usize, i64)]) =
+                (&[(1, 1), (2, -1)], &[(1, 1), (3, -1)]);
+            assert_eq!(
+                dom.lane_try_enter_first([Some(parent)]),
+                Some(0),
+                "the parent runs"
+            );
+            let d = Arc::clone(&dom);
+            let releaser = loom::thread::spawn(move || d.lane_give_back(&[(1, 1)]));
+            let admitted = dom.lane_try_enter_first([Some(a), Some(b)]);
+            releaser.join().unwrap();
+            assert_ne!(admitted, Some(1), "the second task overtook the first");
         });
     }
 

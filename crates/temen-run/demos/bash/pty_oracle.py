@@ -9,9 +9,9 @@ on fd 1, all interleaved in arrival order) are comparable byte-for-byte.
     pty_oracle.py <bash-binary> <chunk>...
 
 Each `<chunk>` is a Python-escaped byte string (`echo hi\\n`, `\\x03`, `\\x04`); a chunk is written
-to the pty only once the transcript so far ends with the prompt (`PS1`, fixed below to the harness's
-value). After the last chunk the master is drained to EOF. The transcript is written to stdout as
-raw bytes.
+to the pty only once bash is **idle at a prompt** (see `idle_at_prompt`). After the last chunk the
+master is drained to EOF. The transcript is written to stdout as raw bytes. A session that stops
+making progress kills bash and exits 3 — it never waits on it unbounded.
 
 Terminal setup mirrors the temen line discipline so the byte streams line up: canonical mode with
 echo (the kernel's defaults), but `ONLCR` off (no `\\r\\n` translation of output and echoed
@@ -25,7 +25,9 @@ import fcntl
 import os
 import pty
 import select
+import signal
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -62,20 +64,46 @@ def main() -> int:
         os._exit(127)
 
     transcript = bytearray()
-    deadline = time.monotonic() + 20.0
     # Bytes already in the transcript when the last chunk was typed: the next prompt must arrive
     # AFTER them (the transcript still ends with the previous prompt while the echo is in flight).
     typed_at = -1
 
+    def idle_at_prompt() -> bool:
+        """Whether bash is waiting for the next keystroke: everything it wrote since the last chunk
+        has been read, it ends with PS1, and bash is asleep — the terminal read, since nothing else
+        blocks it there.
+
+        The prompt text alone is not enough, and each gap has cost a nightly run. Readline repaints
+        the prompt mid-line (Home on a wrapped line redraws `\\e[A\\r$ `), and a key typed then
+        can land after the line is accepted, while bash is between lines in cooked mode; the
+        kernel stores a cooked `^D` as NUL, which readline, raw again, reads as `C-@`. And readline
+        draws the prompt before it blocks in its read: a `^C` in that gap is handled without the
+        interrupted read that makes bash redraw the prompt. Either way bash waits at a prompt the
+        protocol never sees."""
+        if not (len(transcript) > typed_at and transcript.endswith(PS1)):
+            return False
+        if select.select([master], [], [], 0)[0]:
+            return False  # more output pending: bash is still writing (or blocked draining it)
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+        return state[:1] in ("S", "I")  # interruptible sleep (`I`: macOS, asleep > 20 s)
+
     def pump(until_prompt: bool) -> bool:
-        """Read master output into the transcript. `until_prompt`: stop once bytes received since
-        the last chunk was typed end with PS1. Returns False on EOF."""
+        """Read master output into the transcript. `until_prompt`: stop once bash is idle at a
+        prompt. Returns False on EOF; exits 3 if bash makes no progress for 20 s."""
+        deadline = time.monotonic() + 20.0
         while True:
-            if until_prompt and len(transcript) > typed_at and transcript.endswith(PS1):
+            if until_prompt and idle_at_prompt():
                 return True
             if time.monotonic() > deadline:
-                sys.stderr.write("pty_oracle: timeout\n")
-                return False
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                sys.stderr.write(
+                    "pty_oracle: no %s within 20 s; transcript so far: %r\n"
+                    % ("prompt" if until_prompt else "exit", bytes(transcript))
+                )
+                sys.exit(3)
             r, _, _ = select.select([master], [], [], 0.05)
             if not r:
                 continue
@@ -87,19 +115,17 @@ def main() -> int:
                 return False
             transcript.extend(data)
 
-    alive = True
     for chunk in chunks:
         if not pump(until_prompt=True):
-            alive = False
-            break
+            sys.stderr.write(
+                "pty_oracle: bash exited before the chunk %r; transcript: %r\n"
+                % (chunk, bytes(transcript))
+            )
+            return 3
         typed_at = len(transcript)
         os.write(master, chunk)
-    if alive:
-        pump(until_prompt=False)
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
+    pump(until_prompt=False)
+    os.waitpid(pid, 0)  # the slave closed: bash is exiting
     sys.stdout.buffer.write(bytes(transcript))
     sys.stdout.buffer.flush()
     return 0

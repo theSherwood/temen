@@ -468,16 +468,16 @@ impl ChildExec {
         // here would enforce the cap twice and hand out double the granted parallelism. Taking the
         // domain's lane lock while holding this one is the one lock order used anywhere; nothing
         // takes this lock while holding that one.
-        let dom = self.domain();
-        let admit = g.runnable.iter().position(|id| {
+        let mut chains = g.runnable.iter().map(|id| {
             g.tasks
                 .get(id)
                 .and_then(|e| e.task.as_ref())
-                .is_some_and(|t| match dom {
-                    Some(d) => d.lane_try_enter(&t.chain),
-                    None => true, // no domain ⇒ no lanes to honour (the durable nested nursery)
-                })
-        })?;
+                .map(|t| t.chain.as_slice())
+        });
+        let admit = match self.domain() {
+            Some(d) => d.lane_try_enter_first(chains)?,
+            None => chains.position(|c| c.is_some())?, // no domain ⇒ no lanes to honour (the durable nested nursery)
+        };
         let id = g.runnable.remove(admit).expect("position is in range");
         g.tasks.get_mut(&id).expect("scanned").woken = false;
         Some(id)
