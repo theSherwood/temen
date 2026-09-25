@@ -18,9 +18,12 @@ use temen_ir::Module;
 pub const ROOT_WINDOW_LOG2: u8 = 16;
 
 const GUARD: u64 = temen_ir::POWERBOX_NULL_GUARD;
+/// Each pipe's `fds` pair as the mint self-op writes it (`[read: i32][write: i32]`, 8 bytes).
+const PIPE_BASE: u64 = GUARD + 512;
 /// Grant records (16 bytes each: `{name_off: u32, name_len: u32, handle: u32, flags: u32}`).
 const REC_BASE: u64 = GUARD + 1024;
-/// One 16-byte name slot per root capability, shared by every record that grants it.
+/// One 16-byte name slot per root capability, shared by every record that grants it, then two per
+/// pipe (the names its ends are granted under).
 const NAME_BASE: u64 = GUARD + 2048;
 /// The nodes' argv payloads, back to back.
 const ARGV_BASE: u64 = GUARD + 4096;
@@ -33,6 +36,27 @@ pub struct Plan {
     pub caps: Vec<String>,
     /// Spawned in order, then joined in order; the root returns the last node's result.
     pub nodes: Vec<Node>,
+    /// Stream edges between nodes.
+    pub pipes: Vec<Pipe>,
+}
+
+/// Where a grant record's handle comes from in the root: one of its params, or an `i32` in its window
+/// (a pipe end the mint wrote).
+enum Handle {
+    Param(usize),
+    At(u64),
+}
+
+/// A stream edge (#1807): a pipe the root mints, whose write end node `from` is granted under
+/// `from_name` and whose read end node `to` is granted under `to_name` — typically `"stdout"` to
+/// `"stdin"`, so each node runs unchanged. The root closes its own copies of both ends once every node
+/// is spawned, so the reader sees EOF when the writer exits. A pipe parks its reader (or a writer on a
+/// full pipe), so a plan with pipes needs a scheduler that parks: the cooperative bytecode engine.
+pub struct Pipe {
+    pub from: usize,
+    pub from_name: String,
+    pub to: usize,
+    pub to_name: String,
 }
 
 /// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 15) in a
@@ -60,6 +84,7 @@ impl Plan {
                 env: Vec::new(),
                 grants: owned(caps),
             }],
+            pipes: Vec::new(),
         }
     }
 
@@ -75,12 +100,24 @@ impl Plan {
         if n == 0 {
             return Err("a plan spawns at least one node".into());
         }
-        if NAME_BASE + self.caps.len() as u64 * SLOT > ARGV_BASE {
-            return Err(format!("{} root capabilities do not fit", self.caps.len()));
+        // Name slots: each root capability's, then each pipe's two end names.
+        let names: Vec<&String> = self
+            .caps
+            .iter()
+            .chain(self.pipes.iter().flat_map(|p| [&p.from_name, &p.to_name]))
+            .collect();
+        if NAME_BASE + names.len() as u64 * SLOT > ARGV_BASE {
+            return Err(format!("{} capability names do not fit", names.len()));
         }
-        // Capability names, one slot each. Plain ASCII so the name is its own data literal.
+        if PIPE_BASE + self.pipes.len() as u64 * 8 > REC_BASE {
+            return Err(format!("{} pipes do not fit", self.pipes.len()));
+        }
+        if self.pipes.iter().any(|p| p.from >= n || p.to >= n) {
+            return Err("a pipe names a node the plan does not have".into());
+        }
+        // Plain ASCII so the name is its own data literal.
         let mut data = String::new();
-        for (i, name) in self.caps.iter().enumerate() {
+        for (i, name) in names.iter().enumerate() {
             let ok = !name.is_empty()
                 && name.len() as u64 <= SLOT
                 && name
@@ -111,30 +148,68 @@ impl Plan {
         if off > 1u64 << ROOT_WINDOW_LOG2 {
             return Err("the nodes' argv does not fit the root's window".into());
         }
-        // Grant records, each node's contiguous: word0 = {name_off | name_len << 32}, then the handle
-        // (the root's param for that capability).
-        let cap_param = |i: usize| 2 + n + i;
+        // Mint every pipe first (the self-op writes its `[read][write]` handles at its fds slot). A
+        // failed mint leaves the slot zeroed — the root's own Instantiator, which no grant can carry —
+        // so the spawn that names it refuses: fail closed.
         let mut records = String::new();
+        for p in 0..self.pipes.len() {
+            records.push_str(&format!(
+                "  pf{p} = i64.const {fds}\n  pz{p} = i32.const 0\n  \
+                 pm{p} = call.cap 4294967295 16 (i64) -> (i32) pz{p} (pf{p})\n",
+                fds = PIPE_BASE + p as u64 * 8,
+            ));
+        }
+        // Grant records, each node's contiguous: word0 = {name_off | name_len << 32}, then the handle
+        // (the root's param for a capability, or a pipe end read back from its fds slot).
         let mut first_rec = Vec::with_capacity(n);
+        let mut rec_n = Vec::with_capacity(n);
         let mut r = 0u64;
-        for node in &self.nodes {
+        for (k, node) in self.nodes.iter().enumerate() {
             first_rec.push(REC_BASE + r * SLOT);
+            // (name slot, handle): the node's root capabilities, then its pipe ends.
+            let mut grants: Vec<(usize, Handle)> = Vec::new();
             for name in &node.grants {
                 let Some(i) = self.caps.iter().position(|c| c == name) else {
                     return Err(format!(
                         "a node is granted {name:?}, which the root does not hold"
                     ));
                 };
+                grants.push((i, Handle::Param(2 + n + i)));
+            }
+            for (p, pipe) in self.pipes.iter().enumerate() {
+                let slot = self.caps.len() + 2 * p;
+                let fds = PIPE_BASE + p as u64 * 8;
+                if pipe.from == k {
+                    grants.push((slot, Handle::At(fds + 4)));
+                }
+                if pipe.to == k {
+                    grants.push((slot + 1, Handle::At(fds)));
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for (slot, handle) in &grants {
+                let name = names[*slot];
+                if !seen.insert(name) {
+                    return Err(format!("a node is granted {name:?} twice"));
+                }
                 let roff = REC_BASE + r * SLOT;
-                let w0 = (NAME_BASE + i as u64 * SLOT) | ((name.len() as u64) << 32);
+                let w0 = (NAME_BASE + *slot as u64 * SLOT) | ((name.len() as u64) << 32);
+                let (load, hv) = match handle {
+                    Handle::Param(i) => (String::new(), format!("v{i}")),
+                    Handle::At(at) => (
+                        format!("  la{roff} = i64.const {at}\n  hv{roff} = i32.load la{roff}\n"),
+                        format!("hv{roff}"),
+                    ),
+                };
                 records.push_str(&format!(
-                    "  xr{roff} = i64.const {w0}\n  or{roff} = i64.const {roff}\n  i64.store or{roff} xr{roff}\n  \
-                     h{roff} = i64.extend_i32_u v{vi}\n  oh{roff} = i64.const {hoff}\n  i64.store oh{roff} h{roff}\n",
-                    vi = cap_param(i),
+                    "  xr{roff} = i64.const {w0}\n  or{roff} = i64.const {roff}\n  i64.store or{roff} xr{roff}\n\
+                     {load}  h{roff} = i64.extend_i32_u {hv}\n  oh{roff} = i64.const {hoff}\n  \
+                     i64.store oh{roff} h{roff}\n",
                     hoff = roff + 8,
                 ));
                 r += 1;
             }
+            rec_n.push(grants.len());
         }
         if REC_BASE + r * SLOT > NAME_BASE {
             return Err(format!("{r} grant records do not fit"));
@@ -161,9 +236,19 @@ impl Plan {
                  val{s} = i64.const {al}\n  vh{s} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) \
                  -> (i32) v0 (vmin, vmh{s}, vgptr{s}, vgn{s}, ventry{s}, vlog{s}, vq{s}, vap{s}, val{s})\n",
                 gptr = first_rec[k],
-                gn = node.grants.len(),
+                gn = rec_n[k],
                 log = node.window_log2,
             ));
+        }
+        // Every node holds its own ends now; drop the root's, so a reader sees EOF when its writer exits.
+        for p in 0..self.pipes.len() {
+            let fds = PIPE_BASE + p as u64 * 8;
+            for (end, at) in [("r", fds), ("w", fds + 4)] {
+                body.push_str(&format!(
+                    "  ca{end}{p} = i64.const {at}\n  ch{end}{p} = i32.load ca{end}{p}\n  \
+                     cc{end}{p} = call.cap 0 2 () -> (i64) ch{end}{p} ()\n"
+                ));
+            }
         }
         for k in 0..n {
             let s = sfx(k);
@@ -212,6 +297,11 @@ pub fn run(
     mut host: Host,
     caps: &[i32],
 ) -> Result<Vec<Value>, Trap> {
+    // This driver runs each child to completion as it is spawned, so a pipe's reader could never
+    // wait for its writer: refuse a plan with pipes up front rather than trap mid-run.
+    if !plan.pipes.is_empty() {
+        return Err(Trap::Malformed);
+    }
     let src = plan.root_src().map_err(|_| Trap::Malformed)?;
     let root = temen_text::parse_module(&src).map_err(|_| Trap::Malformed)?;
     let prog = bytecode::VcpuProgram::compile(&root).ok_or(Trap::Malformed)?;

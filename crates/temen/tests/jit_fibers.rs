@@ -30,12 +30,7 @@ fn to_slot(v: &Value) -> i64 {
 }
 
 fn trap_matches(t: &Trap, k: &TrapKind) -> bool {
-    matches!(
-        (t, k),
-        (Trap::FiberFault, TrapKind::FiberFault)
-            | (Trap::MemoryFault, TrapKind::MemoryFault)
-            | (Trap::DivByZero, TrapKind::DivByZero)
-    )
+    t.code() == k.code() // one wire code for both engines (#1735)
 }
 
 /// Run `src` on both backends and assert they agree (results bit-for-bit, or the same trap kind).

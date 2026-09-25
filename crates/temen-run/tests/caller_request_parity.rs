@@ -143,8 +143,11 @@ import 3 \"wait4\" (i64, i64, i64, i64) -> (i64)\n\
 import 4 \"argc\" () -> (i64)\n";
 
 fn guest(form: Form, body: Body) -> String {
+    // The shadow arena is where the Cranelift JIT unwinds a forking caller to (FORK.md §9.5); its
+    // placement is the module's (INVARIANTS.md #16), clear of the data below. The interpreters
+    // fork without one, so it changes nothing there.
     let head = format!(
-        "memory 17\n\n{IMPORTS}\n\
+        "memory 17 shadow 65536 69632\n\n{IMPORTS}\n\
          data 40000 \"/bin/c\\x00\"\n\
          data 41000 \"\\xab\\xcd\\x00\\x00\"\n\n"
     );
@@ -346,12 +349,7 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool)
 /// Every (form, grant, engine) cell of one behaviour must produce `want`. The message names the
 /// cell, because "which row disagreed" is the whole diagnostic.
 fn assert_parity(body: Body, registered: bool, want: Outcome) {
-    // The JIT serves `execve` (#1768) but not yet `fork`, so the fork row runs on the interpreters.
-    let backends: &[Backend] = match body {
-        Body::ForkExecReap => &[Backend::TreeWalk, Backend::Bytecode],
-        _ => &[Backend::TreeWalk, Backend::Bytecode, Backend::Jit],
-    };
-    for &backend in backends {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         for grant in Grant::all() {
             for form in Form::all() {
                 let got = run(form, grant, body, backend, registered);

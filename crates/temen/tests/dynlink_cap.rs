@@ -9,7 +9,7 @@
 //! identically on both backends, like every other `Jit` op.
 
 use temen_encode::encode_module;
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Resolved, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{encode_symbol_table, grant_jit, jit_cap_run};
@@ -81,8 +81,8 @@ fn diff(guest_src: &str, init: &[u8], user_args: &[i64], table_log2: u8) -> (Jit
                 assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
             }
         }
-        (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
-        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType)) => {}
+        // The same trap on both engines: one wire code (#1735).
+        (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
     assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");

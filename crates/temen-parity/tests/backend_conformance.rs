@@ -138,8 +138,10 @@ fn cranelift(
             Verdict::Answered(vals.first().copied().unwrap_or(0))
         }
         Ok(temen_jit::JitOutcome::Exited(code)) => Verdict::Exited(code),
-        Ok(temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::CapFault)) => Verdict::Miscalled,
-        Ok(temen_jit::JitOutcome::Trapped(t)) => Verdict::Trapped(format!("{t:?}")),
+        // The kind *is* a trap wire code (#1735): classify it as the oracle's trap is classified.
+        Ok(temen_jit::JitOutcome::Trapped(k)) => verdict(Err(
+            Trap::from_code(k.code()).expect("a trap kind is a trap")
+        )),
         // Only an exec-armed powerbox (`temen_run`'s `jit_run`) unwinds a run; this host is not one.
         Ok(temen_jit::JitOutcome::HostUnwound) => {
             panic!("an unarmed host unwound the run")
@@ -241,36 +243,18 @@ fn the_backend_column_matches_what_the_backends_actually_do() {
     }
 }
 
-/// The divergence the column's first rendering found, pinned as a *specific* fact rather than left
-/// as a bare `NotYet`: `join` (op 1) on a child handle that names no live child traps `ThreadFault`
-/// on the oracle and `CapFault` under the Cranelift thunk. Invariant 9 lets a backend decline to the
-/// oracle; it does not let one run the op and report a different failure, and `instantiator_rt.rs`
-/// documents its arm as "matching the interpreter". Tracked as #1573; this keeps the shape of it
-/// honest so a fix (or a regression) is visible here.
+/// #1573, pinned so it stays fixed: `join` (op 1) on a child handle that names no live child traps
+/// `ThreadFault` on every backend. It used to trap `CapFault` under Cranelift — the JIT's nesting
+/// runtime chose `CapFault` where the oracle's `take_child` answers `ThreadFault`. The row as a whole
+/// is still `NotYet` for op 13 (#1821), so the column test alone would not catch `join` regressing.
 #[test]
-fn join_traps_differently_on_the_oracle_and_the_cranelift_thunk() {
+fn join_traps_as_the_oracle_does() {
     let row = rows()
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
     let found = divergences(&row, 1);
-    assert!(
-        !found.is_empty(),
-        "join no longer diverges — if it was fixed, this pin and the Instantiator cell should move \
-         together"
-    );
-    for (shape, who, want, got) in &found {
-        assert_eq!(
-            *want,
-            Verdict::Trapped("ThreadFault".into()),
-            "{shape}: the oracle should be the one raising ThreadFault, got {want:?}"
-        );
-        assert_eq!(
-            (*who, got.clone()),
-            ("cranelift", Verdict::Miscalled),
-            "{shape}: the divergence should be cranelift reporting a cap fault, got {who}={got:?}"
-        );
-    }
+    assert!(found.is_empty(), "join diverges again: {found:?}");
 }
 
 /// The wasm-JIT's side of this axis, pinned rather than restated: it is a leaf accelerator that does

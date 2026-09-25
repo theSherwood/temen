@@ -20,14 +20,16 @@
 
 use crate::TrapKind;
 use core::ffi::c_void;
+use std::collections::BTreeMap;
 
 /// The compiled entry trampoline ABI (see `build_trampoline`): `(args, results, mem_base,
-/// fn_table_base, trap_out)`. The 4th pointer is opaque here (`FnEntry*` to the JIT).
+/// fn_table_base, vmctx)`. The 4th pointer is opaque here (`FnEntry*` to the JIT); the 5th is the
+/// instance's [`crate::VmCtx`], spelled as the trap cell it starts with.
 type Entry = extern "C" fn(*const i64, *mut i64, *mut u8, *const c_void, *mut i64);
 
 /// Protection the PAL applies to a committed range of the window.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Prot {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Prot {
     /// Readable + writable (the backed prefix; restored before a snapshot read).
     Rw,
     /// Read-only (the D40 const data segment; a later write faults).
@@ -67,12 +69,18 @@ impl GuestWindow {
     /// `mapped` bound, `mapped` must be page-aligned whenever `reserved > mapped` — true for any
     /// `size_log2 >= 12`, which every caller of the decoupled form satisfies.
     pub(crate) fn new(mapped: usize, reserved: usize) -> GuestWindow {
+        Self::try_new(mapped, reserved).expect("temen-jit: window reserve failed")
+    }
+
+    /// [`Self::new`], or `None` when the address space has no room for the reservation — what a
+    /// caller that can refuse (a fork: `-EAGAIN`) builds with instead of failing the host.
+    pub(crate) fn try_new(mapped: usize, reserved: usize) -> Option<GuestWindow> {
         if mapped == 0 {
-            return GuestWindow {
+            return Some(GuestWindow {
                 base: std::ptr::null_mut(),
                 mapped: 0,
                 total: 0,
-            };
+            });
         }
         let page = pal::page_size();
         let reserved = reserved.max(mapped);
@@ -81,15 +89,17 @@ impl GuestWindow {
                                                      // SAFETY: a fresh inaccessible reservation (a huge `reserved` costs only virtual address
                                                      // space until pages are committed/touched). Checked non-null below.
         let base = unsafe { pal::reserve(total) };
-        assert!(!base.is_null(), "temen-jit: window reserve failed");
+        if base.is_null() {
+            return None;
+        }
         // SAFETY: commit the backed prefix `[0, rw)` read/write; the tail + guard stay inaccessible
         // so any access past `mapped` faults.
         unsafe { pal::commit_rw(base, rw) };
-        GuestWindow {
+        Some(GuestWindow {
             base,
             mapped,
             total,
-        }
+        })
     }
 
     /// The logical (backed) window `[0, mapped)`, readable/writable (freshly committed pages are
@@ -104,6 +114,11 @@ impl GuestWindow {
 
     pub(crate) fn base(&self) -> *mut u8 {
         self.base
+    }
+
+    /// The backed prefix's length (`[0, mapped)`).
+    pub(crate) fn mapped(&self) -> usize {
+        self.mapped
     }
 
     /// Re-enable read+write on the whole backed region `[0, mapped)`. The guest may have changed
@@ -210,6 +225,51 @@ impl GuestWindow {
         unsafe { pal::protect(self.base.add(base as usize), guard as usize, Prot::None) };
     }
 
+    /// #1768 — a **private duplicate** of this window for a fork twin (the JIT's
+    /// `Mem::fork_private`): the same geometry, the bytes of every committed page, and the same
+    /// protection on every page. `prots` names each host page (by index) whose state is not the
+    /// default — the backed prefix defaults to read-write, the reserved tail to uncommitted — so it
+    /// lists every committed tail page and every read-only or inaccessible prefix page.
+    ///
+    /// An inaccessible page may still hold bytes (a `protect(none)` keeps them; only an `unmap`
+    /// zeroes), so each is read through a brief read-write window on `self` and put straight back:
+    /// the caller guarantees nothing runs on this window meanwhile (its only vCPU is unwound). Every
+    /// other page of `self` is left exactly as it was. `None` when the address space has no room for
+    /// the duplicate's reservation.
+    ///
+    /// # Safety
+    /// No guest code runs on `self` during the call, and `prots` indexes only pages inside its
+    /// reservation.
+    pub(crate) unsafe fn fork_copy(&self, prots: &BTreeMap<usize, Prot>) -> Option<GuestWindow> {
+        let twin = GuestWindow::try_new(self.mapped, self.total - pal::page_size())?;
+        if self.mapped == 0 {
+            return Some(twin);
+        }
+        let page = pal::page_size();
+        let prefix = round_up(self.mapped, page);
+        let hidden = |p: usize| prots.get(&p) == Some(&Prot::None);
+        // Open the inaccessible pages (prefix and committed tail) for the read.
+        for (&p, _) in prots.iter().filter(|&(&p, _)| hidden(p)) {
+            pal::protect(self.base.add(p * page), page, Prot::Rw);
+        }
+        // The backed prefix in one copy; then each committed tail page, committed in the twin first.
+        std::ptr::copy_nonoverlapping(self.base, twin.base, prefix);
+        for (&p, _) in prots.range(prefix / page..) {
+            pal::commit_rw(twin.base.add(p * page), page);
+            std::ptr::copy_nonoverlapping(self.base.add(p * page), twin.base.add(p * page), page);
+        }
+        // Put `self` back, and give the twin the same protections.
+        for (&p, &prot) in prots {
+            if hidden(p) {
+                pal::protect(self.base.add(p * page), page, Prot::None);
+            }
+            if prot != Prot::Rw {
+                pal::protect(twin.base.add(p * page), page, prot);
+            }
+        }
+        Some(twin)
+    }
+
     /// The address range a fault must land in to be attributed to this window (the whole
     /// reservation, so the inaccessible tail + guard page are covered). `(0, 0)` when there is no
     /// window.
@@ -255,12 +315,22 @@ pub(crate) unsafe fn run_guarded(
     results: *mut i64,
     mem_base: *mut u8,
     fn_table: *const c_void,
-    trap_cell: *mut i64,
+    vmctx: *const crate::VmCtx,
 ) -> bool {
     pal::install_guard();
     let (lo, hi) = window.fault_range();
     let f: Entry = std::mem::transmute(code);
-    pal::run_guarded(f, args, results, mem_base, fn_table, trap_cell, lo, hi)
+    // The entry ABI spells the context pointer as the trap cell it starts with (`VmCtx` field 0).
+    pal::run_guarded(
+        f,
+        args,
+        results,
+        mem_base,
+        fn_table,
+        vmctx as *mut i64,
+        lo,
+        hi,
+    )
 }
 
 /// Install the guard on the calling (worker) thread. Idempotent; the handler is process-wide but its
@@ -322,19 +392,28 @@ pub(crate) unsafe fn run_guarded_range(
     results: *mut i64,
     mem_base: *mut u8,
     fn_table: *const c_void,
-    trap_cell: *mut i64,
+    vmctx: *const crate::VmCtx,
     lo: usize,
     hi: usize,
 ) -> bool {
     let f: Entry = std::mem::transmute(code);
-    pal::run_guarded(f, args, results, mem_base, fn_table, trap_cell, lo, hi)
+    pal::run_guarded(
+        f,
+        args,
+        results,
+        mem_base,
+        fn_table,
+        vmctx as *mut i64,
+        lo,
+        hi,
+    )
 }
 
 /// The trap code a caught guard fault reports.
 pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 
-/// The host page size — the §14 demand-paging granularity (what one fault supplies).
-#[cfg(fiber_rt)]
+/// The host page size — the §14 demand-paging granularity (what one fault supplies), and a fork
+/// copy's (#1768).
 pub(crate) fn page_size() -> usize {
     pal::page_size()
 }
@@ -1215,7 +1294,7 @@ mod tests {
         win: &GuestWindow,
         f: extern "C" fn(*const i64, *mut i64, *mut u8, *const c_void, *mut i64),
     ) -> bool {
-        let mut tc = 0i64;
+        let vm = crate::VmCtx::new(crate::InstanceAddrs::NONE);
         // SAFETY: `f` honours the Entry ABI; `mem_base` is this window's base.
         unsafe {
             run_guarded(
@@ -1225,7 +1304,7 @@ mod tests {
                 std::ptr::null_mut(),
                 win.base(),
                 std::ptr::null(),
-                &mut tc,
+                &vm,
             )
         }
     }

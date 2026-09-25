@@ -12,10 +12,13 @@
 #
 # All of it in-guest: the host seeds the sources and reads the linked module, which then runs.
 #
-# On the engines: the bytecode engine runs the build; the JIT then reruns hexer and runs the program
-# (it serves no fork yet, #1768, so not the build). The tree-walker — the oracle, 4x slower here — is
-# `--engine tree`, for a local run; nim_e2e's `nim_shells_out_through_the_posix_sh` differentials the
-# spawning mechanism across both interpreters on every PR.
+# On the engines: the bytecode engine runs the build; the JIT then reruns hexer and runs the program.
+# The JIT can run the build too (`--engine jit,bytecode`: it serves fork, #1768), but every process
+# first compiles its whole image — a fork twin recompiles its parent (#1825), and nifler2's lexer
+# alone takes ~2 minutes (#1831) — which puts it far past this job's budget. The tree-walker — the
+# oracle, 4x slower here — is `--engine tree`, for a local run; nim_e2e's
+# `nim_shells_out_through_the_posix_sh` differentials the spawning mechanism across all three engines
+# on every PR.
 #
 # Checked against native nimony (`nimony c`) building the same program with the same phases — each
 # one built by nimony from the same source as its Temen build, so only the target differs: every

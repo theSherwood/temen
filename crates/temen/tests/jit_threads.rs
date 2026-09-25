@@ -103,12 +103,7 @@ fn to_slot(v: &Value) -> i64 {
 }
 
 fn trap_matches(t: &Trap, k: &TrapKind) -> bool {
-    matches!(
-        (t, k),
-        (Trap::ThreadFault, TrapKind::ThreadFault)
-            | (Trap::FiberFault, TrapKind::FiberFault)
-            | (Trap::MemoryFault, TrapKind::MemoryFault)
-    )
+    t.code() == k.code() // one wire code for both engines (#1735)
 }
 
 fn assert_jit_matches_interp(src: &str) {

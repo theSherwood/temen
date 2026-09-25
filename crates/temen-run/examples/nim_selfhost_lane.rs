@@ -24,7 +24,7 @@
 //!
 //! **Engines** (`--engine E1,E2,…`): E1 runs the build — the driver and every process it spawns.
 //! Each later engine runs hexer over every module again, held to E1's bytes, and **every** engine
-//! runs the program. The JIT serves `execve` but not `fork` yet (#1768), so it cannot be E1.
+//! runs the program. Any engine can be E1: the JIT serves `fork`, `execve` and `waitpid` too (#1768).
 //!
 //! `--expect` makes the run a **test**: every artifact of every phase must be native nimony's,
 //! byte for byte, when native runs the same phases built by the same compiler (see
@@ -118,8 +118,8 @@ fn command_module(path: &str, what: &str) -> temen_ir::Module {
 }
 
 /// **hexer** again, on `engine`: lower every semchecked module to Leng as the driver's plan did
-/// (`hexer c`, the same flags), host-sequenced — the JIT cannot run the plan (no fork yet, #1768),
-/// but it can run each phase. Every `.x.nif` must be the one the in-guest build wrote.
+/// (`hexer c`, the same flags), host-sequenced. Every `.x.nif` must be the one the in-guest build
+/// wrote.
 fn relower(
     hexer: &temen_ir::Module,
     posix: &temen_posix::Posix,
@@ -342,7 +342,7 @@ fn main() {
     let expect = flag("--expect");
     // `--engine E1,E2,…` (`tree`, `bytecode`, `jit`; default `tree`): E1 runs the build — the driver
     // and every process it spawns; each later engine reruns hexer, and every engine runs the
-    // program. The JIT serves no fork yet, so it cannot be E1.
+    // program.
     let engines: Vec<temen_run::Backend> = flag("--engine")
         .unwrap_or_else(|| "tree".to_string())
         .split(',')
@@ -354,12 +354,6 @@ fn main() {
         })
         .collect();
     let engine = engines[0];
-    // The build is the stage that spawns (driver → nifmake → every phase), and the JIT serves no
-    // fork yet: refuse it here rather than let the driver report its first spawn failed.
-    assert!(
-        engine != temen_run::Backend::Jit,
-        "--engine: the JIT cannot run the build (no fork yet, #1768); put it after an interpreter"
-    );
     let [libdir, prog, dump] = &a[..] else {
         panic!(
             "usage: nim_selfhost_lane --sh <sh.ir> --nimony <nimony.temen> --nifmake \

@@ -761,12 +761,40 @@ fn link_selected_with_extra(
         temen_ir::link(&link_units)
     };
     let mut linked = linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))?;
-    // A synth-`_start` module is a powerbox entry whose guest allocator bumps in-window; seed its
-    // heap bump-pointer words now that the merged window is known (see [`seed_powerbox_heap`]).
+    // A synth-`_start` module is a powerbox program: declare its durable shadow arena, then seed its
+    // heap bump-pointer words above it now that the merged window is known (see
+    // [`place_shadow_arena`], [`seed_powerbox_heap`]).
     if synth_start {
+        place_shadow_arena(&mut linked);
         seed_powerbox_heap(&mut linked);
     }
     Ok(linked)
+}
+
+/// The per-context shadow regions a linked powerbox program's arena holds ([`place_shadow_arena`]):
+/// 64 KiB. A forking caller's frames unwind into it on the JIT, so it bounds how much a fork's call
+/// stack may spill; past it the unwind traps on the shadow stack's overflow check, never corrupts.
+const SHADOW_CONTEXTS: u64 = 16;
+
+/// Declare a linked powerbox program's **durable shadow arena** (INVARIANTS.md #16: the placement is
+/// the module's — there is no default): where a durable run keeps its per-context shadow regions,
+/// and where the Cranelift JIT unwinds a program that `fork`s (FORK.md §9.5). Without one, a nim
+/// program's `fork` on the JIT answers `-ENOSYS`.
+///
+/// R9's "a toolchain points the arena at a BSS array", as the LLVM on-ramp's `--shadow-arena`
+/// places it: on top of everything the window already holds — the data and the data stack above it
+/// ([`temen_ir::POWERBOX_STACK_RESERVE`]) — and below the heap, which [`seed_powerbox_heap`] starts at
+/// the arena's end, so neither the allocator nor a data segment can alias it (the verifier checks the
+/// latter). Its base is the stack reserve's end, [`temen_ir::POWERBOX_STACK_ALIGN`]-aligned, so it
+/// never shares a host page with a read-only segment. The window grows if the arena would eat into
+/// the heap floor [`temen_ir::link`] sized it for ([`temen_ir::POWERBOX_HEAP_RESERVE`]).
+fn place_shadow_arena(m: &mut Module) {
+    let base = temen_ir::powerbox_entry_sp(m) + temen_ir::POWERBOX_STACK_RESERVE;
+    let end = base + SHADOW_CONTEXTS * temen_ir::durable_abi::SHADOW_STRIDE;
+    let Some(mem) = m.memory.as_mut() else { return };
+    let need = end + temen_ir::POWERBOX_HEAP_RESERVE;
+    mem.size_log2 = mem.size_log2.max((64 - (need - 1).leading_zeros()) as u8);
+    mem.shadow = Some(temen_ir::durable_abi::ShadowArena { base, end });
 }
 
 /// Seed the guest **heap bump-pointer words** into a linked powerbox module's data image:
@@ -777,8 +805,9 @@ fn link_selected_with_extra(
 /// the allocator by handing out `[brk, brk+len)` and advancing `POWERBOX_HEAP_BRK`. If that word is
 /// left 0 the arena starts at address 0 and overlaps the placed static data — a heap allocation can
 /// reuse a program's `LongString` const and `add`/realloc scribbles it (the #1051 corruption, whose
-/// order-sensitivity was #1054). Seeding the base to `data.top + POWERBOX_STACK_RESERVE` puts the
-/// heap above **all** placed data for any link order. Seeding the ceiling to the real window top
+/// order-sensitivity was #1054). Seeding the base to `data.top + POWERBOX_STACK_RESERVE` — or, above
+/// that, the end of the program's shadow arena ([`place_shadow_arena`]) — puts the heap above **all**
+/// placed data for any link order. Seeding the ceiling to the real window top
 /// makes the heap use the whole remaining window (no capacity cliff) and lets the shim `mmap`
 /// fail closed when the guest would bump past it (#1060) — the confinement mask already prevents an
 /// out-of-window access from escaping, so this turns a self-corrupting wrap into a clean allocation
@@ -797,7 +826,11 @@ fn link_selected_with_extra(
 fn seed_powerbox_heap(m: &mut Module) {
     let Some(mem) = m.memory else { return };
     let win = 1u64 << mem.size_log2;
-    let brk = temen_ir::powerbox_entry_sp(m) + temen_ir::POWERBOX_STACK_RESERVE;
+    // Above the shadow arena when the program declares one ([`place_shadow_arena`]).
+    let brk = mem.shadow.map_or(
+        temen_ir::powerbox_entry_sp(m) + temen_ir::POWERBOX_STACK_RESERVE,
+        |a| a.end,
+    );
     // `POWERBOX_HEAP_TOP` sits 8 bytes above `POWERBOX_HEAP_BRK`; write both in one contiguous segment.
     debug_assert_eq!(temen_ir::POWERBOX_HEAP_TOP, temen_ir::POWERBOX_HEAP_BRK + 8);
     let mut bytes = brk.to_le_bytes().to_vec();

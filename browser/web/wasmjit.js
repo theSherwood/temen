@@ -10,9 +10,10 @@
 // `ex` is the cdylib's exports (must be the NON-threads build, whose `memory` is exported here;
 // the threads build imports it and the caller passes that object instead — see `memoryOf`).
 
-// Emitter trap codes — must match browser/src/lib.rs WASMJIT_TRAP_* (re-exported from temen-wasmjit).
-export const TRAP_OUT_OF_FUEL = 1;
-export const TRAP_MEMORY_FAULT = 2;
+// Emitter trap codes — must match browser/src/lib.rs WASMJIT_TRAP_* (re-exported from temen-wasmjit),
+// which are the one trap wire code (temen_ir::trap_code: OUT_OF_FUEL = 11, MEMORY_FAULT = 8).
+export const TRAP_OUT_OF_FUEL = 11;
+export const TRAP_MEMORY_FAULT = 8;
 
 // Default per-call dispatcher fuel (debited once per block dispatch — a coarse §5 bound; huge so
 // only a genuine runaway trips it).

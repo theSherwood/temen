@@ -121,8 +121,11 @@ fn main() {
     temen_run::collect_x_nif(&cache, &mut mods);
     // An **in-tree** build (a nimony phase, whose imports are relative so it cannot be copied to a
     // scratch dir) shares one `nimcache` with every other program built there. Narrow to this
-    // program's own closure, or the link sees two `main`s.
-    if let Some(note) = temen_run::nim_program_closure(&cache, &nim, &mut mods) {
+    // program's own closure, or the link sees two `main`s. The closure is named by the path nimony
+    // was handed — `file`, relative to its cwd `dir` — which is what it records in line info; the
+    // caller's own spelling of the path names nothing when it ran from the file's directory.
+    let given = file.to_str().expect("utf-8 program path");
+    if let Some(note) = temen_run::nim_program_closure(&cache, given, &mut mods) {
         // A fallback means the closure belongs to some *other* program. Linking it anyway writes a
         // plausible artifact for the wrong source and reports success — which is what happened the
         // first time this ran: 581 funcs written where nimsem has ~12,725, under the message
