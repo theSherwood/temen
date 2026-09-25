@@ -90,7 +90,8 @@ jobs:
             .
             crates/temen-llvm
       - name: install LLVM/clang (on-ramp build tools)
-        run: bash scripts/ci/install-llvm.sh flex bison
+        uses: ./.github/actions/install-llvm
+        with: { packages: flex bison }
 
       # The threads engine — the exact `browser-real` recipe (shared, imported memory + the TLS
       # exports the Workers call). Output: browser/target/wasm32-unknown-unknown/release/temen_browser.wasm

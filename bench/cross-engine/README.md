@@ -375,8 +375,8 @@ Embench results. The source isn't vendored (mixed per-benchmark licenses) — po
 `verify_benchmark`'s strict pass/fail, used as both the timed kernel and the cross-engine oracle):
 
 ```sh
-curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
-EMBENCH=/tmp/embench-iot-master cargo run -p temen-llvm --release --example embench
+export "$(bash scripts/ci/fetch-embench.sh)"   # EMBENCH=<the pinned checkout>
+cargo run -p temen-llvm --release --example embench
 ```
 
 Indicative (temen-jit ÷ native; **every engine bit-exact = native, `verify`=1**):

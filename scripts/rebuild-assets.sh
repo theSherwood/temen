@@ -66,7 +66,7 @@ if [ -x "$REPO/nimony/bin/nifler" ]; then
 fi
 # The nim C backend #include's `nimbase.h` from the Nim lib. build_e2e_chain.sh falls back to
 # `.nimtool/nim-src/lib` when `nim dump` doesn't print the lib path (some toolchains don't) — point
-# that at the picked Nim's lib so the fallback resolves (what provision-nimony.sh's nim-src clone gives).
+# that at the picked Nim's lib so the fallback resolves.
 if [ -n "${NIM_BIN:-}" ] && [ -f "$NIM_BIN/../lib/nimbase.h" ] && [ ! -f "$REPO/.nimtool/nim-src/lib/nimbase.h" ]; then
   mkdir -p "$REPO/.nimtool/nim-src"
   ln -sfn "$NIM_BIN/../lib" "$REPO/.nimtool/nim-src/lib"

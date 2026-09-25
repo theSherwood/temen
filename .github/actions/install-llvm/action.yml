@@ -1,0 +1,23 @@
+# The pinned LLVM/clang toolchain (`scripts/ci/install-llvm.sh`), with its packages restored from
+# the Actions cache so a job reaches apt.llvm.org only when the cache is empty; the script says why.
+# Every job that needs LLVM uses this one step, so the cache and the install cannot drift apart
+# across the nine jobs that run them (INVARIANTS #15).
+name: install LLVM
+description: Install the pinned LLVM/clang toolchain, plus any extra apt packages the job needs.
+inputs:
+  packages:
+    description: Extra apt packages, space-separated, installed in the same apt run.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+      with:
+        path: ~/.cache/temen-ci/llvm
+        key: llvm-${{ runner.os }}-${{ hashFiles('scripts/ci/install-llvm.sh') }}
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      # Unquoted on purpose: one apt package per word.
+      run: bash scripts/ci/install-llvm.sh $PACKAGES

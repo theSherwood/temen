@@ -126,37 +126,6 @@ jobs:
       # under one key the part that saved first would leave the other's dependencies uncached.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { key: "${{ matrix.part }}" }
-      # #856 — `setup-nim` resolves `version: devel` to the nim-lang/nightlies `latest-devel` release,
-      # which is transiently ABSENT for a short window while the nightly is being re-cut. The observed
-      # flake was exactly that: "Could not find any release named 'latest-devel'", failing in ~188 ms
-      # before any repo code ran. That window is upstream timing, not a repo failure — so wait for the
-      # release to reappear before invoking setup-nim instead of reddening the run on it. Bounded
-      # (~5 min of backoff): a genuine upstream outage still fails the job well inside the 45-min budget.
-      - name: Wait for the Nim devel nightly to be published (#856)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -u
-          api='https://api.github.com/repos/nim-lang/nightlies/releases/tags/latest-devel'
-          for attempt in 1 2 3 4 5 6; do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' \
-              -H 'Accept: application/vnd.github+json' \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "$api" || echo 000)
-            if [ "$code" = 200 ]; then
-              echo "nim-lang/nightlies latest-devel is published (HTTP 200, attempt ${attempt})."
-              exit 0
-            fi
-            echo "Attempt ${attempt}: latest-devel not resolvable yet (HTTP ${code}); backing off..."
-            [ "$attempt" = 6 ] || sleep "$((attempt * 20))"
-          done
-          echo "::error::nim-lang/nightlies latest-devel still missing after 6 attempts — likely a genuine upstream outage, not the usual re-cut window (#856)."
-          exit 1
-      - name: Setup Nim (devel)
-        uses: alaviss/setup-nim@0.1.1 # owner: pin by SHA on copy-over
-        with:
-          path: nim
-          version: devel
       # provision-nimony.sh now SKIPS its ~4-min build when the restored `nimony/bin` compiles a
       # probe, so this key has to track the vendored frontend: serving a toolchain built from a
       # different nimony commit than the checkout's `lib/` would be a silent stale-toolchain bug,
@@ -166,12 +135,16 @@ jobs:
       - name: Pin the nimony cache to the vendored commits
         id: nimony-rev
         run: echo "sha=$(git rev-parse HEAD:nimony)-$(git rev-parse HEAD:nativenif)" >> "$GITHUB_OUTPUT"
+      # #1839 — the Nim compiler rides the same cache: provision-nimony.sh builds it from the
+      # commit pinned there (NIM_SRC_REV), so the script's hash in the key covers it too. That
+      # replaced `setup-nim`'s moving devel nightly and the wait loop around its re-cut window (#856).
       - name: Cache nimony toolchain build
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
           path: |
             nimony/bin
             ~/.cache/nim
+            ~/.cache/temen-ci/nim
           # No `restore-keys`: a prefix fallback restores a toolchain built by a DIFFERENT script
           # revision (an `NIM_SRC_REV` bump, say), which is precisely the staleness the skip now
           # makes consequential. Exact key or rebuild.
@@ -192,7 +165,7 @@ jobs:
       # temen-llvm-translate), so it needs the LLVM tools pinned to the stable rustc's major.
       - name: install LLVM (the lane's temen-link build)
         if: matrix.part == 'selfhost'
-        run: bash scripts/ci/install-llvm.sh
+        uses: ./.github/actions/install-llvm
       - name: Self-hosted nimony lane (must match native)
         if: matrix.part == 'selfhost'
         run: bash scripts/ci/nim-selfhost-lane.sh
@@ -291,7 +264,7 @@ jobs:
       - name: cache cargo-nextest archive
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
-          path: ~/.cache/temen-ci
+          path: ~/.cache/temen-ci/nextest
           key: nextest-${{ runner.os }}-${{ hashFiles('scripts/ci/install-nextest.sh') }}
       - name: install cargo-nextest (pinned + checksummed per platform)
         shell: bash
@@ -510,7 +483,7 @@ jobs:
         # The version lives in `scripts/ci/install-llvm.sh` — pinned to the stable rustc's LLVM major
         # so the peval probe can feed default-`rustc` IR straight to `llvm-link`/`opt` (no second
         # rustc toolchain); `ci_tool_canary` asserts the two agree.
-        run: bash scripts/ci/install-llvm.sh
+        uses: ./.github/actions/install-llvm
       # This job's cost is test *execution*, not compilation — 8.7 min of it against 2.0 min of
       # fmt+clippy+compile — and `cargo test` runs the 99 integration-test binaries one at a time, so
       # three of the runner's four cores sat idle for most of it. See the script for the pin and the
@@ -521,7 +494,7 @@ jobs:
       - name: cache cargo-nextest archive
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
-          path: ~/.cache/temen-ci
+          path: ~/.cache/temen-ci/nextest
           key: nextest-${{ runner.os }}-${{ hashFiles('scripts/ci/install-nextest.sh') }}
       - name: install cargo-nextest
         timeout-minutes: 5
@@ -673,7 +646,7 @@ jobs:
         with: { workspaces: crates/temen-llvm }
       - name: install LLVM/clang (for the on-ramp)
         # clang + llvm-dis, same out-of-process on-ramp tools as the temen-llvm job.
-        run: bash scripts/ci/install-llvm.sh
+        uses: ./.github/actions/install-llvm
       # temen-llvm is workspace-excluded, so run from its own directory (like the `temen-llvm` job) rather
       # than `-p temen-llvm`. The trailing `${{ matrix.tier }}` is the libtest name filter: it selects the
       # `*_bytecode` or `*_tree_walker` ignored tests in the binary (the `*_jit` variants aren't #[ignore]d,
@@ -704,7 +677,8 @@ jobs:
       - name: install LLVM/clang (+ make/curl for the capstone fetchers)
         # clang + llvm-dis for the on-ramp; make + curl let the Tcl/sqlite capstones fetch and build
         # their sources rather than self-skip.
-        run: bash scripts/ci/install-llvm.sh make curl
+        uses: ./.github/actions/install-llvm
+        with: { packages: make curl }
       # `translate`'s ignored set is the three capstones (both #[ignore]d Tcl demos + the full sqlite
       # sweep) — no perf benches ride along.
       - name: whole-language capstones (Tcl REPL/init, full sqlite sweep)
@@ -941,7 +915,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
       - name: install LLVM/clang (build tools for the temen-llvm test harness)
-        run: bash scripts/ci/install-llvm.sh
+        uses: ./.github/actions/install-llvm
       - name: cargo test -p temen-llvm setjmp (ASan, JIT path live)
         run: cargo test --manifest-path crates/temen-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
         env:
@@ -1003,7 +977,8 @@ jobs:
       # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (temen-llvm links no
       # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
       - name: install LLVM/clang (+ Postgres build deps)
-        run: bash scripts/ci/install-llvm.sh flex bison
+        uses: ./.github/actions/install-llvm
+        with: { packages: flex bison }
 
       # Regenerate the Postgres artifacts from current code and stage them into web/assets/, so the
       # `browser-test.mjs` Postgres check BOOTS instead of SKIPping (it skips when unstaged). That boot
@@ -1465,13 +1440,16 @@ jobs:
             crates/temen-llvm
             bench/cross-engine/wasmtime-rs
       - name: install LLVM/clang (clang for the kernels & wasm, llvm-dis for the on-ramp)
-        run: bash scripts/ci/install-llvm.sh
-      - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
-        # -f + retries: codeload sometimes serves an error page instead of the tarball, which
-        # `curl -sS | tar xz` can't detect ("not in gzip format" — ISSUES.md I18 class 4).
-        run: |
-          curl -sSL -f --retry 5 --retry-all-errors https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
-          echo "EMBENCH=/tmp/embench-iot-master" >> "$GITHUB_ENV"
+        uses: ./.github/actions/install-llvm
+      # #1840 — fetch-embench.sh keeps its pinned checkout here, so a run fetches only when the cache
+      # is empty. Keyed on the script, where the pinned commit lives.
+      - name: cache Embench-IoT checkout
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.cache/temen-ci/embench
+          key: embench-${{ hashFiles('scripts/ci/fetch-embench.sh') }}
+      - name: fetch Embench-IoT (pinned commit; not vendored — mixed per-kernel licenses)
+        run: bash scripts/ci/fetch-embench.sh
       - name: build the in-process Wasmtime runner (populates the wt/* columns)
         run: cargo build --release --bin embench_one --manifest-path bench/cross-engine/wasmtime-rs/Cargo.toml
       - name: embench differential (strict — MISCOMPILE or on-ramp failure ⇒ red)
@@ -1500,7 +1478,7 @@ jobs:
             crates/temen-llvm
             browser
       - name: install LLVM/clang (clang for the kernels, llvm-dis for the on-ramp)
-        run: bash scripts/ci/install-llvm.sh
+        uses: ./.github/actions/install-llvm
       - run: rustup target add wasm32-unknown-unknown
       - name: build the temen-browser wasm32 cdylib (so the temen-bytecode-wasm row runs)
         run: cargo build --release --lib --target wasm32-unknown-unknown --manifest-path browser/Cargo.toml
