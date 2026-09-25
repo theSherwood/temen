@@ -1468,12 +1468,15 @@ jobs:
             bench/cross-engine/wasmtime-rs
       - name: install LLVM/clang (clang for the kernels & wasm, llvm-dis for the on-ramp)
         uses: ./.github/actions/install-llvm
-      - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
-        # -f + retries: codeload sometimes serves an error page instead of the tarball, which
-        # `curl -sS | tar xz` can't detect ("not in gzip format" — ISSUES.md I18 class 4).
-        run: |
-          curl -sSL -f --retry 5 --retry-all-errors https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
-          echo "EMBENCH=/tmp/embench-iot-master" >> "$GITHUB_ENV"
+      # #1840 — fetch-embench.sh keeps its pinned checkout here, so a run fetches only when the cache
+      # is empty. Keyed on the script, where the pinned commit lives.
+      - name: cache Embench-IoT checkout
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.cache/temen-ci/embench
+          key: embench-${{ hashFiles('scripts/ci/fetch-embench.sh') }}
+      - name: fetch Embench-IoT (pinned commit; not vendored — mixed per-kernel licenses)
+        run: bash scripts/ci/fetch-embench.sh
       - name: build the in-process Wasmtime runner (populates the wt/* columns)
         run: cargo build --release --bin embench_one --manifest-path bench/cross-engine/wasmtime-rs/Cargo.toml
       - name: embench differential (strict — MISCOMPILE or on-ramp failure ⇒ red)

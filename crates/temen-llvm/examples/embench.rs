@@ -3,8 +3,8 @@
 //! three Temen engines, for numbers comparable to published Embench results. Embench source is *not*
 //! vendored (mixed per-benchmark licenses) — point it at a checkout:
 //!
-//!   curl -sSL https://github.com/embench/embench-iot/archive/refs/heads/master.tar.gz | tar xz -C /tmp
-//!   EMBENCH=/tmp/embench-iot-master cargo run -p temen-llvm --release --example embench
+//!   export "$(bash scripts/ci/fetch-embench.sh)"   # EMBENCH=<the pinned checkout>
+//!   cargo run -p temen-llvm --release --example embench
 //!
 //! Each benchmark is wrapped by `bench/embench/wrapper.c` (which `#include`s the kernel `.c` and
 //! exposes `long run(long n)` = `n` Embench iterations → `verify_benchmark` strict pass/fail). Native
