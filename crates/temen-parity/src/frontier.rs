@@ -306,15 +306,14 @@ const B: Cell = Cell {
     note: "",
 };
 
-/// The divergence the **backend** column's first rendering found: `join` (op 1) traps `ThreadFault`
-/// on the oracle and `CapFault` under the Cranelift thunk for the same forged child handle, on 18
-/// call shapes. Invariant 9 lets a backend decline to the oracle; it does not let one run the op and
-/// report a different failure. `instantiator_rt.rs` documents its arm as "matching the interpreter",
-/// which the measurement contradicts — so this is a `NotYet`, not a `Declines`.
-const JOIN_TRAP_DIVERGES: Cell = Cell {
+/// The Instantiator's divergence on the **backend** column: `instantiate_module` (op 13) answers
+/// `-EINVAL` on the oracle and traps `CapFault` under the Cranelift probe on 6 call shapes (#1821).
+/// Invariant 9 lets a backend decline to the oracle; it does not let one run the op and report a
+/// different failure — so this is a `NotYet`, not a `Declines`. (`join`'s #1573 divergence is fixed
+/// and pinned by `join_traps_as_the_oracle_does`.)
+const INSTANTIATE_MODULE_DIVERGES: Cell = Cell {
     status: Status::NotYet,
-    note:
-        "join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)",
+    note: "instantiate_module (op 13) answers -EINVAL on the oracle and CapFault under the Cranelift probe (#1821)",
 };
 
 /// `Full` on the **code origin** axis: a §22 guest-JIT unit and the host-translated base module get
@@ -400,7 +399,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::Instantiator => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
             F,
-            JOIN_TRAP_DIVERGES,
+            INSTANTIATE_MODULE_DIVERGES,
             U,
             K,
             declines(

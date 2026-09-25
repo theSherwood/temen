@@ -90,7 +90,7 @@ impl DurableCell {
 }
 
 /// One spawned child's join-table entry: its completion cell plus whether it has been `join`ed (a
-/// second join is inert — `CapFault`, matching the interpreter's once-only join).
+/// second join is inert — `ThreadFault`, matching the interpreter's once-only join).
 struct Child {
     done: std::sync::Arc<ChildDone>,
     joined: bool,
@@ -2386,7 +2386,11 @@ pub(crate) unsafe extern "C" fn join(
             c.done.clone() // clone the cell + drop the `children` lock before parking
         }
         _ => {
-            *trap_out = TrapKind::CapFault as i64; // forged or already-joined handle
+            // A forged or already-joined child handle: `ThreadFault`, as the oracle's `take_child`
+            // answers — a child rides the §12 executor as a vCPU, so this is a thread-handle
+            // forgery, not a capability one (#1573). The `Instantiator` operand itself was checked
+            // above and is the `CapFault` case.
+            *trap_out = TrapKind::ThreadFault as i64;
             return 0;
         }
     };

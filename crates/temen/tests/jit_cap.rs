@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 use temen_encode::encode_module;
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{grant_jit, grant_jit_fibers, grant_jit_threads, jit_cap_run};
@@ -99,11 +99,8 @@ fn diff_run_t(
                 assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
             }
         }
-        (Err(Trap::Unreachable), JitOutcome::Trapped(TrapKind::Unreachable))
-        | (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
-        | (Err(Trap::MemoryFault), JitOutcome::Trapped(TrapKind::MemoryFault))
-        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType))
-        | (Err(Trap::DivByZero), JitOutcome::Trapped(TrapKind::DivByZero)) => {}
+        // The same trap on both engines: one wire code (#1735).
+        (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
     // …and the escape-oracle: byte-identical final memory.
@@ -169,9 +166,8 @@ fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (Ji
                 assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
             }
         }
-        (Err(Trap::FiberFault), JitOutcome::Trapped(TrapKind::FiberFault))
-        | (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
-        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType)) => {}
+        // The same trap on both engines: one wire code (#1735).
+        (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
     assert_eq!(imem, jmem, "final memory must be byte-identical");
@@ -242,8 +238,8 @@ fn diff_run_threads(
                 assert_eq!(iv, *s, "interp {ires:?} != jit {jout:?}");
             }
         }
-        (Err(Trap::CapFault), JitOutcome::Trapped(TrapKind::CapFault))
-        | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType)) => {}
+        // The same trap on both engines: one wire code (#1735).
+        (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
     assert_eq!(imem, jmem, "final memory must be byte-identical");

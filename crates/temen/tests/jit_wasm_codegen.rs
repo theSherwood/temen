@@ -131,12 +131,9 @@ fn val_to_slot(v: &Val) -> i64 {
 /// Map a wasmi trap back to the Temen trap taxonomy — the TEMEN-specific kinds arrive through `env.trap`
 /// (fuel / memory fault), wasm's own kinds from the trap code.
 fn map_trap(host_code: i32, e: &wasmi::Error) -> Trap {
-    use temen_wasm_jit::{TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
-    if host_code == TRAP_OUT_OF_FUEL {
-        return Trap::OutOfFuel;
-    }
-    if host_code == TRAP_MEMORY_FAULT {
-        return Trap::MemoryFault;
+    // An `env.trap` code *is* a trap wire code (#1735).
+    if let Some(t) = Trap::from_code(host_code as i64) {
+        return t;
     }
     use wasmi::core::TrapCode;
     match e.as_trap_code() {
