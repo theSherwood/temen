@@ -9357,7 +9357,14 @@ fn exec_image_build(
     let m = cur_mem.ok_or(super::EINVAL)?;
     let grants = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))
         .map_err(|_| super::EINVAL)?;
-    let img = cur_host.exec_image(&command, &grants, entry, size_log2, m.window.mapped())?;
+    let img = cur_host.exec_image(
+        &command,
+        &grants,
+        entry,
+        size_log2,
+        m.window.mapped(),
+        m.window.reserved(),
+    )?;
     let child_args: Vec<Value> = img.entry_args.iter().map(|&h| Value::I64(h)).collect();
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).

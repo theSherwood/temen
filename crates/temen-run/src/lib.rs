@@ -540,7 +540,15 @@ unsafe fn cap_thunk_impl(
                 let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
                 if serves
                     && jit_proc::serve_request(
-                        host, parks, dispatch, view, mem_size, results, n_results, trap_out, bell,
+                        host,
+                        parks,
+                        dispatch,
+                        view,
+                        (mem_size, mem_reserved),
+                        results,
+                        n_results,
+                        trap_out,
+                        bell,
                     )
                 {
                     continue;

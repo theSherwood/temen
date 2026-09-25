@@ -2480,6 +2480,93 @@ fn nim_shells_out_through_the_posix_sh() {
     }
 }
 
+/// An `execve`'d nim program's heap **grows past its window** too, and survives a fork: the image
+/// that replaces a process holds the process's own memory authority over its window, not a carve
+/// of its backed prefix (#763). nimsem is such a program — `nifmake` runs it through `/bin/sh` —
+/// and ran out of memory on its largest module once the heap outgrew the window. Here the command
+/// allocates more than its whole window, shells out, allocates as much again and reads both.
+#[test]
+fn an_execd_nim_programs_heap_grows_past_its_window() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP an_execd_nim_programs_heap_grows_past_its_window (no toolchain)");
+        return;
+    };
+    const N: u64 = 3_000_000;
+    let child = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/cmdline\n\
+         write(stdout, \"child:\" & paramStr(1) & \"|\")\n\
+         quit(3)\n",
+    );
+    let grower = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/os\n\
+         var s = newSeq[int](3_000_000)\n\
+         s[2_999_999] = 7\n\
+         let rc = execShellCmd(\"bin/child hi\")\n\
+         var t = newSeq[int](3_000_000)\n\
+         t[2_999_999] = 5\n\
+         write(stdout, \"grower:\" & $rc & \"|\" & $(s[2_999_999] + t[2_999_999]) & \"|\")\n\
+         quit(4)\n",
+    );
+    let parent = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/os\n\
+         let rc = execShellCmd(\"bin/grower\")\n\
+         write(stdout, \"parent:\" & $rc)\n",
+    );
+    // The command runs in the window of the process it replaces — the parent's, through the shell.
+    let window = 1u64 << parent.memory.expect("a window").size_log2;
+    assert!(
+        window < N * 8,
+        "one seq ({} MiB) must not fit the window ({} MiB), or nothing grows",
+        (N * 8) >> 20,
+        window >> 20
+    );
+    let sh = posix_sh();
+    for engine in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+            std::sync::Arc::new(make);
+        let run = temen_run::nim_noc_run(
+            parent.clone(),
+            &posix,
+            make,
+            &["parent".to_string()],
+            &temen_run::ExecGrants {
+                commands: &[
+                    ("/bin/sh".to_string(), sh.clone()),
+                    ("bin/child".to_string(), child.clone()),
+                    ("bin/grower".to_string(), grower.clone()),
+                ],
+                built: false,
+            },
+            engine,
+        );
+        let crashed = temen_interp::last_twin_traps();
+        assert!(
+            engine == temen_run::Backend::Bytecode || crashed.is_empty(),
+            "{engine:?}: a command crashed:\n{}",
+            crashed
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            "child:hi|grower:3|12|parent:4",
+            "{engine:?}: the command grew its heap past the window, shelled out, grew it again, and \
+             exited with its own status (127 was nim's out-of-memory abort)"
+        );
+    }
+}
+
 /// #763 — **a nim program reads a command's output** (`osproc.execCmdEx`): how nimony's compile-time
 /// evaluation runs the program it built for a `const` and reads its answer, and how it builds that
 /// program in the first place. Unlike `execShellCmd`, the child's stdin, stdout and stderr are

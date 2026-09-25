@@ -12362,7 +12362,14 @@ fn build_exec_req(
     let img = {
         let mut h = host.lock_unpoisoned();
         let command = h.exec_module(cmd)?;
-        h.exec_image(&command, &grants, entry, size_log2, m.window.mapped())?
+        h.exec_image(
+            &command,
+            &grants,
+            entry,
+            size_log2,
+            m.window.mapped(),
+            m.window.reserved(),
+        )?
     };
     // FORK.md §8.6 — wake any pipe the old image's released ends left with 0 writers (→ EOF for its
     // readers) or 0 readers (→ `-EPIPE` for its writers).
@@ -27617,6 +27624,13 @@ impl Host {
     /// built ([`Self::spawn_named_child`]) and the process state carried into it
     /// ([`Self::exec_carry`]).
     ///
+    /// The new image's starter caps span `window_reserved`, the caller's **whole window** — its
+    /// reservation, the confinement bound its `GuestMem` reports ([`GuestMem::window_size`]). The
+    /// image replaces the caller's in the same window, so it holds the memory authority the caller
+    /// held there: its `vm_map` grows the heap past the backed prefix as the caller's could, a root's
+    /// up to its reservation and a §14 child's up to its carve. Spanning only the backed prefix, a
+    /// process lost its heap's growth on `execve`, and a compiler it ran ran out of memory (#763).
+    ///
     /// `Err(errno)` is a refusal that changed nothing — the caller keeps running and gets the errno:
     /// `-E2BIG` for a command whose declared window does not fit the caller's, `-EINVAL` otherwise.
     /// `Ok` is the commit point: the caller's powerbox has handed its personality to the new image,
@@ -27630,6 +27644,7 @@ impl Host {
         entry: u64,
         size_log2: i64,
         window_mapped: u64,
+        window_reserved: u64,
     ) -> Result<ExecImage, i64> {
         let g = &m.0;
         let f = g.funcs.get(entry as usize).ok_or(EINVAL)?;
@@ -27641,14 +27656,20 @@ impl Host {
             .then(|| window_mapped.trailing_zeros() as u8)
             .ok_or(EINVAL)?;
         let memory_log2 = g.memory_log2.ok_or(EINVAL)?;
-        if !(0..64).contains(&size_log2) || !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
+        if !(0..64).contains(&size_log2)
+            || !window_reserved.is_power_of_two()
+            || window_reserved < window_mapped
+            || !grants.iter().all(|(_, h)| self.can_regrant(*h))
+        {
             return Err(EINVAL);
         }
         if memory_log2 > win_log2 {
             return Err(E2BIG);
         }
         let child_size = 1u64 << win_log2;
-        let (mut host, ci, ca) = self.spawn_named_child(grants, child_size).ok_or(EINVAL)?;
+        let (mut host, ci, ca) = self
+            .spawn_named_child(grants, window_reserved)
+            .ok_or(EINVAL)?;
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
@@ -32405,7 +32426,7 @@ mod fork_powerbox_tests {
         let mh = host.grant_module(&cmd);
         let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
         let mut image = host
-            .exec_image(&command, &[], 0, 0, 1 << 16)
+            .exec_image(&command, &[], 0, 0, 1 << 16, 1 << 16)
             .expect("admits");
         assert!(
             image.host.resolve(lh, cap_id::MODULE_LOADER).is_ok(),
@@ -32414,6 +32435,50 @@ mod fork_powerbox_tests {
         assert!(
             image.host.module_from_bytes(&blob) >= 0,
             "the new image's loader mints a module — its validator was carried"
+        );
+    }
+
+    /// #763 — an exec'd image holds the **caller's memory authority** over the window it replaces the
+    /// caller in: its `AddressSpace` spans the window's reservation, not the backed prefix, so its heap
+    /// grows past the prefix as the caller's could. Spanning the prefix, a compiler a shell exec'd
+    /// (nimsem, under nifmake) ran out of memory once its heap outgrew the window.
+    #[test]
+    fn an_execd_image_maps_past_the_backed_prefix() {
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mut host = Host::new();
+        let mh = host.grant_module(&cmd);
+        let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let (mapped, reserved) = (1u64 << 16, 1u64 << 20);
+        let mut image = host
+            .exec_image(&command, &[], 0, 0, mapped, reserved)
+            .expect("admits");
+        let space = image
+            .host
+            .resolve_cap_name("addrspace")
+            .expect("the image's AddressSpace");
+        let mut window = vec![0u8; reserved as usize];
+        let mut mem = WindowMem::new(&mut window, reserved);
+        let mut map = |off: u64| {
+            image.host.cap_dispatch_slots(
+                cap_id::ADDRESS_SPACE,
+                0,
+                space,
+                &[off as i64, 4096, 3],
+                Some(&mut mem),
+            )
+        };
+        assert_eq!(
+            map(mapped),
+            Ok(vec![0]),
+            "a page past the backed prefix maps"
+        );
+        assert_eq!(
+            map(reserved),
+            Ok(vec![EINVAL]),
+            "a page past the reservation does not"
         );
     }
 

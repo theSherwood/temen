@@ -889,7 +889,8 @@ impl SendPtr {
 /// * a blocking `waitpid` — wait for the bell and run the op again ([`wait_to_rerun`]), which reaps
 ///   a child that exited or waits on.
 ///
-/// `window` is the call's view of the guest window — the one its op read and wrote through.
+/// `window` is the call's view of the guest window — the one its op read and wrote through — and
+/// `(mapped, reserved)` its backed prefix and reservation.
 ///
 /// # Safety
 /// The [`crate::cap_thunk`] contract for `results`/`trap_out`, over a host armed for caller
@@ -900,7 +901,7 @@ pub(crate) unsafe fn serve_request(
     parks: ParkTransients,
     dispatch: (u32, u32),
     window: Option<&mut dyn GuestMem>,
-    window_mapped: u64,
+    (mapped, reserved): (u64, u64),
     results: *mut i64,
     n_results: u64,
     trap_out: *mut i64,
@@ -929,7 +930,7 @@ pub(crate) unsafe fn serve_request(
                 Err(EINVAL)
             } else {
                 host.exec_module(cmd)
-                    .and_then(|m| host.exec_image(&m, &[], 0, 0, window_mapped))
+                    .and_then(|m| host.exec_image(&m, &[], 0, 0, mapped, reserved))
             };
             match admitted {
                 Ok(img) => {
