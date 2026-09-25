@@ -18,7 +18,9 @@
 use temen_durable::{
     arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, STATE_UNWINDING,
 };
-use temen_interp::{cap_id, run_capture_reserved_with_host, BoundImport, Host, StreamRole};
+use temen_interp::{
+    cap_id, run_capture_reserved_with_host, BoundImport, Host, MemLayout, StreamRole,
+};
 use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, MAX_SHADOW_CONTEXTS, SHADOW_STRIDE};
 use temen_ir::Module;
 
@@ -216,9 +218,16 @@ fn run_on(engine: Engine, inst: &Module, window: &[u8], size_log2: u8, host: &mu
             snap
         }
         Engine::Jit => {
-            let (out, snap) =
-                temen_run::jit_cap_run(inst, 0, &[], window, size_log2, JIT_TABLE_LOG2, host)
-                    .expect("the guest compiles and runs on the JIT");
+            let (out, snap) = temen_run::jit_cap_run(
+                inst,
+                0,
+                &[],
+                &MemLayout::image(window.to_vec()),
+                size_log2,
+                JIT_TABLE_LOG2,
+                host,
+            )
+            .expect("the guest compiles and runs on the JIT");
             assert!(
                 matches!(out, temen_jit::JitOutcome::Returned(_)),
                 "JIT run: {out:?}"

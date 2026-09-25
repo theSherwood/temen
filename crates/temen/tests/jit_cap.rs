@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 use temen_encode::encode_module;
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{grant_jit, grant_jit_fibers, grant_jit_threads, jit_cap_run};
@@ -79,7 +79,7 @@ fn diff_run_t(
         &m,
         0,
         &jargs,
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         table_log2,
         &mut host_j,
@@ -151,8 +151,16 @@ fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (Ji
     );
     let mut jargs = vec![h_j as i64];
     jargs.extend_from_slice(user_args);
-    let (jout, jmem) =
-        jit_cap_run(&m, 0, &jargs, &init, DEFAULT_RESERVED_LOG2, 0, &mut host_j).expect("jit run");
+    let (jout, jmem) = jit_cap_run(
+        &m,
+        0,
+        &jargs,
+        &MemLayout::image(init.to_vec()),
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut host_j,
+    )
+    .expect("jit run");
 
     match (&ires, &jout) {
         (Ok(vals), JitOutcome::Returned(slots)) => {
@@ -219,7 +227,7 @@ fn diff_run_threads(
         &m,
         0,
         &jargs,
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         table_log2,
         &mut host_j,
@@ -386,7 +394,7 @@ fn submitted_unit_threads_compile_split_by_tier() {
         &m,
         0,
         &[h_j as i64],
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host_j,
@@ -444,7 +452,7 @@ func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v
         &m,
         0,
         &[h_j as i64],
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         3,
         &mut host_j,
@@ -711,7 +719,7 @@ fn compile_quota_enforced_identically() {
         &m,
         0,
         &[h as i64],
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host_j,
@@ -1314,8 +1322,16 @@ fn diff_serve(
         tickets_i, tickets_j,
         "identical setups mint identical tickets"
     );
-    let (jout, jmem) =
-        jit_cap_run(m, 0, &[], &[], DEFAULT_RESERVED_LOG2, 0, &mut host_j).expect("jit run");
+    let (jout, jmem) = jit_cap_run(
+        m,
+        0,
+        &[],
+        &MemLayout::image(Vec::new()),
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut host_j,
+    )
+    .expect("jit run");
     let jvals = match jout {
         JitOutcome::Returned(slots) => slots,
         other => panic!("JIT run must return cleanly, got {other:?}"),
@@ -1392,8 +1408,16 @@ fn a_jit_svc_wait_with_an_empty_queue_fails_closed() {
     let m = svc_module(&src);
     let mut host = Host::new();
     host.set_self_module(&m);
-    let (jout, _) =
-        jit_cap_run(&m, 0, &[], &[], DEFAULT_RESERVED_LOG2, 0, &mut host).expect("jit run");
+    let (jout, _) = jit_cap_run(
+        &m,
+        0,
+        &[],
+        &MemLayout::image(Vec::new()),
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut host,
+    )
+    .expect("jit run");
     assert_eq!(
         jout,
         JitOutcome::Trapped(TrapKind::ThreadFault),

@@ -8,7 +8,7 @@
 //!   the page comes back `Rw`) — on **both** the interpreter and the JIT (real `mprotect` /
 //!   `VirtualProtect`), so the two backends agree on a thawed protected window.
 
-use temen_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, Value};
+use temen_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, MemLayout, Value};
 use temen_ir::Memory;
 use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 
@@ -482,7 +482,8 @@ block 0 (v0: i32) {{
 
 /// #1810: a guest that changes its own pages through its `AddressSpace` — a page mapped and then
 /// `protect`ed read-only, one mapped and `unmap`ped, and one grown past the 256 KiB escape-oracle
-/// span — plus a `readonly` data segment.
+/// span, all in the reserved tail, and a page of its declared memory `protect`ed read-only — plus a
+/// `readonly` data segment.
 const PAGE_OPS: &str = "memory 17
 data ro 81920 \"abcd\"
 func (i32) -> (i64) {
@@ -502,14 +503,69 @@ block 0 (v0: i32) {
   v5 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vhi, vlen, vrw)
   vm2 = i64.const 424242
   i64.store vhi vm2
+  vlo = i64.const 98304
+  v6 = call.cap 5 2 (i64, i64, i32) -> (i64) v0 (vlo, vlen, vrd)
   va = i64.add v1 v2
   vb = i64.add v3 v4
   vc = i64.add va vb
   vd = i64.add vc v5
-  return vd
+  ve = i64.add vd v6
+  return ve
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 196608
+  vm = i64.const 7
+  i64.store va vm
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 229376
+  vl = i64.load va
+  return vl
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 524288
+  vl = i64.load va
+  return vl
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 524288
+  vn = i64.const 16384
+  vrd = i32.const 1
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) v0 (va, vn, vrd)
+  return vr
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 98304
+  vm = i64.const 7
+  i64.store va vm
+  vz = i64.const 0
+  return vz
   }
 }
 ";
+/// `PAGE_OPS`' probes of the window its entry 0 left (#1834): 1 does nothing, 2 stores to the
+/// read-only tail page, 3 loads from the unmapped one, 4 loads the grown page's marker, 5 `protect`s
+/// the grown page read-only through the Memory capability (refused on a page it does not see
+/// mapped), and 6 stores to the read-only page of the declared memory.
+const PROBES: [u32; 6] = [1, 2, 3, 4, 5, 6];
 const PAGE_OPS_RESERVED_LOG2: u8 = 20; // 1 MiB
 
 /// #1810: the JIT's durable capture is the interpreter's — bytes through the high-water, and the page
@@ -546,7 +602,7 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
         &m,
         0,
         &[jh as i64],
-        &init,
+        &MemLayout::image(init.clone()),
         PAGE_OPS_RESERVED_LOG2,
         0,
         &mut hj,
@@ -559,6 +615,7 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     // The cases the page map must carry, spelled out.
     for (off, want) in [
         (81920, CapturedProt::Ro),        // the readonly segment
+        (98304, CapturedProt::Ro),        // `protect`ed read-only in the declared memory
         (196608, CapturedProt::Ro),       // `protect`ed read-only
         (229376, CapturedProt::Unmapped), // `unmap`ped
         (524288, CapturedProt::Rw),       // grown past 256 KiB
@@ -572,4 +629,87 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut Host::new()).expect("restore");
     assert!(rwin == ibytes, "restored bytes");
     assert_eq!(rprots, to_codec_prots(&iprots), "restored page map");
+}
+
+/// #1834: a thaw on the JIT re-applies the page map the artifact carries, as the interpreter's does.
+/// The JIT thaw took window bytes alone: the `protect`ed page came back writable, the `unmap`ped one
+/// readable, the page grown past the declared memory was never committed (its marker lost), and the
+/// host's page map started empty, so the next freeze recorded none of it.
+#[test]
+fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let m = temen_text::parse_module(PAGE_OPS).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+
+    // The window entry 0 leaves, through the codec.
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mh = h.grant_memory();
+    let init = MemLayout::image(vec![0u8; 1 << 17]);
+    let (o, frozen) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &[mh as i64],
+        &init,
+        PAGE_OPS_RESERVED_LOG2,
+        0,
+        &mut h,
+    )
+    .expect("jit");
+    assert_eq!(o, temen_jit::JitOutcome::Returned(vec![0]));
+    let art = temen_snapshot::freeze_layout(&m, &frozen, PAGE_OPS_RESERVED_LOG2, &Host::new())
+        .expect("freeze");
+
+    let mut wrong = Vec::new();
+    for entry in PROBES {
+        // The interpreter's thaw: the restored bytes under the restored page map.
+        let mut hi = Host::new();
+        let (rwin, rprots, reserved) = restore_with_prots(&art, &m, &mut hi).expect("restore");
+        let ih = hi.grant_memory();
+        let mut fuel = 1_000_000u64;
+        let (ir, ibytes, iprots) = run_capture_reserved_with_host_prots(
+            &m,
+            entry,
+            &[Value::I32(ih)],
+            &mut fuel,
+            &rwin,
+            Some(&to_captured(&rprots)),
+            reserved,
+            &mut hi,
+        );
+        let iout = match &ir {
+            Ok(v) => format!("{v:?}"),
+            Err(t) => format!("{t:?}"),
+        };
+
+        // The JIT's: the restored layout.
+        let mut hj = Host::new();
+        hj.set_durable(true);
+        let (layout, reserved) =
+            temen_snapshot::restore_layout(&art, &m, &mut hj).expect("restore");
+        let jh = hj.grant_memory();
+        let (jo, jlayout) =
+            temen_run::jit_cap_run(&m, entry, &[jh as i64], &layout, reserved, 0, &mut hj)
+                .expect("jit");
+        let jout = match jo {
+            temen_jit::JitOutcome::Returned(v) => format!("{:?}", [Value::I64(v[0])]),
+            temen_jit::JitOutcome::Trapped(t) => format!("{t:?}"),
+            other => format!("{other:?}"),
+        };
+        if jout != iout {
+            wrong.push(format!("entry {entry}: interp {iout}, JIT {jout}"));
+        }
+        // What the run leaves, as the next freeze would record it.
+        if ir.is_ok() && jlayout.dense_prots() != iprots {
+            wrong.push(format!(
+                "entry {entry}: the page map the run leaves differs"
+            ));
+        }
+        if ir.is_ok() && jlayout.bytes() != &ibytes[..] {
+            wrong.push(format!("entry {entry}: the bytes the run leaves differ"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

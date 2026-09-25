@@ -1552,18 +1552,24 @@ fn set_jit_durable_policy_with(host: &mut Host, m: &Module, validator: temen_int
 /// is suspended in its synchronous `call.cap`). The interpreter counterpart is the plain
 /// `run_capture_reserved_with_host` over the same `Host` setup ([`grant_jit`]) — drive both
 /// with identical inputs for the differential.
+///
+/// `init` seeds the window: a bare [`MemLayout::image`](temen_interp::MemLayout::image) for a fresh
+/// run, or a restored layout for a thaw, whose page map the window is built under (#1834) — the
+/// form the run hands back, so one run's capture can seed the next.
 #[allow(clippy::too_many_arguments)]
 pub fn jit_cap_run(
     m: &Module,
     entry: u32,
     args: &[i64],
-    init_mem: &[u8],
+    init: &temen_interp::MemLayout,
     reserved_log2: u8,
     table_reserve_log2: u8,
     host: &mut Host,
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
-    // A fresh window: no page map from an earlier run may carry over (see `forget_cap_pages`).
-    host.forget_cap_pages();
+    // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
+    host.reset_cap_pages(init.page_map());
+    let restore = jit_restore_prots(m, host, init);
+    let init_mem = init.bytes();
     // #1810: a durable run's capture is its freeze image, so it reaches the guest's high-water.
     let durable = host.is_durable();
     // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
@@ -1605,6 +1611,7 @@ pub fn jit_cap_run(
         if durable {
             cm.set_high_water(Some(cc.high_water()));
         }
+        cm.set_restore_prots(restore);
         if hosts_fibers {
             cm.enable_fiber_hosting(temen_jit::Quota::default())?;
         }
@@ -1660,6 +1667,7 @@ pub fn jit_cap_run(
     if durable {
         cm.set_high_water(Some(cc.high_water()));
     }
+    cm.set_restore_prots(restore);
     if hosts_fibers {
         cm.enable_fiber_hosting(temen_jit::Quota::default())?;
     }
@@ -1826,18 +1834,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 .shadow
                 .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
             image: window.bytes().to_vec(),
-            prots: window
-                .dense_prots()
-                .into_iter()
-                .map(|p| match p {
-                    temen_interp::CapturedProt::Ro => temen_jit::WindowProt::Ro,
-                    temen_interp::CapturedProt::Unmapped => temen_jit::WindowProt::Unmapped,
-                    // A §13 alias is not restorable (the codec refuses it); `Rw` is the default.
-                    temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed => {
-                        temen_jit::WindowProt::Rw
-                    }
-                })
-                .collect(),
+            prots: window.dense_prots().into_iter().map(window_prot).collect(),
             // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
             child: unsafe { gc.assume_init() },
         });
@@ -2733,6 +2730,38 @@ unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .cap_high_water(base)
+}
+
+/// #1834 — the page map a run seeded with `init` builds its window under: the host's view of it,
+/// just seeded from `init` ([`Host::reset_cap_pages`]), read back as [`jit_layout`] reads a capture,
+/// so a thaw re-applies exactly what the freeze recorded. Empty for an `init` that deviates nowhere:
+/// the fresh window.
+fn jit_restore_prots(
+    m: &Module,
+    host: &Host,
+    init: &temen_interp::MemLayout,
+) -> Vec<temen_jit::WindowProt> {
+    if init.page_map().is_empty() {
+        return Vec::new();
+    }
+    let mapped = m.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
+    let npages = init.byte_len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
+    host.capture_window_prots(&m.data, mapped, npages, temen_ir::module_null_guard())
+        .into_iter()
+        .map(window_prot)
+        .collect()
+}
+
+/// A captured page's protection as the JIT window re-applies it.
+fn window_prot(p: temen_interp::CapturedProt) -> temen_jit::WindowProt {
+    match p {
+        temen_interp::CapturedProt::Ro => temen_jit::WindowProt::Ro,
+        temen_interp::CapturedProt::Unmapped => temen_jit::WindowProt::Unmapped,
+        // A §13 alias is not restorable (the codec refuses it); `Rw` is the default.
+        temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed => {
+            temen_jit::WindowProt::Rw
+        }
+    }
 }
 
 /// #1810 — a JIT run's window image in the interpreter's capture form: its bytes, and the page map the

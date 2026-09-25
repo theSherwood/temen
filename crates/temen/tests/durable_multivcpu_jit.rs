@@ -31,7 +31,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module_assume_confined,
     write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -1203,7 +1203,15 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
     h.set_durable(true);
     h.clock_ns = 42;
     let clk = h.grant_clock();
-    let jsnap = match temen_run::jit_cap_run(&inst, 0, &[clk as i64], &fwin, SIZE_LOG2, 0, &mut h) {
+    let jsnap = match temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[clk as i64],
+        &MemLayout::image(fwin.to_vec()),
+        SIZE_LOG2,
+        0,
+        &mut h,
+    ) {
         Ok((_, snap)) => snap.bytes().to_vec(),
         Err(JitError::Unsupported(_)) => return, // a target without the threads runtime
         Err(e) => panic!("JIT freeze failed: {e:?}"),
@@ -1242,8 +1250,16 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
     let tclk = th.grant_clock();
     th.set_frozen_vcpus(jvcpus);
     th.set_frozen_root_sp(h.frozen_root_sp().expect("root extent"));
-    let (tout, _) = temen_run::jit_cap_run(&inst, 0, &[tclk as i64], &twin, SIZE_LOG2, 0, &mut th)
-        .expect("JIT thaw");
+    let (tout, _) = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[tclk as i64],
+        &MemLayout::image(twin.to_vec()),
+        SIZE_LOG2,
+        0,
+        &mut th,
+    )
+    .expect("JIT thaw");
     let want = match iresult {
         Ok(v) => v,
         Err(t) => panic!("interp thaw trapped: {t:?}"),
@@ -1285,7 +1301,7 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
         &inst,
         0,
         &[clk as i64],
-        &init_durable_window(WINDOW, TEST_ARENA),
+        &MemLayout::image(init_durable_window(WINDOW, TEST_ARENA).to_vec()),
         SIZE_LOG2,
         0,
         &mut h,

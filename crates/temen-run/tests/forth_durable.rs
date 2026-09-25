@@ -101,7 +101,7 @@ fn the_kernel_declares_an_arena_clear_of_its_data() {
 
 use temen_durable::{arm_freeze_after, begin_thaw, init_durable_window, read_state, write_state};
 use temen_interp::{
-    bytecode, cap_id, run_capture_reserved_with_host, BoundImport, Host, StreamRole,
+    bytecode, cap_id, run_capture_reserved_with_host, BoundImport, Host, MemLayout, StreamRole,
 };
 use temen_jit::JitOutcome;
 use temen_snapshot::{freeze, restore};
@@ -182,9 +182,16 @@ fn run_on(engine: Engine, inst: &temen_ir::Module, window: &[u8], host: &mut Hos
             snap
         }
         Engine::Jit => {
-            let (out, snap) =
-                temen_run::jit_cap_run(inst, 0, &[], window, SIZE_LOG2, JIT_TABLE_LOG2, host)
-                    .expect("the kernel compiles and runs on the JIT");
+            let (out, snap) = temen_run::jit_cap_run(
+                inst,
+                0,
+                &[],
+                &MemLayout::image(window.to_vec()),
+                SIZE_LOG2,
+                JIT_TABLE_LOG2,
+                host,
+            )
+            .expect("the kernel compiles and runs on the JIT");
             assert!(matches!(out, JitOutcome::Returned(_)), "JIT run: {out:?}");
             snap.bytes().to_vec()
         }

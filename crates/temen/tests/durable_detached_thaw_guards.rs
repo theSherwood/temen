@@ -12,7 +12,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
     write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, MemLayout, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::errno::EINVAL;
 use temen_jit::{JitError, JitOutcome};
@@ -168,7 +168,15 @@ fn run(
             };
             Some((out, snap))
         }
-        Engine::Jit => match temen_run::jit_cap_run(parent, 0, args, win, PARENT_LOG2, 0, host) {
+        Engine::Jit => match temen_run::jit_cap_run(
+            parent,
+            0,
+            args,
+            &MemLayout::image(win.to_vec()),
+            PARENT_LOG2,
+            0,
+            host,
+        ) {
             Ok((JitOutcome::Returned(v), snap)) => Some((Out::Ret(v[0]), snap.bytes().to_vec())),
             Ok((JitOutcome::Trapped(t), snap)) => {
                 Some((Out::Trap(format!("{t:?}")), snap.bytes().to_vec()))

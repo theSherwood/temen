@@ -32,7 +32,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_encode::encode_module;
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_jit::JitOutcome;
 use temen_run::{grant_jit, grant_jit_durable, jit_cap_run};
 use temen_snapshot::{freeze, restore};
@@ -342,7 +342,7 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
         &invoker,
         0,
         &[jd as i64, code.handle as i64],
-        &window,
+        &MemLayout::image(window.to_vec()),
         SIZE_LOG2,
         0,
         &mut th,
@@ -464,7 +464,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         &m,
         0,
         &[jd as i64, BLOB_OFF as i64, unit.len() as i64],
-        &win,
+        &MemLayout::image(win.to_vec()),
         SIZE_LOG2,
         TABLE_LOG2,
         &mut hd,
@@ -490,7 +490,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         &m,
         1,
         &[slot as i64],
-        &window,
+        &MemLayout::image(window.to_vec()),
         SIZE_LOG2,
         TABLE_LOG2,
         &mut th,

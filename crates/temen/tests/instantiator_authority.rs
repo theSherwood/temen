@@ -7,7 +7,7 @@
 //! `CapFault` there. Cranelift passed only the child handle to these thunks, so it joined, polled,
 //! detached, killed and minted through any handle at all.
 
-use temen_interp::{bytecode, Host, Trap, Value};
+use temen_interp::{bytecode, Host, MemLayout, Trap, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::jit_cap_run;
@@ -77,7 +77,7 @@ fn cranelift(m: &temen_ir::Module) -> JitOutcome {
         m,
         0,
         &[inst as i64],
-        &[],
+        &MemLayout::image(Vec::new()),
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host,

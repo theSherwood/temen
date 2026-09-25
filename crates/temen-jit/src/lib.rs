@@ -4075,10 +4075,6 @@ impl CompiledModule {
         let _ = hooks;
     }
 
-    /// §3c.2 — install the [`BudgetTaker`] the record spawn (op 17) consumes a Budget through.
-    /// `None` (or never calling this) leaves budget-funded records the probeable `-EINVAL` of
-    /// §3c (the interpreter-first gap). Separate from [`Self::set_grant_child_hooks`] so the
-    /// many existing hook constructors stay source-compatible.
     /// #1810 — extend a snapshotting run's capture through the guest's high-water, as `hook`
     /// reports it for the live window. For a **durable** run, whose capture is its freeze image;
     /// other captures keep their fixed span (a grown heap is not worth copying for them).
@@ -4086,6 +4082,18 @@ impl CompiledModule {
         self.high_water = hook;
     }
 
+    /// #1834 — the page map the next run's window is built under (DURABILITY.md §12.3): a thaw's,
+    /// one [`WindowProt`] per [`DURABLE_SNAPSHOT_PAGE`], a page past the backed prefix committed
+    /// and seeded from the run's `init_mem` when `Rw`/`Ro`. Empty (the default) builds the fresh
+    /// window.
+    pub fn set_restore_prots(&mut self, prots: Vec<WindowProt>) {
+        self.restore_prots = prots;
+    }
+
+    /// §3c.2 — install the [`BudgetTaker`] the record spawn (op 17) consumes a Budget through.
+    /// `None` (or never calling this) leaves budget-funded records the probeable `-EINVAL` of
+    /// §3c (the interpreter-first gap). Separate from [`Self::set_grant_child_hooks`] so the
+    /// many existing hook constructors stay source-compatible.
     pub fn set_budget_taker(&self, taker: Option<BudgetTaker>) {
         #[cfg(fiber_rt)]
         if let Some(n) = &self._nursery {
@@ -4269,8 +4277,13 @@ impl CompiledModule {
             // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
             // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
             // exactly as the frozen one would — matching `temen-interp`'s `apply_prots`. Applied
-            // after the init copy + data segments; `Rw` and tail pages keep the default.
-            window.apply_prots(t.sub_base, &t.restore_prots, t.win_mapped as u64);
+            // after the init copy + data segments; a grown tail page is committed and seeded here.
+            window.apply_prots(
+                t.sub_base,
+                &t.restore_prots,
+                t.win_mapped as u64,
+                init_mem.unwrap_or(&[]),
+            );
             // #964: reserve the marked module's NULL region last, after every host write above
             // (init seed, data segments, durable prots) has landed — the marked layout keeps all
             // live data at or above the guard, so nothing legitimate is covered. Window-relative

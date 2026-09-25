@@ -9,7 +9,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, MemLayout, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_jit::{JitError, JitOutcome};
 
@@ -97,7 +97,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         &parent,
         0,
         &args,
-        &init_durable_window(1 << PARENT_LOG2, ARENA),
+        &MemLayout::image(init_durable_window(1 << PARENT_LOG2, ARENA).to_vec()),
         PARENT_LOG2,
         0,
         &mut host,
@@ -114,8 +114,16 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     let (mut fhost, fargs) = powerbox(&child);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     write_state(&mut win, STATE_UNWINDING);
-    let (_, fsnap) = temen_run::jit_cap_run(&parent, 0, &fargs, &win, PARENT_LOG2, 0, &mut fhost)
-        .expect("JIT freeze");
+    let (_, fsnap) = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(win.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut fhost,
+    )
+    .expect("JIT freeze");
     assert_eq!(
         read_state(fsnap.bytes()),
         STATE_UNWINDING,
@@ -155,7 +163,15 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     let mut bare = Host::new();
     bare.set_durable(true);
     bare.set_thawed_detached(granted.take_thawed_detached());
-    let refused = temen_run::jit_cap_run(&parent, 0, &fargs, &twin, PARENT_LOG2, 0, &mut bare);
+    let refused = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(twin.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut bare,
+    );
     assert!(
         matches!(refused, Err(JitError::Unsupported(_))),
         "an ungranted child program refuses the thaw: {:?}",
@@ -166,9 +182,16 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
 
     // Thaw on the JIT: the child re-launches at its slot and the join delivers the total.
     let (mut thost, twin) = (granted, twin);
-    let (tout, tsnap) =
-        temen_run::jit_cap_run(&parent, 0, &fargs, &twin, PARENT_LOG2, 0, &mut thost)
-            .expect("JIT thaw");
+    let (tout, tsnap) = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(twin.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut thost,
+    )
+    .expect("JIT thaw");
     assert_eq!(
         returned(tout),
         vec![4950],
@@ -225,7 +248,15 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
     thost.grant_durable_module(&child);
     let mut twin = temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
     begin_thaw(&mut twin, ARENA, 0);
-    match temen_run::jit_cap_run(&parent, 0, &fargs, &twin, PARENT_LOG2, 0, &mut thost) {
+    match temen_run::jit_cap_run(
+        &parent,
+        0,
+        &fargs,
+        &MemLayout::image(twin.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut thost,
+    ) {
         Ok((o, _)) => assert_eq!(
             returned(o),
             vec![4950],

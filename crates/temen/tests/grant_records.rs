@@ -8,7 +8,7 @@
 //! native reader used to pre-size its list on the untrusted count, so on Cranelift the same guest
 //! aborted the host process on the allocation instead.
 
-use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
+use temen_interp::{bytecode, Host, MemLayout, StreamRole, Trap, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::jit_cap_run;
@@ -86,7 +86,7 @@ fn cranelift(m: &temen_ir::Module) -> JitOutcome {
         m,
         0,
         &h.map(i64::from),
-        &[],
+        &MemLayout::image(Vec::new()),
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host,
