@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::JitOutcome;
 use temen_run::{grant_jit, jit_cap_run};
@@ -123,7 +123,7 @@ fn check(guest: &str, units: &[&str], roots: &[i64]) {
         &m,
         0,
         &slots(jit, &codes),
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         0,
         &mut h,

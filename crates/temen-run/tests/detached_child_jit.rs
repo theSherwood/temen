@@ -10,7 +10,7 @@
 //! interpreter's op-15 arm; an exhausted budget refuses `-EINVAL` on both.
 
 use core::ffi::c_void;
-use temen_interp::{run_with_host, Host, Value};
+use temen_interp::{run_with_host, Host, MemLayout, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
@@ -208,7 +208,7 @@ fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_bot
             &p,
             0,
             &args,
-            &[],
+            &MemLayout::image(Vec::new()),
             temen_ir::DEFAULT_RESERVED_LOG2,
             0,
             &mut host,

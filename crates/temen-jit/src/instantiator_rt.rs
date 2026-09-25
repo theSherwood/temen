@@ -963,7 +963,7 @@ impl Nursery {
                 }
                 // Its protections as captured (the guard follows, as on every child window).
                 let mapped = rw.len() as u64;
-                w.apply_prots(0, &prots, mapped);
+                w.apply_prots(0, &prots, mapped, &image);
             },
             |_, _, _| true,
             None,

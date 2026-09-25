@@ -9,7 +9,7 @@
 //! regression the other way (they already ran this case); the bytecode leg is the one #1226 closes.
 #![cfg(all(unix, target_arch = "x86_64"))]
 
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::JitOutcome;
 use temen_run::{grant_jit_fibers, jit_cap_run};
@@ -119,7 +119,7 @@ fn installed_unit_fiber_entry_agrees_across_engines() {
         &m,
         0,
         &[h_j as i64],
-        &init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         TABLE_LOG2,
         &mut host_j,

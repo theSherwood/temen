@@ -9,7 +9,7 @@
 //! identically on both backends, like every other `Jit` op.
 
 use temen_encode::encode_module;
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::{Resolved, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{encode_symbol_table, grant_jit, jit_cap_run};
@@ -62,7 +62,7 @@ fn diff(guest_src: &str, init: &[u8], user_args: &[i64], table_log2: u8) -> (Jit
         &m,
         0,
         &jargs,
-        init,
+        &MemLayout::image(init.to_vec()),
         DEFAULT_RESERVED_LOG2,
         table_log2,
         &mut host_j,

@@ -8,7 +8,7 @@
 use temen::{assemble, load};
 use temen_encode::{decode_module, encode_module};
 use temen_interp::{
-    bytecode, run, run_with_host, run_with_host_fast, Host, StreamRole, Trap, Value,
+    bytecode, run, run_with_host, run_with_host_fast, Host, MemLayout, StreamRole, Trap, Value,
 };
 use temen_ir::{BinOp, Inst, IntTy, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
@@ -2012,7 +2012,7 @@ fn a_revoked_handle_completes_with_an_errno_on_all_backends() {
         &m,
         0,
         &[hs as i64, hc as i64],
-        &[],
+        &MemLayout::image(Vec::new()),
         DEFAULT_RESERVED_LOG2,
         0,
         &mut hj,
@@ -2054,8 +2054,16 @@ fn a_forged_handle_still_traps_on_all_backends() {
     let mut hj = Host::new();
     hj.grant_stream(StreamRole::Out);
     hj.grant_clock();
-    let (jout, _) =
-        jit_cap_run(&m, 0, &[], &[], DEFAULT_RESERVED_LOG2, 0, &mut hj).expect("jit run");
+    let (jout, _) = jit_cap_run(
+        &m,
+        0,
+        &[],
+        &MemLayout::image(Vec::new()),
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut hj,
+    )
+    .expect("jit run");
     assert_eq!(jout, JitOutcome::Trapped(TrapKind::CapFault));
 }
 

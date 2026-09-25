@@ -3690,6 +3690,10 @@ pub fn publish_twin_traps(traps: Vec<TwinTrap>) {
 /// pages are `≥ 4 KiB`), so each codec page's protection is that of its containing host page.
 pub const DURABLE_SNAPSHOT_PAGE: u64 = 4096;
 
+/// The base a seeded JIT window page map is filed under until its window asks for it
+/// ([`Host::reset_cap_pages`]): no window is built at the top of the address space.
+const UNCLAIMED_BASE: usize = usize::MAX;
+
 /// Per-page protection of a captured window region, for the durable snapshot (DURABILITY.md
 /// §12.3). A faithful view of the interpreter's page model; `Backed` is the §13
 /// `SharedRegion`-aliased case a durable snapshot must reject (D-region — freeze refuses).
@@ -3732,7 +3736,7 @@ pub fn run_capture_reserved_with_host_prots(
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         if let Some(prots) = init_prots {
-            mm.apply_prots(prots);
+            mm.apply_prots(prots, init_mem);
         }
         mm
     });
@@ -21136,7 +21140,8 @@ pub struct Host {
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
     /// would fail-closed. Persisting it here (the per-run `Host` is the only state `cap_thunk` reaches)
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
-    /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
+    /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears;
+    /// filed under [`UNCLAIMED_BASE`] while seeded for a window not built yet ([`Host::reset_cap_pages`]).
     cap_pages: Option<(usize, CapPageMap)>,
     /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
@@ -23267,8 +23272,11 @@ impl Host {
     /// across this run's `call.cap`s so a guest-grown heap page stays borrowable. Returns a fresh empty
     /// map when the base changes (a new window / run reusing this `Host`), else the existing one.
     pub fn cap_window_pages(&mut self, base: usize) -> CapPageMap {
-        match &self.cap_pages {
-            Some((b, m)) if *b == base => Arc::clone(m),
+        match &mut self.cap_pages {
+            Some((b, m)) if *b == base || *b == UNCLAIMED_BASE => {
+                *b = base;
+                Arc::clone(m)
+            }
             _ => {
                 let m = Arc::new(Mutex::new(BTreeMap::new()));
                 self.cap_pages = Some((base, Arc::clone(&m)));
@@ -23277,10 +23285,24 @@ impl Host {
         }
     }
 
-    /// Forget the JIT window page map (see [`Host::cap_window_pages`]): a new run is about to build a
-    /// fresh window, which may land at the old one's address, so the old map must not carry over.
-    pub fn forget_cap_pages(&mut self) {
-        self.cap_pages = None;
+    /// Start the JIT window page map (see [`Host::cap_window_pages`]) of a run about to build a fresh
+    /// window: `map`'s deviations — none for a fresh run, the artifact's for a thaw (#1834) — and
+    /// nothing of an earlier run's, whose window the new one may reuse the address of. The window's
+    /// base is not known yet, so the map is claimed by the first base that asks for one.
+    pub fn reset_cap_pages(&mut self, map: &PageMap) {
+        use temen_ir::page_state as ps;
+        let pages: BTreeMap<u64, u8> = map
+            .rebased_to(host_page_size())
+            .into_iter()
+            .filter_map(|(p, prot)| match prot {
+                PageProt::Rw => Some((p, ps::RW)),
+                PageProt::Ro => Some((p, ps::RO)),
+                PageProt::Unmapped => Some((p, ps::UNMAPPED)),
+                // Not restorable: a layout never carries one (`MemLayout::from_parts`).
+                PageProt::Backed { .. } => None,
+            })
+            .collect();
+        self.cap_pages = (!pages.is_empty()).then(|| (UNCLAIMED_BASE, Arc::new(Mutex::new(pages))));
     }
 
     /// #1810 — how far the guest grew JIT window `base` through the Memory capability: one past the
@@ -23288,7 +23310,7 @@ impl Host {
     /// counts it), or `0` when it grew none.
     pub fn cap_high_water(&self, base: usize) -> u64 {
         match &self.cap_pages {
-            Some((b, m)) if *b == base => m
+            Some((b, m)) if *b == base || *b == UNCLAIMED_BASE => m
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .keys()
@@ -29267,6 +29289,15 @@ impl MemLayout {
         )
     }
 
+    /// A bare image under the region default — no page deviating from it: what a fresh run is seeded
+    /// with.
+    pub fn image(bytes: Vec<u8>) -> MemLayout {
+        MemLayout {
+            bytes,
+            map: PageMap::empty(),
+        }
+    }
+
     /// The captured window bytes `[0, len)`.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -31181,8 +31212,20 @@ impl Mem {
     /// exactly as the frozen one would. `Rw` is the prefix default (left absent) but is set
     /// explicitly for a reserved-tail page (a grown commit); `Backed` is skipped — a §13
     /// shared-region alias isn't restorable here (D-region), the embedder re-grants the region.
-    fn apply_prots(&mut self, prots: &[CapturedProt]) {
+    /// A committed reserved-tail page takes its bytes from `init`, the image the map was captured
+    /// with (#1834) — [`seed`](Mem::seed) stops at the prefix. The JIT's `GuestWindow::apply_prots`
+    /// is this rule on its page tables.
+    fn apply_prots(&mut self, prots: &[CapturedProt], init: &[u8]) {
         let mapped = self.window.mapped();
+        for (i, p) in prots.iter().enumerate() {
+            let off = i as u64 * DURABLE_SNAPSHOT_PAGE;
+            if off >= mapped && matches!(p, CapturedProt::Rw | CapturedProt::Ro) {
+                let src = init.get(off as usize..).unwrap_or(&[]);
+                let n = src.len().min(DURABLE_SNAPSHOT_PAGE as usize);
+                // A fresh window has no §13 region, so the bytes go straight to the backing.
+                self.back.write_from(off, &src[..n]);
+            }
+        }
         let mut space = self.space_write();
         space.prot.extend(sparse_prots(prots, self.page, mapped));
     }

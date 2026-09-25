@@ -16,7 +16,7 @@
 //! bytecode `ThreadFault`, Cranelift `CapFault`); before #1578 the invoke route spawned on the oracle
 //! and Cranelift and `CapFault`ed on bytecode.
 
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Trap, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{grant_jit, jit_cap_run};
@@ -159,8 +159,16 @@ fn cranelift(route: &str) -> Outcome {
     let m = guest(route);
     let (mut host, h) = setup(&m);
     let slots: Vec<i64> = h.iter().map(|&x| x as i64).collect();
-    let (out, _) =
-        jit_cap_run(&m, 0, &slots, &[], DEFAULT_RESERVED_LOG2, 4, &mut host).expect("jit run");
+    let (out, _) = jit_cap_run(
+        &m,
+        0,
+        &slots,
+        &MemLayout::image(Vec::new()),
+        DEFAULT_RESERVED_LOG2,
+        4,
+        &mut host,
+    )
+    .expect("jit run");
     match out {
         JitOutcome::Returned(v) if v.len() == 1 => Outcome::Returned(v[0]),
         JitOutcome::Trapped(TrapKind::CapFault) => Outcome::CapFault,

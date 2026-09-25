@@ -13,7 +13,7 @@
     all(windows, target_arch = "x86_64")
 ))]
 
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Trap, Value};
 use temen_ir::{Module, ValType};
 use temen_jit::{JitError, JitOutcome};
 use temen_text::parse_module;
@@ -129,7 +129,15 @@ fn cranelift(child: &Module, detached: bool) -> Option<JitOutcome> {
     let (mut host, h) = powerbox(child);
     let init = vec![0u8; 1 << PARENT_LOG2];
     let args = h.map(i64::from);
-    match temen_run::jit_cap_run(&parent, 0, &args, &init, PARENT_LOG2, 0, &mut host) {
+    match temen_run::jit_cap_run(
+        &parent,
+        0,
+        &args,
+        &MemLayout::image(init.to_vec()),
+        PARENT_LOG2,
+        0,
+        &mut host,
+    ) {
         Ok((o, _)) => Some(o),
         Err(JitError::Unsupported(_)) => None,
         Err(e) => panic!("JIT run failed: {e:?}"),

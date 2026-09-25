@@ -186,16 +186,49 @@ impl GuestWindow {
     }
 
     /// Re-establish a captured page map on a freshly seeded window (DURABILITY.md §12.3): one
-    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] from window-relative `base`, over
-    /// the first `mapped` bytes; `Rw` entries keep the default. A thawed guest then faults on a
-    /// restored `Ro`/`Unmapped` page exactly as the frozen one would — matching `temen-interp`'s
+    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] from window-relative `base`. In
+    /// the first `mapped` bytes `Rw` entries keep the default; past them (the reserved tail) an
+    /// `Rw`/`Ro` page is one the guest grew, so it is committed and seeded from `init` (#1834),
+    /// and an `Unmapped` one stays uncommitted. A thawed guest then faults on a restored
+    /// `Ro`/`Unmapped` page exactly as the frozen one would — matching `temen-interp`'s
     /// `apply_prots`. The root's thaw and a detached child's (#1733) both apply theirs here.
-    pub(crate) fn apply_prots(&self, base: u64, prots: &[crate::WindowProt], mapped: u64) {
+    pub(crate) fn apply_prots(
+        &self,
+        base: u64,
+        prots: &[crate::WindowProt],
+        mapped: u64,
+        init: &[u8],
+    ) {
+        if self.mapped == 0 {
+            return;
+        }
         let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
+        // Everything but the trailing guard page, as `read_low` bounds it.
+        let limit = (self.total - pal::page_size()) as u64;
         for (i, &p) in prots.iter().enumerate() {
             let off = i as u64 * page;
             if off >= mapped {
-                break;
+                if p == crate::WindowProt::Unmapped {
+                    continue;
+                }
+                if base + off + page > limit {
+                    break;
+                }
+                let host = pal::page_size();
+                let start = ((base + off) as usize / host) * host;
+                let end = round_up((base + off + page) as usize, host);
+                let src = init.get(off as usize..).unwrap_or(&[]);
+                let n = src.len().min(page as usize);
+                // SAFETY: `[base+start, base+end)` lies in the reservation below its guard page
+                // (checked above); committed, it takes the `n` image bytes at its offset.
+                unsafe {
+                    pal::commit_rw(self.base.add(start), end - start);
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr(),
+                        self.base.add((base + off) as usize),
+                        n,
+                    );
+                }
             }
             match p {
                 crate::WindowProt::Ro => self.protect_ro(base + off, page),
