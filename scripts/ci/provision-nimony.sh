@@ -2,11 +2,11 @@
 # Build the nimony toolchain (nifler → nimony → hexer → lengc …) for the Nim-source end-to-end
 # tests (`crates/temen-leng/tests/nim_e2e.rs`). Mirrors nim-lang/nimony's own CI build.
 #
-# Prerequisites: a Nim `devel` compiler on PATH (the caller installs it — e.g. the CI job uses the
-# `setup-nim` action). Produces the tools under `<workdir>/nimony/bin` and prints two `KEY=value`
-# lines the caller `eval`s / appends to $GITHUB_ENV:
+# Builds its own Nim compiler from a pinned commit first (see NIM_SRC_REV below), so it needs only git
+# and a C toolchain. Produces the tools under `<workdir>/nimony/bin` and prints two `KEY=value` lines
+# the caller `eval`s / appends to $GITHUB_ENV:
 #     NIMONY_BIN=<abs>/nimony/bin
-#     NIM_BIN=<dir of the nim on PATH>
+#     NIM_BIN=<abs>/.cache/temen-ci/nim/bin
 #
 # The nimony frontend (and its sibling `nativenif`) are vendored as **git submodules** — the exact
 # commit is pinned by the gitlink in `.gitmodules`, reproducible in-tree, and bumped deliberately in
@@ -21,9 +21,6 @@ exec 3>&1 1>&2
 
 WORK="${1:-${GITHUB_WORKSPACE:-$PWD}}"
 cd "$WORK"
-
-command -v nim >/dev/null || { echo "error: nim (devel) not on PATH" >&2; exit 1; }
-NIM_BIN="$(dirname "$(command -v nim)")"
 
 # Ensure the vendored submodules are checked out at their pinned commits. A CI checkout with
 # `submodules: recursive` already does this, so this is a no-op there; it makes a plain checkout or a
@@ -50,39 +47,54 @@ if [ -f "$NATIVENIF_PIN_FILE" ]; then
   fi
 fi
 
-# setup-nim installs the *prebuilt* devel nightly, cut daily and lagging devel's head by hours to
-# a day (or months when nightlies stall). nifler compiles Nim's own parser, so it needs current
-# compiler sources; nimony's CI overlays devel HEAD's `compiler/` onto the nightly for that. An
-# unpinned HEAD over an older nightly splits the sources in two — Nim#26139 changed `docgen.nim`
-# and `rstgen.nim` together, and the nightly's `lib/` no longer matched the overlaid `compiler/`
-# (#1220). So: pin the source commit (bump deliberately, like the nimony submodule) and overlay
-# both `compiler/` and `lib/` from it — one coherent source tree, the nightly only the bootstrap
-# binary (Nim's own bootstrap compiles devel sources with an older binary the same way).
+# The Nim compiler, built from a pinned nim-lang/Nim commit (bump it deliberately, like the nimony
+# submodule). nifler compiles Nim's own parser, so it needs current compiler sources, and the `lib/`
+# beside them must match: an unpinned devel over an older nightly split the tree in two (#1220). This
+# used to overlay the pinned `compiler/` and `lib/` onto the prebuilt devel nightly. Building the
+# pinned tree itself gives one coherent toolchain and drops the nightly, whose `latest-devel` release
+# went missing while it was re-cut (#856) and moved under us every day (#1839). CI caches the build
+# in `~/.cache/temen-ci/nim` alongside the nimony tools, so it runs only when the key changes; it
+# takes ~5 min on a 4-core runner.
 NIM_SRC_REV=973065b279d2ae5b3954c25348c7dc4a02335f2b # nim-lang/Nim devel, 2026-09-03
-# There is a THIRD Nim revision in play, and it used to be invisible: nifler vendors a copy of Nim's
+NIM_ROOT="$HOME/.cache/temen-ci/nim"
+fetch_rev() { # <dir> <url> <commit>: a shallow checkout of exactly <commit>
+  rm -rf "$1"
+  git init -q "$1"
+  git -C "$1" fetch -q --depth 1 "$2" "$3"
+  git -C "$1" checkout -q FETCH_HEAD
+}
+if [ "$(git -C "$NIM_ROOT" rev-parse HEAD 2>/dev/null)" != "$NIM_SRC_REV" ] ||
+  ! "$NIM_ROOT/bin/nim" -v >/dev/null 2>&1; then
+  fetch_rev "$NIM_ROOT" https://github.com/nim-lang/Nim "$NIM_SRC_REV"
+  (
+    cd "$NIM_ROOT"
+    . ci/funs.sh
+    nimDefineVars
+    # Nim's own bootstrap clones the tip of csources' branch and then checks out the pinned hash,
+    # which fails once the branch moves on. Fetch the pinned hash itself.
+    fetch_rev "$nim_csourcesDir" "$nim_csourcesUrl" "$nim_csourcesHash"
+    nimBuildCsourcesIfNeeded
+    bin/nim c --noNimblePath --skipUserCfg --skipParentCfg --hints:off koch
+    ./koch boot -d:release --skipUserCfg --skipParentCfg --hints:off
+    # Keep the toolchain, not the bootstrap: its C sources and objects are 2 GB.
+    rm -rf "$nim_csourcesDir" nimcache bin/nim_csources_*
+  )
+fi
+NIM_BIN="$NIM_ROOT/bin"
+export PATH="$NIM_BIN:$PATH"
+
+# There is a second Nim revision in play, and it used to be invisible: nifler vendors a copy of Nim's
 # parser and records the revision it was taken from in `src/nifler/nimparser/upstream.commit`. That
-# is the revision upstream's own CI overlays. Ours is deliberately separate (we bump it when a
-# nightly/devel split breaks the build — see #1220 above), but a large drift between the two is the
-# first thing to suspect when nifler stops compiling, so print both rather than leave the reader to
-# discover the second one by hitting it.
+# is the revision upstream's own CI uses. Ours is deliberately separate (we bump it when a devel
+# change breaks the build — see #1220 above), but a large drift between the two is the first thing
+# to suspect when nifler stops compiling, so print both rather than leave the reader to discover the
+# second one by hitting it.
 NIFLER_UPSTREAM_FILE=nimony/src/nifler/nimparser/upstream.commit
 if [ -f "$NIFLER_UPSTREAM_FILE" ]; then
-  echo "provision-nimony: overlaying Nim $NIM_SRC_REV; nifler's vendored parser is from \
+  echo "provision-nimony: Nim $NIM_SRC_REV; nifler's vendored parser is from \
 $(cat "$NIFLER_UPSTREAM_FILE")" >&2
 fi
-if [ ! -d nim-src/.git ]; then
-  git init -q nim-src
-  git -C nim-src remote add origin https://github.com/nim-lang/Nim
-fi
-git -C nim-src fetch -q --depth 1 origin "$NIM_SRC_REV"
-git -C nim-src checkout -q FETCH_HEAD
-# The Nim install directory is the parent of its bin/.
-NIM_ROOT="$(dirname "$NIM_BIN")"
-for d in compiler lib; do
-  if [ -d "$NIM_ROOT/$d" ]; then
-    cp -a "nim-src/$d/." "$NIM_ROOT/$d/"
-  fi
-done
+
 # hastur resolves the frontend's NIF libs via `nim/dist/nimony` — point it at our submodule checkout.
 mkdir -p "$NIM_ROOT/dist"
 rm -rf "$NIM_ROOT/dist/nimony"
