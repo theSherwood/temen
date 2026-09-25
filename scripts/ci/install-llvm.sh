@@ -13,15 +13,36 @@ set -euo pipefail
 LLVM_MAJOR=22
 
 # Drop the runner's unused third-party apt sources so a transient outage or publish window on one of
-# those mirrors can't fail `apt-get update` before we install anything (I67/#1017, #1374). Scrub only
-# — the LLVM repo is added just below, and this script runs its own update/install after that.
+# those mirrors can't fail `apt-get update` before we install anything (I67/#1017, #1374). Scrub
+# only: this script runs its own update and install below.
 bash "$(dirname "$0")/apt-prep.sh"
 
+# The LLVM packages live in `~/.cache/temen-ci/llvm`, which CI restores with `actions/cache` keyed
+# on this script (`.github/actions/install-llvm`), so only a run that finds the cache empty talks to
+# apt.llvm.org. Installing from apt.llvm.org on every run was a flake: a runner that could not
+# resolve the host went red before a line was built (main, 2026-09-25). A filled cache also pins the
+# build: every job installs the exact packages apt.llvm.org served when the cache was filled, until
+# this script changes. Only the packages built from `llvm-toolchain-$LLVM_MAJOR` are kept. Their
+# Ubuntu dependencies still come from Ubuntu's archive, so a newer runner image is never asked to
+# downgrade one of its own libraries. The codename in the path makes a new runner OS fill afresh.
 codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg --yes
-echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/$codename/ llvm-toolchain-$codename-$LLVM_MAJOR main" \
-  | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+cache="$HOME/.cache/temen-ci/llvm/$codename"
+if ! compgen -G "$cache/*.deb" >/dev/null; then
+  fill=1
+  curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg --yes
+  echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/$codename/ llvm-toolchain-$codename-$LLVM_MAJOR main" \
+    | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+fi
 sudo apt-get update
-sudo apt-get install -y "llvm-$LLVM_MAJOR" "clang-$LLVM_MAJOR" "$@"
+if [ -n "${fill:-}" ]; then
+  sudo apt-get install -y --download-only "llvm-$LLVM_MAJOR" "clang-$LLVM_MAJOR"
+  mkdir -p "$cache"
+  for deb in /var/cache/apt/archives/*.deb; do
+    if [ "$(dpkg-deb -f "$deb" Source | cut -d' ' -f1)" = "llvm-toolchain-$LLVM_MAJOR" ]; then
+      cp "$deb" "$cache/"
+    fi
+  done
+fi
+sudo apt-get install -y "$cache"/*.deb "$@"
 # Unversioned tool names (`clang`, `llvm-dis`, …) resolve to the pinned version for the rest of the job.
 if [ -n "${GITHUB_PATH:-}" ]; then echo "/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_PATH"; fi

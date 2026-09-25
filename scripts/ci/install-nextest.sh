@@ -41,12 +41,13 @@ if command -v cygpath >/dev/null 2>&1; then
   dest="$(cygpath -u "$dest")"
 fi
 
-# The verified archive lives in `~/.cache/temen-ci`, which CI restores with `actions/cache` keyed on
-# this script, so every run after the first per version and platform extracts it from there. Fetching
-# it from get.nexte.st on every job was the flake (#1605): the CDN's outages turned jobs red before a
-# line was compiled, and no retry budget outlasts an outage longer than itself. The checksum below is
-# checked on every run whichever way the archive arrived, so the pin stays the trust anchor.
-cache="$HOME/.cache/temen-ci"
+# The verified archive lives in `~/.cache/temen-ci/nextest`, which CI restores with `actions/cache`
+# keyed on this script, so every run after the first per version and platform extracts it from
+# there. Fetching it from get.nexte.st on every job was the flake (#1605): the CDN's outages turned
+# jobs red before a line was compiled, and no retry budget outlasts an outage longer than itself.
+# The checksum below is checked on every run whichever way the archive arrived, so the pin stays the
+# trust anchor.
+cache="$HOME/.cache/temen-ci/nextest"
 archive="$cache/cargo-nextest-${NEXTEST_VERSION}-${platform}.tar.gz"
 if [ ! -f "$archive" ]; then
   mkdir -p "$cache"
