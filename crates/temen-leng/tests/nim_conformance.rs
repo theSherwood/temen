@@ -3,10 +3,11 @@
 //! generics, exceptions, closures, methods (dynamic dispatch), `seq`/`string`/`Table`, floats,
 //! iterators, `case`/variant objects, `ref` + ARC destructors — each driven through the **whole real
 //! toolchain** (`nimony c` → nifler → nimony → hexer emit Leng, `temen-leng` lowers + links) and **run
-//! on both engines** (§9 interp/JIT parity). A **compute** fixture links with the W3 compute shim and
-//! reads back an `int` global; an **I/O** fixture (a feature whose real stdlib pulls in the syscall
-//! bottom edge — `Table` → `panic` → `syncio`) links through the nim→powerbox manifest bridge and
-//! checks captured stdout under the POSIX personality.
+//! on both engines** (§9 interp/JIT parity). A **compute** fixture links with the W3 compute shim
+//! ([`temen_leng::nim_compute_shim_unit`]) and reads back an `int` global; an **I/O** fixture (a
+//! feature whose real stdlib pulls in the syscall bottom edge — `Table` → `panic` → `syncio`) links
+//! as a no-C program ([`temen_leng::link_nim_posix`]) and checks captured stdout under the POSIX
+//! personality.
 //!
 //! Unlike the exact-value tests in `nim_e2e.rs`, this suite tolerates *known* fail-closed features: each
 //! fixture carries an [`Expect`], and the test asserts the **measured** status matches it. A feature that
@@ -26,7 +27,7 @@
 use std::panic::AssertUnwindSafe;
 use std::process::Command;
 use temen_interp::Value;
-use temen_ir::{LinkUnit, Module};
+use temen_ir::Module;
 
 // ---- toolchain gating (mirrors nim_e2e.rs) --------------------------------------------------------
 
@@ -51,39 +52,6 @@ fn toolchain_path() -> Option<String> {
             .split(':')
             .any(|d| !d.is_empty() && std::path::Path::new(d).join("nimony").is_file());
     ok.then_some(full)
-}
-
-// ---- the runtime compute shim's bottom-edge bindings (mirrors nim_e2e.rs) -------------------------
-
-const SHIM_BINDINGS: &[(&str, u32)] = &[
-    ("cExitSys", 0),
-    ("cGetpid", 1),
-    ("cKill", 2),
-    ("c_memcpy", 3),
-    ("c_memcmp", 4),
-    ("c_memset", 5),
-    ("mmap", 6),
-    ("atomicLoadN", 7),
-    ("atomicStoreN", 8),
-    ("atomicCompareExchangeN", 9),
-    ("atomicExchangeN", 10),
-    ("atomicAddFetch", 11),
-    ("atomicSubFetch", 12),
-    ("bswap64", 13),
-    ("ctz64", 14),
-    ("clz64", 15),
-    ("cWriteErr", 16),
-    ("dlopen", 17),
-    ("dlclose", 18),
-    ("dlsym", 19),
-];
-
-fn shim_index(name: &str) -> Option<u32> {
-    SHIM_BINDINGS
-        .iter()
-        .filter(|(p, _)| name.starts_with(p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, i)| *i)
 }
 
 // ---- the pipeline, Result-returning so a fail-closed is data, not a panic -------------------------
@@ -154,10 +122,7 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
             if let Some(stem) = name.strip_suffix(".x.nif") {
                 if out.iter().all(|(s, _)| s != stem) {
                     let bytes = std::fs::read(&p).unwrap();
-                    out.push((
-                        stem.to_string(),
-                        String::from_utf8_lossy(&bytes).into_owned(),
-                    ));
+                    out.push((stem.to_string(), temen_leng::nif_text(&bytes).into_owned()));
                 }
             }
         }
@@ -177,36 +142,11 @@ fn link_with_runtime(mods: &[(String, String)]) -> Result<Module, Stage> {
 }
 
 fn link_inner(mods: &[(String, String)]) -> Result<Module, Stage> {
-    let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
-        let obj = temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
-            .map_err(|_| Stage::Translate)?;
-        let obj = temen_encode::decode_unit(&obj).map_err(|_| Stage::Translate)?;
-        for imp in &obj.imports {
-            if import_names.iter().all(|n| n != &imp.name) {
-                import_names.push(imp.name.clone());
-            }
-        }
-    }
-
-    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
-    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
-    let exports: Vec<(String, u32)> = import_names
-        .iter()
-        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
-        .collect();
-    let runtime = LinkUnit {
-        module: shim,
-        exports,
-        ..Default::default()
-    };
-
-    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
-    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
-    let units: Vec<temen_leng::WholeModule> = ordered
+    let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
+    let runtime = temen_leng::nim_compute_shim_unit(&units).map_err(|_| Stage::Translate)?;
     let m =
         temen_leng::link_whole_with_runtime(&units, vec![runtime]).map_err(|_| Stage::Translate)?;
     temen_verify::verify_module(&m).map_err(|_| Stage::Verify)?;
@@ -325,12 +265,12 @@ fn measure(path: &str, f: &Fixture) -> (Status, Option<i64>) {
     }
 }
 
-/// Measure an **I/O** fixture: manifest-link the modules (retaining the raw-syscall leaves as
-/// host-bound imports rather than fail-closing the compute link on them — `panic` → `syncio`'s
-/// `sysWrite`), run the powerbox `_start` on **both engines** under the POSIX personality, and require
-/// the two captured streams to agree (§9 parity) and to contain `want`. This is how a stdlib feature
-/// whose real code pulls in the I/O bottom edge (e.g. `Table`, via `panic`) is exercised — the compute
-/// shim can't bind those leaves (#993). Reuses `nim_e2e.rs`'s proven manifest+POSIX harness.
+/// Measure an **I/O** fixture: link the modules as a no-C program (the syscalls — `panic` →
+/// `syncio`'s `sysWrite` — forwarded to the POSIX personality rather than fail-closing the compute
+/// link on them), run the powerbox `_start` on **both engines**, and require the two captured
+/// streams to agree (§9 parity) and to contain `want`. This is how a stdlib feature whose real code
+/// pulls in the I/O bottom edge (e.g. `Table`, via `panic`) is exercised — the compute shim can't
+/// bind those leaves (#993).
 fn measure_io(mods: &[(String, String)], want: &str) -> Status {
     let linked = std::panic::catch_unwind(AssertUnwindSafe(|| io_link(mods)));
     let m = match linked {
@@ -354,70 +294,26 @@ fn measure_io(mods: &[(String, String)], want: &str) -> Status {
     }
 }
 
-/// Manifest-link the modules with the compute shim bound to the pure-compute bottom edge, but via the
-/// **powerbox manifest** link so the raw-syscall leaves survive as host-bindable imports. `Err(stage)`
-/// on a translate/link failure. (Mirrors `nim_e2e.rs::run_io_program`'s link half.)
+/// Link the modules as a no-C program is linked ([`temen_leng::link_nim_posix`]): the compute bottom
+/// edge bound in-guest, the syscalls forwarded to the POSIX personality. `Err(stage)` on a
+/// translate/link failure.
 fn io_link(mods: &[(String, String)]) -> Result<Module, Stage> {
-    let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
-        let obj = temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
-            .map_err(|_| Stage::Translate)?;
-        let obj = temen_encode::decode_unit(&obj).map_err(|_| Stage::Translate)?;
-        for imp in &obj.imports {
-            if import_names.iter().all(|n| n != &imp.name) {
-                import_names.push(imp.name.clone());
-            }
-        }
-    }
-    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
-    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
-    let exports: Vec<(String, u32)> = import_names
-        .iter()
-        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
-        .collect();
-    let runtime = LinkUnit {
-        module: shim,
-        exports,
-        ..Default::default()
-    };
-    let mut ordered: Vec<&(String, String)> = mods.iter().collect();
-    ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
-    let units: Vec<temen_leng::WholeModule> = ordered
+    let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    temen_leng::link_whole_powerbox_manifest(&units, vec![runtime]).map_err(|_| Stage::Translate)
+    let (names, sigs) = temen_posix::cap_vtable();
+    temen_leng::link_nim_posix(&units, (&names, &sigs), None).map_err(|_| Stage::Translate)
 }
 
-/// Map a retained nimony syscall import to its POSIX-personality op (mirrors `nim_e2e.rs`).
-fn nim_posix_op(name: &str) -> u32 {
-    if name.starts_with("sysWrite") {
-        temen_posix::OP_WRITE
-    } else if name.starts_with("sysRead") {
-        temen_posix::OP_READ
-    } else if name.starts_with("sysOpen") {
-        temen_posix::OP_OPEN
-    } else if name.starts_with("sysClose") {
-        temen_posix::OP_CLOSE
-    } else if name.starts_with("sysLseek") {
-        temen_posix::OP_LSEEK
-    } else {
-        temen_posix::OP_WRITE // any other retained leaf (e.g. sysAssert) — a no-op-ish write sink
-    }
-}
-
-/// Run the manifest module's powerbox `_start` on `backend` with every retained syscall import bound to
-/// a shared POSIX personality; return the guest's stdout (`None` on a trap/instantiate failure).
+/// Run the linked program's powerbox `_start` on `backend`, bound as every no-C driver binds one
+/// ([`temen_run::nim_posix_imports`]); return the guest's stdout (`None` on a trap, an unbound
+/// import or an instantiate failure).
 fn io_run(m: &Module, backend: temen_run::Backend) -> Option<Vec<u8>> {
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make = std::sync::Arc::new(make);
-    let mut imports = temen_run::Imports::new();
-    for imp in &m.imports {
-        let make = std::sync::Arc::clone(&make);
-        imports = imports.provide(
-            imp.name.clone(),
-            temen_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
-        );
+    let (imports, unbound, _) = temen_run::nim_posix_imports(m, &posix, std::sync::Arc::new(make));
+    if !unbound.is_empty() {
+        return None;
     }
     let inst = temen_run::instantiate_with_imports(m.clone(), imports).ok()?;
     inst.run(backend, &temen_run::RunConfig::default()).ok()?;

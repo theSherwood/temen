@@ -263,6 +263,12 @@ fn nif_str_bytes(atom: &str) -> Result<Vec<u8>, LengError> {
     Ok(out)
 }
 
+/// A pointer in static data to the data named `name`, before [`Translator::resolve_data_ptrs`] says
+/// whose it is.
+fn pointee(name: String) -> temen_ir::DataPtrTarget {
+    temen_ir::DataPtrTarget::Sym { name, addend: 0 }
+}
+
 /// Escape a symbol for an temen-text string literal (e.g. an `import` name). Printable ASCII passes
 /// through; `\` and `"` are backslash-escaped; anything else is `\xHH`. Necessary because mangled
 /// Leng names carry NIF hex escapes — the `[]` operator is literally `\5B\5D…`, whose bare backslash
@@ -449,11 +455,13 @@ pub(crate) struct Translator {
     /// Non-zero scalar global initializers → `(unit-local offset, little-endian bytes)`, folded into
     /// the globals `data` segment. Zero-init globals stay zero (the segment is zero-filled).
     data_inits: Vec<(u64, Vec<u8>)>,
-    /// **Data-image pointer relocations** (link mode): a pointer stored *inside* a const's bytes to
-    /// another const — a `string` literal's `more = (addr strlit)`. Each `(at, target_off)` emits a
-    /// `data.ptr <at> self <target_off>` the linker fixes up (temen_ir D-LINK). Runnable mode bakes the
-    /// absolute offset directly instead, so this stays empty there.
-    data_ptrs: Vec<(u64, u64)>,
+    /// **Data-image pointer relocations** (link mode): a pointer stored *inside* a const's bytes — a
+    /// `string` literal's `more = (addr strlit)`. Collected by the target's name, then resolved once
+    /// every global is placed ([`Self::resolve_data_ptrs`]): to this unit's own data (`data.ptr <at>
+    /// self <off>`), or to a sibling unit's data symbol (`data.ptr <at> sym "<name>" 0`), which the
+    /// linker binds or refuses (temen_ir D-LINK). Runnable mode bakes each resolved address instead,
+    /// so this ends empty there.
+    data_ptrs: Vec<(u64, temen_ir::DataPtrTarget)>,
     /// **Data-image funcref relocations** (link mode): a `proctype` gvar whose static initializer is
     /// a proc (`var oomHandler = continueAfterOutOfMem`). Each `(off, sym)` is the gvar's slot offset
     /// and the initializer proc's *local* name; `translate_object_module` suffixes `sym` with the
@@ -769,8 +777,13 @@ impl Translator {
             ));
             // Pointers stored inside const data (a `string`'s `more = (addr strlit)`) are relocated
             // by the linker; the placeholder bytes above are overwritten with the resolved address.
-            for (at, target_off) in &self.data_ptrs {
-                out.push_str(&format!("data.ptr {at} self {target_off}\n"));
+            for (at, target) in &self.data_ptrs {
+                out.push_str(&match target {
+                    temen_ir::DataPtrTarget::SelfOff(off) => format!("data.ptr {at} self {off}\n"),
+                    temen_ir::DataPtrTarget::Sym { name, addend } => {
+                        format!("data.ptr {at} sym \"{}\" {addend}\n", escape_str(name))
+                    }
+                });
             }
             out.push('\n');
         } else {
@@ -933,8 +946,8 @@ impl Translator {
                                 // a funcref slot (a vtable's `mt`) becomes a `data.funcref`.
                                 let n = bytes.len() as u64;
                                 self.data_inits.push((off, bytes));
-                                for (rel_at, target) in relocs {
-                                    self.data_ptrs.push((off + rel_at, target));
+                                for (rel_at, name) in relocs {
+                                    self.data_ptrs.push((off + rel_at, pointee(name)));
                                 }
                                 for (rel_at, sym) in frelocs {
                                     self.funcref_inits.push((off + rel_at, sym));
@@ -988,8 +1001,8 @@ impl Translator {
                             // vtable's `mt` entry) becomes a `data.funcref` the linker fills.
                             let sz = bytes.len() as u64;
                             self.data_inits.push((off, bytes));
-                            for (rel_at, target) in relocs {
-                                self.data_ptrs.push((off + rel_at, target));
+                            for (rel_at, name) in relocs {
+                                self.data_ptrs.push((off + rel_at, pointee(name)));
                             }
                             for (rel_at, sym) in frelocs {
                                 self.funcref_inits.push((off + rel_at, sym));
@@ -1030,6 +1043,49 @@ impl Translator {
             }
         }
         self.globals_top = off;
+        self.resolve_data_ptrs()
+    }
+
+    /// Resolve every pointer stored in static data ([`Self::data_ptrs`]) now that the unit's globals
+    /// are all placed, so a const may point at one placed after it. A name this unit defines is its
+    /// own data. Any other names a sibling unit's: hexer's dead-code elimination keeps one copy of a
+    /// string literal (or a type's data) program-wide, in one module, and every other module points at
+    /// it by that module's name — for the linker to bind, or refuse. A runnable module has no
+    /// siblings, so there such a name is an error. Pointing at nothing is never silently a null.
+    fn resolve_data_ptrs(&mut self) -> Result<(), LengError> {
+        for (at, target) in std::mem::take(&mut self.data_ptrs) {
+            let temen_ir::DataPtrTarget::Sym { name, .. } = &target else {
+                self.data_ptrs.push((at, target));
+                continue;
+            };
+            // The data that holds the pointer. A blob records only pointers inside it, so one that
+            // lies outside means a layout and the value laid out by it disagree.
+            let (base, bytes) = self
+                .data_inits
+                .iter_mut()
+                .find(|(o, b)| *o <= at && at + 8 <= o + b.len() as u64)
+                .ok_or_else(|| {
+                    LengError::Malformed(format!("a pointer to `{name}` at {at} lies in no data"))
+                })?;
+            match (self.globals.get(name), self.link_mode) {
+                (Some((goff, _)), true) => self
+                    .data_ptrs
+                    .push((at, temen_ir::DataPtrTarget::SelfOff(*goff))),
+                (Some((goff, _)), false) => {
+                    let i = (at - *base) as usize;
+                    bytes[i..i + 8].copy_from_slice(&goff.to_le_bytes());
+                }
+                (None, true) => self.data_ptrs.push((at, target)),
+                // An enumerating pre-scan (`scan_lenient`) keeps none of its data, and tolerates a
+                // sibling's name as it does a sibling's type.
+                (None, false) if self.scan_lenient => {}
+                (None, false) => {
+                    return Err(LengError::Unsupported(format!(
+                        "static data points at `{name}`, which this module does not define"
+                    )))
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1051,8 +1107,8 @@ impl Translator {
                     {
                         let sz = bytes.len() as u64;
                         self.data_inits.push((*off, bytes));
-                        for (rel_at, target) in relocs {
-                            self.data_ptrs.push((*off + rel_at, target));
+                        for (rel_at, name) in relocs {
+                            self.data_ptrs.push((*off + rel_at, pointee(name)));
                         }
                         for (rel_at, sym) in frelocs {
                             self.funcref_inits.push((*off + rel_at, sym));
@@ -1172,10 +1228,11 @@ impl Translator {
     fn const_aggregate_bytes(
         &self,
         val: &Node,
-    ) -> Result<Option<(Vec<u8>, TyDesc, Vec<(u64, u64)>, Vec<(u64, String)>)>, LengError> {
-        // Relocations `(rel_at, target_off)`: a pointer at `rel_at` (relative to these bytes) to the
-        // window offset `target_off` — a const-to-const pointer (a `string`'s `more = (addr strlit)`).
-        let mut relocs: Vec<(u64, u64)> = Vec::new();
+    ) -> Result<Option<(Vec<u8>, TyDesc, Vec<(u64, String)>, Vec<(u64, String)>)>, LengError> {
+        // Relocations `(rel_at, target)`: a pointer at `rel_at` (relative to these bytes) to the data
+        // named `target` — a const-to-const pointer (a `string`'s `more = (addr strlit)`), resolved
+        // once every global is placed ([`Self::resolve_data_ptrs`]).
+        let mut relocs: Vec<(u64, String)> = Vec::new();
         // **Funcref relocations** `(rel_at, proc_sym)`: an 8-byte slot at `rel_at` that must hold a
         // function index — an `Rtti` vtable's `mt` method-table entry (a `method` override). Zeroed
         // here; the linker writes `ref.func proc_sym`'s value (the funcref-gvar mechanism, #979).
@@ -1359,24 +1416,17 @@ impl Translator {
                     .is_some_and(|s| self.globals.contains_key(s))
             {
                 // A pointer to another const/global — `more = (addr strlit…)`, or a vtable's `dy`
-                // display-info pointer (`(cast (ptr u32) Type.dy)`). Runnable mode bakes the target's
-                // fixed window offset in; **link** mode emits a `data.ptr` relocation. A `(cast …)`
-                // wrapping the symbol is transparent here (peeled).
+                // display-info pointer (`(cast (ptr u32) Type.dy)`) — by name, resolved once every
+                // global is placed ([`Self::resolve_data_ptrs`]): this unit's data, or a sibling's. A
+                // `(cast …)` wrapping the symbol is transparent here (peeled).
                 let inner = peel_cast(&ka[1]);
                 let target = if ka[1].tag() == Some("addr") {
                     ka[1].args().first().and_then(|n| n.as_atom())
                 } else {
                     inner.as_atom()
                 };
-                match target.and_then(|t| self.globals.get(t)) {
-                    Some((goff, _)) if self.link_mode => relocs.push((off as u64, *goff)),
-                    Some((goff, _)) => {
-                        bytes[off..off + 8].copy_from_slice(&goff.to_le_bytes());
-                    }
-                    // An unresolved target (e.g. a not-yet-materialized RTTI display blob) — reserve a
-                    // zeroed slot rather than abort. Sound: only `mt` (the funcrefs above) is read by
-                    // dynamic dispatch; `dy` feeds `of`/type-name display, tolerant of a null here.
-                    None => {}
+                if let Some(t) = target {
+                    relocs.push((off as u64, t.to_string()));
                 }
             } else if matches!(
                 fdesc,
@@ -2100,15 +2150,16 @@ impl Translator {
     ) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
         t.scan_lenient = true; // enumerating globals; tolerate unresolvable cross-module aggregates
-        t.collect_types(root)?;
-        // The **pooled** cross-module layouts, as the real translation pass gets them. Without these
-        // a global whose type is declared in a sibling module resolves to the `scan_lenient` scalar
-        // placeholder, and exporting that is worse than exporting nothing: the consumer then indexes
-        // `TagData.0.<tags>` as a `Scalar(I64)` and fails with "`at` on a non-array". The pool is
-        // complete before this runs (`link_selected_with_extra` drives it to a fixpoint first), so
-        // there is no ordering cost to using it.
+                               // The **pooled** cross-module layouts, as the real translation pass gets them — and, as there,
+                               // before this unit's own types resolve against them (`array[1, string]` is sized by the pooled
+                               // `string`). Without these a global whose type is declared in a sibling module resolves to the
+                               // `scan_lenient` scalar placeholder, and exporting that is worse than exporting nothing: the
+                               // consumer then indexes `TagData.0.<tags>` as a `Scalar(I64)` and fails with "`at` on a
+                               // non-array". The pool is complete before this runs (`link_selected_with_extra` drives it to a
+                               // fixpoint first), so there is no ordering cost to using it.
         let imported: HashSet<String> = pooled.iter().map(|(n, _)| n.clone()).collect();
         t.import_types(pooled);
+        t.collect_types(root)?;
         t.collect_globals(root)?;
         // This unit's own type names, which the descriptors below must be rewritten into their
         // stem-suffixed global form — the same rewrite `export_types_pooled` applies to a field or

@@ -233,6 +233,107 @@ fn const_to_const_pointer_relocates() {
     assert_eq!(&imem[more + 24..more + 27], b"abc", "blob data");
 }
 
+/// Follow `getmore()`'s pointer in `linked` to the `LongString` blob it names: its `fullLen` and
+/// first three bytes.
+fn follow_more(linked: &temen_ir::Module) -> (u64, Vec<u8>) {
+    temen_verify::verify_module(linked).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let getmore = linked.resolve_export("getmore.0.use").expect("getmore");
+    let seed = vec![0u8; 49152];
+    let mut fuel = u64::MAX;
+    let (ir, imem) = temen_interp::run_capture(linked, getmore, &[], &mut fuel, &seed);
+    let more = match ir.expect("interp").as_slice() {
+        [Value::I64(a)] => *a as usize,
+        o => panic!("{o:?}"),
+    };
+    assert_ne!(more, 0, "`more` points at the blob, not at nothing");
+    let full_len = u64::from_le_bytes(imem[more..more + 8].try_into().unwrap());
+    (full_len, imem[more + 24..more + 27].to_vec())
+}
+
+const LS_TYPES: &str = "\
+ (type :LS.0. . (object . (fld :fullLen.0 . (i +64)) (fld :rc.0 . (i +64)) (fld :capImpl.0 . (i +64)) (fld :data.0 . (uarray (c 8)))))
+ (type :string.0. . (object . (fld :bytes.0 . (u 64)) (fld :more.0 . (ptr LS.0.))))";
+
+/// A const pointing at a string literal **another unit** defines — what hexer's dead-code
+/// elimination makes of a program's string literals: one copy, in one module, which every other
+/// module names by that module's stem (`strlit.0.own`). The pointer is a cross-unit relocation the
+/// linker binds; it used to be left null, and the program read a string at address 0.
+#[test]
+fn a_const_points_at_another_units_data() {
+    let own = format!(
+        "(stmts\n{LS_TYPES}\n (const :strlit.0. . LS.0. (oconstr LS.0. (kv fullLen.0 3) (kv rc.0 0) \
+         (kv capImpl.0 0) (kv data.0 \"abc\"))))"
+    );
+    let user = format!(
+        "(stmts\n{LS_TYPES}\n (const :s.0. . string.0. (oconstr string.0. (kv bytes.0 42) \
+         (kv more.0 (addr strlit.0.own))))\n (proc :getmore.0. . (i +64) . (stmts . (ret (dot s.0. \
+         more.0 0)))))"
+    );
+    let linked = temen_leng::link_units(&[
+        LengModule {
+            stem: "own",
+            src: &own,
+            names: &[],
+        },
+        LengModule {
+            stem: "use",
+            src: &user,
+            names: &["getmore.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(follow_more(&linked), (3, b"abc".to_vec()));
+}
+
+/// A table of strings whose element type another unit defines — nimsem's `requiredObjFiles`, an
+/// `array[1, string]` in a module whose `string` lives in `system`. The linker's enumerating pre-scan
+/// sized the array before it saw the pooled `string`, as one 8-byte element, and laid a 16-byte
+/// string into it: a pointer past the end of its own data, and the link failed.
+#[test]
+fn a_table_of_another_units_strings_points_at_their_data() {
+    let own = format!(
+        "(stmts\n{LS_TYPES}\n (const :strlit.0. . LS.0. (oconstr LS.0. (kv fullLen.0 3) (kv rc.0 0) \
+         (kv capImpl.0 0) (kv data.0 \"abc\"))))"
+    );
+    let user =
+        "(stmts\n (type :Tab.0. . (array string.0.own 1))\n (gvar :tab.0. . Tab.0. (aconstr \
+                Tab.0. (oconstr string.0.own (kv bytes.0 42) (kv more.0 (addr strlit.0.own)))))\n \
+                (proc :getmore.0. . (i +64) . (stmts . (ret (dot (at tab.0. 0) more.0 0)))))";
+    let linked = temen_leng::link_units(&[
+        LengModule {
+            stem: "own",
+            src: &own,
+            names: &[],
+        },
+        LengModule {
+            stem: "use",
+            src: user,
+            names: &["getmore.0."],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(follow_more(&linked), (3, b"abc".to_vec()));
+}
+
+/// A const pointing at one placed **after** it resolves as well: every pointer in static data is
+/// resolved once the unit's globals are all placed, not as each const is read.
+#[test]
+fn a_const_points_at_a_const_placed_after_it() {
+    let leng = format!(
+        "(stmts\n{LS_TYPES}\n (const :s.0. . string.0. (oconstr string.0. (kv bytes.0 42) \
+         (kv more.0 (addr strlit.0.))))\n (const :strlit.0. . LS.0. (oconstr LS.0. (kv fullLen.0 3) \
+         (kv rc.0 0) (kv capImpl.0 0) (kv data.0 \"abc\")))\n (proc :getmore.0. . (i +64) . (stmts . \
+         (ret (dot s.0. more.0 0)))))"
+    );
+    let linked = temen_leng::link_units(&[LengModule {
+        stem: "use",
+        src: &leng,
+        names: &["getmore.0."],
+    }])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(follow_more(&linked), (3, b"abc".to_vec()));
+}
+
 #[test]
 fn const_array_table_indexes() {
     // A `const` array table `(aconstr T e0 e1 …)` — like `system`'s `fsLookupTable` (256 i8s) —

@@ -12,8 +12,10 @@
 //! This needs no toolchain: it links the libc against its own stub unit and reads the merged import
 //! table directly.
 
-/// Every import the committed guest libc declares is either resolved by the stub unit or aliased onto
-/// the powerbox `write` cap — so the only name left unbound is `write` itself.
+/// Every import the committed guest libc declares is resolved by the stub unit, aliased onto the
+/// powerbox `write` cap, or one of the core's memory ops a nim program's heap grows with (`vm_map`,
+/// `vm_page_size`), which every host binds to the program's window — so those are the only names
+/// left unbound. A stub for a memory op would capture the program's own import of it at link.
 #[test]
 fn libc_cap_edge_is_fully_served() {
     let Ok(libc) = std::fs::read("../../browser/web/assets/pg_libc.temeno") else {
@@ -24,10 +26,11 @@ fn libc_cap_edge_is_fully_served() {
     // — this is about the cap edge, and the stub unit it returns is the one the real link uses.
     let units = temen_leng::nim_libc_units(&libc, &[]).expect("build libc + stub link units");
     let merged = temen_ir::link_with_manifest(&units).expect("link the libc against its cap stubs");
-    let left: Vec<&str> = merged.imports.iter().map(|i| i.name.as_str()).collect();
+    let mut left: Vec<&str> = merged.imports.iter().map(|i| i.name.as_str()).collect();
+    left.sort_unstable();
     assert_eq!(
         left,
-        vec!["write"],
+        vec!["vm_map", "vm_page_size", "write"],
         "the guest libc has an import the stub unit does not serve — add it to \
          LIBC_CAP_STUB_NAMES (with a body of the right shape in LIBC_CAP_STUBS), or it becomes a \
          capability every nim program declares"

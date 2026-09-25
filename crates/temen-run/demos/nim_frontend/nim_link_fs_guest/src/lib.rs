@@ -130,8 +130,9 @@ unsafe fn write_file(fs: i32, path: *const u8, bytes: &[u8]) -> bool {
 
 /// `main(argc, argv)` — the §14 child-entry ABI (`main(argc, argv)` forces `synth_start_argv` as func 0;
 /// the starter cap arrives ahead of it and is ignored). `argv = ["link", <in.x.nif>, <out.temen>,
-/// <stem>]`. Exit codes: 1 = bad argv, 2 = input unreadable / not UTF-8, 3 = the linker refused the unit,
-/// 4 = output unwritable, 0 = the linked module was written.
+/// <stem>]`. Exit codes: 1 = bad argv, 2 = input unreadable (or a stem that is not UTF-8), 3 = the
+/// linker refused the unit, 4 = output unwritable, 0 = the linked module was written. The input's NIF
+/// is bytes, read as [`temen_leng::nif_text`] reads them.
 ///
 /// # Safety
 /// `argv` points at `argc` NUL-terminated C strings the parent seeded into the carve.
@@ -152,15 +153,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
     let Some(src_bytes) = read_file(fs, in_path) else {
         return 2;
     };
-    let Ok(src) = core::str::from_utf8(&src_bytes) else {
-        return 2;
-    };
+    let src = temen_leng::nif_text(&src_bytes);
     let stem_bytes = core::slice::from_raw_parts(stem_ptr, clen(stem_ptr));
     let Ok(stem) = core::str::from_utf8(stem_bytes) else {
         return 2;
     };
 
-    let units = [temen_leng::WholeModule { stem, src }];
+    let units = [temen_leng::WholeModule { stem, src: &src }];
     let module = match temen_leng::link_nim_powerbox(&units, None) {
         Ok(m) => m,
         Err(_) => return 3,

@@ -5560,11 +5560,14 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// Bind every retained import of a no-C nim module to one shared **POSIX personality**.
 ///
 /// The module's POSIX imports are the personality's own names (`__px_<op>`, #1668) — the same as a
-/// chibicc command's — so this is [`temen_posix::resolve_import`] and nothing else. It used to be a
-/// table of nimony's mangled leaf names matched by prefix, plus a host stdout `Stream` for the guest
-/// libc's `write` and the `Exit` capability for `_exit`: a vocabulary only this root linker knew, and
-/// two authorities an `execve`'d image does not hold. temen-leng's POSIX edge now forwards every one of
-/// those to the personality, so a nim program binds identically at root and after an exec.
+/// chibicc command's — so they bind through [`temen_posix::resolve_import`]. It used to be a table
+/// of nimony's mangled leaf names matched by prefix, plus a host stdout `Stream` for the guest libc's
+/// `write` and the `Exit` capability for `_exit`: a vocabulary only this root linker knew, and two
+/// authorities an `execve`'d image does not hold. temen-leng's POSIX edge now forwards every one of
+/// those to the personality, so a nim program binds identically at root and after an exec. Its only
+/// other imports are the core's memory ops (`vm_map`, `vm_page_size`), with which its allocator grows
+/// the heap into the window's reserved tail: those bind to the program's own window
+/// ([`HostCap::memory`]), as they do in an `execve`'d image and in a C on-ramp command.
 ///
 /// Returns the [`Imports`], the names it could not serve, and the personality's
 /// [`SharedHostProc`] — its single powerbox entry (#1645), which a caller needs to publish the op
@@ -5589,11 +5592,17 @@ pub fn nim_posix_imports(
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
-        let Some(c) = temen_posix::resolve_import(&imp.name) else {
+        let cap = if let Some(c) = temen_posix::resolve_import(&imp.name) {
+            HostCap::host_proc_shared(c.op, &slot)
+        } else if let Some(c) =
+            temen_ir::default_cap_resolver(&imp.name).filter(|c| c.type_id == cap_id::ADDRESS_SPACE)
+        {
+            HostCap::memory(c.op)
+        } else {
             unbound.push(imp.name.clone());
             continue;
         };
-        imports = imports.provide(imp.name.clone(), HostCap::host_proc_shared(c.op, &slot));
+        imports = imports.provide(imp.name.clone(), cap);
     }
     (imports, unbound, slot)
 }
@@ -5652,7 +5661,8 @@ pub fn nim_noc_run(
     let (imports, unbound, slot) = nim_posix_imports(&module, posix, make);
     if !unbound.is_empty() {
         return Err(format!(
-            "unbound imports — not personality ops (`__px_*`): {unbound:?}"
+            "unbound imports — neither personality ops (`__px_*`) nor the core's memory ops: \
+             {unbound:?}"
         ));
     }
     let cfg = RunConfig {

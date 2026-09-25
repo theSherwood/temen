@@ -3792,10 +3792,10 @@ pub const POWERBOX_STACK_ALIGN: u64 = 65536;
 /// window (`temen-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
 /// The **guest-heap reserve** the linker leaves above the data stack when sizing a powerbox window
-/// (a program carrying a `data.top` stack). A fixed-window frontend whose allocator bumps in-window —
-/// the nim compute-shim `mmap` (no `vm_map` growth) — needs the merged window to actually hold its
-/// heap; otherwise the heap top depends on whatever `memory N` some runtime unit happened to declare
-/// (the compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
+/// (a program carrying a `data.top` stack): the heap a program has in its window before its allocator
+/// must commit the reserved tail with `vm_map`, as the nim compute-shim `mmap` does. Without it that
+/// in-window heap would depend on whatever `memory N` some runtime unit happened to declare (the
+/// compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
 /// makes the window sizing explicit: the window always covers `data + stack reserve + heap reserve`,
 /// growing past a runtime unit's declaration when a program's static data is large. This is a
 /// **floor** on heap room, not a cap — the actual heap ceiling a frontend seeds is the full window

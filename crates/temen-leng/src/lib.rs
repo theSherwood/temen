@@ -56,7 +56,7 @@ mod dethash;
 mod nif;
 mod translate;
 
-pub use nif::{parse as parse_nif, Node};
+pub use nif::{nif_text, parse as parse_nif, Node};
 
 /// A translation failure. `Unsupported` is the fail-closed catch-all for any Leng construct the
 /// skeleton does not yet lower — the frontend never emits IR it cannot stand behind.
@@ -798,10 +798,11 @@ fn place_shadow_arena(m: &mut Module) {
 /// reuse a program's `LongString` const and `add`/realloc scribbles it (the #1051 corruption, whose
 /// order-sensitivity was #1054). Seeding the base to `data.top + POWERBOX_STACK_RESERVE` — or, above
 /// that, the end of the program's shadow arena ([`place_shadow_arena`]) — puts the heap above **all**
-/// placed data for any link order. Seeding the ceiling to the real window top
-/// makes the heap use the whole remaining window (no capacity cliff) and lets the shim `mmap`
-/// fail closed when the guest would bump past it (#1060) — the confinement mask already prevents an
-/// out-of-window access from escaping, so this turns a self-corrupting wrap into a clean allocation
+/// placed data for any link order. Seeding the ceiling to the real window top makes the heap use
+/// the whole mapped window first; past it the shim `mmap` grows the heap through its runtime's hook
+/// ([`HEAP_GROW`], committing the reserved tail under a host), and fails closed where it cannot
+/// (#1060) — the confinement mask already prevents an out-of-window access from escaping, so a bump
+/// past the committed top is never a self-corrupting wrap, only a growth or a clean allocation
 /// failure. The window itself is sized to hold `data + stack + heap` reserves by
 /// [`temen_ir::link`] ([`temen_ir::POWERBOX_HEAP_RESERVE`]), independent of any runtime unit's
 /// `memory N` declaration.
@@ -913,7 +914,65 @@ pub fn link_whole_powerbox_manifest(
 /// the `atomic*` family, `bswap64`/`ctz64`/`clz64`, and a **bump `mmap`** (serves from the powerbox
 /// heap-brk word) — plus stubbed `exit`/`getpid`/`kill`/`cWriteErr`/`dl*`. Linked into a nim program
 /// so those leaves resolve to compiled code; only the true syscalls are left for the host.
+///
+/// A request that would bump the `mmap` past [`temen_ir::POWERBOX_HEAP_TOP`] asks
+/// [`HEAP_GROW_HOOK`] for more heap first — the shim's one import, which the runtime a program links
+/// with supplies: [`HEAP_GROW`] under a host, [`SHIM_HEAP_FIXED`] in a module that has none.
 const POWERBOX_COMPUTE_SHIM: &str = include_str!("powerbox_compute_shim.temt.txt");
+
+/// The compute shim's heap hook: `(top, new) -> top' | -1` — make the committed heap reach `new`
+/// from its current `top`, answering the new top, or `-1` when it cannot grow (the shim's `mmap`
+/// then fails closed, `MAP_FAILED`).
+const HEAP_GROW_HOOK: &str = "__temen_heap_grow";
+
+/// The compute shim's own [`HEAP_GROW_HOOK`]: the heap never grows past the window's mapped top.
+/// It serves a **self-contained** link ([`nim_compute_shim_unit`]), a module run with no host to
+/// grow it — so it imports nothing.
+const SHIM_HEAP_FIXED: u32 = 88;
+
+/// [`HEAP_GROW_HOOK`] under a host: commit the window's reserved tail from `top` up to `new`
+/// rounded to the host's page (`vm_page_size`), with the core's `vm_map`, exactly as the C on-ramp's
+/// allocator does (§1a sparse address space). A program's heap is then bounded by its window's
+/// reservation and the host's policy, not by the size its link gave the window — a compiler's heap
+/// depends on its input, which no link can know. `vm_map` and `vm_page_size` are the core's memory
+/// ops: every host binds them to the program's own window, at root and in an `execve`'d image alike.
+const HEAP_GROW: &str = "\
+import 0 \"vm_map\" (i64, i64, i32) -> (i64)
+import 1 \"vm_page_size\" () -> (i64)
+
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = call.import 1 ()
+  v3 = i64.const 1
+  v4 = i64.sub v2 v3
+  v5 = i64.add v1 v4
+  v6 = i64.const 0
+  v7 = i64.sub v6 v2
+  v8 = i64.and v5 v7
+  v9 = i64.sub v8 v0
+  v10 = i32.const 3
+  v11 = call.import 0 (v0, v9, v10)
+  v12 = i64.lt_s v11 v6
+  br_if v12 1() 2(v8)
+  }
+block 1 () {
+  v0 = i64.const -1
+  return v0
+  }
+block 2 (v0: i64) {
+  return v0
+  }
+}";
+
+/// [`HEAP_GROW`] as a link unit exporting [`HEAP_GROW_HOOK`].
+fn heap_grow_unit() -> Result<temen_ir::LinkUnit, LengError> {
+    Ok(temen_ir::LinkUnit {
+        module: temen_text::parse_module(HEAP_GROW)
+            .map_err(|e| LengError::Malformed(format!("heap grow parse: {e:?}")))?,
+        exports: vec![(HEAP_GROW_HOOK.to_string(), 0)],
+        ..Default::default()
+    })
+}
 
 /// The compute-shim func index serving each pure-compute leaf (longest-prefix match — so
 /// `atomicCompareExchangeN` isn't shadowed by a shorter atomic). The func order is
@@ -1283,22 +1342,25 @@ fn importc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Len
 }
 
 /// Stubs for the guest libc's **non-`write` host caps**. The prebuilt libc is one translation unit,
-/// so linking it for `snprintf`/`strtod` also pulls in its file/heap layer (`fopen`, `malloc`, …) —
-/// dead for a nim program, which has its own allocator and I/O, but their capability imports would
-/// still have to be bound at instantiation or the run refuses to start. Resolving them here to
-/// fail-closed stubs keeps the nim program's manifest to the single `write` STREAM cap it actually
-/// uses (pg_libc's `write` has the same `(buf, len) -> n` shape, so it unifies with the syscall
-/// adapter's). A nim program never reaches these; if one ever did, it sees a clean failure (`-1` /
-/// EOF / a null mapping), never a silent wrong answer. Func order is fixed — see
+/// so linking it for `snprintf`/`strtod` also pulls in its file layer (`fopen`, …) — dead for a nim
+/// program, which has its own I/O, but its capability imports would still have to be bound at
+/// instantiation or the run refuses to start. Resolving them here to fail-closed stubs keeps the nim
+/// program's manifest to what it uses itself (pg_libc's `write` has the same `(buf, len) -> n` shape,
+/// so it unifies with the syscall adapter's). A nim program never reaches these; if one ever did, it
+/// sees a clean failure (`-1` / EOF), never a silent wrong answer. Func order is fixed — see
 /// [`LIBC_CAP_STUB_NAMES`].
+///
+/// The core's memory ops (`vm_map`, `vm_page_size`) are **not** stubbed: they are the program's own
+/// imports — its heap grows with them ([`HEAP_GROW`]) — and every host binds them to the program's
+/// window, so the libc's heap layer binds to the same ones. A stub exported under one of those names
+/// captured the heap hook's import at link: its `vm_map` answered success and committed nothing, so a
+/// program linked with the libc grew its heap onto pages that were never there (#763).
 const LIBC_CAP_STUBS: &str = "\
 import 0 \"write\" (i64, i64) -> (i64)
 
 func (i64, i64, i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) { v5 = i64.const -1 return v5 } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
 func (i32) -> () { block 0 (v0: i32) { return } }
-func (i64, i64, i32) -> (i64) { block 0 (v0: i64, v1: i64, v2: i32) { v3 = i64.const 0 return v3 } }
-func () -> (i64) { block 0 () { v0 = i64.const 65536 return v0 } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }";
 
 /// The cap names [`LIBC_CAP_STUBS`] serves, in its func order.
@@ -1315,14 +1377,7 @@ func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, 
 /// tail-calls the powerbox `write` cap, the same import [`SYSCALL_ADAPTER`] carries, so the two
 /// coalesce into the single manifest import the program already had. Stubbing it would have kept the
 /// manifest just as narrow while silently swallowing anything the libc ever writes.
-const LIBC_CAP_STUB_NAMES: &[&str] = &[
-    "vm_fs",
-    "stream_read",
-    "exit",
-    "vm_map",
-    "vm_page_size",
-    "stream_write",
-];
+const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "stream_read", "exit", "stream_write"];
 
 /// Build the **prebuilt guest-libc link units** for a nim program: the libc itself (its functions
 /// exported under the *nim* leaf symbols that import them, so the linker resolves them directly) plus
@@ -1548,10 +1603,10 @@ const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
 /// descriptor — seeks and reads the file into them. An anonymous request (`fd == -1`, every
 /// allocator call) returns the pages untouched, so the hot path is one extra forwarding call.
 ///
-/// **It stays in the guest, like the shim.** A nested child links these same units and needs
-/// nothing granted at any depth; no new capability crosses a sandbox boundary, and the heap
-/// ceiling check (#1060) stays where it is. A §13 `SharedRegion` premap is the zero-copy upgrade
-/// behind this same symbol when a copy stops being cheap enough.
+/// **It stays in the guest, like the shim.** A nested child links these same units and needs no
+/// capability beyond the personality and its own window; the heap ceiling check (#1060) stays in the
+/// shim. A §13 `SharedRegion` premap is the zero-copy upgrade behind this same symbol when a copy
+/// stops being cheap enough.
 ///
 /// **Fails closed on a short read.** A partial fill is indistinguishable downstream from a truncated
 /// file, so anything other than exactly `len` bytes returns `MAP_FAILED` (-1) and nim's
@@ -1644,28 +1699,10 @@ fn import_sig<'a>(m: &'a Module, imp: &temen_ir::Import) -> Option<(&'a [ValType
 ///
 /// Two link passes: the first (compute shim only) surfaces the retained syscall imports — their nim
 /// names (`sysWrite.0.` …) aren't known until link — then the adapter is bound onto them and the whole
-/// thing re-linked. Re-verify the result like any linked output (the caller runs `run_powerbox`, which
-/// verifies).
+/// thing re-linked. The units link in [`link_order`]. Re-verify the result like any linked output
+/// (the caller runs `run_powerbox`, which verifies).
 pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<Module, LengError> {
-    // #1051/#1054: link the `system` unit **first**, as belt-and-suspenders. The real fix for #1051
-    // is the heap seed in [`synth_start_unit`] — without it the guest heap arena started at 0 and
-    // overlapped placed static data, so a heap allocation could reuse a program's `LongString` const
-    // and `add`/realloc would scribble its length (`write` then dumps stray bytes). That corruption
-    // surfaced only for some link orders (whichever placed a referenced const where an allocation
-    // landed), which looked like `temen_ir::link` was order-sensitive — it is not; its address
-    // arithmetic is order-independent (#1054). With the heap seed the output is correct for **every**
-    // order; this reorder is kept as defense in depth (and to pin a deterministic layout). The
-    // `_start` entry is func 0 via the synthesized start unit, not unit position, so reordering is
-    // safe. Stable-partition so `sysv…` units come first and the rest keep their given order.
-    let mut reordered: Vec<WholeModule> = units
-        .iter()
-        .map(|u| WholeModule {
-            stem: u.stem,
-            src: u.src,
-        })
-        .collect();
-    reordered.sort_by_key(|u| !u.stem.starts_with("sysv"));
-    let units: &[WholeModule] = &reordered;
+    let units = &link_order(units);
     let mut runtime = nim_powerbox_runtime(units)?;
     // The **prebuilt guest libc** ([`LIBC_SERVED`]), when the caller supplies it: `snprintf`/`strtod`/
     // libm, which no hand-written shim could reasonably carry. Without it those leaves stay unbound
@@ -1675,6 +1712,31 @@ pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<M
     }
     // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
     link_whole_powerbox_manifest(units, runtime)
+}
+
+/// The order a nim program's modules link in: the `system` module first, then the rest by stem. A
+/// program is a set of modules, so whichever order a caller lists them in — a build plan's, a
+/// directory walk's, the host's differentialling a guest's link — the same set links to the same
+/// module, byte for byte.
+///
+/// `system` first is #1051's belt-and-suspenders. The real fix for #1051 is the heap seed in
+/// [`synth_start_unit`] — without it the guest heap arena started at 0 and overlapped placed static
+/// data, so a heap allocation could reuse a program's `LongString` const and `add`/realloc would
+/// scribble its length (`write` then dumps stray bytes). That corruption surfaced only for some link
+/// orders (whichever placed a referenced const where an allocation landed), which looked like
+/// `temen_ir::link` was order-sensitive — it is not; its address arithmetic is order-independent
+/// (#1054). The `_start` entry is func 0 via the synthesized start unit, not unit position, so any
+/// order is safe.
+fn link_order<'a>(units: &[WholeModule<'a>]) -> Vec<WholeModule<'a>> {
+    let mut ordered: Vec<WholeModule<'a>> = units
+        .iter()
+        .map(|u| WholeModule {
+            stem: u.stem,
+            src: u.src,
+        })
+        .collect();
+    ordered.sort_by_key(|u| (!u.stem.starts_with("sysv"), u.stem));
+    ordered
 }
 
 /// Build the **nim→powerbox runtime link units** ([compute shim, syscall adapter]) that
@@ -1712,7 +1774,11 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
         ..Default::default()
     };
 
-    Ok(vec![compute_shim_unit(compute_exports)?, adapter])
+    Ok(vec![
+        compute_shim_unit(compute_exports)?,
+        adapter,
+        heap_grow_unit()?,
+    ])
 }
 
 /// The **compute-shim link unit alone** — the half of [`nim_powerbox_runtime`] that carries no
@@ -1723,7 +1789,9 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
 /// `sysOpen`/… go to `temen_posix`'s memfs ops instead of [`SYSCALL_ADAPTER`]'s stdout-only stubs.
 /// Same discovery, same table: one route through the compute bottom edge, two bindings above it.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
-    compute_shim_unit(nim_compute_exports(units)?.0)
+    let mut exports = nim_compute_exports(units)?.0;
+    exports.push((HEAP_GROW_HOOK.to_string(), SHIM_HEAP_FIXED));
+    compute_shim_unit(exports)
 }
 
 /// Bottom-edge leaves the **personality** serves for real, so [`nim_posix_runtime`] withholds them from
@@ -1767,10 +1835,13 @@ const POSIX_SERVED_LEAVES: &[&str] = &[
 /// out.nif`) works — through [`POSIX_OPEN_ADAPTER`] (the path ops' NUL walk),
 /// [`POSIX_MMAP_ADAPTER`], and the generated POSIX edge ([`posix_edge_unit`]).
 ///
-/// **The linked program imports only the personality's own names** (#1668), exactly as `personality`
+/// **The linked program imports the personality's own names** (#1668), exactly as `personality`
 /// publishes them — `__px_write`, `__px_open`, … — so it binds the way a chibicc command does: by the
 /// same table at root, and through the personality's vtable in an `execve`'d image. Before, the
 /// manifest carried nimony's mangled leaf names, which only temen-run's root linker could match.
+/// Besides those it imports only the core's memory ops its heap grows with ([`HEAP_GROW`]:
+/// `vm_map`, `vm_page_size`), which every host binds to the program's own window, as it does an
+/// on-ramp command's.
 pub fn nim_posix_runtime(
     units: &[WholeModule],
     personality: PersonalityVtable,
@@ -1905,6 +1976,7 @@ pub fn nim_posix_runtime(
     };
     let mut out = vec![compute_shim_unit(compute_exports)?, open_adapter];
     out.extend(mmap_adapter);
+    out.push(heap_grow_unit()?);
     // #1668 — **the POSIX edge**: every leaf nothing above serves, forwarded to the personality op of
     // the same C name. The leaves the pass-1 link retained, and the ones withheld from the shim — less
     // any a unit above now exports (pass 1 *widens* the shim with leaves it finds among its own
@@ -1937,17 +2009,18 @@ pub fn nim_posix_runtime(
     Ok(out)
 }
 
-/// Link a nim program's `.x.nif` units into one **POSIX-personality** module: the
-/// [`link_nim_powerbox`] of a program that opens files, forks and execs. It is
-/// [`nim_posix_runtime`], plus the prebuilt guest libc's units when `libc` is given (`snprintf`,
-/// `strtod`, libm, which no hand-written shim carries: without them those stay unbound manifest
-/// imports), linked by [`link_whole_powerbox_manifest`]. Every caller links through this, so a
-/// phase built on the host and a program built in-guest by the self-hosted lane are one link.
+/// Link a nim program's units into one **POSIX-personality** module: the [`link_nim_powerbox`] of a
+/// program that opens files, forks and execs. It is [`nim_posix_runtime`], plus the prebuilt guest
+/// libc's units when `libc` is given (`snprintf`, `strtod`, libm, which no hand-written shim
+/// carries: without them those stay unbound manifest imports), linked by
+/// [`link_whole_powerbox_manifest`] in [`link_order`]. Every caller links through this, so a phase
+/// built on the host and a program built in-guest by the self-hosted lane are one link.
 pub fn link_nim_posix(
     units: &[WholeModule],
     personality: PersonalityVtable,
     libc: Option<&[u8]>,
 ) -> Result<Module, LengError> {
+    let units = &link_order(units);
     let mut runtime = nim_posix_runtime(units, personality)?;
     if let Some(libc) = libc {
         runtime.extend(nim_libc_units(libc, units)?);
@@ -2265,13 +2338,16 @@ fn pipe_body(adopt: usize, results: &[ValType]) -> String {
 }
 
 /// Every import the POSIX runtime emits must be a personality op, spelled and shaped exactly as the
-/// personality publishes it — or served by another runtime unit (the mmap adapter's call into the
-/// shim's allocator). A drift here is a bind-time refusal in every consumer, root and `execve` alike,
-/// so it is caught while linking instead.
+/// personality publishes it — or one of the core's memory ops [`HEAP_GROW`] declares, or served by
+/// another runtime unit (the mmap adapter's call into the shim's allocator). A drift here is a
+/// bind-time refusal in every consumer, root and `execve` alike, so it is caught while linking
+/// instead.
 fn check_personality_imports(
     units: &[temen_ir::LinkUnit],
     (px_names, px_sigs): PersonalityVtable,
 ) -> Result<(), LengError> {
+    let core = temen_text::parse_module(HEAP_GROW)
+        .map_err(|e| LengError::Malformed(format!("heap grow parse: {e:?}")))?;
     for u in units {
         for imp in &u.module.imports {
             if units
@@ -2281,12 +2357,17 @@ fn check_personality_imports(
                 continue;
             }
             let shape = import_sig(&u.module, imp);
-            let ok = px_names.iter().zip(px_sigs).any(|(n, t)| {
+            let published = px_names.iter().zip(px_sigs).any(|(n, t)| {
                 *n == imp.name && shape == Some((t.params.as_slice(), t.results.as_slice()))
             });
-            if !ok {
+            let core_op = core
+                .imports
+                .iter()
+                .any(|c| c.name == imp.name && import_sig(&core, c) == shape);
+            if !(published || core_op) {
                 return Err(LengError::Malformed(format!(
-                    "POSIX runtime import `{}` {:?} is not a personality op as published",
+                    "POSIX runtime import `{}` {:?} is neither a personality op as published nor \
+                     one of the core's memory ops",
                     imp.name, shape
                 )));
             }
@@ -2567,5 +2648,20 @@ mod tests {
     #[test]
     fn the_edge_reads_tags_at_the_personalitys_base() {
         assert_eq!(PIPE_TAG_BASE, temen_posix::PX_TAG_BASE);
+    }
+
+    /// The shim's one import is the heap hook, and both of its implementations have the hook's
+    /// shape: the shim's own fixed heap, where [`SHIM_HEAP_FIXED`] says it is, and [`HEAP_GROW`].
+    #[test]
+    fn both_heap_hooks_have_the_hooks_shape() {
+        let hook = (vec![ValType::I64, ValType::I64], vec![ValType::I64]);
+        let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM).expect("shim parses");
+        let names: Vec<&str> = shim.imports.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, [HEAP_GROW_HOOK]);
+        let fixed = &shim.funcs[SHIM_HEAP_FIXED as usize];
+        assert_eq!((fixed.params.clone(), fixed.results.clone()), hook);
+        let grow = heap_grow_unit().expect("heap grow parses");
+        let f = &grow.module.funcs[0];
+        assert_eq!((f.params.clone(), f.results.clone()), hook);
     }
 }

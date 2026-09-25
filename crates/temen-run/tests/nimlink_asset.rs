@@ -76,7 +76,7 @@ fn in_guest_link_matches_native_link_nim_powerbox() {
         eprintln!("SKIP: gzip unavailable");
         return;
     };
-    let src = String::from_utf8(xnif).expect("x.nif is UTF-8");
+    let src = temen_leng::nif_text(&xnif).into_owned();
     let stem = "sysvq0asl";
 
     // Host-side oracle: the in-tree linker on the same unit.

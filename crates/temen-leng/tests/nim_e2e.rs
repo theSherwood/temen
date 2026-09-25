@@ -109,13 +109,10 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
         } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
             if let Some(stem) = name.strip_suffix(".x.nif") {
                 if out.iter().all(|(s, _)| s != stem) {
-                    // Lossy: a `.x.nif` may carry non-UTF-8 bytes in a string literal (the sweep hit
-                    // this on `strutils`). Identity for the valid-UTF-8 milestone fixtures.
+                    // NIF is bytes, not UTF-8 text: a `char` literal at or above 0x80 is a lone
+                    // byte (the sweep hit one on `strutils`).
                     let bytes = std::fs::read(&p).unwrap();
-                    out.push((
-                        stem.to_string(),
-                        String::from_utf8_lossy(&bytes).into_owned(),
-                    ));
+                    out.push((stem.to_string(), temen_leng::nif_text(&bytes).into_owned()));
                 }
             }
         }
@@ -683,10 +680,139 @@ fn nim_powerbox_link_is_unit_order_independent() {
     }
 }
 
+/// A nim program is a set of modules, so the nim links order them themselves
+/// ([`temen_leng::link_nim_posix`] and [`temen_leng::link_nim_powerbox`] alike): the same set links to
+/// the same module whichever order a caller lists it in. That is what lets the host's link of a
+/// program be held, byte for byte, to the one `temen-link` wrote in-guest from a build plan.
+#[test]
+fn a_nim_program_links_to_the_same_module_in_any_order() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(&path, "import std/syncio\nwrite(stdout, \"in order\\n\")\n");
+    assert!(mods.len() > 2, "a program of several modules");
+    let units = |reverse: bool| -> Vec<temen_leng::WholeModule> {
+        let mut u: Vec<temen_leng::WholeModule> = mods
+            .iter()
+            .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+            .collect();
+        if reverse {
+            u.reverse();
+        }
+        u
+    };
+    let posix = |reverse| temen_leng::link_nim_posix(&units(reverse), px_vtable(), None);
+    assert!(
+        posix(false).expect("link") == posix(true).expect("link"),
+        "link_nim_posix: the order the modules were listed in changed the module"
+    );
+    let powerbox = |reverse| temen_leng::link_nim_powerbox(&units(reverse), None);
+    assert!(
+        powerbox(false).expect("link") == powerbox(true).expect("link"),
+        "link_nim_powerbox: the order the modules were listed in changed the module"
+    );
+}
+
+/// A nim program's heap **grows past its window**: a request past the committed top commits the
+/// reserved tail through the core's `vm_map`, as the C on-ramp's allocator does, so a program's heap
+/// is not bounded by the size its link gave the window — a compiler's depends on its input (#763:
+/// nimsem ran out semchecking its own largest module). The program allocates more than its whole
+/// window, on every engine, through both runtimes.
+///
+/// Linked with the guest libc, as a real program is: the libc's own heap layer imports the same
+/// memory ops, and a stub standing in for them captured the heap's `vm_map`, answering success over
+/// pages that were never committed — nimsem then faulted past its window instead of growing.
+#[test]
+fn a_nim_programs_heap_grows_past_its_window() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let Some(libc) = guest_libc() else {
+        eprintln!("SKIP: browser/web/assets/pg_libc.temeno absent");
+        return;
+    };
+    const N: u64 = 3_000_000;
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\
+         var s = newSeq[int](3_000_000)\n\
+         s[2_999_999] = 7\n\
+         write(stdout, \"grew:\" & $(s.len + s[2_999_999]) & \"\\n\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let want = format!("grew:{}\n", N + 7);
+
+    let posix = temen_leng::link_nim_posix(&units, px_vtable(), Some(&libc)).expect("link");
+    let window = 1u64 << posix.memory.expect("a window").size_log2;
+    assert!(
+        window < N * 8,
+        "the seq ({} MiB) must not fit the window ({} MiB), or nothing grows",
+        (N * 8) >> 20,
+        window >> 20
+    );
+    let cfg = temen_run::RunConfig::default();
+    for backend in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let out = run_io_capture(&posix, backend, &cfg, &[]).stdout();
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            want,
+            "POSIX runtime on {backend:?}"
+        );
+    }
+
+    let powerbox = temen_leng::link_nim_powerbox(&units, Some(&libc)).expect("link");
+    let run = temen_run::run_powerbox(&powerbox, &[]).expect("run the powerbox program");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        want,
+        "powerbox runtime"
+    );
+}
+
+/// A NIF file is bytes, not UTF-8 text: nimony writes a `char` literal at or above `0x80` as a lone
+/// raw byte, and such bytes in a string raw too. Read through [`temen_leng::nif_text`] each keeps
+/// its value — decoded lossily, `'\xff'` read as U+FFFD (65533), matched no `char`, and the string's
+/// bytes became replacement characters, which nimony's own `expreval` and nifler2's BOM check hit.
+#[test]
+fn a_nim_programs_high_byte_literals_keep_their_bytes() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let m = link_posix_program(
+        &path,
+        "import std/syncio\n\
+         let s = \"\\xff\\xefz\"\n\
+         var n = 0\n\
+         for ch in s:\n\
+         \x20 if ch == '\\xff': n += 1\n\
+         \x20 if ch == '\\xef': n += 10\n\
+         write(stdout, \"high:\" & $n & \"|\" & $s.len & \"\\n\")\n",
+    );
+    let cfg = temen_run::RunConfig::default();
+    for backend in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let out = run_io_capture(&m, backend, &cfg, &[]).stdout();
+        assert_eq!(String::from_utf8_lossy(&out), "high:11|3\n", "{backend:?}");
+    }
+}
+
 /// #1060: the guest heap words are baked into the linked powerbox module's data image with the
 /// **break** just above the data stack and the **ceiling** at the real window top (`1 << size_log2`),
-/// so the heap spans the whole remaining window and the compute-shim `mmap` can fail closed past it —
-/// independent of any runtime unit's `memory N` declaration.
+/// so the heap spans the whole mapped window before it grows into the reserved tail — independent
+/// of any runtime unit's `memory N` declaration.
 #[test]
 fn nim_powerbox_seeds_heap_words_to_window_top() {
     let Some(path) = toolchain_path() else {
@@ -806,35 +932,25 @@ fn px_vtable() -> temen_leng::PersonalityVtable<'static> {
     (&v.0, &v.1)
 }
 /// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
-/// embedding (`Instance`), with every retained nim-name syscall import bound to a single shared
-/// **POSIX personality**. Returns the personality itself, so the caller reads back whatever it cares
-/// about — the bytes the guest `write`-to-fd-1'd (`Posix::stdout`), or a file it wrote to the memfs.
-/// `seed` stages the memfs before `_start` (the files the guest will `open`), and `config` carries
-/// the argv/env the guest is run with. The program uses no posix `malloc`/`mmap` (its own runtime
-/// shim serves those), so the personality's heap arena is unused and passed empty.
+/// embedding (`Instance`), its imports bound as every no-C driver binds them
+/// ([`temen_run::nim_posix_imports`]): the personality's own ops to a single shared **POSIX
+/// personality**, and the core's memory ops to the program's window. Returns the personality
+/// itself, so the caller reads back whatever it cares about — the bytes the guest `write`-to-fd-1'd
+/// (`Posix::stdout`), or a file it wrote to the memfs. `seed` stages the memfs before `_start` (the
+/// files the guest will `open`), and `config` carries the argv/env the guest is run with. The
+/// program's heap is its own runtime shim's (which grows the window with `vm_map`), so the
+/// personality's heap arena is unused and passed empty.
 fn run_io_capture(
     m: &Module,
     backend: temen_run::Backend,
     config: &temen_run::RunConfig,
     seed: &[(&str, &[u8])],
 ) -> temen_posix::Posix {
-    // One personality shared across every bound name (one fd table, one stdout buffer): the factory
-    // closes over a single `inner`, so each per-name grant re-mints a handler over the same state.
-    // `temen_posix::cap` hands back an opaque `impl Fn` (no `Clone`), so wrap it in an `Arc` and share
-    // that across the per-name grant closures.
+    // One personality shared across every bound name (one fd table, one stdout buffer), bound the way
+    // every no-C driver binds a program: the personality's own names, and the core's memory ops.
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make = std::sync::Arc::new(make);
-    let mut imports = temen_run::Imports::new();
-    for imp in &m.imports {
-        // The linked program's imports are the personality's own names (#1668): `resolve_import`
-        // is the whole binding — the one a chibicc command's imports go through too.
-        let Some(c) = temen_posix::resolve_import(&imp.name) else {
-            panic!("import `{}` is not a personality op (`__px_*`)", imp.name);
-        };
-        let make = std::sync::Arc::clone(&make);
-        let cap = temen_run::HostCap::host_proc(c.op, move || (*make)());
-        imports = imports.provide(imp.name.clone(), cap);
-    }
+    let (imports, unbound, _) = temen_run::nim_posix_imports(m, &posix, std::sync::Arc::new(make));
+    assert!(unbound.is_empty(), "unbound imports: {unbound:?}");
     for (path, bytes) in seed {
         posix.write_file(path, bytes);
     }
@@ -926,6 +1042,10 @@ fn real_formatted_output_runs_end_to_end() {
 // output against the oracle captured from the native nimony toolchain.
 // -------------------------------------------------------------------------------------------------
 
+/// A powerbox nim program's whole capability manifest, sorted: the `write` STREAM cap, and the core's
+/// memory ops its heap grows the window with (`vm_map`, `vm_page_size`).
+const POWERBOX_MANIFEST: [&str; 3] = ["vm_map", "vm_page_size", "write"];
+
 /// The committed guest libc, or `None` when the asset is absent (the caller then skips).
 fn guest_libc() -> Option<Vec<u8>> {
     std::fs::read("../../browser/web/assets/pg_libc.temeno").ok()
@@ -945,14 +1065,12 @@ fn run_libc_program(src: &str) -> Option<Vec<u8>> {
         .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
     dump_module("libc_program", &m);
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
-    // The guest libc's file/heap caps resolve to stubs at link, so the program's manifest is the one
-    // `write` STREAM cap — exactly as it is without the libc.
+    // The guest libc's file caps resolve to stubs at link, so the program's manifest is what it is
+    // without the libc: the one `write` STREAM cap, and the core's memory ops its heap grows with.
+    let mut manifest: Vec<&str> = m.imports.iter().map(|i| i.name.as_str()).collect();
+    manifest.sort_unstable();
     assert_eq!(
-        m.imports
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["write"],
+        manifest, POWERBOX_MANIFEST,
         "linking the guest libc must not widen the program's capability manifest"
     );
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
@@ -1327,7 +1445,7 @@ fn real_envvars_report_an_empty_environment() {
 }
 
 /// **The epoll trio is bound, and it reports failure.** `run_libc_program` asserts the program's
-/// manifest is exactly the one `write` cap, so this first of all pins that `epoll_create1`/`_ctl`/
+/// manifest is exactly [`POWERBOX_MANIFEST`], so this first of all pins that `epoll_create1`/`_ctl`/
 /// `_wait` are no longer unbound leaves — the thing that kept `std/threadpool` and `std/parfor` from
 /// linking at all.
 ///
@@ -1363,8 +1481,9 @@ fn real_epoll_leaves_report_failure() {
 
 /// **`std/threadpool` and `std/parfor` link and run.** Both were unlinkable for one reason only —
 /// the three epoll leaves above had no provider — so nothing in either module was reachable, pure or
-/// not. Importing them is the whole test: `run_libc_program` pins the manifest to the single `write`
-/// cap, and reaching the `write` proves module-level initialization did not trap on the way.
+/// not. Importing them is the whole test: `run_libc_program` pins the manifest to
+/// [`POWERBOX_MANIFEST`], and reaching the `write` proves module-level initialization did not trap on
+/// the way.
 ///
 /// This does **not** claim a working thread pool. `initPool()` is an explicit call, not a module
 /// initializer, and a program that makes it gets nim's own `assert gIoFd >= 0` — see the epoll rows
@@ -1458,7 +1577,7 @@ fn real_htons_byte_swaps() {
 /// one answers "does it *run*?" — the question stage 3 is about. For every stdlib module in
 /// [`discovered_std_modules`] it compiles a driver that imports the module, links it through the real
 /// `link_nim_powerbox` **with the guest libc**, checks the result verifies and asks for nothing
-/// beyond the one `write` stream cap, and then **runs it and requires the driver's "ok"**. A module
+/// beyond [`POWERBOX_MANIFEST`], and then **runs it and requires the driver's "ok"**. A module
 /// that links with an extra manifest entry has an unbound bottom-edge leaf and would fail to
 /// instantiate in the playground; a module that links and then dies in its own start-up is no more
 /// runnable, and only running it says so.
@@ -1554,7 +1673,7 @@ fn runnability_sweep() {
                     let extra: Vec<String> = module
                         .imports
                         .iter()
-                        .filter(|i| i.name != "write")
+                        .filter(|i| !POWERBOX_MANIFEST.contains(&i.name.as_str()))
                         .map(|i| match i.shape {
                             temen_ir::ImportShape::Func(t) => match module.types.get(t as usize) {
                                 Some(temen_ir::TypeEntry::Func(f)) => {
@@ -1930,7 +2049,7 @@ fn temen_output(
         .imports
         .iter()
         .map(|i| i.name.as_str())
-        .filter(|n| *n != "write")
+        .filter(|n| !POWERBOX_MANIFEST.contains(n))
         .collect();
     if !extra.is_empty() {
         // An unbound bottom-edge leaf. The program would trap at run with nothing to say, so name it
@@ -2253,7 +2372,15 @@ fn posix_sh() -> temen_ir::Module {
     m
 }
 
-/// A nim program linked through the POSIX runtime, checked to import only the personality's ops.
+/// The imports of `m` no no-C driver binds — asked of the binder itself
+/// ([`temen_run::nim_posix_imports`]) rather than of a second list of what it binds.
+fn posix_unbound(m: &temen_ir::Module) -> Vec<String> {
+    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+    temen_run::nim_posix_imports(m, &posix, std::sync::Arc::new(make)).1
+}
+
+/// A nim program linked through the POSIX runtime, checked to import only what a no-C driver binds:
+/// the personality's own ops, and the core's memory ops (its heap's growth).
 fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
     let mods = compile_to_leng(path, src);
     let units: Vec<temen_leng::WholeModule> = mods
@@ -2262,13 +2389,8 @@ fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
         .collect();
     let m = temen_leng::link_nim_posix(&units, px_vtable(), None).expect("link");
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
-    assert!(
-        m.imports
-            .iter()
-            .all(|i| temen_posix::resolve_import(&i.name).is_some()),
-        "a linked program imports only the personality's own ops: {:?}",
-        m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
-    );
+    let unbound = posix_unbound(&m);
+    assert!(unbound.is_empty(), "a linked program imports {unbound:?}");
     m
 }
 
@@ -2433,23 +2555,7 @@ fn nim_forks_and_execs_a_nim_program() {
         eprintln!("SKIP nim_forks_and_execs_a_nim_program (no toolchain)");
         return;
     };
-    let link = |src: &str| -> temen_ir::Module {
-        let mods = compile_to_leng(&path, src);
-        let units: Vec<temen_leng::WholeModule> = mods
-            .iter()
-            .map(|(stem, src)| temen_leng::WholeModule { stem, src })
-            .collect();
-        let m = temen_leng::link_nim_posix(&units, px_vtable(), None).expect("link");
-        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
-        assert!(
-            m.imports
-                .iter()
-                .all(|i| temen_posix::resolve_import(&i.name).is_some()),
-            "a linked program imports only the personality's own ops: {:?}",
-            m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
-        );
-        m
-    };
+    let link = |src: &str| link_posix_program(&path, src);
     let child = link(
         "import std/syncio\nimport std/cmdline\n\
          write(stdout, \"child:\" & paramStr(1) & \"|\")\n\
@@ -2736,15 +2842,9 @@ fn nifler2_links_through_leng() {
                 m.imports.len(),
                 v.map(|_| "ok")
             );
-            // The personality's own ops are *meant* to survive here — they bind by name at
-            // instantiation. Anything else is a leaf nothing serves.
-            let unbound: Vec<&str> = m
-                .imports
-                .iter()
-                .map(|i| i.name.as_str())
-                // Ask the binder, rather than keeping a second list of what it binds.
-                .filter(|n| temen_posix::resolve_import(n).is_none())
-                .collect();
+            // The personality's own ops and the core's memory ops are *meant* to survive here — they
+            // bind by name at instantiation. Anything else is a leaf nothing serves.
+            let unbound = posix_unbound(&m);
             eprintln!(
                 "  nifler2: imports: {:?}",
                 m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()

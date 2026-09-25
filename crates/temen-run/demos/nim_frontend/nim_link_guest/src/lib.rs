@@ -66,8 +66,9 @@ fn rd_u32(b: &[u8], p: &mut usize) -> Option<usize> {
     Some(v)
 }
 
-/// `main`: parse the packed units, link, emit the encoded module. Exit 1 = malformed input, 2 = a unit
-/// was not UTF-8, 3 = the linker refused the units, 0 = the linked module was written to stdout.
+/// `main`: parse the packed units, link, emit the encoded module. Exit 1 = malformed input, 2 = a
+/// unit's stem was not UTF-8, 3 = the linker refused the units, 0 = the linked module was written to
+/// stdout. A unit's NIF is bytes, read as [`temen_leng::nif_text`] reads them.
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
     let input = read_stdin();
@@ -88,10 +89,7 @@ pub extern "C" fn main() -> i32 {
         if p + cl > input.len() {
             return 1;
         }
-        let src = match core::str::from_utf8(&input[p..p + cl]) {
-            Ok(s) => s.to_string(),
-            Err(_) => return 2,
-        };
+        let src = temen_leng::nif_text(&input[p..p + cl]).into_owned();
         p += cl;
         owned.push((stem, src));
     }
