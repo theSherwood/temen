@@ -9332,35 +9332,32 @@ fn exec_image_build(
     cur_host: &mut Host,
     cur_mem: Option<&Mem>,
     dom: &Domain,
-    mh: i32,
+    cmd: super::ExecCmd,
     grants_ptr: u64,
     grants_n: u64,
     entry: u64,
     size_log2: i64,
     personality: bool,
-) -> Result<(Host, SharedSlots, VTask), ()> {
-    // Compile the command first: `Host::exec_image` is the commit point (it hands the caller's
-    // personality to the new powerbox), so everything that can still refuse must come before it.
-    let (cfuncs, cmodule) = match cur_host.resolve_module(mh) {
-        Ok(g) => (g.funcs.clone(), std::sync::Arc::clone(&g.module)),
-        Err(_) => return Err(()),
-    };
+) -> Result<(Host, SharedSlots, VTask), i64> {
+    // Resolve and compile the command first: `Host::exec_image` is the commit point (it hands the
+    // caller's personality to the new powerbox), so everything that can still refuse must come
+    // before it.
+    let command = cur_host.exec_module(cmd)?;
+    let cmodule = std::sync::Arc::clone(&command.0.module);
     let child_compiled = compile_module(
-        &cfuncs,
+        &command.0.funcs,
         &cmodule.types,
         cmodule.memory.and_then(|x| x.shadow),
     )
-    .ok_or(())?;
+    .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
     // layout) from the caller window, then admit + build through the one rule every engine shares:
     // the command's entry, its fit in the caller's backed prefix, the grants' regrantability, the
     // fresh powerbox and the personality carry.
-    let m = cur_mem.ok_or(())?;
+    let m = cur_mem.ok_or(super::EINVAL)?;
     let grants = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))
-        .map_err(|_| ())?;
-    let img = cur_host
-        .exec_image(mh, &grants, entry, size_log2, m.window.mapped())
-        .ok_or(())?;
+        .map_err(|_| super::EINVAL)?;
+    let img = cur_host.exec_image(&command, &grants, entry, size_log2, m.window.mapped())?;
     let child_args: Vec<Value> = img.entry_args.iter().map(|&h| Value::I64(h)).collect();
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
@@ -9392,8 +9389,8 @@ fn exec_image_build(
     let progs_len = child_compiled.progs.len();
     let cm = dom.source.push(child_compiled);
     let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-    let cunit = dom.source.get(cm).ok_or(())?;
-    let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| ())?;
+    let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
+    let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     new_vt.active.module = cm;
     new_vt.active.home = cm;
     Ok((child_host, child_table, new_vt))
@@ -9559,7 +9556,7 @@ enum Outcome {
     /// real window is the caller's). On refusal the driver writes `-EINVAL` to `dst`; on success the
     /// task's activation is swapped and it never returns to the caller.
     Exec {
-        mh: i32,
+        cmd: super::ExecCmd,
         grants_ptr: u64,
         grants_n: u64,
         entry: u64,
@@ -10894,7 +10891,7 @@ enum VcpuStop {
     /// owns the task/env set + `dom.source`. Cooperative-driver-only (like [`VcpuStop::CloneCaller`]);
     /// other drivers `ThreadFault`.
     Exec {
-        mh: i32,
+        cmd: super::ExecCmd,
         grants_ptr: u64,
         grants_n: u64,
         entry: u64,
@@ -11479,7 +11476,7 @@ fn step_vcpu(
                 })
             }
             Outcome::Exec {
-                mh,
+                cmd,
                 grants_ptr,
                 grants_n,
                 entry,
@@ -11488,7 +11485,7 @@ fn step_vcpu(
                 personality,
             } => {
                 return Ok(VcpuStop::Exec {
-                    mh,
+                    cmd,
                     grants_ptr,
                     grants_n,
                     entry,
@@ -13135,7 +13132,7 @@ impl CoopSched {
                     }
                 }
                 Ok(VcpuStop::Exec {
-                    mh,
+                    cmd,
                     grants_ptr,
                     grants_n,
                     entry,
@@ -13144,14 +13141,11 @@ impl CoopSched {
                     personality,
                 }) => {
                     // FORK.md §8.6 — `execve` image-replace (#1080). Every refusal writes a probeable
-                    // `-EINVAL` to `dst` and lets the caller run on (POSIX: `execve` returns only on
+                    // errno to `dst` and lets the caller run on (POSIX: `execve` returns only on
                     // failure); a success swaps this task's activation to the command and never returns.
                     macro_rules! refuse {
-                        () => {{
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        ($e:expr) => {{
+                            tasks[ti].vt.active.set(dst, Reg::from_i32($e as i32));
                             continue;
                         }};
                     }
@@ -13164,7 +13158,7 @@ impl CoopSched {
                         && tasks[ti].vt.active_id == ROOT_FIBER
                         && !host.is_durable();
                     if !clean {
-                        refuse!();
+                        refuse!(super::EINVAL);
                     }
                     // The build (resolve + compile + admit + powerbox + personality carry + image
                     // materialize) runs against the exec'ing task's own window + powerbox, then the
@@ -13178,7 +13172,7 @@ impl CoopSched {
                                 host,
                                 mem.as_ref(),
                                 dom,
-                                mh,
+                                cmd,
                                 grants_ptr,
                                 grants_n,
                                 entry,
@@ -13186,7 +13180,7 @@ impl CoopSched {
                                 personality,
                             );
                             match built {
-                                Err(()) => refuse!(),
+                                Err(e) => refuse!(e),
                                 Ok((child_host, child_table, new_vt)) => {
                                     tasks[ti].vt = new_vt;
                                     let eidx = extra_envs.len();
@@ -13214,7 +13208,7 @@ impl CoopSched {
                                     &mut g,
                                     extra_envs[k].mem.as_ref(),
                                     dom,
-                                    mh,
+                                    cmd,
                                     grants_ptr,
                                     grants_n,
                                     entry,
@@ -13223,7 +13217,7 @@ impl CoopSched {
                                 )
                             };
                             match built {
-                                Err(()) => refuse!(),
+                                Err(e) => refuse!(e),
                                 Ok((child_host, child_table, new_vt)) => {
                                     tasks[ti].vt = new_vt;
                                     extra_envs[k].host =
@@ -15802,7 +15796,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 });
             }
             Ok(VcpuStop::Exec {
-                mh,
+                cmd,
                 grants_ptr,
                 grants_n,
                 entry,
@@ -15811,7 +15805,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 personality,
             }) => {
                 // #748 rung 2 — FORK.md §8.6 `execve` image-replace on the parallel driver. Every
-                // refusal writes a probeable `-EINVAL` to `dst` and lets the caller run on (POSIX:
+                // refusal writes a probeable errno to `dst` and lets the caller run on (POSIX:
                 // `execve` returns only on failure). Admissible from a clean root computation only
                 // (no serve handler, root fiber, a non-durable domain) — the cooperative arm's
                 // gate. Root and fork-twin execs take the SAME path here: each vCPU already owns
@@ -15825,7 +15819,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         &mut g,
                         mem.as_ref(),
                         dom,
-                        mh,
+                        cmd,
                         grants_ptr,
                         grants_n,
                         entry,
@@ -15833,10 +15827,10 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         personality,
                     )
                 } else {
-                    Err(())
+                    Err(super::EINVAL)
                 };
                 match built {
-                    Err(()) => vt.active.set(dst, Reg::from_i32(super::EINVAL as i32)),
+                    Err(e) => vt.active.set(dst, Reg::from_i32(e as i32)),
                     Ok((child_host, child_table, new_vt)) => {
                         // Replace the powerbox INSIDE this vCPU's cell, not the `Arc` itself: a
                         // fork twin's exit-hook holder kept a clone of the cell at spawn, so the
@@ -17728,7 +17722,7 @@ impl Vm {
                             super::ParkEvent::ExecSelf { cmd } => {
                                 self.pc = pc + 1;
                                 return Ok(Outcome::Exec {
-                                    mh: cmd,
+                                    cmd,
                                     grants_ptr: 0,
                                     grants_n: 0,
                                     entry: 0,
@@ -18064,7 +18058,7 @@ impl Vm {
                     self.base = base;
                     self.pc = pc + 1;
                     return Ok(Outcome::Exec {
-                        mh,
+                        cmd: super::ExecCmd::Granted(mh),
                         grants_ptr,
                         grants_n,
                         entry,

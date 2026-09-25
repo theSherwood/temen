@@ -161,8 +161,15 @@ fn relower(
             .read_file(&x)
             .unwrap_or_else(|| panic!("the in-guest build wrote no {x}"));
         argv.push(format!("nimcache/{stem}.s.nif"));
-        temen_run::nim_noc_run(hexer.clone(), posix, Arc::clone(make), &argv, &[], engine)
-            .unwrap_or_else(|e| panic!("hexer on {stem}: {e}"));
+        temen_run::nim_noc_run(
+            hexer.clone(),
+            posix,
+            Arc::clone(make),
+            &argv,
+            &temen_run::ExecGrants::default(),
+            engine,
+        )
+        .unwrap_or_else(|e| panic!("hexer on {stem}: {e}"));
         assert!(
             posix.read_file(&x).as_ref() == Some(&built),
             "hexer on {engine:?} wrote a different {x} than the in-guest build"
@@ -223,7 +230,7 @@ fn run_program(module: &temen_ir::Module, engine: temen_run::Backend) -> Vec<u8>
         &run,
         Arc::new(make),
         &["prog".to_string()],
-        &[],
+        &temen_run::ExecGrants::default(),
         engine,
     )
     .unwrap_or_else(|e| panic!("the program failed on {engine:?}: {e}"));
@@ -414,12 +421,17 @@ fn main() {
         .map(|s| s.to_string())
         .collect();
     let t0 = std::time::Instant::now();
+    // The toolchain may run what it builds (#763): nimony's compile-time evaluation builds a
+    // program and execs it.
     let outcome = temen_run::nim_noc_run(
         phase(&nimony_p, "nimony"),
         &posix,
         Arc::clone(&make),
         &argv,
-        &commands,
+        &temen_run::ExecGrants {
+            commands: &commands,
+            built: true,
+        },
         engine,
     );
     // The driver quits with `FAILURE: <cmd>` on any failed step; that is an ordinary exit, so ask

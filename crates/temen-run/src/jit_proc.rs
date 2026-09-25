@@ -281,9 +281,11 @@ impl Tree {
         let plan = process.then(|| ForkPlan::of(m, &calls, host)).flatten();
         let interrupt = self.interrupt_for(pid, plan.is_some());
         let (cm, image) = match program {
-            Program::Command { grant, size_log2 } if !jit => {
+            Program::Command {
+                digest, size_log2, ..
+            } if !jit => {
                 let key = CodeKey {
-                    grant: Arc::as_ptr(grant) as usize,
+                    digest: *digest,
                     size_log2: *size_log2,
                     entry,
                     polls: interrupt.is_some(),
@@ -296,7 +298,6 @@ impl Tree {
                         .entry(key)
                         .or_insert_with(|| {
                             Arc::new(CodeSlot {
-                                _grant: Arc::clone(grant),
                                 image: Mutex::new(None),
                             })
                         }),
@@ -466,8 +467,10 @@ pub(crate) struct Image {
 /// instantiates the tree's compile of it.
 #[derive(PartialEq, Eq, Hash)]
 struct CodeKey {
-    /// The command's grant, by address — its [`CodeSlot`] holds it, so the address stays its own.
-    grant: usize,
+    /// The command module's content digest ([`temen_interp::ExecImage::digest`]): the same code
+    /// however it reached the exec — a registered command, or a program the tree built and promoted
+    /// on each run of it (#763). Identity is structural (INVARIANTS #10).
+    digest: [u8; 32],
     /// The window it runs in: the confinement mask is baked.
     size_log2: u8,
     entry: FuncIdx,
@@ -481,7 +484,6 @@ struct CodeKey {
 /// it compiles. `None` until then, then whether the code could be shared: when it could not, each
 /// process compiles its own.
 struct CodeSlot {
-    _grant: Arc<Module>,
     image: Mutex<Option<Option<Arc<Image>>>>,
 }
 
@@ -490,7 +492,11 @@ pub(crate) enum Program<'a> {
     /// The embedder's program: the root's first image. No other process starts it.
     Embedder(&'a Module),
     /// An `execve`'s command, from its grant, in a window of `size_log2`: the caller's backed prefix.
-    Command { grant: Arc<Module>, size_log2: u8 },
+    Command {
+        grant: Arc<Module>,
+        digest: [u8; 32],
+        size_log2: u8,
+    },
 }
 
 impl Program<'_> {
@@ -646,6 +652,7 @@ unsafe fn run_process(
         start = Start::Fresh {
             program: Program::Command {
                 grant: img.module,
+                digest: img.digest,
                 size_log2: img.child_size.trailing_zeros() as u8,
             },
             entry: img.entry as FuncIdx,
@@ -685,7 +692,9 @@ unsafe fn compile(
         // The command runs in a window the size of the caller's backed prefix, as on both
         // interpreters, whose image-replace reuses the caller's window in place (a larger window than
         // the command declares is a safe superset, masked to its actual size).
-        Program::Command { grant, size_log2 } => {
+        Program::Command {
+            grant, size_log2, ..
+        } => {
             let mut m = (**grant).clone();
             m.memory = m.memory.map(|mc| temen_ir::Memory {
                 size_log2: *size_log2,
@@ -889,16 +898,18 @@ pub(crate) unsafe fn serve_request(
             // The JIT's own gates — the interpreters' `durable` + clean-root checks: a durable
             // domain's subtree must stay snapshottable, and a fiber is not the process's image to
             // replace.
-            let admissible = !host.is_durable() && !temen_jit::fiber_active();
-            match admissible
-                .then(|| host.exec_image(cmd, &[], 0, 0, window_mapped))
-                .flatten()
-            {
-                Some(img) => {
+            let admitted = if host.is_durable() || temen_jit::fiber_active() {
+                Err(EINVAL)
+            } else {
+                host.exec_module(cmd)
+                    .and_then(|m| host.exec_image(&m, &[], 0, 0, window_mapped))
+            };
+            match admitted {
+                Ok(img) => {
                     host.stash_exec_image(img);
                     *trap_out = temen_jit::HOST_UNWIND_CODE as i64;
                 }
-                None => answer(EINVAL),
+                Err(e) => answer(e),
             }
             false
         }

@@ -5583,6 +5583,23 @@ pub fn nim_posix_imports(
     (imports, unbound, slot)
 }
 
+/// What the processes of a [`nim_noc_run`] may `execve` (#1609, #763): the run's exec authority,
+/// granted on its host, so it arrives down the grant graph (invariant 3). What the embedder does not
+/// pass is simply not there.
+#[derive(Default)]
+pub struct ExecGrants<'a> {
+    /// The **command registry**: each `(path, module)` is granted and registered as a filesystem
+    /// executable, so the guest's own `execve(path, …)` ([`temen_posix::OP_EXECVE`]) can become it.
+    /// That is what lets a nim program spawn its own helpers (nimony's driver runs nifmake, which
+    /// runs every phase) rather than a host cranking the shell-outs from outside.
+    pub commands: &'a [(String, Module)],
+    /// Whether they may also run the **programs they build**: a `ModuleLoader`
+    /// ([`grant_module_loader`]), which every fork and exec carries, promotes a file holding a
+    /// module's encoding at its `execve` (PROCESS.md: `cc x.c && ./a.out`). nimony's compile-time
+    /// evaluation and its plugins build a program and run it.
+    pub built: bool,
+}
+
 /// **Run one no-C nim program** over a shared POSIX personality, with `argv`, on `backend`.
 ///
 /// The single route every no-C driver takes: bind the module's retained imports with
@@ -5592,21 +5609,14 @@ pub fn nim_posix_imports(
 /// one instance would see the first run's globals and heap, which for a compiler phase is not a
 /// rerun at all.
 ///
-/// `commands` is the run's **command registry**: each `(path, module)` is granted on the guest's
-/// `Host` and registered as a filesystem executable, so the guest's own `execve(path, …)`
-/// ([`temen_posix::OP_EXECVE`], #1609) can become it. That is what lets a nim program spawn its own
-/// helpers — nimony's driver runs nifmake, which runs every phase — rather than a host cranking the
-/// shell-outs from outside. The grant rides `run_with_caps_and_host`'s per-run host hook: authority
-/// arrives down the grant graph (invariant 3), and a command the embedder did not pass is simply
-/// not there.
+/// `exec` is what the run's processes may `execve` ([`ExecGrants`]): its registered commands, and
+/// whether they may run the programs they build.
 ///
 /// `backend` is honoured or refused, never quietly swapped: [`Backend::Bytecode`] normally falls
 /// back to the tree-walker for a module outside its subset, which would turn an engine
 /// differential into the oracle checked against itself. So a module the bytecode engine does not
 /// admit is an error here. (Its exec'd images need no such check: the engine compiles each one, and
-/// refuses the exec rather than fall back.) [`Backend::Jit`] serves `execve` but not `fork` yet (#1768): a
-/// program that forks gets the failure back as its own. Which programs spawn is not decidable from
-/// imports — every linked nim program imports the whole personality — so the caller decides.
+/// refuses the exec rather than fall back.)
 ///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
 /// and the trap alone does not.
@@ -5615,7 +5625,7 @@ pub fn nim_noc_run(
     posix: &temen_posix::Posix,
     make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
     argv: &[String],
-    commands: &[(String, Module)],
+    exec: &ExecGrants,
     backend: Backend,
 ) -> Result<(), String> {
     if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits_reserved(&module) {
@@ -5656,11 +5666,14 @@ pub fn nim_noc_run(
         host.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(posix));
         let (names, sigs) = temen_posix::cap_vtable();
         host.set_host_proc_vtable(handle, names, sigs);
-        // The commands this run may become, granted on the very host it uses.
-        for (path, m) in commands {
+        // What this run may exec, granted on the very host it uses.
+        for (path, m) in exec.commands {
             let wl = m.memory.map_or(0, |mc| mc.size_log2);
             let h = host.grant_module(m);
             posix.register_executable(path, h, wl);
+        }
+        if exec.built {
+            grant_module_loader(host);
         }
     };
     inst.run_with_caps_and_host(backend, &cfg, &[], Some(&mut setup))

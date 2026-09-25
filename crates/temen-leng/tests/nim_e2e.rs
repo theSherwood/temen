@@ -2328,10 +2328,13 @@ fn nim_shells_out_through_the_posix_sh() {
             &posix,
             make,
             &["parent".to_string()],
-            &[
-                ("/bin/sh".to_string(), sh.clone()),
-                ("bin/child".to_string(), child.clone()),
-            ],
+            &temen_run::ExecGrants {
+                commands: &[
+                    ("/bin/sh".to_string(), sh.clone()),
+                    ("bin/child".to_string(), child.clone()),
+                ],
+                built: false,
+            },
             engine,
         );
         // The tree-walker and the JIT record twin traps (#1665); a bytecode crash shows in the output.
@@ -2425,7 +2428,10 @@ fn nim_forks_and_execs_a_nim_program() {
             &posix,
             make,
             &["parent".to_string()],
-            &[("/bin/child".to_string(), child.clone())],
+            &temen_run::ExecGrants {
+                commands: &[("/bin/child".to_string(), child.clone())],
+                built: false,
+            },
             engine,
         );
         assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");

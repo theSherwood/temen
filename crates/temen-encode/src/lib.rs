@@ -1880,6 +1880,23 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     decode_impl(bytes, false)
 }
 
+/// The declared window (`size_log2`) of an encoded **runnable module**, read from its header without
+/// decoding the rest — what a loader needs before it commits to a decode: an `execve`'s window fit
+/// and heap placement (#763). The memory descriptor is the first thing after the wire header, so
+/// this reads two bytes past it. `None` for anything that is not a current-version runnable
+/// module's encoding, or declares no memory. It checks nothing else: [`decode_module`] (and the
+/// verifier after it) still decide whether the bytes are a module at all.
+pub fn module_window_log2(bytes: &[u8]) -> Option<u8> {
+    let (hdr, payload) = wire::read_header(bytes).ok()?;
+    if hdr.kind != wire::KIND_MODULE || hdr.version != VERSION {
+        return None;
+    }
+    match payload {
+        [1, size_log2, ..] => Some(*size_log2),
+        _ => None,
+    }
+}
+
 /// Decode a **link unit** (object dialect) — or a runnable module; the header flag picks the
 /// dialect. Tooling-facing (the linker's input path), but held to the same fail-closed
 /// never-panic/never-OOM bar as [`decode_module`]: it shares this decoder and fuzzers reach it.
@@ -2856,6 +2873,48 @@ impl<'a> Cursor<'a> {
         core::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_| DecodeError::BadUtf8)
+    }
+}
+
+#[cfg(test)]
+mod window_peek_tests {
+    use super::*;
+
+    fn with_window(memory: Option<Memory>) -> Module {
+        Module {
+            memory,
+            ..Module::default()
+        }
+    }
+
+    #[test]
+    fn the_peek_reads_the_window_the_encoder_wrote() {
+        for size_log2 in [0, 16, 25, 40] {
+            let m = with_window(Some(Memory {
+                size_log2,
+                shadow: Some(temen_ir::durable_abi::ShadowArena { base: 64, end: 128 }),
+            }));
+            assert_eq!(module_window_log2(&encode_module(&m)), Some(size_log2));
+        }
+    }
+
+    #[test]
+    fn the_peek_answers_only_for_a_runnable_module_with_a_window() {
+        let windowed = with_window(Some(Memory {
+            size_log2: 20,
+            shadow: None,
+        }));
+        assert_eq!(module_window_log2(&encode_module(&with_window(None))), None);
+        assert_eq!(
+            module_window_log2(&encode_unit(&windowed)),
+            None,
+            "an object"
+        );
+        let mut stale = encode_module(&windowed);
+        stale[10] ^= 1; // the version
+        assert_eq!(module_window_log2(&stale), None);
+        assert_eq!(module_window_log2(b"#!/bin/sh\necho\n"), None);
+        assert_eq!(module_window_log2(&encode_module(&windowed)[..17]), None);
     }
 }
 

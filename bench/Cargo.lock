@@ -1502,6 +1502,7 @@ dependencies = [
 name = "temen-posix"
 version = "0.0.0"
 dependencies = [
+ "temen-encode",
  "temen-interp",
  "temen-ir",
  "temen-posix-abi",

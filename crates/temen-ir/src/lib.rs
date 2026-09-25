@@ -230,6 +230,12 @@ pub mod errno {
     pub const ESRCH: i64 = -3;
     /// Interrupted by a delivered signal (#796 — a blocking op woken by a signal).
     pub const EINTR: i64 = -4;
+    /// Argument list too long: `execve`'s argv+envp do not fit the powerbox args region (#1609), or
+    /// the image declares a window larger than the caller's — checked and refused, never truncated.
+    pub const E2BIG: i64 = -7;
+    /// Exec format error: `execve` of a file that is not a module the loader accepts (#763 — the
+    /// bytes do not decode and verify).
+    pub const ENOEXEC: i64 = -8;
     /// Bad file descriptor / handle.
     pub const EBADF: i64 = -9;
     /// No child processes (`wait`/`reap` for a pid that is not a live child).

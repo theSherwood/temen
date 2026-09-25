@@ -132,6 +132,27 @@ enum Body {
     /// `fork()`; the child `execve`s and falls back to `exit(9)`; the parent `wait4`s and exits
     /// with the reaped `WEXITSTATUS`. Nim's `execShellCmd` is exactly this shape.
     ForkExecReap,
+    /// #763 — `execve("/bin/c", NULL, NULL)`, then `exit` with the errno it answered, negated: a
+    /// refusal's *which* is part of the answer every row must agree on.
+    ExecErrno,
+}
+
+/// What is at `/bin/c` when the guest execs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cmd {
+    /// Nothing: `-ENOENT`.
+    Absent,
+    /// A registered command: the embedder granted the module and registered the path.
+    Registered,
+    /// #763 — a program the process built: the module's encoding is a file at the path, and the
+    /// process holds a `ModuleLoader`, which promotes it at the exec.
+    Built,
+    /// The same file, but the process holds no `ModuleLoader`: not executable to it (`-EACCES`).
+    BuiltNoLoader,
+    /// A file that is not a program: `-EACCES`, as for any file without the exec bit.
+    Plain,
+    /// A file whose header is a module's but whose body does not decode: `-ENOEXEC`.
+    Corrupt,
 }
 
 /// The four personality slots every guest declares, in a fixed order so the call indices are
@@ -249,6 +270,23 @@ fn guest(form: Form, body: Body) -> String {
             form.call(0, "vp, vargv, vz"),
             form.call(1, "vnine"),
         ),
+        Body::ExecErrno => format!(
+            "{head}func () -> () {{\n\
+             block 0 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vp = i64.const 40000\n\
+             \x20 vz = i64.const 0\n\
+             \x20 vr = {}\n\
+             \x20 vneg = i64.sub vz vr\n\
+             \x20 vc = i32.wrap_i64 vneg\n\
+             \x20 {}\n\
+             \x20 unreachable\n\
+             \x20 }}\n\
+             }}\n\
+             export 0 func \"_start\" 0\n",
+            form.call(0, "vp, vz, vz"),
+            form.call(1, "vc"),
+        ),
         Body::Exec => format!(
             "{head}func () -> () {{\n\
              block 0 () {{\n\
@@ -288,9 +326,9 @@ fn guest(form: Form, body: Body) -> String {
     }
 }
 
-/// Run one cell of the table. `registered` decides whether `/bin/c` exists, which is the difference
-/// between an exec that replaces the image and one that is refused.
-fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool) -> Outcome {
+/// Run one cell of the table. `cmd` decides what `/bin/c` is, which is the difference between an
+/// exec that replaces the image and one that is refused.
+fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outcome {
     let caller = parse_module(&guest(form, body)).expect("parse caller");
     let command = parse_module(match body {
         Body::ExecRefusedUntouched => UNSTARTABLE,
@@ -301,6 +339,14 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool)
     let cmd_wl = command.memory.expect("command window").size_log2;
 
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+    let image = temen_encode::encode_module(&command);
+    match cmd {
+        Cmd::Built | Cmd::BuiltNoLoader => posix.write_file("/bin/c", &image),
+        Cmd::Plain => posix.write_file("/bin/c", b"echo not a program\n"),
+        // The header and the declared window a module's, the rest cut short.
+        Cmd::Corrupt => posix.write_file("/bin/c", &image[..image.len() / 2]),
+        Cmd::Absent | Cmd::Registered => {}
+    }
     let make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> = Arc::new(make);
     let slot = SharedHostProc::new(
         {
@@ -336,9 +382,12 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool)
         host.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
         let (names, sigs) = temen_posix::cap_vtable();
         host.set_host_proc_vtable(handle, names, sigs);
-        if registered {
+        if cmd == Cmd::Registered {
             let h = host.grant_module(&command);
             p.register_executable("/bin/c", h, cmd_wl);
+        }
+        if matches!(cmd, Cmd::Built | Cmd::Corrupt) {
+            temen_run::grant_module_loader(host);
         }
     };
     inst.run_with_caps_and_host(backend, &RunConfig::default(), &[], Some(&mut setup))
@@ -348,15 +397,14 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool)
 
 /// Every (form, grant, engine) cell of one behaviour must produce `want`. The message names the
 /// cell, because "which row disagreed" is the whole diagnostic.
-fn assert_parity(body: Body, registered: bool, want: Outcome) {
+fn assert_parity(body: Body, cmd: Cmd, want: Outcome) {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         for grant in Grant::all() {
             for form in Form::all() {
-                let got = run(form, grant, body, backend, registered);
+                let got = run(form, grant, body, backend, cmd);
                 assert_eq!(
                     got, want,
-                    "{body:?} (registered={registered}) disagreed at {form:?} / {grant:?} / \
-                     {backend:?}"
+                    "{body:?} ({cmd:?}) disagreed at {form:?} / {grant:?} / {backend:?}"
                 );
             }
         }
@@ -367,7 +415,11 @@ fn assert_parity(body: Body, registered: bool, want: Outcome) {
 /// import row exited 9 (request discarded) while the `call.sym` row returned 77.
 #[test]
 fn execve_replaces_the_image_identically_on_every_route() {
-    assert_parity(Body::Exec, true, Outcome::Returned(vec![Value::I64(77)]));
+    assert_parity(
+        Body::Exec,
+        Cmd::Registered,
+        Outcome::Returned(vec![Value::I64(77)]),
+    );
 }
 
 /// POSIX: `execve` returns only on failure. An unregistered path must leave the caller running with
@@ -375,7 +427,7 @@ fn execve_replaces_the_image_identically_on_every_route() {
 /// an image nobody granted.
 #[test]
 fn a_refused_execve_leaves_the_caller_running_on_every_route() {
-    assert_parity(Body::Exec, false, Outcome::Exited(9));
+    assert_parity(Body::Exec, Cmd::Absent, Outcome::Exited(9));
 }
 
 /// #1768 — the refusal only the engine can make (the command's entry is no shape exec can start),
@@ -385,7 +437,11 @@ fn a_refused_execve_leaves_the_caller_running_on_every_route() {
 /// refused (`exit(2)`: the args region's argc had become 1).
 #[test]
 fn an_execve_the_engine_refuses_leaves_the_caller_untouched_on_every_route() {
-    assert_parity(Body::ExecRefusedUntouched, true, Outcome::Exited(9));
+    assert_parity(
+        Body::ExecRefusedUntouched,
+        Cmd::Registered,
+        Outcome::Exited(9),
+    );
 }
 
 /// #1768 — the new image reads the argv its `execve` passed. On the JIT this is a different road
@@ -395,7 +451,7 @@ fn an_execve_the_engine_refuses_leaves_the_caller_untouched_on_every_route() {
 fn an_execd_image_reads_the_argv_it_was_given_on_every_route() {
     assert_parity(
         Body::ExecDeliversArgv,
-        true,
+        Cmd::Registered,
         Outcome::Returned(vec![Value::I64(3)]),
     );
 }
@@ -406,5 +462,39 @@ fn an_execd_image_reads_the_argv_it_was_given_on_every_route() {
 /// untouched status marker — the reap was never serviced) on the import routes.
 #[test]
 fn a_fork_twin_execs_and_the_parent_reaps_identically_on_every_route() {
-    assert_parity(Body::ForkExecReap, true, Outcome::Exited(77));
+    assert_parity(Body::ForkExecReap, Cmd::Registered, Outcome::Exited(77));
+}
+
+/// #763 — PROCESS.md's `cc x.c && ./a.out`: a program the process built is a file holding a
+/// module's encoding, and the process's `ModuleLoader` promotes it at the exec. It replaces the
+/// image as a registered command does, however the op was reached and on every engine.
+#[test]
+fn a_built_program_execs_like_a_registered_command_on_every_route() {
+    assert_parity(
+        Body::Exec,
+        Cmd::Built,
+        Outcome::Returned(vec![Value::I64(77)]),
+    );
+}
+
+/// #763 — nimony's compile-time evaluation: a fork twin execs the program the build wrote and the
+/// parent reaps it. The twin holds the loader its parent does (the fork clones the powerbox).
+#[test]
+fn a_fork_twin_execs_a_built_program_and_the_parent_reaps_it_on_every_route() {
+    assert_parity(Body::ForkExecReap, Cmd::Built, Outcome::Exited(77));
+}
+
+/// Every refusal answers its own errno, identically on every route: nothing at the path is
+/// `-ENOENT`; a file that is not a program, or a program the process may not load, `-EACCES`; a
+/// file with a module's header whose body does not decode, `-ENOEXEC`.
+#[test]
+fn a_refused_execve_answers_its_errno_on_every_route() {
+    for (cmd, errno) in [
+        (Cmd::Absent, 2),
+        (Cmd::Plain, 13),
+        (Cmd::BuiltNoLoader, 13),
+        (Cmd::Corrupt, 8),
+    ] {
+        assert_parity(Body::ExecErrno, cmd, Outcome::Exited(errno));
+    }
 }
