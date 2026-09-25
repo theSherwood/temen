@@ -885,13 +885,14 @@ forking caller is the running process itself, stopped at its own call, not a cal
 another domain's offer. So the JIT serves it with §9.3's items 1, 3 and 4 alone, over a durable
 unwind at the fork call (`temen_run`'s `jit_proc`):
 
-- **Instrument the fork sites** (`fork_instrumented`). The program is compiled with the one
+- **Instrument the fork sites** (`ForkPlan`). The program is compiled with the one
   `temen-durable` transform, restricted (`TransformOpts::sites`) to the calls that can dispatch the
   personality's fork op: a `call.cap` naming it, an import bound to it, and — since either could come
   to name it — a call through a rebindable import slot or a dynamic-mode call. Only the functions that
-  reach a site are instrumented; the rest of the program is byte-identical. A call is a site by its
-  dispatch pair (`Inst::host_dispatch`) over the host's import bindings — the pair the cap thunk is
-  handed at run time — so the compile and the thunk cannot disagree about which calls are sites.
+  reach a site are instrumented; the rest of the program is byte-identical. The sites are dispatch
+  pairs (`Inst::host_dispatch`), read over the host's import bindings once, into the image's fork
+  plan; the cap thunk checks a fork call's own pair against that plan, so the compile and the thunk
+  cannot disagree about which calls are sites.
 - **Read `call.dyn` by the addresses the program takes** (`TransformOpts::fork`,
   `IndirectReach::AddressTaken`). A freeze must unwind wherever it lands, so it reads a `call.dyn` as
   reaching any function of its signature (R8). From one fork site, that reading instrumented 65% of
@@ -912,13 +913,20 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   embedder's fork hook, which follows the oracle's `fork_vcpu` order — the vCPU quota, the window,
   then the powerbox, with #1648's pid burn — copying the window page for page (bytes and protections,
   from the run's page-state map), duplicating the powerbox (`Host::fork_powerbox_jit`: the page map goes
-  with the window), and starting the twin on its own OS thread over the parent's instrumented program
+  with the window), and starting the twin on its own OS thread running its parent's code
   (`CompiledModule::run_twin`). The compiled code reaches its instance through a `vmctx`
-  (`temen_jit::VmCtx`, Wasmtime's shape), so the twin's code dispatches into the twin's powerbox.
+  (`temen_jit::VmCtx`, Wasmtime's shape), so the twin's instance dispatches into the twin's powerbox.
 - **Return twice** by reply injection (§3): each copy's leaf frame takes its reply
   (`ShadowArena::leaf_reply` — a leaf spills its results first) and its thaw word is set `REWINDING`;
   the entry's prologue rebuilds every frame and the call returns the injected value: the twin's pid in
   the parent, rewound in place, and `0` in the twin.
+- **Compile once** (#1825). A tree compiles a program once. The code is an image each process that
+  runs it instantiates (`temen_jit::SharedCode`), with its own powerbox, function table and run
+  state: the process that compiled it, its twins, and every later `execve` of the same command. The
+  tree finds a command's compile by what the code depends on besides the module: the grant, the
+  window, the entry, whether it polls the tree's kill-path cell, and its fork sites. Code that names
+  an object one instance owns (a thread domain, a §14 nursery, a `setjmp` table), or that a program
+  able to drive the §22 `Jit` could extend, is compiled per process.
 - **Fork again.** Every fork after a process's first unwinds through frames the previous fork's
   rewind rebuilt, each by re-issuing its call. The transform's thaw arms now poll after an op they
   re-run, as the forward path does (`temen-durable`'s `poll`). Before, an arm ran on into its
@@ -963,5 +971,5 @@ A fork in a fiber answers `-EAGAIN`, exactly as the oracle's non-bare refusal do
 plan for 1–2 is to decline such a module to the bytecode engine, which forks it, before it runs
 (#1824); for 4, to keep the data image's function pointers through the link, which leaves only a
 forged index refused (#1830). Still missing from a JIT process: async signal delivery, pipe parks and job control (#1826).
-A twin still recompiles its parent's program and copies its whole window (#1825).
+A twin still copies its parent's whole window (#1825).
 

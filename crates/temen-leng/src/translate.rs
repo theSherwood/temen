@@ -9,7 +9,9 @@
 //! holds a current SSA value; a branch passes the current values as block args, so a control-flow
 //! merge is just the successor's block parameter — no separate φ/dominance analysis. Value numbers
 //! reset per block (temen-text convention): a block's params are `v0..v(nslots-1)`, instructions
-//! continue from `nslots`.
+//! continue from `nslots`. Most slots are dead in most blocks, so the parsed module is pruned
+//! (`temen_ir::prune_block_params`, in `module_of`) before anyone runs it: the text keeps the simple
+//! uniform shape, the module carries only what is live (#1831).
 //!
 //! **Address-taken locals live in a window frame.** A local whose address is taken (`(addr x)`) is
 //! demoted from an SSA slot to a byte offset in a per-call data-stack frame; the proc gains a

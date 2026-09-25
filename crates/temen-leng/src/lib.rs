@@ -82,6 +82,21 @@ impl std::fmt::Display for LengError {
 }
 impl std::error::Error for LengError {}
 
+/// The translator's text parsed into a [`Module`], its dead block parameters pruned. The translator
+/// threads every local through every block ("locals as block parameters"), so most of those
+/// parameters are dead where they sit — 90% across nimony's own programs — and every engine would pay
+/// for them: the interpreters copy them on each branch, and the JIT's register allocator went
+/// superlinear on one lexer (#1831). [`temen_ir::prune_block_params`] drops them.
+fn module_of(text: &str) -> Result<Module, LengError> {
+    let mut m = temen_text::parse_module(text).map_err(|e| {
+        LengError::Malformed(format!(
+            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
+        ))
+    })?;
+    temen_ir::prune_block_params(&mut m);
+    Ok(m)
+}
+
 /// Translate a Leng-NIF module to **Temen text**. The seam a caller can inspect/debug (the emitted
 /// IR is human-readable and rides `temen_text::parse_module`).
 pub fn translate_to_text(src: &str) -> Result<String, LengError> {
@@ -93,11 +108,7 @@ pub fn translate_to_text(src: &str) -> Result<String, LengError> {
 /// callers run `temen_verify::verify_module` (the frontend is untrusted; DESIGN.md §2a).
 pub fn translate(src: &str) -> Result<Module, LengError> {
     let text = translate_to_text(src)?;
-    temen_text::parse_module(&text).map_err(|e| {
-        LengError::Malformed(format!(
-            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-        ))
-    })
+    module_of(&text)
 }
 
 /// Translate a Leng-NIF module to Temen text with **Tier-2 TLS lowering** (NIM.md §3d): a `tvar`
@@ -112,11 +123,7 @@ pub fn translate_tls_to_text(src: &str) -> Result<String, LengError> {
 /// [`translate_tls_to_text`] parsed to an TEMEN-IR [`Module`] (unverified; the caller verifies).
 pub fn translate_tls(src: &str) -> Result<Module, LengError> {
     let text = translate_tls_to_text(src)?;
-    temen_text::parse_module(&text).map_err(|e| {
-        LengError::Malformed(format!(
-            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-        ))
-    })
+    module_of(&text)
 }
 
 /// Translate a **single named proc** out of a full Leng module to Temen text — the "go deep" entry
@@ -153,21 +160,13 @@ fn merge_type_prelude(types: &str, src: &str) -> Result<Node, LengError> {
 pub fn translate_proc_with_types(src: &str, name: &str, types: &str) -> Result<Module, LengError> {
     let root = merge_type_prelude(types, src)?;
     let text = translate::Translator::new().one_proc(&root, name)?;
-    temen_text::parse_module(&text).map_err(|e| {
-        LengError::Malformed(format!(
-            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-        ))
-    })
+    module_of(&text)
 }
 
 /// As [`translate_proc_to_text`], returning the parsed (unverified) [`Module`].
 pub fn translate_proc(src: &str, name: &str) -> Result<Module, LengError> {
     let text = translate_proc_to_text(src, name)?;
-    temen_text::parse_module(&text).map_err(|e| {
-        LengError::Malformed(format!(
-            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-        ))
-    })
+    module_of(&text)
 }
 
 /// Translate a **named subset** of a module's procs together — the multi-proc generalization of
@@ -177,11 +176,7 @@ pub fn translate_proc(src: &str, name: &str) -> Result<Module, LengError> {
 pub fn translate_procs(src: &str, names: &[&str]) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let text = translate::Translator::new().some_procs(&root, names)?;
-    temen_text::parse_module(&text).map_err(|e| {
-        LengError::Malformed(format!(
-            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-        ))
-    })
+    module_of(&text)
 }
 
 /// One nimony module in a multi-module link (NIM.md W2 — the linker). `src` is the module's `hexer`
@@ -267,11 +262,7 @@ fn translate_object_module(
             (text, names.iter().map(|s| s.to_string()).collect())
         }
     };
-    let mut module = temen_text::parse_module(&text).map_err(|e| {
-        LengError::Malformed(format!(
-            "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
-        ))
-    })?;
+    let mut module = module_of(&text)?;
     // Procs export in-band under their global (stem-suffixed) names; this unit's `gvar`s export as
     // cross-module data symbols so another unit's `data.sym` can bind to them.
     module.exports = export_names

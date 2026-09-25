@@ -78,7 +78,7 @@ use temen_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, IToF, Inst,
     IntTy, IntUnOp, LoadOp, Module, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp,
     VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp,
-    VWidenOp, ValIdx, ValType,
+    VWidenOp, ValIdx,
 };
 
 pub mod cfg;
@@ -389,7 +389,7 @@ pub fn optimize_func_with(
         let before = blocks.clone();
         blocks = prune_unreachable(blocks);
         blocks = merge_blocks(blocks, fn_results, types);
-        blocks = drop_dead_params(blocks, fn_results, types);
+        blocks = drop_dead_params(blocks);
         // Copy propagation + identity forwarding: rewrite uses of a value that is a copy of an
         // earlier one (a constant-condition `select`, or an algebraic identity like `x+0`/`x*1`)
         // to that earlier value, so the copy instruction becomes dead for the DCE pass below.
@@ -2423,105 +2423,11 @@ fn remove_block(blocks: &mut Vec<Block>, b: usize) {
     }
 }
 
-/// Drop block parameters that are never referenced within their block, and the matching argument
-/// in every predecessor edge. One pass over all blocks (cascades are caught by the outer fixpoint).
-/// The entry block's parameters are the function signature and are never dropped.
-fn drop_dead_params(
-    blocks: Vec<Block>,
-    fn_results: &[usize],
-    types: &[temen_ir::TypeEntry],
-) -> Vec<Block> {
-    let n = blocks.len();
-    // Dead parameter positions per block (entry excluded).
-    let mut dropped: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, blk) in blocks.iter().enumerate().skip(1) {
-        let used = used_values(blk, fn_results, types);
-        for (p, &u) in used.iter().take(blk.params.len()).enumerate() {
-            if !u {
-                dropped[b].push(p);
-            }
-        }
-    }
-    if dropped.iter().all(Vec::is_empty) {
-        return blocks;
-    }
-
-    // Renumber each block to remove its own dead params, then drop the matching edge arguments.
-    let mut out: Vec<Block> = blocks
-        .iter()
-        .enumerate()
-        .map(|(b, blk)| {
-            if dropped[b].is_empty() {
-                blk.clone()
-            } else {
-                remove_params(blk, &dropped[b])
-            }
-        })
-        .collect();
-    for blk in out.iter_mut() {
-        drop_edge_args(&mut blk.term, &dropped);
-    }
-    out
-}
-
-/// Which SSA values a block references (as an instruction or terminator operand).
-fn used_values(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Vec<bool> {
-    let mut used = vec![false; val_count(b, fn_results, types) as usize];
-    for inst in &b.insts {
-        each_operand(inst, |v| used[v as usize] = true);
-    }
-    let mut term = b.term.clone();
-    map_term_operands(&mut term, &mut |v| {
-        used[v as usize] = true;
-        v
-    });
-    used
-}
-
-/// Rebuild a block with the parameters at `dropped` positions removed, renumbering every value
-/// (the dropped params are unused, so no operand ever references them).
-fn remove_params(b: &Block, dropped: &[usize]) -> Block {
-    let nparams = b.params.len();
-    let is_dropped = |p: usize| dropped.contains(&p);
-    // old value index -> new value index (None only for the dropped params, never referenced).
-    let mut map: Vec<Option<u32>> = Vec::new();
-    let mut next = 0u32;
-    for p in 0..nparams {
-        if is_dropped(p) {
-            map.push(None);
-        } else {
-            map.push(Some(next));
-            next += 1;
-        }
-    }
-    // Instruction results all shift down by the number of dropped params.
-    let drop_n = dropped.len() as u32;
-    let lookup = move |v: ValIdx| -> ValIdx {
-        if (v as usize) < nparams {
-            map[v as usize].expect("a dropped parameter must be unused")
-        } else {
-            v - drop_n
-        }
-    };
-
-    let params: Vec<ValType> = b
-        .params
-        .iter()
-        .enumerate()
-        .filter(|(p, _)| !is_dropped(*p))
-        .map(|(_, t)| *t)
-        .collect();
-    let mut insts = b.insts.clone();
-    for inst in insts.iter_mut() {
-        map_operands(inst, &mut |v| lookup(v));
-    }
-    let mut term = b.term.clone();
-    map_term_operands(&mut term, &mut |v| lookup(v));
-    Block {
-        params,
-        insts,
-        term,
-    }
+/// Drop every block parameter no path carries to a use, and its argument on every edge — the one
+/// pass the "locals as block parameters" frontends need too, so it lives in temen-ir
+/// ([`temen_ir::prune_block_params`]); the fixpoint runs its per-function form.
+fn drop_dead_params(blocks: Vec<Block>) -> Vec<Block> {
+    temen_ir::prune_dead_block_params(blocks)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2690,38 +2596,4 @@ fn jump_thread(
             term: redirect_edges(&b.term, blocks, &consts[q]),
         })
         .collect()
-}
-
-/// In a terminator, remove the edge arguments at the dropped-parameter positions of each target.
-fn drop_edge_args(term: &mut Terminator, dropped: &[Vec<usize>]) {
-    let trim = |args: &mut Vec<ValIdx>, target: u32| {
-        for &p in dropped[target as usize].iter().rev() {
-            args.remove(p);
-        }
-    };
-    match term {
-        Terminator::Br { target, args } => trim(args, *target),
-        Terminator::BrIf {
-            then_blk,
-            then_args,
-            else_blk,
-            else_args,
-            ..
-        } => {
-            trim(then_args, *then_blk);
-            trim(else_args, *else_blk);
-        }
-        Terminator::BrTable {
-            targets, default, ..
-        } => {
-            for (t, args) in targets.iter_mut() {
-                trim(args, *t);
-            }
-            trim(&mut default.1, default.0);
-        }
-        Terminator::Return(_)
-        | Terminator::ReturnCall { .. }
-        | Terminator::ReturnCallIndirect { .. }
-        | Terminator::Unreachable => {}
-    }
 }
