@@ -230,6 +230,12 @@ pub mod errno {
     pub const ESRCH: i64 = -3;
     /// Interrupted by a delivered signal (#796 — a blocking op woken by a signal).
     pub const EINTR: i64 = -4;
+    /// Argument list too long: `execve`'s argv+envp do not fit the powerbox args region (#1609), or
+    /// the image declares a window larger than the caller's — checked and refused, never truncated.
+    pub const E2BIG: i64 = -7;
+    /// Exec format error: `execve` of a file that is not a module the loader accepts (#763 — the
+    /// bytes do not decode and verify).
+    pub const ENOEXEC: i64 = -8;
     /// Bad file descriptor / handle.
     pub const EBADF: i64 = -9;
     /// No child processes (`wait`/`reap` for a pid that is not a live child).
@@ -3786,10 +3792,10 @@ pub const POWERBOX_STACK_ALIGN: u64 = 65536;
 /// window (`temen-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
 /// The **guest-heap reserve** the linker leaves above the data stack when sizing a powerbox window
-/// (a program carrying a `data.top` stack). A fixed-window frontend whose allocator bumps in-window —
-/// the nim compute-shim `mmap` (no `vm_map` growth) — needs the merged window to actually hold its
-/// heap; otherwise the heap top depends on whatever `memory N` some runtime unit happened to declare
-/// (the compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
+/// (a program carrying a `data.top` stack): the heap a program has in its window before its allocator
+/// must commit the reserved tail with `vm_map`, as the nim compute-shim `mmap` does. Without it that
+/// in-window heap would depend on whatever `memory N` some runtime unit happened to declare (the
+/// compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
 /// makes the window sizing explicit: the window always covers `data + stack reserve + heap reserve`,
 /// growing past a runtime unit's declaration when a program's static data is large. This is a
 /// **floor** on heap room, not a cap — the actual heap ceiling a frontend seeds is the full window
@@ -4170,6 +4176,15 @@ pub struct Module {
     /// after the last one is not part of the block. Empty for a runnable module (a survivor is a
     /// verify error: nothing places it).
     pub tls: Vec<Data>,
+    /// **Data-image funcref slots** (#1830): the offsets, ascending, at which the data image holds a
+    /// function index — a 4-byte little-endian `i32`, the value `ref.func` would yield. [`link`]
+    /// records one for every [`DataFuncref`] it bakes, so a linked module keeps what its bytes cannot
+    /// show: which of them are function indices. A function a slot names is *taken* just as one a
+    /// `ref.func` names is ([`taken_funcs`]), which every analysis of the functions a `call.dyn` can
+    /// reach must know. The verifier checks each slot's four bytes are laid down by the data image
+    /// and name a function of the module, so the record cannot name a function the image does not
+    /// hold. Empty for a module whose data holds no function index.
+    pub data_funcref_slots: Vec<u64>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
     /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
@@ -5320,6 +5335,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
     let mut has_data_top = false;
     let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
     let mut data: Vec<Data> = Vec::new();
+    let mut data_funcref_slots: Vec<u64> = Vec::new();
     for (((u, ((&fbase, &dbase), &tbase)), disp), &tls_base) in units
         .iter()
         .zip(fbases.iter().zip(&dbases).zip(&tbases))
@@ -5338,8 +5354,10 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         // 4 placeholder bytes at each slot with the resolved merged funcidx. Like `data.ptr`, this
         // runs while segment offsets are still unit-local (`at` and its covering segment share a
         // frame). The funcidx is already global (`funcs_tab` holds `fbase + local`), so it needs no
-        // later shift by this unit's `offset_func_indices`.
-        apply_unit_data_funcrefs(&mut m, &funcs_tab)?;
+        // later shift by this unit's `offset_func_indices`. Every slot is recorded (#1830), at the
+        // window offset the segment shift below gives it.
+        let slots = apply_unit_data_funcrefs(&mut m, &funcs_tab, fbase)?;
+        data_funcref_slots.extend(slots.into_iter().map(|at| at + dbase));
         // Relocate this unit's data segments into its assigned window region…
         for d in &mut m.data {
             d.offset += dbase;
@@ -5451,6 +5469,9 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         // module is runnable and carries none.
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        // …and each baked funcref is recorded where it sits (#1830). Units are stacked in window
+        // order, so the record ascends unit by unit; within a unit it is sorted where it is made.
+        data_funcref_slots,
         // Every unit's template was placed in the window above; the merged image is plain data.
         tls: Vec::new(),
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
@@ -5792,35 +5813,54 @@ fn tls_span(m: &Module) -> u64 {
 /// Apply a unit's **data-image funcref relocations** ([`Module::data_funcrefs`], the data→code
 /// case): for each [`DataFuncref`], resolve `name` to its merged funcidx via `funcs_tab` (fail-closed
 /// [`LinkError::Unresolved`] if unexported) and write it as a 4-byte little-endian `i32` into the
-/// covering data segment — the value `ref.func name` yields. A slot not covered by a segment (or one
-/// whose 4 bytes run past a segment end) fails closed ([`LinkError::BadDataPtr`]). Clears
-/// `data_funcrefs` on success — the linked module carries none, mirroring `data_ptrs`.
+/// covering data segment — the value `ref.func name` yields. A slot the unit already holds
+/// ([`Module::data_funcref_slots`], a module linked before) is rewritten shifted by the unit's
+/// `fbase`. A slot not covered by a segment (or one whose 4 bytes run past a segment end) fails
+/// closed ([`LinkError::BadDataPtr`]). Clears both lists and returns every slot written, unit-local
+/// and ascending — the linked module records them (#1830) where `data_ptrs` leaves nothing.
 fn apply_unit_data_funcrefs(
     m: &mut Module,
     funcs_tab: &alloc::collections::BTreeMap<String, FuncIdx>,
-) -> Result<(), LinkError> {
-    for r in &m.data_funcrefs {
+    fbase: FuncIdx,
+) -> Result<Vec<u64>, LinkError> {
+    // A slot the unit already holds (a module linked before) names one of its own functions: it
+    // shifts with the unit's functions, as `offset_func_indices` shifts its code.
+    let held: Vec<(u64, FuncIdx)> = m
+        .data_funcref_slots
+        .iter()
+        .zip(data_funcref_targets(m))
+        .map(|(&at, f)| Ok((at, f.ok_or(LinkError::BadDataPtr { at })? + fbase)))
+        .collect::<Result<_, LinkError>>()?;
+    let resolved = m.data_funcrefs.iter().map(|r| {
         let func = *funcs_tab
             .get(r.name.as_str())
             .ok_or_else(|| LinkError::Unresolved(r.name.clone()))?;
-        let end =
-            r.at.checked_add(4)
-                .ok_or(LinkError::BadDataPtr { at: r.at })?;
+        Ok((r.at, func))
+    });
+    let mut slots = Vec::with_capacity(held.len() + m.data_funcrefs.len());
+    for bake in held.into_iter().map(Ok).chain(resolved) {
+        let (at, func) = bake?;
+        let end = at.checked_add(4).ok_or(LinkError::BadDataPtr { at })?;
         let seg = m
             .data
             .iter_mut()
+            .rev() // the last segment laid over the slot is the one its bytes come from
             .find(|d| {
-                d.offset <= r.at
+                d.offset <= at
                     && d.offset
                         .checked_add(d.bytes.len() as u64)
                         .is_some_and(|seg_end| end <= seg_end)
             })
-            .ok_or(LinkError::BadDataPtr { at: r.at })?;
-        let lo = (r.at - seg.offset) as usize;
+            .ok_or(LinkError::BadDataPtr { at })?;
+        let lo = (at - seg.offset) as usize;
         seg.bytes[lo..lo + 4].copy_from_slice(&func.to_le_bytes());
+        slots.push(at);
     }
     m.data_funcrefs.clear();
-    Ok(())
+    m.data_funcref_slots.clear();
+    slots.sort_unstable();
+    slots.dedup();
+    Ok(slots)
 }
 
 /// Add `offset` to every **static function index** in `m` (the merged-module reindex): `call`,
@@ -5919,14 +5959,69 @@ pub struct StubbedFuncs {
 /// Why [`stub_unreachable_funcs`] declined.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum GcError {
-    /// The module's data image has funcidxs baked into bytes ([`Module::data_funcrefs`]), which this
-    /// pass cannot see — the linker resolved and cleared them, so a function reachable *only* from a
-    /// static initializer would look unreachable and be stubbed out from under its caller. Declines,
-    /// changing nothing. (A [`link`]ed module always has an empty list, so check the **units**, as
-    /// the linker's consumers do.)
+    /// The module still carries unresolved data-image funcref relocations ([`Module::data_funcrefs`]):
+    /// a unit, not a linked module, whose data will name functions this pass cannot see yet. Declines,
+    /// changing nothing. A [`link`]ed module records the functions its data image names
+    /// ([`Module::data_funcref_slots`]), and they are roots.
     DataFuncrefs,
     /// A root, or a call target, was out of range — the verifier's job, not this pass's.
     BadRoot(FuncIdx),
+    /// A [`Module::data_funcref_slots`] entry the data image does not lay down — likewise the
+    /// verifier's.
+    BadDataFuncref,
+}
+
+/// The function index each of `m`'s [`Module::data_funcref_slots`] holds in its initial image: the
+/// four bytes at the slot as instantiation lays the data segments down, in order, each over the
+/// last. `None` for a slot whose bytes the segments do not all cover.
+pub fn data_funcref_targets(m: &Module) -> Vec<Option<FuncIdx>> {
+    let slots = &m.data_funcref_slots;
+    let mut bytes = alloc::vec![[0u8; 4]; slots.len()];
+    let mut laid = alloc::vec![0u8; slots.len()]; // which of each slot's bytes a segment wrote
+    for d in &m.data {
+        let end = d.offset.saturating_add(d.bytes.len() as u64);
+        // The slots this segment overlaps, `[at, at + 4)` against `[offset, end)`: they start at the
+        // first slot ending past `offset` (slots ascend; an unsorted list reads as unlaid).
+        let first = slots.partition_point(|&at| at.saturating_add(4) <= d.offset);
+        for (k, &at) in slots.iter().enumerate().skip(first) {
+            if at >= end {
+                break;
+            }
+            for (b, byte) in bytes[k].iter_mut().enumerate() {
+                let x = at.saturating_add(b as u64);
+                if x >= d.offset && x < end {
+                    *byte = d.bytes[(x - d.offset) as usize];
+                    laid[k] |= 1 << b;
+                }
+            }
+        }
+    }
+    bytes
+        .iter()
+        .zip(&laid)
+        .map(|(b, &l)| (l == 0b1111).then(|| u32::from_le_bytes(*b)))
+        .collect()
+}
+
+/// The functions `m` hands out as values: every `ref.func` operand, and every index its data image
+/// holds ([`Module::data_funcref_slots`]). These are the functions a `call.dyn` can select without a
+/// forged index (§3c), so an analysis of indirect calls reads this set, never `ref.func` alone.
+pub fn taken_funcs(m: &Module) -> Vec<bool> {
+    let mut taken = alloc::vec![false; m.funcs.len()];
+    let refs = m
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
+        .filter_map(|x| match x {
+            Inst::RefFunc { func } => Some(*func),
+            _ => None,
+        });
+    for f in refs.chain(data_funcref_targets(m).into_iter().flatten()) {
+        if let Some(t) = taken.get_mut(f as usize) {
+            *t = true;
+        }
+    }
+    taken
 }
 
 /// **Replace the body of every function nothing can reach with a trap** — link-time dead-code
@@ -5961,12 +6056,14 @@ pub enum GcError {
 /// # Roots and edges
 ///
 /// Roots are the module's addressable surface — every [`Module::exports`] entry and every
-/// [`ImplExport`] op — plus `extra_roots`, for a funcidx the caller invokes directly (the entry it is
-/// about to hand [`synth_manifest_start`], say). Edges are followed from a live body: [`Inst::Call`],
-/// [`Inst::RefFunc`], [`Inst::ThreadSpawn`] and [`Terminator::ReturnCall`] — the same set
-/// [`offset_func_indices`] rewrites, and the two must stay in step. A [`Inst::CallImport`] names an
-/// import slot, not a function, so it is not an edge; a [`Inst::CallIndirect`] names no function at
-/// all, which is the whole reason indices are preserved.
+/// [`ImplExport`] op — the functions its data image names ([`data_funcref_targets`], a static
+/// initializer's function pointer: live from the start, like the data), plus `extra_roots`, for a
+/// funcidx the caller invokes directly (the entry it is about to hand [`synth_manifest_start`], say).
+/// Edges are followed from a live body: [`Inst::Call`], [`Inst::RefFunc`], [`Inst::ThreadSpawn`]
+/// and [`Terminator::ReturnCall`] — the same set [`offset_func_indices`] rewrites, and the two must
+/// stay in step. A [`Inst::CallImport`] names an import slot, not a function, so it is not an edge;
+/// a [`Inst::CallIndirect`] names no function at all, which is the whole reason indices are
+/// preserved.
 pub fn stub_unreachable_funcs(
     m: &mut Module,
     extra_roots: &[FuncIdx],
@@ -5996,6 +6093,9 @@ pub fn stub_unreachable_funcs(
         for &f in &e.ops {
             push(f, &mut live, &mut work)?;
         }
+    }
+    for f in data_funcref_targets(m) {
+        push(f.ok_or(GcError::BadDataFuncref)?, &mut live, &mut work)?;
     }
     for &f in extra_roots {
         push(f, &mut live, &mut work)?;
@@ -6493,6 +6593,7 @@ mod import_tests {
         let mut m = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![Func {
@@ -6599,6 +6700,7 @@ mod link_layout_tests {
             module: Module {
                 data_ptrs: Vec::new(),
                 data_funcrefs: Vec::new(),
+                data_funcref_slots: Vec::new(),
                 tls: Vec::new(),
                 types: vec![],
                 funcs: vec![],
@@ -6703,6 +6805,7 @@ mod link_layout_tests {
             module: Module {
                 data_ptrs: Vec::new(),
                 data_funcrefs: Vec::new(),
+                data_funcref_slots: Vec::new(),
                 tls: Vec::new(),
                 types: vec![],
                 funcs: vec![Func {

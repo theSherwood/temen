@@ -45,6 +45,40 @@ impl Node {
     }
 }
 
+/// NIF bytes as the text [`parse`] reads, losslessly. A NIF file is bytes, not UTF-8: nimony writes
+/// a literal's bytes raw unless they are control or syntax bytes, so a `char` literal at or above
+/// `0x80` is a lone byte that is no UTF-8 (`'\xff'`), and so is such a byte in a string. Each byte
+/// that is not part of valid UTF-8 becomes NIF's own `\HH` escape instead, which reads back as the
+/// same byte (a char literal's value, a string's bytes), so the text means what the file does.
+/// Borrowed when the file is valid UTF-8 already, as nearly every one is.
+///
+/// Every reader of NIF for temen-leng goes through this. Decoding lossily instead replaced such a
+/// byte with U+FFFD: the literal `'\xff'` then read as 65533 and compared unequal to every `char`.
+pub fn nif_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    let mut rest = match std::str::from_utf8(bytes) {
+        Ok(text) => return std::borrow::Cow::Borrowed(text),
+        Err(_) => bytes,
+    };
+    let mut out = String::with_capacity(bytes.len() + 16);
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                out.push_str(text);
+                return std::borrow::Cow::Owned(out);
+            }
+            Err(e) => {
+                let (valid, after) = rest.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                let bad = e.error_len().unwrap_or(after.len());
+                for b in &after[..bad] {
+                    out.push_str(&format!("\\{b:02X}"));
+                }
+                rest = &after[bad..];
+            }
+        }
+    }
+}
+
 /// Parse a NIF document into a single root node. A document is a sequence of top-level forms;
 /// leading `(.nif…)`/`(.indexat…)` directives are dropped and the **last** non-directive form (the
 /// `(stmts …)` module) is returned. (Leng modules are a single `stmts`; a bare sequence is wrapped.)
@@ -235,6 +269,23 @@ mod tests {
         assert_eq!(n.args()[1].as_atom(), Some("'0'"));
         assert_eq!(n.args()[2].as_atom(), Some("'\\5C'"));
         assert_eq!(n.args()[3].as_atom(), Some("' '"));
+    }
+
+    /// A byte that is no UTF-8 — a `char` literal at or above `0x80`, or such a byte in a string —
+    /// becomes its `\HH` escape; everything else is untouched.
+    #[test]
+    fn nif_text_escapes_only_bytes_that_are_no_utf8() {
+        assert!(matches!(
+            nif_text(b"(eq x 'a')"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(nif_text(b"(eq x '\xff')"), "(eq x '\\FF')");
+        assert_eq!(
+            nif_text(b"(s \"\xef\xbb\xbf\xef z\")"),
+            "(s \"\u{feff}\\EF z\")"
+        );
+        let n = parse(&nif_text(b"(eq x '\xef')")).unwrap();
+        assert_eq!(n.args()[1].as_atom(), Some("'\\EF'"));
     }
 
     #[test]

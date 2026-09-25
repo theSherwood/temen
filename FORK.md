@@ -649,8 +649,10 @@ follow-up (a shim, not a substrate concern).
     Stable 20/20 under stress.
   - **Sequential** (`a_shell_pipes_the_output_of_one_forked_command_into_another`): fork producer,
     `wait`, `close` the write end, fork consumer — the buffered bytes drain, then EOF.
-  - Interp-only (the park lives in the eval loop; the JIT/bytecode tiers don't block a pipe read, so a
-    differential guest must `close` the write end before an empty read — see `pipe.rs`).
+  - Every engine parks the read, on every call form (#1826): the tree-walker in its eval loop, the
+    bytecode engine's drivers by polling the pipe's readiness, a JIT process tree on its bell (§9.5).
+    A one-shot JIT run is no process tree and parks nothing, so a differential guest there must
+    `close` the write end before an empty read — see `pipe.rs`.
   - **~~SIGPIPE + backpressure~~. DONE — the write side made symmetric to the read side.** The FIFO is
     now a **bounded buffer** (`PIPE_CAP` = 64 KiB, Linux's default) with two write-side contracts:
     - **SIGPIPE (`-EPIPE`).** A **read**-end refcount (the third `Arc` in `PipeBacking`) mirrors the
@@ -897,12 +899,15 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   `IndirectReach::AddressTaken`). A freeze must unwind wherever it lands, so it reads a `call.dyn` as
   reaching any function of its signature (R8). From one fork site, that reading instrumented 65% of
   nimony (8172 of 12552 functions, 1.18M → 8.69M instructions, a 10 GB compile). A fork is an unwind
-  the JIT may decline, so it reads a `call.dyn` as reaching only the functions the program takes the
-  address of (`ref.func`): 222 of nimony's functions, +7.7% instructions. Any other function that
-  can reach a fork can be selected only by an index the program never took (forged, §3c, or baked
-  into the data image — #1830). Its table slot gets a **barrier**: a function that marks the shadow
-  stack occupied while the real body runs. The body moves to the end of the module, and every static
-  reference enters it directly (`Instrumented::body`, the run's entry too).
+  the JIT may decline, so it reads a `call.dyn` as reaching only the functions the program takes
+  (`temen_ir::taken_funcs`): the ones a `ref.func` names, and the ones its data image holds indices
+  of, which `link` records as it bakes each static initializer's function pointer (#1830). With
+  `ref.func` alone that was 222 of nimony's functions, +7.7% instructions. Any other function that
+  can reach a fork can be selected
+  only by an index the program never took (forged, §3c). Its table slot gets a **barrier**: a
+  function that marks the shadow stack occupied while the real body runs. The body moves to the end
+  of the module, and every static reference enters it directly (`Instrumented::body`, the run's entry
+  too).
 - **Reify at the call** (`serve_request`). The thunk that took the `ForkSelf` sets the window's freeze
   word — only from an empty shadow stack (`begin_fork_unwind`): the leaf frame must land at the frame
   base, where the reply goes, and a barrier below the call holds the stack occupied. The call's
@@ -945,9 +950,21 @@ bell and re-runs its op on every ring (invariant 7): a twin's exit — rung afte
 it, the oracle's order — or a personality door (a signal, a child transition). A pending deliverable
 signal completes it `-EINTR`. When the root's image chain ends, the tree is torn down: running twins
 are stopped through the tree's kill-path cell and joined, and the ones that trapped are published
-(`last_twin_traps`). `crates/temen-run/tests/jit_fork.rs` pins fork in a loop, deep in a call stack,
+(`last_twin_traps`).
+
+**Pipes** (#1826). A tree mints core pipes (`pipe`, `CAP_SELF_PIPE`) through the one mint every engine
+serves where its pipe parks are served (`Host::mint_pipe`); a JIT run that is not a tree still answers
+`-EINVAL`. After each op the thunk drains the transients it left (`Host::take_park_transients`, the
+interpreters' drain). A write, or the last close of an end, rings the bell. A read of an empty pipe, or
+a write to a full one, with the other end open waits for the bell and re-runs its op, as `waitpid`
+does, in the process's root context: the interpreters park only a root fiber, and in a fiber the op's
+own answer stands. A process that exits, crashes or execs releases the ends it held
+(`Host::release_pipe_ends`) and rings the bell when that leaves a pipe with no writers (its readers
+wake to EOF) or no readers (its writers wake to `-EPIPE`).
+
+`crates/temen-run/tests/jit_fork.rs` pins fork in a loop, deep in a call stack,
 twice beneath a rewound caller, through a taken function address, nested, and crashing against the
-oracle; `caller_request_parity.rs` runs its fork row on the JIT. `temen-durable`'s `indirect_reach.rs`
+oracle; `caller_request_parity.rs` runs its fork and pipe rows on the JIT. `temen-durable`'s `indirect_reach.rs`
 and `refreeze.rs` pin the barrier and the re-run op's poll on the interpreter.
 
 **Where the JIT refuses a fork the oracle makes**, it answers `-ENOSYS` ("unavailable on this tier") —
@@ -963,13 +980,12 @@ probeable, never a wrong answer:
 3. The fork is made beneath a host frame that re-entered compiled code (`temen_jit::reentered`: a
    `Jit.invoke`d unit, a serve handler) or inside an injected signal handler — frames a durable unwind
    cannot save.
-4. The fork is made beneath a `call.dyn` through an index the program never took — forged, or a
-   static initializer's function pointer, which `link` bakes into the data image without a record
-   (#1830) — so the barrier in the selected slot holds the shadow stack occupied.
+4. The fork is made beneath a `call.dyn` through an index the program never took — a forged one —
+   so the barrier in the selected slot holds the shadow stack occupied. A static initializer's
+   function pointer is taken: `link` records it (#1830).
 
 A fork in a fiber answers `-EAGAIN`, exactly as the oracle's non-bare refusal does. The convergence
 plan for 1–2 is to decline such a module to the bytecode engine, which forks it, before it runs
-(#1824); for 4, to keep the data image's function pointers through the link, which leaves only a
-forged index refused (#1830). Still missing from a JIT process: async signal delivery, pipe parks and job control (#1826).
-A twin still copies its parent's whole window (#1825).
+(#1824). Still missing from a JIT process: async signal delivery and job control (#1826). A twin
+still copies its parent's whole window (#1825).
 

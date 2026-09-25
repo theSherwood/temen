@@ -197,24 +197,27 @@ pub const OP_PIPE_ADOPT: u32 = 52;
 /// only the path→module policy (INVARIANTS #4).
 pub const OP_EXEC_RESOLVE: u32 = 53;
 
-/// #1609 — **`execve(path, argv, envp)`**: become the registered command at `path`. The one op a
-/// guest needs to replace its own image, for guests that have no `exec.c` to do it themselves —
-/// nimony's `std/os` inlines the fork/execve/waitpid trio rather than routing through a single
-/// interceptable `system()`, so a no-C nim program reaches this leaf directly.
+/// #1609 — **`execve(path, argv, envp)`**: become the program at `path`. The one op a guest needs
+/// to replace its own image, for guests that have no `exec.c` to do it themselves — nimony's
+/// `std/os` inlines the fork/execve/waitpid trio rather than routing through a single interceptable
+/// `system()`, so a no-C nim program reaches this leaf directly.
 ///
-/// **Resolution is the command registry and nothing else** — the same table [`OP_EXEC_RESOLVE`]
-/// consults, so authority cannot broaden: a guest can only become a program someone registered
-/// (`-ENOENT` for an unregistered path, `-EACCES` for a memfs file with no executable
-/// registration). The mechanism is unchanged and unduplicated: the op packs argv/envp into the
-/// powerbox args region and fires [`temen_interp::ParkEvent::ExecSelf`], which lands on the very
-/// same `build_exec_req` the `CAP_SELF_EXEC` route uses. The personality adds policy, not
-/// mechanism (INVARIANTS #4).
+/// **What a guest may become** is decided in one place, shared with [`OP_EXEC_RESOLVE`]: a command
+/// someone registered, or (#763) a program the process built — a memfs file holding a runnable
+/// module's encoding, which the engine promotes through the process's `ModuleLoader` (PROCESS.md:
+/// `cc x.c && ./a.out`). Authority cannot broaden either way: the new image gets only what the
+/// caller holds, and a process without a loader cannot run what it builds. The mechanism is
+/// unchanged and unduplicated: the op packs argv/envp into the powerbox args region and fires
+/// [`temen_interp::ParkEvent::ExecSelf`], which lands on the very same `build_exec_req` the
+/// `CAP_SELF_EXEC` route uses. The personality adds policy, not mechanism (INVARIANTS #4).
 ///
 /// **Success does not return.** Every failure is a probeable negative errno with the caller still
-/// running, as POSIX requires: `-ENOENT`/`-EACCES` from the registry, `-E2BIG` when argv+envp
-/// overflow the args region (**checked and refused, never truncated**), `-EFAULT` for an
-/// unreadable pointer, `-EINVAL` for a non-UTF-8 path or a refused image-replace, `-ENOSYS` on a
-/// route with no request door (a fiber, the explorer).
+/// running, as POSIX requires: `-ENOENT` for nothing at the path, `-EACCES` for a file that is not
+/// a program or a built program without a loader, `-ENOEXEC` for one whose bytes do not decode and
+/// verify, `-E2BIG` when argv+envp overflow the args region or the image's window exceeds the
+/// caller's (**checked and refused, never truncated**), `-EFAULT` for an unreadable pointer,
+/// `-EINVAL` for a non-UTF-8 path or an image-replace the engine refuses, `-ENOSYS` on a route with
+/// no request door (a fiber, the explorer).
 ///
 /// **C-ABI-shaped, deliberately.** The personality ABI is otherwise explicit-length `(ptr, len)`,
 /// but nim declares `execve(path: cstring, argv, envp: cstringArray)` and there is no length to
@@ -568,6 +571,16 @@ struct MemFile {
     mtime: i64,
 }
 
+/// What an `execve` path resolves to ([`Ctx::resolve_exec_path`]).
+enum ExecTarget {
+    /// A registered command: the granted `Module` handle the registry names it by.
+    Command(i32),
+    /// #763 — a program the process built: the bytes of a memfs file holding a runnable module's
+    /// encoding, which the engine promotes through the process's `ModuleLoader`
+    /// ([`temen_interp::ExecCmd::Staged`]).
+    Image(Arc<[u8]>),
+}
+
 // The ABI is **explicit-length**, syscall-style: a string argument is `(ptr, len)`, not a
 // NUL-terminated `char*`. This avoids an unbounded window scan (safer) and matches `read`/`write`;
 // a thin guest libc adapts C's NUL-terminated conventions to it (POSIX.md §4, "one ABI, two
@@ -579,9 +592,6 @@ const O_ACCMODE: i64 = 3;
 const O_WRONLY: i64 = 1;
 const O_RDWR: i64 = 2;
 const EACCES: i64 = -13;
-/// #1609 — argv+envp do not fit the powerbox args region. POSIX's `execve` errno for exactly this,
-/// and the one the region's fixed 16 KiB makes reachable: **checked and refused, never truncated**.
-const E2BIG: i64 = -7;
 const ENOTTY: i64 = -25; // #797: not a terminal // #801: a memfs file without the executable registration
 /// #802 rung-3 tail — the **restart sentinel** (Linux's kernel-internal `ERESTART`): a terminal
 /// read that just STOPPED its caller (SIGTTIN) returns this instead of minting the input tag, and
@@ -1291,6 +1301,10 @@ struct Proc {
     /// caller's args region and argv are exactly as they were (POSIX: a failed `execve` leaves the
     /// calling image unchanged). The next `execve` replaces a stale entry.
     pending_exec: Option<(Vec<u8>, Vec<String>)>,
+    /// #763 — the image a staged `execve` of a built program asked for ([`ExecTarget::Image`]): the
+    /// file's bytes as the exec read them, which the engine promotes through the process's
+    /// `ModuleLoader` ([`SignalDoor::exec_image`]). Cleared by every `execve` and by the commit.
+    pending_exec_image: Option<Arc<[u8]>>,
     /// #799 — this process's pid **is a core scheduler `TaskId`** (a fork twin registered by the
     /// factory with the core-minted pid) — exactly the processes whose exit the core's
     /// twin-completion wake covers, so exactly the ones a blocking `waitpid` may bench on.
@@ -1439,6 +1453,12 @@ impl Posix {
             .unwrap_or_else(|e| e.into_inner())
             .cwd
             .clone()
+    }
+
+    /// Set the working directory the program starts in — how an embedder/test stages where its
+    /// relative paths resolve, the `cd` before a command. [`rooted`], as the file seeds are.
+    pub fn set_cwd(&self, dir: &str) {
+        self.root.lock().unwrap_or_else(|e| e.into_inner()).cwd = rooted(dir);
     }
 
     /// Set the program's argument vector (`args[0]` is conventionally the program name) — how an
@@ -1662,13 +1682,16 @@ impl Posix {
     /// presentation — a memfs marker file at `path` (so `stat`/`glob`/`open` see a real file) and
     /// the exec bit (`stat` reports mode `0o755`; `exec_resolve` refuses unregistered files with
     /// `-EACCES`). The `Module` was granted on the shell's `Host` by the embedder — authority
-    /// arrived down the grant graph (invariant 3); this records the path view over it.
+    /// arrived down the grant graph (invariant 3); this records the path view over it. The path is
+    /// [`rooted`], as a file seed's is: an executable is a file, and an `execve` finds it where
+    /// every file op finds a file.
     pub fn register_executable(&self, path: &str, module_handle: i32, win_log2: u8) {
-        self.register_command(path, module_handle, win_log2);
+        let path = rooted(path);
+        self.register_command(&path, module_handle, win_log2);
         let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
-        st.executables.insert(path.to_string());
-        if !st.files.contains_key(path) {
-            st.file_put(path.to_string(), b"\x7fTEMEN".to_vec());
+        st.executables.insert(path.clone());
+        if !st.files.contains_key(&path) {
+            st.file_put(path, b"\x7fTEMEN".to_vec());
         }
     }
 
@@ -2055,9 +2078,19 @@ impl SignalSource for SignalDoor {
     /// over the args blob for the new image's args region. See [`Proc::pending_exec`].
     fn exec_commit(&self) -> Option<Vec<u8>> {
         let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        p.pending_exec_image = None;
         let (blob, argv) = p.pending_exec.take()?;
         p.args = argv;
         Some(blob)
+    }
+
+    /// #763 — the built program a staged `execve` asked for.
+    fn exec_image(&self) -> Option<Arc<[u8]>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_exec_image
+            .clone()
     }
 
     /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
@@ -2213,22 +2246,30 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             p.free_list.clear();
             p.allocated.clear();
         }
-        for entry in p.fds.iter().flatten() {
-            if let FdEntry::CorePipe(t) = entry {
+        // Every adopted pipe end re-points to its new handle — and so does the terminal input end
+        // (#797 interactive rung 2), which rides the same exec carry as a PipeEnd binding, so an
+        // exec'd child's `read(0)` still taps the terminal. Each token moves **once, from the
+        // handle it had before the exec**: `pairs` is a renaming, whose new numbers can be other
+        // ends' old ones, and dup'd fds share one token, so re-pointing fd by fd moved a shared
+        // token twice — the child's stdout, dup'd onto a pipe, landed on another end.
+        let tokens = p
+            .fds
+            .iter()
+            .flatten()
+            .filter_map(|e| match e {
+                FdEntry::CorePipe(t) => Some(t.as_ref()),
+                _ => None,
+            })
+            .chain(p.term_in.as_ref());
+        let moves: Vec<(&CorePipeToken, i32)> = tokens
+            .filter_map(|t| {
                 let cur = t.get();
-                if let Some((_, nh)) = pairs.iter().find(|(o, _)| *o == cur) {
-                    t.handle.store(*nh, Ordering::Relaxed);
-                }
-            }
-        }
-        // #797 interactive rung 2 — the terminal input end rides the same exec carry (it is a
-        // PipeEnd binding in the old powerbox); re-point this process's terminal token like any
-        // adopted pipe end, so an exec'd child's `read(0)` still taps the terminal.
-        if let Some(t) = p.term_in.as_ref() {
-            let cur = t.get();
-            if let Some((_, nh)) = pairs.iter().find(|(o, _)| *o == cur) {
-                t.handle.store(*nh, Ordering::Relaxed);
-            }
+                let (_, nh) = pairs.iter().find(|(o, _)| *o == cur)?;
+                Some((t, *nh))
+            })
+            .collect();
+        for (t, nh) in moves {
+            t.handle.store(nh, Ordering::Relaxed);
         }
     })
 }
@@ -2524,6 +2565,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         restart_ok: false,
         park_req: None,
         pending_exec: None,
+        pending_exec_image: None,
         core_task: false,
         term_in: None,
     }
@@ -2953,6 +2995,7 @@ impl Proc {
             restart_ok: self.restart_ok,
             park_req: None, // the twin's own door lands at mint, like the wake/stop/kill
             pending_exec: None,
+            pending_exec_image: None,
             core_task: false, // stamped by [`fork_factory`] beside the pid
             // #797 — the twin's own terminal token: same handle value (the twin's cloned
             // powerbox table keeps it valid), its own cell (an exec re-points per-process).
@@ -4972,7 +5015,14 @@ impl Ctx<'_> {
             return Ok(vec![EINVAL]);
         };
         Ok(vec![match self.resolve_exec_path(&path) {
-            Ok((h, _)) => h as i64,
+            Ok((ExecTarget::Command(h), _)) => h as i64,
+            // A built program has no handle to report: a guest that drives `__vm_exec_module`
+            // itself promotes it through its own `ModuleLoader` (`from_bytes`). No exec follows
+            // this answer, so the re-base the resolve stashed goes too.
+            Ok((ExecTarget::Image(_), _)) => {
+                self.p.pending_exec_heap = None;
+                EACCES
+            }
             Err(e) => e,
         }])
     }
@@ -4983,23 +5033,33 @@ impl Ctx<'_> {
     /// re-base stash: a second copy would be a second place for "what may a guest become?" to
     /// drift, and that question is the whole confinement story of exec.
     ///
-    /// `Ok((handle, window_log2))` for a registered executable; `Err(-EACCES)` for a memfs file
-    /// with no executable registration, `Err(-ENOENT)` for anything else.
-    fn resolve_exec_path(&mut self, path: &str) -> Result<(i32, u8), i64> {
-        if self.w.executables.contains(path) {
-            if let Some((_, h, wl)) = self.w.commands.iter().find(|(n, _, _)| n == path) {
-                // Stash the command's heap re-base for the exec this resolve precedes (consumed
-                // by the exec-remap hook on commit; overwritten by any later resolve, so a PATH
-                // walk's misses and a refused exec never leave a stale re-base behind).
-                let end = 1u64 << (*wl).min(63);
-                self.p.pending_exec_heap = Some((end / 4 * 3, end));
-                return Ok((*h, *wl));
-            }
-        }
-        if self.w.files.contains_key(path) {
-            return Err(EACCES);
-        }
-        Err(ENOENT)
+    /// `Ok((target, window_log2))`: a registered executable, or (#763) a memfs file holding a
+    /// runnable module's encoding — a program the process built, which the engine promotes through
+    /// the process's `ModuleLoader` at the exec (PROCESS.md: `cc x.c && ./a.out`), refusing it
+    /// `-EACCES` for a process without one. `Err(-EACCES)` for any other memfs file (no exec bit),
+    /// `Err(-ENOENT)` for anything else. Both are found as every file op finds a file: `path`
+    /// resolved against the cwd.
+    fn resolve_exec_path(&mut self, path: &str) -> Result<(ExecTarget, u8), i64> {
+        let file = self.resolve(path);
+        let found = if let Some((_, h, wl)) = self
+            .w
+            .commands
+            .iter()
+            .find(|(n, _, _)| *n == file && self.w.executables.contains(&file))
+        {
+            (ExecTarget::Command(*h), *wl)
+        } else if let Some(f) = self.w.files.get(&file) {
+            let wl = temen_encode::module_window_log2(&f.bytes).ok_or(EACCES)?;
+            (ExecTarget::Image(f.bytes.as_slice().into()), wl)
+        } else {
+            return Err(ENOENT);
+        };
+        // Stash the command's heap re-base for the exec this resolve precedes (consumed by the
+        // exec-remap hook on commit; overwritten by any later resolve, so a PATH walk's misses and
+        // a refused exec never leave a stale re-base behind).
+        let end = 1u64 << found.1.min(63);
+        self.p.pending_exec_heap = Some((end / 4 * 3, end));
+        Ok(found)
     }
 
     /// [`OP_WAIT4`] — `wait4(pid, status, options, rusage)`: [`Self::waitpid`] with the syscall's
@@ -5012,12 +5072,12 @@ impl Ctx<'_> {
         self.waitpid(&args[..3.min(args.len())], mem)
     }
 
-    /// [`OP_EXECVE`] — `execve(path, argv, envp)`: become the registered command at `path`.
+    /// [`OP_EXECVE`] — `execve(path, argv, envp)`: become the program at `path`.
     ///
-    /// Policy here, mechanism in the core: resolve against the command registry (and nothing
-    /// else), bound-walk the two C pointer arrays, check the window fit, pack argv/envp into the
-    /// powerbox args region, then fire [`temen_interp::ParkEvent::ExecSelf`] — which lands on the
-    /// same `build_exec_req` the `CAP_SELF_EXEC` route uses, so there is one image-replace, not two.
+    /// Policy here, mechanism in the core: resolve the path ([`Self::resolve_exec_path`]),
+    /// bound-walk the two C pointer arrays, check the window fit, pack argv/envp into the powerbox
+    /// args region, then fire [`temen_interp::ParkEvent::ExecSelf`] — which lands on the same
+    /// `build_exec_req` the `CAP_SELF_EXEC` route uses, so there is one image-replace, not two.
     ///
     /// On success this **never returns** (the image-replace destroys the continuation); the
     /// `-ENOSYS` below is the no-door placeholder, the `fork` precedent.
@@ -5046,7 +5106,8 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(path) else {
             return Ok(vec![EINVAL]);
         };
-        let (cmd, cmd_wl) = match self.resolve_exec_path(&path) {
+        self.p.pending_exec_image = None;
+        let (target, cmd_wl) = match self.resolve_exec_path(&path) {
             Ok(v) => v,
             Err(e) => return Ok(vec![e]),
         };
@@ -5100,6 +5161,13 @@ impl Ctx<'_> {
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
         self.p.pending_exec = Some((blob, argv));
+        let cmd = match target {
+            ExecTarget::Command(h) => temen_interp::ExecCmd::Granted(h),
+            ExecTarget::Image(bytes) => {
+                self.p.pending_exec_image = Some(bytes);
+                temen_interp::ExecCmd::Staged
+            }
+        };
         req(temen_interp::ParkEvent::ExecSelf { cmd });
         Ok(vec![ENOSYS])
     }
@@ -6970,7 +7038,9 @@ block 0 (vph: i32) {\n\
         }
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![temen_interp::ParkEvent::ExecSelf { cmd: 5 }]
+            vec![temen_interp::ParkEvent::ExecSelf {
+                cmd: temen_interp::ExecCmd::Granted(5)
+            }]
         );
         assert!(
             win[args_base..args_base + 64].iter().all(|&b| b == 0),
@@ -6993,6 +7063,142 @@ block 0 (vph: i32) {\n\
             None,
             "a commit consumes the staged exec"
         );
+    }
+
+    /// #763 — a memfs file holding a runnable module's encoding is a program the process built:
+    /// `execve` stages its bytes and asks for [`temen_interp::ExecCmd::Staged`], which the engine
+    /// promotes through the process's `ModuleLoader`. Any other memfs file stays `-EACCES`.
+    /// `exec_resolve`, which can only report a registered handle, refuses a built program. An image
+    /// declaring a window larger than the caller's is `-E2BIG` before anything is staged, and the
+    /// commit clears the staged image.
+    #[test]
+    fn execve_of_a_built_program_stages_its_image() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let module = |size_log2| {
+            temen_encode::encode_module(&temen_ir::Module {
+                memory: Some(temen_ir::Memory {
+                    size_log2,
+                    shadow: None,
+                }),
+                ..temen_ir::Module::default()
+            })
+        };
+        let prog = module(16);
+        posix.write_file("/out/prog", &prog);
+        posix.write_file("/out/big", &module(40));
+        posix.write_file("/out/notes", b"not a program");
+        let (door, _armed) = cap_signal_source(&posix);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&seen);
+        door.set_park_request(Arc::new(move |ev| rec.lock().unwrap().push(ev)));
+        let mut win = vec![0u8; WIN];
+        win[100_100..100_102].copy_from_slice(b"x\0");
+        win[100_200..100_208].copy_from_slice(&100_100u64.to_le_bytes()); // argv = ["x", NULL]
+        let mut run = |path: &str, op: &str| -> i64 {
+            win[100_000..100_000 + path.len()].copy_from_slice(path.as_bytes());
+            win[100_000 + path.len()] = 0;
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            let r = match op {
+                "execve" => st.execve(&[100_000, 100_200, 0], Some(&mut mem)),
+                _ => st.exec_resolve(&[100_000, path.len() as i64], Some(&mut mem)),
+            };
+            r.unwrap()[0]
+        };
+
+        assert_eq!(run("/out/notes", "execve"), EACCES, "not an executable");
+        assert_eq!(
+            run("/out/big", "execve"),
+            E2BIG,
+            "window larger than the caller's"
+        );
+        assert_eq!(
+            run("/out/prog", "exec_resolve"),
+            EACCES,
+            "no handle to report"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refusal asks for nothing"
+        );
+        assert_eq!(door.exec_image(), None);
+
+        assert_eq!(
+            run("out/prog", "execve"),
+            ENOSYS,
+            "found relative to the cwd"
+        );
+        seen.lock().unwrap().clear();
+        assert_eq!(
+            run("/out/prog", "execve"),
+            ENOSYS,
+            "the request's placeholder"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![temen_interp::ParkEvent::ExecSelf {
+                cmd: temen_interp::ExecCmd::Staged
+            }]
+        );
+        assert_eq!(door.exec_image().as_deref(), Some(prog.as_slice()));
+        assert_eq!(
+            door.exec_commit(),
+            Some(temen_ir::write_args_blob(&[b"x"], &[]))
+        );
+        assert_eq!(
+            door.exec_image(),
+            None,
+            "the commit clears the staged image"
+        );
+    }
+
+    /// An exec renames the process's pipe ends, and each end moves once, from the handle it had
+    /// before: the new numbers can be other ends' old ones, and dup'd fds share one token. Here the
+    /// end dup'd onto two fds moves 5 → 6 and must stay there, not follow the other end's 6 → 7.
+    #[test]
+    fn an_exec_moves_each_pipe_end_once() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let dup = Arc::new(CorePipeToken::new(5));
+        let other = Arc::new(CorePipeToken::new(6));
+        posix.root.lock().unwrap().fds = vec![
+            Some(FdEntry::CorePipe(Arc::clone(&dup))),
+            Some(FdEntry::CorePipe(Arc::clone(&dup))),
+            Some(FdEntry::CorePipe(Arc::clone(&other))),
+        ];
+        (cap_exec_remap_hook(&posix))(&[(5, 6), (6, 7)]);
+        assert_eq!((dup.get(), other.get()), (6, 7));
+    }
+
+    /// A registered executable is a file: an `execve` finds it where its path resolves against the
+    /// cwd, as every file op finds a file — not by the spelling it was registered under.
+    #[test]
+    fn an_executable_is_found_where_its_path_resolves() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.register_executable("/work/bin/c", 5, 16);
+        posix.register_executable("tools/t", 6, 16);
+        let mut win = vec![0u8; WIN];
+        let mut resolve = |path: &str| -> i64 {
+            win[100_000..100_000 + path.len()].copy_from_slice(path.as_bytes());
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            st.exec_resolve(&[100_000, path.len() as i64], Some(&mut mem))
+                .unwrap()[0]
+        };
+        assert_eq!(resolve("/work/bin/c"), 5);
+        assert_eq!(resolve("bin/c"), ENOENT, "from `/`, `bin/c` is `/bin/c`");
+        assert_eq!(
+            resolve("tools/t"),
+            6,
+            "registered relative: rooted, as a seed is"
+        );
+        posix.set_cwd("/work");
+        assert_eq!(posix.cwd(), "/work");
+        assert_eq!(resolve("bin/c"), 5, "found relative to the cwd");
+        assert_eq!(resolve("tools/t"), ENOENT, "`/work/tools/t`: no such file");
+        assert_eq!(resolve("/tools/t"), 6);
     }
 
     #[test]

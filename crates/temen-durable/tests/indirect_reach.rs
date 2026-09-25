@@ -173,3 +173,28 @@ fn a_taken_address_makes_its_signature_a_suspend_point_and_needs_no_barrier() {
     let empty = TEST_ARENA.frame_base(0) as i64;
     assert_eq!(run(&fork.module, fork.body[0], 0), Value::I64(2 * empty));
 }
+
+/// #1830 — an index the data image holds is taken as a `ref.func` makes one: a static initializer's
+/// function pointer, which `link` records ([`Module::data_funcref_slots`]). `site` needs no barrier,
+/// exactly as when `entry` takes its address in code, and a `call.dyn` through the image's index
+/// reaches it with the shadow stack free for an unwind.
+#[test]
+fn an_index_the_data_image_holds_is_taken_like_a_ref_func() {
+    let mut m = module(SRC);
+    m.data = vec![temen_ir::Data {
+        offset: 70000,
+        readonly: true,
+        bytes: 1u32.to_le_bytes().to_vec(),
+    }];
+    m.data_funcref_slots = vec![70000];
+    let fork = transform(&m, &TransformOpts::fork(&is_site)).expect("transform");
+    temen_verify::verify_module(&fork.module).expect("verify");
+    assert_eq!(
+        fork.body,
+        vec![3, 1, 2],
+        "as when `entry` takes `site`'s address"
+    );
+    assert!(is_barrier_over(&fork.module.funcs[0], 3));
+    let empty = TEST_ARENA.frame_base(0) as i64;
+    assert_eq!(run(&fork.module, fork.body[0], 1), Value::I64(2 * empty));
+}

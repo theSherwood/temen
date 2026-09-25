@@ -64,16 +64,18 @@ fn has_indirect_funcref_dispatch(m: &Module) -> bool {
     })
 }
 
-/// Whether the module materializes any funcref via `ref.func`. Its result is the function index as an
-/// observable `i32`, so renumbering functions would change that value wherever it flows to data (a
-/// return, a store, a comparison) rather than an immediately-consumed dispatch. [`dead_func_elim`]
-/// bails to the identity when one is present — see the call site.
+/// Whether the module hands out any function index as a value: a `ref.func`, or an index its data
+/// image holds ([`Module::data_funcref_slots`], #1830). That value is an observable `i32`, so
+/// renumbering functions would change it wherever it flows to data (a return, a store, a comparison)
+/// rather than an immediately-consumed dispatch — and a data image's index would name another
+/// function. [`dead_func_elim`] bails to the identity when one is present — see the call site.
 fn has_ref_func(m: &Module) -> bool {
-    m.funcs
-        .iter()
-        .flat_map(|f| &f.blocks)
-        .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::RefFunc { .. }))
+    !m.data_funcref_slots.is_empty()
+        || m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::RefFunc { .. }))
 }
 
 /// Rewrite every static function index in `f` through the old→new map (the exact set
@@ -203,6 +205,8 @@ pub fn dead_func_elim(m: &Module) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        // None: a module whose data holds a function index bails above.
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs,
         memory: m.memory,
@@ -652,6 +656,7 @@ pub fn inline_calls(m: &Module) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: m.data_funcref_slots.clone(),
         tls: Vec::new(),
         funcs,
         memory: m.memory,
@@ -803,10 +808,13 @@ pub fn const_prop(m: &Module) -> Module {
             opaque[i] = true;
         }
     }
+    for (o, taken) in opaque.iter_mut().zip(temen_ir::taken_funcs(m)) {
+        *o |= taken;
+    }
     for f in &m.funcs {
         for b in &f.blocks {
             for inst in &b.insts {
-                if let Inst::RefFunc { func } | Inst::ThreadSpawn { func, .. } = inst {
+                if let Inst::ThreadSpawn { func, .. } = inst {
                     if (*func as usize) < n {
                         opaque[*func as usize] = true;
                     }
@@ -961,6 +969,7 @@ pub fn const_prop(m: &Module) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: m.data_funcref_slots.clone(),
         tls: Vec::new(),
         funcs,
         memory: m.memory,
@@ -1085,6 +1094,7 @@ pub fn devirtualize(m: &Module) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: m.data_funcref_slots.clone(),
         tls: Vec::new(),
         funcs,
         memory: m.memory,

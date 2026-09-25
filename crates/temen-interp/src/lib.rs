@@ -5375,6 +5375,9 @@ pub struct ExecImage {
     pub host: Host,
     /// The command module.
     pub module: Arc<Module>,
+    /// The command module's content digest ([`module_digest`]): what names its code, however many
+    /// times it is granted or promoted (a JIT tree compiles it once per digest).
+    pub digest: [u8; 32],
     /// The entry function the command starts at.
     pub entry: u64,
     /// The entry's arguments: the starter handles its shape takes (none for a powerbox `_start`).
@@ -5388,7 +5391,7 @@ pub struct ExecImage {
     pub(crate) data: Arc<[Data]>,
     /// The pipes the old image's released ends left with no writers / no readers: a scheduler
     /// wakes their readers (EOF) / writers (`-EPIPE`).
-    pub(crate) zeroed_pipes: (Vec<u32>, Vec<u32>),
+    pub zeroed_pipes: (Vec<u32>, Vec<u32>),
 }
 
 struct ExecReq {
@@ -8471,8 +8474,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (pipe_eofs, pipe_epipes) = if froze {
                     (Vec::new(), Vec::new())
                 } else {
-                    let hg = v.host.lock_unpoisoned();
-                    (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
+                    v.host.lock_unpoisoned().release_pipe_ends()
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
@@ -12137,56 +12139,46 @@ fn handle_mem(
 ///
 /// **Consume everywhere** is the discipline these flags need (a transient left set lands on
 /// somebody else's call), so `drain` takes all of them whether or not this arm acts on them.
-/// Whether it *acts* is [`Decision`]'s business.
-struct ParkTransients {
+/// Whether it *acts* is [`Decision`]'s business on the interpreters, and `jit_proc`'s on a JIT
+/// process tree, which drains through [`Host::take_park_transients`].
+///
+/// Every call form parks on a pipe (#1826). The import routes used to consume the pipe flags
+/// without acting on them, a "posture" that kept an import-routed read of an empty pipe at its
+/// historical `0`, a false EOF while a writer still held the pipe open. The bytecode engine parked
+/// there all along, and the JIT cannot tell `call.sym` from `call.import` at all (both reach its
+/// thunk as the import dispatch).
+pub struct ParkTransients {
     /// A pipe whose parked readers should be woken (a write, or a writer-to-zero close).
-    wake_readers: Option<u32>,
+    pub wake_readers: Option<u32>,
     /// A pipe whose parked writers should be woken (a drained-full read, or a reader-to-zero close).
-    wake_writers: Option<u32>,
+    pub wake_writers: Option<u32>,
     /// A blocking pipe read that found an empty FIFO with writers open.
-    read_park: Option<u32>,
+    pub read_park: Option<u32>,
     /// A blocking pipe write that found a full FIFO with readers open (backpressure).
-    write_park: Option<u32>,
+    pub write_park: Option<u32>,
     /// The #799 caller request: `fork`, `execve`, or a blocking `waitpid`'s bench.
-    request: Option<ParkEvent>,
+    pub request: Option<ParkEvent>,
     /// #796 L1 — a delivered signal interrupted a park this arm would otherwise have taken.
-    sig_intr: bool,
-    /// Whether this call form acts on the pipe parks (see [`ParkPosture`]).
-    pipes: bool,
-}
-
-/// Which parks a call form takes. Not a capability question — a **posture**: an import-routed
-/// blocking read keeps its historical 0-EOF answer rather than parking (the slot-parked calls are
-/// the §3.6 caller-parking slice), while the inline routes park. The caller *request* family is
-/// deliberately not a posture: dropping one leaves the guest holding an `-ENOSYS` placeholder with
-/// nothing to say why, which is what #1621 and #1635 each were.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ParkPosture {
-    /// `call.cap` / `call.sym`: pipe parks are taken.
-    ParksOnPipes,
-    /// `call.import` / `call.import.dyn`: pipe flags are consumed, not acted on.
-    RequestsOnly,
+    pub sig_intr: bool,
 }
 
 impl ParkTransients {
     /// Drain every transient under one host lock.
-    fn drain(hg: &mut Host, posture: ParkPosture) -> Self {
-        let pipes = posture == ParkPosture::ParksOnPipes;
+    fn drain(hg: &mut Host) -> Self {
         let wake_readers = hg.take_pipe_wake();
         let wake_writers = hg.take_pipe_wake_writers();
         let read_park = hg.take_pipe_read_parked();
         let write_park = hg.take_pipe_write_parked();
         let request = hg.take_park_request();
-        // #796 L1 — consume the EINTR flag only when this arm is actually about to park (a
-        // completed read/write must not eat it), which is why the posture is read here: a route
-        // that declines pipe parks must not eat an interrupt on their behalf. Short-circuits so
-        // `take_sig_interrupt` fires only on a genuine park. (`fork` does not participate: POSIX
-        // fork is not interruptible — it succeeds or EAGAINs.)
+        // #796 L1 — consume the EINTR flag only when this op is actually about to park (a
+        // completed read/write must not eat it). Short-circuits so `take_sig_interrupt` fires
+        // only on a genuine park. (`fork` does not participate: POSIX fork is not interruptible —
+        // it succeeds or EAGAINs.)
         let reaps = matches!(
             request,
             Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
         );
-        let sig_intr = (reaps || (pipes && (read_park.is_some() || write_park.is_some())))
+        let sig_intr = (reaps || read_park.is_some() || write_park.is_some())
             && hg.take_sig_interrupt()
             // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
             && !hg.signal_restart();
@@ -12197,7 +12189,6 @@ impl ParkTransients {
             write_park,
             request,
             sig_intr,
-            pipes,
         }
     }
 
@@ -12237,9 +12228,9 @@ enum Decision {
     /// Replace this image. **Never returns**, which is what makes a guest's `execve(...);
     /// exitnow(127)` run `exitnow` only on failure.
     Exec(Box<ExecReq>),
-    /// The exec was refused: the op's `-ENOSYS` placeholder becomes a probeable `-EINVAL`, caller
+    /// The exec was refused: the op's `-ENOSYS` placeholder becomes this probeable errno, caller
     /// still running (POSIX: `execve` returns only on failure).
-    ExecRefused,
+    ExecRefused(i64),
     /// #1672 — the op would park (a pipe read/write, a reap bench) but a freeze is landing on a
     /// durable domain. The op took no effect, so it is **abandoned**: the caller sets its context's
     /// re-issue word and continues with the op's placeholder results. The call's trailing poll
@@ -12281,7 +12272,7 @@ fn decide(
     // #1672 — under a landing freeze a durable domain never parks: the park is abandoned instead.
     let freezing = durable && mem.is_some_and(|m| m.durable_state() == STATE_UNWINDING);
     let park = |d: Decision| if freezing { Decision::Abandon } else { d };
-    if t.pipes && parkable {
+    if parkable {
         if let Some(pipe) = t.read_park {
             return if t.sig_intr {
                 Decision::Eintr
@@ -12318,17 +12309,17 @@ fn decide(
         ParkEvent::TaskExitAny if t.sig_intr => Decision::Eintr,
         ParkEvent::TaskExitAny => park(Decision::Reap(REAP_ANY_CHILD)),
         // The op resolved the path against the command registry and staged argv/envp; only the
-        // resolved command handle rides the request. The staged args are collected at the commit
-        // point and nowhere else (#1768): a refused exec returns to an untouched caller.
+        // resolved command rides the request. The staged args are collected at the commit point and
+        // nowhere else (#1768): a refused exec returns to an untouched caller.
         ParkEvent::ExecSelf { cmd } => {
             match build_exec_req(host, mem, sched, cmd, 0, 0, 0, 0, durable, clean_root) {
-                Some(req) => {
+                Ok(req) => {
                     if let (Some(blob), Some(m)) = (req.host.exec_commit_args(), mem) {
                         m.write_exec_args(&blob);
                     }
                     Decision::Exec(req)
                 }
-                None => Decision::ExecRefused,
+                Err(e) => Decision::ExecRefused(e),
             }
         }
     }
@@ -12347,29 +12338,39 @@ fn build_exec_req(
     host: &Arc<Mutex<Host>>,
     mem: Option<&Mem>,
     sched: &SchedRef,
-    mh: i32,
+    cmd: ExecCmd,
     grants_ptr: u64,
     grants_n: u64,
     entry: u64,
     size_log2: i64,
     durable: bool,
     clean_root: bool,
-) -> Option<Box<ExecReq>> {
+) -> Result<Box<ExecReq>, i64> {
     // The tree-walker's own gates: a durable domain's subtree must stay snapshottable, and only a
     // clean root context (no serve handler / fibers) can be replaced. Everything else — the command,
     // its entry, the window fit (the caller's backed prefix), the grants — is the one rule every
-    // engine admits by, `Host::exec_image`. Anything refused is a probeable `-EINVAL` that leaves the
-    // caller running (POSIX `execve` returns only on failure).
+    // engine admits by, `Host::exec_module` + `Host::exec_image`. Anything refused is a probeable
+    // errno that leaves the caller running (POSIX `execve` returns only on failure).
     if durable || !clean_root {
-        return None;
+        return Err(EINVAL);
     }
-    let m = mem?;
+    let m = mem.ok_or(EINVAL)?;
     // The inherited-cap grant list (same 16-byte record shape as op 13's named grants); a bad record
     // fails the whole exec closed, before anything is mutated.
-    let grants = read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).ok()?;
-    let img =
-        host.lock_unpoisoned()
-            .exec_image(mh, &grants, entry, size_log2, m.window.mapped())?;
+    let grants =
+        read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).map_err(|_| EINVAL)?;
+    let img = {
+        let mut h = host.lock_unpoisoned();
+        let command = h.exec_module(cmd)?;
+        h.exec_image(
+            &command,
+            &grants,
+            entry,
+            size_log2,
+            m.window.mapped(),
+            m.window.reserved(),
+        )?
+    };
     // FORK.md §8.6 — wake any pipe the old image's released ends left with 0 writers (→ EOF for its
     // readers) or 0 readers (→ `-EPIPE` for its writers).
     let (zeroed_w, zeroed_r) = img.zeroed_pipes;
@@ -12379,7 +12380,7 @@ fn build_exec_req(
     for pipe in zeroed_r {
         sched.wake_pipe_writers(pipe);
     }
-    Some(Box::new(ExecReq {
+    Ok(Box::new(ExecReq {
         null_guard: temen_ir::module_null_guard(),
         funcs: img.funcs,
         types: img.types,
@@ -15160,12 +15161,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
-                // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): mint a host-served pipe into this
-                // domain's own powerbox and write `fds[0]` = read end, `fds[1]` = write end (POSIX
-                // order) as two i32s at the guest pointer. A direct self-op like `setpgid` — the guest
-                // mints its own intra-domain FIFO (no host authority) and later grants the ends to its
-                // pipeline children. `Real` scheduler only (the `PipeEnd`/fork machinery); `-EMFILE` on
-                // a full table, `-EFAULT` on a bad `fds`.
+                // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): the one mint ([`Host::mint_pipe`]),
+                // on the `Real` scheduler, whose `PipeEnd` parks the pipe's reads and writes need.
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_PIPE,
@@ -15173,30 +15170,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let fds_ptr = match args.first() {
+                    let fds = match args.first() {
                         Some(a) => get(&frames[top].vals, *a)?.i64() as u64,
                         None => 0,
                     };
-                    let minted = if matches!(sched, SchedRef::Real(_)) {
-                        host.lock_unpoisoned().try_grant_pipe()
+                    let r = if matches!(sched, SchedRef::Real(_)) {
+                        let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                        host.lock_unpoisoned().mint_pipe(fds, gm)
                     } else {
-                        None
-                    };
-                    let r = match minted {
-                        None if !matches!(sched, SchedRef::Real(_)) => EINVAL,
-                        None => EMFILE,
-                        Some((w, rd)) => match mem.as_mut() {
-                            Some(m) => {
-                                let ok0 = m.write_bytes(fds_ptr, &rd.to_le_bytes()).is_some();
-                                let ok1 = m.write_bytes(fds_ptr + 4, &w.to_le_bytes()).is_some();
-                                if ok0 && ok1 {
-                                    0
-                                } else {
-                                    EFAULT
-                                }
-                            }
-                            None => EFAULT,
-                        },
+                        EINVAL
                     };
                     if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
@@ -15247,7 +15229,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         host,
                         mem.as_ref(),
                         sched,
-                        mh,
+                        ExecCmd::Granted(mh),
                         grants_ptr,
                         grants_n,
                         entry,
@@ -15255,11 +15237,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         durable,
                         clean_root,
                     ) {
-                        Some(req) => return Ok(Inner::Exec(req)),
-                        None if !call_sig(&cur_types, *sig).results.is_empty() => {
-                            frames[top].vals.push(Reg::from_i64(EINVAL));
+                        Ok(req) => return Ok(Inner::Exec(req)),
+                        Err(e) if !call_sig(&cur_types, *sig).results.is_empty() => {
+                            frames[top].vals.push(Reg::from_i64(e));
                         }
-                        None => {}
+                        Err(_) => {}
                     }
                 }
                 Inst::CapCall {
@@ -15517,7 +15499,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // empty FIFO with writers open parks, a `write` to a full pipe parks the writer
                     // (backpressure), and a write / last-close flags the other side's wake. Drained
                     // with the #799 caller request and the #796 interrupt flag in one place (#1647).
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::ParksOnPipes);
+                    let t = ParkTransients::drain(&mut hg);
                     let domain = hg.domain_id() as usize;
                     drop(hg);
                     if closed {
@@ -15525,7 +15507,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = false;
+                    let mut exec_refused = None;
                     match decide(
                         t,
                         *cur,
@@ -15537,7 +15519,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused => exec_refused = true,
+                        Decision::ExecRefused(e) => exec_refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -15558,9 +15540,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if exec_refused {
+                        if let Some(e) = exec_refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
+                                frames[top].vals.push(Reg::from_i64(e));
                             }
                         } else {
                             for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
@@ -15720,19 +15702,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *import | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
-                    // Import-routed blocking reads don't park this slice (slot-parked calls are
-                    // the §3.6 caller-parking slice); the flag is consumed so it can't leak into a
-                    // later direct call's park decision — the read keeps its historical 0-EOF.
+                    // An import-routed blocking-stdin read doesn't park on this engine (the
+                    // `set_stdin_blocking` park is `call.cap`'s); the flag is consumed so it can't
+                    // leak into a later direct call's park decision.
                     let _ = hg.take_stdin_parked();
-                    // #1621/#1647 — the **caller request** is not "likewise". Read parking is a
-                    // posture this arm may decline ([`ParkPosture::RequestsOnly`]); `fork`/`exec`/a
-                    // reap bench are requests the drive loop acts on, and dropping one leaves the
-                    // guest holding the op's `-ENOSYS` placeholder with nothing to say why.
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::RequestsOnly);
+                    // #1621/#1647/#1826 — the caller request and the pipe parks are honored on every
+                    // call form: dropping a request leaves the guest holding the op's `-ENOSYS`
+                    // placeholder with nothing to say why, and dropping a pipe park is a false EOF.
+                    let t = ParkTransients::drain(&mut hg);
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = false;
+                    let mut exec_refused = None;
                     match decide(
                         t,
                         *cur,
@@ -15744,7 +15725,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused => exec_refused = true,
+                        Decision::ExecRefused(e) => exec_refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -15765,9 +15746,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if exec_refused {
+                        if let Some(e) = exec_refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
+                                frames[top].vals.push(Reg::from_i64(e));
                             }
                         } else {
                             for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
@@ -15897,12 +15878,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #1647 — the wakes now fire BEFORE the park decision. They used to run after
                     // it, past four `return`s, so a `call.sym` op that both filled a pipe and
                     // parked dropped its wake on the floor.
-                    let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::ParksOnPipes);
+                    let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
+                    let t = ParkTransients::drain(&mut hg);
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = false;
+                    let mut exec_refused = None;
                     match decide(
                         t,
                         *cur,
@@ -15914,7 +15895,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused => exec_refused = true,
+                        Decision::ExecRefused(e) => exec_refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -15935,9 +15916,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if exec_refused {
+                        if let Some(e) = exec_refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
+                                frames[top].vals.push(Reg::from_i64(e));
                             }
                         } else {
                             for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
@@ -15983,16 +15964,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
-                    let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
-                                                    // #1621/#1647 — the caller request is honored here too. No consumer reaches a
-                                                    // personality op through `call.import.dyn` today, but leaving this arm the one
-                                                    // that silently drops the request would just re-create the asymmetry that cost
+                    let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
+                                                    // #1621/#1647/#1826 — requests and pipe parks are honored here too. No consumer
+                                                    // reaches a personality op through `call.import.dyn` today, but leaving this arm
+                                                    // the one that silently drops them would just re-create the asymmetry that cost
                                                     // #1621 four rounds to find.
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::RequestsOnly);
+                    let t = ParkTransients::drain(&mut hg);
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = false;
+                    let mut exec_refused = None;
                     match decide(
                         t,
                         *cur,
@@ -16004,7 +15985,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused => exec_refused = true,
+                        Decision::ExecRefused(e) => exec_refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -16025,9 +16006,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if exec_refused {
+                        if let Some(e) = exec_refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
+                                frames[top].vals.push(Reg::from_i64(e));
                             }
                         } else {
                             for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results)
@@ -18633,7 +18614,9 @@ pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
-use temen_ir::errno::{EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOMEM, ENOSPC, EPIPE};
+use temen_ir::errno::{
+    E2BIG, EACCES, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM, ENOSPC, EPIPE,
+};
 /// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
 /// call returns when the handle it was parked through is revoked out from under it. Probeable
 /// on the fiber's own error path — never a trap (D42: errors return, traps stay for escape).
@@ -20610,25 +20593,41 @@ pub enum ParkEvent {
     /// with the twin's TaskId as the call's result, the twin with `0`. The one request where
     /// complete-with-value is mandatory on both sides — a rewound fork would fork twice.
     ForkSelf,
-    /// #1609 — `execve()` through the personality: replace the calling vCPU's image with the
-    /// registered command `cmd` (a `Module` handle the personality already resolved against its
-    /// command registry, so authority cannot broaden here — a guest can only become a program
-    /// someone granted it). Like [`Self::ForkSelf`] this is a request, not a park: the eval loop
-    /// builds the command's powerbox and hands `dispatch` the same [`Step::Exec`] the
-    /// self-namespace op 14 route produces, over the one shared builder ([`build_exec_req`]).
+    /// #1609 — `execve()` through the personality: replace the calling vCPU's image with `cmd`, a
+    /// registered command the personality already resolved against its registry, or the image it
+    /// staged from the filesystem ([`ExecCmd`]). Authority cannot broaden here: a guest becomes a
+    /// program someone granted it, or one its own `ModuleLoader` promotes. Like
+    /// [`Self::ForkSelf`] this is a request, not a park: the eval loop builds the command's
+    /// powerbox and hands `dispatch` the same [`Step::Exec`] the self-namespace op 14 route
+    /// produces, over the one shared builder ([`build_exec_req`]).
     ///
     /// **Success does not return** — the image-replace destroys the continuation, which is what
     /// makes a guest's `execve(...); exitnow(127)` idiom correct. Every refusal is instead a
-    /// probeable errno completing the call (never a trap, never a hang): `-EINVAL` for an
-    /// unusable module or an unclean context, `-E2BIG` for a command whose declared window does
-    /// not fit the caller's — checked and refused, never truncated.
-    ExecSelf { cmd: i32 },
+    /// probeable errno completing the call (never a trap, never a hang): see [`Host::exec_module`]
+    /// and [`Host::exec_image`] for which.
+    ExecSelf { cmd: ExecCmd },
 }
 
-/// #1609 — the `park_request` cell's tag for [`ParkEvent::ExecSelf`]; the resolved command's
-/// `Module` handle rides the low 32 bits. Handles are non-negative, so this block cannot collide
-/// with [`ParkEvent::ForkSelf`]/[`ParkEvent::TaskExitAny`], which are this same tag at `-1`/`-2`.
+/// What an `execve` becomes (#1609, #763).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecCmd {
+    /// A `Module` the process holds a grant for: a registered command (the personality's
+    /// registry names it by handle), or one a guest's own `exec_module` (op 14) passes.
+    Granted(i32),
+    /// The image the personality staged from its filesystem ([`SignalSource::exec_image`]): a
+    /// program the process built, which its `ModuleLoader` promotes as `from_bytes` would —
+    /// PROCESS.md's `cc x.c && ./a.out`.
+    Staged,
+}
+
+/// #1609 — the `park_request` cell's tag for [`ParkEvent::ExecSelf`] of an [`ExecCmd::Granted`]
+/// command; its `Module` handle rides the low 32 bits. Handles are non-negative, so this block
+/// cannot collide with the sentinels at the top of the range, which are this same tag at `-1`
+/// ([`ParkEvent::ForkSelf`]), `-2` ([`ParkEvent::TaskExitAny`]) and `-3` ([`EXEC_STAGED`]).
 const EXEC_SELF_TAG: u64 = 0xFFFF_FFFF_0000_0000;
+
+/// #763 — the `park_request` cell's value for [`ParkEvent::ExecSelf`] of [`ExecCmd::Staged`].
+const EXEC_STAGED: u64 = u64::MAX - 2;
 
 impl ParkEvent {
     /// The `park_request` cell encoding. This lived as five identical copies of the same `match`
@@ -20643,20 +20642,28 @@ impl ParkEvent {
             ParkEvent::TaskExit(id) => id,
             ParkEvent::TaskExitAny => u64::MAX - 1,
             ParkEvent::ForkSelf => u64::MAX,
-            ParkEvent::ExecSelf { cmd } => EXEC_SELF_TAG | (cmd as u32 as u64),
+            ParkEvent::ExecSelf {
+                cmd: ExecCmd::Granted(h),
+            } => EXEC_SELF_TAG | (h as u32 as u64),
+            ParkEvent::ExecSelf {
+                cmd: ExecCmd::Staged,
+            } => EXEC_STAGED,
         }
     }
 
-    /// The inverse of [`Self::encode`] (`0` = no request). The two sentinels are matched before
-    /// the [`Self::ExecSelf`] block so the `-1`/`-2` aliases resolve to them, and the block itself
-    /// admits only non-negative handles.
+    /// The inverse of [`Self::encode`] (`0` = no request). The three sentinels are matched before
+    /// the granted-command block so the `-1`/`-2`/`-3` aliases resolve to them, and the block
+    /// itself admits only non-negative handles.
     fn decode(v: u64) -> Option<ParkEvent> {
         match v {
             0 => None,
             u64::MAX => Some(ParkEvent::ForkSelf),
             v if v == u64::MAX - 1 => Some(ParkEvent::TaskExitAny),
+            EXEC_STAGED => Some(ParkEvent::ExecSelf {
+                cmd: ExecCmd::Staged,
+            }),
             v if v >= EXEC_SELF_TAG && (v as u32) <= i32::MAX as u32 => Some(ParkEvent::ExecSelf {
-                cmd: v as u32 as i32,
+                cmd: ExecCmd::Granted(v as u32 as i32),
             }),
             id => Some(ParkEvent::TaskExit(id)),
         }
@@ -20826,6 +20833,14 @@ pub trait SignalSource: Send + Sync {
     /// failure, and then the calling image is unchanged). Called only for an `ExecSelf`-requested
     /// exec, never for a guest's own `exec_module` (op 14). Default `None`: a source with no exec op.
     fn exec_commit(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// #763 — the image this source's [`ParkEvent::ExecSelf`] of [`ExecCmd::Staged`] asked for:
+    /// the bytes of the file its `execve` named, read when it did (POSIX: exec reads the file
+    /// then). [`Host::exec_module`] promotes them to a module. `None` when nothing is staged.
+    /// Default `None`: a source with no exec op.
+    fn exec_image(&self) -> Option<Arc<[u8]>> {
         None
     }
 }
@@ -21609,6 +21624,30 @@ struct ModuleGrant {
     module: Arc<Module>,
 }
 
+impl ModuleGrant {
+    /// The record a grant of `m` keeps — one derivation for a `Module` grant
+    /// ([`Host::grant_module`]) and for an image an `execve` promotes ([`Host::exec_module`]).
+    fn of(m: Arc<Module>, durable: bool) -> ModuleGrant {
+        ModuleGrant {
+            funcs: m.funcs.clone().into(),
+            shadow: m.memory.and_then(|mc| mc.shadow),
+            memory_log2: m.memory.map(|mc| mc.size_log2),
+            data: m.data.clone().into(),
+            exports: m.exports.clone().into(),
+            imports: m.imports.clone().into(),
+            types: m.types.clone().into(),
+            durable,
+            digest: module_digest(&m),
+            module: m,
+        }
+    }
+}
+
+/// What an `execve` becomes, resolved ([`Host::exec_module`]): the module the new image runs.
+/// Opaque outside this crate — an engine hands it back to [`Host::exec_image`].
+#[derive(Clone)]
+pub struct ExecModule(ModuleGrant);
+
 /// The §4 nested-child module-identity digest: a content hash of a grant's **semantic image**
 /// (functions, memory, data, exports), computed the same way at freeze-grant and thaw-grant so a
 /// separate-module child re-attaches against the matching re-granted module. Debug info and
@@ -21618,6 +21657,9 @@ pub fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        // Which data bytes are function indices is part of the image (#1830): it decides what an
+        // analysis of its indirect calls may assume, so two modules that differ in it are two.
+        data_funcref_slots: m.data_funcref_slots.clone(),
         tls: Vec::new(),
         funcs: m.funcs.clone(),
         memory: m.memory,
@@ -22553,6 +22595,13 @@ impl Host {
         ParkEvent::decode(self.park_request.swap(0, Ordering::SeqCst))
     }
 
+    /// #1826 — every park transient the last dispatch left, drained at once ([`ParkTransients`]):
+    /// the one drain the interpreters' call arms use, for an engine that decides outside this crate
+    /// (a JIT process tree, `jit_proc`).
+    pub fn take_park_transients(&mut self) -> ParkTransients {
+        ParkTransients::drain(self)
+    }
+
     /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
     /// eval loop can register a `Blocked::PipeRead` and re-issue the read on wake.
     fn take_pipe_read_parked(&mut self) -> Option<u32> {
@@ -22721,17 +22770,18 @@ impl Host {
             .unwrap_or(u32::MAX)
     }
 
-    /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
-    /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
-    /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
-    /// by crashing — releases its write ends and never wedges a downstream consumer.
-    /// FORK.md §8.6 — a domain finishing releases every pipe end it holds, so a peer reader sees EOF
-    /// and a peer writer `-EPIPE`. For a driver whose parked peers poll, so the zeroed pipes need no
-    /// wake. Call it once per domain: each call decrements the shared end counts again.
-    pub(crate) fn release_pipe_ends(&self) {
-        let _ = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+    /// FORK.md §8.6 — a process leaving this powerbox (it exits, crashes, or execs) releases every
+    /// pipe end it holds. Returns the pipes left with no writers, whose readers must wake to EOF, and
+    /// the pipes left with no readers, whose writers must wake to `-EPIPE` (global ids, the wake key).
+    /// A driver whose parked peers poll drops them. Call it once per powerbox: each call decrements
+    /// the shared end counts again.
+    pub fn release_pipe_ends(&self) -> (Vec<u32>, Vec<u32>) {
+        (self.drop_all_pipe_writers(), self.drop_all_pipe_readers())
     }
 
+    /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
+    /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF), so a
+    /// producer that exits — even by crashing — never wedges a downstream consumer.
     fn drop_all_pipe_writers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {
@@ -22746,9 +22796,8 @@ impl Host {
 
     /// FORK.md §8.6 (EPIPE) — the read-end counterpart of [`Self::drop_all_pipe_writers`]: decrement the
     /// reader count for **every** live pipe *read* end this Host holds, returning the pipe ids that
-    /// reached `0` readers (writers of those must be woken → `-EPIPE`). Called on exec/teardown so a
-    /// consumer that exits — even by crashing — releases its read ends and never wedges a parked
-    /// upstream producer (backpressure) forever.
+    /// reached `0` readers (writers of those must be woken → `-EPIPE`), so a consumer that exits —
+    /// even by crashing — never wedges a parked upstream producer (backpressure) forever.
     fn drop_all_pipe_readers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {
@@ -24496,6 +24545,35 @@ impl Host {
         Some((w, r))
     }
 
+    /// FORK.md §8.6 — `pipe(fds)` ([`CAP_SELF_PIPE`]), the mint every engine serves it with: a pipe
+    /// in this domain's own powerbox, its read end written at `fds` and its write end at `fds + 4`
+    /// (POSIX order, two little-endian `i32`s). A direct self-op like `setpgid`: the guest mints its
+    /// own intra-domain FIFO, no host authority, and later grants the ends to its children.
+    ///
+    /// `0`, or `-EMFILE` on a full table or channel cap, or `-EFAULT` when `fds` can't take the
+    /// ends — and then nothing is minted: both ends are released again, as Linux's `pipe` does on a
+    /// failed copy-out. An engine serves the op only where it serves the parks the pipe's reads and
+    /// writes make, and answers `-EINVAL` everywhere else.
+    pub fn mint_pipe(&mut self, fds: u64, mem: Option<&mut dyn GuestMem>) -> i64 {
+        let Some((w, r)) = self.try_grant_pipe() else {
+            return EMFILE;
+        };
+        let mut ends = [0u8; 8];
+        ends[..4].copy_from_slice(&r.to_le_bytes());
+        ends[4..].copy_from_slice(&w.to_le_bytes());
+        if mem.and_then(|m| m.write_bytes(fds, &ends)).is_some() {
+            return 0;
+        }
+        // No one can hold or wait on the pipe `try_grant_pipe` just pushed: closing both ends
+        // leaves it dead, its channel charge refunded.
+        let pipe = self.pipes.len() as u32 - 1;
+        self.drop_pipe_writer(pipe);
+        self.drop_pipe_reader(pipe);
+        self.close(w);
+        self.close(r);
+        EFAULT
+    }
+
     /// Grant a **read-only pipe end** and hand back both its handle and the shared FIFO backing — the
     /// input counterpart of [`Self::shared_stdout`]. An embedder (e.g. the POSIX personality's
     /// `exec_stdin`) pushes the bytes a child will read into the returned `backing`; the `read_handle`
@@ -25794,18 +25872,7 @@ impl Host {
     /// recognizable as such ([`Host::is_self_module`]).
     fn grant_module_shared(&mut self, m: Arc<Module>, durable: bool) -> i32 {
         let id = self.modules.len() as u32;
-        self.modules.push(ModuleGrant {
-            funcs: m.funcs.clone().into(),
-            shadow: m.memory.and_then(|mc| mc.shadow),
-            memory_log2: m.memory.map(|mc| mc.size_log2),
-            data: m.data.clone().into(),
-            exports: m.exports.clone().into(),
-            imports: m.imports.clone().into(),
-            types: m.types.clone().into(),
-            durable,
-            digest: module_digest(&m),
-            module: m,
-        });
+        self.modules.push(ModuleGrant::of(m, durable));
         self.grant(cap_id::MODULE, Binding::Module(id))
     }
 
@@ -27392,16 +27459,26 @@ impl Host {
         // `/bin/sh` shared slot 1 with the fresh AddressSpace, so no exec'd image — and no fork of
         // one — could ever run a shell (nimony's nifmake, exec'd by the driver, spawns every job
         // through one). Only if the table is full does a grant stay behind and fail closed.
-        let is_module = |t: &[Slot], j: usize| matches!(t[j].entry, Some(Binding::Module(_)));
+        //
+        // #763 — the process's `ModuleLoader` carries the same way, and for the same reason: it is
+        // pure authority the process held an instant ago (no per-instance state), and what lets a
+        // program it builds be exec'd ([`Host::exec_module`]). A compiler exec'd by a shell must
+        // still run the programs it compiles. The gate the loader runs rides with it.
+        let carried = |t: &[Slot], j: usize| {
+            matches!(t[j].entry, Some(Binding::Module(_) | Binding::ModuleLoader))
+        };
         let base = child.modules.len() as u32;
         child.modules.extend(self.modules.iter().cloned());
+        child.module_validator = self.module_validator;
         for (i, st) in self.table.iter().enumerate() {
-            let Some(Binding::Module(m)) = st.entry else {
-                continue;
+            let entry = match st.entry {
+                Some(Binding::Module(m)) => Binding::Module(m + base),
+                Some(Binding::ModuleLoader) => Binding::ModuleLoader,
+                _ => continue,
             };
             if child.table[i].entry.is_some() {
-                let Some(j) = (0..CAP)
-                    .find(|&j| child.table[j].entry.is_none() && !is_module(&self.table, j))
+                let Some(j) =
+                    (0..CAP).find(|&j| child.table[j].entry.is_none() && !carried(&self.table, j))
                 else {
                     continue;
                 };
@@ -27422,7 +27499,7 @@ impl Host {
                 }
             }
             child.table[i] = Slot {
-                entry: Some(Binding::Module(m + base)),
+                entry: Some(entry),
                 ..*st
             };
         }
@@ -27494,8 +27571,7 @@ impl Host {
                 // A failed exec leaves the caller running with its personality intact: release the
                 // child's pre-bumped ends (a never-run child Host has no teardown) and move the carried
                 // `host_procs` back to `self` (they sit at the tail of the child's vec).
-                child.drop_all_pipe_writers();
-                child.drop_all_pipe_readers();
+                child.release_pipe_ends();
                 let n = child.host_procs.len();
                 self.host_procs = child.host_procs.drain(n - nmoved..).collect();
                 Err(())
@@ -27503,72 +27579,123 @@ impl Host {
         }
     }
 
+    /// #763 — what an `execve` becomes, resolved to the module the new image runs **without
+    /// changing anything**: an engine compiles it (the bytecode engine) and admits it
+    /// ([`Self::exec_image`]) after this, and a refusal anywhere leaves the caller as it was.
+    ///
+    /// * [`ExecCmd::Granted`] — a `Module` this process holds a grant for; `-EINVAL` when the
+    ///   handle names none.
+    /// * [`ExecCmd::Staged`] — the image the personality staged from its filesystem
+    ///   ([`SignalSource::exec_image`]), promoted by the process's `ModuleLoader` exactly as
+    ///   `ModuleLoader.from_bytes` would: through the host's decode+verify gate
+    ///   ([`Self::set_module_validator`]). This is PROCESS.md's `cc x.c && ./a.out`: the process
+    ///   built the program, and its loader is the authority to run it. The new image gets only the
+    ///   caller's grants ([`Self::exec_image`]), so authority does not widen; only the code is new.
+    ///   `-EACCES` without a `ModuleLoader` or its gate (the file is not executable to this
+    ///   process); `-ENOEXEC` when the bytes do not decode and verify.
+    pub fn exec_module(&self, cmd: ExecCmd) -> Result<ExecModule, i64> {
+        match cmd {
+            ExecCmd::Granted(mh) => self
+                .resolve_module(mh)
+                .map(|g| ExecModule(g.clone()))
+                .map_err(|_| EINVAL),
+            ExecCmd::Staged => {
+                let loader = self
+                    .table
+                    .iter()
+                    .any(|s| matches!(s.entry, Some(Binding::ModuleLoader)));
+                let validate = self.module_validator.filter(|_| loader).ok_or(EACCES)?;
+                let bytes = self
+                    .signal_poll()
+                    .and_then(|(_, source)| source.exec_image())
+                    .ok_or(EINVAL)?;
+                let m = validate(&bytes).map_err(|_| ENOEXEC)?;
+                Ok(ExecModule(ModuleGrant::of(Arc::new(m), false)))
+            }
+        }
+    }
+
     /// FORK.md §8.6 / #1768 — **admit and build** an `execve` image-replace: the one rule every engine
-    /// admits an exec by, and the one place its new powerbox is built. The command `mh` must resolve
-    /// to a granted module; its `entry` must be a shape a §14 child may enter by
+    /// admits an exec by, and the one place its new powerbox is built. The command `m`
+    /// ([`Self::exec_module`]) is entered at `entry`, which must be a shape a §14 child may enter by
     /// ([`bytecode::child_entry_ok`]); its declared memory must fit `window_mapped`, the caller's
     /// **backed prefix** (the image-replace runs where the caller did, and pages past the backed prefix
     /// have no backing); and every inherited grant must be regrantable. Then the fresh powerbox is
     /// built ([`Self::spawn_named_child`]) and the process state carried into it
     /// ([`Self::exec_carry`]).
     ///
-    /// `None` is a refusal that changed nothing — the caller keeps running and gets `-EINVAL`. `Some`
-    /// is the commit point: the caller's powerbox has handed its personality to the new image, so the
-    /// engine must now replace the image. The engine-specific gates (a durable domain, a context that
-    /// cannot be replaced — a fiber, a serve handler, sibling threads) are the caller's to check
-    /// first. The tree-walker, the bytecode engine and the JIT all build through here.
+    /// The new image's starter caps span `window_reserved`, the caller's **whole window** — its
+    /// reservation, the confinement bound its `GuestMem` reports ([`GuestMem::window_size`]). The
+    /// image replaces the caller's in the same window, so it holds the memory authority the caller
+    /// held there: its `vm_map` grows the heap past the backed prefix as the caller's could, a root's
+    /// up to its reservation and a §14 child's up to its carve. Spanning only the backed prefix, a
+    /// process lost its heap's growth on `execve`, and a compiler it ran ran out of memory (#763).
+    ///
+    /// `Err(errno)` is a refusal that changed nothing — the caller keeps running and gets the errno:
+    /// `-E2BIG` for a command whose declared window does not fit the caller's, `-EINVAL` otherwise.
+    /// `Ok` is the commit point: the caller's powerbox has handed its personality to the new image,
+    /// so the engine must now replace the image. The engine-specific gates (a durable domain, a
+    /// context that cannot be replaced — a fiber, a serve handler, sibling threads) are the caller's
+    /// to check first. The tree-walker, the bytecode engine and the JIT all build through here.
     pub fn exec_image(
         &mut self,
-        mh: i32,
+        m: &ExecModule,
         grants: &[(String, i32)],
         entry: u64,
         size_log2: i64,
         window_mapped: u64,
-    ) -> Option<ExecImage> {
-        let g = self.resolve_module(mh).ok()?;
-        let (funcs, types, data, memory_log2, module) = (
-            Arc::clone(&g.funcs),
-            Arc::clone(&g.types),
-            Arc::clone(&g.data),
-            g.memory_log2,
-            Arc::clone(&g.module),
-        );
-        let f = funcs.get(entry as usize)?;
-        let arity = bytecode::child_entry_ok(&f.params, &f.results).then_some(f.params.len())?;
+        window_reserved: u64,
+    ) -> Result<ExecImage, i64> {
+        let g = &m.0;
+        let f = g.funcs.get(entry as usize).ok_or(EINVAL)?;
+        let arity = bytecode::child_entry_ok(&f.params, &f.results)
+            .then_some(f.params.len())
+            .ok_or(EINVAL)?;
         let win_log2 = window_mapped
             .is_power_of_two()
-            .then(|| window_mapped.trailing_zeros() as u8)?;
-        let fits = (0..64).contains(&size_log2) && memory_log2.is_some_and(|ml| ml <= win_log2);
-        if !fits || !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
-            return None;
+            .then(|| window_mapped.trailing_zeros() as u8)
+            .ok_or(EINVAL)?;
+        let memory_log2 = g.memory_log2.ok_or(EINVAL)?;
+        if !(0..64).contains(&size_log2)
+            || !window_reserved.is_power_of_two()
+            || window_reserved < window_mapped
+            || !grants.iter().all(|(_, h)| self.can_regrant(*h))
+        {
+            return Err(EINVAL);
+        }
+        if memory_log2 > win_log2 {
+            return Err(E2BIG);
         }
         let child_size = 1u64 << win_log2;
-        let (mut host, ci, ca) = self.spawn_named_child(grants, child_size)?;
+        let (mut host, ci, ca) = self
+            .spawn_named_child(grants, window_reserved)
+            .ok_or(EINVAL)?;
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
-            &module,
-            &module.imports,
-            &module.types,
+            &g.module,
+            &g.module.imports,
+            &g.module.types,
             &mut starters,
         )
-        .ok()?;
+        .map_err(|()| EINVAL)?;
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
         // counts never dip through this.
-        let zeroed_pipes = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
-        Some(ExecImage {
+        let zeroed_pipes = self.release_pipe_ends();
+        Ok(ExecImage {
             zeroed_pipes,
             host,
             entry_args: bytecode::child_entry_handles(arity, starters[0], starters[1]).collect(),
             entry,
             child_size,
-            image_len: 1u64 << memory_log2.expect("fits"),
-            module,
-            funcs,
-            types,
-            data,
+            image_len: 1u64 << memory_log2,
+            digest: g.digest,
+            module: Arc::clone(&g.module),
+            funcs: Arc::clone(&g.funcs),
+            types: Arc::clone(&g.types),
+            data: Arc::clone(&g.data),
         })
     }
 
@@ -27712,7 +27839,9 @@ impl Host {
                 // can run guest handler code / read `serve_run`): a probeable `-EINVAL`, never a
                 // trap — the guest's serve loop can fall back. (The tree-walk eval loop intercepts
                 // these before dispatch; the bytecode engine declines them at compile and falls back
-                // to the tree-walker.)
+                // to the tree-walker.) `pipe` likewise: each engine serves it where its pipe parks
+                // are served ([`Host::mint_pipe`]) — a JIT process tree in its thunk — and a call
+                // that reaches this table is a tier that doesn't.
                 CAP_SELF_SVC_POLL
                 | CAP_SELF_SVC_WAIT
                 | CAP_SELF_CLONE_CALLER
@@ -32274,6 +32403,85 @@ mod fork_powerbox_tests {
         );
     }
 
+    /// #763 — an **exec** carries the loader the same way ([`Host::exec_carry`]): at its handle
+    /// number, with the validator it runs. A compiler exec'd by a shell must still promote the
+    /// programs it builds — nimsem, exec'd by nifmake's shell, running its compile-time evaluator.
+    #[test]
+    fn exec_carries_a_module_loader_and_its_validator() {
+        fn validator(bytes: &[u8]) -> Result<Module, i64> {
+            let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
+            temen_verify::verify_module(&m).map_err(|_| -22i64)?;
+            Ok(m)
+        }
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        temen_verify::verify_module(&cmd).expect("verify");
+        let blob = temen_encode::encode_module(&cmd);
+
+        let mut host = Host::new();
+        host.set_module_validator(validator);
+        let lh = host.grant_module_loader();
+        let mh = host.grant_module(&cmd);
+        let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let mut image = host
+            .exec_image(&command, &[], 0, 0, 1 << 16, 1 << 16)
+            .expect("admits");
+        assert!(
+            image.host.resolve(lh, cap_id::MODULE_LOADER).is_ok(),
+            "the new image resolves the loader at the caller's handle number"
+        );
+        assert!(
+            image.host.module_from_bytes(&blob) >= 0,
+            "the new image's loader mints a module — its validator was carried"
+        );
+    }
+
+    /// #763 — an exec'd image holds the **caller's memory authority** over the window it replaces the
+    /// caller in: its `AddressSpace` spans the window's reservation, not the backed prefix, so its heap
+    /// grows past the prefix as the caller's could. Spanning the prefix, a compiler a shell exec'd
+    /// (nimsem, under nifmake) ran out of memory once its heap outgrew the window.
+    #[test]
+    fn an_execd_image_maps_past_the_backed_prefix() {
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mut host = Host::new();
+        let mh = host.grant_module(&cmd);
+        let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let (mapped, reserved) = (1u64 << 16, 1u64 << 20);
+        let mut image = host
+            .exec_image(&command, &[], 0, 0, mapped, reserved)
+            .expect("admits");
+        let space = image
+            .host
+            .resolve_cap_name("addrspace")
+            .expect("the image's AddressSpace");
+        let mut window = vec![0u8; reserved as usize];
+        let mut mem = WindowMem::new(&mut window, reserved);
+        let mut map = |off: u64| {
+            image.host.cap_dispatch_slots(
+                cap_id::ADDRESS_SPACE,
+                0,
+                space,
+                &[off as i64, 4096, 3],
+                Some(&mut mem),
+            )
+        };
+        assert_eq!(
+            map(mapped),
+            Ok(vec![0]),
+            "a page past the backed prefix maps"
+        );
+        assert_eq!(
+            map(reserved),
+            Ok(vec![EINVAL]),
+            "a page past the reservation does not"
+        );
+    }
+
     #[test]
     fn fork_shares_arc_backings_but_gives_the_twin_its_own_table() {
         let mut host = Host::new();
@@ -33754,6 +33962,44 @@ mod channel_budget_tests {
         assert_eq!(twin.channel_used(), 0, "the twin was never charged");
     }
 
+    /// #1826 — the one mint ([`Host::mint_pipe`]) writes the ends at `fds` in POSIX order, read end
+    /// first. A mint whose `fds` can't take them leaves nothing behind, no charge and no handle, as
+    /// Linux's `pipe` releases what it made when the copy-out faults.
+    #[test]
+    fn a_mint_whose_fds_fault_leaves_nothing_behind() {
+        let mut h = Host::new();
+        h.set_channel_cap(PIPE_CAP as i64); // room for exactly one pipe
+        let mut window = vec![0u8; 4096];
+        let mut mem = WindowMem::new(&mut window, 4096);
+        let held = |h: &Host| h.table.iter().filter(|s| s.entry.is_some()).count();
+        let before = held(&h);
+        assert_eq!(
+            h.mint_pipe(4092, Some(&mut mem)),
+            EFAULT,
+            "fds[1] is past the window"
+        );
+        assert_eq!(held(&h), before, "the faulted mint's ends are closed");
+        assert_eq!(h.channel_used(), 0, "the faulted mint is refunded");
+        assert_eq!(
+            h.mint_pipe(64, Some(&mut mem)),
+            0,
+            "the cap still has its one pipe"
+        );
+        let ends = mem.read_bytes(64, 8).expect("in window");
+        let end = |i: usize| i32::from_le_bytes(ends[i..i + 4].try_into().unwrap());
+        let (r, w) = (end(0), end(4));
+        assert!(
+            matches!(
+                h.resolve(r, cap_id::STREAM),
+                Ok(Binding::PipeEnd { write: false, .. })
+            ) && matches!(
+                h.resolve(w, cap_id::STREAM),
+                Ok(Binding::PipeEnd { write: true, .. })
+            ),
+            "fds[0] is the read end, fds[1] the write end"
+        );
+    }
+
     #[test]
     fn embedder_and_terminal_mints_are_uncharged() {
         let mut h = Host::new();
@@ -33776,21 +34022,31 @@ mod park_event_encoding_tests {
     //! #1609 — the `park_request` cell encoding. The cell is a single `AtomicU64`, so every
     //! [`ParkEvent`] has to survive a round trip through one integer. This used to be five copies
     //! of the same `match` at the five closure-install sites; it is one pair now, and these pin it
-    //! — in particular that [`ParkEvent::ExecSelf`]'s tagged block cannot swallow the two
-    //! sentinels that alias it at handle `-1`/`-2`, which is the failure a sixth copy would have
-    //! hidden.
+    //! — in particular that [`ParkEvent::ExecSelf`]'s tagged block cannot swallow the three
+    //! sentinels that alias it at handle `-1`/`-2`/`-3`, which is the failure a sixth copy would
+    //! have hidden.
     use super::*;
 
     #[test]
     fn park_event_roundtrip() {
         for ev in [
             ParkEvent::TaskExit(1),
-            ParkEvent::TaskExit(u64::MAX - 2),
+            // The largest id below the tagged block: task ids count up from 1 and never reach it.
+            ParkEvent::TaskExit(EXEC_SELF_TAG - 1),
             ParkEvent::TaskExitAny,
             ParkEvent::ForkSelf,
-            ParkEvent::ExecSelf { cmd: 0 },
-            ParkEvent::ExecSelf { cmd: 7 },
-            ParkEvent::ExecSelf { cmd: i32::MAX },
+            ParkEvent::ExecSelf {
+                cmd: ExecCmd::Granted(0),
+            },
+            ParkEvent::ExecSelf {
+                cmd: ExecCmd::Granted(7),
+            },
+            ParkEvent::ExecSelf {
+                cmd: ExecCmd::Granted(i32::MAX),
+            },
+            ParkEvent::ExecSelf {
+                cmd: ExecCmd::Staged,
+            },
         ] {
             assert_eq!(ParkEvent::decode(ev.encode()), Some(ev), "{ev:?}");
         }
@@ -33803,12 +34059,18 @@ mod park_event_encoding_tests {
 
     #[test]
     fn exec_self_block_does_not_swallow_the_sentinels() {
-        // `ForkSelf`/`TaskExitAny` are `EXEC_SELF_TAG` at handle `-1`/`-2`. Decoding must see
-        // them as themselves, never as an `ExecSelf` with a negative command handle.
+        // `ForkSelf`/`TaskExitAny`/a staged exec are `EXEC_SELF_TAG` at handle `-1`/`-2`/`-3`.
+        // Decoding must see them as themselves, never as an `ExecSelf` with a negative handle.
         assert_eq!(ParkEvent::decode(u64::MAX), Some(ParkEvent::ForkSelf));
         assert_eq!(
             ParkEvent::decode(u64::MAX - 1),
             Some(ParkEvent::TaskExitAny)
+        );
+        assert_eq!(
+            ParkEvent::decode(u64::MAX - 2),
+            Some(ParkEvent::ExecSelf {
+                cmd: ExecCmd::Staged
+            })
         );
         // A handle with the sign bit set is not a handle: it stays a `TaskExit` id rather than
         // decoding to a negative `ExecSelf`, so a forged cell cannot reach the exec builder.

@@ -3,14 +3,14 @@
 //!
 //! nimony's Temen backend (`nimony t`) plans this as the one whole-program node after DCE, in the
 //! place `lengc` + `cc` + the linker take in the C backend; nifmake execs it through `/bin/sh`. Every
-//! input is one module's DCE'd Leng (`<stem>.c.nif`); the first is the main module, and the rest are
-//! linked in stem order, so the output depends on the module set alone. The link is [`temen_leng::link_nim_posix`] —
-//! the call the host makes — against the personality's vocabulary ([`temen_posix_abi::vtable`]) and
-//! the prebuilt guest libc (`/lib/temen/libc.temeno`, or `--libc:`; linked without one if absent).
+//! input is one module's DCE'd Leng (`<stem>.c.nif`). The link is [`temen_leng::link_nim_posix`] —
+//! the call the host makes, which orders the modules itself, so the output depends on the module
+//! set alone — against the personality's vocabulary ([`temen_posix_abi::vtable`]) and the prebuilt
+//! guest libc (`/lib/temen/libc.temeno`, or `--libc:`; linked without one if absent).
 //!
 //! It reaches the world only through the personality's imports (`__px_*`, #1668), so it binds in an
 //! exec'd powerbox exactly like the nim programs around it. Exit codes: 1 = bad arguments,
-//! 2 = an input unreadable or not UTF-8, 3 = the link refused, 4 = the output unwritable.
+//! 2 = an input unreadable, 3 = the link refused, 4 = the output unwritable.
 //!
 //! Its heap is a size-class allocator over the on-ramp's `malloc` (see [`Heap`]).
 
@@ -184,14 +184,8 @@ fn run(args: &[&str]) -> i32 {
     let mut srcs = Vec::new();
     for &p in &inputs {
         let Some(bytes) = read_file(p) else { return 2 };
-        let Ok(src) = String::from_utf8(bytes) else {
-            return 2;
-        };
-        srcs.push((stem(p), src));
+        srcs.push((stem(p), temen_leng::nif_text(&bytes).into_owned()));
     }
-    // The main module first (the plan passes it first), the rest by stem: the linked module is a
-    // function of the program's module set, not of the order a plan happened to list it in.
-    srcs[1..].sort_by(|a, b| a.0.cmp(b.0));
     let units: Vec<temen_leng::WholeModule> = srcs
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })

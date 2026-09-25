@@ -4104,6 +4104,7 @@ impl CompiledModule {
             detached_seed: Vec::new(),
             thaw_root_sp: self.shadow.frame_base(0),
             freeze_ctl: None,
+            high_water: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
             fiber_rt: None,

@@ -330,6 +330,11 @@ pub mod wire {
         matches!(sniff_kind(bytes), Some(KIND_MODULE | KIND_OBJECT))
     }
 }
+// v13 (#1830) adds the **data-image funcref slots** to both dialects, directly after the data
+// segments: the offsets at which the image holds a function index, which `link` records as it bakes
+// each `data.funcref`. A linked module otherwise keeps no record of which of its data bytes are
+// function indices, and an analysis of the functions a `call.dyn` can reach (the JIT's fork
+// instrumentation, link-time DCE) must know. Every committed asset is regenerated.
 // v12 (#1715) adds **thread-local templates** to the object dialect: a section of the unit's
 // `_Thread_local` initial bytes (after `data.funcref`), and a `tls` flag byte on `data.ptr` entries,
 // data exports, and the `data.self`/`data.sym` opcodes. The runnable dialect is unchanged byte for
@@ -374,7 +379,7 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 12;
+const VERSION: u16 = 13;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -516,6 +521,13 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         write_uleb(&mut out, d.offset);
         write_uleb(&mut out, d.bytes.len() as u64);
         out.extend_from_slice(&d.bytes);
+    }
+    // Data-image funcref slots (v13, #1830), in both dialects, directly after the image they
+    // describe: count, then each slot's offset. What `link` recorded of the funcrefs it baked (a
+    // unit may hold them too, when it was linked before); the verifier checks them against the image.
+    write_uleb(&mut out, m.data_funcref_slots.len() as u64);
+    for &at in &m.data_funcref_slots {
+        write_uleb(&mut out, at);
     }
     // Object-only `data.ptr` relocation section (v9, D-LINK), directly after the data image it
     // patches: count, then each entry's `at` offset and tagged target (0 = self + uleb offset,
@@ -1880,6 +1892,23 @@ pub fn decode_module(bytes: &[u8]) -> Result<Module, DecodeError> {
     decode_impl(bytes, false)
 }
 
+/// The declared window (`size_log2`) of an encoded **runnable module**, read from its header without
+/// decoding the rest — what a loader needs before it commits to a decode: an `execve`'s window fit
+/// and heap placement (#763). The memory descriptor is the first thing after the wire header, so
+/// this reads two bytes past it. `None` for anything that is not a current-version runnable
+/// module's encoding, or declares no memory. It checks nothing else: [`decode_module`] (and the
+/// verifier after it) still decide whether the bytes are a module at all.
+pub fn module_window_log2(bytes: &[u8]) -> Option<u8> {
+    let (hdr, payload) = wire::read_header(bytes).ok()?;
+    if hdr.kind != wire::KIND_MODULE || hdr.version != VERSION {
+        return None;
+    }
+    match payload {
+        [1, size_log2, ..] => Some(*size_log2),
+        _ => None,
+    }
+}
+
 /// Decode a **link unit** (object dialect) — or a runnable module; the header flag picks the
 /// dialect. Tooling-facing (the linker's input path), but held to the same fail-closed
 /// never-panic/never-OOM bar as [`decode_module`]: it shares this decoder and fuzzers reach it.
@@ -1945,6 +1974,13 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             readonly,
             bytes,
         });
+    }
+    // Data-image funcref slots (v13, #1830), mirroring the encoder. Byte shape only — the verifier
+    // checks each against the image. Grows on demand (the count is attacker-influenced).
+    let nslots = c.count()?;
+    let mut data_funcref_slots = Vec::new();
+    for _ in 0..nslots {
+        data_funcref_slots.push(c.uleb()?);
     }
     // Object-only `data.ptr` relocation section (v9), mirroring the encoder. Well-formedness
     // beyond byte shape (`at` inside a data segment, resolvable names) is the linker's job —
@@ -2108,6 +2144,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     Ok(Module {
         data_ptrs,
         data_funcrefs,
+        data_funcref_slots,
         tls,
         funcs,
         memory,
@@ -2860,6 +2897,48 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
+mod window_peek_tests {
+    use super::*;
+
+    fn with_window(memory: Option<Memory>) -> Module {
+        Module {
+            memory,
+            ..Module::default()
+        }
+    }
+
+    #[test]
+    fn the_peek_reads_the_window_the_encoder_wrote() {
+        for size_log2 in [0, 16, 25, 40] {
+            let m = with_window(Some(Memory {
+                size_log2,
+                shadow: Some(temen_ir::durable_abi::ShadowArena { base: 64, end: 128 }),
+            }));
+            assert_eq!(module_window_log2(&encode_module(&m)), Some(size_log2));
+        }
+    }
+
+    #[test]
+    fn the_peek_answers_only_for_a_runnable_module_with_a_window() {
+        let windowed = with_window(Some(Memory {
+            size_log2: 20,
+            shadow: None,
+        }));
+        assert_eq!(module_window_log2(&encode_module(&with_window(None))), None);
+        assert_eq!(
+            module_window_log2(&encode_unit(&windowed)),
+            None,
+            "an object"
+        );
+        let mut stale = encode_module(&windowed);
+        stale[10] ^= 1; // the version
+        assert_eq!(module_window_log2(&stale), None);
+        assert_eq!(module_window_log2(b"#!/bin/sh\necho\n"), None);
+        assert_eq!(module_window_log2(&encode_module(&windowed)[..17]), None);
+    }
+}
+
+#[cfg(test)]
 mod object_tests {
     use super::*;
 
@@ -2898,6 +2977,7 @@ mod object_tests {
                 },
             ],
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: vec![Data {
                 offset: 0,
                 readonly: false,
@@ -2970,6 +3050,7 @@ mod object_tests {
         let base = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],
@@ -3015,6 +3096,7 @@ mod object_tests {
         let m = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],
@@ -3249,6 +3331,7 @@ mod debug_tests {
         Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],

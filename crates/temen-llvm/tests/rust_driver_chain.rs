@@ -422,7 +422,7 @@ fn rust_driver_guest_drives_nimsem_hexer_link_pipeline_byte_exact() {
 
     let produced_temen =
         get("nimcache/sysvq0asl.temen").expect("the link phase produced no sysvq0asl.temen");
-    let src = String::from_utf8(x_nif).expect("x.nif is UTF-8");
+    let src = temen_leng::nif_text(&x_nif).into_owned();
     let expected_temen = temen_encode::encode_module(
         &temen_leng::link_nim_powerbox(
             &[temen_leng::WholeModule {

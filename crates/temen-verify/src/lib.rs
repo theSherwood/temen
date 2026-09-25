@@ -84,6 +84,11 @@ pub enum VerifyError {
     /// index) would be loaded and `call.dyn`'d unpatched, so it is fail-closed here. `link`
     /// resolves and clears these; a survivor was never linked.
     UnlinkedDataFuncref { at: u64 },
+    /// A recorded data-image funcref slot (#1830, [`Module::data_funcref_slots`]) that does not
+    /// describe the image: out of ascending order or overlapping the one before, not laid down by
+    /// the data segments, or holding no function of the module. The record is what an analysis of
+    /// indirect calls trusts to name every function the data image can hand out.
+    DataFuncrefSlot { slot: u32 },
     /// A runnable module still carries a thread-local template ([`Module::tls`], #1715): only
     /// [`temen_ir::link`] places one in the window, so it was never linked.
     UnlinkedTls,
@@ -251,6 +256,17 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     // would be loaded and dispatched unpatched.
     if let Some(r) = m.data_funcrefs.first() {
         return Err(VerifyError::UnlinkedDataFuncref { at: r.at });
+    }
+    // #1830 — what `link` recorded of those it baked: the slots ascend, each clear of the one
+    // before, and each is four bytes the data image lays down that name a function of this module.
+    let slots = &m.data_funcref_slots;
+    if let Some(i) = (1..slots.len()).find(|&i| slots[i] < slots[i - 1].saturating_add(4)) {
+        return Err(VerifyError::DataFuncrefSlot { slot: i as u32 });
+    }
+    for (i, f) in temen_ir::data_funcref_targets(m).into_iter().enumerate() {
+        if !matches!(f, Some(f) if (f as usize) < m.funcs.len()) {
+            return Err(VerifyError::DataFuncrefSlot { slot: i as u32 });
+        }
     }
     // Likewise a thread-local template (#1715): `link` places it in the window as plain data, and a
     // runnable module carries no thread-local export.
@@ -1763,6 +1779,7 @@ mod shadow_arena_tests {
         Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],

@@ -30,43 +30,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use temen_interp::Value;
-use temen_ir::{LinkUnit, Module};
+use temen_ir::Module;
 use temen_run::exec::{domain_exec_with_fs, DomainProgram};
 use temen_run::{instantiate, Backend, HostCap, Limits, Outcome, RunConfig};
-
-/// The W3 runtime shim's function indices, keyed by the bottom-edge C symbol each import lowers to
-/// (longest-prefix wins so `atomicCompareExchangeN` isn't shadowed by a shorter atomic). Mirrors
-/// `temen-leng/tests/nim_e2e.rs` — the same shim the native end-to-end links against.
-const SHIM_BINDINGS: &[(&str, u32)] = &[
-    ("cExitSys", 0),
-    ("cGetpid", 1),
-    ("cKill", 2),
-    ("c_memcpy", 3),
-    ("c_memcmp", 4),
-    ("c_memset", 5),
-    ("mmap", 6),
-    ("atomicLoadN", 7),
-    ("atomicStoreN", 8),
-    ("atomicCompareExchangeN", 9),
-    ("atomicExchangeN", 10),
-    ("atomicAddFetch", 11),
-    ("atomicSubFetch", 12),
-    ("bswap64", 13),
-    ("ctz64", 14),
-    ("clz64", 15),
-    ("cWriteErr", 16),
-    ("dlopen", 17),
-    ("dlclose", 18),
-    ("dlsym", 19),
-];
-
-fn shim_index(name: &str) -> Option<u32> {
-    SHIM_BINDINGS
-        .iter()
-        .filter(|(p, _)| name.starts_with(p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, i)| *i)
-}
 
 /// Recursively collect `(relative-key, bytes)` under `dir`, prefixing each key with `prefix`.
 fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
@@ -497,7 +463,7 @@ fn main() {
         .map(|&i| {
             let stem = steps[i].stem.clone();
             let x = run_hexer(&stem);
-            (stem, String::from_utf8_lossy(&x).into_owned())
+            (stem, temen_leng::nif_text(&x).into_owned())
         })
         .collect();
 
@@ -543,32 +509,13 @@ fn main() {
         return;
     }
 
-    // Compute program: link with the W3 runtime shim (discover the system module's bottom-edge C
-    // imports and bind them), then call an exported proc on both engines (§9 parity).
+    // Compute program: link with the W3 runtime shim (which binds the program's bottom-edge C
+    // imports), then call an exported proc on both engines (§9 parity).
     let expected: i64 = expected_raw
         .parse()
         .expect("expected is i64 in compute mode");
-    let sys_src = leng
-        .iter()
-        .find(|(s, _)| s.starts_with("sysv"))
-        .map(|(s, src)| temen_leng::WholeModule { stem: s, src })
-        .expect("no system module among the lowered units");
-    let obj = temen_encode::decode_unit(
-        &temen_leng::compile_whole_object(&sys_src)
-            .unwrap_or_else(|e| panic!("compile system module: {e}")),
-    )
-    .expect("decode object");
-    let exports: Vec<(String, u32)> = obj
-        .imports
-        .iter()
-        .filter_map(|imp| shim_index(&imp.name).map(|i| (imp.name.clone(), i)))
-        .collect();
-    const SHIM: &str = include_str!("../../temen-leng/src/powerbox_compute_shim.temt.txt");
-    let runtime = LinkUnit {
-        module: temen_text::parse_module(SHIM).expect("runtime shim parses"),
-        exports,
-        ..Default::default()
-    };
+    let runtime =
+        temen_leng::nim_compute_shim_unit(&units).unwrap_or_else(|e| panic!("compute shim: {e}"));
     let m: Module = temen_leng::link_whole_with_runtime(&units, vec![runtime])
         .unwrap_or_else(|e| panic!("link with runtime: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));

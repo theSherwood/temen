@@ -668,7 +668,7 @@ plumbing. Five workstreams, roughly independent:
     `DataFuncref{at, name}` under the initializer's stem-suffixed name, and `link` resolves it to the
     merged funcidx and writes it (4-byte `i32`, the value `ref.func` yields) into the gvar's data
     slot — then clears the list (a survivor is a fail-closed `UnlinkedDataFuncref` verify error, the
-    twin of `UnlinkedDataPtr`). The real `@[]`/`add` program now runs to completion with **no
+    twin of `UnlinkedDataPtr`), recording the slot it wrote (`data_funcref_slots`, #1830). The real `@[]`/`add` program now runs to completion with **no
     hand-patching**. Tested: a hand-written funcref gvar with a static `= dbl` initializer, called
     cross-module with *no runtime setter* — the materialized slot dispatches to `dbl`, both engines
     (`tests/link.rs`).

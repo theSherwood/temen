@@ -219,6 +219,9 @@ fi
 if want nim_phases; then
   echo "=== [nim_phases] crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh → gzip nimsem+hexer ==="
   E2E_OUT="${TEMEN_E2E_CACHE:-/tmp/temen_e2e_chain}/temen"
+  # build_e2e_chain.sh reuses any phase guest its cache already holds, which is stale after exactly
+  # the changes this script exists for (a wire bump decodes it as `BadVersion`). A rebuild rebuilds.
+  rm -f "$E2E_OUT"/nifler.temen "$E2E_OUT"/nimsem.temen "$E2E_OUT"/hexer.temen
   if bash crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh; then
     ok=1
     for p in nimsem hexer; do

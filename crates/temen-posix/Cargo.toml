@@ -14,6 +14,8 @@ publish = false
 temen-ir = { path = "../temen-ir" }
 temen-posix-abi = { path = "../temen-posix-abi" }
 temen-interp = { path = "../temen-interp" }
+# #763 — `execve` recognizes a runnable module's encoding (and reads its declared window) in a file.
+temen-encode = { path = "../temen-encode" }
 
 [dev-dependencies]
 temen-text = { path = "../temen-text" }

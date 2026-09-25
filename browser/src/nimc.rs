@@ -879,13 +879,11 @@ fn compile_nim_ce_impl(
                 read(&handle, &key).ok_or(format!("hexer produced no {key}"))?
             }
         };
-        leng.push((stem.clone(), String::from_utf8_lossy(&x).into_owned()));
+        leng.push((stem.clone(), temen_leng::nif_text(&x).into_owned()));
     }
 
-    // ---- phase 4: link + run (main first, system last) -------------------------------------------
-    let mut ordered: Vec<&(String, String)> = leng.iter().collect();
-    ordered.sort_by_key(|(stem, _)| (*stem != main_stem, stem.starts_with("sysv")));
-    let units: Vec<temen_leng::WholeModule> = ordered
+    // ---- phase 4: link + run (in `link_nim_powerbox`'s one link order) ---------------------------
+    let units: Vec<temen_leng::WholeModule> = leng
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();

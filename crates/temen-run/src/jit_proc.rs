@@ -39,7 +39,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use temen_interp::{GuestMem, Host, ParkEvent, Trap, TwinTrap, Value};
+use temen_interp::{GuestMem, Host, ParkEvent, ParkTransients, Trap, TwinTrap, Value};
 use temen_ir::durable_abi::{ShadowArena, STATE_OFF, STATE_UNWINDING};
 use temen_ir::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
 use temen_ir::{cap_id, FuncIdx, Inst, Module, ValType};
@@ -281,9 +281,11 @@ impl Tree {
         let plan = process.then(|| ForkPlan::of(m, &calls, host)).flatten();
         let interrupt = self.interrupt_for(pid, plan.is_some());
         let (cm, image) = match program {
-            Program::Command { grant, size_log2 } if !jit => {
+            Program::Command {
+                digest, size_log2, ..
+            } if !jit => {
                 let key = CodeKey {
-                    grant: Arc::as_ptr(grant) as usize,
+                    digest: *digest,
                     size_log2: *size_log2,
                     entry,
                     polls: interrupt.is_some(),
@@ -296,7 +298,6 @@ impl Tree {
                         .entry(key)
                         .or_insert_with(|| {
                             Arc::new(CodeSlot {
-                                _grant: Arc::clone(grant),
                                 image: Mutex::new(None),
                             })
                         }),
@@ -370,8 +371,12 @@ impl Tree {
             }
             // The OS would not give the twin a thread, after its personalities registered it: it
             // dies at birth, as a crash — retired through its exit hooks and reaped by its parent
-            // like any twin that trapped, never a table entry no one can reap.
+            // like any twin that trapped, never a table entry no one can reap. Its powerbox went
+            // with the thread's closure, unrun, so the parent releases the pipe ends it inherited:
+            // the twin's table is the parent's, copied an instant ago, so releasing the parent's
+            // set once releases exactly the twin's copies (and zeroes no pipe the parent holds).
             Err(_) => {
+                let _ = host.release_pipe_ends();
                 let crash = Err(Trap::ThreadFault);
                 for hook in hooks {
                     hook(temen_interp::reap_status(&crash));
@@ -466,8 +471,10 @@ pub(crate) struct Image {
 /// instantiates the tree's compile of it.
 #[derive(PartialEq, Eq, Hash)]
 struct CodeKey {
-    /// The command's grant, by address — its [`CodeSlot`] holds it, so the address stays its own.
-    grant: usize,
+    /// The command module's content digest ([`temen_interp::ExecImage::digest`]): the same code
+    /// however it reached the exec — a registered command, or a program the tree built and promoted
+    /// on each run of it (#763). Identity is structural (INVARIANTS #10).
+    digest: [u8; 32],
     /// The window it runs in: the confinement mask is baked.
     size_log2: u8,
     entry: FuncIdx,
@@ -481,7 +488,6 @@ struct CodeKey {
 /// it compiles. `None` until then, then whether the code could be shared: when it could not, each
 /// process compiles its own.
 struct CodeSlot {
-    _grant: Arc<Module>,
     image: Mutex<Option<Option<Arc<Image>>>>,
 }
 
@@ -490,7 +496,11 @@ pub(crate) enum Program<'a> {
     /// The embedder's program: the root's first image. No other process starts it.
     Embedder(&'a Module),
     /// An `execve`'s command, from its grant, in a window of `size_log2`: the caller's backed prefix.
-    Command { grant: Arc<Module>, size_log2: u8 },
+    Command {
+        grant: Arc<Module>,
+        digest: [u8; 32],
+        size_log2: u8,
+    },
 }
 
 impl Program<'_> {
@@ -627,12 +637,12 @@ unsafe fn run_process(
             })
         );
         if !unwound {
-            cur.disarm_caller_requests();
+            retire(tree, cur);
             return (r, results, image_host);
         }
         // An exec: only an armed process stores the unwind code, and only with an image parked.
         let Some(img) = cur.take_exec_image() else {
-            cur.disarm_caller_requests();
+            retire(tree, cur);
             return (Err(temen_jit::JitError::Malformed), results, image_host);
         };
         // The commit: the personality hands over the argv it staged, and the new image finds it in
@@ -646,6 +656,7 @@ unsafe fn run_process(
         start = Start::Fresh {
             program: Program::Command {
                 grant: img.module,
+                digest: img.digest,
                 size_log2: img.child_size.trailing_zeros() as u8,
             },
             entry: img.entry as FuncIdx,
@@ -653,6 +664,17 @@ unsafe fn run_process(
             init_mem: init,
         };
         image_host = Some(img.host);
+    }
+}
+
+/// A process is done with its last image: disarm its powerbox, and release the pipe ends it holds
+/// ([`Host::release_pipe_ends`]) — ringing the tree when that left a pipe with no writers or no
+/// readers, whose blocked readers wake to EOF and writers to `-EPIPE`.
+fn retire(tree: &Tree, host: &mut Host) {
+    host.disarm_caller_requests();
+    let (eof, epipe) = host.release_pipe_ends();
+    if !eof.is_empty() || !epipe.is_empty() {
+        tree.ring();
     }
 }
 
@@ -685,7 +707,9 @@ unsafe fn compile(
         // The command runs in a window the size of the caller's backed prefix, as on both
         // interpreters, whose image-replace reuses the caller's window in place (a larger window than
         // the command declares is a safe superset, masked to its actual size).
-        Program::Command { grant, size_log2 } => {
+        Program::Command {
+            grant, size_log2, ..
+        } => {
             let mut m = (**grant).clone();
             m.memory = m.memory.map(|mc| temen_ir::Memory {
                 size_log2: *size_log2,
@@ -840,12 +864,18 @@ impl SendPtr {
     }
 }
 
-/// #1768 — the JIT's arm of the caller-request decision (the interpreters' `decide`), made by the
-/// `call.cap` thunk of a JIT process right after a personality op raised a request. `dispatch` is the
-/// `(type_id, op)` the call handed the thunk ([`Inst::host_dispatch`]); `bell` is the tree's ring
-/// count read *before* the op ran ([`bell_of`]), so a child that exits between the op's look and the
-/// wait below is not slept through. Returns `true` when the op must run again (a waiter was woken).
+/// #1768/#1826 — the JIT's arm of the park decision (the interpreters' `decide`), made by the
+/// `call.cap` thunk of a JIT process right after an op, over the transients the op left (`parks`,
+/// [`Host::take_park_transients`]). `dispatch` is the `(type_id, op)` the call handed the thunk
+/// ([`Inst::host_dispatch`]); `bell` is the tree's ring count read *before* the op ran
+/// ([`bell_of`]), so an event between the op's look and the wait below is not slept through.
+/// Returns `true` when the op must run again (a waiter was woken).
 ///
+/// * a pipe **wake** (a write, or the last close of an end) rings the tree: a process blocked on
+///   the other end may proceed.
+/// * a pipe **park** (a read of an empty pipe, or a write to a full one, with the other end open)
+///   waits for the bell and runs the op again ([`wait_to_rerun`]) — in the process's root context,
+///   as the interpreters park only a root fiber; in a fiber the op's own answer stands.
 /// * `execve` — admit and build the image through the one rule every engine shares
 ///   ([`Host::exec_image`]); admitted, park it and unwind the whole run
 ///   ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the
@@ -856,11 +886,11 @@ impl SendPtr {
 ///   In a fiber, `-EAGAIN`, as the oracle refuses a non-bare fork; anywhere else the JIT cannot unwind
 ///   to (an image with no fork plan, a host frame or a barrier below the call), `-ENOSYS` — fork
 ///   unavailable here.
-/// * a blocking `waitpid` — `-EINTR` if a deliverable signal is pending (in a run that delivers
-///   signals); else wait for the bell and run the op again, which reaps a child that exited or waits
-///   on. A kill-path store (a deadline, the tree's teardown) ends the wait with the kill trap.
+/// * a blocking `waitpid` — wait for the bell and run the op again ([`wait_to_rerun`]), which reaps
+///   a child that exited or waits on.
 ///
-/// `window` is the call's view of the guest window — the one its op read and wrote through.
+/// `window` is the call's view of the guest window — the one its op read and wrote through — and
+/// `(mapped, reserved)` its backed prefix and reservation.
 ///
 /// # Safety
 /// The [`crate::cap_thunk`] contract for `results`/`trap_out`, over a host armed for caller
@@ -868,9 +898,10 @@ impl SendPtr {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn serve_request(
     host: &mut Host,
+    parks: ParkTransients,
     dispatch: (u32, u32),
     window: Option<&mut dyn GuestMem>,
-    window_mapped: u64,
+    (mapped, reserved): (u64, u64),
     results: *mut i64,
     n_results: u64,
     trap_out: *mut i64,
@@ -884,21 +915,33 @@ pub(crate) unsafe fn serve_request(
     let Some(proc) = proc_of(trap_out) else {
         return false;
     };
-    match host.take_park_request() {
+    if parks.wake_readers.is_some() || parks.wake_writers.is_some() {
+        proc.tree.ring();
+    }
+    if parks.read_park.is_some() || parks.write_park.is_some() {
+        return !temen_jit::fiber_active() && wait_to_rerun(host, proc, bell, trap_out, answer);
+    }
+    match parks.request {
         Some(ParkEvent::ExecSelf { cmd }) => {
             // The JIT's own gates — the interpreters' `durable` + clean-root checks: a durable
             // domain's subtree must stay snapshottable, and a fiber is not the process's image to
             // replace.
-            let admissible = !host.is_durable() && !temen_jit::fiber_active();
-            match admissible
-                .then(|| host.exec_image(cmd, &[], 0, 0, window_mapped))
-                .flatten()
-            {
-                Some(img) => {
+            let admitted = if host.is_durable() || temen_jit::fiber_active() {
+                Err(EINVAL)
+            } else {
+                host.exec_module(cmd)
+                    .and_then(|m| host.exec_image(&m, &[], 0, 0, mapped, reserved))
+            };
+            match admitted {
+                Ok(img) => {
+                    // The old image's pipe ends went with it.
+                    if !img.zeroed_pipes.0.is_empty() || !img.zeroed_pipes.1.is_empty() {
+                        proc.tree.ring();
+                    }
                     host.stash_exec_image(img);
                     *trap_out = temen_jit::HOST_UNWIND_CODE as i64;
                 }
-                None => answer(EINVAL),
+                Err(e) => answer(e),
             }
             false
         }
@@ -916,25 +959,41 @@ pub(crate) unsafe fn serve_request(
             false
         }
         Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) => {
-            // A deliverable signal completes the wait `-EINTR`, as on the interpreters — in a run
-            // that delivers signals, where the handler then takes it. A run that delivers none
-            // (every process run today: the #932 delivery is armed only by the one-shot entry)
-            // would find the same signal still pending on every retry, so it waits on.
-            if delivers_signals(trap_out) && host.wait_interrupted() {
-                answer(EINTR);
-                return false;
-            }
-            proc.tree.wait(bell);
-            if blocked_wait_interrupted(host.epoch_cell(), trap_out) {
-                if *trap_out == 0 {
-                    *trap_out = TrapKind::OutOfFuel as i64;
-                }
-                return false;
-            }
-            true
+            wait_to_rerun(host, proc, bell, trap_out, answer)
         }
         None => false,
     }
+}
+
+/// Wait out a park: wait for the tree's bell to ring past `bell` and return `true`, so the op runs
+/// again (invariant 7: the rewound park) and either proceeds or parks anew. Ends early with
+/// `-EINTR` if a deliverable signal is pending, as on the interpreters — in a run that delivers
+/// signals, where the handler then takes it. A run that delivers none (every process run today: the
+/// #932 delivery is armed only by the one-shot entry) would find the same signal still pending on
+/// every retry, so it waits on. A kill-path store (a deadline, the tree's teardown) ends the wait
+/// with the kill trap.
+///
+/// # Safety
+/// As [`serve_request`].
+unsafe fn wait_to_rerun(
+    host: &Host,
+    proc: &ProcCtx,
+    bell: u64,
+    trap_out: *mut i64,
+    answer: impl Fn(i64),
+) -> bool {
+    if delivers_signals(trap_out) && host.wait_interrupted() {
+        answer(EINTR);
+        return false;
+    }
+    proc.tree.wait(bell);
+    if blocked_wait_interrupted(host.epoch_cell(), trap_out) {
+        if *trap_out == 0 {
+            *trap_out = TrapKind::OutOfFuel as i64;
+        }
+        return false;
+    }
+    true
 }
 
 /// Start the root context's unwind for a fork: set the window's freeze word, which the call's

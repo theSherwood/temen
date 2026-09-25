@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use temen_interp::Value;
-use temen_ir::{LinkUnit, Module};
+use temen_ir::Module;
 use temen_run::exec::{domain_exec_with_fs, DomainProgram};
 use temen_run::{instantiate, Backend, HostCap, Limits, Outcome, RunConfig};
 
@@ -90,39 +90,6 @@ fn module_suffix(file: &str, cwd: &str, search_paths: &[&str]) -> String {
     let mut stem: String = name.chars().take(3).collect();
     stem.push_str(&base36(uhash(&rel)));
     stem
-}
-
-// ---- the runtime shim binding table (mirrors nim_e2e_chain) ----------------------------------------
-
-const SHIM_BINDINGS: &[(&str, u32)] = &[
-    ("cExitSys", 0),
-    ("cGetpid", 1),
-    ("cKill", 2),
-    ("c_memcpy", 3),
-    ("c_memcmp", 4),
-    ("c_memset", 5),
-    ("mmap", 6),
-    ("atomicLoadN", 7),
-    ("atomicStoreN", 8),
-    ("atomicCompareExchangeN", 9),
-    ("atomicExchangeN", 10),
-    ("atomicAddFetch", 11),
-    ("atomicSubFetch", 12),
-    ("bswap64", 13),
-    ("ctz64", 14),
-    ("clz64", 15),
-    ("cWriteErr", 16),
-    ("dlopen", 17),
-    ("dlclose", 18),
-    ("dlsym", 19),
-];
-
-fn shim_index(name: &str) -> Option<u32> {
-    SHIM_BINDINGS
-        .iter()
-        .filter(|(p, _)| name.starts_with(p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, i)| *i)
 }
 
 // ---- shared in-window memfs (mirrors nim_e2e_chain) ------------------------------------------------
@@ -513,7 +480,7 @@ fn main() {
         .map(|stem| {
             (
                 stem.clone(),
-                String::from_utf8_lossy(&run_hexer(stem)).into_owned(),
+                temen_leng::nif_text(&run_hexer(stem)).into_owned(),
             )
         })
         .collect();
@@ -546,26 +513,8 @@ fn main() {
     }
 
     let expected: i64 = expected_raw.parse().expect("expected is i64");
-    let sys = leng
-        .iter()
-        .find(|(s, _)| s.starts_with("sysv"))
-        .map(|(s, src)| temen_leng::WholeModule { stem: s, src })
-        .expect("no system unit");
-    let obj = temen_encode::decode_unit(
-        &temen_leng::compile_whole_object(&sys).unwrap_or_else(|e| panic!("compile system: {e}")),
-    )
-    .expect("decode object");
-    let exports: Vec<(String, u32)> = obj
-        .imports
-        .iter()
-        .filter_map(|imp| shim_index(&imp.name).map(|i| (imp.name.clone(), i)))
-        .collect();
-    const SHIM: &str = include_str!("../../temen-leng/src/powerbox_compute_shim.temt.txt");
-    let runtime = LinkUnit {
-        module: temen_text::parse_module(SHIM).expect("shim parses"),
-        exports,
-        ..Default::default()
-    };
+    let runtime =
+        temen_leng::nim_compute_shim_unit(&units).unwrap_or_else(|e| panic!("compute shim: {e}"));
     let m: Module = temen_leng::link_whole_with_runtime(&units, vec![runtime])
         .unwrap_or_else(|e| panic!("link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));

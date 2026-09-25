@@ -491,8 +491,20 @@ unsafe fn cap_thunk_impl(
         return;
     }
     // #1768 — a JIT process's powerbox serves its personality's caller requests (`fork`, `execve`,
-    // a blocking `waitpid`) here, after the op that raised one ([`jit_proc::serve_request`]).
+    // a blocking `waitpid`) and its pipes' parks here, after the op that raised one
+    // ([`jit_proc::serve_request`]).
     let serves = host.caller_requests_armed();
+    // FORK.md §8.6 — `pipe(fds)`: a process tree serves the parks its pipes' reads and writes make,
+    // so it mints them, through the one mint ([`Host::mint_pipe`]). Any other JIT run leaves the op
+    // to the host's `-EINVAL`, as every tier that can't park does.
+    if serves && type_id == temen_ir::CAP_SELF_TYPE_ID && op == temen_interp::CAP_SELF_PIPE {
+        let r = host.mint_pipe(arg_slots.first().copied().unwrap_or(0) as u64, gm);
+        if n_results != 0 {
+            *results = r;
+        }
+        *trap_out = 0;
+        return;
+    }
     let (mut gm, mut pending) = (gm, pending);
     loop {
         // Clear the caller-request cell first, so the only request acted on is one THIS dispatch
@@ -521,11 +533,22 @@ unsafe fn cap_thunk_impl(
                     }
                 }
                 *trap_out = 0;
-                // A woken blocking wait runs its op again (invariant 7: the rewound park).
+                // Every transient the op left is drained, acted on or not: one left set would land
+                // on a later call.
+                let parks = host.take_park_transients();
+                // A woken park runs its op again (invariant 7: the rewound park).
                 let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
                 if serves
                     && jit_proc::serve_request(
-                        host, dispatch, view, mem_size, results, n_results, trap_out, bell,
+                        host,
+                        parks,
+                        dispatch,
+                        view,
+                        (mem_size, mem_reserved),
+                        results,
+                        n_results,
+                        trap_out,
+                        bell,
                     )
                 {
                     continue;
@@ -5545,11 +5568,14 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// Bind every retained import of a no-C nim module to one shared **POSIX personality**.
 ///
 /// The module's POSIX imports are the personality's own names (`__px_<op>`, #1668) — the same as a
-/// chibicc command's — so this is [`temen_posix::resolve_import`] and nothing else. It used to be a
-/// table of nimony's mangled leaf names matched by prefix, plus a host stdout `Stream` for the guest
-/// libc's `write` and the `Exit` capability for `_exit`: a vocabulary only this root linker knew, and
-/// two authorities an `execve`'d image does not hold. temen-leng's POSIX edge now forwards every one of
-/// those to the personality, so a nim program binds identically at root and after an exec.
+/// chibicc command's — so they bind through [`temen_posix::resolve_import`]. It used to be a table
+/// of nimony's mangled leaf names matched by prefix, plus a host stdout `Stream` for the guest libc's
+/// `write` and the `Exit` capability for `_exit`: a vocabulary only this root linker knew, and two
+/// authorities an `execve`'d image does not hold. temen-leng's POSIX edge now forwards every one of
+/// those to the personality, so a nim program binds identically at root and after an exec. Its only
+/// other imports are the core's memory ops (`vm_map`, `vm_page_size`), with which its allocator grows
+/// the heap into the window's reserved tail: those bind to the program's own window
+/// ([`HostCap::memory`]), as they do in an `execve`'d image and in a C on-ramp command.
 ///
 /// Returns the [`Imports`], the names it could not serve, and the personality's
 /// [`SharedHostProc`] — its single powerbox entry (#1645), which a caller needs to publish the op
@@ -5574,13 +5600,36 @@ pub fn nim_posix_imports(
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
-        let Some(c) = temen_posix::resolve_import(&imp.name) else {
+        let cap = if let Some(c) = temen_posix::resolve_import(&imp.name) {
+            HostCap::host_proc_shared(c.op, &slot)
+        } else if let Some(c) =
+            temen_ir::default_cap_resolver(&imp.name).filter(|c| c.type_id == cap_id::ADDRESS_SPACE)
+        {
+            HostCap::memory(c.op)
+        } else {
             unbound.push(imp.name.clone());
             continue;
         };
-        imports = imports.provide(imp.name.clone(), HostCap::host_proc_shared(c.op, &slot));
+        imports = imports.provide(imp.name.clone(), cap);
     }
     (imports, unbound, slot)
+}
+
+/// What the processes of a [`nim_noc_run`] may `execve` (#1609, #763): the run's exec authority,
+/// granted on its host, so it arrives down the grant graph (invariant 3). What the embedder does not
+/// pass is simply not there.
+#[derive(Default)]
+pub struct ExecGrants<'a> {
+    /// The **command registry**: each `(path, module)` is granted and registered as a filesystem
+    /// executable, so the guest's own `execve(path, …)` ([`temen_posix::OP_EXECVE`]) can become it.
+    /// That is what lets a nim program spawn its own helpers (nimony's driver runs nifmake, which
+    /// runs every phase) rather than a host cranking the shell-outs from outside.
+    pub commands: &'a [(String, Module)],
+    /// Whether they may also run the **programs they build**: a `ModuleLoader`
+    /// ([`grant_module_loader`]), which every fork and exec carries, promotes a file holding a
+    /// module's encoding at its `execve` (PROCESS.md: `cc x.c && ./a.out`). nimony's compile-time
+    /// evaluation and its plugins build a program and run it.
+    pub built: bool,
 }
 
 /// **Run one no-C nim program** over a shared POSIX personality, with `argv`, on `backend`.
@@ -5592,21 +5641,14 @@ pub fn nim_posix_imports(
 /// one instance would see the first run's globals and heap, which for a compiler phase is not a
 /// rerun at all.
 ///
-/// `commands` is the run's **command registry**: each `(path, module)` is granted on the guest's
-/// `Host` and registered as a filesystem executable, so the guest's own `execve(path, …)`
-/// ([`temen_posix::OP_EXECVE`], #1609) can become it. That is what lets a nim program spawn its own
-/// helpers — nimony's driver runs nifmake, which runs every phase — rather than a host cranking the
-/// shell-outs from outside. The grant rides `run_with_caps_and_host`'s per-run host hook: authority
-/// arrives down the grant graph (invariant 3), and a command the embedder did not pass is simply
-/// not there.
+/// `exec` is what the run's processes may `execve` ([`ExecGrants`]): its registered commands, and
+/// whether they may run the programs they build.
 ///
 /// `backend` is honoured or refused, never quietly swapped: [`Backend::Bytecode`] normally falls
 /// back to the tree-walker for a module outside its subset, which would turn an engine
 /// differential into the oracle checked against itself. So a module the bytecode engine does not
 /// admit is an error here. (Its exec'd images need no such check: the engine compiles each one, and
-/// refuses the exec rather than fall back.) [`Backend::Jit`] serves `execve` but not `fork` yet (#1768): a
-/// program that forks gets the failure back as its own. Which programs spawn is not decidable from
-/// imports — every linked nim program imports the whole personality — so the caller decides.
+/// refuses the exec rather than fall back.)
 ///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
 /// and the trap alone does not.
@@ -5615,7 +5657,7 @@ pub fn nim_noc_run(
     posix: &temen_posix::Posix,
     make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
     argv: &[String],
-    commands: &[(String, Module)],
+    exec: &ExecGrants,
     backend: Backend,
 ) -> Result<(), String> {
     if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits_reserved(&module) {
@@ -5627,7 +5669,8 @@ pub fn nim_noc_run(
     let (imports, unbound, slot) = nim_posix_imports(&module, posix, make);
     if !unbound.is_empty() {
         return Err(format!(
-            "unbound imports — not personality ops (`__px_*`): {unbound:?}"
+            "unbound imports — neither personality ops (`__px_*`) nor the core's memory ops: \
+             {unbound:?}"
         ));
     }
     let cfg = RunConfig {
@@ -5656,11 +5699,14 @@ pub fn nim_noc_run(
         host.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(posix));
         let (names, sigs) = temen_posix::cap_vtable();
         host.set_host_proc_vtable(handle, names, sigs);
-        // The commands this run may become, granted on the very host it uses.
-        for (path, m) in commands {
+        // What this run may exec, granted on the very host it uses.
+        for (path, m) in exec.commands {
             let wl = m.memory.map_or(0, |mc| mc.size_log2);
             let h = host.grant_module(m);
             posix.register_executable(path, h, wl);
+        }
+        if exec.built {
+            grant_module_loader(host);
         }
     };
     inst.run_with_caps_and_host(backend, &cfg, &[], Some(&mut setup))
@@ -5771,106 +5817,44 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
     out
 }
 
-/// Every `<stem>.x.nif` (Leng) module under `dir`, as `(stem, text)`, recursing into build
-/// subdirectories. Deduplicated by stem, first one wins.
-pub fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+/// A nim program's modules as nimony's backends link them: the DCE'd Leng of each, `<stem>.c.nif`,
+/// from the program's own build directory `<nimcache>/<main>/`, as `(stem, NIF bytes)` by stem — the
+/// bytes for `temen_leng::nif_text`, since NIF is not UTF-8 text. It is
+/// what `nimony t` hands `temen-link`, and what `nimony c` hands `lengc`: exactly the program's
+/// modules, whatever else a shared `nimcache` holds — the programs its compile-time evaluation
+/// built, or other programs built in the same tree.
+///
+/// `<main>` is the stem of `src`, the program's path as nimony was given it (relative to its cwd):
+/// [`nim_module_suffix`] with no search path, which is how the driver names a main module.
+pub fn nim_program_units(
+    nimcache: &std::path::Path,
+    src: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let main = nim_module_suffix(src, &[]);
+    let dir = nimcache.join(&main);
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("{src}: no build directory {}: {e}", dir.display()))?;
+    let mut units = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            collect_x_nif(&p, out);
-        } else if let Some(stem) = p
+        let Some(stem) = p
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".x.nif"))
-        {
-            if out.iter().all(|(s, _)| s != stem) {
-                if let Ok(bytes) = std::fs::read(&p) {
-                    out.push((
-                        stem.to_string(),
-                        String::from_utf8_lossy(&bytes).into_owned(),
-                    ));
-                }
-            }
-        }
+            .and_then(|n| n.strip_suffix(".c.nif"))
+        else {
+            continue;
+        };
+        let nif = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        units.push((stem.to_string(), nif));
     }
-}
-
-/// Narrow a shared `nimcache`'s modules to the closure of **one** program, named by the source path
-/// it was built from (`src_rel`, e.g. `src/nimony/nimsem.nim`).
-///
-/// An in-tree `nimcache` accumulates the modules of *every* program ever built there, and nimony
-/// takes no `--nimcache`. Linking all of them is wrong twice over: two `main`s are a
-/// `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
-/// cross-module references need not resolve in this program.
-///
-/// nimony writes one `<stem>.c` per module into the program's own build directory
-/// (`nimcache/<program stem>/`), so that directory's `.c` stems are exactly this program's closure —
-/// which drops the foreign modules *and* their `main`s together, one rule instead of a
-/// duplicate-`main` hack that leaves the rest of the foreign program in the link.
-///
-/// The program module is the one carrying `main` **whose own `.x.nif` names `src_rel` in its line
-/// info** — not the newest. `nimony c` is cached, so a run whose output is already up to date
-/// rewrites nothing and mtime then names whichever program was built last: a hexer probe and a
-/// nifler2 probe would both select hexer, and the nifler2 run would silently link hexer's closure.
-///
-/// Falls back to newest-by-mtime when nothing names `src_rel`, and to "keep that one `main`, sweep
-/// the rest" when the build directory is absent (an older toolchain, or a layout change) — imprecise
-/// rather than wrong. Returns the reason when it falls back, for the caller to report.
-pub fn nim_program_closure(
-    nimcache: &std::path::Path,
-    src_rel: &str,
-    mods: &mut Vec<(String, String)>,
-) -> Option<String> {
-    let mains: Vec<usize> = mods
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
-        .map(|(i, _)| i)
-        .collect();
-    if mains.is_empty() {
-        return None;
-    }
-    let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(src_rel));
-    let note = by_src
-        .is_none()
-        .then(|| format!("no program module names `{src_rel}` — falling back to newest `main`"));
-    let keep = by_src.unwrap_or_else(|| {
-        *mains
-            .iter()
-            .max_by_key(|&&i| {
-                std::fs::metadata(nimcache.join(format!("{}.x.nif", mods[i].0)))
-                    .and_then(|m| m.modified())
-                    .ok()
-            })
-            .expect("a newest program module")
-    });
-    let keep_stem = mods[keep].0.clone();
-    let own: std::collections::HashSet<String> = std::fs::read_dir(nimcache.join(&keep_stem))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            e.path()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".c"))
-                .map(|s| s.to_string())
-        })
-        .collect();
-    if own.is_empty() {
-        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
-        for i in drop.into_iter().rev() {
-            mods.remove(i);
-        }
-        return Some(format!(
-            "no build dir for `{keep_stem}` — keeping that `main` only"
+    units.sort();
+    if !units.iter().any(|(stem, _)| *stem == main) {
+        return Err(format!(
+            "{src}: {} holds no {main}.c.nif — not built with `--isMain`?",
+            dir.display()
         ));
     }
-    mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
-    note
+    Ok(units)
 }
 
 /// The window `size_log2` an op-13 **nimony phase child** (nimsem, hexer) needs for its carve.
