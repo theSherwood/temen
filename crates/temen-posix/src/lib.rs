@@ -2246,22 +2246,30 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             p.free_list.clear();
             p.allocated.clear();
         }
-        for entry in p.fds.iter().flatten() {
-            if let FdEntry::CorePipe(t) = entry {
+        // Every adopted pipe end re-points to its new handle — and so does the terminal input end
+        // (#797 interactive rung 2), which rides the same exec carry as a PipeEnd binding, so an
+        // exec'd child's `read(0)` still taps the terminal. Each token moves **once, from the
+        // handle it had before the exec**: `pairs` is a renaming, whose new numbers can be other
+        // ends' old ones, and dup'd fds share one token, so re-pointing fd by fd moved a shared
+        // token twice — the child's stdout, dup'd onto a pipe, landed on another end.
+        let tokens = p
+            .fds
+            .iter()
+            .flatten()
+            .filter_map(|e| match e {
+                FdEntry::CorePipe(t) => Some(t.as_ref()),
+                _ => None,
+            })
+            .chain(p.term_in.as_ref());
+        let moves: Vec<(&CorePipeToken, i32)> = tokens
+            .filter_map(|t| {
                 let cur = t.get();
-                if let Some((_, nh)) = pairs.iter().find(|(o, _)| *o == cur) {
-                    t.handle.store(*nh, Ordering::Relaxed);
-                }
-            }
-        }
-        // #797 interactive rung 2 — the terminal input end rides the same exec carry (it is a
-        // PipeEnd binding in the old powerbox); re-point this process's terminal token like any
-        // adopted pipe end, so an exec'd child's `read(0)` still taps the terminal.
-        if let Some(t) = p.term_in.as_ref() {
-            let cur = t.get();
-            if let Some((_, nh)) = pairs.iter().find(|(o, _)| *o == cur) {
-                t.handle.store(*nh, Ordering::Relaxed);
-            }
+                let (_, nh) = pairs.iter().find(|(o, _)| *o == cur)?;
+                Some((t, *nh))
+            })
+            .collect();
+        for (t, nh) in moves {
+            t.handle.store(nh, Ordering::Relaxed);
         }
     })
 }
@@ -7143,6 +7151,24 @@ block 0 (vph: i32) {\n\
             None,
             "the commit clears the staged image"
         );
+    }
+
+    /// An exec renames the process's pipe ends, and each end moves once, from the handle it had
+    /// before: the new numbers can be other ends' old ones, and dup'd fds share one token. Here the
+    /// end dup'd onto two fds moves 5 → 6 and must stay there, not follow the other end's 6 → 7.
+    #[test]
+    fn an_exec_moves_each_pipe_end_once() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let dup = Arc::new(CorePipeToken::new(5));
+        let other = Arc::new(CorePipeToken::new(6));
+        posix.root.lock().unwrap().fds = vec![
+            Some(FdEntry::CorePipe(Arc::clone(&dup))),
+            Some(FdEntry::CorePipe(Arc::clone(&dup))),
+            Some(FdEntry::CorePipe(Arc::clone(&other))),
+        ];
+        (cap_exec_remap_hook(&posix))(&[(5, 6), (6, 7)]);
+        assert_eq!((dup.get(), other.get()), (6, 7));
     }
 
     /// A registered executable is a file: an `execve` finds it where its path resolves against the
