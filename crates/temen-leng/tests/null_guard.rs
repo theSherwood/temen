@@ -86,10 +86,20 @@ fn guarded_powerbox_link_marks_and_clears_the_null_region() {
     let win = 1u64 << m.memory.expect("powerbox module has a window").size_log2;
     let brk = read_word(scratch + temen_ir::POWERBOX_HEAP_BRK);
     let top = read_word(scratch + temen_ir::POWERBOX_HEAP_TOP);
+    // The heap starts above the durable shadow arena the link declares on top of the data stack
+    // (INVARIANTS.md #16: the placement is the module's; FORK.md §9.5).
+    let arena = m
+        .memory
+        .and_then(|mc| mc.shadow)
+        .expect("a powerbox link declares a shadow arena");
     assert_eq!(
-        brk,
+        arena.base,
         temen_ir::powerbox_entry_sp(&m) + temen_ir::POWERBOX_STACK_RESERVE,
-        "heap break seeded just above the data stack"
+        "the shadow arena sits just above the data stack"
+    );
+    assert_eq!(
+        brk, arena.end,
+        "heap break seeded just above the shadow arena"
     );
     assert_eq!(top, win, "heap ceiling seeded to the mapped window top");
     assert!(brk >= guard, "the heap break itself is above the guard");

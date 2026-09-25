@@ -20,7 +20,7 @@
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
 #   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nifler nim_hello nim_phases
-#           nim_driver_guest lua_snapshot
+#           nim_driver_guest nim_link lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -248,31 +248,6 @@ if want nim_driver_guest; then
   else
     note "nim_driver_guest SKIP/✗ (nimony toolchain — see build_frontend.sh; then refresh the expected via the test)"
   fi
-  # The nim->powerbox link guest (link-in-guest) — separate build-std pipeline (rustc 1.81 / LLVM 18);
-  # no nimony toolchain, only rustc +1.81.0 + rust-src + llvm-18. Gzips fixtures/nim-link.temen.gz itself.
-  if bash crates/temen-run/demos/nim_frontend/build_nim_link.sh >/dev/null 2>&1 \
-     && gunzip -c "$FX/nim-link.temen.gz" > /tmp/rebuild_nim_link.temen 2>/dev/null \
-     && validate /tmp/rebuild_nim_link.temen; then
-    note "nim_link ✓ (nim-link.temen.gz)"
-  else
-    note "nim_link SKIP/✗ (rustc + rust-src + llvm-link/opt of rustc\'s LLVM major — see below)"
-  fi
-  # Its **memfs-I/O twin** (`nim-link-fs.temen.gz`): the same `link_nim_powerbox`, but reading its
-  # inputs from and writing its output to the shared memfs instead of stdin/stdout. Same build-std
-  # pipeline, same gate shape (`nim_link_fs_asset`), so it is rebuilt here beside `nim_link` — it is
-  # coupled to exactly the same leng changes, and leaving it out of this script meant a leng change
-  # silently left it stale while its byte-identical gate went red.
-  # NOT `validate`d here: that runs `prep_temen`, which asserts a module declaring imports is a named
-  # **powerbox entry** — and this one is `--child-entry`, so func 0 is the child ABI and the assert
-  # legitimately fires. Its gate is the op-13 test (`tests/nim_link_fs_asset.rs`), exactly as the
-  # builder's own last line says. Decode is still checked, so a truncated gzip cannot pass silently.
-  if bash crates/temen-run/demos/nim_frontend/build_nim_link_fs.sh >/dev/null 2>&1 \
-     && gunzip -c "$FX/nim-link-fs.temen.gz" > /tmp/rebuild_nim_link_fs.temen 2>/dev/null \
-     && [ -s /tmp/rebuild_nim_link_fs.temen ]; then
-    note "nim_link_fs ✓ (nim-link-fs.temen.gz — gated by tests/nim_link_fs_asset.rs)"
-  else
-    note "nim_link_fs SKIP/✗ (rustc + rust-src + llvm-link/opt — see build_nim_link_fs.sh)"
-  fi
   # The nimc card's whole-card tier-up (#1025 3e) op-13-spawns the CHILD-ENTRY phase guests; the
   # playground fetches them from web/assets, so mirror the committed `_ce` fixtures there (they're the
   # same wire-coupled modules the browser op-13 tests use — nifler_ce from the nifler demo, nimsem_ce +
@@ -302,6 +277,42 @@ if want nim_driver_guest; then
       || note "nim_prestdlib SKIP/✗ (needs threads wasm + playwright — see build-prestdlib.mjs)"
   else
     note "nim_prestdlib SKIP (threads wasm absent; build the browser engine first)"
+  fi
+fi
+
+# --- 6d) the in-guest linkers (nim-link.temen.gz + nim-link-fs.temen.gz): `temen_leng::link_nim_powerbox`
+# compiled to Temen, so they go stale on ANY change to temen-leng's link — its window layout included —
+# whatever the wire format does. Their own step, so a linker change rebuilds just them (they share no
+# build with the nimony frontend fixtures above). Toolchain: rustc + rust-src + llvm-link/opt of
+# rustc's LLVM major (see the summary note). ----------------------------------------------------------
+if want nim_link; then
+  echo "=== [nim_link] build_nim_link.sh + build_nim_link_fs.sh → nim-link(-fs).temen.gz ==="
+  FX=crates/temen-run/demos/nim_frontend/fixtures
+  # The nim->powerbox link guest (link-in-guest) — the build-std pipeline of the leng step (default
+  # rustc + rust-src + llvm-link/opt of rustc's LLVM major); no nimony toolchain. Gzips
+  # fixtures/nim-link.temen.gz itself.
+  if bash crates/temen-run/demos/nim_frontend/build_nim_link.sh >/dev/null 2>&1 \
+     && gunzip -c "$FX/nim-link.temen.gz" > /tmp/rebuild_nim_link.temen 2>/dev/null \
+     && validate /tmp/rebuild_nim_link.temen; then
+    note "nim_link ✓ (nim-link.temen.gz)"
+  else
+    note "nim_link SKIP/✗ (rustc + rust-src + llvm-link/opt of rustc\'s LLVM major — see below)"
+  fi
+  # Its **memfs-I/O twin** (`nim-link-fs.temen.gz`): the same `link_nim_powerbox`, but reading its
+  # inputs from and writing its output to the shared memfs instead of stdin/stdout. Same build-std
+  # pipeline, same gate shape (`nim_link_fs_asset`), so it is rebuilt here beside `nim_link` — it is
+  # coupled to exactly the same leng changes, and leaving it out of this script meant a leng change
+  # silently left it stale while its byte-identical gate went red.
+  # NOT `validate`d here: that runs `prep_temen`, which asserts a module declaring imports is a named
+  # **powerbox entry** — and this one is `--child-entry`, so func 0 is the child ABI and the assert
+  # legitimately fires. Its gate is the op-13 test (`tests/nim_link_fs_asset.rs`), exactly as the
+  # builder's own last line says. Decode is still checked, so a truncated gzip cannot pass silently.
+  if bash crates/temen-run/demos/nim_frontend/build_nim_link_fs.sh >/dev/null 2>&1 \
+     && gunzip -c "$FX/nim-link-fs.temen.gz" > /tmp/rebuild_nim_link_fs.temen 2>/dev/null \
+     && [ -s /tmp/rebuild_nim_link_fs.temen ]; then
+    note "nim_link_fs ✓ (nim-link-fs.temen.gz — gated by tests/nim_link_fs_asset.rs)"
+  else
+    note "nim_link_fs SKIP/✗ (rustc + rust-src + llvm-link/opt — see build_nim_link_fs.sh)"
   fi
 fi
 

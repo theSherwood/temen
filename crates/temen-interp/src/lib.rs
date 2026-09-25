@@ -3571,6 +3571,12 @@ pub fn last_twin_traps() -> Vec<TwinTrap> {
     LAST_TWIN_TRAPS.with(|c| c.borrow().clone())
 }
 
+/// #1768 — publish the twins that trapped in a run driven by **another engine** (the JIT's process
+/// tree), so [`last_twin_traps`] answers for whichever engine ran last on this thread.
+pub fn publish_twin_traps(traps: Vec<TwinTrap>) {
+    LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = traps);
+}
+
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s
 /// `PAGE`). Protections are captured at this fixed size — independent of the host page size — so
 /// an artifact is portable across hosts. A 4 KiB codec page sits within one host page (host
@@ -6715,7 +6721,7 @@ enum ReapOutcome {
 /// first `i64` result (an `exit(n)` / `return n`); a **trapped** twin yields a single nonzero crash
 /// status — never a propagated trap — so a crashing command cannot crash the waiting shell
 /// (STAGE1.md). POSIX's exact `128 + signal` encoding is a shell/guest concern (ISSUES.md I43).
-fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
+pub fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
     match result {
         Ok(vals) => match vals.first() {
             Some(Value::I64(x)) => *x,
@@ -11170,7 +11176,9 @@ impl VCpu {
     /// FORK.md PR 1 increment 3b — build a live `fork()` **twin** of this parked caller vCPU. The twin
     /// resumes the *same* continuation (`frames`) at the fork `call.cap`'s post-call resume point over a
     /// **private** window (`twin_mem`) and a **duplicated** powerbox (`twin_host`), as its **own domain**
-    /// (fresh fiber registry, new `id`/`tls`). `pending` is left `None` — the caller sets
+    /// (fresh fiber registry, new `id`). Its `vcpu.tls` register is the caller's: POSIX's child inherits
+    /// the forking thread, and a guest that keeps its TLS block's address there (the fs-base recipe)
+    /// finds that block at the same offset of the copied window. `pending` is left `None` — the caller sets
     /// `CapResult(reply_twin)` so the reload delivers the twin's reply. Only ever called on a caller
     /// parked at its root on a `call.cap` (`cur == ROOT_FIBER`, no children/fibers — checked by
     /// [`Scheduler::fork_parked_caller`]), so the child/serve/fiber fields start empty.
@@ -11214,7 +11222,7 @@ impl VCpu {
             depth: self.depth,
             id: new_id,
             parent_task: self.parent_task,
-            tls: new_id as i64,
+            tls: self.tls,
             setjmp_points: BTreeMap::new(),
             pending: None, // the caller sets `CapResult(reply_twin)`
             sched: self.sched.clone(),
@@ -20746,10 +20754,10 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
-    /// #1768 — the hand-off an engine that serves a personality `execve` by **unwinding its run**
-    /// (the JIT) uses: `None` — this run does not serve exec that way; `Some(None)` — armed
-    /// ([`Host::arm_exec_replace`]); `Some(Some(img))` — an admitted image waiting for the unwound
-    /// run's driver to start it ([`Host::take_exec_image`]).
+    /// #1768 — the caller-request arm of an engine that serves its personality's `fork`/`execve`/
+    /// blocking `waitpid` **from the `call.cap` thunk** (the JIT's process driver): `None` — this run
+    /// does not; `Some(None)` — armed ([`Host::arm_caller_requests`]); `Some(Some(img))` — an admitted
+    /// `execve` image waiting for the unwound run's driver to start it ([`Host::take_exec_image`]).
     exec_replace: Option<Option<Box<ExecImage>>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `call.cap`, so without a persistent home a guest-*grown* heap page (committed
@@ -22943,10 +22951,15 @@ impl Host {
             let m = map.lock().unwrap();
             for (p, slot) in out.iter_mut().enumerate() {
                 let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
-                match m.get(&hp) {
-                    Some(1) => *slot = CapturedProt::Rw,
-                    Some(2) => *slot = CapturedProt::Ro,
-                    Some(3) => *slot = CapturedProt::Unmapped,
+                use temen_ir::page_state as ps;
+                match m.get(&hp).copied() {
+                    Some(ps::RW) => *slot = CapturedProt::Rw,
+                    Some(ps::RO) => *slot = CapturedProt::Ro,
+                    Some(ps::UNMAPPED) => *slot = CapturedProt::Unmapped,
+                    // A §13 alias is not snapshot state — a domain holding a shared region is not
+                    // freezable (its handle is non-durable), so the capture never gets this far
+                    // with one; reported as what it is rather than as a private page.
+                    Some(ps::BACKED_RW | ps::BACKED_RO) => *slot = CapturedProt::Backed,
                     _ => {}
                 }
             }
@@ -24832,28 +24845,55 @@ impl Host {
     /// op remap (not the LiveImpl `base_op + op` scheme), because it stands in for exactly what
     /// the generic offer dispatch would compute.
     fn instanced_offer_for_import(&self, packed: u32) -> Option<(OfferEntry, u32)> {
-        let slot = packed & 0xFFFF;
-        let cop = packed >> 16;
-        let b = self.import_bindings.get(slot as usize).copied()?;
-        if !b.bound {
-            return None;
-        }
-        let eff_op = match self
-            .import_remaps
-            .get(slot as usize)
-            .and_then(|r| r.as_ref())
-        {
-            Some(remap) => *remap.get(cop as usize)?,
-            None if cop == 0 => b.op,
-            None => return None,
-        };
-        match self.resolve(b.handle, b.type_id) {
+        let (type_id, eff_op, handle) = self.import_target(packed).ok()?;
+        match self.resolve(handle, type_id) {
             Ok(Binding::Offer(idx)) => {
                 let e = self.offers.get(idx as usize)?;
                 e.state.is_some().then(|| (e.clone(), eff_op))
             }
             _ => None,
         }
+    }
+
+    /// §3.5 — the `(type_id, op, handle)` an executable `call.import` dispatch reaches: `packed` is
+    /// the dispatch's op (`slot | consumer_op << 16`; a flat `call.sym` passes `slot`, so consumer op
+    /// `0`), resolved through the slot's live binding, and a grouped binding's consumer op through its
+    /// bind-time remap. `CapFault` for an unbound slot or an out-of-range consumer op — fail-closed,
+    /// probeable. The one translation: the dispatch ([`Host::cap_dispatch_slots`]), its pre-probe, and
+    /// an engine that must know ahead of a call what it reaches (the JIT's fork sites, #1768) all
+    /// read this.
+    pub fn import_target(&self, packed: u32) -> Result<(u32, u32, i32), Trap> {
+        let slot = packed & 0xFFFF;
+        let cop = packed >> 16;
+        let b = self
+            .import_bindings
+            .get(slot as usize)
+            .copied()
+            .ok_or(Trap::CapFault)?;
+        // An unbound rebindable slot (declared, never attached — phase 2) is fail-closed.
+        if !b.bound {
+            return Err(Trap::CapFault);
+        }
+        // A grouped binding translates the consumer-local op through its bind-time remap (frozen by
+        // the coverage walk); a flat binding requires consumer op 0 and uses the bound op.
+        let eff_op = match self
+            .import_remaps
+            .get(slot as usize)
+            .and_then(|r| r.as_ref())
+        {
+            Some(remap) => *remap.get(cop as usize).ok_or(Trap::CapFault)?,
+            None if cop == 0 => b.op,
+            None => return Err(Trap::CapFault),
+        };
+        Ok((b.type_id, eff_op, b.handle))
+    }
+
+    /// Whether `import.attach` may retarget import slot `slot` during the run (its manifest mode is
+    /// `rebindable`) — so what a `call.import` through it reaches is not fixed at instantiation.
+    pub fn import_rebindable(&self, slot: u32) -> bool {
+        self.import_bindings
+            .get(slot as usize)
+            .is_some_and(|b| b.rebindable)
     }
 
     /// CALLS.md increment 3, slice 1 — the `call.import.dyn` pre-probe. Reproduces the
@@ -26724,18 +26764,71 @@ impl Host {
         self.external_wake = Some(Arc::new((Mutex::new(0), Condvar::new())));
     }
 
-    /// #1768 — opt this host's run into serving a personality `execve` by **unwinding** it (the JIT,
-    /// whose caller is a live native stack the exec discards): wire the caller-request door, so the
-    /// personality's `execve` raises [`ParkEvent::ExecSelf`] instead of answering `-ENOSYS`, and arm
-    /// the slot an admitted [`ExecImage`] waits in while the run unwinds.
-    pub fn arm_exec_replace(&mut self) {
+    /// #1768 — opt this host's run into serving its personality's **caller requests** from the
+    /// `call.cap` thunk (the JIT's process driver, whose caller is a live native stack): wire the
+    /// caller-request door, so the personality's `fork`/`execve`/blocking `waitpid` raise their
+    /// [`ParkEvent`] instead of answering their no-door placeholder, and arm the slot an admitted
+    /// `execve`'s [`ExecImage`] waits in while the run unwinds.
+    pub fn arm_caller_requests(&mut self) {
         self.wire_park_door();
         self.exec_replace = Some(None);
     }
 
-    /// Whether [`Self::arm_exec_replace`] armed this host.
-    pub fn exec_replace_armed(&self) -> bool {
+    /// Whether [`Self::arm_caller_requests`] armed this host.
+    pub fn caller_requests_armed(&self) -> bool {
         self.exec_replace.is_some()
+    }
+
+    /// End the run [`Self::arm_caller_requests`] armed this host for: a host is armed exactly while
+    /// such a run is on it (dropping any image still parked).
+    pub fn disarm_caller_requests(&mut self) {
+        self.exec_replace = None;
+    }
+
+    /// #1768 — the **JIT's** fork of this process's powerbox (FORK.md §9.5): [`Self::fork_powerbox`],
+    /// except that the JIT window's page map ([`Self::cap_window_pages`]) goes with the window instead
+    /// of refusing the fork as in-flight run state. It *is* window state on the JIT — which pages the
+    /// guest committed or protected — and the twin gets a private copy of the window, so it gets a copy
+    /// of the map, filed under its own window's base (`twin_base`). The parent's map is untouched.
+    pub fn fork_powerbox_jit(&mut self, twin_pid: u64, twin_base: usize) -> Option<Host> {
+        let pages = self.cap_pages.take();
+        let twin = self.fork_powerbox(twin_pid);
+        let copy = pages
+            .as_ref()
+            .map(|(_, m)| m.lock_unpoisoned().clone())
+            .unwrap_or_default();
+        self.cap_pages = pages;
+        let mut twin = twin?;
+        twin.cap_pages = Some((twin_base, Arc::new(Mutex::new(copy))));
+        Some(twin)
+    }
+
+    /// #1768 — the exit hooks a fork twin's personalities rode in on ([`Self::fork_powerbox`]): an
+    /// engine fires them with the twin's [`reap_status`] when it finishes, so each retires the process
+    /// in its own table (Live → Zombie) before any parent waiting on it is woken.
+    pub fn exit_hooks(&self) -> Vec<Arc<dyn Fn(i64) + Send + Sync>> {
+        self.exit_hooks.clone()
+    }
+
+    /// #1768 — a **JIT** blocking wait's interrupt gate: a deliverable signal is pending whose delivery
+    /// does not carry `SA_RESTART`, so a waiting `waitpid` completes `-EINTR` rather than going on
+    /// waiting — the pre-park check the interpreters make at their park insert
+    /// ([`SignalSource::interrupt_pending`]), made by a JIT waiter before it waits and after each wake.
+    pub fn wait_interrupted(&self) -> bool {
+        self.park_interrupted()
+    }
+
+    /// #1768 — ring `bell` whenever this process's personality says a blocked caller may now proceed:
+    /// a deliverable signal ([`SignalSource::set_wake`]), a child's stop/continue/exit
+    /// ([`SignalSource::set_chld_wake`]), or bytes fed to a pipe ([`SignalSource::set_pipe_wake`]). The
+    /// JIT's waiters re-run their op on every ring (invariant 7), so the doors need not say which.
+    pub fn set_wake_bell(&self, bell: Arc<dyn Fn() + Send + Sync>) {
+        if let Some((_, source)) = self.signal_poll() {
+            let (b1, b2) = (Arc::clone(&bell), Arc::clone(&bell));
+            source.set_wake(Arc::new(move || b1()));
+            source.set_chld_wake(Arc::new(move || b2()));
+            source.set_pipe_wake(Arc::new(move |_| bell()));
+        }
     }
 
     /// Park an admitted image for the unwinding run's driver (a no-op on an unarmed host).
@@ -27078,31 +27171,8 @@ impl Host {
         // handle argument is ignored: the binding carries the granted handle (the operand is
         // vestigial in static dispatch — IMPORTS.md §2.5).
         let (type_id, op, handle) = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-            // §3.5: `op` packs `(slot | consumer_op << 16)`. A grouped binding translates the
-            // consumer-local op through its bind-time remap (frozen by the coverage walk); a
-            // flat binding requires consumer_op 0 and uses the bound op. Fail-closed on an
-            // out-of-range consumer op — probeable, like every capability fault.
-            let slot = op & 0xFFFF;
-            let cop = op >> 16;
-            let b = self
-                .import_bindings
-                .get(slot as usize)
-                .copied()
-                .ok_or(Trap::CapFault)?;
-            // An unbound rebindable slot (declared, never attached — phase 2) is fail-closed.
-            if !b.bound {
-                return Err(Trap::CapFault);
-            }
-            let eff_op = match self
-                .import_remaps
-                .get(slot as usize)
-                .and_then(|r| r.as_ref())
-            {
-                Some(remap) => *remap.get(cop as usize).ok_or(Trap::CapFault)?,
-                None if cop == 0 => b.op,
-                None => return Err(Trap::CapFault),
-            };
-            (b.type_id, eff_op, b.handle)
+            // §3.5: `op` packs `(slot | consumer_op << 16)` — see [`Host::import_target`].
+            self.import_target(op)?
         } else if type_id == temen_ir::CAP_DYN_TYPE_ID {
             // §3.5 dynamic mode by type-section reference: `op` packs `(type_idx | op << 16)`;
             // intern the registered self-module shape and re-enter with the effective id — the

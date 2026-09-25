@@ -67,7 +67,9 @@ unsafe extern "C" fn reentry_thunk(
     }
     let args = std::slice::from_raw_parts(args, n_args as usize);
     let results = std::slice::from_raw_parts_mut(results, n_results as usize);
-    CompiledModule::invoke_extra(cm, tc.code.get(), args, results, mem_base, trap_out)
+    // The thunk's `trap_out` is the running instance's `VmCtx`: the unit runs as that instance.
+    let vm = trap_out as *const temen_jit::VmCtx;
+    CompiledModule::invoke_extra(cm, tc.code.get(), args, results, mem_base, vm)
         .expect("invoke_extra during a live run");
 }
 
@@ -177,7 +179,7 @@ fn invoke_outside_a_run_is_rejected() {
         .expect("define outside run")[0]
         .tramp;
     let mut results = [0i64; 1];
-    let mut trap = 0i64;
+    let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
     let err = unsafe {
         CompiledModule::invoke_extra(
             ctx.cm.get(),
@@ -185,7 +187,7 @@ fn invoke_outside_a_run_is_rejected() {
             &[1, 2],
             &mut results,
             core::ptr::null_mut(),
-            &mut trap,
+            &vm,
         )
     };
     assert!(err.is_err(), "invoke outside an in-flight run must fail");
