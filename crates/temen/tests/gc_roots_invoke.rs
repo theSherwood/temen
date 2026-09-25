@@ -130,7 +130,7 @@ fn check(guest: &str, units: &[&str], roots: &[i64]) {
     )
     .expect("jit run");
     assert!(matches!(out, JitOutcome::Returned(_)), "cranelift: {out:?}");
-    let got = roots_in(&snap);
+    let got = roots_in(snap.bytes());
     assert!(
         want.is_subset(&got),
         "cranelift missed a root: want {want:?}, got {got:?}"

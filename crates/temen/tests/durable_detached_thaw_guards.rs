@@ -169,8 +169,10 @@ fn run(
             Some((out, snap))
         }
         Engine::Jit => match temen_run::jit_cap_run(parent, 0, args, win, PARENT_LOG2, 0, host) {
-            Ok((JitOutcome::Returned(v), snap)) => Some((Out::Ret(v[0]), snap)),
-            Ok((JitOutcome::Trapped(t), snap)) => Some((Out::Trap(format!("{t:?}")), snap)),
+            Ok((JitOutcome::Returned(v), snap)) => Some((Out::Ret(v[0]), snap.bytes().to_vec())),
+            Ok((JitOutcome::Trapped(t), snap)) => {
+                Some((Out::Trap(format!("{t:?}")), snap.bytes().to_vec()))
+            }
             Ok((other, _)) => panic!("unexpected outcome {other:?}"),
             Err(JitError::Unsupported(_)) => None,
             Err(e) => panic!("JIT run failed: {e:?}"),

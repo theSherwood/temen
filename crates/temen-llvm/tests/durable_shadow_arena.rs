@@ -223,7 +223,7 @@ fn run_on(engine: Engine, inst: &Module, window: &[u8], size_log2: u8, host: &mu
                 matches!(out, temen_jit::JitOutcome::Returned(_)),
                 "JIT run: {out:?}"
             );
-            snap
+            snap.bytes().to_vec()
         }
     }
 }

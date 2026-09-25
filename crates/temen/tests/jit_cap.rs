@@ -104,8 +104,8 @@ fn diff_run_t(
         other => panic!("backends disagree: {other:?}"),
     }
     // …and the escape-oracle: byte-identical final memory.
-    assert_eq!(imem, jmem, "final memory must be byte-identical");
-    (jout, jmem)
+    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
+    (jout, jmem.bytes().to_vec())
 }
 
 /// A guest that compiles the blob then invokes it with `(a, b)`, returning the result:
@@ -170,8 +170,8 @@ fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (Ji
         (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
-    assert_eq!(imem, jmem, "final memory must be byte-identical");
-    (jout, jmem)
+    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
+    (jout, jmem.bytes().to_vec())
 }
 
 /// Like [`diff_run_t`], but grant the `Jit` domain **thread-hosting** (`grant_jit_threads`,
@@ -242,8 +242,8 @@ fn diff_run_threads(
         (Err(t), JitOutcome::Trapped(k)) if t.code() == k.code() => {}
         other => panic!("backends disagree: {other:?}"),
     }
-    assert_eq!(imem, jmem, "final memory must be byte-identical");
-    (jout, jmem)
+    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
+    (jout, jmem.bytes().to_vec())
 }
 
 /// **Threads in an installed submitted unit — native tier** (CONSOLIDATION.md §11, the §11 slice-2
@@ -466,7 +466,7 @@ func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v
         }
         other => panic!("backends disagree: {other:?}"),
     }
-    assert_eq!(imem, jmem, "final memory must be byte-identical");
+    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
 }
 
 fn with_len(src: &str, len: usize) -> String {
@@ -1335,7 +1335,7 @@ fn diff_serve(
         "completion cells must match for {dispatches:?}"
     );
     assert_eq!(iagain, jagain, "cells drain once on both backends");
-    assert_eq!(imem, jmem, "final memory must be byte-identical");
+    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
     (jvals, jcells)
 }
 

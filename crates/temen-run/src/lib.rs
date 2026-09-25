@@ -1561,7 +1561,11 @@ pub fn jit_cap_run(
     reserved_log2: u8,
     table_reserve_log2: u8,
     host: &mut Host,
-) -> Result<(JitOutcome, Vec<u8>), temen_jit::JitError> {
+) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
+    // A fresh window: no page map from an earlier run may carry over (see `forget_cap_pages`).
+    host.forget_cap_pages();
+    // #1810: a durable run's capture is its freeze image, so it reaches the guest's high-water.
+    let durable = host.is_durable();
     // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
     // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
     let hosts_fibers = host.jit_hosts_fibers();
@@ -1598,6 +1602,9 @@ pub fn jit_cap_run(
         // (`powerbox_compile_run`); without them a granted spawn here was an inert `CapFault`.
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
         cm.set_budget_taker(Some(production_budget_taker(cc)));
+        if durable {
+            cm.set_high_water(Some(cc.high_water()));
+        }
         if hosts_fibers {
             cm.enable_fiber_hosting(temen_jit::Quota::default())?;
         }
@@ -1630,7 +1637,7 @@ pub fn jit_cap_run(
             jit_durable_leave(&mut cm, &mut hg);
         }
         hg_restore(host, host_mutex);
-        return r;
+        return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)));
     }
     let cc = CapCtx::Raw(host as *mut Host);
     let mut cm = CompiledModule::compile(
@@ -1650,6 +1657,9 @@ pub fn jit_cap_run(
     // The granted §14 spawns, as in the locked branch above.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
     cm.set_budget_taker(Some(production_budget_taker(cc)));
+    if durable {
+        cm.set_high_water(Some(cc.high_water()));
+    }
     if hosts_fibers {
         cm.enable_fiber_hosting(temen_jit::Quota::default())?;
     }
@@ -1666,7 +1676,8 @@ pub fn jit_cap_run(
         host.set_serve_native_ctx(0);
         return Err(e);
     }
-    // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
+    // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing — and, for a
+    // durable run, through the guest's high-water (#1810).
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
     let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18)) };
@@ -1674,7 +1685,7 @@ pub fn jit_cap_run(
     host.set_jit_native_ctx(0);
     host.set_serve_native_ctx(0);
     jit_durable_leave(&mut cm, host);
-    r
+    r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)))
 }
 
 /// Hand the embedder back the powerbox [`jit_cap_run`]'s serialized path moved into its mutex.
@@ -2694,6 +2705,45 @@ impl CapCtx {
     fn is_locked(self) -> bool {
         matches!(self, CapCtx::Locked(_))
     }
+
+    /// The #1810 high-water hook for this shape, with its ctx.
+    fn high_water(self) -> (temen_jit::HighWater, *mut c_void) {
+        let f: temen_jit::HighWater = match self {
+            CapCtx::Raw(_) => high_water,
+            CapCtx::Locked(_) => high_water_locked,
+        };
+        (f, self.ptr())
+    }
+}
+
+/// [`temen_jit::HighWater`] over a raw host: [`Host::cap_high_water`].
+///
+/// # Safety
+/// `ctx` is the run's live `*mut Host`.
+unsafe extern "C" fn high_water(ctx: *mut c_void, base: usize) -> u64 {
+    (*(ctx as *const Host)).cap_high_water(base)
+}
+
+/// [`high_water`] over a locked host (the run's vCPUs are joined by the time it is asked).
+///
+/// # Safety
+/// `ctx` is the run's live `*const Mutex<Host>`.
+unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
+    (*(ctx as *const Mutex<Host>))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .cap_high_water(base)
+}
+
+/// #1810 — a JIT run's window image in the interpreter's capture form: its bytes, and the page map the
+/// host rebuilds from the module's `readonly` segments, the NULL guard, and the guest's own
+/// Memory-capability changes ([`Host::capture_window_prots`]). One form for both engines; an embedder
+/// freezes it with `temen_snapshot::freeze_layout`, which keeps the page map.
+fn jit_layout(m: &Module, host: &Host, bytes: Vec<u8>) -> temen_interp::MemLayout {
+    let mapped = m.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
+    let npages = bytes.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
+    let prots = host.capture_window_prots(&m.data, mapped, npages, temen_ir::module_null_guard());
+    temen_interp::MemLayout::from_dense(bytes, &prots, mapped)
 }
 
 /// The production §14 child hooks for a run with this cap ctx: the family that decodes `ctx`'s shape
