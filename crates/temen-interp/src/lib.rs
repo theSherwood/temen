@@ -5391,7 +5391,7 @@ pub struct ExecImage {
     pub(crate) data: Arc<[Data]>,
     /// The pipes the old image's released ends left with no writers / no readers: a scheduler
     /// wakes their readers (EOF) / writers (`-EPIPE`).
-    pub(crate) zeroed_pipes: (Vec<u32>, Vec<u32>),
+    pub zeroed_pipes: (Vec<u32>, Vec<u32>),
 }
 
 struct ExecReq {
@@ -8474,8 +8474,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (pipe_eofs, pipe_epipes) = if froze {
                     (Vec::new(), Vec::new())
                 } else {
-                    let hg = v.host.lock_unpoisoned();
-                    (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
+                    v.host.lock_unpoisoned().release_pipe_ends()
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
@@ -12140,56 +12139,46 @@ fn handle_mem(
 ///
 /// **Consume everywhere** is the discipline these flags need (a transient left set lands on
 /// somebody else's call), so `drain` takes all of them whether or not this arm acts on them.
-/// Whether it *acts* is [`Decision`]'s business.
-struct ParkTransients {
+/// Whether it *acts* is [`Decision`]'s business on the interpreters, and `jit_proc`'s on a JIT
+/// process tree, which drains through [`Host::take_park_transients`].
+///
+/// Every call form parks on a pipe (#1826). The import routes used to consume the pipe flags
+/// without acting on them, a "posture" that kept an import-routed read of an empty pipe at its
+/// historical `0`, a false EOF while a writer still held the pipe open. The bytecode engine parked
+/// there all along, and the JIT cannot tell `call.sym` from `call.import` at all (both reach its
+/// thunk as the import dispatch).
+pub struct ParkTransients {
     /// A pipe whose parked readers should be woken (a write, or a writer-to-zero close).
-    wake_readers: Option<u32>,
+    pub wake_readers: Option<u32>,
     /// A pipe whose parked writers should be woken (a drained-full read, or a reader-to-zero close).
-    wake_writers: Option<u32>,
+    pub wake_writers: Option<u32>,
     /// A blocking pipe read that found an empty FIFO with writers open.
-    read_park: Option<u32>,
+    pub read_park: Option<u32>,
     /// A blocking pipe write that found a full FIFO with readers open (backpressure).
-    write_park: Option<u32>,
+    pub write_park: Option<u32>,
     /// The #799 caller request: `fork`, `execve`, or a blocking `waitpid`'s bench.
-    request: Option<ParkEvent>,
+    pub request: Option<ParkEvent>,
     /// #796 L1 — a delivered signal interrupted a park this arm would otherwise have taken.
-    sig_intr: bool,
-    /// Whether this call form acts on the pipe parks (see [`ParkPosture`]).
-    pipes: bool,
-}
-
-/// Which parks a call form takes. Not a capability question — a **posture**: an import-routed
-/// blocking read keeps its historical 0-EOF answer rather than parking (the slot-parked calls are
-/// the §3.6 caller-parking slice), while the inline routes park. The caller *request* family is
-/// deliberately not a posture: dropping one leaves the guest holding an `-ENOSYS` placeholder with
-/// nothing to say why, which is what #1621 and #1635 each were.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ParkPosture {
-    /// `call.cap` / `call.sym`: pipe parks are taken.
-    ParksOnPipes,
-    /// `call.import` / `call.import.dyn`: pipe flags are consumed, not acted on.
-    RequestsOnly,
+    pub sig_intr: bool,
 }
 
 impl ParkTransients {
     /// Drain every transient under one host lock.
-    fn drain(hg: &mut Host, posture: ParkPosture) -> Self {
-        let pipes = posture == ParkPosture::ParksOnPipes;
+    fn drain(hg: &mut Host) -> Self {
         let wake_readers = hg.take_pipe_wake();
         let wake_writers = hg.take_pipe_wake_writers();
         let read_park = hg.take_pipe_read_parked();
         let write_park = hg.take_pipe_write_parked();
         let request = hg.take_park_request();
-        // #796 L1 — consume the EINTR flag only when this arm is actually about to park (a
-        // completed read/write must not eat it), which is why the posture is read here: a route
-        // that declines pipe parks must not eat an interrupt on their behalf. Short-circuits so
-        // `take_sig_interrupt` fires only on a genuine park. (`fork` does not participate: POSIX
-        // fork is not interruptible — it succeeds or EAGAINs.)
+        // #796 L1 — consume the EINTR flag only when this op is actually about to park (a
+        // completed read/write must not eat it). Short-circuits so `take_sig_interrupt` fires
+        // only on a genuine park. (`fork` does not participate: POSIX fork is not interruptible —
+        // it succeeds or EAGAINs.)
         let reaps = matches!(
             request,
             Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
         );
-        let sig_intr = (reaps || (pipes && (read_park.is_some() || write_park.is_some())))
+        let sig_intr = (reaps || read_park.is_some() || write_park.is_some())
             && hg.take_sig_interrupt()
             // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
             && !hg.signal_restart();
@@ -12200,7 +12189,6 @@ impl ParkTransients {
             write_park,
             request,
             sig_intr,
-            pipes,
         }
     }
 
@@ -12284,7 +12272,7 @@ fn decide(
     // #1672 — under a landing freeze a durable domain never parks: the park is abandoned instead.
     let freezing = durable && mem.is_some_and(|m| m.durable_state() == STATE_UNWINDING);
     let park = |d: Decision| if freezing { Decision::Abandon } else { d };
-    if t.pipes && parkable {
+    if parkable {
         if let Some(pipe) = t.read_park {
             return if t.sig_intr {
                 Decision::Eintr
@@ -15166,12 +15154,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frames[top].vals.push(Reg::from_i64(r));
                     }
                 }
-                // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): mint a host-served pipe into this
-                // domain's own powerbox and write `fds[0]` = read end, `fds[1]` = write end (POSIX
-                // order) as two i32s at the guest pointer. A direct self-op like `setpgid` — the guest
-                // mints its own intra-domain FIFO (no host authority) and later grants the ends to its
-                // pipeline children. `Real` scheduler only (the `PipeEnd`/fork machinery); `-EMFILE` on
-                // a full table, `-EFAULT` on a bad `fds`.
+                // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): the one mint ([`Host::mint_pipe`]),
+                // on the `Real` scheduler, whose `PipeEnd` parks the pipe's reads and writes need.
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_PIPE,
@@ -15179,30 +15163,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let fds_ptr = match args.first() {
+                    let fds = match args.first() {
                         Some(a) => get(&frames[top].vals, *a)?.i64() as u64,
                         None => 0,
                     };
-                    let minted = if matches!(sched, SchedRef::Real(_)) {
-                        host.lock_unpoisoned().try_grant_pipe()
+                    let r = if matches!(sched, SchedRef::Real(_)) {
+                        let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                        host.lock_unpoisoned().mint_pipe(fds, gm)
                     } else {
-                        None
-                    };
-                    let r = match minted {
-                        None if !matches!(sched, SchedRef::Real(_)) => EINVAL,
-                        None => EMFILE,
-                        Some((w, rd)) => match mem.as_mut() {
-                            Some(m) => {
-                                let ok0 = m.write_bytes(fds_ptr, &rd.to_le_bytes()).is_some();
-                                let ok1 = m.write_bytes(fds_ptr + 4, &w.to_le_bytes()).is_some();
-                                if ok0 && ok1 {
-                                    0
-                                } else {
-                                    EFAULT
-                                }
-                            }
-                            None => EFAULT,
-                        },
+                        EINVAL
                     };
                     if !call_sig(&cur_types, *sig).results.is_empty() {
                         frames[top].vals.push(Reg::from_i64(r));
@@ -15523,7 +15492,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // empty FIFO with writers open parks, a `write` to a full pipe parks the writer
                     // (backpressure), and a write / last-close flags the other side's wake. Drained
                     // with the #799 caller request and the #796 interrupt flag in one place (#1647).
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::ParksOnPipes);
+                    let t = ParkTransients::drain(&mut hg);
                     let domain = hg.domain_id() as usize;
                     drop(hg);
                     if closed {
@@ -15726,15 +15695,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *import | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
-                    // Import-routed blocking reads don't park this slice (slot-parked calls are
-                    // the §3.6 caller-parking slice); the flag is consumed so it can't leak into a
-                    // later direct call's park decision — the read keeps its historical 0-EOF.
+                    // An import-routed blocking-stdin read doesn't park on this engine (the
+                    // `set_stdin_blocking` park is `call.cap`'s); the flag is consumed so it can't
+                    // leak into a later direct call's park decision.
                     let _ = hg.take_stdin_parked();
-                    // #1621/#1647 — the **caller request** is not "likewise". Read parking is a
-                    // posture this arm may decline ([`ParkPosture::RequestsOnly`]); `fork`/`exec`/a
-                    // reap bench are requests the drive loop acts on, and dropping one leaves the
-                    // guest holding the op's `-ENOSYS` placeholder with nothing to say why.
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::RequestsOnly);
+                    // #1621/#1647/#1826 — the caller request and the pipe parks are honored on every
+                    // call form: dropping a request leaves the guest holding the op's `-ENOSYS`
+                    // placeholder with nothing to say why, and dropping a pipe park is a false EOF.
+                    let t = ParkTransients::drain(&mut hg);
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
@@ -15903,8 +15871,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #1647 — the wakes now fire BEFORE the park decision. They used to run after
                     // it, past four `return`s, so a `call.sym` op that both filled a pipe and
                     // parked dropped its wake on the floor.
-                    let _ = hg.take_stdin_parked(); // no slot-parking this slice (see call.import)
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::ParksOnPipes);
+                    let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
+                    let t = ParkTransients::drain(&mut hg);
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
@@ -15989,12 +15957,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
-                    let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
-                                                    // #1621/#1647 — the caller request is honored here too. No consumer reaches a
-                                                    // personality op through `call.import.dyn` today, but leaving this arm the one
-                                                    // that silently drops the request would just re-create the asymmetry that cost
+                    let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
+                                                    // #1621/#1647/#1826 — requests and pipe parks are honored here too. No consumer
+                                                    // reaches a personality op through `call.import.dyn` today, but leaving this arm
+                                                    // the one that silently drops them would just re-create the asymmetry that cost
                                                     // #1621 four rounds to find.
-                    let t = ParkTransients::drain(&mut hg, ParkPosture::RequestsOnly);
+                    let t = ParkTransients::drain(&mut hg);
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
@@ -22617,6 +22585,13 @@ impl Host {
         ParkEvent::decode(self.park_request.swap(0, Ordering::SeqCst))
     }
 
+    /// #1826 — every park transient the last dispatch left, drained at once ([`ParkTransients`]):
+    /// the one drain the interpreters' call arms use, for an engine that decides outside this crate
+    /// (a JIT process tree, `jit_proc`).
+    pub fn take_park_transients(&mut self) -> ParkTransients {
+        ParkTransients::drain(self)
+    }
+
     /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
     /// eval loop can register a `Blocked::PipeRead` and re-issue the read on wake.
     fn take_pipe_read_parked(&mut self) -> Option<u32> {
@@ -22785,17 +22760,18 @@ impl Host {
             .unwrap_or(u32::MAX)
     }
 
-    /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
-    /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
-    /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
-    /// by crashing — releases its write ends and never wedges a downstream consumer.
-    /// FORK.md §8.6 — a domain finishing releases every pipe end it holds, so a peer reader sees EOF
-    /// and a peer writer `-EPIPE`. For a driver whose parked peers poll, so the zeroed pipes need no
-    /// wake. Call it once per domain: each call decrements the shared end counts again.
-    pub(crate) fn release_pipe_ends(&self) {
-        let _ = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+    /// FORK.md §8.6 — a process leaving this powerbox (it exits, crashes, or execs) releases every
+    /// pipe end it holds. Returns the pipes left with no writers, whose readers must wake to EOF, and
+    /// the pipes left with no readers, whose writers must wake to `-EPIPE` (global ids, the wake key).
+    /// A driver whose parked peers poll drops them. Call it once per powerbox: each call decrements
+    /// the shared end counts again.
+    pub fn release_pipe_ends(&self) -> (Vec<u32>, Vec<u32>) {
+        (self.drop_all_pipe_writers(), self.drop_all_pipe_readers())
     }
 
+    /// FORK.md §8.6 — decrement the writer count for **every** live pipe *write* end this Host holds,
+    /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF), so a
+    /// producer that exits — even by crashing — never wedges a downstream consumer.
     fn drop_all_pipe_writers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {
@@ -22810,9 +22786,8 @@ impl Host {
 
     /// FORK.md §8.6 (EPIPE) — the read-end counterpart of [`Self::drop_all_pipe_writers`]: decrement the
     /// reader count for **every** live pipe *read* end this Host holds, returning the pipe ids that
-    /// reached `0` readers (writers of those must be woken → `-EPIPE`). Called on exec/teardown so a
-    /// consumer that exits — even by crashing — releases its read ends and never wedges a parked
-    /// upstream producer (backpressure) forever.
+    /// reached `0` readers (writers of those must be woken → `-EPIPE`), so a consumer that exits —
+    /// even by crashing — never wedges a parked upstream producer (backpressure) forever.
     fn drop_all_pipe_readers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {
@@ -24558,6 +24533,35 @@ impl Host {
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
         Some((w, r))
+    }
+
+    /// FORK.md §8.6 — `pipe(fds)` ([`CAP_SELF_PIPE`]), the mint every engine serves it with: a pipe
+    /// in this domain's own powerbox, its read end written at `fds` and its write end at `fds + 4`
+    /// (POSIX order, two little-endian `i32`s). A direct self-op like `setpgid`: the guest mints its
+    /// own intra-domain FIFO, no host authority, and later grants the ends to its children.
+    ///
+    /// `0`, or `-EMFILE` on a full table or channel cap, or `-EFAULT` when `fds` can't take the
+    /// ends — and then nothing is minted: both ends are released again, as Linux's `pipe` does on a
+    /// failed copy-out. An engine serves the op only where it serves the parks the pipe's reads and
+    /// writes make, and answers `-EINVAL` everywhere else.
+    pub fn mint_pipe(&mut self, fds: u64, mem: Option<&mut dyn GuestMem>) -> i64 {
+        let Some((w, r)) = self.try_grant_pipe() else {
+            return EMFILE;
+        };
+        let mut ends = [0u8; 8];
+        ends[..4].copy_from_slice(&r.to_le_bytes());
+        ends[4..].copy_from_slice(&w.to_le_bytes());
+        if mem.and_then(|m| m.write_bytes(fds, &ends)).is_some() {
+            return 0;
+        }
+        // No one can hold or wait on the pipe `try_grant_pipe` just pushed: closing both ends
+        // leaves it dead, its channel charge refunded.
+        let pipe = self.pipes.len() as u32 - 1;
+        self.drop_pipe_writer(pipe);
+        self.drop_pipe_reader(pipe);
+        self.close(w);
+        self.close(r);
+        EFAULT
     }
 
     /// Grant a **read-only pipe end** and hand back both its handle and the shared FIFO backing — the
@@ -27557,8 +27561,7 @@ impl Host {
                 // A failed exec leaves the caller running with its personality intact: release the
                 // child's pre-bumped ends (a never-run child Host has no teardown) and move the carried
                 // `host_procs` back to `self` (they sit at the tail of the child's vec).
-                child.drop_all_pipe_writers();
-                child.drop_all_pipe_readers();
+                child.release_pipe_ends();
                 let n = child.host_procs.len();
                 self.host_procs = child.host_procs.drain(n - nmoved..).collect();
                 Err(())
@@ -27656,7 +27659,7 @@ impl Host {
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
         // counts never dip through this.
-        let zeroed_pipes = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+        let zeroed_pipes = self.release_pipe_ends();
         Ok(ExecImage {
             zeroed_pipes,
             host,
@@ -27812,7 +27815,9 @@ impl Host {
                 // can run guest handler code / read `serve_run`): a probeable `-EINVAL`, never a
                 // trap — the guest's serve loop can fall back. (The tree-walk eval loop intercepts
                 // these before dispatch; the bytecode engine declines them at compile and falls back
-                // to the tree-walker.)
+                // to the tree-walker.) `pipe` likewise: each engine serves it where its pipe parks
+                // are served ([`Host::mint_pipe`]) — a JIT process tree in its thunk — and a call
+                // that reaches this table is a tier that doesn't.
                 CAP_SELF_SVC_POLL
                 | CAP_SELF_SVC_WAIT
                 | CAP_SELF_CLONE_CALLER
@@ -33887,6 +33892,44 @@ mod channel_budget_tests {
             "the minter is refunded exactly once"
         );
         assert_eq!(twin.channel_used(), 0, "the twin was never charged");
+    }
+
+    /// #1826 — the one mint ([`Host::mint_pipe`]) writes the ends at `fds` in POSIX order, read end
+    /// first. A mint whose `fds` can't take them leaves nothing behind, no charge and no handle, as
+    /// Linux's `pipe` releases what it made when the copy-out faults.
+    #[test]
+    fn a_mint_whose_fds_fault_leaves_nothing_behind() {
+        let mut h = Host::new();
+        h.set_channel_cap(PIPE_CAP as i64); // room for exactly one pipe
+        let mut window = vec![0u8; 4096];
+        let mut mem = WindowMem::new(&mut window, 4096);
+        let held = |h: &Host| h.table.iter().filter(|s| s.entry.is_some()).count();
+        let before = held(&h);
+        assert_eq!(
+            h.mint_pipe(4092, Some(&mut mem)),
+            EFAULT,
+            "fds[1] is past the window"
+        );
+        assert_eq!(held(&h), before, "the faulted mint's ends are closed");
+        assert_eq!(h.channel_used(), 0, "the faulted mint is refunded");
+        assert_eq!(
+            h.mint_pipe(64, Some(&mut mem)),
+            0,
+            "the cap still has its one pipe"
+        );
+        let ends = mem.read_bytes(64, 8).expect("in window");
+        let end = |i: usize| i32::from_le_bytes(ends[i..i + 4].try_into().unwrap());
+        let (r, w) = (end(0), end(4));
+        assert!(
+            matches!(
+                h.resolve(r, cap_id::STREAM),
+                Ok(Binding::PipeEnd { write: false, .. })
+            ) && matches!(
+                h.resolve(w, cap_id::STREAM),
+                Ok(Binding::PipeEnd { write: true, .. })
+            ),
+            "fds[0] is the read end, fds[1] the write end"
+        );
     }
 
     #[test]

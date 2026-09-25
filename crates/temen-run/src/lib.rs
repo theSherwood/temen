@@ -491,8 +491,20 @@ unsafe fn cap_thunk_impl(
         return;
     }
     // #1768 — a JIT process's powerbox serves its personality's caller requests (`fork`, `execve`,
-    // a blocking `waitpid`) here, after the op that raised one ([`jit_proc::serve_request`]).
+    // a blocking `waitpid`) and its pipes' parks here, after the op that raised one
+    // ([`jit_proc::serve_request`]).
     let serves = host.caller_requests_armed();
+    // FORK.md §8.6 — `pipe(fds)`: a process tree serves the parks its pipes' reads and writes make,
+    // so it mints them, through the one mint ([`Host::mint_pipe`]). Any other JIT run leaves the op
+    // to the host's `-EINVAL`, as every tier that can't park does.
+    if serves && type_id == temen_ir::CAP_SELF_TYPE_ID && op == temen_interp::CAP_SELF_PIPE {
+        let r = host.mint_pipe(arg_slots.first().copied().unwrap_or(0) as u64, gm);
+        if n_results != 0 {
+            *results = r;
+        }
+        *trap_out = 0;
+        return;
+    }
     let (mut gm, mut pending) = (gm, pending);
     loop {
         // Clear the caller-request cell first, so the only request acted on is one THIS dispatch
@@ -521,11 +533,14 @@ unsafe fn cap_thunk_impl(
                     }
                 }
                 *trap_out = 0;
-                // A woken blocking wait runs its op again (invariant 7: the rewound park).
+                // Every transient the op left is drained, acted on or not: one left set would land
+                // on a later call.
+                let parks = host.take_park_transients();
+                // A woken park runs its op again (invariant 7: the rewound park).
                 let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
                 if serves
                     && jit_proc::serve_request(
-                        host, dispatch, view, mem_size, results, n_results, trap_out, bell,
+                        host, parks, dispatch, view, mem_size, results, n_results, trap_out, bell,
                     )
                 {
                     continue;

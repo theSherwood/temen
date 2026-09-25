@@ -9323,10 +9323,10 @@ pub fn compile_and_run_sliced(
 /// pushes the compiled command as a new domain unit. Returns `(child_host, child_table, new_vt)` for
 /// the caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
 /// caller then writes a probeable `-EINVAL` and lets the task run on — POSIX: execve returns only on
-/// failure). The old image's pipe ends are released here (`drop_all_pipe_*`) so the shared counts do
-/// not leak; waking any pipe that thereby reached EOF is the tree-walker's job (the cooperative engine
-/// has no CorePipe park — pipe-through-exec is a later rung), and is a no-op for a command that
-/// inherited none.
+/// failure). The old image's pipe ends are released here ([`Host::release_pipe_ends`]) so the shared
+/// counts do not leak; waking any pipe that thereby reached EOF is the tree-walker's job (the
+/// cooperative engine has no CorePipe park — pipe-through-exec is a later rung), and is a no-op for a
+/// command that inherited none.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn exec_image_build(
     cur_host: &mut Host,
@@ -17474,32 +17474,13 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
-                    // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): mint a host-served pipe
-                    // into this domain's powerbox and write `fds[0]` = read end, `fds[1]` = write end
-                    // (POSIX order) as two i32s at the guest pointer. The tree-walker handles this in its
-                    // eval loop (not `cap_dispatch_slots`), so the bytecode engine services it here rather
-                    // than in the generic dispatch below. `-EMFILE` on a full table, `-EFAULT` on a bad ptr.
+                    // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): the one mint
+                    // ([`super::Host::mint_pipe`]). The generic dispatch below declines it (an engine
+                    // serves it only where its reads and writes can park), so it is serviced here.
                     if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == super::CAP_SELF_PIPE {
-                        let fds_ptr = argv.first().copied().unwrap_or(0) as u64;
-                        let minted = host.with(|p| p.try_grant_pipe());
-                        let r = match minted {
-                            None => super::EMFILE,
-                            Some((w, rd)) => match mem.as_ref() {
-                                // Validate the 8-byte `int fds[2]` is in-window (else `-EFAULT`), then
-                                // write `fds[0]` = read end, `fds[1]` = write end at absolute addresses.
-                                Some(m) if m.read_window(fds_ptr, 8).is_ok() => {
-                                    let base = m.window.base();
-                                    for (k, &b) in rd.to_le_bytes().iter().enumerate() {
-                                        m.set_byte(base + fds_ptr + k as u64, b);
-                                    }
-                                    for (k, &b) in w.to_le_bytes().iter().enumerate() {
-                                        m.set_byte(base + fds_ptr + 4 + k as u64, b);
-                                    }
-                                    0
-                                }
-                                _ => super::EFAULT,
-                            },
-                        };
+                        let fds = argv.first().copied().unwrap_or(0) as u64;
+                        let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                        let r = host.with(|p| p.mint_pipe(fds, gm));
                         if !results.is_empty() {
                             self.regs[base + *dst as usize] = Reg::from_i64(r);
                         }
