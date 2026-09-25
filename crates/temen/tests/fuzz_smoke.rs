@@ -79,6 +79,23 @@ fn drive(bytes: &[u8]) {
     }
 }
 
+/// Inputs the nightly `roundtrip` fuzz target crashed on, replayed here on every stable run.
+#[test]
+fn roundtrip_fuzz_crashes_stay_fixed() {
+    const CRASHES: &[&[u8]] = &[
+        // crash-d619ae4d (nightly, 2026-09-25): a debug section whose tables are all empty but whose
+        // `tls_root` is set decoded as `Some`, and the text printer dropped it.
+        &[
+            0x54, 0x45, 0x4d, 0x45, 0x4e, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x81, 0xf9, 0x90,
+            0x6,
+        ],
+    ];
+    for bytes in CRASHES {
+        drive(bytes);
+    }
+}
+
 #[test]
 fn decode_verify_interp_never_panic_on_random_bytes() {
     let mut rng = Rng(0x9E3779B97F4A7C15);

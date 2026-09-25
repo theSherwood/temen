@@ -202,18 +202,11 @@ pub fn print_module(m: &Module) -> String {
 /// Print the frontend-neutral debug-info waist (DEBUGGING.md §6) as module-level directives after
 /// the functions: `debug.file <idx> "<path>"`, `debug.loc <fn> <bb> <i> <file> <line> <col>`,
 /// the structured type table (`debug.type` / `debug.field`), and
-/// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent ⇒ nothing printed.
+/// `debug.var <fn> "<name>" win|ssa <n> "<type>" [<type_id>]`. Absent or vacuous ⇒ nothing printed.
 fn print_debug_info(s: &mut String, m: &Module) {
-    let Some(di) = &m.debug_info else { return };
-    if di.files.is_empty()
-        && di.locs.is_empty()
-        && di.types.is_empty()
-        && di.vars.is_empty()
-        && di.blobs.is_empty()
-        && di.func_names.is_empty()
-    {
+    let Some(di) = m.debug_info.as_ref().filter(|di| !di.is_vacuous()) else {
         return;
-    }
+    };
     s.push('\n');
     for (i, f) in di.files.iter().enumerate() {
         let _ = writeln!(s, "debug.file {i} {}", quote_str(f));
@@ -1676,23 +1669,18 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
             _ => funcs.push(p.parse_func(funcs.len() as u32)?),
         }
     }
-    let no_explicit = dbg_files.is_empty()
-        && dbg_locs.is_empty()
-        && dbg_types.is_empty()
-        && dbg_vars.is_empty()
-        && dbg_blobs.is_empty()
-        && dbg_func_names.is_empty();
-    let debug_info = if !no_explicit {
+    let explicit = DebugInfo {
+        files: dbg_files,
+        locs: dbg_locs,
+        types: dbg_types,
+        vars: dbg_vars,
+        blobs: dbg_blobs,
+        func_names: dbg_func_names,
+        tls_root: dbg_tls_root,
+    };
+    let debug_info = if !explicit.is_vacuous() {
         // An explicit `debug` section wins verbatim.
-        Some(DebugInfo {
-            files: dbg_files,
-            locs: dbg_locs,
-            types: dbg_types,
-            vars: dbg_vars,
-            blobs: dbg_blobs,
-            func_names: dbg_func_names,
-            tls_root: dbg_tls_root,
-        })
+        Some(explicit)
     } else if auto_debug && !p.auto_locs.is_empty() {
         // No explicit section, and the caller asked to synthesize one from the source.
         Some(DebugInfo {

@@ -4273,6 +4273,31 @@ pub struct DebugInfo {
 }
 
 impl DebugInfo {
+    /// True when every table is empty. Such a `DebugInfo` says nothing: [`tls_root`](Self::tls_root)
+    /// only locates [`VarLoc::Tls`] variables, so on its own nothing reads it. The decoder, the text
+    /// printer and parser, and the linker all treat a vacuous `DebugInfo` as none, so "no debug info"
+    /// has one form (`None`) and every round trip keeps it.
+    pub fn is_vacuous(&self) -> bool {
+        // Destructured exhaustively: a new field fails to compile here until it is classified as a
+        // table or, like `tls_root`, as context for one. A field this test missed (#1715's
+        // `tls_root`) broke the text round-trip (fuzz `roundtrip`, 2026-09-25).
+        let DebugInfo {
+            files,
+            locs,
+            types,
+            vars,
+            blobs,
+            func_names,
+            tls_root: _,
+        } = self;
+        files.is_empty()
+            && locs.is_empty()
+            && types.is_empty()
+            && vars.is_empty()
+            && blobs.is_empty()
+            && func_names.is_empty()
+    }
+
     /// The window address of byte `off` of a thread's thread-local block ([`VarLoc::Tls`], #1715),
     /// given that thread's `vcpu.tls` word: the word itself once the thread has installed its block,
     /// or [`tls_root`](DebugInfo::tls_root) while it is 0 (the root thread). `None` for word 0 in a
@@ -5448,14 +5473,8 @@ fn merge_debug_info(
             }));
         out.blobs.extend(di.blobs.iter().cloned());
     }
-    // Vacuous in ⇒ nothing out (the same emptiness test `temen-text`'s printer applies).
-    let empty = out.files.is_empty()
-        && out.locs.is_empty()
-        && out.types.is_empty()
-        && out.vars.is_empty()
-        && out.blobs.is_empty()
-        && out.func_names.is_empty();
-    if empty {
+    // Vacuous in ⇒ nothing out.
+    if out.is_vacuous() {
         return None;
     }
     Some(out)
