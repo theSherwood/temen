@@ -479,3 +479,79 @@ block 0 (v0: i32) {{
         "grown page captured Rw"
     );
 }
+
+/// #1810: a guest that changes its own pages through its `AddressSpace` — a page mapped and then
+/// `protect`ed read-only, one mapped and `unmap`ped, and one grown past the 256 KiB escape-oracle
+/// span — plus a `readonly` data segment.
+const PAGE_OPS: &str = "memory 17
+data ro 81920 \"abcd\"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vro = i64.const 196608
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vrd = i32.const 1
+  v1 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vro, vlen, vrw)
+  vm1 = i64.const 55
+  i64.store vro vm1
+  v2 = call.cap 5 2 (i64, i64, i32) -> (i64) v0 (vro, vlen, vrd)
+  vun = i64.const 229376
+  v3 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vun, vlen, vrw)
+  v4 = call.cap 5 1 (i64, i64) -> (i64) v0 (vun, vlen)
+  vhi = i64.const 524288
+  v5 = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (vhi, vlen, vrw)
+  vm2 = i64.const 424242
+  i64.store vhi vm2
+  va = i64.add v1 v2
+  vb = i64.add v3 v4
+  vc = i64.add va vb
+  vd = i64.add vc v5
+  return vd
+  }
+}
+";
+const PAGE_OPS_RESERVED_LOG2: u8 = 20; // 1 MiB
+
+/// #1810: the JIT's durable capture is the interpreter's, byte for byte, through the high-water.
+/// It stopped at 256 KiB, so the page at 512 KiB never reached a JIT freeze.
+#[test]
+fn jit_durable_capture_matches_interp_past_the_oracle_span() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let m = temen_text::parse_module(PAGE_OPS).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let init = vec![0u8; 1 << 17];
+
+    let mut hi = Host::new();
+    let ih = hi.grant_memory();
+    let mut fuel = 1_000_000u64;
+    let (ir, ibytes, _) = run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init,
+        None,
+        PAGE_OPS_RESERVED_LOG2,
+        &mut hi,
+    );
+    assert_eq!(ir, Ok(vec![Value::I64(0)]), "every page op succeeds");
+
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let jh = hj.grant_memory();
+    let (jo, jbytes) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &[jh as i64],
+        &init,
+        PAGE_OPS_RESERVED_LOG2,
+        0,
+        &mut hj,
+    )
+    .expect("jit");
+    assert_eq!(jo, temen_jit::JitOutcome::Returned(vec![0]));
+    assert_eq!(jbytes.len(), ibytes.len(), "capture extent");
+    assert!(jbytes == ibytes, "capture bytes");
+}
