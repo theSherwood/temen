@@ -1295,3 +1295,126 @@ fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
         "a live self-serve grant of a nonexistent export fails the spawn closed"
     );
 }
+
+/// #1815: a client's death must reach the server's `svc.wait` even when another vCPU of the server
+/// domain is parked **under the same key** as a non-consumer. Here that vCPU is a server thread
+/// idling in `cont.resume.block` on a futex-parked fiber (keyed on its own domain, I48). The client
+/// finishes while that resumer is parked and the serve loop is not yet at `svc.wait` (it is joining
+/// the thread). The death used to spend its one-shot wake on the resumer — which re-parks, its
+/// fiber still blocked — and leave no token, so the serve loop's later `svc.wait` parked forever.
+///
+/// The ordering is forced, not hoped for: the fiber raises a flag and futex-parks, the root waits
+/// for the flag (plus a settle for the resumer to file its park), and only then spawns the client,
+/// which returns at once. After joining the client the root releases the fiber, the thread
+/// returns, and the serve loop reaches `svc.wait` with its only client long gone: it must return
+/// `0`, so the root exits `0`.
+#[test]
+fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
+    // The server is a 4-KiB carve at root offset 65536; the flag (2048) and the fiber's go-cell
+    // (2056) are server-window offsets, i.e. root addresses 67584 and 67592.
+    let src = granted_client_program("  vz9 = i64.const 0\n  return vz9")
+        .replace(
+            "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
+            "block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 4 vz vz
+  vj = thread.join vt
+  vz32 = i32.const 0
+  vs = svc.wait vz32
+  return vs
+  }",
+        )
+        .replace(
+            "  vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)\n",
+            "  vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
+  vfl = i64.const 67584
+  vfe = i32.const 0
+  vinf = i64.const -1
+  vfw = i32.atomic.wait vfl vfe vinf
+  vdead = i64.const 67600
+  vms = i64.const 50000000
+  vsettle = i32.atomic.wait vdead vfe vms
+",
+        )
+        .replace(
+            "  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)\n",
+            "  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
+  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vgo = i64.const 67592
+  vgone = i32.const 1
+  i32.store vgo vgone
+  vgw = atomic.notify vgo vgone
+",
+        )
+        + "func 4 (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vf = ref.func 5
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs, vv = cont.resume.block vk vz
+  return vv
+  }
+}
+func 5 (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vflag = i64.const 2048
+  vone = i32.const 1
+  i32.store vflag vone
+  vw = atomic.notify vflag vone
+  vgo = i64.const 2056
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vgo vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+";
+    assert!(
+        src.contains("thread.spawn 4") && src.contains("vsettle") && src.contains("vjg"),
+        "the rewrites must apply"
+    );
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 0, "{b:?}");
+    }
+}
+
+/// #1815: a demand child's page fault must **wake** a pager parked at `svc.wait` when the fault is
+/// not served by direct handoff. The fault arm enqueued the request and parked the child on the
+/// reply ticket, but only the handoff path ever reached the pager — with handoff off (or a handoff
+/// that found no serve loop to take) the parked pager slept through the request and the run
+/// deadlocked. The fault is the same request a `call.cap` makes, so it takes the same
+/// enqueue + `svc_wake` + park. Pinned handoff-off; handoff-on is `record_spawn_carries_the_pager_binding`.
+#[test]
+fn a_page_fault_wakes_a_parked_pager_without_handoff() {
+    let m = parse_module(&record_pager_program()).expect("parse");
+    verify_module(&m).expect("verify");
+    for b in BACKENDS {
+        let m = m.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let registry = Imports::new().provide("exit", HostCap::exit());
+            let inst = instantiate_with_imports(m, registry).expect("instantiate");
+            let cfg = RunConfig {
+                handoff: false,
+                ..RunConfig::default()
+            };
+            let r = inst.run_with_caps(
+                b,
+                &cfg,
+                &[(
+                    "vm",
+                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                )],
+            );
+            let _ = tx.send(r.map(|r| r.outcome).map_err(|e| e.to_string()));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{b:?}: the run hung"));
+        assert!(
+            matches!(r, Ok(Outcome::Exited(1123))),
+            "{b:?}: the pager serves the fault: {r:?}"
+        );
+    }
+}

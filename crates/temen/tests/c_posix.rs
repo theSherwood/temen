@@ -7120,3 +7120,72 @@ int main(void) {{\n\
         "the line discipline echoed the typed line into the stdout sink at feed time"
     );
 }
+
+/// #1816 — a fork child whose **sibling thread traps** while its main thread is parked in
+/// `thread.join`. The trap tears the child's domain down, and the parked main vCPU is killed through
+/// the teardown sweep (`reap`), not the `Done` arm. That path recorded the outcome but skipped every
+/// fork-twin wake the `Done` arm does: the personality never heard the exit (the child stayed Live),
+/// a parent benched in `waitpid` was never woken, and a later bench re-admitted on the recorded
+/// result, re-ran a `waitpid` that still saw a Live child, and benched again — a spin. The parent
+/// must reap the child with the crash status 128 (`REAP_CRASH_STATUS`, what a trap on the child's
+/// main thread reaps as — not the `return 7` it never reached) and return 42. The tree-walker was
+/// the one driver that lost the exit; the bytecode drivers are pinned alongside as the differential.
+fn twin_thread_trap_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);\n\
+long __vm_thread_join(int h);\n\
+static int status;\n\
+static volatile long zero;\n\
+long boom(long arg){{ return 1 / zero; }}\n\
+int main(void){{\n\
+  long s = __px_fork(0,0);\n\
+  if (s < 0) return 1;\n\
+  if (s == 0){{\n\
+    int t = __vm_thread_spawn(boom, (void *)0, 0);\n\
+    __vm_thread_join(t);\n\
+    return 7;    /* unreachable: the thread's trap tears this process down */\n\
+  }}\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  if (h != s) return 100;\n\
+  if (status != (128 << 8)) return 2000 + status;  /* the crash status 128, as a trap on main reaps */\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+#[test]
+fn c_a_twin_torn_down_by_its_thread_is_reaped_by_its_parent() {
+    fn within(what: &'static str, f: fn() -> Effects) -> Vec<Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f().result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what}: the parent never reaped the torn-down child"))
+    }
+    let want = vec![Value::I32(42)];
+    assert_eq!(
+        within("tree-walker", || run_interp_only(
+            &twin_thread_trap_src(),
+            |_| {}
+        )),
+        want
+    );
+    assert_eq!(
+        within("coop bytecode", || run_bytecode_only(
+            &twin_thread_trap_src(),
+            |_| {}
+        )),
+        want
+    );
+    assert_eq!(
+        within("parallel", || run_bytecode_parallel_only(
+            &twin_thread_trap_src(),
+            |_| {}
+        )),
+        want
+    );
+}
