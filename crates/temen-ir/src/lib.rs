@@ -3247,6 +3247,71 @@ pub enum Terminator {
 }
 
 impl Terminator {
+    /// Each edge of this terminator: its successor and the arguments it passes (in `br_table`
+    /// order, the default last). A return or tail call has none.
+    pub fn edges(&self) -> Vec<(BlockIdx, &[ValIdx])> {
+        match self {
+            Terminator::Br { target, args } => vec![(*target, args.as_slice())],
+            Terminator::BrIf {
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+                ..
+            } => vec![
+                (*then_blk, then_args.as_slice()),
+                (*else_blk, else_args.as_slice()),
+            ],
+            Terminator::BrTable {
+                targets, default, ..
+            } => targets
+                .iter()
+                .chain(core::iter::once(default))
+                .map(|(b, args)| (*b, args.as_slice()))
+                .collect(),
+            Terminator::Return(_)
+            | Terminator::ReturnCall { .. }
+            | Terminator::ReturnCallIndirect { .. }
+            | Terminator::Unreachable => Vec::new(),
+        }
+    }
+
+    /// Keep an edge argument only where `keep(successor, position)` says so.
+    pub fn retain_edge_args(&mut self, mut keep: impl FnMut(BlockIdx, usize) -> bool) {
+        let mut trim = |target: BlockIdx, args: &mut Vec<ValIdx>| {
+            let mut j = 0;
+            args.retain(|_| {
+                j += 1;
+                keep(target, j - 1)
+            });
+        };
+        match self {
+            Terminator::Br { target, args } => trim(*target, args),
+            Terminator::BrIf {
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+                ..
+            } => {
+                trim(*then_blk, then_args);
+                trim(*else_blk, else_args);
+            }
+            Terminator::BrTable {
+                targets, default, ..
+            } => {
+                for (t, args) in targets.iter_mut() {
+                    trim(*t, args);
+                }
+                trim(default.0, &mut default.1);
+            }
+            Terminator::Return(_)
+            | Terminator::ReturnCall { .. }
+            | Terminator::ReturnCallIndirect { .. }
+            | Terminator::Unreachable => {}
+        }
+    }
+
     /// Apply `f` to every **value operand** of this terminator, in place — the branch condition /
     /// table index, all edge block-arguments, and return / tail-call arguments. Block-index
     /// *targets* are **not** value operands and are left untouched (the optimizer remaps those
@@ -6022,6 +6087,167 @@ pub fn prune_unused_imports(m: &mut Module) -> PrunedImports {
         keep
     });
     PrunedImports { pruned }
+}
+
+/// **Drop every block parameter no path carries to a use**, in every function of `m`, with the
+/// matching argument on every edge into it (#1831).
+///
+/// A parameter is **live** when an instruction or its block's terminator uses it — a branch
+/// condition, a table index, a return or tail-call operand — or when an edge passes it into a live
+/// parameter of a successor: a backward fixpoint over the CFG, so a value threaded around a loop and
+/// never read dies with the loop. The entry block's parameters are the function signature and are
+/// never dropped.
+///
+/// Values are block-local, so a value used far from its definition must be threaded through every
+/// block between; that much is the form. But the "locals as block parameters" frontends (temen-leng,
+/// chibicc's `codegen_ir`) thread **every** local through **every** block, and most of what they
+/// thread is dead where it is threaded — 90% of nimony's 3.8M parameters. Every engine pays for the
+/// dead ones: the interpreters copy them on each branch, and Cranelift's register allocator spent two
+/// minutes on one lexer that carried 576,689 of them, 14,349 live.
+///
+/// Semantics-preserving: nothing dropped is read. The output verifies wherever the input did.
+/// Instructions don't move, so line locations stay put, and value-keyed debug locations follow
+/// their values (a variable dead in a block loses its entry there).
+pub fn prune_block_params(m: &mut Module) {
+    for (i, f) in m.funcs.iter_mut().enumerate() {
+        let live = live_block_params(&mut f.blocks);
+        if live.iter().all(|l| l.iter().all(|&x| x)) {
+            continue;
+        }
+        f.blocks = drop_block_params(core::mem::take(&mut f.blocks), &live);
+        if let Some(di) = &mut m.debug_info {
+            remap_debug_values(di, i as FuncIdx, &live);
+        }
+    }
+}
+
+/// [`prune_block_params`] for one function's blocks, debug info aside — the form an optimizer's
+/// fixpoint runs (temen-opt drops debug info anyway).
+pub fn prune_dead_block_params(mut blocks: Vec<Block>) -> Vec<Block> {
+    let live = live_block_params(&mut blocks);
+    drop_block_params(blocks, &live)
+}
+
+/// Which block parameters are live (see [`prune_block_params`]): `live[b][p]` for parameter `p` of
+/// block `b`. Takes the blocks mutably only to read their operands through the one exhaustive
+/// visitor ([`Inst::for_each_operand_mut`]); nothing is changed.
+fn live_block_params(blocks: &mut [Block]) -> Vec<Vec<bool>> {
+    let mut live: Vec<Vec<bool>> = blocks.iter().map(|b| vec![false; b.params.len()]).collect();
+    for (b, blk) in blocks.iter_mut().enumerate() {
+        let np = blk.params.len() as ValIdx;
+        let mut mark = |v: &mut ValIdx| {
+            if *v < np {
+                live[b][*v as usize] = true;
+            }
+        };
+        for inst in &mut blk.insts {
+            inst.for_each_operand_mut(&mut mark);
+        }
+        match &mut blk.term {
+            Terminator::Br { .. } => {}
+            Terminator::BrIf { cond, .. } => mark(cond),
+            Terminator::BrTable { idx, .. } => mark(idx),
+            t => t.for_each_operand_mut(&mut mark),
+        }
+    }
+    if let Some(entry) = live.first_mut() {
+        entry.fill(true);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (b, blk) in blocks.iter().enumerate() {
+            let np = blk.params.len() as ValIdx;
+            for (succ, args) in blk.term.edges() {
+                for (j, &a) in args.iter().enumerate() {
+                    let flows = live.get(succ as usize).and_then(|s| s.get(j)) == Some(&true);
+                    if a < np && flows && !live[b][a as usize] {
+                        live[b][a as usize] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    live
+}
+
+/// Drop the parameters `live` does not mark, and their arguments on every edge into them.
+fn drop_block_params(blocks: Vec<Block>, live: &[Vec<bool>]) -> Vec<Block> {
+    blocks
+        .into_iter()
+        .zip(live)
+        .map(|(mut blk, keep)| {
+            // Edge arguments first: one can be a dead parameter of this very block, passed on to a
+            // dead one; once they are gone nothing references a dead parameter.
+            blk.term.retain_edge_args(|succ, j| live[succ as usize][j]);
+            if keep.iter().all(|&k| k) {
+                return blk;
+            }
+            let mut params = Vec::with_capacity(blk.params.len());
+            for (&t, &k) in blk.params.iter().zip(keep) {
+                if k {
+                    params.push(t);
+                }
+            }
+            blk.params = params;
+            let mut to = |v: &mut ValIdx| {
+                *v = moved_value(keep, *v).expect("a dropped parameter is never read");
+            };
+            for inst in &mut blk.insts {
+                inst.for_each_operand_mut(&mut to);
+            }
+            blk.term.for_each_operand_mut(&mut to);
+            blk
+        })
+        .collect()
+}
+
+/// Where block-local value `v` went when [`drop_block_params`] dropped the block's dead
+/// parameters (`keep`): a kept parameter moves down past the dropped ones before it, an instruction
+/// result down by all of them, and a dropped parameter is gone (`None`).
+fn moved_value(keep: &[bool], v: ValIdx) -> Option<ValIdx> {
+    match keep.get(v as usize) {
+        Some(true) => Some(keep[..v as usize].iter().filter(|&&k| k).count() as ValIdx),
+        Some(false) => None,
+        None => Some(v - keep.iter().filter(|&&k| !k).count() as ValIdx),
+    }
+}
+
+/// Re-point function `func`'s value-keyed debug locations at the values [`drop_block_params`]
+/// renumbered, so a debugger reads the variable it read before — never a neighbour that slid into
+/// its index. A location-list entry follows its value, or goes with it when it was a dropped
+/// parameter (the variable was dead there). A function-wide [`VarLoc::Ssa`] names one index in every
+/// block (a φ-model slot), which no longer holds, so it becomes the list of where that slot now sits.
+fn remap_debug_values(di: &mut DebugInfo, func: FuncIdx, live: &[Vec<bool>]) {
+    let remap = |locs: &mut Vec<SsaLoc>| {
+        locs.retain_mut(|l| match live.get(l.block as usize) {
+            Some(keep) => moved_value(keep, l.value).map(|v| l.value = v).is_some(),
+            None => true,
+        });
+    };
+    for var in di.vars.iter_mut().filter(|v| v.func == func) {
+        match &mut var.loc {
+            VarLoc::Ssa { value } => {
+                let value = *value;
+                var.loc = VarLoc::SsaList(
+                    live.iter()
+                        .enumerate()
+                        .filter_map(|(b, keep)| {
+                            moved_value(keep, value).map(|v| SsaLoc {
+                                block: b as u32,
+                                inst: 0,
+                                value: v,
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            VarLoc::SsaList(locs) => remap(locs),
+            VarLoc::WindowVia { base, .. } => remap(base),
+            _ => {}
+        }
+    }
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`

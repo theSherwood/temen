@@ -406,6 +406,96 @@ fn merges_straight_line_chain() {
     assert_eq!(run(&opt, &[Value::I64(10)]), Ok(vec![Value::I64(11)]));
 }
 
+/// `sum(n)` = n + (n-1) + … + 1, with a `junk` value threaded around the loop (header → body →
+/// header) and out to the exit, and never read — what a "locals as block parameters" frontend emits
+/// for every local of a proc (#1831). Each junk parameter is referenced in its block, as an edge
+/// argument, so only a liveness that follows the edges sees it is dead.
+fn loop_threading_junk() -> Module {
+    let i64s = |n: usize| vec![ValType::I64; n];
+    Module {
+        funcs: vec![Func {
+            params: i64s(1),
+            results: i64s(1),
+            blocks: vec![
+                Block {
+                    params: i64s(1), // 0: n
+                    insts: vec![
+                        Inst::ConstI64(0),   // 1: acc
+                        Inst::ConstI64(777), // 2: junk
+                    ],
+                    term: Terminator::Br {
+                        target: 1,
+                        args: vec![0, 1, 2],
+                    },
+                },
+                Block {
+                    params: i64s(3), // 0: n, 1: acc, 2: junk
+                    insts: vec![
+                        Inst::ConstI64(0), // 3
+                        Inst::IntCmp {
+                            ty: IntTy::I64,
+                            op: CmpOp::Eq,
+                            a: 0,
+                            b: 3,
+                        }, // 4: n == 0
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 4,
+                        then_blk: 3,
+                        then_args: vec![1, 2],
+                        else_blk: 2,
+                        else_args: vec![0, 1, 2],
+                    },
+                },
+                Block {
+                    params: i64s(3), // 0: n, 1: acc, 2: junk
+                    insts: vec![
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Add,
+                            a: 1,
+                            b: 0,
+                        }, // 3: acc + n
+                        Inst::ConstI64(1), // 4
+                        Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Sub,
+                            a: 0,
+                            b: 4,
+                        }, // 5: n - 1
+                    ],
+                    term: Terminator::Br {
+                        target: 1,
+                        args: vec![5, 3, 2],
+                    },
+                },
+                Block {
+                    params: i64s(2), // 0: acc, 1: junk
+                    insts: vec![],
+                    term: Terminator::Return(vec![0]),
+                },
+            ],
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn drops_a_dead_value_threaded_around_a_loop() {
+    // The optimizer's parameter pass is temen-ir's `prune_block_params` (its own tests pin the pass);
+    // here, that its fixpoint then sweeps the junk's now-unused constant as well.
+    let opt = check_equiv(
+        &loop_threading_junk(),
+        &[vec![Value::I64(0)], vec![Value::I64(4)]],
+    );
+    assert!(opt.funcs[0].blocks.iter().all(|b| b.params.len() <= 2));
+    assert!(!opt.funcs[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::ConstI64(777))));
+}
+
 #[test]
 fn drops_dead_block_parameter_across_predecessors() {
     // A diamond whose join block has two predecessors (so it cannot be merged) and an unused
