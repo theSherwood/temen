@@ -594,6 +594,56 @@ impl SharedFiberTable {
         slot
     }
 
+    /// #1684 — thaw-seed a free slot (its fiber finished before the freeze) at its generation, on
+    /// the free list.
+    fn seed_free(&self, generation: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.slots.len();
+        t.slots.push(Arc::new(FiberSlot {
+            own: Ownership::new_free_at(generation),
+            running_on: AtomicU64::new(NOT_RUNNING),
+            fiber: Mutex::new(None),
+            shadow_sp: AtomicU64::new(self.shadow.frame_base(slot + 1)),
+            func: 0,
+            sp: 0,
+            event_park: AtomicBool::new(false),
+            park_self_resolving: AtomicBool::new(false),
+            consumed: AtomicBool::new(false),
+            pending: Mutex::new(None),
+        }));
+        t.free.push(Reverse(slot));
+        slot
+    }
+
+    /// #1684 — the residue of every slot a freeze left unflattened (not in `flattened`): a fresh
+    /// fiber at its empty frame base, which a thaw resume starts from its entry, and a free slot with
+    /// its generation.
+    pub(crate) fn unflattened_for_freeze(&self, flattened: &[usize]) -> Vec<crate::FrozenFiber> {
+        let t = self.lock();
+        t.slots
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| !flattened.contains(slot))
+            .filter_map(|(slot, s)| {
+                let generation = s.own.generation();
+                if s.own.is_free() {
+                    Some(crate::FrozenFiber::free(slot, generation))
+                } else if s.own.is_owned() {
+                    Some(crate::FrozenFiber {
+                        slot,
+                        func: s.func,
+                        sp: s.sp,
+                        shadow_sp: self.shadow.frame_base(slot + 1),
+                        generation,
+                        consumed: false,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Resolve a (forgeable) handle: **masked** into the power-of-two-padded table (Spectre-safe,
     /// like `call.dyn` — and the same shape as the interp registry, so a forged handle now
     /// resolves over the same domain-wide namespace on both backends). Returns the **slot index** (for
@@ -1397,6 +1447,11 @@ pub(crate) unsafe fn seed_frozen_fibers(
     let mut seed = seed.to_vec();
     seed.sort_by_key(|f| f.slot);
     for (expected, f) in seed.iter().enumerate() {
+        if f.is_free() {
+            let got = r.table.seed_free(f.generation);
+            debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
+            continue;
+        }
         // `0`: no counted-fuel entry runs durable, so a thawed fiber has no budget to refund into.
         let Some(fiber) = make_fiber(
             f.func,

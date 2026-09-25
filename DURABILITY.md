@@ -1324,7 +1324,12 @@ both directions. The page-protection story is complete.
 The §12.4 **fiber control state** now rides along too (Section 2 — the `FrozenFiber` residue,
 slice 3.1.5): a freeze flattens each parked fiber's continuation into the window image and records
 its residue (slot/funcref/sp/shadow-SP) in a TLV control section (tag 2, elided when there are no
-fibers, so no-fiber artifacts stay byte-identical); `restore` re-seeds the `Host`. A single-fiber
+fibers, so no-fiber artifacts stay byte-identical); `restore` re-seeds the `Host`. Every slot of the
+fiber table rides, not only the parked ones (#1684): a **fresh** fiber (`cont.new`, never resumed) is a
+record whose extent is its empty frame base, so the resume that thaws it starts it from its entry, and
+a **free** slot (its fiber finished) is a record with extent `0` carrying its generation, so a stale
+handle stays stale and the next `cont.new` recycles it into the same handle. The thaw re-seeds the
+table slot for slot, on all three engines. A single-fiber
 domain now round-trips through the real artifact (`crates/temen-snapshot/tests/roundtrip.rs`,
 including the §12.6 canonical re-serialize invariant). Remaining Phase-3 control-state work is
 **multi-vCPU** (per-context state words) and the **dispatch table** (a module-derived no-op today).

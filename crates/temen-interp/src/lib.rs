@@ -2546,9 +2546,12 @@ fn seed_domain(
         let mut seed: Vec<FrozenFiber> = thaw_fibers;
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
-            let got =
+            let got = if ff.is_free() {
+                root.registry.seed_free(ff.generation)
+            } else {
                 root.registry
-                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation, ff.consumed);
+                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation, ff.consumed)
+            };
             debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
             debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
         }
@@ -3235,7 +3238,7 @@ fn drive_over_cell(
             }));
         }
     }
-    let root_id = {
+    let (root_id, registry, arena) = {
         let mut s = sched.lock();
         let id = s.next_task;
         s.next_task += 1;
@@ -3301,8 +3304,9 @@ fn drive_over_cell(
             quota,
             thaw,
         );
+        let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         s.runnable.push_back(root);
-        id
+        (id, registry, arena)
     };
     // Run as worker 0 until the run shuts down (every vCPU finished), then join spawned workers.
     worker_loop(&sched);
@@ -3381,6 +3385,14 @@ fn drive_over_cell(
     }
     let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
+        // #1684 — every fiber slot the freeze did not flatten rides too: a fresh one (never
+        // resumed) and a free one (its generation), so the thaw rebuilds the table slot for slot.
+        if s.froze {
+            host_shared
+                .lock_unpoisoned()
+                .frozen_fibers
+                .extend(registry.unflattened_for_freeze(arena));
+        }
         // #1685 — a thread that finished and was never joined rides the freeze as completed
         // residue at its join slot; the thaw hands its result to the rewound `join`.
         if s.froze {
@@ -9949,6 +9961,10 @@ const ROOT_FIBER: usize = usize::MAX;
 /// shadow region `[shadow_region_base(slot+1), shadow_sp)`; this is the small host-side residue:
 /// where it sits and how to re-enter it on thaw. Re-entry recreates it as a `Pending` fiber so a
 /// thaw `cont.resume` runs its entry under `REWINDING`, rebuilding then re-parking it.
+///
+/// Every slot of the fiber table rides (#1684), so a thaw rebuilds the table slot for slot: a
+/// **fresh** fiber (never resumed) is a record whose extent is its empty frame base — the resume that
+/// thaws it starts it from its entry — and a **free** slot is [`FrozenFiber::free`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenFiber {
     /// Registry slot = the guest fiber handle (so re-seeding preserves handle values).
@@ -9960,6 +9976,7 @@ pub struct FrozenFiber {
     pub sp: i64,
     /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
+    /// `0` for a free slot: no shadow region lies at offset 0.
     pub shadow_sp: u64,
     /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
     /// *recycled* (generation > 0) fiber still resolves (`(generation << 24) | slot`). 0 for a
@@ -9975,6 +9992,25 @@ pub struct FrozenFiber {
     /// park is **fresh**: the resumer's in-flight `cont.resume` has yet to observe it, so the thaw
     /// re-issue re-parks and re-delivers `(SUSPENDED, value)`. Snapshot format v24.
     pub consumed: bool,
+}
+
+impl FrozenFiber {
+    /// #1684 — a free slot (its fiber finished): only its generation rides.
+    pub fn free(slot: usize, generation: u64) -> FrozenFiber {
+        FrozenFiber {
+            slot,
+            func: 0,
+            sp: 0,
+            shadow_sp: 0,
+            generation,
+            consumed: false,
+        }
+    }
+
+    /// Whether this is a [`FrozenFiber::free`] slot.
+    pub fn is_free(&self) -> bool {
+        self.shadow_sp == 0
+    }
 }
 
 /// §13.4 slice 4c — a nested child's **host state** at a subtree freeze: its serve trio and its
@@ -10676,6 +10712,43 @@ impl FiberRegistry {
             .fibers
             .iter()
             .any(|f| matches!(f, RegFiber::ParkedOn { .. }))
+    }
+
+    /// #1684 — the residue of every slot a freeze leaves unflattened: a **fresh** fiber (`cont.new`,
+    /// never resumed) at its empty frame base, which a thaw resume starts from its entry, and a
+    /// **free** slot ([`FrozenFiber::free`]) carrying its generation, so a stale handle stays stale
+    /// and a recycled `cont.new` gets the handle it would have.
+    fn unflattened_for_freeze(&self, arena: ShadowArena) -> Vec<FrozenFiber> {
+        let t = self.lock();
+        t.fibers
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, f)| match f {
+                RegFiber::Pending { func, sp } => Some(FrozenFiber {
+                    slot,
+                    func: *func,
+                    sp: *sp,
+                    shadow_sp: arena.frame_base(shadow_context_index(slot)),
+                    generation: t.gens[slot],
+                    consumed: false,
+                }),
+                RegFiber::Done => Some(FrozenFiber::free(slot, t.gens[slot])),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #1684 — re-create a free slot on thaw, at its recorded generation and on the free list.
+    fn seed_free(&self, generation: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.fibers.len();
+        t.fibers.push(RegFiber::Done);
+        t.shadow.push(0);
+        t.gens.push(generation);
+        t.consumed.push(false);
+        t.pending.push(None);
+        t.free.push(Reverse(slot));
+        slot
     }
 
     fn take_parked_for_freeze(&self) -> Option<(usize, Vec<Frame>)> {

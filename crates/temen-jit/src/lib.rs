@@ -479,11 +479,14 @@ pub enum WindowProt {
 /// this carries what a thaw must re-seed: the registry slot (= guest handle), entry funcref +
 /// data-stack base (to re-enter it), and the flattened shadow-SP extent. A durable **freeze** run
 /// returns one per flattened fiber; a **thaw** run is handed them back to re-create the fibers.
+/// Every slot of the table rides (#1684): a fresh fiber at its empty frame base, and a free slot as
+/// [`FrozenFiber::free`] — the same records as the interpreter's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FrozenFiber {
     pub slot: usize,
     pub func: i32,
     pub sp: i64,
+    /// `0` for a free slot: no shadow region lies at offset 0.
     pub shadow_sp: u64,
     /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
     /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `temen_interp::FrozenFiber`
@@ -493,6 +496,25 @@ pub struct FrozenFiber {
     /// thaw claim delivers its argument at the rewound `suspend` instead of re-parking. Mirrors
     /// `temen_interp::FrozenFiber::consumed`.
     pub consumed: bool,
+}
+
+impl FrozenFiber {
+    /// #1684 — a free slot (its fiber finished): only its generation rides.
+    pub fn free(slot: usize, generation: u64) -> FrozenFiber {
+        FrozenFiber {
+            slot,
+            func: 0,
+            sp: 0,
+            shadow_sp: 0,
+            generation,
+            consumed: false,
+        }
+    }
+
+    /// Whether this is a [`FrozenFiber::free`] slot.
+    pub fn is_free(&self) -> bool {
+        self.shadow_sp == 0
+    }
 }
 
 /// The host-side residue of a **spawned vCPU** (a `thread.spawn` child) flattened by a multi-vCPU
@@ -4696,6 +4718,16 @@ impl CompiledModule {
                 // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
                 // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
                 (*this).frozen_out.extend(d.take_frozen_fibers());
+            }
+        }
+        // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
+        // rebuilds the table slot for slot. After `join_all`: no vCPU can still create a fiber.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+            if let Some(rt) = (*this).fiber_rt.as_ref() {
+                let flattened: Vec<usize> = (*this).frozen_out.iter().map(|f| f.slot).collect();
+                let rest = rt.table().unflattened_for_freeze(&flattened);
+                (*this).frozen_out.extend(rest);
             }
         }
         // §5 W3 Stage 3 — a trap that originated on a *spawned* vCPU stashed its backtrace capture in
