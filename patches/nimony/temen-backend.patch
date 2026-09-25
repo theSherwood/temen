@@ -12,6 +12,15 @@ ithaqua is its whole-program tool), shares its output-naming helper (`wholeProgr
 its own backend directory (`<main>.temen/`). `nimony t -r` refuses: a Temen module runs under a
 Temen host. `temen-link` itself lives in this repo (`crates/temen-run/demos/temen_link`).
 
+A program built for Temen sees `defined(temen)`: its target CPU/OS are the C backend's, but it runs
+under a Temen host. The define changes no artifact of code that does not test it (the `.p/.s/.x/.c.nif`
+of a program built with and without it are byte-identical). The compiler relies on it: built for
+Temen, it builds the programs it runs itself for Temen too, since there is no C compiler under a
+Temen host and only Temen modules run there. So `prepareEval` precompiles `std/writenif` with `t`, a
+plugin is built with `t`, and `nimony s` (the program a compile-time evaluation runs) uses the Temen
+backend, whose output `runProgram` then executes. `nimsem e` (`buildGraphForEval`) still plans the C
+toolchain itself; no build uses it.
+
 Applied to a COPY of the pinned sources at build time (`scripts/ci/nim-selfhost-lane.sh`); the
 vendored `nimony/` submodule is never modified. Against the submodule pin (v0.6.2, 851fe262).
 Drop it when upstream nimony has a Temen backend — it is written to be upstreamed as is.
@@ -190,16 +199,86 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      optDebug   # default: -O1 (debug-friendly but avoids dumb codegen)
 --- a/src/nimony/nimony.nim
 +++ b/src/nimony/nimony.nim
-@@ -148,6 +148,12 @@
+@@ -148,9 +148,22 @@
      # backendWasm block in handleCmdLine): wasm32/standalone/32 bits.
      config.backend = backendWasm
      FullProject
 +  of "t":
 +    # Temen backend: the C backend's pipeline to the DCE'd `.c.nif`, then
 +    # temen-link writes one whole-program Temen module (no C compiler, no
-+    # linker). The target is the C backend's: nothing is implied.
++    # linker). The target CPU/OS are the C backend's; the platform is a Temen
++    # host's, which the program sees as `defined(temen)` (the backendTemen
++    # block in handleCmdLine).
 +    config.backend = backendTemen
 +    FullProject
    of "check":
      CheckProject
    of "s":
++    # A NIF-input build of a program this compiler runs itself (compile-time
++    # evaluation, `semos.runProgram`): built for the platform the compiler
++    # itself was built for.
++    when defined(temen):
++      config.backend = backendTemen
+     SemCheckNif
+   of "doc":
+     DocProject
+@@ -367,6 +380,13 @@
+     discard c.config.setTargetOS("standalone")
+     c.config.bits = 32
+     c.commandLineArgs.add " --cpu:wasm32 --os:standalone --bits:32"
++  if c.config.backend == backendTemen:
++    # A program built for Temen runs under a Temen host, whatever its target
++    # CPU/OS (the C backend's), and sees `defined(temen)`. The compiler relies
++    # on it: built for Temen, it builds the programs it runs itself for Temen
++    # too (`semos.hostBackend`).
++    c.config.addDefine "temen"
++    c.commandLineArgs.add " --define:temen"
+   let nativeBackend = c.config.backend == backendNative
+   let optOutAll = c.config.isDefined("useLibc")
+   if nativeBackend or not (optOutAll or c.config.isDefined("useMimalloc")):
+--- a/src/nimony/semos.nim
++++ b/src/nimony/semos.nim
+@@ -26,6 +26,12 @@
+ 
+ import ".." / gear2 / modnames
+ 
++const hostBackend = when defined(temen): "t" else: "c"
++  ## The command that builds a program this compiler runs itself (its
++  ## compile-time evaluator's helpers, its plugins): the backend of the
++  ## platform the compiler was built for. Under a Temen host that is the Temen
++  ## backend: there is no C compiler, and only Temen modules run.
++
+ proc nimonyDir(): string =
+   ## The project root for stdlib resolution. `bin*` (not just `bin`) is
+   ## matched so the boot bootstrap can stage toolchains under sibling
+@@ -461,7 +467,7 @@
+   var cmd = pluginCompileCmd(config, cacheDir)
+   cmd.add " -o:"
+   cmd.add quoteShell(staging)
+-  cmd.add " c "
++  cmd.add " " & hostBackend & " "
+   cmd.add quoteShell(nf)
+   exec cmd
+   if not vfsMoveInto(staging, exefile):
+@@ -705,7 +711,11 @@
+   if result.exitCode != 0: return
+ 
+   let modname = extractModuleSuffix(file)
+-  let exe = nimcachePath / modname / splitFile(file).name.addFileExt(ExeExt)
++  # Where `nimony s` put the program: its backend's output for the main module.
++  let exe = when defined(temen):
++      nimcachePath / modname & BackendDirTemen / splitFile(file).name.addFileExt("temen")
++    else:
++      nimcachePath / modname / splitFile(file).name.addFileExt(ExeExt)
+   # The child may start in `sourceDir`; keep the exe path absolute so it
+   # still resolves against the outer compile's cwd, not the module dir.
+   var exeToRun = exe
+@@ -739,7 +749,7 @@
+       let nimonyExe = findTool("nimony")
+       var cmd = quoteShell(nimonyExe) & c.commandLineArgs &
+         " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
+-        " c " & quoteShell(stdlibFile("std/writenif.nim"))
++        " " & hostBackend & " " & quoteShell(stdlibFile("std/writenif.nim"))
+       try:
+         let (output, exitCode) = execCmdEx(cmd)
+         if exitCode != 0:

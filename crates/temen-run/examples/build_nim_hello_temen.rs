@@ -24,11 +24,14 @@ use std::process::Command;
 fn main() {
     // `[--posix] [--root <tree>] [--native <out-exe>] [--nimcache <dir>] <src> <out.temen>`.
     //
-    // `--native` also keeps the **native** binary nimony built from the same source on the way (it
-    // runs the whole chain, gcc included): the same compiler, only the target differs. That is the
-    // reference a Temen build of a program is differentialled against — a phase built by some other
-    // compiler (hastur builds `nimony/bin` with classic Nim) is a different program, whose hash
-    // tables iterate in a different order.
+    // `--native` also builds the **native** binary of the same source (the whole chain, gcc
+    // included): the same compiler, only the target differs. That is the reference a Temen build of
+    // a program is differentialled against — a phase built by some other compiler (hastur builds
+    // `nimony/bin` with classic Nim) is a different program, whose hash tables iterate in a
+    // different order. It is a build of its own: the Temen module is built with `-d:temen`, the
+    // platform `nimony t` gives what it builds (#763), and the native binary is not — a compiler
+    // built for Temen builds the programs it runs itself (compile-time evaluation, plugins) for
+    // Temen, and a native one for native.
     //
     // `--root` compiles **in tree**, the way nimony is normally invoked: `<src>` is then relative to
     // `<tree>`, which is also the string nimony records in each module's line info and therefore the
@@ -104,18 +107,24 @@ fn main() {
         Some(c) => std::path::absolute(c).unwrap_or_else(|e| panic!("--nimcache {c}: {e}")),
         None => dir.join("nimcache"),
     };
-    let mut nimony = Command::new("nimony");
-    nimony.args(["c", "--isMain"]);
-    if nimcache.is_some() {
-        nimony.arg(format!("--nimcache:{}", cache.display()));
-    }
-    let status = nimony
-        .arg(file)
-        .current_dir(dir)
-        .env("PATH", &full_path)
-        .status()
-        .expect("run nimony (set NIMONY_BIN/NIM_BIN or put nimony on PATH)");
-    assert!(status.success(), "nimony c failed");
+    let build = |defines: &[&str], cache: Option<&Path>| {
+        let mut nimony = Command::new("nimony");
+        nimony.args(["c", "--isMain"]);
+        for d in defines {
+            nimony.arg(format!("-d:{d}"));
+        }
+        if let Some(c) = cache {
+            nimony.arg(format!("--nimcache:{}", c.display()));
+        }
+        let status = nimony
+            .arg(file)
+            .current_dir(dir)
+            .env("PATH", &full_path)
+            .status()
+            .expect("run nimony (set NIMONY_BIN/NIM_BIN or put nimony on PATH)");
+        assert!(status.success(), "nimony c failed");
+    };
+    build(&["temen"], nimcache.is_some().then_some(cache.as_path()));
 
     let mut mods: Vec<(String, String)> = Vec::new();
     temen_run::collect_x_nif(&cache, &mut mods);
@@ -143,14 +152,17 @@ fn main() {
     );
     if let Some(native) = &native {
         // nimony links the program as `nimcache/<program stem>/<name>`; the program module is the
-        // one closure member carrying `main`.
+        // one closure member carrying `main`. Its own cache: its defines differ, and they are the
+        // cache key.
         let stem = mods
             .iter()
             .find(|(_, src)| src.contains("(exportc \"main\")"))
             .map(|(s, _)| s.as_str())
             .expect("no program module in the closure");
+        let native_cache = std::path::PathBuf::from(format!("{}.native", cache.display()));
+        build(&[], Some(&native_cache));
         let name = file.file_stem().expect("nim file stem");
-        let exe = cache.join(stem).join(name);
+        let exe = native_cache.join(stem).join(name);
         std::fs::copy(&exe, native).unwrap_or_else(|e| panic!("copy {exe:?} to {native}: {e}"));
         eprintln!("wrote {native} — the same source, as nimony built it natively");
     }

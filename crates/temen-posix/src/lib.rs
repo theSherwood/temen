@@ -1455,6 +1455,12 @@ impl Posix {
             .clone()
     }
 
+    /// Set the working directory the program starts in — how an embedder/test stages where its
+    /// relative paths resolve, the `cd` before a command. [`rooted`], as the file seeds are.
+    pub fn set_cwd(&self, dir: &str) {
+        self.root.lock().unwrap_or_else(|e| e.into_inner()).cwd = rooted(dir);
+    }
+
     /// Set the program's argument vector (`args[0]` is conventionally the program name) — how an
     /// embedder hands a personality program its `argv` (e.g. `["sh", "-c", "echo hi"]`), read back by
     /// the guest through the `argc`/`argv` ops.
@@ -1676,13 +1682,16 @@ impl Posix {
     /// presentation — a memfs marker file at `path` (so `stat`/`glob`/`open` see a real file) and
     /// the exec bit (`stat` reports mode `0o755`; `exec_resolve` refuses unregistered files with
     /// `-EACCES`). The `Module` was granted on the shell's `Host` by the embedder — authority
-    /// arrived down the grant graph (invariant 3); this records the path view over it.
+    /// arrived down the grant graph (invariant 3); this records the path view over it. The path is
+    /// [`rooted`], as a file seed's is: an executable is a file, and an `execve` finds it where
+    /// every file op finds a file.
     pub fn register_executable(&self, path: &str, module_handle: i32, win_log2: u8) {
-        self.register_command(path, module_handle, win_log2);
+        let path = rooted(path);
+        self.register_command(&path, module_handle, win_log2);
         let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
-        st.executables.insert(path.to_string());
-        if !st.files.contains_key(path) {
-            st.file_put(path.to_string(), b"\x7fTEMEN".to_vec());
+        st.executables.insert(path.clone());
+        if !st.files.contains_key(&path) {
+            st.file_put(path, b"\x7fTEMEN".to_vec());
         }
     }
 
@@ -5020,15 +5029,15 @@ impl Ctx<'_> {
     /// runnable module's encoding — a program the process built, which the engine promotes through
     /// the process's `ModuleLoader` at the exec (PROCESS.md: `cc x.c && ./a.out`), refusing it
     /// `-EACCES` for a process without one. `Err(-EACCES)` for any other memfs file (no exec bit),
-    /// `Err(-ENOENT)` for anything else. The registry is keyed by the spelling the embedder
-    /// registered; a file is found as every file op finds it, relative to the cwd.
+    /// `Err(-ENOENT)` for anything else. Both are found as every file op finds a file: `path`
+    /// resolved against the cwd.
     fn resolve_exec_path(&mut self, path: &str) -> Result<(ExecTarget, u8), i64> {
         let file = self.resolve(path);
         let found = if let Some((_, h, wl)) = self
             .w
             .commands
             .iter()
-            .find(|(n, _, _)| n == path && self.w.executables.contains(path))
+            .find(|(n, _, _)| *n == file && self.w.executables.contains(&file))
         {
             (ExecTarget::Command(*h), *wl)
         } else if let Some(f) = self.w.files.get(&file) {
@@ -7134,6 +7143,36 @@ block 0 (vph: i32) {\n\
             None,
             "the commit clears the staged image"
         );
+    }
+
+    /// A registered executable is a file: an `execve` finds it where its path resolves against the
+    /// cwd, as every file op finds a file — not by the spelling it was registered under.
+    #[test]
+    fn an_executable_is_found_where_its_path_resolves() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.register_executable("/work/bin/c", 5, 16);
+        posix.register_executable("tools/t", 6, 16);
+        let mut win = vec![0u8; WIN];
+        let mut resolve = |path: &str| -> i64 {
+            win[100_000..100_000 + path.len()].copy_from_slice(path.as_bytes());
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            st.exec_resolve(&[100_000, path.len() as i64], Some(&mut mem))
+                .unwrap()[0]
+        };
+        assert_eq!(resolve("/work/bin/c"), 5);
+        assert_eq!(resolve("bin/c"), ENOENT, "from `/`, `bin/c` is `/bin/c`");
+        assert_eq!(
+            resolve("tools/t"),
+            6,
+            "registered relative: rooted, as a seed is"
+        );
+        posix.set_cwd("/work");
+        assert_eq!(posix.cwd(), "/work");
+        assert_eq!(resolve("bin/c"), 5, "found relative to the cwd");
+        assert_eq!(resolve("tools/t"), ENOENT, "`/work/tools/t`: no such file");
+        assert_eq!(resolve("/tools/t"), 6);
     }
 
     #[test]

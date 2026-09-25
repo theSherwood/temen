@@ -39,22 +39,26 @@ export PATH="$NIMONY_BIN:$NIM_BIN:$PATH"
 W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
 
-# The native reference runs from a private copy of the toolchain, so its stdlib sits at `lib/` beside
-# its cwd — exactly where the guest's memfs has it. nimony records every source path relative to its
-# cwd, so the two then record the same paths. (nimony finds its stdlib at `<bin>/../lib`; 38 MB.)
+# The native reference runs from a private copy of the toolchain, its stdlib at `lib/` beside its cwd
+# (nimony finds it at `<bin>/../lib`; 38 MB). The guest's build runs in the same directory — its
+# memfs holds the tree at the same path — so the two record the same paths: nimony records a source
+# path relative to its cwd, but writes a compile-time evaluation program's imports and output file
+# absolute.
 N="$W/nimony"
 mkdir -p "$N"
 cp -r "$ROOT/nimony/bin" "$ROOT/nimony/lib" "$N/"
 
 echo "[1/4] the toolchain, through the POSIX edge"
-# Each phase twice from one nimony build: the Temen module, and (`--native`) the native binary, which
-# replaces the reference toolchain's own. `nimony/bin`'s are built by classic Nim — a different
-# compiler, whose hash tables iterate in another order (#1753) — so they are not the reference. The
-# driver and nifmake only sequence work; their native copies stay as they are.
+# Each phase twice from the same sources: the Temen module (built for the Temen platform,
+# `-d:temen`), and (`--native`) the native binary, which replaces the reference toolchain's own.
+# `nimony/bin`'s are built by classic Nim — a different compiler, whose hash tables iterate in another
+# order (#1753) — so they are not the reference. The driver and nifmake only sequence work; their
+# native copies stay as they are.
 cargo build --release -q -p temen-run --example build_nim_hello_temen --example nim_selfhost_lane
 B=target/release/examples
-# The driver and nifmake are built from a patched COPY of the pinned sources (the submodule is never
-# modified): nifmake is a classic-Nim-only program upstream, and the driver learns the Temen backend.
+# Every tool is built from a patched COPY of the pinned sources (the submodule is never modified):
+# nifmake is a classic-Nim-only program upstream, the driver learns the Temen backend, and a compiler
+# built for Temen builds the programs it runs itself (compile-time evaluation, plugins) for Temen.
 # See each patch's own preamble.
 mkdir -p "$W/patched"
 cp -r "$ROOT/nimony/src" "$ROOT/nimony/doc" "$W/patched/"
@@ -66,7 +70,7 @@ build() { "$B/build_nim_hello_temen" --posix --nimcache "$W/nimcache-$1" "${@:2}
 pids=()
 for p in nifler2/nifler2 nimony/nimsem hexer/hexer; do
   n="$(basename "$p")"
-  build "$n" --root nimony --native "$N/bin/$n" "src/$p.nim" "$W/$n.temen" &
+  build "$n" --root "$W/patched" --native "$N/bin/$n" "src/$p.nim" "$W/$n.temen" &
   pids+=($!)
 done
 build nimony --root "$W/patched" src/nimony/nimony.nim "$W/nimony.temen" &
@@ -78,14 +82,20 @@ pids+=($!)
 for pid in "${pids[@]}"; do wait "$pid"; done
 
 echo "[2/4] the native reference: nimony builds and runs the program"
+# `atCompileTime` is a `const` nimony evaluates by building a program and running it, so the build
+# in-guest must build and run one too (#763).
 cat >"$N/prog.nim" <<'NIM'
 import std/[strutils, syncio]
+proc lengths(s: string): int =
+  result = 0
+  for p in s.split(","): result += p.len
+const atCompileTime = lengths("a,bb,ccc")
 let parts = "a,bb,ccc".split(",")
-var total = 0
-for p in parts: total += p.len
-echo "parts=", parts.len, " total=", total, " up=", toUpperAscii("temen")
+echo "parts=", parts.len, " total=", lengths("a,bb,ccc"), " ctfe=", atCompileTime, " up=", toUpperAscii("temen")
 NIM
-(cd "$N" && ./bin/nimony c --isMain prog.nim >/dev/null)
+# For the Temen platform (`-d:temen`), as `nimony t` builds: the C backend's pipeline to the
+# `.c.nif`, which is what makes every artifact comparable byte for byte.
+(cd "$N" && ./bin/nimony c -d:temen --isMain prog.nim >/dev/null)
 "$(ls "$N"/nimcache/*/prog | head -1)" >"$W/native.out"
 
 echo "[3/4] /bin/sh: the POSIX build of demos/shell"
@@ -100,7 +110,7 @@ echo "[4/4] the lane: the program built on Temen, by nimony's own toolchain"
   --sh "$W/sh.ir" --nimony "$W/nimony.temen" --nifmake "$W/nifmake.temen" \
   --nimsem "$W/nimsem.temen" --nifler "$W/nifler2.temen" --hexer "$W/hexer.temen" \
   --temen-link "$W/temen-link.temen" \
-  --expect "$N/nimcache" nimony/lib "$N/prog.nim" "$W/cache" >"$W/temen.out"
+  --expect nimony/lib "$N/prog.nim" "$W/cache" >"$W/temen.out"
 if ! diff -u "$W/native.out" "$W/temen.out"; then
   echo "the program built on Temen does not print what the native build prints (diff above)" >&2
   exit 1
