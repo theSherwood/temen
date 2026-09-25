@@ -411,7 +411,6 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
                 &may_suspend,
                 &tainted_sigs,
                 &m.types,
-                arena.end,
                 opts,
             )?;
             out.funcs[i] = nf;
@@ -423,10 +422,10 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
         let mem = out.memory.ok_or(TransformError::NoMemory)?;
         // The reserved region `[0, arena.end)` must fit in the declared window (it is part of
         // the guest's allotment; guest memory is the remainder `[arena.end, window)`), and a
-        // single shadow frame must fit in the arena.
-        // A live call chain stacks one frame per suspended activation; the reserve bounds the
-        // total depth (overflow-trapping the shadow stack is DURABILITY.md §12.7 future work).
-        if mem.size() < arena.end || arena.base + max_frame > arena.end {
+        // single shadow frame must fit in one context's region.
+        // A live call chain stacks one frame per suspended activation; the region bounds the
+        // total depth, and the UNWIND check traps a chain deeper than that (#1683).
+        if mem.size() < arena.end || REGION_HEADER_LEN + max_frame > SHADOW_STRIDE {
             return Err(TransformError::MemoryTooSmall);
         }
     }
@@ -875,10 +874,11 @@ enum SuspendKind {
     /// on the fiber side being wired.
     Resume { k: ValIdx, arg: ValIdx },
     /// `thread.join` (§12.8 next slice): a vCPU blocked joining a child is a freeze safepoint too — the
-    /// `thread_join` thunk returns a sentinel on observing `UNWINDING`, the trailing poll unwinds, and
-    /// the join is **re-issued on thaw** (like a propagated call / `cont.resume`): by then the child has
-    /// been re-spawned and run to completion, so the re-executed join resolves immediately to its
-    /// recorded result. `handle` is the joined vCPU handle's block-local index (spilled + reloaded).
+    /// trailing poll unwinds it. Like a host call it carries the re-issue word (#1685): a join the freeze
+    /// ended (the runtime returned without the child's result, or with the placeholder of a child that
+    /// itself unwound) is **re-issued on thaw** against the re-spawned child; a join that got the
+    /// child's real result reloads it, since that child is not re-run. `handle` is the joined vCPU
+    /// handle's block-local index (spilled + reloaded).
     ThreadJoin { handle: ValIdx },
     /// `<ty>.atomic.wait` (§12.8 parked-vCPU slice): a vCPU blocked in a futex wait is a freeze
     /// safepoint too — the `thread_wait` thunk returns on observing `UNWINDING` (with `WAIT_FROZEN`),
@@ -995,7 +995,7 @@ struct PointPlan {
     frame_offsets: Vec<u64>,  // window offset of each spilled value (parallel to `spilled`)
     frame_size: u64,
     rid_off: u64,
-    flag_off: Option<u64>, // a host call's spilled re-issue word (`Leaf` only)
+    flag_off: Option<u64>, // the spilled re-issue word (`Leaf` and `ThreadJoin`)
     cont_seg: u32,         // new block index of the continuation segment (after the op)
 }
 
@@ -1022,8 +1022,6 @@ fn transform_func(
     may_suspend: &[bool],
     tainted_sigs: &[temen_ir::FuncType],
     type_section: &[TypeEntry],
-    // The shadow-overflow trap line: the module's declared arena `end`.
-    arena_end: u64,
     opts: &TransformOpts,
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
@@ -1323,15 +1321,17 @@ fn transform_func(
                 // results `[save_end, out)` are recomputed, not spilled.
                 let save_end = match kind {
                     // A wait's status is spilled too (#1769): one the wait completed with before the
-                    // cut is delivered on thaw; only the freeze's own `WAIT_FROZEN` re-issues it.
-                    SuspendKind::Leaf { .. } | SuspendKind::MemoryWait { .. } => out,
+                    // cut is delivered on thaw; only the freeze's own `WAIT_FROZEN` re-issues it. A
+                    // join's result likewise, unless the freeze ended it (#1685).
+                    SuspendKind::Leaf { .. }
+                    | SuspendKind::MemoryWait { .. }
+                    | SuspendKind::ThreadJoin { .. } => out,
                     // The op's results are recomputed (re-issue) or redelivered (resume), so
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
                     | SuspendKind::PropagatedIndirect { .. }
                     | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. }
-                    | SuspendKind::ThreadJoin { .. }
                     | SuspendKind::SvcServe { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
                     SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
@@ -1399,8 +1399,13 @@ fn transform_func(
                     frame_offsets[j] = off;
                     off += vsize(slot_types[i]);
                 }
-                // A host call's frame also carries the re-issue word it saw (#1672), below the id.
-                let flag_off = matches!(kind, SuspendKind::Leaf { .. }).then(|| {
+                // A host call's frame also carries the re-issue word it saw (#1672), below the id; so
+                // does a join's (#1685).
+                let flag_off = matches!(
+                    kind,
+                    SuspendKind::Leaf { .. } | SuspendKind::ThreadJoin { .. }
+                )
+                .then(|| {
                     off = align_up(off, 4);
                     off += 4;
                     off - 4
@@ -1462,17 +1467,20 @@ fn transform_func(
         // The point's UNWIND check block — where its polls send an unwinding frame.
         let unwind_blk = unwind_base + 2 * gid as u32;
 
-        // UNWIND check: a push of this frame must not run past the reserve into guest memory
-        // (R9 / DURABILITY.md §12.7). The shadow stack mirrors the call stack, so this only
-        // trips for a chain deeper than the arena holds — a clean trap, never silent
-        // corruption. It lives on the (cold) freeze path, not the per-call path.
+        // UNWIND check: a push of this frame must not run past the running context's own region
+        // `[region base, +SHADOW_STRIDE)` — past it lies the next context's shadow frames, or
+        // guest memory for the last region (R9 / DURABILITY.md §12.7, #1683). The shadow stack
+        // mirrors the call stack, so this only trips for a chain deeper than a region holds — a
+        // clean trap, never silent corruption. It lives on the (cold) freeze path, not the
+        // per-call path.
         let mut cb = Bb::new(pt.slot_types.clone());
         let sp_a = cb.one(Inst::DurableShadowBase);
         let sp = cb.one(load(LoadOp::I64, sp_a, 0));
         let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
         let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
-        let reserve = cb.one(Inst::ConstI64(arena_end as i64));
-        let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, reserve));
+        let stride = cb.one(Inst::ConstI64(SHADOW_STRIDE as i64));
+        let region_end = cb.one(ibin(IntTy::I64, BinOp::Add, sp_a, stride));
+        let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, region_end));
         let live: Vec<ValIdx> = (0..pt.out as u32).collect();
         unwind_blocks.push(cb.finish(Terminator::BrIf {
             cond: over,
@@ -1489,7 +1497,7 @@ fn transform_func(
         for (j, &i) in pt.spilled.iter().enumerate() {
             ub.zero(spill(pt.slot_types[i], sp, i as u32, pt.frame_offsets[j]));
         }
-        // A host call moves the context's re-issue word into its frame and clears it, so the word
+        // A host call (or a join) moves the context's re-issue word into its frame and clears it, so the word
         // is set only between the abandoning runtime and this spill.
         if let Some(flag_off) = pt.flag_off {
             let flag = ub.one(load(LoadOp::I32, sp_a, REISSUE_IN_REGION_OFF));
@@ -1594,19 +1602,10 @@ fn transform_func(
                 let v = reloaded[spill_slot(*value as usize).expect("suspend value spilled")];
                 ab.many(Inst::Suspend { value: v }, pt.nres)
             }
-            // `thread.join` re-issue: reload the spilled vCPU handle and re-execute the join. By thaw the
-            // child has been re-spawned and run to completion, so the join resolves to its recorded result
-            // immediately (no block) — its result is *re-issued* (not reloaded), like `cont.resume`, so
-            // §12.6 holds (the child's side effects are replayed on its own rewind). But unlike a
-            // propagated call / resume, the join has **no in-thread callee** to flip the state word: the
-            // joined child rewinds as a *separate* vCPU (and the thaw driver resets the word to
-            // `REWINDING` afterward), so on this thread the join is the globally-deepest frozen frame —
-            // it flips the state to `NORMAL` itself, like a leaf, *before* re-issuing.
-            SuspendKind::ThreadJoin { handle } => {
-                let hh =
-                    reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
-                ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
-            }
+            // `thread.join`: the joined child rewinds as a *separate* vCPU, so on this thread the join is
+            // the globally-deepest frozen frame — it flipped the state to `NORMAL` above, like a leaf.
+            // Its terminator below reloads the result or re-issues the join (#1685).
+            SuspendKind::ThreadJoin { .. } => vec![],
             // `atomic.wait`: like `thread.join`, the wait is the globally-deepest frozen frame on this
             // thread (the notifier is a *separate* vCPU), so the state word was flipped to `NORMAL`
             // above. Its status was spilled and is reloaded into the continuation; the terminator
@@ -1706,6 +1705,24 @@ fn transform_func(
                     &operands,
                     &reloaded,
                     |p| with_operands(op, p),
+                )
+            }
+            // A join the freeze ended (its spilled re-issue word is set) is re-issued against the
+            // re-spawned child; one that got its child's real result reloads it (#1685).
+            SuspendKind::ThreadJoin { handle } => {
+                let flag = flag.expect("a join's frame carries its re-issue word");
+                let zero = ab.one(Inst::ConstI32(0));
+                let cond = ab.one(icmp(IntTy::I32, CmpOp::Ne, flag, zero));
+                reissue_branch(
+                    &mut extra_blocks,
+                    trap_blk + 1,
+                    unwind_blk,
+                    pt,
+                    cont_args,
+                    cond,
+                    &[*handle],
+                    &reloaded,
+                    |p| Inst::ThreadJoin { handle: p[0] },
                 )
             }
             // A loop header re-enters its body; nothing ran again.

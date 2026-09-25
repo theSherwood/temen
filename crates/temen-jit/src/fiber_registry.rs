@@ -115,6 +115,14 @@ impl Ownership {
         }
     }
 
+    /// #1684 — a **free** slot at a carried generation: a thaw re-seeds a slot whose fiber finished
+    /// before the freeze, so a stale handle to it stays stale and a recycled `cont.new` reuses it.
+    pub(crate) fn new_free_at(generation: u64) -> Ownership {
+        Ownership {
+            word: AtomicU64::new(pack(generation, FREE)),
+        }
+    }
+
     /// The owner begins running an `OWNED` fiber: `OWNED → RUNNING`, keeping the generation. Returns
     /// `false` if the slot is not `OWNED` (a caller bug — an owned fiber is not concurrently
     /// stealable, so only its owner transitions it, and this CAS cannot legitimately lose).
@@ -281,6 +289,17 @@ impl Ownership {
     /// the scan happens at a safepoint with the chain quiescent / stop-the-world).
     pub(crate) fn is_running(&self) -> bool {
         state_of(self.word.load(Ordering::Relaxed)) == RUNNING
+    }
+
+    /// Whether the slot is `FREE` (its fiber returned) — #1684's freeze residue.
+    pub(crate) fn is_free(&self) -> bool {
+        state_of(self.word.load(Ordering::Relaxed)) == FREE
+    }
+
+    /// Whether the slot is `OWNED` — after a freeze has unwound every running fiber and flattened
+    /// every suspended one, only a fresh fiber (created, never resumed) is (#1684).
+    pub(crate) fn is_owned(&self) -> bool {
+        state_of(self.word.load(Ordering::Relaxed)) == OWNED
     }
 
     /// Whether the fiber is **voluntarily suspended** (`RUNNABLE`, in the steal pool) — the durable

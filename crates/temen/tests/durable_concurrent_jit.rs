@@ -1383,33 +1383,13 @@ fn recycled_context_freeze_residue_is_sparse() {
         "freeze placeholder"
     );
     // The recycled-context residue: A finished + had its context freed, then B reserved a context (reusing
-    // the freed slot) and froze live there. The residue is **B frozen** (`completed_result == None`) plus
-    // **A as a completed child** (`completed_result == Some`) — completed children always ride so the
-    // thaw's per-parent join table stays dense (follow-up A); the recycling shows in the *reused context*,
-    // not a smaller record count.
+    // the freed slot) and froze live there. A was joined before the freeze, so only **B** rides — at its
+    // own join slot (1), which the thaw seeds directly, leaving A's slot empty (#1685).
+    assert_eq!(fvcpus.len(), 1, "B frozen; A joined, so it does not ride");
     assert_eq!(
-        fvcpus.len(),
-        2,
-        "B frozen + A completed (kept for join-table density)"
-    );
-    let frozen: Vec<_> = fvcpus
-        .iter()
-        .filter(|v| v.completed_result.is_none())
-        .collect();
-    let completed: Vec<_> = fvcpus
-        .iter()
-        .filter(|v| v.completed_result.is_some())
-        .collect();
-    assert_eq!(frozen.len(), 1, "exactly one live (frozen) child — B");
-    assert_eq!(
-        completed.len(),
-        1,
-        "exactly one completed child — the recycled A"
-    );
-    assert_eq!(
-        completed[0].completed_result,
-        Some(1007),
-        "A's join result (7 + 1000) rides the artifact"
+        (fvcpus[0].slot, fvcpus[0].completed_result),
+        (1, None),
+        "B frozen at its join slot"
     );
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
@@ -1429,14 +1409,14 @@ fn recycled_context_freeze_residue_is_sparse() {
 
 // §12.8 4A.6 codec follow-up — the recycled-context artifact through the **temen-snapshot §12 codec**.
 // `recycled_context_freeze_residue_is_sparse` (above) checks the *in-memory* residue shape; this drives
-// the **same real concurrent freeze residue** (B frozen + A completed, A's context recycled) through the
-// serialize/restore codec and asserts the **§12.6 invariant 1 (canonical re-freeze)**: serialize → restore
-// → re-serialize is **byte-identical**, with the recycled vCPU residue (`completed_result` included) and the
-// sparse window image (recycled regions zero-elided) surviving intact.
+// the **same real concurrent freeze residue** (B frozen at slot 1, A joined and its context recycled)
+// through the serialize/restore codec and asserts the **§12.6 invariant 1 (canonical re-freeze)**:
+// serialize → restore → re-serialize is **byte-identical**, with the vCPU residue and the sparse window
+// image (recycled regions zero-elided) surviving intact.
 //
-// The codec is `temen_interp::Host`-based, and the interp can't *produce* a recycled residue — it runs durable
-// single-worker, so `completed_result` is always `None` (temen-interp lib.rs) and no sibling context is freed
-// at a freeze. So we bridge the JIT residue (field-identical mirror types) into a fresh codec-ready host that
+// The codec is `temen_interp::Host`-based, and the interp can't *produce* a recycled residue — it runs
+// durable single-worker, so no sibling context is freed at a freeze. So we bridge the JIT residue
+// (field-identical mirror types) into a fresh codec-ready host that
 // grants only the **durable clock**: the concurrent harness's signalling host-fn is a non-durable handle the
 // codec would refuse (`FreezeError::NonDurableHandle`), and the children's clock reads already reloaded into
 // the window image, so a clean clock-only handle table is a faithful artifact for the canonical-re-freeze check.
@@ -1456,12 +1436,8 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
     );
     assert_eq!(
         fvcpus.len(),
-        2,
-        "recycled residue we serialize: B frozen + A completed"
-    );
-    assert!(
-        fvcpus.iter().any(|v| v.completed_result == Some(1007)),
-        "A's join result (7 + 1000) is in the residue we serialize",
+        1,
+        "recycled residue we serialize: B frozen (A was joined)"
     );
 
     // Bridge the real JIT residue into a fresh codec-ready interp host. `temen_jit` and `temen_interp` frozen
@@ -1483,6 +1459,7 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
         .map(|v| temen_interp::FrozenVCpu {
             task: v.task,
             parent_task: v.parent_task,
+            slot: v.slot,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
@@ -1505,25 +1482,22 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
         artifact.len(),
     );
 
-    // Restore into a fresh host; the residue (completed_result included) + root extent re-seed.
+    // Restore into a fresh host; the residue (B at its join slot) + root extent re-seed.
     let mut thost = Host::new();
     thost.set_durable(true);
     let window = codec_restore(&artifact, &inst, &mut thost).expect("recycled artifact restores");
     assert_eq!(
-        thost.frozen_vcpus().len(),
-        2,
-        "restore re-seeded both residue records (B frozen + A completed)",
-    );
-    assert!(
         thost
             .frozen_vcpus()
             .iter()
-            .any(|v| v.completed_result == Some(1007)),
-        "A's completed-child result survived the codec round-trip",
+            .map(|v| (v.slot, v.completed_result))
+            .collect::<Vec<_>>(),
+        vec![(1, None)],
+        "restore re-seeded B at its join slot",
     );
 
     // §12.6 invariant 1 — canonical: re-serializing the freshly-restored domain reproduces the recycled
-    // artifact byte-for-byte (sparse window image + recycled vCPU residue, completed_result included).
+    // artifact byte-for-byte (sparse window image + recycled vCPU residue).
     assert_eq!(
         codec_freeze(&inst, &window, &thost).expect("re-freeze"),
         artifact,

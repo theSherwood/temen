@@ -172,3 +172,16 @@ fn a_detached_window_with_a_shared_region_mapped_declines() {
     };
     assert_eq!(f.census(&root_seat), None);
 }
+
+/// #1688 — an unreaped fork twin runs in a window and powerbox of its own that no artifact records.
+#[test]
+fn an_unreaped_fork_twin_declines() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    rs.lock().forked_twins.insert(9, Twin { parent: 0 });
+    assert_eq!(f.census(&f.root_seat()), Some(DeclineCause::ForkTwin));
+    rs.lock().forked_twins.remove(&9); // reaped
+    assert_eq!(f.census(&f.root_seat()), None);
+}

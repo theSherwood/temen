@@ -2505,11 +2505,7 @@ fn seed_domain(
     let live = |m: &BTreeMap<TaskId, TaskId>, t: usize| m.get(&(t as TaskId)).copied();
     // A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
     // byte-identical; a fresh id otherwise, never a collision.
-    let claim = |s: &mut Sched, want: usize| {
-        let cid = (want as TaskId).max(s.next_task);
-        s.next_task = cid + 1;
-        cid
-    };
+    let claim = claim_task;
     // Every vCPU the thaw re-creates below the root (spawned and nested), by thaw id, so any record
     // can attach to any of them. Enqueued together at the end, ascending id = parents first.
     let mut children: BTreeMap<TaskId, Box<VCpu>> = BTreeMap::new();
@@ -2548,9 +2544,12 @@ fn seed_domain(
         let mut seed: Vec<FrozenFiber> = thaw_fibers;
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
-            let got =
+            let got = if ff.is_free() {
+                root.registry.seed_free(ff.generation)
+            } else {
                 root.registry
-                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation, ff.consumed);
+                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation, ff.consumed)
+            };
             debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
             debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
         }
@@ -2558,75 +2557,17 @@ fn seed_domain(
     // Thaw re-spawn (slice 3.2.1): reconstruct the spawned vCPUs a freeze flattened. The root's
     // rewind *skips* its prologue `thread.spawn` (the REWINDING prologue jumps straight to the
     // resume ARM), so a child that existed before the freeze point is **not** re-created by the
-    // root — the runtime re-creates it here, under `REWINDING`, with its flattened shadow-SP
-    // restored, so it rewinds from its frozen point and runs forward. Children re-spawn in
-    // ascending task (= spawn) order; their regions return via the restored shadow-SP, and the
-    // root's `threads` (join) table is rebuilt to map each handle slot to its child — so the root's
-    // re-executed `thread.join` (after its checkpoint) resolves. As of slice 3.2.2 the root may
-    // also own fibers (top-down vCPU contexts vs. up-growing fiber contexts no longer collide).
-    // Only the root's *direct* children are handled (flat spawns); nested spawns and a *spawned*
-    // child owning fibers (per-child freeze_drive) are follow-ups.
-    {
-        let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
-        // Ascending task = ascending spawn order across the whole tree, and a parent's id is always
-        // < its children's (it was spawned first), so this order re-attaches **parents before
-        // children** — essential for nested spawns (slice 3.4): a grandchild's handle is rebuilt
-        // into its *parent child's* table, which must already exist.
-        vseed.sort_by_key(|f| f.task);
-        // Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
-        //   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since
-        //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
-        //     post-thaw spawn lands in a genuinely-free context.
-        //   • task id — *preserved* when free (`claim`), so the §12.6 canonical re-freeze is byte-identical.
-        //   • join handle — appended into the **parent's** `threads` in ascending-task (= spawn)
-        //     order, so the guest's reloaded handle resolves in the table of whoever spawned it
-        //     (the root for a direct child, a re-spawned child for a grandchild).
-        let mut vcpu_mask: u64 = 0;
-        for ff in vseed {
-            let Some(parent) = live(&live_ids, ff.parent_task) else {
-                continue;
-            };
-            let cid = claim(s, ff.task);
-            live_ids.insert(ff.task as TaskId, cid);
-            s.live += 1;
-            let ctx = root.arena().ctx_of_sp(ff.shadow_sp);
-            vcpu_mask |= 1 << ctx;
-            let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
-            let mut child = Box::new(VCpu::new(
-                Arc::clone(funcs),
-                Arc::clone(types),
-                ff.func as FuncIdx,
-                &[
-                    Value::I64(ff.args.first().copied().unwrap_or(0)),
-                    Value::I64(ff.args.get(1).copied().unwrap_or(0)),
-                ],
-                child_mem,
-                Arc::clone(host_shared),
-                fuel,
-                0,
-                cid,
-                SchedRef::Real(Arc::clone(sched)),
-                quota,
-                Arc::clone(dt),
-            ));
-            child.registry = Arc::clone(&root.registry);
-            child.durable = true;
-            child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
-            child.root_shadow_sp = ff.shadow_sp;
-            child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
-            child.parent_task = parent;
-            child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
-            // Append the handle into the spawning vCPU's join table (root, or a re-spawned child).
-            if parent == id {
-                root.threads.push(Some(cid));
-            } else if let Some(p) = children.get_mut(&parent) {
-                p.threads.push(Some(cid));
-            }
-            children.insert(cid, child);
-        }
-        // Seed the registry's vCPU-context occupancy from the re-spawned children (recycling).
-        root.registry.seed_vcpu_mask(vcpu_mask);
-    }
+    // root — the runtime re-creates it here ([`seed_thread`]), under `REWINDING`, with its
+    // flattened shadow-SP restored, so it rewinds from its frozen point and runs forward.
+    //
+    // Ascending task = ascending spawn order across the whole tree, and a parent's id is always
+    // < its children's, so taking threads and §14 nested children together in task order
+    // re-creates **every parent before its children** — a thread whose spawner is a nested child
+    // (#1686) as much as a nested child whose instantiator is a thread. The nested loop below
+    // takes each thread due before its next record.
+    let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
+    vseed.sort_by_key(|f| f.task);
+    let mut vseed = vseed.into_iter().peekable();
     // §4 subtree thaw (DURABILITY.md): re-attach the §14 nested children a subtree freeze
     // recorded — now to **arbitrary depth** (parent→child→grandchild, …). Each child's whole
     // state — window, durable reserve, unwound continuation — is already in the restored image
@@ -2662,6 +2603,21 @@ fn seed_domain(
             std::collections::BTreeMap::new();
         let mut holder_hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
         for fnr in nseed {
+            while let Some(ff) = vseed.next_if(|f| f.task < fnr.task) {
+                seed_thread(
+                    s,
+                    sched,
+                    root,
+                    &mut children,
+                    &mut live_ids,
+                    funcs,
+                    types,
+                    dt,
+                    fuel,
+                    quota,
+                    ff,
+                );
+            }
             let Some(parent) = live(&live_ids, fnr.parent_task) else {
                 continue;
             };
@@ -2886,6 +2842,21 @@ fn seed_domain(
             abs_off.insert(cid, abs_carve);
             children.insert(cid, child);
         }
+        for ff in vseed.by_ref() {
+            seed_thread(
+                s,
+                sched,
+                root,
+                &mut children,
+                &mut live_ids,
+                funcs,
+                types,
+                dt,
+                fuel,
+                quota,
+                ff,
+            );
+        }
         // §13.4 slice 4d: re-link every holder's restored `LiveImpl` handles to their
         // re-created callees now that the subtree exists — the holder's rewound call then
         // dispatches to the live callee exactly as before the freeze. Each holder (the root and
@@ -2967,6 +2938,105 @@ fn seed_domain(
             s.runnable.push_back(child);
         }
     }
+}
+
+/// A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
+/// byte-identical; a fresh id otherwise, never a collision.
+fn claim_task(s: &mut Sched, want: usize) -> TaskId {
+    let cid = (want as TaskId).max(s.next_task);
+    s.next_task = cid + 1;
+    cid
+}
+
+/// Thaw: re-create one spawned vCPU a freeze recorded ([`seed_domain`]), under the parent that spawned
+/// it — the root, a re-created thread, or a re-created §14 nested child (#1686). The thread gets its
+/// parent's window, powerbox, fiber registry and freeze-residue sink, exactly as `thread.spawn` gave
+/// them, and its handle lands at its recorded slot in the parent's join table (#1685). A parent the
+/// thaw did not re-create leaves the thread out: that parent's rewound join then fails closed.
+///
+/// Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
+///   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since the region
+///     rides in the absolute shadow-SP; added to the parent registry's occupancy mask so a post-thaw
+///     spawn lands in a genuinely-free context.
+///   • task id — *preserved* when free ([`claim_task`]).
+///   • join handle — at its recorded slot, so a slot joined before the freeze stays empty.
+#[allow(clippy::too_many_arguments)]
+fn seed_thread(
+    s: &mut Sched,
+    sched: &Arc<Scheduler>,
+    root: &mut VCpu,
+    children: &mut BTreeMap<TaskId, Box<VCpu>>,
+    live_ids: &mut BTreeMap<TaskId, TaskId>,
+    funcs: &Arc<[Func]>,
+    types: &Arc<[temen_ir::TypeEntry]>,
+    dt: &Arc<DomainTable>,
+    fuel: u64,
+    quota: Quota,
+    ff: FrozenVCpu,
+) {
+    let Some(&parent) = live_ids.get(&(ff.parent_task as TaskId)) else {
+        return;
+    };
+    let p: &mut VCpu = if parent == root.id {
+        root
+    } else {
+        match children.get_mut(&parent) {
+            Some(p) => p,
+            None => return,
+        }
+    };
+    let cid = claim_task(s, ff.task);
+    if p.threads.len() <= ff.slot {
+        p.threads.resize(ff.slot + 1, None);
+    }
+    p.threads[ff.slot] = Some(cid);
+    // #1685 — a child that finished unjoined is not re-created: its result waits in the scheduler
+    // for the rewound `join`, as it did before the freeze.
+    if let Some(r) = ff.completed_result {
+        s.results.insert(
+            cid,
+            Outcome {
+                result: Ok(vec![Value::I64(r)]),
+                mem: None,
+                fuel,
+                trap_bt: Vec::new(),
+                trap_fiber: None,
+                trap_fault: None,
+            },
+        );
+        return;
+    }
+    live_ids.insert(ff.task as TaskId, cid);
+    s.live += 1;
+    let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
+    p.registry.seed_vcpu_mask(1 << ctx);
+    let mut child = Box::new(VCpu::new(
+        Arc::clone(funcs),
+        Arc::clone(types),
+        ff.func as FuncIdx,
+        &[
+            Value::I64(ff.args.first().copied().unwrap_or(0)),
+            Value::I64(ff.args.get(1).copied().unwrap_or(0)),
+        ],
+        p.mem.as_ref().map(|m| m.fork_for_thread()),
+        Arc::clone(&p.host),
+        fuel,
+        0,
+        cid,
+        SchedRef::Real(Arc::clone(sched)),
+        quota,
+        Arc::clone(dt),
+    ));
+    child.registry = Arc::clone(&p.registry);
+    child.freeze_sink = p.freeze_sink.clone();
+    child.kill = p.kill.clone();
+    child.durable = true;
+    child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
+    child.root_shadow_sp = ff.shadow_sp;
+    child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
+    child.parent_task = parent;
+    child.spawn_residue = Some((ff.func as FuncIdx, ff.args, ff.slot));
+    children.insert(cid, child);
 }
 
 /// #1361 step 4 — re-launch a live detached child a thaw carries: rebuild its window from its own
@@ -3215,7 +3285,7 @@ fn drive_over_cell(
             }));
         }
     }
-    let root_id = {
+    let (root_id, registry, arena) = {
         let mut s = sched.lock();
         let id = s.next_task;
         s.next_task += 1;
@@ -3281,8 +3351,9 @@ fn drive_over_cell(
             quota,
             thaw,
         );
+        let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         s.runnable.push_back(root);
-        id
+        (id, registry, arena)
     };
     // Run as worker 0 until the run shuts down (every vCPU finished), then join spawned workers.
     worker_loop(&sched);
@@ -3361,10 +3432,44 @@ fn drive_over_cell(
     }
     let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
+        // #1684 — every fiber slot the freeze did not flatten rides too: a fresh one (never
+        // resumed) and a free one (its generation), so the thaw rebuilds the table slot for slot.
+        if s.froze {
+            host_shared
+                .lock_unpoisoned()
+                .frozen_fibers
+                .extend(registry.unflattened_for_freeze(arena));
+        }
+        // #1685 — a thread that finished and was never joined rides the freeze as completed
+        // residue at its join slot; the thaw hands its result to the rewound `join`.
+        if s.froze {
+            for (task, f) in std::mem::take(&mut s.finished_threads) {
+                let Some(Ok(r)) = s.results.get(&task).map(|o| join_outcome(o.result.clone()))
+                else {
+                    continue;
+                };
+                f.sink.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
+                    task: task as usize,
+                    parent_task: f.parent_task as usize,
+                    slot: f.slot,
+                    func: 0,
+                    args: Vec::new(),
+                    shadow_sp: 0,
+                    completed_result: Some(r),
+                });
+            }
+        }
         // Present even when the root never finished on its own: a §12 teardown (owner 2026-07-24)
         // synthesizes the root's outcome — the domain's ending trap, with its `mem`/`fuel`
         // residue — when a sibling's trap/exit killed it while parked or running.
-        let out = s.results.remove(&root_id).expect("root vCPU finished");
+        let mut out = s.results.remove(&root_id).expect("root vCPU finished");
+        // #1689 — a freeze is all-or-nothing (INVARIANTS #9c): a vCPU that failed once the freeze
+        // was in flight — a §14 child's backstop refusal, say — fails the run, though the root
+        // itself unwound `Ok` before it. Otherwise the residue already recorded looks like a whole
+        // freeze.
+        if let (Ok(_), Some(t)) = (&out.result, s.freeze_fault) {
+            out.result = Err(t);
+        }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
     };
     LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = twin_traps);
@@ -5586,6 +5691,14 @@ struct Twin {
     parent: usize,
 }
 
+/// Where a finished, unjoined `thread.spawn` child's completed residue goes on a freeze (#1685).
+struct FinishedThread {
+    parent_task: TaskId,
+    slot: usize,
+    /// The spawner's freeze-residue sink (the root host, for a thread inside a §14 subtree).
+    sink: Arc<Mutex<Host>>,
+}
+
 #[derive(Default)]
 struct Sched {
     /// vCPUs ready to run.
@@ -5768,6 +5881,17 @@ struct Sched {
     /// freeze is in flight, and the worker loop brings every park the scheduler owns through it
     /// ([`admit_parks_for_freeze`]) instead of reaping them as deadlocked.
     froze: bool,
+    /// #1685 — every durable `thread.spawn` child that finished cleanly and has not been joined yet,
+    /// by task. A join takes it out with the result ([`SchedRef::take_result`]); on a freeze, `drive`
+    /// turns what is left into completed [`FrozenVCpu`] residue, so the rewound `join` finds it. A
+    /// child can finish after its parent has already unwound, so the parent cannot record it itself.
+    finished_threads: BTreeMap<TaskId, FinishedThread>,
+    /// #1685 — the vCPUs that finished by unwinding for the freeze: their results are placeholders,
+    /// so a `join` that takes one is re-issued on thaw rather than reloaded.
+    unwound: std::collections::BTreeSet<TaskId>,
+    /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
+    /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
+    freeze_fault: Option<Trap>,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
     /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
     /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
@@ -7592,6 +7716,9 @@ fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option
     let mut registries: Vec<(TaskId, bool, Arc<FiberRegistry>)> = Vec::new();
     {
         let s = rs.lock();
+        if let Some(&twin) = s.forked_twins.keys().next() {
+            return declined(DeclineCause::ForkTwin, twin, None);
+        }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in std::iter::once(me).chain(others.iter()) {
             if seat.handler_parked {
@@ -7925,9 +8052,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // records `FrozenVCpu` residue and its region is kept for thaw) from a **genuine finish**
                 // (NORMAL completion). Context recycling frees a finished child's shadow context back to
                 // the registry, but a frozen child must keep it (it is re-spawned there on thaw).
+                // A spawned vCPU that ran to a genuine finish under an `UNWINDING` window left its own
+                // region empty: it completed, it did not freeze, and re-running it on thaw would
+                // repeat its effects (#1685).
                 let froze = v.durable
                     && result.is_ok()
-                    && v.mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                    && v.mem.as_ref().is_some_and(|m| {
+                        m.durable_state() == STATE_UNWINDING
+                            && (v.spawn_residue.is_none()
+                                || m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx))
+                                    > v.arena().frame_base(v.vcpu_ctx))
+                    });
                 // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
                 // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
                 // parked into theirs, while the registry is alive, before the window is snapshotted. **Every**
@@ -8148,16 +8283,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         .as_ref()
                         .map(|m| m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx)))
                         .unwrap_or_else(|| v.arena().frame_base(v.vcpu_ctx));
-                    if let Some((func, args)) = v.spawn_residue.clone() {
+                    if let Some((func, args, slot)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
-                        // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
-                        v.host.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
+                        // lives in its own region (extent = `self_sp`); a thaw re-spawns it there. Into
+                        // the subtree's sink, so a thread of a §14 child reaches the artifact (#1686).
+                        let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                        sink.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
                             task: v.id as usize,
                             parent_task: v.parent_task as usize,
+                            slot,
                             func: func as i32,
                             args,
                             shadow_sp: self_sp,
-                            completed_result: None, // interp runs durable single-worker
+                            completed_result: None, // re-spawned and rewound on thaw
                         });
                     } else if !v.nested_child {
                         // The root: record its extent (the shared active-SP word will be overwritten by a
@@ -8172,15 +8310,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // makes the accumulation order irrelevant to the artifact.
                     if !v.frozen.is_empty() {
                         let frozen = std::mem::take(&mut v.frozen);
-                        if v.nested_child {
-                            // A nested child's fiber residue is child-local (its slots/extents name
-                            // its own registry + carve) — it cannot ride the parent's tables. Fail
-                            // closed until per-child fiber residue lands (DURABILITY.md §4).
+                        if v.freeze_sink.is_some() {
+                            // A §14 subtree's fiber residue — a nested child's or its threads' — is
+                            // child-local (its slots/extents name the child's own registry + carve):
+                            // it cannot ride the parent's tables. Fail closed until per-child fiber
+                            // residue lands (DURABILITY.md §4, #1675).
                             drop(frozen);
                             r = Err(Trap::ThreadFault);
                         } else {
                             v.host.lock_unpoisoned().frozen_fibers.extend(frozen);
                         }
+                    }
+                    // Likewise a fresh fiber in a §14 child's own table (#1684: the root's rides
+                    // from `drive`): refused rather than lost.
+                    let arena = v.arena();
+                    if v.nested_child
+                        && v.registry
+                            .unflattened_for_freeze(arena)
+                            .iter()
+                            .any(|f| !f.is_free())
+                    {
+                        r = Err(Trap::ThreadFault);
                     }
                     r
                 } else {
@@ -8233,6 +8383,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
                 let gone = client_gone_targets(&v);
+                // #1685 — a durable thread that finished cleanly: its result must ride a freeze
+                // until it is joined.
+                let finished_thread = match &v.spawn_residue {
+                    Some((_, _, slot)) if v.durable && !froze && result.is_ok() => {
+                        Some(FinishedThread {
+                            parent_task: v.parent_task,
+                            slot: *slot,
+                            sink: v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host)),
+                        })
+                    }
+                    _ => None,
+                };
                 let mut outcome = Outcome {
                     result,
                     mem: v.mem.take(),
@@ -8246,6 +8408,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #1584 — a freeze is now in flight: the worker loop drains the parks that will not
                 // otherwise observe it (see `freeze_in_flight`).
                 s.froze |= froze;
+                if froze {
+                    s.unwound.insert(id);
+                }
+                if s.froze && !s.forked_twins.contains_key(&id) {
+                    if let Err(t) = &outcome.result {
+                        s.freeze_fault.get_or_insert(*t);
+                    }
+                }
+                // #1688 — nothing records a fork twin, so a freeze that unwinds while one is
+                // unreaped would lose it: fail the freeze (the census declines it when it can).
+                if froze && !s.forked_twins.is_empty() {
+                    s.freeze_fault.get_or_insert(Trap::ThreadFault);
+                }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
                 if !froze {
                     for service in gone {
@@ -8336,6 +8511,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else if wake_reap_any(&mut s, id) {
                     // a `wait(-1)` caller reaps this twin (no named `wait(pid)` claimed it).
                     sched.work.notify_one();
+                }
+                if let Some(f) = finished_thread {
+                    s.finished_threads.insert(id, f);
                 }
                 s.results.insert(id, outcome);
                 s.live -= 1;
@@ -8997,7 +9175,11 @@ impl SchedRef {
     /// Take a finished child's outcome (for a resuming `thread.join`).
     fn take_result(&self, id: TaskId) -> Option<Outcome> {
         match self {
-            SchedRef::Real(s) => s.lock().results.remove(&id),
+            SchedRef::Real(s) => {
+                let mut s = s.lock();
+                s.finished_threads.remove(&id);
+                s.results.remove(&id)
+            }
             SchedRef::Det(d) => d.lock().results.remove(&id),
         }
     }
@@ -9027,6 +9209,13 @@ impl SchedRef {
     /// Whether `id` has already completed (result posted, unjoined) — a non-destructive probe the
     /// §14 subtree freeze uses to tell a **live** child (broadcast + residue) from a
     /// **completed-but-unjoined** one (refused fail-closed until completed-result residue lands).
+    /// #1685 — whether `id` finished by unwinding for a freeze, so its result is a placeholder.
+    fn unwound(&self, id: TaskId) -> bool {
+        match self {
+            SchedRef::Real(s) => s.lock().unwound.contains(&id),
+            SchedRef::Det(_) => false,
+        }
+    }
     fn has_result(&self, id: TaskId) -> bool {
         match self {
             SchedRef::Real(s) => s.lock().results.contains_key(&id),
@@ -9739,12 +9928,8 @@ pub use temen_ir::durable_abi::SHADOW_SP_OFF;
 /// Per-context shadow-stack stride: context `i` occupies `[ShadowArena::region_base(i), +
 /// SHADOW_STRIDE)`. 4 KiB per context (a 48 KiB arena holds 12) — a provisional
 /// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
-///
-/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the arena's
-/// `end`, not at a per-region bound, so a fiber recursed deeper than
-/// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
-/// (every test today) stay confined; making the overflow bound per-region travels with the
-/// sizing decision.
+/// The transform's shadow-overflow guard bounds each push by this stride (#1683), so a context
+/// recursed deeper than one region traps the freeze instead of writing its neighbour's frames.
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// The shadow arena: where the per-context shadow regions sit (one definition of placement).
 pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
@@ -9965,6 +10150,10 @@ const ROOT_FIBER: usize = usize::MAX;
 /// shadow region `[shadow_region_base(slot+1), shadow_sp)`; this is the small host-side residue:
 /// where it sits and how to re-enter it on thaw. Re-entry recreates it as a `Pending` fiber so a
 /// thaw `cont.resume` runs its entry under `REWINDING`, rebuilding then re-parking it.
+///
+/// Every slot of the fiber table rides (#1684), so a thaw rebuilds the table slot for slot: a
+/// **fresh** fiber (never resumed) is a record whose extent is its empty frame base — the resume that
+/// thaws it starts it from its entry — and a **free** slot is [`FrozenFiber::free`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenFiber {
     /// Registry slot = the guest fiber handle (so re-seeding preserves handle values).
@@ -9976,6 +10165,7 @@ pub struct FrozenFiber {
     pub sp: i64,
     /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
+    /// `0` for a free slot: no shadow region lies at offset 0.
     pub shadow_sp: u64,
     /// The slot's **generation** at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
     /// *recycled* (generation > 0) fiber still resolves (`(generation << 24) | slot`). 0 for a
@@ -9991,6 +10181,25 @@ pub struct FrozenFiber {
     /// park is **fresh**: the resumer's in-flight `cont.resume` has yet to observe it, so the thaw
     /// re-issue re-parks and re-delivers `(SUSPENDED, value)`. Snapshot format v24.
     pub consumed: bool,
+}
+
+impl FrozenFiber {
+    /// #1684 — a free slot (its fiber finished): only its generation rides.
+    pub fn free(slot: usize, generation: u64) -> FrozenFiber {
+        FrozenFiber {
+            slot,
+            func: 0,
+            sp: 0,
+            shadow_sp: 0,
+            generation,
+            consumed: false,
+        }
+    }
+
+    /// Whether this is a [`FrozenFiber::free`] slot.
+    pub fn is_free(&self) -> bool {
+        self.shadow_sp == 0
+    }
 }
 
 /// §13.4 slice 4c — a nested child's **host state** at a subtree freeze: its serve trio and its
@@ -10045,6 +10254,9 @@ pub struct FrozenVCpu {
     /// residue by this, re-attaches parents before children, and rebuilds each parent's join table so a
     /// grandchild's reloaded handle resolves in its *parent's* table, not the root's.
     pub parent_task: usize,
+    /// The child's handle in its spawner's join table (#1685). The thaw re-attaches it there, not by
+    /// push, so a handle joined before the freeze leaves its slot empty instead of shifting the rest.
+    pub slot: usize,
     /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
     pub func: i32,
     /// The child's spawn args (`[sp, arg]`, the fiber-style thread entry), replayed on re-spawn.
@@ -10052,10 +10264,10 @@ pub struct FrozenVCpu {
     /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
     /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
     pub shadow_sp: u64,
-    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** concurrent child (JIT
-    /// only — the interp runs durable single-worker, so it always records `None`). The thaw delivers the
-    /// result into the spawner's join table without re-running the child. `None` for a normal frozen
-    /// child (re-spawned + rewound).
+    /// §12.8 4A.5 follow-up A: `Some(result)` for a **completed-but-unjoined** child — one that
+    /// finished before or during the freeze and was never joined (#1685). The thaw delivers the result
+    /// into the spawner's join table without re-running the child; `func`, `args` and `shadow_sp` are
+    /// then inert (`0`, empty, `0`). `None` for a normal frozen child (re-spawned + rewound).
     pub completed_result: Option<i64>,
 }
 
@@ -10462,9 +10674,10 @@ impl FiberRegistry {
     /// Seed the durable vCPU-context occupancy a **thaw** re-establishes (context recycling): the
     /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
     /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
-    /// allocates into a genuinely-free context. Set once after re-seeding, before forward execution.
+    /// allocates into a genuinely-free context. Each re-spawned child adds its own, before forward
+    /// execution.
     fn seed_vcpu_mask(&self, mask: u64) {
-        self.lock().vcpu_mask = mask;
+        self.lock().vcpu_mask |= mask;
     }
 
     /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
@@ -10689,6 +10902,43 @@ impl FiberRegistry {
             .fibers
             .iter()
             .any(|f| matches!(f, RegFiber::ParkedOn { .. }))
+    }
+
+    /// #1684 — the residue of every slot a freeze leaves unflattened: a **fresh** fiber (`cont.new`,
+    /// never resumed) at its empty frame base, which a thaw resume starts from its entry, and a
+    /// **free** slot ([`FrozenFiber::free`]) carrying its generation, so a stale handle stays stale
+    /// and a recycled `cont.new` gets the handle it would have.
+    fn unflattened_for_freeze(&self, arena: ShadowArena) -> Vec<FrozenFiber> {
+        let t = self.lock();
+        t.fibers
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, f)| match f {
+                RegFiber::Pending { func, sp } => Some(FrozenFiber {
+                    slot,
+                    func: *func,
+                    sp: *sp,
+                    shadow_sp: arena.frame_base(shadow_context_index(slot)),
+                    generation: t.gens[slot],
+                    consumed: false,
+                }),
+                RegFiber::Done => Some(FrozenFiber::free(slot, t.gens[slot])),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #1684 — re-create a free slot on thaw, at its recorded generation and on the free list.
+    fn seed_free(&self, generation: u64) -> usize {
+        let mut t = self.lock();
+        let slot = t.fibers.len();
+        t.fibers.push(RegFiber::Done);
+        t.shadow.push(0);
+        t.gens.push(generation);
+        t.consumed.push(false);
+        t.pending.push(None);
+        t.free.push(Reverse(slot));
+        slot
     }
 
     fn take_parked_for_freeze(&self) -> Option<(usize, Vec<Frame>)> {
@@ -10936,11 +11186,12 @@ struct VCpu {
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
-    /// `Some` on a **spawned** (`thread.spawn`) vCPU: its `(entry, [sp, arg])`, retained so that when
-    /// it unwinds under a freeze it can emit its [`FrozenVCpu`] residue (its frames are gone by then).
+    /// `Some` on a **spawned** (`thread.spawn`) vCPU: its `(entry, [sp, arg], join slot)`, retained so
+    /// that when it unwinds under a freeze it can emit its [`FrozenVCpu`] residue (its frames are gone
+    /// by then), or, finishing unjoined, its completed residue (#1685).
     /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
     /// (slice 3.2.1)
-    spawn_residue: Option<(FuncIdx, Vec<i64>)>,
+    spawn_residue: Option<(FuncIdx, Vec<i64>, usize)>,
     /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
     /// `thread.spawn` and freed back to the registry when the vCPU genuinely finishes (context
     /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
@@ -12082,6 +12333,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 .ok_or(Trap::ThreadFault)?;
             v.threads[slot] = None; // a handle is joined once
             credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
+                                                                 // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the join
+                                                                 // for re-issue on thaw, against the re-spawned child. A child that finished for real is
+                                                                 // not re-run, so its result rides this frame instead.
+            if v.durable && v.sched.unwound(child) {
+                abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
+            }
             let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
             let vals = out.result?; // a child trap propagates as this vCPU's trap
             let top = v.frames.len() - 1;
@@ -16242,6 +16499,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // flag, so killing the §14 child terminates its whole thread subtree; `None` (root
                     // / top-level thread) stays unkillable.
                     let kill_inherit = kill.clone();
+                    // #1686: its freeze residue goes where its spawner's does — the root host for a
+                    // thread inside a §14 subtree, whose own powerbox is private.
+                    let sink_inherit = freeze_sink.clone();
+                    let slot = threads.len(); // the handle `threads.push` below returns
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
                             cfuncs,
@@ -16270,9 +16531,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
-                        child.spawn_residue = Some((entry, vec![spv, av]));
+                        child.spawn_residue = Some((entry, vec![spv, av], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
+                        child.freeze_sink = sink_inherit;
                         child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
                         Box::new(child)
                     });
@@ -18960,6 +19222,9 @@ pub enum DeclineCause {
     FiberParkedOnCall,
     /// A detached child's window has a §13 region mapped, so its image cannot be taken (#1679).
     SharedRegionWindow,
+    /// A fork twin has not been reaped: it runs in a window and powerbox of its own that no artifact
+    /// records yet, and its exit status would be lost to its parent's `wait` (#1688).
+    ForkTwin,
 }
 
 /// #1671 — a freeze the run **declined**. At the instant a freeze trigger fires, a census asks

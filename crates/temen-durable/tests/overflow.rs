@@ -1,13 +1,16 @@
 //! The shadow stack traps on overflow instead of corrupting guest memory (R9 / §12.7).
 //!
 //! The shadow stack mirrors the call stack; the freeze-path `UNWIND` check refuses to push
-//! a frame whose top would cross `TEST_ARENA.end` into the guest's region. Reaching a real
+//! a frame whose top would cross the running context's own region — into the next context's
+//! shadow frames, or into the guest's memory past the last one (#1683). Reaching a real
 //! overflow by natural recursion is impractical for typical frames (`MAX_CALL_DEPTH` caps the
 //! reified call stack), so we drive the guard directly: seed the shadow-SP near the top of the
-//! reserve, so the very next push would cross it. This is exactly why the check exists — a
-//! large-frame guest recursing near the cap must trap here, never write past the reserve.
+//! region, so the very next push would cross it. This is exactly why the check exists — a
+//! large-frame guest recursing near the cap must trap here, never write past its region.
 
-use temen_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
+use temen_durable::{
+    init_durable_window, transform_module, write_state, SHADOW_STRIDE, STATE_UNWINDING,
+};
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::{Memory, Module};
 
@@ -82,5 +85,24 @@ fn shadow_overflow_traps_instead_of_corrupting() {
     assert!(
         freeze_with_sp(&inst, TEST_ARENA.region_base(0)).is_ok(),
         "a freeze that fits within the reserve still works"
+    );
+}
+
+/// #1683: the bound is the context's own region, not the arena end. Context 0's region ends where
+/// context 1's begins, well below `TEST_ARENA.end`; a push across that line would write context
+/// 1's shadow frames, so it traps too.
+#[test]
+fn shadow_overflow_into_the_next_context_traps() {
+    let inst = instrument();
+    let region_end = TEST_ARENA.region_base(0) + SHADOW_STRIDE;
+    assert_eq!(region_end, TEST_ARENA.region_base(1));
+    assert!(region_end < TEST_ARENA.end);
+    assert!(
+        freeze_with_sp(&inst, region_end - 8).is_err(),
+        "a push past the context's region traps, never writes the next context's frames"
+    );
+    assert!(
+        freeze_with_sp(&inst, region_end - 64).is_ok(),
+        "a frame that still fits in the region pushes"
     );
 }

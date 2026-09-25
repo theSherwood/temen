@@ -1706,3 +1706,200 @@ fn a_durable_freeze_is_never_killed_by_a_detached_child() {
         "and the freeze completes rather than failing some other way: {r:?}"
     );
 }
+
+/// #1686 — a same-module nested child (func 1) that spawns a looping thread (func 2, sums 0..100) and
+/// joins it, returning the total + 1. The thread's opening wait returns at once (the word isn't 1);
+/// it makes the thread may-suspend, so its loop polls and a freeze catches it mid-loop.
+const PARENT_CHILD_THREAD: &str = "memory 18 shadow 16448 65536
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = thread.spawn 2 v1 v1
+  v3 = thread.join v2
+  v4 = i64.const 1
+  v5 = i64.add v3 v4
+  return v5
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  w0 = i64.const 70000
+  w1 = i32.const 1
+  w2 = i64.const 0
+  w3 = i32.atomic.wait w0 w1 w2
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br 1(v2, v3)
+}
+block 1 (v4: i64, v5: i64) {
+  v6 = i64.const 100
+  v7 = i64.lt_s v4 v6
+  br_if v7 2(v4, v5) 3(v5)
+}
+block 2 (v8: i64, v9: i64) {
+  v10 = i64.add v9 v8
+  v11 = i64.const 1
+  v12 = i64.add v8 v11
+  br 1(v12, v10)
+}
+block 3 (v13: i64) {
+  return v13
+  }
+}
+";
+
+/// #1686 — a thread spawned **inside** a §14 child records its residue in the subtree's sink (the
+/// root host), not the child's private powerbox, and the thaw re-creates it under the re-created
+/// child, so the child's rewound `join` gets the thread's total.
+#[test]
+fn a_thread_inside_a_nested_child_rides_and_thaws_under_it() {
+    // The thread's wait reads guest memory, so this module instruments on the cooperating-toolchain
+    // path.
+    let parent = temen_durable::transform_module_assume_confined(
+        &parse_module(PARENT_CHILD_THREAD).expect("parse"),
+    )
+    .expect("transform");
+    verify_module(&parent).expect("instrumented module verifies");
+    let run = |host: &mut Host, win: &[u8]| {
+        let ih = host.grant_instantiator(0, WINDOW as u64);
+        let mut fuel = 50_000_000u64;
+        run_capture_reserved_with_host(
+            &parent,
+            0,
+            &[Value::I32(ih)],
+            &mut fuel,
+            win,
+            SIZE_LOG2,
+            host,
+        )
+    };
+    let mut host = Host::new();
+    host.set_durable(true);
+    let (base, _) = run(&mut host, &init_durable_window(WINDOW, TEST_ARENA));
+    assert_eq!(base, Ok(vec![Value::I64(4951)]), "uninterrupted");
+
+    // Freeze from the start: the parent unwinds after instantiating; the child spawns its thread,
+    // parks joining it, and unwinds once the thread has unwound into its own region.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+    let (fr, fsnap) = run(&mut fhost, &win);
+    assert!(fr.is_ok(), "subtree freeze returns a placeholder: {fr:?}");
+    let nested = fhost.frozen_nested().to_vec();
+    let vcpus = fhost.frozen_vcpus().to_vec();
+    assert_eq!(nested.len(), 1, "the child rides");
+    assert_eq!(vcpus.len(), 1, "its thread rides, in the root host");
+    assert_eq!(
+        (
+            vcpus[0].parent_task,
+            vcpus[0].slot,
+            vcpus[0].completed_result
+        ),
+        (nested[0].task, 0, None),
+        "the thread is frozen at slot 0 of the child's join table"
+    );
+
+    let mut twin = fsnap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_nested(nested);
+    thost.set_frozen_vcpus(vcpus);
+    let (tr, tsnap) = run(&mut thost, &twin);
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(4951)]),
+        "the child's join gets its thread's total"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL);
+}
+
+/// #1689 — a same-module nested child that creates a fiber and leaves it fresh, then waits and loops
+/// (the wait returns at once; it makes the child may-suspend, and is where a freeze unwinds it).
+const PARENT_CHILD_FRESH_FIBER: &str = "memory 18 shadow 16448 65536
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  f0 = ref.func 2
+  f1 = i64.const 4096
+  f2 = cont.new f0 f1
+  w0 = i64.const 70000
+  w1 = i32.const 1
+  w2 = i64.const 0
+  w3 = i32.atomic.wait w0 w1 w2
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br 1(v2, v3)
+}
+block 1 (v4: i64, v5: i64) {
+  v6 = i64.const 100
+  v7 = i64.lt_s v4 v6
+  br_if v7 2(v4, v5) 3(v5)
+}
+block 2 (v8: i64, v9: i64) {
+  v10 = i64.add v9 v8
+  v11 = i64.const 1
+  v12 = i64.add v8 v11
+  br 1(v12, v10)
+}
+block 3 (v13: i64) {
+  return v13
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  return v1
+  }
+}
+";
+
+/// #1689 — a refusal inside the frozen tree fails the freeze as a whole. A freeze from the start has
+/// no trigger for the census to decline at, so the child reaches its backstop: a §14 child's fresh
+/// fiber can't ride (#1675). The child's `ThreadFault` must reach the run, not vanish behind the
+/// parent's `Ok` unwind with the child's record already in the residue.
+#[test]
+fn a_refusal_inside_the_tree_fails_the_whole_freeze() {
+    let parent = temen_durable::transform_module_assume_confined(
+        &parse_module(PARENT_CHILD_FRESH_FIBER).expect("parse"),
+    )
+    .expect("transform");
+    verify_module(&parent).expect("instrumented module verifies");
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(r, Err(Trap::ThreadFault), "the freeze fails as a whole");
+}

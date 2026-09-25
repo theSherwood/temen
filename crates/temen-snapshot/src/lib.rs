@@ -227,7 +227,11 @@ use temen_ir::Module;
 /// Section 9 (`TAG_PIPES`) carries each pipe's buffered bytes in that order. Elided when no pipe
 /// rides. A host call's shadow frame also gains its re-issue word (§12.7), which only the
 /// instrumented code reads.
-const FORMAT_VERSION: u16 = 32;
+/// v33 (#1685): each spawned-vCPU record carries its **join slot** after `parent_task`, and a thread
+/// that finished unjoined rides as a completed record (its `func`/`args`/`shadow_sp` inert zeros). The
+/// thaw seeds each handle at its slot instead of by push, so a slot joined before the freeze stays
+/// empty rather than shifting every later handle down.
+const FORMAT_VERSION: u16 = 33;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -697,6 +701,7 @@ fn freeze_at(
                 for v in &vcpus {
                     write_uleb(b, v.task as u64);
                     write_uleb(b, v.parent_task as u64); // slice 3.4 (v4): who spawned it (nested spawns)
+                    write_uleb(b, v.slot as u64); // v33 (#1685): its handle in the spawner's join table
                     write_uleb(b, v.func as u32 as u64);
                     write_uleb(b, v.args.len() as u64);
                     for &a in &v.args {
@@ -1621,6 +1626,7 @@ fn decode_control(
             }
             last = Some(task);
             let parent_task = cr.uleb()?; // slice 3.4 (v4): the spawning task (nested spawns)
+            let slot = cr.uleb()?; // v33 (#1685): its handle in the spawner's join table
             let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
             let nargs = cr.uleb()?;
             let mut args = Vec::with_capacity(nargs as usize);
@@ -1636,6 +1642,7 @@ fn decode_control(
             vcpus.push(FrozenVCpu {
                 task: usize::try_from(task).map_err(|_| RestoreError::Malformed)?,
                 parent_task: usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?,
+                slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
                 func,
                 args,
                 shadow_sp,

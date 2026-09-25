@@ -10197,7 +10197,21 @@ fn freeze_drive(
                 (vm, false)
             }
             other => {
-                fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
+                // Not parked: nothing to flatten. A fresh or finished slot still rides (#1684), so
+                // the thaw rebuilds the table slot for slot.
+                match &other {
+                    FiberState::Pending { funcref, sp, .. } => frozen.push(super::FrozenFiber {
+                        slot,
+                        func: *funcref,
+                        sp: *sp,
+                        shadow_sp: arena.frame_base(slot + 1),
+                        generation: 0,
+                        consumed: false,
+                    }),
+                    FiberState::Done => frozen.push(super::FrozenFiber::free(slot, 0)),
+                    _ => {}
+                }
+                fibers[slot] = other;
                 continue;
             }
         };
@@ -12042,10 +12056,14 @@ impl CoopSched {
                     fibers.len(),
                     "re-seeded slot matches the recorded handle"
                 );
-                fibers.push(FiberState::Pending {
-                    funcref: ff.func,
-                    sp: ff.sp,
-                    consumed: ff.consumed, // #1538: its first resume delivers at the rewound suspend
+                fibers.push(if ff.is_free() {
+                    FiberState::Done // #1684: a finished slot keeps its place
+                } else {
+                    FiberState::Pending {
+                        funcref: ff.func,
+                        sp: ff.sp,
+                        consumed: ff.consumed, // #1538: its first resume delivers at the rewound suspend
+                    }
                 });
                 fiber_sp.push(ff.shadow_sp);
                 fiber_meta.push((ff.func, ff.sp));
