@@ -4710,9 +4710,9 @@ struct JitRun {
 /// seeded with `init_mem` and (when `snapshot_cap` is `Some`) snapshotting the low `snapshot_cap`
 /// window bytes. The guest runs the serialized [`cap_thunk_locked`] over the per-domain `locked`
 /// `Mutex<Host>` — so worker threads can `call.cap` (incl. threaded `Jit.compile`) without racing —
-/// and forgoes the single-threaded-only D45 fast path. (A single-threaded guest runs
-/// [`jit_proc::run_image`] instead: the unlocked [`cap_thunk`] + raw `*mut Host` + [`fast_cap_resolver`],
-/// zero lock cost.)
+/// and forgoes the single-threaded-only D45 fast path. (A single-threaded guest is compiled by
+/// [`jit_proc::compile_image`] instead: the unlocked [`cap_thunk`] + raw `*mut Host` +
+/// [`fast_cap_resolver`], zero lock cost.)
 ///
 /// # Safety
 /// `interrupt` (when `Some`) outlives the call; the same `cap_thunk`/ctx/resolver contracts as
@@ -6146,7 +6146,11 @@ fn jit_run(
                 snapshot_cap,
             };
             let ip = interrupt.map(std::sync::Arc::as_ptr);
-            let r = unsafe { jit_proc::run_image(host, m, func, ip, quota, None, start) };
+            let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
+            let r = unsafe {
+                jit_proc::compile_image(host, m, func, ip, quota, jit)
+                    .and_then(|cm| jit_proc::run_image(host, cm, ip, None, start))
+            };
             (r, results)
         }
     });

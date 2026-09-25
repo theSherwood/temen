@@ -2172,7 +2172,8 @@ fn run_inner(
 /// Freeing on drop is sound because the owner ([`CompiledModule`], root or §14 child) already pins
 /// the lifetime contract "nothing that points into the code may outlive this struct": the field
 /// is declared last, so runtimes/tables/trampolines drop first, and no fiber, thread, or
-/// installed table entry survives the owner (documented on the structs).
+/// installed table entry survives the owner (documented on the structs). Instances sharing code
+/// ([`SharedCode`]) each hold the arena's `Arc`, so it is freed with the last of them.
 struct OwnedJit(Option<JITModule>);
 
 impl OwnedJit {
@@ -2181,18 +2182,21 @@ impl OwnedJit {
     }
 }
 
-impl core::ops::Deref for OwnedJit {
-    type Target = JITModule;
-    fn deref(&self) -> &JITModule {
-        self.0.as_ref().expect("JITModule present until drop")
-    }
+/// #1825 — the code arena, to extend it (`define_extra`, the hosting trampolines): only while one
+/// instance holds it alone. Instances sharing code ([`SharedCode`]) run the same finalized bytes, on
+/// several threads at once, so none of them may add to it. The one way to the `JITModule` of an arena
+/// that is already an instance's.
+fn arena_mut(module: &mut Arc<OwnedJit>) -> Result<&mut JITModule, JitError> {
+    let arena = Arc::get_mut(module).ok_or(JitError::Unsupported(
+        "this code is shared with another instance, so it cannot be extended",
+    ))?;
+    Ok(arena.0.as_mut().expect("JITModule present until drop"))
 }
 
-impl core::ops::DerefMut for OwnedJit {
-    fn deref_mut(&mut self) -> &mut JITModule {
-        self.0.as_mut().expect("JITModule present until drop")
-    }
-}
+// SAFETY: a shared `&OwnedJit` reaches nothing. Its `JITModule` is touched only through `&mut`
+// (`arena_mut`, on a unique `Arc`, and `Drop`), so instances sharing an arena on several threads
+// (#1825) share only the finalized code they execute.
+unsafe impl Sync for OwnedJit {}
 
 impl Drop for OwnedJit {
     fn drop(&mut self) {
@@ -2790,10 +2794,17 @@ pub struct CompiledModule {
     /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
     /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
     debug_types: Vec<temen_ir::TypeDef>,
+    /// #1825 — whether the compiled code names an object only this instance owns: the thread domain
+    /// its `thread.*`/fiber sites bake, the §14 nursery its `Instantiator` sites bake, the `setjmp`
+    /// table its `SetJmp`/`LongJmp` sites bake. (A nursery stood up only for units this module may
+    /// install, #1726, is not named by the module's own code.) Such code cannot be shared.
+    code_names_objects: bool,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it — and the drop **releases** the
-    /// code arena back to the OS (see [`OwnedJit`]; a bare `JITModule` would leak it).
-    module: OwnedJit,
+    /// code arena back to the OS (see [`OwnedJit`]; a bare `JITModule` would leak it). Shared by every
+    /// instance of the same code ([`SharedCode`]); only an instance that holds it alone can extend it
+    /// ([`arena_mut`]).
+    module: Arc<OwnedJit>,
 }
 
 impl CompiledModule {
@@ -3775,7 +3786,15 @@ impl CompiledModule {
             .collect();
         #[cfg(not(fiber_rt))]
         let _ = &quota;
+        #[cfg(fiber_rt)]
+        let code_names_objects = domain.is_some() || module_uses_instantiator(m);
+        #[cfg(not(fiber_rt))]
+        let code_names_objects = false;
+        #[cfg(setjmp_rt)]
+        let code_names_objects = code_names_objects || setjmp_runtime.is_some();
+        MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         Ok(CompiledModule {
+            code_names_objects,
             fn_table,
             tramp_code,
             tramp_code_limited: core::ptr::null(), // a root is never a child-domain task
@@ -3857,7 +3876,7 @@ impl CompiledModule {
                 .as_ref()
                 .map(|di| di.types.clone())
                 .unwrap_or_default(),
-            module: OwnedJit::new(module),
+            module: Arc::new(OwnedJit::new(module)),
         })
     }
 
@@ -3956,6 +3975,117 @@ impl CompiledModule {
             None,
             Some(twin),
         )
+    }
+
+    /// #1825 — this module's code as [`SharedCode`], for more instances to run. `None` unless the code
+    /// is **only code**: it names no object one instance owns (see `code_names_objects`), no runtime
+    /// was stood up on it after its compile (the §22 hosting entries), and nothing was defined past
+    /// it. From here on no instance can extend it ([`arena_mut`]) — this module included, which goes
+    /// on running as the first instance.
+    pub fn share(&self) -> Option<SharedCode> {
+        self.is_only_code().then(|| {
+            SharedCode(self.instance(InstanceAddrs {
+                cap_ctx: core::ptr::null_mut(),
+                embedder: core::ptr::null_mut(),
+                ..self.instance
+            }))
+        })
+    }
+
+    /// See [`Self::share`].
+    fn is_only_code(&self) -> bool {
+        // A runtime stood up after the compile (the §22 hosting entries) is per-instance run state.
+        #[cfg(fiber_rt)]
+        let hosting = self.fiber_rt.is_some() || self.domain.is_some();
+        #[cfg(not(fiber_rt))]
+        let hosting = false;
+        !self.code_names_objects && !hosting && self.next_extra == 0
+    }
+
+    /// A new instance of this module's code at `addrs` ([`SharedCode::instance`]): the compile's
+    /// products, the function table copied (a run is handed its address; nothing bakes it), and fresh
+    /// run state. Only for code [`Self::is_only_code`] admits, so it carries no runtime — not even the
+    /// §14 nursery a module with install room gets for its units (#1726): no unit can be defined
+    /// into shared code.
+    fn instance(&self, addrs: InstanceAddrs) -> CompiledModule {
+        CompiledModule {
+            code_names_objects: self.code_names_objects,
+            fn_table: self
+                .fn_table
+                .iter()
+                .map(|e| FnEntry::new(e.type_id(), e.code()))
+                .collect(),
+            tramp_code: self.tramp_code,
+            tramp_code_limited: self.tramp_code_limited,
+            serve_tramps: self.serve_tramps.clone(),
+            n_params: self.n_params,
+            n_results: self.n_results,
+            n_real_funcs: self.n_real_funcs,
+            distinct: self.distinct.clone(),
+            cap: self.cap,
+            fiber: self.fiber,
+            thread: self.thread,
+            inst: InstEnv::null(),
+            setjmp: self.setjmp,
+            mask: self.mask,
+            cap_mapped: self.cap_mapped,
+            sub_base: self.sub_base,
+            epoch: self.epoch,
+            fuel: self.fuel,
+            instance: addrs,
+            fn_table_mask: self.fn_table_mask,
+            next_extra: self.next_extra,
+            extra_bytes: self.extra_bytes,
+            base_bytes: self.base_bytes,
+            live_fault_range: None,
+            caller_window: self.caller_window,
+            last_trap_backtrace: Vec::new(),
+            last_trap_fiber: None,
+            win_mapped: self.win_mapped,
+            win_reserved: self.win_reserved,
+            win_size: self.win_size,
+            null_guard: self.null_guard,
+            mem_size_log2: self.mem_size_log2,
+            data: self.data.clone(),
+            restore_prots: Vec::new(),
+            durable: false,
+            shadow: self.shadow,
+            concurrent_durable: false,
+            frozen_seed: Vec::new(),
+            frozen_out: Vec::new(),
+            frozen_vcpus_out: Vec::new(),
+            frozen_nested_out: Vec::new(),
+            frozen_root_sp_out: 0,
+            frozen_vcpu_seed: Vec::new(),
+            frozen_nested_seed: Vec::new(),
+            detached_out: Vec::new(),
+            detached_seed: Vec::new(),
+            thaw_root_sp: self.shadow.frame_base(0),
+            freeze_ctl: None,
+            fork_hook: None,
+            #[cfg(fiber_rt)]
+            fiber_rt: None,
+            #[cfg(fiber_rt)]
+            domain: None,
+            #[cfg(fiber_rt)]
+            _nursery: None,
+            #[cfg(fiber_rt)]
+            _unit_progs: Vec::new(),
+            #[cfg(setjmp_rt)]
+            _setjmp_rt: None,
+            #[cfg(fiber_rt)]
+            call_tramp: self.call_tramp,
+            #[cfg(fiber_rt)]
+            fiber_cfg: self.fiber_cfg,
+            #[cfg(fiber_rt)]
+            fiber_table: None,
+            src_ranges: self.src_ranges.clone(),
+            src_files: self.src_files.clone(),
+            func_names: self.func_names.clone(),
+            var_locs: self.var_locs.clone(),
+            debug_types: self.debug_types.clone(),
+            module: Arc::clone(&self.module),
+        }
     }
 
     /// #1768 — hand this module's own instance the embedder's per-instance state (the vmctx
@@ -4816,6 +4946,8 @@ impl CompiledModule {
                 ));
             }
         }
+        // Shared code cannot take the unit (#1825): refused before anything is recorded.
+        let module = arena_mut(&mut self.module)?;
         // Intern the unit's signatures (its functions' own + its call sites') into the
         // append-only registry BEFORE lowering, so the ids baked into this unit's dispatch
         // checks are real, stable ids — id-equality ≡ structural equality across all units
@@ -4827,8 +4959,8 @@ impl CompiledModule {
             .map(|f| {
                 let name = format!("x{}", self.next_extra);
                 self.next_extra += 1;
-                let sig = natural_sig(&mut self.module, f);
-                self.module
+                let sig = natural_sig(&mut *module, f);
+                module
                     .declare_function(&name, Linkage::Local, &sig)
                     .map_err(|e| JitError::Backend(e.to_string()))
             })
@@ -4892,10 +5024,10 @@ impl CompiledModule {
         };
         #[cfg(not(fiber_rt))]
         let inst = self.inst;
-        let mut ctx = self.module.make_context();
+        let mut ctx = module.make_context();
         for (f, id) in funcs.iter().zip(&ids) {
             build_clif(
-                &mut self.module,
+                &mut *module,
                 &ids,
                 funcs,
                 &self.distinct,
@@ -4921,46 +5053,55 @@ impl CompiledModule {
                 None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
                 None, // …nor value-label points (Stage 3a)
             )?;
-            self.module
+            module
                 .define_function(*id, &mut ctx)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
             // Byte-accurate occupancy: the just-emitted code size, read before `clear_context`.
             self.extra_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
-            self.module.clear_context(&mut ctx);
+            module.clear_context(&mut ctx);
         }
         // One buffer-ABI trampoline per function, so the host can invoke any of them (any arity).
         let tramp_ids: Vec<FuncId> = funcs
             .iter()
             .zip(&ids)
             .map(|(f, id)| {
-                build_trampoline(&mut self.module, &mut ctx.func, *id, f, false);
+                build_trampoline(&mut *module, &mut ctx.func, *id, f, false);
                 let name = format!("xt{}", self.next_extra);
                 self.next_extra += 1;
-                let t = self
-                    .module
+                let t = module
                     .declare_function(&name, Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.module
+                module
                     .define_function(t, &mut ctx)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
                 self.extra_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
-                self.module.clear_context(&mut ctx);
+                module.clear_context(&mut ctx);
                 Ok(t)
             })
             .collect::<Result<_, JitError>>()?;
         // Incremental finalize: mprotects only the newly defined code pages; already-finalized,
         // possibly-running code is untouched (the DESIGN.md §22 Phase-1 W^X spike is the test asserting
         // exactly this).
-        self.module
+        module
             .finalize_definitions()
             .map_err(|e| JitError::Backend(e.to_string()))?;
+        // Each function's finalized natural-ABI entry and buffer-ABI trampoline.
+        let finalized: Vec<(*const u8, *const u8)> = ids
+            .iter()
+            .zip(&tramp_ids)
+            .map(|(id, t)| {
+                (
+                    module.get_finalized_function(*id),
+                    module.get_finalized_function(*t),
+                )
+            })
+            .collect();
         // Publish the unit's now-finalized functions into the slots reserved above, so a `ref.func`
         // funcref (remapped to `ref_slots[N]`) resolves to the unit's own function through the
         // ordinary masked dispatch (DESIGN.md §22 "unit-own funcref"). Slots were picked from the
         // padding pool and are still free (single `call.cap`), so each `install_at` succeeds.
         if let Some(slots) = &ref_slots {
-            for ((f, id), &slot) in funcs.iter().zip(&ids).zip(slots) {
-                let code = self.module.get_finalized_function(*id);
+            for ((f, &(code, _)), &slot) in funcs.iter().zip(&finalized).zip(slots) {
                 let type_id = type_id_of(
                     &self.distinct,
                     &FuncType {
@@ -4980,11 +5121,10 @@ impl CompiledModule {
         // `call.dyn` calls the natural ABI, not the trampoline).
         Ok(funcs
             .iter()
-            .zip(&ids)
-            .zip(&tramp_ids)
-            .map(|((f, id), t)| DefinedFn {
-                tramp: self.module.get_finalized_function(*t),
-                code: self.module.get_finalized_function(*id),
+            .zip(finalized)
+            .map(|(f, (code, tramp))| DefinedFn {
+                tramp,
+                code,
                 type_id: type_id_of(
                     &self.distinct,
                     &FuncType {
@@ -5051,20 +5191,20 @@ impl CompiledModule {
         let tramp = match self.call_tramp {
             Some(t) => t,
             None => {
-                let mut ctx = self.module.make_context();
-                build_fiber_call_trampoline(&mut self.module, &mut ctx.func);
-                let id = self
-                    .module
+                let module = arena_mut(&mut self.module)?;
+                let mut ctx = module.make_context();
+                build_fiber_call_trampoline(&mut *module, &mut ctx.func);
+                let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.module
+                module
                     .define_function(id, &mut ctx)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.module.clear_context(&mut ctx);
-                self.module
+                module.clear_context(&mut ctx);
+                module
                     .finalize_definitions()
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                let addr = self.module.get_finalized_function(id);
+                let addr = module.get_finalized_function(id);
                 // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the ABI its
                 // builder emitted (`code` + the guest entry's Tail args) — the same `transmute`
                 // `compile` does for its own trampoline.
@@ -5140,20 +5280,20 @@ impl CompiledModule {
         let tramp = match self.call_tramp {
             Some(t) => t,
             None => {
-                let mut ctx = self.module.make_context();
-                build_fiber_call_trampoline(&mut self.module, &mut ctx.func);
-                let id = self
-                    .module
+                let module = arena_mut(&mut self.module)?;
+                let mut ctx = module.make_context();
+                build_fiber_call_trampoline(&mut *module, &mut ctx.func);
+                let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.module
+                module
                     .define_function(id, &mut ctx)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.module.clear_context(&mut ctx);
-                self.module
+                module.clear_context(&mut ctx);
+                module
                     .finalize_definitions()
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                let addr = self.module.get_finalized_function(id);
+                let addr = module.get_finalized_function(id);
                 // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly the ABI its builder
                 // emitted — the same `transmute` `compile`/`enable_fiber_hosting` do for their own.
                 unsafe { std::mem::transmute::<*const u8, fiber_rt::FiberCallTramp>(addr) }
@@ -5712,6 +5852,32 @@ unsafe impl Send for CompiledModule {}
 #[cfg(fiber_rt)]
 unsafe impl Sync for CompiledModule {}
 
+/// #1825 — compiled code more than one instance runs ([`CompiledModule::share`]): a fork twin its
+/// parent's program, every `execve` of a command the one compile of it. Each [`Self::instance`] is a
+/// [`CompiledModule`] of its own — its own powerbox, function table and run state — over the same
+/// finalized code, which none of them can extend.
+pub struct SharedCode(CompiledModule);
+
+// SAFETY: the wrapped module is never run and never mutated — `instance` only reads it. Its code
+// pointers name finalized, read-execute memory its `Arc<OwnedJit>` keeps alive, and every instance holds
+// a clone of that `Arc`, so the arena outlives the last run of it. `share` admits only code that names
+// no per-instance runtime. So any thread may hold it, and any number may make instances of it at once —
+// the argument above for a §14 child's code.
+unsafe impl Send for SharedCode {}
+unsafe impl Sync for SharedCode {}
+
+impl SharedCode {
+    /// A new instance of the code, dispatching its `call.cap`s into `cap_ctx` — the instance's own
+    /// powerbox. It polls the kill-path, fuel and signal cells the code was compiled against, which
+    /// every instance of it shares.
+    pub fn instance(&self, cap_ctx: *mut core::ffi::c_void) -> CompiledModule {
+        self.0.instance(InstanceAddrs {
+            cap_ctx,
+            ..self.0.instance
+        })
+    }
+}
+
 // Compile-time proof that the child artifact stays thread-shareable — if a future field reintroduced a
 // `!Send`/`!Sync` type (e.g. an `Rc` or `Cell`) without a matching soundness review, this assertion
 // would fail to compile, catching the regression at the type level (the S1c executor relies on it).
@@ -6165,6 +6331,9 @@ fn compile_child_windowed(
     // per-carve cache). Counting successful compiles is what lets a test prove the cache hits.
     CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
     Ok(CompiledModule {
+        // A §14 child's code is shared its own way — the nursery's per-carve cache — never through
+        // `share`.
+        code_names_objects: true,
         fn_table,
         tramp_code: code,
         tramp_code_limited: code_limited,
@@ -6235,7 +6404,7 @@ fn compile_child_windowed(
         func_names: std::collections::HashMap::new(),
         var_locs: Vec::new(),
         debug_types: Vec::new(),
-        module: OwnedJit::new(module),
+        module: Arc::new(OwnedJit::new(module)),
     })
 }
 
@@ -6245,6 +6414,17 @@ fn compile_child_windowed(
 /// public [`child_compiles`] reads it (a real metric, and the cache-hit test's observable).
 #[cfg(fiber_rt)]
 pub(crate) static CHILD_COMPILES: AtomicU64 = AtomicU64::new(0);
+
+/// #1825 — every whole-module compile ([`CompiledModule::compile`]); see [`module_compiles`].
+static MODULE_COMPILES: AtomicU64 = AtomicU64::new(0);
+
+/// #1825 — how many modules this process has JIT-compiled whole ([`CompiledModule::compile`]; a §14
+/// child's compile counts in [`child_compiles`] instead). An instance of shared code
+/// ([`SharedCode::instance`]) does **not** advance it: the metric is the observable of the process
+/// tree's compile-once.
+pub fn module_compiles() -> u64 {
+    MODULE_COMPILES.load(Ordering::Relaxed)
+}
 
 /// PROCESS.md S1: how many §14 child modules this process has JIT-compiled (0 where nesting is
 /// unsupported — no child ever compiles). A repeat spawn of a cached `(module, entry, size)` does
