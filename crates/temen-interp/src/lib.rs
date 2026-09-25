@@ -6784,6 +6784,24 @@ fn reap_bench_missed(s: &mut Sched, key: TaskId, exits: Option<TaskId>) -> bool 
     s.reap_pending.remove(&key) || exits.is_some_and(|c| s.results.contains_key(&c))
 }
 
+/// Everything a blocking `waitpid` about to bench under `key` may have missed since its op ran:
+/// the scheduler's own marks ([`reap_bench_missed`]), a kill or deliverable signal
+/// ([`interrupt_before_park`]), and a child transition the personality reported only as its
+/// one-shot re-check edge ([`SignalSource::reap_pending`]).
+///
+/// That last one is the child that stops or continues **without** entering the core stop park —
+/// parked on a pipe or stream read when its SIGTSTP lands. Its parent's clean re-scan
+/// ([`Scheduler::rescan_reap_parks`]) drains the parent's benches, but a specific-child bench not
+/// filed yet was neither there nor marked, so the parent slept through a `WUNTRACED` stop no other
+/// event would repeat. The personality raises the edge under the parent's lock *before* firing
+/// that re-scan, so reading it here, under the scheduler lock the re-scan also takes, cannot miss
+/// it. It is the edge the cooperative driver's sweep consumes; a stale one costs one re-run.
+fn reap_bench_must_wake(s: &mut Sched, key: TaskId, exits: Option<TaskId>, hg: &mut Host) -> bool {
+    reap_bench_missed(s, key, exits)
+        || interrupt_before_park(hg)
+        || hg.signal_poll().is_some_and(|(_, src)| src.reap_pending())
+}
+
 #[cfg(test)]
 mod reap_bench_tests {
     //! #1340 — the park-vs-transition protocol for a blocking `waitpid` on one child, in the order
@@ -6803,6 +6821,29 @@ mod reap_bench_tests {
             !reap_bench_missed(&mut s, 7, Some(7)),
             "once: the next bench sleeps"
         );
+    }
+
+    /// A child that stops parked on a read reports only the personality's edge (and a re-scan
+    /// that finds no bench): the late bench re-runs, once.
+    #[test]
+    fn a_personality_edge_that_beats_the_bench_readmits_it_once() {
+        struct Edge(AtomicBool);
+        impl SignalSource for Edge {
+            fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+                None
+            }
+            fn reap_pending(&self) -> bool {
+                self.0.swap(false, Ordering::SeqCst)
+            }
+        }
+        let mut s = Sched::default();
+        let mut h = Host::new();
+        h.set_signal_source(
+            Arc::new(Edge(AtomicBool::new(true))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(reap_bench_must_wake(&mut s, 7, Some(7), &mut h));
+        assert!(!reap_bench_must_wake(&mut s, 7, Some(7), &mut h), "once");
     }
 
     #[test]
@@ -7172,6 +7213,68 @@ fn teardown_run(s: &mut Sched) {
 /// touch it while it ran; the park arms are exactly the "next safepoint"). Checked under the same
 /// lock as the park insert, so a teardown can never slip between the check and the park. Returns
 /// the vCPU back when its world is still alive.
+/// The pipe and `waitpid` park arms' half of [`Host::park_must_wake`]: a kill or a deliverable
+/// signal that landed before this park was filed wakes it here exactly as the sweep would have —
+/// the host's EINTR flag, and a re-admit whose rewound op re-executes (and the per-op poll traps a
+/// killed domain). Returns whether the park must not sleep.
+fn interrupt_before_park(hg: &mut Host) -> bool {
+    let wake = hg.park_must_wake();
+    if wake {
+        hg.set_sig_interrupt();
+    }
+    wake
+}
+
+#[cfg(test)]
+mod park_before_wake_tests {
+    //! The park-vs-interrupt protocol for the pipe, `waitpid` and stream-read parks, in the order
+    //! the tree-walker's real worker threads can run it: the vCPU passes its last per-op poll and
+    //! its op decides to park, a kill or a deliverable raise lands and its door sweeps the parked
+    //! set (finding nothing — the vCPU is not filed yet), then the park arm runs. The arm must see
+    //! what the door raised, or the vCPU sleeps through it: a killed `cat` on an idle pipe waited
+    //! for bytes that never came, and its shell waited on the `cat`.
+    use super::*;
+
+    struct Pending;
+    impl SignalSource for Pending {
+        fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+            None
+        }
+        fn interrupt_pending(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_kill_that_beats_the_park_wakes_it() {
+        let mut h = Host::new();
+        h.term_flag.store(true, Ordering::SeqCst); // the kill door's inline apply
+        assert!(
+            interrupt_before_park(&mut h),
+            "the late park re-runs its op"
+        );
+        assert!(
+            h.take_sig_interrupt(),
+            "as the sweep would have: the EINTR flag"
+        );
+    }
+
+    #[test]
+    fn a_raise_that_beats_the_park_wakes_it() {
+        let mut h = Host::new();
+        h.set_signal_source(Arc::new(Pending), Arc::new(AtomicBool::new(true)));
+        assert!(interrupt_before_park(&mut h));
+        assert!(h.take_sig_interrupt());
+    }
+
+    #[test]
+    fn a_quiet_park_sleeps() {
+        let mut h = Host::new();
+        assert!(!interrupt_before_park(&mut h));
+        assert!(!h.take_sig_interrupt());
+    }
+}
+
 fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
     let key = domain_key_of(&v);
     if !s.shutdown && !s.dead.contains_key(&key) {
@@ -8329,7 +8432,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // re-check beside it: a deliverable raise that landed after this vCPU's last
                     // per-op poll ran its sweep against a map we were not yet in; complete the
                     // read `-EINTR` instead of blocking through the signal.
-                    (hg.handle_live(handle), hg.park_interrupted())
+                    (hg.handle_live(handle), hg.park_must_wake())
                 };
                 if live && !interrupted {
                     s.cap_waiters
@@ -8386,7 +8489,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else {
                     (child, Some(child))
                 };
-                if reap_bench_missed(&mut s, key, exits) {
+                if reap_bench_must_wake(&mut s, key, exits, &mut v.host.lock_unpoisoned()) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
@@ -8464,15 +8567,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
                 // so a wake from another image of the pipe (fork twin, exec carry) finds them.
                 let (ready, gid) = {
-                    let hg = v.host.lock_unpoisoned();
-                    match hg.pipes.get(pipe as usize) {
+                    let mut hg = v.host.lock_unpoisoned();
+                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
                         Some((fifo, writers, _, gid, _)) => (
                             !fifo.lock_unpoisoned().is_empty()
                                 || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
                         ),
                         None => (true, u32::MAX), // vanished — re-run to fail closed
-                    }
+                    };
+                    (ready || interrupt_before_park(&mut hg), gid)
                 };
                 if ready {
                     s.runnable.push_back(v);
@@ -8495,15 +8599,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // Same global-id keying as the read park above.
                 let (ready, gid) = {
-                    let hg = v.host.lock_unpoisoned();
-                    match hg.pipes.get(pipe as usize) {
+                    let mut hg = v.host.lock_unpoisoned();
+                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
                         Some((fifo, _, readers, gid, _)) => (
                             fifo.lock_unpoisoned().len() < PIPE_CAP
                                 || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
                         ),
                         None => (true, u32::MAX), // vanished — re-run to fail closed
-                    }
+                    };
+                    (ready || interrupt_before_park(&mut hg), gid)
                 };
                 if ready {
                     s.runnable.push_back(v);
@@ -22193,6 +22298,16 @@ impl Host {
             .as_ref()
             .map(|s| s.interrupt_pending() && !s.syscall_restart())
             .unwrap_or(false)
+    }
+
+    /// Must an interruptible park (a pipe read/write, a blocking `waitpid`, a stream read) not
+    /// sleep? True when a deliverable signal is pending ([`Self::park_interrupted`]) or this domain
+    /// was terminated (`term_flag`). Both are raised by a door that *then* sweeps the parked set
+    /// ([`Scheduler::interrupt_interruptible_parks`]), and a vCPU past its last per-op poll but not
+    /// yet filed was missed by that sweep — so each park arm asks this under the scheduler lock,
+    /// after the sweep's lock-ordered point, and wakes itself the way the sweep would have.
+    fn park_must_wake(&self) -> bool {
+        self.term_flag.load(Ordering::SeqCst) || self.park_interrupted()
     }
 
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its

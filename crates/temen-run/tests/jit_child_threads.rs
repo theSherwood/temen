@@ -308,3 +308,65 @@ block 0 (vsp: i64, varg: i64) {{
     );
     assert_eq!(parity(&child), [Ok(42), Ok(42)]);
 }
+
+/// **A child task that joins a finished vCPU is not blocked.** The child's root spawns W, which
+/// waits indefinitely for the store the root makes after joining C, a vCPU that naps 20 µs so the
+/// root is parked in `thread.join` when it ends — 300 rounds. The root is a task, so its join parks
+/// the *task*, counted by the executor until C's exit broadcast re-offers it — *after* C's exit has
+/// dropped the run-wide `live`. W, woken by that exit, reads the predicate in between. Today the
+/// parent's instantiator `join` is never counted parked (#1820), which keeps `live > parked` here;
+/// this pins that counting it must not turn the window into a false `ThreadFault`. The task half of
+/// `futex_deadlock_all_backends.rs`'s `JOIN_THEN_NOTIFY`.
+#[test]
+fn a_task_joining_a_finished_vcpu_is_not_counted_blocked() {
+    let child = format!(
+        "memory {CHILD_LOG2}
+func (i64) -> (i64) {{
+block 0 (vs: i64) {{
+  vz = i64.const 0
+  br 1(vz)
+}}
+block 1 (vi: i64) {{
+  vz1 = i64.const 0
+  vc = thread.spawn 1 vz1 vz1
+  vw = thread.spawn 2 vz1 vi
+  vrc = thread.join vc
+  vk = i64.const 16392
+  vone = i64.const 1
+  vnext = i64.add vi vone
+  vn32 = i32.wrap_i64 vnext
+  i32.atomic.store vk vn32
+  vcnt = i32.const 1
+  vwoke = atomic.notify vk vcnt
+  vrw = thread.join vw
+  vrounds = i64.const 300
+  vmore = i64.lt_u vnext vrounds
+  br_if vmore 1(vnext) 2(vnext)
+}}
+block 2 (vr: i64) {{
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const 20000
+  vst = i32.atomic.wait vaddr vexp vto
+  vz = i64.const 0
+  return vz
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vk = i64.const 16392
+  vexp = i32.wrap_i64 varg
+  vinf = i64.const -1
+  vst = i32.atomic.wait vk vexp vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }}
+}}"
+    );
+    assert_eq!(parity(&child), [Ok(300), Ok(300)]);
+}
