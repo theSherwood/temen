@@ -342,6 +342,11 @@ pub(crate) struct FiberSlot {
     /// sleeping on its own deadline answers yes, exactly as a *timed* 1:1 `futex_wait` does
     /// (#1625), so it must not be counted.
     park_self_resolving: AtomicBool,
+    /// The futex wait cell this event park is waiting on — `None` for a host-thunk park, which has
+    /// none. Written and cleared beside [`Self::event_park`] by [`fiber_event_park`]. A vCPU idling
+    /// on this fiber in `cont.resume.block` counts its park through the cell, so the `notify` that
+    /// claims the fiber's wait also ends the vCPU's park, under the futex lock (#1625's rule).
+    park_cell: Mutex<Option<Arc<crate::os_thread_rt::WaitCell>>>,
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -466,6 +471,7 @@ impl SharedFiberTable {
             sp,
             event_park: AtomicBool::new(false),
             park_self_resolving: AtomicBool::new(false),
+            park_cell: Mutex::new(None),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
         });
@@ -502,9 +508,16 @@ impl FiberSlot {
             sp: 0,
             event_park: AtomicBool::new(false),
             park_self_resolving: AtomicBool::new(false),
+            park_cell: Mutex::new(None),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
         })
+    }
+
+    /// #1469 — whether this is a task's platform slot rather than a guest fiber's: the running
+    /// code is a child root exactly when the innermost live resume is one.
+    pub(crate) fn is_platform(&self) -> bool {
+        self.func == -1
     }
 
     /// D66 — whether the task's last yield was an event park (a futex/join wait inside it), as the
@@ -582,6 +595,7 @@ impl SharedFiberTable {
             sp,
             event_park: AtomicBool::new(false),
             park_self_resolving: AtomicBool::new(false),
+            park_cell: Mutex::new(None),
             consumed: AtomicBool::new(consumed), // #1538: delivers at its rewound suspend
             pending: Mutex::new(None),
         }));
@@ -730,6 +744,11 @@ impl FiberRuntime {
     }
 
     /// Record the finalized call-trampoline address (must be set before any fiber runs).
+    /// The fiber table this runtime runs over — its domain's one handle namespace.
+    pub(crate) fn table(&self) -> Arc<SharedFiberTable> {
+        Arc::clone(&self.table)
+    }
+
     pub(crate) fn set_call_tramp(&mut self, t: FiberCallTramp) {
         self.call_tramp = Some(t);
     }
@@ -742,6 +761,13 @@ impl FiberRuntime {
     }
     pub(crate) fn pop_active(&mut self) {
         self.active_slots.pop();
+    }
+
+    /// #1469 — is this runtime a child-domain task's? Its outermost live resume is then the
+    /// executor's resume of the task's platform fiber, and `yielders[0]` is that fiber's yielder,
+    /// which belongs to the worker, not to the guest.
+    fn runs_task(&self) -> bool {
+        self.active_slots.first().is_some_and(|s| s.is_platform())
     }
 
     /// Arm the **durable** fiber-switch swap for this run (DURABILITY.md §12.8): record the window
@@ -1179,6 +1205,12 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
     // Mid-run freeze trigger: count this `suspend` safepoint before the switch (mirroring the
     // interpreter's per-op tick). The promotion takes effect for the *resumer's* poll after this
     // fiber parks (suspend's own trailing poll is deferred to the fiber's next resume).
+    // #1469 — a child root runs on its task's platform fiber, whose yielder is the executor's: the
+    // root suspending is the root computation suspending, a `FiberFault` as on an OS thread.
+    if current_fiber_slot().is_some_and(|s| s.is_platform()) {
+        fault(trap_out);
+        return 0;
+    }
     if (*rt).durable {
         window_tick_arm((*rt).mem_base);
     }
@@ -1246,6 +1278,27 @@ pub(crate) unsafe fn park_is_self_resolving(handle: i64) -> bool {
         .is_some_and(|(_, slot)| slot.took_self_resolving_park())
 }
 
+/// The futex wait cell `handle`'s fiber is event-parked on, if any (see [`FiberSlot::park_cell`]).
+///
+/// # Safety
+/// As [`park_is_self_resolving`].
+pub(crate) unsafe fn park_cell(handle: i64) -> Option<Arc<crate::os_thread_rt::WaitCell>> {
+    let rt = &*current();
+    rt.table.resolve(handle).and_then(|(_, slot)| {
+        slot.park_cell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    })
+}
+
+/// #1469 — is this thread running a child-domain task (its root or a guest fiber inside it)?
+pub(crate) fn in_task() -> bool {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    !rt.is_null() && unsafe { (*rt).runs_task() }
+}
+
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
     let rt = current();
     if rt.is_null() {
@@ -1265,7 +1318,11 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
 /// # Safety
 /// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
 /// thunk resolves it via [`current_fiber_slot`]).
-pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>, self_resolving: bool) {
+pub(crate) unsafe fn fiber_event_park(
+    slot: &Arc<FiberSlot>,
+    self_resolving: bool,
+    cell: Option<&Arc<crate::os_thread_rt::WaitCell>>,
+) {
     let y = {
         let rt = &mut *current();
         rt.yielders
@@ -1277,9 +1334,11 @@ pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>, self_resolving: boo
     // sees the two together and never a stale answer from the previous park.
     slot.park_self_resolving
         .store(self_resolving, Ordering::Relaxed);
+    *slot.park_cell.lock().unwrap_or_else(|e| e.into_inner()) = cell.cloned();
     let _ = (*y).suspend(0); // the poll's resume arg is deliberately not delivered
     slot.event_park.store(false, Ordering::Relaxed);
     slot.park_self_resolving.store(false, Ordering::Relaxed);
+    *slot.park_cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Back from the poll — possibly on a different OS thread (a sibling vCPU's `cont.resume`):
     // push the yielder onto the *resuming* thread's runtime, exactly as `fiber_suspend` does.
     {
@@ -1600,9 +1659,10 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     // (3) The root computation's frames on the OS thread stack, when recorded. Its low bound is the
     // current SP if `gc.roots` is called directly from the root (no fiber on this vCPU), else the
     // outermost fiber's resumer SP — the root's saved low-water mark at the point it resumed the
-    // chain.
+    // chain. A task's root (#1469) runs on its platform fiber, so its outermost guest fiber is
+    // `yielders[1]`: `yielders[0]`'s resumer SP is on the worker's stack.
     if rt.root_entry_sp != 0 {
-        let root_low = match rt.yielders.first() {
+        let root_low = match rt.yielders.get(rt.runs_task() as usize) {
             None => current_sp(),
             Some(&y) => (*y).resumer_sp() as usize,
         };

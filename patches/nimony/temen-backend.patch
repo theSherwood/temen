@@ -1,0 +1,205 @@
+nimony learns a **Temen backend** (`nimony t`), so the self-hosted lane's driver plans the whole build.
+
+Why: the self-hosted lane (#1609) runs nimony's own driver in-guest on Temen. With the C backend the
+plan ends in lengc + cc + a linker, none of which exist there, so the host used to run hexer and the
+link itself. With this backend the driver's plan is the whole build and the host only seeds sources.
+
+What: the C backend's pipeline unchanged up to the DCE'd `.c.nif` (same target, same hexer, same
+flags, so every artifact up to there is byte-identical to `nimony c`'s), then ONE whole-program
+node in place of lengc + cc + link: `temen-link -o:<prog.temen> <every module's .c.nif, main
+first>`, which writes one verified Temen module. It sits beside `backendWasm` (the same shape:
+ithaqua is its whole-program tool), shares its output-naming helper (`wholeProgramFile`), and gets
+its own backend directory (`<main>.temen/`). `nimony t -r` refuses: a Temen module runs under a
+Temen host. `temen-link` itself lives in this repo (`crates/temen-run/demos/temen_link`).
+
+Applied to a COPY of the pinned sources at build time (`scripts/ci/nim-selfhost-lane.sh`); the
+vendored `nimony/` submodule is never modified. Against the submodule pin (v0.6.2, 851fe262).
+Drop it when upstream nimony has a Temen backend — it is written to be upstreamed as is.
+--- a/src/gear2/modnames.nim
++++ b/src/gear2/modnames.nim
+@@ -38,6 +38,7 @@
+   BackendDirLLVM* = ".ll"  ## `nimony l`
+   BackendDirNative* = ".n" ## `nimony n`
+   BackendDirWasm* = ".wasm" ## `nimony w`
++  BackendDirTemen* = ".temen" ## `nimony t`
+ 
+ proc moduleSuffix*(path: string; searchPaths: openArray[string]): string =
+   # `getCurrentDir`/`relativePath` are `.raises`, but the only reason they can
+--- a/src/nimony/deps.nim
++++ b/src/nimony/deps.nim
+@@ -96,6 +96,7 @@
+   of backendLLVM: result.add BackendDirLLVM
+   of backendNative: result.add BackendDirNative
+   of backendWasm: result.add BackendDirWasm
++  of backendTemen: result.add BackendDirTemen
+ 
+ proc hexedFile(config: NifConfig; f: FilePair): string = config.nifcachePath / f.modname & ".x.nif"
+ proc lengcFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
+@@ -123,20 +124,25 @@
+   ## no reindex pass is needed.
+   let base = if backendDir.len > 0: config.nifcachePath / backendDir else: config.nifcachePath
+   base / f.modname & ".asm.nif"
+-proc wasmFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
+-  ## ithaqua's whole-program output; the appConsole naming rules of `exeFile`
+-  ## (`--out`/`--outdir` overrides, else nimcache) with a fixed `.wasm` ext.
++proc wholeProgramFile(config: NifConfig; f: FilePair; backendDir, ext: string): string =
++  ## A whole-program backend's single output (ithaqua's `.wasm`, temen-link's
++  ## `.temen`); the appConsole naming rules of `exeFile` (`--out`/`--outdir`
++  ## overrides, else nimcache) with a fixed extension.
+   let baseName = f.nimFile.splitFile.name
+   let base = if backendDir.len > 0: config.nifcachePath / backendDir else: config.nifcachePath
+   if config.outFile.len > 0 or config.outDir.len > 0:
+     let nameOnly = if config.outFile.len > 0: config.outFile else: baseName
+     let withExt =
+       if nameOnly.splitFile.ext.len > 0: nameOnly
+-      else: nameOnly.addFileExt("wasm")
++      else: nameOnly.addFileExt(ext)
+     if config.outDir.len > 0: config.outDir / withExt
+     else: withExt
+   else:
+-    base / baseName.addFileExt("wasm")
++    base / baseName.addFileExt(ext)
++proc wasmFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
++  wholeProgramFile(config, f, backendDir, "wasm")
++proc temenFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
++  wholeProgramFile(config, f, backendDir, "temen")
+ 
+ proc genFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
+   case config.backend
+@@ -144,6 +150,7 @@
+   of backendLLVM: config.llFile(f, backendDir)
+   of backendNative: config.asmFile(f, backendDir)
+   of backendWasm: config.lengcFile(f, backendDir)  # ithaqua consumes Leng directly
++  of backendTemen: config.lengcFile(f, backendDir)  # so does temen-link
+ proc objFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
+   let base = if backendDir.len > 0: config.nifcachePath / backendDir else: config.nifcachePath
+   base / f.modname & ".o"
+@@ -1074,6 +1081,11 @@
+     # actually requested (`--opt:speed` / `--opt:size`); default/debug builds
+     # are byte-for-byte unaffected.
+     let wasm = c.config.backend == backendWasm
++    # The Temen backend is the C backend's pipeline up to the DCE'd `.c.nif`
++    # (same target, same hexer), then ONE whole-program node in place of
++    # lengc + cc + link: temen-link reads every module's `.c.nif` and writes
++    # a verified Temen module. No C compiler, no linker.
++    let temen = c.config.backend == backendTemen
+     let useOptimizer = c.config.optLevel in {optSpeed, optSize}
+     let native = c.config.backend == backendNative
+     # A native program that uses the `.compile`/`{.build…}` pragma (in ANY module)
+@@ -1106,6 +1118,17 @@
+         b.withTree "input":
+           b.addIntLit 0
+           b.addIntLit 0
++    elif temen:
++      # temen-link reads EVERY input (the whole program's `.c.nif`, main
++      # first) and writes the linked module to `-o:<path>`.
++      b.withTree "cmd":
++        b.addSymbolDef "temenLink"
++        b.addStrLit findTool("temen-link")
++        b.withTree "output":
++          b.addStrLit "-o:"
++        b.withTree "input":
++          b.addIntLit 0
++          b.addIntLit -1
+     elif native:
+       # Native backend: arkham (Leng -> typed asm-NIF) replaces lengc. Output is
+       # passed as the single token `-o:<path>` (the colon form; `addFilename`
+@@ -1424,6 +1447,22 @@
+                 b.addStrLit cn
+           b.withTree "output":
+             b.addStrLit c.config.wasmFile(c.rootNode.files[0], backend)
++      elif temen:
++        b.withTree "do":
++          b.addIdent "temenLink"
++          var lengcInput = c.config.lengcFile(c.rootNode.files[0], backend)
++          if useOptimizer: lengcInput = c.config.optimizedFile(c.rootNode.files[0], backend)
++          b.withTree "input":
++            b.addStrLit lengcInput
++          objFiles.incl lengcInput
++          for v in c.nodes:
++            var cn = c.config.lengcFile(v.files[0], backend)
++            if useOptimizer: cn = c.config.optimizedFile(v.files[0], backend)
++            if not objFiles.containsOrIncl(cn):
++              b.withTree "input":
++                b.addStrLit cn
++          b.withTree "output":
++            b.addStrLit c.config.temenFile(c.rootNode.files[0], backend)
+       elif customLinkerName.len > 0 or (not native and not nativeSysLink):
+         # Manifest-based link. The plain C/LLVM backend links through the default
+         # `link` command (== `niflink`); a `{.bundle.}` module overrides it with
+@@ -1553,7 +1592,7 @@
+       # source) don't depend on the user's project. A plain native build has no
+       # such TUs (arkham/nifasm go straight to machine code); only a native build
+       # that uses the `.compile` pragma (`nativeSysLink`) compiles them.
+-      if (not native) or nativeSysLink:
++      if (not native and not temen) or nativeSysLink:
+         for cfile in c.toBuild:
+           let obj = sharedObjFile(cfile)
+           if not objFiles.containsOrIncl(obj):
+@@ -1573,7 +1612,7 @@
+                 b.addStrLit obj
+ 
+       for i, v in pairs c.nodes:
+-        if not native and not wasm:
++        if not native and not wasm and not temen:
+           let obj = c.config.objFile(v.files[0], backend)
+           if not objFiles.containsOrIncl(obj):
+             b.withTree "do":
+@@ -1606,9 +1645,10 @@
+         else:
+           lengcInput = c.config.lengcFile(v.files[0], backend)
+ 
+-        if wasm:
+-          discard  # no per-module codegen: ithaqua's single whole-program
+-                   # node (see "Link executable" above) consumes the .c.nif
++        if wasm or temen:
++          discard  # no per-module codegen: the single whole-program node
++                   # (ithaqua / temen-link, see "Link executable" above)
++                   # consumes the .c.nif
+         elif native:
+           # arkham: per-module Leng -> typed asm-NIF. arkham additionally loads
+           # imported modules' `.c.nif` on demand (cross-module type/sig
+@@ -2207,6 +2247,8 @@
+     var exeOutPath = c.config.exeFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
+     if c.config.backend == backendWasm:
+       exeOutPath = c.config.wasmFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
++    elif c.config.backend == backendTemen:
++      exeOutPath = c.config.temenFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
+     let exeOutDir = exeOutPath.parentDir
+     if exeOutDir.len > 0:
+       onRaiseQuit createDir(path(exeOutDir))
+@@ -2251,5 +2293,9 @@
+         let shim = compilerDir() / "tests" / "ithaqua" / "run_wasm.js"
+         exec "node " & quoteShell(shim) & " " &
+              quoteShell(c.config.wasmFile(c.rootNode.files[0], backend)) & executableArgs
++      elif c.config.backend == backendTemen:
++        # A Temen module runs under a Temen host (`temen-run`), not natively.
++        quit "nimony t -r: run " & c.config.temenFile(c.rootNode.files[0], backend) &
++             " under a Temen host"
+       else:
+         exec c.config.exeFile(c.rootNode.files[0], backend) & executableArgs
+--- a/src/nimony/nifconfig.nim
++++ b/src/nimony/nifconfig.nim
+@@ -88,6 +88,7 @@
+     backendLLVM = "llvm"
+     backendNative = "native"  # C-free: Leng -> arkham -> nifasm (static, libc-free)
+     backendWasm = "wasm"      # C-free: Leng -> ithaqua (whole-program .wasm, no linker)
++    backendTemen = "temen"    # C-free: Leng -> temen-link (whole-program Temen module, no linker)
+ 
+   OptLevel* = enum
+     optDebug   # default: -O1 (debug-friendly but avoids dumb codegen)
+--- a/src/nimony/nimony.nim
++++ b/src/nimony/nimony.nim
+@@ -148,6 +148,12 @@
+     # backendWasm block in handleCmdLine): wasm32/standalone/32 bits.
+     config.backend = backendWasm
+     FullProject
++  of "t":
++    # Temen backend: the C backend's pipeline to the DCE'd `.c.nif`, then
++    # temen-link writes one whole-program Temen module (no C compiler, no
++    # linker). The target is the C backend's: nothing is implied.
++    config.backend = backendTemen
++    FullProject
+   of "check":
+     CheckProject
+   of "s":

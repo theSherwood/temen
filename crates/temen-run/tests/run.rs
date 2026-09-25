@@ -634,6 +634,65 @@ fn powerbox_region_minting_round_trips() {
     );
 }
 
+/// Unmapping one alias of a `SharedRegion` drops **that alias**, never the region's bytes: another
+/// mapping of the same region still reads what was stored, and the unmapped window range, mapped
+/// again as ordinary memory, is the domain's own private zero page — a store there reaches no alias.
+/// The same on every engine (the oracle's `Mem::unmap` re-points the page at the domain's own
+/// backing). The region is mapped at `A1 = 65536` and `A2 = 65536 + g` (whole granules, as
+/// `powerbox_region_minting_round_trips` lays them out); `123` goes in through `A1`, `A1` is unmapped
+/// through the region and mapped again as memory, `7` is stored there, and the guest returns
+/// `A2 + (A1 << 8) + (A2 << 16)` as read after the unmap, after the re-map, and after that store.
+#[test]
+fn unmapping_a_region_alias_keeps_the_regions_bytes_on_every_engine() {
+    let m = load(
+        "memory 18\n\
+         export 0 func \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block 0 () {\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i64.const 65536\n\
+         \x20 v2 = call.sym \"vm_region_create\" (i64) -> (i64) v0(v1)\n\
+         \x20 v3 = i32.wrap_i64 v2\n\
+         \x20 vg = call.cap 4 3 () -> (i64) v3()\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vrw = i32.const 3\n\
+         \x20 va1 = i64.const 65536\n\
+         \x20 va2 = i64.add va1 vg\n\
+         \x20 vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(va1, vz, vg, vrw)\n\
+         \x20 vm2 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v3(va2, vz, vg, vrw)\n\
+         \x20 v123 = i32.const 123\n\
+         \x20 i32.store8 va1 v123\n\
+         \x20 vu = call.cap 4 1 (i64, i64) -> (i64) v3(va1, vg)\n\
+         \x20 vx = i32.load8_u va2\n\
+         \x20 vr = call.sym \"vm_map\" (i64, i64, i32) -> (i64) v0(va1, vg, vrw)\n\
+         \x20 vy = i32.load8_u va1\n\
+         \x20 v7 = i32.const 7\n\
+         \x20 i32.store8 va1 v7\n\
+         \x20 vw = i32.load8_u va2\n\
+         \x20 v8 = i32.const 8\n\
+         \x20 v16 = i32.const 16\n\
+         \x20 vys = i32.shl vy v8\n\
+         \x20 vws = i32.shl vw v16\n\
+         \x20 vs1 = i32.add vx vys\n\
+         \x20 vs2 = i32.add vs1 vws\n\
+         \x20 return vs2\n\
+           }\n\
+         }\n",
+    );
+    let want = Outcome::Returned(vec![Value::I32(123 + (123 << 16))]);
+    for backend in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let run = temen_run::instantiate(m.clone())
+            .expect("instantiate")
+            .run(backend, &temen_run::RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(run.outcome, want, "{backend:?}");
+    }
+}
+
 /// The capstone for the §5 kill-path: drive the **`temen-run` binary** on a C `for(;;){}` compiled by
 /// the frontend, with `TEMEN_DEADLINE_MS` set — it must be detect-and-killed (non-zero exit, an
 /// `OutOfFuel` message) instead of hanging the process. The real end-to-end product path: C source →

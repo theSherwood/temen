@@ -2777,6 +2777,9 @@ fn seed_domain(
                 .find(|cs| cs.parent_task == fnr.parent_task && cs.slot == fnr.slot);
             let arity = cfuncs.get(fnr.entry as usize).map_or(0, |f| f.params.len());
             let child_args = if let Some(cs) = cstate {
+                // #1680: its pipe ends re-open on the pipes the root's restore rebuilt, shared
+                // with every other domain of the tree that holds an end.
+                ch.thaw_pipes = host_shared.lock_unpoisoned().thaw_pipes.clone();
                 ch.restore_durable_handles(&cs.handles);
                 // #1296: rebuild the child's §22 unit tables (from their captured, re-verified IR)
                 // and its dispatch-table reservation *before* the run resolves its `JitTable`
@@ -3568,6 +3571,12 @@ pub fn last_twin_traps() -> Vec<TwinTrap> {
     LAST_TWIN_TRAPS.with(|c| c.borrow().clone())
 }
 
+/// #1768 — publish the twins that trapped in a run driven by **another engine** (the JIT's process
+/// tree), so [`last_twin_traps`] answers for whichever engine ran last on this thread.
+pub fn publish_twin_traps(traps: Vec<TwinTrap>) {
+    LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = traps);
+}
+
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s
 /// `PAGE`). Protections are captured at this fixed size — independent of the host page size — so
 /// an artifact is portable across hosts. A 4 KiB codec page sits within one host page (host
@@ -3623,7 +3632,10 @@ pub fn run_capture_reserved_with_host_prots(
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
-        .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
+        .map(|mm| {
+            let span = mm.capture_extent(SNAP_CAP) as usize;
+            (mm.snapshot_window(span), mm.snapshot_prots(span))
+        })
         .unwrap_or_default();
     (r, snap, prots)
 }
@@ -5626,15 +5638,16 @@ struct Sched {
     /// twin-completion point (after the exit hooks retire the personality entry, so the
     /// re-executed op reaps), by the EINTR sweep, and at teardown.
     posix_reap_waiters: BTreeMap<TaskId, VecDeque<Box<VCpu>>>,
-    /// #802 rung 3 — pending any-child transitions, keyed by the [`REAP_ANY_BASE`] wildcard key.
-    /// Closes the park-vs-transition race for [`ParkEvent::TaskExitAny`]: a child transition that
-    /// finds **no** benched wildcard waiter marks the parent's key here (level-triggered), and a
-    /// wildcard bench insert that finds its key marked consumes the mark and re-admits instead of
-    /// parking — the rewound op re-executes and reports the transition it would have slept
-    /// through. A mark the parent already consumed by other means costs one spurious re-admit
-    /// (the re-executed op finds nothing fresh and re-benches, mark now clear) — never a spin:
-    /// each transition sets at most one mark.
-    reap_any_pending: BTreeSet<TaskId>,
+    /// #802 rung 3, #1340 — pending child transitions, keyed like `posix_reap_waiters`: a child's
+    /// task id, or a parent's [`REAP_ANY_BASE`] wildcard key. Closes the park-vs-transition race
+    /// for every blocking `waitpid` bench ([`Blocked::ReapWait`]): a transition that finds **no**
+    /// benched waiter under a key marks it here ([`wake_posix_reap_locked`]), and a bench insert
+    /// that finds its key marked consumes the mark and re-admits instead of parking — the rewound
+    /// op re-executes and reports the transition it would have slept through. A mark the parent
+    /// already consumed by other means costs one spurious re-admit (the re-executed op finds
+    /// nothing fresh and re-benches, mark now clear) — never a spin: each transition sets at most
+    /// one mark. A child's exit is covered by `results` instead, and clears the child's mark.
+    reap_pending: BTreeSet<TaskId>,
     /// FORK.md §8.6 — vCPUs/fibers parked in a **blocking pipe read** ([`Blocked::PipeRead`]), keyed
     /// by pipe id. Woken by a `write` to that pipe (data available) or by its last write end closing
     /// (writer count → 0, EOF); both drain the entry into `runnable` and the read re-issues. Same shape
@@ -5926,8 +5939,12 @@ impl Scheduler {
         // re-executes and the personality reports the fresh continue (`cont_fresh`).
         let mut reap_hits: Vec<Box<VCpu>> = Vec::new();
         for v in &woken {
-            if let Some(ws) = s.posix_reap_waiters.remove(&v.id) {
-                reap_hits.extend(ws);
+            match s.posix_reap_waiters.remove(&v.id) {
+                Some(ws) => reap_hits.extend(ws),
+                // #1340 — no bencher yet: mark it, as the stop-park wake does.
+                None => {
+                    s.reap_pending.insert(v.id);
+                }
             }
             // #802 rung 3 — a CONTINUE is an any-child transition too: wake (or mark for) the
             // continued twin's parent's wildcard benchers.
@@ -6704,7 +6721,7 @@ enum ReapOutcome {
 /// first `i64` result (an `exit(n)` / `return n`); a **trapped** twin yields a single nonzero crash
 /// status — never a propagated trap — so a crashing command cannot crash the waiting shell
 /// (STAGE1.md). POSIX's exact `128 + signal` encoding is a shell/guest concern (ISSUES.md I43).
-fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
+pub fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
     match result {
         Ok(vals) => match vals.first() {
             Some(Value::I64(x)) => *x,
@@ -6751,13 +6768,102 @@ fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
 
 /// #802 rung 3 — a child of `parent` (a domain key) just transitioned (exit, stop, or continue):
 /// wake any [`ParkEvent::TaskExitAny`] bencher parked under the parent's wildcard key, or mark
-/// the key pending (see [`Sched::reap_any_pending`]) so a bench racing this drain re-admits at
+/// the key pending (see [`Sched::reap_pending`]) so a bench racing this drain re-admits at
 /// its insert instead of sleeping through the transition. Returns whether waiters were woken
 /// (callers notify the worker pool). Distinct from [`wake_reap_any`] — that is the core
 /// servicer-reap lane (`Pending::ReapPid` completion); this is the #799 personality bench lane
 /// (rewound op, no pending value).
 fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
-    let key = REAP_ANY_BASE | parent as TaskId;
+    wake_posix_reap_locked(s, REAP_ANY_BASE | parent as TaskId)
+}
+
+/// #1340 — the other half of [`wake_posix_reap_locked`]: whether a `waitpid` about to bench under
+/// `key` already missed what it waits for — a stop/continue mark, or (`exits`) that child's exit —
+/// and must re-admit instead. Consumes the mark.
+fn reap_bench_missed(s: &mut Sched, key: TaskId, exits: Option<TaskId>) -> bool {
+    s.reap_pending.remove(&key) || exits.is_some_and(|c| s.results.contains_key(&c))
+}
+
+/// Everything a blocking `waitpid` about to bench under `key` may have missed since its op ran:
+/// the scheduler's own marks ([`reap_bench_missed`]), a kill or deliverable signal
+/// ([`interrupt_before_park`]), and a child transition the personality reported only as its
+/// one-shot re-check edge ([`SignalSource::reap_pending`]).
+///
+/// That last one is the child that stops or continues **without** entering the core stop park —
+/// parked on a pipe or stream read when its SIGTSTP lands. Its parent's clean re-scan
+/// ([`Scheduler::rescan_reap_parks`]) drains the parent's benches, but a specific-child bench not
+/// filed yet was neither there nor marked, so the parent slept through a `WUNTRACED` stop no other
+/// event would repeat. The personality raises the edge under the parent's lock *before* firing
+/// that re-scan, so reading it here, under the scheduler lock the re-scan also takes, cannot miss
+/// it. It is the edge the cooperative driver's sweep consumes; a stale one costs one re-run.
+fn reap_bench_must_wake(s: &mut Sched, key: TaskId, exits: Option<TaskId>, hg: &mut Host) -> bool {
+    reap_bench_missed(s, key, exits)
+        || interrupt_before_park(hg)
+        || hg.signal_poll().is_some_and(|(_, src)| src.reap_pending())
+}
+
+#[cfg(test)]
+mod reap_bench_tests {
+    //! #1340 — the park-vs-transition protocol for a blocking `waitpid` on one child, in the order
+    //! the tree-walker's real worker threads can run it: the parent's op finds nothing fresh, the
+    //! child SIGTTIN-stops (its stop-park wake finds no bencher yet), then the parent benches.
+    use super::*;
+
+    #[test]
+    fn a_stop_that_beats_the_bench_readmits_it_once() {
+        let mut s = Sched::default();
+        assert!(!wake_posix_reap_locked(&mut s, 7), "no parent benched yet");
+        assert!(
+            reap_bench_missed(&mut s, 7, Some(7)),
+            "the late bench re-runs its waitpid"
+        );
+        assert!(
+            !reap_bench_missed(&mut s, 7, Some(7)),
+            "once: the next bench sleeps"
+        );
+    }
+
+    /// A child that stops parked on a read reports only the personality's edge (and a re-scan
+    /// that finds no bench): the late bench re-runs, once.
+    #[test]
+    fn a_personality_edge_that_beats_the_bench_readmits_it_once() {
+        struct Edge(AtomicBool);
+        impl SignalSource for Edge {
+            fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+                None
+            }
+            fn reap_pending(&self) -> bool {
+                self.0.swap(false, Ordering::SeqCst)
+            }
+        }
+        let mut s = Sched::default();
+        let mut h = Host::new();
+        h.set_signal_source(
+            Arc::new(Edge(AtomicBool::new(true))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(reap_bench_must_wake(&mut s, 7, Some(7), &mut h));
+        assert!(!reap_bench_must_wake(&mut s, 7, Some(7), &mut h), "once");
+    }
+
+    #[test]
+    fn a_mark_is_per_child() {
+        let mut s = Sched::default();
+        assert!(!wake_posix_reap_locked(&mut s, 7));
+        assert!(
+            !reap_bench_missed(&mut s, 8, Some(8)),
+            "another child's stop is not ours"
+        );
+        assert!(reap_bench_missed(&mut s, 7, Some(7)));
+    }
+}
+
+/// #1340 — a child transition (stop or continue) for the benchers under `key` — the child's own
+/// task id, or a parent's wildcard key: wake them, or mark the key pending (see
+/// [`Sched::reap_pending`]) so a `waitpid` whose op ran before the transition, and is on its way
+/// to the bench, re-admits instead of sleeping through it. Returns whether waiters were woken
+/// (callers notify the worker pool).
+fn wake_posix_reap_locked(s: &mut Sched, key: TaskId) -> bool {
     match s.posix_reap_waiters.remove(&key) {
         Some(ws) => {
             let woke = !ws.is_empty();
@@ -6767,7 +6873,7 @@ fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
             woke
         }
         None => {
-            s.reap_any_pending.insert(key);
+            s.reap_pending.insert(key);
             false
         }
     }
@@ -7090,7 +7196,7 @@ fn teardown_run(s: &mut Sched) {
             .into_values()
             .flatten(),
     );
-    s.reap_any_pending.clear();
+    s.reap_pending.clear();
     for v in victims {
         let reason = s
             .dead
@@ -7107,6 +7213,68 @@ fn teardown_run(s: &mut Sched) {
 /// touch it while it ran; the park arms are exactly the "next safepoint"). Checked under the same
 /// lock as the park insert, so a teardown can never slip between the check and the park. Returns
 /// the vCPU back when its world is still alive.
+/// The pipe and `waitpid` park arms' half of [`Host::park_must_wake`]: a kill or a deliverable
+/// signal that landed before this park was filed wakes it here exactly as the sweep would have —
+/// the host's EINTR flag, and a re-admit whose rewound op re-executes (and the per-op poll traps a
+/// killed domain). Returns whether the park must not sleep.
+fn interrupt_before_park(hg: &mut Host) -> bool {
+    let wake = hg.park_must_wake();
+    if wake {
+        hg.set_sig_interrupt();
+    }
+    wake
+}
+
+#[cfg(test)]
+mod park_before_wake_tests {
+    //! The park-vs-interrupt protocol for the pipe, `waitpid` and stream-read parks, in the order
+    //! the tree-walker's real worker threads can run it: the vCPU passes its last per-op poll and
+    //! its op decides to park, a kill or a deliverable raise lands and its door sweeps the parked
+    //! set (finding nothing — the vCPU is not filed yet), then the park arm runs. The arm must see
+    //! what the door raised, or the vCPU sleeps through it: a killed `cat` on an idle pipe waited
+    //! for bytes that never came, and its shell waited on the `cat`.
+    use super::*;
+
+    struct Pending;
+    impl SignalSource for Pending {
+        fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+            None
+        }
+        fn interrupt_pending(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_kill_that_beats_the_park_wakes_it() {
+        let mut h = Host::new();
+        h.term_flag.store(true, Ordering::SeqCst); // the kill door's inline apply
+        assert!(
+            interrupt_before_park(&mut h),
+            "the late park re-runs its op"
+        );
+        assert!(
+            h.take_sig_interrupt(),
+            "as the sweep would have: the EINTR flag"
+        );
+    }
+
+    #[test]
+    fn a_raise_that_beats_the_park_wakes_it() {
+        let mut h = Host::new();
+        h.set_signal_source(Arc::new(Pending), Arc::new(AtomicBool::new(true)));
+        assert!(interrupt_before_park(&mut h));
+        assert!(h.take_sig_interrupt());
+    }
+
+    #[test]
+    fn a_quiet_park_sleeps() {
+        let mut h = Host::new();
+        assert!(!interrupt_before_park(&mut h));
+        assert!(!h.take_sig_interrupt());
+    }
+}
+
 fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
     let key = domain_key_of(&v);
     if !s.shutdown && !s.dead.contains_key(&key) {
@@ -7222,18 +7390,33 @@ fn freeze_in_flight(s: &Sched) -> bool {
             .values()
             .flatten()
             .any(|(_, w)| matches!(w, Waiter::VCpu(v) if unwinding(v)))
+        || s.pipe_waiters
+            .values()
+            .chain(s.pipe_write_waiters.values())
+            .flatten()
+            .any(|w| matches!(w, Waiter::VCpu(v) if unwinding(v)))
+        || s.posix_reap_waiters
+            .values()
+            .flatten()
+            .any(|v| unwinding(v))
 }
 
-/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait` and futex **vCPU**
-/// parks are re-admitted; a joiner or lane waiter is woken by something else, and a fiber park is
-/// its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left would spin
-/// the worker loop instead of falling through to the deadlock check.
+/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe and
+/// reap **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
+/// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
+/// would spin the worker loop instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
     !s.svc_waiters.is_empty()
+        || !s.posix_reap_waiters.is_empty()
         || s.wait_waiters
             .values()
             .flatten()
             .any(|(_, w)| matches!(w, Waiter::VCpu(_)))
+        || s.pipe_waiters
+            .values()
+            .chain(s.pipe_write_waiters.values())
+            .flatten()
+            .any(|w| matches!(w, Waiter::VCpu(_)))
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -7250,7 +7433,9 @@ fn freeze_can_admit(s: &Sched) -> bool {
 /// re-executed suspend point observes `UNWINDING` and unwinds. The transform instruments both as
 /// re-issue suspend points (`SuspendKind::MemoryWait` for `atomic.wait`), so a futex waiter gets the
 /// same `WAIT_WOKEN` the JIT's own freeze arm delivers: discarded by the safepoint that unwinds
-/// before the guest can observe it, and the thaw re-issues the wait.
+/// before the guest can observe it, and the thaw re-issues the wait. A pipe read/write or reap bench
+/// is re-admitted too (#1672): its rewound op re-executes under the freeze and is abandoned
+/// ([`Decision::Abandon`]), and the thaw re-issues the call.
 ///
 /// A joiner or lane waiter *will* be woken by something else — its child completing (here, by
 /// unwinding), a lane coming free — so it takes the phase without re-admission. Without the phase
@@ -7269,6 +7454,29 @@ fn admit_parks_for_freeze(s: &mut Sched) {
     }
     for v in s.lane_waiters.iter_mut() {
         v.dstate = STATE_UNWINDING;
+    }
+    // #1672 — a pipe read/write or a reap bench parked with its op rewound and unperformed. The
+    // re-admitted vCPU re-executes it under the freeze, which abandons it ([`Decision::Abandon`]) for
+    // the thaw to re-issue. A parked fiber stays, as for a futex wait (#1676).
+    for waiters in [&mut s.pipe_waiters, &mut s.pipe_write_waiters] {
+        for q in waiters.values_mut() {
+            for w in std::mem::take(q) {
+                match w {
+                    Waiter::VCpu(mut v) => {
+                        v.dstate = STATE_UNWINDING;
+                        s.runnable.push_back(v);
+                    }
+                    fiber => q.push(fiber),
+                }
+            }
+        }
+        waiters.retain(|_, q| !q.is_empty());
+    }
+    for (_, q) in std::mem::take(&mut s.posix_reap_waiters) {
+        for mut v in q {
+            v.dstate = STATE_UNWINDING;
+            s.runnable.push_back(v);
+        }
     }
     for (key, q) in std::mem::take(&mut s.wait_waiters) {
         for (tag, w) in q {
@@ -7822,6 +8030,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             // its `JitTable` handle on thaw). Captured beside the handles + serve trio.
                             let jit_tables = hg.capture_durable_jit();
                             let jit_table_log2 = hg.jit_table_log2();
+                            // #1680: the pipes its ends name ride the sink too; their bytes are
+                            // read at capture, once the whole tree has quiesced.
+                            let pipes = hg.durable_pipe_backings();
                             // Record whenever the child holds ANY state a fresh-host thaw would
                             // drop — handles included (every child holds at least its
                             // instantiator grant; restoring the captured table verbatim
@@ -7835,18 +8046,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 drop(hg);
                                 let sink =
                                     v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                                sink.lock_unpoisoned()
-                                    .frozen_child_state
-                                    .push(FrozenChildState {
-                                        parent_task: v.parent_task as usize,
-                                        slot: v.nested_slot,
-                                        svc_queue: q,
-                                        svc_results: r,
-                                        svc_next_ticket: t,
-                                        handles,
-                                        jit_tables,
-                                        jit_table_log2,
-                                    });
+                                let mut sg = sink.lock_unpoisoned();
+                                sg.frozen_pipes.extend(pipes);
+                                sg.frozen_child_state.push(FrozenChildState {
+                                    parent_task: v.parent_task as usize,
+                                    slot: v.nested_slot,
+                                    svc_queue: q,
+                                    svc_results: r,
+                                    svc_next_ticket: t,
+                                    handles,
+                                    jit_tables,
+                                    jit_table_log2,
+                                });
                             }
                             false
                         }
@@ -8009,7 +8220,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // hit 0 writers; wake their parked readers once the scheduler lock is held below. It
                 // *also* releases its read ends — a consumer that exits (e.g. `head`) drops the reader
                 // count, so a parked upstream producer wakes to `-EPIPE` rather than hang forever.
-                let (pipe_eofs, pipe_epipes) = {
+                // A vCPU that unwound for a freeze has not exited (#1672): its ends stay open for the
+                // cut, or a reader elsewhere in the tree would see a false EOF mid-freeze.
+                let (pipe_eofs, pipe_epipes) = if froze {
+                    (Vec::new(), Vec::new())
+                } else {
                     let hg = v.host.lock_unpoisoned();
                     (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
                 };
@@ -8093,6 +8308,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                     sched.work.notify_all();
                 }
+                // #1340 — `results` answers every later bench on this child; drop its stop/continue mark.
+                s.reap_pending.remove(&id);
                 // #802 rung 3 — and any-child benchers of this twin's PARENT (the wildcard key),
                 // or mark the transition pending for a bench racing this drain.
                 if let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) {
@@ -8215,7 +8432,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // re-check beside it: a deliverable raise that landed after this vCPU's last
                     // per-op poll ran its sweep against a map we were not yet in; complete the
                     // read `-EINTR` instead of blocking through the signal.
-                    (hg.handle_live(handle), hg.park_interrupted())
+                    (hg.handle_live(handle), hg.park_must_wake())
                 };
                 if live && !interrupted {
                     s.cap_waiters
@@ -8256,25 +8473,27 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                if child == REAP_ANY_CHILD {
-                    // #802 rung 3 — the any-child bench: park under the caller's per-parent
-                    // wildcard key, which every child-transition drain point wakes. The race
-                    // check is the pending mark (`reap_any_pending`), not `results` — a
-                    // personality-lane twin's outcome lingers in `results` after the guest
-                    // reaps it from the personality table, so a `results` scan would re-admit
-                    // (and spin) forever once any child had ever exited.
-                    let key = REAP_ANY_BASE | domain_key_of(&v) as TaskId;
-                    if s.reap_any_pending.remove(&key) {
-                        s.runnable.push_back(v);
-                        sched.work.notify_one();
-                    } else {
-                        s.posix_reap_waiters.entry(key).or_default().push_back(v);
-                    }
-                } else if s.results.contains_key(&child) {
+                // #802 rung 3 — the any-child bench parks under the caller's per-parent wildcard
+                // key, which every child-transition drain point wakes. Its race check is the
+                // pending mark alone, not `results` — a personality-lane twin's outcome lingers in
+                // `results` after the guest reaps it from the personality table, so a `results`
+                // scan would re-admit (and spin) forever once any child had ever exited.
+                //
+                // #1340 — a specific-child bench checks the mark too: a STOP or CONTINUE is as
+                // reportable as the exit `results` covers, and the child can make that transition
+                // between this op finding nothing fresh and this insert (the tree-walker's workers
+                // are real threads). Without the mark the parent slept through a SIGTTIN stop and
+                // the child waited forever for the SIGCONT only that parent would send.
+                let (key, exits) = if child == REAP_ANY_CHILD {
+                    (REAP_ANY_BASE | domain_key_of(&v) as TaskId, None)
+                } else {
+                    (child, Some(child))
+                };
+                if reap_bench_must_wake(&mut s, key, exits, &mut v.host.lock_unpoisoned()) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
-                    s.posix_reap_waiters.entry(child).or_default().push_back(v);
+                    s.posix_reap_waiters.entry(key).or_default().push_back(v);
                 }
             }
             Step::Park(Blocked::Stopped) => {
@@ -8318,10 +8537,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     // twin-completion point does — the rewound op re-executes and the
                     // personality reports the fresh stop (`stop_fresh`).
                     let id = v.id;
-                    if let Some(ws) = s.posix_reap_waiters.remove(&id) {
-                        for w in ws {
-                            s.runnable.push_back(w);
-                        }
+                    if wake_posix_reap_locked(&mut s, id) {
                         sched.work.notify_all();
                     }
                     // #802 rung 3 — a STOP is an any-child transition too: wake (or mark for)
@@ -8351,15 +8567,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
                 // so a wake from another image of the pipe (fork twin, exec carry) finds them.
                 let (ready, gid) = {
-                    let hg = v.host.lock_unpoisoned();
-                    match hg.pipes.get(pipe as usize) {
+                    let mut hg = v.host.lock_unpoisoned();
+                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
                         Some((fifo, writers, _, gid, _)) => (
                             !fifo.lock_unpoisoned().is_empty()
                                 || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
                         ),
                         None => (true, u32::MAX), // vanished — re-run to fail closed
-                    }
+                    };
+                    (ready || interrupt_before_park(&mut hg), gid)
                 };
                 if ready {
                     s.runnable.push_back(v);
@@ -8382,15 +8599,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // Same global-id keying as the read park above.
                 let (ready, gid) = {
-                    let hg = v.host.lock_unpoisoned();
-                    match hg.pipes.get(pipe as usize) {
+                    let mut hg = v.host.lock_unpoisoned();
+                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
                         Some((fifo, _, readers, gid, _)) => (
                             fifo.lock_unpoisoned().len() < PIPE_CAP
                                 || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
                         ),
                         None => (true, u32::MAX), // vanished — re-run to fail closed
-                    }
+                    };
+                    (ready || interrupt_before_park(&mut hg), gid)
                 };
                 if ready {
                     s.runnable.push_back(v);
@@ -9533,6 +9751,7 @@ pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 /// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
 /// `temen_durable::REGION_HEADER_LEN`.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
+use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
 /// Bytes reserved at each region's base for its **per-context shadow-SP word** (§12.8 4A.5): the SP
 /// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
 /// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
@@ -11062,7 +11281,9 @@ impl VCpu {
     /// FORK.md PR 1 increment 3b — build a live `fork()` **twin** of this parked caller vCPU. The twin
     /// resumes the *same* continuation (`frames`) at the fork `call.cap`'s post-call resume point over a
     /// **private** window (`twin_mem`) and a **duplicated** powerbox (`twin_host`), as its **own domain**
-    /// (fresh fiber registry, new `id`/`tls`). `pending` is left `None` — the caller sets
+    /// (fresh fiber registry, new `id`). Its `vcpu.tls` register is the caller's: POSIX's child inherits
+    /// the forking thread, and a guest that keeps its TLS block's address there (the fs-base recipe)
+    /// finds that block at the same offset of the copied window. `pending` is left `None` — the caller sets
     /// `CapResult(reply_twin)` so the reload delivers the twin's reply. Only ever called on a caller
     /// parked at its root on a `call.cap` (`cur == ROOT_FIBER`, no children/fibers — checked by
     /// [`Scheduler::fork_parked_caller`]), so the child/serve/fiber fields start empty.
@@ -11106,7 +11327,7 @@ impl VCpu {
             depth: self.depth,
             id: new_id,
             parent_task: self.parent_task,
-            tls: new_id as i64,
+            tls: self.tls,
             setjmp_points: BTreeMap::new(),
             pending: None, // the caller sets `CapResult(reply_twin)`
             sched: self.sched.clone(),
@@ -11688,6 +11909,12 @@ enum Decision {
     /// The exec was refused: the op's `-ENOSYS` placeholder becomes a probeable `-EINVAL`, caller
     /// still running (POSIX: `execve` returns only on failure).
     ExecRefused,
+    /// #1672 — the op would park (a pipe read/write, a reap bench) but a freeze is landing on a
+    /// durable domain. The op took no effect, so it is **abandoned**: the caller sets its context's
+    /// re-issue word and continues with the op's placeholder results. The call's trailing poll
+    /// unwinds, and the thaw re-issues the call against the restored state (DURABILITY §4, "the cut
+    /// and its boundary"). Parking instead would hold the freeze on an event that may never come.
+    Abandon,
 }
 
 /// #799/#1609/#1621/#1635/#1647 — the **one decision** every call form shares, over the transients
@@ -11720,19 +11947,22 @@ fn decide(
     // A fiber or the deterministic explorer cannot be parked or handed to the fork engine; it
     // keeps whatever the op answered.
     let parkable = cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_));
+    // #1672 — under a landing freeze a durable domain never parks: the park is abandoned instead.
+    let freezing = durable && mem.is_some_and(|m| m.durable_state() == STATE_UNWINDING);
+    let park = |d: Decision| if freezing { Decision::Abandon } else { d };
     if t.pipes && parkable {
         if let Some(pipe) = t.read_park {
             return if t.sig_intr {
                 Decision::Eintr
             } else {
-                Decision::PipeRead(pipe)
+                park(Decision::PipeRead(pipe))
             };
         }
         if let Some(pipe) = t.write_park {
             return if t.sig_intr {
                 Decision::Eintr
             } else {
-                Decision::PipeWrite(pipe)
+                park(Decision::PipeWrite(pipe))
             };
         }
     }
@@ -11751,11 +11981,11 @@ fn decide(
             let _ = id;
             Decision::Eintr
         }
-        ParkEvent::TaskExit(id) => Decision::Reap(id),
+        ParkEvent::TaskExit(id) => park(Decision::Reap(id)),
         // #802 rung 3 — the any-child bench: the sentinel flows through the same rewind+park; the
         // drive loop's insert translates it to the per-parent key.
         ParkEvent::TaskExitAny if t.sig_intr => Decision::Eintr,
-        ParkEvent::TaskExitAny => Decision::Reap(REAP_ANY_CHILD),
+        ParkEvent::TaskExitAny => park(Decision::Reap(REAP_ANY_CHILD)),
         // The op resolved the path against the command registry and staged argv/envp; only the
         // resolved command handle rides the request. The staged args are collected at the commit
         // point and nowhere else (#1768): a refused exec returns to an untouched caller.
@@ -11770,6 +12000,14 @@ fn decide(
                 None => Decision::ExecRefused,
             }
         }
+    }
+}
+
+/// #1672 — mark the running context's host call abandoned ([`Decision::Abandon`]): its unwind
+/// spills the re-issue word into the call's frame, and the thaw re-issues the call.
+fn abandon_for_freeze(mem: &mut Option<Mem>, ctx: usize) {
+    if let Some(m) = mem.as_mut() {
+        m.durable_set_reissue(ctx);
     }
 }
 
@@ -12220,33 +12458,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 OutOfFuel,
                             }
                             let adm_ = {
-                                let mut guard_ = match state_.try_lock() {
-                                    Ok(g) => g,
-                                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                                    // Held only by the 3a fallback (durable providers) or a
-                                    // wiring/introspection API; the animated path releases it and
-                                    // guards with `busy`.
-                                    Err(std::sync::TryLockError::WouldBlock) => {
-                                        // CALLS.md increment 7 (§10.1) — a `Threaded` provider
-                                        // promises **no admission gate**, so contention on this
-                                        // brief snapshot lock must NOT read as busy. The threaded
-                                        // critical section holds `state_` only to fork the window
-                                        // and clone the powerbox cell, and drops it before the
-                                        // handler runs (it never spans a sub-run — a threaded offer
-                                        // is never durable, so the long-holding 3a fallback cannot
-                                        // apply). Blocking to acquire it is therefore bounded, and
-                                        // it closes I69's lost-caller window: two concurrent callers
-                                        // colliding here used to hand the loser a spurious `-EAGAIN`,
-                                        // silently dropping its dispatch. Every other tier keeps the
-                                        // 3a semantics — a held lock reads as busy: `-EAGAIN`.
-                                        if entry_.policy == OfferPolicy::Threaded {
-                                            state_.lock_unpoisoned()
-                                        } else {
-                                            frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                            continue;
-                                        }
-                                    }
-                                };
+                                // The instance's brief snapshot lock — held only for short critical
+                                // sections: another caller's admission, a settle, a waiter's
+                                // `admit_parked` bookkeeping, the host-side tier's checkout and
+                                // check-in (6c released it across that tier's sub-run). So waiting
+                                // for it is bounded, and a held lock must NOT read as busy: that
+                                // handed the loser of two colliding callers a spurious `-EAGAIN`
+                                // instead of the park-and-retry below (I69 for `Threaded`; #1606
+                                // for `single`, whose 3a-era `try_lock` outlived the long holder
+                                // it guarded against). Admission is decided by `busy`, under it.
+                                let mut guard_ = state_.lock_unpoisoned();
                                 let st_ = &mut *guard_;
                                 if entry_.policy == OfferPolicy::Threaded {
                                     // CALLS.md increment 7 (§10.1) — **no admission gate**: the
@@ -14996,6 +15217,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -15202,6 +15424,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -15371,6 +15594,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -15460,6 +15684,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -18386,8 +18611,9 @@ enum Binding {
     /// in [`Host::pipes`] and which half it is. `write = true` appends to the FIFO (op 1), `false`
     /// drains it (op 0). **Blocking + bounded** (FORK.md §8.6): an empty read parks while a writer is
     /// open (else EOF); a write to a full FIFO parks (backpressure, `PIPE_CAP`) and a write to a
-    /// reader-closed pipe is `-EPIPE`. Index-carrying, so non-durable and non-copyable, like
-    /// [`Binding::SharedRegion`].
+    /// reader-closed pipe is `-EPIPE`. Index-carrying, so non-copyable, like
+    /// [`Binding::SharedRegion`]. Durable when the domain tree minted it (#1680,
+    /// [`DurableBinding::PipeEnd`]).
     PipeEnd {
         pipe: u32,
         write: bool,
@@ -18584,6 +18810,14 @@ pub enum DurableBinding {
     JitTable {
         idx: u32,
     },
+    /// #1680 — one end of a pipe the domain tree minted (DURABILITY §4, "the cut and its boundary"):
+    /// a pipe with every end inside the cut is data, so it rides. `pipe` is the pipe's live global
+    /// id, the key of its [`DurablePipe`]; the codec renumbers it to an artifact-local number on the
+    /// wire and back to the id [`Host::restore_durable_pipes`] minted on restore. `write` is which end.
+    PipeEnd {
+        pipe: u32,
+        write: bool,
+    },
     /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
     /// `jit_tables`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
     /// index pair is its whole authority — durable once the domain's units are captured.
@@ -18741,6 +18975,29 @@ pub struct FreezeDeclined {
     pub task: u64,
     /// The task's child slot the cause is about, when it is about a child.
     pub slot: Option<usize>,
+}
+
+/// #1680 — a pipe inside the cut, for a snapshot: its buffered bytes, plus the live end counts the
+/// codec checks the cut against. Every end of a pipe that rides must be a [`DurableBinding::PipeEnd`]
+/// somewhere in the frozen tree; a pipe with an end outside it (held by another domain, or fed by
+/// the embedder) crosses the cut's boundary, which this slice does not yet carry.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurablePipe {
+    /// The key its [`DurableBinding::PipeEnd`]s name (see there).
+    pub key: u32,
+    /// The FIFO's contents, oldest first. At most the pipe capacity.
+    pub bytes: Vec<u8>,
+    /// Open write ends: at capture, the live count; on restore, the ends the cut carries — the
+    /// root's and every nested child's, including a child not yet re-created by the thaw.
+    pub writers: usize,
+    /// Open read ends, like `writers`.
+    pub readers: usize,
+}
+
+/// #1680 — a restore offered a pipe larger than a pipe can hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PipeRestoreError {
+    pub key: u32,
 }
 
 /// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
@@ -19784,9 +20041,10 @@ pub struct ProviderState {
     /// instance's world checked out (its `mem`/`host` swapped onto the animating vCPU). A
     /// concurrent caller observing it answers a probeable `-EAGAIN`, exactly as 3a's held
     /// `try_lock` did — the animated path cannot hold the state guard across the handler's many
-    /// loop iterations, so this flag serializes admission in its place. The 3a `drive_arc`
-    /// fallback (durable providers) still admits under the held guard and never sets this. (The
-    /// full §10.3 closed bit — freeze/teardown — rides 4b.)
+    /// loop iterations, so this flag serializes admission in its place. Since 6c the host-side
+    /// `drive_arc` tier sets it too (owner `0`) and releases the guard across its sub-run, so the
+    /// guard itself is only ever held briefly. (The full §10.3 closed bit — freeze/teardown —
+    /// rides 4b.)
     busy: bool,
     /// CALLS.md 4c.1 — count of **admission-waiters** parked on this busy instance
     /// ([`Sched::admit_waiters`]). Incremented under the state lock when a distinct-vCPU caller
@@ -20601,10 +20859,10 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
-    /// #1768 — the hand-off an engine that serves a personality `execve` by **unwinding its run**
-    /// (the JIT) uses: `None` — this run does not serve exec that way; `Some(None)` — armed
-    /// ([`Host::arm_exec_replace`]); `Some(Some(img))` — an admitted image waiting for the unwound
-    /// run's driver to start it ([`Host::take_exec_image`]).
+    /// #1768 — the caller-request arm of an engine that serves its personality's `fork`/`execve`/
+    /// blocking `waitpid` **from the `call.cap` thunk** (the JIT's process driver): `None` — this run
+    /// does not; `Some(None)` — armed ([`Host::arm_caller_requests`]); `Some(Some(img))` — an admitted
+    /// `execve` image waiting for the unwound run's driver to start it ([`Host::take_exec_image`]).
     exec_replace: Option<Option<Box<ExecImage>>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `call.cap`, so without a persistent home a guest-*grown* heap page (committed
@@ -20741,6 +20999,13 @@ pub struct Host {
     /// self-unwind into the subtree's shared sink; the codec merges it into the child's
     /// nested record). Empty for plain children, so plain-subtree artifacts are unchanged.
     frozen_child_state: Vec<FrozenChildState>,
+    /// #1680 — the pipes a subtree freeze's nested children hold, by global id, pushed into the
+    /// shared sink by each child's self-unwind beside its [`FrozenChildState`]. Their bytes are read
+    /// at capture ([`Host::capture_durable_pipes`]), once every vCPU has quiesced.
+    frozen_pipes: BTreeMap<u32, PipeBacking>,
+    /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
+    /// for [`Host::restore_durable_handles`] to re-open ends on. A thawed nested child is handed a copy.
+    thaw_pipes: BTreeMap<u32, PipeBacking>,
     /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
     /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
     /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
@@ -21160,6 +21425,8 @@ impl Host {
             thawed_detached: Vec::new(),
             freeze_declined: None,
             frozen_child_state: Vec::new(),
+            frozen_pipes: BTreeMap::new(),
+            thaw_pipes: BTreeMap::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
             named_cap_registrar: None,
@@ -22033,6 +22300,16 @@ impl Host {
             .unwrap_or(false)
     }
 
+    /// Must an interruptible park (a pipe read/write, a blocking `waitpid`, a stream read) not
+    /// sleep? True when a deliverable signal is pending ([`Self::park_interrupted`]) or this domain
+    /// was terminated (`term_flag`). Both are raised by a door that *then* sweeps the parked set
+    /// ([`Scheduler::interrupt_interruptible_parks`]), and a vCPU past its last per-op poll but not
+    /// yet filed was missed by that sweep — so each park arm asks this under the scheduler lock,
+    /// after the sweep's lock-ordered point, and wakes itself the way the sweep would have.
+    fn park_must_wake(&self) -> bool {
+        self.term_flag.load(Ordering::SeqCst) || self.park_interrupted()
+    }
+
     /// FORK.md §8.6 — decrement a pipe's shared **writer** count by one (a write end closed or its
     /// holder exited). Returns `true` if the count reached `0` — the caller must then wake that pipe's
     /// parked readers (they re-issue their read, see writers == 0, and get EOF).
@@ -22101,6 +22378,13 @@ impl Host {
     /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
     /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
     /// by crashing — releases its write ends and never wedges a downstream consumer.
+    /// FORK.md §8.6 — a domain finishing releases every pipe end it holds, so a peer reader sees EOF
+    /// and a peer writer `-EPIPE`. For a driver whose parked peers poll, so the zeroed pipes need no
+    /// wake. Call it once per domain: each call decrements the shared end counts again.
+    pub(crate) fn release_pipe_ends(&self) {
+        let _ = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+    }
+
     fn drop_all_pipe_writers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {
@@ -22789,10 +23073,15 @@ impl Host {
             let m = map.lock().unwrap();
             for (p, slot) in out.iter_mut().enumerate() {
                 let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
-                match m.get(&hp) {
-                    Some(1) => *slot = CapturedProt::Rw,
-                    Some(2) => *slot = CapturedProt::Ro,
-                    Some(3) => *slot = CapturedProt::Unmapped,
+                use temen_ir::page_state as ps;
+                match m.get(&hp).copied() {
+                    Some(ps::RW) => *slot = CapturedProt::Rw,
+                    Some(ps::RO) => *slot = CapturedProt::Ro,
+                    Some(ps::UNMAPPED) => *slot = CapturedProt::Unmapped,
+                    // A §13 alias is not snapshot state — a domain holding a shared region is not
+                    // freezable (its handle is non-durable), so the capture never gets this far
+                    // with one; reported as what it is rather than as a private page.
+                    Some(ps::BACKED_RW | ps::BACKED_RO) => *slot = CapturedProt::Backed,
                     _ => {}
                 }
             }
@@ -23099,7 +23388,13 @@ impl Host {
                 // rides verbatim. The index is valid by construction (`budgets` only grows, and every
                 // `Binding::Budget` is minted from a push), so this is a lookup, not a check.
                 Binding::Budget(i) => DurableBinding::Budget(self.budgets[i as usize]),
-                Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
+                // #1680: a pipe the domain tree minted rides by its global id (the codec checks that
+                // every end is inside the cut). An embedder-fed pipe (no channel charge) is fed from
+                // outside the tree: the cut's boundary, not yet carried.
+                Binding::PipeEnd { pipe, write } => match self.pipes.get(pipe as usize) {
+                    Some(b) if b.4.is_some() => DurableBinding::PipeEnd { pipe: b.3, write },
+                    _ => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
+                },
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -23162,7 +23457,10 @@ impl Host {
                 Binding::HostProc(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
-                Binding::PipeEnd { .. } => NonDurableKind::Pipe,
+                Binding::PipeEnd { pipe, .. } => match self.pipes.get(pipe as usize) {
+                    Some(b) if b.4.is_some() => continue, // #1680: durable, a drain keeps it
+                    _ => NonDurableKind::Pipe,
+                },
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -23224,6 +23522,20 @@ impl Host {
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
+                // #1680: re-open the end on the pipe `restore_durable_pipes` rebuilt under this key.
+                // That pipe's counts already include this end (they are the cut's), so none is
+                // bumped here. A key naming no pipe (a mis-sequenced embedder; the codec rejects it)
+                // leaves the slot closed rather than forging a pipe.
+                DurableBinding::PipeEnd { pipe, write } => match self.thaw_pipes.get(&pipe) {
+                    Some(b) => {
+                        self.pipes.push(b.clone());
+                        Binding::PipeEnd {
+                            pipe: self.pipes.len() as u32 - 1,
+                            write,
+                        }
+                    }
+                    None => continue,
+                },
                 // #1361: re-resolve the module the artifact *names* against what this host has been
                 // granted. `check_modules_for_thaw` validated every carried digest before any slot
                 // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
@@ -23250,6 +23562,70 @@ impl Host {
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// #1680 — the tree-minted pipes this domain's live ends name, with those its nested children
+    /// pushed into this sink, by global id: the pipe half of [`DurableBinding::PipeEnd`]. Read after
+    /// the freeze has quiesced, so the bytes are the cut's. Ascending key.
+    pub fn capture_durable_pipes(&self) -> Vec<DurablePipe> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut all = self.frozen_pipes.clone();
+        all.extend(self.durable_pipe_backings());
+        all.into_iter()
+            .map(|(key, (fifo, writers, readers, _, _))| DurablePipe {
+                key,
+                bytes: fifo.lock_unpoisoned().iter().copied().collect(),
+                writers: writers.load(SeqCst),
+                readers: readers.load(SeqCst),
+            })
+            .collect()
+    }
+
+    /// #1680 — the tree-minted pipes this domain's live ends name, by global id.
+    fn durable_pipe_backings(&self) -> BTreeMap<u32, PipeBacking> {
+        self.table
+            .iter()
+            .filter_map(|s| match s.entry {
+                Some(Binding::PipeEnd { pipe, .. }) => self.pipes.get(pipe as usize),
+                _ => None,
+            })
+            .filter(|b| b.4.is_some())
+            .map(|b| (b.3, b.clone()))
+            .collect()
+    }
+
+    /// #1680 — rebuild the cut's pipes before [`Self::restore_durable_handles`] re-opens their ends:
+    /// each gets its bytes, a fresh global id, the cut's end counts (every end the tree carries,
+    /// including those of nested children the thaw has yet to re-create), and a channel charge on
+    /// this domain (the thawing root holds the tree's pipe memory). Replaces any earlier set.
+    /// Refuses, with nothing rebuilt, a pipe holding more than a pipe can.
+    ///
+    /// Returns each pipe's new global id, in order: the caller rewrites the carried ends' keys to
+    /// them before re-pinning any ([`DurableBinding::PipeEnd`]).
+    pub fn restore_durable_pipes(
+        &mut self,
+        pipes: &[DurablePipe],
+    ) -> Result<Vec<u32>, PipeRestoreError> {
+        if let Some(p) = pipes.iter().find(|p| p.bytes.len() > PIPE_CAP) {
+            return Err(PipeRestoreError { key: p.key });
+        }
+        let count = |n| Arc::new(std::sync::atomic::AtomicUsize::new(n));
+        self.thaw_pipes.clear();
+        let mut ids = Vec::with_capacity(pipes.len());
+        for p in pipes {
+            let fifo = Arc::new(Mutex::new(p.bytes.iter().copied().collect()));
+            let gid = next_pipe_gid();
+            let b = (
+                fifo,
+                count(p.writers),
+                count(p.readers),
+                gid,
+                self.charge_channel(),
+            );
+            self.thaw_pipes.insert(gid, b);
+            ids.push(gid);
+        }
+        Ok(ids)
     }
 
     /// #1361 — check every carried [`DurableBinding::Module`] digest against this host's re-granted
@@ -24591,28 +24967,55 @@ impl Host {
     /// op remap (not the LiveImpl `base_op + op` scheme), because it stands in for exactly what
     /// the generic offer dispatch would compute.
     fn instanced_offer_for_import(&self, packed: u32) -> Option<(OfferEntry, u32)> {
-        let slot = packed & 0xFFFF;
-        let cop = packed >> 16;
-        let b = self.import_bindings.get(slot as usize).copied()?;
-        if !b.bound {
-            return None;
-        }
-        let eff_op = match self
-            .import_remaps
-            .get(slot as usize)
-            .and_then(|r| r.as_ref())
-        {
-            Some(remap) => *remap.get(cop as usize)?,
-            None if cop == 0 => b.op,
-            None => return None,
-        };
-        match self.resolve(b.handle, b.type_id) {
+        let (type_id, eff_op, handle) = self.import_target(packed).ok()?;
+        match self.resolve(handle, type_id) {
             Ok(Binding::Offer(idx)) => {
                 let e = self.offers.get(idx as usize)?;
                 e.state.is_some().then(|| (e.clone(), eff_op))
             }
             _ => None,
         }
+    }
+
+    /// §3.5 — the `(type_id, op, handle)` an executable `call.import` dispatch reaches: `packed` is
+    /// the dispatch's op (`slot | consumer_op << 16`; a flat `call.sym` passes `slot`, so consumer op
+    /// `0`), resolved through the slot's live binding, and a grouped binding's consumer op through its
+    /// bind-time remap. `CapFault` for an unbound slot or an out-of-range consumer op — fail-closed,
+    /// probeable. The one translation: the dispatch ([`Host::cap_dispatch_slots`]), its pre-probe, and
+    /// an engine that must know ahead of a call what it reaches (the JIT's fork sites, #1768) all
+    /// read this.
+    pub fn import_target(&self, packed: u32) -> Result<(u32, u32, i32), Trap> {
+        let slot = packed & 0xFFFF;
+        let cop = packed >> 16;
+        let b = self
+            .import_bindings
+            .get(slot as usize)
+            .copied()
+            .ok_or(Trap::CapFault)?;
+        // An unbound rebindable slot (declared, never attached — phase 2) is fail-closed.
+        if !b.bound {
+            return Err(Trap::CapFault);
+        }
+        // A grouped binding translates the consumer-local op through its bind-time remap (frozen by
+        // the coverage walk); a flat binding requires consumer op 0 and uses the bound op.
+        let eff_op = match self
+            .import_remaps
+            .get(slot as usize)
+            .and_then(|r| r.as_ref())
+        {
+            Some(remap) => *remap.get(cop as usize).ok_or(Trap::CapFault)?,
+            None if cop == 0 => b.op,
+            None => return Err(Trap::CapFault),
+        };
+        Ok((b.type_id, eff_op, b.handle))
+    }
+
+    /// Whether `import.attach` may retarget import slot `slot` during the run (its manifest mode is
+    /// `rebindable`) — so what a `call.import` through it reaches is not fixed at instantiation.
+    pub fn import_rebindable(&self, slot: u32) -> bool {
+        self.import_bindings
+            .get(slot as usize)
+            .is_some_and(|b| b.rebindable)
     }
 
     /// CALLS.md increment 3, slice 1 — the `call.import.dyn` pre-probe. Reproduces the
@@ -24774,9 +25177,11 @@ impl Host {
     /// **Lock invariant (CALLS.md increment 3, slice 1; narrowed by 6b):** this is now the one
     /// blocking `state.lock()` accessor (the provider-pays metering pair left with 6b). It takes
     /// the provider `state` mutex *while the caller holds `&mut Host`* — an `hg → state`
-    /// acquisition order; every dispatch-path acquisition is a non-blocking `state.try_lock()`,
-    /// so no cycle can form **during a live run**. Pre-run wiring only (as today); the caveat
-    /// dissolves entirely when `ProviderState` retires (the 6d binding-merge residue).
+    /// acquisition order, the reverse of the dispatch paths' `state → hg`. Safe because it runs
+    /// **pre-run only**: during a live run the eval-loop admission blocks on `state` (#1606 — every
+    /// holder is brief, and the admitter holds no other lock while it waits) and the host-side
+    /// tier `try_lock`s it. The caveat dissolves entirely when `ProviderState` retires (the 6d
+    /// binding-merge residue).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let st = state.lock_unpoisoned();
@@ -26481,18 +26886,71 @@ impl Host {
         self.external_wake = Some(Arc::new((Mutex::new(0), Condvar::new())));
     }
 
-    /// #1768 — opt this host's run into serving a personality `execve` by **unwinding** it (the JIT,
-    /// whose caller is a live native stack the exec discards): wire the caller-request door, so the
-    /// personality's `execve` raises [`ParkEvent::ExecSelf`] instead of answering `-ENOSYS`, and arm
-    /// the slot an admitted [`ExecImage`] waits in while the run unwinds.
-    pub fn arm_exec_replace(&mut self) {
+    /// #1768 — opt this host's run into serving its personality's **caller requests** from the
+    /// `call.cap` thunk (the JIT's process driver, whose caller is a live native stack): wire the
+    /// caller-request door, so the personality's `fork`/`execve`/blocking `waitpid` raise their
+    /// [`ParkEvent`] instead of answering their no-door placeholder, and arm the slot an admitted
+    /// `execve`'s [`ExecImage`] waits in while the run unwinds.
+    pub fn arm_caller_requests(&mut self) {
         self.wire_park_door();
         self.exec_replace = Some(None);
     }
 
-    /// Whether [`Self::arm_exec_replace`] armed this host.
-    pub fn exec_replace_armed(&self) -> bool {
+    /// Whether [`Self::arm_caller_requests`] armed this host.
+    pub fn caller_requests_armed(&self) -> bool {
         self.exec_replace.is_some()
+    }
+
+    /// End the run [`Self::arm_caller_requests`] armed this host for: a host is armed exactly while
+    /// such a run is on it (dropping any image still parked).
+    pub fn disarm_caller_requests(&mut self) {
+        self.exec_replace = None;
+    }
+
+    /// #1768 — the **JIT's** fork of this process's powerbox (FORK.md §9.5): [`Self::fork_powerbox`],
+    /// except that the JIT window's page map ([`Self::cap_window_pages`]) goes with the window instead
+    /// of refusing the fork as in-flight run state. It *is* window state on the JIT — which pages the
+    /// guest committed or protected — and the twin gets a private copy of the window, so it gets a copy
+    /// of the map, filed under its own window's base (`twin_base`). The parent's map is untouched.
+    pub fn fork_powerbox_jit(&mut self, twin_pid: u64, twin_base: usize) -> Option<Host> {
+        let pages = self.cap_pages.take();
+        let twin = self.fork_powerbox(twin_pid);
+        let copy = pages
+            .as_ref()
+            .map(|(_, m)| m.lock_unpoisoned().clone())
+            .unwrap_or_default();
+        self.cap_pages = pages;
+        let mut twin = twin?;
+        twin.cap_pages = Some((twin_base, Arc::new(Mutex::new(copy))));
+        Some(twin)
+    }
+
+    /// #1768 — the exit hooks a fork twin's personalities rode in on ([`Self::fork_powerbox`]): an
+    /// engine fires them with the twin's [`reap_status`] when it finishes, so each retires the process
+    /// in its own table (Live → Zombie) before any parent waiting on it is woken.
+    pub fn exit_hooks(&self) -> Vec<Arc<dyn Fn(i64) + Send + Sync>> {
+        self.exit_hooks.clone()
+    }
+
+    /// #1768 — a **JIT** blocking wait's interrupt gate: a deliverable signal is pending whose delivery
+    /// does not carry `SA_RESTART`, so a waiting `waitpid` completes `-EINTR` rather than going on
+    /// waiting — the pre-park check the interpreters make at their park insert
+    /// ([`SignalSource::interrupt_pending`]), made by a JIT waiter before it waits and after each wake.
+    pub fn wait_interrupted(&self) -> bool {
+        self.park_interrupted()
+    }
+
+    /// #1768 — ring `bell` whenever this process's personality says a blocked caller may now proceed:
+    /// a deliverable signal ([`SignalSource::set_wake`]), a child's stop/continue/exit
+    /// ([`SignalSource::set_chld_wake`]), or bytes fed to a pipe ([`SignalSource::set_pipe_wake`]). The
+    /// JIT's waiters re-run their op on every ring (invariant 7), so the doors need not say which.
+    pub fn set_wake_bell(&self, bell: Arc<dyn Fn() + Send + Sync>) {
+        if let Some((_, source)) = self.signal_poll() {
+            let (b1, b2) = (Arc::clone(&bell), Arc::clone(&bell));
+            source.set_wake(Arc::new(move || b1()));
+            source.set_chld_wake(Arc::new(move || b2()));
+            source.set_pipe_wake(Arc::new(move |_| bell()));
+        }
     }
 
     /// Park an admitted image for the unwinding run's driver (a no-op on an unarmed host).
@@ -26835,31 +27293,8 @@ impl Host {
         // handle argument is ignored: the binding carries the granted handle (the operand is
         // vestigial in static dispatch — IMPORTS.md §2.5).
         let (type_id, op, handle) = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-            // §3.5: `op` packs `(slot | consumer_op << 16)`. A grouped binding translates the
-            // consumer-local op through its bind-time remap (frozen by the coverage walk); a
-            // flat binding requires consumer_op 0 and uses the bound op. Fail-closed on an
-            // out-of-range consumer op — probeable, like every capability fault.
-            let slot = op & 0xFFFF;
-            let cop = op >> 16;
-            let b = self
-                .import_bindings
-                .get(slot as usize)
-                .copied()
-                .ok_or(Trap::CapFault)?;
-            // An unbound rebindable slot (declared, never attached — phase 2) is fail-closed.
-            if !b.bound {
-                return Err(Trap::CapFault);
-            }
-            let eff_op = match self
-                .import_remaps
-                .get(slot as usize)
-                .and_then(|r| r.as_ref())
-            {
-                Some(remap) => *remap.get(cop as usize).ok_or(Trap::CapFault)?,
-                None if cop == 0 => b.op,
-                None => return Err(Trap::CapFault),
-            };
-            (b.type_id, eff_op, b.handle)
+            // §3.5: `op` packs `(slot | consumer_op << 16)` — see [`Host::import_target`].
+            self.import_target(op)?
         } else if type_id == temen_ir::CAP_DYN_TYPE_ID {
             // §3.5 dynamic mode by type-section reference: `op` packs `(type_idx | op << 16)`;
             // intern the registered self-module shape and re-enter with the effective id — the
@@ -29951,6 +30386,13 @@ impl Mem {
         let _ = self.write_bytes_impl(self.thaw_state_off(ctx), &state.to_le_bytes());
     }
 
+    /// #1672: set context `ctx`'s re-issue word ([`REISSUE_IN_REGION_OFF`]), marking the host call
+    /// it is in as abandoned under a landing freeze.
+    fn durable_set_reissue(&mut self, ctx: usize) {
+        let off = self.shadow.region_base(ctx) + REISSUE_IN_REGION_OFF;
+        let _ = self.write_bytes_impl(off, &1i32.to_le_bytes());
+    }
+
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
     /// stage 1): the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`) takes precedence; else
     /// context `ctx`'s per-context **thaw** word (`REWINDING`/`NORMAL`). Mirror of [`Self::durable_store_dstate`].
@@ -30271,6 +30713,24 @@ impl Mem {
             .min(self.back.len().saturating_sub(self.window.base()))
     }
 
+    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map.
+    fn high_water(&self, space: &AddrSpace) -> u64 {
+        let mut high = self.window.mapped();
+        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
+            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
+        }
+        high.min(self.window.reserved())
+    }
+
+    /// A durable capture's span: at least `snap_cap` (the escape-oracle span the JIT captures too),
+    /// and always through the high-water mark, so a page grown past `snap_cap` rides a freeze
+    /// (#1700). Only the freeze capture wants it — a run that reads just its low window must not
+    /// copy a grown heap (a compiler guest's is hundreds of MiB).
+    fn capture_extent(&self, snap_cap: usize) -> u64 {
+        let high = self.high_water(&self.space_read());
+        self.window.reserved().min(high.max(snap_cap as u64))
+    }
+
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
     /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
     /// [`restore_layout`](Mem::restore_layout). Precondition: [`layout_snapshot_safe`](Mem::layout_snapshot_safe)
@@ -30281,11 +30741,7 @@ impl Mem {
     /// children ride in the root capture.
     fn layout_snapshot(&self) -> MemLayout {
         let space = self.space.read_unpoisoned();
-        let mut high = self.window.mapped();
-        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
-            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
-        }
-        high = high.min(self.window.reserved());
+        let high = self.high_water(&space);
         // Bulk fast path (the mirror of [`snapshot`](Mem::snapshot)/[`seed`](Mem::seed)): with no §13
         // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
         // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch

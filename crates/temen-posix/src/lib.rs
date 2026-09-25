@@ -2128,88 +2128,13 @@ impl SignalSource for SignalDoor {
 /// whose declared shim signature drifts from this table is refused at bind — a clean `-EINVAL`
 /// from `execve`, never a runtime misdispatch.
 fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
-    use temen_ir::ValType::I64;
-    // (bare resolve-name, i64 params after the dummy). Order IS the op number.
-    const OPS: &[(&str, usize)] = &[
-        ("write", 3),        // 0
-        ("read", 3),         // 1
-        ("malloc", 1),       // 2
-        ("free", 1),         // 3
-        ("exit", 0),         // 4 (special-cased below: (i32, i32) -> ())
-        ("open", 3),         // 5
-        ("close", 1),        // 6
-        ("lseek", 3),        // 7
-        ("unlink", 2),       // 8
-        ("getcwd", 2),       // 9
-        ("chdir", 2),        // 10
-        ("getenv", 2),       // 11
-        ("setenv", 5),       // 12
-        ("stat", 3),         // 13
-        ("opendir", 2),      // 14
-        ("readdir", 3),      // 15
-        ("closedir", 1),     // 16
-        ("argc", 0),         // 17
-        ("argv", 3),         // 18
-        ("exec_lookup", 2),  // 19
-        ("exec_stdout", 0),  // 20
-        ("exec_stdin", 2),   // 21
-        ("exec_win", 1),     // 22
-        ("pipe", 1),         // 23
-        ("dup2", 2),         // 24
-        ("dup", 1),          // 25
-        ("fcntl", 3),        // 26
-        ("spawn", 4),        // 27
-        ("waitpid", 3),      // 28
-        ("wait", 1),         // 29
-        ("signal", 2),       // 30
-        ("kill", 2),         // 31
-        ("sigcheck", 1),     // 32
-        ("clock", 1),        // 33
-        ("getenv_r", 4),     // 34
-        ("unsetenv", 2),     // 35
-        ("environ", 3),      // 36
-        ("mkdir", 3),        // 37
-        ("rename", 4),       // 38
-        ("rmdir", 2),        // 39
-        ("sigprocmask", 3),  // 40
-        ("sigaction", 3),    // 41
-        ("sigaltstack", 2),  // 42
-        ("spawn2", 1),       // 43
-        ("getpid", 0),       // 44
-        ("setpgid", 2),      // 45
-        ("getpgid", 1),      // 46
-        ("tcgetpgrp", 1),    // 47
-        ("tcsetpgrp", 2),    // 48
-        ("isatty", 1),       // 49
-        ("getppid", 0),      // 50
-        ("fork", 1),         // 51
-        ("pipe_adopt", 3),   // 52
-        ("exec_resolve", 2), // 53
-        ("tcgetattr", 2),    // 54
-        ("tcsetattr", 2),    // 55
-        ("tcgetwinsize", 2), // 56
-        ("ttyname", 3),      // 57
-        ("fstat", 2),        // 58
-        ("statp", 3),        // 59
-        ("execve", 3),       // 60
-        ("wait4", 4),        // 61
-    ];
-    let mut names = Vec::with_capacity(OPS.len());
-    let mut sigs = Vec::with_capacity(OPS.len());
-    for (op, (name, nargs)) in OPS.iter().enumerate() {
-        // The table order must agree with `resolve` — a drift here is a bind-time refusal in
-        // every vtable consumer, but pin it eagerly too.
+    // The table and its shapes live in `temen-posix-abi`, the vocabulary a linker binds against; the
+    // order must agree with `resolve` — a drift is a bind-time refusal in every vtable consumer, so
+    // pin it eagerly too.
+    for (op, (name, _)) in temen_posix_abi::OPS.iter().enumerate() {
         debug_assert_eq!(resolve(name).map(|c| c.op), Some(op as u32), "{name}");
-        names.push(format!("__px_{name}"));
-        let params = vec![I64; if *name == "exit" { 1 } else { *nargs }];
-        let results = if *name == "exit" {
-            Vec::new()
-        } else {
-            vec![I64]
-        };
-        sigs.push(temen_ir::FuncType { params, results });
     }
-    (names, sigs)
+    temen_posix_abi::vtable()
 }
 
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {

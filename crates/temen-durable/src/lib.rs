@@ -27,7 +27,9 @@
 //!   reaches a `call.cap`) — frames stack up across the call chain. On thaw a non-deepest
 //!   frame reloads its pre-call live set and **re-issues the call** (leaving the state
 //!   `REWINDING` so the callee rewinds in turn); only the innermost leaf flips to
-//!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8).
+//!   `NORMAL`. This is the DURABILITY.md §12.7 "re-issue vs. continue" branch (R8). The
+//!   re-issued call then polls like the original: the program runs on inside it, and a later
+//!   freeze can land beneath it.
 //!
 //! Each original block is split at its suspend ops into forward segments; branch targets
 //! are remapped to the target block's first segment; a `br_table` in the prologue dispatch
@@ -47,8 +49,11 @@
 //! `call.dyn` of type `T` suspends iff some function of type `T` does — the natural table
 //! admits any signature match), and the site re-issues the call on thaw with the reloaded index
 //! (`SuspendKind::PropagatedIndirect`), so the re-selected — and, by the taint rule, instrumented
-//! — callee rewinds in turn. Out of scope (rejected — the frame is replaced, so there is no poll to
-//! unwind at): a **tail** call, direct or indirect, into a may-suspend callee.
+//! — callee rewinds in turn. An unwind the runtime may *decline* (a fork) narrows that to the
+//! functions the module takes the address of, and fronts every other may-suspend function's table
+//! slot with a **barrier** that declines an unwind beneath it ([`IndirectReach`]). Out of scope
+//! (rejected — the frame is replaced, so there is no poll to unwind at): a **tail** call, direct or
+//! indirect, into a may-suspend callee.
 //!
 //! The remaining extensions (DURABILITY.md §9) are fibers / multi-vCPU / STW (Phase 3).
 
@@ -144,10 +149,14 @@ pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// `[32, 64)` gap, so an unarmed run stays byte-identical. Must equal `temen-interp`'s copy.
 pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
 /// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
-/// the 8-byte shadow-SP word plus the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to
-/// keep frames 8-aligned. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
+/// the 8-byte shadow-SP word, the 4-byte thaw state word at [`STATE_IN_REGION_OFF`] and the 4-byte
+/// re-issue word at [`REISSUE_IN_REGION_OFF`]. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
 /// `temen-interp`/`temen-jit`'s copy.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
+/// #1672: byte offset of the per-context **re-issue** word within a context's region — set by the
+/// runtime when it abandons a host call that would have parked under a landing freeze, and moved into
+/// that call's shadow frame by its unwind, so the thaw re-issues the call instead of reloading a result.
+pub use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
 /// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
 pub use temen_ir::durable_abi::SHADOW_SP_OFF;
 /// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
@@ -209,11 +218,131 @@ pub enum TransformError {
     GuestUsesMemory,
 }
 
+/// How [`transform`] instruments a module — the one transform, parameterized by who unwinds it.
+#[derive(Clone, Copy)]
+pub struct TransformOpts<'a> {
+    /// Refuse a module any of whose functions touch linear memory (R9) — the strict path for an
+    /// untrusted module ([`transform_module`]). Off for a cooperating toolchain's module
+    /// ([`transform_module_assume_confined`]).
+    pub enforce_r9: bool,
+    /// Which suspendable operations (a capability call, a fiber switch, a `thread.join`, an
+    /// `atomic.wait`) are suspend points. `None` instruments every one: a durable domain can be
+    /// caught by a freeze inside any of them. `Some(site)` instruments only the ops `site` admits,
+    /// and so only the functions that can reach one: a **fork** (#1768, FORK.md §9.5) is an unwind
+    /// the guest's own call triggers, so only the calls that can fork need a poll, and a program
+    /// that cannot reach one is left byte-identical. The runtime unwinds only at an op this admitted.
+    pub sites: Option<&'a dyn Fn(&Inst) -> bool>,
+    /// Poll at every loop header too (Phase-4 Slice A: an async freeze lands in a poll-free loop
+    /// at bounded latency). An unwind the guest's own call starts is never inside a loop body, so
+    /// a fork needs none.
+    pub loop_polls: bool,
+    /// The unwind duplicates the running thread **alive** — a fork — rather than freezing it into a
+    /// snapshot, so the thread state an engine keeps outside the window travels with it: the vCPU TLS
+    /// register (`vcpu.tls.*`) needs no frame slot, and the ops on it instrument like any other. A
+    /// snapshot carries the window alone, so for a freeze (`false`) those ops fail closed
+    /// (`UnsupportedInst`) rather than thaw with the register lost.
+    pub carries_thread: bool,
+    /// Which functions a `call.dyn` can select, for the may-suspend taint (see [`IndirectReach`]).
+    pub indirect: IndirectReach,
+}
+
+/// Which functions a `call.dyn` of a given signature can select — the may-suspend taint's reading
+/// of an indirect call (R8), whose target is a runtime table index.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndirectReach {
+    /// **Any** function of that signature. A funcref is a forgeable integer (§3c) and the table maps
+    /// every function into a slot, so this is the only reading sound for every program: every
+    /// may-suspend function taints its signature. The reading for an unwind the runtime must be
+    /// able to complete wherever it lands — a freeze.
+    Signature,
+    /// Only a function whose address the module **takes** (`ref.func`) — the indirect calls a
+    /// program makes through the funcrefs it was given. Every other may-suspend function whose
+    /// signature is left untainted is one no instrumented `call.dyn` can select, so an index that
+    /// selects it is forged (or baked into the data image, which a linked module no longer records)
+    /// and lands from an uninstrumented site: its table slot is fronted by a **barrier** that holds
+    /// the running context's shadow stack occupied ([`BARRIER_SP`]) while the real body runs. The
+    /// body moves to the end of the module, and every static reference enters it directly
+    /// ([`Instrumented::body`]). The runtime's half of the contract: it starts an unwind only when
+    /// the running context's shadow-SP is its empty frame base ([`ShadowArena::frame_base`]), so a
+    /// barrier below the call declines it. The reading for an unwind the runtime may decline — a
+    /// fork (FORK.md §9.5), which one call site triggers: it instruments the calls that can reach a
+    /// fork, not every function that shares a signature with one.
+    AddressTaken,
+}
+
+/// The shadow-SP a barrier ([`IndirectReach::AddressTaken`]) holds while its body runs: `0`, below
+/// every arena (which starts at or above [`DURABLE_CONTROL_END`]), so it never reads as a context's
+/// empty frame base — and a push at it would fault on the NULL guard rather than land anywhere.
+pub const BARRIER_SP: u64 = 0;
+const _: () = assert!(BARRIER_SP < DURABLE_CONTROL_END);
+
+/// A module [`transform`] instrumented.
+#[derive(Clone, Debug)]
+pub struct Instrumented {
+    pub module: Module,
+    /// `body[f]` is where input function `f`'s body lives in `module`: `f` itself, unless a
+    /// barrier took its place ([`IndirectReach::AddressTaken`]) and the body moved to the end. Enter
+    /// a function at its body to run it directly (a run's entry); its own index is the table slot a
+    /// `call.dyn` lands on.
+    pub body: Vec<FuncIdx>,
+}
+
+impl<'a> TransformOpts<'a> {
+    /// A durable domain's instrumentation: every suspendable op, loop polls, strict R9.
+    pub const DURABLE: TransformOpts<'static> = TransformOpts {
+        enforce_r9: true,
+        sites: None,
+        loop_polls: true,
+        carries_thread: false,
+        indirect: IndirectReach::Signature,
+    };
+
+    /// A **fork**'s instrumentation (#1768, FORK.md §9.5): the unwind a guest's own call starts, at
+    /// the ops `sites` admits — so no loop polls; the thread travels alive (`carries_thread`); and,
+    /// the runtime being free to decline it, a `call.dyn` reads only the address-taken functions
+    /// ([`IndirectReach::AddressTaken`]). A forking program is a cooperating toolchain's, which keeps
+    /// its data and heap clear of its own declared arena (the verifier holds its data segments to
+    /// that; R9's contract covers the rest), so R9 is not enforced.
+    pub fn fork(sites: &'a dyn Fn(&Inst) -> bool) -> Self {
+        TransformOpts {
+            enforce_r9: false,
+            sites: Some(sites),
+            loop_polls: false,
+            carries_thread: true,
+            indirect: IndirectReach::AddressTaken,
+        }
+    }
+
+    /// Whether `x` is a suspend point under these options.
+    fn is_site(&self, x: &Inst) -> bool {
+        is_suspendable_op(x) && self.sites.is_none_or(|site| site(x))
+    }
+}
+
+/// The operations that can suspend a frame to the host or another stack: `call.cap` suspends to
+/// the host; a fiber `cont.resume`/`suspend` switches stacks and is a freeze safepoint too
+/// (`cont.new` alone merely allocates); `call.import` / `call.import.dyn` / `call.sym` are
+/// capability calls bound at run time (IMPORTS.md) — the same host suspend as `call.cap` (#1300
+/// Phase 2); a vCPU blocked in `thread.join` or `atomic.wait` is a safepoint (§12.8).
+fn is_suspendable_op(x: &Inst) -> bool {
+    matches!(
+        x,
+        Inst::CapCall { .. }
+            | Inst::CallImport { .. }
+            | Inst::CallImportDyn { .. }
+            | Inst::CallSym { .. }
+            | Inst::ContResume { .. }
+            | Inst::Suspend { .. }
+            | Inst::ThreadJoin { .. }
+            | Inst::MemoryWait { .. }
+    )
+}
+
 /// Instrument every may-suspend function in `m` for freeze/thaw. Functions that can
 /// never suspend are returned unchanged. The result is ordinary IR; run it through
 /// `temen_verify::verify_module` before executing.
 pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
-    transform_module_inner(m, true)
+    transform(m, &TransformOpts::DURABLE).map(|t| t.module)
 }
 
 /// Like [`transform_module`], but **allows the guest to use linear memory**, on the caller's
@@ -228,13 +357,24 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
 /// violates it can corrupt only its own durability, and fails safe (see the region notes) —
 /// so prefer [`transform_module`] (fails closed, no memory) for *untrusted* modules.
 pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformError> {
-    transform_module_inner(m, false)
+    transform(
+        m,
+        &TransformOpts {
+            enforce_r9: false,
+            ..TransformOpts::DURABLE
+        },
+    )
+    .map(|t| t.module)
 }
 
-fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
+/// Instrument `m` as `opts` says (see [`TransformOpts`]); [`transform_module`] and
+/// [`transform_module_assume_confined`] are its two durable presets.
+pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, TransformError> {
+    let enforce_r9 = opts.enforce_r9;
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
-    let may_suspend = compute_may_suspend(&m.funcs, &m.types);
-    let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend);
+    let targets = indirect_targets(&m.funcs, opts.indirect);
+    let may_suspend = compute_may_suspend(&m.funcs, &m.types, opts, &targets);
+    let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend, &targets);
     let any_instrumented = may_suspend.iter().any(|&s| s);
 
     // R9 enforcement: the durable region shares the window with guest memory at fixed low
@@ -272,6 +412,7 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
                 &tainted_sigs,
                 &m.types,
                 arena.end,
+                opts,
             )?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
@@ -289,7 +430,105 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
             return Err(TransformError::MemoryTooSmall);
         }
     }
-    Ok(out)
+
+    // A may-suspend function whose signature no selectable may-suspend function shares is one no
+    // instrumented `call.dyn` can reach: under `AddressTaken`, its slot gets a barrier and its body
+    // moves to the end (see [`IndirectReach::AddressTaken`]). Under `Signature` every may-suspend
+    // function taints its own signature, so there is none.
+    let mut body: Vec<FuncIdx> = (0..m.funcs.len() as FuncIdx).collect();
+    for (g, f) in m.funcs.iter().enumerate() {
+        if may_suspend[g] && !tainted_sigs.iter().any(|s| sig_matches(s, f)) {
+            let moved = out.funcs.len() as FuncIdx;
+            let real = std::mem::replace(&mut out.funcs[g], barrier(f, moved));
+            out.funcs.push(real);
+            body[g] = moved;
+        }
+    }
+    retarget_static_refs(&mut out, &body);
+    Ok(Instrumented { module: out, body })
+}
+
+/// The functions a `call.dyn` can select under `reach` (see [`IndirectReach`]).
+fn indirect_targets(funcs: &[Func], reach: IndirectReach) -> Vec<bool> {
+    let mut targets = vec![reach == IndirectReach::Signature; funcs.len()];
+    if reach == IndirectReach::AddressTaken {
+        for x in funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
+        {
+            if let Inst::RefFunc { func } = x {
+                if let Some(t) = targets.get_mut(*func as usize) {
+                    *t = true;
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Whether `f` has signature `s`.
+fn sig_matches(s: &FuncType, f: &Func) -> bool {
+    s.params == f.params && s.results == f.results
+}
+
+/// The **barrier** that takes a function's table slot when its body moves to `body`
+/// ([`IndirectReach::AddressTaken`]): it holds the running context's shadow stack occupied
+/// ([`BARRIER_SP`]) for the duration of a call to the body, then restores it. It has the body's
+/// signature and returns its results, so a `call.dyn` that selects the slot computes exactly what it
+/// did — only an unwind beneath it is declined.
+fn barrier(f: &Func, body: FuncIdx) -> Func {
+    let mut b = Bb::new(f.params.clone());
+    let sp_a = b.one(Inst::DurableShadowBase);
+    let sp = b.one(load(LoadOp::I64, sp_a, 0));
+    let occupied = b.one(Inst::ConstI64(BARRIER_SP as i64));
+    b.zero(store(StoreOp::I64, sp_a, occupied, 0));
+    let args = (0..f.params.len() as ValIdx).collect();
+    let results = b.many(Inst::Call { func: body, args }, f.results.len());
+    b.zero(store(StoreOp::I64, sp_a, sp, 0));
+    Func {
+        params: f.params.clone(),
+        results: f.results.clone(),
+        blocks: vec![b.finish(Terminator::Return(results))],
+    }
+}
+
+/// Point every **static** reference to a function at its body (`body`, see [`Instrumented`]): the
+/// calls, a thread's entry, the exports and impl-export ops a host enters directly, and the debug
+/// info that describes the body. A `ref.func` is left alone: its value is a table slot — a barrier's,
+/// for a moved function — and none names one the analysis gave a barrier.
+fn retarget_static_refs(m: &mut Module, body: &[FuncIdx]) {
+    let to = |f: &mut FuncIdx| {
+        if let Some(&b) = body.get(*f as usize) {
+            *f = b;
+        }
+    };
+    for f in &mut m.funcs {
+        for blk in &mut f.blocks {
+            for inst in &mut blk.insts {
+                if let Inst::Call { func, .. } | Inst::ThreadSpawn { func, .. } = inst {
+                    to(func);
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &mut blk.term {
+                to(func);
+            }
+        }
+    }
+    for e in &mut m.exports {
+        to(&mut e.func);
+    }
+    for e in &mut m.impl_exports {
+        e.ops.iter_mut().for_each(to);
+    }
+    if let Some(di) = &mut m.debug_info {
+        di.locs.iter_mut().for_each(|l| to(&mut l.func));
+        di.func_names.iter_mut().for_each(|n| to(&mut n.func));
+        for v in &mut di.vars {
+            if v.func != temen_ir::GLOBAL_SCOPE {
+                to(&mut v.func);
+            }
+        }
+    }
 }
 
 /// A guest linear-memory instruction (one that reads or writes a window address). These
@@ -482,49 +721,35 @@ fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
 /// maps *every* function into a slot (and `Jit.install` can add more at run time), so the
 /// only sound static rule is by **signature**: a `call.dyn` of type `T` can reach any
 /// function whose signature equals `T`, hence it suspends iff **some may-suspend function
-/// shares its signature**. This is the ceiling of static precision here — there is no
-/// element/table section in the IR to narrow it (DURABILITY.md §6; the breadth cost is R7).
-/// The taint set grows with `ms`, so it is re-read each fixpoint round (a newly-may-suspend
-/// function taints its own signature). Marking the caller (rather than ignoring the
-/// indirect call) is what flips R8 from fail-**open** — silent under-instrumentation — to
-/// sound: `transform_func` then either instruments the site or fails the module closed.
-fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
-    let mut ms = vec![false; funcs.len()];
-    for (i, f) in funcs.iter().enumerate() {
-        if f.blocks.iter().any(|b| {
-            b.insts.iter().any(|x| {
-                // `call.cap` suspends to the host; a fiber `cont.resume`/`suspend` switches
-                // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
-                // `call.import` / `call.import.dyn` / `call.sym` are capability calls bound at
-                // run time (IMPORTS.md) — the same host suspend as `call.cap` (#1300 Phase 2).
-                matches!(
-                    x,
-                    Inst::CapCall { .. }
-                        | Inst::CallImport { .. }
-                        | Inst::CallImportDyn { .. }
-                        | Inst::CallSym { .. }
-                        | Inst::ContResume { .. }
-                        | Inst::Suspend { .. }
-                        | Inst::ThreadJoin { .. }
-                        | Inst::MemoryWait { .. }
-                )
-            })
-        }) {
-            ms[i] = true;
-        }
-    }
+/// shares its signature**. This is the ceiling of static precision for an unwind that must
+/// complete wherever it lands — there is no element/table section in the IR to narrow it
+/// (DURABILITY.md §6; the breadth cost is R7). An unwind the runtime may decline reads only the
+/// address-taken functions as selectable (`targets`), and a barrier declines it beneath any other
+/// ([`IndirectReach::AddressTaken`]). The taint set grows with `ms`, so it is re-read each fixpoint
+/// round (a newly-may-suspend function taints its own signature). Marking the caller (rather than
+/// ignoring the indirect call) is what flips R8 from fail-**open** — silent under-instrumentation —
+/// to sound: `transform_func` then either instruments the site or fails the module closed.
+fn compute_may_suspend(
+    funcs: &[Func],
+    types: &[TypeEntry],
+    opts: &TransformOpts,
+    targets: &[bool],
+) -> Vec<bool> {
+    let mut ms: Vec<bool> = funcs
+        .iter()
+        .map(|f| {
+            f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|x| opts.is_site(x)))
+        })
+        .collect();
     loop {
         // A `call.dyn` of type `ty` reaches a may-suspend target iff some already-may-suspend
-        // function has that exact signature. Re-derived each round from the live `ms`. Collect the
-        // newly-tainted functions first (read-only over `ms`), then apply — so the taint predicate's
-        // borrow of `ms` doesn't clash with the mutation.
-        let tainted = |ty: u32| -> bool {
-            let ft = sig_of(types, ty);
-            funcs
-                .iter()
-                .enumerate()
-                .any(|(j, g)| ms[j] && g.params == ft.params && g.results == ft.results)
-        };
+        // function it can select (`targets`, per [`IndirectReach`]) has that exact signature.
+        // Re-derived each round from the live `ms`; collect the newly-tainted functions first, then
+        // apply.
+        let sigs = tainted_signatures(funcs, &ms, targets);
+        let tainted = |ty: u32| sigs.contains(sig_of(types, ty));
         let to_mark: Vec<usize> = funcs
             .iter()
             .enumerate()
@@ -559,13 +784,14 @@ fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
     ms
 }
 
-/// The distinct signatures of the may-suspend functions — the tainted set a `call.dyn`
-/// checks its type against (see [`compute_may_suspend`]). Computed once from the final `ms`
-/// and threaded into `transform_func` so it recognizes indirect suspend sites the same way.
-fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<temen_ir::FuncType> {
+/// The distinct signatures of the may-suspend functions a `call.dyn` can select (`targets`) — the
+/// tainted set a `call.dyn` checks its type against (see [`compute_may_suspend`]). Computed once
+/// from the final `ms` and threaded into `transform_func` so it recognizes indirect suspend sites
+/// the same way.
+fn tainted_signatures(funcs: &[Func], ms: &[bool], targets: &[bool]) -> Vec<temen_ir::FuncType> {
     let mut sigs: Vec<temen_ir::FuncType> = Vec::new();
     for (i, f) in funcs.iter().enumerate() {
-        if ms[i] {
+        if ms[i] && targets[i] {
             let ty = temen_ir::FuncType {
                 params: f.params.clone(),
                 results: f.results.clone(),
@@ -583,8 +809,10 @@ fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<temen_ir::FuncType> {
 /// functions, this is the set a durable host stashes so it can gate later `Jit.compile`s
 /// ([`unit_suspends_untainted`]). Exposed for the durable-JIT install fence (DURABILITY.md §12.5).
 pub fn tainted_signatures_of(funcs: &[Func], types: &[TypeEntry]) -> Vec<temen_ir::FuncType> {
-    let ms = compute_may_suspend(funcs, types);
-    tainted_signatures(funcs, &ms)
+    let opts = TransformOpts::DURABLE;
+    let targets = indirect_targets(funcs, opts.indirect);
+    let ms = compute_may_suspend(funcs, types, &opts, &targets);
+    tainted_signatures(funcs, &ms, &targets)
 }
 
 /// The durable-JIT install fence (DURABILITY.md §12.5, R8 fork-critical case). Returns `true`
@@ -605,7 +833,9 @@ pub fn unit_suspends_untainted(
     if unit_funcs.is_empty() {
         return false; // no entry to invoke; the empty-unit case is rejected elsewhere
     }
-    let ms = compute_may_suspend(unit_funcs, unit_types);
+    let opts = TransformOpts::DURABLE;
+    let targets = indirect_targets(unit_funcs, opts.indirect);
+    let ms = compute_may_suspend(unit_funcs, unit_types, &opts, &targets);
     if !ms[0] {
         return false; // entry cannot suspend → no continuation to lose → safe
     }
@@ -618,8 +848,13 @@ pub fn unit_suspends_untainted(
 
 /// The single may-suspend operation in an instrumented block.
 enum SuspendKind {
-    /// `call.cap`: the host performs the op; the deepest frame reloads its result.
-    Leaf,
+    /// A host call (`call.cap` / `call.import` / `call.import.dyn` / `call.sym`); `op` is the original
+    /// instruction. It is the deepest frame, and its thaw arm does one of two things. A call the host
+    /// **performed** before the cut reloads its result. A call the runtime **abandoned** without effect
+    /// (it would have parked while a freeze was landing, #1672) is **re-issued** with its reloaded
+    /// operands. The runtime marks an abandoned call by setting the context's re-issue word
+    /// ([`REISSUE_IN_REGION_OFF`]); the unwind spills that word into the frame and clears it.
+    Leaf { op: Inst },
     /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
     /// `call.dyn` to a (by-signature, conservatively) may-suspend target (R8): the indirect
@@ -702,7 +937,10 @@ impl SuspendKind {
     /// operands; `Leaf`/`LoopHeader` have none (they only reload their own result / block params).
     fn operands(&self) -> Vec<ValIdx> {
         match self {
-            SuspendKind::Leaf | SuspendKind::LoopHeader => Vec::new(),
+            SuspendKind::Leaf { op } => {
+                inst_operands(op).expect("a host call's operands are modeled")
+            }
+            SuspendKind::LoopHeader => Vec::new(),
             SuspendKind::Propagated { args, .. } => args.clone(),
             SuspendKind::PropagatedIndirect { idx, args, .. } => {
                 let mut v = Vec::with_capacity(args.len() + 1);
@@ -736,7 +974,7 @@ impl SuspendKind {
     fn flips_thaw_word(&self) -> bool {
         matches!(
             self,
-            SuspendKind::Leaf
+            SuspendKind::Leaf { .. }
                 | SuspendKind::LoopHeader
                 | SuspendKind::Yield { .. }
                 | SuspendKind::ThreadJoin { .. }
@@ -757,7 +995,8 @@ struct PointPlan {
     frame_offsets: Vec<u64>,  // window offset of each spilled value (parallel to `spilled`)
     frame_size: u64,
     rid_off: u64,
-    cont_seg: u32, // new block index of the continuation segment (after the op)
+    flag_off: Option<u64>, // a host call's spilled re-issue word (`Leaf` only)
+    cont_seg: u32,         // new block index of the continuation segment (after the op)
 }
 
 /// Per-original-block analysis: value types, the value count after each instruction, and
@@ -785,6 +1024,7 @@ fn transform_func(
     type_section: &[TypeEntry],
     // The shadow-overflow trap line: the module's declared arena `end`.
     arena_end: u64,
+    opts: &TransformOpts,
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
     // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
@@ -813,7 +1053,13 @@ fn transform_func(
         let mut types = blk.params.clone();
         let mut vend = Vec::with_capacity(blk.insts.len());
         for inst in &blk.insts {
-            types.extend(result_types(inst, &types, func_results, type_section)?);
+            types.extend(result_types(
+                inst,
+                &types,
+                func_results,
+                type_section,
+                opts,
+            )?);
             vend.push(types.len());
         }
         let scs: Vec<usize> = blk
@@ -821,17 +1067,9 @@ fn transform_func(
             .iter()
             .enumerate()
             .filter(|(_, inst)| match inst {
-                Inst::CapCall { .. }
-                | Inst::CallImport { .. }
-                | Inst::CallImportDyn { .. }
-                | Inst::CallSym { .. }
-                | Inst::ContResume { .. }
-                | Inst::Suspend { .. }
-                | Inst::ThreadJoin { .. }
-                | Inst::MemoryWait { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
                 Inst::CallIndirect { ty, .. } => is_tainted(*ty),
-                _ => false,
+                x => opts.is_site(x),
             })
             .map(|(pos, _)| pos)
             .collect();
@@ -854,10 +1092,12 @@ fn transform_func(
     // the R6 caveat). Each header adds one resume point (a `LoopHeader` poll) and one segment (the
     // poll itself, ahead of the header's body segments).
     let mut is_header = vec![false; nb];
-    for (b, blk) in f.blocks.iter().enumerate() {
-        for t in term_targets(&blk.term) {
-            if (t as usize) <= b {
-                is_header[t as usize] = true;
+    if opts.loop_polls {
+        for (b, blk) in f.blocks.iter().enumerate() {
+            for t in term_targets(&blk.term) {
+                if (t as usize) <= b {
+                    is_header[t as usize] = true;
+                }
             }
         }
     }
@@ -977,21 +1217,14 @@ fn transform_func(
                 frame_offsets,
                 rid_off: frame_size - 4,
                 frame_size,
+                flag_off: None,
                 cont_seg: seg(b, 0), // re-enter the header body, past the poll
             });
             let mut psb = Bb::new(slot_types);
-            let (st_a, st_off) = psb.freeze_word_addr();
-            let st = psb.one(load(LoadOp::I32, st_a, st_off));
-            let unw = psb.one(Inst::ConstI32(STATE_UNWINDING));
-            let is_unw = psb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
             let live: Vec<ValIdx> = (0..plen as u32).collect();
-            seg_blocks.push(psb.finish(Terminator::BrIf {
-                cond: is_unw,
-                then_blk: unwind_base + 2 * gid, // the point's UNWIND check block
-                then_args: live.clone(),
-                else_blk: seg(b, 0), // the header body
-                else_args: live,
-            }));
+            // On to the header body (the point's continuation) unless a freeze is unwinding.
+            let term = poll(&mut psb, unwind_base + 2 * gid, seg(b, 0), live);
+            seg_blocks.push(psb.finish(term));
         }
         for k in 0..=m {
             let mut sb = Bb::new(bi.types[0..in_of(k)].to_vec());
@@ -1002,19 +1235,10 @@ fn transform_func(
                 sb.insts.extend_from_slice(&blk.insts[seg_start..=pos]);
                 let out = bi.vend[pos];
                 sb.next = out as u32;
-                let (st_a, st_off) = sb.freeze_word_addr();
-                let st = sb.one(load(LoadOp::I32, st_a, st_off));
-                let unw = sb.one(Inst::ConstI32(STATE_UNWINDING));
-                let is_unw = sb.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
                 let gid = points.len() as u32;
                 let live: Vec<ValIdx> = (0..out as u32).collect();
-                seg_blocks.push(sb.finish(Terminator::BrIf {
-                    cond: is_unw,
-                    then_blk: unwind_base + 2 * gid, // the point's UNWIND check block
-                    then_args: live.clone(),
-                    else_blk: seg(b, k + 1),
-                    else_args: live,
-                }));
+                let term = poll(&mut sb, unwind_base + 2 * gid, seg(b, k + 1), live);
+                seg_blocks.push(sb.finish(term));
 
                 // resume plan for this point
                 let kind = match &blk.insts[pos] {
@@ -1038,10 +1262,10 @@ fn transform_func(
                     // effect happened before the freeze, so the thaw reloads its result. (A
                     // durable domain never resolves an import to a serve op — `Host::import_binding`
                     // fails those closed — so the `SvcServe` re-issue case cannot hide behind one.)
-                    Inst::CapCall { .. }
+                    op @ (Inst::CapCall { .. }
                     | Inst::CallImport { .. }
                     | Inst::CallImportDyn { .. }
-                    | Inst::CallSym { .. } => SuspendKind::Leaf,
+                    | Inst::CallSym { .. }) => SuspendKind::Leaf { op: op.clone() },
                     Inst::Call { func, args } => SuspendKind::Propagated {
                         callee: *func,
                         args: args.clone(),
@@ -1073,7 +1297,7 @@ fn transform_func(
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (
-                        SuspendKind::Leaf,
+                        SuspendKind::Leaf { .. },
                         Inst::CapCall { sig, .. }
                         | Inst::CallImport { sig, .. }
                         | Inst::CallImportDyn { sig, .. }
@@ -1100,7 +1324,7 @@ fn transform_func(
                 let save_end = match kind {
                     // A wait's status is spilled too (#1769): one the wait completed with before the
                     // cut is delivered on thaw; only the freeze's own `WAIT_FROZEN` re-issues it.
-                    SuspendKind::Leaf | SuspendKind::MemoryWait { .. } => out,
+                    SuspendKind::Leaf { .. } | SuspendKind::MemoryWait { .. } => out,
                     // The op's results are recomputed (re-issue) or redelivered (resume), so
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
@@ -1144,6 +1368,11 @@ fn transform_func(
                 for o in kind.operands() {
                     used[o as usize] = true;
                 }
+                // A leaf's own results are always in its frame, even ones the continuation never
+                // reads: they are the reply slot a host injects into before a thaw (#1768).
+                if matches!(kind, SuspendKind::Leaf { .. }) {
+                    used[out - nres..out].iter_mut().for_each(|u| *u = true);
+                }
                 // A wait's thaw arm reads its own status to decide re-issue vs. deliver (#1769).
                 if matches!(kind, SuspendKind::MemoryWait { .. }) {
                     used[out - 1] = true;
@@ -1153,16 +1382,32 @@ fn transform_func(
                 } else {
                     (0..save_end).filter(|&i| used[i]).collect()
                 };
-                // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top.
-                let mut frame_offsets = Vec::with_capacity(spilled.len());
+                // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top. A
+                // leaf's results come first, at the frame base, in declaration order — the reply
+                // slot (`ShadowArena::leaf_reply`); the rest of its live set follows. `spilled`
+                // itself stays in value order (the reload order), so each value keeps its own offset.
+                let is_reply =
+                    |i: usize| matches!(kind, SuspendKind::Leaf { .. }) && i >= out - nres;
+                let mut frame_offsets = vec![0u64; spilled.len()];
                 let mut off = 0u64;
-                for &i in &spilled {
+                let replies_first = (0..spilled.len())
+                    .filter(|&j| is_reply(spilled[j]))
+                    .chain((0..spilled.len()).filter(|&j| !is_reply(spilled[j])));
+                for j in replies_first.collect::<Vec<_>>() {
+                    let i = spilled[j];
                     off = align_up(off, vsize(slot_types[i]));
-                    frame_offsets.push(off);
+                    frame_offsets[j] = off;
                     off += vsize(slot_types[i]);
                 }
+                // A host call's frame also carries the re-issue word it saw (#1672), below the id.
+                let flag_off = matches!(kind, SuspendKind::Leaf { .. }).then(|| {
+                    off = align_up(off, 4);
+                    off += 4;
+                    off - 4
+                });
                 let frame_size = align_up(off + 4, 16);
                 points.push(PointPlan {
+                    flag_off,
                     kind,
                     nres,
                     out,
@@ -1214,6 +1459,8 @@ fn transform_func(
     for (gid, pt) in points.iter().enumerate() {
         // index in `pt.spilled` (and thus the reloaded vec) of a block-local value, if spilled
         let spill_slot = |i: usize| pt.spilled.binary_search(&i).ok();
+        // The point's UNWIND check block — where its polls send an unwinding frame.
+        let unwind_blk = unwind_base + 2 * gid as u32;
 
         // UNWIND check: a push of this frame must not run past the reserve into guest memory
         // (R9 / DURABILITY.md §12.7). The shadow stack mirrors the call stack, so this only
@@ -1231,7 +1478,7 @@ fn transform_func(
             cond: over,
             then_blk: trap_blk,
             then_args: vec![],
-            else_blk: unwind_base + 2 * gid as u32 + 1, // the spill block
+            else_blk: unwind_blk + 1, // the spill block
             else_args: live,
         }));
 
@@ -1241,6 +1488,14 @@ fn transform_func(
         let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
         for (j, &i) in pt.spilled.iter().enumerate() {
             ub.zero(spill(pt.slot_types[i], sp, i as u32, pt.frame_offsets[j]));
+        }
+        // A host call moves the context's re-issue word into its frame and clears it, so the word
+        // is set only between the abandoning runtime and this spill.
+        if let Some(flag_off) = pt.flag_off {
+            let flag = ub.one(load(LoadOp::I32, sp_a, REISSUE_IN_REGION_OFF));
+            ub.zero(store(StoreOp::I32, sp, flag, flag_off));
+            let zero = ub.one(Inst::ConstI32(0));
+            ub.zero(store(StoreOp::I32, sp_a, zero, REISSUE_IN_REGION_OFF));
         }
         let rid = ub.one(Inst::ConstI32(gid as i32 + 1));
         ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
@@ -1262,6 +1517,7 @@ fn transform_func(
             .enumerate()
             .map(|(j, &i)| ab.one(reload(pt.slot_types[i], base, pt.frame_offsets[j])))
             .collect();
+        let flag = pt.flag_off.map(|o| ab.one(load(LoadOp::I32, base, o)));
         ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
 
         // Flip the shadow thaw-state word back to `NORMAL` for the globally-deepest frozen frame
@@ -1279,7 +1535,7 @@ fn transform_func(
             // A leaf call.cap and a loop-header poll are both the globally-deepest frozen frame with
             // no op to re-issue: the leaf then reloads its call.cap result; the header reloads its
             // block params and re-enters the body (`cont_seg`). Neither produces an `op_results` value.
-            SuspendKind::Leaf | SuspendKind::LoopHeader => vec![],
+            SuspendKind::Leaf { .. } | SuspendKind::LoopHeader => vec![],
             SuspendKind::Propagated { callee, args } => {
                 let mapped: Vec<ValIdx> = args
                     .iter()
@@ -1403,54 +1659,65 @@ fn transform_func(
             })
             .collect();
         let term = match &pt.kind {
+            // A wait that completed before the cut (woken, not-equal, timed out) delivers its status
+            // as it was; one the freeze ended (`WAIT_FROZEN`) is re-issued and re-checks the restored
+            // value (#1769).
             SuspendKind::MemoryWait {
                 ty,
                 addr,
                 expected,
                 timeout,
             } => {
-                let ops = [*addr, *expected, *timeout].map(|v| {
-                    reloaded[spill_slot(v as usize).expect("atomic.wait operand spilled")]
-                });
                 let status = cont_args[pt.out - 1];
                 let frozen = ab.one(Inst::ConstI32(WAIT_FROZEN));
-                let reissue = ab.one(icmp(IntTy::I32, CmpOp::Eq, status, frozen));
-                // The re-issue block: the continuation's args but the status, then the operands.
-                let kept = pt.out - 1;
-                let mut params = pt.slot_types[..kept].to_vec();
-                params.extend([*addr, *expected, *timeout].map(|v| pt.slot_types[v as usize]));
-                let mut rb = Bb::new(params);
-                let n = kept as u32;
-                let r = rb.many(
-                    Inst::MemoryWait {
-                        ty: *ty,
-                        addr: n,
-                        expected: n + 1,
-                        timeout: n + 2,
+                let cond = ab.one(icmp(IntTy::I32, CmpOp::Eq, status, frozen));
+                let ty = *ty;
+                reissue_branch(
+                    &mut extra_blocks,
+                    trap_blk + 1,
+                    unwind_blk,
+                    pt,
+                    cont_args,
+                    cond,
+                    &[*addr, *expected, *timeout],
+                    &reloaded,
+                    |p| Inst::MemoryWait {
+                        ty,
+                        addr: p[0],
+                        expected: p[1],
+                        timeout: p[2],
                     },
-                    pt.nres,
-                );
-                let mut args: Vec<ValIdx> = (0..n).collect();
-                args.extend(r);
-                let blk = trap_blk + 1 + extra_blocks.len() as u32;
-                extra_blocks.push(rb.finish(Terminator::Br {
-                    target: pt.cont_seg,
-                    args,
-                }));
-                let mut then_args = cont_args[..kept].to_vec();
-                then_args.extend(ops);
-                Terminator::BrIf {
-                    cond: reissue,
-                    then_blk: blk,
-                    then_args,
-                    else_blk: pt.cont_seg,
-                    else_args: cont_args,
-                }
+                )
             }
-            _ => Terminator::Br {
+            // A host call the runtime abandoned (its spilled re-issue word is set) is re-issued; one
+            // it performed reloads its result (#1672).
+            SuspendKind::Leaf { op } => {
+                let flag = flag.expect("a host call's frame carries its re-issue word");
+                let zero = ab.one(Inst::ConstI32(0));
+                let cond = ab.one(icmp(IntTy::I32, CmpOp::Ne, flag, zero));
+                let operands = inst_operands(op).expect("a host call's operands are modeled");
+                reissue_branch(
+                    &mut extra_blocks,
+                    trap_blk + 1,
+                    unwind_blk,
+                    pt,
+                    cont_args,
+                    cond,
+                    &operands,
+                    &reloaded,
+                    |p| with_operands(op, p),
+                )
+            }
+            // A loop header re-enters its body; nothing ran again.
+            SuspendKind::LoopHeader => Terminator::Br {
                 target: pt.cont_seg,
                 args: cont_args,
             },
+            // Every other kind ran its op again above — a live call, as on the forward path, so it
+            // polls as the forward path does: an unwind that starts beneath it later (the next
+            // freeze, the next fork) must find this frame unwinding too, not running on with the
+            // placeholder its callee returned.
+            _ => poll(&mut ab, unwind_blk, pt.cont_seg, cont_args),
         };
         arm_blocks.push(ab.finish(term));
     }
@@ -1523,6 +1790,17 @@ pub fn write_thaw_state(window: &mut [u8], arena: ShadowArena, ctx: usize, state
 pub fn begin_thaw(window: &mut [u8], arena: ShadowArena, ctx: usize) {
     write_state(window, STATE_NORMAL);
     write_thaw_state(window, arena, ctx, STATE_REWINDING);
+}
+
+/// **Inject** `reply` as the result the frozen call of context `ctx` returns on thaw, in place of
+/// the one it returned before the freeze (FORK.md §3 — reply-injection, never re-issue; #1768). The
+/// deepest frame of a context frozen at a capability call is that call's leaf frame, which holds the
+/// call's results first ([`ShadowArena::leaf_reply`]), so this writes the first result's slot as an
+/// `i64`. A fork writes a different reply into each copy of one frozen window, and each thaw resumes
+/// past the same call with its own answer — return-twice.
+pub fn inject_leaf_reply(window: &mut [u8], arena: ShadowArena, ctx: usize, reply: i64) {
+    let off = arena.leaf_reply(ctx) as usize;
+    window[off..off + 8].copy_from_slice(&reply.to_le_bytes());
 }
 
 /// Read context `ctx`'s per-context **thaw** state word — after a thaw, a completed rewind reads
@@ -1659,6 +1937,107 @@ fn icmp(ty: IntTy, op: CmpOp, a: ValIdx, b: ValIdx) -> Inst {
     Inst::IntCmp { ty, op, a, b }
 }
 
+/// The **poll** that follows a suspend op, ending the block that ran it: while a freeze or fork is
+/// unwinding (the state word reads `UNWINDING`), on to the point's UNWIND check block `unwind_blk`,
+/// which spills `live` and returns; otherwise on to the continuation `cont` with the same values. The
+/// forward path polls after the op, and so does an arm that ran the op again on a thaw — a re-issued
+/// call is as live as the original, and an unwind can start beneath it later.
+fn poll(b: &mut Bb, unwind_blk: BlockIdx, cont: BlockIdx, live: Vec<ValIdx>) -> Terminator {
+    let (st_a, st_off) = b.freeze_word_addr();
+    let st = b.one(load(LoadOp::I32, st_a, st_off));
+    let unw = b.one(Inst::ConstI32(STATE_UNWINDING));
+    let is_unw = b.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
+    Terminator::BrIf {
+        cond: is_unw,
+        then_blk: unwind_blk,
+        then_args: live.clone(),
+        else_blk: cont,
+        else_args: live,
+    }
+}
+
+/// An arm's terminator for a point that either delivers its reloaded result or **re-issues** its op:
+/// `cond` selects a re-issue block, appended to `extra_blocks` (numbered from `first_extra`). That
+/// block takes the continuation's args minus the op's results, then the op's reloaded `operands`;
+/// `make` builds the op over those operand params, and its results complete the continuation's args,
+/// which the re-issued op's poll ([`poll`], unwinding to `unwind_blk`) hands on.
+#[allow(clippy::too_many_arguments)]
+fn reissue_branch(
+    extra_blocks: &mut Vec<Block>,
+    first_extra: u32,
+    unwind_blk: BlockIdx,
+    pt: &PointPlan,
+    cont_args: Vec<ValIdx>,
+    cond: ValIdx,
+    operands: &[ValIdx],
+    reloaded: &[ValIdx],
+    make: impl FnOnce(&[ValIdx]) -> Inst,
+) -> Terminator {
+    let slot = |v: ValIdx| {
+        pt.spilled
+            .binary_search(&(v as usize))
+            .expect("a re-issued op's operand is spilled")
+    };
+    let kept = pt.out - pt.nres;
+    let mut params = pt.slot_types[..kept].to_vec();
+    params.extend(operands.iter().map(|&v| pt.slot_types[v as usize]));
+    let mut rb = Bb::new(params);
+    let n = kept as u32;
+    let op_params: Vec<ValIdx> = (n..n + operands.len() as u32).collect();
+    let r = rb.many(make(&op_params), pt.nres);
+    let mut args: Vec<ValIdx> = (0..n).collect();
+    args.extend(r);
+    let blk = first_extra + extra_blocks.len() as u32;
+    let term = poll(&mut rb, unwind_blk, pt.cont_seg, args);
+    extra_blocks.push(rb.finish(term));
+    let mut then_args = cont_args[..kept].to_vec();
+    then_args.extend(operands.iter().map(|&v| reloaded[slot(v)]));
+    Terminator::BrIf {
+        cond,
+        then_blk: blk,
+        then_args,
+        else_blk: pt.cont_seg,
+        else_args: cont_args,
+    }
+}
+
+/// A host call `op` rebuilt over new operands, in [`inst_operands`] order (handle first, then args).
+fn with_operands(op: &Inst, ops: &[ValIdx]) -> Inst {
+    match op {
+        Inst::CapCall {
+            type_id, op, sig, ..
+        } => Inst::CapCall {
+            type_id: *type_id,
+            op: *op,
+            sig: *sig,
+            handle: ops[0],
+            args: ops[1..].to_vec(),
+        },
+        Inst::CallImportDyn { ty, op, sig, .. } => Inst::CallImportDyn {
+            ty: *ty,
+            op: *op,
+            sig: *sig,
+            handle: ops[0],
+            args: ops[1..].to_vec(),
+        },
+        Inst::CallSym { import, sig, .. } => Inst::CallSym {
+            import: *import,
+            sig: *sig,
+            handle: ops[0],
+            args: ops[1..].to_vec(),
+        },
+        Inst::CallImport {
+            import, op, sig, ..
+        } => Inst::CallImport {
+            import: *import,
+            op: *op,
+            sig: *sig,
+            args: ops.to_vec(),
+        },
+        _ => unreachable!("a leaf is a host call"),
+    }
+}
+
 fn zero_const(t: ValType) -> Inst {
     match t {
         ValType::I32 => Inst::ConstI32(0),
@@ -1720,8 +2099,9 @@ fn reload(t: ValType, addr: ValIdx, offset: u64) -> Inst {
 /// and each function's result types. Covers the scalar/memory/call subset a Phase-1
 /// prefix can use; returns `UnsupportedInst` for anything else — the ops whose state does not
 /// live in values the shadow frame can carry: `setjmp`/`longjmp` (an interpreter-frame jump
-/// buffer), `gc.roots`, `import.attach` (host binding-table mutation) and vCPU TLS — so the
-/// transform fails closed rather than mis-typing a frame.
+/// buffer), `gc.roots`, `import.attach` (host binding-table mutation) and vCPU TLS (unless the
+/// unwind carries the thread, [`TransformOpts::carries_thread`]) — so the transform fails closed
+/// rather than mis-typing a frame.
 ///
 /// Deliberately **not** `temen_verify::func_value_types` (#913): that one is whole-function and
 /// **total** — it types every op and degrades gracefully (an underivable value is simply absent)
@@ -1734,6 +2114,7 @@ fn result_types(
     types: &[ValType],
     func_results: &[Vec<ValType>],
     type_section: &[TypeEntry],
+    opts: &TransformOpts,
 ) -> Result<Vec<ValType>, TransformError> {
     use Inst::*;
     Ok(match inst {
@@ -1820,6 +2201,10 @@ fn result_types(
         // `atomic.notify` an `i32` woken count. `atomic.wait` is a may-suspend re-issue safepoint
         // (the parked-vCPU slice); `atomic.notify` is copied verbatim into its segment.
         MemoryWait { .. } | MemoryNotify { .. } => vec![ValType::I32],
+        // §12 vCPU TLS: the register is the thread's, so only an unwind that carries the thread keeps
+        // it — `get` then yields a scalar like any other, `set` nothing.
+        VcpuTlsGet if opts.carries_thread => vec![ValType::I64],
+        VcpuTlsSet { .. } if opts.carries_thread => vec![],
         _ => return Err(TransformError::UnsupportedInst),
     })
 }
@@ -1873,14 +2258,14 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            8,
-            "one point: 4n+4 blocks with n=1"
+            9,
+            "one host-call point: 4n+4 blocks + its re-issue block"
         );
     }
 
     #[test]
     fn two_cap_calls_become_two_resume_points() {
-        // Two suspend points in one block ⇒ two br_table arms ⇒ 3·2 + 4 = 10 blocks.
+        // Two host-call points: 4·2 + 4 blocks, plus one re-issue block each.
         let m = parse_with_mem(
             "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
             18,
@@ -1889,8 +2274,8 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            12,
-            "two-point layout: 4n+4 with n=2"
+            14,
+            "two-point layout: 4n+4 with n=2, plus two re-issue blocks"
         );
     }
 
@@ -1913,8 +2298,8 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            8,
-            "one point: 4n+4 blocks with n=1"
+            9,
+            "one host-call point: 4n+4 blocks + its re-issue block"
         );
     }
 
@@ -1966,8 +2351,8 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            8,
-            "one point: 4n+4 blocks with n=1"
+            9,
+            "one host-call point: 4n+4 blocks + its re-issue block"
         );
     }
 
@@ -1986,7 +2371,7 @@ mod tests {
             8,
             "caller (propagated) instrumented"
         );
-        assert_eq!(out.funcs[1].blocks.len(), 8, "callee (leaf) instrumented");
+        assert_eq!(out.funcs[1].blocks.len(), 9, "callee (leaf) instrumented");
     }
 
     #[test]
@@ -2001,7 +2386,7 @@ mod tests {
         let helper_before = m.funcs[1].clone();
         let out = transform_module(&m).expect("transform");
         temen_verify::verify_module(&out).expect("verify");
-        assert_eq!(out.funcs[0].blocks.len(), 8, "leaf instrumented");
+        assert_eq!(out.funcs[0].blocks.len(), 9, "leaf instrumented");
         assert_eq!(
             out.funcs[1], helper_before,
             "non-suspending helper untouched"

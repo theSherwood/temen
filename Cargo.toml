@@ -23,6 +23,7 @@ members = [
     "crates/temen-wasm",
     "crates/temen-wasm-jit",
     "crates/temen-leng",
+    "crates/temen-posix-abi",
     "crates/temen-posix",
     "crates/temen-capi",
     "crates/temen-parity",

@@ -427,3 +427,94 @@ fn a_thawed_fiber_park_idles_and_freezes_again() {
     );
     assert_eq!(h2.frozen_fibers().len(), 1, "the fiber is back in the cut");
 }
+
+/// The root spawns a sibling (handing it the pipe's write end), then reads one byte from the pipe's
+/// read end: the pipe is empty and its writer open, so the root parks. The sibling loops (the
+/// back-edge countdown fires the freeze inside it), then writes `x` and returns 7. The root joins
+/// and returns `1000·n + byte + 7`.
+const SRC_PIPE_PARKED_ROOT: &str = r#"
+memory 17
+func (i32, i32) -> (i64) {
+block 0 (vr: i32, vw: i32) {
+  vz = i64.const 0
+  vw64 = i64.extend_i32_u vw
+  vt = thread.spawn 1 vz vw64
+  vbuf = i64.const 66100
+  vlen = i64.const 1
+  vn = call.cap 0 0 (i64, i64) -> (i64) vr (vbuf, vlen)
+  vj = thread.join vt
+  vk = i64.const 1000
+  vnk = i64.mul vn vk
+  vb = i32.load8_u vbuf
+  vb64 = i64.extend_i32_u vb
+  vs = i64.add vnk vb64
+  vres = i64.add vs vj
+  return vres
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vi0 = i64.const 0
+  br 1(varg, vi0)
+}
+block 1 (va: i64, vi: i64) {
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 1000
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(va, vi2) 2(va)
+}
+block 2 (va2: i64) {
+  vw = i32.wrap_i64 va2
+  vbuf = i64.const 66200
+  vx = i32.const 120
+  i32.store8 vbuf vx
+  vlen = i64.const 1
+  vn = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vlen)
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// **#1672 — a pipe-parked vCPU is abandoned, not waited on, and its read is re-issued on thaw.**
+/// The root parks reading an empty pipe, and the freeze lands in its sibling before the sibling has
+/// written. Nothing in the cut would wake the read, so before #1672 the freeze waited on it for good.
+/// Now the in-flight freeze re-admits the root, its re-executed read is abandoned (no effect, the
+/// re-issue word set), and it unwinds. Two things would make the thaw wrong, and this pins both: a
+/// *reloaded* result (the read's placeholder `0`) instead of a re-issued read, and the sibling's
+/// unwind releasing the domain's pipe ends as if it had exited, which drops the writer count to 0 and
+/// wakes the root to a false EOF mid-freeze. On thaw the sibling finishes its loop and writes, and the
+/// root's re-issued read gets the byte: `1000·1 + 'x' + 7`.
+#[test]
+fn a_pipe_parked_root_is_abandoned_and_its_read_reissued_on_thaw() {
+    let inst = instrumented(SRC_PIPE_PARKED_ROOT);
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_self_module(&inst);
+    let (w, r) = h.grant_pipe();
+    let args = [Value::I32(r), Value::I32(w)];
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after_backedges(&mut win, 5);
+    let mut fuel = 1_000_000u64;
+    let (res, snap) =
+        run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert_eq!(
+        res,
+        Ok(vec![Value::I64(0)]),
+        "the root unwinds for the freeze"
+    );
+    assert_eq!(h.frozen_vcpus().len(), 1, "the sibling is in the cut");
+
+    // An in-memory thaw on the same powerbox: the pipe and its ends are still there.
+    let mut win2 = snap.clone();
+    begin_thaw(&mut win2, TEST_ARENA, 0);
+    let mut fuel2 = 1_000_000u64;
+    let (res2, _) =
+        run_capture_reserved_with_host(&inst, 0, &args, &mut fuel2, &win2, SIZE_LOG2, &mut h);
+    assert_eq!(
+        res2,
+        Ok(vec![Value::I64(1000 + i64::from(b'x') + 7)]),
+        "the thawed root re-issues its read and gets the sibling's byte"
+    );
+}

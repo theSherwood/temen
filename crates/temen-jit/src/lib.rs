@@ -60,7 +60,7 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
@@ -75,6 +75,7 @@ use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use temen_ir::cap_id;
@@ -122,6 +123,39 @@ pub fn fiber_active() -> bool {
     fiber_rt::current_fiber_slot().is_some()
 }
 
+/// #1768 — whether compiled code on this OS thread is running beneath a **host frame that
+/// re-entered it** over a live window ([`CompiledModule::invoke_extra`]: a `Jit.invoke`d unit, a
+/// serve handler). The embedder's fork gate: a fork is reified by unwinding the caller's instrumented
+/// frames into the window's shadow stack, and a host frame between them and the run's entry is not a
+/// frame that unwinding can save or a rewind rebuild — so a fork made beneath one is refused.
+pub fn reentered() -> bool {
+    reentry::DEPTH.with(|d| d.get() != 0)
+}
+
+/// The per-thread re-entry depth behind [`reentered`], held up for exactly the span of a re-entry.
+mod reentry {
+    use core::cell::Cell;
+
+    thread_local! {
+        pub(super) static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// One re-entry in progress on this thread; dropping it ends it (so a caught fault's return,
+    /// which drops it too, cannot leave the count raised).
+    pub(super) struct Guard;
+
+    pub(super) fn enter() -> Guard {
+        DEPTH.with(|d| d.set(d.get() + 1));
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+}
+
 /// F3 (FIBER_PARK.md) — park the current fiber once: unwinds `FIBER_PARKED` to the resumer
 /// (the suspend the guest didn't write) and returns when a `cont.resume` polls this fiber
 /// again. The host thunk's event-park seam — exactly what the futex thunk's wait loop does
@@ -134,12 +168,16 @@ pub unsafe fn fiber_park_current() {
     let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
     // #1631 — a bare host-thunk park carries no deadline: nothing wakes it on its own, so it
     // counts as parked.
-    fiber_rt::fiber_event_park(&slot, false);
+    fiber_rt::fiber_event_park(&slot, false, None);
 }
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
+
+// #1768 — the per-instance context compiled code reaches through its threaded context pointer.
+mod vmctx;
+pub use vmctx::{InstanceAddrs, VmCtx};
 
 // §12.8 4A.5 durable-runtime-internal per-OS-thread shadow-region base (`durable.shadow_base`): the
 // base of the region the running durable context spills into, so concurrent vCPUs each have their own
@@ -1540,6 +1578,46 @@ pub struct FreezeController {
     /// `0` = window not live yet (spin); a live window base; [`STORING`] while a request writes;
     /// [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
     base: AtomicUsize,
+    /// #1693 — the durable §14 children running now, each in its own window: a request rings them
+    /// too (see [`Self::enter_child`]).
+    children: std::sync::Mutex<RungChildren>,
+}
+
+/// [`FreezeController::children`]: the live child window bases (they run synchronously and nested,
+/// so this is a stack) and whether a request has landed.
+#[derive(Default)]
+struct RungChildren {
+    bases: Vec<usize>,
+    requested: bool,
+}
+
+/// Store `UNWINDING` into the durable state word of the window at `base` — what a request does to the
+/// root's window and to each live child's.
+///
+/// # Safety
+/// `base` is a live durable window: `base + STATE_OFF` is in its committed RW control region.
+unsafe fn ring(base: usize) {
+    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above the #1094 NULL
+    // guard). STATE_UNWINDING = 1 (must match `temen-interp` / `temen-durable`). An aligned atomic i32
+    // store the guest's back-edge poll loads (defined under §12 races).
+    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
+    (*(state as *const AtomicI32)).store(1, Ordering::Release);
+}
+
+/// A live durable child's registration with its run's [`FreezeController`]; dropping it deregisters
+/// the window, which must happen before the window is freed.
+pub(crate) struct ChildRing<'a> {
+    fc: &'a FreezeController,
+    base: usize,
+}
+
+impl Drop for ChildRing<'_> {
+    fn drop(&mut self) {
+        let mut c = self.fc.children.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = c.bases.iter().rposition(|&b| b == self.base) {
+            c.bases.remove(i);
+        }
+    }
 }
 
 /// [`FreezeController::base`] while a request's store is in flight.
@@ -1554,6 +1632,7 @@ impl FreezeController {
     pub fn new() -> Arc<Self> {
         Arc::new(FreezeController {
             base: AtomicUsize::new(0),
+            children: std::sync::Mutex::new(RungChildren::default()),
         })
     }
 
@@ -1572,20 +1651,39 @@ impl FreezeController {
                     {
                         continue; // retired meanwhile: the next load says so
                     }
-                    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above
-                    // the #1094 NULL guard). STATE_UNWINDING = 1 (must match `temen-interp` /
-                    // `temen-durable`). An aligned atomic i32 store the guest's back-edge poll loads
-                    // (defined under §12 races).
                     // SAFETY: `base` was the live window and `retire` cannot complete while this
-                    // request holds `STORING`, so the window is mapped; `base + STATE_OFF` is in the
-                    // committed RW durable control region.
-                    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
-                    unsafe { (*(state as *const AtomicI32)).store(1, Ordering::Release) };
+                    // request holds `STORING`, so the window is mapped.
+                    unsafe { ring(base) };
+                    // #1693: then every live durable child, each polling only its own window. The
+                    // root first: a child that unwinds returns into its parent's `instantiate`, whose
+                    // trailing poll must already see the freeze. SAFETY: a registered window is live
+                    // until its `ChildRing` drops, which takes this lock.
+                    let mut c = self.children.lock().unwrap_or_else(|e| e.into_inner());
+                    c.requested = true;
+                    for &b in &c.bases {
+                        unsafe { ring(b) };
+                    }
+                    drop(c);
                     self.base.store(LANDED, Ordering::Release);
                     return;
                 }
             }
         }
+    }
+
+    /// #1693 — a durable §14 child starts running in its own window at `base`: register it so a
+    /// request rings it too, and if one has already landed, ring it now (it was born `NORMAL` from a
+    /// parent that had not polled yet). The window stays registered until the returned guard drops.
+    ///
+    /// # Safety
+    /// `base` is the child's live durable window, and outlives the returned guard.
+    pub(crate) unsafe fn enter_child(&self, base: usize) -> ChildRing<'_> {
+        let mut c = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if c.requested {
+            ring(base);
+        }
+        c.bases.push(base);
+        ChildRing { fc: self, base }
     }
 
     /// Run-side: publish the live window base (the run is now blocked in the guest).
@@ -1739,6 +1837,143 @@ pub struct DetachedSeed {
     pub prots: Vec<WindowProt>,
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
+}
+
+/// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
+/// clone the window → thaw both, with each copy's reply injected (FORK.md §1, §3).
+///
+/// The program is compiled with its fork calls as durable suspend points (the `temen-durable`
+/// transform, sites = the fork calls), and the run is armed with this hook
+/// ([`CompiledModule::set_fork_hook`]). When the guest forks, the embedder's `call.cap` thunk sets
+/// the window's freeze word, the instrumented frames unwind into the root's shadow stack, and the
+/// root returns — unwound, not finished. The run then calls the hook with the frozen window: the
+/// hook duplicates the process — mints the twin's pid and powerbox, takes the twin's window from
+/// [`ForkPoint::twin`] and starts it ([`CompiledModule::run_twin`], on its own thread) — and returns
+/// the parent's reply: the twin's pid, or a negative errno when it refused (nothing duplicated).
+/// The run injects that reply, rewinds the root in place, and carries on past the fork call.
+pub type ForkHook = Box<dyn FnMut(&ForkPoint<'_>) -> i64 + Send>;
+
+/// #1768 — a run frozen at a fork, as its [`ForkHook`] sees it: the live window, unwound into its
+/// root's shadow stack, and what a private duplicate of it needs.
+pub struct ForkPoint<'a> {
+    window: &'a mem::GuestWindow,
+    /// The module's data segments (its `readonly` ones are read-only pages of every window).
+    data: &'a [Data],
+    /// The NULL guard every window of this module seeds inaccessible (`None` when it does not fit).
+    null_guard: Option<u64>,
+    shadow: temen_ir::durable_abi::ShadowArena,
+    args: &'a [i64],
+}
+
+/// #1768 — a fork twin's window: a private duplicate of its parent's at the fork, its reply injected
+/// and its root set rewinding — what [`CompiledModule::run_twin`] runs. Moves to the twin's thread.
+pub struct TwinWindow {
+    window: mem::GuestWindow,
+    /// The twin's `vcpu.tls` register at its first entry: its parent's at the fork.
+    tls: i64,
+}
+
+impl TwinWindow {
+    /// The duplicate's base — the key the twin's page-state map is filed under.
+    pub fn base(&self) -> usize {
+        self.window.base() as usize
+    }
+}
+
+impl ForkPoint<'_> {
+    /// The forking entry's arguments — what the twin's run re-enters the entry with.
+    pub fn args(&self) -> &[i64] {
+        self.args
+    }
+
+    /// The base of the frozen window — the key its page-state map is filed under (the embedder's
+    /// `call.cap` view of the window keeps one; see [`Self::twin`]).
+    pub fn window_base(&self) -> usize {
+        self.window.base() as usize
+    }
+
+    /// The twin's window: a private duplicate of this one (the JIT's `Mem::fork_private`) — every
+    /// committed page's bytes and protection — with `reply` injected as the fork call's result and
+    /// its root set rewinding. `pages` is the run's page-state map (host page → a
+    /// [`temen_ir::page_state`] code, absent ⇒ the default), which says which tail pages the guest
+    /// committed and which pages it protected; together with the module's read-only data segments
+    /// and NULL guard it describes every page. `None` when the window cannot be duplicated: a page
+    /// aliases a §13 shared region (fork shares no memory — the interpreter's `fork_private` refuses
+    /// the same window), or the address space has no room for another window.
+    pub fn twin(&self, pages: &BTreeMap<u64, u8>, reply: i64) -> Option<TwinWindow> {
+        use temen_ir::page_state as ps;
+        let page = mem::page_size() as u64;
+        let mut prots: BTreeMap<usize, mem::Prot> = BTreeMap::new();
+        // The seed-time protections: the NULL guard, then the read-only data segments (host-page
+        // granular, as `protect_ro` applies them).
+        if let Some(guard) = self.null_guard.filter(|g| g.is_multiple_of(page)) {
+            for p in 0..guard / page {
+                prots.insert(p as usize, mem::Prot::None);
+            }
+        }
+        for d in self
+            .data
+            .iter()
+            .filter(|d| d.readonly && !d.bytes.is_empty())
+        {
+            let (lo, hi) = (
+                d.offset / page,
+                (d.offset + d.bytes.len() as u64).div_ceil(page),
+            );
+            for p in lo..hi {
+                prots.insert(p as usize, mem::Prot::Ro);
+            }
+        }
+        // What the guest changed since, which overrides them (the same order a live window saw).
+        let prefix = (self.window.mapped() as u64).div_ceil(page);
+        for (&p, &code) in pages {
+            let prot = match code {
+                ps::RW => mem::Prot::Rw,
+                ps::RO => mem::Prot::Ro,
+                ps::UNMAPPED => mem::Prot::None,
+                _ => return None, // a §13 alias (or a code this build does not know): refuse
+            };
+            if prot == mem::Prot::Rw && p < prefix {
+                prots.remove(&(p as usize)); // the prefix default
+            } else {
+                prots.insert(p as usize, prot);
+            }
+        }
+        // SAFETY: the run is unwound — no guest code runs on this window until it rewinds — and
+        // every index is a page of the window (the page map only ever records its own pages).
+        let window = unsafe { self.window.fork_copy(&prots) }?;
+        // SAFETY: the duplicate is this window's layout, so the reply slot and control words lie in
+        // its backed prefix.
+        unsafe { arm_fork_rewind(window.base(), self.shadow, reply) };
+        Some(TwinWindow {
+            window,
+            tls: vcpu_tls::get(),
+        })
+    }
+}
+
+/// The window's global freeze word (`STATE_OFF`), read by the host between entries.
+///
+/// # Safety
+/// `base` is a live window whose backed prefix covers the durable control words.
+unsafe fn window_state(base: *mut u8) -> i32 {
+    (base.add(temen_ir::durable_abi::STATE_OFF as usize) as *const i32).read_unaligned()
+}
+
+/// #1768 — set a window frozen at a fork up to **rewind** its root with `reply` as the fork call's
+/// result (FORK.md §3, reply injection): the reply into the root's leaf frame
+/// ([`temen_ir::durable_abi::ShadowArena::leaf_reply`]), the root context's thaw word `REWINDING`, and
+/// the global freeze word back to `NORMAL` (else the rewinding code's polls would unwind again) —
+/// `temen_durable::inject_leaf_reply` + `begin_thaw`, on a live window.
+///
+/// # Safety
+/// `base` is a live window of a module declaring `shadow`, frozen at a fork (its root's deepest frame
+/// is the fork call's leaf), with nothing running on it.
+unsafe fn arm_fork_rewind(base: *mut u8, shadow: temen_ir::durable_abi::ShadowArena, reply: i64) {
+    use temen_ir::durable_abi::{STATE_NORMAL, STATE_OFF, STATE_REWINDING};
+    (base.add(shadow.leaf_reply(0) as usize) as *mut i64).write_unaligned(reply);
+    (base.add(shadow.thaw_state_off(0) as usize) as *mut i32).write_unaligned(STATE_REWINDING);
+    (base.add(STATE_OFF as usize) as *mut i32).write_unaligned(STATE_NORMAL);
 }
 
 /// How a durable JIT run is driven beyond its residue.
@@ -2392,10 +2627,15 @@ pub struct CompiledModule {
     mask: u64,
     cap_mapped: u64,
     sub_base: u64,
-    epoch_addr: i64,
-    /// The counted-fuel cell address baked into this module's functions (`0` ⇒ fuel un-armed), so
-    /// `define_extra` recompiles new units against the same cell. See [`Lower::fuel_addr`].
-    fuel_addr: i64,
+    /// Whether this module's code polls a kill-path cell / charges a fuel cell (see [`Lower::epoch`]
+    /// / [`Lower::fuel`]) — the code's shape, which `define_extra` compiles new units to match.
+    epoch: bool,
+    fuel: bool,
+    /// #1768 — the addresses this module's **own** instance fills its [`VmCtx`] from: the powerbox
+    /// ctx, kill-path cell, fuel cell and signal arm the compile was handed. Nothing reads them from
+    /// the code; each run mints its context from these ([`VmCtx::new`]), and a run of the same code
+    /// as another instance supplies its own.
+    instance: InstanceAddrs,
     /// The `call.dyn` index mask fixed at compile time (`next_pow2(n_funcs) - 1`) and baked
     /// into every call site. `define_extra` compiles new units against this same constant.
     fn_table_mask: u64,
@@ -2501,6 +2741,9 @@ pub struct CompiledModule {
     /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
     /// can write `UNWINDING` into the running window. `None` for every non-interruptible run.
     freeze_ctl: Option<Arc<FreezeController>>,
+    /// #1768 — the embedder's fork hook ([`Self::set_fork_hook`]): set on a run armed to fork, whose
+    /// root unwinds at a fork call for the hook to duplicate. `None` for every other run.
+    fork_hook: Option<ForkHook>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -2843,26 +3086,33 @@ impl CompiledModule {
             .max(1);
         // §5 fuel/epoch kill-path: the address of the host-owned interrupt cell the lowering polls at
         // loop back-edges + function entries. `0` when the caller armed no kill-path (then no checks are
-        // emitted — guest code is byte-identical to before). The cell must outlive the module; the caller
-        // owns it (e.g. an `Arc<AtomicU64>` a watchdog thread sets), so the baked address stays valid.
+        // emitted — guest code is byte-identical to before). The cell must outlive every run of this
+        // module's own instance (it is read from the instance's `VmCtx`); the caller owns it (e.g. an
+        // `Arc<AtomicU64>` a watchdog thread sets).
         let epoch_addr = interrupt.map_or(0, |p| p as i64);
         // Fuel unification: the address of the host-owned counted-fuel cell the lowering decrements at
         // safepoints (function entries + taken back-edges + `cont.resume`). `0` ⇒ no fuel armed (no
         // fuel checks emitted — guest code byte-identical). The caller owns the `u64` cell (it must
-        // outlive the module, since its address is baked into the code) and reads the remaining budget
-        // back after the run.
+        // outlive the runs that charge it) and reads the remaining budget back after the run.
         let fuel_addr = fuel.map_or(0, |p| p as i64);
-        // #932 — the async-signal delivery arm baked into `emit_signal_check` at safepoints. `null`
-        // (no checks emitted) unless the caller supplied a `SignalArm`. Its three addresses (the
-        // `Host::sig_armed` flag + the take/return thunks + the delivery ctx) are baked into the code,
-        // so the caller must keep them valid for the module's life (the one-shot signal entry holds
-        // the delivery ctx for the whole run).
-        let sig = signal.map_or(SigEnv::null(), |s| SigEnv {
-            armed_addr: s.armed as i64,
+        // #932 — the async-signal delivery arm `emit_signal_check` polls at safepoints. `null` (no
+        // checks emitted) unless the caller supplied a `SignalArm`. The two thunks are process globals
+        // baked into the code; the `Host::sig_armed` flag + the delivery ctx are the instance's, read
+        // from its `VmCtx`, so the caller keeps them valid for the runs of this instance (the one-shot
+        // signal entry holds the delivery ctx for the whole run).
+        let sig = signal.as_ref().map_or(SigEnv::null(), |s| SigEnv {
+            armed: true,
             take_thunk: s.take as usize as i64,
             return_thunk: s.ret as usize as i64,
-            ctx_addr: s.ctx as i64,
         });
+        let instance = InstanceAddrs {
+            cap_ctx,
+            epoch: epoch_addr as *const AtomicU64,
+            fuel: fuel_addr as *mut u64,
+            sig_armed: signal.as_ref().map_or(core::ptr::null(), |s| s.armed),
+            sig_ctx: signal.as_ref().map_or(core::ptr::null_mut(), |s| s.ctx),
+            embedder: core::ptr::null_mut(),
+        };
         // Calls can reach any function, so every function must be lowerable.
         for f in &m.funcs {
             ensure_supported(f, &m.types)?;
@@ -2956,10 +3206,10 @@ impl CompiledModule {
         }
         let distinct = distinct;
 
-        // The host thunk + ctx addresses, baked into `call.cap` sites as constants.
+        // The host thunk address, baked into `call.cap` sites as a constant (its ctx is the
+        // instance's, read from the `VmCtx`).
         let cap = CapEnv {
             thunk_addr: cap_thunk as usize as i64,
-            ctx_addr: cap_ctx as usize as i64,
             fast_resolver,
         };
 
@@ -3256,8 +3506,8 @@ impl CompiledModule {
                 cap_mapped,
                 sub_base,
                 guard_offset_of(win_reserved as u64),
-                epoch_addr,
-                fuel_addr,
+                epoch_addr != 0,
+                fuel_addr != 0,
                 !thread.is_null(), // spawned vCPUs run this code beside the root
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
                 None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
@@ -3542,8 +3792,9 @@ impl CompiledModule {
             mask,
             cap_mapped,
             sub_base,
-            epoch_addr,
-            fuel_addr,
+            epoch: epoch_addr != 0,
+            fuel: fuel_addr != 0,
+            instance,
             fn_table_mask: (table_len as u64) - 1,
             next_extra: 0,
             extra_bytes: 0,
@@ -3576,6 +3827,7 @@ impl CompiledModule {
             detached_seed: Vec::new(),
             thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
+            fork_hook: None,
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -3633,6 +3885,7 @@ impl CompiledModule {
                 args,
                 init_mem,
                 snapshot_cap,
+                None,
             )
         }
     }
@@ -3670,7 +3923,53 @@ impl CompiledModule {
             args,
             init_mem,
             snapshot_cap,
+            None,
         )
+    }
+
+    /// #1768 — run a **fork twin** (FORK.md §9.5): this module's entry, re-entered over `twin` — the
+    /// window a [`ForkPoint::twin`] duplicated from the forking run, its reply injected and its root
+    /// set rewinding — so the entry's prologue rebuilds the parent's frames and the twin resumes past
+    /// the fork call with its own reply. `this` is the twin's own instance of the parent's program
+    /// (its own powerbox); `args` are the parent entry's (the rewind reads none of them). Otherwise
+    /// exactly [`Self::run_raw`]: the twin may fork again through this module's [`ForkHook`].
+    ///
+    /// # Safety
+    /// As [`Self::run_raw`]; `this` is compiled from the same (fork-instrumented) program as the
+    /// module whose run produced `twin`, with the same window geometry.
+    pub unsafe fn run_twin(
+        this: *mut CompiledModule,
+        twin: TwinWindow,
+        args: &[i64],
+    ) -> Result<(JitOutcome, Vec<u8>), JitError> {
+        let (code, n_params, n_results) = {
+            let t = &*this;
+            (t.tramp_code, t.n_params, t.n_results)
+        };
+        Self::run_code_raw(
+            this,
+            code,
+            n_params,
+            n_results,
+            args,
+            None,
+            None,
+            Some(twin),
+        )
+    }
+
+    /// #1768 — hand this module's own instance the embedder's per-instance state (the vmctx
+    /// `embedder` slot, [`VmCtx::embedder`]): its `call.cap` thunk finds it through `trap_out`.
+    pub fn set_embedder_ctx(&mut self, ctx: *mut core::ffi::c_void) {
+        self.instance.embedder = ctx;
+    }
+
+    /// #1768 — arm this module's runs to **fork**: a run whose root unwinds at a fork hands the
+    /// live window to `hook` and, with the reply the hook returns, rewinds the root in place and runs
+    /// on (see [`ForkHook`]). Only for a program instrumented to unwind at its fork calls, run as a
+    /// single-threaded, non-durable root — the embedder's contract; `None` disarms.
+    pub fn set_fork_hook(&mut self, hook: Option<ForkHook>) {
+        self.fork_hook = hook;
     }
 
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
@@ -3730,7 +4029,7 @@ impl CompiledModule {
         args: &[i64],
         init_mem: Option<&[u8]>,
     ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-        Self::run_code_raw(self, code, n_params, n_results, args, init_mem, None)
+        Self::run_code_raw(self, code, n_params, n_results, args, init_mem, None, None)
     }
 
     /// I36 slice 3 — the buffer-ABI trampoline for impl-export handler `func`:
@@ -3780,13 +4079,14 @@ impl CompiledModule {
 
     /// Invoke an extra trampoline **over the live window of an in-flight run** — the engine of
     /// the `Jit` capability's `invoke` op. Called from inside a `call.cap` handler while the
-    /// guest is suspended; `mem_base`/`trap_out` are the values the cap thunk received (the
-    /// run's window base and trap cell), so the invoked code reads/writes the guest's own
-    /// memory in place and a trap in it propagates exactly like a guest trap.
+    /// guest is suspended; `mem_base`/`vmctx` are the values the cap thunk received (the run's
+    /// window base, and its `trap_out` — the running instance's [`VmCtx`]), so the invoked code
+    /// reads/writes the guest's own memory in place, dispatches its own `call.cap`s into the same
+    /// powerbox, and a trap in it propagates exactly like a guest trap.
     ///
     /// Runs under a **nested** detect-and-kill recovery (`run_guarded_range` is re-entrant —
     /// the same §14 child-fault pattern as `compile_child_and_run`): a memory fault in the
-    /// invoked code is caught *here*, written to `trap_out` as `MemoryFault`, and this returns
+    /// invoked code is caught *here*, written to the trap cell as `MemoryFault`, and this returns
     /// normally — the guest's `call.cap` trap-propagation check then unwinds the domain. Traps
     /// in invoked code are **terminal for the domain** (DESIGN.md §22); a guest wanting
     /// trap isolation uses the `Instantiator`, not `Jit`.
@@ -3797,14 +4097,15 @@ impl CompiledModule {
     ///   hold no Rust reference into `*this` across this call.
     /// - `code` must be a trampoline returned by `define_extra` on this module; `args` must
     ///   cover its param count and `results` its result count.
-    /// - `mem_base` and `trap_out` must be the live run's window base and trap cell.
+    /// - `mem_base` and `vmctx` must be the live run's window base and instance context (the cap
+    ///   thunk's `mem_base` / `trap_out`).
     pub unsafe fn invoke_extra(
         this: *mut CompiledModule,
         code: *const u8,
         args: &[i64],
         results: &mut [i64],
         mem_base: *mut u8,
-        trap_out: *mut i64,
+        vmctx: *const VmCtx,
     ) -> Result<(), JitError> {
         let (fn_table_ptr, live, caller_window, reserved) = {
             let t = &*this;
@@ -3828,20 +4129,21 @@ impl CompiledModule {
                 ))
             }
         };
+        let _reentry = reentry::enter();
         let faulted = mem::run_guarded_range(
             code,
             args.as_ptr(),
             results.as_mut_ptr(),
             mem_base,
             fn_table_ptr,
-            trap_out,
+            vmctx,
             lo,
             hi,
         );
         if faulted {
             // Detect-and-kill (§5), reported the same way the outer run reports it; the
             // guest's call.cap propagation check sees the cell and unwinds the domain.
-            *trap_out = mem::FAULT_TRAP;
+            (*vmctx).trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -3869,6 +4171,9 @@ impl CompiledModule {
         args: &[i64],
         init_mem: Option<&[u8]>,
         snapshot_cap: Option<usize>,
+        // #1768 — a fork twin's window, already duplicated and set rewinding ([`Self::run_twin`]);
+        // `None` builds a fresh window from the module (and `init_mem`).
+        twin: Option<TwinWindow>,
     ) -> Result<(JitOutcome, Vec<u8>), JitError> {
         // The trampoline reads exactly `n_params` arg slots; a shorter buffer would be an
         // out-of-bounds read from safe code. (The one-shot wrappers always pass exact-length
@@ -3885,12 +4190,21 @@ impl CompiledModule {
             let t = &*this;
             if let Some(n) = &t._nursery {
                 n.set_durable(t.durable);
+                n.set_freeze(t.freeze_ctl.clone());
             }
         }
         // ---- Setup: references into `*this` live only inside this block. ----
         // Allocate the guest window for this run: `mapped` backed RW bytes inside the reserved
         // virtual range planned at compile time (§4); zero-sized when the module has no memory.
-        let (mut window, win_size, mask, fn_table_ptr) = {
+        let twin_tls = twin.as_ref().map(|t| t.tls);
+        let (mut window, win_size, mask, fn_table_ptr) = if let Some(twin) = twin {
+            // A fork twin's window is its parent's, byte for byte and page for page: seeded,
+            // protected and set rewinding by the fork (`ForkPoint::twin`), so none of the fresh
+            // window's seeding below applies.
+            let t = &*this;
+            let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
+            (twin.window, t.win_size, t.mask, fn_table_ptr)
+        } else {
             let t = &mut *this;
             let mut window = mem::GuestWindow::new(t.win_mapped, t.win_reserved);
             let win_size = t.win_size;
@@ -3942,18 +4256,29 @@ impl CompiledModule {
             if t.null_guard <= t.cap_mapped {
                 window.seed_null_guard(t.sub_base, t.null_guard);
             }
+            // #1768 — a run armed to fork keeps its root's shadow stack in context 0 of the
+            // declared arena; a fresh window starts it empty (the durable `init_durable_window`
+            // seed), so the first fork's unwind pushes from the frame base.
+            if t.fork_hook.is_some() && t.shadow.region_fits(0) {
+                let sp_word = window.base().add(t.shadow.region_base(0) as usize) as *mut u64;
+                sp_word.write_unaligned(t.shadow.frame_base(0));
+            }
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
             (window, win_size, t.mask, fn_table_ptr)
         };
 
         let mem_base = window.base();
         let mut results = vec![0i64; n_results];
-        // Trap cell: 0 = ok; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit
-        // code for an Exit. A trapping path (or the cap thunk) writes it. It is **shared across vCPU
-        // threads** (every spawned vCPU gets its address via `set_env`), so the Rust accesses are atomic
-        // (audit #2): the JIT writes it via an aligned `i64` store in emitted code (hardware-atomic,
-        // foreign to Rust's model); concurrent Rust writers (dying vCPUs) and this reader must not race.
-        let trap_cell = AtomicI64::new(0);
+        // This run's instance context: the module's own instance (#1768 — the powerbox, kill-path
+        // cell, fuel cell and signal arm its compile was handed), entered by the root and shared with
+        // every vCPU and fiber of the run. Its field 0 is the trap cell: 0 = ok; low 32 bits = a
+        // TrapKind / EXIT_CODE; high 32 bits = the exit code for an Exit. A trapping path (or the cap
+        // thunk) writes it. It is **shared across vCPU threads** (every spawned vCPU gets its address
+        // via `set_env`), so the Rust accesses are atomic (audit #2): the JIT writes it via an aligned
+        // `i64` store in emitted code (hardware-atomic, foreign to Rust's model); concurrent Rust
+        // writers (dying vCPUs) and this reader must not race.
+        let vm = VmCtx::new((*this).instance);
+        let trap_cell = &vm.trap;
 
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
         // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
@@ -3965,14 +4290,14 @@ impl CompiledModule {
                 d.set_env(
                     mem_base as u64,
                     fn_table_ptr as u64,
-                    trap_cell.as_ptr(),
+                    &vm, // spawned vCPUs are this instance's
                     // `None` on a futex-only domain (a nesting module with no `thread.*`/`cont.*` ops
                     // of its own): no spawn site exists to call through it.
                     t.call_tramp,
                     window.fault_range(),
                     t.fiber_cfg,
                     t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
-                    t.epoch_addr as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
+                    t.instance.epoch as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
                     t.durable, // slice 3.3: run spawned children inline (single-worker) under a freeze/thaw
                 );
             }
@@ -4015,7 +4340,7 @@ impl CompiledModule {
                         &seed,
                         mem_base as u64,
                         fn_table_ptr as u64,
-                        trap_cell.as_ptr() as u64,
+                        &vm as *const VmCtx as u64, // the fibers are this instance's
                     );
                 }
                 fiber_rt::set_current(&mut **rt as *mut fiber_rt::FiberRuntime)
@@ -4097,6 +4422,7 @@ impl CompiledModule {
                         std::sync::Arc::clone(&sink),
                         std::sync::Arc::clone(&counter),
                         &seed, // the full subtree residue — each level re-attaches its own children
+                        n.freeze(),
                     ) {
                         Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
                         Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
@@ -4131,7 +4457,9 @@ impl CompiledModule {
         // joined below).
         // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
         // worker thread carries from a prior run before guest code can `vcpu.tls.get` it.
-        vcpu_tls::seed(0);
+        // A fork twin's register is the parent's at the fork (POSIX: the child's thread state is
+        // a copy of the forking thread's).
+        vcpu_tls::seed(twin_tls.unwrap_or(0));
         // §12.8 4A.5: seed the durable shadow-base register to the root's region (context 0 =
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
@@ -4169,7 +4497,7 @@ impl CompiledModule {
         };
         #[cfg(fiber_rt)]
         if !root_has_lane {
-            (*(trap_cell.as_ptr() as *const AtomicI64))
+            trap_cell
                 .compare_exchange(
                     0,
                     TrapKind::ThreadFault as i64,
@@ -4184,15 +4512,46 @@ impl CompiledModule {
             // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
             false
         } else {
-            mem::run_guarded(
-                &window,
-                code,
-                args.as_ptr(),
-                results.as_mut_ptr(),
-                mem_base,
-                fn_table_ptr,
-                trap_cell.as_ptr(),
-            )
+            loop {
+                let faulted = mem::run_guarded(
+                    &window,
+                    code,
+                    args.as_ptr(),
+                    results.as_mut_ptr(),
+                    mem_base,
+                    fn_table_ptr,
+                    &vm, // the root enters as the module's own instance
+                );
+                // #1768 — the root returned *unwound*, at a fork (the only unwind a fork-armed,
+                // non-durable run has): hand the frozen window to the embedder, which duplicates the
+                // process, then rewind this root in place with the reply it gives, as the twin will
+                // with its own. A trap or fault ends the run as usual.
+                let forked = !faulted
+                    && trap_cell.load(Ordering::Relaxed) == 0
+                    && !(*this).durable
+                    && (*this).fork_hook.is_some()
+                    && window_state(mem_base) == temen_ir::durable_abi::STATE_UNWINDING;
+                if !forked {
+                    break faulted;
+                }
+                let reply = {
+                    // The hook is taken out for the call, so the fork point's shared view of the
+                    // module never overlaps the hook's own `&mut`.
+                    let mut hook = (*this).fork_hook.take().expect("fork-armed");
+                    let t = &*this;
+                    let point = ForkPoint {
+                        window: &window,
+                        data: &t.data,
+                        null_guard: (t.null_guard <= t.cap_mapped).then_some(t.null_guard),
+                        shadow: t.shadow,
+                        args,
+                    };
+                    let reply = hook(&point);
+                    (*this).fork_hook = Some(hook);
+                    reply
+                };
+                arm_fork_rewind(mem_base, (*this).shadow, reply);
+            }
         };
         // The root's computation has ended: its lane goes back, so a still-running child task or a
         // spawned vCPU queued behind it can take it (teardown below joins them).
@@ -4245,7 +4604,7 @@ impl CompiledModule {
         if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
-                fiber_rt::freeze_drive(rt, trap_cell.as_ptr() as u64);
+                fiber_rt::freeze_drive(rt, &vm as *const VmCtx as u64);
                 (*this).frozen_out = fiber_rt::take_frozen(rt); // read back by the durable entry
             }
             // Slice 3.3: capture the **root's** flattened extent now — the freeze driver restored the
@@ -4553,8 +4912,8 @@ impl CompiledModule {
                 self.cap_mapped,
                 self.sub_base,
                 guard_offset_of(self.win_reserved as u64),
-                self.epoch_addr,
-                self.fuel_addr, // same counted-fuel cell as the parent module's functions
+                self.epoch,
+                self.fuel, // charges the running instance's fuel cell, as the parent's functions do
                 !self.thread.is_null(), // as the parent module's functions
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
                 ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
@@ -4992,6 +5351,9 @@ pub(crate) unsafe fn compile_child_and_run(
     nested_sink: std::sync::Arc<std::sync::Mutex<Vec<FrozenNested>>>,
     task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     nested_seeds: &[FrozenNested],
+    // #1693 — the run's async freeze controller: the child registers its window with it while it
+    // runs, and hands it to its own nursery for its grandchildren.
+    freeze: Option<std::sync::Arc<FreezeController>>,
 ) -> Result<(i64, i64, bool), JitError> {
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
 
@@ -5037,6 +5399,7 @@ pub(crate) unsafe fn compile_child_and_run(
             child_shadow,
         ));
         n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
+        n.set_freeze(freeze.clone());
         Some(n)
     } else {
         None
@@ -5076,6 +5439,7 @@ pub(crate) unsafe fn compile_child_and_run(
         &[], // the durable/sync nested child is never an offer target — no serve trampolines
         0,   // an empty powerbox holds no `Jit` — the natural table,,
         child_shadow,
+        ChildRun::Inline, // on its parent's thread: no fiber runtime or thread domain of its own
     )?;
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.tramp_code;
@@ -5106,6 +5470,8 @@ pub(crate) unsafe fn compile_child_and_run(
     const STATE_OFF: usize = temen_ir::durable_abi::STATE_OFF as usize; // global durable state word
     let ctx0_sp_off = child_shadow.region_base(0) as usize;
     let ctx0_thaw_off = child_shadow.thaw_state_off(0) as usize;
+    // Born into a freeze (its parent's window was already `UNWINDING`) — see `unwound` below.
+    let mut born_unwinding = false;
     if durable && (child_size as usize) >= ctx0_thaw_off + 4 {
         let ctx0_frame_base = child_shadow.frame_base(0);
         const STATE_REWINDING: i32 = 2;
@@ -5128,6 +5494,7 @@ pub(crate) unsafe fn compile_child_and_run(
                 i32::from_le_bytes([p[0], p[1], p[2], p[3]])
             };
             w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&parent_phase.to_le_bytes()); // global state = parent's phase
+            born_unwinding = parent_phase == temen_ir::durable_abi::STATE_UNWINDING;
             w[ctx0_thaw_off..ctx0_thaw_off + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
             w[ctx0_sp_off..ctx0_sp_off + 8].copy_from_slice(&ctx0_frame_base.to_le_bytes());
             // ctx-0 SP
@@ -5177,6 +5544,7 @@ pub(crate) unsafe fn compile_child_and_run(
                     std::sync::Arc::clone(&nested_sink),
                     std::sync::Arc::clone(&task_counter),
                     nested_seeds,
+                    freeze.clone(),
                 );
                 match out {
                     Ok((r, t, _)) => cn.seed_child_result(rec.slot, r, t),
@@ -5187,7 +5555,9 @@ pub(crate) unsafe fn compile_child_and_run(
     }
 
     let mut results = vec![0i64; n_results];
-    let mut trap_cell: i64 = 0;
+    // The child runs as its own instance (its empty powerbox + the parent's kill-path cell and its
+    // own budget cell, as its compile recorded them).
+    let vm = VmCtx::new(child.instance);
     // SAFETY: `code` honours the `Entry` ABI; it accesses only its own window `[child_base, …+size)`
     // (baked masking; a width-overrun hits this window's guard page), reads the child `fn_table`, and
     // writes its result/trap slots. The guard is re-entrant, so a child fault is caught here and the
@@ -5202,6 +5572,12 @@ pub(crate) unsafe fn compile_child_and_run(
         durable_shadow::seed(child_shadow.region_base(0));
         s
     });
+    // #1693: the child polls only its own window, so an async freeze must reach it here too.
+    // SAFETY: the window is live until after the ring is dropped below.
+    let ring = freeze
+        .as_ref()
+        .filter(|_| durable)
+        .map(|fc| fc.enter_child(child_base as usize));
     let faulted = mem::run_guarded(
         &child_window,
         code,
@@ -5209,14 +5585,17 @@ pub(crate) unsafe fn compile_child_and_run(
         results.as_mut_ptr(),
         child_base,
         fn_table_ptr as *const core::ffi::c_void,
-        &mut trap_cell,
+        &vm,
     );
+    drop(ring);
     if let Some(s) = saved_shadow {
         durable_shadow::seed(s);
     }
-    if faulted {
-        trap_cell = mem::FAULT_TRAP;
-    }
+    let trap_cell = if faulted {
+        mem::FAULT_TRAP
+    } else {
+        vm.trap.load(Ordering::Relaxed)
+    };
     // Copy the child's final window back into the parent's sub-region — the parent (the superset) now
     // sees the child's writes (materialized at `instantiate`-completion for a synchronous child). A
     // guest with no Memory cap leaves every page mapped; `restore_rw` is defensive.
@@ -5224,9 +5603,17 @@ pub(crate) unsafe fn compile_child_and_run(
     // (spilled its continuation into the carve + returned a placeholder) instead of completing. Detect
     // it from the carve's state word before the copy-back carries the carve into the parent window.
     // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
-    // A child that trapped did not unwind, even under a freeze: it finished, with that trap.
-    let unwound =
-        durable && !faulted && trap_cell == 0 && fiber_rt::window_is_unwinding(child_base as u64);
+    // A child that trapped did not unwind, even under a freeze: it finished, with that trap. Nor did
+    // one an async request rang after its last poll (#1693): it ran to the end, its shadow stack still
+    // empty, as the root's late-request check reads it. A child born unwinding keeps its rule: it is
+    // recorded, and a thaw re-runs it.
+    let unwound = durable
+        && !faulted
+        && trap_cell == 0
+        && fiber_rt::window_is_unwinding(child_base as u64)
+        && (born_unwinding
+            || fiber_rt::read_shadow_sp(child_base as u64, child_shadow.region_base(0))
+                > child_shadow.frame_base(0));
     // Its own unjoined children ride too (depth-2+).
     if unwound {
         if let Some(n) = &child_nursery {
@@ -5257,7 +5644,8 @@ pub(crate) unsafe fn compile_child_and_run(
 /// `cc` is the live [`CompiledModule`] the in-flight child was compiled from (registered at spawn,
 /// cleared at release); `code` is one of its finalized serve trampolines; `args`/`results` match
 /// the trampoline's arity; `[mem_base, mem_base+mem_size)` is the child's live mapped window;
-/// `trap_out` is the run's trap cell.
+/// `vmctx` is the **child's** instance context — its own run's (the serve loop's thunk `trap_out`),
+/// or one minted from [`child_instance`] for a handler run on another thread (the handoff).
 #[cfg(fiber_rt)]
 pub unsafe fn child_invoke_handler(
     cc: *const core::ffi::c_void,
@@ -5266,7 +5654,7 @@ pub unsafe fn child_invoke_handler(
     results: &mut [i64],
     mem_base: *mut u8,
     mem_size: u64,
-    trap_out: *mut i64,
+    vmctx: *const VmCtx,
 ) -> bool {
     let cc = cc as *const CompiledModule;
     let fn_table_ptr = (*cc).fn_table.as_ptr() as *const core::ffi::c_void;
@@ -5277,10 +5665,22 @@ pub unsafe fn child_invoke_handler(
         results.as_mut_ptr(),
         mem_base,
         fn_table_ptr,
-        trap_out,
+        vmctx,
         lo,
         lo + mem_size as usize,
     )
+}
+
+/// #1768 — the instance a registered §14 child runs as (its powerbox, and the kill-path and fuel
+/// cells its compile was handed): what a caller running one of its handlers **on another thread**
+/// (the CALLS.md 5c.2 handoff) mints the handler's [`VmCtx`] from, so the handler's `call.cap`s reach
+/// the child's powerbox, never the caller's.
+///
+/// # Safety
+/// `cc` is a live registered child module (see [`child_invoke_handler`]).
+#[cfg(fiber_rt)]
+pub unsafe fn child_instance(cc: *const core::ffi::c_void) -> InstanceAddrs {
+    (*(cc as *const CompiledModule)).instance
 }
 
 /// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw child [`CompiledModule`]
@@ -5408,6 +5808,8 @@ fn compile_child(
     // #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
     table_reserve_log2: u8,
     shadow: temen_ir::durable_abi::ShadowArena,
+    // How the child runs, which decides the runtimes it may use (#1469); see [`ChildRun`].
+    run: ChildRun,
 ) -> Result<CompiledModule, JitError> {
     compile_child_windowed(
         funcs,
@@ -5424,7 +5826,23 @@ fn compile_child(
         serve_handlers,
         table_reserve_log2,
         shadow,
+        run,
     )
+}
+
+/// How a §14 child runs, which decides the fiber and thread runtimes its code may call (#1469).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChildRun {
+    /// Synchronously on its parent's thread (the durable nested path): the running fiber runtime
+    /// is the parent's, so `cont.*` and `thread.*` stay refused.
+    Inline,
+    /// As a child-executor task (`child_exec`): a fiber runtime of its own, and a domain of its
+    /// own for `thread.spawn`/`join`.
+    Task,
+    /// As a **durable** task (a durable parent's detached child, or a thawed one): a fiber runtime
+    /// of its own; `thread.spawn` stays refused — its vCPUs would run outside the freeze that
+    /// captures the child.
+    DurableTask,
 }
 
 /// [`compile_child`] over a **decoupled** window: `mapped_log2` committed bytes inside a
@@ -5435,8 +5853,12 @@ fn compile_child(
 ///
 /// The result is a [`CompiledModule`] — **the same shape a root compiles to** (#1296: a domain is a
 /// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
-/// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no fiber /
-/// setjmp / nursery runtime of its own (those ops are rejected below). Being the root's shape is what
+/// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no
+/// setjmp / nursery runtime of its own (those ops are rejected below). A child that runs as an
+/// executor task may use `cont.*` fibers and `gc.roots`, and a non-durable one `thread.spawn`/`join`
+/// (#1469): the thunks are static and find the running fiber runtime and thread domain through
+/// thread-locals, and each task brings its own (`child_exec`), so the code stays shareable across
+/// spawns. Being the root's shape is what
 /// lets a child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
 /// submitted unit against exactly these baked constants, into the child's own table.
 #[allow(clippy::too_many_arguments)]
@@ -5456,7 +5878,11 @@ fn compile_child_windowed(
     table_reserve_log2: u8,
     // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     shadow: temen_ir::durable_abi::ShadowArena,
+    // How the child runs (see [`ChildRun`]): only a task has a fiber runtime of its own, and only a
+    // non-durable one a thread domain.
+    run: ChildRun,
 ) -> Result<CompiledModule, JitError> {
+    let in_task = run != ChildRun::Inline;
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
@@ -5476,11 +5902,18 @@ fn compile_child_windowed(
         .clone();
     for f in funcs {
         ensure_supported(f, types)?;
-        // A child using §12 fibers/threads would compile against null fiber/thread thunks (no
-        // per-child runtime yet) — reject rather than emit a call through a null pointer.
-        if f.uses_fibers_or_threads() {
+        // `thread.spawn`/`join` need the task's own domain, and its parent's to share the futex
+        // with; without them they would compile against null thread thunks — reject. Likewise
+        // `cont.*` in a child that has no fiber runtime of its own (not a task), or no domain for
+        // `cont.resume.block` to bake.
+        if f.uses_threads() && !(run == ChildRun::Task && cfg!(fiber_rt) && futex_sched != 0) {
             return Err(JitError::Unsupported(
-                "a §14 JIT child using fibers/threads is not supported yet",
+                "a §14 JIT child using thread.spawn/join needs a non-durable task and its parent's domain",
+            ));
+        }
+        if !(in_task && cfg!(fiber_rt) && futex_sched != 0) && f.uses_fibers_or_threads() {
+            return Err(JitError::Unsupported(
+                "a §14 JIT child using fibers needs a task and its parent's domain",
             ));
         }
         // `atomic.wait`/`notify` compile against the parent domain's shared futex when one was
@@ -5516,20 +5949,44 @@ fn compile_child_windowed(
     // equality across the child's program and its units (DESIGN.md §22).
     let mut distinct = distinct_types(funcs);
     intern_unit_sigs(&mut distinct, funcs, types)?;
+    // A task child using `cont.*` or `gc.roots` gets the fiber thunks, as a root does
+    // (`compile_with_signal`); the fiber-entry signature is interned the same way.
+    let uses_fibers = in_task && funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots());
+    // Thread ops passed the check above only in a task that can host them.
+    let uses_threads = funcs.iter().any(|f| f.uses_threads());
+    #[cfg(fiber_rt)]
+    if uses_fibers {
+        intern_type(&mut distinct, &fiber_func_type())?;
+    }
     let distinct = distinct;
+    #[cfg(fiber_rt)]
+    let fiber = if uses_fibers {
+        FiberEnv {
+            new_thunk: fiber_rt::fiber_new as *const () as i64,
+            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+            block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
+            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+            roots_thunk: fiber_rt::temen_gc_roots_flush as *const () as i64,
+        }
+    } else {
+        FiberEnv::null()
+    };
+    #[cfg(not(fiber_rt))]
+    let fiber = FiberEnv::null();
 
     let cap = CapEnv {
         thunk_addr: cap_thunk as *const () as i64,
-        ctx_addr: cap_ctx as i64,
         fast_resolver: None, // nested child: `call.cap`s go to the coroutine thunk, not a fast path
     };
-    // Wait/notify-only thread env over the **parent's** futex domain (spawn/join stay rejected
-    // above, so their null thunks are never reached); null when no domain was supplied.
+    // The thread env over the **parent's** futex domain: wait/notify rendezvous there, and a task's
+    // `thread.spawn`/`join` act in its own domain, which the thunks look up (`CURRENT_DOMAIN`). The
+    // spawn/join thunks are null unless the child uses them; null when no domain was supplied.
     let thread_env = if futex_sched != 0 {
+        let if_threads = |t: i64| if uses_threads { t } else { 0 };
         ThreadEnv {
             sched_addr: futex_sched as i64,
-            spawn_thunk: 0,
-            join_thunk: 0,
+            spawn_thunk: if_threads(os_thread_rt::thread_spawn as *const () as i64),
+            join_thunk: if_threads(os_thread_rt::thread_join as *const () as i64),
             wait_thunk: os_thread_rt::thread_wait as *const () as i64,
             notify_thunk: os_thread_rt::thread_notify as *const () as i64,
         }
@@ -5546,7 +6003,7 @@ fn compile_child_windowed(
             &distinct,
             types,
             cap,
-            FiberEnv::null(),
+            fiber,
             thread_env,
             inst_env, // §4: a durable child's baked nested-nursery `InstEnv` (else null — no nesting)
             SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
@@ -5557,11 +6014,11 @@ fn compile_child_windowed(
             mapped, // the committed prefix (== reserved for a carve child; the declared size detached)
             0,      // top-level confinement over the child's own window
             guard_offset_of(reserved), // its own window's trailing guard
-            epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
-            fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
-            true,             // a §14 child always runs beside its parent, which may tear it down
-            fn_table_mask,    // the child's own (reserved) table mask
-            None,             // §14 child: own window/table, `ref.func N` = slot N (no remap)
+            epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
+            fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
+            true,   // a §14 child always runs beside its parent, which may tear it down
+            fn_table_mask, // the child's own (reserved) table mask
+            None,   // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
             None, // …nor value-label points (Stage 3a)
@@ -5637,9 +6094,42 @@ fn compile_child_windowed(
             }
         }
     }
+    // The call-trampoline (a fiber's first resume, and a spawned vCPU's entry, call through it), as
+    // a root's.
+    #[cfg(fiber_rt)]
+    let fiber_tramp = if uses_fibers || uses_threads {
+        build_fiber_call_trampoline(&mut module, &mut ctx.func);
+        let id = module
+            .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module
+            .define_function(id, &mut ctx)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module.clear_context(&mut ctx);
+        Some(id)
+    } else {
+        None
+    };
     module
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
+    // What a task's own fiber runtime needs (`child_exec`): the trampoline, and the fiber-entry
+    // type id + the funcref mask (the reserved table's, as a root's `fiber_mask`).
+    #[cfg(fiber_rt)]
+    let (call_tramp, fiber_cfg): (Option<fiber_rt::FiberCallTramp>, Option<(u32, u64)>) =
+        match fiber_tramp {
+            Some(id) => {
+                let addr = module.get_finalized_function(id);
+                // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly this ABI.
+                let t: fiber_rt::FiberCallTramp = unsafe { std::mem::transmute(addr) };
+                // A pure-thread child has the trampoline but no fibers, as a pure-thread root.
+                (
+                    Some(t),
+                    uses_fibers.then(|| (type_id_of(&distinct, &fiber_func_type()), fn_table_mask)),
+                )
+            }
+            None => (None, None),
+        };
 
     let fn_table: Box<[FnEntry]> = (0..table_len)
         .map(|slot| match funcs.get(slot) {
@@ -5684,15 +6174,23 @@ fn compile_child_windowed(
         n_real_funcs: funcs.len(),
         distinct,
         cap,
-        fiber: FiberEnv::null(),
+        fiber,
         thread: thread_env,
         inst: inst_env,
         setjmp: SetjmpEnv::null(),
         mask,
         cap_mapped: mapped,
         sub_base: 0,
-        epoch_addr: epoch_addr as i64,
-        fuel_addr: fuel_addr as i64,
+        epoch: epoch_addr != 0,
+        fuel: fuel_addr != 0,
+        // The child's own instance: its powerbox (the ctx its compile was handed), the parent's
+        // kill-path cell, its own budget cell. §14 children are not signal-delivery armed.
+        instance: InstanceAddrs {
+            cap_ctx,
+            epoch: epoch_addr as *const AtomicU64,
+            fuel: fuel_addr as *mut u64,
+            ..InstanceAddrs::NONE
+        },
         fn_table_mask,
         next_extra: 0,
         extra_bytes: 0,
@@ -5722,14 +6220,15 @@ fn compile_child_windowed(
         thaw_root_sp: shadow.frame_base(0),
         shadow,
         freeze_ctl: None,
+        fork_hook: None,
         fiber_rt: None,
         domain: None,
         _nursery: None,
         _unit_progs: Vec::new(),
         #[cfg(setjmp_rt)]
         _setjmp_rt: None,
-        call_tramp: None,
-        fiber_cfg: None,
+        call_tramp,
+        fiber_cfg,
         fiber_table: None,
         src_ranges: Vec::new(),
         src_files: Vec::new(),
@@ -5797,6 +6296,7 @@ pub(crate) fn compile_nondurable_child(
         &[], // a plain (ungranted) child is never an offer target — no serve trampolines
         0,   // an empty powerbox holds no `Jit` — the natural table,
         shadow,
+        ChildRun::Task, // a plain child runs as an executor task (#1469)
     )
 }
 
@@ -6063,38 +6563,37 @@ pub struct SignalArm {
     pub ctx: *mut core::ffi::c_void,
 }
 
-/// #932 — the async-signal delivery environment baked into [`emit_signal_check`]: the host `armed`
-/// flag address, the two call-out thunk addresses, and the ctx address. All `0` ⇒ no delivery is
-/// armed for this compile (the check is not emitted — guest code is byte-identical to the un-armed
-/// build), exactly like [`Lower::epoch_addr`]/[`Lower::fuel_addr`].
+/// #932 — the async-signal delivery shape baked into [`emit_signal_check`]: whether this compile
+/// delivers at all, and the two call-out thunk addresses (process globals). The instance's `armed`
+/// flag and delivery ctx are per-instance, read from its [`VmCtx`]. Un-armed ⇒ the check is not
+/// emitted — guest code is byte-identical to the un-armed build, exactly like [`Lower::epoch`] /
+/// [`Lower::fuel`].
 #[derive(Clone, Copy)]
 struct SigEnv {
-    armed_addr: i64,
+    armed: bool,
     take_thunk: i64,
     return_thunk: i64,
-    ctx_addr: i64,
 }
 
 impl SigEnv {
     fn null() -> SigEnv {
         SigEnv {
-            armed_addr: 0,
+            armed: false,
             take_thunk: 0,
             return_thunk: 0,
-            ctx_addr: 0,
         }
     }
     /// True when this compile arms safepoint signal delivery (the host supplied a [`SignalArm`]).
     fn is_armed(&self) -> bool {
-        self.armed_addr != 0
+        self.armed
     }
 }
 
-/// The host `call.cap` thunk + ctx addresses, baked into each `call.cap` as constants.
+/// The host `call.cap` thunk address, baked into each `call.cap` as a constant (a process global).
+/// The ctx it is handed — the instance's powerbox — is per-instance, read from its [`VmCtx`].
 #[derive(Clone, Copy)]
 struct CapEnv {
     thunk_addr: i64,
-    ctx_addr: i64,
     /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
     /// nested children, whose `call.cap`s go to the coroutine thunk). Invoked at compile time.
     fast_resolver: Option<FastCapResolver>,
@@ -6256,9 +6755,10 @@ struct Lower<'a> {
     mem_var: Variable,
     /// Holds `fn_table_base` for `call.dyn` dispatch and call threading.
     fn_table_var: Variable,
-    /// Holds `trap_out`, the host-owned `*mut i64` trap cell a trap (or the cap thunk)
-    /// writes before returning (the host reads it to learn the run trapped, §5).
-    trap_var: Variable,
+    /// Holds the instance's [`VmCtx`] pointer — which is also its trap cell (field 0), the host-owned
+    /// `*mut i64` a trap (or the cap thunk) writes before returning (the host reads it to learn the
+    /// run trapped, §5). Every other per-instance address is loaded from it ([`vmctx_load`]).
+    vmctx_var: Variable,
     /// §2b path B: holds `stack_limit` (the running stack's `usable_low`, or 0 for the root), for the
     /// prologue [`emit_stack_check`] and to thread on to callees. Always present (the guard is in the
     /// always-on escape-TCB path).
@@ -6313,24 +6813,25 @@ struct Lower<'a> {
     /// [`emit_signal_check`] at safepoints (`SigEnv::null()` ⇒ no signal delivery armed — the check is
     /// not emitted, guest code byte-identical to the un-armed build).
     sig: SigEnv,
-    /// Address of the host-owned **interrupt cell** (`AtomicU64`) for the §5 fuel/epoch kill-path.
-    /// `0` ⇒ no kill-path is armed for this compile (the checks are not emitted — guest code is
-    /// byte-identical to the un-armed build). When non-zero, the lowering polls `*epoch_addr` at
-    /// loop back-edges and function entries and traps [`TrapKind::OutOfFuel`] if the host has set it
-    /// non-zero, so a non-terminating guest is stopped. The guest cannot disable the poll — only the
-    /// host (who chose to arm it) writes the cell.
-    epoch_addr: i64,
-    /// Address of the host-owned **counted-fuel cell** (`u64`) for safepoint-anchored fuel metering
-    /// (INTERP_PERF.md "Fuel unification"). `0` ⇒ no fuel budget is armed for this compile (no fuel
-    /// checks are emitted — guest code is byte-identical to the un-armed build). When non-zero, the
-    /// lowering decrements `*fuel_addr` by one at every function entry, taken back-edge and
-    /// `cont.resume` (the same IR safepoints the interpreters charge at; a fiber's entry is refunded,
-    /// since the resume that started it paid — #1642) and traps [`TrapKind::OutOfFuel`] when it would
-    /// go below zero — so `fuel` = (function entries + taken back-edges + resumes) executed, identical
-    /// to the interpreters. Unlike [`Self::epoch_addr`] this is the **guest's own budget**, not written
-    /// by the host mid-run, so the load/decrement/store is plain (non-atomic); the store⇒load dependency
-    /// on the same address keeps Cranelift from hoisting the check out of a loop.
-    fuel_addr: i64,
+    /// Whether this compile polls the host-owned **interrupt cell** (`AtomicU64`, the instance's
+    /// [`VmCtx::epoch`]) for the §5 fuel/epoch kill-path. `false` ⇒ no kill-path is armed (the checks
+    /// are not emitted — guest code is byte-identical to the un-armed build). When set, the lowering
+    /// polls the cell at loop back-edges and function entries and traps [`TrapKind::OutOfFuel`] if the
+    /// host has set it non-zero, so a non-terminating guest is stopped. The guest cannot disable the
+    /// poll — only the host (who chose to arm it) writes the cell.
+    epoch: bool,
+    /// Whether this compile charges the host-owned **counted-fuel cell** (`u64`, the instance's
+    /// [`VmCtx::fuel`]) for safepoint-anchored fuel metering (INTERP_PERF.md "Fuel unification").
+    /// `false` ⇒ no fuel budget is armed (no fuel checks are emitted — guest code is byte-identical to
+    /// the un-armed build). When set, the lowering decrements the cell by one at every function entry,
+    /// taken back-edge and `cont.resume` (the same IR safepoints the interpreters charge at; a fiber's
+    /// entry is refunded, since the resume that started it paid — #1642) and traps
+    /// [`TrapKind::OutOfFuel`] when it would go below zero — so `fuel` = (function entries + taken
+    /// back-edges + resumes) executed, identical to the interpreters. Unlike [`Self::epoch`] this is
+    /// the **guest's own budget**, not written by the host mid-run, so the load/decrement/store is
+    /// plain (non-atomic); the store⇒load dependency on the same address keeps Cranelift from hoisting
+    /// the check out of a loop.
+    fuel: bool,
     /// DESIGN §12 domain teardown for **running** vCPUs: poll this vCPU's own trap cell at every loop
     /// back-edge (and the entry of a function that tail-calls), and unwind when it is non-zero — a sibling's trap, the root's
     /// completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown of a §14 child. On for code
@@ -6418,8 +6919,8 @@ fn build_clif(
     mapped: u64,
     sub_base: u64,
     guard_offset: u64,
-    epoch_addr: i64,
-    fuel_addr: i64,
+    epoch: bool,
+    fuel: bool,
     domain_poll: bool,
     fn_table_mask: u64,
     ref_slots: Option<&[u32]>,
@@ -6448,7 +6949,7 @@ fn build_clif(
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
-    b.append_block_param(entry, I64); // trap_out
+    b.append_block_param(entry, I64); // vmctx (its field 0 is the trap cell)
     b.append_block_param(entry, I64); // stack_limit (§2b path B) — mirrors sig_from
     if sret {
         b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
@@ -6460,15 +6961,15 @@ fn build_clif(
     b.seal_block(entry);
     let mem_base = b.block_params(entry)[0];
     let fn_table_base = b.block_params(entry)[1];
-    let trap_out = b.block_params(entry)[2];
+    let vmctx = b.block_params(entry)[2];
 
     // The context pointers are needed across blocks; stash them in variables.
     let mem_var = b.declare_var(I64);
     b.def_var(mem_var, mem_base);
     let fn_table_var = b.declare_var(I64);
     b.def_var(fn_table_var, fn_table_base);
-    let trap_var = b.declare_var(I64);
-    b.def_var(trap_var, trap_out);
+    let vmctx_var = b.declare_var(I64);
+    b.def_var(vmctx_var, vmctx);
     // §2b path B: stash the stack-limit param (block index 3, right after the context pointers) so the
     // prologue check and every call can reach it.
     let limit_var = {
@@ -6499,7 +7000,7 @@ fn build_clif(
     let lower = Lower {
         mem_var,
         fn_table_var,
-        trap_var,
+        vmctx_var,
         limit_var,
         sret_var,
         funcs,
@@ -6517,8 +7018,8 @@ fn build_clif(
         inst,
         setjmp,
         sig,
-        epoch_addr,
-        fuel_addr,
+        epoch,
+        fuel,
         domain_poll,
         ids,
         distinct,
@@ -6842,8 +7343,8 @@ fn lower_block(
                                                         // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
             if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
                 if !sig.results.is_empty() {
-                    let v = if lower.fuel_addr != 0 {
-                        let addr = b.ins().iconst(I64, lower.fuel_addr);
+                    let v = if lower.fuel {
+                        let addr = vmctx_load(b, lower, vmctx::FUEL);
                         b.ins().load(I64, MemFlags::trusted(), addr, 0)
                     } else {
                         b.ins().iconst(I64, i64::MAX)
@@ -6884,74 +7385,23 @@ fn lower_block(
         // implementation with the interpreter and the bytecode engine. The vestigial handle operand
         // is not read (constant 0, like `self.*`); the module bytes are never rewritten, so the
         // compiled code is identical across instantiations (the binding is host-side state).
-        if let Inst::CallImport {
-            import,
-            op,
-            sig,
-            args,
-            ..
-        } = inst
+        //
+        // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`; a bound `call.sym`
+        // (§7/§22 symbolic call) is a flat import dispatch (consumer op 0) whose legacy handle
+        // operand is not read either. The dynamic-mode dispatch by type-section reference packs
+        // `(type_idx | op << 16)` into the reserved dyn entry, and its handle operand is live (the
+        // value being driven). [`Inst::host_dispatch`] is the one definition of the packings.
+        if let Inst::CallImport { sig, args, .. }
+        | Inst::CallSym { sig, args, .. }
+        | Inst::CallImportDyn { sig, args, .. } = inst
         {
             let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
-            let h0 = b.ins().iconst(I32, 0);
-            lower_cap_call(
-                module,
-                b,
-                lower,
-                temen_ir::CAP_IMPORT_TYPE_ID,
-                // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
-                *import | (*op << 16),
-                sig,
-                h0,
-                args,
-                &mut vals,
-            )?;
-            continue;
-        }
-        // §7/§22 symbolic call: a bound `call.sym` is a flat import dispatch (op 0); the
-        // legacy handle operand is not read by the dispatch (constant 0, like `call.import`).
-        if let Inst::CallSym {
-            import, sig, args, ..
-        } = inst
-        {
-            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
-            let h0 = b.ins().iconst(I32, 0);
-            lower_cap_call(
-                module,
-                b,
-                lower,
-                temen_ir::CAP_IMPORT_TYPE_ID,
-                *import,
-                sig,
-                h0,
-                args,
-                &mut vals,
-            )?;
-            continue;
-        }
-        // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
-        // `(type_idx | op << 16)`; the handle operand is live (the value being driven).
-        if let Inst::CallImportDyn {
-            ty,
-            op,
-            sig,
-            handle,
-            args,
-        } = inst
-        {
-            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
-            let h = get(&vals, *handle)?;
-            lower_cap_call(
-                module,
-                b,
-                lower,
-                temen_ir::CAP_DYN_TYPE_ID,
-                *ty | (*op << 16),
-                sig,
-                h,
-                args,
-                &mut vals,
-            )?;
+            let (type_id, op) = inst.host_dispatch().expect("an import-form call");
+            let h = match inst {
+                Inst::CallImportDyn { handle, .. } => get(&vals, *handle)?,
+                _ => b.ins().iconst(I32, 0),
+            };
+            lower_cap_call(module, b, lower, type_id, op, sig, h, args, &mut vals)?;
             continue;
         }
         // §3.5 self-namespace extensions — the shared dispatch entry with `CAP_SELF_TYPE_ID` and
@@ -7028,7 +7478,7 @@ fn lower_block(
             // prologue charge its starting `cont.resume` already paid (#1642).
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
             let spv = get(&vals, *sp)?;
             let mut tsig = module.make_signature();
@@ -7038,7 +7488,11 @@ fn lower_block(
             tsig.returns.push(AbiParam::new(I64)); // i64 fiber handle (16-bit slot + 48-bit generation)
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
-            let fuel = b.ins().iconst(I64, lower.fuel_addr);
+            let fuel = if lower.fuel {
+                vmctx_load(b, lower, vmctx::FUEL)
+            } else {
+                b.ins().iconst(I64, 0)
+            };
             let call =
                 b.ins()
                     .call_indirect(tref, thunk, &[mem_base, fnt, trap_out, funcref, spv, fuel]);
@@ -7065,7 +7519,7 @@ fn lower_block(
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let kh = get(&vals, *k)?;
             let av = get(&vals, *arg)?;
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             let call = if blocking {
                 // fiber_resume_block(sched, handle, arg, status_out, trap_out) -> value:i64.
                 let sched = b.ins().iconst(I64, lower.thread.sched_addr);
@@ -7101,7 +7555,7 @@ fn lower_block(
         if let Inst::Suspend { value } = inst {
             // fiber_suspend(value:i64, trap_out:i64) -> next-resume arg:i64
             let v = get(&vals, *value)?;
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             let mut tsig = module.make_signature();
             for t in [I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7151,7 +7605,7 @@ fn lower_block(
         if let Inst::LongJmp { buf, val } = inst {
             let bufv = get(&vals, *buf)?;
             let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             // slot = rt_setjmp_lookup(rt_addr, buf, trap_out) -> *mut jmp_buf (null + trap on miss)
             let mut s1 = module.make_signature();
             for t in [I64, I64, I64] {
@@ -7237,7 +7691,7 @@ fn lower_block(
             let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
             let mappedv = b.ins().iconst(I64, win_reserved as i64);
             let subv = b.ins().iconst(I64, lower.sub_base as i64);
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             // Marshal the ten args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
             // `#[repr(C)]` field order) and pass a single pointer. The thunk is the register-flush
             // trampoline, which spills the callee-saved registers before the scan; a one-pointer ABI
@@ -7283,7 +7737,7 @@ fn lower_block(
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             // The spawn entry is dispatched through the shared `fn_table` (`os_thread_rt` masks it
             // into the table like any `call.dyn`). A submitted unit's own functions live in
             // auto-installed padding slots, not at their module-relative indices — so remap `func`
@@ -7317,7 +7771,7 @@ fn lower_block(
             // thread_join(sched, handle:i32, trap_out:i64) -> result:i64
             let sched = b.ins().iconst(I64, lower.thread.sched_addr);
             let h = get(&vals, *handle)?;
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             let mut tsig = module.make_signature();
             for t in [I64, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -7352,7 +7806,7 @@ fn lower_block(
             };
             let width = b.ins().iconst(I32, w as i64);
             let to = get(&vals, *timeout)?;
-            let trap_out = b.use_var(lower.trap_var);
+            let trap_out = b.use_var(lower.vmctx_var);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
@@ -8259,8 +8713,8 @@ fn lower_block(
                                                  // static per edge, but which edge is taken is a runtime value — so an edge that is a
                                                  // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
                                                  // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
-            let then_be = lower.fuel_addr != 0 && *then_blk as usize <= block_idx;
-            let else_be = lower.fuel_addr != 0 && *else_blk as usize <= block_idx;
+            let then_be = lower.fuel && *then_blk as usize <= block_idx;
+            let else_be = lower.fuel && *else_blk as usize <= block_idx;
             match (then_be, else_be) {
                 // Neither edge charges (or fuel un-armed) — the plain conditional branch.
                 (false, false) => {
@@ -8310,7 +8764,7 @@ fn lower_block(
                                                  // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
                                                  // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
                                                  // `fuel_addr != 0` so an un-armed compile builds the identical table.
-            let is_be = |t: u32| lower.fuel_addr != 0 && t as usize <= block_idx;
+            let is_be = |t: u32| lower.fuel && t as usize <= block_idx;
             let all_be = is_be(default.0) && targets.iter().all(|(t, _)| is_be(*t));
             let any_be = is_be(default.0) || targets.iter().any(|(t, _)| is_be(*t));
             if all_be {
@@ -8430,11 +8884,22 @@ fn lower_block(
 
 /// The leading context arguments threaded into every guest call: `(mem_base,
 /// fn_table_base, trap_out, stack_limit)`.
+/// Load one of the instance's per-run addresses from its [`VmCtx`] (a field offset from
+/// [`vmctx`](crate::vmctx)). The fields are written before an entry and never during it, so the load is
+/// `readonly` + `can_move`: Cranelift may hoist it out of a loop or share it between uses — the
+/// address is loop-invariant; what it points *at* (the interrupt cell, the armed flag) is still read
+/// by the caller with its own ordering.
+fn vmctx_load(b: &mut FunctionBuilder, lower: &Lower, field: i32) -> Value {
+    let vmctx = b.use_var(lower.vmctx_var);
+    let flags = MemFlags::trusted().with_readonly().with_can_move();
+    b.ins().load(I64, flags, vmctx, field)
+}
+
 fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
     vec![
         b.use_var(lower.mem_var),
         b.use_var(lower.fn_table_var),
-        b.use_var(lower.trap_var),
+        b.use_var(lower.vmctx_var),
         // §2b path B: pass our own stack-limit on to the callee (same stack, same limit) — mirrors
         // sig_from. Constant within a stack's call tree; set anew at each fiber/root entry.
         b.use_var(lower.limit_var),
@@ -8515,7 +8980,7 @@ fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
         let helper = b.ins().iconst(I64, addr);
         b.ins().call_indirect(sigref, helper, &[fp]);
     }
-    let cell = b.use_var(lower.trap_var);
+    let cell = b.use_var(lower.vmctx_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     b.ins().store(MemFlags::trusted(), code, cell, 0);
 }
@@ -8543,12 +9008,12 @@ fn emit_trap_return(b: &mut FunctionBuilder, lower: &Lower) {
 /// On return the builder is positioned at a fresh continuation block (the not-interrupted path);
 /// the caller emits the real terminator / jump there.
 fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
-    if lower.epoch_addr == 0 {
+    if !lower.epoch {
         return; // no kill-path armed for this compile — emit nothing
     }
     let cont = b.create_block();
     let trap_blk = b.create_block();
-    let addr = b.ins().iconst(I64, lower.epoch_addr);
+    let addr = vmctx_load(b, lower, vmctx::EPOCH);
     // The host stores into this cell **concurrently** (the watchdog thread), so the poll must reload
     // it every check. An **atomic** load is the reliable way to say so: under `opt_level=speed`
     // Cranelift's alias analysis sees no *guest* store to the cell and would hoist/CSE a plain load out
@@ -8575,7 +9040,7 @@ fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
     if !lower.domain_poll {
         return;
     }
-    let trap_out = b.use_var(lower.trap_var);
+    let trap_out = b.use_var(lower.vmctx_var);
     let tc = b.ins().atomic_load(I64, atomic_flags(), trap_out);
     let stop = b.create_block();
     let cont = b.create_block();
@@ -8614,7 +9079,7 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
     b.switch_to_block(poll);
     // Poll the host `AtomicBool` armed flag. Atomic load (like the epoch cell) so it is re-read every
     // iteration — a plain load would be hoisted out of the loop and the poll would fire only once.
-    let armed_addr = b.ins().iconst(I64, lower.sig.armed_addr);
+    let armed_addr = vmctx_load(b, lower, vmctx::SIG_ARMED);
     let armed = b.ins().atomic_load(I8, atomic_flags(), armed_addr);
     let maybe = b.create_block();
     b.ins().brif(armed, maybe, &[], cont, &[]);
@@ -8623,7 +9088,7 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
     b.switch_to_block(maybe);
     let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
     let out = b.ins().stack_addr(I64, out_ss, 0);
-    let ctx = b.ins().iconst(I64, lower.sig.ctx_addr);
+    let ctx = vmctx_load(b, lower, vmctx::SIG_CTX);
     let take_sig = {
         let mut s = module.make_signature(); // host C ABI (matches the `extern "C"` thunk)
         s.params.push(AbiParam::new(I64)); // ctx
@@ -8667,7 +9132,7 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
         b.import_signature(s)
     };
     let retf = b.ins().iconst(I64, lower.sig.return_thunk);
-    let ctx2 = b.ins().iconst(I64, lower.sig.ctx_addr);
+    let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
     b.ins().call_indirect(ret_sig, retf, &[ctx2]);
     b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
     b.switch_to_block(cont);
@@ -8692,12 +9157,12 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
 /// is `0` (would underflow), i.e. before the charge that would make it negative — matching the
 /// interpreters' `checked_sub(1)` at the safepoint.
 fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
-    if lower.fuel_addr == 0 {
+    if !lower.fuel {
         return; // no fuel armed for this compile — emit nothing
     }
     let cont = b.create_block();
     let trap_blk = b.create_block();
-    let addr = b.ins().iconst(I64, lower.fuel_addr);
+    let addr = vmctx_load(b, lower, vmctx::FUEL);
     // Plain load (not `readonly`) — the store below writes the same address, so the load is not
     // loop-invariant and is re-evaluated each iteration. `trusted()` = aligned + notrap (a host-owned
     // aligned cell that never faults), no atomic ordering (single guest thread owns this budget).
@@ -8813,7 +9278,7 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
 /// immediately — before any later op can observe bogus zero results or overwrite the cell (a
 /// *successful* `call.cap` resets it to 0, which would otherwise mask a callee's trap).
 fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
-    let trap_out = b.use_var(lower.trap_var);
+    let trap_out = b.use_var(lower.vmctx_var);
     let tc = b.ins().load(I64, MemFlags::trusted(), trap_out, 0);
     let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
     let trapret = b.create_block();
@@ -8867,7 +9332,7 @@ fn lower_cap_call_fast(
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
     let n_res = sig.results.len();
-    let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
+    let ctx = vmctx_load(b, lower, vmctx::CAP_CTX);
     let mem_base = b.use_var(lower.mem_var);
     // #826: this frozen `lower.mapped` is deliberate — the ABI slot is the window's
     // default-committed **prefix** (the interpreter's equally-frozen `window.mapped`; growth lives
@@ -8876,7 +9341,7 @@ fn lower_cap_call_fast(
     // `MprotectWindow` does, not this bound alone.
     let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     let h = get(vals, handle)?;
-    let trap_out = b.use_var(lower.trap_var);
+    let trap_out = b.use_var(lower.vmctx_var);
 
     // Signature: (ctx, mem_base, mem_size, handle:i32, trap_out, args…:i64) -> [i64].
     let mut tsig = module.make_signature();
@@ -8971,8 +9436,8 @@ fn lower_cap_call(
         }
     }
 
-    // Assemble the thunk arguments (see `CapThunk`).
-    let ctx = b.ins().iconst(I64, lower.cap.ctx_addr);
+    // Assemble the thunk arguments (see `CapThunk`): the ctx is the instance's powerbox.
+    let ctx = vmctx_load(b, lower, vmctx::CAP_CTX);
     let mem_base = b.use_var(lower.mem_var);
     // #826: this frozen `lower.mapped` is deliberate — it is the window's default-committed
     // **prefix** (the interpreter's equally-frozen `window.mapped`): the thunk builds its
@@ -8987,7 +9452,7 @@ fn lower_cap_call(
     let opc = b.ins().iconst(I32, op as i64);
     let na = b.ins().iconst(I64, n_args as i64);
     let nr = b.ins().iconst(I64, n_res as i64);
-    let trap_out = b.use_var(lower.trap_var);
+    let trap_out = b.use_var(lower.vmctx_var);
     let thunk = b.ins().iconst(I64, lower.cap.thunk_addr);
 
     let mut tsig = module.make_signature(); // host C ABI (matches `extern "C"`)
@@ -9109,7 +9574,7 @@ fn lower_instantiator(
     // #1726: which program a self child of this code runs (0 = module 0; else this unit's).
     let self_prog = b.ins().iconst(I64, lower.inst.self_prog);
     let mem_base = b.use_var(lower.mem_var);
-    let trap_out = b.use_var(lower.trap_var);
+    let trap_out = b.use_var(lower.vmctx_var);
     match op {
         0 | 5 => {
             // instantiate(nursery, mem_base, handle:i32, module:i64, entry:i64, off:i64,

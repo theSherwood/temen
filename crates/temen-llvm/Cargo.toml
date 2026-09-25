@@ -19,6 +19,9 @@ temen-ir = { path = "../temen-ir" }
 # pure-Rust serializers (no LLVM), shared with the runtime crates.
 temen-text = { path = "../temen-text" }
 temen-encode = { path = "../temen-encode" }
+# The POSIX personality's import vocabulary (`__px_<op>` names + signatures): a declaration-only
+# `__px_*` function lowers to that import, typed from the one table the personality serves.
+temen-posix-abi = { path = "../temen-posix-abi" }
 
 [dev-dependencies]
 temen-verify = { path = "../temen-verify" }

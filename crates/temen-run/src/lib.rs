@@ -47,6 +47,7 @@ pub use temen_interp::{Quota, Value};
 pub use temen_opt::instrument::MemHookStats;
 pub mod exec;
 pub mod fs;
+mod jit_proc;
 pub mod posix;
 use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
 pub use temen_peval::{SpecArg, SpecConfig};
@@ -425,13 +426,16 @@ unsafe fn cap_thunk_impl(
         let _ = (mem_base, mem_size, mem_reserved);
         None
     };
+    // #1768 — the call's own `(type_id, op)`, before any translation: what a JIT process's fork
+    // gate matches against the fork sites its program was instrumented at.
+    let dispatch = (type_id, op);
     // IMPORTS.md phase 3: a `call.import` dispatch arrives as the `CAP_IMPORT_TYPE_ID` sentinel
-    // (import index in `op`). Translate it through the instance's binding table *here*, before the
-    // `Jit` interception below — otherwise an imported `Jit.compile` would bypass the native
-    // servicing and dead-end in the generic Host arm. An unbound slot is a fail-closed CapFault.
+    // (the packed import slot in `op`). Translate it *here*, before the `Jit` interception below —
+    // otherwise an imported `Jit.compile` would bypass the native servicing and dead-end in the
+    // generic Host arm. An unbound slot is a fail-closed CapFault.
     let (type_id, op, handle) = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
-        match host.import_binding(op) {
-            Some(b) => (b.type_id, b.op, b.handle),
+        match import_dispatch(host, op) {
+            Some(t) => t,
             None => {
                 *trap_out = TrapKind::CapFault as i64;
                 return;
@@ -486,73 +490,63 @@ unsafe fn cap_thunk_impl(
         }
         return;
     }
-    // #1768 — a run armed to serve a personality `execve` by unwinding (`jit_run`'s single-threaded
-    // root): clear the caller-request cell first, so the only request acted on below is one THIS
-    // dispatch raised.
-    let serves_exec = host.exec_replace_armed();
-    if serves_exec {
-        let _ = host.take_park_request();
-    }
-    let r = match pending {
-        Some(slot) => host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, gm, slot),
-        None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm),
-    };
-    match r {
-        Ok(res) => {
-            if n_results != 0 {
-                let out = std::slice::from_raw_parts_mut(results, n_results as usize);
-                for (o, r) in out.iter_mut().zip(res) {
-                    *o = r;
+    // #1768 — a JIT process's powerbox serves its personality's caller requests (`fork`, `execve`,
+    // a blocking `waitpid`) here, after the op that raised one ([`jit_proc::serve_request`]).
+    let serves = host.caller_requests_armed();
+    let (mut gm, mut pending) = (gm, pending);
+    loop {
+        // Clear the caller-request cell first, so the only request acted on is one THIS dispatch
+        // raised; and read the process tree's bell before the op looks, so a child that exits
+        // between that look and a wait is not slept through.
+        let bell = if serves {
+            let _ = host.take_park_request();
+            jit_proc::bell_of(trap_out)
+        } else {
+            0
+        };
+        // Reborrowed per use (a wait's re-run dispatches again over the same window view).
+        let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
+        let r = match pending.as_deref_mut() {
+            Some(slot) => {
+                host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, view, slot)
+            }
+            None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, view),
+        };
+        match r {
+            Ok(res) => {
+                if n_results != 0 {
+                    let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+                    for (o, r) in out.iter_mut().zip(res) {
+                        *o = r;
+                    }
+                }
+                *trap_out = 0;
+                // A woken blocking wait runs its op again (invariant 7: the rewound park).
+                let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
+                if serves
+                    && jit_proc::serve_request(
+                        host, dispatch, view, mem_size, results, n_results, trap_out, bell,
+                    )
+                {
+                    continue;
                 }
             }
-            *trap_out = 0;
-            if serves_exec {
-                jit_serve_exec(host, mem_size, results, n_results, trap_out);
-            }
+            Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
+            Err(_) => *trap_out = TrapKind::CapFault as i64,
         }
-        Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
-        Err(_) => *trap_out = TrapKind::CapFault as i64,
+        return;
     }
 }
 
-/// #1768 — the JIT's half of a personality `execve` (FORK.md §8.6). The op staged the new argv and
-/// raised [`temen_interp::ParkEvent::ExecSelf`]; admit and build the image through the one rule every
-/// engine shares ([`Host::exec_image`]). Admitted: park it for [`jit_run`] and unwind the whole run
-/// ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the caller's
-/// native stack is simply discarded. Refused: `-EINVAL`, with nothing changed, exactly as both
-/// interpreters answer. Any other request (a `fork`, a blocking `waitpid`) is dropped and the op's
-/// placeholder stands, as on every engine that cannot serve it (fork on the JIT: #1768).
-///
-/// # Safety
-/// `results` is valid for `n_results` slots and `trap_out` is writable (the [`cap_thunk`] contract).
-unsafe fn jit_serve_exec(
-    host: &mut Host,
-    window_mapped: u64,
-    results: *mut i64,
-    n_results: u64,
-    trap_out: *mut i64,
-) {
-    let Some(temen_interp::ParkEvent::ExecSelf { cmd }) = host.take_park_request() else {
-        return;
-    };
-    // The JIT's own gates — the interpreters' `durable` + clean-root checks: a durable domain's
-    // subtree must stay snapshottable, and a fiber is not the process's image to replace. (Only a
-    // non-serving, single-threaded root is ever armed; see `jit_run`.)
-    let admissible = !host.is_durable() && !temen_jit::fiber_active();
-    match admissible
-        .then(|| host.exec_image(cmd, &[], 0, 0, window_mapped))
-        .flatten()
-    {
-        Some(img) => {
-            host.stash_exec_image(img);
-            *trap_out = temen_jit::HOST_UNWIND_CODE as i64;
-        }
-        None => {
-            if n_results != 0 {
-                *results = EINVAL;
-            }
-        }
-    }
+/// The `(type_id, op, handle)` a thunk's `call.import` dispatch reaches — `packed` is the dispatch's
+/// op, `slot | consumer_op << 16`: the slot's live binding (the one getter, [`Host::import_binding`],
+/// with its #1300 durable rule), and its consumer op through the one translation every engine's
+/// dispatch reads ([`Host::import_target`]). `None` (unbound, withheld, an out-of-range consumer op)
+/// is a fail-closed `CapFault`. Translating by the slot alone sent a grouped import's every op but
+/// its first to a `CapFault` on this tier only, while both interpreters dispatched it.
+fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
+    host.import_binding(packed & 0xFFFF)?;
+    host.import_target(packed).ok()
 }
 
 /// **Multi-threaded `call.cap` thunk** (DESIGN.md §22 threaded *compile*): the same dispatch as
@@ -592,8 +586,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // lock (released before any re-entrant path below) — same reason as [`cap_thunk`]'s translate.
     let (type_id, op, handle) = if type_id == temen_ir::CAP_IMPORT_TYPE_ID {
         let guard = m.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.import_binding(op) {
-            Some(b) => (b.type_id, b.op, b.handle),
+        match import_dispatch(&guard, op) {
+            Some(t) => t,
             None => {
                 *trap_out = TrapKind::CapFault as i64;
                 return;
@@ -759,7 +753,9 @@ unsafe fn jit_invoke_locked(
         &args[1..],
         out,
         mem_base,
-        trap_out,
+        // The thunk's `trap_out` is the running instance's `VmCtx` (its field 0 is the trap cell):
+        // the unit runs as the instance that invoked it.
+        trap_out as *const temen_jit::VmCtx,
     )
     .is_err()
     {
@@ -834,7 +830,9 @@ unsafe fn serve_native(
         // SAFETY: `cm` is the in-flight run's CompiledModule (the guest is suspended in this
         // synchronous `call.cap` on this thread); `code` is its finalized handler trampoline;
         // arity checked above; no `&mut Host` is live (the scoped pops/settles above ended).
-        if CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, trap_out).is_err() {
+        // The handler runs as the serving instance: the thunk's `trap_out` is its `VmCtx`.
+        let vm = trap_out as *const temen_jit::VmCtx;
+        if CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, vm).is_err() {
             *trap_out = TrapKind::CapFault as i64; // not in-flight — unreachable from a real run
             return;
         }
@@ -1024,7 +1022,8 @@ unsafe fn jit_native_op(
                 &args[1..],
                 out,
                 mem_base,
-                trap_out,
+                // The thunk's `trap_out` is the invoking instance's `VmCtx` (field 0 = trap cell).
+                trap_out as *const temen_jit::VmCtx,
             )
             .is_err()
             {
@@ -2988,7 +2987,9 @@ unsafe fn serve_locked_child(
                 &mut res,
                 mem_base,
                 mem_size,
-                trap_out,
+                // Served on the child's own thread, inside its own run: the thunk's `trap_out` is
+                // the child's `VmCtx`.
+                trap_out as *const temen_jit::VmCtx,
             );
             if faulted {
                 return; // detect-and-kill: the fault trap is already in the cell
@@ -3081,10 +3082,12 @@ unsafe fn live_impl_call(
                 Some((code, n_params, n_res)) if args.len() == n_params => {
                     drop(guard);
                     let mut res = vec![0i64; n_res];
-                    // A handler trap/fault under handoff is the CHILD's outcome (on the enqueue
-                    // path the child would have died serving this dispatch): capture into a
-                    // local cell, never the caller's trap cell.
-                    let mut child_trap: i64 = 0;
+                    // The handler runs on THIS thread but as the CHILD's instance — its powerbox,
+                    // never the caller's (#1768). A handler trap/fault under handoff is the child's
+                    // outcome (on the enqueue path the child would have died serving this dispatch):
+                    // it lands in this context's own cell, never the caller's trap cell.
+                    let child_vm =
+                        temen_jit::VmCtx::new(temen_jit::child_instance(sctx as *const c_void));
                     CROSSING_DEPTH.with(|d| d.set(d.get() + 1));
                     let _faulted = temen_jit::child_invoke_handler(
                         sctx as *const c_void,
@@ -3093,9 +3096,10 @@ unsafe fn live_impl_call(
                         &mut res,
                         cbase as *mut u8,
                         csize,
-                        &mut child_trap,
+                        &child_vm,
                     );
                     CROSSING_DEPTH.with(|d| d.set(d.get() - 1));
+                    let child_trap = child_vm.trap.load(std::sync::atomic::Ordering::Relaxed);
                     let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
                     if child_trap != 0 {
                         // Route the trap to the child (it folds + dies on wake) and answer the
@@ -3575,22 +3579,33 @@ enum PageState {
     Rw,
     Ro,
     Unmapped,
+    /// A §13 `SharedRegion` alias (writable or not): committed, but another object's memory — a
+    /// fork cannot duplicate it (#1768), exactly as the interpreter's `PageProt::Backed`.
+    Backed {
+        writable: bool,
+    },
 }
 
 #[cfg(any(unix, windows))]
 impl PageState {
     fn code(self) -> u8 {
+        use temen_ir::page_state as ps;
         match self {
-            PageState::Rw => 1,
-            PageState::Ro => 2,
-            PageState::Unmapped => 3,
+            PageState::Rw => ps::RW,
+            PageState::Ro => ps::RO,
+            PageState::Unmapped => ps::UNMAPPED,
+            PageState::Backed { writable: true } => ps::BACKED_RW,
+            PageState::Backed { writable: false } => ps::BACKED_RO,
         }
     }
     fn from_code(c: u8) -> Option<PageState> {
+        use temen_ir::page_state as ps;
         match c {
-            1 => Some(PageState::Rw),
-            2 => Some(PageState::Ro),
-            3 => Some(PageState::Unmapped),
+            ps::RW => Some(PageState::Rw),
+            ps::RO => Some(PageState::Ro),
+            ps::UNMAPPED => Some(PageState::Unmapped),
+            ps::BACKED_RW => Some(PageState::Backed { writable: true }),
+            ps::BACKED_RO => Some(PageState::Backed { writable: false }),
             _ => None,
         }
     }
@@ -3681,6 +3696,7 @@ impl MprotectWindow {
         match self.prot_get(page) {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
+            Some(PageState::Backed { writable }) => Some(writable),
             Some(PageState::Unmapped) => None,
             None => (page * self.page < self.mapped).then_some(true),
         }
@@ -3831,6 +3847,56 @@ impl MprotectWindow {
     }
     #[cfg(windows)]
     fn hw_release_hint(&self, _off: u64, _len: u64) {}
+
+    /// Drop the §13 alias over `[off, off+len)`: the range stops being the region's memory and is
+    /// the window's own again — private, zero, inaccessible — with the region's bytes untouched for
+    /// every other mapping of it. On unix, a fresh private anonymous `MAP_FIXED` mapping replaces
+    /// the shared one. On windows the range must be whole views (allocation granules, as `map_region`
+    /// placed them): each view is released back to a placeholder, then committed as private memory
+    /// like the rest of the backed prefix, and protected `none`. Returns `false` if the OS refuses.
+    #[cfg(unix)]
+    fn hw_unalias(&self, off: u64, len: u64) -> bool {
+        // SAFETY: `[base+off, +len)` is within the reserved mapping (validated); `MAP_FIXED` replaces
+        // exactly those pages, which are this window's (the shared view is dropped, not the region).
+        let p = unsafe {
+            libc::mmap(
+                self.base.add(off as usize) as *mut c_void,
+                len as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        p != libc::MAP_FAILED
+    }
+    #[cfg(windows)]
+    fn hw_unalias(&self, off: u64, len: u64) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            UnmapViewOfFile2, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let gran = temen_interp::host_region_granularity();
+        if !off.is_multiple_of(gran) || !len.is_multiple_of(gran) {
+            return false;
+        }
+        // SAFETY: GetCurrentProcess returns the current-process pseudo-handle; always safe.
+        let proc = unsafe { GetCurrentProcess() };
+        for i in 0..len / gran {
+            let addr = MEMORY_MAPPED_VIEW_ADDRESS {
+                // SAFETY: in the reservation (validated); `map_region` mapped a view at each granule.
+                Value: unsafe { self.base.add((off + i * gran) as usize) } as *mut c_void,
+            };
+            // SAFETY: `addr` is the base of a view `map_region` placed; releasing it with
+            // `MEM_PRESERVE_PLACEHOLDER` leaves the placeholder the window's reservation had.
+            if unsafe { UnmapViewOfFile2(proc, addr, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+                return false;
+            }
+        }
+        self.hw_commit_rw(off, len);
+        self.hw_apply(off, len, 0);
+        true
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -3896,6 +3962,30 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        // A §13 alias is the region's memory, not the window's: drop the alias first, so the range is
+        // the window's own again and the zeroing below never reaches the region — which every other
+        // mapping of it still reads (the oracle's `Mem::unmap` re-points the page at the domain's own
+        // backing). Each maximal run of aliased pages is un-aliased whole.
+        let mut run: Option<(u64, u64)> = None;
+        for page in pages.clone().chain(std::iter::once(*pages.end() + 1)) {
+            let aliased = page <= *pages.end()
+                && matches!(self.prot_get(page), Some(PageState::Backed { .. }));
+            match (aliased, run) {
+                (true, None) => run = Some((page, page)),
+                (true, Some((first, _))) => run = Some((first, page)),
+                (false, Some((first, last))) => {
+                    let (off, len) = (first * self.page, (last + 1 - first) * self.page);
+                    if !self.hw_unalias(off, len) {
+                        return EINVAL;
+                    }
+                    for p in first..=last {
+                        self.prot_set(p, PageState::Unmapped);
+                    }
+                    run = None;
+                }
+                (false, None) => {}
+            }
+        }
         // Commit + make RW, zero it, hint the OS to drop the backing, then protect NONE so any later
         // access faults (detect-and-kill).
         self.hw_commit_rw(start, plen);
@@ -3921,7 +4011,18 @@ impl GuestMem for MprotectWindow {
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
         self.hw_commit_rw(start, plen);
         for page in pages {
-            self.set_prot(page, prot);
+            // A §13 alias stays an alias — only its writability changes, or it is gone if neither
+            // R nor W is left — exactly the interpreter's `Mem::protect`.
+            match self.prot_get(page) {
+                Some(PageState::Backed { .. }) if prot & 3 != 0 => self.prot_set(
+                    page,
+                    PageState::Backed {
+                        writable: prot & 2 != 0,
+                    },
+                ),
+                Some(PageState::Backed { .. }) => self.prot_set(page, PageState::Unmapped),
+                _ => self.set_prot(page, prot),
+            }
         }
         self.hw_apply(start, plen, prot);
         0
@@ -3995,11 +4096,7 @@ impl GuestMem for MprotectWindow {
                 return EINVAL;
             }
             // Mirror the software page state (committed; RW or RO) for in-call §7 borrow checks.
-            let state = if writable {
-                PageState::Rw
-            } else {
-                PageState::Ro
-            };
+            let state = PageState::Backed { writable };
             for page in pages {
                 self.prot_set(page, state);
             }
@@ -4089,11 +4186,7 @@ impl GuestMem for MprotectWindow {
                 }
             }
             // Mirror the software page state (committed; RW or RO) for in-call §7 borrow checks.
-            let state = if writable {
-                PageState::Rw
-            } else {
-                PageState::Ro
-            };
+            let state = PageState::Backed { writable };
             for page in pages {
                 self.prot_set(page, state);
             }
@@ -4612,24 +4705,23 @@ struct JitRun {
     snapshot: Vec<u8>,
 }
 
-/// Compile `module`'s function `func`, register the live module for the `Jit` cap's mid-run re-entry,
-/// and run it over `slots` under the §5 kill-path armed by `interrupt`, seeded with `init_mem` and
-/// (when `snapshot_cap` is `Some`) snapshotting the low `snapshot_cap` window bytes. A **concurrent**
-/// guest (`locked` is `Some`) runs the serialized [`cap_thunk_locked`] over a per-domain `Mutex<Host>`
-/// — so worker threads can `call.cap` (incl. threaded `Jit.compile`) without racing — and forgoes the
-/// single-threaded-only D45 fast path; a single-threaded guest keeps the unlocked [`cap_thunk`] + raw
-/// `*mut Host` + [`fast_cap_resolver`] exactly as before (zero lock cost). Exactly one of `locked` /
-/// `raw_host` is used. The single low-level JIT entry, shared by [`jit_run`].
+/// Compile `module`'s function `func` for a **concurrent** guest, register the live module for the
+/// `Jit` cap's mid-run re-entry, and run it over `slots` under the §5 kill-path armed by `interrupt`,
+/// seeded with `init_mem` and (when `snapshot_cap` is `Some`) snapshotting the low `snapshot_cap`
+/// window bytes. The guest runs the serialized [`cap_thunk_locked`] over the per-domain `locked`
+/// `Mutex<Host>` — so worker threads can `call.cap` (incl. threaded `Jit.compile`) without racing —
+/// and forgoes the single-threaded-only D45 fast path. (A single-threaded guest runs
+/// [`jit_proc::run_image`] instead: the unlocked [`cap_thunk`] + raw `*mut Host` + [`fast_cap_resolver`],
+/// zero lock cost.)
 ///
 /// # Safety
-/// `raw_host` (when `locked` is `None`) is a live `*mut Host`; `interrupt` (when `Some`) outlives the
-/// call; the same `cap_thunk`/ctx/resolver contracts as [`run_powerbox_cfg`].
+/// `interrupt` (when `Some`) outlives the call; the same `cap_thunk`/ctx/resolver contracts as
+/// [`run_powerbox_cfg`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn powerbox_compile_run(
     module: &Module,
     func: FuncIdx,
-    locked: Option<&Mutex<Host>>,
-    raw_host: *mut Host,
+    m: &Mutex<Host>,
     slots: &[i64],
     interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
     quota: temen_jit::Quota,
@@ -4637,70 +4729,9 @@ unsafe fn powerbox_compile_run(
     snapshot_cap: Option<usize>,
 ) -> Result<JitRun, temen_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
-    if let Some(m) = locked {
-        // #1234: one value carries the shape and the pointer — the compile below and the hooks
-        // further down both take it, so they cannot disagree about how to read it.
-        let cc = CapCtx::Locked(m as *const Mutex<Host>);
-        let mut cm = CompiledModule::compile(
-            module,
-            func,
-            cc.thunk(),
-            cc.ptr(),
-            temen_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            Some(module_resolver_locked), // §14 module children resolve their `Module` grant
-            interrupt_ptr,
-            None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
-            None, // no D45 fast path: the fast fns deref a raw `*mut Host`, not a `Mutex<Host>`
-            quota,
-            CLI_JIT_TABLE_LOG2,
-        )?;
-        // Fiber-hosting grant (`set_jit_hosts_fibers`, e.g. the powerbox): stand up the fiber runtime
-        // so a submitted unit's `cont.*` resolve even when the top-level module uses no fibers itself.
-        // Idempotent when the top-level already built its fiber runtime (`enable_fiber_hosting`).
-        if m.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .jit_hosts_fibers()
-        {
-            cm.enable_fiber_hosting(quota)?;
-        }
-        // Thread-hosting grant (`set_jit_hosts_threads`, CONSOLIDATION.md §11): stand up the thread
-        // scheduler so an installed unit's `thread.*` / futex resolve. Only the **locked** powerbox
-        // path hosts threads — a hosted unit's spawned vCPUs are concurrent `call.cap`ers, so the
-        // serialized `Host` is required. Idempotent when the top-level already built the scheduler.
-        if m.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .jit_hosts_threads()
-        {
-            cm.enable_thread_hosting(quota)?;
-        }
-        m.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
-        // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
-        cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
-        cm.set_budget_taker(Some(production_budget_taker(cc)));
-        if let Some(ip) = interrupt_ptr {
-            m.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_epoch_cell(ip as usize);
-        }
-        let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap);
-        m.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_jit_native_ctx(0);
-        // §5 W3 — carry the trap-time source backtrace + trapping fiber (§23-D57) out (empty/`None`
-        // unless the guest trapped and the module carried `-g`), so the kill message can name *which
-        // fiber* was *where*.
-        return r.map(|(outcome, snapshot)| JitRun {
-            outcome,
-            backtrace: cm.last_trap_backtrace().to_vec(),
-            trap_fiber: cm.last_trap_fiber(),
-            snapshot,
-        });
-    }
-    // #1234: the single-threaded shape, as one value — the compile and the hooks below both read it.
-    let cc = CapCtx::Raw(raw_host);
+    // #1234: one value carries the shape and the pointer — the compile below and the hooks further
+    // down both take it, so they cannot disagree about how to read it.
+    let cc = CapCtx::Locked(m as *const Mutex<Host>);
     let mut cm = CompiledModule::compile(
         module,
         func,
@@ -4708,33 +4739,52 @@ unsafe fn powerbox_compile_run(
         cc.ptr(),
         temen_ir::DEFAULT_RESERVED_LOG2,
         None,
-        Some(module_resolver), // §14 module children resolve their `Module` grant
+        Some(module_resolver_locked), // §14 module children resolve their `Module` grant
         interrupt_ptr,
         None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
-        Some(fast_cap_resolver),
+        None, // no D45 fast path: the fast fns deref a raw `*mut Host`, not a `Mutex<Host>`
         quota,
         CLI_JIT_TABLE_LOG2,
     )?;
-    let host = &mut *raw_host;
-    // Fiber-hosting grant (see the locked branch above): enable it so a submitted unit's `cont.*`
-    // resolve even when this (single-threaded) top-level module uses no fibers of its own.
-    if host.jit_hosts_fibers() {
+    // Fiber-hosting grant (`set_jit_hosts_fibers`, e.g. the powerbox): stand up the fiber runtime
+    // so a submitted unit's `cont.*` resolve even when the top-level module uses no fibers itself.
+    // Idempotent when the top-level already built its fiber runtime (`enable_fiber_hosting`).
+    if m.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .jit_hosts_fibers()
+    {
         cm.enable_fiber_hosting(quota)?;
     }
-    host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    // Thread-hosting grant (`set_jit_hosts_threads`, CONSOLIDATION.md §11): stand up the thread
+    // scheduler so an installed unit's `thread.*` / futex resolve. Only the **locked** powerbox
+    // path hosts threads — a hosted unit's spawned vCPUs are concurrent `call.cap`ers, so the
+    // serialized `Host` is required. Idempotent when the top-level already built the scheduler.
+    if m.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .jit_hosts_threads()
+    {
+        cm.enable_thread_hosting(quota)?;
+    }
+    m.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
     cm.set_budget_taker(Some(production_budget_taker(cc)));
     if let Some(ip) = interrupt_ptr {
-        host.set_epoch_cell(ip as usize);
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_epoch_cell(ip as usize);
     }
-    // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
-    // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
-    // Single-threaded path only: the locked thunk never serves (see `cap_thunk_locked`).
-    host.set_serve_native_ctx(&mut cm as *mut CompiledModule as usize);
     let r = CompiledModule::run_raw(&mut cm, slots, init_mem, snapshot_cap);
-    host.set_jit_native_ctx(0);
-    host.set_serve_native_ctx(0);
+    {
+        let mut h = m.lock().unwrap_or_else(|e| e.into_inner());
+        h.set_jit_native_ctx(0);
+        h.set_epoch_cell(0);
+    }
+    // §5 W3 — carry the trap-time source backtrace + trapping fiber (§23-D57) out (empty/`None`
+    // unless the guest trapped and the module carried `-g`), so the kill message can name *which
+    // fiber* was *where*.
     r.map(|(outcome, snapshot)| JitRun {
         outcome,
         backtrace: cm.last_trap_backtrace().to_vec(),
@@ -6038,8 +6088,10 @@ fn with_deadline<T>(
 /// watchdog), seeded with `init_mem` and (when `snapshot_cap` is `Some`) returning the low-window
 /// snapshot, folding a guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A
 /// concurrent guest serializes the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the
-/// unlocked fast path. Backs both the run-once [`run_jit`] (`func` 0, no snapshot) and the reactor
-/// per-call capture ([`run_capture_on`]'s `Jit` arm: an export `func`, `REACTOR_SNAP_CAP` snapshot).
+/// unlocked fast path, and — run as a `process` — is the root of a process tree whose personality
+/// `fork`/`execve`/blocking `waitpid` the JIT serves (#1768, [`jit_proc`]). Backs both the run-once
+/// [`run_jit`] (`func` 0, no snapshot, a process) and the reactor per-call capture
+/// ([`run_capture_on`]'s `Jit` arm: an export `func`, `REACTOR_SNAP_CAP` snapshot, not a process).
 #[allow(clippy::too_many_arguments)]
 fn jit_run(
     m: &Module,
@@ -6049,7 +6101,7 @@ fn jit_run(
     limits: &Limits,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
-    serve_exec: bool,
+    process: bool,
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
     let quota = limits.quota();
@@ -6057,14 +6109,14 @@ fn jit_run(
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
     // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.
     let (run, results) = with_deadline(limits.deadline, |interrupt| {
+        let results = m.funcs[func as usize].results.clone();
         if concurrent {
             let locked = Mutex::new(std::mem::take(host));
             let r = unsafe {
                 powerbox_compile_run(
                     m,
                     func,
-                    Some(&locked),
-                    std::ptr::null_mut(),
+                    &locked,
                     slots,
                     interrupt,
                     quota,
@@ -6073,10 +6125,10 @@ fn jit_run(
                 )
             };
             *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
-            (r, m.funcs[func as usize].results.clone())
-        } else {
+            (r, results)
+        } else if process {
             unsafe {
-                jit_run_images(
+                jit_proc::run_root(
                     m,
                     func,
                     slots,
@@ -6085,9 +6137,17 @@ fn jit_run(
                     quota,
                     init_mem,
                     snapshot_cap,
-                    serve_exec,
                 )
             }
+        } else {
+            let start = jit_proc::Entry::Fresh {
+                args: slots,
+                init_mem,
+                snapshot_cap,
+            };
+            let ip = interrupt.map(std::sync::Arc::as_ptr);
+            let r = unsafe { jit_proc::run_image(host, m, func, ip, quota, None, start) };
+            (r, results)
         }
     });
     let run = run.map_err(|e| format!("JIT compile failed: {e:?}"))?;
@@ -6102,100 +6162,6 @@ fn jit_run(
         ));
     }
     Ok((run.outcome, run.snapshot, results))
-}
-
-/// #1768 — the single-threaded JIT run, serving a personality `execve` (FORK.md §8.6) when
-/// `serve_exec`: the root is armed ([`Host::arm_exec_replace`]), an admitted exec unwinds its run
-/// ([`jit_serve_exec`]), and the parked image then runs here, in a fresh run over the powerbox the exec
-/// built — and so on down a chain of execs, all under the caller's one watchdog. Returns the last
-/// run and the result types of the entry that produced it (an exec'd command's, not the caller's).
-///
-/// The command runs in a window the size of the caller's backed prefix, as on both interpreters,
-/// whose image-replace reuses the caller's window in place (a larger window than the command declares
-/// is a safe superset, masked to its actual size). The embedder's `host` stays the powerbox it
-/// granted, as there too: the image-replace swaps the running image's powerbox, not the caller's.
-///
-/// A serving module is never armed: a serve handler is not the process image to replace.
-///
-/// # Safety
-/// The [`powerbox_compile_run`] contract for the non-locked shape.
-#[allow(clippy::too_many_arguments)]
-unsafe fn jit_run_images(
-    m: &Module,
-    func: FuncIdx,
-    slots: &[i64],
-    host: &mut Host,
-    interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    quota: temen_jit::Quota,
-    init_mem: Option<&[u8]>,
-    snapshot_cap: Option<usize>,
-    serve_exec: bool,
-) -> (Result<JitRun, temen_jit::JitError>, Vec<ValType>) {
-    if serve_exec && !module_serves(m) {
-        host.arm_exec_replace();
-    }
-    let mut r = powerbox_compile_run(
-        m,
-        func,
-        None,
-        host,
-        slots,
-        interrupt,
-        quota,
-        init_mem,
-        snapshot_cap,
-    );
-    let mut results = m.funcs[func as usize].results.clone();
-    // The running image's powerbox once an exec has replaced the caller's.
-    let mut image_host: Option<Host> = None;
-    while matches!(
-        r,
-        Ok(JitRun {
-            outcome: JitOutcome::HostUnwound,
-            ..
-        })
-    ) {
-        let cur = match image_host.as_mut() {
-            Some(h) => h,
-            None => &mut *host,
-        };
-        // Only an armed root stores the unwind code, and only with an image parked.
-        let Some(img) = cur.take_exec_image() else {
-            r = Err(temen_jit::JitError::Malformed);
-            break;
-        };
-        // The commit: the personality hands over the argv it staged, and the new image finds it in
-        // its args region.
-        let init = img.host.exec_commit_args().map(|blob| {
-            let mut buf = vec![0u8; temen_ir::module_args_base() as usize];
-            buf.extend_from_slice(&blob);
-            buf
-        });
-        let mut module = (*img.module).clone();
-        module.memory = module.memory.map(|mc| temen_ir::Memory {
-            size_log2: img.child_size.trailing_zeros() as u8,
-            ..mc
-        });
-        let mut next = img.host;
-        if !module_serves(&module) {
-            next.arm_exec_replace();
-        }
-        let entry = img.entry as FuncIdx;
-        results = module.funcs[entry as usize].results.clone();
-        let next = image_host.insert(next);
-        r = powerbox_compile_run(
-            &module,
-            entry,
-            None,
-            next,
-            &img.entry_args,
-            interrupt,
-            quota,
-            init.as_deref(),
-            snapshot_cap,
-        );
-    }
-    (r, results)
 }
 
 /// Compile + run function 0 on the JIT under `limits` (the run-once powerbox entry, no snapshot),

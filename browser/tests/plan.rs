@@ -4,8 +4,8 @@
 //! refused by the generator. The guests are written inline, so nothing is staged.
 
 use std::sync::{Arc, Mutex};
-use temen_browser::plan::{run, Node, Plan};
-use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Value};
+use temen_browser::plan::{run, Node, Pipe, Plan};
+use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Trap, Value};
 use temen_ir::Module;
 
 /// A one-node plan is the nim phase driver, byte for byte: the text `nimc`'s phases ran on before
@@ -97,6 +97,7 @@ fn run_two(grants_a: &[&str], grants_b: &[&str]) -> (i64, Vec<i64>) {
     let plan = Plan {
         caps: vec!["tally".into()],
         nodes: vec![node(grants_a), node(grants_b)],
+        pipes: vec![],
     };
     let log: Arc<Mutex<Vec<i64>>> = Arc::default();
     let mint = {
@@ -155,6 +156,7 @@ fn a_plan_the_root_cannot_honour_is_refused() {
     let plan = |caps: &[&str], nodes: Vec<Node>| Plan {
         caps: caps.iter().map(|c| c.to_string()).collect(),
         nodes,
+        pipes: vec![],
     };
     let err = |p: Plan| p.root_src().unwrap_err();
     assert!(err(plan(&["fs"], vec![])).contains("at least one node"));
@@ -207,4 +209,132 @@ fn a_card_module_runs_nested_as_built() {
         vec![Value::I64(direct.value)],
         "same result, widened to the join's i64"
     );
+}
+
+/// Reads `stdin` 64 bytes at a time until EOF, echoing each chunk to `stdout`; returns the byte count.
+const CAT: &str = r#"memory 16
+data 20480 "stdin"
+data 20496 "stdout"
+func () -> (i64) {
+block 0 () {
+  vinn = i64.const 20480
+  vinl = i64.const 5
+  vin = self.resolve vinn vinl
+  voutn = i64.const 20496
+  voutl = i64.const 6
+  vout = self.resolve voutn voutl
+  vz = i64.const 0
+  br 1(vin, vout, vz)
+  }
+block 1 (hi: i32, ho: i32, tot: i64) {
+  vbuf = i64.const 24576
+  vcap = i64.const 64
+  vn = call.cap 0 0 (i64, i64) -> (i64) hi (vbuf, vcap)
+  vzero = i64.const 0
+  vdone = i64.le_s vn vzero
+  br_if vdone 2(tot) 3(hi, ho, tot, vn)
+  }
+block 2 (t: i64) {
+  return t
+  }
+block 3 (hi3: i32, ho3: i32, tot3: i64, n: i64) {
+  vbuf3 = i64.const 24576
+  vw = call.cap 0 1 (i64, i64) -> (i64) ho3 (vbuf3, n)
+  vt = i64.add tot3 n
+  br 1(hi3, ho3, vt)
+  }
+}
+export 0 func "_start" 0
+"#;
+
+/// Writes one line to `stdout`; returns what the write returned.
+const ECHO: &str = r#"memory 16
+data 20480 "stdout"
+data 20496 "hello, pipe\n"
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 20480
+  vl = i64.const 6
+  vh = self.resolve vn vl
+  vb = i64.const 20496
+  vbl = i64.const 12
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vb, vbl)
+  return vw
+  }
+}
+export 0 func "_start" 0
+"#;
+
+/// #1807 — a pipe edge: the root mints a pipe, grants its write end to `echo` as `stdout` and its
+/// read end to `cat` as `stdin`, and `cat` echoes what it reads to the root's `stdout`. `cat` is
+/// spawned first, so it parks on the empty pipe; it sees EOF only because the root dropped its own
+/// copies of both ends after spawning and `echo`'s exit released the last write end.
+#[test]
+fn a_pipe_edge_carries_one_nodes_stdout_to_anothers_stdin() {
+    let parse = |src: &str| {
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        m
+    };
+    let (cat, echo) = (parse(CAT), parse(ECHO));
+    let node = |grants: &[&str]| Node {
+        window_log2: 16,
+        argv: vec![],
+        env: vec![],
+        grants: grants.iter().map(|g| g.to_string()).collect(),
+    };
+    let plan = Plan {
+        caps: vec!["stdout".into()],
+        nodes: vec![node(&["stdout"]), node(&[])],
+        pipes: vec![Pipe {
+            from: 1,
+            from_name: "stdout".into(),
+            to: 0,
+            to_name: "stdin".into(),
+        }],
+    };
+    let root = temen_text::parse_module(&plan.root_src().expect("root")).expect("root parses");
+    temen_verify::verify_module(&root).expect("root verifies");
+
+    let mut host = Host::new();
+    let sink = host.shared_stdout();
+    let stdout = host.grant_stream(temen_interp::StreamRole::Out);
+    let args = plan.root_args(&mut host, &[&cat, &echo], &[stdout]);
+    let mut fuel = u64::MAX;
+    let out =
+        temen_interp::bytecode::compile_and_run_with_host(&root, 0, &args, &mut fuel, &mut host)
+            .expect("the bytecode engine runs the root");
+
+    assert_eq!(out, Ok(vec![Value::I64(12)]), "echo wrote its whole line");
+    assert_eq!(&*sink.lock().unwrap(), b"hello, pipe\n", "cat echoed it");
+    // The same plan cannot run on the spawn-to-completion driver: it is refused, not half-run.
+    assert_eq!(
+        run(&plan, &[&cat, &echo], Host::new(), &[stdout]),
+        Err(Trap::Malformed)
+    );
+}
+
+#[test]
+fn a_pipe_the_plan_cannot_wire_is_refused() {
+    let node = |grants: &[&str]| Node {
+        window_log2: 16,
+        argv: vec![],
+        env: vec![],
+        grants: grants.iter().map(|g| g.to_string()).collect(),
+    };
+    let pipe = |from, to| Pipe {
+        from,
+        from_name: "stdout".into(),
+        to,
+        to_name: "stdin".into(),
+    };
+    let plan = |nodes, pipes| Plan {
+        caps: vec!["stdout".into()],
+        nodes,
+        pipes,
+    };
+    let err = |p: Plan| p.root_src().unwrap_err();
+    assert!(err(plan(vec![node(&[])], vec![pipe(0, 1)])).contains("node the plan does not have"));
+    // A node granted the root's `stdout` and a pipe's write end under the same name.
+    assert!(err(plan(vec![node(&["stdout"]), node(&[])], vec![pipe(0, 1)])).contains("twice"));
 }

@@ -3055,11 +3055,12 @@ int main(void) {{\n\
 }
 
 /// #972 slice 1 — **freeze witness** (invariant 7-adjacent): after the personality makes pipe ends
-/// reachable from libc (`pipe()` = mint + adopt), a freeze of the domain still hits the existing
-/// clean refusal — `capture_durable_handles` reports `NonDurableKind::Pipe`, never a partial
-/// snapshot or a new failure mode.
+/// reachable from libc (`pipe()` = mint + adopt), a freeze of the domain hits a clean refusal —
+/// `capture_durable_handles` names the personality's `HostProc`, never a partial snapshot or a new
+/// failure mode. Since #1680 the pipe ends themselves are durable: a pipe the domain minted rides
+/// the cut as data; only an embedder-fed pipe (fed from outside the tree) still refuses.
 #[test]
-fn c_core_pipe_freeze_refuses_nondurable() {
+fn c_core_pipe_freeze_refuses_the_personality_not_the_pipe() {
     let src = format!(
         "{PIPE_SHIM}\n\
 static int fds[2];\n\
@@ -3075,29 +3076,27 @@ int main(void) {{ return pipe(fds) == 0 ? 42 : 9; }}\n"
     let mut fuel = 50_000_000u64;
     let r = run_with_host(&raw, 0, &[], &mut fuel, &mut ih).expect("run");
     assert_eq!(r, vec![Value::I32(42)], "the guest minted + adopted a pipe");
-    // The refusal reports the FIRST non-durable slot: the personality's own HostProc handle sits
-    // below the pipe ends, so a personality domain was non-durable before pipes and stays so —
-    // the same clean refusal, no new failure mode.
+    // The personality's own HostProc handle is non-durable, so the domain refuses on it.
     let err = ih
         .capture_durable_handles()
-        .expect_err("a personality domain holding pipe ends must refuse durable capture");
-    assert_eq!(
-        err.kind,
-        temen_interp::NonDurableKind::HostProc,
-        "the personality slot refuses first (it precedes the pipe ends in the table)"
-    );
-    // And the pipe ends refuse in their own right: a bare host whose only non-durable slots are a
-    // minted pipe's two ends reports NonDurableKind::Pipe.
+        .expect_err("a personality domain must refuse durable capture");
+    assert_eq!(err.kind, temen_interp::NonDurableKind::HostProc);
+    // A minted pipe's ends are durable in their own right (#1680)...
     let mut bare = Host::new();
     let (_w, _r) = bare.grant_pipe();
-    let err = bare
+    let ends = bare
         .capture_durable_handles()
-        .expect_err("a live pipe end alone must refuse durable capture");
-    assert_eq!(
-        err.kind,
-        temen_interp::NonDurableKind::Pipe,
-        "the pipe end's own refusal kind"
-    );
+        .expect("a minted pipe's ends ride the cut");
+    assert!(ends
+        .iter()
+        .all(|h| matches!(h.binding, temen_interp::DurableBinding::PipeEnd { .. })));
+    // ...but a pipe the embedder feeds crosses the cut's boundary, which is not yet carried.
+    let mut fed = Host::new();
+    let (_r, _backing) = fed.grant_input_pipe();
+    let err = fed
+        .capture_durable_handles()
+        .expect_err("an embedder-fed pipe refuses");
+    assert_eq!(err.kind, temen_interp::NonDurableKind::Pipe);
 }
 
 const EXEC_C: &str = include_str!("../../temen-run/demos/posix_libc/exec.c");
@@ -6529,6 +6528,90 @@ fn c_terminate_a_twin_parked_in_waitpid() {
         "parallel driver: the killed grandchild's exit woke the subshell's condvar reap wait, and the \
          subshell's re-run died at its per-op term_flag safepoint — no dedicated escape needed, matching \
          the oracle"
+    );
+}
+
+/// [`reapkill_src`] with the kill as the only way out: root releases the grandchild only *after*
+/// reaping the subshell, so nothing but the kill itself can wake the subshell's `waitpid` park.
+fn reapkill_only_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long s, g;\n\
+static int fb[2];  /* the grandchild's block pipe (write end held by root) */\n\
+static int fs[2];  /* subshell -> root sync pipe */\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }}\n\
+int main(void){{\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  int hz[2]; __vm_pipe(hz); __px_pipe_adopt(0, hz[0], hz[1], (long)fs);\n\
+  s = __px_fork(0,0);\n\
+  if (s < 0) return 1;\n\
+  if (s == 0){{\n\
+    g = __px_fork(0,0);\n\
+    if (g < 0) return 80;\n\
+    if (g == 0){{ if (rd1(fb[0]) <= 0) return 81; return 5; }}\n\
+    wr1(fs[1]);  /* tell root we are about to park in waitpid */\n\
+    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){{}}\n\
+    return 7;    /* unreachable: g is released only after we are reaped */\n\
+  }}\n\
+  rd1(fs[0]);\n\
+  __px_kill(0, s, 9);          /* SIGKILL the subshell parked in waitpid — the only wake there is */\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  if (h != s) return 100;\n\
+  if ((status & 0x7f) != 9) return 2000 + (status & 0xffff);  /* subshell WIFSIGNALED(SIGKILL) */\n\
+  wr1(fb[1]);                  /* only now release the grandchild, so its thread returns */\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+/// A twin parked in `waitpid` on a child that cannot exit first dies to a kill — on every driver.
+/// The parallel driver's reap park woke only on a child's exit, so here it slept forever, and root
+/// with it. [`c_terminate_a_twin_parked_in_waitpid`] missed it: its root releases the grandchild
+/// before reaping, and that exit woke the park.
+#[test]
+fn c_a_kill_alone_wakes_a_twin_parked_in_waitpid() {
+    fn within(what: &'static str, f: fn() -> Effects) -> Vec<Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f().result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what}: the killed subshell slept in its waitpid"))
+    }
+    let want = vec![Value::I32(42)];
+    assert_eq!(
+        within("tree-walker", || run_interp_only(
+            &reapkill_only_src(),
+            |_| {}
+        )),
+        want
+    );
+    assert_eq!(
+        within("coop bytecode", || run_bytecode_only(
+            &reapkill_only_src(),
+            |_| {}
+        )),
+        want
+    );
+    assert_eq!(
+        within("parallel", || run_bytecode_parallel_only(
+            &reapkill_only_src(),
+            |_| {}
+        )),
+        want
     );
 }
 

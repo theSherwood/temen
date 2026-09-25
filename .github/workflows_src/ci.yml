@@ -118,7 +118,10 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with: { toolchain: "${{ env.RUST_STABLE }}" }
+        with:
+          toolchain: "${{ env.RUST_STABLE }}"
+          # rust-src: the self-hosted lane builds `temen-link` (demos/temen_link) with `-Z build-std`.
+          components: rust-src
       # A cache per part: they build different profiles (`test`, and the lane's `--release`), and
       # under one key the part that saved first would leave the other's dependencies uncached.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -181,10 +184,15 @@ jobs:
       - name: Nim language conformance matrix (#956)
         if: matrix.part == 'tests'
         run: cargo test -p temen-leng --test nim_conformance -- --nocapture
-      # #1609: the self-hosted lane end to end, release mode — nimsem (Temen, no C) forks and
-      # execs its own nifler through the chibicc-built POSIX /bin/sh, and its semchecked system
-      # must match native nimony's (paths and index offsets normalized). Mechanism-level coverage
-      # is `nim_shells_out_through_the_posix_sh` in nim_e2e above; this is the whole compiler.
+      # #1609: the self-hosted lane end to end, release mode — nimony's own driver (Temen, no C)
+      # builds a program in-guest (nifmake → nifler/nimsem/hexer/temen-link through the POSIX
+      # /bin/sh), every artifact byte-identical to native nimony's, and the program runs.
+      # Mechanism-level coverage is `nim_shells_out_through_the_posix_sh` in nim_e2e above.
+      # #1609: the lane builds `temen-link` through the LLVM on-ramp (rustc IR → llvm-link/opt →
+      # temen-llvm-translate), so it needs the LLVM tools pinned to the stable rustc's major.
+      - name: install LLVM (the lane's temen-link build)
+        if: matrix.part == 'selfhost'
+        run: bash scripts/ci/install-llvm.sh
       - name: Self-hosted nimony lane (must match native)
         if: matrix.part == 'selfhost'
         run: bash scripts/ci/nim-selfhost-lane.sh

@@ -281,65 +281,194 @@ fn stdio_host(child: &temen_ir::Module) -> (Host, Vec<Value>) {
     (host, args)
 }
 
-#[test]
-fn a_child_reads_its_parents_stdin_from_where_the_parent_left_it_on_every_runner() {
-    let (parent, child) = (module(STDIO_PARENT), module(STDIO_CHILD));
-    let want: Result<Vec<Value>, Trap> = Ok(vec![Value::I64(b'c' as i64)]);
+/// What one runner made of a run: its result, or `None` for a declared decline (INVARIANTS #9 — the
+/// debug scheduler leaves pipes to the run harness), and what it wrote to stdout.
+type RunnerOutcome = (&'static str, Option<Result<Vec<Value>, Trap>>, Vec<u8>);
 
-    let (mut host, args) = stdio_host(&child);
-    let mut fuel = u64::MAX;
-    let r = run_with_host(&parent, 0, &args, &mut fuel, &mut host);
-    assert_eq!(
-        (r, host.take_stdout()),
-        (want.clone(), b"b".to_vec()),
-        "tree-walk oracle"
-    );
+/// Run `parent` on every runner — the tree-walk oracle, the cooperative executor, the parallel
+/// driver, the debug scheduler — each over a fresh `host()`.
+fn on_every_runner(
+    parent: &temen_ir::Module,
+    host: impl Fn() -> (Host, Vec<Value>),
+) -> Vec<RunnerOutcome> {
+    let mut out = Vec::new();
 
-    let (mut host, args) = stdio_host(&child);
+    let (mut h, args) = host();
     let mut fuel = u64::MAX;
-    let r = bytecode::compile_and_run_with_host(&parent, 0, &args, &mut fuel, &mut host)
+    let r = run_with_host(parent, 0, &args, &mut fuel, &mut h);
+    out.push(("tree-walk oracle", Some(r), h.take_stdout()));
+
+    let (mut h, args) = host();
+    let mut fuel = u64::MAX;
+    let r = bytecode::compile_and_run_with_host(parent, 0, &args, &mut fuel, &mut h)
         .expect("the cooperative executor runs this module");
-    assert_eq!(
-        (r, host.take_stdout()),
-        (want.clone(), b"b".to_vec()),
-        "cooperative executor"
-    );
+    out.push(("cooperative executor", Some(r), h.take_stdout()));
 
-    let (mut host, args) = stdio_host(&child);
+    let (mut h, args) = host();
     let (back, base, layout) = shared_window(1 << 16);
     let mut fuel = u64::MAX;
     let (r, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
-        &parent,
+        parent,
         0,
         &args,
         &mut fuel,
         &[],
         Arc::clone(&back),
-        &mut host,
+        &mut h,
     )
     .expect("the parallel driver runs this module");
     drop(back);
     // SAFETY: same layout; the region and every borrow of `base` are gone (the run joined its vCPUs).
     unsafe { std::alloc::dealloc(base, layout) };
-    assert_eq!(
-        (r, host.take_stdout()),
-        (want.clone(), b"b".to_vec()),
-        "parallel driver"
-    );
+    out.push(("parallel driver", Some(r), h.take_stdout()));
 
-    let (host, args) = stdio_host(&child);
-    let mut run = ScheduledDebugRun::new_with_host(&parent, 0, &args, host).expect("in subset");
+    let (h, args) = host();
+    let mut run = ScheduledDebugRun::new_with_host(parent, 0, &args, h).expect("in subset");
     let mut fuel = u64::MAX;
     let r = loop {
         match run.run_until_stop(&mut fuel) {
-            SchedStop::Finished(r) => break r,
+            SchedStop::Finished(r) => break Some(r),
             SchedStop::Break { .. } => continue,
+            SchedStop::Declined => break None,
             other => panic!("the debug scheduler must drive op 15, got {other:?}"),
         }
     };
-    assert_eq!(
-        (r, run.host_mut().take_stdout()),
-        (want, b"b".to_vec()),
-        "debug scheduler"
+    out.push(("debug scheduler", r, run.host_mut().take_stdout()));
+    out
+}
+
+#[test]
+fn a_child_reads_its_parents_stdin_from_where_the_parent_left_it_on_every_runner() {
+    let (parent, child) = (module(STDIO_PARENT), module(STDIO_CHILD));
+    for (runner, r, stdout) in on_every_runner(&parent, || stdio_host(&child)) {
+        assert_eq!(
+            (r, stdout),
+            (Some(Ok(vec![Value::I64(b'c' as i64)])), b"b".to_vec()),
+            "{runner}"
+        );
+    }
+}
+
+// ---- #1807: a pipe between two detached children --------------------------------------------------
+//
+// The parent mints a pipe (self-op 16), grants its write end to one child as `stdout` and its read end
+// to another as `stdin`, drops its own copies, and joins both. The reader sees EOF only when every
+// write end is gone — the parent's, closed explicitly, and the writer's, released when the writer's
+// domain finishes. A runner that skipped that release would park the reader forever.
+
+/// Params `(inst, writer, reader, budget)`. Returns `reader * 1000 + writer`.
+const PIPE_PARENT: &str = r#"memory 16
+data 17472 "stdin"
+data 17480 "stdout"
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vmw: i32, vmr: i32, vbud: i32) {
+  vfds = i64.const 16896
+  vz = i32.const 0
+  vpm = call.cap 4294967295 16 (i64) -> (i32) vz (vfds)
+  vrd = i32.load vfds
+  vwa = i64.const 16900
+  vwr = i32.load vwa
+  vg0 = i64.const 17408
+  vw0 = i64.const 25769821256
+  i64.store vg0 vw0
+  vg0h = i64.const 17416
+  vwr64 = i64.extend_i32_u vwr
+  i64.store vg0h vwr64
+  vg1 = i64.const 17424
+  vw1 = i64.const 21474853952
+  i64.store vg1 vw1
+  vg1h = i64.const 17432
+  vrd64 = i64.extend_i32_u vrd
+  i64.store vg1h vrd64
+  vmin = i64.extend_i32_u vbud
+  vgn = i64.const 1
+  ve = i64.const 0
+  vlog = i64.const 15
+  vq = i64.const 0
+  vmw64 = i64.extend_i32_u vmw
+  vhw = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmw64, vg0, vgn, ve, vlog, vq)
+  vmr64 = i64.extend_i32_u vmr
+  vhr = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmr64, vg1, vgn, ve, vlog, vq)
+  vcr = call.cap 0 2 () -> (i64) vrd ()
+  vcw = call.cap 0 2 () -> (i64) vwr ()
+  vjr = call.cap 6 1 (i32) -> (i64) v0 (vhr)
+  vjw = call.cap 6 1 (i32) -> (i64) v0 (vhw)
+  vk = i64.const 1000
+  vs = i64.mul vjr vk
+  vt = i64.add vs vjw
+  return vt
+  }
+}
+"#;
+
+/// Writes `hello, pipe\n` (12 bytes) to its `stdout`; returns what the write returned.
+const PIPE_WRITER: &str = r#"memory 15
+data 16384 "stdout"
+data 16400 "hello, pipe\n"
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  vp = i64.const 16384
+  vl = i64.const 6
+  vh = self.resolve vp vl
+  vb = i64.const 16400
+  vn = i64.const 12
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vb, vn)
+  return vw
+  }
+}
+"#;
+
+/// Reads its `stdin` 5 bytes at a time until EOF; returns the byte count.
+const PIPE_READER: &str = r#"memory 15
+data 16384 "stdin"
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  vp = i64.const 16384
+  vl = i64.const 5
+  vh = self.resolve vp vl
+  vz = i64.const 0
+  br 1(vh, vz)
+  }
+block 1 (h: i32, tot: i64) {
+  vb = i64.const 16400
+  vc = i64.const 5
+  vn = call.cap 0 0 (i64, i64) -> (i64) h (vb, vc)
+  vzero = i64.const 0
+  vdone = i64.le_s vn vzero
+  br_if vdone 2(tot) 3(h, tot, vn)
+  }
+block 2 (t: i64) {
+  return t
+  }
+block 3 (h3: i32, tot3: i64, n: i64) {
+  vt = i64.add tot3 n
+  br 1(h3, vt)
+  }
+}
+"#;
+
+#[test]
+fn a_pipe_between_two_detached_children_reaches_eof_on_every_runner() {
+    let (parent, writer, reader) = (
+        module(PIPE_PARENT),
+        module(PIPE_WRITER),
+        module(PIPE_READER),
     );
+    let host = || {
+        let mut h = Host::new();
+        let inst = h.grant_instantiator(0, 1 << 16);
+        let mw = h.grant_module(&writer);
+        let mr = h.grant_module(&reader);
+        let budget = h.grant_budget(0, 1 << 20, 0);
+        let args = [inst, mw, mr, budget].map(Value::I32).to_vec();
+        (h, args)
+    };
+    for (runner, r, _) in on_every_runner(&parent, host) {
+        // The debug scheduler declines a pipe park (the run harness drives pipes, not the debugger):
+        // the declared frontier, pinned here so a change to it is a decision.
+        let want = (runner != "debug scheduler").then(|| Ok(vec![Value::I64(12_012)]));
+        assert_eq!(r, want, "{runner}");
+    }
 }
