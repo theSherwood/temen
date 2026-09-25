@@ -1749,8 +1749,12 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 ///   fail-closed stub makes the whole sequence report failure, and *which* one is invisible from
 ///   the outside — the symptom is only a non-zero shell-out. `execve` and `wait4` are what
 ///   `OP_EXECVE`/`OP_WAIT4` exist to serve.
+/// - `pipe` / `dup2` / `close` → a process's pipes (#763): `osproc.startProcess` wires a child's
+///   stdio to pipes this way whenever the caller reads its output (`execCmdEx`, and so nimony's
+///   compile-time evaluation). On the stubs `pipe` failed and nothing could be started. The edge
+///   ([`posix_edge_unit`]) makes `pipe` a core pipe, as C's is.
 const POSIX_SERVED_LEAVES: &[&str] = &[
-    "getcwd", "cExitSys", "fstat", "execve", "fork", "wait4", "exitnow",
+    "getcwd", "cExitSys", "fstat", "execve", "fork", "wait4", "exitnow", "pipe", "dup2", "close",
 ];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
@@ -1999,6 +2003,14 @@ fn functype_text(params: &[ValType], results: &[ValType]) -> String {
 /// error here, so it cannot be bound wrong in silence. Two exceptions, both named: `fork`, whose op
 /// takes an unused operand the leaf does not have; and the guest libc's fd-less stdout `write`
 /// (`(buf, len)`, [`LIBC_CAP_STUBS`]), which is `write` to fd 1.
+///
+/// **Pipes are the core's** (#972, #763), as a C guest's are (`demos/bash/bash_shim.c`): `pipe`
+/// mints a core pipe (the self-namespace op `CAP_SELF_PIPE`), whose read end parks while writers
+/// remain and reads EOF only when they are gone, and adopts its two ends as fds (`pipe_adopt`). A
+/// transfer the personality cannot make itself, on such an fd, answers a **tag**
+/// (`PIPE_TAG_BASE - handle`), and `read`/`write`/`close` re-issue it on that core end (see
+/// [`EdgeBody`]). The personality's own `pipe` op is an in-personality FIFO whose empty read is EOF:
+/// a parent reading a child's output would see the end before the child wrote a byte.
 fn posix_edge_unit(
     leaves: &[(String, temen_ir::FuncType)],
     importc: &[(String, String)],
@@ -2012,22 +2024,48 @@ fn posix_edge_unit(
             .position(|n| *n == name)
             .map(|i| (name, &px_sigs[i]))
     };
-    // (export name, leaf shape, op name, op shape, leading constant args)
+    // (export name, leaf shape, op name, op shape, leading constant args, body)
     let mut fwds: Vec<(
         String,
         temen_ir::FuncType,
         String,
         temen_ir::FuncType,
         Vec<i64>,
+        EdgeBody,
     )> = Vec::new();
     for (name, shape) in leaves {
         let Some((_, c)) = importc.iter().find(|(s, _)| s == name) else {
             continue; // not an `importc` leaf: left to whatever else serves it (or reported unbound)
         };
         let c = if c == "_exit" { "exit" } else { c.as_str() };
+        let (c, body) = match c {
+            "pipe" => ("pipe_adopt", EdgeBody::Pipe),
+            "read" => ("read", EdgeBody::Tagged(0)),
+            "write" => ("write", EdgeBody::Tagged(1)),
+            "close" => ("close", EdgeBody::Tagged(2)),
+            c => (c, EdgeBody::Plain),
+        };
         let Some((opname, opsig)) = op(c) else {
             continue; // not a personality op: left retained, as before
         };
+        if body == EdgeBody::Pipe {
+            // `pipe(int fds[2]) -> int`: the adopt takes the two minted ends and the same `fds`.
+            if shape.params != [ValType::I64] || shape.results.len() > 1 {
+                return Err(LengError::Unsupported(format!(
+                    "POSIX leaf `{name}` (C `pipe`) is {}, not `(ptr) -> (int)`",
+                    functype_text(&shape.params, &shape.results),
+                )));
+            }
+            fwds.push((
+                name.clone(),
+                shape.clone(),
+                opname,
+                opsig.clone(),
+                Vec::new(),
+                body,
+            ));
+            continue;
+        }
         let pad = c == "fork" && shape.params.is_empty() && opsig.params.len() == 1;
         let arity_ok = shape.params.len() == opsig.params.len() || pad;
         let args_ok = shape
@@ -2047,7 +2085,14 @@ fn posix_edge_unit(
             )));
         }
         let lead = if pad { vec![0] } else { Vec::new() };
-        fwds.push((name.clone(), shape.clone(), opname, opsig.clone(), lead));
+        fwds.push((
+            name.clone(),
+            shape.clone(),
+            opname,
+            opsig.clone(),
+            lead,
+            body,
+        ));
     }
     // The guest libc's stdout: `write(buf, len)` is `write(1, buf, len)`.
     if let Some((opname, opsig)) = op("write") {
@@ -2055,14 +2100,21 @@ fn posix_edge_unit(
             params: vec![ValType::I64; 2],
             results: vec![ValType::I64],
         };
-        fwds.push(("write".into(), shape, opname, opsig.clone(), vec![1]));
+        fwds.push((
+            "write".into(),
+            shape,
+            opname,
+            opsig.clone(),
+            vec![1],
+            EdgeBody::Tagged(1),
+        ));
     }
 
     let mut imports: Vec<(String, temen_ir::FuncType)> = Vec::new();
     let mut text = String::new();
     let mut funcs = String::new();
     let mut exports = Vec::new();
-    for (i, (name, shape, opname, opsig, lead)) in fwds.iter().enumerate() {
+    for (i, (name, shape, opname, opsig, lead, body)) in fwds.iter().enumerate() {
         let k = match imports.iter().position(|(n, _)| n == opname) {
             Some(k) => k,
             None => {
@@ -2070,6 +2122,11 @@ fn posix_edge_unit(
                 imports.len() - 1
             }
         };
+        if *body == EdgeBody::Pipe {
+            funcs.push_str(&pipe_body(k, &shape.results));
+            exports.push((name.clone(), i as u32));
+            continue;
+        }
         let params: Vec<String> = shape
             .params
             .iter()
@@ -2105,14 +2162,17 @@ fn posix_edge_unit(
         } else {
             let r = next;
             funcs.push_str(&format!("  v{r} = call.import {k} ({})\n", args.join(", ")));
+            let mut r = format!("v{r}");
+            if let EdgeBody::Tagged(core_op) = body {
+                funcs.push_str(&tag_reissue(*core_op, &r, &args));
+                r = "t0".to_string();
+            }
             match shape.results.as_slice() {
                 [] => funcs.push_str("  return\n"),
-                [ValType::I32] => funcs.push_str(&format!(
-                    "  v{} = i32.wrap_i64 v{r}\n  return v{}\n",
-                    r + 1,
-                    r + 1
-                )),
-                _ => funcs.push_str(&format!("  return v{r}\n")),
+                [ValType::I32] => {
+                    funcs.push_str(&format!("  n0 = i32.wrap_i64 {r}\n  return n0\n"))
+                }
+                _ => funcs.push_str(&format!("  return {r}\n")),
             }
         }
         funcs.push_str("  }\n}\n\n");
@@ -2133,6 +2193,75 @@ fn posix_edge_unit(
         exports,
         ..Default::default()
     })
+}
+
+/// What a [`posix_edge_unit`] forwarder does with its op.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EdgeBody {
+    /// Forward the arguments, narrow the answer.
+    Plain,
+    /// Forward, then — when the personality answers a tag, because the fd is an adopted core pipe
+    /// end (#972) — re-issue on that end with the core `Stream` op (`0` read, `1` write, `2` close).
+    Tagged(u32),
+    /// `pipe`: mint a core pipe, then adopt its ends as fds.
+    Pipe,
+}
+
+/// `temen_posix`'s tag base (`PX_TAG_BASE`): an answer at or below it names the core handle
+/// `PIPE_TAG_BASE - answer`, well below every errno.
+const PIPE_TAG_BASE: i64 = -(1 << 20);
+
+/// The rest of a [`EdgeBody::Tagged`] forwarder's block after the op's answer `r`: a tag re-issues
+/// the transfer on the core end it names (`read`/`write` take the forwarded `(buf, len)`, `close`
+/// takes nothing and answers `0`, as the C shim's does). Ends in block 2 with the answer as `t0`.
+fn tag_reissue(core_op: u32, r: &str, args: &[String]) -> String {
+    let xfer = core_op < 2;
+    let pass = if xfer {
+        format!("{r}, {}, {}", args[1], args[2])
+    } else {
+        r.to_string()
+    };
+    let params = if xfer {
+        "t0: i64, t1: i64, t2: i64"
+    } else {
+        "t0: i64"
+    };
+    let reissue = if xfer {
+        format!("  t6 = call.cap 0 {core_op} (i64, i64) -> (i64) t5 (t1, t2)\n")
+    } else {
+        "  t7 = call.cap 0 2 () -> (i64) t5 ()\n  t6 = i64.const 0\n".to_string()
+    };
+    format!(
+        "  u0 = i64.const {PIPE_TAG_BASE}\n  u1 = i64.le_s {r} u0\n  br_if u1 1({pass}) 2({r})\n  }}\n\
+         block 1 ({params}) {{\n  t3 = i64.const {PIPE_TAG_BASE}\n  t4 = i64.sub t3 t0\n  \
+         t5 = i32.wrap_i64 t4\n{reissue}  br 2(t6)\n  }}\nblock 2 (t0: i64) {{\n"
+    )
+}
+
+/// The `pipe(int fds[2])` forwarder ([`EdgeBody::Pipe`]): mint a core pipe into `fds` (its two
+/// powerbox handles, read end first), then `pipe_adopt` (import `adopt`) turns them into fds, written
+/// over the handles. An errno from either is the answer.
+fn pipe_body(adopt: usize, results: &[ValType]) -> String {
+    let ret = match results {
+        [] => "  return\n",
+        [ValType::I32] => "  r1 = i32.wrap_i64 r0\n  return r1\n",
+        _ => "  return r0\n",
+    };
+    format!(
+        "func (i64) -> ({}) {{\n\
+         block 0 (v0: i64) {{\n  v1 = i32.const 0\n  \
+         v2 = call.cap 4294967295 16 (i64) -> (i64) v1 (v0)\n  v3 = i64.eqz v2\n  \
+         br_if v3 1(v0) 2(v2)\n  }}\n\
+         block 1 (v0: i64) {{\n  v1 = i32.load v0\n  v2 = i64.const 4\n  v3 = i64.add v0 v2\n  \
+         v4 = i32.load v3\n  v5 = i64.extend_i32_s v1\n  v6 = i64.extend_i32_s v4\n  \
+         v7 = call.import {adopt} (v5, v6, v0)\n  br 2(v7)\n  }}\n\
+         block 2 (r0: i64) {{\n{ret}  }}\n}}\n\n",
+        results
+            .iter()
+            .map(|t| valtype_text(*t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Every import the POSIX runtime emits must be a personality op, spelled and shaped exactly as the
@@ -2427,4 +2556,16 @@ pub fn bottom_edge_index(name: &str) -> Option<u32> {
 pub(crate) struct Val {
     pub id: u32,
     pub ty: ValType,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The edge reads a tag with the personality's base: a drift would read every tag as an errno,
+    /// and every read of a pipe would fail.
+    #[test]
+    fn the_edge_reads_tags_at_the_personalitys_base() {
+        assert_eq!(PIPE_TAG_BASE, temen_posix::PX_TAG_BASE);
+    }
 }

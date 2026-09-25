@@ -2358,6 +2358,65 @@ fn nim_shells_out_through_the_posix_sh() {
     }
 }
 
+/// #763 — **a nim program reads a command's output** (`osproc.execCmdEx`): how nimony's compile-time
+/// evaluation runs the program it built for a `const` and reads its answer, and how it builds that
+/// program in the first place. Unlike `execShellCmd`, the child's stdin, stdout and stderr are
+/// pipes (`startProcess` without `poParentStreams`): the parent reads the child's stdout until EOF
+/// and reaps its exit code.
+#[test]
+fn nim_reads_a_commands_output_through_execcmdex() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nim_reads_a_commands_output_through_execcmdex (no toolchain)");
+        return;
+    };
+    let child = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/cmdline\n\
+         write(stdout, \"child:\" & paramStr(1) & \"\\n\")\n\
+         quit(3)\n",
+    );
+    let parent = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/osproc\n\
+         try:\n\
+         \x20 let (outp, rc) = execCmdEx(\"bin/child hi\")\n\
+         \x20 write(stdout, \"parent:\" & $rc & \"|\" & outp)\n\
+         except ErrorCode as e:\n\
+         \x20 write(stdout, \"parent raised:\" & $e)\n",
+    );
+    let sh = posix_sh();
+    for engine in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+            std::sync::Arc::new(make);
+        let run = temen_run::nim_noc_run(
+            parent.clone(),
+            &posix,
+            make,
+            &["parent".to_string()],
+            &temen_run::ExecGrants {
+                commands: &[
+                    ("/bin/sh".to_string(), sh.clone()),
+                    ("bin/child".to_string(), child.clone()),
+                ],
+                built: false,
+            },
+            engine,
+        );
+        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            "parent:3|child:hi\n",
+            "{engine:?}: the parent read the child's output and its exit code (stderr: {:?})",
+            String::from_utf8_lossy(&posix.stderr())
+        );
+    }
+}
+
 /// #1668 — **a nim program forks and execs a nim program**, the shape every nimony compiler phase
 /// uses to reach the next one (`os.execShellCmd` is fork + `execve` + `waitpid`, inlined).
 ///
