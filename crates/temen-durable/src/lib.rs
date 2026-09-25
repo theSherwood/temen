@@ -209,11 +209,71 @@ pub enum TransformError {
     GuestUsesMemory,
 }
 
+/// How [`transform`] instruments a module — the one transform, parameterized by who unwinds it.
+#[derive(Clone, Copy)]
+pub struct TransformOpts<'a> {
+    /// Refuse a module any of whose functions touch linear memory (R9) — the strict path for an
+    /// untrusted module ([`transform_module`]). Off for a cooperating toolchain's module
+    /// ([`transform_module_assume_confined`]).
+    pub enforce_r9: bool,
+    /// Which suspendable operations (a capability call, a fiber switch, a `thread.join`, an
+    /// `atomic.wait`) are suspend points. `None` instruments every one: a durable domain can be
+    /// caught by a freeze inside any of them. `Some(site)` instruments only the ops `site` admits,
+    /// and so only the functions that can reach one: a **fork** (#1768, FORK.md §9.5) is an unwind
+    /// the guest's own call triggers, so only the calls that can fork need a poll, and a program
+    /// that cannot reach one is left byte-identical. The runtime unwinds only at an op this admitted.
+    pub sites: Option<&'a dyn Fn(&Inst) -> bool>,
+    /// Poll at every loop header too (Phase-4 Slice A: an async freeze lands in a poll-free loop
+    /// at bounded latency). An unwind the guest's own call starts is never inside a loop body, so
+    /// a fork needs none.
+    pub loop_polls: bool,
+    /// The unwind duplicates the running thread **alive** — a fork — rather than freezing it into a
+    /// snapshot, so the thread state an engine keeps outside the window travels with it: the vCPU TLS
+    /// register (`vcpu.tls.*`) needs no frame slot, and the ops on it instrument like any other. A
+    /// snapshot carries the window alone, so for a freeze (`false`) those ops fail closed
+    /// (`UnsupportedInst`) rather than thaw with the register lost.
+    pub carries_thread: bool,
+}
+
+impl TransformOpts<'_> {
+    /// A durable domain's instrumentation: every suspendable op, loop polls, strict R9.
+    pub const DURABLE: TransformOpts<'static> = TransformOpts {
+        enforce_r9: true,
+        sites: None,
+        loop_polls: true,
+        carries_thread: false,
+    };
+
+    /// Whether `x` is a suspend point under these options.
+    fn is_site(&self, x: &Inst) -> bool {
+        is_suspendable_op(x) && self.sites.is_none_or(|site| site(x))
+    }
+}
+
+/// The operations that can suspend a frame to the host or another stack: `call.cap` suspends to
+/// the host; a fiber `cont.resume`/`suspend` switches stacks and is a freeze safepoint too
+/// (`cont.new` alone merely allocates); `call.import` / `call.import.dyn` / `call.sym` are
+/// capability calls bound at run time (IMPORTS.md) — the same host suspend as `call.cap` (#1300
+/// Phase 2); a vCPU blocked in `thread.join` or `atomic.wait` is a safepoint (§12.8).
+fn is_suspendable_op(x: &Inst) -> bool {
+    matches!(
+        x,
+        Inst::CapCall { .. }
+            | Inst::CallImport { .. }
+            | Inst::CallImportDyn { .. }
+            | Inst::CallSym { .. }
+            | Inst::ContResume { .. }
+            | Inst::Suspend { .. }
+            | Inst::ThreadJoin { .. }
+            | Inst::MemoryWait { .. }
+    )
+}
+
 /// Instrument every may-suspend function in `m` for freeze/thaw. Functions that can
 /// never suspend are returned unchanged. The result is ordinary IR; run it through
 /// `temen_verify::verify_module` before executing.
 pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
-    transform_module_inner(m, true)
+    transform(m, &TransformOpts::DURABLE)
 }
 
 /// Like [`transform_module`], but **allows the guest to use linear memory**, on the caller's
@@ -228,12 +288,21 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
 /// violates it can corrupt only its own durability, and fails safe (see the region notes) —
 /// so prefer [`transform_module`] (fails closed, no memory) for *untrusted* modules.
 pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformError> {
-    transform_module_inner(m, false)
+    transform(
+        m,
+        &TransformOpts {
+            enforce_r9: false,
+            ..TransformOpts::DURABLE
+        },
+    )
 }
 
-fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, TransformError> {
+/// Instrument `m` as `opts` says (see [`TransformOpts`]); [`transform_module`] and
+/// [`transform_module_assume_confined`] are its two durable presets.
+pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Module, TransformError> {
+    let enforce_r9 = opts.enforce_r9;
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
-    let may_suspend = compute_may_suspend(&m.funcs, &m.types);
+    let may_suspend = compute_may_suspend(&m.funcs, &m.types, opts);
     let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend);
     let any_instrumented = may_suspend.iter().any(|&s| s);
 
@@ -272,6 +341,7 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
                 &tainted_sigs,
                 &m.types,
                 arena.end,
+                opts,
             )?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
@@ -488,28 +558,13 @@ fn term_targets(t: &Terminator) -> Vec<BlockIdx> {
 /// function taints its own signature). Marking the caller (rather than ignoring the
 /// indirect call) is what flips R8 from fail-**open** — silent under-instrumentation — to
 /// sound: `transform_func` then either instruments the site or fails the module closed.
-fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
+fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry], opts: &TransformOpts) -> Vec<bool> {
     let mut ms = vec![false; funcs.len()];
     for (i, f) in funcs.iter().enumerate() {
-        if f.blocks.iter().any(|b| {
-            b.insts.iter().any(|x| {
-                // `call.cap` suspends to the host; a fiber `cont.resume`/`suspend` switches
-                // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
-                // `call.import` / `call.import.dyn` / `call.sym` are capability calls bound at
-                // run time (IMPORTS.md) — the same host suspend as `call.cap` (#1300 Phase 2).
-                matches!(
-                    x,
-                    Inst::CapCall { .. }
-                        | Inst::CallImport { .. }
-                        | Inst::CallImportDyn { .. }
-                        | Inst::CallSym { .. }
-                        | Inst::ContResume { .. }
-                        | Inst::Suspend { .. }
-                        | Inst::ThreadJoin { .. }
-                        | Inst::MemoryWait { .. }
-                )
-            })
-        }) {
+        if f.blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|x| opts.is_site(x)))
+        {
             ms[i] = true;
         }
     }
@@ -583,7 +638,7 @@ fn tainted_signatures(funcs: &[Func], ms: &[bool]) -> Vec<temen_ir::FuncType> {
 /// functions, this is the set a durable host stashes so it can gate later `Jit.compile`s
 /// ([`unit_suspends_untainted`]). Exposed for the durable-JIT install fence (DURABILITY.md §12.5).
 pub fn tainted_signatures_of(funcs: &[Func], types: &[TypeEntry]) -> Vec<temen_ir::FuncType> {
-    let ms = compute_may_suspend(funcs, types);
+    let ms = compute_may_suspend(funcs, types, &TransformOpts::DURABLE);
     tainted_signatures(funcs, &ms)
 }
 
@@ -605,7 +660,7 @@ pub fn unit_suspends_untainted(
     if unit_funcs.is_empty() {
         return false; // no entry to invoke; the empty-unit case is rejected elsewhere
     }
-    let ms = compute_may_suspend(unit_funcs, unit_types);
+    let ms = compute_may_suspend(unit_funcs, unit_types, &TransformOpts::DURABLE);
     if !ms[0] {
         return false; // entry cannot suspend → no continuation to lose → safe
     }
@@ -785,6 +840,7 @@ fn transform_func(
     type_section: &[TypeEntry],
     // The shadow-overflow trap line: the module's declared arena `end`.
     arena_end: u64,
+    opts: &TransformOpts,
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
     // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
@@ -813,7 +869,13 @@ fn transform_func(
         let mut types = blk.params.clone();
         let mut vend = Vec::with_capacity(blk.insts.len());
         for inst in &blk.insts {
-            types.extend(result_types(inst, &types, func_results, type_section)?);
+            types.extend(result_types(
+                inst,
+                &types,
+                func_results,
+                type_section,
+                opts,
+            )?);
             vend.push(types.len());
         }
         let scs: Vec<usize> = blk
@@ -821,17 +883,9 @@ fn transform_func(
             .iter()
             .enumerate()
             .filter(|(_, inst)| match inst {
-                Inst::CapCall { .. }
-                | Inst::CallImport { .. }
-                | Inst::CallImportDyn { .. }
-                | Inst::CallSym { .. }
-                | Inst::ContResume { .. }
-                | Inst::Suspend { .. }
-                | Inst::ThreadJoin { .. }
-                | Inst::MemoryWait { .. } => true,
                 Inst::Call { func, .. } => may_suspend[*func as usize],
                 Inst::CallIndirect { ty, .. } => is_tainted(*ty),
-                _ => false,
+                x => opts.is_site(x),
             })
             .map(|(pos, _)| pos)
             .collect();
@@ -854,10 +908,12 @@ fn transform_func(
     // the R6 caveat). Each header adds one resume point (a `LoopHeader` poll) and one segment (the
     // poll itself, ahead of the header's body segments).
     let mut is_header = vec![false; nb];
-    for (b, blk) in f.blocks.iter().enumerate() {
-        for t in term_targets(&blk.term) {
-            if (t as usize) <= b {
-                is_header[t as usize] = true;
+    if opts.loop_polls {
+        for (b, blk) in f.blocks.iter().enumerate() {
+            for t in term_targets(&blk.term) {
+                if (t as usize) <= b {
+                    is_header[t as usize] = true;
+                }
             }
         }
     }
@@ -1144,6 +1200,11 @@ fn transform_func(
                 for o in kind.operands() {
                     used[o as usize] = true;
                 }
+                // A leaf's own results are always in its frame, even ones the continuation never
+                // reads: they are the reply slot a host injects into before a thaw (#1768).
+                if matches!(kind, SuspendKind::Leaf) {
+                    used[out - nres..out].iter_mut().for_each(|u| *u = true);
+                }
                 // A wait's thaw arm reads its own status to decide re-issue vs. deliver (#1769).
                 if matches!(kind, SuspendKind::MemoryWait { .. }) {
                     used[out - 1] = true;
@@ -1153,12 +1214,20 @@ fn transform_func(
                 } else {
                     (0..save_end).filter(|&i| used[i]).collect()
                 };
-                // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top.
-                let mut frame_offsets = Vec::with_capacity(spilled.len());
+                // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top. A
+                // leaf's results come first, at the frame base, in declaration order — the reply
+                // slot (`ShadowArena::leaf_reply`); the rest of its live set follows. `spilled`
+                // itself stays in value order (the reload order), so each value keeps its own offset.
+                let is_reply = |i: usize| matches!(kind, SuspendKind::Leaf) && i >= out - nres;
+                let mut frame_offsets = vec![0u64; spilled.len()];
                 let mut off = 0u64;
-                for &i in &spilled {
+                let replies_first = (0..spilled.len())
+                    .filter(|&j| is_reply(spilled[j]))
+                    .chain((0..spilled.len()).filter(|&j| !is_reply(spilled[j])));
+                for j in replies_first.collect::<Vec<_>>() {
+                    let i = spilled[j];
                     off = align_up(off, vsize(slot_types[i]));
-                    frame_offsets.push(off);
+                    frame_offsets[j] = off;
                     off += vsize(slot_types[i]);
                 }
                 let frame_size = align_up(off + 4, 16);
@@ -1525,6 +1594,17 @@ pub fn begin_thaw(window: &mut [u8], arena: ShadowArena, ctx: usize) {
     write_thaw_state(window, arena, ctx, STATE_REWINDING);
 }
 
+/// **Inject** `reply` as the result the frozen call of context `ctx` returns on thaw, in place of
+/// the one it returned before the freeze (FORK.md §3 — reply-injection, never re-issue; #1768). The
+/// deepest frame of a context frozen at a capability call is that call's leaf frame, which holds the
+/// call's results first ([`ShadowArena::leaf_reply`]), so this writes the first result's slot as an
+/// `i64`. A fork writes a different reply into each copy of one frozen window, and each thaw resumes
+/// past the same call with its own answer — return-twice.
+pub fn inject_leaf_reply(window: &mut [u8], arena: ShadowArena, ctx: usize, reply: i64) {
+    let off = arena.leaf_reply(ctx) as usize;
+    window[off..off + 8].copy_from_slice(&reply.to_le_bytes());
+}
+
 /// Read context `ctx`'s per-context **thaw** state word — after a thaw, a completed rewind reads
 /// `NORMAL` (the deepest frame's re-issue flipped it).
 pub fn read_thaw_state(window: &[u8], arena: ShadowArena, ctx: usize) -> i32 {
@@ -1720,8 +1800,9 @@ fn reload(t: ValType, addr: ValIdx, offset: u64) -> Inst {
 /// and each function's result types. Covers the scalar/memory/call subset a Phase-1
 /// prefix can use; returns `UnsupportedInst` for anything else — the ops whose state does not
 /// live in values the shadow frame can carry: `setjmp`/`longjmp` (an interpreter-frame jump
-/// buffer), `gc.roots`, `import.attach` (host binding-table mutation) and vCPU TLS — so the
-/// transform fails closed rather than mis-typing a frame.
+/// buffer), `gc.roots`, `import.attach` (host binding-table mutation) and vCPU TLS (unless the
+/// unwind carries the thread, [`TransformOpts::carries_thread`]) — so the transform fails closed
+/// rather than mis-typing a frame.
 ///
 /// Deliberately **not** `temen_verify::func_value_types` (#913): that one is whole-function and
 /// **total** — it types every op and degrades gracefully (an underivable value is simply absent)
@@ -1734,6 +1815,7 @@ fn result_types(
     types: &[ValType],
     func_results: &[Vec<ValType>],
     type_section: &[TypeEntry],
+    opts: &TransformOpts,
 ) -> Result<Vec<ValType>, TransformError> {
     use Inst::*;
     Ok(match inst {
@@ -1820,6 +1902,10 @@ fn result_types(
         // `atomic.notify` an `i32` woken count. `atomic.wait` is a may-suspend re-issue safepoint
         // (the parked-vCPU slice); `atomic.notify` is copied verbatim into its segment.
         MemoryWait { .. } | MemoryNotify { .. } => vec![ValType::I32],
+        // §12 vCPU TLS: the register is the thread's, so only an unwind that carries the thread keeps
+        // it — `get` then yields a scalar like any other, `set` nothing.
+        VcpuTlsGet if opts.carries_thread => vec![ValType::I64],
+        VcpuTlsSet { .. } if opts.carries_thread => vec![],
         _ => return Err(TransformError::UnsupportedInst),
     })
 }

@@ -115,6 +115,8 @@ fn epoch_fired(addr: usize) -> bool {
 struct Env {
     mem_base: u64,
     fn_table_base: u64,
+    /// The domain's instance context ([`crate::VmCtx`]), spelled as its field-0 trap cell: every vCPU
+    /// enters guest code with it, and reads/stores the trap through it.
     trap_out: *mut i64,
     /// The guest call-trampoline vCPU entries run through. `None` on a **futex-only** domain (stood
     /// up so §14 children can `atomic.wait`/`notify` against the parent's shared futex, in a module
@@ -572,7 +574,9 @@ impl Domain {
         &self,
         mem_base: u64,
         fn_table_base: u64,
-        trap_out: *mut i64,
+        // The instance the domain's vCPUs run as — the one whose window and powerbox they share. Its
+        // field 0 is the domain's shared trap cell (`trap_out` below).
+        vmctx: *const crate::VmCtx,
         call_tramp: Option<FiberCallTramp>,
         fault: (usize, usize),
         fiber_cfg: Option<(u32, u64)>,
@@ -583,7 +587,7 @@ impl Domain {
         *lock(&self.env) = Some(Env {
             mem_base,
             fn_table_base,
-            trap_out,
+            trap_out: vmctx as *mut i64,
             call_tramp,
             fault_lo: fault.0,
             fault_hi: fault.1,

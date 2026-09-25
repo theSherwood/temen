@@ -272,6 +272,25 @@ pub mod errno {
     pub const ECONNREFUSED: i64 = -111;
 }
 
+/// The state codes of a JIT window's **page map** (`temen_interp::CapPageMap`): host page index →
+/// one of these, absent ⇒ the region default (read-write in the backed prefix, unmapped in the
+/// reserved tail). One definition for the three readers: the flat-window backend that writes them
+/// (`temen_run::MprotectWindow`), the durable capture that turns them into a snapshot's page map
+/// (`temen_interp::Host::capture_window_prots`), and the JIT's fork copy (`temen_jit`).
+pub mod page_state {
+    /// Committed read-write.
+    pub const RW: u8 = 1;
+    /// Committed read-only.
+    pub const RO: u8 = 2;
+    /// Inaccessible — an `unmap` (zeroed) or a `protect(none)` (contents kept).
+    pub const UNMAPPED: u8 = 3;
+    /// A §13 `SharedRegion` alias, read-write: the page *is* another object's memory, so it cannot
+    /// be copied into a private duplicate (a fork refuses the window, as the interpreter's does).
+    pub const BACKED_RW: u8 = 4;
+    /// A §13 `SharedRegion` alias, read-only.
+    pub const BACKED_RO: u8 = 5;
+}
+
 /// The **durable (freeze/thaw) ABI layout** (DURABILITY.md §12) — the byte offsets and state-word
 /// values the transform emits and every backend (temen-durable, temen-interp, temen-jit) plus the durable
 /// runtime must agree on. Hoisted here (temen-ir is the common dependency of all three) so the layout
@@ -395,6 +414,18 @@ pub mod durable_abi {
         /// Window offset of context `ctx`'s per-context **thaw** state word.
         pub const fn thaw_state_off(self, ctx: usize) -> u64 {
             self.region_base(ctx) + STATE_IN_REGION_OFF
+        }
+
+        /// Window offset of the **reply slot** of context `ctx`'s deepest frozen frame — where a
+        /// host **injects** the reply a thaw resumes with, in place of what the call returned
+        /// (FORK.md §3: fork is reply-injection, never re-issue; #1768).
+        ///
+        /// An unwind pushes the innermost frame first, so the deepest frame sits at the empty
+        /// frame base; and a **leaf** frame (a capability call's) lays its call's results out
+        /// first, in declaration order, each naturally aligned — the transform's one leaf layout.
+        /// So result 0 is here. Meaningful only for a context frozen at a leaf.
+        pub const fn leaf_reply(self, ctx: usize) -> u64 {
+            self.frame_base(ctx)
         }
 
         /// A module that declared **no** arena: zero regions at the control-word boundary. Nothing
@@ -2760,6 +2791,24 @@ impl Effects {
 }
 
 impl Inst {
+    /// The `(type_id, op)` this instruction hands the host's shared `call.cap` dispatch entry, when it
+    /// calls a capability op: a `call.cap`'s own pair, and the reserved packings of the import forms —
+    /// [`CAP_IMPORT_TYPE_ID`] with `slot | consumer_op << 16` (a `call.sym` is a flat import, consumer
+    /// op `0`) and [`CAP_DYN_TYPE_ID`] with `type_idx | op << 16`. `None` for every other instruction.
+    /// One definition: the JIT lowers these calls with it, and whatever must know ahead of a call what
+    /// the entry will be handed (the JIT's fork sites, #1768) reads the same pair.
+    pub fn host_dispatch(&self) -> Option<(u32, u32)> {
+        match self {
+            Inst::CapCall { type_id, op, .. } => Some((*type_id, *op)),
+            Inst::CallImport { import, op, .. } => {
+                Some((CAP_IMPORT_TYPE_ID, *import | (*op << 16)))
+            }
+            Inst::CallSym { import, .. } => Some((CAP_IMPORT_TYPE_ID, *import)),
+            Inst::CallImportDyn { ty, op, .. } => Some((CAP_DYN_TYPE_ID, *ty | (*op << 16))),
+            _ => None,
+        }
+    }
+
     /// This instruction's [`Effects`] — the optimizer's legality oracle. Exhaustive by design (no
     /// wildcard arm) so adding an `Inst` variant forces a classification decision here.
     pub fn effects(&self) -> Effects {

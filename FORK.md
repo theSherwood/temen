@@ -713,7 +713,7 @@ process table; the core's contribution is the domain stop park, `Blocked::Stoppe
 surface a shell drives is complete. (Process groups — `setpgid`/`waitpid(-pgid)` — are the
 personality's, not the core's, since #973; see the §8.6 note above.)
 
-## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
+## 9. Fast-backend fork parity — bytecode DONE; Cranelift: the personality fork DONE (§9.5), `clone_caller` next
 
 Fork is a real parity gap we intend to close, not a by-design fold (INVARIANTS.md #9: "very few
 gaps we don't want to close" — this is not one of them). It runs on the tree-walk oracle **and now the
@@ -858,14 +858,15 @@ freeze/thaw round-trip that resumes past the call with an injected reply.
 Exec does **not** need §9.3: an image-replace never returns to its caller, so the caller's native
 stack is simply discarded — nothing has to be reified. The JIT serves it by **unwinding**:
 
-- `temen_run::jit_run` arms the single-threaded, non-serving root (`Host::arm_exec_replace`: the
-  caller-request door, plus a slot for the admitted image). After a personality op the cap thunk takes
-  the request; an `ExecSelf` is admitted and built by **`Host::exec_image`** — the one admission rule and
-  powerbox build all three engines use (the tree-walker's `build_exec_req` and the bytecode engine's
-  `exec_image_build` were two copies of it) — parked, and the run unwound with
-  `temen_jit::HOST_UNWIND_CODE` (the `Exit` mechanism, ending `JitOutcome::HostUnwound`). `jit_run` then
-  runs the parked image in a fresh run in a caller-sized window, under the same watchdog, down any chain
-  of execs. A refusal is `-EINVAL`, as on both interpreters.
+- A JIT process (`temen_run`'s `jit_proc`, §9.5) arms its non-serving image's host
+  (`Host::arm_caller_requests`: the caller-request door, plus a slot for the admitted image). After a
+  personality op the cap thunk takes the request; an `ExecSelf` is admitted and built by
+  **`Host::exec_image`** — the one admission rule and powerbox build all three engines use (the
+  tree-walker's `build_exec_req` and the bytecode engine's `exec_image_build` were two copies of it) —
+  parked, and the run unwound with `temen_jit::HOST_UNWIND_CODE` (the `Exit` mechanism, ending
+  `JitOutcome::HostUnwound`). The process then runs the parked image in a fresh run in a caller-sized
+  window, under the same watchdog, down any chain of execs. A refusal is `-EINVAL`, as on both
+  interpreters.
 - **A failed `execve` returns to an unchanged caller** (POSIX). The personality used to write the new
   args blob into the caller's window and replace its argv *before* raising the request, so an exec no
   engine served (`-ENOSYS`) or the engine refused (`-EINVAL`) still clobbered both. It now **stages**
@@ -875,8 +876,67 @@ stack is simply discarded — nothing has to be reified. The JIT serves it by **
 - `caller_request_parity.rs` runs its exec rows on all three engines, plus a row for the refusal only
   the engine can make.
 
-Fork (and so a blocking wait, whose only children are fork twins) is still §9.3. One design point to add
-to it: compiled code bakes its host `ctx` in as a constant (`lower_cap_call`), so a twin cannot share
-its parent's code. The context should reach compiled code through a per-vCPU pointer (Wasmtime's
-`vmctx`) — which also lets exec'd images and a code cache reuse a compile.
+Fork (and so a blocking wait, whose only children are fork twins) is §9.5.
+
+### 9.5 `fork` and a blocking `waitpid` on the JIT (#1768)
+
+The personality `fork` (the #799 door's `ForkSelf`) needs none of §9.3's live-offer parking: the
+forking caller is the running process itself, stopped at its own call, not a caller parked on
+another domain's offer. So the JIT serves it with §9.3's items 1, 3 and 4 alone, over a durable
+unwind at the fork call (`temen_run`'s `jit_proc`):
+
+- **Instrument the fork sites** (`fork_instrumented`). The program is compiled with the one
+  `temen-durable` transform, restricted (`TransformOpts::sites`) to the calls that can dispatch the
+  personality's fork op: a `call.cap` naming it, an import bound to it, and — since either could come
+  to name it — a call through a rebindable import slot or a dynamic-mode call. Only the functions that
+  reach a site are instrumented; the rest of the program is byte-identical. A call is a site by its
+  dispatch pair (`Inst::host_dispatch`) over the host's import bindings — the pair the cap thunk is
+  handed at run time — so the compile and the thunk cannot disagree about which calls are sites.
+- **Reify at the call** (`serve_request`). The thunk that took the `ForkSelf` sets the window's freeze
+  word; the call's trailing poll unwinds the caller into its shadow arena (context 0), and the run
+  returns unwound.
+- **Duplicate** (`temen_jit::ForkPoint::twin`, `Tree::fork`). The run hands the frozen window to the
+  embedder's fork hook, which follows the oracle's `fork_vcpu` order — the vCPU quota, the window,
+  then the powerbox, with #1648's pid burn — copying the window page for page (bytes and protections,
+  from the run's page-state map), duplicating the powerbox (`Host::fork_powerbox_jit`: the page map goes
+  with the window), and starting the twin on its own OS thread over the parent's instrumented program
+  (`CompiledModule::run_twin`). The compiled code reaches its instance through a `vmctx`
+  (`temen_jit::VmCtx`, Wasmtime's shape), so the twin's code dispatches into the twin's powerbox.
+- **Return twice** by reply injection (§3): each copy's leaf frame takes its reply
+  (`ShadowArena::leaf_reply` — a leaf spills its results first) and its thaw word is set `REWINDING`;
+  the entry's prologue rebuilds every frame and the call returns the injected value: the twin's pid in
+  the parent, rewound in place, and `0` in the twin.
+- **The thread goes with it.** A fork duplicates the running thread alive, so what the engine keeps
+  outside the window travels too: the twin's `vcpu.tls` register is its parent's
+  (`TransformOpts::carries_thread` admits the TLS ops a snapshot must refuse). POSIX's child inherits
+  the forking thread, and a guest keeping its TLS block's address there finds the block in its copy of
+  the window — on every engine: the tree-walker's twin used to start at its own task id instead.
+
+**The process tree** (`Tree`) is the root process and every twin, each an OS thread over its own
+window and powerbox, with pids as the interpreters mint them. A blocking `waitpid` waits on the tree's
+bell and re-runs its op on every ring (invariant 7): a twin's exit — rung after its exit hooks retire
+it, the oracle's order — or a personality door (a signal, a child transition). A pending deliverable
+signal completes it `-EINTR`. When the root's image chain ends, the tree is torn down: running twins
+are stopped through the tree's kill-path cell and joined, and the ones that trapped are published
+(`last_twin_traps`). `crates/temen-run/tests/jit_fork.rs` pins fork in a loop, deep in a call stack,
+nested, and crashing against the oracle; `caller_request_parity.rs` runs its fork row on the JIT.
+
+**Where the JIT refuses a fork the oracle makes**, it answers `-ENOSYS` ("unavailable on this tier") —
+probeable, never a wrong answer:
+
+1. The program declares no shadow arena — its placement is the module's (INVARIANTS.md #16), so a
+   toolchain whose programs fork declares one.
+2. The program is not *bare*: it has fiber, thread or `setjmp`/`longjmp` ops, or a call that may reach
+   the §14 Instantiator — state a fork would have to duplicate that lives outside the window on the
+   JIT (the oracle forks such a program whenever it is momentarily bare) — or a function that can
+   reach a fork holds a construct the durable transform cannot instrument (a tail call into another
+   such function, `import.attach`, `gc.roots`).
+3. The fork is made beneath a host frame that re-entered compiled code (`temen_jit::reentered`: a
+   `Jit.invoke`d unit, a serve handler) or inside an injected signal handler — frames a durable unwind
+   cannot save.
+
+A fork in a fiber answers `-EAGAIN`, exactly as the oracle's non-bare refusal does. The convergence
+plan for 1–2 is to decline such a module to the bytecode engine, which forks it, before it runs
+(#1824). Still missing from a JIT process: async signal delivery, pipe parks and job control (#1826).
+A twin still recompiles its parent's program and copies its whole window (#1825).
 

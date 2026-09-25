@@ -29,7 +29,7 @@
 //! `GuestWindow: Send`).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ use temen_fiber::{Fiber, State};
 use crate::fiber_rt::{self, FiberRuntime, FiberSlot, SharedFiberTable};
 use crate::instantiator_rt::ChildDone;
 use crate::os_thread_rt::{self, Domain};
-use crate::{mem, vcpu_tls, CompiledModule, TrapKind};
+use crate::{mem, vcpu_tls, CompiledModule, TrapKind, VmCtx};
 
 /// A task's native control stack: the fiber arena's slot size (`temen-fiber` hands out fixed
 /// 256 KiB slots), the same stack every guest fiber runs on. Less headroom than the 2 MiB OS thread
@@ -86,9 +86,11 @@ pub(crate) struct ChildTask {
     /// (`GuestWindow: Send`).
     window: mem::GuestWindow,
     fault: (usize, usize),
-    /// The task's own trap cell (R4). Heap-stable: baked into the child's frames at first entry.
-    /// Shared with the task's [`Entry`] so teardown can reach it while a worker holds the task.
-    trap: Arc<AtomicI64>,
+    /// The task's own instance context — the child's powerbox, the parent's kill-path cell, its own
+    /// budget cell, and (field 0) its own trap cell (R4). Heap-stable: threaded into the child's
+    /// frames at first entry. Shared with the task's [`Entry`] so teardown can reach the trap cell
+    /// while a worker holds the task.
+    vm: Arc<VmCtx>,
     /// The entry's result buffer (heap-stable, written by the trampoline at return).
     results: Box<[i64]>,
     /// The arguments, alive until the fiber body's first entry reads them.
@@ -161,7 +163,8 @@ impl ChildTask {
             return Err(teardown);
         }
         let fault = window.fault_range();
-        let trap = Arc::new(AtomicI64::new(0));
+        // The child runs as its own instance, the one its compile recorded (#1768).
+        let vm = Arc::new(VmCtx::new(code.instance));
         let results: Box<[i64]> = vec![0i64; n_results.max(1)].into_boxed_slice();
         let args: Box<[i64]> = args.into_boxed_slice();
         // The child domain's own execution context and fiber table (#1469): its `cont.*` handles
@@ -192,7 +195,8 @@ impl ChildTask {
         let r = SendRaw(results.as_ptr() as *mut i64);
         let b = SendRaw(base);
         let t = SendRaw(code.fn_table.as_ptr() as *const core::ffi::c_void);
-        let c = SendRaw(Arc::as_ptr(&trap) as *mut i64);
+        // The entry ABI spells the vmctx as its trap cell (`VmCtx` field 0).
+        let c = SendRaw(Arc::as_ptr(&vm) as *mut i64);
         // The body: enter the child once through the limit-taking trampoline with this fiber's
         // stack low bound (§2b path B — the prologue checks guard the fiber stack). Every park inside
         // is a `fiber_event_park` yield from within this call; the body returns when the entry does.
@@ -212,7 +216,7 @@ impl ChildTask {
             rt,
             window,
             fault,
-            trap,
+            vm,
             results,
             _args: args,
             _code: code,
@@ -280,7 +284,7 @@ struct Entry {
     /// completion ends its nested children, running ones included (DESIGN §12 domain teardown),
     /// and a running task is reachable only through this — its `task` is on a worker. `None` for a
     /// detached child, which a parent's completion does not end.
-    stop: Option<Arc<AtomicI64>>,
+    stop: Option<Arc<VmCtx>>,
     /// #1469 — the task's own domain, reachable while a worker holds the task: a poisoned task's
     /// parked vCPUs must be woken to observe it.
     dom: Option<Arc<Domain>>,
@@ -348,12 +352,12 @@ impl ChildExec {
                 d.set_env(
                     task.window.base() as u64,
                     task._code.fn_table.as_ptr() as u64,
-                    Arc::as_ptr(&task.trap) as *mut i64,
+                    Arc::as_ptr(&task.vm), // the child's vCPUs are its instance
                     task._code.call_tramp,
                     task.fault,
                     task._code.fiber_cfg,
                     Some(task.rt.table()),
-                    task._code.epoch_addr as usize,
+                    task._code.instance.epoch as usize,
                     false,
                 );
                 task.dom = Some(d);
@@ -374,7 +378,7 @@ impl ChildExec {
             .map(|&(_, cap)| cap as usize)
             .min()
             .unwrap_or(g.tasks.len() + 1);
-        let stop = task.copy_back.is_some().then(|| Arc::clone(&task.trap));
+        let stop = task.copy_back.is_some().then(|| Arc::clone(&task.vm));
         let dom = task.dom.clone();
         g.tasks.insert(
             id,
@@ -544,7 +548,7 @@ impl ChildExec {
                         // Teardown: a park now would wait for a wake that can never come. Poison the
                         // task's cell so its wait returns and the trailing guard unwinds it.
                         let t = task.as_ref().expect("held");
-                        t.trap
+                        t.vm.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
                         if let Some(d) = &t.dom {
                             d.wake_own_parked(); // its vCPUs share the cell
@@ -575,7 +579,7 @@ impl ChildExec {
                         // Run teardown ends the domain its vCPUs outlived its root in, as the
                         // oracle's teardown sweep reaps them: poison the cell they share and wake
                         // the parked ones.
-                        t.trap
+                        t.vm.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
                         if let Some(d) = &t.dom {
                             d.wake_own_parked();
@@ -642,7 +646,7 @@ impl ChildExec {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
-                &*task.trap as *const AtomicI64 as *mut i64,
+                Arc::as_ptr(&task.vm),
                 task.fault.0,
                 task.fault.1,
             )
@@ -656,7 +660,7 @@ impl ChildExec {
         }
         fiber_rt::set_current(prev_rt);
         if faulted {
-            task.trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
+            task.vm.trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
             task.slot.finish_task();
             return Outcome::Finished;
         }
@@ -671,7 +675,8 @@ impl ChildExec {
             }
             Some(State::Yielded(_)) => {
                 // Unreachable by construction; fail closed rather than resume an unknown yield.
-                task.trap
+                task.vm
+                    .trap
                     .store(TrapKind::ThreadFault as i64, Ordering::Relaxed);
                 task.slot.finish_task();
                 Outcome::Finished
@@ -699,7 +704,7 @@ impl ChildExec {
             }
             return;
         }
-        let trap = task.trap.load(Ordering::Relaxed);
+        let trap = task.vm.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
         task.window.restore_rw();
         // #1361 step 4 — a durable child that unwound for a freeze leaves its window image for the
@@ -740,7 +745,7 @@ impl ChildExec {
     /// the vCPUs write after it stays in the child's image.
     fn settle(&self, task: &mut ChildTask) {
         task.retiring = true;
-        let trap = task.trap.load(Ordering::Relaxed);
+        let trap = task.vm.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
         // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
         if trap != 0 {
@@ -778,13 +783,13 @@ impl ChildExec {
             for e in g.tasks.values_mut() {
                 let poisoned = if e.parked {
                     if let Some(t) = &e.task {
-                        t.trap
+                        t.vm.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
                     }
                     true
                 } else if let Some(stop) = e.stop.as_ref().filter(|_| end_domain) {
                     // Never clobber a trap the child already recorded.
-                    let _ = stop.compare_exchange(
+                    let _ = stop.trap.compare_exchange(
                         0,
                         crate::DOMAIN_DONE_CODE as i64,
                         Ordering::Relaxed,

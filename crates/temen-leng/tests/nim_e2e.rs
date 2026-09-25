@@ -722,10 +722,20 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
     let top = read_word(scratch + temen_ir::POWERBOX_HEAP_TOP);
     let entry_sp = temen_ir::powerbox_entry_sp(&m);
 
+    // The heap starts above the durable shadow arena the link declares on top of the data stack
+    // (INVARIANTS.md #16; where the JIT unwinds a forking program, FORK.md §9.5).
+    let arena = m
+        .memory
+        .and_then(|mc| mc.shadow)
+        .expect("a powerbox link declares a shadow arena");
     assert_eq!(
-        brk,
+        arena.base,
         entry_sp + temen_ir::POWERBOX_STACK_RESERVE,
-        "heap break seeded just above the data stack"
+        "the shadow arena sits just above the data stack"
+    );
+    assert_eq!(
+        brk, arena.end,
+        "heap break seeded just above the shadow arena"
     );
     assert_eq!(top, win, "heap ceiling seeded to the mapped window top");
     assert!(
@@ -2301,10 +2311,15 @@ fn nim_shells_out_through_the_posix_sh() {
          except:\n\
          \x20 write(stdout, \"parent:\" & $rc & \"|no file\")\n",
     );
-    // Both interpreters: the tree-walker is the oracle, and the bytecode engine must agree — its
-    // exec path used to refuse a nim `_start` the tree-walker admitted (one rule now, #1668).
+    // Every engine: the tree-walker is the oracle; the bytecode engine must agree — its exec path used
+    // to refuse a nim `_start` the tree-walker admitted (one rule now, #1668) — and so must the JIT,
+    // which forks by unwinding the parent into the shadow arena its link declares (#1768).
     let sh = posix_sh();
-    for engine in [temen_run::Backend::TreeWalk, temen_run::Backend::Bytecode] {
+    for engine in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
         let (posix, make) = temen_posix::cap(0, 0, Vec::new());
         let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
             std::sync::Arc::new(make);
@@ -2319,10 +2334,10 @@ fn nim_shells_out_through_the_posix_sh() {
             ],
             engine,
         );
-        // The twin-trap record is the tree-walker's (#1665); a bytecode crash shows in the output.
+        // The tree-walker and the JIT record twin traps (#1665); a bytecode crash shows in the output.
         let crashed = temen_interp::last_twin_traps();
         assert!(
-            engine != temen_run::Backend::TreeWalk || crashed.is_empty(),
+            engine == temen_run::Backend::Bytecode || crashed.is_empty(),
             "{engine:?}: a command crashed:\n{}",
             crashed
                 .iter()
@@ -2397,23 +2412,30 @@ fn nim_forks_and_execs_a_nim_program() {
          else:\n\
          \x20 write(stdout, \"parent:\" & $WEXITSTATUS(status))\n",
     );
-    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-        std::sync::Arc::new(make);
-    let run = temen_run::nim_noc_run(
-        parent,
-        &posix,
-        make,
-        &["parent".to_string()],
-        &[("/bin/child".to_string(), child)],
+    for engine in [
         temen_run::Backend::TreeWalk,
-    );
-    assert_eq!(run, Ok(()), "the parent ran to completion");
-    assert_eq!(
-        String::from_utf8_lossy(&posix.stdout()),
-        "child:hi|parent:7",
-        "the child ran with the argv execve wrote, and the parent reaped its own exit status"
-    );
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+            std::sync::Arc::new(make);
+        let run = temen_run::nim_noc_run(
+            parent.clone(),
+            &posix,
+            make,
+            &["parent".to_string()],
+            &[("/bin/child".to_string(), child.clone())],
+            engine,
+        );
+        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            "child:hi|parent:7",
+            "{engine:?}: the child ran with the argv execve wrote, and the parent reaped its own \
+             exit status"
+        );
+    }
 }
 
 #[test]

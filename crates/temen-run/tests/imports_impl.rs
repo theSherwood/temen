@@ -410,6 +410,39 @@ fn a_grouped_host_interface_from_the_preseeded_builtin_shape_dispatches() {
     }
 }
 
+/// A grouped import's **second** op: the consumer declares `interface { read, write }` and calls
+/// `write` — its consumer op 1, which the frozen remap sends to the stream's native op 1. Every other
+/// grouped test here calls consumer op 0, which a translation by the slot alone also gets right; the
+/// Cranelift JIT's thunk translated that way and `CapFault`ed this call while both interpreters
+/// dispatched it.
+#[test]
+fn a_grouped_import_dispatches_an_op_past_its_first_on_every_backend() {
+    let consumer = parse_module(&GROUPED_CONSUMER.replace(
+        "type 1 interface { write: 0 }",
+        "type 1 interface { read: 0, write: 0 }",
+    ))
+    .expect("consumer parses");
+    let shape = temen_run::IfaceShape::builtin(temen_interp::cap_id::STREAM)
+        .expect("Stream is a pre-seeded built-in");
+    let registry = Imports::new()
+        .provide(
+            "log",
+            HostCap::iface(&shape, |h, _| h.grant_stream(temen_interp::StreamRole::Out)),
+        )
+        .provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(consumer, registry).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run(backend, &RunConfig::default())
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(3),
+            "{backend:?}: consumer op 1 (`write`) dispatched through the remap"
+        );
+    }
+}
+
 /// CALLS.md 7.3 — the same stateful instanced offer wired **`Threaded`** keeps its semantics on
 /// all three backends: the eval-loop tier animates with no admission gate (7.1), and the
 /// JIT/host-side tier runs the handler in a sub-run **over the instance's live shared cell**

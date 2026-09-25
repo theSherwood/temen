@@ -12,10 +12,10 @@
 #
 # All of it in-guest: the host seeds the sources and reads the linked module, which then runs.
 #
-# On the engines: the bytecode engine runs the build; the JIT then reruns hexer and runs the program
-# (it serves no fork yet, #1768, so not the build). The tree-walker — the oracle, 4x slower here — is
+# On the engines: the JIT runs the build — the driver and every process it forks (#1768); the bytecode
+# engine then reruns hexer and runs the program. The tree-walker — the oracle, 4x slower here — is
 # `--engine tree`, for a local run; nim_e2e's `nim_shells_out_through_the_posix_sh` differentials the
-# spawning mechanism across both interpreters on every PR.
+# spawning mechanism across all three engines on every PR.
 #
 # Checked against native nimony (`nimony c`) building the same program with the same phases — each
 # one built by nimony from the same source as its Temen build, so only the target differs: every
@@ -95,7 +95,7 @@ frontend/chibicc/chibicc -cc1 --emit-ir --child-entry -DTEMEN_SHELL_POSIX \
   -cc1-input "$W/sh.c" -cc1-output "$W/sh.ir" "$W/sh.c"
 
 echo "[4/4] the lane: the program built on Temen, by nimony's own toolchain"
-"$B/nim_selfhost_lane" --engine bytecode,jit \
+"$B/nim_selfhost_lane" --engine jit,bytecode \
   --sh "$W/sh.ir" --nimony "$W/nimony.temen" --nifmake "$W/nifmake.temen" \
   --nimsem "$W/nimsem.temen" --nifler "$W/nifler2.temen" --hexer "$W/hexer.temen" \
   --temen-link "$W/temen-link.temen" \
