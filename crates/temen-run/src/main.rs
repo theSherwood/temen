@@ -600,21 +600,39 @@ fn fresh_temp_dir() -> Result<PathBuf, String> {
 
 /// Find the chibicc binary: `$TEMEN_CHIBICC`, else the in-repo `frontend/chibicc/chibicc` (built
 /// on demand via `make`, when `temen-run` is run from its source tree).
+///
+/// The build holds the tree's `.cache.lock`, the OS file lock the test suites take for the same
+/// tree (`crates/temen/tests/support/cache_lock.rs`). Two unlocked `make`s there compile the same
+/// `.o`, link a half-written one, or rewrite `chibicc` while another process runs it (#1610). Under
+/// the lock the first caller builds and every later one finds the tree up to date. A failed build
+/// is an error: the binary it leaves behind, if any, is stale or partial.
 fn locate_chibicc() -> Result<PathBuf, String> {
     if let Ok(p) = env::var("TEMEN_CHIBICC") {
         return Ok(PathBuf::from(p));
     }
+    const UNAVAILABLE: &str =
+        "set $TEMEN_CHIBICC to the frontend binary, or pass a .temt/.temen file";
     // `CARGO_MANIFEST_DIR` is `<repo>/crates/temen-run`; the frontend is `<repo>/frontend/chibicc`.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .ok_or("cannot locate the repo root")?
         .join("frontend/chibicc");
-    let _ = Command::new("make").arg("-s").current_dir(&dir).status();
-    let bin = dir.join("chibicc");
-    if bin.exists() {
-        Ok(bin)
-    } else {
-        Err("cannot find chibicc — set $TEMEN_CHIBICC to the frontend binary, or pass a .temt/.temen file".into())
+    if !dir.is_dir() {
+        return Err(format!("cannot find chibicc — {UNAVAILABLE}"));
+    }
+    let lock = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".cache.lock"))
+        .and_then(|f| f.lock().map(|()| f))
+        .map_err(|e| format!("cannot lock the chibicc tree {}: {e}", dir.display()))?;
+    let built = Command::new("make").arg("-s").current_dir(&dir).status();
+    drop(lock);
+    match built {
+        Ok(s) if s.success() => Ok(dir.join("chibicc")),
+        Ok(s) => Err(format!("building chibicc failed ({s}) — {UNAVAILABLE}")),
+        Err(e) => Err(format!("cannot build chibicc: `make`: {e} — {UNAVAILABLE}")),
     }
 }

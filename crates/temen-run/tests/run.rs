@@ -138,21 +138,6 @@ fn demo(name: &str) -> PathBuf {
         .join(name)
 }
 
-#[path = "../../temen/tests/support/chibicc.rs"]
-mod chibicc;
-
-/// The `temen-run` binary for a `.c` input, handed the chibicc every frontend suite shares
-/// (`support/chibicc.rs`, built under the tree's cache lock) through `$TEMEN_CHIBICC`. Left to
-/// itself the CLI runs its own `make` in that same tree, unlocked, racing every other test's build
-/// (#1610). Off unix there is no chibicc toolchain; the CLI's own lookup reports it unavailable.
-fn temen_run_c() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_temen-run"));
-    if cfg!(unix) {
-        cmd.env("TEMEN_CHIBICC", chibicc::chibicc());
-    }
-    cmd
-}
-
 /// Run a demo through the `temen-run` binary with a hard wall-clock timeout, so the rare
 /// work-stealing **wedge** (ISSUES.md I7 — a liveness flake in the guest scheduler / fiber-steal
 /// path, seen once on Linux CI where it hung the job for >1 h) fails *fast* with a captured thread
@@ -177,7 +162,7 @@ fn run_demo_failfast(rel: &str) -> std::process::Output {
     const GUEST_DEADLINE_MS: u64 = 30_000;
     const HARD_TIMEOUT: Duration = Duration::from_secs(90);
 
-    let mut child = temen_run_c()
+    let mut child = Command::new(env!("CARGO_BIN_EXE_temen-run"))
         .arg(demo(rel))
         .env("TEMEN_DEADLINE_MS", GUEST_DEADLINE_MS.to_string())
         .stdout(Stdio::piped())
@@ -299,7 +284,10 @@ fn assert_demo_matches_cc(name: &str) {
         }
     }
     let native = Command::new(&exe).output().expect("run native build");
-    let temen = temen_run_c().arg(&c).output().expect("spawn temen-run");
+    let temen = Command::new(env!("CARGO_BIN_EXE_temen-run"))
+        .arg(&c)
+        .output()
+        .expect("spawn temen-run");
     if !temen.status.success() {
         let err = String::from_utf8_lossy(&temen.stderr);
         if err.contains("chibicc") {
@@ -332,7 +320,7 @@ fn demo_calc_matches_native() {
 /// (not failed) when the chibicc frontend is unavailable.
 #[test]
 fn demo_clay_layout_runs() {
-    let out = temen_run_c()
+    let out = Command::new(env!("CARGO_BIN_EXE_temen-run"))
         .arg(demo("clay/clay_demo.c"))
         .output()
         .expect("spawn temen-run");
@@ -434,7 +422,7 @@ fn demo_heapgrow_matches_native() {
 /// greeting from C source. Skipped (not failed) when the toolchain is unavailable.
 #[test]
 fn cli_compiles_and_runs_c() {
-    let out = temen_run_c()
+    let out = Command::new(env!("CARGO_BIN_EXE_temen-run"))
         .arg(demo("hello.c"))
         .output()
         .expect("spawn temen-run");
@@ -701,7 +689,7 @@ fn unmapping_a_region_alias_keeps_the_regions_bytes_on_every_engine() {
 fn cli_deadline_kills_runaway_c_program() {
     let cfile = std::env::temp_dir().join(format!("temen_runaway_{}.c", std::process::id()));
     std::fs::write(&cfile, "int main(void){ for(;;){} return 0; }\n").expect("write temp C");
-    let out = temen_run_c()
+    let out = Command::new(env!("CARGO_BIN_EXE_temen-run"))
         .arg(&cfile)
         .env("TEMEN_DEADLINE_MS", "200")
         .output()
@@ -811,7 +799,7 @@ fn demo_steal_fibers_runs() {
     all(windows, target_arch = "x86_64")
 ))]
 fn demo_jit_threads_runs() {
-    let out = temen_run_c()
+    let out = Command::new(env!("CARGO_BIN_EXE_temen-run"))
         .arg(demo("jit/jit_threads.c"))
         .output()
         .expect("spawn temen-run");
