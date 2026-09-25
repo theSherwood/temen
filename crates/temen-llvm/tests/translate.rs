@@ -13378,10 +13378,9 @@ fn demo_bash_translates_and_verifies() {
         "trap \"\" INT; kill -INT $$; echo ignored-ok",
         "trap \"echo u1\" USR1; kill -USR1 $$; kill -USR1 $$; echo twice",
         "trap \"echo bye\" EXIT; (echo sub); echo main",
-        // The shell ITSELF signaled from a subshell while it waits: bash's `wait_sigint` discard logic
-        // (the child exited normally, so the SIGINT is dropped and `$?` is the child's 0) — the slice-4
-        // README listed this as a 128-vs-0 divergence; it matches native on all three tiers, pinned.
-        "(kill -INT $$); echo rc=$?; echo after",
+        // The shell ITSELF signaled from a subshell, with a trap: deterministic in bash (the trap
+        // catches the SIGINT whenever it lands). The untrapped form races in bash itself — see
+        // `SELF_SIGINT` below the loop.
         "trap 'echo trapped' INT; (kill -INT $$); echo rc=$?",
         // Rung-3 tail — here-docs/here-strings into BUILTIN readers (bash spools each one into
         // an unlinked temp file, so these came free with the #800/#801 fs surface; pinned here
@@ -13598,6 +13597,68 @@ fn demo_bash_translates_and_verifies() {
             native_out,
             "bash -c {script:?}: parallel driver stdout differs from the oracle"
         );
+    }
+
+    // ▶ #1803 — the shell signaled from an untrapped subshell, `(kill -INT $$)`. This one is a race
+    // **in bash itself**, so no single native run is its oracle. A non-interactive shell's SIGINT is
+    // `SIG_DFL` except inside `wait_for` (`wait_sigint_handler`), and `make_child` blocks SIGINT
+    // across `fork` and unblocks it just after. If the child's `kill` lands before that unblock, the
+    // pending SIGINT is delivered at it with `SIG_DFL` and the shell dies (native: 130, no output);
+    // if the shell reached `wait_for` first, the SIGINT is discarded because the child exited
+    // normally, and it prints `rc=0` / `after`. Native bash under CPU load took the first branch in
+    // 501 of 2000 runs; the capstone compared one native sample against one temen sample and failed
+    // whenever they fell on different sides. Every engine — native included — must land on one of
+    // bash's two outcomes, and a death must be precisely SIGINT's default action, not any trap.
+    const SELF_SIGINT: &str = "(kill -INT $$); echo rc=$?; echo after";
+    let survived = |code: i32, out: &str| code == 0 && out == "rc=0\nafter\n";
+    let native = Command::new(&oracle)
+        .args(["-c", SELF_SIGINT])
+        .env_clear()
+        .env("PATH", "/bin")
+        .env("HOME", "/")
+        .output()
+        .expect("run the native oracle");
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let out = String::from_utf8_lossy(&native.stdout);
+        let killed = native.status.signal() == Some(2) && out.is_empty();
+        assert!(
+            killed || native.status.code().is_some_and(|c| survived(c, &out)),
+            "native bash left bash's outcome set: {:?} {out:?}",
+            native.status
+        );
+    }
+    let config = temen_run::RunConfig {
+        args: vec![
+            b"bash".to_vec(),
+            b"-c".to_vec(),
+            SELF_SIGINT.as_bytes().to_vec(),
+        ],
+        env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+        ..Default::default()
+    };
+    for tier in ["tree-walk", "coop bytecode", "parallel"] {
+        let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
+        let caps = [("posix", cap)];
+        let run = match tier {
+            "tree-walk" => inst.run_with_caps(temen_run::Backend::TreeWalk, &config, &caps),
+            "coop bytecode" => inst.run_with_caps(temen_run::Backend::Bytecode, &config, &caps),
+            _ => inst.run_with_caps_parallel(&config, &caps),
+        };
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        match run {
+            Ok(r) => assert!(
+                survived(bash_exit_code(&r.outcome), &out),
+                "{tier}: {SELF_SIGINT:?} survived with {:?} {out:?}, not bash's `rc=0`/`after`",
+                r.outcome
+            ),
+            Err(e) => assert!(
+                posix.term_signal() == Some(2) && out.is_empty(),
+                "{tier}: {SELF_SIGINT:?} ended in {e} — not bash's SIGINT death \
+                 (term signal {:?}, stdout {out:?})",
+                posix.term_signal()
+            ),
+        }
     }
 
     // ▶ Slice 4 tail — **external commands**: stage the #801 /bin (the chibicc-world coreutils,

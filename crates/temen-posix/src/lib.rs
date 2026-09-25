@@ -1335,6 +1335,14 @@ pub struct Posix {
 }
 
 impl Posix {
+    /// The signal whose default action terminated this personality's root process, if one did
+    /// (POSIX `WTERMSIG` for the root). A root killed that way ends its run as a trap — the engine's
+    /// kill is signal-blind — so this is how an embedder tells "bash died of SIGINT, as bash does"
+    /// from an engine fault (#1803).
+    pub fn term_signal(&self) -> Option<i32> {
+        self.root.lock().unwrap_or_else(|e| e.into_inner()).term_sig
+    }
+
     /// Bytes the guest `write`-to-fd-1'd — from the shared sink when one is set ([`Posix::set_stdout_sink`]),
     /// else the personality's own captured buffer.
     pub fn stdout(&self) -> Vec<u8> {
