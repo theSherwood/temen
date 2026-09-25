@@ -3844,6 +3844,56 @@ impl MprotectWindow {
     }
     #[cfg(windows)]
     fn hw_release_hint(&self, _off: u64, _len: u64) {}
+
+    /// Drop the §13 alias over `[off, off+len)`: the range stops being the region's memory and is
+    /// the window's own again — private, zero, inaccessible — with the region's bytes untouched for
+    /// every other mapping of it. On unix, a fresh private anonymous `MAP_FIXED` mapping replaces
+    /// the shared one. On windows the range must be whole views (allocation granules, as `map_region`
+    /// placed them): each view is released back to a placeholder, then committed as private memory
+    /// like the rest of the backed prefix, and protected `none`. Returns `false` if the OS refuses.
+    #[cfg(unix)]
+    fn hw_unalias(&self, off: u64, len: u64) -> bool {
+        // SAFETY: `[base+off, +len)` is within the reserved mapping (validated); `MAP_FIXED` replaces
+        // exactly those pages, which are this window's (the shared view is dropped, not the region).
+        let p = unsafe {
+            libc::mmap(
+                self.base.add(off as usize) as *mut c_void,
+                len as usize,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        p != libc::MAP_FAILED
+    }
+    #[cfg(windows)]
+    fn hw_unalias(&self, off: u64, len: u64) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            UnmapViewOfFile2, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let gran = temen_interp::host_region_granularity();
+        if !off.is_multiple_of(gran) || !len.is_multiple_of(gran) {
+            return false;
+        }
+        // SAFETY: GetCurrentProcess returns the current-process pseudo-handle; always safe.
+        let proc = unsafe { GetCurrentProcess() };
+        for i in 0..len / gran {
+            let addr = MEMORY_MAPPED_VIEW_ADDRESS {
+                // SAFETY: in the reservation (validated); `map_region` mapped a view at each granule.
+                Value: unsafe { self.base.add((off + i * gran) as usize) } as *mut c_void,
+            };
+            // SAFETY: `addr` is the base of a view `map_region` placed; releasing it with
+            // `MEM_PRESERVE_PLACEHOLDER` leaves the placeholder the window's reservation had.
+            if unsafe { UnmapViewOfFile2(proc, addr, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+                return false;
+            }
+        }
+        self.hw_commit_rw(off, len);
+        self.hw_apply(off, len, 0);
+        true
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -3909,6 +3959,30 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        // A §13 alias is the region's memory, not the window's: drop the alias first, so the range is
+        // the window's own again and the zeroing below never reaches the region — which every other
+        // mapping of it still reads (the oracle's `Mem::unmap` re-points the page at the domain's own
+        // backing). Each maximal run of aliased pages is un-aliased whole.
+        let mut run: Option<(u64, u64)> = None;
+        for page in pages.clone().chain(std::iter::once(*pages.end() + 1)) {
+            let aliased = page <= *pages.end()
+                && matches!(self.prot_get(page), Some(PageState::Backed { .. }));
+            match (aliased, run) {
+                (true, None) => run = Some((page, page)),
+                (true, Some((first, _))) => run = Some((first, page)),
+                (false, Some((first, last))) => {
+                    let (off, len) = (first * self.page, (last + 1 - first) * self.page);
+                    if !self.hw_unalias(off, len) {
+                        return EINVAL;
+                    }
+                    for p in first..=last {
+                        self.prot_set(p, PageState::Unmapped);
+                    }
+                    run = None;
+                }
+                (false, None) => {}
+            }
+        }
         // Commit + make RW, zero it, hint the OS to drop the backing, then protect NONE so any later
         // access faults (detect-and-kill).
         self.hw_commit_rw(start, plen);
