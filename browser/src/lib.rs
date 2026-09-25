@@ -10193,9 +10193,7 @@ pub fn link_program_multi(
     };
     let entry_idx = linked.resolve_export(boot).ok_or(STATUS_UNSUPPORTED)?;
     // A *library* unit's bootstrap is not this program's entry, and `synth_manifest_start` refuses a
-    // module that already exports `_start`. The DCE branch below would drop it as a side effect of
-    // retaining only `prog_exports`, but that branch is conditional — do it unconditionally so the
-    // outcome does not depend on whether some unit happened to bake a funcidx into its data image.
+    // module that already exports `_start`.
     linked.exports.retain(|e| e.name != PROG_START_ALIAS);
     // **Drop what nothing reaches** (#1407). The link merges whole modules, so a program that calls
     // `printf` also carries the prebuilt libc's `<string.h>` and the whole series-based libm — dead
@@ -10205,27 +10203,22 @@ pub fn link_program_multi(
     // unit's exports in the merged table, so all 119 libc names would be roots. They existed to
     // *resolve* the program's calls, and that is done — a linked executable does not re-export its
     // libc. What stays is the program unit's own surface (`prog_exports`, which includes `entry`),
-    // exactly what a host can still address by name afterwards.
-    //
-    // Skipped when either unit baked a funcidx into its data image (`data.funcref`): the linker has
-    // already resolved and cleared those, so a function reachable *only* from a static initializer
-    // would look unreachable and be emptied out from under its caller. chibicc emits none; a nim-style
-    // unit can, and simply keeps every body — slower, correct.
-    if libs.iter().all(|u| u.module.data_funcrefs.is_empty()) && program.data_funcrefs.is_empty() {
-        linked
-            .exports
-            .retain(|e| prog_exports.iter().any(|(n, _)| *n == e.name));
-        // One root: the bootstrap. `entry` (`main`) is reachable *through* it — that is the whole
-        // point of entering there — so it needs no separate root, and anything neither reaches is
-        // genuinely dead.
-        let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
-        // ...and then the manifest rows those emptied bodies were the only users of (#1629). The
-        // linker publishes every unit's imports, so linking the prebuilt graphics unit made *every*
-        // program declare `fb_present`/`fb_poll` — capabilities it has no path to. It must run after
-        // the DCE (a dead body still names its imports until it is emptied) and before
-        // `synth_manifest_start`, which reads the table this reports.
-        let _ = temen_ir::prune_unused_imports(&mut linked);
-    }
+    // exactly what a host can still address by name afterwards. A function a unit's static
+    // initializer points at is a root too: the linker records every funcidx it bakes into the data
+    // image (#1830).
+    linked
+        .exports
+        .retain(|e| prog_exports.iter().any(|(n, _)| *n == e.name));
+    // One root: the bootstrap. `entry` (`main`) is reachable *through* it — that is the whole point
+    // of entering there — so it needs no separate root, and anything neither reaches is genuinely
+    // dead.
+    let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
+    // ...and then the manifest rows those emptied bodies were the only users of (#1629). The linker
+    // publishes every unit's imports, so linking the prebuilt graphics unit made *every* program
+    // declare `fb_present`/`fb_poll` — capabilities it has no path to. It must run after the DCE (a
+    // dead body still names its imports until it is emptied) and before `synth_manifest_start`,
+    // which reads the table this reports.
+    let _ = temen_ir::prune_unused_imports(&mut linked);
     let module =
         temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;
     // Verify before handing it on: a program that references an undefined proc links to an

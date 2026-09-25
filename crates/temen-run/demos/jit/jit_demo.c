@@ -129,7 +129,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (12) & 0xff); eb(buf, (12) >> 8); // version (u16)
+  eb(buf, (13) & 0xff); eb(buf, (13) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
@@ -138,6 +138,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 17);
   eb(buf, 0); // no shadow arena (v11: the durable arena is module-declared; this unit spawns nothing)
   eb(buf, 0); // no data segments (the validator rejects them anyway)
+  eb(buf, 0); // no data-image funcref slots (v13 section)
   eb(buf, 0); // no imports — this unit is self-contained (v2 import section)
   eb(buf, 0); // no exports — invoked by handle, not by name (v3 export section)
   eb(buf, 0); // no interfaces (v6 interface section)

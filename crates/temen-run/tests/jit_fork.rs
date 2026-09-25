@@ -495,6 +495,19 @@ fn a_fork_through_a_taken_function_address_resumes_identically_on_every_engine()
     assert_every_engine(&src, Outcome::Exited(2));
 }
 
+/// #1830 — the same through a function pointer the data image holds (a static initializer's, which
+/// `link` records): the function it names is taken, so the JIT instruments the `call.dyn` and forks
+/// there as the interpreters do. Before the record the image's index read as forged and the JIT
+/// answered `-ENOSYS` — which is how nimsem's compile-time evaluation failed on the JIT (#763).
+#[test]
+fn a_fork_through_a_function_pointer_in_the_data_image_resumes_identically_on_every_engine() {
+    let src = format!(
+        "data 42000 \"\\x01\\x00\\x00\\x00\"\ndata.funcref 42000\n{}",
+        FORK_THROUGH_SLOT.replace("SLOT", "pa = i64.const 42000\n  idx = i32.load pa")
+    );
+    assert_every_engine(&src, Outcome::Exited(2));
+}
+
 /// FORK.md §9.5 — an index the program never took (a funcref is a forgeable integer, §3c) can still
 /// select a function that forks, from a `call.dyn` the JIT did not instrument: the forking function's
 /// slot is fronted by a barrier, and the JIT answers `-ENOSYS` rather than unwind through a frame it

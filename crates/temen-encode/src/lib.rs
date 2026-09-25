@@ -330,6 +330,11 @@ pub mod wire {
         matches!(sniff_kind(bytes), Some(KIND_MODULE | KIND_OBJECT))
     }
 }
+// v13 (#1830) adds the **data-image funcref slots** to both dialects, directly after the data
+// segments: the offsets at which the image holds a function index, which `link` records as it bakes
+// each `data.funcref`. A linked module otherwise keeps no record of which of its data bytes are
+// function indices, and an analysis of the functions a `call.dyn` can reach (the JIT's fork
+// instrumentation, link-time DCE) must know. Every committed asset is regenerated.
 // v12 (#1715) adds **thread-local templates** to the object dialect: a section of the unit's
 // `_Thread_local` initial bytes (after `data.funcref`), and a `tls` flag byte on `data.ptr` entries,
 // data exports, and the `data.self`/`data.sym` opcodes. The runnable dialect is unchanged byte for
@@ -374,7 +379,7 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 12;
+const VERSION: u16 = 13;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -516,6 +521,13 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         write_uleb(&mut out, d.offset);
         write_uleb(&mut out, d.bytes.len() as u64);
         out.extend_from_slice(&d.bytes);
+    }
+    // Data-image funcref slots (v13, #1830), in both dialects, directly after the image they
+    // describe: count, then each slot's offset. What `link` recorded of the funcrefs it baked (a
+    // unit may hold them too, when it was linked before); the verifier checks them against the image.
+    write_uleb(&mut out, m.data_funcref_slots.len() as u64);
+    for &at in &m.data_funcref_slots {
+        write_uleb(&mut out, at);
     }
     // Object-only `data.ptr` relocation section (v9, D-LINK), directly after the data image it
     // patches: count, then each entry's `at` offset and tagged target (0 = self + uleb offset,
@@ -1963,6 +1975,13 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             bytes,
         });
     }
+    // Data-image funcref slots (v13, #1830), mirroring the encoder. Byte shape only — the verifier
+    // checks each against the image. Grows on demand (the count is attacker-influenced).
+    let nslots = c.count()?;
+    let mut data_funcref_slots = Vec::new();
+    for _ in 0..nslots {
+        data_funcref_slots.push(c.uleb()?);
+    }
     // Object-only `data.ptr` relocation section (v9), mirroring the encoder. Well-formedness
     // beyond byte shape (`at` inside a data segment, resolvable names) is the linker's job —
     // the decoder stays a pure fail-closed byte reader.
@@ -2125,6 +2144,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     Ok(Module {
         data_ptrs,
         data_funcrefs,
+        data_funcref_slots,
         tls,
         funcs,
         memory,
@@ -2957,6 +2977,7 @@ mod object_tests {
                 },
             ],
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: vec![Data {
                 offset: 0,
                 readonly: false,
@@ -3029,6 +3050,7 @@ mod object_tests {
         let base = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],
@@ -3074,6 +3096,7 @@ mod object_tests {
         let m = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],
@@ -3308,6 +3331,7 @@ mod debug_tests {
         Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             types: vec![],
             funcs: vec![],

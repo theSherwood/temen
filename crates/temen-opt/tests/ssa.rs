@@ -26,6 +26,7 @@ fn one_func_module(f: Func) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         types: vec![],
         funcs: vec![f],
@@ -183,6 +184,7 @@ fn multi_result_call_identity_and_defs() {
     let m = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         types: vec![],
         funcs: vec![caller, callee],

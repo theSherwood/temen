@@ -58,6 +58,7 @@ fn unit_b() -> Module {
             tls: false,
         }],
         data_funcrefs: vec![],
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: vec![Func {
             params: vec![],

@@ -295,9 +295,8 @@ fn a_fully_reachable_module_is_left_alone() {
     assert_eq!(m, before, "byte-for-byte the same module");
 }
 
-/// The pass **declines** on a module whose data image has funcidxs baked into bytes: the linker has
-/// already resolved and cleared those, so a function reachable only from a static initializer would
-/// look unreachable and be emptied out from under its caller. Changes nothing.
+/// The pass **declines** on a module still carrying unresolved data-image funcref relocations — a
+/// unit, not a linked module: its data will name functions the pass cannot see yet. Changes nothing.
 #[test]
 fn a_module_with_baked_data_funcrefs_is_declined() {
     let mut m = module(vec![leaf(1), leaf(2)], &[("main", 0)]);
@@ -316,4 +315,30 @@ fn a_module_with_baked_data_funcrefs_is_declined() {
         Err(GcError::DataFuncrefs)
     );
     assert_eq!(m, before, "a declined pass changes nothing");
+}
+
+/// #1830 — a function only a static initializer points at is live: a linked module records every
+/// funcidx its data image holds (`data_funcref_slots`), and the pass roots each one. Before the
+/// record, a function reachable only from a static initializer looked dead, so the pass had to be
+/// skipped for any program whose units baked one.
+#[test]
+fn a_function_the_data_image_points_at_is_a_root() {
+    // 0: entry, 1: dead, 2: only the data image points at it, and it reaches 3.
+    let mut m = module(
+        vec![leaf(10), leaf(11), caller(3), leaf(13)],
+        &[("main", 0)],
+    );
+    m.data = vec![temen_ir::Data {
+        offset: 1024,
+        readonly: true,
+        bytes: 2u32.to_le_bytes().to_vec(),
+    }];
+    m.data_funcref_slots = vec![1024];
+    let before = m.clone();
+    let gc = temen_ir::stub_unreachable_funcs(&mut m, &[]).expect("gc");
+    assert_eq!(gc.stubbed, 1, "only 1 is unreachable");
+    for f in [0, 2, 3] {
+        assert_eq!(m.funcs[f], before.funcs[f], "{f} is live and untouched");
+    }
+    assert_eq!(m.funcs[1].blocks[0].term, Terminator::Unreachable);
 }

@@ -23,6 +23,7 @@ fn oracle_module() -> Module {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         impl_exports: vec![],
         funcs: vec![Func {

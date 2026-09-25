@@ -314,6 +314,58 @@ fn keeps_functions_when_a_ref_func_value_is_observable() {
     }
 }
 
+/// #1830 — a function index the data image holds is as observable as a `ref.func`'s: renumbering
+/// would leave the image naming the wrong function (or none). The entry reads its data-image index
+/// and returns it; func 1 is dead. DFE must be a no-op, and the optimizer keeps the record.
+#[test]
+fn keeps_functions_when_the_data_image_holds_an_index() {
+    let entry = Func {
+        params: vec![ValType::I32],
+        results: vec![ValType::I32],
+        blocks: vec![Block {
+            params: vec![ValType::I32],
+            insts: vec![
+                Inst::ConstI64(32768),
+                Inst::Load {
+                    op: temen_ir::LoadOp::I32,
+                    addr: 1,
+                    offset: 0,
+                },
+            ],
+            term: Terminator::Return(vec![2]),
+        }],
+    };
+    let m = Module {
+        funcs: vec![entry, add_const(999), add_const(1)],
+        memory: Some(temen_ir::Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
+        data: vec![temen_ir::Data {
+            offset: 32768,
+            readonly: true,
+            bytes: 2u32.to_le_bytes().to_vec(),
+        }],
+        data_funcref_slots: vec![32768],
+        ..Default::default()
+    };
+    verify_module(&m).expect("input verifies");
+    assert_eq!(run(&m, 0, &[Value::I32(0)]), Ok(vec![Value::I32(2)]));
+    assert_eq!(
+        dead_func_elim(&m).funcs.len(),
+        3,
+        "DFE must not renumber while the data image holds an index"
+    );
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("optimized re-verifies");
+    assert_eq!(
+        opt.data_funcref_slots,
+        vec![32768],
+        "the record rides along"
+    );
+    assert_eq!(run(&opt, 0, &[Value::I32(0)]), Ok(vec![Value::I32(2)]));
+}
+
 /// `helper(a, b) = a*3 + b*5 + 7`, a single-block leaf.
 fn affine_helper() -> Func {
     Func {

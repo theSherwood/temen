@@ -225,6 +225,7 @@ fn gen_module(g: &mut Rng) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: (0..nfuncs).map(|_| gen_func(g, nfuncs, None)).collect(),
         memory: None,
@@ -252,6 +253,7 @@ fn gen_module_acyclic(g: &mut Rng) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: (0..nfuncs).map(|i| gen_func(g, nfuncs, Some(i))).collect(),
         memory: None,

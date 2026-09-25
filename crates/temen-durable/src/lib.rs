@@ -255,11 +255,11 @@ pub enum IndirectReach {
     /// may-suspend function taints its signature. The reading for an unwind the runtime must be
     /// able to complete wherever it lands — a freeze.
     Signature,
-    /// Only a function whose address the module **takes** (`ref.func`) — the indirect calls a
-    /// program makes through the funcrefs it was given. Every other may-suspend function whose
-    /// signature is left untainted is one no instrumented `call.dyn` can select, so an index that
-    /// selects it is forged (or baked into the data image, which a linked module no longer records)
-    /// and lands from an uninstrumented site: its table slot is fronted by a **barrier** that holds
+    /// Only a function the module **takes** ([`temen_ir::taken_funcs`]: a `ref.func`, or an index
+    /// its data image holds) — the indirect calls a program makes through the funcrefs it was given.
+    /// Every other may-suspend function whose signature is left untainted is one no instrumented
+    /// `call.dyn` can select, so an index that selects it is forged and lands from an
+    /// uninstrumented site: its table slot is fronted by a **barrier** that holds
     /// the running context's shadow stack occupied ([`BARRIER_SP`]) while the real body runs. The
     /// body moves to the end of the module, and every static reference enters it directly
     /// ([`Instrumented::body`]). The runtime's half of the contract: it starts an unwind only when
@@ -372,7 +372,7 @@ pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformE
 pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, TransformError> {
     let enforce_r9 = opts.enforce_r9;
     let func_results: Vec<Vec<ValType>> = m.funcs.iter().map(|f| f.results.clone()).collect();
-    let targets = indirect_targets(&m.funcs, opts.indirect);
+    let targets = indirect_targets(m, opts.indirect);
     let may_suspend = compute_may_suspend(&m.funcs, &m.types, opts, &targets);
     let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend, &targets);
     let any_instrumented = may_suspend.iter().any(|&s| s);
@@ -447,23 +447,20 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
     Ok(Instrumented { module: out, body })
 }
 
-/// The functions a `call.dyn` can select under `reach` (see [`IndirectReach`]).
-fn indirect_targets(funcs: &[Func], reach: IndirectReach) -> Vec<bool> {
-    let mut targets = vec![reach == IndirectReach::Signature; funcs.len()];
-    if reach == IndirectReach::AddressTaken {
-        for x in funcs
-            .iter()
-            .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
-        {
-            if let Inst::RefFunc { func } = x {
-                if let Some(t) = targets.get_mut(*func as usize) {
-                    *t = true;
-                }
-            }
-        }
+/// The functions of `m` a `call.dyn` can select under `reach` (see [`IndirectReach`]).
+fn indirect_targets(m: &Module, reach: IndirectReach) -> Vec<bool> {
+    match reach {
+        IndirectReach::Signature => vec![true; m.funcs.len()],
+        IndirectReach::AddressTaken => temen_ir::taken_funcs(m),
     }
-    targets
 }
+
+// The durable preset reads a `call.dyn` by signature, as the unit-level readings below rely on:
+// every function is a target.
+const _: () = assert!(matches!(
+    TransformOpts::DURABLE.indirect,
+    IndirectReach::Signature
+));
 
 /// Whether `f` has signature `s`.
 fn sig_matches(s: &FuncType, f: &Func) -> bool {
@@ -809,7 +806,7 @@ fn tainted_signatures(funcs: &[Func], ms: &[bool], targets: &[bool]) -> Vec<teme
 /// ([`unit_suspends_untainted`]). Exposed for the durable-JIT install fence (DURABILITY.md §12.5).
 pub fn tainted_signatures_of(funcs: &[Func], types: &[TypeEntry]) -> Vec<temen_ir::FuncType> {
     let opts = TransformOpts::DURABLE;
-    let targets = indirect_targets(funcs, opts.indirect);
+    let targets = vec![true; funcs.len()];
     let ms = compute_may_suspend(funcs, types, &opts, &targets);
     tainted_signatures(funcs, &ms, &targets)
 }
@@ -833,7 +830,7 @@ pub fn unit_suspends_untainted(
         return false; // no entry to invoke; the empty-unit case is rejected elsewhere
     }
     let opts = TransformOpts::DURABLE;
-    let targets = indirect_targets(unit_funcs, opts.indirect);
+    let targets = vec![true; unit_funcs.len()];
     let ms = compute_may_suspend(unit_funcs, unit_types, &opts, &targets);
     if !ms[0] {
         return false; // entry cannot suspend → no continuation to lose → safe

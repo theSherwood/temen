@@ -151,6 +151,8 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
         exports: Vec::new(),
         data_exports: Vec::new(),
         data_funcrefs: Vec::new(),
+        // Function indices are unchanged, so the image's still hold.
+        data_funcref_slots: module.data_funcref_slots.clone(),
         tls: Vec::new(),
         impl_exports: Vec::new(),
         // FuncType interning (#922): the residual's `call.dyn`/`call.cap` carry an interned

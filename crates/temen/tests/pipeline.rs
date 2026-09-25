@@ -535,6 +535,7 @@ fn verifier_rejects_forward_value_reference() {
     let m = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: vec![Func {
             params: vec![],
@@ -571,6 +572,7 @@ fn verifier_rejects_bad_branch_target() {
     let m = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: vec![Func {
             params: vec![],
@@ -605,6 +607,7 @@ fn verifier_rejects_entry_param_mismatch() {
     let m = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],
@@ -1107,6 +1110,7 @@ fn verifier_rejects_call_to_missing_function() {
     let m = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs: vec![Func {
             params: vec![ValType::I32],

@@ -899,12 +899,15 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   `IndirectReach::AddressTaken`). A freeze must unwind wherever it lands, so it reads a `call.dyn` as
   reaching any function of its signature (R8). From one fork site, that reading instrumented 65% of
   nimony (8172 of 12552 functions, 1.18M → 8.69M instructions, a 10 GB compile). A fork is an unwind
-  the JIT may decline, so it reads a `call.dyn` as reaching only the functions the program takes the
-  address of (`ref.func`): 222 of nimony's functions, +7.7% instructions. Any other function that
-  can reach a fork can be selected only by an index the program never took (forged, §3c, or baked
-  into the data image — #1830). Its table slot gets a **barrier**: a function that marks the shadow
-  stack occupied while the real body runs. The body moves to the end of the module, and every static
-  reference enters it directly (`Instrumented::body`, the run's entry too).
+  the JIT may decline, so it reads a `call.dyn` as reaching only the functions the program takes
+  (`temen_ir::taken_funcs`): the ones a `ref.func` names, and the ones its data image holds indices
+  of, which `link` records as it bakes each static initializer's function pointer (#1830). With
+  `ref.func` alone that was 222 of nimony's functions, +7.7% instructions. Any other function that
+  can reach a fork can be selected
+  only by an index the program never took (forged, §3c). Its table slot gets a **barrier**: a
+  function that marks the shadow stack occupied while the real body runs. The body moves to the end
+  of the module, and every static reference enters it directly (`Instrumented::body`, the run's entry
+  too).
 - **Reify at the call** (`serve_request`). The thunk that took the `ForkSelf` sets the window's freeze
   word — only from an empty shadow stack (`begin_fork_unwind`): the leaf frame must land at the frame
   base, where the reply goes, and a barrier below the call holds the stack occupied. The call's
@@ -977,13 +980,12 @@ probeable, never a wrong answer:
 3. The fork is made beneath a host frame that re-entered compiled code (`temen_jit::reentered`: a
    `Jit.invoke`d unit, a serve handler) or inside an injected signal handler — frames a durable unwind
    cannot save.
-4. The fork is made beneath a `call.dyn` through an index the program never took — forged, or a
-   static initializer's function pointer, which `link` bakes into the data image without a record
-   (#1830) — so the barrier in the selected slot holds the shadow stack occupied.
+4. The fork is made beneath a `call.dyn` through an index the program never took — a forged one —
+   so the barrier in the selected slot holds the shadow stack occupied. A static initializer's
+   function pointer is taken: `link` records it (#1830).
 
 A fork in a fiber answers `-EAGAIN`, exactly as the oracle's non-bare refusal does. The convergence
 plan for 1–2 is to decline such a module to the bytecode engine, which forks it, before it runs
-(#1824); for 4, to keep the data image's function pointers through the link, which leaves only a
-forged index refused (#1830). Still missing from a JIT process: async signal delivery and job control
-(#1826). A twin still copies its parent's whole window (#1825).
+(#1824). Still missing from a JIT process: async signal delivery and job control (#1826). A twin
+still copies its parent's whole window (#1825).
 

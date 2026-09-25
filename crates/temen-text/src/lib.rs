@@ -72,6 +72,11 @@ pub fn print_module(m: &Module) -> String {
             escape_bytes(&d.bytes)
         );
     }
+    // Data-image funcref slots (#1830): `data.funcref <at>`, where the image above holds a function
+    // index `link` baked.
+    for at in &m.data_funcref_slots {
+        let _ = writeln!(s, "data.funcref {at}");
+    }
     // Thread-local template segments (#1715), in the unit's per-thread block: `data tls <off> "…"`.
     for d in &m.tls {
         let _ = writeln!(s, "data tls {} \"{}\"", d.offset, escape_bytes(&d.bytes));
@@ -1250,6 +1255,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
     let mut data_ptrs: Vec<temen_ir::DataPtr> = Vec::new();
+    let mut data_funcref_slots: Vec<u64> = Vec::new();
     let mut tls_data: Vec<Data> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
     let mut data_exports: Vec<temen_ir::DataExport> = Vec::new();
@@ -1553,6 +1559,12 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     data.push(seg);
                 }
             }
+            // A data-image funcref slot (#1830): `data.funcref <at>` — the data image holds a
+            // function index at `at` (what `link` records as it bakes one).
+            Some(Tok::Ident(s)) if s == "data.funcref" => {
+                p.next()?;
+                data_funcref_slots.push(p.parse_u64()?);
+            }
             // Data-image pointer relocation (the data→data case, D-LINK): `data.ptr <at> self
             // <off>` writes this unit's own data address `dbase+off` at slot `at`; `data.ptr <at>
             // sym "<name>" <addend>` writes a cross-unit data symbol's address. `link` resolves and
@@ -1700,9 +1712,11 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         memory,
         data,
         data_ptrs,
-        // `data.funcref` relocations have no text opcode — the nimony frontend attaches them to the
-        // parsed object module directly (they need the module stem, which the text layer lacks).
+        // `data.funcref` relocations (by name) have no text form — the nimony frontend attaches
+        // them to the parsed object module directly (they need the module stem, which the text
+        // layer lacks). The slots `link` resolves them into do: `data.funcref <at>`.
         data_funcrefs: Vec::new(),
+        data_funcref_slots,
         tls: tls_data,
         imports: std::mem::take(&mut p.imports),
         exports,
@@ -1771,6 +1785,11 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 }
                 p.parse_int()?;
                 p.parse_str()?;
+            }
+            // `data.funcref <at>` — skip in the header prescan.
+            Some(Tok::Ident(s)) if s == "data.funcref" => {
+                p.next()?;
+                p.parse_int()?;
             }
             // `data.ptr <at> self <off>` / `data.ptr <at> sym "<name>" <addend>` — skip in the
             // header prescan (carries no function; lexes as its own ident, distinct from `data`).

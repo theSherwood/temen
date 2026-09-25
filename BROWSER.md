@@ -590,12 +590,14 @@ running code nothing could reach — strictly safer than before. It also means n
 there is no index map for callers to thread through and no way for an unhandled funcidx-bearing form to
 cause a silent miscompile. The saving is the bodies, which is where the cost was.
 
-Roots are the module's addressable surface (every `exports` entry, every `ImplExport` op) plus the
-caller's `extra_roots`. Edges are followed from a live body: `Call`, `RefFunc` (the address-taken case
-a call-graph-only walk would miss), `ThreadSpawn`, `ReturnCall` — the same set `offset_func_indices`
-rewrites, and **the two must stay in step**. A module whose data image has funcidxs baked into bytes
-(`data.funcref`, resolved and cleared by the linker) is declined: a function reachable only from a
-static initializer would look unreachable and be emptied out from under its caller.
+Roots are the module's addressable surface (every `exports` entry, every `ImplExport` op), every
+function its data image holds an index of, plus the caller's `extra_roots`. A static initializer's
+function pointer (`data.funcref`) is baked into the image by the linker, which records where
+(`data_funcref_slots`, #1830), so a function reachable only from one is live. Edges are followed from
+a live body: `Call`, `RefFunc` (the address-taken case a call-graph-only walk would miss),
+`ThreadSpawn`, `ReturnCall` — the same set `offset_func_indices` rewrites, and **the two must stay in
+step**. A module still carrying unresolved `data.funcref` relocations (a unit, not a linked module)
+is declined.
 
 The library's exports have to be pruned first or there is nothing to collect — they existed to
 *resolve* the program's calls, and a linked executable does not re-export its libc. `link_program`

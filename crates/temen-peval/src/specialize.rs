@@ -789,6 +789,8 @@ pub fn specialize_with_config(
             data: module.data.clone(),
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            // Every function stays at its index, so the image's function indices still hold.
+            data_funcref_slots: module.data_funcref_slots.clone(),
             tls: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -884,6 +886,8 @@ pub fn specialize_with_config(
     Ok(Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        // None: the source's slots name functions this residual renumbered.
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         funcs,
         memory: module.memory,

@@ -71,7 +71,7 @@ static void sleb(char *buf, long v) {
       return;
   }
 }
-// Magic + v2 + memory(16) + 0 data segments (common to every unit).
+// Magic + version + memory(16) + 0 data segments + 0 funcref slots (common to every unit).
 static void emit_header(char *buf) {
   n_out = 0;
   // Header: the unified TEMEN wire header (WIRE.md) — 16 bytes, little-endian:
@@ -80,12 +80,13 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (12) & 0xff); eb(buf, (12) >> 8); // version (u16)
+  eb(buf, (13) & 0xff); eb(buf, (13) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);
   eb(buf, 17);
   eb(buf, 0); // no shadow arena (v11: the durable arena is module-declared; this unit spawns nothing)
-  eb(buf, 0);
+  eb(buf, 0); // no data segments
+  eb(buf, 0); // no data-image funcref slots (v13 section)
 }
 // A `(i64, i64) -> (i64)` signature.
 static void emit_i64_pair_sig(char *buf) {

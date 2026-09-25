@@ -298,6 +298,7 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     let optimized = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: m.data_funcref_slots.clone(),
         tls: Vec::new(),
         funcs: m
             .funcs

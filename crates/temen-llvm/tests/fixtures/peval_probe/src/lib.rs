@@ -80,6 +80,7 @@ pub fn build_module() -> Module {
         data_exports: Vec::new(),
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        data_funcref_slots: Vec::new(),
         tls: Vec::new(),
         impl_exports: Vec::new(),
         debug_info: None,

@@ -21650,6 +21650,9 @@ pub fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        // Which data bytes are function indices is part of the image (#1830): it decides what an
+        // analysis of its indirect calls may assume, so two modules that differ in it are two.
+        data_funcref_slots: m.data_funcref_slots.clone(),
         tls: Vec::new(),
         funcs: m.funcs.clone(),
         memory: m.memory,
