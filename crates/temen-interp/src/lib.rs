@@ -9632,12 +9632,8 @@ pub use temen_ir::durable_abi::SHADOW_SP_OFF;
 /// Per-context shadow-stack stride: context `i` occupies `[ShadowArena::region_base(i), +
 /// SHADOW_STRIDE)`. 4 KiB per context (a 48 KiB arena holds 12) — a provisional
 /// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
-///
-/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the arena's
-/// `end`, not at a per-region bound, so a fiber recursed deeper than
-/// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
-/// (every test today) stay confined; making the overflow bound per-region travels with the
-/// sizing decision.
+/// The transform's shadow-overflow guard bounds each push by this stride (#1683), so a context
+/// recursed deeper than one region traps the freeze instead of writing its neighbour's frames.
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// The shadow arena: where the per-context shadow regions sit (one definition of placement).
 pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};

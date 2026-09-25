@@ -411,7 +411,6 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
                 &may_suspend,
                 &tainted_sigs,
                 &m.types,
-                arena.end,
                 opts,
             )?;
             out.funcs[i] = nf;
@@ -423,10 +422,10 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
         let mem = out.memory.ok_or(TransformError::NoMemory)?;
         // The reserved region `[0, arena.end)` must fit in the declared window (it is part of
         // the guest's allotment; guest memory is the remainder `[arena.end, window)`), and a
-        // single shadow frame must fit in the arena.
-        // A live call chain stacks one frame per suspended activation; the reserve bounds the
-        // total depth (overflow-trapping the shadow stack is DURABILITY.md §12.7 future work).
-        if mem.size() < arena.end || arena.base + max_frame > arena.end {
+        // single shadow frame must fit in one context's region.
+        // A live call chain stacks one frame per suspended activation; the region bounds the
+        // total depth, and the UNWIND check traps a chain deeper than that (#1683).
+        if mem.size() < arena.end || REGION_HEADER_LEN + max_frame > SHADOW_STRIDE {
             return Err(TransformError::MemoryTooSmall);
         }
     }
@@ -1022,8 +1021,6 @@ fn transform_func(
     may_suspend: &[bool],
     tainted_sigs: &[temen_ir::FuncType],
     type_section: &[TypeEntry],
-    // The shadow-overflow trap line: the module's declared arena `end`.
-    arena_end: u64,
     opts: &TransformOpts,
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
@@ -1462,17 +1459,20 @@ fn transform_func(
         // The point's UNWIND check block — where its polls send an unwinding frame.
         let unwind_blk = unwind_base + 2 * gid as u32;
 
-        // UNWIND check: a push of this frame must not run past the reserve into guest memory
-        // (R9 / DURABILITY.md §12.7). The shadow stack mirrors the call stack, so this only
-        // trips for a chain deeper than the arena holds — a clean trap, never silent
-        // corruption. It lives on the (cold) freeze path, not the per-call path.
+        // UNWIND check: a push of this frame must not run past the running context's own region
+        // `[region base, +SHADOW_STRIDE)` — past it lies the next context's shadow frames, or
+        // guest memory for the last region (R9 / DURABILITY.md §12.7, #1683). The shadow stack
+        // mirrors the call stack, so this only trips for a chain deeper than a region holds — a
+        // clean trap, never silent corruption. It lives on the (cold) freeze path, not the
+        // per-call path.
         let mut cb = Bb::new(pt.slot_types.clone());
         let sp_a = cb.one(Inst::DurableShadowBase);
         let sp = cb.one(load(LoadOp::I64, sp_a, 0));
         let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
         let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
-        let reserve = cb.one(Inst::ConstI64(arena_end as i64));
-        let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, reserve));
+        let stride = cb.one(Inst::ConstI64(SHADOW_STRIDE as i64));
+        let region_end = cb.one(ibin(IntTy::I64, BinOp::Add, sp_a, stride));
+        let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, region_end));
         let live: Vec<ValIdx> = (0..pt.out as u32).collect();
         unwind_blocks.push(cb.finish(Terminator::BrIf {
             cond: over,
