@@ -11877,6 +11877,9 @@ struct CoopSched {
     /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
     /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
     hooked_twins: std::collections::BTreeSet<usize>,
+    /// FORK.md §8.6 / #1807 — child envs (§14 children and fork twins) whose pipe ends were released at
+    /// their domain's finish. Released once: the release decrements the shared end counts.
+    released_envs: std::collections::BTreeSet<usize>,
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
@@ -12058,6 +12061,7 @@ impl CoopSched {
         // `-ECHILD`, never a park that hangs); an id is retired when reaped.
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let released_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
         // #1122 — an armed external-wake doorbell: wire the personality's pipe-wake door to ring
         // it (the cooperative twin of the tree-walker's `set_pipe_wake` → scheduler wiring). The
@@ -12086,6 +12090,7 @@ impl CoopSched {
             dead_envs,
             forked_twins,
             hooked_twins,
+            released_envs,
             clock,
             eligible,
             page_checked,
@@ -12124,6 +12129,7 @@ impl CoopSched {
             dead_envs,
             forked_twins,
             hooked_twins,
+            released_envs,
             clock,
             eligible,
             page_checked,
@@ -12245,6 +12251,23 @@ impl CoopSched {
             for ti2 in killed {
                 complete(tasks, ti2, Err(Trap::ThreadFault));
             }
+            // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its env done, cleanly
+            // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
+            // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
+            // parked producer to `-EPIPE`.
+            let mut live = vec![false; extra_envs.len()];
+            let mut seen = vec![false; extra_envs.len()];
+            for t in tasks.iter() {
+                if let Some(k) = t.env {
+                    seen[k] = true;
+                    live[k] |= !matches!(t.state, TaskState::Done(_));
+                }
+            }
+            for k in 0..extra_envs.len() {
+                if seen[k] && !live[k] && released_envs.insert(k) {
+                    extra_envs[k].host.lock_unpoisoned().release_pipe_ends();
+                }
+            }
             // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
             // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
             // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
@@ -12263,14 +12286,8 @@ impl CoopSched {
                 })
                 .collect();
             for (ti2, status, k) in to_hook {
-                let hooks = {
-                    let g = extra_envs[k].host.lock_unpoisoned();
-                    // #1080 rung 4 — release this task's pipe ends at exit (the tree-walker's exit-time
-                    // `drop_all_pipe_*`) so a peer reader sees EOF / a peer writer `-EPIPE`: its settle
-                    // poll then re-admits. Polling needs no explicit wake, so the zeroed ids are dropped.
-                    let _ = (g.drop_all_pipe_writers(), g.drop_all_pipe_readers());
-                    g.exit_hooks.clone()
-                };
+                // Its pipe ends were released above, with every finished domain's.
+                let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
                 for h in hooks {
                     h(status);
                 }
@@ -15724,7 +15741,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             let status = super::reap_status(&r);
                             let hooks = {
                                 let g = hooks_host.lock_unpoisoned();
-                                let _ = (g.drop_all_pipe_writers(), g.drop_all_pipe_readers());
+                                g.release_pipe_ends();
                                 g.exit_hooks.clone()
                             };
                             for h in hooks {
@@ -16137,6 +16154,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             child_fuel,
                         )
                     });
+                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+                    child_host.lock_unpoisoned().release_pipe_ends();
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -16229,6 +16248,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             child_fuel,
                         )
                     });
+                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+                    child_host.lock_unpoisoned().release_pipe_ends();
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -16424,6 +16445,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             child_fuel,
                         )
                     });
+                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+                    child_host.lock_unpoisoned().release_pipe_ends();
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
