@@ -161,6 +161,8 @@ jobs:
       # builds a program in-guest (nifmake → nifler/nimsem/hexer/temen-link through the POSIX
       # /bin/sh), every artifact byte-identical to native nimony's, and the program runs.
       # Mechanism-level coverage is `nim_shells_out_through_the_posix_sh` in nim_e2e above.
+      # #763: the nightly (and a manual dispatch) also has nimony build nimsem itself in-guest, and
+      # holds it to the nimsem that built it (`NIM_LANE_SELF`); a PR run leaves it out.
       # #1609: the lane builds `temen-link` through the LLVM on-ramp (rustc IR → llvm-link/opt →
       # temen-llvm-translate), so it needs the LLVM tools pinned to the stable rustc's major.
       - name: install LLVM (the lane's temen-link build)
@@ -168,6 +170,8 @@ jobs:
         uses: ./.github/actions/install-llvm
       - name: Self-hosted nimony lane (must match native)
         if: matrix.part == 'selfhost'
+        env:
+          NIM_LANE_SELF: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
         run: bash scripts/ci/nim-selfhost-lane.sh
   # Three mechanical consistency gates that share a runner. Each was its own job; each ran in ~6
   # SECONDS and then held one of the account's ~20 concurrency slots, which is the thing actually
