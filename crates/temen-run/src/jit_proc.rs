@@ -32,7 +32,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use temen_interp::{Host, ParkEvent, Trap, TwinTrap, Value};
+use temen_interp::{GuestMem, Host, ParkEvent, Trap, TwinTrap, Value};
+use temen_ir::durable_abi::{ShadowArena, STATE_OFF, STATE_UNWINDING};
 use temen_ir::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
 use temen_ir::{cap_id, FuncIdx, Inst, Module, ValType};
 use temen_jit::{CompiledModule, ForkPoint, JitOutcome, TrapKind, TwinWindow, VmCtx};
@@ -80,17 +81,20 @@ fn is_fork_site(inst: &Inst, host: &Host) -> bool {
         .is_some_and(|(t, o)| may_reach(t, o, host, is_fork_op))
 }
 
-/// `m`, instrumented to **fork** on the JIT — or `None` when this image cannot fork here, in which
-/// case a `fork` it makes answers `-ENOSYS` ("unavailable on this tier").
+/// `m`'s image instrumented to **fork** on the JIT, entered at `entry` — or `None` when this image
+/// cannot fork here, in which case a `fork` it makes answers `-ENOSYS` ("unavailable on this tier").
 ///
 /// An image can fork on the JIT when it can reach a fork site at all, declares a shadow arena to
 /// unwind into (INVARIANTS.md #16: the placement is the module's; there is no default), and is
-/// **bare** — no fibers, threads, `setjmp`, or §14 children, the state a fork would have to duplicate
-/// that lives outside the window on the JIT. (The oracle forks such a module when it is momentarily
-/// bare; FORK.md §9.5.) The transform then instruments exactly the functions that can reach a fork
-/// site; everything else is left byte-identical, so an image that never forks pays nothing.
-pub(crate) fn fork_instrumented(m: &Module, host: &Host) -> Option<Module> {
-    if !m.memory?.shadow?.region_fits(0) {
+/// **bare** — no fibers, threads, `setjmp`, §14 children or §22 units, the state a fork would have to
+/// duplicate that lives outside the window, or code the transform never saw on the stack. (The oracle
+/// forks such a module when it is momentarily bare; FORK.md §9.5.) The transform then instruments
+/// the functions that can reach a fork site — through direct calls, and through `call.dyn`s that can
+/// select a function whose address the program takes ([`temen_durable::TransformOpts::fork`]) —
+/// and leaves everything else byte-identical, so an image that never forks pays nothing.
+pub(crate) fn fork_instrumented(m: &Module, entry: FuncIdx, host: &Host) -> Option<Image> {
+    let arena = m.memory?.shadow?;
+    if !arena.region_fits(0) {
         return None;
     }
     let insts = || {
@@ -98,28 +102,25 @@ pub(crate) fn fork_instrumented(m: &Module, host: &Host) -> Option<Module> {
             .iter()
             .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
     };
+    // §14 children and §22 units run code the transform never saw: a child on its own vCPU, a unit
+    // through the `call.dyn` slot `Jit.install` gives it.
+    let foreign_code = |t: u32, _| t == cap_id::INSTANTIATOR || t == cap_id::JIT;
     let bare = !m.funcs.iter().any(|f| f.uses_fibers_or_threads())
         && !insts().any(|i| {
             matches!(i, Inst::SetJmp { .. } | Inst::LongJmp { .. })
                 || i.host_dispatch()
-                    .is_some_and(|(t, o)| may_reach(t, o, host, |t, _| t == cap_id::INSTANTIATOR))
+                    .is_some_and(|(t, o)| may_reach(t, o, host, foreign_code))
         });
     let site = |i: &Inst| is_fork_site(i, host);
     if !bare || !insts().any(site) {
         return None;
     }
-    let opts = temen_durable::TransformOpts {
-        // A toolchain module keeps its data and heap clear of its own declared arena (the verifier
-        // holds its data segments to that; R9's cooperating-toolchain contract covers the rest).
-        enforce_r9: false,
-        sites: Some(&site),
-        // A fork is an unwind the guest's own call starts, never one landing inside a loop.
-        loop_polls: false,
-        // A fork duplicates the thread alive: the twin's vCPU TLS register is its parent's
-        // (`ForkPoint::twin`), and the parent's is untouched by its unwind and rewind.
-        carries_thread: true,
-    };
-    temen_durable::transform(m, &opts).ok()
+    let t = temen_durable::transform(m, &temen_durable::TransformOpts::fork(&site)).ok()?;
+    Some(Image {
+        arena,
+        entry: t.body[entry as usize],
+        module: t.module,
+    })
 }
 
 /// A JIT run's **process tree**: the state its processes share. Lives as long as any of them.
@@ -297,9 +298,9 @@ impl Tree {
         // SAFETY: this thread owns `host` for the whole process.
         let (r, results, final_host) = unsafe { run_process(&self, pid, &mut host, start, None) };
         let result = interp_result(&r, &results);
-        for hook in final_host.as_ref().unwrap_or(&host).exit_hooks() {
-            hook(temen_interp::reap_status(&result));
-        }
+        // Retire it from the tree before its exit is observable: once its exit hooks run, its parent
+        // can reap it and go on — fork again, or end the run — so its vCPU slot must be free and its
+        // crash on record by then, as the oracle's are when its task ends.
         {
             let mut st = self.lock();
             st.live -= 1;
@@ -316,6 +317,9 @@ impl Tree {
                     });
                 }
             }
+        }
+        for hook in final_host.as_ref().unwrap_or(&host).exit_hooks() {
+            hook(temen_interp::reap_status(&result));
         }
         self.ring();
     }
@@ -337,10 +341,13 @@ impl Tree {
     }
 }
 
-/// A program a fork-instrumented process runs — what its twins run too.
+/// A program instrumented to fork ([`fork_instrumented`]) — what a process runs, and its twins too.
 pub(crate) struct Image {
     module: Module,
+    /// Where the run enters: the entry's body ([`temen_durable::Instrumented::body`]).
     entry: FuncIdx,
+    /// The declared shadow arena the program's root context unwinds into.
+    arena: ShadowArena,
 }
 
 /// How a process image starts: fresh from its module (the root's first image, or an exec's), or as a
@@ -360,10 +367,10 @@ enum Start<'a> {
 }
 
 /// What a process image's `call.cap` thunk finds through its vmctx's `embedder` slot: the tree it
-/// belongs to, and whether its image was instrumented to fork.
+/// belongs to, and — when its image was instrumented to fork — the arena it unwinds into.
 pub(crate) struct ProcCtx {
     tree: Arc<Tree>,
-    fork_armed: bool,
+    fork: Option<ShadowArena>,
 }
 
 /// The process a thunk call's `trap_out` (the running instance's vmctx) belongs to, if any.
@@ -416,14 +423,16 @@ unsafe fn run_process(
                     cur.arm_caller_requests();
                 }
                 let image = (!serving)
-                    .then(|| fork_instrumented(module, cur))
+                    .then(|| fork_instrumented(module, entry, cur))
                     .flatten()
-                    .map(|m| Arc::new(Image { module: m, entry }));
+                    .map(Arc::new);
                 let ctx = ProcCtx {
                     tree: Arc::clone(tree),
-                    fork_armed: image.is_some(),
+                    fork: image.as_ref().map(|i| i.arena),
                 };
-                let program = image.as_ref().map_or(module, |i| &i.module);
+                let (program, entry) = image
+                    .as_ref()
+                    .map_or((module, entry), |i| (&i.module, i.entry));
                 let r = run_image(
                     cur,
                     program,
@@ -450,7 +459,7 @@ unsafe fn run_process(
                 cur.arm_caller_requests();
                 let ctx = ProcCtx {
                     tree: Arc::clone(tree),
-                    fork_armed: true,
+                    fork: Some(image.arena),
                 };
                 let r = run_image(
                     cur,
@@ -573,11 +582,6 @@ pub(crate) unsafe fn run_image(
     if host.jit_hosts_fibers() {
         cm.enable_fiber_hosting(quota)?;
     }
-    // A fork twin's powerbox carries its parent's §22 units (its own tables, #1297): define them in
-    // this compile, as a thaw does.
-    if let Entry::Twin { .. } = start {
-        crate::reconstruct_jit_units(&mut cm, host)?;
-    }
     if let Some(p) = &process {
         cm.set_embedder_ctx(p.ctx as *const ProcCtx as *mut c_void);
         host.set_wake_bell(p.ctx.tree.bell());
@@ -644,23 +648,25 @@ impl SendPtr {
 ///   ([`Host::exec_image`]); admitted, park it and unwind the whole run
 ///   ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the
 ///   caller's native stack is simply discarded (FORK.md §9.4). Refused: `-EINVAL`, nothing changed.
-/// * `fork` — on the process's root computation, at a fork site of an image instrumented to fork, set
-///   the window's freeze word: the call's trailing poll unwinds the caller into its shadow stack, and
-///   the run hands the frozen window to the fork hook. In a fiber, `-EAGAIN`, as the oracle refuses
-///   a non-bare fork; anywhere else the JIT cannot unwind to (an uninstrumented image, a host frame
-///   below the call), `-ENOSYS` — fork unavailable here.
+/// * `fork` — on the process's root computation, at a fork site of an image instrumented to fork,
+///   start the unwind ([`begin_fork_unwind`]): the call's trailing poll unwinds the caller into its
+///   shadow stack, and the run hands the frozen window to the fork hook. In a fiber, `-EAGAIN`, as
+///   the oracle refuses a non-bare fork; anywhere else the JIT cannot unwind to (an uninstrumented
+///   image, a host frame or a barrier below the call), `-ENOSYS` — fork unavailable here.
 /// * a blocking `waitpid` — `-EINTR` if a deliverable signal is pending (in a run that delivers
 ///   signals); else wait for the bell and run the op again, which reaps a child that exited or waits
 ///   on. A kill-path store (a deadline, the tree's teardown) ends the wait with the kill trap.
 ///
+/// `window` is the call's view of the guest window — the one its op read and wrote through.
+///
 /// # Safety
-/// The [`crate::cap_thunk`] contract for `mem_base`/`results`/`trap_out`, over a host armed for
-/// caller requests.
+/// The [`crate::cap_thunk`] contract for `results`/`trap_out`, over a host armed for caller
+/// requests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn serve_request(
     host: &mut Host,
     dispatch: (u32, u32),
-    mem_base: *mut u8,
+    window: Option<&mut dyn GuestMem>,
     window_mapped: u64,
     results: *mut i64,
     n_results: u64,
@@ -696,14 +702,14 @@ pub(crate) unsafe fn serve_request(
         Some(ParkEvent::ForkSelf) => {
             if temen_jit::fiber_active() {
                 answer(EAGAIN);
-            } else if proc.fork_armed
-                && may_reach(dispatch.0, dispatch.1, host, is_fork_op)
+            } else if !(may_reach(dispatch.0, dispatch.1, host, is_fork_op)
                 && !temen_jit::reentered()
                 && !in_signal_handler(trap_out)
+                && proc
+                    .fork
+                    .zip(window)
+                    .is_some_and(|(arena, w)| begin_fork_unwind(w, arena)))
             {
-                let state = mem_base.add(temen_ir::durable_abi::STATE_OFF as usize) as *mut i32;
-                state.write_unaligned(temen_ir::durable_abi::STATE_UNWINDING);
-            } else {
                 answer(ENOSYS);
             }
             false
@@ -728,6 +734,24 @@ pub(crate) unsafe fn serve_request(
         }
         None => false,
     }
+}
+
+/// Start the root context's unwind for a fork: set the window's freeze word, which the call's
+/// trailing poll reads. Only from an **empty** shadow stack — its SP word reads its frame base. The
+/// leaf frame must land there, where the fork injects the reply ([`ShadowArena::leaf_reply`]); and a
+/// barrier below the call holds it occupied ([`temen_durable::BARRIER_SP`]) when a `call.dyn`
+/// reached the fork through an index the program never took, whose uninstrumented frame the unwind
+/// could not resume. Read and written as a host op reads the guest's memory: a control word the guest
+/// unmapped refuses the fork rather than faulting the host.
+fn begin_fork_unwind(window: &mut dyn GuestMem, arena: ShadowArena) -> bool {
+    let empty = window
+        .read_bytes(arena.region_base(0), 8)
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .is_some_and(|b| u64::from_le_bytes(b) == arena.frame_base(0));
+    empty
+        && window
+            .write_bytes(STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+            .is_some()
 }
 
 /// Whether the run delivers #932 async signals (its compile armed the delivery check).

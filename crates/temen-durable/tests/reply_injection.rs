@@ -71,23 +71,21 @@ fn plain() -> Module {
     m
 }
 
-fn fork_instrumented() -> Module {
-    let m = transform(
-        &plain(),
-        &TransformOpts {
-            enforce_r9: true,
-            sites: Some(&is_site),
-            loop_polls: false,
-            carries_thread: true,
-        },
-    )
-    .expect("transform");
-    temen_verify::verify_module(&m).expect("verify");
-    m
+/// The fork-instrumented module, and where its entry's body now lives (the entry's own slot holds a
+/// barrier: no function's address is taken, so the entry is one no instrumented `call.dyn` selects).
+fn fork_instrumented() -> (Module, u32) {
+    let t = transform(&plain(), &TransformOpts::fork(&is_site)).expect("transform");
+    temen_verify::verify_module(&t.module).expect("verify");
+    (t.module, t.body[0])
 }
 
-/// Run `m` from `window` with a fresh host whose clock reads `clock`; the result and final window.
-fn run(m: &Module, window: &[u8], clock: i64) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>) {
+/// Run `m` at `entry` from `window` with a fresh host whose clock reads `clock`; the result and
+/// final window.
+fn run(
+    (m, entry): &(Module, u32),
+    window: &[u8],
+    clock: i64,
+) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>) {
     let mut host = Host::new();
     host.clock_ns = clock;
     let clk = host.grant_clock();
@@ -95,7 +93,7 @@ fn run(m: &Module, window: &[u8], clock: i64) -> (Result<Vec<Value>, temen_inter
     let mut fuel = 1_000_000u64;
     run_capture_reserved_with_host(
         m,
-        0,
+        *entry,
         &[Value::I32(clk), Value::I32(out)],
         &mut fuel,
         window,
@@ -106,9 +104,9 @@ fn run(m: &Module, window: &[u8], clock: i64) -> (Result<Vec<Value>, temen_inter
 
 #[test]
 fn only_the_functions_that_reach_a_site_are_instrumented() {
-    let (before, after) = (plain(), fork_instrumented());
+    let (before, (after, entry)) = (plain(), fork_instrumented());
     assert_ne!(
-        before.funcs[0], after.funcs[0],
+        before.funcs[0], after.funcs[entry as usize],
         "the entry reaches the site"
     );
     assert_eq!(
@@ -188,13 +186,9 @@ block 0 (v0: i32) {
         size_log2: SIZE_LOG2,
         shadow: Some(TEST_ARENA),
     });
-    let fork = TransformOpts {
-        enforce_r9: true,
-        sites: Some(&is_site),
-        loop_polls: false,
-        carries_thread: true,
-    };
-    let forked = transform(&m, &fork).expect("a fork carries the register");
+    let forked = transform(&m, &TransformOpts::fork(&is_site))
+        .expect("a fork carries the register")
+        .module;
     temen_verify::verify_module(&forked).expect("verify");
     assert_eq!(
         transform(&m, &TransformOpts::DURABLE).err(),

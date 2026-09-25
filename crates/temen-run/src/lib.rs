@@ -504,11 +504,13 @@ unsafe fn cap_thunk_impl(
         } else {
             0
         };
-        // Reborrowed per pass (a wait's re-run dispatches again over the same window view).
-        let gm = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
+        // Reborrowed per use (a wait's re-run dispatches again over the same window view).
+        let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
         let r = match pending.as_deref_mut() {
-            Some(slot) => host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, gm, slot),
-            None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm),
+            Some(slot) => {
+                host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, view, slot)
+            }
+            None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, view),
         };
         match r {
             Ok(res) => {
@@ -520,9 +522,10 @@ unsafe fn cap_thunk_impl(
                 }
                 *trap_out = 0;
                 // A woken blocking wait runs its op again (invariant 7: the rewound park).
+                let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
                 if serves
                     && jit_proc::serve_request(
-                        host, dispatch, mem_base, mem_size, results, n_results, trap_out, bell,
+                        host, dispatch, view, mem_size, results, n_results, trap_out, bell,
                     )
                 {
                     continue;

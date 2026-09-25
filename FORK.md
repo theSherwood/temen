@@ -892,9 +892,22 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   reach a site are instrumented; the rest of the program is byte-identical. A call is a site by its
   dispatch pair (`Inst::host_dispatch`) over the host's import bindings — the pair the cap thunk is
   handed at run time — so the compile and the thunk cannot disagree about which calls are sites.
+- **Read `call.dyn` by the addresses the program takes** (`TransformOpts::fork`,
+  `IndirectReach::AddressTaken`). A freeze must unwind wherever it lands, so it reads a `call.dyn` as
+  reaching any function of its signature (R8). From one fork site, that reading instrumented 65% of
+  nimony (8172 of 12552 functions, 1.18M → 8.69M instructions, a 10 GB compile). A fork is an unwind
+  the JIT may decline, so it reads a `call.dyn` as reaching only the functions the program takes the
+  address of (`ref.func`): 222 of nimony's functions, +7.7% instructions. Any other function that
+  can reach a fork can be selected only by an index the program never took (forged, §3c, or baked
+  into the data image — #1830). Its table slot gets a **barrier**: a function that marks the shadow
+  stack occupied while the real body runs. The body moves to the end of the module, and every static
+  reference enters it directly (`Instrumented::body`, the run's entry too).
 - **Reify at the call** (`serve_request`). The thunk that took the `ForkSelf` sets the window's freeze
-  word; the call's trailing poll unwinds the caller into its shadow arena (context 0), and the run
-  returns unwound.
+  word — only from an empty shadow stack (`begin_fork_unwind`): the leaf frame must land at the frame
+  base, where the reply goes, and a barrier below the call holds the stack occupied. The call's
+  trailing poll unwinds the caller into its shadow arena (context 0), and the run returns unwound. The
+  thunk reads and writes those words through the call's checked window view, so a guest that unmapped
+  them gets a refusal, not a host fault.
 - **Duplicate** (`temen_jit::ForkPoint::twin`, `Tree::fork`). The run hands the frozen window to the
   embedder's fork hook, which follows the oracle's `fork_vcpu` order — the vCPU quota, the window,
   then the powerbox, with #1648's pid burn — copying the window page for page (bytes and protections,
@@ -906,6 +919,12 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   (`ShadowArena::leaf_reply` — a leaf spills its results first) and its thaw word is set `REWINDING`;
   the entry's prologue rebuilds every frame and the call returns the injected value: the twin's pid in
   the parent, rewound in place, and `0` in the twin.
+- **Fork again.** Every fork after a process's first unwinds through frames the previous fork's
+  rewind rebuilt, each by re-issuing its call. The transform's thaw arms now poll after an op they
+  re-run, as the forward path does (`temen-durable`'s `poll`). Before, an arm ran on into its
+  continuation with the placeholder its unwinding callee returned, so a second unwind beneath a thawed
+  frame lost that frame. A freeze that followed a thaw had the same bug. The lane found it: nimony's
+  second fork trapped `Unreachable` on the resume.
 - **The thread goes with it.** A fork duplicates the running thread alive, so what the engine keeps
   outside the window travels too: the twin's `vcpu.tls` register is its parent's
   (`TransformOpts::carries_thread` admits the TLS ops a snapshot must refuse). POSIX's child inherits
@@ -919,7 +938,9 @@ it, the oracle's order — or a personality door (a signal, a child transition).
 signal completes it `-EINTR`. When the root's image chain ends, the tree is torn down: running twins
 are stopped through the tree's kill-path cell and joined, and the ones that trapped are published
 (`last_twin_traps`). `crates/temen-run/tests/jit_fork.rs` pins fork in a loop, deep in a call stack,
-nested, and crashing against the oracle; `caller_request_parity.rs` runs its fork row on the JIT.
+twice beneath a rewound caller, through a taken function address, nested, and crashing against the
+oracle; `caller_request_parity.rs` runs its fork row on the JIT. `temen-durable`'s `indirect_reach.rs`
+and `refreeze.rs` pin the barrier and the re-run op's poll on the interpreter.
 
 **Where the JIT refuses a fork the oracle makes**, it answers `-ENOSYS` ("unavailable on this tier") —
 probeable, never a wrong answer:
@@ -927,16 +948,20 @@ probeable, never a wrong answer:
 1. The program declares no shadow arena — its placement is the module's (INVARIANTS.md #16), so a
    toolchain whose programs fork declares one.
 2. The program is not *bare*: it has fiber, thread or `setjmp`/`longjmp` ops, or a call that may reach
-   the §14 Instantiator — state a fork would have to duplicate that lives outside the window on the
-   JIT (the oracle forks such a program whenever it is momentarily bare) — or a function that can
-   reach a fork holds a construct the durable transform cannot instrument (a tail call into another
-   such function, `import.attach`, `gc.roots`).
+   the §14 Instantiator or the §22 `Jit` — state a fork would have to duplicate that lives outside the
+   window on the JIT, or code the transform never saw (the oracle forks such a program whenever it is
+   momentarily bare) — or a function that can reach a fork holds a construct the durable transform
+   cannot instrument (a tail call into another such function, `import.attach`, `gc.roots`).
 3. The fork is made beneath a host frame that re-entered compiled code (`temen_jit::reentered`: a
    `Jit.invoke`d unit, a serve handler) or inside an injected signal handler — frames a durable unwind
    cannot save.
+4. The fork is made beneath a `call.dyn` through an index the program never took — forged, or a
+   static initializer's function pointer, which `link` bakes into the data image without a record
+   (#1830) — so the barrier in the selected slot holds the shadow stack occupied.
 
 A fork in a fiber answers `-EAGAIN`, exactly as the oracle's non-bare refusal does. The convergence
 plan for 1–2 is to decline such a module to the bytecode engine, which forks it, before it runs
-(#1824). Still missing from a JIT process: async signal delivery, pipe parks and job control (#1826).
+(#1824); for 4, to keep the data image's function pointers through the link, which leaves only a
+forged index refused (#1830). Still missing from a JIT process: async signal delivery, pipe parks and job control (#1826).
 A twin still recompiles its parent's program and copies its whole window (#1825).
 

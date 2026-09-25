@@ -452,3 +452,131 @@ fn without_a_shadow_arena_the_jit_refuses_fork_probeably() {
         "the JIT answers -ENOSYS"
     );
 }
+
+/// The fork reached through a `call.dyn`. `_start` calls `forker` through the index `SLOT` and
+/// exits with what `fork` answered it: `0` in the child, the child's pid (`2`) in the parent, and
+/// `100 + errno` on a refusal.
+const FORK_THROUGH_SLOT: &str = "\
+func () -> () {
+block 0 () {
+  SLOT
+  p = call.dyn () -> (i64) idx ()
+  z = i64.const 0
+  neg = i64.lt_s p z
+  br_if neg 1(p) 2(p)
+  }
+block 1 (ep: i64) {
+  e100 = i64.const 100
+  e = i64.sub e100 ep
+  ec = i32.wrap_i64 e
+  call.import 2 (ec)
+  unreachable
+  }
+block 2 (op: i64) {
+  oc = i32.wrap_i64 op
+  call.import 2 (oc)
+  unreachable
+  }
+}
+func () -> (i64) {
+block 0 () {
+  p = call.import 0 ()
+  return p
+  }
+}
+export 0 func \"_start\" 0
+";
+
+/// A `call.dyn` through a function address the program took (`ref.func`) is a fork path like a
+/// direct call: the JIT instruments it, and forks there as the interpreters do.
+#[test]
+fn a_fork_through_a_taken_function_address_resumes_identically_on_every_engine() {
+    let src = FORK_THROUGH_SLOT.replace("SLOT", "idx = ref.func 1");
+    assert_every_engine(&src, Outcome::Exited(2));
+}
+
+/// FORK.md §9.5 — an index the program never took (a funcref is a forgeable integer, §3c) can still
+/// select a function that forks, from a `call.dyn` the JIT did not instrument: the forking function's
+/// slot is fronted by a barrier, and the JIT answers `-ENOSYS` rather than unwind through a frame it
+/// could not resume. The interpreters, which clone the vCPU, fork it.
+#[test]
+fn a_fork_beneath_a_forged_index_is_refused_probeably_on_the_jit() {
+    let src = FORK_THROUGH_SLOT.replace("SLOT", "idx = i32.const 1");
+    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+        assert_eq!(
+            run_on(&src, true, backend),
+            Outcome::Exited(2),
+            "{backend:?}"
+        );
+    }
+    assert_eq!(
+        run_on(&src, true, Backend::Jit),
+        Outcome::Exited(100 + 38),
+        "the JIT answers -ENOSYS"
+    );
+}
+
+/// Two forks from one callee: `_start` calls `forker`, which forks, then forks again. The second
+/// fork unwinds through `_start`'s frame as the first fork's rewind rebuilt it — a re-issued call,
+/// which must poll as the original did. The children exit `10` and `20`; `forker` returns
+/// `100 * pid1 + pid2` = `203` in the parent, which reaps both and exits `203 - 200 + 10 + 20 = 33`.
+const FORK_TWICE: &str = "\
+func () -> () {
+block 0 () {
+  r = call 1 ()
+  any = i64.const -1
+  st = i64.const 41000
+  z = i64.const 0
+  w1 = call.import 1 (any, st, z, z)
+  hi = i64.const 41001
+  s1b = i32.load8_u hi
+  s1 = i64.extend_i32_u s1b
+  w2 = call.import 1 (any, st, z, z)
+  s2b = i32.load8_u hi
+  s2 = i64.extend_i32_u s2b
+  base = i64.const 200
+  d = i64.sub r base
+  t1 = i64.add d s1
+  t2 = i64.add t1 s2
+  tc = i32.wrap_i64 t2
+  call.import 2 (tc)
+  unreachable
+  }
+}
+func () -> (i64) {
+block 0 () {
+  a = call.import 0 ()
+  z = i64.const 0
+  ac = i64.eq a z
+  br_if ac 1() 2(a)
+  }
+block 1 () {
+  ten = i32.const 10
+  call.import 2 (ten)
+  unreachable
+  }
+block 2 (pa: i64) {
+  b = call.import 0 ()
+  bz = i64.const 0
+  bc = i64.eq b bz
+  br_if bc 3() 4(pa, b)
+  }
+block 3 () {
+  twenty = i32.const 20
+  call.import 2 (twenty)
+  unreachable
+  }
+block 4 (qa: i64, qb: i64) {
+  h = i64.const 100
+  x = i64.mul qa h
+  y = i64.add x qb
+  return y
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn a_second_fork_beneath_a_rewound_caller_unwinds_it_again_on_every_engine() {
+    assert_every_engine(FORK_TWICE, Outcome::Exited(33));
+}
