@@ -328,8 +328,13 @@ pub mod durable_abi {
     /// SP word. Each frozen vCPU rewinds against its own word, so thaw can run them as concurrent
     /// threads; the stop-the-world freeze state stays at the global [`STATE_OFF`].
     pub const STATE_IN_REGION_OFF: u64 = SHADOW_SP_WORD_LEN;
-    /// §12.8: bytes reserved at a context region's base before its shadow frames — the SP word plus
-    /// the thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to keep frames 8-aligned.
+    /// #1672: byte offset of a context's `i32` **re-issue** word within its region, just past the thaw
+    /// word. The runtime sets it to `1` when it abandons a host call that would have parked while a
+    /// freeze is landing: the call took no effect, so the thaw must re-issue it rather than reload a
+    /// result. The call's unwind spills the word into its shadow frame and clears it.
+    pub const REISSUE_IN_REGION_OFF: u64 = STATE_IN_REGION_OFF + 4;
+    /// §12.8: bytes reserved at a context region's base before its shadow frames — the SP word, the
+    /// thaw state word at [`STATE_IN_REGION_OFF`] and the re-issue word at [`REISSUE_IN_REGION_OFF`].
     pub const REGION_HEADER_LEN: u64 = 16;
     /// Per-context shadow-region stride: context `i` owns `[ShadowArena::region_base(i), +stride)`.
     pub const SHADOW_STRIDE: u64 = 1 << 12;

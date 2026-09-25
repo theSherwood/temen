@@ -58,9 +58,9 @@
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     Attestation, BudgetState, BudgetThawRefused, CapturedDetached, CapturedProt, DetachedLaunch,
-    DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap, FreezeScope,
-    FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout,
-    NonDurableHandle, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, Trap,
+    DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap, DurablePipe,
+    FreezeScope, FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host,
+    MemLayout, NonDurableHandle, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, Trap,
 };
 use temen_ir::Module;
 
@@ -222,7 +222,12 @@ use temen_ir::Module;
 /// trap's code ([`Trap::code`]), so a child that finished with a trap rides the artifact and the
 /// thawed `join` re-raises it. A nested record's `0 | 1 + value` is unchanged; a detached record's
 /// bare value gains the tag.
-const FORMAT_VERSION: u16 = 31;
+/// v32 (#1680, #1672): pipes inside the cut ride. `B_PIPE_END` names a pipe by its artifact number
+/// (first appearance: the root's table by slot, then each nested child's in record order), and
+/// Section 9 (`TAG_PIPES`) carries each pipe's buffered bytes in that order. Elided when no pipe
+/// rides. A host call's shadow frame also gains its re-issue word (§12.7), which only the
+/// instrumented code reads.
+const FORMAT_VERSION: u16 = 32;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -252,6 +257,9 @@ const TAG_ATTEST: u64 = 6;
 const TAG_NAMED: u64 = 7;
 /// Section 8 (v29, #1361 step 4): live detached children, each a nested artifact. See [`write_detached`].
 const TAG_DETACHED: u64 = 8;
+/// Section 9 (v32, #1680): the pipes inside the cut, by artifact number — each one's buffered bytes.
+/// Emitted only when a pipe end rides.
+const TAG_PIPES: u64 = 9;
 /// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
 /// untrusted artifact must not choose the depth; freeze refuses past the same bound, so it never emits
 /// an artifact restore would reject.
@@ -289,6 +297,8 @@ const B_FREEZE_DETACHED: u8 = 13;
 /// *name*, not a payload: the restore resolves it against the modules the restoring host itself
 /// granted, so the artifact conveys identity and never code.
 const B_MODULE: u8 = 14;
+/// v32 (#1680): a pipe end — the pipe's artifact number (Section 9) and which end.
+const B_PIPE_END: u8 = 15;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -330,6 +340,9 @@ pub enum FreezeError {
     DetachedUnreached { parent_task: usize, slot: usize },
     /// Detached children nest deeper than [`MAX_DETACHED_DEPTH`].
     DetachedTooDeep,
+    /// #1680 — a pipe has an end outside the cut (held by a domain the freeze does not carry, such
+    /// as a fork twin or a detached child). The cut's boundary is not yet carried (#1680 slice 2).
+    PipeCrossesCut,
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -395,6 +408,35 @@ pub enum RestoreError {
 /// reservation's uncommitted tail faults inside the window (the domain the masking lowering confines
 /// guest addresses to). An artifact may carry exactly what a live run can hold; bounding by the image
 /// instead refused every detached child, whose caps always span past it.
+/// The window geometry an artifact may carry — the one rule freeze and restore both apply, so a freeze
+/// never emits an artifact restore rejects (#1700). v18 (#1154): the committed extent `mapped` may
+/// exceed the declared window (a `vm_map` grow), so the three quantities are a nested chain,
+/// `1 << size_log2 <= mapped <= 1 << reserved_log2`, with `mapped` a nonzero page multiple. A flat
+/// window (`mapped == 1 << reserved_log2 == 1 << size_log2`) satisfies it exactly.
+///
+/// The chain is arithmetic in `u64`: `reserved_log2` and `size_log2` are guest address-space
+/// quantities, and a 4 GiB reservation (`reserved_log2 == 32`) is ordinary even on a 32-bit host
+/// (wasm32, the browser engine). Only `mapped` — the image itself — has to fit a `usize`.
+fn geometry_ok(module: &Module, mapped: u64, reserved_log2: u8) -> bool {
+    if reserved_log2 as u32 >= u64::BITS {
+        return false;
+    }
+    if mapped == 0 || !mapped.is_multiple_of(PAGE as u64) || mapped > 1u64 << reserved_log2 {
+        return false;
+    }
+    module
+        .memory
+        .is_none_or(|mem| (mem.size_log2 as u32) < u64::BITS && 1u64 << mem.size_log2 <= mapped)
+}
+
+/// The first handle whose binding falls outside a window of `size` bytes, as the restore gate reads
+/// it ([`binding_in_window`]).
+fn first_out_of_window(handles: &[DurableHandle], size: u64) -> Option<&DurableHandle> {
+    handles
+        .iter()
+        .find(|h| !binding_in_window(&h.binding, size))
+}
+
 fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
     let (base, size) = match *binding {
         // The whole-window `AddressSpace` form (`{0, u64::MAX}` — the retired `Memory` kind,
@@ -516,19 +558,9 @@ fn freeze_at(
             slot: p.slot,
         });
     }
-    // The committed extent is page-granular (a `vm_map` grows whole pages) and must fit the mask
-    // domain it grew within. Unlike v17 it need not be a power of two — a grown high-water rarely is.
-    //
-    // The reservation is a **guest** address-space quantity, so it is bounded by `u64`, not by the
-    // host's pointer width: a guest reserving the usual 4 GiB mask domain has `reserved_log2 == 32`,
-    // which a `usize::BITS` bound would reject on a 32-bit host (wasm32 — the browser engine) while
-    // accepting it on a 64-bit one. Only the *committed* extent has to fit the host's `usize`, and
-    // `window.len()` already is one.
-    if window.len() < PAGE
-        || !window.len().is_multiple_of(PAGE)
-        || reserved_log2 as u32 >= u64::BITS
-        || (window.len() as u64) > 1u64 << reserved_log2
-    {
+    // The committed extent is page-granular (a `vm_map` grows whole pages), covers the declared
+    // window, and fits the mask domain it grew within — restore's own rule ([`geometry_ok`]).
+    if !geometry_ok(module, window.len() as u64, reserved_log2) {
         return Err(FreezeError::WindowGeometry(window.len()));
     }
     let npages = window.len() / PAGE;
@@ -544,11 +576,23 @@ fn freeze_at(
     // Freeze-side twin of the restore boundary's `binding_in_window` gate: refuse to emit an
     // artifact restore would reject, so out-of-window authority fails at freeze with a clear
     // error instead of surfacing as a Malformed artifact later.
-    if let Some(h) = handles
-        .iter()
-        .find(|h| !binding_in_window(&h.binding, 1u64 << reserved_log2))
-    {
+    if let Some(h) = first_out_of_window(&handles, 1u64 << reserved_log2) {
         return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
+    }
+    // ... and on each nested child's handles against the child's own window, as restore reads them
+    // (#1700). A child's host state rides only beside its nested record, so that names the window.
+    for c in host.frozen_child_state() {
+        let Some(n) = host
+            .frozen_nested()
+            .iter()
+            .find(|n| n.parent_task == c.parent_task && n.slot == c.slot)
+        else {
+            continue;
+        };
+        let size = 1u64.checked_shl(n.size_log2 as u32).unwrap_or(0);
+        if let Some(h) = first_out_of_window(&c.handles, size) {
+            return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
+        }
     }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
@@ -572,7 +616,13 @@ fn freeze_at(
     let mut detached = host.frozen_detached().to_vec();
     detached.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
-    let child_state = host.frozen_child_state().to_vec();
+    let mut child_state = host.frozen_child_state().to_vec();
+    let mut handles = handles;
+    let pipes = number_pipes(
+        &host.capture_durable_pipes(),
+        &mut handles,
+        &mut child_state,
+    )?;
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
             .memory
@@ -795,7 +845,62 @@ fn freeze_at(
         section(&mut out, TAG_DETACHED, |b| b.extend_from_slice(&body));
     }
 
+    // Section 9 — pipes inside the cut (#1680, v32), by artifact number. Elided when none rides.
+    if !pipes.is_empty() {
+        section(&mut out, TAG_PIPES, |b| {
+            write_uleb(b, pipes.len() as u64);
+            for p in &pipes {
+                write_uleb(b, p.len() as u64);
+                b.extend_from_slice(p);
+            }
+        });
+    }
+
     Ok(out)
+}
+
+/// #1680 — number the pipes the cut's ends name, and check the cut holds every end of each.
+///
+/// A pipe's number is the order its first end appears in: the root's table by slot, then each nested
+/// child's table in canonical record order (`(parent_task, slot)`, as Section 2 writes them). That
+/// order is structural, so a thawed tree re-freezes to the same numbers (§12.6). Each `PipeEnd`'s live
+/// id is rewritten to its number. A pipe whose live end counts exceed the ends the cut holds has an
+/// end outside it, and fails the freeze. Returns each pipe's bytes, by number.
+fn number_pipes(
+    live: &[DurablePipe],
+    root: &mut [DurableHandle],
+    children: &mut [FrozenChildState],
+) -> Result<Vec<Vec<u8>>, FreezeError> {
+    children.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+    let mut order: Vec<(u32, usize, usize)> = Vec::new(); // (live id, write ends, read ends)
+    let ends = root
+        .iter_mut()
+        .chain(children.iter_mut().flat_map(|c| c.handles.iter_mut()));
+    for h in ends {
+        let DurableBinding::PipeEnd { pipe, write } = &mut h.binding else {
+            continue;
+        };
+        let n = match order.iter().position(|o| o.0 == *pipe) {
+            Some(n) => n,
+            None => {
+                order.push((*pipe, 0, 0));
+                order.len() - 1
+            }
+        };
+        if *write {
+            order[n].1 += 1;
+        } else {
+            order[n].2 += 1;
+        }
+        *pipe = n as u32;
+    }
+    order
+        .iter()
+        .map(|&(id, w, r)| match live.iter().find(|p| p.key == id) {
+            Some(p) if p.writers == w && p.readers == r => Ok(p.bytes.clone()),
+            _ => Err(FreezeError::PipeCrossesCut),
+        })
+        .collect()
 }
 
 /// v31 (#1674): a finished child's `join` outcome — `0` none, `1` + its value, `2` + its trap's code.
@@ -922,6 +1027,33 @@ fn decode_named(body: Option<&[u8]>) -> Result<Vec<Option<DurableNamedCap>>, Res
     Ok(out)
 }
 
+/// Decode Section 9 ([`TAG_PIPES`], v32): each pipe's bytes, keyed by artifact number. Absent ⇒ no
+/// pipe rides; present but empty is non-canonical.
+fn decode_pipes(body: Option<&[u8]>) -> Result<Vec<DurablePipe>, RestoreError> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed);
+    }
+    let mut out = Vec::with_capacity(n.min(1024));
+    for key in 0..n {
+        let len = r.uleb()? as usize;
+        out.push(DurablePipe {
+            key: u32::try_from(key).map_err(|_| RestoreError::Malformed)?,
+            bytes: r.take(len)?.to_vec(),
+            writers: 0,
+            readers: 0,
+        });
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(out)
+}
+
 /// Serialize the durable guest-JIT domains (Section 5, v17). Canonical: the `table_log2` header,
 /// then domains and units in index order (capture already yields them so), install occupancy in
 /// install order — all minimal LEB128.
@@ -1039,6 +1171,7 @@ fn restore_at(
     let mut attest_body = None;
     let mut named_body = None;
     let mut detached_body = None;
+    let mut pipes_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -1053,6 +1186,7 @@ fn restore_at(
             TAG_ATTEST => attest_body = Some(body),
             TAG_NAMED => named_body = Some(body),
             TAG_DETACHED => detached_body = Some(body),
+            TAG_PIPES => pipes_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -1077,34 +1211,11 @@ fn restore_at(
     if digest != digest256(&encode_module(module)) {
         return Err(RestoreError::ModuleMismatch);
     }
-    // v18 geometry (#1154): the committed extent `mapped` may exceed the declared window (a `vm_map`
-    // grow), so the three quantities the codec once locked together — declared `size_log2`, the mask
-    // domain `reserved_log2`, and the committed `mapped` — are now checked as a nested chain:
-    //   `1 << size_log2  <=  mapped  <=  1 << reserved_log2`,   `mapped` page-aligned.
-    // The reservation must cover at least the declared window (a smaller one is corrupt), and the
-    // committed extent sits between the declared window and the reservation. A flat v17-shaped window
-    // (`mapped == 1 << reserved_log2 == 1 << size_log2`) still satisfies it exactly.
-    //
-    // The chain is arithmetic in `u64` for the same reason the freeze side is: `reserved_log2` and
-    // `size_log2` are guest address-space quantities, and a 4 GiB reservation (`reserved_log2 == 32`)
-    // is ordinary. Only `mapped` — the image this host is about to allocate — must fit a `usize`, and
-    // it is read as one.
-    if page_size != PAGE || reserved_log2 as u32 >= u64::BITS {
+    // v18 geometry (#1154), the rule freeze applies too ([`geometry_ok`]).
+    if page_size != PAGE || !geometry_ok(module, mapped as u64, reserved_log2) {
         return Err(RestoreError::GeometryMismatch);
     }
     let reserved = 1u64 << reserved_log2;
-    if mapped == 0 || !mapped.is_multiple_of(PAGE) || mapped as u64 > reserved {
-        return Err(RestoreError::GeometryMismatch);
-    }
-    if let Some(mem) = &module.memory {
-        if (mem.size_log2 as u32) >= u64::BITS {
-            return Err(RestoreError::GeometryMismatch);
-        }
-        let declared = 1u64 << mem.size_log2;
-        if declared > mapped as u64 {
-            return Err(RestoreError::GeometryMismatch);
-        }
-    }
 
     // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
     let mut window = vec![0u8; mapped];
@@ -1168,6 +1279,43 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
 
+    // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue. The section is
+    // present iff there are fibers or spawned vCPUs (canonical). Decoded before anything is granted,
+    // so the pipe check below sees every nested child's ends too. ----
+    let (fibers, vcpus, root_sp, nested, mut child_state, detached) = decode_control(
+        control_body,
+        fiber_count,
+        spawned_count,
+        module
+            .memory
+            .and_then(|m| m.shadow)
+            .unwrap_or(ShadowArena::EMPTY)
+            .region_base(0),
+    )?;
+    // ---- Pipes inside the cut (#1680, v32): every end, the root's or a nested child's, must name a
+    // carried pipe, and every carried pipe must be named (canonical: a freeze carries only pipes with
+    // an end in the cut). ----
+    // Each pipe's end counts are the ends the cut carries, so they are rebuilt here, not stored.
+    let mut pipes = decode_pipes(pipes_body)?;
+    let ends = handles
+        .iter()
+        .chain(child_state.iter().flat_map(|c| c.handles.iter()));
+    for h in ends {
+        if let DurableBinding::PipeEnd { pipe, write } = h.binding {
+            let p = pipes
+                .get_mut(pipe as usize)
+                .ok_or(RestoreError::Malformed)?;
+            *if write {
+                &mut p.writers
+            } else {
+                &mut p.readers
+            } += 1;
+        }
+    }
+    if pipes.iter().any(|p| p.writers + p.readers == 0) {
+        return Err(RestoreError::Malformed);
+    }
+
     // ---- Durable guest-JIT state (§12.5 Slice 2, v16): decode Section 5, bounds-check the handle
     // table's JIT indices against it, and rebuild the domains (each unit re-verified). Do this
     // *before* re-granting the table so a forged `JitTable`/`JitCode` index that names no restored
@@ -1215,21 +1363,23 @@ fn restore_at(
     // here, with nothing granted.
     host.attenuate_budgets_for_thaw(&mut handles)
         .map_err(RestoreError::BudgetRefused)?;
+    // The interpreter names a pipe by its live id: rewrite each carried end's artifact number to the
+    // id its rebuilt pipe was minted.
+    let ids = host
+        .restore_durable_pipes(&pipes)
+        .map_err(|_| RestoreError::Malformed)?;
+    let ends = handles
+        .iter_mut()
+        .chain(child_state.iter_mut().flat_map(|c| c.handles.iter_mut()));
+    for h in ends {
+        if let DurableBinding::PipeEnd { pipe, .. } = &mut h.binding {
+            *pipe = ids[*pipe as usize];
+        }
+    }
     host.restore_durable_handles(&handles);
 
-    // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
-    // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
-    // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
-    let (fibers, vcpus, root_sp, nested, child_state, detached) = decode_control(
-        control_body,
-        fiber_count,
-        spawned_count,
-        module
-            .memory
-            .and_then(|m| m.shadow)
-            .unwrap_or(ShadowArena::EMPTY)
-            .region_base(0),
-    )?;
+    // ---- Control state (§12.4): seed the frozen-fiber + spawned-vCPU residue (decoded above) for
+    // the thaw, so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
     host.set_frozen_fibers(fibers);
     if !vcpus.is_empty() {
         host.set_frozen_vcpus(vcpus);
@@ -1809,6 +1959,11 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, slot as u64);
             write_uleb(b, export as u64);
         }
+        DurableBinding::PipeEnd { pipe, write } => {
+            b.push(B_PIPE_END);
+            write_uleb(b, pipe as u64);
+            b.push(write as u8);
+        }
         DurableBinding::JitTable { idx } => {
             b.push(B_JIT_TABLE);
             write_uleb(b, idx as u64);
@@ -1876,6 +2031,14 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         },
         B_JIT_TABLE => DurableBinding::JitTable {
             idx: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_PIPE_END => DurableBinding::PipeEnd {
+            pipe: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            write: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(RestoreError::Malformed),
+            },
         },
         B_JIT_CODE => DurableBinding::JitCode {
             domain: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
@@ -2021,5 +2184,90 @@ mod binding_window_tests {
             },
             mapped
         ));
+    }
+}
+
+#[cfg(test)]
+mod pipe_numbering_tests {
+    use super::*;
+
+    fn end(slot: u32, pipe: u32, write: bool) -> DurableHandle {
+        DurableHandle {
+            slot,
+            generation: 0,
+            type_id: 0,
+            binding: DurableBinding::PipeEnd { pipe, write },
+        }
+    }
+
+    fn live(key: u32, writers: usize, readers: usize) -> DurablePipe {
+        DurablePipe {
+            key,
+            bytes: vec![key as u8],
+            writers,
+            readers,
+        }
+    }
+
+    /// #1680: pipes are numbered by first appearance (root by slot, then children in record order),
+    /// not by their process-global ids, so a thawed tree re-freezes to the same numbers.
+    #[test]
+    fn pipes_are_numbered_by_first_appearance() {
+        let mut root = vec![end(1, 90, false), end(2, 40, true)];
+        let mut children = vec![FrozenChildState {
+            parent_task: 0,
+            slot: 0,
+            svc_queue: Vec::new(),
+            svc_results: Vec::new(),
+            svc_next_ticket: 0,
+            handles: vec![end(0, 90, true), end(1, 40, false)],
+            jit_tables: Vec::new(),
+            jit_table_log2: 0,
+        }];
+        let bytes = number_pipes(&[live(40, 1, 1), live(90, 1, 1)], &mut root, &mut children)
+            .expect("every end is inside the cut");
+        assert_eq!(
+            bytes,
+            vec![vec![90], vec![40]],
+            "numbered in appearance order"
+        );
+        let pipes: Vec<_> = root
+            .iter()
+            .chain(&children[0].handles)
+            .map(|h| h.binding)
+            .collect();
+        assert_eq!(
+            pipes,
+            vec![
+                DurableBinding::PipeEnd {
+                    pipe: 0,
+                    write: false
+                },
+                DurableBinding::PipeEnd {
+                    pipe: 1,
+                    write: true
+                },
+                DurableBinding::PipeEnd {
+                    pipe: 0,
+                    write: true
+                },
+                DurableBinding::PipeEnd {
+                    pipe: 1,
+                    write: false
+                },
+            ]
+        );
+    }
+
+    /// #1680: a pipe with more live ends than the cut holds has an end outside it (another domain,
+    /// a fork twin). Carrying it would thaw a reader waiting on a writer that no longer exists, so
+    /// the freeze refuses it until the boundary edge lands.
+    #[test]
+    fn a_pipe_with_an_end_outside_the_cut_refuses() {
+        let mut root = vec![end(1, 7, false), end(2, 7, true)];
+        assert_eq!(
+            number_pipes(&[live(7, 2, 1)], &mut root, &mut []),
+            Err(FreezeError::PipeCrossesCut)
+        );
     }
 }

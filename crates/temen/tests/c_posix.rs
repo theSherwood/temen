@@ -3055,11 +3055,12 @@ int main(void) {{\n\
 }
 
 /// #972 slice 1 — **freeze witness** (invariant 7-adjacent): after the personality makes pipe ends
-/// reachable from libc (`pipe()` = mint + adopt), a freeze of the domain still hits the existing
-/// clean refusal — `capture_durable_handles` reports `NonDurableKind::Pipe`, never a partial
-/// snapshot or a new failure mode.
+/// reachable from libc (`pipe()` = mint + adopt), a freeze of the domain hits a clean refusal —
+/// `capture_durable_handles` names the personality's `HostProc`, never a partial snapshot or a new
+/// failure mode. Since #1680 the pipe ends themselves are durable: a pipe the domain minted rides
+/// the cut as data; only an embedder-fed pipe (fed from outside the tree) still refuses.
 #[test]
-fn c_core_pipe_freeze_refuses_nondurable() {
+fn c_core_pipe_freeze_refuses_the_personality_not_the_pipe() {
     let src = format!(
         "{PIPE_SHIM}\n\
 static int fds[2];\n\
@@ -3075,29 +3076,27 @@ int main(void) {{ return pipe(fds) == 0 ? 42 : 9; }}\n"
     let mut fuel = 50_000_000u64;
     let r = run_with_host(&raw, 0, &[], &mut fuel, &mut ih).expect("run");
     assert_eq!(r, vec![Value::I32(42)], "the guest minted + adopted a pipe");
-    // The refusal reports the FIRST non-durable slot: the personality's own HostProc handle sits
-    // below the pipe ends, so a personality domain was non-durable before pipes and stays so —
-    // the same clean refusal, no new failure mode.
+    // The personality's own HostProc handle is non-durable, so the domain refuses on it.
     let err = ih
         .capture_durable_handles()
-        .expect_err("a personality domain holding pipe ends must refuse durable capture");
-    assert_eq!(
-        err.kind,
-        temen_interp::NonDurableKind::HostProc,
-        "the personality slot refuses first (it precedes the pipe ends in the table)"
-    );
-    // And the pipe ends refuse in their own right: a bare host whose only non-durable slots are a
-    // minted pipe's two ends reports NonDurableKind::Pipe.
+        .expect_err("a personality domain must refuse durable capture");
+    assert_eq!(err.kind, temen_interp::NonDurableKind::HostProc);
+    // A minted pipe's ends are durable in their own right (#1680)...
     let mut bare = Host::new();
     let (_w, _r) = bare.grant_pipe();
-    let err = bare
+    let ends = bare
         .capture_durable_handles()
-        .expect_err("a live pipe end alone must refuse durable capture");
-    assert_eq!(
-        err.kind,
-        temen_interp::NonDurableKind::Pipe,
-        "the pipe end's own refusal kind"
-    );
+        .expect("a minted pipe's ends ride the cut");
+    assert!(ends
+        .iter()
+        .all(|h| matches!(h.binding, temen_interp::DurableBinding::PipeEnd { .. })));
+    // ...but a pipe the embedder feeds crosses the cut's boundary, which is not yet carried.
+    let mut fed = Host::new();
+    let (_r, _backing) = fed.grant_input_pipe();
+    let err = fed
+        .capture_durable_handles()
+        .expect_err("an embedder-fed pipe refuses");
+    assert_eq!(err.kind, temen_interp::NonDurableKind::Pipe);
 }
 
 const EXEC_C: &str = include_str!("../../temen-run/demos/posix_libc/exec.c");

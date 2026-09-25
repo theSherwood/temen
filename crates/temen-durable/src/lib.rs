@@ -144,10 +144,14 @@ pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// `[32, 64)` gap, so an unarmed run stays byte-identical. Must equal `temen-interp`'s copy.
 pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
 /// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
-/// the 8-byte shadow-SP word plus the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to
-/// keep frames 8-aligned. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
+/// the 8-byte shadow-SP word, the 4-byte thaw state word at [`STATE_IN_REGION_OFF`] and the 4-byte
+/// re-issue word at [`REISSUE_IN_REGION_OFF`]. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
 /// `temen-interp`/`temen-jit`'s copy.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
+/// #1672: byte offset of the per-context **re-issue** word within a context's region — set by the
+/// runtime when it abandons a host call that would have parked under a landing freeze, and moved into
+/// that call's shadow frame by its unwind, so the thaw re-issues the call instead of reloading a result.
+pub use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
 /// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
 pub use temen_ir::durable_abi::SHADOW_SP_OFF;
 /// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
@@ -673,8 +677,13 @@ pub fn unit_suspends_untainted(
 
 /// The single may-suspend operation in an instrumented block.
 enum SuspendKind {
-    /// `call.cap`: the host performs the op; the deepest frame reloads its result.
-    Leaf,
+    /// A host call (`call.cap` / `call.import` / `call.import.dyn` / `call.sym`); `op` is the original
+    /// instruction. It is the deepest frame, and its thaw arm does one of two things. A call the host
+    /// **performed** before the cut reloads its result. A call the runtime **abandoned** without effect
+    /// (it would have parked while a freeze was landing, #1672) is **re-issued** with its reloaded
+    /// operands. The runtime marks an abandoned call by setting the context's re-issue word
+    /// ([`REISSUE_IN_REGION_OFF`]); the unwind spills that word into the frame and clears it.
+    Leaf { op: Inst },
     /// `Call` to a may-suspend callee: re-issued on thaw so the callee rewinds in turn.
     Propagated { callee: FuncIdx, args: Vec<ValIdx> },
     /// `call.dyn` to a (by-signature, conservatively) may-suspend target (R8): the indirect
@@ -757,7 +766,10 @@ impl SuspendKind {
     /// operands; `Leaf`/`LoopHeader` have none (they only reload their own result / block params).
     fn operands(&self) -> Vec<ValIdx> {
         match self {
-            SuspendKind::Leaf | SuspendKind::LoopHeader => Vec::new(),
+            SuspendKind::Leaf { op } => {
+                inst_operands(op).expect("a host call's operands are modeled")
+            }
+            SuspendKind::LoopHeader => Vec::new(),
             SuspendKind::Propagated { args, .. } => args.clone(),
             SuspendKind::PropagatedIndirect { idx, args, .. } => {
                 let mut v = Vec::with_capacity(args.len() + 1);
@@ -791,7 +803,7 @@ impl SuspendKind {
     fn flips_thaw_word(&self) -> bool {
         matches!(
             self,
-            SuspendKind::Leaf
+            SuspendKind::Leaf { .. }
                 | SuspendKind::LoopHeader
                 | SuspendKind::Yield { .. }
                 | SuspendKind::ThreadJoin { .. }
@@ -812,7 +824,8 @@ struct PointPlan {
     frame_offsets: Vec<u64>,  // window offset of each spilled value (parallel to `spilled`)
     frame_size: u64,
     rid_off: u64,
-    cont_seg: u32, // new block index of the continuation segment (after the op)
+    flag_off: Option<u64>, // a host call's spilled re-issue word (`Leaf` only)
+    cont_seg: u32,         // new block index of the continuation segment (after the op)
 }
 
 /// Per-original-block analysis: value types, the value count after each instruction, and
@@ -1033,6 +1046,7 @@ fn transform_func(
                 frame_offsets,
                 rid_off: frame_size - 4,
                 frame_size,
+                flag_off: None,
                 cont_seg: seg(b, 0), // re-enter the header body, past the poll
             });
             let mut psb = Bb::new(slot_types);
@@ -1094,10 +1108,10 @@ fn transform_func(
                     // effect happened before the freeze, so the thaw reloads its result. (A
                     // durable domain never resolves an import to a serve op — `Host::import_binding`
                     // fails those closed — so the `SvcServe` re-issue case cannot hide behind one.)
-                    Inst::CapCall { .. }
+                    op @ (Inst::CapCall { .. }
                     | Inst::CallImport { .. }
                     | Inst::CallImportDyn { .. }
-                    | Inst::CallSym { .. } => SuspendKind::Leaf,
+                    | Inst::CallSym { .. }) => SuspendKind::Leaf { op: op.clone() },
                     Inst::Call { func, args } => SuspendKind::Propagated {
                         callee: *func,
                         args: args.clone(),
@@ -1129,7 +1143,7 @@ fn transform_func(
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
                     (
-                        SuspendKind::Leaf,
+                        SuspendKind::Leaf { .. },
                         Inst::CapCall { sig, .. }
                         | Inst::CallImport { sig, .. }
                         | Inst::CallImportDyn { sig, .. }
@@ -1156,7 +1170,7 @@ fn transform_func(
                 let save_end = match kind {
                     // A wait's status is spilled too (#1769): one the wait completed with before the
                     // cut is delivered on thaw; only the freeze's own `WAIT_FROZEN` re-issues it.
-                    SuspendKind::Leaf | SuspendKind::MemoryWait { .. } => out,
+                    SuspendKind::Leaf { .. } | SuspendKind::MemoryWait { .. } => out,
                     // The op's results are recomputed (re-issue) or redelivered (resume), so
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
@@ -1202,7 +1216,7 @@ fn transform_func(
                 }
                 // A leaf's own results are always in its frame, even ones the continuation never
                 // reads: they are the reply slot a host injects into before a thaw (#1768).
-                if matches!(kind, SuspendKind::Leaf) {
+                if matches!(kind, SuspendKind::Leaf { .. }) {
                     used[out - nres..out].iter_mut().for_each(|u| *u = true);
                 }
                 // A wait's thaw arm reads its own status to decide re-issue vs. deliver (#1769).
@@ -1218,7 +1232,8 @@ fn transform_func(
                 // leaf's results come first, at the frame base, in declaration order — the reply
                 // slot (`ShadowArena::leaf_reply`); the rest of its live set follows. `spilled`
                 // itself stays in value order (the reload order), so each value keeps its own offset.
-                let is_reply = |i: usize| matches!(kind, SuspendKind::Leaf) && i >= out - nres;
+                let is_reply =
+                    |i: usize| matches!(kind, SuspendKind::Leaf { .. }) && i >= out - nres;
                 let mut frame_offsets = vec![0u64; spilled.len()];
                 let mut off = 0u64;
                 let replies_first = (0..spilled.len())
@@ -1230,8 +1245,15 @@ fn transform_func(
                     frame_offsets[j] = off;
                     off += vsize(slot_types[i]);
                 }
+                // A host call's frame also carries the re-issue word it saw (#1672), below the id.
+                let flag_off = matches!(kind, SuspendKind::Leaf { .. }).then(|| {
+                    off = align_up(off, 4);
+                    off += 4;
+                    off - 4
+                });
                 let frame_size = align_up(off + 4, 16);
                 points.push(PointPlan {
+                    flag_off,
                     kind,
                     nres,
                     out,
@@ -1311,6 +1333,14 @@ fn transform_func(
         for (j, &i) in pt.spilled.iter().enumerate() {
             ub.zero(spill(pt.slot_types[i], sp, i as u32, pt.frame_offsets[j]));
         }
+        // A host call moves the context's re-issue word into its frame and clears it, so the word
+        // is set only between the abandoning runtime and this spill.
+        if let Some(flag_off) = pt.flag_off {
+            let flag = ub.one(load(LoadOp::I32, sp_a, REISSUE_IN_REGION_OFF));
+            ub.zero(store(StoreOp::I32, sp, flag, flag_off));
+            let zero = ub.one(Inst::ConstI32(0));
+            ub.zero(store(StoreOp::I32, sp_a, zero, REISSUE_IN_REGION_OFF));
+        }
         let rid = ub.one(Inst::ConstI32(gid as i32 + 1));
         ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
         let fsz = ub.one(Inst::ConstI64(pt.frame_size as i64));
@@ -1331,6 +1361,7 @@ fn transform_func(
             .enumerate()
             .map(|(j, &i)| ab.one(reload(pt.slot_types[i], base, pt.frame_offsets[j])))
             .collect();
+        let flag = pt.flag_off.map(|o| ab.one(load(LoadOp::I32, base, o)));
         ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
 
         // Flip the shadow thaw-state word back to `NORMAL` for the globally-deepest frozen frame
@@ -1348,7 +1379,7 @@ fn transform_func(
             // A leaf call.cap and a loop-header poll are both the globally-deepest frozen frame with
             // no op to re-issue: the leaf then reloads its call.cap result; the header reloads its
             // block params and re-enters the body (`cont_seg`). Neither produces an `op_results` value.
-            SuspendKind::Leaf | SuspendKind::LoopHeader => vec![],
+            SuspendKind::Leaf { .. } | SuspendKind::LoopHeader => vec![],
             SuspendKind::Propagated { callee, args } => {
                 let mapped: Vec<ValIdx> = args
                     .iter()
@@ -1472,49 +1503,52 @@ fn transform_func(
             })
             .collect();
         let term = match &pt.kind {
+            // A wait that completed before the cut (woken, not-equal, timed out) delivers its status
+            // as it was; one the freeze ended (`WAIT_FROZEN`) is re-issued and re-checks the restored
+            // value (#1769).
             SuspendKind::MemoryWait {
                 ty,
                 addr,
                 expected,
                 timeout,
             } => {
-                let ops = [*addr, *expected, *timeout].map(|v| {
-                    reloaded[spill_slot(v as usize).expect("atomic.wait operand spilled")]
-                });
                 let status = cont_args[pt.out - 1];
                 let frozen = ab.one(Inst::ConstI32(WAIT_FROZEN));
-                let reissue = ab.one(icmp(IntTy::I32, CmpOp::Eq, status, frozen));
-                // The re-issue block: the continuation's args but the status, then the operands.
-                let kept = pt.out - 1;
-                let mut params = pt.slot_types[..kept].to_vec();
-                params.extend([*addr, *expected, *timeout].map(|v| pt.slot_types[v as usize]));
-                let mut rb = Bb::new(params);
-                let n = kept as u32;
-                let r = rb.many(
-                    Inst::MemoryWait {
-                        ty: *ty,
-                        addr: n,
-                        expected: n + 1,
-                        timeout: n + 2,
+                let cond = ab.one(icmp(IntTy::I32, CmpOp::Eq, status, frozen));
+                let ty = *ty;
+                reissue_branch(
+                    &mut extra_blocks,
+                    trap_blk + 1,
+                    pt,
+                    cont_args,
+                    cond,
+                    &[*addr, *expected, *timeout],
+                    &reloaded,
+                    |p| Inst::MemoryWait {
+                        ty,
+                        addr: p[0],
+                        expected: p[1],
+                        timeout: p[2],
                     },
-                    pt.nres,
-                );
-                let mut args: Vec<ValIdx> = (0..n).collect();
-                args.extend(r);
-                let blk = trap_blk + 1 + extra_blocks.len() as u32;
-                extra_blocks.push(rb.finish(Terminator::Br {
-                    target: pt.cont_seg,
-                    args,
-                }));
-                let mut then_args = cont_args[..kept].to_vec();
-                then_args.extend(ops);
-                Terminator::BrIf {
-                    cond: reissue,
-                    then_blk: blk,
-                    then_args,
-                    else_blk: pt.cont_seg,
-                    else_args: cont_args,
-                }
+                )
+            }
+            // A host call the runtime abandoned (its spilled re-issue word is set) is re-issued; one
+            // it performed reloads its result (#1672).
+            SuspendKind::Leaf { op } => {
+                let flag = flag.expect("a host call's frame carries its re-issue word");
+                let zero = ab.one(Inst::ConstI32(0));
+                let cond = ab.one(icmp(IntTy::I32, CmpOp::Ne, flag, zero));
+                let operands = inst_operands(op).expect("a host call's operands are modeled");
+                reissue_branch(
+                    &mut extra_blocks,
+                    trap_blk + 1,
+                    pt,
+                    cont_args,
+                    cond,
+                    &operands,
+                    &reloaded,
+                    |p| with_operands(op, p),
+                )
             }
             _ => Terminator::Br {
                 target: pt.cont_seg,
@@ -1739,6 +1773,88 @@ fn icmp(ty: IntTy, op: CmpOp, a: ValIdx, b: ValIdx) -> Inst {
     Inst::IntCmp { ty, op, a, b }
 }
 
+/// An arm's terminator for a point that either delivers its reloaded result or **re-issues** its op:
+/// `cond` selects a re-issue block, appended to `extra_blocks` (numbered from `first_extra`). That
+/// block takes the continuation's args minus the op's results, then the op's reloaded `operands`;
+/// `make` builds the op over those operand params, and its results complete the continuation's args.
+#[allow(clippy::too_many_arguments)]
+fn reissue_branch(
+    extra_blocks: &mut Vec<Block>,
+    first_extra: u32,
+    pt: &PointPlan,
+    cont_args: Vec<ValIdx>,
+    cond: ValIdx,
+    operands: &[ValIdx],
+    reloaded: &[ValIdx],
+    make: impl FnOnce(&[ValIdx]) -> Inst,
+) -> Terminator {
+    let slot = |v: ValIdx| {
+        pt.spilled
+            .binary_search(&(v as usize))
+            .expect("a re-issued op's operand is spilled")
+    };
+    let kept = pt.out - pt.nres;
+    let mut params = pt.slot_types[..kept].to_vec();
+    params.extend(operands.iter().map(|&v| pt.slot_types[v as usize]));
+    let mut rb = Bb::new(params);
+    let n = kept as u32;
+    let op_params: Vec<ValIdx> = (n..n + operands.len() as u32).collect();
+    let r = rb.many(make(&op_params), pt.nres);
+    let mut args: Vec<ValIdx> = (0..n).collect();
+    args.extend(r);
+    let blk = first_extra + extra_blocks.len() as u32;
+    extra_blocks.push(rb.finish(Terminator::Br {
+        target: pt.cont_seg,
+        args,
+    }));
+    let mut then_args = cont_args[..kept].to_vec();
+    then_args.extend(operands.iter().map(|&v| reloaded[slot(v)]));
+    Terminator::BrIf {
+        cond,
+        then_blk: blk,
+        then_args,
+        else_blk: pt.cont_seg,
+        else_args: cont_args,
+    }
+}
+
+/// A host call `op` rebuilt over new operands, in [`inst_operands`] order (handle first, then args).
+fn with_operands(op: &Inst, ops: &[ValIdx]) -> Inst {
+    match op {
+        Inst::CapCall {
+            type_id, op, sig, ..
+        } => Inst::CapCall {
+            type_id: *type_id,
+            op: *op,
+            sig: *sig,
+            handle: ops[0],
+            args: ops[1..].to_vec(),
+        },
+        Inst::CallImportDyn { ty, op, sig, .. } => Inst::CallImportDyn {
+            ty: *ty,
+            op: *op,
+            sig: *sig,
+            handle: ops[0],
+            args: ops[1..].to_vec(),
+        },
+        Inst::CallSym { import, sig, .. } => Inst::CallSym {
+            import: *import,
+            sig: *sig,
+            handle: ops[0],
+            args: ops[1..].to_vec(),
+        },
+        Inst::CallImport {
+            import, op, sig, ..
+        } => Inst::CallImport {
+            import: *import,
+            op: *op,
+            sig: *sig,
+            args: ops.to_vec(),
+        },
+        _ => unreachable!("a leaf is a host call"),
+    }
+}
+
 fn zero_const(t: ValType) -> Inst {
     match t {
         ValType::I32 => Inst::ConstI32(0),
@@ -1959,14 +2075,14 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            8,
-            "one point: 4n+4 blocks with n=1"
+            9,
+            "one host-call point: 4n+4 blocks + its re-issue block"
         );
     }
 
     #[test]
     fn two_cap_calls_become_two_resume_points() {
-        // Two suspend points in one block ⇒ two br_table arms ⇒ 3·2 + 4 = 10 blocks.
+        // Two host-call points: 4·2 + 4 blocks, plus one re-issue block each.
         let m = parse_with_mem(
             "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
             18,
@@ -1975,8 +2091,8 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            12,
-            "two-point layout: 4n+4 with n=2"
+            14,
+            "two-point layout: 4n+4 with n=2, plus two re-issue blocks"
         );
     }
 
@@ -1999,8 +2115,8 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            8,
-            "one point: 4n+4 blocks with n=1"
+            9,
+            "one host-call point: 4n+4 blocks + its re-issue block"
         );
     }
 
@@ -2052,8 +2168,8 @@ mod tests {
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
-            8,
-            "one point: 4n+4 blocks with n=1"
+            9,
+            "one host-call point: 4n+4 blocks + its re-issue block"
         );
     }
 
@@ -2072,7 +2188,7 @@ mod tests {
             8,
             "caller (propagated) instrumented"
         );
-        assert_eq!(out.funcs[1].blocks.len(), 8, "callee (leaf) instrumented");
+        assert_eq!(out.funcs[1].blocks.len(), 9, "callee (leaf) instrumented");
     }
 
     #[test]
@@ -2087,7 +2203,7 @@ mod tests {
         let helper_before = m.funcs[1].clone();
         let out = transform_module(&m).expect("transform");
         temen_verify::verify_module(&out).expect("verify");
-        assert_eq!(out.funcs[0].blocks.len(), 8, "leaf instrumented");
+        assert_eq!(out.funcs[0].blocks.len(), 9, "leaf instrumented");
         assert_eq!(
             out.funcs[1], helper_before,
             "non-suspending helper untouched"

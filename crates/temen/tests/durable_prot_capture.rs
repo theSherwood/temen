@@ -427,3 +427,55 @@ fn jit_capture_overlays_runtime_protect_over_the_default() {
         "untouched pages stay Rw"
     );
 }
+
+/// #1700: a page grown past the 256 KiB escape-oracle span still rides the capture. The capture ran
+/// to `max(mapped, 256 KiB)`, so a guest that `vm_map`ped at 512 KiB lost the page (bytes and
+/// protection) and a freeze of it silently dropped live memory.
+#[test]
+fn a_page_grown_past_the_oracle_span_is_captured() {
+    const RESERVED_LOG2: u8 = 20; // 1 MiB reservation
+    const GROWN: usize = 512 << 10; // the grown page, past 256 KiB
+    const MARK_OFF: usize = GROWN + 7;
+    let src = format!(
+        "memory 17 shadow 16448 65536
+func (i32) -> (i64) {{
+block 0 (v0: i32) {{
+  voff = i64.const {GROWN}
+  vlen = i64.const {PAGE}
+  vprot = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (voff, vlen, vprot)
+  vaddr = i64.const {MARK_OFF}
+  vmark = i64.const 424242
+  i64.store vaddr vmark
+  return vr
+  }}
+}}
+"
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    let mut host = Host::new();
+    let mem_h = host.grant_memory();
+    let mut fuel = 100_000u64;
+    let (r, window, caps) = run_capture_reserved_with_host_prots(
+        &m,
+        0,
+        &[Value::I32(mem_h)],
+        &mut fuel,
+        &vec![0u8; 1 << 17],
+        None,
+        RESERVED_LOG2,
+        &mut host,
+    );
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "the vm_map grow succeeds");
+    assert!(
+        window.len() >= GROWN + PAGE,
+        "the capture reaches the grown page: {} bytes",
+        window.len()
+    );
+    assert_eq!(&window[MARK_OFF..MARK_OFF + 8], &424242i64.to_le_bytes());
+    assert_eq!(
+        caps[GROWN / PAGE],
+        CapturedProt::Rw,
+        "grown page captured Rw"
+    );
+}
