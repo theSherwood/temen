@@ -7611,6 +7611,9 @@ fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option
     let mut registries: Vec<(TaskId, bool, Arc<FiberRegistry>)> = Vec::new();
     {
         let s = rs.lock();
+        if let Some(&twin) = s.forked_twins.keys().next() {
+            return declined(DeclineCause::ForkTwin, twin, None);
+        }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in std::iter::once(me).chain(others.iter()) {
             if seat.handler_parked {
@@ -8307,6 +8310,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     if let Err(t) = &outcome.result {
                         s.freeze_fault.get_or_insert(*t);
                     }
+                }
+                // #1688 — nothing records a fork twin, so a freeze that unwinds while one is
+                // unreaped would lose it: fail the freeze (the census declines it when it can).
+                if froze && !s.forked_twins.is_empty() {
+                    s.freeze_fault.get_or_insert(Trap::ThreadFault);
                 }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
                 if !froze {
@@ -19107,6 +19115,9 @@ pub enum DeclineCause {
     FiberParkedOnCall,
     /// A detached child's window has a §13 region mapped, so its image cannot be taken (#1679).
     SharedRegionWindow,
+    /// A fork twin has not been reaped: it runs in a window and powerbox of its own that no artifact
+    /// records yet, and its exit status would be lost to its parent's `wait` (#1688).
+    ForkTwin,
 }
 
 /// #1671 — a freeze the run **declined**. At the instant a freeze trigger fires, a census asks
