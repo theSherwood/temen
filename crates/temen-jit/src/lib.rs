@@ -508,6 +508,8 @@ pub struct FrozenVCpu {
     /// children, a child's task for a grandchild. Thaw rebuilds the per-parent join tables from this so
     /// a grandchild's reloaded handle resolves in its parent's table. Mirror of `temen_interp`'s field.
     pub parent_task: usize,
+    /// The child's handle in its spawner's join table (#1685) — the thaw re-attaches it there.
+    pub slot: usize,
     pub func: i32,
     pub args: Vec<i64>,
     pub shadow_sp: u64,

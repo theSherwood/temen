@@ -1720,6 +1720,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
         .map(|v| temen_jit::FrozenVCpu {
             task: v.task,
             parent_task: v.parent_task,
+            slot: v.slot,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
@@ -1952,6 +1953,7 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
                 .map(|v| temen_interp::FrozenVCpu {
                     task: v.task,
                     parent_task: v.parent_task,
+                    slot: v.slot,
                     func: v.func,
                     args: v.args,
                     shadow_sp: v.shadow_sp,

@@ -347,6 +347,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
         .map(|v| JitVCpu {
             task: v.task,
             parent_task: v.parent_task,
+            slot: v.slot,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
@@ -948,6 +949,7 @@ fn jit_and_interp_freeze_a_futex_parked_child_identically() {
         .map(|v| JitVCpu {
             task: v.task,
             parent_task: v.parent_task,
+            slot: v.slot,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,

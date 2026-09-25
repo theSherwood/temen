@@ -1632,9 +1632,10 @@ some vCPU contexts have been **freed and reused** (`free_vcpu_context` on a genu
 *sparse/gappy* set, since recycled siblings' contexts are free — and those regions are the only non-zero
 shadow regions, so the **window image** is sparse (zero-page elision skips the recycled regions). *Payoff:*
 artifacts proportional to *peak-concurrent* live state, not lifetime spawns. *(Refined during impl:* the
-*record count* is **not** smaller than lifetime spawns — a finished child still rides as a `completed_result`
-record so the thaw's per-parent join table stays dense, follow-up **A**. The recycling shows in the
-**reused contexts** + the **elided regions**, not a shorter residue vector.)*
+*record count* was at first **not** smaller than lifetime spawns — every finished child rode as a
+`completed_result` record so the thaw's per-parent join table stayed dense, follow-up **A**. Since #1685
+each record carries its join slot and only an **unjoined** finished child rides, so the residue is
+proportional to live and unjoined children too.)*
 
 *Already built — no `FORMAT_VERSION` bump.* The residue *shape* is unchanged; the gap-tolerant thaw derives
 each child's context from its restored shadow-SP (`shadow_context_of_sp`), so it re-attaches any sparse/gappy
@@ -2054,8 +2055,11 @@ doesn't capture, so the root's later (post-freeze) `thread.join` couldn't resolv
 `run_child` records every completed concurrent child; on a freeze the coordinator turns them into
 `completed_result` `FrozenVCpu` residue (`FORMAT_VERSION` 5→6), and the thaw delivers each result into
 the spawner's join table **without re-running** the child (its effects are already in the snapshot).
-Emitting *all* completed children keeps the per-parent table dense so every handle still resolves.
-Pinned by `concurrent_join_result_survives_a_freeze_before_the_join`.
+Each record carries its join slot (#1685, `FORMAT_VERSION` 33), so only children still **unjoined** ride,
+and the thaw seeds each handle at its slot rather than by push. The single-worker paths (the interpreter,
+the JIT's deferred children) record them too: a child that ran to a genuine finish under the freeze —
+its own region empty — is completed, not frozen, and is never re-run on thaw. Pinned by
+`concurrent_join_result_survives_a_freeze_before_the_join` and `temen/tests/durable_join_slots.rs`.
 
 *Follow-up B.1 — concurrent child owns fibers (LANDED).* `run_child` now arms the child's fiber runtime
 durable (`set_durable_env`) and, on a freeze-unwind, runs its own `freeze_drive` over its parked fibers
@@ -2093,10 +2097,13 @@ caught mid-flight; the grandchild drives the spawn-before-freeze handshake; the 
 
 **Freezing a vCPU blocked in `thread.join` — done.** `thread.join` is now a may-suspend re-issue
 safepoint: `compute_may_suspend` counts it (so a "spawn then join" root is instrumented), the transform
-classifies it as `SuspendKind::ThreadJoin` (its result is *re-issued* on thaw like `cont.resume`, since
-the joined child replays its own side effects on its rewind — §12.6), and the `thread_join` runtime thunk
+classifies it as `SuspendKind::ThreadJoin`, and the `thread_join` runtime thunk
 now returns on observing `UNWINDING` so a vCPU **parked in the join** unwinds at the trailing safepoint
-rather than blocking the stop-the-world freeze. On thaw the join is re-issued; because the join has no
+rather than blocking the stop-the-world freeze. Like a host call (#1672) the join's frame carries the
+re-issue word (#1685): a join the freeze ended — the thunk returned without a result, or took the
+placeholder of a child that itself unwound — is re-issued on thaw against the re-spawned child, which
+replays its own side effects on its rewind (§12.6); a join that took a child's **real** result reloads it,
+since that child is not re-run. On a re-issue, because the join has no
 in-thread callee to flip the state word (the child rewinds as a *separate* vCPU and the thaw driver
 resets the word to `REWINDING` afterward), the join is the globally-deepest frozen frame on its own
 thread, so — like a leaf — it flips the state to `NORMAL` itself before re-issuing. Pinned by
