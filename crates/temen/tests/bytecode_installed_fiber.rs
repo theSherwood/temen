@@ -131,5 +131,9 @@ fn installed_unit_fiber_entry_agrees_across_engines() {
         }
         other => panic!("Cranelift JIT diverged: {other:?}"),
     }
-    assert_eq!(jmem, imem, "Cranelift final memory must be byte-identical");
+    assert_eq!(
+        jmem.bytes(),
+        imem,
+        "Cranelift final memory must be byte-identical"
+    );
 }

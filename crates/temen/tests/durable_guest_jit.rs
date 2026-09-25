@@ -476,7 +476,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
     };
 
     // Freeze + restore.
-    let artifact = freeze(&m, &snap, &hd).expect("freeze");
+    let artifact = freeze(&m, snap.bytes(), &hd).expect("freeze");
     let mut th = Host::new();
     let window = restore(&artifact, &m, &mut th).expect("restore");
     assert_eq!(

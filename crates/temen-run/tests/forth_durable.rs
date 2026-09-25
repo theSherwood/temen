@@ -186,7 +186,7 @@ fn run_on(engine: Engine, inst: &temen_ir::Module, window: &[u8], host: &mut Hos
                 temen_run::jit_cap_run(inst, 0, &[], window, SIZE_LOG2, JIT_TABLE_LOG2, host)
                     .expect("the kernel compiles and runs on the JIT");
             assert!(matches!(out, JitOutcome::Returned(_)), "JIT run: {out:?}");
-            snap
+            snap.bytes().to_vec()
         }
     }
 }

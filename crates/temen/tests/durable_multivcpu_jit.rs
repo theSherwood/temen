@@ -1204,7 +1204,7 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
     h.clock_ns = 42;
     let clk = h.grant_clock();
     let jsnap = match temen_run::jit_cap_run(&inst, 0, &[clk as i64], &fwin, SIZE_LOG2, 0, &mut h) {
-        Ok((_, snap)) => snap,
+        Ok((_, snap)) => snap.bytes().to_vec(),
         Err(JitError::Unsupported(_)) => return, // a target without the threads runtime
         Err(e) => panic!("JIT freeze failed: {e:?}"),
     };
@@ -1290,7 +1290,11 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
         0,
         &mut h,
     );
-    assert!(matches!(r, Err(JitError::Unsupported(_))), "refused: {r:?}");
+    assert!(
+        matches!(r, Err(JitError::Unsupported(_))),
+        "refused: {:?}",
+        r.as_ref().map(|(o, _)| o)
+    );
     assert_eq!(
         h.frozen_detached(),
         &[detached],

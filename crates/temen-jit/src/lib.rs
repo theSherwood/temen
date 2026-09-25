@@ -811,6 +811,11 @@ pub type GrantChildReleaser = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 ///
 /// # Safety
 /// `ctx` is the run's parent-`Host` pointer (the cap thunk's ctx); `out`/`trap_out` writable.
+/// #1810 — the embedder's report of how far a guest grew its window at `base` through the Memory
+/// capability: one past its highest page (`0` for none). The host keeps that page map; the JIT does
+/// not. `ctx` is the pointer the hook was installed with ([`CompiledModule::set_high_water`]).
+pub type HighWater = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, base: usize) -> u64;
+
 pub type BudgetTaker = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     handle: i32,
@@ -2561,6 +2566,8 @@ pub struct CompiledModule {
     /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
     /// can write `UNWINDING` into the running window. `None` for every non-interruptible run.
     freeze_ctl: Option<Arc<FreezeController>>,
+    /// #1810 — a durable run's capture reaches the guest's high-water (see [`HighWater`]).
+    high_water: Option<(HighWater, *mut core::ffi::c_void)>,
     // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
     // --- exactly as long as the code can run, i.e. as long as `module`.
     #[cfg(fiber_rt)]
@@ -3636,6 +3643,7 @@ impl CompiledModule {
             detached_seed: Vec::new(),
             thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
+            high_water: None,
             #[cfg(fiber_rt)]
             fiber_rt,
             #[cfg(fiber_rt)]
@@ -3822,6 +3830,13 @@ impl CompiledModule {
     /// `None` (or never calling this) leaves budget-funded records the probeable `-EINVAL` of
     /// §3c (the interpreter-first gap). Separate from [`Self::set_grant_child_hooks`] so the
     /// many existing hook constructors stay source-compatible.
+    /// #1810 — extend a snapshotting run's capture through the guest's high-water, as `hook`
+    /// reports it for the live window. For a **durable** run, whose capture is its freeze image;
+    /// other captures keep their fixed span (a grown heap is not worth copying for them).
+    pub fn set_high_water(&mut self, hook: Option<(HighWater, *mut core::ffi::c_void)>) {
+        self.high_water = hook;
+    }
+
     pub fn set_budget_taker(&self, taker: Option<BudgetTaker>) {
         #[cfg(fiber_rt)]
         if let Some(n) = &self._nursery {
@@ -4420,8 +4435,13 @@ impl CompiledModule {
         // `snapshot_cap` (the `_with_host` capture) widens the snapshot past the backed prefix to also
         // cover reserved-tail pages the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the
         // read sees zero/their content instead of faulting. `read_low` clamps to the reservation.
+        // #1810: a durable run's capture also reaches the guest's high-water, while the window lives.
+        let high = match (*this).high_water {
+            Some((f, ctx)) => f(ctx, mem_base as usize) as usize,
+            None => 0,
+        };
         let snap = match snapshot_cap {
-            Some(cap) if win_size > 0 => cap.min((mask + 1) as usize).max(win_size),
+            Some(cap) if win_size > 0 => cap.max(high).min((mask + 1) as usize).max(win_size),
             _ => win_size,
         };
         let final_mem = if snap > win_size {
@@ -5899,6 +5919,7 @@ fn compile_child_windowed(
         thaw_root_sp: shadow.frame_base(0),
         shadow,
         freeze_ctl: None,
+        high_water: None,
         fiber_rt: None,
         domain: None,
         _nursery: None,

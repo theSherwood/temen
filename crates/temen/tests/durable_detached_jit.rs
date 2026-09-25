@@ -116,7 +116,11 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     write_state(&mut win, STATE_UNWINDING);
     let (_, fsnap) = temen_run::jit_cap_run(&parent, 0, &fargs, &win, PARENT_LOG2, 0, &mut fhost)
         .expect("JIT freeze");
-    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "the parent froze");
+    assert_eq!(
+        read_state(fsnap.bytes()),
+        STATE_UNWINDING,
+        "the parent froze"
+    );
     assert!(
         fhost.unreached_detached().is_empty(),
         "the child reached its poll"
@@ -134,7 +138,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     );
 
     // Through the codec, into a fresh host that re-grants the child's program (D-scope).
-    let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
+    let art = temen_snapshot::freeze(&parent, fsnap.bytes(), &fhost).expect("serialize");
     let restore = || {
         let mut h = Host::new();
         h.set_durable(true);
@@ -154,7 +158,8 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     let refused = temen_run::jit_cap_run(&parent, 0, &fargs, &twin, PARENT_LOG2, 0, &mut bare);
     assert!(
         matches!(refused, Err(JitError::Unsupported(_))),
-        "an ungranted child program refuses the thaw: {refused:?}"
+        "an ungranted child program refuses the thaw: {:?}",
+        refused.as_ref().map(|(o, _)| o)
     );
     assert_eq!(bare.thawed_detached().len(), 1, "and keeps the residue");
     granted.set_thawed_detached(bare.take_thawed_detached());
@@ -169,7 +174,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         vec![4950],
         "JIT thaw: the re-launched child finished its loop"
     );
-    assert_eq!(read_state(&tsnap), STATE_NORMAL, "back to NORMAL");
+    assert_eq!(read_state(tsnap.bytes()), STATE_NORMAL, "back to NORMAL");
 
     // The same artifact thaws on the interpreter — one form for both engines.
     let (mut ihost, iwin) = restore();

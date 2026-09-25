@@ -85,8 +85,8 @@ fn diff(guest_src: &str, init: &[u8], user_args: &[i64], table_log2: u8) -> (Jit
         | (Err(Trap::IndirectCallType), JitOutcome::Trapped(TrapKind::IndirectCallType)) => {}
         other => panic!("backends disagree: {other:?}"),
     }
-    assert_eq!(imem, jmem, "final memory must be byte-identical");
-    (jout, jmem)
+    assert_eq!(imem, jmem.bytes(), "final memory must be byte-identical");
+    (jout, jmem.bytes().to_vec())
 }
 
 // Window layout shared by the guests below (all above the #1094 NULL guard at 16384).

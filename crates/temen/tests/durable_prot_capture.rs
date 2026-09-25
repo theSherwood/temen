@@ -512,8 +512,9 @@ block 0 (v0: i32) {
 ";
 const PAGE_OPS_RESERVED_LOG2: u8 = 20; // 1 MiB
 
-/// #1810: the JIT's durable capture is the interpreter's, byte for byte, through the high-water.
-/// It stopped at 256 KiB, so the page at 512 KiB never reached a JIT freeze.
+/// #1810: the JIT's durable capture is the interpreter's — bytes through the high-water, and the page
+/// map. It stopped at 256 KiB, so the page at 512 KiB never reached a JIT freeze; and it was bytes
+/// alone, so a JIT freeze recorded every page `Rw`, losing the guest's `protect` and `unmap`.
 #[test]
 fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     if !temen_jit::fiber_supported() {
@@ -526,7 +527,7 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     let mut hi = Host::new();
     let ih = hi.grant_memory();
     let mut fuel = 1_000_000u64;
-    let (ir, ibytes, _) = run_capture_reserved_with_host_prots(
+    let (ir, ibytes, iprots) = run_capture_reserved_with_host_prots(
         &m,
         0,
         &[Value::I32(ih)],
@@ -541,7 +542,7 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     let mut hj = Host::new();
     hj.set_durable(true);
     let jh = hj.grant_memory();
-    let (jo, jbytes) = temen_run::jit_cap_run(
+    let (jo, jlayout) = temen_run::jit_cap_run(
         &m,
         0,
         &[jh as i64],
@@ -552,6 +553,23 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     )
     .expect("jit");
     assert_eq!(jo, temen_jit::JitOutcome::Returned(vec![0]));
-    assert_eq!(jbytes.len(), ibytes.len(), "capture extent");
-    assert!(jbytes == ibytes, "capture bytes");
+    assert_eq!(jlayout.bytes().len(), ibytes.len(), "capture extent");
+    assert!(jlayout.bytes() == ibytes, "capture bytes");
+    assert_eq!(jlayout.dense_prots(), iprots, "page map");
+    // The cases the page map must carry, spelled out.
+    for (off, want) in [
+        (81920, CapturedProt::Ro),        // the readonly segment
+        (196608, CapturedProt::Ro),       // `protect`ed read-only
+        (229376, CapturedProt::Unmapped), // `unmap`ped
+        (524288, CapturedProt::Rw),       // grown past 256 KiB
+    ] {
+        assert_eq!(iprots[off / PAGE], want, "interp page at {off}");
+    }
+
+    // Through the codec and back: the JIT's artifact keeps what the interpreter's does.
+    let art = temen_snapshot::freeze_layout(&m, &jlayout, PAGE_OPS_RESERVED_LOG2, &Host::new())
+        .expect("freeze");
+    let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut Host::new()).expect("restore");
+    assert!(rwin == ibytes, "restored bytes");
+    assert_eq!(rprots, to_codec_prots(&iprots), "restored page map");
 }

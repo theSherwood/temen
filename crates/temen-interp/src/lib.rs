@@ -22880,6 +22880,27 @@ impl Host {
         }
     }
 
+    /// Forget the JIT window page map (see [`Host::cap_window_pages`]): a new run is about to build a
+    /// fresh window, which may land at the old one's address, so the old map must not carry over.
+    pub fn forget_cap_pages(&mut self) {
+        self.cap_pages = None;
+    }
+
+    /// #1810 — how far the guest grew JIT window `base` through the Memory capability: one past the
+    /// highest page in its `cap_pages` (whatever that page's state, as the interpreter's own map
+    /// counts it), or `0` when it grew none.
+    pub fn cap_high_water(&self, base: usize) -> u64 {
+        match &self.cap_pages {
+            Some((b, m)) if *b == base => m
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .next_back()
+                .map_or(0, |&p| (p + 1) * host_page_size()),
+            _ => 0,
+        }
+    }
+
     /// Capture the window's per-page protections for a durable freeze of a **JIT** run
     /// (DURABILITY.md §12.3). The JIT keeps protections in the OS page tables, so — unlike the
     /// interpreter, where [`run_capture_reserved_with_host_prots`] reads its software map — a
