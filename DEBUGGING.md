@@ -519,6 +519,14 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines in **slice 17**; position-level breakpoints/step-into and
   window reads work today.
 
+  **One admission with production (#1855, #1414).** `dbg_instantiate` and `dbg_instantiate_module` were
+  hand copies of the production arms, and they drifted: they refused a §3d budget and every grant list
+  with `Trap::Malformed` (so every op-13 spawn trapped under the debugger, where the oracle runs it), and
+  they checked a nested holder's carve against the *root's* NULL guard. Both are gone. The debug
+  scheduler admits every confined child through `admit_confined_child`, the function the cooperative
+  executor and the OS-thread parallel driver call, and `dbg_start_child` only schedules it (as for op 15).
+  `confined_spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
+
   **§14 coroutine step-into on the multi-vCPU engine (slice 16).** Coroutine step-into (14b/14c) now
   reaches the scheduled engine: `coro_step_into` is on by default for every debug-engine `VTask`, and the
   coroutine-active task is **pinned** in the scheduler (`dbg_pinned_coro` in `drive`/`tick`) — a `resume`

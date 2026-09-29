@@ -407,9 +407,10 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                  seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)",
             ),
             conditional(
-                "instantiate/join/instantiate_module_named/instantiate_detached compile; the \
-                 coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches \
-                 the debug scheduler and is declined",
+                "instantiate/join/instantiate_module(_named)/instantiate_rec/instantiate_detached \
+                 run on the debug scheduler through the executor's admission (#1855); the \
+                 coroutine spawns fall back, and child_offer (op 14) reaches the debug scheduler \
+                 and is declined",
             )],
 
         // Declines on nesting (its index into `Host::budgets` is meaningless in another table — a child
