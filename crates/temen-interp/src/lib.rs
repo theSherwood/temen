@@ -30421,7 +30421,12 @@ impl Mem {
     /// statics land on) and every byte zeroed — C's `.bss` is a *no-segment zero guarantee*, and
     /// stale caller bytes must not leak into the new image. The exec admissibility gate already
     /// bounded the command's declared memory by this window, so `len` never exceeds `reserved()`.
-    /// Data segments materialize after this (Step::Exec), exactly like a fresh instantiation.
+    /// Data segments materialize after this (Step::Exec), exactly like a fresh instantiation — and,
+    /// like one, the image starts behind this window's NULL guard (#1094: every instantiation seeds
+    /// it, [`seed_null_guard`](Mem::seed_null_guard)): committing the image read-write must not
+    /// open `[0, guard)`, or a null dereference in an exec'd program reads zeros where the same
+    /// program loaded fresh faults — and where its emitted twin, whose guard compare is baked, faults
+    /// too (#1896).
     ///
     /// One carve-out: the **args region** `[null_guard + EXEC_ARGS_BASE, null_guard + EXEC_ARGS_END)`
     /// is *preserved*, not zeroed — the caller packed `{argc, envc}` + NUL-packed argv/envp strings
@@ -30440,6 +30445,9 @@ impl Mem {
                 } else {
                     space.prot.insert(p, PageProt::Rw); // explicit commit in the reserved tail
                 }
+            }
+            for p in 0..self.null_guard / self.page {
+                space.prot.insert(p, PageProt::Unmapped); // the guard `seed_null_guard` armed
             }
         }
         let base = self.window.base();

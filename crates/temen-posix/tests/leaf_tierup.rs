@@ -34,6 +34,19 @@ block 0 (vcap: i64) {\n\
   }\n\
 }\n";
 
+/// `/bin/leaf` that loads through a null pointer, then exits 7.
+const NULL_LEAF: &str = "memory 17\n\
+import 0 \"__px_exit\" (i64) -> ()\n\
+func (i64) -> (i64) {\n\
+block 0 (vcap: i64) {\n\
+  vnull = i64.const 8\n\
+  vx = i64.load vnull\n\
+  vseven = i64.const 7\n\
+  call.import 0 (vseven)\n\
+  unreachable\n\
+  }\n\
+}\n";
+
 /// Forks; the child execs `/bin/leaf` (exiting 9 if it could not), and the parent exits with the
 /// child's exit status. With `pipe`, it first makes a pipe, which the child inherits.
 fn guest(pipe: bool) -> String {
@@ -240,4 +253,24 @@ fn an_image_that_can_park_runs_interpreted() {
         leaves.offered.is_empty() && leaves.tierups.is_empty(),
         "an image that imports fork is not offered"
     );
+}
+
+/// An exec'd image starts behind the NULL guard, as a freshly loaded one does (#1094): a null
+/// dereference crashes the process, which its parent reaps as 128, where it once read zeros and
+/// exited 7. The emitted tier bakes the guard, so this is also what makes a leaf end the same way
+/// emitted as interpreted.
+#[test]
+fn an_execd_image_starts_behind_the_null_guard() {
+    let (interpreted, _) = run_tree(&guest(false), NULL_LEAF, false);
+    assert_eq!(
+        interpreted,
+        Ending {
+            root: Ok(128),
+            wrote: None,
+        },
+        "the child crashed on the null load"
+    );
+    let (emitted, leaves) = run_tree(&guest(false), NULL_LEAF, true);
+    assert_eq!(emitted, interpreted);
+    assert_eq!(leaves.tierups.len(), 1);
 }

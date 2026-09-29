@@ -9,7 +9,8 @@
 // of a program other than 0, unpaged, and the tree ends with exit 5 and the file written. A leaf that
 // makes a page read-only, then reads memory from emitted code, tiers up page-checked and ends the
 // same way. With a pipe made before the fork, the child holds pipe ends it could block on, so it runs
-// interpreted — no tier-up — and the tree ends the same way.
+// interpreted — no tier-up — and the tree ends the same way. A leaf that loads through a null
+// pointer crashes the same way on both tiers.
 //
 // Usage:  node browser-nim-leaf-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -36,26 +37,34 @@ const dec = new TextDecoder();
 
 // A leaf image. The entry is compute the emitter takes; the helper it calls makes the `__px_*`
 // calls, which the emitted entry bounces to the interpreter — the shape of a real nim module's
-// `_start`. With \`ro\`, a second helper first makes a page of the window read-only (\`vm_protect\`)
-// and returns where the status' source byte is, and the entry then reads it itself ('l' − 103 = 5),
-// an access the emitter cannot prove in bounds: the page state is past one bound mid-run, which only
-// a page-checked emit (#1896: the engine offers an image that can change its page state paged) runs
-// without a false fault.
-const leafImage = (ro) => `memory 17
+// `_start`. It writes `leaf` to `out.txt` and exits 5, but for its `kind`:
+// - `ro`: a second helper first makes a page of the window read-only (`vm_protect`) and returns
+//   where the status' source byte is, and the entry reads it itself ('l' − 103 = 5) — an access the
+//   emitter cannot prove in bounds, after the page state went past one bound: only a page-checked
+//   emit (#1896: the engine offers an image that can change its page state paged) runs it without a
+//   false fault;
+// - `null`: the entry first loads through a null pointer, which faults on both tiers — an exec'd
+//   image starts behind the NULL guard (#1094), as the emitted code's baked guard does — so the
+//   process crashes and its parent reaps 128.
+const leafImage = (kind) => `memory 17
 import 0 "__px_open" (i64, i64, i64) -> (i64)
 import 1 "__px_write" (i64, i64, i64) -> (i64)
 import 2 "__px_close" (i64) -> (i64)
 import 3 "__px_exit" (i64) -> ()
-${ro ? 'import 4 "vm_protect" (i64, i64, i64) -> (i64)\nimport 5 "vm_page_size" () -> (i64)\n' : ''}data 40000 "out.txt"
+${kind === 'ro' ? 'import 4 "vm_protect" (i64, i64, i64) -> (i64)\nimport 5 "vm_page_size" () -> (i64)\n' : ''}data 40000 "out.txt"
 data 40100 "leaf"
 func (i64) -> (i64) {
 block 0 (vcap: i64) {
-${ro ? `  vp = call 2 ()
+${{
+  ro: `  vp = call 2 ()
   vb = i32.load8_u vp
   vbl = i64.extend_i32_u vb
   vk = i64.const 103
   vfive = i64.sub vbl vk
-` : '  vfive = i64.const 5\n'}  vr = call 1 (vfive)
+`,
+  null: '  vnull = i64.const 8\n  vx = i64.load vnull\n  vfive = i64.const 5\n',
+  plain: '  vfive = i64.const 5\n',
+}[kind]}  vr = call 1 (vfive)
   return vr
   }
 }
@@ -73,7 +82,7 @@ block 0 (vstatus: i64) {
   unreachable
   }
 }
-${ro ? `func () -> (i64) {
+${kind === 'ro' ? `func () -> (i64) {
 block 0 () {
   vpg = call.import 5 ()
   vtwenty = i64.const 20
@@ -149,7 +158,7 @@ const blob = (entries) => {
 
 // Build the tree and drive it, counting the tier-ups of programs other than 0 (each TIERUP service
 // reads `temen_coop_module` once) and whether any event ran page-checked (`temen_coop_paged`).
-const run = async (pipe, ro) => {
+const run = async (pipe, kind) => {
   const leafTierups = [];
   let paged = false;
   const watch = {
@@ -164,7 +173,7 @@ const run = async (pipe, ro) => {
     }));
   const args = [
     put(parse(driver(pipe))),
-    put(blob([['/w/bin/leaf\n/bin/leaf', parse(leafImage(ro))]])),
+    put(blob([['/w/bin/leaf\n/bin/leaf', parse(leafImage(kind))]])),
     put(blob([])),
     put(enc.encode('bin/driver\0')),
     put(enc.encode('/w')),
@@ -178,23 +187,32 @@ const run = async (pipe, ro) => {
 };
 
 const fail = (msg) => { console.error(`FAIL: ${msg}`); process.exitCode = 1; };
-const ended = (name, r) => {
-  if (r.exit !== 5 || r.wrote !== 'leaf') fail(`${name} tree: exit ${r.exit}, wrote ${r.wrote}`);
+const ended = (name, r, exit, wrote) => {
+  if (r.exit !== exit || r.wrote !== wrote) {
+    fail(`${name} tree: exit ${r.exit}, wrote ${r.wrote} (want ${exit}, ${wrote})`);
+  }
 };
-const leaf = await run(false, false);
-ended('leaf', leaf);
+const leaf = await run(false, 'plain');
+ended('leaf', leaf, 5, 'leaf');
 if (leaf.leafTierups.length !== 1 || leaf.paged) {
   fail(`the leaf child tiers up once, unpaged: ${leaf.leafTierups}, paged ${leaf.paged}`);
 }
-const ro = await run(false, true);
-ended('read-only page', ro);
+const ro = await run(false, 'ro');
+ended('read-only page', ro, 5, 'leaf');
 if (ro.leafTierups.length !== 1 || !ro.paged) {
   fail(`the protecting leaf tiers up once, paged: ${ro.leafTierups}, paged ${ro.paged}`);
 }
-const piped = await run(true, false);
-ended('piped', piped);
+const piped = await run(true, 'plain');
+ended('piped', piped, 5, 'leaf');
 if (piped.leafTierups.length !== 0) fail(`a child holding a pipe runs interpreted: ${piped.leafTierups}`);
+const nul = await run(false, 'null');
+const nulPiped = await run(true, 'null');
+ended('null leaf, emitted', nul, 128, null);
+ended('null leaf, interpreted', nulPiped, 128, null);
+if (nul.leafTierups.length !== 1 || nulPiped.leafTierups.length !== 0) {
+  fail(`the null leaf tiers up only without the pipe: ${nul.leafTierups} / ${nulPiped.leafTierups}`);
+}
 if (process.exitCode) process.exit(process.exitCode);
 console.log(`ok — the leaf child ran on the emitted tier (program ${leaf.leafTierups[0]}); the one `
-  + 'that protects a page ran page-checked; the piped one interpreted; every tree exits 5 with the '
-  + 'file written');
+  + 'that protects a page ran page-checked; the piped one interpreted, each ending with exit 5 and '
+  + 'the file written; a null load crashed the child on both tiers alike');
