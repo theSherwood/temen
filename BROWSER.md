@@ -670,8 +670,8 @@ in session discussion; collected here so the next slice has a home to be picked 
   currently just asks for a reload. A cooperative cancel (a run-wide stop flag in shared memory the
   engine polls at its fuel/epoch check points, DESIGN.md §5) would let a stopped run leave the
   instance reusable.
-- [ ] **Run-wide fuel budget across Workers.** Fuel is per-vCPU today (`new_confined_child` takes a
-  quota; a §14 parent can cut a child's budget), but a run has no *aggregate* bound — 8 workers ×
+- [ ] **Run-wide fuel budget across Workers.** Fuel is per-vCPU today (a §14 spawn cuts the child's
+  fuel from its parent's, up to a quota), but a run has no *aggregate* bound — 8 workers ×
   per-vCPU fuel is 8× the intended ceiling. A shared fuel pool (an atomic in shared linear memory,
   debited in the engine's existing fuel decrements) would give the browser the §5 metering story the
   native drivers have.
@@ -1097,8 +1097,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    page-ops directly still falls to the interpreter), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
    through the *same* confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms
    — the grandchild spawns on its own Worker via the page relay; `env.join` `Atomics.wait`s its slot;
-   the carve checks (power-of-two, aligned, inside the child's own window) replicate the engine's, so a
-   violation traps exactly as the interpreter does. Wiring this surfaced two pre-existing depth-2 bugs,
+   the engine admits the grandchild against the child's own vCPU (`temen_par_inst_instantiate`, the
+   one admission; E2 of #1414 retired the JS copy of the carve checks), so a bad carve is `-EINVAL`
+   exactly as on the interpreter. Wiring this surfaced two pre-existing depth-2 bugs,
    both fixed: `event_instantiate` validated against `primary()` and stamped `module: 0` (an op-0
    instantiate from an `instantiate_module` child got `-EINVAL`; it now uses the calling frame's
    module), and the JS JOIN arms hung on a bad handle (`Atomics.wait` on address 0; they now deliver a

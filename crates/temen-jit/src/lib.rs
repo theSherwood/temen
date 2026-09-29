@@ -4250,6 +4250,13 @@ impl CompiledModule {
         let _ = hooks;
     }
 
+    /// Install the run's async freeze trigger (see [`FreezeController`]); `None` for none. What
+    /// [`DurableRun::freeze`] sets for [`compile_and_run_durable`], for an embedder that compiles and runs
+    /// the module itself.
+    pub fn set_freeze_controller(&mut self, fc: Option<Arc<FreezeController>>) {
+        self.freeze_ctl = fc;
+    }
+
     /// #1810 — extend a snapshotting run's capture through the guest's high-water, as `hook`
     /// reports it for the live window. For a **durable** run, whose capture is its freeze image;
     /// other captures keep their fixed span (a grown heap is not worth copying for them).

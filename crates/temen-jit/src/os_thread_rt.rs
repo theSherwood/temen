@@ -196,12 +196,13 @@ impl Done {
     }
 }
 
-/// #1685 — mark the running context's `thread.join` for re-issue on thaw: the freeze ended it, or it
-/// took the placeholder of a child that unwound. Its unwind spills the word into the join's frame.
+/// #1685 — mark the running context's `thread.join` (or `Instantiator.join`, #1904) for re-issue on
+/// thaw: the freeze ended it, or it took the placeholder of a child that unwound. Its unwind spills the
+/// word into the join's frame.
 ///
 /// # Safety
 /// `mem_base` is a durable run's committed window base.
-unsafe fn mark_join_reissue(mem_base: u64) {
+pub(crate) unsafe fn mark_join_reissue(mem_base: u64) {
     let word = crate::durable_shadow::get() + temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
     *((mem_base + word) as *mut i32) = 1;
 }

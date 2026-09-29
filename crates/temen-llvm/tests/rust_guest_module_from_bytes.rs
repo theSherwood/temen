@@ -1,7 +1,7 @@
-//! **#1025 — run-in-guest: a Rust guest mints a module from its own bytes, then op-13-spawns it.**
+//! **#1025 — run-in-guest: a Rust guest mints a module from its own bytes, then spawns it.**
 //!
 //! The endgame of moving the nim compiler driver *into* the sandbox is that the driver runs the program
-//! it produced. `rust_guest_op13` proved a Rust-on-Temen guest can op-13-spawn a child — but the child
+//! it produced. `rust_guest_op13` proved a Rust-on-Temen guest can spawn a child — but the child
 //! there is a module the **host** granted (`grant_module` + `__vm_cap_resolve("child")`). A driver that
 //! *linked* its program (slice 3c step 12, in-guest) holds it as **bytes in its own memory**, not a
 //! host grant. This proves the primitive that bridges the two: `__vm_module_from_bytes` (the
@@ -11,7 +11,7 @@
 //! It is `rust_guest_op13` with one line changed in spirit: instead of resolving a host-granted child
 //! module by name, the guest calls `from_bytes` over the child's encoded module (embedded in the guest's
 //! own data segment — where a linker's output would live) and spawns *that* handle. Same counter child,
-//! same op-13 grant list, same join, and — crucially — run on **both engines** (invariant 9/14: the
+//! same grant list and spawn (the shared `vm_spawn`), same join, and — crucially — run on **both engines** (invariant 9/14: the
 //! primitive lands identically on the tree-walker and the Cranelift JIT). A correct run returns `1` and
 //! the re-granted `fs` counter ticks once, on each engine.
 //!
@@ -26,7 +26,7 @@ use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, 
 
 // The child (identical to `rust_guest_op13`'s): its `Instantiator` arrives as `v0` (unused). It seeds
 // the name `"fs"` (`0x7366` little-endian) into its own window, resolves it, and calls the granted
-// `HOST_PROC` counter (type 13, op 0) — post-increment `1`. `memory 17` matches the 128 KiB carve.
+// `HOST_PROC` counter (type 13, op 0) — post-increment `1`. Its window is its declared `memory 17`.
 const CHILD: &str = r#"memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -43,10 +43,10 @@ block 0 (v0: i64) {
 "#;
 
 /// Build the Rust guest source with `child_bytes` embedded as a `static` array — the child's encoded
-/// module, where an in-guest linker would leave its output. The guest resolves `inst`/`loader`/`fs` by
-/// name, mints the child module via `__vm_module_from_bytes` over that static, lays a one-entry grant
-/// record for `fs`, spawns the child into a 128 KiB-aligned 128 KiB carve inside `POOL`, and returns
-/// `join(child)`. `POOL` (384 KiB) forces a window big enough for the carve and holds the record + name.
+/// module, where an in-guest linker would leave its output. The guest resolves
+/// `inst`/`loader`/`budget`/`fs` by name, mints the child module via `__vm_module_from_bytes` over that
+/// static, spawns it with `{"fs"}` re-granted (the shared `vm_spawn`, appended), and returns
+/// `join(child)`.
 fn guest_src(child_bytes: &[u8]) -> String {
     let mut bytes_lit = String::new();
     for (i, b) in child_bytes.iter().enumerate() {
@@ -67,10 +67,6 @@ fn ph(_: &core::panic::PanicInfo) -> ! {{
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {{}}
 
-#[repr(C, align(8))]
-struct Pool([u8; 393216]);
-static mut POOL: Pool = Pool([0; 393216]);
-
 // The child module's encoded bytes — the linker's output a real driver would hold in memory.
 static CHILD_BYTES: [u8; {n}] = [{bytes_lit}
 ];
@@ -78,16 +74,6 @@ static CHILD_BYTES: [u8; {n}] = [{bytes_lit}
 extern "C" {{
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
     fn __vm_module_from_bytes(loader: i32, ptr: i64, len: i64) -> i64;
-    fn __vm_instantiate(
-        inst: i32,
-        module: i64,
-        grants_ptr: i64,
-        grants_n: i64,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
 }}
 
@@ -96,8 +82,9 @@ pub extern "C" fn run() -> i64 {{
     unsafe {{
         let inst = __vm_cap_resolve(b"inst".as_ptr(), 4);
         let loader = __vm_cap_resolve(b"loader".as_ptr(), 6);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
-        if inst < 0 || loader < 0 || fs < 0 {{
+        if inst < 0 || loader < 0 || budget < 0 || fs < 0 {{
             return -1;
         }}
         // Promote the guest's own bytes to a spawnable module handle — the run-in-guest primitive.
@@ -109,25 +96,14 @@ pub extern "C" fn run() -> i64 {{
         if mh < 0 {{
             return -2;
         }}
-        let base = core::ptr::addr_of_mut!(POOL) as i64;
-        // grant record at base: {{name_off:u32, name_len:u32, handle:i32, flags:u32}}
-        let rec = base as *mut u32;
-        rec.add(0).write((base + 16) as u32); // name_off
-        rec.add(1).write(2); // name_len ("fs")
-        rec.add(2).write(fs as u32); // handle
-        rec.add(3).write(0); // flags
-        let nm = (base + 16) as *mut u8;
-        nm.add(0).write(b'f');
-        nm.add(1).write(b's');
-        // a 128 KiB-aligned 128 KiB carve above the record
-        let carve = (base + 131071) & !131071;
-        let child = __vm_instantiate(inst, mh, base, 1, 0, carve, 17, 0);
+        let child = vm_spawn(inst, budget, mh as i32, &[(b"fs", fs)], &[]);
         __vm_join(inst, child)
     }}
 }}
-"##,
+{vm_spawn}"##,
         n = child_bytes.len(),
         bytes_lit = bytes_lit,
+        vm_spawn = include_str!("support/guest_vm_spawn.rs"),
     )
 }
 
@@ -189,21 +165,23 @@ fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
     temen_run::production_grant_hooks(temen_run::CapCtx::Raw(host))
 }
 
-/// A host granting `inst` (Instantiator), `loader` (ModuleLoader — the run-in-guest cap), and `fs` by
+/// A host granting `inst` (Instantiator), `loader` (ModuleLoader — the run-in-guest cap), `budget`, and `fs` by
 /// name over a fresh counter. **No** `child` module is host-granted — the guest mints it from bytes.
 fn granted_host(win: u64) -> (Host, Arc<Mutex<i64>>) {
     let counter = Arc::new(Mutex::new(0i64));
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, win);
     let loader = temen_run::grant_module_loader(&mut host);
+    let budget = host.grant_budget(0, 1 << 17, 0); // the child's window
     let fsh = grant_fs(&mut host, &counter);
     host.register_cap_name("inst", inst);
     host.register_cap_name("loader", loader);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fsh);
     (host, counter)
 }
 
-/// Interpreter (cooperative engine — honors the op-13 grant list inline): returns `(result, counter)`.
+/// Interpreter (cooperative engine — honors the grant list inline): returns `(result, counter)`.
 fn run_interp(m: &temen_ir::Module, entry: u32, sp: i64, win: u64) -> (i64, i64) {
     let (mut host, counter) = granted_host(win);
     let mut fuel = 200_000_000u64;
@@ -218,7 +196,7 @@ fn run_interp(m: &temen_ir::Module, entry: u32, sp: i64, win: u64) -> (i64, i64)
     (out, cval)
 }
 
-/// JIT (given the module resolver + named-grant hooks op-13 needs): returns `(result, counter)`.
+/// JIT (given the module resolver + named-grant hooks the spawn needs): returns `(result, counter)`.
 fn run_jit(m: &temen_ir::Module, entry: u32, sp: i64, win: u64) -> (i64, i64) {
     let (mut host, counter) = granted_host(win);
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
@@ -275,15 +253,15 @@ fn rust_guest_mints_module_from_bytes_then_spawns_it() {
 
     assert_eq!(
         io, 1,
-        "interp: the guest minted the child from its bytes, op-13-spawned it, and joined its result (1)"
+        "interp: the guest minted the child from its bytes, spawned it, and joined its result (1)"
     );
     assert_eq!(
         jo, 1,
-        "jit: same from_bytes -> op-13 spawn, same joined result (1)"
+        "jit: same from_bytes -> spawn, same joined result (1)"
     );
     assert_eq!(
         io, jo,
-        "§9 the guest's from_bytes+op-13 run agrees on both engines"
+        "§9 the guest's from_bytes+spawn run agrees on both engines"
     );
     assert_eq!(
         (ic, jc),

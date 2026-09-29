@@ -32,8 +32,8 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2, jitRuntime, tierupPaged, childMem } = e.data;
+    smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
+    jitB2, jitRuntime, tierupPaged, childMem, ticket } = e.data;
   // I22 liveness backstop. The `temen_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
   // _inst_codegen, temen_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -248,7 +248,7 @@ self.onmessage = async (e) => {
     // path would run it. On a paged unit (the module reaches a page op) the emitted accesses consult a
     // page-state table re-synced from this vCPU after each bounce. Its starter cap handles (the entry
     // args) come from the argv stash — no longer inert zeros.
-    const cv = ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel));
+    const cv = ex.temen_par_child_confined(prog, BigInt(ticket), win, slog);
     if (cv === 0) {
       Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2);
       self.postMessage({ kind: 'fail', why: 'confined child vcpu build failed (codegen path)' });
@@ -270,30 +270,22 @@ self.onmessage = async (e) => {
           if (ex.temen_par_inst_call_interp(cv, f, a) !== 0) throw new Error('cross-tier trap');
           if (paged) syncPaged();
         },
-        // §14 VM-in-VM spawn bounce. The emitted parent does no confinement itself, so the engine's
-        // carve checks (`admit_confined_child`) are replicated here: the grandchild's power-of-two carve
-        // must be aligned and lie inside THIS child's own window (confinement composes); a violation
-        // throws → this child's slot reads trapped, exactly as the interpreter traps the parent.
-        // The `inst` handle arg is inert (0n) on the emitted tier — authority is this child's §14
-        // construction itself (every confined child holds an attenuated Instantiator), mirroring the
-        // native harness (crates/temen-wasm-jit/tests/nested_vm.rs).
-        instantiate: (cwin, _inst, centry, off, cslog, quota) => {
-          const gsize = 1 << Number(cslog), goff = Number(off);
-          // #1206: a carve may not dip into this child's own NULL guard (`[0, 16 KiB)`, seeded on any
-          // window of at least the guard's size — the engine's `carve_fits` rule, `POWERBOX_NULL_GUARD`).
-          const guard = winSize >= 16384 ? 16384 : 0;
-          if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize || goff < guard)
-            throw new Error('bad nested carve');
+        // §14 VM-in-VM spawn bounce. The engine admits the grandchild against THIS child's vCPU — the
+        // `inst` handle resolved in its powerbox, the carve checked against its window, the fuel cut
+        // from its own — exactly as the interpreted op (`temen_par_inst_instantiate`), and hands back
+        // a ticket for the grandchild's Worker. A refusal is the spawn's `-EINVAL` result; a forged
+        // handle throws → this child's slot reads trapped, as the interpreter traps the parent.
+        instantiate: (cwin, inst, centry, off, cslog, quota) => {
+          const t = ex.temen_par_inst_instantiate(cv, inst, centry, off, cslog, quota);
+          if (t === 0n) throw new Error('nested instantiate trapped');
+          if (t < 0n) return Number(t);
+          const gslog = Number(cslog), carve = Number(ex.temen_par_ev_c(cv));
           const gslot = ex.temen_par_alloc(SLOT);
           const gstackTop = ex.temen_par_alloc(STACK) + STACK;
           const gtlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-          // Fuel: min(quota, parent's) — the emitted tier tracks fuel coarsely (the env-cell
-          // counter), so "parent's" is this child's own granted fuel from its init cfg.
-          const pf = BigInt(fuel);
-          const gfuel = quota > 0n && quota < pf ? quota : pf;
           self.postMessage({
-            kind: 'spawn', role: 'confined', smod, entry: Number(centry), slog: Number(cslog),
-            fuel: gfuel.toString(), win: cwin + goff, winSize: gsize,
+            kind: 'spawn', role: 'confined', ticket: t.toString(), smod, entry: Number(centry),
+            slog: gslog, win: cwin + carve, winSize: 2 ** gslog,
             slot: gslot, stackTop: gstackTop, tlsBase: gtlsBase,
           });
           const h = childSlots.length;
@@ -320,7 +312,7 @@ self.onmessage = async (e) => {
           self.postMessage({
             kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
             rootDomain, // a thread joins its spawner's domain
-            win, winSize, fuel,
+            win, winSize,
             slot: tslot, stackTop: tstackTop, tlsBase: ttlsBase,
           });
           const h = threadSlots.length;
@@ -387,9 +379,9 @@ self.onmessage = async (e) => {
   const v = role === 'root'
     ? ex.temen_par_root(prog, win, winSize, func)
     : role === 'confined'
-      ? ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
+      ? ex.temen_par_child_confined(prog, BigInt(ticket), win, slog)
       : role === 'detached'
-        ? ex.temen_par_child_detached(prog, registerForeign(childMem, fbase), slog, smod, entry, BigInt(fuel))
+        ? ex.temen_par_child_detached(prog, BigInt(ticket), registerForeign(childMem, fbase), slog)
         : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
@@ -491,19 +483,19 @@ self.onmessage = async (e) => {
       continue;
     }
     if (evc === INSTANTIATE) {
-      // §14 confined executor child (THREADS.md 4c-domain §14-D2): the engine already validated the
-      // carve + built everything authority-bearing; the operands are inert integers we shuttle into
-      // a new Worker (whose window IS the carve), joined via the same completion-slot protocol.
-      const am = ex.temen_par_ev_a(v); // (module << 32) | entry
-      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
+      // §14 confined executor child (THREADS.md 4c-domain §14-D2): the engine admitted it and built
+      // everything authority-bearing; we relay its ticket to a new Worker (whose window IS the
+      // carve), joined via the same completion-slot protocol.
+      const t = ex.temen_par_ev_a(v); // the admitted child, opaque
       const carve = Number(ex.temen_par_ev_b(v)), cslog = Number(ex.temen_par_ev_c(v));
-      const cfuel = ex.temen_par_ev_d(v); // i64 → BigInt, shuttled verbatim
+      const am = ex.temen_par_ev_d(v); // (module << 32) | entry
+      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
       const cslot = ex.temen_par_alloc(SLOT);
       const cstackTop = ex.temen_par_alloc(STACK) + STACK;
       const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
-        kind: 'spawn', role: 'confined', smod: csmod, entry: centry, slog: cslog,
-        fuel: cfuel.toString(), win: win + carve, winSize: 1 << cslog,
+        kind: 'spawn', role: 'confined', ticket: t.toString(), smod: csmod, entry: centry,
+        slog: cslog, win: win + carve, winSize: 1 << cslog,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
       const handle = handles.length;
@@ -512,39 +504,27 @@ self.onmessage = async (e) => {
       continue;
     }
     if (evc === INSTANTIATE_DETACHED) {
-      // §5 detached child (#1286 slice 3b): the engine already resolved the Instantiator, took the
-      // WindowMinter's quota and compiled the module; what is left is the window itself. Mint the child
-      // a fresh shared Memory — one host header page (env cell, page-state, DETACHED_JIT.md §3.1) +
-      // the declared window, growable in place to the detached ceiling — seed it from the event's
-      // segment blob (data segments + args payload; `{off:u64, len:u32, bytes}` records after a u32
-      // count) at `header + off`, and post it to a new Worker. A shared Memory posts by reference, so
-      // the child Worker and this one see the same bytes; the engine here never addresses them again.
-      const am = ex.temen_par_ev_a(v); // (module << 32) | entry
-      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
-      const cslog = Number(ex.temen_par_ev_b(v)), cfuel = ex.temen_par_ev_c(v);
+      // §5 detached child (#1286 slice 3b): the engine admitted it (the Instantiator resolved, the
+      // WindowMinter's quota taken, the module compiled, its powerbox built); what is left is the
+      // window itself. Mint the child a fresh shared Memory — one host header page (env cell,
+      // page-state, DETACHED_JIT.md §3.1) + the declared window, growable in place to the detached
+      // ceiling — and post it with the ticket to a new Worker, which starts the child over it; the
+      // engine seeds it there. A shared Memory posts by reference.
+      const t = ex.temen_par_ev_a(v), cslog = Number(ex.temen_par_ev_b(v));
       const hdr = ex.temen_detached_header_bytes(), PAGE = 65536;
       const cmem = new WebAssembly.Memory({
         initial: Math.ceil((hdr + 2 ** cslog) / PAGE),
         maximum: Math.ceil((hdr + Number(ex.temen_detached_max_bytes())) / PAGE),
         shared: true,
       });
-      const cu8 = new Uint8Array(cmem.buffer);
-      const sptr = Number(ex.temen_par_det_seed_ptr(v)), slen = Number(ex.temen_par_det_seed_len(v));
-      const sdv = new DataView(memory.buffer, sptr, slen), su8 = new Uint8Array(memory.buffer, sptr, slen);
-      let p = 4;
-      for (let n = sdv.getUint32(0, true); n > 0; n--) {
-        const off = Number(sdv.getBigUint64(p, true)), len = sdv.getUint32(p + 8, true);
-        cu8.set(su8.subarray(p + 12, p + 12 + len), hdr + off);
-        p += 12 + len;
-      }
       const cslot = ex.temen_par_alloc(SLOT);
       const cstackTop = ex.temen_par_alloc(STACK) + STACK;
       const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       // No `win`/`winSize`: the child has no window in the engine memory. No tier-up: the emitted tier
       // binds the engine memory (a separate-module child keeps the bitmap inert regardless).
       self.postMessage({
-        kind: 'spawn', role: 'detached', childMem: cmem, smod: csmod, entry: centry, slog: cslog,
-        fuel: cfuel.toString(), win: 0, winSize: 2 ** cslog, tierup: false,
+        kind: 'spawn', role: 'detached', ticket: t.toString(), childMem: cmem, slog: cslog,
+        win: 0, winSize: 2 ** cslog, tierup: false,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
       const handle = handles.length;

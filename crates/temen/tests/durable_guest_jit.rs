@@ -344,6 +344,7 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
         SIZE_LOG2,
         0,
         &mut th,
+        None,
     )
     .expect("native thaw run");
     match out {
@@ -466,6 +467,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         SIZE_LOG2,
         TABLE_LOG2,
         &mut hd,
+        None,
     )
     .expect("native install run");
     let slot = match out {
@@ -492,6 +494,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
         SIZE_LOG2,
         TABLE_LOG2,
         &mut th,
+        None,
     )
     .expect("native thaw call run");
     match out2 {

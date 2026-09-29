@@ -1,7 +1,7 @@
-//! **#1025 slice 3c — the driver-guest port, step 10: hexer's lowering, op-13-spawned from the guest.**
-//! Step 9 ran nimsem (sema) as an op-13 §14 child of a Rust-on-Temen driver guest. This runs the *next*
-//! phase the same way: the guest `instantiate_module`s (op 13) the real child-entry **hexer** over a
-//! shared memfs, re-granting three caps `{fs, stdout, exit}` — hexer needs no `exec` (unlike nimsem it
+//! **#1025 slice 3c — the driver-guest port, step 10: hexer's lowering, spawned from the guest.**
+//! Step 9 ran nimsem (sema) as a §14 child of a Rust-on-Temen driver guest. This runs the *next* phase
+//! the same way: the guest spawns the real child-entry **hexer** (the shared `vm_spawn`: its own window)
+//! over a shared memfs, re-granting three caps `{fs, stdout, exit}` — hexer needs no `exec` (unlike nimsem it
 //! spawns nothing; it reads a `.s.nif` and lowers it). It reads the semchecked system module nimsem left
 //! behind (`hexer c nimcache/sysvq0asl.s.nif`) and writes the Leng `sysvq0asl.x.nif`, which the host
 //! asserts is **byte-identical** to the committed expected.
@@ -10,12 +10,12 @@
 //! its README): `hexer_ce.temen.gz` (hexer built `--child-entry`), the `sysvq0asl.s.nif.gz` +
 //! `sysvq0asl.s.idx.nif` hexer reads (shared with step 9 — that is nimsem's output), and
 //! `sysvq0asl.x.nif.gz` (the expected Leng — hexer is deterministic for a fixed input). If an
-//! IR/ABI/encoder change breaks decode/verify or the op-13 spawn, or a frontend bump changes the emitted
+//! IR/ABI/encoder change breaks decode/verify or the spawn, or a frontend bump changes the emitted
 //! Leng, this gate fails — regenerate together. The byte-exact-vs-*native* chain stays in the
 //! toolchain-gated `build_frontend.sh` (issue #1221).
 //!
-//! Heavy: the guest carves hexer a 256 MiB window (the no-GC system lowering peaks high), so the guest
-//! runs in a ~1 GiB window. Gated Linux + rustc + gzip.
+//! Heavy: hexer's no-GC system lowering grows its heap well past its declared window, into the window's
+//! reserved tail. Gated Linux + rustc + gzip.
 
 #![cfg(target_os = "linux")]
 
@@ -35,8 +35,8 @@ const SYS_SIDX: &[u8] =
 const EXPECTED_XNIF_GZ: &[u8] =
     include_bytes!("../../temen-run/demos/nim_frontend/fixtures/sysvq0asl.x.nif.gz");
 
-/// The driver guest: resolve `{inst, hexer, fs, stdout, exit}`, build the three-cap op-13 grant list +
-/// the `hexer c nimcache/sysvq0asl.s.nif` argv in a 256 MiB carve, spawn hexer, join.
+/// The driver guest: resolve `{inst, hexer, budget, fs, stdout, exit}`, spawn hexer with the three caps
+/// re-granted and argv `hexer c nimcache/sysvq0asl.s.nif` (the shared `vm_spawn`, appended), join.
 const GUEST: &str = r##"#![no_std]
 #![allow(internal_features)]
 #[panic_handler]
@@ -44,27 +44,9 @@ fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
-#[repr(C, align(65536))]
-struct Pool([u8; 536870912]); // 512 MiB of static -> a 256 MiB carve for hexer (window rounds to 1 GiB)
-static mut POOL: Pool = Pool([0; 536870912]);
-
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32, module: i64, grants_ptr: i64, grants_n: i64,
-        entry: i64, off: i64, size_log2: i64, quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
-}
-
-unsafe fn wr(p: i64, b: u8) { (p as *mut u8).write(b); }
-
-unsafe fn put_rec(base: i64, i: i64, name_off: i64, name_len: u32, handle: i32) {
-    let rec = (base + i * 16) as *mut u32;
-    rec.add(0).write(name_off as u32);
-    rec.add(1).write(name_len);
-    rec.add(2).write(handle as u32);
-    rec.add(3).write(0);
 }
 
 #[no_mangle]
@@ -72,49 +54,25 @@ pub extern "C" fn run() -> i64 {
     unsafe {
         let inst = __vm_cap_resolve(b"inst".as_ptr(), 4);
         let hexer = __vm_cap_resolve(b"hexer".as_ptr(), 5);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
         let out = __vm_cap_resolve(b"stdout".as_ptr(), 6);
         let ex = __vm_cap_resolve(b"exit".as_ptr(), 4);
-        if inst < 0 || hexer < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
-        let base = core::ptr::addr_of_mut!(POOL) as i64;
-
-        // Three grant records {fs, stdout, exit} at base+0.., their names packed at base+64. POOL sits
-        // above the module NULL guard, so base+0 is a legal writable address.
-        let nm = (base + 64) as *mut u8;
-        let names: [&[u8]; 3] = [b"fs", b"stdout", b"exit"];
-        let mut off = 0usize; let mut ai = 0;
-        let mut noffs: [i64; 3] = [0; 3];
-        while ai < 3 {
-            noffs[ai] = base + 64 + off as i64;
-            let s = names[ai]; let mut j = 0;
-            while j < s.len() { nm.add(off + j).write(s[j]); j += 1; }
-            off += s.len(); ai += 1;
-        }
-        put_rec(base, 0, noffs[0], 2, fs);
-        put_rec(base, 1, noffs[1], 6, out);
-        put_rec(base, 2, noffs[2], 4, ex);
-
-        // 256 MiB carve, 2^28-aligned within the window.
-        let mask: i64 = (1 << 28) - 1;
-        let carve = (base + 128 + mask) & !mask;
-
-        // argv at carve + 16512 (the child's module_args_base): "hexer" "c" "nimcache/sysvq0asl.s.nif"
-        let a = carve + 16512;
-        (a as *mut u32).add(0).write(3);
-        (a as *mut u32).add(1).write(0);
-        let args: [&[u8]; 3] = [b"hexer", b"c", b"nimcache/sysvq0asl.s.nif"];
-        let mut p = 8i64; let mut i = 0;
-        while i < 3 {
-            let s = args[i]; let mut j = 0;
-            while j < s.len() { wr(a + p, s[j]); p += 1; j += 1; }
-            wr(a + p, 0); p += 1; i += 1;
-        }
-
-        let child = __vm_instantiate(inst, hexer as i64, base, 3, 0, carve, 28, 0);
+        if inst < 0 || hexer < 0 || budget < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
+        let child = vm_spawn(
+            inst,
+            budget,
+            hexer,
+            &[(b"fs", fs), (b"stdout", out), (b"exit", ex)],
+            &[b"hexer", b"c", b"nimcache/sysvq0asl.s.nif"],
+        );
         __vm_join(inst, child)
     }
 }
 "##;
+
+/// The shared guest-side spawn, appended to every driver guest's source.
+const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
 fn rustc_emit_ll(src: &Path, ll: &Path) -> bool {
     Command::new("rustc")
@@ -169,7 +127,7 @@ fn rust_driver_guest_op13_spawns_real_hexer_byte_exact() {
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("g.rs");
     let ll = dir.join("g.ll");
-    std::fs::write(&src, GUEST).unwrap();
+    std::fs::write(&src, format!("{GUEST}\n{VM_SPAWN}")).unwrap();
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc unavailable)");
         return;
@@ -200,6 +158,8 @@ fn rust_driver_guest_op13_spawns_real_hexer_byte_exact() {
     let win = 1u64 << t.module.memory.as_ref().expect("driver window").size_log2;
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&hexer);
+    // hexer's window, paid from this and returned when it ends.
+    let budget = host.grant_budget(0, 1 << hexer.memory.expect("hexer window").size_log2, 0);
     let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
@@ -213,6 +173,7 @@ fn rust_driver_guest_op13_spawns_real_hexer_byte_exact() {
     let exit_h = host.grant_exit();
     host.register_cap_name("inst", inst);
     host.register_cap_name("hexer", modh);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);

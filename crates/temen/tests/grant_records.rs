@@ -90,6 +90,7 @@ fn cranelift(m: &temen_ir::Module) -> JitOutcome {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host,
+        None,
     )
     .expect("jit run")
     .0

@@ -127,6 +127,7 @@ fn check(guest: &str, units: &[&str], roots: &[i64]) {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut h,
+        None,
     )
     .expect("jit run");
     assert!(matches!(out, JitOutcome::Returned(_)), "cranelift: {out:?}");

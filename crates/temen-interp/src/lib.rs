@@ -8528,7 +8528,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let mut refuse = false;
                     for slot in detached {
                         let cid = v.threads[slot].expect("filtered to Some");
-                        if let Some(o) = v.sched.take_result(cid) {
+                        // A child that already unwound for this freeze (rung while its parent was
+                        // parked, #1904) is harvested like a running one, not recorded as complete.
+                        let finished = !v.sched.unwound(cid);
+                        if let Some(o) = finished.then(|| v.sched.take_result(cid)).flatten() {
                             let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
                             sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
                                 parent_task: v.id as usize,
@@ -12650,20 +12653,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 .get(slot)
                 .and_then(|x| *x)
                 .ok_or(Trap::ThreadFault)?;
-            v.threads[slot] = None; // a handle is joined once
-            credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
-                                                                 // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the join
-                                                                 // for re-issue on thaw, against the re-spawned child. A child that finished for real is
-                                                                 // not re-run, so its result rides this frame instead.
-            if v.durable && v.sched.unwound(child) {
+            // #1904 — a **detached** child the freeze unwound is not joined: it keeps its slot, and its
+            // result (its window) is left for the harvest, so it rides the artifact. The join is
+            // re-issued on thaw against the re-launched child.
+            let detached = v.child_hosts.contains_key(&slot)
+                && !v.nested_children.iter().any(|c| c.slot == slot);
+            if v.durable && detached && v.sched.unwound(child) {
                 abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
+                let top = v.frames.len() - 1;
+                v.frames[top].vals.push(Reg::from_i64(0));
+            } else {
+                v.threads[slot] = None; // a handle is joined once
+                credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
+                                                                     // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the join
+                                                                     // for re-issue on thaw, against the re-spawned child. A child that finished for real is
+                                                                     // not re-run, so its result rides this frame instead.
+                if v.durable && v.sched.unwound(child) {
+                    abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
+                }
+                let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
+                let vals = out.result?; // a child trap propagates as this vCPU's trap
+                let top = v.frames.len() - 1;
+                v.frames[top].vals.push(Reg::from_value(
+                    vals.first().copied().unwrap_or(Value::I64(0)),
+                ));
             }
-            let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
-            let vals = out.result?; // a child trap propagates as this vCPU's trap
-            let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Reg::from_value(
-                vals.first().copied().unwrap_or(Value::I64(0)),
-            ));
         }
         Some(Pending::ReapPid { pid }) => {
             // The twin `pid` finished and the generic join-wake re-admitted us. Take its outcome
@@ -31242,10 +31256,18 @@ impl Mem {
     /// region of the parent backing (matching trap-confinement, which confines child accesses to
     /// `[win_base, win_base + size)`). `win_base == 0` is the ordinary top-level window.
     fn init_data_at(&mut self, data: &[Data], win_base: u64) {
-        // Byte writes first (no §13 regions exist at init ⇒ `set_byte` is lock-free)...
+        // Byte writes first. No §13 regions exist at init, so each segment is one bulk write into
+        // the backing — a single call even through a `Region::Foreign` (a detached child's own
+        // `WebAssembly.Memory`), where a byte at a time is a host call per byte...
+        let aliased = self.has_regions.load(Ordering::Relaxed);
         for d in data {
-            for (i, &b) in d.bytes.iter().enumerate() {
-                self.set_byte(win_base + d.offset + i as u64, b);
+            let at = win_base + d.offset;
+            if aliased {
+                for (i, &b) in d.bytes.iter().enumerate() {
+                    self.set_byte(at + i as u64, b);
+                }
+            } else {
+                self.back.write_from(at, &d.bytes);
             }
         }
         // ...then the read-only protections, under one address-space write lock. The prot map is

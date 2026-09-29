@@ -256,6 +256,7 @@ fn run_on(engine: Engine, inst: &Module, window: &[u8], size_log2: u8, host: &mu
                 size_log2,
                 JIT_TABLE_LOG2,
                 host,
+                None,
             )
             .expect("the guest compiles and runs on the JIT");
             assert!(

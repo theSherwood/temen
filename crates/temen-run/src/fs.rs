@@ -718,7 +718,7 @@ mod tests {
     }
 
     /// `temen-llvm` pins `Instantiator`'s interface id numerically (`INSTANTIATOR_TYPE_ID`, for the
-    /// `__vm_instantiate`/`__vm_join` §14 spawn builtins a guest driver lowers to); this locks that
+    /// `__vm_instantiate_rec`/`__vm_join` §14 spawn builtins a guest driver lowers to); this locks that
     /// pin to the real constant.
     #[test]
     fn instantiator_type_id_matches() {

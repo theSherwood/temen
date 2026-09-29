@@ -98,6 +98,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         PARENT_LOG2,
         0,
         &mut host,
+        None,
     ) {
         Ok((o, _)) => returned(o),
         Err(JitError::Unsupported(_)) => return, // a target without the child executor
@@ -119,6 +120,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         PARENT_LOG2,
         0,
         &mut fhost,
+        None,
     )
     .expect("JIT freeze");
     assert_eq!(
@@ -168,6 +170,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         PARENT_LOG2,
         0,
         &mut bare,
+        None,
     );
     assert!(
         matches!(refused, Err(JitError::Unsupported(_))),
@@ -187,6 +190,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         PARENT_LOG2,
         0,
         &mut thost,
+        None,
     )
     .expect("JIT thaw");
     assert_eq!(
@@ -253,6 +257,7 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
         PARENT_LOG2,
         0,
         &mut thost,
+        None,
     ) {
         Ok((o, _)) => assert_eq!(
             returned(o),

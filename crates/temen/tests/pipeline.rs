@@ -2020,6 +2020,7 @@ fn a_revoked_handle_completes_with_an_errno_on_all_backends() {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut hj,
+        None,
     )
     .expect("jit run");
     assert_eq!(
@@ -2066,6 +2067,7 @@ fn a_forged_handle_still_traps_on_all_backends() {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut hj,
+        None,
     )
     .expect("jit run");
     assert_eq!(jout, JitOutcome::Trapped(TrapKind::CapFault));
