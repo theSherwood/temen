@@ -2,8 +2,9 @@
 // driver**. A root vCPU (on its own Worker) holds an `Instantiator`, a child `Module` and a
 // `WindowMinter` (the §14 recipe + `minter`), and issues three §5 `instantiate_detached` (op 15) spawns
 // back to back — each child lands in its OWN fresh shared `WebAssembly.Memory` on its OWN Worker (the
-// spawning Worker mints + seeds the memory from the event's segment blob; the page relays the Worker
-// start) — then a fourth the exhausted minter must refuse probeably (`-EINVAL`), then joins the three.
+// spawning Worker mints the memory and posts it with the admitted child's ticket; the child's Worker
+// starts it, and the engine seeds the window; the page relays the Worker start) — then a fourth the
+// exhausted minter must refuse probeably (`-EINVAL`), then joins the three.
 // Each child reads the 8-byte payload the root passed at `module_args_base()`, `vm_map`s a page PAST
 // its declared 64 KiB window (the grow reaches the child memory through `Region::Foreign` →
 // `foreign_grow`), stores/loads the word on the grown page and returns it + 1.

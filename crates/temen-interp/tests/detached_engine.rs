@@ -83,30 +83,19 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 }
 
 /// The host side of the protocol: mint a backing of the child's declared size, start the admitted
-/// child over it, deliver the join handle. Records the payload the event carried for the assertions.
+/// child over it, deliver the join handle. Records each surfaced spawn's window size (log2).
 fn drive(
     prog: &bytecode::VcpuProgram,
-    child_mod: &temen_ir::Module,
     mut vcpu: bytecode::Vcpu<'_>,
-    seen_payload: &mut Vec<Vec<u8>>,
+    seen: &mut Vec<u8>,
 ) -> Result<Vec<Value>, Trap> {
     let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::InstantiateDetached {
-                size_log2,
-                args,
-                data,
-                ..
-            } => {
-                seen_payload.push(args.clone());
-                assert_eq!(
-                    &data[..],
-                    &child_mod.data[..],
-                    "the event carries the child's segments"
-                );
+            bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
+                seen.push(size_log2);
                 // The fresh window: the host's to allocate — nothing of it in the parent's.
                 let back = Arc::new(Region::new(1u64 << size_log2, 4096));
                 let child = vcpu
@@ -114,7 +103,7 @@ fn drive(
                     .expect("an InstantiateDetached carries its admitted child")
                     .start(prog, back, None)
                     .expect("detached child builds");
-                let r = drive(prog, child_mod, child, seen_payload);
+                let r = drive(prog, child, seen);
                 let handle = children.len() as i32;
                 children.push(r);
                 vcpu.deliver_handle(handle);
@@ -127,7 +116,7 @@ fn drive(
     }
 }
 
-fn run(parent_src: &str, minter_quota: u64) -> (Result<Vec<Value>, Trap>, Vec<Vec<u8>>) {
+fn run(parent_src: &str, minter_quota: u64) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     run_in(parent_src, minter_quota, false)
 }
 
@@ -136,7 +125,7 @@ fn run_in(
     parent_src: &str,
     minter_quota: u64,
     durable: bool,
-) -> (Result<Vec<Value>, Trap>, Vec<Vec<u8>>) {
+) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     let parent = module(parent_src);
     let child = module(CHILD);
     let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
@@ -156,7 +145,7 @@ fn run_in(
     )
     .expect("root vcpu");
     let mut seen = Vec::new();
-    let r = drive(&prog, &child, root, &mut seen);
+    let r = drive(&prog, root, &mut seen);
     (r, seen)
 }
 
@@ -166,12 +155,13 @@ fn op15_surfaces_a_detached_spawn_with_its_args_payload() {
     assert_eq!(
         r,
         Ok(vec![Value::I64(ARGV_WORD + 1)]),
-        "the child read argv from the host-seeded payload and attested tier 1 / unexposed"
+        "the child read argv from the engine-seeded payload and attested tier 1 / unexposed"
     );
-    assert_eq!(seen.len(), 1, "exactly one detached spawn surfaced");
-    assert_eq!(seen[0].len(), 24);
-    assert_eq!(&seen[0][..8], &1u64.to_le_bytes(), "argc = 1, envc = 0");
-    assert_eq!(&seen[0][8..16], b"hello-de");
+    assert_eq!(
+        seen,
+        vec![16],
+        "exactly one detached spawn surfaced, its declared 64 KiB window"
+    );
 }
 
 #[test]
@@ -182,7 +172,7 @@ fn the_seven_arg_form_seeds_no_payload() {
         Ok(vec![Value::I64(1)]),
         "no argv: the word reads 0, attest adds 1"
     );
-    assert_eq!(seen, vec![Vec::<u8>::new()]);
+    assert_eq!(seen, vec![16]);
 }
 
 #[test]

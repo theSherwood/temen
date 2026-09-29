@@ -61,7 +61,7 @@ child in its own address space.** In temen that structure already has a name.
 | Detached window size must equal the module's declared (`mod_ok = memory_log2 == size_log2`, §14 transparency) | `lib.rs` ~11889 | **Built** |
 | Detached child's starter `Instantiator`/`AddressSpace` span its **reservation** (a root's shape), so `vm_map` grows the window. **Corrected in #1286**: the built arm bounded them to the declared size, which refused every `vm_map` past it — a detached interpreter child could not actually grow | `lib.rs` ~11940; `detached_windows::a_detached_child_grows_past_its_declared_window` | **Fixed** |
 | op 15 optional trailing `(args_ptr, args_len)` — the spawn-time args payload copied to the child's `module_args_base()` (#1286) | `lib.rs` op-15 arm; `bytecode.rs` `Op::InstantiateDetached` | **Built** (both engines) |
-| Resumable-engine op 15: `VcpuEvent::InstantiateDetached { module, entry, size_log2, fuel, args }` — the host mints the window (#1286) | `bytecode.rs`; browser `temen_op13jit_step` + `foreign_mint` | **Built** |
+| Resumable-engine op 15: `VcpuEvent::InstantiateDetached { size_log2 }` — the host mints the window and starts the admitted child over it (#1286, #1414) | `bytecode.rs`; browser `temen_op13jit_step` + `foreign_mint` | **Built** |
 | `self.attest` → `tier \| window_exposed<<8 \| freeze_exposed<<9`; detached attests `window_exposed = false` | `lib.rs` 16358–16385, 19496 | **Built** (PROCESS.md §6) |
 | Spawner keeps kill/join/fuel; detachment severs **read**, not lifecycle; live offers work (`child_offer`, op 14) | PROCESS.md §5; `detached_windows.rs` | **Built** |
 | Durable domain **refuses** detached (multi-window freeze = O6, deferred) | `lib.rs` 19593–19651 | **Built (fail-closed)** |
@@ -593,7 +593,10 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    driver: a detached vCPU's nested **carve** (op 13) or `thread.spawn` traps (the sibling Worker
    would alias the engine memory at `win`), and a spawn with a re-granted cap list traps (no
    cross-Worker path for the powerbox; the op-13 arm has the same shape). Threads inside a detached
-   child are the natural follow-up (a `temen_par_child` over the same foreign id).
+   child are the natural follow-up (a `temen_par_child` over the same foreign id). *(Since #1414's
+   E2 the admitted child crosses to its Worker whole, as a ticket: the engine seeds the window, the
+   event carries no segment blob, and a spawn with re-grants or a pre-mapped region runs rather than
+   trapping, on both arms.)*
 4. **#1287 — Native JIT hosting of op 15** (**done**): the `instantiate_detached` thunk, the
    decoupled-window child compile, the copy-free detached runner, the `build_detached` /
    `minter_take` hooks; `detached_child_jit.rs` is the differential vs the tree-walker.

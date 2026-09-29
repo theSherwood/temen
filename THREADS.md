@@ -280,25 +280,27 @@ property, so in practice:
         authority-bearing work in-Vm (carve validation with `-EINVAL` in place; for op 5 the granted
         module resolved from its own powerbox + compiled + pushed to the shared source + data segments
         materialized into the carve), then surfaces one mechanical event —
-        `VcpuEvent::Instantiate { module, entry, carve, size_log2, fuel }` — serviced exactly like
-        `Spawn`: start a Worker/thread running `Vcpu::new_confined_child(prog, module, entry,
-        carve_region, size_log2, fuel)` and wire its completion slot into `join`. Per DESIGN.md §14
+        `VcpuEvent::Instantiate { module, entry, carve, size_log2 }` — serviced exactly like
+        `Spawn`: take the admitted child (`Vcpu::take_child`), start it on a Worker/thread over the
+        carve region (`PendingChild::start`) and wire its completion slot into `join`. Per DESIGN.md §14
         ("a sub-window is indistinguishable from a top-level window") the carve region — a fresh
         `Region::shared` at `parent_win + carve` — simply *is* the child's window: **no new `temen-mem`
         machinery** (the earlier estimate was wrong). The attenuated powerbox (`Instantiator` +
-        `AddressSpace` over the child's own range, its entry args) and the child's own domain
-        (`own_dom`: a natural table over its module in the shared source — the fresh table is the
-        confinement) are built in-engine, so **no authority ever crosses JS** (event operands are
-        inert integers). `carve` is window-relative, so nesting composes with no special casing.
+        `AddressSpace` over the child's own range, its entry args, any re-grants) and the child's own
+        domain (`own_dom`: a natural table over its module in the shared source — the fresh table is
+        the confinement) are built in-engine by the one admission, so **no authority is built in JS**:
+        the browser relays the admitted child to its Worker as an opaque ticket, a pointer into the
+        shared linear memory that the child's Worker redeems once. `carve` is window-relative, so
+        nesting composes with no special casing.
         Proven natively by `bytecode_vcpu_orchestration_instantiate.rs` (fan-out 40, **depth-2
         nesting** 72, module fan-out 600 — each vs the cooperative oracle) +
         `vcpu_instantiate_miri.rs` (aliasing carve-region views race/UB/provenance-clean under Miri);
         in Node by `threads-spawn.mjs` `TEMEN_INST=1` (nested = **17 Workers across three
         generations**); and in **real Chromium** by the `#inst` work item (40 / 72×17 Workers / 600).
         Browser glue: `temen_par_powerbox_inst` (the §14 recipe: root `Instantiator` span + optional
-        granted module — the root builds its powerbox in `temen_par_root`), `temen_par_child_confined`,
-        `PAR_INSTANTIATE = 6`, and an `INSTANTIATE` arm in the JS hosts that relays the operands into
-        a new Worker whose `win`/`winSize` are the carve. Also fixed a latent JS-host bug D2 exposed:
+        granted module — the root builds its powerbox in `temen_par_root`), `temen_par_child_confined`
+        (starts the child from its ticket), `PAR_INSTANTIATE = 6`, and an `INSTANTIATE` arm in the JS
+        hosts that relays the ticket into a new Worker whose `win`/`winSize` are the carve. Also fixed a latent JS-host bug D2 exposed:
         cached `Int32Array`/`BigInt64Array` views go stale when the shared `WebAssembly.Memory` grows
         mid-run (e.g. a module compile+push) — the hosts now refresh views before Atomics access.
 - [x] **4d — host I/O (`call.cap`) from every vCPU, resumable + browser.** The last driver-capability

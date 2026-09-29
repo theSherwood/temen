@@ -715,6 +715,12 @@ pub const PAR_SPAWN: i32 = 2;
 pub const PAR_JOIN: i32 = 3;
 pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
+/// §14 confined child (THREADS.md 4c-domain §14-D2): the engine admitted it — its powerbox built,
+/// its carve validated — and hands it over as a **ticket** (`temen_par_ev_a`, an opaque `i64` the
+/// JS host relays verbatim to the child's Worker, which starts it with
+/// [`temen_par_child_confined`]). `_b` = the carve's offset in this vCPU's window, `_c` =
+/// `size_log2`, `_d` = `(module << 32) | entry`. Joined through the completion-slot protocol of
+/// [`PAR_SPAWN`].
 pub const PAR_INSTANTIATE: i32 = 6;
 /// wasm-JIT tier-up (browser wasm-JIT threads slice): the vCPU reached a `Call` to a JIT-eligible
 /// function. `temen_par_ev_a` = the func index; `temen_par_ev_b` = the window's committed extent, which
@@ -736,16 +742,15 @@ pub const PAR_TIERUP: i32 = 7;
 /// Worker runs the emitted `f{entry}(win, env, …args)` and calls `temen_par_deliver_jit_invoke`/`_trap`.
 pub const PAR_JIT_INVOKE: i32 = 8;
 /// §5 `instantiate_detached` (op 15, #1286 slice 3b): the vCPU spawned a **detached** child — a
-/// separate-module child in its OWN `WebAssembly.Memory`, not a carve of this window. Everything
-/// authority-bearing already happened in-engine (the `Instantiator` resolved, the `WindowMinter` quota
-/// taken, the module compiled + pushed); the Worker mints the child a fresh shared `Memory` (one host
-/// header page + the declared window, growable to `temen_detached_max_bytes()`), seeds it from the
-/// event's segment blob ([`temen_par_det_seed_ptr`]/`_len` — the module's data segments plus the args
-/// payload at `module_args_base()`, each `{off:u64, len:u32, bytes}` after a `u32` count), and posts it
-/// to a new Worker that runs [`temen_par_child_detached`] over it through `Region::Foreign`. Operands:
-/// `temen_par_ev_a` = `(module << 32) | entry`, `_b` = `size_log2`, `_c` = fuel. Joined through the same
-/// completion-slot protocol as [`PAR_INSTANTIATE`]. Children run **concurrently**, each in its own Worker
-/// over its own memory — the reason this is a Worker event and not an in-Rust one.
+/// separate-module child in its OWN `WebAssembly.Memory`, not a carve of this window. The engine
+/// admitted it (the `Instantiator` resolved, the `WindowMinter` quota taken, the module compiled and
+/// pushed, its powerbox built) and hands it over as a ticket (`temen_par_ev_a`); `_b` = `size_log2`.
+/// The Worker mints the child a fresh shared `Memory` (one host header page + the declared window,
+/// growable to `temen_detached_max_bytes()`) and posts it and the ticket to a new Worker, which starts
+/// the child over it through `Region::Foreign` ([`temen_par_child_detached`] — the engine seeds the
+/// window). Joined through the same completion-slot protocol as [`PAR_INSTANTIATE`]. Children run
+/// **concurrently**, each in its own Worker over its own memory — the reason this is a Worker event
+/// and not an in-Rust one.
 pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
 
 /// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to four
@@ -760,8 +765,6 @@ pub struct ParVcpu {
     /// `WebAssembly.Memory`, which the Worker-side carve/thread protocols (a `[win + carve)` alias, a
     /// `thread.spawn` sibling over `win`) cannot address — those events fail closed (`PAR_TRAP`).
     detached: bool,
-    /// The seed blob of a pending [`PAR_INSTANTIATE_DETACHED`] (format: see the event).
-    det_seed: Vec<u8>,
     /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
     /// Worker via [`temen_par_tierup_argv_ptr`]/[`temen_par_tierup_argv_len`] to call the emitted region.
     tierup_argv: Vec<i64>,
@@ -811,7 +814,6 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
         c: 0,
         d: 0,
         detached: false,
-        det_seed: Vec::new(),
         tierup_argv: Vec::new(),
         jit_argv: Vec::new(),
         jit_code: 0,
@@ -1369,9 +1371,8 @@ fn par_resolve_unit(
 // the host to resolve against): §14 resolves its `Instantiator` authority in-Vm during `resume`, so
 // the grant must be in the vCPU's own `Host`. This static only carries the *recipe* — the authority
 // range and the optional granted module — published once by the main thread so the root Worker can
-// build its powerbox deterministically. Confined children never touch it: their attenuated powerbox
-// is built inside `Vcpu::new_confined_child`, so no authority ever crosses JS (the `PAR_INSTANTIATE`
-// event operands are inert integers).
+// build its powerbox deterministically. Children never touch it: the engine admits each one and
+// builds its powerbox, and the JS host relays it as an opaque ticket, so no authority crosses JS.
 
 /// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant +
 /// an optional `WindowMinter` (#1286: `minter_quota > 0` bytes of detached-window admission).
@@ -1535,16 +1536,6 @@ pub extern "C" fn temen_par_inst_eligible(entry: u32) -> i32 {
         .map_or(0, |b| b as i32)
 }
 
-/// The granted unit's `entry` param count (1 or 2 — the instantiator/address-space cap handles a pure
-/// unit ignores). The Worker passes this many `0` args to the emitted `f{entry}`. `0` if no recipe.
-#[no_mangle]
-pub extern "C" fn temen_par_inst_nparams(entry: u32) -> usize {
-    par_inst()
-        .and_then(|c| c.module.as_ref())
-        .and_then(|m| m.funcs.get(entry as usize))
-        .map_or(0, |f| f.params.len())
-}
-
 /// Whether the run's emitted §14 unit is **paged** (see [`INST_PAGED`]): the Worker must then call
 /// [`temen_par_inst_pagestate_sync`] before the entry and re-point the unit instance's
 /// `"pagestate"`/`"mapped"` globals from the child vCPU after it and after every bounce.
@@ -1599,6 +1590,38 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
             0
         }
         Err(_) => 1,
+    }
+}
+
+/// §14 VM-in-VM spawn from **emitted** code: the confined child `v` runs its entry on the wasm tier,
+/// and its `instantiate` (op 0) arrived as the Worker's `env.instantiate` bounce. The engine admits
+/// it as the interpreted op — `inst` resolved in `v`'s own powerbox, the carve checked against `v`'s
+/// window, the fuel cut from `v`'s ([`bytecode::Vcpu::admit_instantiate`]) — so the Worker keeps no
+/// copy of the carve rules. Returns the grandchild's ticket for its Worker
+/// ([`temen_par_child_confined`]), with the carve's offset in `v`'s window left in
+/// `temen_par_ev_c(v)`; `-EINVAL` for a refusal, which the emitted parent reads as the spawn's
+/// result; `0` for a trap (a forged handle), which the Worker raises.
+#[no_mangle]
+pub extern "C" fn temen_par_inst_instantiate(
+    v: *mut ParVcpu,
+    inst: i32,
+    entry: i64,
+    off: i64,
+    size_log2: i64,
+    quota: i64,
+) -> i64 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    let v = unsafe { &mut *v };
+    match v
+        .inner
+        .admit_instantiate(inst, entry, off, size_log2, quota)
+    {
+        Ok(Some((child, carve))) => {
+            v.c = carve as i64;
+            ticket(child)
+        }
+        Ok(None) => temen_ir::errno::EINVAL,
+        Err(_) => 0,
     }
 }
 
@@ -2257,40 +2280,47 @@ pub extern "C" fn temen_par_child(
     }
 }
 
-/// Build a §14 **confined executor child** vCPU (THREADS.md 4c-domain §14-D2) over the parent's carve
-/// `[carve_ptr, carve_ptr + 2^size_log2)` — the operands of a [`PAR_INSTANTIATE`] event, shuttled
-/// verbatim by the JS host (`carve_ptr` = the parent Worker's window pointer + the event's `carve`).
-/// Per DESIGN.md §14 a sub-window is indistinguishable from a top-level window, so the carve region
-/// simply *is* the child's window; the attenuated powerbox and the child's own dispatch table are
-/// built in-engine ([`bytecode::Vcpu::new_confined_child`]) — no authority crosses JS. Called on the
-/// child's Worker. Null on a bad module/entry.
+/// A child the engine admitted, boxed as a **ticket**: an opaque `i64` the JS host relays verbatim
+/// from the spawning Worker to the child's, which starts it ([`temen_par_child_confined`],
+/// [`temen_par_child_detached`]). The whole admitted child crosses — its powerbox, re-grants and
+/// pre-mapped region included — through the one linear memory every Worker shares, so nothing is
+/// rebuilt from integers on the other side.
+fn ticket(child: bytecode::PendingChild) -> i64 {
+    Box::into_raw(Box::new(child)) as usize as i64
+}
+
+/// Take back a [`ticket`].
+///
+/// # Safety
+/// `t` came from [`ticket`] and is taken exactly once.
+unsafe fn redeem(t: i64) -> bytecode::PendingChild {
+    *Box::from_raw(t as usize as *mut bytecode::PendingChild)
+}
+
+/// Start a §14 **confined executor child** (THREADS.md 4c-domain §14-D2) from its ticket over the
+/// parent's carve `[carve_ptr, carve_ptr + 2^size_log2)` — a [`PAR_INSTANTIATE`] event's operands, or
+/// [`temen_par_inst_instantiate`]'s, relayed by the JS host (`carve_ptr` = the parent Worker's window
+/// pointer + the carve offset). Per DESIGN.md §14 a sub-window is indistinguishable from a top-level
+/// window, so the carve region simply *is* the child's window. Called on the child's Worker. Null past
+/// the live cap or if the child fails to start (the ticket is spent either way).
 #[no_mangle]
 pub extern "C" fn temen_par_child_confined(
     prog: *mut bytecode::VcpuProgram,
+    ticket: i64,
     carve_ptr: *mut u8,
     size_log2: u32,
-    module: u32,
-    entry: u32,
-    fuel: i64,
 ) -> *mut ParVcpu {
+    // SAFETY: the host relays each ticket to exactly one child Worker.
+    let child = unsafe { redeem(ticket) };
     if size_log2 >= 64 || !par_vcpu_admit() {
         return core::ptr::null_mut();
     }
-    // SAFETY: the host guarantees the carve is inside the parent's live window (the engine validated
-    // it before surfacing the event); aliasing views of the shared memory are the §13 data plane.
+    // SAFETY: the carve is inside the parent's live window (the engine admitted it); aliasing views
+    // of the shared memory are the §13 data plane.
     let back =
         std::sync::Arc::new(unsafe { temen_interp::Region::shared(carve_ptr, 1u64 << size_log2) });
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    // (No shared-host attach: a §14 confined child's powerbox is its own attenuated one, built
-    // in-engine — its capability set never includes the run's I/O grants.)
-    match bytecode::Vcpu::new_confined_child(
-        unsafe { prog_ref(prog) },
-        module,
-        entry,
-        back,
-        size_log2 as u8,
-        fuel as u64,
-    ) {
+    match child.start(unsafe { prog_ref(prog) }, back, None) {
         // #816 item 5: a same-module confined child's compute leaves tier up over its OWN carve —
         // its Worker's `win` is the carve base and each event's `mapped`/page-state come from the
         // child's own `Mem` (the carve-sized confinement bound). A separate-module child carries
@@ -2317,39 +2347,31 @@ pub extern "C" fn temen_par_child_confined(
     }
 }
 
-/// Build a §5 **detached child** vCPU (#1286 slice 3b) over its own `WebAssembly.Memory`, registered
-/// in this Worker's foreign registry as `mem_id` (`registerForeign(childMem, header)` — region offset 0
-/// is one host header page in, DETACHED_JIT.md §3.1). The operands of a [`PAR_INSTANTIATE_DETACHED`]
-/// event, shuttled verbatim by the JS host, which already seeded the memory from the event's blob. The
-/// window starts at the declared `1 << size_log2` and `vm_map`-grows in place (`Mem::map` →
-/// `Region::grow_to` → `foreign_grow`): the starter caps span the reservation, a root's shape. Same
-/// attenuated powerbox as [`temen_par_child_confined`] — no authority crosses JS. No tier-up: the
-/// emitted tier binds the ONE engine memory, and this window is not in it (the bitmap is inert on a
-/// separate module anyway). Called on the child's Worker; null on a bad module/entry.
+/// Start a §5 **detached child** (#1286 slice 3b) from its ticket over its own `WebAssembly.Memory`,
+/// registered in this Worker's foreign registry as `mem_id` (`registerForeign(childMem, header)` —
+/// region offset 0 is one host header page in, DETACHED_JIT.md §3.1): a [`PAR_INSTANTIATE_DETACHED`]
+/// event's operands, relayed by the JS host with the memory it minted. The engine seeds the window —
+/// its data segments under the NULL guard, the args payload, a pre-mapped region — which starts at
+/// the declared `1 << size_log2` and `vm_map`-grows in place (`Mem::map` → `Region::grow_to` →
+/// `foreign_grow`). No tier-up: the emitted tier binds the ONE engine memory, and this window is not
+/// in it. Called on the child's Worker. Null past the live cap or if the child fails to start (the
+/// ticket is spent either way).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_child_detached(
     prog: *mut bytecode::VcpuProgram,
+    ticket: i64,
     mem_id: u32,
     size_log2: u32,
-    module: u32,
-    entry: u32,
-    fuel: i64,
 ) -> *mut ParVcpu {
+    // SAFETY: the host relays each ticket to exactly one child Worker.
+    let child = unsafe { redeem(ticket) };
     if size_log2 >= 64 || !par_vcpu_admit() {
         return core::ptr::null_mut();
     }
     let back = std::sync::Arc::new(foreign_region(mem_id, 1u64 << size_log2));
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_confined_child_grow(
-        unsafe { prog_ref(prog) },
-        module,
-        entry,
-        back,
-        size_log2 as u8,
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        fuel as u64,
-    ) {
+    match child.start(unsafe { prog_ref(prog) }, back, None) {
         Ok(inner) => {
             let v = par_box(inner);
             // SAFETY: freshly boxed, exclusively ours until returned to the Worker.
@@ -2716,32 +2738,24 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     }
                 }
             }
-            // §14 confined executor child (THREADS.md 4c-domain §14-D2): all authority-bearing work
-            // already happened in-Vm — the operands are inert integers the JS host shuttles into a
-            // new Worker running `temen_par_child_confined` over `[win + carve, +2^size_log2)`, joined
-            // through the same completion-slot protocol as `PAR_SPAWN`.
+            // §14 confined executor child (THREADS.md 4c-domain §14-D2): the engine admitted it, so the
+            // JS host only relays its ticket to a new Worker, which starts it over `[win + carve,
+            // +2^size_log2)` (`temen_par_child_confined`), joined through the same completion-slot
+            // protocol as `PAR_SPAWN`. A carve of a detached window is not addressable as `win + carve`
+            // in the engine memory (see [`ParVcpu::detached`]): fail closed.
             bytecode::VcpuEvent::Instantiate {
                 module,
                 entry,
                 carve,
                 size_log2,
-                fuel,
             } => {
-                // The engine admitted the child and built its powerbox, but this driver rebuilds the
-                // child in its own Worker from these inert integers (`temen_par_child_confined` →
-                // `Vcpu::new_confined_child`), which carries only the starter caps. So a spawn that
-                // re-granted named caps (op 13, a §3d record's) fails closed rather than run the child
-                // without them — the detached arm below refuses the same way — and so does a carve of a
-                // detached window, which is not addressable as `win + carve` in the engine memory (see
-                // [`ParVcpu::detached`]). A grant-less op-13 spawn is not refused: its list is empty.
-                let admitted = v.inner.take_child();
-                if v.detached || admitted.is_some_and(|c| c.granted()) {
+                let Some(child) = v.inner.take_child().filter(|_| !v.detached) else {
                     return PAR_TRAP;
-                }
-                v.a = ((module as i64) << 32) | entry as i64;
+                };
+                v.a = ticket(child);
                 v.b = carve as i64;
                 v.c = size_log2 as i64;
-                v.d = fuel as i64;
+                v.d = ((module as i64) << 32) | entry as i64;
                 return PAR_INSTANTIATE;
             }
             // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
@@ -2750,41 +2764,13 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             // #1366: a host-completed cap park has no completer on this driver — fail closed.
             bytecode::VcpuEvent::CapPending { .. } => return PAR_TRAP,
             // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
-            // mints and seeds from this blob, then posts to a new Worker (see
-            // [`PAR_INSTANTIATE_DETACHED`]). As in the confined arm above, the child is rebuilt there
-            // from integers with only its starter caps, so a spawn whose admitted powerbox carries
-            // re-granted caps or a pre-mapped region fails closed instead of silently running the
-            // child without them.
-            bytecode::VcpuEvent::InstantiateDetached {
-                module,
-                entry,
-                size_log2,
-                fuel,
-                args,
-                data,
-            } => {
-                let admitted = v.inner.take_child();
-                if admitted.is_some_and(|c| c.granted()) {
+            // mints and posts, with the ticket, to a new Worker (see [`PAR_INSTANTIATE_DETACHED`]).
+            bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
+                let Some(child) = v.inner.take_child() else {
                     return PAR_TRAP;
-                }
-                let mut seed = Vec::new();
-                let segs = data
-                    .iter()
-                    .map(|d| (d.offset, d.bytes.as_slice()))
-                    .chain((!args.is_empty()).then(|| (temen_ir::module_args_base(), &args[..])));
-                seed.extend_from_slice(&0u32.to_le_bytes());
-                let mut n = 0u32;
-                for (off, bytes) in segs {
-                    seed.extend_from_slice(&off.to_le_bytes());
-                    seed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                    seed.extend_from_slice(bytes);
-                    n += 1;
-                }
-                seed[..4].copy_from_slice(&n.to_le_bytes());
-                v.det_seed = seed;
-                v.a = ((module as i64) << 32) | entry as i64;
+                };
+                v.a = ticket(child);
                 v.b = size_log2 as i64;
-                v.c = fuel as i64;
                 return PAR_INSTANTIATE_DETACHED;
             }
         }
@@ -2863,20 +2849,6 @@ pub extern "C" fn temen_par_tierup_pagestate_len(v: *mut ParVcpu) -> usize {
 pub extern "C" fn temen_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).tierup_argv.len() }
-}
-
-/// The seed blob of a pending [`PAR_INSTANTIATE_DETACHED`]: what the Worker writes into the child's
-/// fresh memory (at `header + off` per record) before posting it. Lives until the next event.
-#[no_mangle]
-pub extern "C" fn temen_par_det_seed_ptr(v: *mut ParVcpu) -> *const u8 {
-    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
-    unsafe { (*v).det_seed.as_ptr() }
-}
-
-#[no_mangle]
-pub extern "C" fn temen_par_det_seed_len(v: *mut ParVcpu) -> usize {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).det_seed.len() }
 }
 
 /// Deliver the results of a tier-up region (after `PAR_TIERUP`): `[results_ptr, n)` are the emitted
@@ -12912,14 +12884,12 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             // (§3.5 / #1296), its attestation and its import manifest bound. The spawn-time args
             // payload is seeded at `module_args_base()`; this servicer holds the decoded child already.
             #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-            bytecode::VcpuEvent::InstantiateDetached {
-                size_log2, args, ..
-            } => {
+            bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
                 let Some(child) = d.root.take_child() else {
                     return OP13JIT_TRAP;
                 };
                 let child_size = 1u64 << size_log2;
-                let init_mem = args_init_mem_raw(&args);
+                let init_mem = args_init_mem_raw(child.payload());
                 // On a key change (a different phase child — nifler_ce → nimsem_ce → hexer_ce across the
                 // whole card, #1025 3e), drop the stale emit BEFORE emitting the new child, so the old
                 // child's hundreds-of-MB `SharedProgram` + wasm doesn't co-reside with the new emit and

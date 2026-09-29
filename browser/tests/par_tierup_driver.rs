@@ -2,13 +2,14 @@
 //! former "plain compute paths only" gate is lifted, so a same-module confined child's eligible
 //! leaves tier up over the child's OWN carve. This is the first native harness for the par FFI at
 //! all (it was real-browser-only): the test plays `par.js` + `worker.js` single-threaded — it
-//! services `PAR_INSTANTIATE` by building the child vCPU itself (`temen_par_child_confined`) and
-//! driving it to completion before delivering the join, and services each `PAR_TIERUP` the way the
-//! Worker's emitted region would: write the leaf's store through the **serving vCPU's window**
-//! (the root window for the root's event, the carve for the child's) and deliver the computed
-//! results. The per-vCPU routing pins are direct: the child event's `ev_b` (the `"mapped"` value)
-//! must be the CHILD's carve size, not the root window's, and each leaf's store must land in its
-//! own task's window (the root reads the child's marker back through the carve offset).
+//! services `PAR_INSTANTIATE` by starting the admitted child from its ticket
+//! (`temen_par_child_confined`) and driving it to completion before delivering the join, and
+//! services each `PAR_TIERUP` the way the Worker's emitted region would: write the leaf's store
+//! through the **serving vCPU's window** (the root window for the root's event, the carve for the
+//! child's) and deliver the computed results. The per-vCPU routing pins are direct: the child
+//! event's `ev_b` (the `"mapped"` value) must be the CHILD's carve size, not the root window's, and
+//! each leaf's store must land in its own task's window (the root reads the child's marker back
+//! through the carve offset).
 //! Differential against the same guest on the cooperative interpreter (no bitmap).
 //!
 //! The emitted-wasm execution half over a confined carve is pinned by the coop browser gate
@@ -21,7 +22,7 @@ use temen_browser::{
     temen_par_ev_b, temen_par_ev_c, temen_par_ev_d, temen_par_free, temen_par_powerbox_inst,
     temen_par_root, temen_par_run, temen_par_tierup_argv_len, temen_par_tierup_argv_ptr,
     temen_par_tierup_pagestate_len, temen_par_tierup_pagestate_ptr, PAR_DONE, PAR_INSTANTIATE,
-    PAR_JOIN, PAR_TIERUP, PAR_TRAP,
+    PAR_JOIN, PAR_TIERUP,
 };
 use temen_interp::{bytecode, host_page_size, Host, Value};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -187,23 +188,23 @@ fn par_confined_child_tiers_up_over_its_own_carve() {
                 service_tierup(root, win_ptr, 1 << 17);
             }
             PAR_INSTANTIATE => {
-                // (module << 32) | entry, the carve offset, its size log2, the child's fuel —
-                // shuttled verbatim into the child constructor, exactly as worker.js does.
-                let am = temen_par_ev_a(root);
-                let (smod, entry) = ((am >> 32) as u32, am as u32);
-                assert_eq!((smod, entry), (0, 1), "same-module child at f1");
+                // The admitted child's ticket, the carve offset, its size log2 — relayed verbatim to
+                // the child's start, exactly as worker.js does — and (module << 32) | entry.
+                let ticket = temen_par_ev_a(root);
                 let carve = temen_par_ev_b(root) as usize;
                 let slog = temen_par_ev_c(root) as u32;
+                let am = temen_par_ev_d(root);
+                let (smod, entry) = ((am >> 32) as u32, am as u32);
+                assert_eq!((smod, entry), (0, 1), "same-module child at f1");
                 assert_eq!(
                     (carve as u64, slog),
                     (CARVE_OFF, CARVE_LOG2),
                     "32 KiB carve at 64 KiB"
                 );
-                let cfuel = temen_par_ev_d(root);
                 // SAFETY: the engine validated the carve lies inside the root window before
                 // surfacing the event (worker.js relies on the same contract).
                 let carve_ptr = unsafe { win_ptr.add(carve) };
-                let child = temen_par_child_confined(prog, carve_ptr, slog, smod, entry, cfuel);
+                let child = temen_par_child_confined(prog, ticket, carve_ptr, slog);
                 assert!(!child.is_null(), "confined child vCPU builds");
                 // Drive the child to completion (single-threaded stand-in for its Worker): its
                 // tier-up events serve over ITS OWN CARVE — the #816 item 5 behavior under test.
@@ -358,15 +359,15 @@ fn par_confined_child_paged_reflects_its_own_unmap() {
         match temen_par_run(root) {
             PAR_DONE => break temen_par_ev_a(root),
             PAR_INSTANTIATE => {
-                let am = temen_par_ev_a(root);
-                let (smod, entry) = ((am >> 32) as u32, am as u32);
-                assert_eq!((smod, entry), (0, 1), "same-module child at f1");
+                let ticket = temen_par_ev_a(root);
                 let carve = temen_par_ev_b(root) as usize;
                 let slog = temen_par_ev_c(root) as u32;
-                let cfuel = temen_par_ev_d(root);
+                let am = temen_par_ev_d(root);
+                let (smod, entry) = ((am >> 32) as u32, am as u32);
+                assert_eq!((smod, entry), (0, 1), "same-module child at f1");
                 // SAFETY: the engine validated the carve lies inside the root window.
                 let carve_ptr = unsafe { win_ptr.add(carve) };
-                let child = temen_par_child_confined(prog, carve_ptr, slog, smod, entry, cfuel);
+                let child = temen_par_child_confined(prog, ticket, carve_ptr, slog);
                 assert!(!child.is_null(), "confined child vCPU builds");
                 let v = loop {
                     match temen_par_run(child) {
@@ -959,23 +960,44 @@ block 0 (v0: i32) {{
     );
 }
 
-/// An op-13 spawn on the per-Worker driver is refused only when it re-grants named caps. The engine
-/// admits the child with its whole powerbox, but this driver rebuilds the child in its own Worker from
-/// the event's integers, which cannot carry a grant — so a spawn that re-grants its `Module` handle by
-/// name fails closed. Op 13 always carries a grant list, empty when the guest re-grants nothing, and a
-/// grant-less spawn must still reach `PAR_INSTANTIATE` (#1876 briefly refused that too).
+/// An op-13 child on the per-Worker driver holds what its spawn re-granted. The child's Worker starts
+/// the admitted child from its ticket, powerbox included, so the child resolves a `Module` handle its
+/// parent re-granted by name, and misses the name (`-EINVAL`) when the parent granted nothing — as on
+/// the cooperative oracle. This driver used to rebuild the child from the event's integers, which
+/// could not carry a grant, and refused such a spawn instead.
 #[test]
-fn par_op13_refuses_only_a_spawn_that_carries_grants() {
+fn par_op13_child_holds_what_its_spawn_granted() {
     let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // #1182 — serial single-run
+                                                                         // The child resolves `mod` by name and returns the handle, or `-EINVAL` when it holds none.
     let unit = temen_text::parse_module(
-        "memory 12\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  vr = i64.const 42\n  return vr\n  }\n}\n",
+        "memory 12
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va0 = i64.const 100
+  vb0 = i32.const 109
+  i32.store8 va0 vb0
+  va1 = i64.const 101
+  vb1 = i32.const 111
+  i32.store8 va1 vb1
+  va2 = i64.const 102
+  vb2 = i32.const 100
+  i32.store8 va2 vb2
+  vp = i64.const 100
+  vl = i64.const 3
+  vh = self.resolve vp vl
+  vr = i64.extend_i32_s vh
+  return vr
+  }
+}
+",
     )
     .expect("parse unit");
     temen_verify::verify_module(&unit).expect("verify unit");
     let unit_bytes = temen_encode::encode_module(&unit);
-    for (grants_n, want) in [(0, PAR_INSTANTIATE), (1, PAR_TRAP)] {
+    for grants_n in [0, 1] {
         // Root `(instantiator, module) -> i64`: a grant record at 16384 naming the module handle `mod`
-        // (read only when `grants_n` is 1), then op 13 of the unit's entry into a 4 KiB carve at 64 KiB.
+        // (read only when `grants_n` is 1), then op 13 of the unit's entry into a 4 KiB carve at 64 KiB,
+        // joined.
         let src = format!(
             r#"memory 17
 func (i32, i32) -> (i64) {{
@@ -1017,6 +1039,35 @@ block 0 (vinst: i32, vmod: i32) {{
         let root = temen_text::parse_module(&src).expect("parse root");
         temen_verify::verify_module(&root).expect("verify root");
         let root_bytes = temen_encode::encode_module(&root);
+
+        // Oracle: the same guest and powerbox on the cooperative interpreter.
+        let want = {
+            let mut host = Host::new();
+            let inst = host.grant_instantiator(0, 1 << 17);
+            let modh = host.grant_module(&unit);
+            let args = [Value::I32(inst), Value::I32(modh)];
+            let mut run = bytecode::CoopRun::new(&root, 0, &args, FUEL, host, None)
+                .expect("supported")
+                .expect("entry in range");
+            match run.run() {
+                bytecode::CoopEvent::Done(vals) => match vals.first() {
+                    Some(Value::I64(x)) => *x,
+                    other => panic!("non-i64 oracle result {other:?}"),
+                },
+                bytecode::CoopEvent::Trapped(t) => panic!("oracle trapped: {t:?}"),
+                other => panic!(
+                    "oracle did not run to completion: {:?}",
+                    core::mem::discriminant(&other)
+                ),
+            }
+        };
+        assert_eq!(
+            want >= 0,
+            grants_n == 1,
+            "the oracle's child holds `mod` iff its spawn granted it (got {want})"
+        );
+
+        // The parallel drive, this test playing par.js + worker.js single-threaded.
         assert_eq!(
             temen_par_powerbox_inst(1 << 17, unit_bytes.as_ptr(), unit_bytes.len(), 0),
             1,
@@ -1025,13 +1076,39 @@ block 0 (vinst: i32, vmod: i32) {{
         let prog = temen_par_compile(root_bytes.as_ptr(), root_bytes.len());
         assert!(!prog.is_null(), "root program compiles");
         let mut win = vec![0u8; 1 << 17];
-        let v = temen_par_root(prog, win.as_mut_ptr(), win.len(), 0);
+        let win_ptr = win.as_mut_ptr();
+        let v = temen_par_root(prog, win_ptr, win.len(), 0);
         assert!(!v.is_null(), "root vCPU builds");
-        assert_eq!(
-            temen_par_run(v),
-            want,
-            "op 13 with {grants_n} grant record(s)"
-        );
+        let mut child_value = None;
+        let got = loop {
+            match temen_par_run(v) {
+                PAR_DONE => break temen_par_ev_a(v),
+                PAR_INSTANTIATE => {
+                    let (ticket, carve) = (temen_par_ev_a(v), temen_par_ev_b(v) as usize);
+                    let slog = temen_par_ev_c(v) as u32;
+                    // SAFETY: the engine validated the carve lies inside the root window.
+                    let carve_ptr = unsafe { win_ptr.add(carve) };
+                    let child = temen_par_child_confined(prog, ticket, carve_ptr, slog);
+                    assert!(!child.is_null(), "the child starts from its ticket");
+                    assert_eq!(
+                        temen_par_run(child),
+                        PAR_DONE,
+                        "the child runs to completion"
+                    );
+                    child_value = Some(temen_par_ev_a(child));
+                    temen_par_free(child);
+                    temen_par_deliver_handle(v, 0);
+                }
+                PAR_JOIN => {
+                    temen_par_deliver_join(v, child_value.expect("child ran before join"), 0);
+                }
+                ev => panic!("unexpected root event {ev} (op 13 with {grants_n} grant record(s))"),
+            }
+        };
         temen_par_free(v);
+        assert_eq!(
+            got, want,
+            "op 13 with {grants_n} grant record(s): the per-Worker driver diverged from the oracle"
+        );
     }
 }

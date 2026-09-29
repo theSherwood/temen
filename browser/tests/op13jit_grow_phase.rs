@@ -10,9 +10,10 @@
 //! This pins the *scale* the pre-size blocked: a child declaring 1 MiB grows to the full 256 MiB carve
 //! in four `vm_map`s and touches the deepest page of every grown chunk. The wasmi driver plays
 //! `driveJitRun` (`env.call_interp` → `run_cross_tier`, re-pointing `"mapped"` after each bounce); the
-//! oracle is `new_confined_child_grow` over the same carve — the committed-declared, carve-growing
-//! window the op-13 step's interpreter fallback starts its child over. Value parity, four bounces, and a
-//! `"mapped"` high-water at the whole carve are the non-vacuity proof.
+//! oracle is the interpreter over the same carve with starter caps spanning it — the committed-declared,
+//! carve-growing window the op-13 step's interpreter fallback starts its child over
+//! (`PendingChild::start` with `committed_log2`). Value parity, four bounces, and a `"mapped"`
+//! high-water at the whole carve are the non-vacuity proof.
 
 use std::sync::Arc;
 
@@ -83,6 +84,8 @@ fn build() -> temen_ir::Module {
 
 /// The interpreter oracle: the child as a **growable** confined child over the carve — declared `DECL`
 /// committed, `vm_map`-growing into `1 << CARVE` — the window the op-13 step's fallback starts it over.
+/// Its starter caps span the carve; the window over it is a root vCPU's, since a sub-window is
+/// indistinguishable from a top-level window (DESIGN.md §14).
 fn oracle(m: &temen_ir::Module) -> i64 {
     let prog = bytecode::VcpuProgram::compile(m).expect("compile");
     let carve = 1usize << CARVE;
@@ -93,16 +96,12 @@ fn oracle(m: &temen_ir::Module) -> i64 {
     // SAFETY: `base` is `carve` valid bytes, exclusively this child's window, freed only after the vCPU.
     let back = Arc::new(unsafe { Region::shared(base, carve as u64) });
     let out = {
-        let mut vcpu = bytecode::Vcpu::new_confined_child_grow(
-            &prog,
-            0,
-            0,
-            Arc::clone(&back),
-            DECL,
-            CARVE,
-            u64::MAX,
-        )
-        .expect("growable confined child builds");
+        let mut host = Host::new();
+        let (inst, space) = host.grant_starter_caps(1 << CARVE);
+        let args = [Value::I64(inst.into()), Value::I64(space.into())];
+        let mut vcpu =
+            bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, Arc::clone(&back), &[], host)
+                .expect("growable confined child builds");
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => match v.first() {
                 Some(Value::I64(x)) => *x,

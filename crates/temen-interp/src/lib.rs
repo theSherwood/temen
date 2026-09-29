@@ -31263,10 +31263,18 @@ impl Mem {
     /// region of the parent backing (matching trap-confinement, which confines child accesses to
     /// `[win_base, win_base + size)`). `win_base == 0` is the ordinary top-level window.
     fn init_data_at(&mut self, data: &[Data], win_base: u64) {
-        // Byte writes first (no §13 regions exist at init ⇒ `set_byte` is lock-free)...
+        // Byte writes first. No §13 regions exist at init, so each segment is one bulk write into
+        // the backing — a single call even through a `Region::Foreign` (a detached child's own
+        // `WebAssembly.Memory`), where a byte at a time is a host call per byte...
+        let aliased = self.has_regions.load(Ordering::Relaxed);
         for d in data {
-            for (i, &b) in d.bytes.iter().enumerate() {
-                self.set_byte(win_base + d.offset + i as u64, b);
+            let at = win_base + d.offset;
+            if aliased {
+                for (i, &b) in d.bytes.iter().enumerate() {
+                    self.set_byte(at + i as u64, b);
+                }
+            } else {
+                self.back.write_from(at, &d.bytes);
             }
         }
         // ...then the read-only protections, under one address-space write lock. The prot map is
