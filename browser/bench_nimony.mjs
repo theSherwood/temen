@@ -1,15 +1,19 @@
 // nimony's own driver in a real browser (#958): the wasm export `temen_nim_build` builds a nim program
 // the way `scripts/ci/nim-selfhost-lane.sh`'s step 4 does natively — `nimony t --isMain prog.nim`, which
 // forks and execs nifmake, `/bin/sh`, nifler2, nimsem, hexer and temen-link, and a compile-time
-// evaluation's own build — every process on the interpreter tier inside Chromium. Reports the build's
-// wall-clock and the engine's linear memory after it (a wasm memory only grows, so that is its peak).
-// A measurement, not a gate; it fails only when the build does not link the module it should.
+// evaluation's own build — every process on the interpreter tier inside Chromium, but temen-link, which
+// the engine serves natively. Reports the build's wall-clock and the engine's linear memory after it (a
+// wasm memory only grows, so that is its peak). A measurement, not a gate; it fails only when the build
+// does not link the module it should.
 //
-//   NIM_LANE_DIR=<dir> NIM_TREE=<tree> NIM_PROG=prog.nim [NIM_EXPECT=<module>] [NIM_MAX_PAGES=65536] \
-//     node bench_nimony.mjs
+//   NIM_LANE_DIR=<dir> NIM_TREE=<tree> NIM_PROG=prog.nim [NIM_AT=<dir>] [NIM_LIB=<pack>] \
+//     [NIM_EXPECT=<module>] [NIM_MAX_PAGES=65536] node bench_nimony.mjs
 //
 // `NIM_LANE_DIR` holds the lane's toolchain as `src/nimbuild.rs` reads it (`nimony.temen`, …, `sh.ir`,
-// `libc.temeno`); `NIM_TREE` is a lane program tree. The page receives them over routed URLs.
+// `libc.temeno`); `NIM_TREE` is a lane program tree, seeded and built at `NIM_AT` (by default its host
+// path). `NIM_LIB` is a library pack (`nimbuild --pack`, from a build at the same `NIM_AT`), seeded
+// after the tree so the build compiles only the program's own modules. The page receives them over
+// routed URLs.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -17,17 +21,18 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'n
 import { createHash } from 'node:crypto';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const { NIM_LANE_DIR: LANE, NIM_TREE, NIM_PROG, NIM_EXPECT } = process.env;
+const { NIM_LANE_DIR: LANE, NIM_TREE, NIM_PROG, NIM_AT, NIM_LIB, NIM_EXPECT } = process.env;
 const WASM = `${ROOT}/target/wasm32-unknown-unknown/release/temen_browser.wasm`;
 if (!LANE || !NIM_TREE || !NIM_PROG || !existsSync(WASM)) {
   console.log('SKIP: set NIM_LANE_DIR, NIM_TREE and NIM_PROG, and build the threads wasm');
   process.exit(0);
 }
-const TOOLS = ['nimony', 'nifmake', 'nimsem', 'nifler2', 'hexer', 'temen-link'];
-const dir = realpathSync(NIM_TREE);
+const TOOLS = ['nimony', 'nifmake', 'nimsem', 'nifler2', 'hexer'];
+const tree = realpathSync(NIM_TREE);
+const dir = NIM_AT || tree;
 
-// The tree at its host path, without `bin/` (the toolchain) or `nimcache/` (what a build writes),
-// in the order `nimbuild` seeds it; then the guest libc where temen-link looks for it.
+// The tree at `dir`, without `bin/` (the toolchain) or `nimcache/` (what a build writes), in the
+// order `nimbuild` seeds it; then the library pack; then the guest libc where temen-link looks for it.
 const files = [];
 const walk = (d, prefix) => {
   for (const name of readdirSync(d).sort()) {
@@ -36,11 +41,24 @@ const walk = (d, prefix) => {
     else files.push({ path: `${prefix}${name}`, disk: p });
   }
 };
-for (const name of readdirSync(dir).sort()) {
+for (const name of readdirSync(tree).sort()) {
   if (name === 'bin' || name === 'nimcache') continue;
-  const p = join(dir, name);
+  const p = join(tree, name);
   if (statSync(p).isDirectory()) walk(p, `${dir}/${name}/`);
   else files.push({ path: `${dir}/${name}`, disk: p });
+}
+if (NIM_LIB) {
+  // A registry blob: u32 count, then per entry u32 name length, the name, u32 length, the bytes.
+  const pack = readFileSync(NIM_LIB);
+  let o = 4;
+  for (let i = pack.readUInt32LE(0); i > 0; i--) {
+    const n = pack.readUInt32LE(o);
+    const path = pack.toString('utf8', o + 4, o + 4 + n);
+    const len = pack.readUInt32LE(o + 4 + n);
+    o += 8 + n;
+    files.push({ path, body: pack.subarray(o, o + len) });
+    o += len;
+  }
 }
 files.push({ path: '/lib/temen/libc.temeno', disk: join(LANE, 'libc.temeno') });
 const manifest = {
@@ -67,12 +85,13 @@ page.on('console', (m) => {
   else if (m.text().startsWith('nimbench: ')) console.log(m.text());
 });
 const bytes = (disk) => ({ status: 200, contentType: 'application/octet-stream', body: readFileSync(disk) });
+const file = (f) => (f.body ? { status: 200, contentType: 'application/octet-stream', body: f.body } : bytes(f.disk));
 await page.route((url) => url.pathname.startsWith('/web/nimbench/'), (route) => {
   const rest = new URL(route.request().url()).pathname.slice('/web/nimbench/'.length);
   if (rest === 'manifest.json') return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(manifest) });
   if (rest === 'sh.ir') return route.fulfill(bytes(join(LANE, 'sh.ir')));
   if (rest.startsWith('tool/')) return route.fulfill(bytes(join(LANE, `${rest.slice(5)}.temen`)));
-  if (rest.startsWith('file/')) return route.fulfill(bytes(files[Number(rest.slice(5))].disk));
+  if (rest.startsWith('file/')) return route.fulfill(file(files[Number(rest.slice(5))]));
   return route.fulfill({ status: 404, body: '' });
 });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
