@@ -1,11 +1,12 @@
-//! **Run the real `nimsem` (sema) phase as a confined §14 op-13 child** — the front-end driver's
+//! **Run the real `nimsem` (sema) phase as a confined §14 child** — the front-end driver's
 //! nested-spawn shape on Temen (NIM.md §3c, W5). `nim_frontend_driver` runs nimsem *top-level*; this
-//! runs it as an op-13 child, the way a Rust-on-Temen driver guest fans phases out. The wrinkle vs
-//! nifler/hexer: nimsem is itself a driver — it `system("nifler … parse <src> <out.p.nif>")`s to parse
-//! stdlib modules on demand, routed by the shim to an **`exec`** cap. So the op-13 grant list carries
-//! **four** caps — `{fs, stdout, exit, exec}` — and the re-granted `exec` (a `domain_exec_with_fs` over
-//! the *same* shared memfs) lets nimsem-the-child spawn `nifler` grandchildren that write into the store
-//! nimsem reads. The emitted `.s.nif` is compared (path-normalized) to native nimsem by the caller.
+//! runs it as a child (through the [`temen_run::conductor`]), the way a Rust-on-Temen driver guest fans
+//! phases out. The wrinkle vs nifler/hexer: nimsem is itself a driver — it `system("nifler … parse
+//! <src> <out.p.nif>")`s to parse stdlib modules on demand, routed by the shim to an **`exec`** cap. So
+//! the grant list carries **four** caps — `{fs, stdout, exit, exec}` — and the re-granted `exec` (a
+//! `domain_exec_with_fs` over the *same* shared memfs) lets nimsem-the-child spawn `nifler`
+//! grandchildren that write into the store nimsem reads. The emitted `.s.nif` is compared
+//! (path-normalized) to native nimsem by the caller.
 //!
 //! ```text
 //! cargo run -q --release -p temen-run --example nimsem_child_driver -- \
@@ -38,64 +39,6 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
             }
         }
     }
-}
-
-/// The op-13 parent: four grant records `{fs, stdout, exit, exec}`, their names, and `argv`, all laid
-/// out for the **#1094 guarded window** — the grant records/cap-names sit in the parent window (read by
-/// the op-13 handler in the parent's context), but the parent is itself a guarded module, so they must
-/// live **above** the NULL guard `[0, POWERBOX_NULL_GUARD)`: records at `guard + 1024..`, names at
-/// `guard + 2048..`, and `argv` at `carve + module_args_base()` (the child reads its args there, one
-/// guard up). This mirrors `crates/temen-run/tests/nifler_child_asset.rs`; before #1094 they sat at
-/// 1024../2048../`carve + POWERBOX_ARGS_BASE`, which now falls inside the guard and NULL-faults.
-fn parent_src(child_sl: u32, carve_off: u64, argv: &[String]) -> String {
-    let parent_sl = child_sl + 1;
-    let guard = temen_ir::POWERBOX_NULL_GUARD;
-    let rec_base = guard + 1024;
-    let name_base = guard + 2048;
-    let argv_off = carve_off + temen_ir::module_args_base();
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&0u32.to_le_bytes());
-    for s in argv {
-        blob.extend_from_slice(s.as_bytes());
-        blob.push(0);
-    }
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-    // record `i` at rec_base + i*16: word0 = name_off | (name_len<<32) at that offset, handle (param
-    // v(2+i)) at +8. Cap-name bytes at name_base + i*16.
-    let names = [("fs", 2u64), ("stdout", 6), ("exit", 4), ("exec", 4)];
-    let mut records = String::new();
-    let mut name_data = String::new();
-    for (i, (n, len)) in names.iter().enumerate() {
-        let off = rec_base + i as u64 * 16;
-        let noff = name_base + i as u64 * 16;
-        let w0 = noff | (len << 32);
-        records.push_str(&format!(
-            "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n  h{off} = i64.extend_i32_u v{vi}\n  oh{off} = i64.const {hoff}\n  i64.store oh{off} h{off}\n",
-            vi = 2 + i,
-            hoff = off + 8,
-        ));
-        name_data.push_str(&format!("data {noff} \"{n}\"\n"));
-    }
-    format!(
-        r#"memory {parent_sl}
-{name_data}data {argv_off} "{argv_esc}"
-func (i32, i32, i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {{
-{records}  vmh = i64.extend_i32_u v1
-  vgptr = i64.const {rec_base}
-  vgn = i64.const 4
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-    )
 }
 
 fn main() {
@@ -152,32 +95,26 @@ fn main() {
     };
     let exec_cap = domain_exec_with_fs(programs, child_fs);
 
-    // The child-entry nimsem module + carve geometry (generous heap — nimsem's system semcheck is large).
+    // The child-entry nimsem module.
     let nimsem = temen_encode::decode_module(
         &std::fs::read(&nimsem_p).unwrap_or_else(|e| panic!("read {nimsem_p}: {e}")),
     )
     .expect("decode nimsem_ce.temen");
     temen_verify::verify_module(&nimsem).expect("nimsem verifies");
-    let decl = nimsem.memory.as_ref().expect("nimsem window").size_log2 as u32;
-    // The carve floor is measured, documented and shared — see `temen_run::nim_phase_carve_log2`.
-    let child_sl = temen_run::nim_phase_carve_log2(decl);
-    let carve_off = 1u64 << child_sl;
-    let parent_win = 1u64 << (child_sl + 1);
-
-    let argv: Vec<String> = [
-        "nimsem",
-        "--define:nimNativeAlloc",
-        "--define:nimNativeIo",
-        "m",
-        "--isSystem",
-        &format!("nimcache/{sys_stem}.p.nif"),
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    let parent =
-        temen_text::parse_module(&parent_src(child_sl, carve_off, &argv)).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    let log2 = nimsem.memory.as_ref().expect("nimsem window").size_log2;
+    let sys_pnif_key = format!("nimcache/{sys_stem}.p.nif");
+    let parent = temen_run::conductor(
+        log2,
+        &["fs", "stdout", "exit", "exec"],
+        &[
+            "nimsem",
+            "--define:nimNativeAlloc",
+            "--define:nimNativeIo",
+            "m",
+            "--isSystem",
+            &sys_pnif_key,
+        ],
+    );
 
     let mut host = Host::new();
     let (fs_init, fs_init_state) = (*factory)();
@@ -192,13 +129,12 @@ fn main() {
     let sink = host.shared_stdout();
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let exec_h = exec_cap.install(&mut host, parent_win);
-    let inst = host.grant_instantiator(0, parent_win);
-    let modh = host.grant_module(&nimsem);
+    let exec_h = exec_cap.install(&mut host, 1u64 << temen_run::CONDUCTOR_LOG2);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &nimsem);
 
     let mut fuel = 2_000_000_000_000u64;
     // `_traced`, not the plain `run_with_host`: the trap this driver exists to report belongs to the
-    // op-13 **child**, whose window dies with its outcome, so `Err(t)` alone is a bare `MemoryFault`
+    // **child**, whose window dies with its outcome, so `Err(t)` alone is a bare `MemoryFault`
     // with nothing left to ask (#1591). The backtrace it returns is the first-wins trap-origin
     // capture — the child's frames, not the parent's join site.
     let (r, trap_bt, _fiber) = run_with_host_traced(
@@ -207,6 +143,7 @@ fn main() {
         &[
             Value::I32(inst),
             Value::I32(modh),
+            Value::I32(budget),
             Value::I32(fs_h),
             Value::I32(stdout_h),
             Value::I32(exit_h),

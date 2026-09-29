@@ -1,20 +1,10 @@
-//! **The committed child-entry nifler asset, op-13-spawned on the JIT** (NIM.md §3c, W5). The
-//! `nifler_child_asset` gate runs the phase child on the tree-walker; this runs the *same* op-13 spawn
-//! on the **Cranelift JIT** — the tier-up-capable engine a browser wasm-JIT card also uses — via the
-//! granted-spawn hooks (`GrantChildHooks` + `module_resolver`, the shape `rust_guest_op13` established).
-//! nifler runs as a confined §14 op-13 child on emitted code and its `.p.nif` is byte-identical to native.
-//!
-//! **The bring-up (landed).** The root cause of the earlier `CapFault` was an interp/JIT divergence in
-//! the op-13 `mod_ok` gate: the JIT required a separate-module child's carve to *exactly equal* its
-//! declared window, while the interpreter had already been relaxed (FORK.md §8.6 / #773) to `declared
-//! <= carve`. A malloc child *needs* the larger carve — the synthesized bump allocator's `heap_base`
-//! is `1<<declared` and it grows the heap up into `[1<<declared, carve)` — so the strict-equal JIT
-//! rejected the spawn `-EINVAL`, and the parent's `join` on that forged handle surfaced as the
-//! `CapFault` (the child never ran). Relaxing the JIT gate to `declared <= carve`
-//! (`instantiator_rt::instantiate_module_named`) brings it into lockstep with the interpreter; the
-//! `child_entry_multicap_jit` fast repro is what pins the grant-marshaling half per-PR — the
-//! `child_entry_io_jit` this line used to name was never written (#1221). This
-//! is the enabler for the browser wasm-JIT compile card (which bounces op-13 to the same host path).
+//! **The committed child-entry nifler asset, spawned on the JIT** (NIM.md §3c, W5). The
+//! `nifler_child_asset` gate runs the phase child on the tree-walker; this runs the *same* spawn — the
+//! [`temen_run::conductor`], an op-17 v1 detached record — on the **Cranelift JIT**, via the
+//! granted-spawn hooks (`GrantChildHooks` + `module_resolver`). nifler runs as a confined §14 child on
+//! emitted code, in its own window (its heap grows by `vm_map` into the window's reserved tail), and
+//! its `.p.nif` is byte-identical to native. `child_entry_multicap_jit` is the fast per-PR stand-in for
+//! the grant marshaling this exercises (#1221).
 
 #![cfg(target_os = "linux")]
 
@@ -47,61 +37,6 @@ fn inflate() -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
-/// The op-13 parent: grant records `{fs, stdout, exit}` at 1024, argv `nifler p /in.nim /out.nif` at
-/// `carve + POWERBOX_ARGS_BASE`. Same shape as `nifler_child_asset`, sized for the JIT run.
-fn parent_src(child_sl: u32, carve_off: u64) -> String {
-    let parent_sl = child_sl + 1;
-    let argv_off = carve_off + temen_ir::POWERBOX_ARGS_BASE;
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&4u32.to_le_bytes());
-    blob.extend_from_slice(&0u32.to_le_bytes());
-    for s in ["nifler", "p", "/in.nim", "/out.nif"] {
-        blob.extend_from_slice(s.as_bytes());
-        blob.push(0);
-    }
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-    let rec = |off: u64, name_off: u64, name_len: u64| -> String {
-        let w0 = name_off | (name_len << 32);
-        format!(
-            "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n"
-        )
-    };
-    format!(
-        r#"memory {parent_sl}
-data 2048 "fs"
-data 2064 "stdout"
-data 2080 "exit"
-data {argv_off} "{argv_esc}"
-func (i32, i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
-{r0}  hf = i64.extend_i32_u v2
-  ohf = i64.const 1032
-  i64.store ohf hf
-{r1}  hs = i64.extend_i32_u v3
-  ohs = i64.const 1048
-  i64.store ohs hs
-{r2}  he = i64.extend_i32_u v4
-  ohe = i64.const 1064
-  i64.store ohe he
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
-  vgn = i64.const 3
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-        r0 = rec(1024, 2048, 2),
-        r1 = rec(1040, 2064, 6),
-        r2 = rec(1056, 2080, 4),
-    )
-}
-
 /// The production granted-spawn hook table (temen-run's child build/bind/release/mint/thunk/serve), the
 /// same one the JIT granted-spawn suites and `rust_guest_op13` install.
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
@@ -123,11 +58,12 @@ fn nifler_child_runs_on_the_jit_byte_identical() {
     };
     let child = temen_encode::decode_module(&temen).expect("decode nifler_ce.temen");
     temen_verify::verify_module(&child).expect("child verifies");
-    let decl = child.memory.as_ref().expect("child window").size_log2 as u32;
-    let child_sl = (decl + 3).max(24);
-    let carve_off = 1u64 << child_sl;
-    let parent = temen_text::parse_module(&parent_src(child_sl, carve_off)).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    let log2 = child.memory.as_ref().expect("child window").size_log2;
+    let parent = temen_run::conductor(
+        log2,
+        &["fs", "stdout", "exit"],
+        &["nifler", "p", "/in.nim", "/out.nif"],
+    );
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(
         vec![("in.nim".into(), IN_NIM.as_bytes().to_vec())],
@@ -147,14 +83,14 @@ fn nifler_child_runs_on_the_jit_byte_identical() {
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let inst = host.grant_instantiator(0, 1u64 << (child_sl + 1));
-    let modh = host.grant_module(&child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
-    // Drive the parent (and thus the op-13 nifler child) on the JIT: the granted-spawn hooks build and
+    // Drive the conductor (and thus the nifler child) on the JIT: the granted-spawn hooks build and
     // run the child on emitted code; `module_resolver` fetches the granted child module by handle.
     let args = [
         inst as i64,
         modh as i64,
+        budget as i64,
         fs_h as i64,
         stdout_h as i64,
         exit_h as i64,
@@ -187,6 +123,6 @@ fn nifler_child_runs_on_the_jit_byte_identical() {
     assert_eq!(
         emitted,
         EXPECT_NIF.as_bytes(),
-        "nifler as an op-13 §14 child on the JIT parses byte-identically to native"
+        "nifler as a §14 child on the JIT parses byte-identically to native"
     );
 }

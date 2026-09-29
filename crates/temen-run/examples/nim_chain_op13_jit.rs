@@ -1,17 +1,18 @@
-//! **The nimony front-end chain on the Cranelift JIT — every phase a confined §14 op-13 child**
-//! (NIM.md §3c, W5). The exact twin of `nim_chain_op13`, but the native conductor spawns each phase
-//! on **emitted code** (`compile_and_run_capture_reserved_with_host_ex` + the granted-spawn hooks)
-//! rather than the tree-walker — the tier-up-capable engine a browser wasm-JIT compile card also uses.
+//! **The nimony front-end chain on the Cranelift JIT — every phase a confined §14 child** (NIM.md §3c,
+//! W5). The exact twin of `nim_chain_op13`, but the native driver runs the [`temen_run::conductor`]
+//! for each phase on **emitted code** (`compile_and_run_capture_reserved_with_host_ex` + the
+//! granted-spawn hooks) rather than the tree-walker — the tier-up-capable engine a browser wasm-JIT
+//! compile card also uses.
 //!
-//!   system.p.nif ─nimsem(op-13 JIT child)─▶ .s.nif ─hexer(op-13 JIT child)─▶ .x.nif (Leng)
+//!   system.p.nif ─nimsem(JIT child)─▶ .s.nif ─hexer(JIT child)─▶ .x.nif (Leng)
 //!                        │
 //!                        └─ nifler grandchildren (via the re-granted `exec` cap) parse stdlib on demand
 //!
 //! nimsem gets a four-cap grant list `{fs, stdout, exit, exec}` (the re-granted `exec` lets it spawn its
 //! nifler grandchildren over the same store); hexer gets `{fs, stdout, exit}` and reads the `.s.nif`
 //! nimsem left in the store. The `.x.nif` is diffed (path-normalized) against native hexer by the caller.
-//! The op-13 `mod_ok` relaxation (`declared <= carve`, matching the interpreter — FORK.md §8.6 / #773)
-//! is what lets these malloc-heavy phases carve the heap room they need on the JIT.
+//! Each phase runs in a detached window of its own, its malloc heap growing into the window's reserved
+//! tail — no carve to size, so no carve to outgrow the JIT's window cap (#1591).
 //!
 //! ```text
 //! cargo run -q --release -p temen-run --example nim_chain_op13_jit -- \
@@ -48,68 +49,8 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
     }
 }
 
-/// The op-13 parent for a phase spawn: `caps` grant records and names, plus `argv`, laid out for the
-/// #1094 guarded window — records at `guard + 1024..`, names at `guard + 2048..`, `argv` at
-/// `carve + module_args_base()` (all above the NULL guard `[0, POWERBOX_NULL_GUARD)`; the pre-#1094
-/// 1024../2048../`carve + POWERBOX_ARGS_BASE` layout now falls inside the guard and NULL-faults).
-/// Params: `(inst, module, cap0, cap1, …)`. Identical to the interp twin.
-fn parent_src(child_sl: u32, carve_off: u64, argv: &[String], caps: &[&str]) -> String {
-    let parent_sl = child_sl + 1;
-    let guard = temen_ir::POWERBOX_NULL_GUARD;
-    let rec_base = guard + 1024;
-    let name_base = guard + 2048;
-    let argv_off = carve_off + temen_ir::module_args_base();
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&0u32.to_le_bytes());
-    for s in argv {
-        blob.extend_from_slice(s.as_bytes());
-        blob.push(0);
-    }
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-    let n = caps.len() + 2;
-    let sig: String = vec!["i32"; n].join(", ");
-    let bparams: String = (0..n)
-        .map(|i| format!("v{i}: i32"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut data = String::new();
-    let mut records = String::new();
-    for (i, name) in caps.iter().enumerate() {
-        let noff = name_base + i as u64 * 16;
-        data.push_str(&format!("data {noff} \"{name}\"\n"));
-        let off = rec_base + i as u64 * 16;
-        let w0 = noff | ((name.len() as u64) << 32);
-        records.push_str(&format!(
-            "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n  h{off} = i64.extend_i32_u v{vi}\n  oh{off} = i64.const {hoff}\n  i64.store oh{off} h{off}\n",
-            vi = 2 + i,
-            hoff = off + 8,
-        ));
-    }
-    let gn = caps.len();
-    format!(
-        r#"memory {parent_sl}
-{data}data {argv_off} "{argv_esc}"
-func ({sig}) -> (i64) {{
-block 0 ({bparams}) {{
-{records}  vmh = i64.extend_i32_u v1
-  vgptr = i64.const {rec_base}
-  vgn = i64.const {gn}
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-    )
-}
-
 /// The production granted-spawn hook table (temen-run's child build/bind/release/mint/thunk/serve) —
-/// the same table `nifler_child_jit` / `rust_guest_op13` install to run an op-13 child on emitted code.
+/// the same table `nifler_child_jit` / `rust_guest_op13` install to run a child on emitted code.
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
 /// the parent pointer it decodes are chosen together (this used to hand-roll both, and nothing
 /// checked that the pointer matched the ctx the run baked).
@@ -117,25 +58,20 @@ fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
     temen_run::production_grant_hooks(temen_run::CapCtx::Raw(host))
 }
 
-/// op-13-spawn one phase `module` with `argv` and the named `caps` **on the JIT** (each cap already
-/// granted in `host`, handles in `cap_handles`), into a `carve_sl`-sized carve. Returns the joined
-/// status. The parent text-IR is identical to the interp twin — only the engine differs.
-#[allow(clippy::too_many_arguments)]
+/// Spawn one phase `module` through the [`temen_run::conductor`] **on the JIT**, with `argv` and the
+/// named `caps` (each already granted in `host`, handles in `cap_handles`). Returns the joined status.
+/// The conductor is the interp twin's — only the engine differs.
 fn spawn_phase(
     host: &mut Host,
     module: &temen_ir::Module,
-    argv: &[String],
+    argv: &[&str],
     caps: &[&str],
     cap_handles: &[i32],
-    carve_sl: u32,
 ) -> i64 {
-    let carve_off = 1u64 << carve_sl;
-    let parent = temen_text::parse_module(&parent_src(carve_sl, carve_off, argv, caps))
-        .expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
-    let inst = host.grant_instantiator(0, 1u64 << (carve_sl + 1));
-    let modh = host.grant_module(module);
-    let mut args = vec![inst as i64, modh as i64];
+    let log2 = module.memory.as_ref().expect("phase window").size_log2;
+    let parent = temen_run::conductor(log2, caps, argv);
+    let (inst, modh, budget) = temen_run::grant_conductor(host, module);
+    let mut args = vec![inst as i64, modh as i64, budget as i64];
     args.extend(cap_handles.iter().map(|h| *h as i64));
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         &parent,
@@ -171,11 +107,6 @@ fn grant_fs(
     });
     host.grant_host_proc_forkable(init, fork, state)
 }
-
-/// Exit code for "this engine cannot run this workload" — distinct from success (0) and from a real
-/// failure (1), so `build_frontend.sh` can skip the diff instead of comparing against a file that was
-/// never produced.
-const SKIP_EXIT: i32 = 3;
 
 fn main() {
     let mut a = std::env::args().skip(1);
@@ -229,30 +160,7 @@ fn main() {
         })
         .collect();
 
-    // ---- Phase 1: nimsem (op-13 JIT child, exec re-granted) — semcheck the system module. -------------
-    let nimsem_carve = temen_run::nim_phase_carve_log2(nimsem.memory.unwrap().size_log2 as u32);
-    // The reference JIT caps a window at `MAX_JIT_WINDOW_LOG2`; a phase carve of `n` needs a parent
-    // window of `n + 1`. When the phase outgrows that, say so and stop — the alternative is an
-    // `Unsupported` panic that takes `build_frontend.sh` down with it under `set -e`, and with it the
-    // `nim_driver_guest` asset rebuild, for a step that cannot run on this engine either way.
-    //
-    // It is not a regression: below the cap the phase exhausts its carve instead (measured — at a
-    // 256 MiB carve this driver reports `Trapped(MemoryFault)`). The JIT's own comment sized the cap
-    // for a "(128, 256] MiB" peak that is now 2043 MiB. See #1591.
-    if nimsem_carve + 1 > temen_jit::MAX_JIT_WINDOW_LOG2 as u32 {
-        eprintln!(
-            "SKIP nim_chain_op13_jit: the phase needs a 2^{nimsem_carve} carve (parent 2^{}), over \
-             the reference JIT's 2^{} window cap — see #1591",
-            nimsem_carve + 1,
-            temen_jit::MAX_JIT_WINDOW_LOG2,
-        );
-        // Exit **3**, not 0: a caller that cannot tell "skipped" from "succeeded" will go on to diff
-        // an output that was never written and report a byte difference — which is what happened,
-        // and it left the asset rebuild just as blocked as the panic did. `build_frontend.sh` reads
-        // this code.
-        std::process::exit(SKIP_EXIT);
-    }
-    let win1 = 1u64 << (nimsem_carve + 1);
+    // ---- Phase 1: nimsem (a JIT child, exec re-granted) — semcheck the system module. ----------------
     let mut h1 = Host::new();
     let fs1 = grant_fs(&mut h1, &factory);
     let out1 = h1.grant_stream(StreamRole::Out);
@@ -261,27 +169,24 @@ fn main() {
         let f = factory.clone();
         HostCap::host_proc(0, move || (f)())
     };
-    let exec1 = domain_exec_with_fs(programs, child_fs).install(&mut h1, win1);
-    let argv1: Vec<String> = [
-        "nimsem",
-        "--define:nimNativeAlloc",
-        "--define:nimNativeIo",
-        "m",
-        "--isSystem",
-        &format!("nimcache/{sys}.p.nif"),
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let exec1 =
+        domain_exec_with_fs(programs, child_fs).install(&mut h1, 1u64 << temen_run::CONDUCTOR_LOG2);
+    let sys_pnif_key = format!("nimcache/{sys}.p.nif");
     let s1 = spawn_phase(
         &mut h1,
         &nimsem,
-        &argv1,
+        &[
+            "nimsem",
+            "--define:nimNativeAlloc",
+            "--define:nimNativeIo",
+            "m",
+            "--isSystem",
+            &sys_pnif_key,
+        ],
         &["fs", "stdout", "exit", "exec"],
         &[fs1, out1, ex1, exec1],
-        nimsem_carve,
     );
-    eprintln!("nimsem (op-13 JIT child) joined: {s1}");
+    eprintln!("nimsem (JIT child) joined: {s1}");
     assert!(
         handle
             .seed()
@@ -291,25 +196,20 @@ fn main() {
         "nimsem produced no .s.nif on the JIT"
     );
 
-    // ---- Phase 2: hexer (op-13 JIT child) — lower the .s.nif nimsem just wrote into the shared store. --
-    let hexer_carve = temen_run::nim_phase_carve_log2(hexer.memory.unwrap().size_log2 as u32);
+    // ---- Phase 2: hexer (a JIT child) — lower the .s.nif nimsem just wrote into the shared store. -----
     let mut h2 = Host::new();
     let fs2 = grant_fs(&mut h2, &factory);
     let out2 = h2.grant_stream(StreamRole::Out);
     let ex2 = h2.grant_exit();
-    let argv2: Vec<String> = ["hexer", "c", &format!("nimcache/{sys}.s.nif")]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let sys_snif_key = format!("nimcache/{sys}.s.nif");
     let s2 = spawn_phase(
         &mut h2,
         &hexer,
-        &argv2,
+        &["hexer", "c", &sys_snif_key],
         &["fs", "stdout", "exit"],
         &[fs2, out2, ex2],
-        hexer_carve,
     );
-    eprintln!("hexer (op-13 JIT child) joined: {s2}");
+    eprintln!("hexer (JIT child) joined: {s2}");
 
     // Dump the phase outputs (everything not seeded).
     let (produced, _) = handle.seed();
