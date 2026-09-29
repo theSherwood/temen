@@ -427,6 +427,14 @@ pub mod durable_abi {
     pub const SVC_POLL_OP: u32 = 9;
     pub const SVC_WAIT_OP: u32 = 10;
 
+    /// Whether a host call `(type_id, op)` is a **serve op** (`svc.poll` / `svc.wait`): the one host
+    /// call the durable transform re-issues unconditionally on thaw (§13.4 slice 4b) rather than
+    /// modelling as a leaf whose result reloads. The one definition the transform, the import
+    /// binding and a landing freeze's abandon all ask.
+    pub const fn is_serve_op(type_id: u32, op: u32) -> bool {
+        type_id == crate::CAP_SELF_TYPE_ID && matches!(op, SVC_POLL_OP | SVC_WAIT_OP)
+    }
+
     /// End of the **always-live** durable control words: the state word, shadow-SP and arm
     /// countdowns occupy `[guard, guard+32)` and are polled at every safepoint, so their offsets
     /// are fixed ABI; `[guard+32, guard+64)` is the powerbox heap words and empty argv/envp, which a

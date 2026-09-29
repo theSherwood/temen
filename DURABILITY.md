@@ -1471,6 +1471,18 @@ interpreter oracle abandons today; the JIT and bytecode engines never set the wo
 host calls keep reloading. Pinned by `temen-durable/tests/quiesce_parks.rs::
 a_pipe_parked_root_is_abandoned_and_its_read_reissued_on_thaw`.
 
+**A freeze sees through a job-control stop (#1672).** A stopped vCPU runs no ops, so it never
+reaches a freeze point. But a stop lands asynchronously, and landing at the next freeze point
+instead of between two ops is indistinguishable to the guest, provided nothing leaves the domain
+meanwhile. So under a landing freeze a stopped vCPU runs on (the freeze re-admits one parked
+stopped), and every host call it reaches is abandoned, as above, rather than performed: the ops
+on the way touch only the domain's own window, whose vCPUs are all stopped. It unwinds at the
+call's poll. A serve op is left to run, since its thaw re-issues it anyway. The stop itself is the
+personality's state, so restoring a thawed domain stopped waits on that state riding the artifact.
+Only the interpreter oracle parks between ops; the JIT and bytecode engines take a stop inside the
+personality's syscall path. Pinned by `quiesce_parks.rs::a_stopped_domain_reaches_its_freeze_point_
+without_leaving_the_domain` and `::a_vcpu_stopped_before_the_freeze_is_brought_through_it`.
+
 **State word** (`NORMAL | UNWINDING | REWINDING`): per-vCPU, in-window (§2); every
 poll/prologue reads it. Freeze sets all to `UNWINDING` and drives each fiber to drain
 its native stack into its shadow stack; thaw sets `REWINDING` and re-enters.
