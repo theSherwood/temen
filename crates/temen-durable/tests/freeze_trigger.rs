@@ -73,10 +73,13 @@ fn run_armed(n: i64) -> (u64, bool) {
     let sink = Arc::clone(&calls);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
-        sink.fetch_add(1, Ordering::Relaxed);
-        Ok(vec![0])
-    }));
+    let hf = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _| {
+            sink.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![0])
+        }),
+        temen_interp::CapState::Stateless,
+    );
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, n);
@@ -130,10 +133,13 @@ fn an_unarmed_durable_run_is_untouched() {
     let sink = Arc::clone(&calls);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
-        sink.fetch_add(1, Ordering::Relaxed);
-        Ok(vec![0])
-    }));
+    let hf = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _| {
+            sink.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![0])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut fuel = 100_000u64;
     let (res, snap) = run_capture_reserved_with_host(

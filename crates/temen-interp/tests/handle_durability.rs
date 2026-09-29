@@ -109,7 +109,10 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     let mut a = Host::new();
     a.grant_clock(); // slot 0 — durable
     a.grant_blocking(std::time::Duration::ZERO, None); // slot 1 — non-durable
-    a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // slot 2 — non-durable
+    a.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    ); // slot 2 — non-durable
 
     assert!(
         a.capture_durable_handles().is_err(),
@@ -216,7 +219,10 @@ fn empty_table_captures_empty_and_capacity_is_table_size() {
 #[test]
 fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
     let mut named = Host::new();
-    let h = named.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![7])));
+    let h = named.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![7])),
+        temen_interp::CapState::Stateless,
+    );
     named.register_cap_name("fs", h);
     let captured = named
         .capture_durable_handles()
@@ -225,27 +231,54 @@ fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
     assert_eq!(captured[0].binding, DurableBinding::Named { idx: 0 });
 
     let mut unnamed = Host::new();
-    unnamed.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![7])));
+    unnamed.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![7])),
+        temen_interp::CapState::Stateless,
+    );
     let err = unnamed
         .capture_durable_handles()
         .expect_err("an unnamed host capability has no reconstruction rule");
     assert_eq!(err.kind, NonDurableKind::HostProc);
 }
 
+/// #1699 — a name is not enough when the provider holds state it doesn't capture: a thaw would put a
+/// fresh handler under the guest in its place, so a freeze refuses it like an unnamed one.
+#[test]
+fn a_named_host_cap_with_uncaptured_state_is_not_durable() {
+    let mut host = Host::new();
+    let h = host.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![7])),
+        temen_interp::CapState::Uncaptured,
+    );
+    host.register_cap_name("posix", h);
+    let err = host
+        .capture_durable_handles()
+        .expect_err("its state would be lost on thaw");
+    assert_eq!(err.kind, NonDurableKind::HostProc);
+}
+
 /// The out-of-line half: the name and the provider's own state, positional over `host_procs` so a
-/// captured `Named { idx }` re-resolves. A capability that declared no state captures an empty one.
+/// captured `Named { idx }` re-resolves. A capability its provider declared stateless captures an empty one.
 #[test]
 fn capture_named_carries_the_providers_state() {
     let cursors = std::sync::Arc::new(std::sync::Mutex::new(vec![3u8, 1, 4]));
     let mut a = Host::new();
 
-    let stateless = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    let stateless = a.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    );
     a.register_cap_name("display", stateless);
 
-    let stateful = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
-    a.register_cap_name("fs", stateful);
     let c = std::sync::Arc::clone(&cursors);
-    a.set_cap_state_capture(stateful, Box::new(move || c.lock().unwrap().clone()));
+    let stateful = a.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Captured {
+            capture: Box::new(move || c.lock().unwrap().clone()),
+            restore: Box::new(|_| {}),
+        },
+    );
+    a.register_cap_name("fs", stateful);
 
     // State is read at capture time, not at registration time.
     cursors.lock().unwrap().push(1);
@@ -263,9 +296,14 @@ fn capture_named_carries_the_providers_state() {
 #[test]
 fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     let mut a = Host::new();
-    let h = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![1])));
+    let h = a.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![1])),
+        temen_interp::CapState::Captured {
+            capture: Box::new(|| vec![42]),
+            restore: Box::new(|_| {}),
+        },
+    );
     a.register_cap_name("fs", h);
-    a.set_cap_state_capture(h, Box::new(|| vec![42]));
 
     let handles = a.capture_durable_handles().expect("named ⇒ durable");
     let named = a.capture_durable_named();
@@ -278,10 +316,11 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
         // Re-seed the fresh handler from the captured state — this is the provider reading back
         // exactly the bytes it wrote at freeze.
         let answer = state.first().copied().unwrap_or(0) as i64;
-        Some((
-            Box::new(move |_op: u32, _args: &[i64], _mem, _| Ok(vec![answer])),
-            None,
-        ))
+        Some(temen_interp::NamedCapGrant {
+            handler: Box::new(move |_op: u32, _args: &[i64], _mem, _| Ok(vec![answer])),
+            fork: None,
+            state: temen_interp::CapState::Stateless,
+        })
     }));
     b.restore_durable_named(&named)
         .expect("the registrar serves `fs`");
@@ -310,10 +349,12 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
         Box::new(|_op, _args, _mem, _| Ok(vec![7]))
     }
     fn factory() -> temen_interp::HostProcFork {
-        std::sync::Arc::new(|_pid| temen_interp::ForkedProc::shared(answer()))
+        std::sync::Arc::new(|_pid| {
+            temen_interp::ForkedProc::shared(answer(), temen_interp::CapState::Stateless)
+        })
     }
     let mut a = Host::new();
-    let h = a.grant_host_proc_forkable(answer(), factory());
+    let h = a.grant_host_proc_forkable(answer(), factory(), temen_interp::CapState::Stateless);
     a.register_cap_name("display", h);
     let handles = a.capture_durable_handles().expect("named ⇒ durable");
     let named = a.capture_durable_named();
@@ -321,7 +362,11 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
     for forkable in [true, false] {
         let mut b = Host::new();
         b.set_named_cap_registrar(Box::new(move |_name, _state| {
-            Some((answer(), forkable.then(factory)))
+            Some(temen_interp::NamedCapGrant {
+                handler: answer(),
+                fork: forkable.then(factory),
+                state: temen_interp::CapState::Stateless,
+            })
         }));
         b.restore_durable_named(&named)
             .expect("the registrar serves it");
@@ -348,7 +393,10 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
 #[test]
 fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     let mut a = Host::new();
-    let h = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![1])));
+    let h = a.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![1])),
+        temen_interp::CapState::Stateless,
+    );
     a.register_cap_name("fs", h);
     let named = a.capture_durable_named();
 
@@ -363,9 +411,10 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     // A registrar that serves a *different* name refuses this one rather than substituting.
     let mut picky = Host::new();
     picky.set_named_cap_registrar(Box::new(|name, _state| {
-        (name == "display").then(|| {
-            let h: temen_interp::HostProc = Box::new(|_op, _args, _mem, _| Ok(vec![0]));
-            (h, None)
+        (name == "display").then(|| temen_interp::NamedCapGrant {
+            handler: Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+            fork: None,
+            state: temen_interp::CapState::Stateless,
         })
     }));
     assert_eq!(picky.restore_durable_named(&named).unwrap_err().name, "fs");

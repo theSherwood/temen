@@ -1235,15 +1235,16 @@ fn cc1_imports(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> temen_run::I
     use temen_run::HostCap;
     // The fs seam: op-in-arg0 over one shared mem_fs store (fresh per host grant, deterministic seed).
     let fs = HostCap::host_proc(0, move || {
-        let (mut inner, _handle) = temen_run::fs::mem_fs_seeded_shared(files.clone(), dirs.clone());
-        Box::new(
+        let (mut inner, handle) = temen_run::fs::mem_fs_seeded_shared(files.clone(), dirs.clone());
+        let h: temen_interp::HostProc = Box::new(
             move |_slot_op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn temen_interp::GuestMem>,
                   minter: Option<&mut dyn temen_interp::RegionMinter>| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             },
-        )
+        );
+        (h, handle.cap_state())
     });
     temen_run::Imports::new()
         .provide("stream_write", HostCap::stdout())

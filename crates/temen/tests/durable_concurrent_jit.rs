@@ -99,13 +99,16 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
     host.clock_ns = 42;
     let clk = host.grant_clock();
     // The root calls this once it has spawned its children; it flips the flag the controller waits on.
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
-        match &at_signal {
-            Some(fc) => fc.request_freeze(),
-            None => sig.store(true, Ordering::SeqCst),
-        }
-        Ok(vec![0])
-    }));
+    let hf = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _| {
+            match &at_signal {
+                Some(fc) => fc.request_freeze(),
+                None => sig.store(true, Ordering::SeqCst),
+            }
+            Ok(vec![0])
+        }),
+        temen_interp::CapState::Stateless,
+    );
 
     let controller = matches!(from, FreezeFrom::Controller).then(|| {
         let fc = Arc::clone(&freeze);
@@ -159,7 +162,10 @@ fn thaw(
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
     // The host fn is granted (handle order preserved) but never called on the thaw path.
-    let _ = thost.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])));
+    let _ = thost.grant_host_proc(
+        Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    );
     let (tout, tfinal, ..) = compile_and_run_durable(
         inst,
         0,
@@ -1131,7 +1137,10 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
     let mut host = Host::new();
     host.clock_ns = 42;
     let clk = host.grant_clock();
-    let _ = host.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])));
+    let _ = host.grant_host_proc(
+        Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    );
     let (out, win, ..) = compile_and_run_durable(
         inst,
         0,

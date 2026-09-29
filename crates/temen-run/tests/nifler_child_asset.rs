@@ -21,7 +21,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value};
+use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, StreamRole, Value};
 
 /// The gzipped child-entry module — built by `build_nifler_temen.sh` alongside the browser asset.
 const ASSET_GZ: &[u8] = include_bytes!("../demos/nifler_temen/nifler_ce.temen.gz");
@@ -176,13 +176,16 @@ fn child_entry_asset_parses_nim_byte_identical_to_native_nifler() {
         let factory = Arc::new(factory);
 
         let mut host = Host::new();
-        let fs_init: HostProc = (*factory)();
+        let (fs_init, fs_init_state) = (*factory)();
         let fs_fork: HostProcFork = {
             let f = Arc::clone(&factory);
-            Arc::new(move |_pid| ForkedProc::shared((*f)()))
+            Arc::new(move |_pid| {
+                let (h, s) = (*f)();
+                ForkedProc::shared(h, s)
+            })
         };
         // Grant list {fs (by name), stdout (write/read), exit}; vm_map auto-binds to the AddressSpace.
-        let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+        let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
         let stdout_h = host.grant_stream(StreamRole::Out);
         let exit_h = host.grant_exit();
         let inst = host.grant_instantiator(0, 1u64 << (child_sl + 1));
@@ -350,12 +353,15 @@ fn child_entry_asset_runs_under_multi_cap_guarded_parent() {
     );
     let factory = Arc::new(factory);
     let mut host = Host::new();
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     let extra_h = host.grant_stream(StreamRole::Out); // the spare offered cap (a valid regrantable handle)

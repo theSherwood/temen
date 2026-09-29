@@ -138,11 +138,17 @@ fn spawn_phase(
     }
 }
 
-fn grant_fs(host: &mut Host, factory: &Arc<impl Fn() -> HostProc + Send + Sync + 'static>) -> i32 {
-    let init: HostProc = (*factory)();
+fn grant_fs(
+    host: &mut Host,
+    factory: &Arc<impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static>,
+) -> i32 {
+    let (init, state) = (*factory)();
     let f = Arc::clone(factory);
-    let fork: HostProcFork = Arc::new(move |_pid| ForkedProc::shared((*f)()));
-    host.grant_host_proc_forkable(init, fork)
+    let fork: HostProcFork = Arc::new(move |_pid| {
+        let (h, s) = (*f)();
+        ForkedProc::shared(h, s)
+    });
+    host.grant_host_proc_forkable(init, fork, state)
 }
 
 fn main() {

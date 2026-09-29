@@ -48,14 +48,17 @@ type Recorded = Arc<Mutex<Vec<(u64, i64)>>>;
 fn host_completed(recorded: &Recorded) -> (Host, i32) {
     let mut host = Host::new();
     let rec = Arc::clone(recorded);
-    let h = host.grant_host_proc_offloadable(Box::new(move |op, args| {
-        let a = *args.first().unwrap_or(&0);
-        if op == 0 {
-            return OffloadOutcome::Done(Ok(vec![a + 100]));
-        }
-        let rec = Arc::clone(&rec);
-        OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            let a = *args.first().unwrap_or(&0);
+            if op == 0 {
+                return OffloadOutcome::Done(Ok(vec![a + 100]));
+            }
+            let rec = Arc::clone(&rec);
+            OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     (host, h)
 }
 
@@ -63,13 +66,16 @@ fn host_completed(recorded: &Recorded) -> (Host, i32) {
 /// offload pool (`Offload`) — the posture the parity test compares against.
 fn pool_completed() -> (Host, i32) {
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(Box::new(move |op, args| {
-        let a = *args.first().unwrap_or(&0);
-        if op == 0 {
-            return OffloadOutcome::Done(Ok(vec![a + 100]));
-        }
-        OffloadOutcome::Offload(Box::new(move || a + 100))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            let a = *args.first().unwrap_or(&0);
+            if op == 0 {
+                return OffloadOutcome::Done(Ok(vec![a + 100]));
+            }
+            OffloadOutcome::Offload(Box::new(move || a + 100))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     (host, h)
 }
 
@@ -141,16 +147,19 @@ fn host_completing_inside_submit_does_not_park() {
     let mut host = Host::new();
     let comps = host.completions();
     let comps_for_hook = Arc::clone(&comps);
-    let h = host.grant_host_proc_offloadable(Box::new(move |op, args| {
-        let a = *args.first().unwrap_or(&0);
-        if op == 0 {
-            return OffloadOutcome::Done(Ok(vec![a + 100]));
-        }
-        let c = Arc::clone(&comps_for_hook);
-        OffloadOutcome::Host(Box::new(move |id| {
-            c.complete_host(id, a + 100);
-        }))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            let a = *args.first().unwrap_or(&0);
+            if op == 0 {
+                return OffloadOutcome::Done(Ok(vec![a + 100]));
+            }
+            let c = Arc::clone(&comps_for_hook);
+            OffloadOutcome::Host(Box::new(move |id| {
+                c.complete_host(id, a + 100);
+            }))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let mut v = vcpu(&prog, host, h);
     match v.run() {
         VcpuEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
@@ -232,9 +241,10 @@ fn sync_ops_never_pay_for_the_host_posture() {
     let prog = program(&m);
     let mut host = Host::new();
     let comps = host.completions();
-    let h = host.grant_host_proc_offloadable(Box::new(|_op, args| {
-        OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
+        temen_interp::CapState::Stateless,
+    );
     let mut v = vcpu(&prog, host, h);
     match v.run() {
         VcpuEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),

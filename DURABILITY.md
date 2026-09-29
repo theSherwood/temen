@@ -1196,10 +1196,16 @@ re-resolves. An **unnamed** one is unchanged: no reconstruction rule, so it stil
 
 Two halves make it honest:
 
-- **Provider state** — `Host::set_cap_state_capture(handle, f)` declares how a capability serializes
-  what the *guest can observe* about it: an `fs` server's per-`open` cursors are read back by the
-  guest's next `read`, so a thaw that forgot them resumes a guest whose open file silently rewound.
-  Opt-in, because `display` (pure output) and `keyboard` (a queue the guest refills) need nothing.
+- **Provider state** — a `CapState`, which the provider gives wherever a handler is minted: at grant
+  (`Host::grant_host_proc*`), by a fork factory (`ForkedProc::state`), and by the thaw's registrar
+  (`NamedCapGrant::state`). It says what the *guest can observe* about the capability: an `fs`
+  server's per-`open` cursors are read back by the guest's next `read`, so a thaw that forgot them
+  resumes a guest whose open file silently rewound. `Captured { capture, restore }` serializes it;
+  `Stateless` claims there is nothing (`display` is pure output); `Uncaptured` holds state nothing
+  serializes yet (a POSIX personality's fd table), and refuses a freeze like an unnamed capability.
+  *A required answer since #1699, not an opt-in:* when "stateless" was the default, a provider that
+  forgot to declare froze with empty state and thawed reset, and a thawed capability came back from
+  the registrar with no capture at all, so the next freeze lost its state even when the first had it.
 - **The registrar** — `Host::set_named_cap_registrar` is what the thaw consults, and it is the
   **authority seam**. An artifact *names* a capability; it never carries one. The restoring embedder
   returns a handler or refuses, so a restore can only ever grant what that host would have granted a

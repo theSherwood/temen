@@ -27,9 +27,7 @@
 
 use std::sync::Arc;
 
-use temen_interp::{
-    bytecode, run_with_host, ForkedProc, Host, HostProc, HostProcFork, Region, Trap, Value,
-};
+use temen_interp::{bytecode, run_with_host, ForkedProc, Host, HostProcFork, Region, Trap, Value};
 use temen_ir::Module;
 use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
@@ -89,12 +87,15 @@ fn spawn_child_over_memfs(
     // Grant the parent a *forkable* memfs host proc: the initial handler plus a fork factory minting a
     // fresh handler over the same store. `regrant_into_child` needs `fork.is_some()` to carry it into a
     // child (a factory-less host proc fails `can_regrant`, fail-closed).
-    let init: HostProc = (*factory)();
+    let (init, init_state) = (*factory)();
     let fork: HostProcFork = {
         let factory = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*factory)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*factory)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(init, fork);
+    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(child);
 
@@ -299,12 +300,15 @@ fn child_entry_writes_a_file_through_a_regranted_memfs_on_the_resumable_engine()
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
     let factory = Arc::new(factory);
     let mut host = Host::new();
-    let init: HostProc = (*factory)();
+    let (init, init_state) = (*factory)();
     let fork: HostProcFork = {
         let factory = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*factory)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*factory)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(init, fork);
+    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
     let win = 1u64 << 17;
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);

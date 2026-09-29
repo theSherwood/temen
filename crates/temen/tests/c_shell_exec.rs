@@ -218,7 +218,7 @@ fn run(
     let out_h = host.grant_stream(StreamRole::Out);
     let _inst_h = host.grant_instantiator(0, win as u64);
     let echo_h = host.grant_module(cmd);
-    let _exec_h = host.grant_host_proc(exec_host(out_h, echo_h));
+    let _exec_h = host.grant_host_proc(exec_host(out_h, echo_h), temen_interp::CapState::Stateless);
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
     let m = temen_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");

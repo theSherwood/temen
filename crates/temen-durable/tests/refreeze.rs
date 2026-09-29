@@ -69,15 +69,18 @@ fn run(
     let mut host = Host::new();
     host.set_durable(true);
     let calls = Arc::new(AtomicI64::new(0));
-    let hf = host.grant_host_proc(Box::new(move |_op, _args, mem, _| {
-        let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if Some(n) == freeze_on {
-            let mem = mem.expect("a window");
-            mem.write_bytes(STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                .expect("the freeze word is mapped");
-        }
-        Ok(vec![made + n])
-    }));
+    let hf = host.grant_host_proc(
+        Box::new(move |_op, _args, mem, _| {
+            let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if Some(n) == freeze_on {
+                let mem = mem.expect("a window");
+                mem.write_bytes(STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                    .expect("the freeze word is mapped");
+            }
+            Ok(vec![made + n])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let mut fuel = 100_000u64;
     run_capture_reserved_with_host(
         inst,

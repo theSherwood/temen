@@ -155,9 +155,12 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
             let mint = move || -> temen_interp::HostProc {
                 Box::new(move |op, args, mem, _| Ok(vec![dispatch(slot as u32, op, args, mem)]))
             };
-            let fork: temen_interp::HostProcFork =
-                std::sync::Arc::new(move |_pid| temen_interp::ForkedProc::shared(mint()));
-            let handle = host.grant_host_proc_forkable(mint(), fork);
+            // The JS function's state lives on the page, which nothing here serializes (#1699).
+            let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
+                temen_interp::ForkedProc::shared(mint(), temen_interp::CapState::Uncaptured)
+            });
+            let handle =
+                host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);
             // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
             host.register_cap_name(name, handle);
             handle

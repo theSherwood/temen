@@ -184,7 +184,10 @@ fn host_proc_seam_overrides_the_table() {
         shape: ImportShape::Func(0),
         mode: ImportMode::Required,
     }];
-    let h = host.grant_host_proc(Box::new(|_op, _args, _mem, _minter| Ok(vec![0i64])));
+    let h = host.grant_host_proc(
+        Box::new(|_op, _args, _mem, _minter| Ok(vec![0i64])),
+        temen_interp::CapState::Stateless,
+    );
 
     let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[("vm_fs", h)]);
     assert!(refusals.is_empty());

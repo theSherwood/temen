@@ -887,8 +887,8 @@ struct HostReplaySubstate {
     /// cursors) would otherwise come back at its *initial* state under a guest at logical time `c`.
     /// This is the identical capture/restore pair a §12 freeze writes into the artifact's named-cap
     /// section — one definition of "the cap state", read two ways (INVARIANTS #13), so the ladder and
-    /// the artifact cannot drift apart. `None` for a provider that declared none, which is the common
-    /// case (`display` is pure output; `keyboard` is a queue the guest refills).
+    /// the artifact cannot drift apart. `None` for a capability that isn't [`CapState::Captured`] —
+    /// the common case (`display` is pure output).
     cap_states: Vec<Option<Vec<u8>>>,
 }
 
@@ -19204,8 +19204,8 @@ pub struct DurableNamedCap {
     /// The name the grant was registered under ([`Host::register_cap_name`]) — the whole of what the
     /// thaw has to go on.
     pub name: String,
-    /// The provider's own state at freeze ([`Host::set_cap_state_capture`]), or empty when the
-    /// capability declared none. Opaque bytes: written by the provider, read back by the registrar.
+    /// The provider's own state at freeze ([`CapState::Captured`]), or empty for a capability its
+    /// provider declared [`CapState::Stateless`]. Opaque bytes: written by the provider, read back by the registrar.
     pub state: Vec<u8>,
 }
 
@@ -19852,19 +19852,23 @@ pub struct ForkedProc {
     /// handles the process already held; what to do with it is the provider's policy (invariant 4).
     /// `None` = no notification.
     pub exec_remap: Option<ExecRemapHook>,
+    /// #1699 — the new handler's own [`CapState`]: its serializer closes over the *new* domain's
+    /// state, which the parent's would not.
+    pub state: CapState,
 }
 
 impl ForkedProc {
     /// A shared-state mint: fresh closure over the same provider state, no per-process signal door,
     /// fork-of-fork through the same factory. The pre-#863 contract, right for providers whose
     /// state is deliberately global (a scripted table, a shared service shim).
-    pub fn shared(handler: HostProc) -> Self {
+    pub fn shared(handler: HostProc, state: CapState) -> Self {
         Self {
             handler,
             signal: None,
             refork: None,
             exit: None,
             exec_remap: None,
+            state,
         }
     }
 }
@@ -19975,18 +19979,44 @@ struct HostProcEntry {
     /// checked at bind (the POSIX.md §4 ABI pin, machine-checked). `None` = an opaque handler
     /// (no in-loop manifest binding; the embedder's `set_import_bindings` remains its only route).
     vtable: Option<HostFnVtable>,
-    /// #1455 — how this capability serializes **its own** host-side state for a freeze
-    /// ([`Host::set_cap_state_capture`]). `None` = stateless: a thaw's fresh grant is as good as the
-    /// old one (`display` presents, `keyboard` polls a queue the guest refills). `Some` = the
-    /// provider holds state the guest can observe — an `fs` server's per-`open` cursors — so the
-    /// freeze captures it and the registrar re-seeds a fresh closure with it at thaw.
-    state: Option<HostProcStateCapture>,
-    /// #1458 — how this capability puts a captured state back **into the live handler**
-    /// ([`Host::set_cap_state_restore`]). The freeze/thaw path doesn't need this — there the
-    /// registrar mints a fresh closure seeded from the bytes — but an *in-session* rewind does: the
-    /// closures are still live and the caller wants them reset in place, not replaced. One state
-    /// definition per capability, two ways to put it back.
-    restore: Option<HostProcStateRestore>,
+    /// #1455 / #1699 — the provider's own answer to "what host-side state does this capability
+    /// hold?", given wherever a handler is minted ([`CapState`]).
+    state: CapState,
+}
+
+/// #1699 — a host capability's **host-side state**, declared by its provider wherever a handler is
+/// minted: at grant (`Host::grant_host_proc*`), by a thaw's registrar ([`NamedCapGrant`]), and by a
+/// fork factory ([`ForkedProc`]). A required answer, not an opt-in: only the provider knows whether
+/// the guest can observe state it holds, and the VM can't tell a stateless provider from one whose
+/// author forgot to say. When "stateless" was the default, a forgotten declaration froze with empty
+/// state and the thaw silently reset the guest's file cursors or buffers.
+pub enum CapState {
+    /// A fresh handler is as good as the old one: a `display` that only presents, a `keyboard`
+    /// whose queue the guest refills. A claim the provider makes, not a default.
+    Stateless,
+    /// The provider holds state the guest can observe — an `fs` server's per-`open` cursors. A
+    /// freeze captures it and hands the bytes to the thaw's registrar, which re-seeds a fresh
+    /// handler with them (#1455); an in-session rewind puts them back into the live handler
+    /// (#1458). One state definition, both ways back.
+    Captured {
+        capture: HostProcStateCapture,
+        restore: HostProcStateRestore,
+    },
+    /// The provider holds state the guest can observe and does not serialize it — a POSIX
+    /// personality's fd table and cwd. Named or not, it is not durable: a freeze refuses it
+    /// (`NonDurableKind::HostProc`) rather than thaw a fresh one in its place, and an in-session
+    /// rewind can't invert it.
+    Uncaptured,
+}
+
+impl CapState {
+    /// The provider's state now, or `None` for a stateless capability.
+    fn capture(&self) -> Option<Vec<u8>> {
+        match self {
+            CapState::Stateless | CapState::Uncaptured => None,
+            CapState::Captured { capture, .. } => Some(capture()),
+        }
+    }
 }
 
 /// #1455 — a host capability's own state serializer: called at freeze, its bytes handed back to the
@@ -20012,8 +20042,16 @@ pub type HostProcStateRestore = Box<dyn Fn(&[u8]) + Send>;
 /// run" includes forkability. A capability granted forkable (so it can be re-granted into a §14
 /// child — `Host::can_regrant` — or carried into a `fork()` twin) must come back forkable, or a
 /// thawed domain could no longer hand a child what the same domain could before its freeze.
-pub type NamedCapRegistrar =
-    Box<dyn FnMut(&str, &[u8]) -> Option<(HostProc, Option<HostProcFork>)> + Send>;
+pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<NamedCapGrant> + Send>;
+
+/// What a [`NamedCapRegistrar`] re-grants: the handler, its fork factory when the capability is
+/// forkable (#1718), and its [`CapState`] (#1699) — so a thawed stateful capability is captured by
+/// the next freeze as the original was.
+pub struct NamedCapGrant {
+    pub handler: HostProc,
+    pub fork: Option<HostProcFork>,
+    pub state: CapState,
+}
 
 /// Why a thaw could not re-grant a named host capability (#1455): the restoring embedder's registrar
 /// does not serve `name` — or there was no registrar at all. Fail-closed, and named, so an embedder
@@ -21999,13 +22037,9 @@ impl Host {
                 // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
                 // command and have its manifest bind against the twin's own personality.
                 vtable: e.vtable.clone(),
-                // #1455 — the state serializer does NOT ride the fork: the twin's handler is a
-                // fresh closure the provider's factory minted over whatever state it chose to
-                // give the twin, so the parent's serializer (closed over the *parent's* state)
-                // would capture the wrong domain's. A forked twin that wants to be freezable
-                // re-registers one.
-                state: None,
-                restore: None,
+                // #1455 — not the parent's serializer, which closes over the *parent's* state: the
+                // factory's answer for the handler it minted (#1699).
+                state: forked.state,
             });
         }
         // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
@@ -23118,7 +23152,7 @@ impl Host {
     fn checkpoint_safe(&self) -> bool {
         self.regions.is_empty()
             && self.blockings.is_empty()
-            && self.every_host_proc_named()
+            && self.every_host_proc_reconstructible()
             && self.jit_tables.is_empty()
     }
 
@@ -23184,17 +23218,32 @@ impl Host {
         self.in_shared.is_none()
             && queue.is_empty()
             && results.is_empty()
-            && (self.cap_record.is_some() || self.host_procs.iter().all(|e| e.state.is_none()))
+            && (self.cap_record.is_some()
+                || self
+                    .host_procs
+                    .iter()
+                    .all(|e| matches!(e.state, CapState::Stateless)))
     }
 
-    /// Whether every **live** host capability carries a registered name — the same reconstruction rule
+    /// Whether every **live** host capability can be reconstructed: it carries a registered name, and
+    /// its provider does not hold state it leaves uncaptured (#1699) — the same rule
     /// [`Host::capture_durable_handles`] demands of a `Binding::HostProc`, read here for the checkpoint
     /// ladder. A dead slot is irrelevant: nothing can dispatch through it, and the positional cap-state
     /// vector covers it either way.
-    fn every_host_proc_named(&self) -> bool {
-        self.table.iter().enumerate().all(|(slot, s)| {
-            !matches!(s.entry, Some(Binding::HostProc(_))) || self.cap_name_of_slot(slot).is_some()
-        })
+    fn every_host_proc_reconstructible(&self) -> bool {
+        self.table
+            .iter()
+            .enumerate()
+            .all(|(slot, s)| match s.entry {
+                Some(Binding::HostProc(idx)) => {
+                    self.cap_name_of_slot(slot).is_some()
+                        && !matches!(
+                            self.host_procs.get(idx as usize).map(|e| &e.state),
+                            Some(CapState::Uncaptured)
+                        )
+                }
+                _ => true,
+            })
     }
 
     /// Snapshot the run-mutable substate a time-travel **checkpoint** (W1) must restore so resuming a
@@ -23282,57 +23331,15 @@ impl Host {
         self.handoff
     }
 
-    /// #1455 — declare how the host capability at `handle` serializes **its own** state, so a freeze
-    /// can capture it and a thaw's registrar can re-seed a fresh handler with it. No-op for a handle
-    /// that is not a live `HostProc`.
-    ///
-    /// Only a provider holding guest-observable state needs this: an `fs` server's per-`open` cursors
-    /// are read back by the guest's next `read`, so a thaw that forgot them would resume a guest whose
-    /// open file had silently rewound. A `display` that only presents, or a `keyboard` whose queue the
-    /// guest refills, needs nothing — a fresh grant is as good as the old one, which is why this is
-    /// opt-in rather than a required part of every grant.
-    ///
-    /// The bytes are opaque to the VM: the provider writes them and the same provider reads them back
-    /// in the registrar. Pair with [`register_cap_name`](Host::register_cap_name) — a capability is
-    /// durable because it has a **name** the thawing embedder can re-grant, and this only says what to
-    /// carry across with it.
-    pub fn set_cap_state_capture(&mut self, handle: i32, capture: HostProcStateCapture) {
-        if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
-            if let Some(e) = self.host_procs.get_mut(idx as usize) {
-                e.state = Some(capture);
-            }
-        }
-    }
-
-    /// #1458 — declare how the host capability at `handle` puts a captured state back into its
-    /// **still-live** handler, the in-session counterpart of
-    /// [`set_cap_state_capture`](Host::set_cap_state_capture).
-    ///
-    /// Freeze/thaw does not need this: there the registrar mints a fresh closure seeded from the
-    /// bytes. An in-session rewind does — a reactor scrubbing back to an earlier frame still holds
-    /// the same `fs` server and the same input queues, and wants them *reset*, not replaced. Pairing
-    /// the two means a capability's state is defined **once**, by the provider that owns it, and both
-    /// paths use that definition instead of each hand-rolling what "the cap's state" means.
-    pub fn set_cap_state_restore(&mut self, handle: i32, restore: HostProcStateRestore) {
-        if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
-            if let Some(e) = self.host_procs.get_mut(idx as usize) {
-                e.restore = Some(restore);
-            }
-        }
-    }
-
     /// #1458 — capture every host capability's declared state, positionally over `host_procs`
-    /// (`None` where a capability declared none). The in-session half of a moment: pair with
+    /// (`None` where a capability isn't [`CapState::Captured`]). The in-session half of a moment: pair with
     /// [`restore_cap_states`](Host::restore_cap_states) to rewind the capabilities alongside the
     /// window, without re-granting anything.
     ///
     /// This is the same per-capability state [`capture_durable_named`](Host::capture_durable_named)
     /// puts in an artifact — one definition, read two ways.
     pub fn capture_cap_states(&self) -> Vec<Option<Vec<u8>>> {
-        self.host_procs
-            .iter()
-            .map(|e| e.state.as_ref().map(|f| f()))
-            .collect()
+        self.host_procs.iter().map(|e| e.state.capture()).collect()
     }
 
     /// Put a [`capture_cap_states`](Host::capture_cap_states) back into the live handlers. Entries
@@ -23340,7 +23347,7 @@ impl Host {
     /// so a moment taken before a later grant restores what it can rather than failing.
     pub fn restore_cap_states(&mut self, states: &[Option<Vec<u8>>]) {
         for (e, state) in self.host_procs.iter().zip(states) {
-            if let (Some(restore), Some(bytes)) = (&e.restore, state) {
+            if let (CapState::Captured { restore, .. }, Some(bytes)) = (&e.state, state) {
                 restore(bytes);
             }
         }
@@ -23796,10 +23803,19 @@ impl Host {
                 Binding::JitCode { domain, unit } => DurableBinding::JitCode { domain, unit },
                 // #1455: a host capability is durable iff it carries a registered **name** — the
                 // reconstruction rule a thaw's registrar can act on. An unnamed one is still an
-                // opaque closure with nothing to re-grant it by, so it refuses exactly as before.
+                // opaque closure with nothing to re-grant it by, so it refuses exactly as before;
+                // so does one whose provider holds state it doesn't capture (#1699), which a thaw
+                // would silently replace with a fresh handler's.
                 Binding::HostProc(idx) => match self.cap_name_of_slot(slot) {
-                    Some(_) => DurableBinding::Named { idx },
-                    None => return Err(self.non_durable(slot, NonDurableKind::HostProc)),
+                    Some(_)
+                        if !matches!(
+                            self.host_procs.get(idx as usize).map(|e| &e.state),
+                            Some(CapState::Uncaptured)
+                        ) =>
+                    {
+                        DurableBinding::Named { idx }
+                    }
+                    _ => return Err(self.non_durable(slot, NonDurableKind::HostProc)),
                 },
                 Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
                 Binding::LiveImpl(idx) => {
@@ -24098,8 +24114,7 @@ impl Host {
     /// §22 domains). Positional over `host_procs`, dead entries included, so a captured binding's
     /// index re-resolves against the table [`Self::restore_durable_named`] rebuilds.
     ///
-    /// Each live, named entry contributes its name plus whatever its provider declared as state
-    /// ([`Self::set_cap_state_capture`]); an entry no name reaches is `None` — nothing to re-grant,
+    /// Each live, named entry contributes its name plus its provider's state ([`CapState`]); an entry no name reaches is `None` — nothing to re-grant,
     /// and no live handle can be naming it, because [`Self::capture_durable_handles`] refuses such a
     /// slot outright.
     pub fn capture_durable_named(&self) -> Vec<Option<DurableNamedCap>> {
@@ -24152,17 +24167,21 @@ impl Host {
         let mut out = Vec::with_capacity(caps.len());
         let mut refused = None;
         for cap in caps {
-            let (handler, fork) = match cap {
+            let grant = match cap {
                 // An index no live handle named: keep the slot so later indices line up, but install
                 // a handler that traps rather than one that silently answers.
-                None => (None, None),
+                None => None,
                 Some(c) => match registrar.as_mut().and_then(|r| r(&c.name, &c.state)) {
-                    Some((h, fork)) => (Some(h), fork),
+                    Some(g) => Some(g),
                     None => {
                         refused.get_or_insert_with(|| c.name.clone());
-                        (None, None)
+                        None
                     }
                 },
+            };
+            let (handler, fork, state) = match grant {
+                Some(g) => (Some(g.handler), g.fork, g.state),
+                None => (None, None, CapState::Stateless),
             };
             out.push(HostProcEntry {
                 handler: ProcHandler::Sync(
@@ -24173,8 +24192,7 @@ impl Host {
                 fork,
                 mints: false,
                 vtable: None,
-                state: None,
-                restore: None,
+                state,
             });
         }
         self.named_cap_registrar = registrar;
@@ -24827,15 +24845,15 @@ impl Host {
     /// [`cap_id::HOST_PROC`]). The guest reaches it with `call.cap HOST_PROC <op> <handle> (args)`; the
     /// closure supplies the semantics, so a host adds a capability (e.g. a WASI shim) without
     /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
-    /// (masked `GuestMem`) but is reached only through this masked, type-checked handle.
-    pub fn grant_host_proc(&mut self, f: HostProc) -> i32 {
+    /// (masked `GuestMem`) but is reached only through this masked, type-checked handle. `state` is
+    /// the provider's answer for what host-side state it holds ([`CapState`], #1699).
+    pub fn grant_host_proc(&mut self, f: HostProc, state: CapState) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Sync(f),
             fork: None,
             mints: false,
             vtable: None,
-            state: None,
-            restore: None,
+            state,
         })
     }
 
@@ -24848,14 +24866,13 @@ impl Host {
     /// handler. Compared to [`Host::grant_host_proc`] this face *loses* powers — no window, no
     /// minter, no fork factory — the pool must never touch the window (the ring's discipline,
     /// kept), and a punted call's declared signature carries at most one result (invariant 8).
-    pub fn grant_host_proc_offloadable(&mut self, f: OffloadHostProc) -> i32 {
+    pub fn grant_host_proc_offloadable(&mut self, f: OffloadHostProc, state: CapState) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Offloadable(f),
             fork: None,
             mints: false,
             vtable: None,
-            state: None,
-            restore: None,
+            state,
         })
     }
 
@@ -24903,14 +24920,18 @@ impl Host {
         }
     }
 
-    pub fn grant_host_proc_forkable(&mut self, f: HostProc, fork: HostProcFork) -> i32 {
+    pub fn grant_host_proc_forkable(
+        &mut self,
+        f: HostProc,
+        fork: HostProcFork,
+        state: CapState,
+    ) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Sync(f),
             fork: Some(fork),
             mints: false,
             vtable: None,
-            state: None,
-            restore: None,
+            state,
         })
     }
 
@@ -24920,14 +24941,13 @@ impl Host {
     /// (a plain registration gets `None`), so it can mint a file-backed `SharedRegion` and return
     /// the handle — the delivery mechanism for the zero-copy file-mmap bridge. The extra authority
     /// is exactly region-minting (nothing else of the `Host` is reachable).
-    pub fn grant_host_proc_region(&mut self, f: HostProc) -> i32 {
+    pub fn grant_host_proc_region(&mut self, f: HostProc, state: CapState) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Sync(f),
             fork: None,
             mints: true,
             vtable: None,
-            state: None,
-            restore: None,
+            state,
         })
     }
 
@@ -27090,6 +27110,7 @@ impl Host {
                     let h = child.grant_host_proc_forkable(
                         forked.handler,
                         forked.refork.unwrap_or_else(|| Arc::clone(&factory)),
+                        forked.state,
                     );
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
@@ -32121,15 +32142,18 @@ mod region_minter_tests {
     fn host_proc_region_handler_mints_a_region_and_returns_a_live_handle() {
         let mut host = Host::new();
         // Op 0: mint a 64-byte region and hand back its handle — the shape an mmap-capable fs uses.
-        let h = host.grant_host_proc_region(Box::new(|op, _args, _mem, minter| {
-            if op == 0 {
-                let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
-                let minter = minter.expect("a region-registered handler is handed the minter");
-                Ok(vec![minter.grant_region(backing) as i64])
-            } else {
-                Ok(vec![-22])
-            }
-        }));
+        let h = host.grant_host_proc_region(
+            Box::new(|op, _args, _mem, minter| {
+                if op == 0 {
+                    let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
+                    let minter = minter.expect("a region-registered handler is handed the minter");
+                    Ok(vec![minter.grant_region(backing) as i64])
+                } else {
+                    Ok(vec![-22])
+                }
+            }),
+            CapState::Stateless,
+        );
         assert!(
             h >= 0,
             "grant_host_proc_region should yield a handle under iface HOST_PROC"
@@ -32158,8 +32182,9 @@ mod region_minter_tests {
     #[test]
     fn region_and_plain_host_proc_are_distinct_handles_under_the_same_iface() {
         let mut host = Host::new();
-        let plain = host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
-        let region = host.grant_host_proc_region(Box::new(|_, _, _, _| Ok(vec![0])));
+        let plain = host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let region =
+            host.grant_host_proc_region(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
         assert!(plain >= 0 && region >= 0 && plain != region);
     }
 }
@@ -32515,7 +32540,7 @@ mod fork_powerbox_tests {
     #[test]
     fn fork_refuses_a_domain_with_a_factory_less_host_proc() {
         let mut host = Host::new();
-        host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
+        host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
         assert!(
             host.fork_powerbox(7).is_none(),
             "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
@@ -32523,7 +32548,10 @@ mod fork_powerbox_tests {
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
         host.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![1])),
-            Arc::new(|_pid| ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])))),
+            Arc::new(|_pid| {
+                ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])), CapState::Stateless)
+            }),
+            CapState::Stateless,
         );
         assert!(
             host.fork_powerbox(7).is_none(),
@@ -32550,8 +32578,11 @@ mod fork_powerbox_tests {
             }
         };
         let mut host = Host::new();
-        let h =
-            host.grant_host_proc_forkable(make(), Arc::new(move |_pid| ForkedProc::shared(make())));
+        let h = host.grant_host_proc_forkable(
+            make(),
+            Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
+            CapState::Stateless,
+        );
         let twin = host.fork_powerbox(7).expect("a forkable host_proc forks");
         // Same handle value resolves in the twin, through the factory-minted fresh closure.
         let mut twin = twin;
@@ -32570,6 +32601,27 @@ mod fork_powerbox_tests {
             twin.fork_powerbox(7).is_some(),
             "a forked domain is still forkable — nested guests can fork"
         );
+    }
+
+    /// #1699 — a fork twin's capability carries the state its factory declared for the handler it
+    /// minted, not the parent's (which closes over the parent's state).
+    #[test]
+    fn a_fork_twin_carries_its_factorys_cap_state() {
+        let captured = |b: u8| CapState::Captured {
+            capture: Box::new(move || vec![b]),
+            restore: Box::new(|_| {}),
+        };
+        let mut parent = Host::new();
+        parent.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| {
+                ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), captured(9))
+            }),
+            captured(1),
+        );
+        let twin = parent.fork_powerbox(7).expect("forkable");
+        assert_eq!(parent.capture_cap_states(), vec![Some(vec![1])]);
+        assert_eq!(twin.capture_cap_states(), vec![Some(vec![9])]);
     }
 
     /// FORK.md §8.5 slice 3 — a **forkable** host proc re-grants into a spawned child over the SAME
@@ -32592,8 +32644,11 @@ mod fork_powerbox_tests {
             }
         };
         let mut parent = Host::new();
-        let h = parent
-            .grant_host_proc_forkable(make(), Arc::new(move |_pid| ForkedProc::shared(make())));
+        let h = parent.grant_host_proc_forkable(
+            make(),
+            Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
+            CapState::Stateless,
+        );
         let mut child = Host::new();
         let ch = parent
             .regrant_into_child(h, &mut child)
@@ -32613,7 +32668,8 @@ mod fork_powerbox_tests {
             "the child's inherited libc is itself forkable — the guest can then fork"
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.
-        let opaque = parent.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
+        let opaque =
+            parent.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
         assert!(
             parent.regrant_into_child(opaque, &mut child).is_none(),
             "a factory-less host proc fails the re-grant closed"
@@ -34104,6 +34160,7 @@ mod signal_door_claim_tests {
                 refork: None,
                 exit: None,
                 exec_remap: None,
+                state: CapState::Stateless,
             }
         })
     }
@@ -34122,6 +34179,7 @@ mod signal_door_claim_tests {
             h.grant_host_proc_forkable(
                 Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
                 factory(d, calls),
+                CapState::Stateless,
             );
         }
         h

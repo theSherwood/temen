@@ -51,7 +51,7 @@ fn resolve(name: &str) -> Option<ResolvedCap> {
 /// the call.
 fn grant(host: &mut Host) -> (i32, WasiOut) {
     let out = WasiOut::default();
-    let handle = host.grant_host_proc(handler(out.clone()));
+    let handle = host.grant_host_proc(handler(out.clone()), temen_interp::CapState::Stateless);
     (handle, out)
 }
 

@@ -134,7 +134,8 @@ fn a_punt_in_a_fiber_parks_identically_on_all_three_engines() {
         &m,
         &|| {
             let mut h = Host::new();
-            let hh = h.grant_host_proc_offloadable(punting_handler());
+            let hh =
+                h.grant_host_proc_offloadable(punting_handler(), temen_interp::CapState::Stateless);
             (h, hh)
         },
         30_105,
@@ -326,7 +327,8 @@ fn ordered_delivery_holds_identically_on_all_three_engines() {
         &m,
         &|| {
             let mut h = Host::new();
-            let hh = h.grant_host_proc_offloadable(gated_handler());
+            let hh =
+                h.grant_host_proc_offloadable(gated_handler(), temen_interp::CapState::Stateless);
             (h, hh)
         },
         50_111_222,
@@ -365,13 +367,16 @@ fn root_return_abandons_a_cap_parked_fiber_identically_on_all_three() {
     let m = module(RESUME_ONCE);
     let mk = || {
         let mut h = Host::new();
-        let hh = h.grant_host_proc_offloadable(Box::new(|_op, args| {
-            let a = *args.first().unwrap_or(&0);
-            OffloadOutcome::Offload(Box::new(move || {
-                std::thread::sleep(Duration::from_millis(100));
-                a + 100
-            }))
-        }));
+        let hh = h.grant_host_proc_offloadable(
+            Box::new(|_op, args| {
+                let a = *args.first().unwrap_or(&0);
+                OffloadOutcome::Offload(Box::new(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    a + 100
+                }))
+            }),
+            temen_interp::CapState::Stateless,
+        );
         (h, hh)
     };
     let t0 = std::time::Instant::now();

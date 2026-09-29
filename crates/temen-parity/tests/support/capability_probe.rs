@@ -228,7 +228,10 @@ pub fn rows() -> Vec<Row> {
             &[0],
             Box::new(|| {
                 let mut h = Host::new();
-                let x = h.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])));
+                let x = h.grant_host_proc(
+                    Box::new(|_, _, _, _| Ok(vec![0])),
+                    temen_interp::CapState::Stateless,
+                );
                 (h, x)
             }),
         ),

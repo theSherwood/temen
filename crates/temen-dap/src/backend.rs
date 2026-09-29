@@ -94,15 +94,19 @@ fn grant_io_powerbox(
         }
         let cell = std::sync::Arc::clone(parked);
         let cap_name = name.clone();
-        let h = host.grant_host_proc_offloadable(Box::new(move |_op: u32, args: &[i64]| {
-            let cell = std::sync::Arc::clone(&cell);
-            let name = cap_name.clone();
-            let args = args.to_vec();
-            temen_interp::OffloadOutcome::Host(Box::new(move |id| {
-                *cell.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(CapRequest { id, name, args });
-            }))
-        }));
+        let h = host.grant_host_proc_offloadable(
+            Box::new(move |_op: u32, args: &[i64]| {
+                let cell = std::sync::Arc::clone(&cell);
+                let name = cap_name.clone();
+                let args = args.to_vec();
+                temen_interp::OffloadOutcome::Host(Box::new(move |id| {
+                    *cell.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(CapRequest { id, name, args });
+                }))
+            }),
+            // Each call is answered afresh by the debugger's user; nothing is held between calls.
+            temen_interp::CapState::Stateless,
+        );
         host.register_cap_name(name, h);
         declared.push((name.clone(), h));
     }

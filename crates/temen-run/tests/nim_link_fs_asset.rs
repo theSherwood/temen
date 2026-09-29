@@ -22,7 +22,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, Value};
+use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, Value};
 
 const NIM_LINK_FS_GZ: &[u8] = include_bytes!("../demos/nim_frontend/fixtures/nim-link-fs.temen.gz");
 const SYS_XNIF_GZ: &[u8] = include_bytes!("../demos/nim_frontend/fixtures/sysvq0asl.x.nif.gz");
@@ -167,12 +167,15 @@ fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
     let factory = Arc::new(factory);
 
     let mut host = Host::new();
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let inst = host.grant_instantiator(0, 1u64 << (child_sl + 1));
     let modh = host.grant_module(&child);
 

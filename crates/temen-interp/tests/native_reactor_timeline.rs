@@ -83,34 +83,31 @@ impl NativeReactor {
 
         // One event per call, `-1` when empty — the `poll` ABI the playground's `keyboard` cap serves.
         let q = Arc::clone(&queue);
-        let kbd = host.grant_host_proc(Box::new(move |_op, _args, _mem, _minter| {
-            Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
-        }));
-        host.register_cap_name("kbd", kbd);
         // The capability declares its own state — the undrained queue — through the pair a moment
         // captures and a §12 freeze writes into its named-capability section (#1455). One definition,
         // read two ways.
-        let q = Arc::clone(&queue);
-        host.set_cap_state_capture(
-            kbd,
-            Box::new(move || {
-                q.lock()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|e| e.to_le_bytes())
-                    .collect()
+        let (qc, qr) = (Arc::clone(&queue), Arc::clone(&queue));
+        let kbd = host.grant_host_proc(
+            Box::new(move |_op, _args, _mem, _minter| {
+                Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
             }),
+            temen_interp::CapState::Captured {
+                capture: Box::new(move || {
+                    qc.lock()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|e| e.to_le_bytes())
+                        .collect()
+                }),
+                restore: Box::new(move |bytes: &[u8]| {
+                    *qr.lock().unwrap() = bytes
+                        .chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                }),
+            },
         );
-        let q = Arc::clone(&queue);
-        host.set_cap_state_restore(
-            kbd,
-            Box::new(move |bytes: &[u8]| {
-                *q.lock().unwrap() = bytes
-                    .chunks_exact(8)
-                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-            }),
-        );
+        host.register_cap_name("kbd", kbd);
 
         NativeReactor {
             inst,

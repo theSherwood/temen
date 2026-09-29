@@ -793,12 +793,15 @@ fn run_join_after_call(
     let ih = h.grant_instantiator(0, WINDOW as u64);
     let fc = freeze.then(temen_jit::FreezeController::new);
     let at_call = fc.clone();
-    let hf = h.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
-        if let Some(fc) = &at_call {
-            fc.request_freeze();
-        }
-        Ok(vec![0])
-    }));
+    let hf = h.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _| {
+            if let Some(fc) = &at_call {
+                fc.request_freeze();
+            }
+            Ok(vec![0])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     compile_and_run_durable(
         inst,
         0,

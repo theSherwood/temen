@@ -34,7 +34,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value};
+use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, StreamRole, Value};
 use temen_run::exec::{domain_exec_with_fs, DomainProgram};
 use temen_run::{instantiate, HostCap, Limits};
 
@@ -334,12 +334,15 @@ fn drive_pipeline(with_link: bool) -> Option<Vec<(String, Vec<u8>)>> {
     let inst = host.grant_instantiator(0, win);
     let nimsem_h = host.grant_module(&nimsem);
     let hexer_h = host.grant_module(&hexer);
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     let exec_h = exec_cap.install(&mut host, win);

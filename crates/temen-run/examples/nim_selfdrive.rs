@@ -95,7 +95,7 @@ fn module_suffix(file: &str, cwd: &str, search_paths: &[&str]) -> String {
 // ---- shared in-window memfs (mirrors nim_e2e_chain) ------------------------------------------------
 
 struct Memfs {
-    factory: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    factory: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
     handle: temen_run::fs::MemFsHandle,
 }
 
@@ -104,7 +104,8 @@ impl Memfs {
         let (factory, handle) =
             temen_run::fs::mem_fs_shared_factory(files, vec!["nimcache".into()]);
         Memfs {
-            factory: Arc::new(factory) as Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+            factory: Arc::new(factory)
+                as Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
             handle,
         }
     }

@@ -76,42 +76,45 @@ fn doom_frame_hashes_match_native() {
     // A read-only in-memory WAD over the `fs` capability (op protocol per lua_files_stdio.c):
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.
     let mut cursors: Vec<u64> = Vec::new();
-    let h = host.grant_host_proc(Box::new(move |op, a, mem, _| match op {
-        0 => {
-            let name = mem
-                .and_then(|m| m.read_bytes(a[0] as u64, a[1] as u64))
-                .unwrap_or_default();
-            if String::from_utf8_lossy(&name).contains(".wad") {
-                cursors.push(0);
-                Ok(vec![(cursors.len() - 1) as i64])
-            } else {
-                Ok(vec![-2]) // ENOENT → fopen NULL → Doom uses defaults
+    let h = host.grant_host_proc(
+        Box::new(move |op, a, mem, _| match op {
+            0 => {
+                let name = mem
+                    .and_then(|m| m.read_bytes(a[0] as u64, a[1] as u64))
+                    .unwrap_or_default();
+                if String::from_utf8_lossy(&name).contains(".wad") {
+                    cursors.push(0);
+                    Ok(vec![(cursors.len() - 1) as i64])
+                } else {
+                    Ok(vec![-2]) // ENOENT → fopen NULL → Doom uses defaults
+                }
             }
-        }
-        1 => {
-            let (fd, buf, len) = (a[0] as usize, a[1] as u64, a[2] as u64);
-            let (cur, end) = (cursors[fd], (cursors[fd] + len).min(wad.len() as u64));
-            if end > cur {
-                mem.expect("mem")
-                    .write_bytes(buf, &wad[cur as usize..end as usize])
-                    .unwrap();
+            1 => {
+                let (fd, buf, len) = (a[0] as usize, a[1] as u64, a[2] as u64);
+                let (cur, end) = (cursors[fd], (cursors[fd] + len).min(wad.len() as u64));
+                if end > cur {
+                    mem.expect("mem")
+                        .write_bytes(buf, &wad[cur as usize..end as usize])
+                        .unwrap();
+                }
+                cursors[fd] = end;
+                Ok(vec![(end - cur) as i64])
             }
-            cursors[fd] = end;
-            Ok(vec![(end - cur) as i64])
-        }
-        3 => {
-            let (fd, whence, off) = (a[0] as usize, a[1], a[2]);
-            let base = match whence {
-                1 => cursors[fd] as i64,
-                2 => wad.len() as i64,
-                _ => 0,
-            };
-            cursors[fd] = (base + off).max(0) as u64;
-            Ok(vec![cursors[fd] as i64])
-        }
-        2 => Ok(vec![a[2]]), // write: discard-accept (config/savegame), non-fatal
-        _ => Ok(vec![0]),
-    }));
+            3 => {
+                let (fd, whence, off) = (a[0] as usize, a[1], a[2]);
+                let base = match whence {
+                    1 => cursors[fd] as i64,
+                    2 => wad.len() as i64,
+                    _ => 0,
+                };
+                cursors[fd] = (base + off).max(0) as u64;
+                Ok(vec![cursors[fd] as i64])
+            }
+            2 => Ok(vec![a[2]]), // write: discard-accept (config/savegame), non-fatal
+            _ => Ok(vec![0]),
+        }),
+        temen_interp::CapState::Stateless,
+    );
     host.register_cap_name("fs", h);
 
     // func 0 = _start → main → doomgeneric_Create + the N-frame loop, printing a hash per frame.

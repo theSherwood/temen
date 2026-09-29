@@ -42,10 +42,13 @@ fn parse(src: &str) -> temen_ir::Module {
 /// identically either way.
 fn run(m: &temen_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
-    let handle = host.grant_host_proc(Box::new(|op, args, _mem, _| {
-        assert_eq!(op, 0, "the guest calls op 0");
-        Ok(vec![args[0] + args[1]])
-    }));
+    let handle = host.grant_host_proc(
+        Box::new(|op, args, _mem, _| {
+            assert_eq!(op, 0, "the guest calls op 0");
+            Ok(vec![args[0] + args[1]])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     host.set_import_bindings(vec![BoundImport::required(13, 0, handle)]);
     let mut r = bytecode::Reactor::open(m).expect("open reactor");
     let mut fuel = u64::MAX;

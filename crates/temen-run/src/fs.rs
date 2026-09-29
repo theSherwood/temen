@@ -113,16 +113,17 @@ fn mem_fs_cap(store: impl Fn() -> temen_fs::MemFsHandle + Send + Sync + 'static)
     let store = std::sync::Arc::new(store);
     let fork: temen_interp::HostProcFork = std::sync::Arc::new({
         let store = std::sync::Arc::clone(&store);
-        move |_pid| temen_interp::ForkedProc::shared(store().handler())
+        move |_pid| {
+            let fs = store();
+            temen_interp::ForkedProc::shared(fs.handler(), fs.cap_state())
+        }
     });
     HostCap {
         type_id: temen_interp::cap_id::HOST_PROC,
         op: 0,
         grant: std::sync::Arc::new(move |h, _| {
             let fs = store();
-            let handle = h.grant_host_proc_forkable(fs.handler(), std::sync::Arc::clone(&fork));
-            fs.declare_state(h, handle);
-            handle
+            h.grant_host_proc_forkable(fs.handler(), std::sync::Arc::clone(&fork), fs.cap_state())
         }),
         unbound: false,
         offer: None,
@@ -665,14 +666,16 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
             maps: Vec::new(),
             crash: None,
         };
-        Box::new(
+        let h = Box::new(
             move |op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn GuestMem>,
                   minter: Option<&mut dyn RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem, minter)])
             },
-        ) as HostProc
+        ) as HostProc;
+        // Open host files and directories, guest-visible cursors: `Uncaptured` (#1699).
+        (h, temen_interp::CapState::Uncaptured)
     })
 }
 
@@ -685,14 +688,16 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
             maps: Vec::new(),
             crash: crashy.then(CrashCtl::default),
         };
-        Box::new(
+        let h = Box::new(
             move |op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn temen_interp::RegionMinter>| {
                 Ok(vec![st.handle(op, args, mem, None)])
             },
-        ) as HostProc
+        ) as HostProc;
+        // Open host files and directories, guest-visible cursors: `Uncaptured` (#1699).
+        (h, temen_interp::CapState::Uncaptured)
     })
 }
 

@@ -335,23 +335,26 @@ fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
     let gate_rel = Arc::clone(&gate);
     let mut host = Host::new();
     host.set_self_module(&m);
-    let h = host.grant_host_proc_offloadable(Box::new(move |op, _args| {
-        if op == 1 {
-            let (mx, cv) = &*gate_rel;
-            *mx.lock().unwrap() = true;
-            cv.notify_all();
-            return temen_interp::OffloadOutcome::Done(Ok(vec![0]));
-        }
-        let g = Arc::clone(&gate_job);
-        temen_interp::OffloadOutcome::Offload(Box::new(move || {
-            let (mx, cv) = &*g;
-            let mut open = mx.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, _args| {
+            if op == 1 {
+                let (mx, cv) = &*gate_rel;
+                *mx.lock().unwrap() = true;
+                cv.notify_all();
+                return temen_interp::OffloadOutcome::Done(Ok(vec![0]));
             }
-            111
-        }))
-    }));
+            let g = Arc::clone(&gate_job);
+            temen_interp::OffloadOutcome::Offload(Box::new(move || {
+                let (mx, cv) = &*g;
+                let mut open = mx.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                111
+            }))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let comps = host.completions();
     let t_punt = host
         .svc_enqueue(0, 0, vec![h as i64])

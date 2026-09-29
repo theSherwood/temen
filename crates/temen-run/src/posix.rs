@@ -53,7 +53,8 @@ fn posix_cap_inner(
     // binds through the coverage walk).
     let p = posix.clone();
     let cap = HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
-        let handle = h.grant_host_proc_forkable(make(), std::sync::Arc::clone(&fork));
+        let (f, state) = make();
+        let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
         let (door, armed) = temen_posix::cap_signal_source(&p);
         h.set_signal_source(door, armed);
         h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));

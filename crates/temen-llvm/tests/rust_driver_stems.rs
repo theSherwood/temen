@@ -237,7 +237,8 @@ fn rust_driver_guest_computes_module_stems_matching_nimc() {
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
     let factory = Arc::new(factory);
     let mut host = Host::new();
-    let fs_h = host.grant_host_proc((*factory)());
+    let (fs_proc, fs_state) = (*factory)();
+    let fs_h = host.grant_host_proc(fs_proc, fs_state);
     host.register_cap_name("fs", fs_h);
     let _ = host.grant_stream(StreamRole::Out);
 
