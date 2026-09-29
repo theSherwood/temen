@@ -146,15 +146,17 @@ struct Orch {
     cv: Condvar,
 }
 
-/// A window pointer that crosses the scoped-thread hand-off (raw pointers are not `Send`).
+/// A window pointer that crosses the scoped-thread hand-off (raw pointers are not `Send`). Null for
+/// a detached child, whose window is not addressable from here.
 #[derive(Clone, Copy)]
 struct WinPtr(*mut u8);
-// SAFETY: it only ever names the one live window allocation, which outlives the scope.
+// SAFETY: it only ever names the one live window allocation, which outlives the scope, or is null.
 unsafe impl Send for WinPtr {}
 
-/// Drive one `Vcpu` to completion on this thread, starting each confined child on its own scoped
-/// thread over its carve, as the browser's per-Worker driver does with Workers. An event this
-/// harness does not orchestrate fails the test rather than guessing an answer.
+/// Drive one `Vcpu` to completion on this thread, starting each child on its own scoped thread — a
+/// confined one over its carve, a detached one over a fresh backing — as the browser's per-Worker
+/// driver does with Workers. An event this harness does not orchestrate fails the test rather than
+/// guessing an answer.
 fn drive<'s, 'e>(
     scope: &'s std::thread::Scope<'s, 'e>,
     prog: &'e bytecode::VcpuProgram,
@@ -170,26 +172,24 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::Instantiate {
                 carve, size_log2, ..
             } => {
-                let id = {
-                    let mut n = orch.next.lock().unwrap();
-                    *n += 1;
-                    *n
-                };
+                if win.0.is_null() {
+                    unorchestrated("a confined spawn inside a detached child");
+                }
                 // SAFETY: the engine validated the carve inside this vCPU's window.
                 let child_win = WinPtr(unsafe { win.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve, alive for the scope.
                 let back = Arc::new(unsafe { Region::shared(child_win.0, 1u64 << size_log2) });
-                let Some(pending) = vcpu.take_child() else {
-                    panic!("an Instantiate carries its admitted child");
-                };
-                let child = pending.start(prog, back, None)?;
-                scope.spawn(move || {
-                    let r = drive(scope, prog, child_win, orch, child);
-                    orch.done.lock().unwrap().insert(id, r);
-                    orch.cv.notify_all();
-                });
-                vcpu.deliver_handle(handles.len() as i32);
-                handles.push(id);
+                start(scope, prog, orch, &mut vcpu, &mut handles, child_win, back)?;
+            }
+            bytecode::VcpuEvent::InstantiateDetached { .. } => {
+                // A fresh reservation, as every driver's detached window has; the engine seeds it.
+                // Not flat on every host (no `mmap` on Windows), so its bytes are not addressed here.
+                let back = Arc::new(Region::new(
+                    1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                    temen_interp::host_page_size(),
+                ));
+                let win = WinPtr(std::ptr::null_mut());
+                start(scope, prog, orch, &mut vcpu, &mut handles, win, back)?;
             }
             bytecode::VcpuEvent::Join { handle } => {
                 let Some(&id) = usize::try_from(handle).ok().and_then(|h| handles.get(h)) else {
@@ -213,13 +213,40 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::JitInstall { .. } => unorchestrated("JitInstall"),
             bytecode::VcpuEvent::JitUninstall { .. } => unorchestrated("JitUninstall"),
             bytecode::VcpuEvent::JitInvoke { .. } => unorchestrated("JitInvoke"),
-            bytecode::VcpuEvent::InstantiateDetached { .. } => {
-                unorchestrated("InstantiateDetached")
-            }
             bytecode::VcpuEvent::CapPending { .. } => unorchestrated("CapPending"),
             bytecode::VcpuEvent::StdinPark => unorchestrated("StdinPark"),
         }
     }
+}
+
+/// Start the child the last event announced over `back` — its window, whose bytes start at `win`
+/// (null for a detached one) — on its own scoped thread, and give `vcpu` the handle it joins it by.
+fn start<'s, 'e>(
+    scope: &'s std::thread::Scope<'s, 'e>,
+    prog: &'e bytecode::VcpuProgram,
+    orch: &'e Orch,
+    vcpu: &mut bytecode::Vcpu<'e>,
+    handles: &mut Vec<u64>,
+    win: WinPtr,
+    back: Arc<Region>,
+) -> Result<(), Trap> {
+    let id = {
+        let mut n = orch.next.lock().unwrap();
+        *n += 1;
+        *n
+    };
+    let Some(pending) = vcpu.take_child() else {
+        panic!("a spawn event carries its admitted child");
+    };
+    let child = pending.start(prog, back, None)?;
+    scope.spawn(move || {
+        let r = drive(scope, prog, win, orch, child);
+        orch.done.lock().unwrap().insert(id, r);
+        orch.cv.notify_all();
+    });
+    vcpu.deliver_handle(handles.len() as i32);
+    handles.push(id);
+    Ok(())
 }
 
 fn unorchestrated(event: &str) -> ! {

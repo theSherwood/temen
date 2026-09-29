@@ -2762,9 +2762,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             bytecode::VcpuEvent::CapPending { .. } => return PAR_TRAP,
             // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
             // mints and seeds from this blob, then posts to a new Worker (see
-            // [`PAR_INSTANTIATE_DETACHED`]). The by-name grant list has no path across Workers on this
-            // driver (as the op-13 arm above: a par child runs on its starter caps), so a spawn that
-            // stashed re-granted caps fails closed instead of silently running the child without them.
+            // [`PAR_INSTANTIATE_DETACHED`]). As in the confined arm above, the child is rebuilt there
+            // from integers with only its starter caps, so a spawn whose admitted powerbox carries
+            // re-granted caps or a pre-mapped region fails closed instead of silently running the
+            // child without them.
             bytecode::VcpuEvent::InstantiateDetached {
                 module,
                 entry,
@@ -2773,7 +2774,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 args,
                 data,
             } => {
-                if v.inner.take_granted_host().is_some() {
+                let admitted = v.inner.take_child();
+                if admitted.is_some_and(|c| c.granted()) {
                     return PAR_TRAP;
                 }
                 let mut seed = Vec::new();
@@ -12858,12 +12860,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // AddressSpace]` for the two-param shape, `child_entry_ok`) — #1201: a page-op child's
                 // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`. The
                 // emitted entry is `f{entry}` (0 for the phase drivers here).
-                let (host, args) = child.into_powerbox();
-                let handle = |i: usize| match args.get(i) {
-                    Some(Value::I64(h)) => *h as u64,
-                    _ => 0,
-                };
-                let (cinst, cas) = (handle(0), handle(1));
+                let (host, cinst, cas) = child.into_powerbox();
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
@@ -12899,38 +12896,19 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             // #1286 — a DETACHED child (op 15): its window is a fresh `WebAssembly.Memory` the page mints
             // (`foreign_mint`), reached only through `Region::Foreign`; the emitted `_start` runs bound to
             // that memory (`driveDetachedRun`). No carve, no alias — the driver cannot address a byte of
-            // it. Same powerbox shape as the op-13 arm (starter caps over the declared window, the child
-            // manifest bound), plus the spawn-time args payload seeded at `module_args_base()`.
+            // it. The engine admitted the child through the one admission every driver uses: its
+            // powerbox carries the starter caps over the reservation (a root's shape — growth is bounded
+            // by the minted memory's `maximum`), the marshaled caps, the child module as its own
+            // (§3.5 / #1296), its attestation and its import manifest bound. The spawn-time args
+            // payload is seeded at `module_args_base()`; this servicer holds the decoded child already.
             #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
             bytecode::VcpuEvent::InstantiateDetached {
-                module,
-                entry,
-                size_log2,
-                fuel,
-                args,
-                data: _, // this servicer holds the decoded child (`d.child.data`) already
+                size_log2, args, ..
             } => {
-                // A grant-less spawn (`grants_n == 0`) stashes no powerbox: the child gets a fresh one.
-                let mut host = d.root.take_granted_host().unwrap_or_default();
-                host.set_self_module(&d.child); // #1296: as the nested arm — the child's own module
-                let child_size = 1u64 << size_log2;
-                host.set_attestation(temen_interp::Attestation {
-                    tier: 1,
-                    window_exposed: false,
-                    freeze_exposed: false,
-                });
-                // Starter caps span the reservation (a root's shape; the tree-walker's op-15 arm grants
-                // the same): a detached child has no carve, and bounding `AddressSpace` to the declared
-                // window would refuse the `vm_map` growth it exists for. Growth is bounded by the minted
-                // memory's `maximum`.
-                let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
-                let (cinst, cas) = host.grant_starter_caps(reservation);
-                if host
-                    .bind_child_manifest(&d.child.imports, &d.child.types)
-                    .is_err()
-                {
+                let Some(child) = d.root.take_child() else {
                     return OP13JIT_TRAP;
-                }
+                };
+                let child_size = 1u64 << size_log2;
                 let init_mem = args_init_mem_raw(&args);
                 // On a key change (a different phase child — nifler_ce → nimsem_ce → hexer_ce across the
                 // whole card, #1025 3e), drop the stale emit BEFORE emitting the new child, so the old
@@ -12961,30 +12939,14 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     Some(e) => e,
                     None => {
                         // #1151 decline → the interpreter twin over a private sparse backing (the
-                        // child never enters the emitted tier, so it needs no JS-owned memory): seed
-                        // the segments + payload, run it to completion, bank the result.
+                        // child never enters the emitted tier, so it needs no JS-owned memory), which
+                        // the engine seeds; run it to completion, bank the result.
                         let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
                         let back = std::sync::Arc::new(temen_interp::Region::paged(
                             1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                             temen_interp::host_page_size(),
                         ));
-                        for seg in &d.child.data {
-                            back.write_from(seg.offset, &seg.bytes);
-                        }
-                        back.write_from(0, &init_mem);
-                        let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
-                            prog,
-                            module,
-                            entry,
-                            back,
-                            size_log2,
-                            temen_ir::DEFAULT_RESERVED_LOG2,
-                            fuel,
-                            host,
-                        ) {
-                            Ok(c) => drive_detached_leaf(c),
-                            Err(t) => Err(t),
-                        };
+                        let r = child.start(prog, back, None).and_then(drive_detached_leaf);
                         let handle = d.children.len() as i32;
                         d.children.push(Some(r));
                         d.root.deliver_handle(handle);
@@ -12997,7 +12959,8 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 ) else {
                     return OP13JIT_TRAP;
                 };
-                let _ = entry;
+                // The child's entry gets the starter handles the interpreter passes.
+                let (mut host, cinst, cas) = child.into_powerbox();
                 // #1527: an op-15 pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
                 // cannot alias, but a detached child runs to completion before its parent resumes
                 // (the handle is delivered only after `driveDetachedRun`; `join` reads the banked
@@ -13015,8 +12978,8 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         host: Box::new(host),
                         init_mem,
                         readback: None,
-                        entry_sp: cinst as u64,
-                        entry_as: cas as u64,
+                        entry_sp: cinst,
+                        entry_as: cas,
                     },
                     Some(emit),
                 ) {

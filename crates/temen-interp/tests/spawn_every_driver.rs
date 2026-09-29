@@ -1,9 +1,10 @@
-//! **#1855 — a §14 confined spawn answers the same on every driver.** The spawn family (op 0, op 5,
-//! op 13 and the §3d record op 17) had one admission per driver, and three of them still refused
-//! what the cooperative driver serves: a budget-funded or grant-carrying same-module op-17 spawn
-//! trapped `Malformed` on the parallel driver and the debug scheduler (the grant list on `Vcpu` too),
-//! and every op-13 spawn trapped under the debugger. The debug scheduler also checked a nested
-//! holder's carve against the root's NULL guard instead of its own.
+//! **#1855 — a spawn answers the same on every driver.** The §14 confined family (op 0, op 5, op 13
+//! and the §3d record op 17) had one admission per driver, and three of them still refused what the
+//! cooperative driver serves: a budget-funded or grant-carrying same-module op-17 spawn trapped
+//! `Malformed` on the parallel driver and the debug scheduler (the grant list on `Vcpu` too), and
+//! every op-13 spawn trapped under the debugger. The debug scheduler also checked a nested holder's
+//! carve against the root's NULL guard instead of its own. The §5 detached spawn (op 15) had a
+//! second admission on `Vcpu`, whose host built the child's powerbox and seeded its window (#1414).
 //!
 //! Each case runs on the oracle, the cooperative executor, the parallel driver, the debug scheduler
 //! and an orchestrated `Vcpu`, and every one must give the oracle's result and stream bytes.
@@ -12,7 +13,7 @@
 mod drivers;
 
 use drivers::{agree_on_every_driver, Ran};
-use temen_interp::{Host, StreamRole, Value};
+use temen_interp::{Attestation, Host, StreamRole, Trap, Value};
 use temen_ir::Module;
 use temen_text::parse_module;
 
@@ -417,4 +418,211 @@ fn a_module_child_whose_import_is_unbound_is_refused() {
         (h, vec![Value::I32(i), Value::I32(c), Value::I32(o)])
     };
     agree_on_every_driver("op 13, an unbound required import", &m, &setup, &ok(-22));
+}
+
+// ---- §5 detached spawns (op 15): a fresh window of the child's own, never a carve ----
+
+/// The payload word an op-15 parent hands its child at `module_args_base()`.
+const PAYLOAD: i64 = 1000;
+
+/// An op-15 parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64`: `module`'s entry 0 in a fresh
+/// 32 KiB window, funded by `budget`, handed `PAYLOAD` as its 8-byte args payload and, iff `grant`,
+/// `stdout` by name.
+fn op15(grant: bool) -> String {
+    format!(
+        "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
+{g}  pa = i64.const 20480
+  pw = i64.const {PAYLOAD}
+  i64.store pa pw
+  vm = i64.extend_i32_s vmod
+  vb = i64.extend_i32_s vbud
+  gp = i64.const 16384
+  gn = i64.const {n}
+  en = i64.const 0
+  sl = i64.const 15
+  q = i64.const 0
+  al = i64.const 8
+  vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gp, gn, en, sl, q, pa, al)
+{JOIN_OR_ERRNO}",
+        g = store_grant("g", 16384, 16484, "stdout", "vout"),
+        n = u8::from(grant),
+    )
+}
+
+/// The powerbox an op-15 parent runs over: its `Instantiator`, `child` as a `Module`, a `Budget` whose
+/// `mem` quota is `mem` bytes, and `stdout`.
+fn op15_setup(child: &Module, mem: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    move || {
+        let mut h = Host::new();
+        let i = h.grant_instantiator(0, 1 << 17);
+        let c = h.grant_module(child);
+        let b = h.grant_budget(0, mem, 0);
+        let o = h.grant_stream(StreamRole::Out);
+        let args = vec![Value::I32(i), Value::I32(c), Value::I32(b), Value::I32(o)];
+        (h, args)
+    }
+}
+
+/// A detached child that returns its payload word plus the word of its data segment.
+const CHILD_READS: &str = "memory 15
+data 24576 \"ABCDEFGH\"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 16512
+  vp = i64.load va
+  vd = i64.const 24576
+  vw = i64.load vd
+  vr = i64.add vp vw
+  return vr
+  }
+}
+";
+
+/// A detached child that returns its `self.attest` report: `tier | window_exposed << 8 |
+/// freeze_exposed << 9`.
+const CHILD_ATTESTS: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vr = call.cap 4294967295 4 () -> (i64) vz ()
+  return vr
+  }
+}
+";
+
+/// A detached child that imports `exit` — a required slot the spawn must bind or refuse.
+const DETACHED_IMPORTS_EXIT: &str = "memory 15
+import 0 \"exit\" (i32) -> ()
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vr = i64.const 42
+  return vr
+  }
+}
+";
+
+/// A detached child that writes to its own read-only data segment.
+const CHILD_WRITES_RO: &str = "memory 15
+data ro 24576 \"ABCDEFGH\"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 24576
+  vw = i64.const 7
+  i64.store va vw
+  vr = i64.const 42
+  return vr
+  }
+}
+";
+
+/// A detached child whose entry resolves `stdout` by name, writes `M` and returns 42 (its scratch above
+/// the NULL guard its 32 KiB window has).
+fn detached_writes_m() -> String {
+    format!(
+        "memory 15
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{n}  vl = i64.const 6
+  vp = i64.const 20000
+  vh = self.resolve vp vl
+  vb = i64.const 20100
+  vc = i32.const 77
+  i32.store8 vb vc
+  one = i64.const 1
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vb, one)
+  vr = i64.const 42
+  return vr
+  }}
+}}
+",
+        n = store_name("c", 20000, "stdout"),
+    )
+}
+
+#[test]
+fn a_detached_child_starts_with_its_data_and_payload() {
+    let m = module(&op15(false));
+    let child = module(CHILD_READS);
+    let want = ok(PAYLOAD.wrapping_add(i64::from_le_bytes(*b"ABCDEFGH")));
+    agree_on_every_driver(
+        "op 15, data + payload",
+        &m,
+        &op15_setup(&child, 1 << 20),
+        &want,
+    );
+}
+
+/// A detached child attests its spawner's isolation tier, with a window no ancestor reads (PROCESS.md
+/// §5). `Vcpu`'s host used to build the child's powerbox and gave it the default report, tier 1.
+#[test]
+fn a_detached_child_attests_its_spawners_tier() {
+    let m = module(&op15(false));
+    let child = module(CHILD_ATTESTS);
+    let base = op15_setup(&child, 1 << 20);
+    let setup = || {
+        let (mut h, args) = base();
+        h.set_attestation(Attestation {
+            tier: 0,
+            window_exposed: false,
+            freeze_exposed: false,
+        });
+        (h, args)
+    };
+    agree_on_every_driver("op 15, a tier-0 spawner", &m, &setup, &ok(0));
+}
+
+/// An unbound required import refuses the spawn `-EINVAL` (IMPORTS.md §3.3 withhold). `Vcpu`'s host
+/// used to bind the manifest when it built the child and trapped `Malformed`.
+#[test]
+fn a_detached_child_whose_import_is_unbound_is_refused() {
+    let m = module(&op15(false));
+    let child = module(DETACHED_IMPORTS_EXIT);
+    let setup = op15_setup(&child, 1 << 20);
+    agree_on_every_driver("op 15, an unbound import", &m, &setup, &ok(-22));
+}
+
+#[test]
+fn a_detached_child_gets_the_caps_granted_it_by_name() {
+    let m = module(&op15(true));
+    let child = module(&detached_writes_m());
+    let want = Ran {
+        result: Ok(vec![Value::I64(42)]),
+        stdout: b"M".to_vec(),
+        stderr: Vec::new(),
+    };
+    agree_on_every_driver(
+        "op 15 + a named grant",
+        &m,
+        &op15_setup(&child, 1 << 20),
+        &want,
+    );
+}
+
+/// A `ro` data segment is read-only in the child's fresh window. `Vcpu`'s hosts used to seed the
+/// window themselves, writably.
+#[test]
+fn a_detached_childs_read_only_data_stays_read_only() {
+    let m = module(&op15(false));
+    let child = module(CHILD_WRITES_RO);
+    let want = Ran {
+        result: Err(Trap::MemoryFault),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    agree_on_every_driver(
+        "op 15, a write to ro data",
+        &m,
+        &op15_setup(&child, 1 << 20),
+        &want,
+    );
+}
+
+#[test]
+fn a_detached_spawn_beyond_the_budget_is_refused() {
+    let m = module(&op15(false));
+    let child = module(CHILD_READS);
+    let setup = op15_setup(&child, (1 << 15) - 1);
+    agree_on_every_driver("op 15, a budget one byte short", &m, &setup, &ok(-22));
 }

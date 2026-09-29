@@ -1383,12 +1383,50 @@ struct ConfinedSpawn {
     budget: i32,
 }
 
+/// A §5 detached spawn (op 15, #1286) as its lowering resolved it: a separate module in a fresh
+/// window of its own, never a carve of the spawner's.
+#[derive(Clone, Copy)]
+struct DetachedSpawn {
+    /// The `Budget` handle whose `mem` quota pays for the window.
+    budget: i32,
+    /// The granted `Module` handle the child runs.
+    module: i32,
+    entry: i64,
+    /// The window: `1 << size_log2` bytes, the module's declared memory.
+    size_log2: i64,
+    /// The child's fuel quota (`<= 0` inherits the parent's remaining).
+    quota: i64,
+    /// The by-name grant list's `(ptr, count)` in the spawner's window; `None` grants only the
+    /// starter caps.
+    grants: Option<(u64, u64)>,
+    /// The spawn-time payload `(ptr, len)` in the spawner's window, seeded at the child's
+    /// `module_args_base()`.
+    args: Option<(u64, u64)>,
+    /// A `SharedRegion` of the spawner's, `(region, child_off)`, aliased into the child's window
+    /// before it starts.
+    premap: Option<(i32, u64)>,
+}
+
 /// What an admitted child runs.
 enum ChildProgram {
     /// The spawning frame's own module (#1726): a same-module child (op 0, a module-less op 17).
     Spawner(u32, std::sync::Arc<Compiled>),
-    /// A granted separate module, compiled; [`child_task`] lands it in the driver's source.
+    /// A granted separate module, compiled; [`land`](ChildProgram::land) pushes it to the source.
     Granted(Compiled),
+}
+
+impl ChildProgram {
+    /// Land the program in `source` (a granted module is pushed and gets its own index): the module
+    /// index the child runs, and its compiled unit.
+    fn land(self, source: &ModuleSource) -> Result<(u32, std::sync::Arc<Compiled>), Trap> {
+        match self {
+            ChildProgram::Spawner(m, p) => Ok((m, p)),
+            ChildProgram::Granted(c) => {
+                let m = source.push(c);
+                Ok((m as u32, source.get(m).ok_or(Trap::Malformed)?))
+            }
+        }
+    }
 }
 
 /// A §14 confined or §5 detached child as every in-process bytecode driver builds it — the **one
@@ -1400,8 +1438,7 @@ enum ChildProgram {
 /// grant list the cooperative driver serves.)
 struct AdmittedChild {
     /// The child's window: a view of the holder's carve (confined), or a fresh window of its own
-    /// (`Mem::detached`, its own guard) seeded with the module's data, the args payload at
-    /// `module_args_base()` and any pre-mapped region (detached).
+    /// (detached) once its [`FreshWindow`] is built over the driver's backing.
     mem: Option<Mem>,
     /// The child powerbox: the starter `Instantiator`/`AddressSpace`, the by-name re-grants, the
     /// module the child serves, its import manifest bound, and a funding budget's channel ceiling.
@@ -1577,52 +1614,81 @@ fn confined_child_host(
     Ok(bound.then_some((child_host, cinst, cas)))
 }
 
-/// Land an admitted child's program in `source` (a granted module is pushed and gets its own index)
-/// and build its entry task and its own natural dispatch table over that module — no installed §22
-/// units; #1296: sized for the install slots its re-granted `Jit` carries.
+/// A child's entry task in `module` (`prog`, its landed program) and its own natural dispatch table
+/// over that module — no installed §22 units; #1296: sized for the install slots its re-granted
+/// `Jit` carries.
 fn child_task(
-    source: &ModuleSource,
-    program: ChildProgram,
+    module: u32,
+    prog: &Compiled,
     entry: i64,
     args: &[Value],
     jit_table_log2: u8,
 ) -> Result<(VTask, SharedSlots), Trap> {
-    let (module, prog) = match program {
-        ChildProgram::Spawner(m, p) => (m, p),
-        ChildProgram::Granted(c) => {
-            let m = source.push(c);
-            (m as u32, source.get(m).ok_or(Trap::Malformed)?)
-        }
-    };
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let mut vt = VTask::new(&prog, entry as usize, args)?;
+    let mut vt = VTask::new(prog, entry as usize, args)?;
     vt.active.module = module as usize;
     vt.active.home = module as usize;
     Ok((vt, table))
 }
 
-/// Admit an op-15 spawn against `host` (the parent powerbox) and build the child. `pm` is the
-/// parent's window (the grant list and the args payload are read from it); `parent_fuel` its
-/// remaining fuel. `Ok(None)` is a **probeable refusal** — the driver lands `-EINVAL` and nothing
-/// was charged; `Err` is a trap (a forged handle, an unreadable payload). The checks — entry shape,
-/// the window = the module's declared memory, the payload fitting the args area, `premap_admit`,
-/// no durable domain — run before the `Budget.mem` take, so a refusal charges nothing.
-#[allow(clippy::too_many_arguments)]
+/// An admitted detached child's window before it exists: a fresh window, never a carve of the
+/// spawner's, that starts with its module's data segments under the NULL guard and the spawn-time
+/// payload at `module_args_base()`. The driver supplies the backing ([`build`](FreshWindow::build)).
+struct FreshWindow {
+    size_log2: u8,
+    shadow: Option<super::ShadowArena>,
+    data: std::sync::Arc<[temen_ir::Data]>,
+    payload: Vec<u8>,
+}
+
+impl FreshWindow {
+    /// Build the window over `back` (`None`: a reservation of the engine's own) the way the
+    /// tree-walker builds it ([`Mem::detached`]), and alias in the pre-mapped region the child's
+    /// powerbox `host` carries.
+    fn build(
+        &self,
+        back: Option<std::sync::Arc<super::Region>>,
+        host: &mut Host,
+    ) -> Result<Mem, Trap> {
+        let mut mem = Mem::detached(
+            DEFAULT_RESERVED_LOG2,
+            self.size_log2,
+            self.shadow,
+            &self.data,
+            back,
+        );
+        if !self.payload.is_empty() {
+            let _ = mem.write_bytes(temen_ir::module_args_base(), &self.payload);
+        }
+        if host.apply_premap(&mut mem) < 0 {
+            return Err(Trap::Malformed);
+        }
+        Ok(mem)
+    }
+}
+
+/// Admit an op-15 spawn against `host` (the parent powerbox) and build the child, with its window
+/// still to be built over a backing the driver supplies. `pm` is the parent's window (the grant list
+/// and the args payload are read from it); `parent_fuel` its remaining fuel. `Ok(None)` is a
+/// **probeable refusal** — the driver lands `-EINVAL` and nothing was charged; `Err` is a trap (a
+/// forged handle, an unreadable payload). The checks — entry shape, the window = the module's
+/// declared memory, the payload fitting the args area, `premap_admit`, durability — run before the
+/// `Budget.mem` take, so a refusal charges nothing.
+///
+/// `freezes_detached`: whether a freeze of this run captures a detached child. A durable domain
+/// spawns detached only an attested-freezable module, and only while it holds freeze authority over
+/// its detached progeny (#1361 step 4, #1440, #1501). The tree-walker's freeze captures the child and
+/// `Vcpu` leaves the capture to its embedder, but the in-process drivers' freeze cannot, so there a
+/// durable domain's detached spawn refuses (#1893).
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     parent_fuel: u64,
-    budget: i32,
-    mh: i32,
-    entry: i64,
-    size_log2: i64,
-    quota: i64,
-    grants: Option<(u64, u64)>,
-    args: Option<(u64, u64)>,
-    premap: Option<(i32, u64)>,
-) -> Result<Option<AdmittedChild>, Trap> {
-    let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule, cshadow) = {
-        let g = host.resolve_module(mh)?;
+    s: DetachedSpawn,
+    freezes_detached: bool,
+) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
+    let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule, cshadow, cdurable) = {
+        let g = host.resolve_module(s.module)?;
         (
             g.funcs.clone(),
             g.memory_log2,
@@ -1631,21 +1697,22 @@ fn admit_detached_child(
             g.types.clone(),
             std::sync::Arc::clone(&g.module),
             g.shadow,
+            g.durable,
         )
     };
     let compiled = compile_module(&cfuncs, &ctypes, cshadow)
         .ok_or(Trap::Malformed)?
         .with_manifest(cimports, ctypes);
-    let sig = compiled.sigs.get(entry as usize);
+    let sig = compiled.sigs.get(s.entry as usize);
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
+    let child_size = if (0..64).contains(&s.size_log2) {
+        1u64 << s.size_log2
     } else {
         0
     };
-    let mod_ok = cmem_log2 == Some(size_log2 as u8);
-    let payload: Vec<u8> = match args {
+    let mod_ok = cmem_log2 == Some(s.size_log2 as u8);
+    let payload: Vec<u8> = match s.args {
         Some((ptr, len)) => pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?,
         None => Vec::new(),
     };
@@ -1653,7 +1720,7 @@ fn admit_detached_child(
         payload.len() as u64 <= temen_ir::module_args_end() - temen_ir::module_args_base();
     // The op-11 record format: `{name_off u32, name_len u32, handle i32, _ u32}`, fail-closed on a
     // handle the parent may not re-grant.
-    let glist = match grants {
+    let glist = match s.grants {
         Some((gptr, gn)) => {
             let m = pm.ok_or(Trap::Malformed)?;
             super::read_grant_records(gptr, gn, |o, l| m.read_window(o, l))?
@@ -1663,18 +1730,21 @@ fn admit_detached_child(
     if !glist.iter().all(|(_, h)| host.can_regrant(*h)) {
         return Err(Trap::CapFault);
     }
-    let premap_ok = match premap {
+    let premap_ok = match s.premap {
         Some((r, o)) => host.premap_admit(r, o, child_size)?,
         None => true,
     };
+    let durable = host.is_durable();
+    let durable_ok = !durable || (freezes_detached && cdurable);
     if !ok_entry
         || child_size == 0
         || !mod_ok
         || !payload_ok
         || !premap_ok
-        || host.is_durable()
-        || match host.admit_detached_spawn(budget, child_size) {
-            // D66 — see the resumable arm: single-spawn lane parity, lane returned at once.
+        || !durable_ok
+        || match host.admit_detached_spawn(s.budget, child_size) {
+            // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do
+            // not yet return a lane at their reap, so the lane is given straight back (#1600).
             Some(lane) => {
                 host.give_lane(lane);
                 false
@@ -1684,11 +1754,9 @@ fn admit_detached_child(
     {
         return Ok(None);
     }
-    let mut mem = Mem::detached(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow, &cdata);
-    if !payload.is_empty() {
-        let _ = mem.write_bytes(temen_ir::module_args_base(), &payload);
-    }
     let mut child_host = Host::new();
+    // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
+    child_host.set_durable(durable);
     child_host.set_attestation(host.detached_child_attestation());
     let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
@@ -1697,15 +1765,16 @@ fn admit_detached_child(
             child_host.register_cap_name(name, cg);
         }
     }
-    if let Some((r, o)) = premap {
-        if !(host.stage_premap(r, o, &mut child_host) && child_host.apply_premap(&mut mem) >= 0) {
+    // The pre-mapped region rides the child's powerbox; the window build aliases it in.
+    if let Some((r, o)) = s.premap {
+        if !host.stage_premap(r, o, &mut child_host) {
             return Err(Trap::Malformed);
         }
     }
     child_host.set_self_module(&cmodule);
     // A child of the running module itself binds leniently (#1234 — its manifest is the parent's
     // whole import surface, not one written for the child).
-    let bound = if host.is_self_module(mh) {
+    let bound = if host.is_self_module(s.module) {
         child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
     } else {
         child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
@@ -1714,18 +1783,40 @@ fn admit_detached_child(
         return Ok(None);
     }
     let args = child_entry_args(arity, cinst, cas);
-    let fuel = if quota <= 0 {
+    let fuel = if s.quota <= 0 {
         parent_fuel
     } else {
-        (quota as u64).min(parent_fuel)
+        (s.quota as u64).min(parent_fuel)
     };
-    Ok(Some(AdmittedChild {
-        mem: Some(mem),
+    let child = AdmittedChild {
+        mem: None,
         host: child_host,
         program: ChildProgram::Granted(compiled),
         args,
         fuel,
-    }))
+    };
+    let window = FreshWindow {
+        size_log2: s.size_log2 as u8,
+        shadow: cshadow,
+        data: cdata,
+        payload,
+    };
+    Ok(Some((child, window)))
+}
+
+/// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
+/// built at once, over a reservation of the engine's own.
+fn admit_detached_in_process(
+    host: &mut Host,
+    pm: Option<&Mem>,
+    parent_fuel: u64,
+    s: DetachedSpawn,
+) -> Result<Option<AdmittedChild>, Trap> {
+    let Some((mut child, window)) = admit_detached_child(host, pm, parent_fuel, s, false)? else {
+        return Ok(None);
+    };
+    child.mem = Some(window.build(None, &mut child.host)?);
+    Ok(Some(child))
 }
 
 pub fn compile_module(
@@ -3677,21 +3768,19 @@ pub enum VcpuEvent {
         /// when the guest passed no quota).
         fuel: u64,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): start a child vCPU in a **fresh window
-    /// the host mints** — no carve, nothing of it in the parent's window. Admission (child entry,
-    /// window = declared memory, `Budget` quota) and the module compile + push already happened;
-    /// the re-granted child powerbox is stashed for [`Vcpu::take_granted_host`]. The host allocates a
-    /// window of `1 << size_log2` (grown by the child's `vm_map`s), seeds the module's data segments
-    /// and `args` at `module_args_base()`, runs the child with
-    /// [`Vcpu::new_confined_child_grow_over_host`]`(prog, module, entry, back, size_log2,
-    /// DEFAULT_RESERVED_LOG2, fuel, host)` (the committed window starts at the declared size; the
-    /// starter caps span the reservation, as a root's do, so `vm_map` grows it — the tree-walker's
-    /// op-15 arm grants the same), and
-    /// [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`] protocol minus the
-    /// carve. A spawn with a grant list and/or a pre-mapped region stashes the child powerbox
-    /// ([`Vcpu::take_granted_host`] is `Some`); the pre-map rides it and the child constructor applies
-    /// it, so a driver needs no extra step — a driver whose emitted tier cannot alias
-    /// [`Host::take_premap`]s it instead and copies the region in before / out after the run.
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): start a child in a **fresh window the
+    /// host mints** — no carve, nothing of it in the parent's window. The engine already admitted it
+    /// with the one admission every driver uses ([`admit_detached_child`]): the entry, the window =
+    /// the declared memory, the `Budget` quota; its powerbox built (the starter caps span the
+    /// reservation, as a root's do, so `vm_map` grows the window), its module compiled and pushed.
+    /// The host takes the child ([`Vcpu::take_child`]), starts it over a backing it mints for the
+    /// window ([`PendingChild::start`], which seeds the data segments, the payload and a pre-mapped
+    /// region), and [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`]
+    /// protocol minus the carve. A host that runs the child on an emitted tier takes its powerbox
+    /// instead ([`PendingChild::into_powerbox`]) and, since its window cannot alias, copies a
+    /// pre-mapped region ([`Host::take_premap`]) in before and out after the run. The operands below
+    /// are what a host that rebuilds the child elsewhere needs ([`Vcpu::new_confined_child_grow`]
+    /// over a memory it seeds from `data` and `args`).
     InstantiateDetached {
         module: u32,
         entry: u32,
@@ -3746,8 +3835,9 @@ enum PendingJit {
 /// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, §22
 /// guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
 /// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (`spawn_coroutine_module`
-/// serviced internally; `instantiate`/`instantiate_module` surfacing [`VcpuEvent::Instantiate`], the
-/// child a [`Vcpu::new_confined_child`] on its own Worker). By default carries a deny-all `Host` (an
+/// serviced internally; the confined and detached spawns surfacing [`VcpuEvent::Instantiate`] and
+/// [`VcpuEvent::InstantiateDetached`], whose admitted child the host takes ([`Vcpu::take_child`]) and
+/// starts on its own Worker). By default carries a deny-all `Host` (an
 /// I/O `call.cap` is an inert `CapFault`); attach the run's shared powerbox with
 /// [`with_shared_host`](Vcpu::with_shared_host) (THREADS.md 4d) and `call.cap` host I/O works from
 /// every vCPU sharing it, serialized per call — `drive_parallel`'s 4c-host model.
@@ -3810,70 +3900,116 @@ pub struct Vcpu<'p> {
     /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
     /// slots — the caller's window base is the one the spill persisted).
     pending_tierup: Option<(usize, Box<[ValType]>)>,
-    /// The §14 confined child the last [`VcpuEvent::Instantiate`] announced — admitted, and waiting for
-    /// the host to take it ([`take_child`](Self::take_child)).
+    /// The child the last [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced
+    /// — admitted, and waiting for the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
-    /// #1011 slice 3a / #1286: the **pre-built child powerbox** of the last
-    /// [`VcpuEvent::InstantiateDetached`]: the engine re-granted the spawn's named caps (a shared `fs`)
-    /// from *this* vCPU's own powerbox into a fresh `Host` (approach A, interpreter-side) and stashed it
-    /// here, for the host that mints the detached window to take
-    /// ([`take_granted_host`](Self::take_granted_host)). `None` for a grant-less detached spawn.
-    pending_granted_host: Option<Host>,
 }
 
-/// A §14 confined child that a [`VcpuEvent::Instantiate`] announced, as the engine admitted it. The one
-/// admission every driver uses ([`admit_confined_child`]) built its powerbox — the starter
-/// `Instantiator`/`AddressSpace` over the carve, the by-name re-grants, the module it serves and its
-/// import manifest, a funding budget's channel ceiling — charged its budget, and landed its program in
-/// the run's shared source. What is left for the host is mechanism: a region over the carve and a
-/// thread or Worker to run it on ([`start`](Self::start)), or, for a host that runs the child on an
-/// emitted tier, its powerbox and entry arguments ([`into_powerbox`](Self::into_powerbox)).
+/// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
+/// (§5, op 15) announced, as the engine admitted it. The one admission every driver uses
+/// ([`admit_confined_child`], [`admit_detached_child`]) built its powerbox — the starter
+/// `Instantiator`/`AddressSpace`, the by-name re-grants, the module it serves and its import
+/// manifest, a funding budget's channel ceiling, a pre-mapped region — charged its budget, and landed
+/// its program in the run's shared source. What is left for the host is mechanism: a region for the
+/// child's window and a thread or Worker to run it on ([`start`](Self::start)), or, for a host that
+/// runs the child on an emitted tier, its powerbox and starter handles
+/// ([`into_powerbox`](Self::into_powerbox)).
 pub struct PendingChild {
     host: Host,
     module: u32,
     entry: u32,
     args: Vec<Value>,
     fuel: u64,
-    carve_log2: u8,
+    window: ChildWindow,
     granted: bool,
 }
 
+/// The window a [`PendingChild`] runs in.
+enum ChildWindow {
+    /// A `1 << log2` carve of the spawner's window, already holding the child's bytes (§14).
+    Carve(u8),
+    /// A fresh window of its own (§5), seeded when it is built.
+    Fresh(FreshWindow),
+}
+
 impl PendingChild {
-    /// Start the child as a vCPU over `back`, a region covering exactly its carve — `[win + carve,
-    /// +2^size_log2)` of the parent's window, which per DESIGN.md §14 simply *is* the child's window
-    /// (anything the parent wrote there, a module child's data segments, is already in it). The whole
-    /// carve is committed, as on every other driver, unless `committed_log2` commits less at start and
-    /// leaves the child to `vm_map` the rest (#1123 slice 4: the op-13 phase lanes' shape, #1253).
+    /// Start the child as a vCPU over `back`. For a confined child, `back` covers exactly its carve —
+    /// `[win + carve, +2^size_log2)` of the parent's window, which per DESIGN.md §14 simply *is* the
+    /// child's window (anything the parent wrote there, a module child's data segments, is already in
+    /// it). For a detached child, `back` is a fresh backing the host minted; the engine seeds it (the
+    /// module's data segments under the NULL guard, the args payload, a pre-mapped region), as every
+    /// other driver's window is seeded. A carve is committed whole, as on every other driver, unless
+    /// `committed_log2` commits less at start and leaves the child to `vm_map` the rest (#1123 slice 4:
+    /// the op-13 phase lanes' shape, #1253); a fresh window always starts at its declared size.
     pub fn start(
-        self,
+        mut self,
         prog: &VcpuProgram,
         back: std::sync::Arc<super::Region>,
         committed_log2: Option<u8>,
     ) -> Result<Vcpu<'_>, Trap> {
-        Vcpu::confined_over(
+        let mem = match (&self.window, committed_log2) {
+            (ChildWindow::Carve(log2), committed) => {
+                let shadow = prog
+                    .dom
+                    .source
+                    .get(self.module as usize)
+                    .ok_or(Trap::Malformed)?
+                    .shadow;
+                carve_window(back, committed.unwrap_or(*log2), *log2, shadow)?
+            }
+            (ChildWindow::Fresh(w), None) => w.build(Some(back), &mut self.host)?,
+            (ChildWindow::Fresh(_), Some(_)) => return Err(Trap::Malformed),
+        };
+        Vcpu::child_over(
             prog,
             self.module,
             self.entry,
-            back,
-            committed_log2.unwrap_or(self.carve_log2),
-            self.carve_log2,
+            mem,
             self.fuel,
             self.host,
             self.args,
         )
     }
 
-    /// The child's powerbox and its entry's arguments (its starter cap handles), for a host that runs
-    /// it on an emitted tier over the same carve rather than as a vCPU.
-    pub fn into_powerbox(self) -> (Host, Vec<Value>) {
-        (self.host, self.args)
+    /// The child's powerbox and its entry's starter handles — its `Instantiator` and `AddressSpace`,
+    /// `0` for one the entry does not take — for a host that runs it on an emitted tier over the same
+    /// window rather than as a vCPU. A detached child's pre-mapped region is still staged in the
+    /// powerbox ([`Host::take_premap`]).
+    pub fn into_powerbox(self) -> (Host, u64, u64) {
+        let handle = |i: usize| match self.args.get(i) {
+            Some(Value::I64(h)) => *h as u64,
+            _ => 0,
+        };
+        let (inst, space) = (handle(0), handle(1));
+        (self.host, inst, space)
     }
 
-    /// Whether the spawn re-granted named caps into the child's powerbox — the part of it a host that
-    /// rebuilds the child from the event's operands (the browser's per-Worker driver) cannot carry.
+    /// Whether the spawn put authority into the child's powerbox by name — re-granted caps, or a
+    /// detached child's pre-mapped region: the part a host that rebuilds the child from the event's
+    /// operands (the browser's per-Worker driver) cannot carry.
     pub fn granted(&self) -> bool {
         self.granted
     }
+}
+
+/// A confined child's window over `back`, a region covering its `1 << carve_log2` carve: committed
+/// to `1 << committed_log2` at start and `vm_map`-growable to the carve (#1123 slice 4), under the
+/// NULL guard. #964/#1094/#1206: the guard is the one canonical layout — a carve reserves `[0,
+/// POWERBOX_NULL_GUARD)` exactly as a root window does (the tree-walker's nested arm and every
+/// cross-tier bounce over the same carve seed it; the emitted tier's guard compare is unconditional).
+/// `seed_null_guard` skips a carve smaller than the guard, so a tiny sub-window stays fully usable.
+fn carve_window(
+    back: std::sync::Arc<super::Region>,
+    committed_log2: u8,
+    carve_log2: u8,
+    shadow: Option<super::ShadowArena>,
+) -> Result<Mem, Trap> {
+    if carve_log2 >= 64 || committed_log2 > carve_log2 {
+        return Err(Trap::Malformed);
+    }
+    let mut mem = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, committed_log2, back, shadow);
+    mem.seed_null_guard(temen_ir::module_null_guard());
+    Ok(mem)
 }
 
 impl<'p> Vcpu<'p> {
@@ -4085,7 +4221,6 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
-            pending_granted_host: None,
         })
     }
 
@@ -4104,24 +4239,19 @@ impl<'p> Vcpu<'p> {
         size_log2: u8,
         fuel: u64,
     ) -> Result<Vcpu<'p>, Trap> {
-        Self::new_confined_child_core(
-            prog,
-            module,
-            entry,
-            back,
-            size_log2,
-            size_log2, // carve == declared: a non-growing child, fully committed
-            fuel,
-            Host::new(),
-        )
+        // carve == declared: a non-growing child, fully committed
+        Self::new_confined_child_grow(prog, module, entry, back, size_log2, size_log2, fuel)
     }
 
-    /// A **growable** §14 confined child (#1123 slice 4): the parent grants a carve of `1<<carve_log2`
-    /// (the child's `Instantiator`/`AddressSpace` span it) but the child's committed window starts at
-    /// its smaller declared `1<<declared_log2`, growing into the carve via `vm_map` — your rule: a
-    /// child's carve may grow because the parent granted it that room. `back` must cover the whole
-    /// carve (`len == 1<<carve_log2`). With `carve_log2 == declared_log2` this is exactly
-    /// [`new_confined_child`](Self::new_confined_child).
+    /// A **growable** child rebuilt from integers (#1123 slice 4): its `Instantiator`/`AddressSpace`
+    /// span `1<<carve_log2`, but its committed window starts at the smaller declared `1<<declared_log2`
+    /// and grows into the rest via `vm_map`. `back` must cover the committed window and grow or reserve
+    /// up to the span. The browser's per-Worker driver rebuilds a detached child this way, over a
+    /// memory it seeded from the event (span = the reservation), and it is the plain growable-child
+    /// oracle the emitted tier's grow tests compare against. With `carve_log2 == declared_log2` this
+    /// is exactly [`new_confined_child`](Self::new_confined_child). The child module's import manifest
+    /// is bound against the starter caps (IMPORTS.md phase 3 / §3.3): a `required` slot with nothing to
+    /// bind fails the build closed, `Malformed`.
     pub fn new_confined_child_grow(
         prog: &'p VcpuProgram,
         module: u32,
@@ -4130,64 +4260,6 @@ impl<'p> Vcpu<'p> {
         declared_log2: u8,
         carve_log2: u8,
         fuel: u64,
-    ) -> Result<Vcpu<'p>, Trap> {
-        Self::new_confined_child_core(
-            prog,
-            module,
-            entry,
-            back,
-            declared_log2,
-            carve_log2,
-            fuel,
-            Host::new(),
-        )
-    }
-
-    /// [`new_confined_child_grow`](Self::new_confined_child_grow) over a **caller-built powerbox** —
-    /// a detached spawn's re-granted `Host` ([`take_granted_host`](Self::take_granted_host)) runs a
-    /// phase child whose committed window starts at its declared `1<<declared_log2` and grows via
-    /// `vm_map` into `1<<carve_log2` (#1253 — the interpreter twin of the emitted phase child, whose
-    /// `"mapped"` likewise starts at the declared window, so a decline runs byte-identical to the emit).
-    /// The starter `Instantiator`+`AddressSpace` are granted on top of `host`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_confined_child_grow_over_host(
-        prog: &'p VcpuProgram,
-        module: u32,
-        entry: u32,
-        back: std::sync::Arc<super::Region>,
-        declared_log2: u8,
-        carve_log2: u8,
-        fuel: u64,
-        host: Host,
-    ) -> Result<Vcpu<'p>, Trap> {
-        Self::new_confined_child_core(
-            prog,
-            module,
-            entry,
-            back,
-            declared_log2,
-            carve_log2,
-            fuel,
-            host,
-        )
-    }
-
-    /// A confined child whose powerbox is built host-side: the starter `Instantiator`+`AddressSpace`
-    /// over the carve granted on top of `host`, and the child module's import manifest bound (IMPORTS.md
-    /// phase 3 / §3.3; a `required` slot with nothing to bind fails the spawn closed, `Malformed`) —
-    /// then [`confined_over`](Self::confined_over). The starter caps span the parent-granted carve
-    /// `1<<carve_log2`, not the smaller committed window, so a growing child's `vm_map` into the rest of
-    /// the carve is authorized.
-    #[allow(clippy::too_many_arguments)]
-    fn new_confined_child_core(
-        prog: &'p VcpuProgram,
-        module: u32,
-        entry: u32,
-        back: std::sync::Arc<super::Region>,
-        size_log2: u8,
-        carve_log2: u8,
-        fuel: u64,
-        mut host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
         let carve_size = 1u64
             .checked_shl(u32::from(carve_log2))
@@ -4199,67 +4271,46 @@ impl<'p> Vcpu<'p> {
             .ok_or(Trap::Malformed)?;
         // One or two entry args, per the signature the parent already validated (its starter caps).
         let arity = cunit.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
+        let mut host = Host::new();
         let (cinst, cas) = host.grant_starter_caps(carve_size);
         host.bind_child_manifest(&cunit.imports, &cunit.types)
             .map_err(|_| Trap::Malformed)?;
         let args = child_entry_args(arity, cinst, cas);
-        Self::confined_over(
-            prog, module, entry, back, size_log2, carve_log2, fuel, host, args,
-        )
+        let mem = carve_window(back, declared_log2, carve_log2, cunit.shadow)?;
+        Self::child_over(prog, module, entry, mem, fuel, host, args)
     }
 
-    /// A confined child vCPU over `back` with a finished powerbox `host` and entry `args`. Its window
-    /// commits `1 << committed_log2` at start and may `vm_map`-grow to the carve `1 << carve_log2` that
-    /// `back` covers (#1123 slice 4; equal for a non-growing child); it dispatches through its own
-    /// natural table over `module` in the shared source (no parent §22 install slots — the fresh table
-    /// is the confinement).
-    #[allow(clippy::too_many_arguments)]
-    fn confined_over(
+    /// A child vCPU over its built window `mem`, with a finished powerbox `host` and entry `args`. It
+    /// dispatches through its own natural table over `module` in the shared source (no parent §22
+    /// install slots — the fresh table is the confinement).
+    fn child_over(
         prog: &'p VcpuProgram,
         module: u32,
         entry: u32,
-        back: std::sync::Arc<super::Region>,
-        committed_log2: u8,
-        carve_log2: u8,
+        mem: Mem,
         fuel: u64,
-        mut host: Host,
+        host: Host,
         args: Vec<Value>,
     ) -> Result<Vcpu<'p>, Trap> {
-        if carve_log2 >= 64 || committed_log2 > carve_log2 {
-            return Err(Trap::Malformed);
-        }
         let cunit = prog
             .dom
             .source
             .get(module as usize)
             .ok_or(Trap::Malformed)?;
-        let mut mm =
-            Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, committed_log2, back, cunit.shadow);
-        // #964/#1094/#1206: the NULL guard is the one canonical layout — a confined child's carve
-        // reserves `[0, POWERBOX_NULL_GUARD)` exactly as a root window does (the tree-walker's nested
-        // arm and every cross-tier bounce over the same carve already seed it; the emitted tier's guard
-        // compare is unconditional). `seed_null_guard` skips a carve smaller than the guard, so a tiny
-        // sub-window (a 1-KiB grandchild) stays fully usable.
-        mm.seed_null_guard(temen_ir::module_null_guard());
-        // Op-15 pre-map: the region staged into this powerbox is aliased onto the fresh window before
-        // the child starts, through its own `map` path. Nothing staged ⇒ no-op.
-        if host.apply_premap(&mut mm) < 0 {
-            return Err(Trap::Malformed);
-        }
-        let mem = Some(mm);
-        let mut vt = VTask::new(&cunit, entry as usize, &args)?;
-        vt.active.module = module as usize;
-        vt.active.home = module as usize;
-        let own_dom = Domain::child(
-            std::sync::Arc::clone(&prog.dom.source),
-            build_table_for(cunit.progs.len(), host.jit_table_log2(), module), // #1296
-        );
+        let (vt, table) = child_task(
+            module,
+            &cunit,
+            i64::from(entry),
+            &args,
+            host.jit_table_log2(),
+        )?;
+        let own_dom = Domain::child(std::sync::Arc::clone(&prog.dom.source), table);
         Ok(Vcpu {
             vt,
             fibers: Vec::new(),
             fiber_sp: Vec::new(),
             fiber_meta: Vec::new(),
-            mem,
+            mem: Some(mem),
             fuel,
             host,
             shared_host: None,
@@ -4275,7 +4326,6 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
-            pending_granted_host: None,
         })
     }
 
@@ -4683,33 +4733,19 @@ impl<'p> Vcpu<'p> {
                     };
                     match admitted {
                         Ok(Some(child)) => {
-                            let AdmittedChild {
-                                host,
-                                program,
-                                args,
-                                fuel,
-                                ..
-                            } = child;
-                            let module = match program {
-                                ChildProgram::Spawner(m, _) => m,
-                                ChildProgram::Granted(c) => source.push(c) as u32,
+                            let (entry, size_log2) = (spawn.entry as u32, spawn.size_log2 as u8);
+                            let fuel = child.fuel;
+                            let granted = spawn.grants.is_some_and(|(_, n)| n > 0);
+                            let window = ChildWindow::Carve(size_log2);
+                            let module = match self.pend_child(child, entry, window, granted, dst) {
+                                Ok(m) => m,
+                                Err(t) => return VcpuEvent::Trapped(t),
                             };
                             // Where the carve starts in this vCPU's own window: the host adds its window
                             // pointer, so nesting composes with no special casing.
                             let carve = self.mem.as_ref().map_or(0, |m| m.window.base())
                                 + spawn.ibase
                                 + spawn.off as u64;
-                            let (entry, size_log2) = (spawn.entry as u32, spawn.size_log2 as u8);
-                            self.pending = Some(dst);
-                            self.pending_child = Some(PendingChild {
-                                host,
-                                module,
-                                entry,
-                                args,
-                                fuel,
-                                carve_log2: size_log2,
-                                granted: spawn.grants.is_some_and(|(_, n)| n > 0),
-                            });
                             return VcpuEvent::Instantiate {
                                 module,
                                 entry,
@@ -4722,59 +4758,49 @@ impl<'p> Vcpu<'p> {
                         Err(t) => return VcpuEvent::Trapped(t),
                     }
                 }
-                // op 15 (`instantiate_detached`, #1286): the fresh-window twin of the confined arm above,
-                // whose window is the host's to mint (the event carries no carve) — so the host builds
-                // the child, and the engine hands it only the powerbox. Parse + gate the grant list first,
-                // commit (budget quota take, module compile + push, payload read) in
-                // `event_instantiate_detached`, then re-grant and stash the child powerbox for the host
-                // (`take_granted_host`).
-                Ok(VcpuStop::InstantiateDetached {
-                    budget,
-                    mh,
-                    entry,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    args,
-                    premap,
-                }) => {
-                    let glist = match grants {
-                        Some((gptr, gn)) => match self.read_grant_list(gptr, gn) {
-                            Ok(l) => Some(l),
-                            Err(t) => return VcpuEvent::Trapped(t),
-                        },
-                        None => None,
+                // op 15 (`instantiate_detached`, #1286): admitted by `admit_detached_child`, the one
+                // admission every driver uses, as the confined arm above. The child's window is fresh
+                // rather than a carve, so the host mints its backing and `PendingChild::start` seeds
+                // it. `true`: this engine leaves the capture of a durable domain's detached child to
+                // its embedder's freeze.
+                Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
+                    let admitted = match self.shared_host {
+                        Some(m) => admit_detached_child(
+                            &mut m.lock_unpoisoned(),
+                            self.mem.as_ref(),
+                            self.fuel,
+                            spawn,
+                            true,
+                        ),
+                        None => admit_detached_child(
+                            &mut self.host,
+                            self.mem.as_ref(),
+                            self.fuel,
+                            spawn,
+                            true,
+                        ),
                     };
-                    match self.event_instantiate_detached(
-                        budget, mh, entry, size_log2, quota, args, premap, dst,
-                    ) {
-                        Ok(Some(ev)) => {
-                            // A grant list and/or a pre-mapped region ride the stashed child powerbox
-                            // (the driver builds the child over it; the constructor applies the map).
-                            if glist.is_some() || premap.is_some() {
-                                let mut child = match self
-                                    .regrant_list_into_child(glist.as_deref().unwrap_or(&[]))
-                                {
-                                    Ok(h) => h,
-                                    Err(t) => return VcpuEvent::Trapped(t),
-                                };
-                                if let Some((r, o)) = premap {
-                                    let staged = match self.shared_host {
-                                        Some(m) => {
-                                            m.lock_unpoisoned().stage_premap(r, o, &mut child)
-                                        }
-                                        None => self.host.stage_premap(r, o, &mut child),
-                                    };
-                                    if !staged {
-                                        return VcpuEvent::Trapped(Trap::CapFault);
-                                    }
-                                }
-                                self.pending_granted_host = Some(child);
-                            }
-                            return ev;
+                    match admitted {
+                        Ok(Some((child, window))) => {
+                            let (entry, size_log2) = (spawn.entry as u32, window.size_log2);
+                            let fuel = child.fuel;
+                            let (args, data) = (window.payload.clone(), window.data.clone());
+                            let granted = spawn.grants.is_some() || spawn.premap.is_some();
+                            let window = ChildWindow::Fresh(window);
+                            let module = match self.pend_child(child, entry, window, granted, dst) {
+                                Ok(m) => m,
+                                Err(t) => return VcpuEvent::Trapped(t),
+                            };
+                            return VcpuEvent::InstantiateDetached {
+                                module,
+                                entry,
+                                size_log2,
+                                fuel,
+                                args,
+                                data,
+                            };
                         }
-                        Ok(None) => {} // -EINVAL landed in place — keep running
+                        Ok(None) => self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32)),
                         Err(t) => return VcpuEvent::Trapped(t),
                     }
                 }
@@ -4786,195 +4812,30 @@ impl<'p> Vcpu<'p> {
         }
     }
 
-    /// Validate + commit a §5 `instantiate_detached` (op 15, #1286) and produce its
-    /// [`VcpuEvent::InstantiateDetached`], or land `-EINVAL` in place (`Ok(None)`). The tree-walker's
-    /// admission, exactly: the entry is a child entry, the window equals the module's declared memory
-    /// (§14 transparency: a detached window has no superset room — it grows into its own reservation),
-    /// the payload fits the args region, and the `Budget` quota covers the window (a forged /
-    /// exhausted budget refuses, charging nothing). The child's data segments are **not** seeded here:
-    /// the host owns the fresh window and seeds `module.data` + the payload before start.
-    #[allow(clippy::too_many_arguments)]
-    fn event_instantiate_detached(
+    /// Keep an admitted child for the host to take ([`take_child`](Self::take_child)), the event
+    /// announcing it answering `dst`: its program lands in the run's shared source. Returns the
+    /// module index it runs.
+    fn pend_child(
         &mut self,
-        budget: i32,
-        mh: i32,
-        entry: i64,
-        size_log2: i64,
-        quota: i64,
-        args: Option<(u64, u64)>,
-        premap: Option<(i32, u64)>,
+        child: AdmittedChild,
+        entry: u32,
+        window: ChildWindow,
+        granted: bool,
         dst: u32,
-    ) -> Result<Option<VcpuEvent>, Trap> {
-        let (cfuncs, cmem_log2, cimports, ctypes, cdata, cshadow, cdurable) = match self.shared_host
-        {
-            Some(m) => {
-                let g = m.lock_unpoisoned();
-                let g = g.resolve_module(mh)?;
-                (
-                    g.funcs.clone(),
-                    g.memory_log2,
-                    g.imports.clone(),
-                    g.types.clone(),
-                    g.data.clone(),
-                    g.shadow,
-                    g.durable,
-                )
-            }
-            None => {
-                let g = self.host.resolve_module(mh)?;
-                (
-                    g.funcs.clone(),
-                    g.memory_log2,
-                    g.imports.clone(),
-                    g.types.clone(),
-                    g.data.clone(),
-                    g.shadow,
-                    g.durable,
-                )
-            }
-        };
-        let child_compiled = compile_module(&cfuncs, &ctypes, cshadow)
-            .ok_or(Trap::Malformed)?
-            .with_manifest(cimports, ctypes);
-        let ok_entry = child_compiled
-            .sigs
-            .get(entry as usize)
-            .is_some_and(|(p, r)| child_entry_ok(p, r));
-        let child_size = if (0..64).contains(&size_log2) {
-            1u64 << size_log2
-        } else {
-            0
-        };
-        let mod_ok = cmem_log2 == Some(size_log2 as u8);
-        // The payload is read from THIS vCPU's window (a bad range is a fault, as any window read);
-        // an over-long one refuses probeably.
-        let payload: Vec<u8> = match args {
-            Some((ptr, len)) => self
-                .mem
-                .as_ref()
-                .ok_or(Trap::Malformed)?
-                .read_window(ptr, len as usize)?,
-            None => Vec::new(),
-        };
-        let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
-        let payload_ok = payload.len() as u64 <= args_room;
-        // The pre-mapped region's geometry (a forged handle traps, as the tree-walker's arm).
-        let premap_ok = match premap {
-            Some((r, o)) => match self.shared_host {
-                Some(m) => m.lock_unpoisoned().premap_admit(r, o, child_size)?,
-                None => self.host.premap_admit(r, o, child_size)?,
-            },
-            None => true,
-        };
-        // #1361 step 4 — a durable domain spawns detached on the terms every engine applies: an
-        // attested-freezable module (#1501) and, inside the shared admission below, freeze authority
-        // over its detached progeny (#1440). This engine hands the child to its embedder's driver, so
-        // capturing it at a freeze is that driver's; the browser's grants neither the authority nor an
-        // attested module, so its durable reactors are refused here as on every engine.
-        let durable = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().is_durable(),
-            None => self.host.is_durable(),
-        };
-        let mod_durable_ok = !durable || cdurable;
-        if !ok_entry || child_size == 0 || !mod_ok || !mod_durable_ok || !payload_ok || !premap_ok {
-            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-            return Ok(None);
-        }
-        // Admission = the budget's quota take (the commit; every refusal above charged nothing).
-        // D66 — one admission call, shared with the tree-walker (`Host::admit_detached_spawn`): the
-        // funding budget's lane is checked against this domain's cap and its `mem` taken, or neither.
-        // This engine's detached children are serviced by the embedder's driver, whose join/detach
-        // does not yet return a lane, so the lane is given straight back here: the engines agree on
-        // the single-spawn answer (a lane wider than the cap refuses) and the lasting Σ accounting
-        // lands with that driver's lane slice (#1600).
-        let admit = |h: &mut Host| -> bool {
-            match h.admit_detached_spawn(budget, child_size) {
-                Some(lane) => {
-                    h.give_lane(lane);
-                    true
-                }
-                None => false,
-            }
-        };
-        let admitted = match self.shared_host {
-            Some(m) => admit(&mut m.lock_unpoisoned()),
-            None => admit(&mut self.host),
-        };
-        if !admitted {
-            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-            return Ok(None);
-        }
-        let cm = self.prog.dom.source.push(child_compiled);
-        let fuel = if quota <= 0 {
-            self.fuel
-        } else {
-            (quota as u64).min(self.fuel)
-        };
+    ) -> Result<u32, Trap> {
+        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
+        let (module, _) = child.program.land(source)?;
         self.pending = Some(dst);
-        Ok(Some(VcpuEvent::InstantiateDetached {
-            module: cm as u32,
-            entry: entry as u32,
-            size_log2: size_log2 as u8,
-            fuel,
-            args: payload,
-            data: cdata,
-        }))
-    }
-
-    /// **Read + `can_regrant`-gate a detached spawn's grant list** (#1011 slice 3a production wiring;
-    /// op 15, #1286). Read the `grants_n`
-    /// × 16-byte records from this vCPU's confined window (`{name_off:u32, name_len:u32, handle:i32,
-    /// flags:u32}`), resolve each `(name, handle)`, and reject a non-re-grantable handle with `CapFault`
-    /// — fail closed **before** any spawn commits, exactly as the tree-walker gates the list at parse
-    /// time (a refused list leaves the child unspawned). No state changes here (`&self`); the actual
-    /// re-grant is [`regrant_list_into_child`](Self::regrant_list_into_child), run only after the spawn
-    /// commits.
-    fn read_grant_list(&self, grants_ptr: u64, grants_n: u64) -> Result<Vec<(String, i32)>, Trap> {
-        let mem = self.mem.as_ref().ok_or(Trap::Malformed)?;
-        let list = super::read_grant_records(grants_ptr, grants_n, |o, l| mem.read_window(o, l))?;
-        // `can_regrant` gate against the run's powerbox (shared when attached) — the same policy
-        // check the cooperative arm applies to the parsed records.
-        let ok = |h: &Host| list.iter().all(|(_, g)| h.can_regrant(*g));
-        let ok = match self.shared_host {
-            Some(m) => ok(&m.lock_unpoisoned()),
-            None => ok(&self.host),
-        };
-        ok.then_some(list).ok_or(Trap::CapFault)
-    }
-
-    /// **Re-grant a validated grant list into a fresh child powerbox** (#1011 slice 3a): for each
-    /// `(name, handle)` (already `can_regrant`-gated by [`read_grant_list`](Self::read_grant_list)),
-    /// call this vCPU's [`Host::regrant_into_child`] and install the child-side handle under its name
-    /// (`register_cap_name`) — so the confined child resolves an inherited `fs`/`stdout` by name
-    /// (`self.resolve`) with the same authority the tree-walker grants. Run **only after the spawn
-    /// commits** (the cooperative arm's ordering — a refused spawn mutates no host). The starter
-    /// `Instantiator`+`AddressSpace` are added on top by the host's child constructor
-    /// ([`new_confined_child_grow_over_host`](Self::new_confined_child_grow_over_host)); this host
-    /// carries only the re-granted caps. INVARIANTS §4: the grant *policy* stays here (the
-    /// interpreter), the constructor stays pure mechanism.
-    fn regrant_list_into_child(&mut self, list: &[(String, i32)]) -> Result<Host, Trap> {
-        let mut child = Host::new();
-        match self.shared_host {
-            Some(m) => {
-                let mut hg = m.lock_unpoisoned();
-                for (name, handle) in list {
-                    let cg = hg
-                        .regrant_into_child(*handle, &mut child)
-                        .ok_or(Trap::CapFault)?;
-                    child.register_cap_name(name, cg);
-                }
-            }
-            None => {
-                for (name, handle) in list {
-                    let cg = self
-                        .host
-                        .regrant_into_child(*handle, &mut child)
-                        .ok_or(Trap::CapFault)?;
-                    child.register_cap_name(name, cg);
-                }
-            }
-        }
-        Ok(child)
+        self.pending_child = Some(PendingChild {
+            host: child.host,
+            module,
+            entry,
+            args: child.args,
+            fuel: child.fuel,
+            window,
+            granted,
+        });
+        Ok(module)
     }
 
     /// Deliver a `thread.spawn` handle (after `Spawn`).
@@ -4982,21 +4843,12 @@ impl<'p> Vcpu<'p> {
         self.deliver_code(handle);
     }
 
-    /// Take the confined child the just-surfaced [`VcpuEvent::Instantiate`] announced — admitted, its
-    /// powerbox built — to start it over its carve ([`PendingChild::start`]) or run it on an emitted
-    /// tier ([`PendingChild::into_powerbox`]). One-shot per `Instantiate`; a host that declines the
-    /// spawn simply never takes it.
+    /// Take the child the just-surfaced [`VcpuEvent::Instantiate`] or
+    /// [`VcpuEvent::InstantiateDetached`] announced — admitted, its powerbox built — to start it
+    /// ([`PendingChild::start`]) or run it on an emitted tier ([`PendingChild::into_powerbox`]).
+    /// One-shot per event; a host that declines the spawn simply never takes it.
     pub fn take_child(&mut self) -> Option<PendingChild> {
         self.pending_child.take()
-    }
-
-    /// Take the child powerbox stashed for the just-surfaced [`VcpuEvent::InstantiateDetached`]
-    /// (#1011 slice 3a / #1286): `Some(host)` when the spawn carried a grant list — the engine already
-    /// re-granted its named caps (a shared `fs`) from this vCPU's powerbox — so the host runs the child
-    /// over it ([`new_confined_child_grow_over_host`](Self::new_confined_child_grow_over_host)); `None`
-    /// for a grant-less spawn. One-shot per `InstantiateDetached`.
-    pub fn take_granted_host(&mut self) -> Option<Host> {
-        self.pending_granted_host.take()
     }
 
     /// Deliver a `Wait` wasm code or a `Notify` woken-count into the pending dst.
@@ -7388,21 +7240,10 @@ fn service_advance(
             // §5 `instantiate_detached` (op 15): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
-            Outcome::InstantiateDetached {
-                budget,
-                mh,
-                entry,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                args,
-                premap,
-            } => {
+            Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
                 if let Err(t) = dbg_instantiate_detached(
-                    tasks, ti, extra_envs, source, mem, *fuel, host, budget, mh, entry, size_log2,
-                    quota, grants, args, premap, dst,
+                    tasks, ti, extra_envs, source, mem, *fuel, host, spawn, dst,
                 ) {
                     dbg_complete(tasks, ti, Err(t));
                 }
@@ -7557,7 +7398,8 @@ fn dbg_start_child(
         args,
         fuel,
     } = child;
-    let (vt, table) = child_task(source, program, entry, &args, host.jit_table_log2())?;
+    let (module, prog) = program.land(source)?;
+    let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
         mem,
@@ -7592,14 +7434,7 @@ fn dbg_instantiate_detached(
     shared_mem: &Option<Mem>,
     shared_fuel: u64,
     host: &mut Host,
-    budget: i32,
-    mh: i32,
-    entry: i64,
-    size_log2: i64,
-    quota: i64,
-    grants: Option<(u64, u64)>,
-    args: Option<(u64, u64)>,
-    premap: Option<(i32, u64)>,
+    spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
     // The parent's window and fuel, and the powerbox its handles resolve in: its own (#1727).
@@ -7610,17 +7445,14 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host, e.fuel)
         }
     };
-    let Some(child) = admit_detached_child(
-        owner, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
-    )?
-    else {
+    let Some(child) = admit_detached_in_process(owner, pm, pfuel, spawn)? else {
         tasks[ti]
             .vt
             .active
             .set(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    dbg_start_child(tasks, ti, extra_envs, source, child, entry, dst)
+    dbg_start_child(tasks, ti, extra_envs, source, child, spawn.entry, dst)
 }
 
 /// `thread.join`: deliver a finished child's result now, else park the joiner. Mirrors `drive`'s `Join`.
@@ -9508,20 +9340,12 @@ enum Outcome {
         spawn: ConfinedSpawn,
         dst: u32,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): a separate-module child in a fresh
-    /// host-minted window. `budget` is the `Budget` handle (admission = quota take), `grants`
-    /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window,
-    /// `premap` the optional `(region, child_off)` pre-mapped `SharedRegion`.
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): the driver admits the separate-module
+    /// child `spawn` describes, in a fresh window of its own ([`admit_detached_child`]), and writes
+    /// the join handle (or `EINVAL`) to `dst`.
     InstantiateDetached {
-        budget: i32,
-        mh: i32,
-        entry: i64,
-        size_log2: i64,
-        quota: i64,
+        spawn: DetachedSpawn,
         dst: u32,
-        grants: Option<(u64, u64)>,
-        args: Option<(u64, u64)>,
-        premap: Option<(i32, u64)>,
     },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
@@ -10849,15 +10673,8 @@ enum VcpuStop {
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
-        budget: i32,
-        mh: i32,
-        entry: i64,
-        size_log2: i64,
-        quota: i64,
+        spawn: DetachedSpawn,
         dst: u32,
-        grants: Option<(u64, u64)>,
-        args: Option<(u64, u64)>,
-        premap: Option<(i32, u64)>,
     },
     Wait {
         base: u64,
@@ -11393,28 +11210,8 @@ fn step_vcpu(
             Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
             Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
             Outcome::Instantiate { spawn, dst } => return Ok(VcpuStop::Instantiate { spawn, dst }),
-            Outcome::InstantiateDetached {
-                budget,
-                mh,
-                entry,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                args,
-                premap,
-            } => {
-                return Ok(VcpuStop::InstantiateDetached {
-                    budget,
-                    mh,
-                    entry,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    args,
-                    premap,
-                })
+            Outcome::InstantiateDetached { spawn, dst } => {
+                return Ok(VcpuStop::InstantiateDetached { spawn, dst })
             }
             Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
             Outcome::MemoryWait {
@@ -11571,7 +11368,8 @@ fn coop_start_child(
         args,
         fuel,
     } = child;
-    let (mut vt, table) = child_task(source, program, entry, &args, host.jit_table_log2())?;
+    let (module, prog) = program.land(source)?;
+    let (mut vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
     if let Some((eligible, page_checked)) = tierup {
         vt.active.jit_eligible = Some(eligible);
         vt.active.jit_page_checked = page_checked;
@@ -13436,25 +13234,15 @@ impl CoopSched {
                     }
                 }
                 // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
-                // **fresh window of its own** (`Mem::with_reservation`, its own guard) — not a carve —
-                // the tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative
-                // driver. Admission first (entry shape, the window = the module's declared memory,
-                // the args payload, `premap_admit`, no durable domain, then the `Budget.mem` take —
-                // a refused spawn lands `-EINVAL` and charges nothing); then the child powerbox:
-                // starter `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants
-                // (the op-11 record format, fail-closed), and a pre-mapped `SharedRegion` staged and
-                // applied to the window before the child runs an op. `join` is the shared seam below.
-                Ok(VcpuStop::InstantiateDetached {
-                    budget,
-                    mh,
-                    entry,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    args,
-                    premap,
-                }) => {
+                // **fresh window of its own** (`Mem::detached`, its own guard) — not a carve — the
+                // tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative driver.
+                // Admission first (entry shape, the window = the module's declared memory, the args
+                // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
+                // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
+                // `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants (the op-11
+                // record format, fail-closed), and a pre-mapped `SharedRegion` staged and applied to
+                // the window before the child runs an op. `join` is the shared seam below.
+                Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
                     let pm: Option<&Mem> = match tasks[ti].env {
                         None => mem.as_ref(),
                         Some(k) => extra_envs[k].mem.as_ref(),
@@ -13463,11 +13251,8 @@ impl CoopSched {
                         None => *fuel,
                         Some(k) => extra_envs[k].fuel,
                     };
-                    let admitted = task_host(host, extra_envs, tasks[ti].env).with(|h| {
-                        admit_detached_child(
-                            h, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
-                        )
-                    });
+                    let admitted = task_host(host, extra_envs, tasks[ti].env)
+                        .with(|h| admit_detached_in_process(h, pm, pfuel, spawn));
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
@@ -13488,7 +13273,7 @@ impl CoopSched {
                         ti,
                         &dom.source,
                         child,
-                        entry,
+                        spawn.entry,
                         dst,
                         None,
                     );
@@ -15639,33 +15424,13 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // cooperative executor's spawn (`admit_detached_child`, the same admission and child
             // powerbox) on this driver, then `run_vcpu_parallel` over the child's `Mem` exactly as a
             // confined child, its result published to the parent's `reg` for `join`.
-            Ok(VcpuStop::InstantiateDetached {
-                budget,
-                mh,
-                entry,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                args,
-                premap,
-            }) => {
-                let admitted = {
-                    let mut hg = host.lock_unpoisoned();
-                    admit_detached_child(
-                        &mut hg,
-                        mem.as_ref(),
-                        fuel,
-                        budget,
-                        mh,
-                        entry,
-                        size_log2,
-                        quota,
-                        grants,
-                        args,
-                        premap,
-                    )
-                };
+            Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
+                let admitted = admit_detached_in_process(
+                    &mut host.lock_unpoisoned(),
+                    mem.as_ref(),
+                    fuel,
+                    spawn,
+                );
                 let child = match admitted {
                     Ok(Some(c)) => c,
                     Ok(None) => {
@@ -15674,7 +15439,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &mut threads, child, entry) {
+                match par_start_child(scope, dom, reg, &mut threads, child, spawn.entry) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -15707,7 +15472,8 @@ fn par_start_child<'scope, 'env>(
         args,
         fuel,
     } = child;
-    let (vt, table) = child_task(&dom.source, program, entry, &args, host.jit_table_log2())?;
+    let (module, prog) = program.land(&dom.source)?;
+    let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
     let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), table);
     let id = reg
         .next_id
@@ -17397,7 +17163,7 @@ impl Vm {
                 }
                 // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
                 // CapFault, as every op above); the budget's quota take and the module resolve happen at
-                // the driver's commit site (`event_instantiate_detached`), peek-then-drain like op 13.
+                // the driver's commit site (`admit_detached_child`), peek-then-drain like op 13.
                 Op::InstantiateDetached {
                     handle,
                     budget,
@@ -17412,32 +17178,24 @@ impl Vm {
                 } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
-                    let budget = r!(*budget).i64() as i32;
-                    let mh = r!(*module_reg).i64() as i32;
-                    let entry = r!(*entry).i64();
-                    let size_log2 = r!(*size_log2).i64();
-                    let quota = r!(*quota).i64();
-                    let grants = grants
-                        .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
-                        .filter(|(_, n)| *n != 0);
-                    let args = args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64));
-                    let premap = premap.map(|(rr, or)| (r!(rr).i64() as i32, r!(or).i64() as u64));
+                    let spawn = DetachedSpawn {
+                        budget: r!(*budget).i64() as i32,
+                        module: r!(*module_reg).i64() as i32,
+                        entry: r!(*entry).i64(),
+                        size_log2: r!(*size_log2).i64(),
+                        quota: r!(*quota).i64(),
+                        grants: grants
+                            .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
+                            .filter(|(_, n)| *n != 0),
+                        args: args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64)),
+                        premap: premap.map(|(rr, or)| (r!(rr).i64() as i32, r!(or).i64() as u64)),
+                    };
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::InstantiateDetached {
-                        budget,
-                        mh,
-                        entry,
-                        size_log2,
-                        quota,
-                        dst,
-                        grants,
-                        args,
-                        premap,
-                    });
+                    return Ok(Outcome::InstantiateDetached { spawn, dst });
                 }
                 // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the 56-byte record from
                 // this vCPU's confined window and fail closed exactly as the tree-walker's arm does
