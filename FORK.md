@@ -61,9 +61,10 @@ re-issues.
 The Instantiator ops (0 `instantiate`, 5/13 `instantiate_module`, `temen-interp:11376`) return an `i32`
 **`child_handle`**, non-blocking. That handle is a **capability** — "holding the handle is the authority
 to nest (D19)". It resolves (in the *parent's* runtime) to a scheduler `TaskId` → the child's `VCpu`
-(its own `vcpu_ctx`, shadow region, and window carve via `nested_view`). Sibling ops already take it:
-`join` (1), `poll` (9), `kill` (12), `child_offer` (14). It is **capability-scoped, not a global PID
-table**: a parent only holds handles to children it spawned.
+(its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is being retired,
+INVARIANTS #13 2026-09-29; an op-15 detached child's handle names its own window). Sibling ops
+already take it: `join` (1), `poll` (9), `kill` (12), `child_offer` (14). It is **capability-scoped,
+not a global PID table**: a parent only holds handles to children it spawned.
 
 The clone verb therefore slots in as a natural sibling:
 
@@ -112,7 +113,9 @@ it `clone_caller() -> twin_child_handle` (self-namespace, servicer-side) or `clo
    **reply slot** — the reply-injection capture, not a placeholder and not a re-issue arm.
 2. **Twin it.** Copy the caller's carve (window slice) into a fresh child domain (via the
    `spawn_named_child` path), re-grant its pass-through handles, and re-seed a `CapReply` park for the
-   twin with a second `(callee, ticket')` in `ticket_waiters`.
+   twin with a second `(callee, ticket')` in `ticket_waiters`. (The carve is being retired —
+   INVARIANTS #13, 2026-09-29; #1289. A detached caller's window is its own, and `Mem::fork_private`
+   already copies into a fresh private window.)
 3. **Reply to each.** The servicer delivers `A` to the caller's ticket and `B` to the twin's — each
    fiber reloads its injected reply and resumes **past** the call.
 

@@ -255,6 +255,33 @@ parent's `Mem`) and the detached path ever diverge into two genuinely different 
 one parameterized one, *that* is the #13 violation — closed by a dated deletion of the carve path (the
 #1289 Decision-B convergence), never by keeping both.
 
+**Ruling — the nested carve placement is retired; the escape hatch above is invoked (owner,
+2026-09-29, #1814, tracked in #1289):** the two placements *have* diverged into two mechanisms. The
+tree-walker, the bytecode engine and the wasm-JIT run a carve child directly over its parent's
+backing, so parent and child see each other's stores live; the Cranelift JIT runs it in its own
+window seeded from the carve and copied back at finish. A parent and a carve child that talk through
+the carve while both run complete on the oracle and deadlock on the Cranelift JIT (#1814) — a
+guest-visible divergence on the backend axis, so this is also an **invariant 14 violation**, not a
+parked difference. The resolution is the one this ruling reserved: **every §14 child is placed in a
+detached window, and the carve path is deleted** — on every engine, with its spawn forms, its
+host-side machinery, and the docs that describe it. No live-aliasing fix is built for carves, and no
+new feature lands on the carve path. Retiring it is invariant-14 work: *in flight*, prioritized as the
+frontier's own repair, never parked. Until it is gone:
+
+- **The carve's contract is a hand-off.** The parent may write a child's carve before the spawn and
+  read it after the join. Parent and child using the carve concurrently — stores, futex rendezvous —
+  is not a supported channel; #1814 is the tracked divergence (invariant 9's "tracked debt with a
+  convergence plan", the plan being this deletion).
+- **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
+  `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
+  spawn-time args payload; results ride the join and the region.
+- **What still leans on the carve moves first:** the §2.2 pager (the parent writes the page through
+  its own window — becomes a byte transfer at supply, retiring "pager ⇒ nested"); the durable subtree
+  freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
+  `FreezeScope`'s carve-named form folds into the detached one); and every producer still emitting a
+  carve spawn. The carve-specific escape oracle and fuzz targets retire with the path they test, once
+  detached-window twins cover the same confinement property.
+
 ## 14. One frontier, consistent across every axis
 
 The set of **accepted** guest-observable capabilities is the *frontier*. New functionality may be
@@ -299,7 +326,8 @@ over a descendant *only by grant*, attenuating down the grant graph like any oth
 (PROCESS.md §6), freeze-ability follows window-read authority: a **nested carve** child's window is a
 sub-range of its parent's, so the parent can read — hence freeze — it by construction (the grant is
 implied by the aliasing, the current behavior); a **detached** child owns its window, so an ancestor
-can freeze it *only if granted*. Placement is therefore orthogonal to durability, and §6's rule reads:
+can freeze it *only if granted*. (The nested case is being retired with the carve path — #13's 2026-09-29 ruling — after which every
+child is the detached case.) Placement is therefore orthogonal to durability, and §6's rule reads:
 *confidential = freezable by nobody below the platform; a domain is confidential **or**
 ancestor-freezable per grant, not per placement* — a detached child may be platform-durable **and**
 ancestor-confidential at once. A detached child freezes as its own root-shaped artifact (the one codec

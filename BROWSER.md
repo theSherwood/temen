@@ -711,7 +711,8 @@ in session discussion; collected here so the next slice has a home to be picked 
   (`bench/cross-engine/README.md` § "TEMEN-in-wasm, the JIT tier"). The remaining loose ends are
   itemized in the slice notes: cross-tier `call.dyn` (the trampoline), relaxed SIMD + scalar
   `Fma`, §22 Model B2 (`install` + shared-table funcrefs), guest-*compiled* units crossing Workers,
-  nested VM-in-VM on the emitted tier, and deopt (a genuine no-op until `call.cap` joins the
+  nested VM-in-VM on the emitted tier (on op 15's detached path — the carve is being retired,
+  INVARIANTS #13, 2026-09-29), and deopt (a genuine no-op until `call.cap` joins the
   emitted subset).
 
 ## wasm-JIT tier — design & implementation plan
@@ -971,6 +972,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    TEMEN_JIT_CODEGEN=1` (`TEMEN_JIT_SERVICE=1` for the f64 kernel) (8 Workers
    each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
    `#jitcodegen` page item (same across real Web Workers → 1136, 8 units ran on emitted wasm).
+   *(Retiring: the §14 entries in this slice run a child over a carve of the engine memory —
+   `win = carve base`, `env.call_interp` bounces over the carve, the op-13 loop — and the carve path
+   is being deleted (INVARIANTS #13, 2026-09-29; #1289). The detached equivalent is op 15: a
+   per-child `WebAssembly.Memory` reached through `Region::Foreign` (DETACHED_JIT.md §3.1, §3.3).)*
    **[landed — §14 `instantiate_module` compile-on-push]** A confined executor child whose granted
    module is fully **in-subset** runs its entry on **emitted wasm** on its own Worker (the unit
    "compiles on push") instead of a confined vCPU. This needs **no engine change**: the host already

@@ -763,7 +763,9 @@ holder is the domain that implements them:
 - **Honest limit:** this controls who can *call through* your offers. In
   window-exposed tiers a §14 parent already reads and writes the child's
   entire carve — export protection cannot create confidentiality the memory
-  model doesn't provide. That is `attest`'s job: a child that finds itself
+  model doesn't provide. (Retiring with the carve placement, INVARIANTS #13
+  ruling 2026-09-29: a detached child is window-exposed only over a region it
+  was granted, so this limit narrows to pre-mapped `SharedRegion`s.) That is `attest`'s job: a child that finds itself
   window-exposed to an untrusted parent should refuse to hold secrets at
   all; distrust means separate processes (§1a). The two compose: attest
   tells you which world you are in; `export.handle` keeps offer wiring

@@ -15,6 +15,19 @@
 >
 > Proposed decision: **D60** (D59 is currently the last). See bottom of file.
 
+**Carve placement is being retired** (INVARIANTS.md #13, ruling 2026-09-29; #1289): every §14 child
+moves to a detached window, and the nested carve path is deleted on every engine. For this document
+that means the nested subtree freeze that rides the parent's window image (the `UNWINDING` broadcast
+into a child's carve, `FrozenNested` re-attach records, thaw's in-place carve re-attach, the
+carve-named `FreezeAuthority`) is the path being deleted; the surviving mechanism is the detached
+child's own root-shaped artifact (Section 8), rung to unwind by its freeze doorbell under
+`FreezeScope::DetachedProgeny` (§4, "Detached children"). Carve descriptions below stay accurate for
+today's code and are marked **Retiring**; new work targets the detached path, and planned work below
+that would extend the carve path (JIT nesting parity, separate-module carve children, carve-masking
+fuzz units, nested freeze declines "to be closed") is withdrawn — those gaps close by deletion. The
+interim contract: the parent writes a carve before the spawn and reads it after the join; concurrent
+use is unsupported, which is where the engines diverge today (#1814).
+
 A "durable" domain can be quiesced, serialized to `(window pages + prots, shadow
 control state, handle table)`, and later restored to bytewise-equivalent execution —
 possibly on the other backend, possibly on a different host. The artifact must
@@ -266,6 +279,11 @@ is a parser over attacker-controlled frames in the host.
 
 ## 4. Unit of durability
 
+> **Retiring:** this section's nested-subtree freeze describes the carve path, which is being deleted
+> (INVARIANTS #13, 2026-09-29): the carve half of the snapshot-unit bullet, the subtree freeze and its
+> codec, separate-module and depth-2 nesting, and the JIT-parity arc. The detached equivalent is
+> "Detached children — live capture and re-launch (v29)" and "The gate is lifted" below.
+
 - **Instrumentation unit = the module** (a compile-mode flag). Includes `Jit`-cap
   units (`DESIGN.md` §22): the host runs the pass on submitted IR before
   verification, so guest-driven JIT composes for free.
@@ -357,6 +375,10 @@ freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_
 (install → freeze → restore → `call.dyn` ≡ 42, both backends) and
 `jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize).
 
+> **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
+> The detached equivalent: a detached child's units ride Section 5 of its own root-shaped artifact
+> ("Detached children — live capture and re-launch (v29)" below).
+
 **A §14 child's guest-JIT units ride its `FrozenChildState`, not Section 5 (#1296).** Section 5 is
 captured on the **root** host (`capture_durable_jit` once per artifact), so a nested child that holds a
 `Jit` cap of its own — `regrant_into_child` mints it a fresh, attenuated table — would restore a
@@ -412,6 +434,11 @@ The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
 closed under a durable run (its child runner re-compiles children with no durable state; the
 interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
 domains are unaffected (`separate_module.rs` unchanged).
+
+> **Retiring:** from its subtree-freeze slice on, this block describes the carve path (the
+> `UNWINDING` broadcast into the carve, `FrozenNested`, in-place carve re-attach), which is being
+> deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is the doorbell, harvest and
+> `relaunch_detached` path in "Detached children — live capture and re-launch (v29)" below.
 
 **Freeze × live §14 children — fail-closed (same PR).** A freeze that completes while a §14
 child is **live-or-unjoined** (an `instantiate`d domain still running / its join pending, or a
@@ -545,6 +572,11 @@ missing grant refuses), `temen/tests/durable_detached_jit.rs` (freeze on the JIT
 JIT **and** on the interpreter; freeze on the interpreter → thaw on the JIT; without the doorbell nothing
 is captured, without the re-launch the thaw's join traps), and `durable_detached_parity.rs` (the oracle
 and the resumable engine admit with the authority and refuse without it, alike).
+
+> **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
+> The detached equivalent is `DetachedLaunch`'s module digest, resolved against the restoring host
+> (`ModuleUnresolved` otherwise) — "Detached children — live capture and re-launch (v29)" above.
+
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared
@@ -560,6 +592,11 @@ handles. Pinned by
 `durable_nesting.rs::{freeze_with_live_separate_module_child_thaws_through_the_codec,
 thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module}`. This completes depth-1
 nesting for **both** module kinds (same- and separate-module) in every child state.
+
+> **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
+> The detached equivalent is the recursive harvest: a captured detached child's own detached children
+> ride its own Section 8, bounded by `MAX_DETACHED_DEPTH` ("Detached children — live capture" above).
+
 **Depth-2 (deeper nesting, interp + in-memory).** The subtree freeze now composes to a
 `parent→child→grandchild` chain. `FrozenNested` gains a `parent_task` (the task id of the vCPU that
 instantiated the child; a root's direct child carries `0`, a grandchild carries its parent-child's
@@ -608,6 +645,11 @@ closed. A re-created task keeps its frozen id when that id is still free, so the
 stays byte-identical. The JIT's re-attach runs each child as its recorded `task` instead of replaying
 a counter. Pinned by `durable_nesting.rs::a_grandchild_reattaches_to_its_recorded_parent_when_a_joined_sibling_shifted_the_ids`
 (interpreter and JIT thaw of one artifact).
+
+> **Retiring:** this JIT-parity arc (through "Completed children need no separate residue", including
+> the carve-masking security hinge) describes the carve path, which is being deleted (INVARIANTS #13,
+> 2026-09-29). The detached equivalent is "The JIT captures them too" above: a `DurableCell` per
+> child, rung by a store of `UNWINDING` into the child's own freeze word.
 
 **JIT parity (design; the interpreter is the oracle).** All of the above — depth-1, depth-2, and the
 codec — is **interpreter-only**. The JIT's durable `instantiate`/`coro_spawn` **fail closed**
@@ -1126,6 +1168,10 @@ construction. What's stored:
   pure function of the module (not stored).
 
 ### 12.5 Section 3 — Handle table (durability classification)
+
+> **Retiring:** the `FreezeAuthority` row's carve-named form (a carve's `base`/`size`) rests on the
+> carve path, which is being deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is the
+> same row's detached-progeny scope, `FreezeScope::DetachedProgeny`, into which the carve form folds.
 
 Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 
@@ -1903,6 +1949,10 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
 
+> **Retiring:** this describes the carve path (a nested child run inside `instantiate`), which is
+> being deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is `FrozenDetached`'s
+> completed-result residue (§4, "Detached children — completed-result residue (v23)").
+
 **A finished, unjoined §14 child on the JIT (#1692).** A durable JIT child runs synchronously inside
 `instantiate`, and the JIT used to record it only if it unwound. A child that finished before the cut
 but was not yet joined left nothing behind, so the thawed parent's `join` read 0. Records are now
@@ -2580,6 +2630,12 @@ stays the runtime fast path; the id is the durable name and the thaw-time re-lin
 is a bounded, behavior-neutral refactor and the first implementation slice.
 
 ### 13.4 Build order
+
+> **Retiring:** step 4's nested-subtree wiring (4c's `FrozenChildState` in the nested record, the
+> nested variant of 4c-bis, and the 4d / nested-holder `LiveImpl` re-link by join slot) rides the
+> carve path, which is being deleted (INVARIANTS #13, 2026-09-29). A detached child's serve trio
+> rides its own root-shaped artifact (§4, v29); a `LiveImpl` re-link onto a detached child has no
+> detached equivalent yet — tracked in #1289.
 
 1. **Stable domain keys** (13.3) — behavior-neutral, unblocks everything.
    **BUILT 2026-07-24:** `Host::domain_id` (process-unique, minted at construction from a

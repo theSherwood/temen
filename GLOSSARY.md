@@ -44,8 +44,9 @@ The system is four ideas wearing many names:
 - **host** — the trusted embedder side. Also the name of the concrete struct (`Host`)
   that owns a domain's handle table and capability state.
 - **window** — a domain's linear memory: one contiguous range, every access masked or
-  proven inside `[0, size)`. A §14 child's window is a sub-range ("carve") of its
-  parent's.
+  proven inside `[0, size)`. A §14 child's window is its own **detached** reservation. (It used to be
+  a sub-range — a "carve" — of its parent's; that placement is retiring, INVARIANTS #13 ruling
+  2026-09-29.)
 - **powerbox** — a domain's capability state as a whole: the handle table plus the
   host-side objects behind it. "Granting into the powerbox" = making a capability
   reachable from that domain.

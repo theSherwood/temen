@@ -10,6 +10,15 @@
 > settled parts into `DESIGN.md` and drop this file when the gaps close.
 >
 > Proposed decision: **D63** (D62 is currently the last). See bottom of file.
+>
+> **Carve placement is being retired (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289).**
+> Every §14 child gets a **detached** window (§5); the nested carve — a child in a sub-range of its
+> parent's window, and with it the "parent sees the child's memory" superset — is being deleted on
+> every engine. Until it goes the carve is a before-spawn / after-join hand-off only. Where this doc
+> builds on the nested superset (argv seeding, parent-as-pager, parent↔child futex through carve
+> addresses, nested subtree freeze), the detached replacement is: op 15's spawn-time args payload, a
+> pager that supplies bytes, a pre-mapped `SharedRegion` + canonical-key futex, and the detached
+> child's own freeze artifact.
 
 The one-sentence design: **the substrate offers process primitives, not process policy —
 exactly as D56 offers concurrency primitives, not a scheduler.** A process is a domain;
@@ -106,7 +115,7 @@ Two layers above the (unchanged) core VM:
   Sketched seconds, to keep the substrate honest: an actor personality
   (spawn/link/monitor/mailboxes ≈ `start`+`poll`/`kill`+async endpoints) and a
   deterministic-dataflow personality for durable pipelines. Personalities are recipes:
-  `posix_spawn` = "nested window + my budget + `start` + endpoints named
+  `posix_spawn` = "detached window (nested until 2026-09-29) + my budget + `start` + endpoints named
   stdin/stdout/stderr". The substrate never learns a recipe.
 
 The discipline (prime directive): **design for two personalities, build for one.**
@@ -117,7 +126,7 @@ second personality never forces a re-layering.
 
 | dial | how it's chosen | mechanism |
 |---|---|---|
-| memory visible to parent? | **which window source you pass** to `create` | `AddressSpace` sub-range (nested carve — visible superset, §14) vs. platform window minter (detached — opaque) |
+| memory visible to parent? | **which window source you pass** to `create` | `AddressSpace` sub-range (nested carve — visible superset, §14; **retiring** 2026-09-29) vs. platform window minter (detached — opaque; the only placement once carves are deleted) — visibility is then a pre-mapped `SharedRegion`, not placement |
 | parent↔child interface | **which verb you drive with** | `call` (sync) / `resume` (coroutine) / `start`+`join` (concurrent) |
 | peer / cousin IPC | same mechanism as everything else | an `Endpoint` (sync `call.cap` or async via parked completions) granted to both parties |
 | who is charged | **which `Budget` you pass** to `create` | budget lineage, not requester identity |
@@ -250,6 +259,10 @@ reply(serve_end, caller, result)  -> 0 | -errno            (resume that caller)
   keys — the O2 spike, promoted to first in the tracker).
 
 ### S0 spike results — the library-endpoint path is viable  [DONE]
+
+> **Retiring:** the nested (parent ↔ child through the carve) half below rides the carve path being
+> deleted (INVARIANTS #13, 2026-09-29) — and the Cranelift JIT never supported it (#1814). The
+> surviving channel is the region-aliased one: a `SharedRegion` with canonical-key futex.
 
 The go/no-go for "endpoints as a library over shared memory + futex" was: does futex
 `wait`/`notify` rendezvous *across domains* on shared backing? Findings, grounded in the
@@ -386,6 +399,10 @@ can back N concurrent OS-thread children.
 
 ### S1 remaining — async children: the architecture, corrected by integration  [design]
 
+> **Completed by the carve retirement (2026-09-29):** the conclusion below — children keep their own
+> guarded window and live channels are `SharedRegion`s, never carve addresses — now holds on every
+> engine: the carve placement itself is being deleted (INVARIANTS #13 ruling).
+
 The JIT already has a **1:1 OS-thread executor** (`os_thread_rt.rs`, D56/§12): each
 `thread.spawn` is a real OS thread over the shared window with hardware atomics, and the §5
 kill-path reaches parked siblings (`KILL_RECHECK`). So "async children" reuses that, not new
@@ -448,7 +465,8 @@ lowering — the security hinge stays untouched; children keep their own guarded
 **Visibility = window provenance.** `create`'s `window` argument is a handle to a window
 object, and *who holds authority over its backing* is the whole visibility story:
 
-- **Nested**: a sub-range minted from my `AddressSpace` (machinery exists). I see the
+- **Nested** *(retiring — INVARIANTS #13 ruling 2026-09-29; every child becomes detached)*: a
+  sub-range minted from my `AddressSpace` (machinery exists). I see the
   child (§14 superset) — the hypervisor relationship: free argv seeding, parent-as-pager,
   subtree freeze works **today**. Geometric (power-of-two) attenuation, mask-enforced.
 - **Detached**: a window minted by a **platform window-minter capability** — an ordinary
@@ -515,6 +533,8 @@ Trade-offs stated once, honestly: detached subtrees make freeze/clone a **multi-
 snapshot** — new `DURABILITY.md` work (nested subtrees freeze today); nested carves
 subdivide parent VA (real in the browser's wasm32 window). Projects choose per child; a
 shell would plausibly run coreutils detached and its own helper coroutines nested.
+*(Superseded 2026-09-29: there is no per-child choice any more — nested is retired, detached is the
+only placement.)*
 (Carve *geometry* no longer costs the JIT recompiles — S1's cache is position-independent,
 §4 S1 results — so JIT compile-cache pressure is no longer a reason to prefer detached.)
 
@@ -552,6 +572,11 @@ eager push at spawn and `transfer` the lazy push on demand — the two primitive
 already call for.
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
+
+> **Retiring (the pager's data path):** today the pager writes the page through its own window into
+> the child's carve. With carves deleted (INVARIANTS #13, 2026-09-29) the pager instead supplies the
+> page's bytes and the runtime copies them into the child's window at supply; the
+> fault → suspend → supply → retry-on-resume shape below is unchanged. Tracked in #1289.
 
 Two different things surface as "SIGSEGV" and the design splits them:
 
@@ -615,7 +640,8 @@ self.attest() -> { isolation_tier,                      (§2: 0 / 1 / 3)
   `freeze_authority` in the report, and the rule (INVARIANTS #14 ruling 2026-09-08,
   #1289 R1): freeze authority is an explicit, attenuating **capability**, not a consequence
   of placement. A domain is **confidential** (freezable by nobody below the platform) **or**
-  **ancestor-freezable**, per *grant*, not per placement — pick per domain. For a **nested
+  **ancestor-freezable**, per *grant*, not per placement — pick per domain. (The nested case below is
+  retiring with the carve path, 2026-09-29.) For a **nested
   carve** child the grant is implied by the aliasing (the parent reads its carve, so it can
   always freeze it — every nested durable child today); a **detached** child owns its window,
   so an ancestor freezes it only if granted, and may thus be platform-durable **and**
