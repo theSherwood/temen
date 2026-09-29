@@ -1,5 +1,5 @@
 //! **#1025 slice 3c — the driver-guest port, step 1: a Rust-on-Temen guest reads a phase's fs output.**
-//! `rust_driver_nifler` proved a guest can op-13-spawn the real nifler phase. The import crawl needs one
+//! `rust_driver_nifler` proved a guest can spawn the real nifler phase. The import crawl needs one
 //! more guest capability: after spawning a phase, the guest must **read that phase's output back out of
 //! the shared memfs itself** — the crawl reads each module's `.p.deps.nif` to discover its imports, then
 //! spawns nifler on those. This test proves the guest-side fs read: the same driver guest spawns nifler
@@ -25,7 +25,7 @@ const NIFLER_CE_GZ: &[u8] = include_bytes!("../../temen-run/demos/nifler_temen/n
 const IN_NIM: &str = include_str!("../../temen-run/demos/nifler_temen/inputs/basic.nim");
 const EXPECT_NIF: &str = include_str!("../../temen-run/demos/nifler_temen/expected/basic.p.nif");
 
-// The Rust-on-Temen driver guest. It op-13-spawns nifler `p /in.nim /out.nif` over the re-granted memfs
+// The Rust-on-Temen driver guest. It spawns nifler `p /in.nim /out.nif` over the re-granted memfs
 // (exactly as `rust_driver_nifler`), then — the new step — reads `out.nif` back through its own `fs`
 // cap: `open("out.nif", O_READ)`, `read` into a scratch buffer, `close`. Returns the bytes read (or a
 // negative sentinel on any failure), which the host checks against native nifler's `.p.nif` length.
@@ -38,25 +38,13 @@ fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
 pub extern "C" fn rust_eh_personality() {}
 
 #[repr(C, align(65536))]
-struct Pool([u8; 33619968]); // 32 MiB + 64 KiB — a 2^26 window with headroom above the 16 MiB carve
-static mut POOL: Pool = Pool([0; 33619968]);
+struct Pool([u8; 131072]); // the driver's own scratch (worklist, paths, read buffers)
+static mut POOL: Pool = Pool([0; 131072]);
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32, module: i64, grants_ptr: i64, grants_n: i64,
-        entry: i64, off: i64, size_log2: i64, quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
     fn __vm_host_call(handle: i32, op: i32, a: i64, b: i64, c: i64, d: i64) -> i64;
-}
-
-unsafe fn put_rec(base: i64, i: i64, name_off: i64, name_len: u32, handle: i32) {
-    let rec = (base + i * 16) as *mut u32;
-    rec.add(0).write(name_off as u32);
-    rec.add(1).write(name_len);
-    rec.add(2).write(handle as u32);
-    rec.add(3).write(0);
 }
 
 #[no_mangle]
@@ -67,32 +55,11 @@ pub extern "C" fn run() -> i64 {
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
         let out = __vm_cap_resolve(b"stdout".as_ptr(), 6);
         let ex = __vm_cap_resolve(b"exit".as_ptr(), 4);
-        if inst < 0 || nifler < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
+        if inst < 0 || nifler < 0 || budget < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
         let base = core::ptr::addr_of_mut!(POOL) as i64;
-        let nm = (base + 64) as *mut u8;
-        let fsn = b"fs"; let son = b"stdout"; let exn = b"exit";
-        let mut k = 0; while k < 2 { nm.add(k).write(fsn[k]); k += 1; }
-        let mut k = 0; while k < 6 { nm.add(2 + k).write(son[k]); k += 1; }
-        let mut k = 0; while k < 4 { nm.add(8 + k).write(exn[k]); k += 1; }
-        put_rec(base, 0, base + 64, 2, fs);
-        put_rec(base, 1, base + 66, 6, out);
-        put_rec(base, 2, base + 72, 4, ex);
-        let mask: i64 = (1 << 24) - 1;
-        let carve = (base + 128 + mask) & !mask;
-        let argv = (carve + 16512) as *mut u8;
-        (argv as *mut u32).add(0).write(4); // argc
-        (argv as *mut u32).add(1).write(0); // envc
-        let mut p = 8usize;
-        let args: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.nif"];
-        let mut ai = 0;
-        while ai < 4 {
-            let s = args[ai];
-            let mut j = 0;
-            while j < s.len() { argv.add(p).write(s[j]); p += 1; j += 1; }
-            argv.add(p).write(0); p += 1;
-            ai += 1;
-        }
-        let child = __vm_instantiate(inst, nifler as i64, base, 3, 0, carve, 24, 0);
+        let g: [(&[u8], i32); 3] = [(b"fs", fs), (b"stdout", out), (b"exit", ex)];
+        let child = vm_spawn(inst, budget, nifler, &g, &[b"nifler", b"p", b"/in.nim", b"/out.nif"]);
         let status = __vm_join(inst, child);
         if status != 0 && status != 5 { return -100 + status; }
 
@@ -114,10 +81,10 @@ pub extern "C" fn run() -> i64 {
 "##;
 
 // Slice 1b — the crawl loop in the guest: spawn nifler on the main module, read its `.p.deps.nif`,
-// parse the first `(import IDENT)`, build the import's file path, and spawn nifler on it. `spawn` lays
-// argv into a carve and op-13-spawns nifler (the two runs use two disjoint 16 MiB carves in the 64 MiB
-// window). The deps parser handles the bare/local import form `(import foo)` — the infix `std/os` form
-// is skipped here (its multi-segment path resolution is slice 1c's full `parse_imports` port). Returns
+// parse the first `(import IDENT)`, build the import's file path, and spawn nifler on it (the shared
+// `vm_spawn`, each child in a window of its own). The deps parser handles the bare/local import form
+// `(import foo)` — the infix `std/os` form is skipped here (its multi-segment path resolution is slice
+// 1c's full `parse_imports` port). Returns
 // the byte length of the discovered module's `.p.nif` read back through fs, or a negative sentinel.
 const CRAWL_SRC: &str = r##"
 #![no_std]
@@ -128,51 +95,27 @@ fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
 pub extern "C" fn rust_eh_personality() {}
 
 #[repr(C, align(65536))]
-struct Pool([u8; 67043328]); // 64 MiB - 64 KiB → a 2^26 window holding two 16 MiB carves
-static mut POOL: Pool = Pool([0; 67043328]);
+struct Pool([u8; 131072]); // the driver's own scratch (worklist, paths, read buffers)
+static mut POOL: Pool = Pool([0; 131072]);
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32, module: i64, grants_ptr: i64, grants_n: i64,
-        entry: i64, off: i64, size_log2: i64, quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
     fn __vm_host_call(handle: i32, op: i32, a: i64, b: i64, c: i64, d: i64) -> i64;
 }
 
-unsafe fn put_rec(base: i64, i: i64, name_off: i64, name_len: u32, handle: i32) {
-    let rec = (base + i * 16) as *mut u32;
-    rec.add(0).write(name_off as u32);
-    rec.add(1).write(name_len);
-    rec.add(2).write(handle as u32);
-    rec.add(3).write(0);
-}
-
-// argv[] for `nifler --portablePaths --deps parse <inp> <outp>`, seeded at `carve + 16512`; op-13 spawn
-// nifler into `[carve, carve+2^24)` and join. `inp`/`outp` are (ptr,len) byte ranges in the guest window.
+// `nifler --portablePaths --deps parse <in> <out>` (`in`/`out` byte ranges in the guest window): spawn
+// nifler with the grant list `g` (the shared `vm_spawn`, appended at build) and join it.
 unsafe fn spawn_nifler(
-    inst: i32, nifler: i32, base: i64, carve: i64,
+    inst: i32, budget: i32, nifler: i32, g: &[(&[u8], i32)],
     inp: *const u8, inl: usize, outp: *const u8, outl: usize,
 ) -> i64 {
-    let argv = (carve + 16512) as *mut u8;
-    (argv as *mut u32).add(0).write(6); // argc
-    (argv as *mut u32).add(1).write(0); // envc
-    let mut p = 8usize;
-    let fixed: [&[u8]; 4] = [b"nifler", b"--portablePaths", b"--deps", b"parse"];
-    let mut ai = 0;
-    while ai < 4 {
-        let s = fixed[ai];
-        let mut j = 0;
-        while j < s.len() { argv.add(p).write(s[j]); p += 1; j += 1; }
-        argv.add(p).write(0); p += 1;
-        ai += 1;
-    }
-    let mut j = 0; while j < inl { argv.add(p).write(*inp.add(j)); p += 1; j += 1; }
-    argv.add(p).write(0); p += 1;
-    let mut j = 0; while j < outl { argv.add(p).write(*outp.add(j)); p += 1; j += 1; }
-    argv.add(p).write(0);
-    let child = __vm_instantiate(inst, nifler as i64, base, 3, 0, carve, 24, 0);
+    let argv: [&[u8]; 6] = [
+        b"nifler", b"--portablePaths", b"--deps", b"parse",
+        core::slice::from_raw_parts(inp, inl),
+        core::slice::from_raw_parts(outp, outl),
+    ];
+    let child = vm_spawn(inst, budget, nifler, g, &argv);
     __vm_join(inst, child)
 }
 
@@ -197,27 +140,18 @@ pub extern "C" fn run() -> i64 {
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
         let out = __vm_cap_resolve(b"stdout".as_ptr(), 6);
         let ex = __vm_cap_resolve(b"exit".as_ptr(), 4);
-        if inst < 0 || nifler < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
+        if inst < 0 || nifler < 0 || budget < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
         let base = core::ptr::addr_of_mut!(POOL) as i64;
-        let nm = (base + 64) as *mut u8;
-        let fsn = b"fs"; let son = b"stdout"; let exn = b"exit";
-        let mut k = 0; while k < 2 { nm.add(k).write(fsn[k]); k += 1; }
-        let mut k = 0; while k < 6 { nm.add(2 + k).write(son[k]); k += 1; }
-        let mut k = 0; while k < 4 { nm.add(8 + k).write(exn[k]); k += 1; }
-        put_rec(base, 0, base + 64, 2, fs);
-        put_rec(base, 1, base + 66, 6, out);
-        put_rec(base, 2, base + 72, 4, ex);
-        let mask: i64 = (1 << 24) - 1;
-        let carve1 = (base + 128 + mask) & !mask;
-        let carve2 = carve1 + (1 << 24);
+        let g: [(&[u8], i32); 3] = [(b"fs", fs), (b"stdout", out), (b"exit", ex)];
 
-        // Spawn 1: nifler on the main module. Input/output paths live in the low window (below carve1).
+        // Spawn 1: nifler on the main module. Input/output paths live in the scratch pool.
         let mainp = (base + 256) as *mut u8;
         let mm = b"/main.nim"; let mut k = 0; while k < 9 { mainp.add(k).write(mm[k]); k += 1; }
         let mainop = (base + 272) as *mut u8;
         let mo = b"/main.p.nif"; let mut k = 0; while k < 11 { mainop.add(k).write(mo[k]); k += 1; }
         let s1 = spawn_nifler(
-            inst, nifler, base, carve1,
+            inst, budget, nifler, &g,
             (base + 256) as *const u8, 9, (base + 272) as *const u8, 11,
         );
         if s1 != 0 && s1 != 5 { return -100 + s1; }
@@ -269,7 +203,7 @@ pub extern "C" fn run() -> i64 {
 
         // Spawn 2: nifler on the discovered import — the crawl's dependent spawn.
         let s2 = spawn_nifler(
-            inst, nifler, base, carve2,
+            inst, budget, nifler, &g,
             (base + 640) as *const u8, in_len, (base + 768) as *const u8, out_len,
         );
         if s2 != 0 && s2 != 5 { return -400 + s2; }
@@ -283,6 +217,9 @@ pub extern "C" fn run() -> i64 {
     }
 }
 "##;
+
+/// The shared guest-side spawn, appended to every driver guest's source.
+const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
 fn rustc_emit_ll(src: &std::path::Path, ll: &std::path::Path) -> bool {
     Command::new("rustc")
@@ -326,7 +263,7 @@ fn rust_driver_guest_reads_a_phase_output_from_the_memfs() {
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("driver.rs");
     let ll = dir.join("driver.ll");
-    std::fs::write(&src, GUEST_SRC).unwrap();
+    std::fs::write(&src, format!("{GUEST_SRC}\n{VM_SPAWN}")).unwrap();
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc unavailable)");
         return;
@@ -372,6 +309,9 @@ fn rust_driver_guest_reads_a_phase_output_from_the_memfs() {
     let exit_h = host.grant_exit();
     host.register_cap_name("inst", inst);
     host.register_cap_name("nifler", modh);
+    // nifler's window (one child live at a time), paid from this and returned when it ends.
+    let budget = host.grant_budget(0, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);
@@ -426,7 +366,7 @@ fn run_driver_guest(
     std::fs::create_dir_all(&dir).ok()?;
     let src = dir.join("g.rs");
     let ll = dir.join("g.ll");
-    std::fs::write(&src, guest_src).ok()?;
+    std::fs::write(&src, format!("{guest_src}\n{VM_SPAWN}")).ok()?;
     if !rustc_emit_ll(&src, &ll) {
         return None;
     }
@@ -462,6 +402,9 @@ fn run_driver_guest(
     let exit_h = host.grant_exit();
     host.register_cap_name("inst", inst);
     host.register_cap_name("nifler", modh);
+    // nifler's window (one child live at a time), paid from this and returned when it ends.
+    let budget = host.grant_budget(0, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);

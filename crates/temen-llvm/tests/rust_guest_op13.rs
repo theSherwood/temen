@@ -1,18 +1,16 @@
-//! **#1011 slice 3c — a Rust guest drives a §14 op-13 spawn.** The nim-compiler driver's endgame is to
-//! move phase orchestration *into* the sandbox: a Rust-on-Temen guest that spawns each nimony phase child
-//! via `instantiate_module_named` (op 13) over a shared `fs`, instead of the native exec cap — so the
-//! phase children run on the tier-up-capable engine (slice 3a) rather than the tree-walker. This is the
-//! enabling first light: the on-ramp now lowers `__vm_instantiate`/`__vm_join` (§14 Instantiator ops 13
-//! and 1) to a `call.cap` on a name-resolved handle, so a real Rust guest — not a hand-written shell —
-//! can issue the spawn. The C precedent is `temen/tests/c_shell_exec.rs`; this is its Rust counterpart via
-//! the new builtins (the Rust on-ramp can't do chibicc's named-import passthrough, hence the builtins).
+//! **#1011 slice 3c — a Rust guest drives a §14 spawn.** The nim-compiler driver's endgame is to move
+//! phase orchestration *into* the sandbox: a Rust-on-Temen guest that spawns each nimony phase child
+//! over a shared `fs`, instead of the native exec cap. This is the enabling first light: the on-ramp
+//! lowers `__vm_instantiate_rec`/`__vm_join` (§14 Instantiator ops 17 and 1) to a `call.cap` on a
+//! name-resolved handle, so a real Rust guest — not a hand-written shell — can issue the spawn, through
+//! the one guest-side helper every driver guest shares (`support/guest_vm_spawn.rs`: an op-17 v1
+//! record, the child in a window of its own). The C precedent is `temen/tests/c_shell_exec.rs`.
 //!
-//! The guest resolves the `Instantiator`, the child `Module`, and the shared `fs` by name
-//! (`__vm_cap_resolve`), writes one 16-byte grant record for `fs` into a global workspace, spawns the
-//! child into a 128 KiB carve, and joins it. The child (a separate module) resolves `fs` by name and
-//! calls it — a granted counter returning `1`. So a correct run returns `1` and the shared counter
-//! ticks once. Window confinement (§2) is untouched: the `fs` grant is authority (§3), a cross-tier
-//! `call.cap`, not a window access.
+//! The guest resolves the `Instantiator`, the child `Module`, its `Budget` and the shared `fs` by name
+//! (`__vm_cap_resolve`) and spawns the child with `{"fs"}` re-granted, then joins it. The child (a
+//! separate module) resolves `fs` by name and calls it — a granted counter returning `1`. So a correct
+//! run returns `1` and the shared counter ticks once. Window confinement (§2) is untouched: the `fs`
+//! grant is authority (§3), a cross-tier `call.cap`, not a window access.
 //!
 //! Gated to Linux + a present `rustc` (like the other on-ramp guest tests); skips cleanly otherwise.
 
@@ -25,7 +23,7 @@ use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, 
 
 // The child: its `Instantiator` arrives as `v0` (unused). It seeds the name `"fs"` (`0x7366`
 // little-endian = 'f','s') into its own window, resolves it, and calls the granted `HOST_PROC` counter
-// (type 13, op 0) — post-increment `1`. `memory 17` matches the 128 KiB carve exactly (both engines).
+// (type 13, op 0) — post-increment `1`. Its window is its declared `memory 17`.
 const CHILD: &str = r#"memory 17
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -41,11 +39,9 @@ block 0 (v0: i64) {
 }
 "#;
 
-// The Rust guest driver. No `std`, no allocator (it allocates nothing) — just the new §14 builtins over
-// a global workspace. It resolves `inst`/`child`/`fs` by name, lays a grant record for `fs`, spawns the
-// child into a 128 KiB-aligned 128 KiB carve inside `POOL`, and returns `join(child)`. `POOL` (384 KiB)
-// both forces a window big enough for the carve and holds the record + name + carve — the C shell's
-// `pool[]` trick, in Rust.
+// The Rust guest driver. No `std`, no allocator — the §14 builtins through the shared `vm_spawn`
+// (`support/guest_vm_spawn.rs`, appended at build). It resolves `inst`/`child`/`budget`/`fs` by name,
+// spawns the child with `{"fs"}` re-granted, and returns `join(child)`.
 const GUEST_SRC: &str = r##"
 #![no_std]
 #![allow(internal_features)]
@@ -58,22 +54,8 @@ fn ph(_: &core::panic::PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
-#[repr(C, align(8))]
-struct Pool([u8; 393216]);
-static mut POOL: Pool = Pool([0; 393216]);
-
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32,
-        module: i64,
-        grants_ptr: i64,
-        grants_n: i64,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
 }
 
@@ -82,28 +64,19 @@ pub extern "C" fn run() -> i64 {
     unsafe {
         let inst = __vm_cap_resolve(b"inst".as_ptr(), 4);
         let child_mod = __vm_cap_resolve(b"child".as_ptr(), 5);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
-        if inst < 0 || child_mod < 0 || fs < 0 {
+        if inst < 0 || child_mod < 0 || budget < 0 || fs < 0 {
             return -1;
         }
-        let base = core::ptr::addr_of_mut!(POOL) as i64;
-        // grant record at base: {name_off:u32, name_len:u32, handle:i32, flags:u32}
-        let rec = base as *mut u32;
-        rec.add(0).write((base + 16) as u32); // name_off
-        rec.add(1).write(2); // name_len ("fs")
-        rec.add(2).write(fs as u32); // handle
-        rec.add(3).write(0); // flags
-        // the name "fs" at base+16
-        let nm = (base + 16) as *mut u8;
-        nm.add(0).write(b'f');
-        nm.add(1).write(b's');
-        // a 128 KiB-aligned 128 KiB carve above the record
-        let carve = (base + 131071) & !131071;
-        let child = __vm_instantiate(inst, child_mod as i64, base, 1, 0, carve, 17, 0);
+        let child = vm_spawn(inst, budget, child_mod, &[(b"fs", fs)], &[]);
         __vm_join(inst, child)
     }
 }
 "##;
+
+/// The shared guest-side spawn, appended to every driver guest's source.
+const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
 /// The granted `"fs"` shape: a forkable host-proc counter (the re-grantable form a shared memfs takes),
 /// one shared `Arc` so a call from inside the confined child is observable here.
@@ -167,14 +140,16 @@ fn granted_host(child: &temen_ir::Module, win: u64) -> (Host, Arc<Mutex<i64>>) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(child);
+    let budget = host.grant_budget(0, 1 << 17, 0); // the child's window
     let fsh = grant_fs(&mut host, &counter);
     host.register_cap_name("inst", inst);
     host.register_cap_name("child", modh);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fsh);
     (host, counter)
 }
 
-/// Interpreter (cooperative engine — honors the op-13 grant list inline): returns `(result, counter)`.
+/// Interpreter (cooperative engine — honors the grant list inline): returns `(result, counter)`.
 fn run_interp(
     m: &temen_ir::Module,
     entry: u32,
@@ -195,7 +170,7 @@ fn run_interp(
     (out, cval)
 }
 
-/// JIT (given the module resolver + named-grant hooks op-13 needs): returns `(result, counter)`.
+/// JIT (given the module resolver + named-grant hooks the spawn needs): returns `(result, counter)`.
 fn run_jit(
     m: &temen_ir::Module,
     entry: u32,
@@ -226,12 +201,12 @@ fn run_jit(
 }
 
 #[test]
-fn rust_guest_spawns_child_via_op13() {
+fn rust_guest_spawns_a_child() {
     let dir = std::env::temp_dir().join(format!("rust_guest_op13_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create work dir");
     let src = dir.join("guest.rs");
     let ll = dir.join("guest.ll");
-    std::fs::write(&src, GUEST_SRC).expect("write guest source");
+    std::fs::write(&src, format!("{GUEST_SRC}\n{VM_SPAWN}")).expect("write guest source");
 
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc --emit=llvm-ir unavailable or failed)");
@@ -256,10 +231,10 @@ fn rust_guest_spawns_child_via_op13() {
 
     assert_eq!(
         io, 1,
-        "interp: the guest spawned the child via op-13 and joined its result (1)"
+        "interp: the guest spawned the child and joined its result (1)"
     );
-    assert_eq!(jo, 1, "jit: same op-13 spawn, same joined result (1)");
-    assert_eq!(io, jo, "§9 the guest's op-13 spawn agrees on both engines");
+    assert_eq!(jo, 1, "jit: same spawn, same joined result (1)");
+    assert_eq!(io, jo, "§9 the guest's spawn agrees on both engines");
     assert_eq!(
         (ic, jc),
         (1, 1),

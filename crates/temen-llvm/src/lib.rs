@@ -259,9 +259,9 @@ pub struct TranslateOptions {
     /// Defaults to [`DEFAULT_STACK_PAGE`] (native). See [`DEFAULT_STACK_PAGE`] for why.
     pub stack_page: u64,
     /// **§14 child-entry mode** (#1011 slice 3c): synthesize the powerbox entry (`_start`, function 0)
-    /// with the `instantiate_module` child ABI — `(i64 starter) -> (i64 status)` — instead of the
-    /// paramless top-level powerbox entry, so a guest-orchestrated driver can `instantiate_module`
-    /// (op 13) this module as a confined phase child. The starter capability is ignored (the child
+    /// with the §14 child ABI — `(i64 starter) -> (i64 status)` — instead of the paramless
+    /// top-level powerbox entry, so a guest-orchestrated driver can spawn this module as a confined
+    /// phase child. The starter capability is ignored (the child
     /// reaches its `fs`/`stdout`/… through the re-granted named caps in its powerbox, bound to its
     /// manifest imports at spawn — the same imports a top-level run binds); `main`'s result is widened
     /// to the `i64` status the parent reads back via `join`. **Off by default** — a normal powerbox
@@ -3842,8 +3842,8 @@ const HOST_PROC_TYPE_ID: u32 = 13;
 /// numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
 /// The `Instantiator` interface id (`temen_interp::cap_id::INSTANTIATOR`) — the §14 VM-in-VM spawner,
-/// reached from a guest via `__vm_instantiate` (op 13, `instantiate_module_named`) and `__vm_join`
-/// (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `instantiator_type_id_matches`
+/// reached from a guest via `__vm_instantiate_rec` (op 17, the v1 spawn record),
+/// `__vm_instantiate_detached` (op 15) and `__vm_join` (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `instantiator_type_id_matches`
 /// test locks the two together.
 const INSTANTIATOR_TYPE_ID: u32 = 6;
 /// The `ModuleLoader` interface id (`temen_interp::cap_id::MODULE_LOADER`) — the §14 authority to
@@ -4389,7 +4389,7 @@ fn synth_start(
     // #964 guarded layout: every low-scratch address shifts up by this (0 = legacy).
     scratch: u64,
     // §14 child-entry mode (#1011 slice 3c): the entry takes a starter capability (ignored) and returns
-    // an `i64` status, so a driver can `instantiate_module` (op 13) this module as a confined child.
+    // an `i64` status, so a driver can spawn this module as a confined child.
     child_entry: bool,
 ) -> Func {
     use temen_ir::StoreOp;
@@ -12961,31 +12961,27 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // §14 VM-in-VM spawn: `long __vm_instantiate(int inst, long module, long grants_ptr,
-        // long grants_n, long entry, long off, long size_log2, long quota)` →
-        // `call.cap INSTANTIATOR 13 inst (module, grants_ptr, grants_n, entry, off, size_log2, quota)`
-        // — the `instantiate_module_named` (op 13) primitive that runs a host-granted separate `Module`
-        // AND re-grants a named grant list into the child's powerbox (the guest-orchestrated shell/driver
-        // primitive: a compiled phase child resolves an inherited `"fs"` by name and does real I/O).
-        // `inst` is the reflection-discovered `Instantiator` handle (`__vm_cap_at`, interface id 6); the
-        // 16-byte grant records (`{name_off:u32, name_len:u32, handle:i32, flags:u32}`) live at
-        // `grants_ptr` in the guest window. Returns the child handle (`-EINVAL` on a bad carve/entry).
-        "__vm_instantiate" => {
+        // §14 spawn: `long __vm_instantiate_rec(int inst, long rec)` → `call.cap INSTANTIATOR 17 inst
+        // (rec)` — the one spawn form (INVARIANTS #13, #1863): `rec` points at an op-17 **v1** record
+        // (`temen_ir::SpawnRec`, 88 bytes) in the guest window naming the module (`-1` = this
+        // program), the `Budget` that pays for the child's window of its own, the by-name grant list,
+        // the spawn-time args payload and an optional pre-mapped region. The same builtin chibicc
+        // lowers. `inst` is the reflection-discovered `Instantiator` handle (`__vm_cap_at`, interface
+        // id 6). Returns the child handle (`-EINVAL` on a refused spawn), joined with `__vm_join`.
+        "__vm_instantiate_rec" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
-            let args = (1..8)
-                .map(|i| ctx.operand_i64(vm_arg(c, i)?)) // module, grants_ptr, grants_n, entry, off, sl, quota
-                .collect::<Result<Vec<_>, _>>()?;
+            let rec = ctx.operand_i64(vm_arg(c, 1)?)?;
             let sig = temen_ir::FuncType {
-                params: vec![ValType::I64; 7],
+                params: vec![ValType::I64],
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
-                op: 13,
+                op: 17,
                 sig,
                 handle,
-                args,
+                args: vec![rec],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -12996,7 +12992,7 @@ fn lower_vm_builtin(
         // entry, size_log2, quota, args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the
         // child runs the host-granted `module` in a window **of its own** (`size_log2` must equal the
         // module's declared memory), not a carve of the spawner's, with the same named-grant records as
-        // `__vm_instantiate` and a spawn-time args payload copied to its `module_args_base()` (length 0
+        // `__vm_instantiate_rec` and a spawn-time args payload copied to its `module_args_base()` (length 0
         // seeds nothing). `budget` is a `Budget` handle the child's resources are drawn from. Returns
         // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
         "__vm_instantiate_detached" => {
@@ -13024,8 +13020,8 @@ fn lower_vm_builtin(
         // decode+verify a wire-encoded module from `[ptr, ptr+len)` in the guest window and mints a
         // `Module` handle for it (returned; `-EINVAL` on a malformed/unverifiable blob). `loader` is the
         // reflection-discovered `ModuleLoader` handle (`__vm_cap_at`, interface id 7); the returned
-        // handle is then passed as `module` to `__vm_instantiate` (op 13) to run the built program as a
-        // confined child. The input side of nesting: a guest that *produces* a module can now run it.
+        // handle is then named as the `module` of a spawn (`__vm_instantiate_rec`) to run the built
+        // program as a confined child. The input side of nesting: a guest that *produces* a module can now run it.
         "__vm_module_from_bytes" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the ModuleLoader handle
             let args = (1..3)
@@ -13048,7 +13044,7 @@ fn lower_vm_builtin(
         }
         // §14 join: `long __vm_join(int inst, long child)` → `call.cap INSTANTIATOR 1 inst (child)` — the
         // happens-before that publishes the child's window writes and returns its result. `inst` is the
-        // Instantiator handle, `child` the handle `__vm_instantiate` returned.
+        // Instantiator handle, `child` the handle a spawn returned.
         "__vm_join" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
             let child = ctx.operand_i64(vm_arg(c, 1)?)?;

@@ -1,8 +1,8 @@
-//! **Minimal repro / bring-up: a manifest-import child on the JIT via op-13.** `child_entry_io` proves a
+//! **Minimal repro / bring-up: a manifest-import child on the JIT.** `child_entry_io` proves a
 //! child-entry `write("hi")` guest binds its `write` import to a re-granted `stdout` on the cooperative
 //! engine; `child_entry_io_resumable` does it on the resumable engine. This is the **JIT** case — the
-//! smallest real op-13 phase-child (one `Stream` manifest import, no `malloc`, no `fs`) run through the
-//! granted-spawn hooks — isolating the `call.import`-in-a-JIT-child dispatch that the full `nifler`
+//! smallest real phase child (one `Stream` manifest import, no `malloc`, no `fs`), spawned by
+//! `temen_run::conductor` and run through the granted-spawn hooks — isolating the `call.import`-in-a-JIT-child dispatch that the full `nifler`
 //! child (`nifler_child_jit`) trips a `CapFault` on. If this passes, nifler's fault is `malloc`/`fs`;
 //! if it faults, the Stream import dispatch is the culprit. Gated to Linux + `rustc`.
 
@@ -98,48 +98,14 @@ fn child_entry_write_binds_stdout_on_the_jit() {
         .expect("translate child-entry")
         .module;
     temen_verify::verify_module(&child).expect("child verifies");
-    let sl = child.memory.expect("child window").size_log2;
-
-    // A one-entry grant record `{"stdout" -> v2}` at 17408, name at 18432 (both above the #1094 NULL
-    // guard); op-13 into a carve at `1<<sl`.
-    let word0: u64 = 18432 | (6u64 << 32);
-    let carve_off: u64 = 1u64 << sl;
-    let parent_src = format!(
-        r#"memory {psl}
-data 18432 "stdout"
-func (i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32) {{
-  vrec0 = i64.const {word0}
-  vrecoff = i64.const 17408
-  i64.store vrecoff vrec0
-  vsh = i64.extend_i32_u v2
-  vrec1off = i64.const 17416
-  i64.store vrec1off vsh
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 1
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-        psl = sl + 1,
-    );
-    let parent = temen_text::parse_module(&parent_src).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    let parent = temen_run::conductor(&["stdout"], &[]);
 
     let mut host = Host::new();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, 1u64 << (sl + 1));
-    let modh = host.grant_module(&child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
-    let args = [inst as i64, modh as i64, out_h as i64];
+    let args = [inst as i64, modh as i64, budget as i64, out_h as i64];
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         &parent,
         0,
@@ -188,43 +154,14 @@ fn child_entry_malloc_binds_vm_map_on_the_jit() {
         .expect("translate child-entry malloc")
         .module;
     temen_verify::verify_module(&child).expect("child verifies");
-    // A malloc child needs heap room above its declared window: the synthesized bump allocator's
-    // `heap_base` is `1<<declared`, and it grows the heap up into `[1<<declared, carve)`. So the
-    // carve must be **larger** than the declared window (FORK.md §8.6 / #773: `declared <= carve` —
-    // a generous window is a safe superset, confinement still masks to the carve). Carve one
-    // power-of-two above the declared window.
-    let decl = child.memory.expect("child window").size_log2;
-    let sl = decl + 1;
-    let carve_off: u64 = 1u64 << sl;
-    // No re-granted caps: `vm_map` binds to the child's *auto-granted* AddressSpace, so the grant list
-    // is empty (grants_n = 0, grants_ptr unused).
-    let parent_src = format!(
-        r#"memory {psl}
-func (i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32) {{
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 0
-  vgn = i64.const 0
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-        psl = sl + 1,
-    );
-    let parent = temen_text::parse_module(&parent_src).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    // The child's heap grows past its declared window into the window's reserved tail through
+    // `vm_map`, bound to its auto-granted AddressSpace — so the grant list is empty.
+    let parent = temen_run::conductor(&[], &[]);
 
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << (sl + 1));
-    let modh = host.grant_module(&child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
-    let args = [inst as i64, modh as i64];
+    let args = [inst as i64, modh as i64, budget as i64];
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         &parent,
         0,
@@ -250,8 +187,8 @@ block 0 (v0: i32, v1: i32) {{
 
 #[test]
 fn child_entry_malloc_via_op5_binds_vm_map_on_the_jit() {
-    // The op-13 malloc test proves a **named-grant** separate-module child (`call.cap 6 13`, empty
-    // grant list) mallocs on the JIT. This proves the plain **op-5** spawn (`call.cap 6 5`, a granted
+    // The malloc test above proves a spawned separate-module child (an op-17 record, empty grant
+    // list) mallocs on the JIT. This proves the plain **op-5** spawn (`call.cap 6 5`, a granted
     // `Module` with no grant list at all) does too — the JIT's op-5 delegates to the op-13 powerbox
     // builder for a separate-module child, so it gets the same Instantiator + AddressSpace + bound
     // manifest and its `vm_map` heap growth works, matching the interpreter's op-5. (Before the

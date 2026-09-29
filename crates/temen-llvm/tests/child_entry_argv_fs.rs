@@ -1,28 +1,26 @@
-//! **#1011 slice 3c — the full real-nifler op-13 shape: an on-ramp `main(argc, argv)` child reads its
-//! input file and writes its output, spawned with argv seeded into its carve and a shared memfs
+//! **#1011 slice 3c — the full real-nifler spawn shape: an on-ramp `main(argc, argv)` child reads its
+//! input file and writes its output, spawned with argv as the spawn's args payload and a shared memfs
 //! re-granted.** This is the last mechanism gap before dropping in the real `nifler` asset. The pieces
-//! were each proven apart: `child_entry_argv` had a synthesized `synth_start_argv` parse a seeded
-//! `POWERBOX_ARGS_BASE` buffer, but driven *directly*, not through an op-13 spawn; `child_entry_fs`
-//! (temen-run) did op-13 + a re-granted memfs + read/write, but with a *hand-written text-IR* child and
-//! *hard-coded* paths, no argv.
+//! were each proven apart: `child_entry_argv` had a synthesized `synth_start_argv` parse a seeded args
+//! buffer, but driven *directly*, not through a spawn; `child_entry_fs` (temen-run) did a spawn + a
+//! re-granted memfs + read/write, but with a *hand-written text-IR* child and *hard-coded* paths, no
+//! argv.
 //! This composes them on a **real on-ramp child**: a Rust `main(argc, argv)` compiled `--child-entry`
-//! (so func 0 is `synth_start_argv`), `instantiate_module`'d (op 13) into a carve whose
-//! `POWERBOX_ARGS_BASE` the parent seeded with `nifler`-shaped argv `["prog","/in.nim","/out.nif"]`,
-//! with a forkable `mem_fs_shared_factory` re-granted as `"fs"`. The child resolves `"fs"`, opens the
-//! `argv[1]` the parent named, reads it, writes it to `argv[2]`, and the parent reads that file back out
-//! of its shared handle — exactly `nifler p <in> <out>`, with a copy stub standing in for the parse.
+//! (so func 0 is `synth_start_argv`), spawned by `temen_run::conductor` — a window of its own, with
+//! `nifler`-shaped argv `["prog","/in.nim","/out.nif"]` landing at its `module_args_base` — with a
+//! forkable `mem_fs_shared_factory` re-granted as `"fs"`. The child resolves `"fs"`, opens the
+//! `argv[1]` the parent named, reads it, writes it to `argv[2]`, and the parent reads that file back
+//! out of its shared handle — exactly `nifler p <in> <out>`, with a copy stub standing in for the parse.
 //!
 //! Why a copy stub and not real `nifler`: building the real child-entry asset needs the nimony
 //! toolchain (`nim` for the C backend), which isn't in per-PR CI. This proves every seam the real asset
-//! rides — argv-in-carve feeding `synth_start_argv`, the fs re-grant, the memfs hand-back — with only
-//! `rustc`, so the real-nifler swap is a build-script change, not a mechanism unknown.
+//! rides — the args payload feeding `synth_start_argv`, the fs re-grant, the memfs hand-back — with
+//! only `rustc`, so the real-nifler swap is a build-script change, not a mechanism unknown.
 //!
-//! The parent pre-seeds argv into the carve because op-13 gives the child a `nested_view` that *aliases*
-//! the parent's window (it does not zero the carve — only the child's own data segments materialize on
-//! top, and the on-ramp keeps them clear of `[128, argv_end)`). The guest strips a leading `/` from each
-//! path because the memfs cap is relative-only (`EACCES` on absolute) — the same normalization the real
-//! `os_shim.c` does for nifler. Window confinement (invariant 2) is untouched: the shared authority is
-//! the granted cap (§3), and every `open`/`read`/`write` buffer is masked to the child's carve.
+//! The guest strips a leading `/` from each path because the memfs cap is relative-only (`EACCES` on
+//! absolute) — the same normalization the real `os_shim.c` does for nifler. Window confinement
+//! (invariant 2) is untouched: the shared authority is the granted cap (§3), and every
+//! `open`/`read`/`write` buffer is masked to the child's own window.
 
 #![cfg(target_os = "linux")]
 
@@ -131,53 +129,9 @@ fn on_ramp_child_reads_argv_paths_and_copies_a_file_over_a_regranted_memfs() {
         esig.params,
         esig.results
     );
-    let sl = child.memory.expect("child window").size_log2;
-    assert!(
-        sl >= 12,
-        "child window must clear the parent's grant scratch (got 2^{sl})"
-    );
-
-    // The parent seeds `POWERBOX_ARGS_BASE` (128) inside the child's carve with `{argc=3, envc=0}` +
-    // packed `"prog\0/in.nim\0/out.nif\0"` — exactly what `synth_start_argv` parses into `argv[]`. It
-    // also lays a one-entry grant record `{name_off:2048, name_len:2} → fs` (the `fs` handle is `v2`),
-    // then op-13-spawns the child into the carve and op-1-joins it. The carve aliases these seeded
-    // bytes, so the child sees both the argv and (by name) the memfs.
-    let carve_off: u64 = 1u64 << sl;
-    // #964/#1094: a guarded child reads argv one guard up — key off `module_args_base` (the grant
-    // records/cap-names below stay in the parent window, read by the op-13 handler, never by the child).
-    let argv_off = carve_off + temen_ir::module_args_base();
-    let word0: u64 = 18432 | (2u64 << 32);
-    // `\x03\x00\x00\x00` = argc 3, `\x00\x00\x00\x00` = envc 0, then the NUL-separated args.
-    let argv_data = "\\x03\\x00\\x00\\x00\\x00\\x00\\x00\\x00prog\\x00/in.nim\\x00/out.nif\\x00";
-    let parent_src = format!(
-        r#"memory {psl}
-data 18432 "fs"
-data {argv_off} "{argv_data}"
-func (i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32) {{
-  vrec0 = i64.const {word0}
-  vrecoff = i64.const 17408
-  i64.store vrecoff vrec0
-  vsh = i64.extend_i32_u v2
-  vrec1off = i64.const 17416
-  i64.store vrec1off vsh
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 1
-  ventry = i64.const {entry}
-  voff = i64.const {carve_off}
-  vsl = i64.const {sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-        psl = sl + 1,
-    );
-    let parent = temen_text::parse_module(&parent_src).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    // The parent spawns the child with `{"fs"}` re-granted and argv `prog /in.nim /out.nif` — exactly
+    // what `synth_start_argv` parses into `argv[]` — and joins it.
+    let parent = temen_run::conductor(&["fs"], &["prog", "/in.nim", "/out.nif"]);
 
     // A cross-domain shared memfs seeded with the input the child will read as `/in.nim` (key `in.nim`,
     // after the guest strips the leading `/`). The parent's `MemFsHandle` observes the same store.
@@ -196,20 +150,24 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
         })
     };
     let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
-    let inst = host.grant_instantiator(0, 1u64 << (sl + 1));
-    let modh = host.grant_module(&child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
     let mut fuel = 200_000_000u64;
     let r = run_with_host(
         &parent,
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(fs_h)],
+        &[
+            Value::I32(inst),
+            Value::I32(modh),
+            Value::I32(budget),
+            Value::I32(fs_h),
+        ],
         &mut fuel,
         &mut host,
     )
     .expect("parent run");
 
-    // The child returned the byte count it copied (== the input length), joined through op-1.
+    // The child returned the byte count it copied (== the input length), joined back.
     let n = input.len() as i64;
     let got = match r.as_slice() {
         [Value::I64(m)] => *m,
@@ -233,6 +191,6 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
         emitted, input,
         "the on-ramp child read the parent-seeded `/in.nim` named by argv[1] and wrote it to the \
          `/out.nif` named by argv[2] through the re-granted memfs — the full `nifler p <in> <out>` \
-         shape, argv-in-carve and all"
+         shape, argv and all"
     );
 }
