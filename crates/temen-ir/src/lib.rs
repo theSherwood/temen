@@ -367,17 +367,17 @@ pub mod durable_abi {
     pub const SHADOW_SP_WORD_LEN: u64 = 8;
     /// Window byte offset of the `i64` **fiber-safepoint arm countdown** — safepoints
     /// (`cont.resume`/`suspend`) still to pass before an `ARMED` run promotes to `UNWINDING`. Inert
-    /// unless armed; lives in the reserve's `[guard+16, guard+64)` gap, so an unarmed run is
-    /// byte-identical.
+    /// unless armed, so an unarmed run is byte-identical.
     pub const ARM_COUNTDOWN_OFF: u64 = super::POWERBOX_NULL_GUARD + 16;
     /// Window byte offset of the `i64` **back-edge arm countdown** — loop back-edges still to pass
     /// before an `ARMED` run promotes to `UNWINDING` (the Phase-4 Slice A back-edge-poll trigger,
-    /// separate from [`ARM_COUNTDOWN_OFF`]). Reserve's `[guard+24, guard+64)` gap.
+    /// separate from [`ARM_COUNTDOWN_OFF`]).
     pub const ARM_BACKEDGE_OFF: u64 = super::POWERBOX_NULL_GUARD + 24;
     /// Window byte offset of the `i8` **freeze-on-quiesce** flag: non-zero arms the runtime to freeze
-    /// when the run would otherwise block only on `svc.wait`-parked consumers (an idle server no
-    /// countdown can reach). Reserve's `[guard+32, guard+64)` gap.
-    pub const ARM_QUIESCE_OFF: u64 = super::POWERBOX_NULL_GUARD + 32;
+    /// when the run would otherwise block only on scheduler-owned parks (an idle server no countdown
+    /// can reach). In the `i32` [`STATE_OFF`] word's padding, `[guard+4, guard+8)`: `[guard+32,
+    /// guard+64)` is the powerbox heap words and empty argv/envp (#1851).
+    pub const ARM_QUIESCE_OFF: u64 = super::POWERBOX_NULL_GUARD + 4;
     /// §12.8 concurrent-thaw: byte offset of a context's **per-context thaw state** word
     /// (`REWINDING`/`NORMAL`) within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte in-region
     /// SP word. Each frozen vCPU rewinds against its own word, so thaw can run them as concurrent
@@ -414,16 +414,24 @@ pub mod durable_abi {
     /// status completed before the cut and is delivered as it was.
     pub const WAIT_FROZEN: i32 = -1;
 
+    /// The status a `cont.resume` returns when its fiber **unwound for a freeze** rather than
+    /// suspending or returning (#1835). Like [`WAIT_FROZEN`] it is never observed: the resume's
+    /// trailing poll unwinds first. The durable transform spills a resume's `(status, value)`; its
+    /// thaw reloads them when the fiber returned (1), whose slot is free, and re-issues the resume
+    /// otherwise, so a suspended or frozen fiber rewinds.
+    pub const FIBER_FROZEN: i32 = -1;
+
     /// `svc.poll` / `svc.wait` op indices on the durable service interface (§13.4) — the two the
     /// quiesce-freeze arming (`ARM_QUIESCE_OFF`) keys on.
     pub const SVC_POLL_OP: u32 = 9;
     pub const SVC_WAIT_OP: u32 = 10;
 
     /// End of the **always-live** durable control words: the state word, shadow-SP and arm
-    /// countdowns occupy `[guard, guard+64)` and are polled at every safepoint, so their offsets
-    /// are fixed ABI. Everything the durable runtime keeps in the window *beyond* this line — the
-    /// per-context shadow regions — is live only during freeze/thaw and is placed by the
-    /// [`ShadowArena`], not by a constant.
+    /// countdowns occupy `[guard, guard+32)` and are polled at every safepoint, so their offsets
+    /// are fixed ABI; `[guard+32, guard+64)` is the powerbox heap words and empty argv/envp, which a
+    /// durable powerbox program keeps too. Everything the durable runtime keeps in the window
+    /// *beyond* this line — the per-context shadow regions — is live only during freeze/thaw and is
+    /// placed by the [`ShadowArena`], not by a constant.
     pub const DURABLE_CONTROL_END: u64 = super::POWERBOX_NULL_GUARD + 64;
 
     /// The **shadow arena**: the window byte range `[base, end)` holding a durable domain's
@@ -3723,9 +3731,9 @@ pub const POWERBOX_HEAP_TOP: u64 = 40;
 /// is nothing there, and a null one faults against the #1094 NULL guard (#1422).
 ///
 /// Both sit in page 0's reserved scratch, in the gap between the heap-state words above and the
-/// args buffer at [`POWERBOX_ARGS_BASE`] — and, under the guarded layout, in the gap between the
-/// durable control words (`durable::ARM_QUIESCE_OFF`, +32) and the shadow stack
-/// (`durable_abi::DURABLE_CONTROL_END`, +64), so they collide with neither.
+/// args buffer at [`POWERBOX_ARGS_BASE`] — and, under the guarded layout, between the durable
+/// control words (`[guard, guard+32)`) and `durable_abi::DURABLE_CONTROL_END` (+64), so they
+/// collide with neither (`page0_words_are_disjoint` pins it).
 pub const POWERBOX_EMPTY_ARGV: u64 = 48;
 /// The `envp` twin of [`POWERBOX_EMPTY_ARGV`]; see it for why an empty vector is a pointer to NULL
 /// rather than NULL itself.
@@ -6605,6 +6613,41 @@ pub mod bounds {
                 b: 1,
             };
             assert_eq!(ub_of(&cmp, &ubs), UB_TOP);
+        }
+    }
+}
+
+#[cfg(test)]
+mod page0_tests {
+    use super::durable_abi as d;
+    use super::*;
+
+    /// #1851: page 0's scratch (one guard up) holds two ABIs' words — the durable control words and
+    /// the powerbox's heap words, empty argv/envp and args buffer — and a durable powerbox program
+    /// keeps both. The quiesce flag once shared its word with the heap pointer.
+    #[test]
+    fn page0_words_are_disjoint() {
+        let g = POWERBOX_NULL_GUARD;
+        let words: [(&str, u64, u64); 10] = [
+            ("durable state", d::STATE_OFF, 4),
+            ("durable quiesce arm", d::ARM_QUIESCE_OFF, 1),
+            ("durable shadow SP", d::SHADOW_SP_OFF, d::SHADOW_SP_WORD_LEN),
+            ("durable countdown arm", d::ARM_COUNTDOWN_OFF, 8),
+            ("durable back-edge arm", d::ARM_BACKEDGE_OFF, 8),
+            ("heap brk", g + POWERBOX_HEAP_BRK, 8),
+            ("heap top", g + POWERBOX_HEAP_TOP, 8),
+            ("empty argv", g + POWERBOX_EMPTY_ARGV, 8),
+            ("empty envp", g + POWERBOX_EMPTY_ENVP, 8),
+            (
+                "args buffer",
+                g + POWERBOX_ARGS_BASE,
+                POWERBOX_ARGS_END - POWERBOX_ARGS_BASE,
+            ),
+        ];
+        for (i, &(a, ao, al)) in words.iter().enumerate() {
+            for &(b, bo, bl) in &words[i + 1..] {
+                assert!(ao + al <= bo || bo + bl <= ao, "{a} overlaps {b}");
+            }
         }
     }
 }

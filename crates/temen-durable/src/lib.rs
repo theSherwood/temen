@@ -177,7 +177,10 @@ pub use temen_ir::durable_abi::STATE_OFF;
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// The shadow arena — one definition of placement (see the region-layout note above) — and the end
 /// of the always-live control words below it.
-pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, WAIT_FROZEN};
+pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, FIBER_FROZEN, WAIT_FROZEN};
+
+/// `cont.resume`'s status for a fiber that returned ([`Inst::ContResume`]).
+const FIBER_RETURNED: i32 = 1;
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
@@ -865,10 +868,11 @@ enum SuspendKind {
         args: Vec<ValIdx>,
     },
     /// `cont.resume` (resumer side): like a propagated call, **re-issued on thaw** so the fiber
-    /// rewinds in turn and redelivers its `(status: i32, value: i64)` (slice 3.1.2). The
-    /// re-issued resume reconstructs the fiber via its own rewind (the `Yield` re-park, slice
-    /// 3.1.3) — until that lands, a thaw that actually re-enters a suspended fiber still relies
-    /// on the fiber side being wired.
+    /// rewinds in turn and redelivers its `(status: i32, value: i64)` (slice 3.1.2) — the `Yield`
+    /// re-park of a suspended fiber, or the rewind of one that unwound for the freeze
+    /// ([`FIBER_FROZEN`]). A fiber that **returned** in the resume the freeze landed at is gone
+    /// (its slot is free), so the resume's spilled `(status, value)` is reloaded instead, and this
+    /// frame, the deepest on its thread, flips the thaw word (#1835).
     Resume { k: ValIdx, arg: ValIdx },
     /// `thread.join` (§12.8 next slice): a vCPU blocked joining a child is a freeze safepoint too — the
     /// trailing poll unwinds it. Like a host call it carries the re-issue word (#1685): a join the freeze
@@ -1320,14 +1324,15 @@ fn transform_func(
                     // A wait's status is spilled too (#1769): one the wait completed with before the
                     // cut is delivered on thaw; only the freeze's own `WAIT_FROZEN` re-issues it. A
                     // join's result likewise, unless the freeze ended it (#1685).
+                    // A resume's, unless its fiber was still there to redeliver them (#1835).
                     SuspendKind::Leaf { .. }
                     | SuspendKind::MemoryWait { .. }
-                    | SuspendKind::ThreadJoin { .. } => out,
-                    // The op's results are recomputed (re-issue) or redelivered (resume), so
+                    | SuspendKind::ThreadJoin { .. }
+                    | SuspendKind::Resume { .. } => out,
+                    // The op's results are recomputed (re-issue) or redelivered (the re-park), so
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
                     | SuspendKind::PropagatedIndirect { .. }
-                    | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. }
                     | SuspendKind::SvcServe { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
@@ -1370,9 +1375,13 @@ fn transform_func(
                 if matches!(kind, SuspendKind::Leaf { .. }) {
                     used[out - nres..out].iter_mut().for_each(|u| *u = true);
                 }
-                // A wait's thaw arm reads its own status to decide re-issue vs. deliver (#1769).
+                // A wait's thaw arm reads its own status to decide re-issue vs. deliver (#1769); so
+                // does a resume's (#1835).
                 if matches!(kind, SuspendKind::MemoryWait { .. }) {
                     used[out - 1] = true;
+                }
+                if matches!(kind, SuspendKind::Resume { .. }) {
+                    used[out - 2] = true;
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -1573,23 +1582,8 @@ fn transform_func(
                     pt.nres,
                 )
             }
-            // `cont.resume` re-issue (slice 3.1.2): reload the (spilled) handle + arg and resume
-            // the fiber again. On thaw the fiber rewinds in turn (its `Yield` re-park) and
-            // redelivers `(status, value)` — the resumer threads those two results into its
-            // continuation just like a propagated call. The resumer does **not** flip the state
-            // word: the resumee's `Yield` arm (the globally-deepest frame) does.
-            SuspendKind::Resume { k, arg } => {
-                let kk = reloaded[spill_slot(*k as usize).expect("resume handle spilled")];
-                let aa = reloaded[spill_slot(*arg as usize).expect("resume arg spilled")];
-                ab.many(
-                    Inst::ContResume {
-                        k: kk,
-                        arg: aa,
-                        block: false,
-                    },
-                    pt.nres,
-                )
-            }
+            // `cont.resume`: its terminator below re-issues it or reloads its results (#1835).
+            SuspendKind::Resume { .. } => vec![],
             // `suspend` re-park (slice 3.1.3): a parked fiber's suspend is the globally-deepest
             // frozen frame, so flip the state word to NORMAL, then re-execute `suspend` — which
             // parks this fiber and hands `value` back to the resumer (in NORMAL). Its result, the
@@ -1721,6 +1715,54 @@ fn transform_func(
                     &reloaded,
                     |p| Inst::ThreadJoin { handle: p[0] },
                 )
+            }
+            // A resume whose fiber did not return is re-issued (slice 3.1.2): the fiber rewinds in
+            // turn (its `Yield` re-park, or the frames it unwound) and redelivers `(status, value)`.
+            // The resumer does **not** flip the thaw word there: the fiber's deepest frame does.
+            // One whose fiber returned reloads the two, and, the deepest frame now, flips it (#1835).
+            SuspendKind::Resume { k, arg } => {
+                let status = cont_args[pt.out - 2];
+                let returned = ab.one(Inst::ConstI32(FIBER_RETURNED));
+                let cond = ab.one(icmp(IntTy::I32, CmpOp::Ne, status, returned));
+                let mut fb = Bb::new(pt.slot_types[..pt.out].to_vec());
+                let (st_a, st_off) = fb.thaw_word_addr();
+                let normal_v = fb.one(Inst::ConstI32(STATE_NORMAL));
+                fb.zero(store(StoreOp::I32, st_a, normal_v, st_off));
+                let reload_blk = trap_blk + 1 + extra_blocks.len() as u32;
+                extra_blocks.push(fb.finish(Terminator::Br {
+                    target: pt.cont_seg,
+                    args: (0..pt.out as u32).collect(),
+                }));
+                match reissue_branch(
+                    &mut extra_blocks,
+                    trap_blk + 1,
+                    unwind_blk,
+                    pt,
+                    cont_args,
+                    cond,
+                    &[*k, *arg],
+                    &reloaded,
+                    |p| Inst::ContResume {
+                        k: p[0],
+                        arg: p[1],
+                        block: false,
+                    },
+                ) {
+                    Terminator::BrIf {
+                        cond,
+                        then_blk,
+                        then_args,
+                        else_args,
+                        ..
+                    } => Terminator::BrIf {
+                        cond,
+                        then_blk,
+                        then_args,
+                        else_blk: reload_blk,
+                        else_args,
+                    },
+                    _ => unreachable!("reissue_branch builds a BrIf"),
+                }
             }
             // A loop header re-enters its body; nothing ran again.
             SuspendKind::LoopHeader => Terminator::Br {

@@ -560,7 +560,7 @@ enum Op {
     /// The 56-byte record is **runtime data** (entry, carve, module, budget, grants — see the
     /// tree-walker's op-17 arm for the layout), so unlike the scalar spawns above the fields are
     /// read from the vCPU's confined window at **exec** time; the op then folds onto the same
-    /// [`Outcome::Instantiate`] / [`Outcome::InstantiateModule`] the drivers already service.
+    /// [`Outcome::Instantiate`] the drivers already service.
     InstantiateRec {
         handle: u32,
         rec: u32,
@@ -802,7 +802,16 @@ impl SharedSlots {
 /// is the primary; `k≥1` is an installed unit. A §14 child / coroutine shares the root's `ModuleSource`
 /// (so its table's module indices resolve) but carries its own [`SharedSlots`].
 struct ModuleSource {
-    mods: std::sync::Mutex<Vec<std::sync::Arc<Compiled>>>,
+    mods: std::sync::Mutex<Units>,
+}
+
+/// A [`ModuleSource`]'s units, and which of them are `execve`'d commands.
+struct Units {
+    code: Vec<std::sync::Arc<Compiled>>,
+    /// Each unit an `execve` compiled, by its module's content digest ([`super::module_digest`]) —
+    /// `(digest, index)`. A command is compiled once per run, however many processes exec it, as a
+    /// JIT tree compiles it once per digest (#1825).
+    commands: Vec<([u8; 32], usize)>,
 }
 
 impl ModuleSource {
@@ -814,47 +823,135 @@ impl ModuleSource {
     /// #1144): the shared `Arc<Compiled>` becomes `mods[0]` of a fresh source.
     fn over(primary: std::sync::Arc<Compiled>) -> ModuleSource {
         ModuleSource {
-            mods: std::sync::Mutex::new(vec![primary]),
+            mods: std::sync::Mutex::new(Units {
+                code: vec![primary],
+                commands: Vec::new(),
+            }),
         }
     }
 
     /// A fresh clone of the module `Arc`s — a vCPU's lock-free local cache (cheap refcount bumps),
     /// refreshed on a miss. The lock acquire pairs with `install`'s push, so the snapshot sees it.
     fn snapshot(&self) -> Vec<std::sync::Arc<Compiled>> {
-        self.mods.lock_unpoisoned().clone()
+        self.mods.lock_unpoisoned().code.clone()
     }
 
     /// The primary program (module 0).
     fn primary(&self) -> std::sync::Arc<Compiled> {
-        std::sync::Arc::clone(&self.mods.lock_unpoisoned()[0])
+        std::sync::Arc::clone(&self.mods.lock_unpoisoned().code[0])
     }
 
     /// Module `i` (`0` = primary, `k≥1` = an installed unit), or `None` if out of range.
     fn get(&self, i: usize) -> Option<std::sync::Arc<Compiled>> {
-        self.mods.lock_unpoisoned().get(i).cloned()
+        self.mods.lock_unpoisoned().code.get(i).cloned()
     }
 
     /// Append a module (a §14 `instantiate_module` child's program) and return its index. (§22
     /// `Jit.install` instead goes through [`Domain::install`], which also fills a dispatch slot.)
     fn push(&self, unit: Compiled) -> usize {
         let mut mods = self.mods.lock_unpoisoned();
-        mods.push(std::sync::Arc::new(unit));
-        mods.len() - 1
+        mods.code.push(std::sync::Arc::new(unit));
+        mods.code.len() - 1
+    }
+
+    /// The unit of the `execve`'d command whose module has content digest `digest`: the one this
+    /// run already compiled, or `compile()`'s, appended. `None` when `compile` refuses. The compile
+    /// runs outside the lock; a racing exec of the same command keeps the unit that landed first.
+    fn command(
+        &self,
+        digest: &[u8; 32],
+        compile: impl FnOnce() -> Option<Compiled>,
+    ) -> Option<usize> {
+        let find = |u: &Units| {
+            u.commands
+                .iter()
+                .find(|(d, _)| d == digest)
+                .map(|&(_, i)| i)
+        };
+        if let Some(i) = find(&self.mods.lock_unpoisoned()) {
+            return Some(i);
+        }
+        let unit = compile()?;
+        let mut mods = self.mods.lock_unpoisoned();
+        if let Some(i) = find(&mods) {
+            return Some(i);
+        }
+        mods.code.push(std::sync::Arc::new(unit));
+        let i = mods.code.len() - 1;
+        mods.commands.push((*digest, i));
+        Some(i)
     }
 
     /// The **non-primary** units (`mods[1..]`) — a time-travel checkpoint captures these (cheap `Arc`
     /// refcount bumps) so a reverse-`seek` restore can re-push them and a separate-module coroutine/child
     /// frame's `module` index resolves as it did at capture. Paired with [`reset_extra`].
     fn extra_units(&self) -> Vec<std::sync::Arc<Compiled>> {
-        self.mods.lock_unpoisoned()[1..].to_vec()
+        self.mods.lock_unpoisoned().code[1..].to_vec()
     }
 
     /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
-    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe.
+    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe. The command index
+    /// is dropped with them: a later exec compiles its command again rather than trust an index into
+    /// units it did not see pushed.
     fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
         let mut mods = self.mods.lock_unpoisoned();
-        mods.truncate(1);
-        mods.extend(units.iter().cloned());
+        mods.code.truncate(1);
+        mods.code.extend(units.iter().cloned());
+        mods.commands.clear();
+    }
+}
+
+#[cfg(test)]
+mod module_source_tests {
+    use super::*;
+
+    fn unit() -> Compiled {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        compile_module(&m.funcs, &m.types, None).expect("compile")
+    }
+
+    #[test]
+    fn an_execd_command_compiles_once_per_run() {
+        let src = ModuleSource::new(unit());
+        let mut compiles = 0;
+        let mut exec = |digest: [u8; 32]| {
+            src.command(&digest, || {
+                compiles += 1;
+                Some(unit())
+            })
+            .expect("compiles")
+        };
+        let a = exec([1; 32]);
+        assert_eq!(
+            exec([1; 32]),
+            a,
+            "an exec of the same command runs its unit"
+        );
+        let b = exec([2; 32]);
+        assert_ne!(a, b, "another command has its own unit");
+        assert_eq!(compiles, 2, "each command compiled once");
+        assert_eq!(
+            src.snapshot().len(),
+            3,
+            "the primary and a unit per command"
+        );
+    }
+
+    #[test]
+    fn a_restore_forgets_which_units_are_commands() {
+        let src = ModuleSource::new(unit());
+        let a = src.command(&[1; 32], || Some(unit())).expect("compiles");
+        src.reset_extra(&[]);
+        let mut compiled = false;
+        let b = src
+            .command(&[1; 32], || {
+                compiled = true;
+                Some(unit())
+            })
+            .expect("compiles");
+        assert!(compiled, "the command is compiled again after a restore");
+        assert_eq!((a, b), (1, 1), "into the restored units");
     }
 }
 
@@ -961,8 +1058,8 @@ fn jit_install_into(source: &ModuleSource, table: &SharedSlots, unit: Compiled) 
         .slots
         .iter()
         .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
-    mods.push(std::sync::Arc::new(unit));
-    let module = (mods.len() - 1) as u32;
+    mods.code.push(std::sync::Arc::new(unit));
+    let module = (mods.code.len() - 1) as u32;
     table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
     Some(slot)
 }
@@ -1193,52 +1290,6 @@ fn compile_module_for(m: &Module) -> Option<Compiled> {
 /// quotas / zero-fuel children land here). `Err(CapFault)` = the handle vanished since the exec
 /// arm's peek (a shared-powerbox race). The fund rule is the tree-walker's: bounded fuel is
 /// `min(budget, parent_remaining)`, unbounded inherits the parent's remaining.
-/// §14 op-13 — build a **separate-module child's powerbox**, the one definition both drivers use
-/// (#1570). Parses the by-name grant list out of the parent window (`grants_n` × 16-byte
-/// `{name_off:u32, name_len:u32, handle:i32, _:u32}` records, the tree-walk arm's format), re-grants
-/// each named cap into a fresh child host via [`Host::spawn_named_child`], registers the running
-/// module as the child's own (§3.6: a separate-module child serves its *own* offers), and binds the
-/// child module's import manifest against that powerbox (IMPORTS.md phase 3 — a chibicc child's
-/// `write`/`read`/`exit` resolve here, or its first `write` would `CapFault`).
-///
-/// `Ok(None)` is a **probeable refusal** — a `required` import slot with nothing to bind, which the
-/// tree-walker answers `-EINVAL` for. `Err` is a trap: an unreadable record, a non-UTF-8 name, or a
-/// handle the parent may not re-grant.
-///
-/// Extracted from the cooperative arm so the OS-thread parallel driver can stop declining named
-/// grants outright (#1570). That driver returned `Trap::Malformed` for them, and never called
-/// `bind_child_manifest` at all — so even a grant-free child's imports went unbound there, where the
-/// cooperative driver binds them (INVARIANTS #9: one op, one answer, whichever loop is driving).
-fn named_child_host(
-    host: &mut Host,
-    pm: Option<&Mem>,
-    grants: Option<(u64, u64)>,
-    child_size: u64,
-    cmodule: &std::sync::Arc<Module>,
-) -> Result<Option<(Host, i32, i32)>, Trap> {
-    let (mut child_host, cinst, cas) = match grants {
-        Some((grants_ptr, grants_n)) => {
-            let m = pm.ok_or(Trap::Malformed)?;
-            let list = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))?;
-            host.spawn_named_child(&list, child_size)
-                .ok_or(Trap::CapFault)?
-        }
-        None => {
-            let mut ch = Host::new();
-            let (cinst, cas) = ch.grant_starter_caps(child_size);
-            (ch, cinst, cas)
-        }
-    };
-    child_host.set_self_module(cmodule);
-    if child_host
-        .bind_child_manifest(&cmodule.imports, &cmodule.types)
-        .is_err()
-    {
-        return Ok(None);
-    }
-    Ok(Some((child_host, cinst, cas)))
-}
-
 fn take_spawn_budget(
     host: &mut Host,
     budget: i32,
@@ -1308,25 +1359,246 @@ pub(crate) fn child_entry_args(arity: usize, inst: i32, space: i32) -> Vec<Value
         .collect()
 }
 
-/// A §5 `instantiate_detached` (op 15) child as every bytecode driver builds it — the **one
-/// definition** of admission and of the child powerbox (INVARIANTS #15), shared by the cooperative
-/// executor (`drive`), the OS-thread parallel driver (`run_vcpu_parallel`) and the debug scheduler
-/// (`dbg_instantiate_detached`). Only *how the child is scheduled* differs per driver: an executor
-/// task, an OS thread, a debug task.
-struct DetachedChild {
-    /// The child's fresh window (`Mem::with_reservation`, its own guard — not a carve), seeded with
-    /// the module's data, the args payload at `module_args_base()`, and any pre-mapped region.
-    mem: Mem,
-    /// The child powerbox: starter `Instantiator`/`AddressSpace` over the reservation, the by-name
-    /// re-grants, the staged pre-map, the manifest bound (leniently for a child of the running
-    /// module, #1234).
+/// A §14 confined spawn — op 0 (`instantiate`), op 5 / op 13 (`instantiate_module[_named]`), or a
+/// §3d record (op 17) — as its lowering resolved it. One event for all of them (INVARIANTS #15): a
+/// separate-module child is this spawn with a `module`, not a second variant.
+#[derive(Clone, Copy)]
+struct ConfinedSpawn {
+    /// The holder's `Instantiator` range `[ibase, ibase + isize)` in its own window.
+    ibase: u64,
+    isize: u64,
+    /// The granted `Module` handle a separate-module child runs; `None` runs the spawning frame's
+    /// own module (#1726).
+    module: Option<i32>,
+    entry: i64,
+    /// The carve: `1 << size_log2` bytes at holder-relative offset `off`.
+    off: i64,
+    size_log2: i64,
+    /// The child's fuel quota (`<= 0` inherits the parent's remaining) when no budget funds it.
+    quota: i64,
+    /// The by-name grant list's `(ptr, count)` in the holder's window (op 13, a record's); `None`
+    /// grants only the starter caps.
+    grants: Option<(u64, u64)>,
+    /// A record's `Budget` handle (`0` = none), drained at the commit site.
+    budget: i32,
+}
+
+/// What an admitted child runs.
+enum ChildProgram {
+    /// The spawning frame's own module (#1726): a same-module child (op 0, a module-less op 17).
+    Spawner(u32, std::sync::Arc<Compiled>),
+    /// A granted separate module, compiled; [`child_task`] lands it in the driver's source.
+    Granted(Compiled),
+}
+
+/// A §14 confined or §5 detached child as every in-process bytecode driver builds it — the **one
+/// definition** of admission and of the child powerbox (INVARIANTS #15), made by
+/// [`admit_confined_child`] or [`admit_detached_child`] and shared by the cooperative executor
+/// (`drive`), the OS-thread parallel driver (`run_vcpu_parallel`) and the debug scheduler. Only *how
+/// the child is scheduled* differs per driver: an executor task, an OS thread, a debug task. (Until
+/// #1855 each driver admitted a confined child its own way, and two of them trapped on a budget or a
+/// grant list the cooperative driver serves.)
+struct AdmittedChild {
+    /// The child's window: a view of the holder's carve (confined), or a fresh window of its own
+    /// (`Mem::detached`, its own guard) seeded with the module's data, the args payload at
+    /// `module_args_base()` and any pre-mapped region (detached).
+    mem: Option<Mem>,
+    /// The child powerbox: the starter `Instantiator`/`AddressSpace`, the by-name re-grants, the
+    /// module the child serves, its import manifest bound, and a funding budget's channel ceiling.
     host: Host,
-    /// The child module compiled to bytecode, manifest attached — the driver pushes it to its source.
-    compiled: Compiled,
+    program: ChildProgram,
     /// The entry's arguments: the starter `Instantiator` (plus `AddressSpace` for a two-arg entry).
     args: Vec<Value>,
-    /// The child's fuel: the op's quota clamped to the parent's remaining fuel.
+    /// The child's fuel: a funding budget's, or the op's quota clamped to the parent's remaining.
     fuel: u64,
+}
+
+/// Admit a §14 confined spawn and build the child. `host` is the spawning task's own powerbox, where
+/// its handles resolve and its budget is charged (#1727); `pm` its window — the holder the carve is
+/// cut from, the grant list is read from and a module's data segments land in; `parent_fuel` its
+/// remaining fuel; `spawner` the spawning frame, whose module a same-module child runs.
+///
+/// `Ok(None)` is a **probeable refusal**: the driver lands `-EINVAL`, and the budget is intact. `Err`
+/// is a trap: a forged module handle, a module this engine cannot lower, an unreadable grant record,
+/// or a handle the parent may not re-grant. The order is the tree-walker's — program, entry and
+/// carve; then a module's data segments, the powerbox and its manifest; the budget last, so a refused
+/// spawn charges nothing. The vCPU ceiling is the scheduler's to check afterwards, as for op 15.
+fn admit_confined_child(
+    host: &mut Host,
+    pm: Option<&Mem>,
+    parent_fuel: u64,
+    source: &ModuleSource,
+    spawner: &Vm,
+    s: ConfinedSpawn,
+) -> Result<Option<AdmittedChild>, Trap> {
+    // The program, and for a separate module its declared window, data segments and module.
+    let (program, granted) = match s.module {
+        None => {
+            let (m, p) = spawner_module(source, spawner).ok_or(Trap::Malformed)?;
+            (ChildProgram::Spawner(m, p), None)
+        }
+        Some(mh) => {
+            let g = host.resolve_module(mh)?;
+            // A module this engine cannot lower is the one place a guest-provided program outruns
+            // coverage (no tree-walker fallback mid-run) — a `Malformed` trap, as for `Jit.install`.
+            let c = compile_module(&g.funcs, &g.types, g.shadow).ok_or(Trap::Malformed)?;
+            let granted = (
+                g.memory_log2,
+                g.data.clone(),
+                std::sync::Arc::clone(&g.module),
+            );
+            (ChildProgram::Granted(c), Some(granted))
+        }
+    };
+    let sig = match &program {
+        ChildProgram::Spawner(_, p) => p.sigs.get(s.entry as usize),
+        ChildProgram::Granted(c) => c.sigs.get(s.entry as usize),
+    };
+    let arity = sig.map_or(0, |(p, _)| p.len());
+    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
+    let child_size = if (0..64).contains(&s.size_log2) {
+        1u64 << s.size_log2
+    } else {
+        0
+    };
+    let off = s.off as u64;
+    // #1094: the holder's own guard. A nested holder in a sub-guard carve is unguarded, so it may
+    // carve below the root's guard.
+    let guard = pm.map_or(0, |m| m.null_guard);
+    let fits = carve_fits(off, s.size_log2, s.isize, s.ibase, guard);
+    // A separate module's carve is at least its declared memory (FORK.md §8.6 / #773: the span above
+    // it is heap room an allocating phase grows into via `vm_map`; §2 still confines every access
+    // to the carve).
+    let mod_ok = granted
+        .as_ref()
+        .is_none_or(|(ml, _, _)| ml.is_some_and(|ml| ml <= s.size_log2 as u8));
+    if !ok_entry || !fits || !mod_ok {
+        return Ok(None);
+    }
+    // Holder-relative → backing-absolute, so nesting composes at any depth.
+    let base = pm.map_or(0, |m| m.window.base()) + s.ibase + off;
+    // A module's data segments land in the carve now, as if the child wrote them (the verifier
+    // bounded them to its declared window). `readonly` is not enforced for a nested child —
+    // intra-domain self-corruption is a §1 non-goal — as on the tree-walker.
+    if let (Some((_, data, _)), Some(m)) = (&granted, pm) {
+        for d in data.iter() {
+            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+                for (k, &b) in d.bytes.iter().enumerate() {
+                    m.set_byte(base + d.offset + k as u64, b);
+                }
+            }
+        }
+    }
+    let module = granted.as_ref().map(|(_, _, m)| m);
+    let Some((mut child_host, cinst, cas)) =
+        confined_child_host(host, pm, s.grants, child_size, module)?
+    else {
+        return Ok(None);
+    };
+    // §3d: a record's budget funds the child here, after every other refusal. #989 slice 1b: its
+    // `channel` ceiling is read before `take_spawn_budget` drains it.
+    let fuel = if s.budget != 0 {
+        let channel = host.peek_budget(s.budget).map(|b| b.channel);
+        let Some(fuel) = take_spawn_budget(host, s.budget, child_size, parent_fuel)? else {
+            return Ok(None);
+        };
+        if let Some(cap) = channel {
+            child_host.set_channel_cap(cap);
+        }
+        fuel
+    } else if s.quota <= 0 {
+        parent_fuel
+    } else {
+        (s.quota as u64).min(parent_fuel)
+    };
+    Ok(Some(AdmittedChild {
+        mem: pm.map(|m| m.nested_view(base, s.size_log2 as u8, m.shadow_arena())),
+        host: child_host,
+        program,
+        args: child_entry_args(arity, cinst, cas),
+        fuel,
+    }))
+}
+
+/// A §14 confined child's powerbox, built from the spawning task's own powerbox `host` (#1570,
+/// #1855). The by-name grant list — `grants_n` × 16-byte `{name_off:u32, name_len:u32, handle:i32,
+/// _:u32}` records in the holder's window `pm`, the tree-walker's format — re-grants each named cap
+/// via [`Host::spawn_named_child`]; with no list the child gets only its starter
+/// `Instantiator`/`AddressSpace` over `[0, child_size)`.
+///
+/// A separate-module child (`module`) serves its *own* offers and binds its own import manifest
+/// (§3.6; IMPORTS.md phase 3 — a chibicc child's `write`/`read`/`exit` resolve here, or its first
+/// `write` would `CapFault`). A same-module child serves over the parent's registered module and binds
+/// the parent's manifest leniently, and only when the spawn handed it caps by name: a grant-less
+/// child was given nothing to bind (#1234).
+///
+/// Returns the host and its starter handles. `Ok(None)` is a **probeable refusal**: a `required` import
+/// slot with nothing to bind, which the tree-walker answers `-EINVAL` for. `Err` is a trap: an
+/// unreadable record, a non-UTF-8 name, or a handle the parent may not re-grant.
+fn confined_child_host(
+    host: &mut Host,
+    pm: Option<&Mem>,
+    grants: Option<(u64, u64)>,
+    child_size: u64,
+    module: Option<&std::sync::Arc<Module>>,
+) -> Result<Option<(Host, i32, i32)>, Trap> {
+    let (mut child_host, cinst, cas) = match grants {
+        Some((grants_ptr, grants_n)) => {
+            let m = pm.ok_or(Trap::Malformed)?;
+            let list = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))?;
+            host.spawn_named_child(&list, child_size)
+                .ok_or(Trap::CapFault)?
+        }
+        None => {
+            let mut ch = Host::new();
+            let (cinst, cas) = ch.grant_starter_caps(child_size);
+            (ch, cinst, cas)
+        }
+    };
+    let bound = match module {
+        Some(cm) => {
+            child_host.set_self_module(cm);
+            child_host
+                .bind_child_manifest(&cm.imports, &cm.types)
+                .is_ok()
+        }
+        None => {
+            child_host.set_self_module_opt(host.self_module.clone());
+            let im = child_host.module_imports(super::SELF_MODULE);
+            let ty = child_host.module_types(super::SELF_MODULE);
+            match (grants, im, ty) {
+                (Some(_), Some(im), Some(ty)) => {
+                    child_host.bind_same_module_manifest(&im, &ty).is_ok()
+                }
+                _ => true,
+            }
+        }
+    };
+    Ok(bound.then_some((child_host, cinst, cas)))
+}
+
+/// Land an admitted child's program in `source` (a granted module is pushed and gets its own index)
+/// and build its entry task and its own natural dispatch table over that module — no installed §22
+/// units; #1296: sized for the install slots its re-granted `Jit` carries.
+fn child_task(
+    source: &ModuleSource,
+    program: ChildProgram,
+    entry: i64,
+    args: &[Value],
+    jit_table_log2: u8,
+) -> Result<(VTask, SharedSlots), Trap> {
+    let (module, prog) = match program {
+        ChildProgram::Spawner(m, p) => (m, p),
+        ChildProgram::Granted(c) => {
+            let m = source.push(c);
+            (m as u32, source.get(m).ok_or(Trap::Malformed)?)
+        }
+    };
+    let table = build_table_for(prog.progs.len(), jit_table_log2, module);
+    let mut vt = VTask::new(&prog, entry as usize, args)?;
+    vt.active.module = module as usize;
+    vt.active.home = module as usize;
+    Ok((vt, table))
 }
 
 /// Admit an op-15 spawn against `host` (the parent powerbox) and build the child. `pm` is the
@@ -1348,7 +1620,7 @@ fn admit_detached_child(
     grants: Option<(u64, u64)>,
     args: Option<(u64, u64)>,
     premap: Option<(i32, u64)>,
-) -> Result<Option<DetachedChild>, Trap> {
+) -> Result<Option<AdmittedChild>, Trap> {
     let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule, cshadow) = {
         let g = host.resolve_module(mh)?;
         (
@@ -1449,10 +1721,10 @@ fn admit_detached_child(
     } else {
         (quota as u64).min(parent_fuel)
     };
-    Ok(Some(DetachedChild {
-        mem,
+    Ok(Some(AdmittedChild {
+        mem: Some(mem),
         host: child_host,
-        compiled,
+        program: ChildProgram::Granted(compiled),
         args,
         fuel,
     }))
@@ -4380,52 +4652,24 @@ impl<'p> Vcpu<'p> {
                 // §14 executor children (THREADS.md 4c-domain §14-D2): this vCPU does all the
                 // authority-bearing validation/preparation, then surfaces a mechanical
                 // [`VcpuEvent::Instantiate`] for the host (a bad carve/entry lands `-EINVAL` in place
-                // and the run continues; a bad module handle traps).
-                Ok(VcpuStop::Instantiate {
-                    ibase,
-                    isize: isz,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                }) => {
-                    // op 11 (named grants) is driven by the scheduler `drive` arm (the browser's
-                    // `compile_and_run_with_host` path); this standalone single-vCPU resume path builds
-                    // no child powerbox, so it declines a grant list rather than silently drop it.
-                    if grants.is_some() {
-                        return VcpuEvent::Trapped(Trap::Malformed);
-                    }
-                    match self
-                        .event_instantiate(ibase, isz, entry, off, size_log2, quota, budget, dst)
-                    {
-                        Ok(Some(ev)) => return ev,
-                        Ok(None) => {} // -EINVAL landed in place — keep running
-                        Err(t) => return VcpuEvent::Trapped(t),
-                    }
-                }
-                Ok(VcpuStop::InstantiateModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                }) => {
-                    // op 13 (`instantiate_module_named`): re-grant the named cap list into the child's
-                    // powerbox (#1011 slice 3a production wiring) so a JIT-tier phase child resolves an
-                    // inherited `fs`/`stdout` by name. Parse + `can_regrant`-gate the list first (fail
-                    // closed before any spawn commits); then, once `event_instantiate_module` commits the
-                    // spawn, re-grant from this vCPU's own authority and stash the child powerbox for the
-                    // driver (`take_granted_host` → `new_confined_child_over_host`). A grant-less op-5
-                    // child is unchanged. (op 11's same-module named-grant form still declines below —
-                    // the nim driver spawns separate-module children, so only op 13 is wired here.)
+                // and the run continues; a bad module handle traps). A by-name grant list (op 13, a
+                // §3d record's) is parsed and `can_regrant`-gated first, so it fails closed before any
+                // spawn commits; once the spawn commits it is re-granted from this vCPU's own
+                // authority and the child powerbox stashed for the driver (`take_granted_host` →
+                // `new_confined_child_over_host`). A same-module child takes the same path as a module
+                // child (#1855: it used to trap `Malformed` on a grant list).
+                Ok(VcpuStop::Instantiate { spawn, dst }) => {
+                    let ConfinedSpawn {
+                        ibase,
+                        isize: isz,
+                        module,
+                        entry,
+                        off,
+                        size_log2,
+                        quota,
+                        grants,
+                        budget,
+                    } = spawn;
                     let glist = match grants {
                         Some((gptr, gn)) => match self.read_grant_list(gptr, gn) {
                             Ok(l) => Some(l),
@@ -4433,9 +4677,15 @@ impl<'p> Vcpu<'p> {
                         },
                         None => None,
                     };
-                    match self.event_instantiate_module(
-                        ibase, isz, mh, entry, off, size_log2, quota, budget, dst,
-                    ) {
+                    let committed = match module {
+                        None => self.event_instantiate(
+                            ibase, isz, entry, off, size_log2, quota, budget, dst,
+                        ),
+                        Some(mh) => self.event_instantiate_module(
+                            ibase, isz, mh, entry, off, size_log2, quota, budget, dst,
+                        ),
+                    };
+                    match committed {
                         Ok(Some(ev)) => {
                             if let Some(list) = glist {
                                 match self.regrant_list_into_child(&list) {
@@ -6360,6 +6610,27 @@ pub enum ScheduledWrite {
     },
 }
 
+/// Write a debugger edit into the window, journaling its pre-image at `turn` first. An edit is not an
+/// op, so [`journal_op`] never sees it; without this an `undo_to` past the edit left the edited bytes
+/// in place wherever the guest had not itself stored since (#1871). Journaled before the op at
+/// `turn` records its own pre-images, so undo — newest-first — unwinds the op, then the edit.
+fn journaled_write(
+    journal: &mut super::journal::Journal,
+    turn: u64,
+    m: &mut Mem,
+    addr: u64,
+    bytes: &[u8],
+) -> bool {
+    let Ok(width) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    let Ok(abs) = m.confine_checked(addr, 0, width) else {
+        return false;
+    };
+    journal.record_write(turn, abs, width, m);
+    m.write_bytes(addr, bytes).is_some()
+}
+
 /// Coerce + store `value` into the typed regs slot / window target. Best-effort like the live
 /// write: an unresolvable or float target is skipped.
 fn apply_target(
@@ -6368,6 +6639,8 @@ fn apply_target(
     width: usize,
     vm_regs: &mut [Reg],
     mem: &mut Option<Mem>,
+    journal: &mut super::journal::Journal,
+    turn: u64,
 ) {
     match target {
         Some(WriteTarget::Ssa { reg, ty }) => {
@@ -6383,7 +6656,7 @@ fn apply_target(
         Some(WriteTarget::Win { addr }) => {
             let w = width.clamp(1, 8);
             if let Some(m) = mem.as_mut() {
-                let _ = m.write_bytes(addr, &value.to_le_bytes()[..w]);
+                journaled_write(journal, turn, m, addr, &value.to_le_bytes()[..w]);
             }
         }
         None => {}
@@ -6404,6 +6677,7 @@ fn apply_due_writes(
     debug: Option<&DebugInfo>,
     fn_block_base: &[Vec<u32>],
     fn_block_types: &[Vec<Vec<ValType>>],
+    journal: &mut super::journal::Journal,
 ) {
     while *cursor < writes.len() && writes[*cursor].0 < turn {
         *cursor += 1;
@@ -6412,7 +6686,7 @@ fn apply_due_writes(
         match &writes[*cursor].1 {
             ScheduledWrite::Window { addr, bytes } => {
                 if let Some(m) = mem.as_mut() {
-                    let _ = m.write_bytes(*addr, bytes);
+                    journaled_write(journal, turn, m, *addr, bytes);
                 }
             }
             ScheduledWrite::Var {
@@ -6435,7 +6709,15 @@ fn apply_due_writes(
                             finished: matches!(t.state, DbgTaskState::Done(Ok(_))),
                         }
                         .write_target(*frame, name);
-                        apply_target(target, *value, *width, &mut t.vt.active.regs, mem);
+                        apply_target(
+                            target,
+                            *value,
+                            *width,
+                            &mut t.vt.active.regs,
+                            mem,
+                            journal,
+                            turn,
+                        );
                     }
                 }
             }
@@ -7269,25 +7551,12 @@ fn service_advance(
                 *turn += 1;
                 dbg_notify(tasks, ti, mem, extra_envs, base, count, dst);
             }
-            // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
-            Outcome::Instantiate {
-                ibase,
-                isize: isz,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            } => {
+            // §14 confined children (ops 0, 5, 13, 17): the executor's admission, scheduled as a debug
+            // task over its own `DbgEnv`, so a spawning guest stays steppable through its child.
+            Outcome::Instantiate { spawn, dst } => {
                 *turn += 1;
-                // op 11 (named-grant spawn) / a §3d budget record is not driven by the debugger path.
-                if grants.is_some() || budget != 0 {
-                    dbg_complete(tasks, ti, Err(Trap::Malformed));
-                } else if let Err(t) = dbg_instantiate(
-                    tasks, ti, extra_envs, source, mem, *fuel, ibase, isz, entry, off, size_log2,
-                    quota, dst,
+                if let Err(t) = dbg_instantiate_confined(
+                    tasks, ti, extra_envs, source, mem, *fuel, host, spawn, dst,
                 ) {
                     dbg_complete(tasks, ti, Err(t));
                 }
@@ -7310,30 +7579,6 @@ fn service_advance(
                 if let Err(t) = dbg_instantiate_detached(
                     tasks, ti, extra_envs, source, mem, *fuel, host, budget, mh, entry, size_log2,
                     quota, grants, args, premap, dst,
-                ) {
-                    dbg_complete(tasks, ti, Err(t));
-                }
-            }
-            // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
-            Outcome::InstantiateModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            } => {
-                *turn += 1;
-                // op 13 (named-grant spawn) / a §3d budget record is not driven by the debugger path.
-                if grants.is_some() || budget != 0 {
-                    dbg_complete(tasks, ti, Err(Trap::Malformed));
-                } else if let Err(t) = dbg_instantiate_module(
-                    tasks, ti, extra_envs, source, mem, *fuel, host, mh, ibase, isz, entry, off,
-                    size_log2, quota, dst,
                 ) {
                     dbg_complete(tasks, ti, Err(t));
                 }
@@ -7427,54 +7672,53 @@ fn service_advance(
     Serviced::Ran
 }
 
-/// §14 `instantiate` (op 0) under the debug scheduler: build a **confined executor child** as a new
-/// scheduled vCPU with its own [`DbgEnv`] (window / attenuated powerbox / quota), registered as a
-/// child handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it). The debug-engine counterpart
-/// of the production `drive`'s `Instantiate` arm — same carve + attenuation + natural table. Writes the
-/// handle (or `EINVAL`) to `dst`; `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`).
+/// §14 confined children (ops 0, 5, 13, 17) under the debug scheduler: [`admit_confined_child`] —
+/// the executor's admission and child powerbox — then [`dbg_start_child`]. Writes the handle (or
+/// `EINVAL`) to `dst`; `Err` is a trap the caller completes `ti` with: a forged module handle, an
+/// un-lowerable module, an unreadable grant list, or the vCPU-count bomb.
 #[allow(clippy::too_many_arguments)]
-fn dbg_instantiate(
+fn dbg_instantiate_confined(
     tasks: &mut Vec<DbgTask>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
     shared_mem: &Option<Mem>,
     shared_fuel: u64,
-    ibase: u64,
-    isz: u64,
-    entry: i64,
-    off: i64,
-    size_log2: i64,
-    quota: i64,
+    host: &mut Host,
+    spawn: ConfinedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
-    // The spawning frame's module (#1726) — the one the entry is validated against and the child runs.
-    let (cmod, c0) = spawner_module(source, &tasks[ti].vt.active).ok_or(Trap::Malformed)?;
-    // A confined child's entry is `(i64 instantiator) -> (i64)` or `(i64 instantiator, i64 address_space)
-    // -> (i64)`; the latter also gets an `AddressSpace` grant so it manages its own pages.
-    let sig = c0.sigs.get(entry as u64 as usize);
-    let arity = sig.map_or(0, |(p, _)| p.len());
-    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
+    // The spawning task's window and fuel, and the powerbox its handles resolve in: its own (#1727).
+    let (pm, owner, pfuel) = match tasks[ti].env {
+        None => (shared_mem.as_ref(), host, shared_fuel),
+        Some(k) => {
+            let e = &mut extra_envs[k];
+            (e.mem.as_ref(), &mut e.host, e.fuel)
+        }
     };
-    let off_u = off as u64;
-    let fits = carve_fits(
-        off_u,
-        size_log2,
-        isz,
-        ibase,
-        shared_mem.as_ref().map_or(0, |m| m.null_guard),
-    );
-    if !ok_entry || !fits {
+    let Some(child) = admit_confined_child(owner, pm, pfuel, source, &tasks[ti].vt.active, spawn)?
+    else {
         tasks[ti]
             .vt
             .active
             .set(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
-    }
+    };
+    dbg_start_child(tasks, ti, extra_envs, source, child, spawn.entry, dst)
+}
+
+/// Schedule an admitted §14/§5 child as a debug task over its own [`DbgEnv`], registered as a child
+/// handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it), and land the handle in `dst`.
+/// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`).
+fn dbg_start_child(
+    tasks: &mut Vec<DbgTask>,
+    ti: usize,
+    extra_envs: &mut Vec<DbgEnv>,
+    source: &ModuleSource,
+    child: AdmittedChild,
+    entry: i64,
+    dst: u32,
+) -> Result<(), Trap> {
     let live = tasks
         .iter()
         .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
@@ -7482,55 +7726,25 @@ fn dbg_instantiate(
     if live >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // instantiate bomb
     }
-    // Holder-relative `ibase`/`off` → backing-absolute base (so nesting composes); parent window base
-    // and fuel come from the parent's environment (shared or its own confined env).
-    let (pbase, pfuel) = match tasks[ti].env {
-        None => (
-            shared_mem.as_ref().map_or(0, |m| m.window.base()),
-            shared_fuel,
-        ),
-        Some(k) => (
-            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-            extra_envs[k].fuel,
-        ),
-    };
-    let abs_base = pbase + ibase + off_u;
-    let child_mem = match tasks[ti].env {
-        None => shared_mem
-            .as_ref()
-            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
-        Some(k) => extra_envs[k]
-            .mem
-            .as_ref()
-            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
-    };
-    // Attenuated powerbox over the child's *own* `[0, child_size)`: an `Instantiator` (so it can nest —
-    // confinement composes) and an `AddressSpace`; these are its entry arguments.
-    let mut child_host = Host::new();
-    let (cinst, cas) = child_host.grant_starter_caps(child_size);
-    let child_args = child_entry_args(arity, cinst, cas);
-    let child_fuel = if quota <= 0 {
-        pfuel
-    } else {
-        (quota as u64).min(pfuel)
-    };
-    // The child is its own domain: a fresh natural table over the module it runs (no installed §22
-    // units).
-    let child_table = build_table_for(c0.progs.len(), child_host.jit_table_log2(), cmod); // #1296
-    let mut child_vt = VTask::new(&c0, entry as u64 as usize, &child_args)?;
-    child_vt.active.module = cmod as usize;
-    child_vt.active.home = cmod as usize;
+    let AdmittedChild {
+        mem,
+        host,
+        program,
+        args,
+        fuel,
+    } = child;
+    let (vt, table) = child_task(source, program, entry, &args, host.jit_table_log2())?;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
-        mem: child_mem,
-        host: child_host,
-        table: child_table,
-        fuel: child_fuel,
+        mem,
+        host,
+        table,
+        fuel,
         fibers: Vec::new(),
     });
     let cidx = tasks.len();
     tasks.push(DbgTask {
-        vt: child_vt,
+        vt,
         threads: Vec::new(),
         env: Some(eidx),
         state: DbgTaskState::Runnable,
@@ -7542,155 +7756,9 @@ fn dbg_instantiate(
     Ok(())
 }
 
-/// §14 `instantiate_module` (op 5) under the debug scheduler: like [`dbg_instantiate`], but the confined
-/// executor child runs a **host-granted separate `Module`** — resolve it from the powerbox, compile it,
-/// **push it to the shared source** (so it dispatches by its own index, like a separate-module coroutine,
-/// slice 14c), materialize its data segments into the carve, and run the child over its own module. The
-/// debug-engine counterpart of the production `drive`'s `InstantiateModule` arm. Writes the handle (or
-/// `EINVAL`) to `dst`; `Err` for a forged/closed module handle, an un-lowerable module, or the vCPU bomb.
-#[allow(clippy::too_many_arguments)]
-fn dbg_instantiate_module(
-    tasks: &mut Vec<DbgTask>,
-    ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
-    source: &ModuleSource,
-    shared_mem: &Option<Mem>,
-    shared_fuel: u64,
-    host: &Host,
-    mh: i32,
-    ibase: u64,
-    isz: u64,
-    entry: i64,
-    off: i64,
-    size_log2: i64,
-    quota: i64,
-    dst: u32,
-) -> Result<(), Trap> {
-    // Resolve + clone the granted module from the spawning task's own powerbox (#1727). A
-    // forged/closed/wrong-type handle is an inert CapFault.
-    let owner = match tasks[ti].env {
-        None => host,
-        Some(k) => &extra_envs[k].host,
-    };
-    let (cfuncs, cmem_log2, cdata, ctypes, cshadow) = {
-        let g = owner.resolve_module(mh)?;
-        (
-            g.funcs.clone(),
-            g.memory_log2,
-            g.data.clone(),
-            g.types.clone(),
-            g.shadow,
-        )
-    };
-    let child_compiled = match compile_module(&cfuncs, &ctypes, cshadow) {
-        Some(c) => c,
-        None => return Err(Trap::Malformed),
-    };
-    // Entry sig is validated against the *child module*; a separate-module child's carve must equal its
-    // declared memory (§14 transparency — it runs exactly as it would standalone).
-    let sig = child_compiled.sigs.get(entry as u64 as usize);
-    let arity = sig.map_or(0, |(p, _)| p.len());
-    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off_u = off as u64;
-    let fits = carve_fits(
-        off_u,
-        size_log2,
-        isz,
-        ibase,
-        shared_mem.as_ref().map_or(0, |m| m.null_guard),
-    );
-    // A larger carve than the child's declared memory is a safe superset (§2 masks to the actual
-    // carve); the extra span is heap room for an allocating phase's `vm_map`. `<=`, matching the arms.
-    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
-    if !ok_entry || !fits || !mod_ok {
-        tasks[ti]
-            .vt
-            .active
-            .set(dst, Reg::from_i32(super::EINVAL as i32));
-        return Ok(());
-    }
-    let live = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
-        .count();
-    if live >= super::MAX_VCPUS {
-        return Err(Trap::ThreadFault);
-    }
-    let (pbase, pfuel) = match tasks[ti].env {
-        None => (
-            shared_mem.as_ref().map_or(0, |m| m.window.base()),
-            shared_fuel,
-        ),
-        Some(k) => (
-            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-            extra_envs[k].fuel,
-        ),
-    };
-    let abs_base = pbase + ibase + off_u;
-    // Materialize the module's data segments into the carve before the child runs, then the view.
-    let child_mem = {
-        let pm: Option<&Mem> = match tasks[ti].env {
-            None => shared_mem.as_ref(),
-            Some(k) => extra_envs[k].mem.as_ref(),
-        };
-        if let Some(m) = pm {
-            for d in cdata.iter() {
-                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                    for (k, &b) in d.bytes.iter().enumerate() {
-                        m.set_byte(abs_base + d.offset + k as u64, b);
-                    }
-                }
-            }
-        }
-        pm.map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
-    };
-    let mut child_host = Host::new();
-    let (cinst, cas) = child_host.grant_starter_caps(child_size);
-    let child_args = child_entry_args(arity, cinst, cas);
-    let child_fuel = if quota <= 0 {
-        pfuel
-    } else {
-        (quota as u64).min(pfuel)
-    };
-    // Push the child's compiled module and run the child over it — its own domain: a natural table
-    // mapping into *its* pushed module index (the mutable-Domain step, like a separate-module coroutine).
-    let progs_len = child_compiled.progs.len();
-    let cm = source.push(child_compiled);
-    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-    let cunit = source.get(cm).ok_or(Trap::Malformed)?;
-    let mut child_vt = VTask::new(&cunit, entry as u64 as usize, &child_args)?;
-    child_vt.active.module = cm;
-    child_vt.active.home = cm;
-    let eidx = extra_envs.len();
-    extra_envs.push(DbgEnv {
-        mem: child_mem,
-        host: child_host,
-        table: child_table,
-        fuel: child_fuel,
-        fibers: Vec::new(),
-    });
-    let cidx = tasks.len();
-    tasks.push(DbgTask {
-        vt: child_vt,
-        threads: Vec::new(),
-        env: Some(eidx),
-        state: DbgTaskState::Runnable,
-        at_bp: false,
-    });
-    let handle = tasks[ti].threads.len() as i32;
-    tasks[ti].threads.push(Some(cidx));
-    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-    Ok(())
-}
-
-/// §5 `instantiate_detached` (op 15) on the debugger path — [`dbg_instantiate_module`]'s twin over a
-/// **fresh window** instead of a carve. Admission and the child powerbox are [`admit_detached_child`]
-/// (the executor's); the child is a `DbgTask` over its own `DbgEnv`, joined like a confined child's.
+/// §5 `instantiate_detached` (op 15) on the debugger path — [`dbg_instantiate_confined`]'s twin over
+/// a **fresh window** instead of a carve. Admission and the child powerbox are [`admit_detached_child`]
+/// (the executor's); the child is scheduled by [`dbg_start_child`], joined like a confined child.
 #[allow(clippy::too_many_arguments)]
 fn dbg_instantiate_detached(
     tasks: &mut Vec<DbgTask>,
@@ -7728,47 +7796,7 @@ fn dbg_instantiate_detached(
             .set(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    let live = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
-        .count();
-    if live >= super::MAX_VCPUS {
-        return Err(Trap::ThreadFault);
-    }
-    let DetachedChild {
-        mem: fm,
-        host: child_host,
-        compiled: child_compiled,
-        args: child_args,
-        fuel: child_fuel,
-    } = child;
-    let progs_len = child_compiled.progs.len();
-    let cm = source.push(child_compiled);
-    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-    let cunit = source.get(cm).ok_or(Trap::Malformed)?;
-    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
-    child_vt.active.module = cm;
-    child_vt.active.home = cm;
-    let eidx = extra_envs.len();
-    extra_envs.push(DbgEnv {
-        mem: Some(fm),
-        host: child_host,
-        table: child_table,
-        fuel: child_fuel,
-        fibers: Vec::new(),
-    });
-    let cidx = tasks.len();
-    tasks.push(DbgTask {
-        vt: child_vt,
-        threads: Vec::new(),
-        env: Some(eidx),
-        state: DbgTaskState::Runnable,
-        at_bp: false,
-    });
-    let handle = tasks[ti].threads.len() as i32;
-    tasks[ti].threads.push(Some(cidx));
-    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-    Ok(())
+    dbg_start_child(tasks, ti, extra_envs, source, child, entry, dst)
 }
 
 /// `thread.join`: deliver a finished child's result now, else park the joiner. Mirrors `drive`'s `Join`.
@@ -8353,6 +8381,7 @@ impl ScheduledDebugRun {
         }
         self.host.restore_journal_cursor(&cursor);
         self.turn = anchor;
+        self.rewind_write_cursor(); // re-execution re-applies the writes it passes
         self.clock = cont.clock;
         self.locate();
         self.last_watch = None;
@@ -8375,6 +8404,7 @@ impl ScheduledDebugRun {
             self.locate();
             self.last_watch = None;
         }
+        self.apply_writes_due_now();
         self.turn == turn
     }
 
@@ -8410,8 +8440,48 @@ impl ScheduledDebugRun {
     /// travel stays truthful. The cursor lands past entries at turns already passed.
     pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
         writes.sort_by_key(|(c, _)| *c);
-        self.write_cursor = writes.partition_point(|(c, _)| *c < self.turn);
         self.scheduled_writes = writes;
+        self.rewind_write_cursor();
+    }
+
+    /// Put the scheduled-write cursor at the first write not yet passed — those at turns before the
+    /// run's own. Called wherever the run's turn moves other than by a tick.
+    fn rewind_write_cursor(&mut self) {
+        let turn = self.turn;
+        self.write_cursor = self.scheduled_writes.partition_point(|(c, _)| *c < turn);
+    }
+
+    /// Apply the scheduled writes due at the run's **current** turn. A write made while stopped at turn
+    /// `t` is part of the state at `t` — the live run shows it there — but the landing replay of a
+    /// `seek` or `undo_to` stops *before* the op at `t`, where a tick would have applied it. Every
+    /// landing calls this so the state at `t` is the same on every path (#1871). A no-op when nothing
+    /// is due, and idempotent: the cursor moves past what it applies, so the tick at `t` won't repeat it.
+    pub fn apply_writes_due_now(&mut self) {
+        let Self {
+            source,
+            mem,
+            tasks,
+            turn,
+            fn_block_base,
+            fn_block_types,
+            debug,
+            journal,
+            scheduled_writes,
+            write_cursor,
+            ..
+        } = self;
+        apply_due_writes(
+            scheduled_writes,
+            write_cursor,
+            *turn,
+            tasks,
+            source,
+            mem,
+            debug.as_ref(),
+            fn_block_base,
+            fn_block_types,
+            journal,
+        );
     }
 
     /// The focused task index (the one a `write_var` resolves in) — the backend records it on a
@@ -8652,6 +8722,7 @@ impl ScheduledDebugRun {
                 debug.as_ref(),
                 fn_block_base,
                 fn_block_types,
+                journal,
             );
             if let Some(sink) = access_sink.as_mut() {
                 let cur_vm = tasks[ti].vt.debug_active();
@@ -8797,6 +8868,7 @@ impl ScheduledDebugRun {
             debug.as_ref(),
             fn_block_base,
             fn_block_types,
+            journal,
         );
         if let Some(sink) = access_sink.as_mut() {
             let cur_vm = tasks[ti].vt.debug_active();
@@ -9265,10 +9337,10 @@ impl ScheduledDebugRun {
     /// **Write bytes into the shared guest window** (slice 8, the DAP `writeMemory` backend). `false`
     /// if the range is unmapped or the module has no memory.
     pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        let turn = self.turn;
         self.mem
             .as_mut()
-            .and_then(|m| m.write_bytes(addr, bytes))
-            .is_some()
+            .is_some_and(|m| journaled_write(&mut self.journal, turn, m, addr, bytes))
     }
 
     /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's
@@ -9347,15 +9419,14 @@ fn exec_image_build(
 ) -> Result<(Host, SharedSlots, VTask), i64> {
     // Resolve and compile the command first: `Host::exec_image` is the commit point (it hands the
     // caller's personality to the new powerbox), so everything that can still refuse must come
-    // before it.
+    // before it. A command this run already compiled is not compiled again.
     let command = cur_host.exec_module(cmd)?;
-    let cmodule = std::sync::Arc::clone(&command.0.module);
-    let child_compiled = compile_module(
-        &command.0.funcs,
-        &cmodule.types,
-        cmodule.memory.and_then(|x| x.shadow),
-    )
-    .ok_or(super::EINVAL)?;
+    let cm = dom
+        .source
+        .command(&command.0.digest, || {
+            compile_module(&command.0.funcs, &command.0.types, command.0.shadow)
+        })
+        .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
     // layout) from the caller window, then admit + build through the one rule every engine shares:
     // the command's entry, its fit in the caller's backed prefix, the grants' regrantability, the
@@ -9397,12 +9468,10 @@ fn exec_image_build(
     // `exec_image` released the old image's own pipe ends (the fork-inherited ones the exec did not
     // carry). Empty for a command that inherited no CorePipe ends (the rung-1/2a case); non-empty
     // ends need the pipe-EOF wake the cooperative engine does not yet drive — a later rung.
-    // Push the command as a new domain unit + build its natural table + activation.
+    // Build the command's natural table + activation over its unit.
     let child_host = img.host;
-    let progs_len = child_compiled.progs.len();
-    let cm = dom.source.push(child_compiled);
-    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
+    let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     new_vt.active.module = cm;
     new_vt.active.home = cm;
@@ -9605,42 +9674,15 @@ enum Outcome {
     PipeWrite {
         pipe: u32,
     },
-    /// §14 `Instantiator.instantiate`: the authority `(ibase, isize)` is resolved; the driver builds a
-    /// **confined executor child** running entry `entry` over `[ibase+off, +2^size_log2)` with its own
-    /// attenuated powerbox and `quota` fuel, registers it (handle = thread slot), and writes the handle
-    /// (or `EINVAL`) to `dst`. Unlike a coroutine, the child runs on the scheduler — joinable via the
-    /// shared thread machinery (`Instantiator.join` compiles to [`Outcome::ThreadJoin`]).
+    /// §14 `Instantiator.instantiate` / `instantiate_module[_named]` / a §3d record (ops 0, 5, 13,
+    /// 17): the authority `(ibase, isize)` is resolved; the driver builds the **confined executor
+    /// child** `spawn` describes with its own attenuated powerbox, registers it (handle = thread
+    /// slot), and writes the handle (or `EINVAL`) to `dst`. Unlike a coroutine, the child runs on the
+    /// scheduler — joinable via the shared thread machinery (`Instantiator.join` compiles to
+    /// [`Outcome::ThreadJoin`]).
     Instantiate {
-        ibase: u64,
-        isize: u64,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
+        spawn: ConfinedSpawn,
         dst: u32,
-        /// op 11 (`instantiate_named`): the grant-list `(ptr, count)` (op 0 is `None`), read from the
-        /// register operands so the driver can re-grant the named caps into the child's powerbox.
-        grants: Option<(u64, u64)>,
-        /// §3d (op 17): the record's `Budget` handle (`0` = none). The driver **funds** the child
-        /// from it at its commit site — peek-then-drain, so a refused spawn leaves it intact.
-        budget: i32,
-    },
-    /// §14 `Instantiator.instantiate_module`: like [`Outcome::Instantiate`], plus the resolved
-    /// `Module` handle `mh` whose granted program the child runs (the driver resolves + compiles it).
-    InstantiateModule {
-        ibase: u64,
-        isize: u64,
-        mh: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
-        dst: u32,
-        /// op 13 `instantiate_module_named`: the resolved `(grants_ptr, grants_n)` window coordinates
-        /// of the child's by-name grant list (op 5 is `None`).
-        grants: Option<(u64, u64)>,
-        /// §3d (op 17): the record's `Budget` handle (`0` = none) — see [`Outcome::Instantiate`].
-        budget: i32,
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286): a separate-module child in a fresh
     /// host-minted window. `budget` is the `Budget` handle (admission = quota take), `grants`
@@ -10044,6 +10086,19 @@ impl VTask {
             root_shadow_sp: c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0), // §12.8 4A.5: empty root = frame base
             active_invoke: None,
         })
+    }
+
+    /// Free a finished task's frames: its register file, call stack and parked fibers. It never
+    /// runs again; its result lives in its [`TaskState::Done`].
+    fn release(&mut self) {
+        let vm = &mut self.active;
+        vm.regs = Vec::new();
+        vm.stack = Vec::new();
+        vm.scratch = Vec::new();
+        vm.setjmp_points = std::collections::BTreeMap::new();
+        vm.sig_handler_stack = Vec::new();
+        self.chain = Vec::new();
+        self.active_invoke = None;
     }
 
     /// The continuation a debug engine is currently stepping: a §22 invoked unit's `Vm`
@@ -10841,7 +10896,6 @@ fn drive_nested(
             // (`temen_run::invoke_refuses`). An *installed* unit spawns like the base module (#1726).
             // (A tier-up bounce — `run_meta` `Some` — keeps the catch-all's refusal below.)
             Outcome::Instantiate { .. }
-            | Outcome::InstantiateModule { .. }
             | Outcome::InstantiateDetached { .. }
             | Outcome::ChildOffer { .. }
                 if run_meta.is_none() =>
@@ -10962,38 +11016,11 @@ enum VcpuStop {
         handle: i32,
         dst: u32,
     },
-    /// §14 `Instantiator.instantiate` — the driver (which owns the task set / extra environments)
-    /// builds the confined executor child and registers it as a joinable thread.
+    /// §14 confined child (ops 0, 5, 13, 17): the driver (which owns the task set / extra
+    /// environments) admits it with [`admit_confined_child`] and registers it as a joinable thread.
     Instantiate {
-        ibase: u64,
-        isize: u64,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
+        spawn: ConfinedSpawn,
         dst: u32,
-        /// op 11 `instantiate_named`: resolved `(grants_ptr, grants_n)` window coordinates of the
-        /// child's by-name grant list (op 0 is `None`).
-        grants: Option<(u64, u64)>,
-        /// §3d (op 17): the record's `Budget` handle (`0` = none) — funded at the driver's commit.
-        budget: i32,
-    },
-    /// §14 `Instantiator.instantiate_module` — the driver additionally resolves + compiles the
-    /// host-granted `Module` (`mh`) and runs it as the confined child's program.
-    InstantiateModule {
-        ibase: u64,
-        isize: u64,
-        mh: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
-        dst: u32,
-        /// op 13 `instantiate_module_named`: resolved `(grants_ptr, grants_n)` window coordinates of
-        /// the child's by-name grant list (op 5 is `None`).
-        grants: Option<(u64, u64)>,
-        /// §3d (op 17): the record's `Budget` handle (`0` = none) — see above.
-        budget: i32,
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
@@ -11157,13 +11184,27 @@ fn step_vcpu(
                     fibers.with(|f, _, _| f[id] = FiberState::Done);
                     // Fiber switch (returning fiber → its resumer): re-point the durable shadow-SP.
                     fibers.shadow_switch(ctx, vt, id, rid);
+                    // #1835: a fiber that unwound for the freeze (frames in its region) did not
+                    // return. This driver does not keep it as residue, so its resumer's re-issue on
+                    // thaw faults rather than reload a placeholder.
+                    let frozen = ctx.durable
+                        && ctx.mem.as_ref().is_some_and(|m| {
+                            m.durable_state() == super::STATE_UNWINDING
+                                && fibers.with(|_, sp, _| sp[id])
+                                    > m.shadow_arena().frame_base(id + 1)
+                        });
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
                     let tls = vt.active.tls;
                     vt.active = resumer;
                     vt.active.tls = tls;
                     vt.active_id = rid;
-                    vt.active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
+                    let status = if frozen {
+                        super::FIBER_FROZEN
+                    } else {
+                        super::FIBER_RETURNED
+                    };
+                    vt.active.set(rdst, Reg::from_i32(status));
                     vt.active.set(rdst + 1, Reg::from_value(retval));
                 }
             },
@@ -11511,54 +11552,7 @@ fn step_vcpu(
             Outcome::PipeRead { pipe } => return Ok(VcpuStop::PipeRead { pipe }),
             Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
             Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
-            Outcome::Instantiate {
-                ibase,
-                isize: isz,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            } => {
-                return Ok(VcpuStop::Instantiate {
-                    ibase,
-                    isize: isz,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                })
-            }
-            Outcome::InstantiateModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            } => {
-                return Ok(VcpuStop::InstantiateModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                })
-            }
+            Outcome::Instantiate { spawn, dst } => return Ok(VcpuStop::Instantiate { spawn, dst }),
             Outcome::InstantiateDetached {
                 budget,
                 mh,
@@ -11706,6 +11700,61 @@ fn task_host<'a>(host: &'a mut Host, envs: &'a [ChildEnv], env: Option<usize>) -
         None => HostCell::Excl(host),
         Some(k) => HostCell::Shared(&envs[k].host),
     }
+}
+
+/// Schedule an admitted §14/§5 child as a task of the cooperative executor over its own environment,
+/// registered as a child handle of task `ti`, and land the handle in `dst`. `tierup` is the run's
+/// eligibility bitmap and page-check flag, for a child that inherits them (see the confined arm).
+/// `Err(ThreadFault)` on the vCPU-count bomb; the caller completes `ti` with it.
+#[allow(clippy::too_many_arguments)]
+fn coop_start_child(
+    tasks: &mut Vec<TaskSlot>,
+    extra_envs: &mut Vec<ChildEnv>,
+    ti: usize,
+    source: &ModuleSource,
+    child: AdmittedChild,
+    entry: i64,
+    dst: u32,
+    tierup: Option<(std::sync::Arc<[bool]>, bool)>,
+) -> Result<(), Trap> {
+    let live = tasks
+        .iter()
+        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+        .count();
+    if live >= super::MAX_VCPUS {
+        return Err(Trap::ThreadFault); // instantiate bomb
+    }
+    let AdmittedChild {
+        mem,
+        host,
+        program,
+        args,
+        fuel,
+    } = child;
+    let (mut vt, table) = child_task(source, program, entry, &args, host.jit_table_log2())?;
+    if let Some((eligible, page_checked)) = tierup {
+        vt.active.jit_eligible = Some(eligible);
+        vt.active.jit_page_checked = page_checked;
+    }
+    let eidx = extra_envs.len();
+    extra_envs.push(ChildEnv {
+        mem,
+        host: std::sync::Arc::new(std::sync::Mutex::new(host)),
+        table,
+        fuel,
+        fibers: FiberTables::default(),
+    });
+    let cidx = tasks.len();
+    tasks.push(TaskSlot {
+        vt,
+        threads: Vec::new(),
+        env: Some(eidx),
+        state: TaskState::Runnable,
+    });
+    let handle = tasks[ti].threads.len() as i32;
+    tasks[ti].threads.push(Some(cidx));
+    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+    Ok(())
 }
 
 /// A scheduled vCPU and its blocking state.
@@ -12291,9 +12340,11 @@ impl CoopSched {
                     live[k] |= !matches!(t.state, TaskState::Done(_));
                 }
             }
+            let mut finished: Vec<usize> = Vec::new();
             for k in 0..extra_envs.len() {
                 if seen[k] && !live[k] && released_envs.insert(k) {
                     extra_envs[k].host.lock_unpoisoned().release_pipe_ends();
+                    finished.push(k);
                 }
             }
             // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
@@ -12320,6 +12371,19 @@ impl CoopSched {
                     h(status);
                 }
                 hooked_twins.insert(ti2);
+            }
+            // A finished domain gives back what it held — its window, its powerbox, its frames — now
+            // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
+            // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
+            // build that forks and execs a compiler per module grew by a window per process.
+            for k in finished {
+                let env = &mut extra_envs[k];
+                env.mem = None;
+                env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+                env.fibers = FiberTables::default();
+                for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
+                    t.vt.release();
+                }
             }
             // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
             // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
@@ -13470,224 +13534,66 @@ impl CoopSched {
                     tasks[ti].threads.push(Some(cidx));
                     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
-                Ok(VcpuStop::Instantiate {
-                    ibase,
-                    isize: isz,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                }) => {
-                    // Validate the child entry signature against the spawning frame's module (a
-                    // same-module child, #1726): it returns one `i64` and takes either its
-                    // `Instantiator` (one `i64`) or its `Instantiator`+`AddressSpace` (two) — its
-                    // starter caps over its own window.
-                    let (cmod, c0) =
-                        spawner_module(&dom.source, &tasks[ti].vt.active).ok_or(Trap::Malformed)?;
-                    let arity = c0.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
-                    let ok_entry = c0
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, r)| child_entry_ok(p, r));
-                    // The carve must be a power-of-two-aligned sub-window within `[0, isize)` — a child
-                    // gets only what the holder sub-allocates (§14/D19).
-                    let child_size = if (0..64).contains(&size_log2) {
-                        1u64 << size_log2
-                    } else {
-                        0
+                // §14 confined children (ops 0, 5, 13, 17): admitted by the one shared
+                // `admit_confined_child` against the spawning task's own window, fuel and powerbox
+                // (#1727), then a task of this executor over its own environment — a nested child is
+                // its own domain (a fresh natural table over the module it runs, no installed §22
+                // units). `join` is the shared seam below.
+                Ok(VcpuStop::Instantiate { spawn, dst }) => {
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    let off_u = off as u64;
-                    // #1094: the guard-overlap check must use the *spawning task's own* window guard,
-                    // not the root's. A nested child running in a sub-guard (< 16384) carve is
-                    // unguarded (`seed_null_guard` skips it, `null_guard == 0`), so a low grandchild
-                    // carve is legal there; a child in a carve at or above the guard is guarded like a
-                    // root (#1206) and refuses one — the OS-thread parallel driver already reads the
-                    // child's own `mem` (this file, the parallel `Instantiate` arm), so the cooperative
-                    // driver must match it or the two engines diverge on depth-2 nesting.
-                    let holder_guard = match tasks[ti].env {
-                        None => mem.as_ref().map_or(0, |m| m.null_guard),
-                        Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.null_guard),
+                    let pfuel = match tasks[ti].env {
+                        None => *fuel,
+                        Some(k) => extra_envs[k].fuel,
                     };
-                    let fits = carve_fits(off_u, size_log2, isz, ibase, holder_guard);
-                    if !ok_entry || !fits {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                    let live = tasks
-                        .iter()
-                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                        .count();
-                    if live >= super::MAX_VCPUS {
-                        complete(tasks, ti, Err(Trap::ThreadFault)); // instantiate bomb
-                        continue;
-                    }
-                    // The parent's window base (holder-relative `ibase`/`off` → backing-absolute, so
-                    // nesting composes) and fuel (the child's quota is sub-allocated from, and capped by,
-                    // the parent's) come from the parent's environment.
-                    let (pbase, pfuel) = match tasks[ti].env {
-                        None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
-                        Some(k) => (
-                            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-                            extra_envs[k].fuel,
-                        ),
-                    };
-                    let abs_base = pbase + ibase + off_u;
-                    let child_mem = match tasks[ti].env {
-                        None => mem
-                            .as_ref()
-                            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
-                        Some(k) => extra_envs[k]
-                            .mem
-                            .as_ref()
-                            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
-                    };
-                    // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
-                    // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
-                    // over its *own* `[0, child_size)` window — its entry arguments. op 0 grants only
-                    // those two; op 11 (`grants` is `Some((ptr, n))`) additionally re-grants a by-name cap
-                    // list read from the parent window, so a spawned stage resolves an inherited region
-                    // (a ring end) by name — the concurrent-pipeline spawn. The named build fails closed
-                    // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm). Grants and the
-                    // budget resolve in the spawning task's own powerbox (#1727).
-                    let mut owner = task_host(host, extra_envs, tasks[ti].env);
-                    let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants
-                    {
-                        // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
-                        // records from the parent window (identical to the op-13 `InstantiateModule` arm).
-                        let pm: Option<&Mem> = match tasks[ti].env {
-                            None => mem.as_ref(),
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                        };
-                        let list = pm.ok_or(Trap::Malformed).and_then(|m| {
-                            super::read_grant_records(grants_ptr, grants_n, |o, l| {
-                                m.read_window(o, l)
-                            })
-                        });
-                        let list = match list {
-                            Ok(l) => l,
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                        };
-                        match owner.with(|h| h.spawn_named_child(&list, child_size)) {
-                            Some(triple) => triple,
-                            None => {
-                                complete(tasks, ti, Err(Trap::CapFault));
-                                continue;
-                            }
+                    let spawner = &tasks[ti].vt.active;
+                    let admitted = task_host(host, extra_envs, tasks[ti].env)
+                        .with(|h| admit_confined_child(h, pm, pfuel, &dom.source, spawner, spawn));
+                    let child = match admitted {
+                        Ok(Some(c)) => c,
+                        Ok(None) => {
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
                         }
-                    } else {
-                        let mut ch = Host::new();
-                        let (cinst, cas) = ch.grant_starter_caps(child_size);
-                        (ch, cinst, cas)
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
                     };
-                    // §3.6: a same-module child serves over the shared program — its serve machinery
-                    // (enqueue admission, handler resolution) and any `child_offer` shape read the
-                    // domain's registered module, exactly the tree-walker's `self_module` handoff.
-                    child_host.set_self_module_opt(owner.with(|h| h.self_module.clone()));
-                    // #1234: and its import manifest is ours too — bind the *parent's* manifest
-                    // against the child's attenuated powerbox, the same binder + `CHILD_BINDABLE`
-                    // policy the op-13 separate-module arm uses below (and the tree-walker's op-0
-                    // arm). Without it a nested copy of the parent `CapFault`s on its first
-                    // `call.import` despite holding a granted `stdout`/`jit`. Only for a child the
-                    // spawn handed caps to by name: a grant-less child has nothing to bind and
-                    // keeps its empty, fail-closed slots.
-                    if grants.is_some() {
-                        let im = child_host.module_imports(super::SELF_MODULE);
-                        let ty = child_host.module_types(super::SELF_MODULE);
-                        if let (Some(im), Some(ty)) = (im, ty) {
-                            if child_host.bind_same_module_manifest(&im, &ty).is_err() {
-                                tasks[ti]
-                                    .vt
-                                    .active
-                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
-                                continue;
-                            }
+                    // #816 env-routed tier-up: a same-module child runs the spawner's module, so the
+                    // run's bitmap applies to it too — inherited when the child's window is servable
+                    // (`nested_view` shares the parent backing, so a root-lineage carve always is; a
+                    // fork twin's descendant is gated by its backing like the twin). The driver serves
+                    // each of the child's tier-ups over its own carve via the pending-env routing
+                    // (`CoopRun::pending_win`/`mem_map_info`); the emitted module's per-access live
+                    // bound (elision off for instantiator-bearing modules, temen-wasm-jit
+                    // `elide_bound`) confines them to the carve.
+                    let tierup = match (&child.program, eligible.as_ref()) {
+                        (ChildProgram::Spawner(..), Some(e))
+                            if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
+                        {
+                            Some((std::sync::Arc::clone(e), *page_checked))
                         }
-                    }
-                    let child_args = child_entry_args(arity, cinst, cas);
-                    // §3d: a record's budget funds the child here — the commit site, after every
-                    // other refusal (geometry, grants), so a refused spawn leaves it intact.
-                    // #989 slice 1b — peek the budget's `channel` cap BEFORE `take_spawn_budget`
-                    // drains it, so a funded spawn can stamp the child's host-served channel ceiling.
-                    let chan_cap = (budget != 0)
-                        .then(|| owner.with(|h| h.peek_budget(budget).map(|b| b.channel)))
-                        .flatten();
-                    let child_fuel = if budget != 0 {
-                        match owner.with(|h| take_spawn_budget(h, budget, child_size, pfuel)) {
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                            Ok(None) => {
-                                tasks[ti]
-                                    .vt
-                                    .active
-                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
-                                continue;
-                            }
-                            Ok(Some(f)) => {
-                                // Funded spawn committed — bound the child's channel memory (`-1` =
-                                // unbounded, a no-op vs. the default).
-                                if let Some(cap) = chan_cap {
-                                    child_host.set_channel_cap(cap);
-                                }
-                                f
-                            }
-                        }
-                    } else if quota <= 0 {
-                        pfuel
-                    } else {
-                        (quota as u64).min(pfuel)
+                        _ => None,
                     };
-                    // A nested child is its **own** domain: a fresh natural table over the module it
-                    // runs (no access to installed §22 units — matching the tree-walker's
-                    // `DomainTable::new(&cfuncs, 0)`). (#1296: reserving the install slots the child's
-                    // re-granted `Jit` carries.)
-                    let child_table =
-                        build_table_for(c0.progs.len(), child_host.jit_table_log2(), cmod);
-                    let mut child_vt = VTask::new(&c0, entry as usize, &child_args)?;
-                    child_vt.active.module = cmod as usize;
-                    child_vt.active.home = cmod as usize;
-                    // #816 env-routed tier-up: a same-module confined child runs module 0, so the
-                    // run's bitmap applies to it too — inherit it when the child's window is
-                    // servable (`nested_view` shares the parent backing, so a root-lineage carve
-                    // always is; a fork twin's descendant is gated by its backing like the twin).
-                    // The driver serves each of the child's tier-ups over its own carve via the
-                    // pending-env routing (`CoopRun::pending_win`/`mem_map_info`); the emitted
-                    // module's per-access live bound (elision off for instantiator-bearing modules,
-                    // temen-wasm-jit `elide_bound`) confines them to the carve.
-                    if tierup_servable(child_mem.as_ref(), mem.as_ref()) {
-                        if let Some(e) = eligible.as_ref() {
-                            child_vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
-                            child_vt.active.jit_page_checked = *page_checked;
-                        }
+                    let started = coop_start_child(
+                        tasks,
+                        extra_envs,
+                        ti,
+                        &dom.source,
+                        child,
+                        spawn.entry,
+                        dst,
+                        tierup,
+                    );
+                    if let Err(t) = started {
+                        complete(tasks, ti, Err(t));
                     }
-                    let eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
-                        mem: child_mem,
-                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                        table: child_table,
-                        fuel: child_fuel,
-                        fibers: FiberTables::default(),
-                    });
-                    let cidx = tasks.len();
-                    tasks.push(TaskSlot {
-                        vt: child_vt,
-                        threads: Vec::new(),
-                        env: Some(eidx),
-                        state: TaskState::Runnable,
-                    });
-                    let handle = tasks[ti].threads.len() as i32;
-                    tasks[ti].threads.push(Some(cidx));
-                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
                 // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
                 // **fresh window of its own** (`Mem::with_reservation`, its own guard) — not a carve —
@@ -13736,257 +13642,19 @@ impl CoopSched {
                             continue;
                         }
                     };
-                    let live = tasks
-                        .iter()
-                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                        .count();
-                    if live >= super::MAX_VCPUS {
-                        complete(tasks, ti, Err(Trap::ThreadFault));
-                        continue;
-                    }
-                    let DetachedChild {
-                        mem: fm,
-                        host: child_host,
-                        compiled: child_compiled,
-                        args: child_args,
-                        fuel: child_fuel,
-                    } = child;
-                    let progs_len = child_compiled.progs.len();
-                    let cm = dom.source.push(child_compiled);
-                    let child_table =
-                        build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
-                    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
-                    child_vt.active.module = cm;
-                    child_vt.active.home = cm;
-                    let eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
-                        mem: Some(fm),
-                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                        table: child_table,
-                        fuel: child_fuel,
-                        fibers: FiberTables::default(),
-                    });
-                    let cidx = tasks.len();
-                    tasks.push(TaskSlot {
-                        vt: child_vt,
-                        threads: Vec::new(),
-                        env: Some(eidx),
-                        state: TaskState::Runnable,
-                    });
-                    let handle = tasks[ti].threads.len() as i32;
-                    tasks[ti].threads.push(Some(cidx));
-                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
-                }
-                Ok(VcpuStop::InstantiateModule {
-                    ibase,
-                    isize: isz,
-                    mh,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                    budget,
-                }) => {
-                    // Resolve the granted Module in the spawning task's own powerbox (#1727; a
-                    // forged/closed/wrong-type handle is an inert CapFault). Its grants and budget below
-                    // resolve there too.
-                    let mut owner = task_host(host, extra_envs, tasks[ti].env);
-                    let resolved = owner.with(|h| {
-                        h.resolve_module(mh).map(|g| {
-                            (
-                                g.funcs.clone(),
-                                g.memory_log2,
-                                g.data.clone(),
-                                std::sync::Arc::clone(&g.module),
-                            )
-                        })
-                    });
-                    let (cfuncs, cmem_log2, cdata, cmodule) = match resolved {
-                        Ok(r) => r,
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    // Compile the granted module to bytecode. A module using an op the engine can't lower
-                    // is the one place a guest-provided program outruns coverage (no tree-walker fallback
-                    // mid-run) — a `Malformed` trap, exactly as for `Jit.install`.
-                    let child_compiled = match compile_module(
-                        &cfuncs,
-                        &cmodule.types,
-                        cmodule.memory.and_then(|x| x.shadow),
-                    ) {
-                        Some(c) => c,
-                        None => {
-                            complete(tasks, ti, Err(Trap::Malformed));
-                            continue;
-                        }
-                    };
-                    // The child entry sig is validated against the *child module*. A separate-module
-                    // child's carve must equal its declared memory (§14 transparency: it runs exactly as
-                    // it would standalone — same window size, same wrap behaviour).
-                    let arity = child_compiled
-                        .sigs
-                        .get(entry as usize)
-                        .map_or(0, |(p, _)| p.len());
-                    let ok_entry = child_compiled
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, r)| child_entry_ok(p, r));
-                    let child_size = if (0..64).contains(&size_log2) {
-                        1u64 << size_log2
-                    } else {
-                        0
-                    };
-                    let off_u = off as u64;
-                    let fits = carve_fits(
-                        off_u,
-                        size_log2,
-                        isz,
-                        ibase,
-                        mem.as_ref().map_or(0, |m| m.null_guard),
+                    let started = coop_start_child(
+                        tasks,
+                        extra_envs,
+                        ti,
+                        &dom.source,
+                        child,
+                        entry,
+                        dst,
+                        None,
                     );
-                    // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
-                    // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
-                    // carve, and the span above the declared memory is the heap room an allocating phase grows into
-                    // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
-                    let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
-                    if !ok_entry || !fits || !mod_ok {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
+                    if let Err(t) = started {
+                        complete(tasks, ti, Err(t));
                     }
-                    let live = tasks
-                        .iter()
-                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                        .count();
-                    if live >= super::MAX_VCPUS {
-                        complete(tasks, ti, Err(Trap::ThreadFault));
-                        continue;
-                    }
-                    let (pbase, pfuel) = match tasks[ti].env {
-                        None => (mem.as_ref().map_or(0, |m| m.window.base()), *fuel),
-                        Some(k) => (
-                            extra_envs[k].mem.as_ref().map_or(0, |m| m.window.base()),
-                            extra_envs[k].fuel,
-                        ),
-                    };
-                    let abs_base = pbase + ibase + off_u;
-                    // Build the child window and materialize the module's data segments into the carve
-                    // (exactly as if the child wrote them; the verifier bounded them to its declared window
-                    // == the carve). RO protection of `readonly` segments is skipped for nested children
-                    // (intra-domain self-corruption is a §1 non-goal), matching the tree-walker.
-                    let child_mem = {
-                        let pm: Option<&Mem> = match tasks[ti].env {
-                            None => mem.as_ref(),
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                        };
-                        if let Some(m) = pm {
-                            for d in cdata.iter() {
-                                if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                                    for (k, &b) in d.bytes.iter().enumerate() {
-                                        m.set_byte(abs_base + d.offset + k as u64, b);
-                                    }
-                                }
-                            }
-                        }
-                        pm.map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
-                    };
-                    // op 5 grants only Instantiator+AddressSpace; op 13 (`grants` is `Some((ptr, n))`)
-                    // additionally re-grants a by-name cap list read from the parent window, so a spawned
-                    // command resolves an inherited `stdout` by name (STAGE1.md — the shell "exec"
-                    // primitive). The named build fails closed via the shared, fuzzed `spawn_named_child`.
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    let (mut child_host, cinst, cas) = match owner
-                        .with(|h| named_child_host(h, pm, grants, child_size, &cmodule))
-                    {
-                        Ok(Some(triple)) => triple,
-                        // A `required` import slot with nothing to bind: probeable `-EINVAL`, as
-                        // the tree-walker answers, never a trap.
-                        Ok(None) => {
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    let child_args = child_entry_args(arity, cinst, cas);
-                    // §3d: a record's budget funds the child here — the commit site, after every
-                    // other refusal (module resolve, geometry, grants, manifest binding).
-                    // #989 slice 1b — peek the channel cap before `take_spawn_budget` drains it.
-                    let chan_cap = (budget != 0)
-                        .then(|| owner.with(|h| h.peek_budget(budget).map(|b| b.channel)))
-                        .flatten();
-                    let child_fuel = if budget != 0 {
-                        match owner.with(|h| take_spawn_budget(h, budget, child_size, pfuel)) {
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                            Ok(None) => {
-                                tasks[ti]
-                                    .vt
-                                    .active
-                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
-                                continue;
-                            }
-                            Ok(Some(f)) => {
-                                // Funded spawn committed — bound the child's channel memory from the
-                                // funding budget's `channel` (see the same-module arm; `-1` = unbounded).
-                                if let Some(cap) = chan_cap {
-                                    child_host.set_channel_cap(cap);
-                                }
-                                f
-                            }
-                        }
-                    } else if quota <= 0 {
-                        pfuel
-                    } else {
-                        (quota as u64).min(pfuel)
-                    };
-                    // Push the child's compiled module and run the child over it — its own domain: a
-                    // natural table mapping into *its* module index (no installed §22 units).
-                    let progs_len = child_compiled.progs.len();
-                    let cm = dom.source.push(child_compiled);
-                    // #1296: the child's own table reserves the install slots its re-granted `Jit`
-                    // table carries (none ⇒ natural).
-                    let child_table =
-                        build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
-                    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
-                    child_vt.active.module = cm;
-                    child_vt.active.home = cm;
-                    let eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
-                        mem: child_mem,
-                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                        table: child_table,
-                        fuel: child_fuel,
-                        fibers: FiberTables::default(),
-                    });
-                    let cidx = tasks.len();
-                    tasks.push(TaskSlot {
-                        vt: child_vt,
-                        threads: Vec::new(),
-                        env: Some(eidx),
-                        state: TaskState::Runnable,
-                    });
-                    let handle = tasks[ti].threads.len() as i32;
-                    tasks[ti].threads.push(Some(cidx));
-                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
                 Ok(VcpuStop::Join { handle, dst }) => {
                     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
@@ -14481,6 +14149,17 @@ pub struct TierUpConfig {
     pub page_checked: bool,
 }
 
+/// What a [`CoopRun`] holds ([`CoopRun::footprint`]): the memory a process tree costs its embedder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Footprint {
+    /// Process windows: the root's, and each child's that has not finished. A finished process
+    /// gives its window back.
+    pub windows: usize,
+    /// Compiled programs: the root's, one per command the run's processes exec'd, and any unit
+    /// installed or spawned. A command exec'd again runs the program its first exec compiled.
+    pub units: usize,
+}
+
 /// A pause of the cooperative tier-up driver [`CoopRun`], mirroring the single-vCPU [`VcpuEvent`]'s
 /// tier-up-relevant subset. The cooperative driver services concurrency (`thread.spawn`, join, futex
 /// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
@@ -14791,6 +14470,15 @@ impl CoopRun {
     /// no SharedArrayBuffer), keeps the deterministic cooperative schedule.
     pub fn set_suspend_on_idle(&mut self, on: bool) {
         self.sched.suspend_on_idle = on;
+    }
+
+    /// What the run holds now ([`Footprint`]).
+    pub fn footprint(&self) -> Footprint {
+        let children = self.sched.extra_envs.iter().filter(|e| e.mem.is_some());
+        Footprint {
+            windows: usize::from(self.mem.is_some()) + children.count(),
+            units: self.dom.source.snapshot().len(),
+        }
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
@@ -16078,114 +15766,34 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // run** on its own scoped thread — joinable through the parent's registry exactly like a
             // `thread.spawn` child. Unlike a `thread.spawn` child (which shares this vCPU's `Mem`
             // view + the shared powerbox), it owns all of these — the §14 confinement.
-            Ok(VcpuStop::Instantiate {
-                ibase,
-                isize: isz,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            }) => {
-                // op 11 (named-grant spawn) / a §3d budget record is driven only by the cooperative
-                // single-thread `drive` path (the browser's wasm-safe entry); the OS-thread parallel
-                // driver declines them.
-                if grants.is_some() || budget != 0 {
-                    return (Err(Trap::Malformed), mem);
-                }
-                // Validate the child entry signature against the spawning frame's module (#1726) and
-                // the power-of-two-aligned carve within `[0, isize)` — identical to the cooperative
-                // `drive` arm.
-                let Some((cmod, c0)) = spawner_module(&dom.source, &vt.active) else {
-                    return (Err(Trap::Malformed), mem);
+            // §14 confined children (ops 0, 5, 13, 17): the executor's admission, under the host lock —
+            // so a budget or a grant list is served here as there (#1855) — then a scoped OS thread
+            // over the carve. This vCPU's own `mem`/`fuel` *are* its environment: a confined parent
+            // already runs on its own thread with its own confined view.
+            Ok(VcpuStop::Instantiate { spawn, dst }) => {
+                let admitted = {
+                    let mut hg = host.lock_unpoisoned();
+                    admit_confined_child(
+                        &mut hg,
+                        mem.as_ref(),
+                        fuel,
+                        &dom.source,
+                        &vt.active,
+                        spawn,
+                    )
                 };
-                let arity = c0.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
-                let ok_entry = c0
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, r)| child_entry_ok(p, r));
-                let child_size = if (0..64).contains(&size_log2) {
-                    1u64 << size_log2
-                } else {
-                    0
-                };
-                let off_u = off as u64;
-                let fits = carve_fits(
-                    off_u,
-                    size_log2,
-                    isz,
-                    ibase,
-                    mem.as_ref().map_or(0, |m| m.null_guard),
-                );
-                if !ok_entry || !fits {
-                    vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
-                }
-                // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
-                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                    > super::MAX_VCPUS
-                {
-                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    return (Err(Trap::ThreadFault), mem);
-                }
-                // This vCPU's own `mem`/`fuel` *are* its environment (no `extra_envs` indirection —
-                // a confined parent already runs on its own thread with its own confined view), so
-                // holder-relative `ibase`/`off` compose straight onto the backing-absolute base.
-                let pbase = mem.as_ref().map_or(0, |m| m.window.base());
-                let abs_base = pbase + ibase + off_u;
-                let child_mem = mem
-                    .as_ref()
-                    .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()));
-                let mut child_host = Host::new();
-                let (cinst, cas) = child_host.grant_starter_caps(child_size);
-                let child_args = child_entry_args(arity, cinst, cas);
-                let child_fuel = if quota <= 0 {
-                    fuel
-                } else {
-                    (quota as u64).min(fuel)
-                };
-                // Own table over the **shared** source, mapping into the module the child runs.
-                let child_table =
-                    build_table_for(c0.progs.len(), child_host.jit_table_log2(), cmod); // #1296
-                let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
-                let mut child_vt = match VTask::new(&c0, entry as usize, &child_args) {
-                    Ok(v) => v,
+                let child = match admitted {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
                     Err(t) => return (Err(t), mem),
                 };
-                child_vt.active.module = cmod as usize;
-                child_vt.active.home = cmod as usize;
-                let id = reg
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                scope.spawn(move || {
-                    // A confined nested run: the child owns its domain (own table, shared source
-                    // `Arc`), its attenuated powerbox (`Excl`), its `nested_view` window, its quota,
-                    // and its **own** thread registry (for threads/instantiates *it* spawns). Its
-                    // result is published to the **parent's** `reg` so the parent's `join` finds it.
-                    let child_reg = ThreadRegistry::new();
-                    let child_host = std::sync::Arc::new(std::sync::Mutex::new(child_host));
-                    let (r, _m) = std::thread::scope(|cscope| {
-                        run_vcpu_parallel(
-                            cscope,
-                            &child_dom,
-                            &child_reg,
-                            std::sync::Arc::clone(&child_host),
-                            std::sync::Arc::new(ParDomain::default()),
-                            None,
-                            child_vt,
-                            child_mem,
-                            child_fuel,
-                        )
-                    });
-                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
-                    child_host.lock_unpoisoned().release_pipe_ends();
-                    reg.publish(id, r);
-                });
-                let handle = threads.len() as i32;
-                threads.push(Some(id));
-                vt.active.set(dst, Reg::from_i32(handle));
+                match par_start_child(scope, dom, reg, &mut threads, child, spawn.entry) {
+                    Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
+                    Err(t) => return (Err(t), mem),
+                }
             }
             // §5 `instantiate_detached` (op 15): a fresh window of its own on its own OS thread — the
             // cooperative executor's spawn (`admit_detached_child`, the same admission and child
@@ -16226,260 +15834,67 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                    > super::MAX_VCPUS
-                {
-                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    return (Err(Trap::ThreadFault), mem);
-                }
-                let DetachedChild {
-                    mem: fm,
-                    host: child_host,
-                    compiled: child_compiled,
-                    args: child_args,
-                    fuel: child_fuel,
-                } = child;
-                let progs_len = child_compiled.progs.len();
-                let cm = dom.source.push(child_compiled);
-                let child_table =
-                    build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-                let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
-                let cunit = match child_dom.source.get(cm) {
-                    Some(u) => u,
-                    None => return (Err(Trap::Malformed), mem),
-                };
-                let mut child_vt = match VTask::new(&cunit, entry as usize, &child_args) {
-                    Ok(v) => v,
+                match par_start_child(scope, dom, reg, &mut threads, child, entry) {
+                    Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
-                };
-                child_vt.active.module = cm;
-                child_vt.active.home = cm;
-                let id = reg
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                scope.spawn(move || {
-                    let child_reg = ThreadRegistry::new();
-                    let child_host = std::sync::Arc::new(std::sync::Mutex::new(child_host));
-                    let (r, _m) = std::thread::scope(|cscope| {
-                        run_vcpu_parallel(
-                            cscope,
-                            &child_dom,
-                            &child_reg,
-                            std::sync::Arc::clone(&child_host),
-                            std::sync::Arc::new(ParDomain::default()),
-                            None,
-                            child_vt,
-                            Some(fm),
-                            child_fuel,
-                        )
-                    });
-                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
-                    child_host.lock_unpoisoned().release_pipe_ends();
-                    reg.publish(id, r);
-                });
-                let handle = threads.len() as i32;
-                threads.push(Some(id));
-                vt.active.set(dst, Reg::from_i32(handle));
-            }
-            // §14 `Instantiator.instantiate_module` (THREADS.md 4c-domain) — a **separate-module**
-            // confined child: the host (which holds the powerbox) is locked to resolve + clone the
-            // granted `Module`, it is compiled to bytecode and **pushed to the shared source** (so it
-            // resolves by index, like a `Jit.invoke` transient), the child's data segments are
-            // materialized into the carve, and the child runs over its own table mapping into *its*
-            // pushed module index. Everything else (confined window, attenuated powerbox, quota, own
-            // registry, nested scoped thread, join) is exactly as op 0.
-            Ok(VcpuStop::InstantiateModule {
-                ibase,
-                isize: isz,
-                mh,
-                entry,
-                off,
-                size_log2,
-                quota,
-                dst,
-                grants,
-                budget,
-            }) => {
-                // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
-                // handle is an inert CapFault → trap). #1570: this comes **first**, before any
-                // feature check — the arm used to test `grants`/`budget` up front and answer
-                // `Trap::Malformed`, so a forged handle got that instead of the `CapFault` the
-                // cooperative driver gives it. Same op, same forged handle, one answer.
-                let (cfuncs, cmem_log2, cdata, ctypes, cshadow, cmodule) = {
-                    let g = host.lock_unpoisoned();
-                    match g.resolve_module(mh) {
-                        Ok(grant) => (
-                            grant.funcs.clone(),
-                            grant.memory_log2,
-                            grant.data.clone(),
-                            grant.types.clone(),
-                            grant.shadow,
-                            std::sync::Arc::clone(&grant.module),
-                        ),
-                        Err(t) => return (Err(t), mem),
-                    }
-                };
-                // Compile to bytecode — a module using an op the engine can't lower is the one place a
-                // guest-provided program outruns coverage (a `Malformed` trap, as for `Jit.install`).
-                let child_compiled = match compile_module(&cfuncs, &ctypes, cshadow) {
-                    Some(c) => c,
-                    None => return (Err(Trap::Malformed), mem),
-                };
-                // Validate the entry against the *child module* and the carve; a separate-module
-                // child's carve must equal its declared memory (§14 transparency).
-                let arity = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .map_or(0, |(p, _)| p.len());
-                let ok_entry = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, r)| child_entry_ok(p, r));
-                let child_size = if (0..64).contains(&size_log2) {
-                    1u64 << size_log2
-                } else {
-                    0
-                };
-                let off_u = off as u64;
-                let fits = carve_fits(
-                    off_u,
-                    size_log2,
-                    isz,
-                    ibase,
-                    mem.as_ref().map_or(0, |m| m.null_guard),
-                );
-                // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 / #773
-                // — a larger window is a safe superset: confinement (§2) still masks every access to the actual
-                // carve, and the span above the declared memory is the heap room an allocating phase grows into
-                // via `vm_map`). `<=`, matching the cooperative/parallel drive arms.
-                let mod_ok = cmem_log2.is_some_and(|ml| ml <= size_log2 as u8);
-                if !ok_entry || !fits || !mod_ok {
-                    vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                    continue;
                 }
-                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                    > super::MAX_VCPUS
-                {
-                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    return (Err(Trap::ThreadFault), mem);
-                }
-                let pbase = mem.as_ref().map_or(0, |m| m.window.base());
-                let abs_base = pbase + ibase + off_u;
-                // Materialize the module's data segments into the carve *before* spawning the child
-                // (the write happens-before the child thread, so it sees them), then the confined view.
-                let child_mem = {
-                    if let Some(m) = mem.as_ref() {
-                        for d in cdata.iter() {
-                            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                                for (k, &b) in d.bytes.iter().enumerate() {
-                                    m.set_byte(abs_base + d.offset + k as u64, b);
-                                }
-                            }
-                        }
-                    }
-                    mem.as_ref()
-                        .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
-                };
-                // #1570 — the child powerbox, through the same [`named_child_host`] the cooperative
-                // arm uses: the by-name grant list re-granted in, the running module registered, and
-                // the child module's import manifest bound. This driver used to decline grants
-                // outright *and* never bind the manifest, so even a grant-free child's imports went
-                // unbound here while the cooperative driver bound them. Re-granting works because
-                // the child's `Host` is still local at this point — it moves to the child's own OS
-                // thread below, which is exactly what op 15 already relies on.
-                let built = {
-                    let mut hg = host.lock_unpoisoned();
-                    named_child_host(&mut hg, mem.as_ref(), grants, child_size, &cmodule)
-                };
-                let (mut child_host, cinst, cas) = match built {
-                    Ok(Some(triple)) => triple,
-                    // A `required` import slot with nothing to bind: probeable, never a trap.
-                    Ok(None) => {
-                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                    Err(t) => return (Err(t), mem),
-                };
-                let child_args = child_entry_args(arity, cinst, cas);
-                // A §3d budget record funds the spawn from a `Budget` rather than the `quota` scalar
-                // — the same `take_spawn_budget` the cooperative arm charges, so the two drivers
-                // spend the same quota for the same spawn.
-                let chan_cap = (budget != 0)
-                    .then(|| {
-                        host.lock_unpoisoned()
-                            .peek_budget(budget)
-                            .map(|b| b.channel)
-                    })
-                    .flatten();
-                let child_fuel = if budget != 0 {
-                    let taken = {
-                        let mut hg = host.lock_unpoisoned();
-                        take_spawn_budget(&mut hg, budget, child_size, fuel)
-                    };
-                    match taken {
-                        Err(t) => return (Err(t), mem),
-                        Ok(None) => {
-                            vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                        Ok(Some(f)) => {
-                            if let Some(cap) = chan_cap {
-                                child_host.set_channel_cap(cap);
-                            }
-                            f
-                        }
-                    }
-                } else if quota <= 0 {
-                    fuel
-                } else {
-                    (quota as u64).min(fuel)
-                };
-                // Push the compiled module to the **shared** source and run the child over its own
-                // table mapping into *its* module index (no parent install slots).
-                let progs_len = child_compiled.progs.len();
-                let cm = dom.source.push(child_compiled);
-                let child_table =
-                    build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
-                let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
-                let cunit = match child_dom.source.get(cm) {
-                    Some(u) => u,
-                    None => return (Err(Trap::Malformed), mem),
-                };
-                let mut child_vt = match VTask::new(&cunit, entry as usize, &child_args) {
-                    Ok(v) => v,
-                    Err(t) => return (Err(t), mem),
-                };
-                child_vt.active.module = cm;
-                child_vt.active.home = cm;
-                let id = reg
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                scope.spawn(move || {
-                    let child_reg = ThreadRegistry::new();
-                    let child_host = std::sync::Arc::new(std::sync::Mutex::new(child_host));
-                    let (r, _m) = std::thread::scope(|cscope| {
-                        run_vcpu_parallel(
-                            cscope,
-                            &child_dom,
-                            &child_reg,
-                            std::sync::Arc::clone(&child_host),
-                            std::sync::Arc::new(ParDomain::default()),
-                            None,
-                            child_vt,
-                            child_mem,
-                            child_fuel,
-                        )
-                    });
-                    // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
-                    child_host.lock_unpoisoned().release_pipe_ends();
-                    reg.publish(id, r);
-                });
-                let handle = threads.len() as i32;
-                threads.push(Some(id));
-                vt.active.set(dst, Reg::from_i32(handle));
             }
         }
     }
+}
+
+/// Start an admitted §14/§5 child on its own scoped OS thread — its own domain (a natural table over
+/// the shared source), attenuated powerbox, window, fuel and thread registry (for the threads and
+/// children *it* spawns) — publishing its result to this vCPU's `reg`, where `join` finds it. Returns
+/// the join handle; `Err(ThreadFault)` on the cross-thread vCPU-count bomb (the cooperative driver's
+/// `live >= MAX_VCPUS`).
+fn par_start_child<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    dom: &'env Domain,
+    reg: &'env ThreadRegistry,
+    threads: &mut Vec<Option<u64>>,
+    child: AdmittedChild,
+    entry: i64,
+) -> Result<i32, Trap> {
+    if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 > super::MAX_VCPUS {
+        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return Err(Trap::ThreadFault);
+    }
+    let AdmittedChild {
+        mem,
+        host,
+        program,
+        args,
+        fuel,
+    } = child;
+    let (vt, table) = child_task(&dom.source, program, entry, &args, host.jit_table_log2())?;
+    let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), table);
+    let id = reg
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    scope.spawn(move || {
+        let child_reg = ThreadRegistry::new();
+        let child_host = std::sync::Arc::new(std::sync::Mutex::new(host));
+        let (r, _m) = std::thread::scope(|cscope| {
+            run_vcpu_parallel(
+                cscope,
+                &child_dom,
+                &child_reg,
+                std::sync::Arc::clone(&child_host),
+                std::sync::Arc::new(ParDomain::default()),
+                None,
+                vt,
+                mem,
+                fuel,
+            )
+        });
+        // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
+        child_host.lock_unpoisoned().release_pipe_ends();
+        reg.publish(id, r);
+    });
+    let handle = threads.len() as i32;
+    threads.push(Some(id));
+    Ok(handle)
 }
 
 /// Mark task `ti` finished with `res`, then wake any vCPU parked on `thread.join` of it: an `Ok`
@@ -18084,15 +17499,18 @@ impl Vm {
                     self.base = base;
                     self.pc = pc + 1;
                     return Ok(Outcome::Instantiate {
-                        ibase,
-                        isize: isz,
-                        entry,
-                        off,
-                        size_log2,
-                        quota,
+                        spawn: ConfinedSpawn {
+                            ibase,
+                            isize: isz,
+                            module: None,
+                            entry,
+                            off,
+                            size_log2,
+                            quota,
+                            grants,
+                            budget: 0,
+                        },
                         dst,
-                        grants,
-                        budget: 0,
                     });
                 }
                 // §14 separate-module executor child — like `Instantiate`, but the first arg is a
@@ -18122,17 +17540,19 @@ impl Vm {
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::InstantiateModule {
-                        ibase,
-                        isize: isz,
-                        mh,
-                        entry,
-                        off,
-                        size_log2,
-                        quota,
+                    return Ok(Outcome::Instantiate {
+                        spawn: ConfinedSpawn {
+                            ibase,
+                            isize: isz,
+                            module: Some(mh),
+                            entry,
+                            off,
+                            size_log2,
+                            quota,
+                            grants,
+                            budget: 0,
+                        },
                         dst,
-                        grants,
-                        budget: 0,
                     });
                 }
                 // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
@@ -18250,31 +17670,19 @@ impl Vm {
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(if modh >= 0 {
-                        Outcome::InstantiateModule {
+                    return Ok(Outcome::Instantiate {
+                        spawn: ConfinedSpawn {
                             ibase,
                             isize: isz,
-                            mh: modh,
+                            module: (modh >= 0).then_some(modh),
                             entry,
                             off,
                             size_log2,
                             quota,
-                            dst,
                             grants,
                             budget,
-                        }
-                    } else {
-                        Outcome::Instantiate {
-                            ibase,
-                            isize: isz,
-                            entry,
-                            off,
-                            size_log2,
-                            quota,
-                            dst,
-                            grants,
-                            budget,
-                        }
+                        },
+                        dst,
                     });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery

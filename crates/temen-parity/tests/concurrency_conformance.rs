@@ -213,7 +213,8 @@ fn the_concurrency_column_matches_what_the_two_drivers_actually_do() {
 /// guard also preceded the module resolve, so a forged handle got that trap instead of the
 /// `CapFault` the cooperative driver gives; and that arm never called `bind_child_manifest`, so a
 /// child's imports went unbound where the cooperative driver bound them. Fixed in #1570 by giving
-/// both drivers one `named_child_host`.
+/// both drivers one child-host build (since #1855 the whole admission is one:
+/// `admit_confined_child`).
 ///
 /// Reaching op 13's admission at all needs a real `Module` handle and a matching `size_log2` — see
 /// `Row::mint`. With the sweep's zeros it dies at the handle resolve, which is why the original

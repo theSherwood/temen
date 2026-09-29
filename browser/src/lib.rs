@@ -30,6 +30,8 @@ use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimc;
+mod nimony;
+pub use nimony::{nim_build, NimBuild};
 pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
@@ -2737,8 +2739,12 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 fuel,
             } => {
                 // A carve of a detached window is not addressable as `win + carve` in the engine
-                // memory (see [`ParVcpu::detached`]): fail closed.
-                if v.detached {
+                // memory (see [`ParVcpu::detached`]): fail closed. So is a spawn whose by-name grant
+                // list the engine re-granted and stashed (op 13, a §3d record's): the child's powerbox
+                // is rebuilt from these inert integers in its own Worker, so the grants have no path
+                // there, and running the child without them would be a silent answer — the detached
+                // arm below refuses the same way.
+                if v.detached || v.inner.take_granted_host().is_some() {
                     return PAR_TRAP;
                 }
                 v.a = ((module as i64) << 32) | entry as i64;
@@ -4074,7 +4080,7 @@ pub fn bash_exec_with(
     m: &temen_ir::Module,
     argv: &[&[u8]],
     stdin: &[u8],
-    bins: &[(&str, &temen_ir::Module, u8)],
+    bins: &[(&str, &temen_ir::Module)],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         trap: None,
@@ -4091,7 +4097,9 @@ pub fn bash_exec_with(
     let Some(compiled) = bytecode::compile_reserved(m) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
-    bash_run_over_compiled(m, compiled, argv, stdin, bins)
+    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
+        bins.iter().map(|&(path, cm)| (cm, vec![path])).collect();
+    bash_run_over_compiled(m, compiled, argv, stdin, &commands)
 }
 
 /// #1145 — the **mask domain** (`1 << N` bytes) a browser bash window runs in. `bash.temen` declares a
@@ -4112,7 +4120,7 @@ fn bash_run_over_compiled(
     compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
     argv: &[&[u8]],
     stdin: &[u8],
-    bins: &[(&str, &temen_ir::Module, u8)],
+    commands: &[(&temen_ir::Module, Vec<&str>)],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         trap: None,
@@ -4124,7 +4132,16 @@ fn bash_run_over_compiled(
         stderr: Vec::new(),
         framebuffer: None,
     };
-    let Some((mut host, posix, init_mem)) = bash_host_build(m, argv, stdin, bins, false) else {
+    let env = bash_env(false);
+    let run = PosixRun {
+        argv,
+        env: &env,
+        stdin,
+        commands,
+        interactive: false,
+        loader: false,
+    };
+    let Some((mut host, posix, init_mem)) = posix_host_build(m, &run) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
     let mut fuel = u64::MAX;
@@ -4200,93 +4217,120 @@ fn cached_bash_program(
     Some((&c.module, std::sync::Arc::clone(&c.compiled)))
 }
 
-/// The shared powerbox build for a bash run ([`bash_exec_with`] and the #1122 interactive
-/// [`temen_bash_session`]): the on-ramp gate, the personality grant (+ terminal + external-wake
-/// doorbell when `interactive`), the `vm_map` bindings, the `/bin` registry, and the argv/env blob.
-/// `None` = not a bash-shaped module.
-fn bash_host_build(
-    m: &temen_ir::Module,
-    argv: &[&[u8]],
-    stdin: &[u8],
-    bins: &[(&str, &temen_ir::Module, u8)],
+/// A POSIX process the browser runs, besides its module: what [`posix_host_build`] gives it.
+struct PosixRun<'a> {
+    argv: &'a [&'a [u8]],
+    /// Its environment, both where a program reads it from its arguments (`envp`, bash) and where it
+    /// asks the personality for it (`getenv`, a nim program).
+    env: &'a [(&'a str, &'a str)],
+    stdin: &'a [u8],
+    /// The commands its processes can `execve`: each module is granted once, at every path listed.
+    commands: &'a [(&'a temen_ir::Module, Vec<&'a str>)],
+    /// #1122 — an interactive session: the #797 controlling terminal (keystrokes arrive via
+    /// `feed_terminal`, from another wasm-thread instantiation over the shared memory) and the
+    /// external-wake doorbell, so the cooperative pump blocks its Worker when every process waits on
+    /// the terminal (bash at the prompt) instead of faulting as a deadlock.
     interactive: bool,
+    /// #763 — whether its processes may run programs they build: a `ModuleLoader`, which every
+    /// fork and exec carries, promotes a file holding a module's encoding at its `execve`.
+    loader: bool,
+}
+
+/// The powerbox of a POSIX process the browser runs — bash ([`bash_exec_with`], the #1122 sessions)
+/// and nimony's driver ([`nimony::nim_build`]): the on-ramp gate, the personality, the import
+/// bindings, the command registry, and the argv/env blob. `None` = not a `_start`-shaped module.
+///
+/// The personality is the whole forkable POSIX surface (fork, signals, exec-remap, fd and process
+/// ops), `grant` wiring what the native `bash_probe` and the nim lane's runs do. It serves no heap
+/// (`0,0`): each program brings its own allocator, which grows into the window's reserved tail through
+/// the core's memory ops. It owns stdin (`read(0)`) and stdout/stderr.
+fn posix_host_build(
+    m: &temen_ir::Module,
+    run: &PosixRun,
 ) -> Option<(Host, temen_posix::Posix, Vec<u8>)> {
-    // The on-ramp shape gate: a `vm_map`-importing bash module is a named-powerbox entry (paramless
-    // `_start`), so `onramp_check` passes it; a non-bash module falls closed here.
+    // The on-ramp shape gate: a named-powerbox entry (paramless `_start`); anything else falls
+    // closed here.
     if onramp_check(m).is_err() {
         return None;
     }
     use temen_interp::cap_id;
     let mut host = Host::new();
-    // The personality — the full forkable POSIX surface (fork, signals, exec-remap, fd/process ops),
-    // `grant` wiring exactly what `bash_probe`'s native `cap` does. Heap `0,0`: bash brings its own
-    // `malloc` (below), so the personality serves no heap. It owns stdin (`read(0)`) and stdout/stderr.
-    let (px_h, posix) = temen_posix::grant(&mut host, 0, 0, stdin.to_vec());
-    // Reached by name: bash's shim resolves the personality via `__vm_cap_resolve("posix")`.
+    let (px_h, posix) = temen_posix::grant(&mut host, 0, 0, run.stdin.to_vec());
+    // Reached by name too: bash's shim resolves the personality via `__vm_cap_resolve("posix")`.
     host.register_cap_name("posix", px_h);
-    if interactive {
-        // #1122 — the interactive session: the #797 controlling terminal (keystrokes arrive via
-        // `feed_terminal` from ANOTHER wasm-thread instantiation over the shared memory) and the
-        // external-wake doorbell, so the cooperative pump BLOCKS this Worker at its all-parked
-        // point (bash waiting at the prompt) instead of faulting as a deadlock.
+    if run.interactive {
         posix.enable_terminal(&mut host);
         host.arm_external_wake();
     }
-    // bash's single manifest import `vm_map` (`AddressSpace` op 0) is its `malloc`'s page-commit op —
-    // bind it to a growable memory cap (`base 0, size u64::MAX`) so the heap grows into the reserved
-    // tail. Other AddressSpace ops (`vm_unmap`/`vm_protect`/`vm_page_size`) share the same handle.
+    // A program's imports are the personality's ops (`__px_<op>`) and the core's memory ops, which
+    // commit its heap into the reserved tail, all through one growable memory cap (`base 0, size
+    // u64::MAX`). Anything else stays unbound and fails closed at dispatch.
     let mem_h = host.grant_memory();
     let bindings = m
         .imports
         .iter()
-        .map(|im| match im.name.as_str() {
-            "vm_map" | "vm_unmap" | "vm_protect" | "vm_page_size" | "vm_region_create" => {
-                let op = match im.name.as_str() {
-                    "vm_map" => 0,
-                    "vm_unmap" => 1,
-                    "vm_protect" => 2,
-                    "vm_page_size" => 3,
-                    _ => 5,
-                };
-                temen_interp::BoundImport::required(cap_id::ADDRESS_SPACE, op, mem_h)
+        .map(|im| {
+            let memory = temen_ir::default_cap_resolver(&im.name)
+                .filter(|c| c.type_id == cap_id::ADDRESS_SPACE);
+            if let Some(c) = memory {
+                temen_interp::BoundImport::required(c.type_id, c.op, mem_h)
+            } else if let Some(c) = temen_posix::resolve_import(&im.name) {
+                temen_interp::BoundImport::required(c.type_id, c.op, px_h)
+            } else {
+                temen_interp::BoundImport::rebindable(0, 0, None)
             }
-            // A bash module should import only the AddressSpace ops; anything else is unexpected —
-            // leave the slot unbound so it fails closed at dispatch rather than mis-binding.
-            _ => temen_interp::BoundImport::rebindable(0, 0, None),
         })
         .collect();
     host.set_import_bindings(bindings);
-    // Optional /bin: register each command module as a filesystem executable so `execve("/bin/<cmd>")`
-    // spawns it (op 13). `register_executable` is the personality's exec-bit registry.
-    for (path, cm, wl) in bins {
+    for (cm, paths) in run.commands {
         let ch = host.grant_module(cm);
-        posix.register_executable(path, ch, *wl);
+        let wl = cm.memory.map_or(0, |mc| mc.size_log2);
+        for path in paths {
+            posix.register_executable(path, ch, wl);
+        }
     }
-    // Seed `argv` + a minimal `env` at the module's powerbox args base (`{argc,envc}` LE prefix +
-    // packed NUL strings), where the synthesized `_start` reads it. `PATH=/bin` lets bash resolve an
-    // external command (`seq` → `/bin/seq`, registered above) for fork → execve; `HOME=/` is the
-    // conventional minimum (the `bash_probe` env).
-    // The interactive session's prompt (bash prints PS1 on fd 2 between commands) and the
-    // #1496 terminal description: readline runs its real redisplay against the personality's
-    // fixed termcap entry (80×24, no auto-margin — the CSI subset the playground pane renders).
-    let term = format!("TERM={}", temen_posix::TERM_NAME);
-    let termcap = format!("TERMCAP={}", temen_posix::TERMCAP_ENTRY);
-    let env: Vec<&[u8]> = if interactive {
-        vec![
-            b"PATH=/bin",
-            b"HOME=/",
-            b"PS1=$ ",
-            term.as_bytes(),
-            termcap.as_bytes(),
-        ]
-    } else {
-        vec![b"PATH=/bin", b"HOME=/"]
-    };
-    let blob = temen_ir::write_args_blob(argv, &env);
+    if run.loader {
+        host.set_module_validator(module_blob_validator);
+        host.grant_module_loader();
+    }
+    for (name, value) in run.env {
+        posix.set_env(name, value);
+    }
+    // `argv` and `envp` at the module's powerbox args base (`{argc,envc}` LE prefix + packed NUL
+    // strings), where the synthesized `_start` reads them.
+    let env: Vec<String> = run.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let env: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
+    let blob = temen_ir::write_args_blob(run.argv, &env);
     let base = temen_ir::module_args_base() as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Some((host, posix, init_mem))
+}
+
+/// The decode+verify gate a `ModuleLoader` promotes a program through (temen-run's
+/// `module_blob_validator`): bytes that do not decode, or a module that does not verify, are
+/// `-EINVAL` and nothing is minted.
+fn module_blob_validator(bytes: &[u8]) -> Result<temen_ir::Module, i64> {
+    let m = temen_encode::decode_module(bytes).map_err(|_| temen_ir::errno::EINVAL)?;
+    temen_verify::verify_module(&m).map_err(|_| temen_ir::errno::EINVAL)?;
+    Ok(m)
+}
+
+/// bash's environment: `PATH=/bin` resolves an external command (`seq` → `/bin/seq`) for fork →
+/// execve, `HOME=/` is the conventional minimum (the `bash_probe` env). An interactive session adds
+/// its prompt (bash prints PS1 on fd 2 between commands) and the #1496 terminal description:
+/// readline runs its real redisplay against the personality's fixed termcap entry (80×24, no
+/// auto-margin — the CSI subset the playground pane renders).
+fn bash_env(interactive: bool) -> Vec<(&'static str, &'static str)> {
+    let mut env = vec![("PATH", "/bin"), ("HOME", "/")];
+    if interactive {
+        env.extend([
+            ("PS1", "$ "),
+            ("TERM", temen_posix::TERM_NAME),
+            ("TERMCAP", temen_posix::TERMCAP_ENTRY),
+        ]);
+    }
+    env
 }
 
 /// Run the **`temen-posix` shell** (STAGE1.md; `crates/temen/tests/c_shell.rs`) — a real command
@@ -9024,49 +9068,50 @@ pub extern "C" fn temen_run_onramp_posix(
     out.value
 }
 
-/// Parse the shell's **PATH-registry blob** at `[ptr, len)` into `(name, module)` pairs. Layout, all
-/// integers little-endian: a `u32` entry count, then per entry a `u32` name length + that many UTF-8
-/// name bytes + a `u32` module length + that many encoded-module bytes. It bundles the `__stage`
-/// ring-filter runner and every external command (`primes`, …) into one buffer so `temen_run_shell` takes
-/// a single extra arg. Defensive: a truncated or malformed blob, or an entry whose module fails to
-/// decode, drops that entry (and everything after a length that overruns) rather than trapping — the
-/// shell still runs, just without the affected command. Returns owned `(String, Module)`s.
-fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, temen_ir::Module)> {
-    let mut out = Vec::new();
-    let rd_u32 = |b: &[u8], at: usize| -> Option<usize> {
-        b.get(at..at + 4)
+/// The entries of a **registry blob** a host builds: all integers little-endian, a `u32` entry
+/// count, then per entry a `u32` name length + that many UTF-8 name bytes + a `u32` length + that
+/// many bytes. One buffer carries a whole set (a shell's commands, a tree's files) through one pair
+/// of arguments. Defensive: reading stops at the first entry that is truncated or not UTF-8, rather
+/// than trapping.
+fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
+    let rd_u32 = |at: usize| -> Option<usize> {
+        bytes
+            .get(at..at + 4)
             .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
     };
-    let count = match rd_u32(bytes, 0) {
-        Some(c) => c,
-        None => return out,
+    let mut out = Vec::new();
+    let Some(count) = rd_u32(0) else {
+        return out;
     };
     let mut off = 4usize;
     for _ in 0..count {
-        let Some(nlen) = rd_u32(bytes, off) else {
+        let Some(nlen) = rd_u32(off) else { break };
+        let Some(name) = bytes.get(off + 4..off + 4 + nlen) else {
             break;
         };
-        off += 4;
-        let Some(name_bytes) = bytes.get(off..off + nlen) else {
+        let Ok(name) = core::str::from_utf8(name) else {
             break;
         };
-        let Ok(name) = core::str::from_utf8(name_bytes) else {
+        off += 4 + nlen;
+        let Some(len) = rd_u32(off) else { break };
+        let Some(body) = bytes.get(off + 4..off + 4 + len) else {
             break;
         };
-        off += nlen;
-        let Some(mlen) = rd_u32(bytes, off) else {
-            break;
-        };
-        off += 4;
-        let Some(mod_bytes) = bytes.get(off..off + mlen) else {
-            break;
-        };
-        off += mlen;
-        if let Ok(m) = temen_encode::decode_module(mod_bytes) {
-            out.push((name.to_string(), m));
-        }
+        off += 4 + len;
+        out.push((name, body));
     }
     out
+}
+
+/// Parse the shell's **PATH-registry blob** ([`blob_entries`]) into `(name, module)` pairs. It bundles
+/// the `__stage` ring-filter runner and every external command (`primes`, …) into one buffer so
+/// `temen_run_shell` takes a single extra arg. An entry whose module fails to decode is dropped
+/// rather than trapping — the shell still runs, just without the affected command.
+fn parse_shell_cmds(bytes: &[u8]) -> Vec<(String, temen_ir::Module)> {
+    blob_entries(bytes)
+        .into_iter()
+        .filter_map(|(name, b)| Some((name.to_string(), temen_encode::decode_module(b).ok()?)))
+        .collect()
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run it as the **`temen-posix` shell** (see
@@ -9169,11 +9214,9 @@ pub extern "C" fn temen_run_bash(
     // entries): bash runs, and an unresolvable command reports `not found` — the same degradation as
     // the shell card. Each command's window log2 comes from its own decoded module.
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let bins: Vec<(&str, &temen_ir::Module, u8)> = owned
-        .iter()
-        .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
-        .collect();
-    let out = bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &bins);
+    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
+        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let out = bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &commands);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -9239,12 +9282,18 @@ pub extern "C" fn temen_bash_session(
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let bins: Vec<(&str, &temen_ir::Module, u8)> = owned
-        .iter()
-        .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
-        .collect();
-    let Some((mut host, posix, init_mem)) = bash_host_build(m, &[b"bash", b"-i"], &[], &bins, true)
-    else {
+    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
+        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let env = bash_env(true);
+    let session = PosixRun {
+        argv: &[b"bash", b"-i"],
+        env: &env,
+        stdin: &[],
+        commands: &commands,
+        interactive: true,
+        loader: false,
+    };
+    let Some((mut host, posix, init_mem)) = posix_host_build(m, &session) else {
         return -1;
     };
     // The card's pane is a TERMINAL: arm the interleaved transcript so `temen_bash_drain(2)` hands it
@@ -9410,14 +9459,20 @@ pub extern "C" fn temen_bash_coop_open(
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let bins: Vec<(&str, &temen_ir::Module, u8)> = owned
-        .iter()
-        .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
-        .collect();
+    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
+        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let env = bash_env(true);
+    let session = PosixRun {
+        argv: &[b"bash", b"-i"],
+        env: &env,
+        stdin: &[],
+        commands: &commands,
+        interactive: true,
+        loader: false,
+    };
     // `interactive`: the #797 terminal (and the doorbell, unused by this driver — the pump yields
     // IDLE before it would ever sleep on the bell).
-    let Some((host, posix, init_mem)) = bash_host_build(m, &[b"bash", b"-i"], &[], &bins, true)
-    else {
+    let Some((host, posix, init_mem)) = posix_host_build(m, &session) else {
         return -1;
     };
     posix.enable_transcript();

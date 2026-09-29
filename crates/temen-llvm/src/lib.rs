@@ -4942,19 +4942,30 @@ fn synth_start_argv(
 /// next free address) and `HEAP_TOP` (the committed boundary). `free` is a no-op and the heap never
 /// reuses, so every result is freshly `vm_map`-zeroed memory (hence `calloc` ≡ `malloc`).
 ///
+/// Bit 0 of `HEAP_BRK` is the **allocation lock**; the break itself is always 16-aligned. vCPUs running
+/// in parallel over one window (`drive_parallel`, the JIT's OS threads, browser Workers) would
+/// otherwise read the same break and hand out the same block (#1097). The vCPU whose `or` finds the bit
+/// clear owns the heap until `commit` stores the new, aligned break. That one store both publishes the
+/// allocation and releases the lock. Like any locking `malloc` it is not async-signal-safe: a signal
+/// handler that allocates while its own vCPU holds the lock spins until the fuel runs out.
+///
 /// ```text
-///   block0(size):                              ; data=brk+16; new=align16(data+size)
-///     brk = load.i64 [HEAP_BRK]; top = load.i64 [HEAP_TOP]
+///   entry(size):                               → lock(size)
+///   lock(size):                                ; spin until this vCPU takes the lock bit
+///     old = atomic.rmw.or.i64 [HEAP_BRK] 1
+///     old & 1 == 0 → alloc(size, brk=old) : lock(size)
+///   alloc(size,brk):                           ; data=brk+16; new=align16(data+size)
+///     top = load.i64 [HEAP_TOP]
 ///     grow? = new >u top   → grow(brk,size,new,top) : commit(brk,size,new)
 ///   grow(brk,size,new,top):                    ; commit [top, page_up(new)) via the Memory cap
 ///     vm_map(mem_handle, top, page_up(new) - top, RW); store.i64 [HEAP_TOP] = page_up(new)
 ///     → commit(brk,size,new)
-///   commit(brk,size,new):                       ; now the page is mapped: write the header + publish
-///     store.i64 [brk] = size                    ; 16-byte size header (for realloc)
-///     store.i64 [HEAP_BRK] = new
-///     return brk + 16                           ; the data pointer
+///   commit(brk,size,new):                      ; now the page is mapped: write the header + publish
+///     store.i64 [brk] = size                   ; 16-byte size header (for realloc)
+///     atomic.store.i64 [HEAP_BRK] = new        ; the new break, lock bit clear
+///     return brk + 16                          ; the data pointer
 /// ```
-/// The header is written in `commit` (not `block0`) because on the first `malloc` `brk` is an
+/// The header is written in `commit` (not `alloc`) because on the first `malloc` `brk` is an
 /// *uncommitted* reserved page — only `grow` (or the prior commit) maps it.
 fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -> Func {
     use temen_ir::{LoadOp, StoreOp};
@@ -4982,35 +4993,77 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32)
         value,
         offset: 0,
     };
-    // block0(size=0): brk = *HEAP_BRK; new = align16(brk+16+size); branch on new > *HEAP_TOP. No
-    // heap write here — `brk` may be an uncommitted page until `grow` maps it.
-    let b0 = Block {
+    let brk_addr = (scratch + HEAP_BRK) as i64;
+
+    // entry(size=0) → lock(size). The spin loop gets a block of its own: no branch targets an entry.
+    let entry = Block {
+        params: vec![ValType::I64], // size = v0
+        insts: vec![],
+        term: Terminator::Br {
+            target: 1,
+            args: vec![0],
+        },
+    };
+
+    // lock(size=0): set the lock bit. An `old` with the bit clear means this vCPU took the lock, and
+    // `old` is the break; otherwise another vCPU is allocating, so try again.
+    let lock = Block {
         params: vec![ValType::I64], // size = v0
         insts: vec![
-            Inst::ConstI64((scratch + HEAP_BRK) as i64), // v1
-            load_i64(1),                                 // v2 = brk
-            Inst::ConstI64(16),                          // v3
-            i64add(2, 3),                                // v4 = brk + 16
-            i64add(4, 0),                                // v5 = brk+16+size
-            Inst::ConstI64(15),                          // v6
-            i64add(5, 6),                                // v7
-            Inst::ConstI64(!15i64),                      // v8 = ~15
-            i64and(7, 8),                                // v9 = new (aligned)
-            Inst::ConstI64((scratch + HEAP_TOP) as i64), // v10
-            load_i64(10),                                // v11 = top
+            Inst::ConstI64(brk_addr), // v1
+            Inst::ConstI64(1),        // v2
+            Inst::AtomicRmw {
+                ty: IntTy::I64,
+                op: AtomicRmwOp::Or,
+                addr: 1,
+                value: 2,
+                offset: 0,
+            }, // v3 = old
+            i64and(3, 2),             // v4 = old & 1
+            Inst::ConstI64(0),        // v5
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::Eq,
+                a: 4,
+                b: 5,
+            }, // v6 = took the lock
+        ],
+        term: Terminator::BrIf {
+            cond: 6,
+            then_blk: 2, // alloc(size=v0, brk=v3)
+            then_args: vec![0, 3],
+            else_blk: 1, // lock(size=v0)
+            else_args: vec![0],
+        },
+    };
+
+    // alloc(size=0, brk=1): new = align16(brk+16+size); branch on new > *HEAP_TOP. No heap write here
+    // — `brk` may be an uncommitted page until `grow` maps it.
+    let alloc = Block {
+        params: vec![ValType::I64, ValType::I64], // size, brk
+        insts: vec![
+            Inst::ConstI64(16),                          // v2
+            i64add(1, 2),                                // v3 = brk + 16
+            i64add(3, 0),                                // v4 = brk+16+size
+            Inst::ConstI64(15),                          // v5
+            i64add(4, 5),                                // v6
+            Inst::ConstI64(!15i64),                      // v7 = ~15
+            i64and(6, 7),                                // v8 = new (aligned)
+            Inst::ConstI64((scratch + HEAP_TOP) as i64), // v9
+            load_i64(9),                                 // v10 = top
             Inst::IntCmp {
                 ty: IntTy::I64,
                 op: CmpOp::GtU,
-                a: 9,
-                b: 11,
-            }, // v12 = new > top
+                a: 8,
+                b: 10,
+            }, // v11 = new > top
         ],
         term: Terminator::BrIf {
-            cond: 12,
-            then_blk: 1, // grow(brk=v2, size=v0, new=v9, top=v11)
-            then_args: vec![2, 0, 9, 11],
-            else_blk: 2, // commit(brk=v2, size=v0, new=v9)
-            else_args: vec![2, 0, 9],
+            cond: 11,
+            then_blk: 3, // grow(brk=v1, size=v0, new=v8, top=v10)
+            then_args: vec![1, 0, 8, 10],
+            else_blk: 4, // commit(brk=v1, size=v0, new=v8)
+            else_args: vec![1, 0, 8],
         },
     };
 
@@ -5042,21 +5095,26 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32)
             store_i64(13, 7),            // *HEAP_TOP = limit
         ],
         term: Terminator::Br {
-            target: 2,
+            target: 4,
             args: vec![0, 1, 2], // commit(brk, size, new)
         },
     };
 
-    // commit(brk=0, size=1, new=2): the page is now mapped — write the size header at brk, publish
-    // the new break, and return the data pointer brk+16.
+    // commit(brk=0, size=1, new=2): the page is now mapped — write the size header at brk, publish the
+    // new break (which releases the lock), and return the data pointer brk+16.
     let c = Block {
         params: vec![ValType::I64, ValType::I64, ValType::I64], // brk, size, new
         insts: vec![
-            store_i64(0, 1),                             // *brk = size (header) — no value
-            Inst::ConstI64((scratch + HEAP_BRK) as i64), // v3
-            store_i64(3, 2),                             // *HEAP_BRK = new — no value
-            Inst::ConstI64(16),                          // v4
-            i64add(0, 4),                                // v5 = brk + 16 (data)
+            store_i64(0, 1),          // *brk = size (header) — no value
+            Inst::ConstI64(brk_addr), // v3
+            Inst::AtomicStore {
+                ty: IntTy::I64,
+                addr: 3,
+                value: 2,
+                offset: 0,
+            }, // *HEAP_BRK = new, lock bit clear — no value
+            Inst::ConstI64(16),       // v4
+            i64add(0, 4),             // v5 = brk + 16 (data)
         ],
         term: Terminator::Return(vec![5]), // data
     };
@@ -5064,7 +5122,7 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32)
     Func {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
-        blocks: vec![b0, g, c],
+        blocks: vec![entry, lock, alloc, g, c],
     }
 }
 

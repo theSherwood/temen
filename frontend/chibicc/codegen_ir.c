@@ -153,15 +153,24 @@ static void close_block(void) {
   }
 }
 
-static void cg(const char *fmt, ...) {
-  if (fmt[0] == ' ' && fmt[1] == ' ') {
-    const char *p = fmt + 2;
-    bool is_term = !strncmp(p, "br ", 3) || !strncmp(p, "br_if ", 6) ||
-                   !strncmp(p, "br_table", 8) || !strncmp(p, "return", 6) ||
-                   !strncmp(p, "unreachable", 11);
+// Advance `cur_inst` past the instructions in `text`: one per `  `-indented line, terminators
+// aside. Counted per emitted line, not per `cg` call — a call that emits two instructions must
+// count two, or every later `debug.loc` / SSA location in the block lands that many instructions
+// early (a breakpoint stopping before the previous line's last store).
+static void count_insts(const char *text) {
+  for (const char *p = text; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
+    if (p[0] != ' ' || p[1] != ' ')
+      continue;
+    const char *q = p + 2;
+    bool is_term = !strncmp(q, "br ", 3) || !strncmp(q, "br_if ", 6) ||
+                   !strncmp(q, "br_table", 8) || !strncmp(q, "return", 6) ||
+                   !strncmp(q, "unreachable", 11);
     if (!is_term)
       cur_inst++;
   }
+}
+
+static void cg(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   if (cur_block != -1) {
@@ -169,6 +178,8 @@ static void cg(const char *fmt, ...) {
     int n = vsnprintf(line, sizeof line, fmt, ap);
     if (n > (int)sizeof line - 1)
       n = (int)sizeof line - 1;
+    line[n] = '\0';
+    count_insts(line);
     blk_append(blk_of(cur_block), line, (size_t)n);
   } else {
     vfprintf(o, fmt, ap);
@@ -2032,31 +2043,35 @@ static int gen_expr(Node *node) {
   case ND_LE:
     return cmpop(node, "le", true);
   case ND_NEG: {
+    // Value numbers are allocated in the order their definitions are emitted: the text parser
+    // numbers values by position, and `debug.var` / SSA locations name them by number.
     int a = gen_expr(node->lhs);
     char *p = irty(node->ty);
-    int r = nv++;
     if (is_flt(node->ty)) {
+      int r = nv++;
       cg("  v%d = %s.neg v%d\n", r, p, a);
-    } else {
-      // -x  ==  0 - x
-      int z = nv++;
-      cg("  v%d = %s.const 0\n", z, p);
-      cg("  v%d = %s.sub v%d v%d\n", r, p, z, a);
+      return r;
     }
+    // -x  ==  0 - x
+    int z = nv++;
+    cg("  v%d = %s.const 0\n", z, p);
+    int r = nv++;
+    cg("  v%d = %s.sub v%d v%d\n", r, p, z, a);
     return r;
   }
   case ND_NOT: {
     // !x  ==  (x == 0), result i32
     int a = gen_expr(node->lhs);
     Type *ot = node->lhs->ty;
-    int r = nv++;
     if (is_flt(ot)) {
       int z = nv++;
       cg("  v%d = %s.const 0\n", z, irty(ot));
+      int r = nv++;
       cg("  v%d = %s.eq v%d v%d\n", r, irty(ot), a, z);
-    } else {
-      cg("  v%d = %s.eqz v%d\n", r, irty(ot), a);
+      return r;
     }
+    int r = nv++;
+    cg("  v%d = %s.eqz v%d\n", r, irty(ot), a);
     return r;
   }
   case ND_BITNOT: {
@@ -3031,8 +3046,11 @@ static void gen_func(Obj *fn) {
 
   gen_stmt(fn->body);
   // Falling off the end: C `main` returns 0; for other paths it is UB, and returning a
-  // zero is a safe, defined value. Every block needs a terminator (§3b).
+  // zero is a safe, defined value. Every block needs a terminator (§3b). The implicit return
+  // sits on the closing `}` line, so stepping out of a function's last statement stops there,
+  // with its locals still in view, before returning to the caller (as gdb does).
   if (!term) {
+    dbg_loc(fn->body->end_tok);
     if (ret->kind == TY_VOID || is_agg(ret)) {
       cg("  return\n"); // void, or a struct-returning func that wrote via sret
     } else {

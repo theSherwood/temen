@@ -565,10 +565,16 @@ into the window's reserved tail by `vm_map`-committing pages on demand via the `
 - [x] A program that allocates gets a **4-handle `_start`** (`stdout, stdin, exit, memory`); the
       powerbox grants `Memory` for a 4-param entry. `_start` stashes the handle and seeds the heap
       (`HEAP_BRK`/`HEAP_TOP` = the window's mapped boundary, the first reserved page).
-- [x] `__temen_malloc`: a 3-block CFG — align the request to 16; if it crosses the committed boundary,
-      `CallImport "vm_map"(top, page_up(new) − top, RW)` (resolved to `Memory.map`) and advance the
-      boundary; publish the new break and return the old. `free` is a no-op; the heap never reuses, so
-      freshly-committed (`vm_map`-zeroed) pages make `calloc` ≡ `malloc`. `realloc` stays `Unsupported`.
+- [x] `__temen_malloc`: take the allocation lock, then align the request to 16; if it crosses the
+      committed boundary, `CallImport "vm_map"(top, page_up(new) − top, RW)` (resolved to `Memory.map`)
+      and advance the boundary; publish the new break and return the old. `free` is a no-op; the heap
+      never reuses, so freshly-committed (`vm_map`-zeroed) pages make `calloc` ≡ `malloc`. `realloc`
+      stays `Unsupported`.
+- [x] **The allocation lock (#1097)** is bit 0 of `HEAP_BRK`; the break is 16-aligned, so the bit is
+      free. `malloc` takes it with an atomic `or` (spinning while another vCPU holds it) and releases
+      it with the atomic store that publishes the new break. Without it, vCPUs running in parallel over
+      one window read the same break and got the same block; `malloc_hands_parallel_threads_distinct_blocks`
+      pins that.
 - [x] **Demo:** `demo_heapgrow_vs_native` — a guest allocating eight 128 KiB blocks (~16× its initial
       window), growing on demand via the `Memory` cap, byte-identical to native. Plus a focused
       `heap_malloc_calloc_free` check (a growth-forcing `malloc` + a zero-reading `calloc`).

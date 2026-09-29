@@ -1870,6 +1870,7 @@ static Node *compound_stmt(Token **rest, Token *tok) {
       v->scope_end_line = tok->line_no;
 
   node->body = head.next;
+  node->end_tok = tok;
   *rest = tok->next;
   return node;
 }

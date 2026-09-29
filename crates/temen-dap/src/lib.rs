@@ -146,6 +146,9 @@ struct Place {
     tid: u64,
     addr: u64,
     type_id: TypeId,
+    /// For a pointer type: `addr` *is* the pointer's value rather than where it is stored — a
+    /// pointer held in an SSA value has no window location to read it back from.
+    rvalue: bool,
 }
 
 /// Expandable-variable references start here, above the frame references (`frame_refs`, numbered
@@ -189,7 +192,7 @@ impl DapServer {
             "next" => self.on_step(StepKind::Over),
             "stepIn" => self.on_step(StepKind::In),
             "stepOut" => self.on_step(StepKind::Out),
-            "stepBack" => self.on_step_back(),
+            "stepBack" => self.on_step_back(args),
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
             "provideStdin" => self.on_provide_stdin(args),
@@ -953,6 +956,29 @@ impl DapServer {
             let width = scalar_width(self.types(), type_id, &ty);
             let session = self.session.as_ref()?;
             if let Some(val) = session.inspector.read_var(frame_idx, &name, width) {
+                // A pointer held in an SSA value is still followable: render its address like a
+                // window pointer's and expand it to its pointee through an rvalue place.
+                let ptr = match (&val, type_id) {
+                    (VarValue::Value(Value::I64(p)), Some(t))
+                        if matches!(
+                            self.types().get(t as usize),
+                            Some(TypeDef::Pointer { .. })
+                        ) =>
+                    {
+                        Some((*p as u64, t))
+                    }
+                    _ => None,
+                };
+                if let Some((addr, type_id)) = ptr {
+                    let vr = self.push_place(Place {
+                        tid,
+                        addr,
+                        type_id,
+                        rvalue: true,
+                    });
+                    out.push(var_json(&name, &format!("0x{addr:x}"), &ty, vr));
+                    continue;
+                }
                 let rendered = match (&val, type_id) {
                     (VarValue::Bytes(b), Some(tid)) => fmt_scalar(self.types(), tid, b),
                     _ => fmt_var(&val),
@@ -968,7 +994,7 @@ impl DapServer {
     fn expand_place(&mut self, idx: usize) -> Option<Vec<Json>> {
         let session = self.session.as_ref()?;
         let place = session.place_refs.get(idx)?;
-        let (tid, base, type_id) = (place.tid, place.addr, place.type_id);
+        let (tid, base, type_id, rvalue) = (place.tid, place.addr, place.type_id, place.rvalue);
         let types = session.debug.as_ref()?.types.clone();
         self.session.as_mut()?.inspector.select_task(tid);
 
@@ -989,11 +1015,15 @@ impl DapServer {
             // A pointer expands to its pointee under a synthetic `*` child (`*p`).
             TypeDef::Pointer { pointee, .. } => {
                 let session = self.session.as_ref()?;
-                match session
-                    .inspector
-                    .read_window(base, 8)
-                    .map(|b| le_uint(&b, 8))
-                {
+                let ptr = if rvalue {
+                    Ok(base)
+                } else {
+                    session
+                        .inspector
+                        .read_window(base, 8)
+                        .map(|b| le_uint(&b, 8))
+                };
+                match ptr {
                     // A null pointer has no pointee; an unreadable one can't be followed.
                     Ok(0) => return Some(vec![var_json("*", "<null>", "", 0)]),
                     Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0)]),
@@ -1060,8 +1090,17 @@ impl DapServer {
 
     /// Record an expandable `Place` and return its `variablesReference`.
     fn alloc_place(&mut self, tid: u64, addr: u64, type_id: TypeId) -> i64 {
+        self.push_place(Place {
+            tid,
+            addr,
+            type_id,
+            rvalue: false,
+        })
+    }
+
+    fn push_place(&mut self, place: Place) -> i64 {
         let session = self.session.as_mut().expect("session present");
-        session.place_refs.push(Place { tid, addr, type_id });
+        session.place_refs.push(place);
         PLACE_BASE + (session.place_refs.len() - 1) as i64
     }
 
@@ -1417,15 +1456,94 @@ impl DapServer {
             .and_then(|f| f.source.as_ref().map(|src| (src.file.clone(), src.line)))
     }
 
-    fn on_step_back(&mut self) -> (bool, Json, Vec<Event>) {
-        // Reverse single-step (DEBUGGING.md W1): `Inspector::step_back` re-executes to one unit of
-        // logical time earlier. At the start it stays put. Lands as a `step` stop. Unsupported on the
-        // forward-only bytecode backend — fail cleanly there.
+    fn on_step_back(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // Reverse step (DEBUGGING.md W1). With debug info it is the reverse of `next`: one *source
+        // line* back, landing where a forward `next` would have stopped. `granularity: "instruction"`
+        // (the DAP `SteppingGranularity`), or no debug info, keeps the single op: `Inspector::step_back`
+        // re-executes to one unit of logical time earlier. At the start it stays put. Lands as a `step`
+        // stop. Fails cleanly on a backend without reverse.
+        let by_op = args
+            .and_then(|a| a.get("granularity"))
+            .and_then(|g| g.as_str())
+            == Some("instruction");
         let stop = match self.session.as_mut() {
-            Some(s) if s.inspector.supports_reverse() => s.inspector.step_back(),
+            Some(s) if s.inspector.supports_reverse() => {
+                if by_op || s.debug.is_none() {
+                    s.inspector.step_back()
+                } else {
+                    self.step_back_source_line()
+                }
+            }
             _ => return (false, Json::Null, vec![]),
         };
         (true, Json::Null, self.stop_events(stop))
+    }
+
+    /// One source line back — the reverse of [`step_source_line`](Self::step_source_line)'s `next`.
+    /// Op-step back until the focused frame is on a different (mapped) line, then on through that
+    /// line's run to its first op, where a forward `next` would have stopped. The run's start is only
+    /// known once a step has gone past it, so the last op-step is undone with a `seek` to the last
+    /// position that was still on the line. The op-steps are depth-aware (`Debuggee::step_back`
+    /// rewinds within the frame, not into a callee), so a line that called a function is one step.
+    fn step_back_source_line(&mut self) -> Stop {
+        const CAP: usize = 1_000_000;
+        let (start, from) = (self.current_source_line(), self.position());
+        let mut last = Stop::Blocked;
+        let mut target = None;
+        for _ in 0..CAP {
+            let before = self.position();
+            last = self.session.as_mut().unwrap().inspector.step_back();
+            if self.position() == before || !matches!(last, Stop::Break { .. }) {
+                break; // at the start of the program: nowhere further back
+            }
+            let now = self.current_source_line();
+            if now.is_some() && now != start {
+                target = now;
+                break;
+            }
+        }
+        let Some(line) = target else {
+            // No earlier source line — only sourceless startup code precedes this one. A forward
+            // `next` never stops on an unmapped op, so neither does its reverse: stay where we were.
+            if self.current_source_line().is_none() && start.is_some() {
+                return self.session.as_mut().unwrap().inspector.seek(from);
+            }
+            return last;
+        };
+        let (mut on_line, depth) = (self.position(), self.frame_depth());
+        for _ in 0..CAP {
+            let before = self.position();
+            let stop = self.session.as_mut().unwrap().inspector.step_back();
+            if self.position() == before {
+                return stop; // the line's run starts the program
+            }
+            match self.current_source_line() {
+                Some(l) if l == line => on_line = self.position(),
+                // An unmapped op in the same frame is not a stop position — keep looking. One in a
+                // shallower frame means the run began at the function's entry (its caller, e.g. the
+                // sourceless startup wrapper, is where this op sits).
+                None if self.frame_depth() >= depth => {}
+                _ => return self.session.as_mut().unwrap().inspector.seek(on_line),
+            }
+        }
+        last
+    }
+
+    /// Frames on the focused thread's stack.
+    fn frame_depth(&self) -> usize {
+        self.session
+            .as_ref()
+            .map_or(0, |s| s.inspector.backtrace().len())
+    }
+
+    /// The time-travel coordinate: the global scheduler `turn` when multithreaded, the op `clock`
+    /// single-threaded.
+    fn position(&self) -> u64 {
+        match self.session.as_ref() {
+            Some(s) if s.scheduled => s.inspector.turn(),
+            Some(s) => s.inspector.clock(),
+            None => 0,
+        }
     }
 
     fn on_reverse_continue(&mut self) -> (bool, Json, Vec<Event>) {
