@@ -167,6 +167,7 @@ fn cranelift(route: &str) -> Outcome {
         DEFAULT_RESERVED_LOG2,
         4,
         &mut host,
+        None,
     )
     .expect("jit run");
     match out {

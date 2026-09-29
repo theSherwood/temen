@@ -92,6 +92,31 @@ impl DurableCell {
             high_water,
         }
     }
+
+    /// Ring the child's doorbell: store `UNWINDING` into its **own** freeze word (what
+    /// [`crate::FreezeController::request_freeze`] does for the root), so it unwinds at its next poll
+    /// and its task deposits its window image at finish. A no-op once its window is gone.
+    pub(crate) fn ring(&self) {
+        let base = self.base.lock().unwrap_or_else(|e| e.into_inner());
+        if *base != 0 {
+            // SAFETY: a nonzero base is the child's live window (its task retires the base under
+            // this lock before freeing it); `STATE_OFF` is within its first mapped page, and the
+            // word is only ever accessed as an aligned `i32`.
+            unsafe {
+                (*((*base + temen_ir::durable_abi::STATE_OFF as usize)
+                    as *const std::sync::atomic::AtomicI32))
+                    .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Whether the child unwound for a freeze (its task deposited its image).
+    pub(crate) fn unwound(&self) -> bool {
+        self.image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
 }
 
 /// One spawned child's join-table entry: its completion cell plus whether it has been `join`ed (a
@@ -867,19 +892,8 @@ impl Nursery {
     pub(crate) fn ring_detached(&self) {
         let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         for c in children.iter().filter(|c| !c.joined) {
-            let Some(d) = c.done.durable.as_ref() else {
-                continue;
-            };
-            let base = d.base.lock().unwrap_or_else(|e| e.into_inner());
-            if *base != 0 {
-                // SAFETY: a nonzero base is the child's live window (its task retires the base under
-                // this lock before freeing it); `STATE_OFF` is within its first mapped page, and the
-                // word is only ever accessed as an aligned `i32`.
-                unsafe {
-                    (*((*base + temen_ir::durable_abi::STATE_OFF as usize)
-                        as *const std::sync::atomic::AtomicI32))
-                        .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
-                }
+            if let Some(d) = c.done.durable.as_ref() {
+                d.ring();
             }
         }
     }
@@ -2456,6 +2470,15 @@ pub(crate) unsafe extern "C" fn join(
             if let Some(outcome) = *st {
                 break outcome;
             }
+            // #1904 — a freeze reached this parent while it waits: it drives the child it is joining,
+            // as the freeze drives a `thread.join`'s, by ringing the child's doorbell.
+            if let Some(d) = done.durable.as_ref() {
+                if rt.durable.load(Ordering::Acquire)
+                    && crate::fiber_rt::window_is_unwinding(mem_base)
+                {
+                    d.ring();
+                }
+            }
             // §5 kill-path: the host set the parent's interrupt cell — stop waiting and **propagate
             // `OutOfFuel` right here** (the child bakes the same cell, so it unwinds too, and is joined at
             // teardown). We must not return a bare `0` and lean on "the parent traps at its next epoch
@@ -2486,6 +2509,14 @@ pub(crate) unsafe extern "C" fn join(
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         };
+        drop(st);
+        // #1904 — a child the freeze unwound is not joined: it stays for the harvest (its window rides
+        // the artifact), and the join is re-issued on thaw against the re-launched child.
+        if done.durable.as_ref().is_some_and(DurableCell::unwound) {
+            rt.children.lock().unwrap_or_else(|e| e.into_inner())[slot].joined = false;
+            crate::os_thread_rt::mark_join_reissue(mem_base);
+            return 0;
+        }
         if trap != 0 {
             *trap_out = trap; // a child trap propagates to the parent on join
             0

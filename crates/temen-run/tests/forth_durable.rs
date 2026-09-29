@@ -187,6 +187,7 @@ fn run_on(engine: Engine, inst: &temen_ir::Module, window: &[u8], host: &mut Hos
                 SIZE_LOG2,
                 JIT_TABLE_LOG2,
                 host,
+                None,
             )
             .expect("the kernel compiles and runs on the JIT");
             assert!(matches!(out, JitOutcome::Returned(_)), "JIT run: {out:?}");

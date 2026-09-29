@@ -93,6 +93,7 @@ fn cranelift(child: &Module) -> Option<JitOutcome> {
         PARENT_LOG2,
         0,
         &mut host,
+        None,
     ) {
         Ok((o, _)) => Some(o),
         Err(JitError::Unsupported(_)) => None,

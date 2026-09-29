@@ -66,6 +66,7 @@ fn diff(guest_src: &str, init: &[u8], user_args: &[i64], table_log2: u8) -> (Jit
         DEFAULT_RESERVED_LOG2,
         table_log2,
         &mut host_j,
+        None,
     )
     .expect("jit run");
 

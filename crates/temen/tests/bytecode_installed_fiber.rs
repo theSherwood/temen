@@ -123,6 +123,7 @@ fn installed_unit_fiber_entry_agrees_across_engines() {
         DEFAULT_RESERVED_LOG2,
         TABLE_LOG2,
         &mut host_j,
+        None,
     )
     .expect("jit run");
     match jout {

@@ -1579,6 +1579,9 @@ fn set_jit_durable_policy_with(host: &mut Host, m: &Module, validator: temen_int
 /// `init` seeds the window: a bare [`MemLayout::image`](temen_interp::MemLayout::image) for a fresh
 /// run, or a restored layout for a thaw, whose page map the window is built under (#1834) — the
 /// form the run hands back, so one run's capture can seed the next.
+///
+/// `freeze` is a durable run's async freeze trigger ([`temen_jit::FreezeController`]): another thread
+/// may request a freeze while the guest runs. `None` for none.
 #[allow(clippy::too_many_arguments)]
 pub fn jit_cap_run(
     m: &Module,
@@ -1588,6 +1591,7 @@ pub fn jit_cap_run(
     reserved_log2: u8,
     table_reserve_log2: u8,
     host: &mut Host,
+    freeze: Option<std::sync::Arc<temen_jit::FreezeController>>,
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
@@ -1635,6 +1639,7 @@ pub fn jit_cap_run(
             cm.set_high_water(Some(cc.high_water()));
         }
         cm.set_restore_prots(restore);
+        cm.set_freeze_controller(freeze);
         if hosts_fibers {
             cm.enable_fiber_hosting(temen_jit::Quota::default())?;
         }
@@ -1691,6 +1696,7 @@ pub fn jit_cap_run(
         cm.set_high_water(Some(cc.high_water()));
     }
     cm.set_restore_prots(restore);
+    cm.set_freeze_controller(freeze);
     if hosts_fibers {
         cm.enable_fiber_hosting(temen_jit::Quota::default())?;
     }
