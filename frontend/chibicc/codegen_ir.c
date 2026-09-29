@@ -2574,8 +2574,12 @@ static void gen_for(Node *node) {
   cg("  br %d(" SP "%s)\n", cond, cvals());
   term = true;
 
+  // The condition and the increment are expressions, not statements, so `gen_stmt` gives them no
+  // line; without one each iteration's test and step are unmapped and a line step from the body
+  // runs straight back into it, through the whole loop. Give each its own expression's line.
   open_block(cond);
   if (node->cond) {
+    dbg_loc(node->cond->tok);
     int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
     // Emit the test INVERTED so the body is the fall-through (else) edge and the loop exit is the
     // taken (then) edge. temen-jit lowers a `br_if`'s second target as the fall-through, so putting
@@ -2599,8 +2603,10 @@ static void gen_for(Node *node) {
     cg("  br %d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
-  if (node->inc)
+  if (node->inc) {
+    dbg_loc(node->inc->tok);
     gen_expr(node->inc);
+  }
   cg("  br %d(" SP "%s)\n", cond, cvals());
 
   open_block(end);
@@ -2620,6 +2626,7 @@ static void gen_do(Node *node) {
     cg("  br %d(" SP "%s)\n", cont, cvals());
 
   open_block(cont);
+  dbg_loc(node->cond->tok); // an expression: no line from `gen_stmt` (see `gen_for`)
   int c = gen_truth(node->cond); // normalize to an i32 0/1 br_if condition
   cg("  br_if v%d %d(" SP "%s) %d(" SP "%s)\n", c, body, cvals(), end,
           cvals());

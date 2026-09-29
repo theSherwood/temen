@@ -465,6 +465,58 @@ fn top_frame(s: &mut DapServer, seq: i64) -> Option<(i64, String, String)> {
     ))
 }
 
+const LOOPS_SRC: &str = r#"int main(void) {
+  int a = 0;
+  for (int i = 0; i < 2; i++)
+    a += i;
+  while (a < 3)
+    a++;
+  do
+    a--;
+  while (a > 1);
+  return a;
+}
+"#;
+
+/// **`next` visits a loop's test on every iteration**, as gdb does: the `for` line (increment +
+/// condition) comes back between body runs, and so do a `while`'s and a `do`/`while`'s condition
+/// lines. chibicc gave statements a line but not a loop's condition/increment *expressions*, so
+/// those ops were unmapped and a line step from the body ran through the rest of the loop.
+#[test]
+fn next_stops_on_each_loop_test() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, LOOPS_SRC);
+
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 2, false);
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let mut lines = vec![top_frame(&mut s, 5).expect("stopped at line 2").0];
+    for i in 0..40 {
+        s.handle(&req(
+            10 + i,
+            "next",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        match top_frame(&mut s, 100 + i) {
+            Some((line, name, _)) if name.contains("main") && line != 0 => lines.push(line),
+            _ => break,
+        }
+        if lines.last() == Some(&10) {
+            break;
+        }
+    }
+    // Line 7, the `do` itself, is a stop too: chibicc emits the branch into the body there.
+    assert_eq!(
+        lines,
+        [2, 3, 4, 3, 4, 3, 5, 6, 5, 6, 5, 7, 8, 9, 8, 9, 10],
+        "the line sequence `next` walks"
+    );
+}
+
 const NEXT_SRC: &str = r#"#include <stdio.h>
 int main(void) {
   printf("one\n");
