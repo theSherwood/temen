@@ -2043,31 +2043,35 @@ static int gen_expr(Node *node) {
   case ND_LE:
     return cmpop(node, "le", true);
   case ND_NEG: {
+    // Value numbers are allocated in the order their definitions are emitted: the text parser
+    // numbers values by position, and `debug.var` / SSA locations name them by number.
     int a = gen_expr(node->lhs);
     char *p = irty(node->ty);
-    int r = nv++;
     if (is_flt(node->ty)) {
+      int r = nv++;
       cg("  v%d = %s.neg v%d\n", r, p, a);
-    } else {
-      // -x  ==  0 - x
-      int z = nv++;
-      cg("  v%d = %s.const 0\n", z, p);
-      cg("  v%d = %s.sub v%d v%d\n", r, p, z, a);
+      return r;
     }
+    // -x  ==  0 - x
+    int z = nv++;
+    cg("  v%d = %s.const 0\n", z, p);
+    int r = nv++;
+    cg("  v%d = %s.sub v%d v%d\n", r, p, z, a);
     return r;
   }
   case ND_NOT: {
     // !x  ==  (x == 0), result i32
     int a = gen_expr(node->lhs);
     Type *ot = node->lhs->ty;
-    int r = nv++;
     if (is_flt(ot)) {
       int z = nv++;
       cg("  v%d = %s.const 0\n", z, irty(ot));
+      int r = nv++;
       cg("  v%d = %s.eq v%d v%d\n", r, irty(ot), a, z);
-    } else {
-      cg("  v%d = %s.eqz v%d\n", r, irty(ot), a);
+      return r;
     }
+    int r = nv++;
+    cg("  v%d = %s.eqz v%d\n", r, irty(ot), a);
     return r;
   }
   case ND_BITNOT: {

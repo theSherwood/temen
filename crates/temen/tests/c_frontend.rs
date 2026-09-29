@@ -2520,6 +2520,48 @@ fn c_the_line_after_an_initializer_starts_after_its_last_store() {
     );
 }
 
+/// chibicc's value names must follow definition order. The text parser numbers a block's values by
+/// position — its params, then each result in the order it is defined — while `debug.var` and SSA
+/// location lists name values by chibicc's own number, so an out-of-order name makes the debugger
+/// read the wrong value: integer negation defined `v9 = i32.const 0` before `v8 = i32.sub v9 v7`, and
+/// `int x = -1;` showed `x = 0`.
+#[test]
+fn c_value_names_follow_definition_order() {
+    let ir = c_to_ir_g(
+        "int neg(int a) { return -a; }\n\
+         int not_f(float f) { return !f; }\n\
+         int main(void) {\n\
+         \x20 int x = -1;\n\
+         \x20 long y = -(long)x;\n\
+         \x20 return neg(x) + not_f(0.0f) + (int)y + ~x;\n\
+         }\n",
+    );
+    let mut next = 0usize;
+    for line in ir.lines() {
+        let t = line.trim_start();
+        if let Some(params) = t.strip_prefix("block ") {
+            next = params.matches(": ").count(); // `block N (v0: i64, v1: i32) {`
+            continue;
+        }
+        let Some((lhs, _)) = t.split_once(" = ") else {
+            continue;
+        };
+        if !line.starts_with("  ") || !lhs.starts_with('v') {
+            continue;
+        }
+        for name in lhs.split(", ") {
+            assert_eq!(
+                name,
+                format!("v{next}"),
+                "value defined out of order in `{line}`:\n{ir}"
+            );
+            next += 1;
+        }
+    }
+    let m = parse_module(&ir).expect("parse");
+    assert!(m.debug_info.is_some(), "-g emits debug info");
+}
+
 /// What C forbids is refused with a diagnostic: a thread-local's address as a constant initializer
 /// (each thread has its own copy), a block-scope `_Thread_local` that is neither `static` nor
 /// `extern`, and an alignment the per-thread block cannot honor.
