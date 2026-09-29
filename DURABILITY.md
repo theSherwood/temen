@@ -1566,6 +1566,12 @@ resumer already took under `NORMAL` — and a fiber re-claimed under `UNWINDING`
 freeze unwind drops — is **consumed**: each runtime tracks that per fiber, the residue carries it
 (`FrozenFiber::consumed`, format v24), and a thaw claim of such a fiber makes its rewound `suspend`
 *return the claim's argument* so the fiber runs on, instead of re-parking with the stale value.
+**Returned fibers (#1835).** Re-issuing is right only while the fiber is still there to redeliver.
+One that **returned** inside the resume the freeze landed at is done and its slot free, so the
+resume's `(status, value)` is spilled with its frame, and its thaw arm reloads them when the status
+is *returned* (and, the deepest frame on its thread then, flips the thaw word); any other status
+re-issues. A fiber that unwound for the freeze reports `FIBER_FROZEN` (`-1`, never observed: the
+trailing poll unwinds first) rather than *returned*, in every engine, so its resume is re-issued.
 The byte-level snapshot **Section-2 codec** lands too: `temen-snapshot` serializes the
 `FrozenFiber` residue (slot/funcref/sp/shadow-SP) into a TLV control section (elided when there
 are no fibers, so no-fiber artifacts stay byte-identical) and `restore` re-seeds the `Host`, so a

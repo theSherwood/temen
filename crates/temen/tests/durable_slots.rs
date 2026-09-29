@@ -227,6 +227,64 @@ block 0 (v0: i64, v1: i64) {
 }
 "#;
 
+/// The root resumes a fiber that returns at once, then reads the clock. Returns
+/// `clock + 10 status + 100 value`.
+const RETURNS: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  f = ref.func 1
+  sp = i64.const 4096
+  k = cont.new f sp
+  a = i64.const 5
+  s, x = cont.resume k a
+  z = i32.const 0
+  c = call.cap 2 0 (i32) -> (i64) v0 (z)
+  c10 = i64.const 10
+  c100 = i64.const 100
+  s64 = i64.extend_i32_u s
+  t1 = i64.mul s64 c10
+  t2 = i64.mul x c100
+  r1 = i64.add c t1
+  r2 = i64.add r1 t2
+  return r2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 1
+  v3 = i64.add v1 v2
+  return v3
+  }
+}
+"#;
+
+/// The root resumes a fiber that reads the clock (where a freeze from the start lands, inside the
+/// fiber) and returns. Returns `10 status + value`.
+const UNWINDS: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  f = ref.func 1
+  sp = i64.const 4096
+  k = cont.new f sp
+  a = i64.extend_i32_u v0
+  s, x = cont.resume k a
+  s64 = i64.extend_i32_u s
+  c10 = i64.const 10
+  t1 = i64.mul s64 c10
+  r = i64.add x t1
+  return r
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  h = i32.wrap_i64 v1
+  z = i32.const 0
+  c = call.cap 2 0 (i32) -> (i64) h (z)
+  return c
+  }
+}
+"#;
+
 fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
@@ -566,4 +624,20 @@ fn fresh_fibers_start_from_their_entries() {
         fibers.sort();
         assert_eq!(fibers, [(0, true), (1, true)], "{engine:?}: residue");
     }
+}
+
+/// #1835: the fiber returns inside the resume the freeze lands at. The resumer already has its
+/// `(status, value)`, and the fiber's slot is free, so the thaw must reload them: re-issuing the
+/// resume faults on the free slot.
+#[test]
+fn a_resume_whose_fiber_returned_reloads_its_result() {
+    freeze_thaw(ALL_ENGINES, RETURNS, |w| write_state(w, STATE_UNWINDING));
+    freeze_thaw(ARMED_ENGINES, RETURNS, |w| arm_freeze_after(w, 1));
+}
+
+/// And the case the re-issue is for: the fiber unwinds for the freeze inside the resume, so the thaw
+/// re-issues the resume and the fiber rewinds to its clock read.
+#[test]
+fn a_resume_whose_fiber_unwound_is_re_issued() {
+    freeze_thaw(ARMED_ENGINES, UNWINDS, |w| write_state(w, STATE_UNWINDING));
 }

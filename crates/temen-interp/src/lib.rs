@@ -3295,11 +3295,13 @@ fn drive_over_cell(
                        // trap/exit anywhere in the shared-powerbox domain ends the whole run, not
                        // just the trapping vCPU (the batch activation's owner is gone).
         s.root_domain = host_shared.lock_unpoisoned().domain_id() as usize;
-        // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once.
-        s.freeze_on_quiesce = mem
-            .as_ref()
-            .map(|m| m.durable_freeze_on_quiesce())
-            .unwrap_or(false);
+        // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once. Only a
+        // durable run has the control words; any other keeps its own data there (#1851).
+        s.freeze_on_quiesce = durable
+            && mem
+                .as_ref()
+                .map(|m| m.durable_freeze_on_quiesce())
+                .unwrap_or(false);
         // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
         // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
         // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
@@ -5048,6 +5050,7 @@ pub use temen_ir::Quota;
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
 const FIBER_RETURNED: i32 = 1;
+use temen_ir::durable_abi::FIBER_FROZEN;
 /// §3.6 slice 5a — the third `cont.resume` status (beside suspended/returned; `2` was the retired
 /// coroutine `CORO_FAULTED`, kept unassigned): the fiber hit an event park (`memory.wait`, a
 /// blocking read, a live-callee call) and was set aside — **the fiber parked, not the vCPU**
@@ -17155,7 +17158,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                     } else {
-                        frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
+                        // #1835: a fiber that unwound for the freeze did not return; its resumer
+                        // re-issues the resume on thaw.
+                        let status = if freezing {
+                            FIBER_FROZEN
+                        } else {
+                            FIBER_RETURNED
+                        };
+                        frames[rtop].vals.push(Reg::from_i32(status));
                         frames[rtop]
                             .vals
                             .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));
