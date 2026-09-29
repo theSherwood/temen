@@ -5125,7 +5125,10 @@ impl<'p> Vcpu<'p> {
                 &mut self.mem,
                 &mut cell,
                 &mut fibers,
-                Some(BounceRunCtx { jit_mirror: mirror }),
+                Some(BounceRunCtx {
+                    jit_mirror: mirror,
+                    park: None,
+                }),
                 None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
             )?
         };
@@ -9083,17 +9086,21 @@ struct LeafStart {
     /// state ([`image_pages`]): its `"mapped"` is the window's reservation, and the host keeps the
     /// page-state table.
     paged: bool,
+    /// Its host suspends its emitted frames where a call parks ([`LeafOffer::parks`]).
+    parks: bool,
 }
 
-/// #1896 — may a process running image `m` **park**: block in an op until another process, or
-/// another of its own threads, acts? A frame on the emitted tier cannot be suspended, so only an
-/// image that cannot runs there ([`TierUpConfig::leaf`]). The process's signal source answers for
-/// the ops bound to it ([`super::SignalSource::import_parks`]); the address-space ops cannot park;
-/// a stream op parks only on a pipe end, or reading a blocking stdin; a §12 concurrency op may (a
-/// join or a futex wait parks, and a thread or a fiber needs the interpreter to schedule it); an
-/// import `import.attach` may retarget may; any other import or inline capability call may. (A
-/// linked program has no `call.sym` left: linking rewrote each to one of these.)
-fn image_may_park(host: &Host, m: &Module) -> bool {
+/// #1896 — how a process running image `m` can **park**: block in an op until another process, or
+/// another of its own threads, acts. An emitted frame cannot wait by itself, so an image runs on the
+/// emitted tier ([`TierUpConfig::leaf`]) when it cannot park, or when it parks only in a **stream**
+/// call and its host can suspend the emitted frames there ([`LeafOffer::parks`]). A stream read
+/// parks on a pipe end or a blocking stdin, and a stream write on a pipe end. The process's signal
+/// source answers for the ops bound to it ([`super::SignalSource::import_parks`]); the address-space
+/// ops cannot park; a §12 concurrency op may (a join or a futex wait parks, and a thread or a fiber
+/// needs the interpreter to schedule it); an import `import.attach` may retarget may; any other
+/// import or capability call may, a dynamic one included. (A linked program has no `call.sym` left:
+/// linking rewrote each to one of these.)
+fn image_parks(host: &Host, m: &Module) -> Parks {
     use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
     let source = host.signal_poll().map(|(_, s)| s);
     let import_parks = |(import, b): (&temen_ir::Import, &super::BoundImport)| match b.type_id {
@@ -9109,35 +9116,56 @@ fn image_may_park(host: &Host, m: &Module) -> bool {
         .table
         .iter()
         .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })));
-    let cap_parks = |i: &Inst| match *i {
+    // A call that parks other than in a stream call.
+    let may_park = |i: &Inst| match *i {
         Inst::CapCall {
             type_id: STREAM,
             op,
             ..
-        } => match op {
-            0 => holds_pipe || host.stdin_block,
-            1 => holds_pipe,
-            2 => false,
-            _ => true,
-        },
+        } => op > 2,
         Inst::CapCall {
             type_id: ADDRESS_SPACE,
             ..
         } => false,
-        Inst::CapCall { .. } => true,
+        Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
         _ => false,
     };
-    m.imports.len() != host.import_bindings.len()
+    let stream_parks = |i: &Inst| match *i {
+        Inst::CapCall {
+            type_id: STREAM,
+            op,
+            ..
+        } => (op == 0 && (holds_pipe || host.stdin_block)) || (op == 1 && holds_pipe),
+        _ => false,
+    };
+    let insts = || {
+        m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+    };
+    if m.imports.len() != host.import_bindings.len()
         || m.imports
             .iter()
             .zip(&host.import_bindings)
             .any(import_parks)
         || m.funcs.iter().any(temen_ir::Func::uses_concurrency)
-        || m.funcs
-            .iter()
-            .flat_map(|f| &f.blocks)
-            .flat_map(|b| &b.insts)
-            .any(cap_parks)
+        || insts().any(may_park)
+    {
+        return Parks::Otherwise;
+    }
+    match insts().any(stream_parks) {
+        true => Parks::InStreams,
+        false => Parks::Never,
+    }
+}
+
+/// How a process running an image can park ([`image_parks`]).
+enum Parks {
+    Never,
+    /// Only in a stream call.
+    InStreams,
+    Otherwise,
 }
 
 /// #1896 — can a process running image `m` change its **page state**: reach an address-space
@@ -9211,14 +9239,27 @@ fn exec_image_build(
     // emitted code can address it, materialized exactly as it would be in place. Chosen only after
     // the commit, and only where the image runs: without such a window it runs in place, interpreted.
     let leaf = leaf
-        .filter(|_| !image_may_park(&img.host, &img.module))
-        .map(|emit| (emit, image_pages(&img.host, &img.module)))
-        .filter(|(emit, paged)| emit(cm, &img.module, entry as u32, *paged))
-        .and_then(|(_, paged)| {
+        .and_then(|emit| {
+            let parks = match image_parks(&img.host, &img.module) {
+                Parks::Never => false,
+                Parks::InStreams => true,
+                Parks::Otherwise => return None,
+            };
+            let paged = image_pages(&img.host, &img.module);
+            let offer = LeafOffer {
+                module: cm,
+                image: &img.module,
+                entry: entry as u32,
+                paged,
+                parks,
+            };
+            emit(&offer).then_some((paged, parks))
+        })
+        .and_then(|(paged, parks)| {
             let flat = |_| super::Region::growable(m.window.mapped(), m.page);
-            Some((m.fork_private_over(flat)?, paged))
+            Some((m.fork_private_over(flat)?, paged, parks))
         });
-    let m = leaf.as_ref().map_or(m, |(win, _)| win);
+    let m = leaf.as_ref().map_or(m, |(win, ..)| win);
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
     {
@@ -9244,13 +9285,14 @@ fn exec_image_build(
     let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     new_vt.active.module = cm;
     new_vt.active.home = cm;
-    let leaf = leaf.map(|(win, paged)| {
+    let leaf = leaf.map(|(win, paged, parks)| {
         let start = LeafStart {
             module: cm as u32,
             entry: entry as u32,
             argv: img.entry_args.iter().copied().collect(),
             results: cunit.result_types[entry as usize].clone().into(),
             paged,
+            parks,
         };
         (win, start)
     });
@@ -10357,6 +10399,10 @@ struct BounceRunCtx<'a> {
     /// bounces is not yet mirrored there) and for a §14 child (#1296: a child's installs stay in its
     /// own table, never the root's mirror).
     jit_mirror: Option<JitMirror<'a>>,
+    /// #1896 — where a bounce out of a leaf whose host suspends its emitted frames
+    /// ([`LeafOffer::parks`]) leaves a call that parks: its continuation, and the state its task
+    /// parks in. `None` for any other bounce, in which a park faults.
+    park: Option<&'a mut Option<(Vm, TaskState)>>,
 }
 
 /// A wasm-JIT driver's dispatch-table mirror — the `slot → (domain, unit)` array and its generation
@@ -10665,6 +10711,24 @@ fn drive_nested(
                 };
                 let total = gc_write(mem, buf, cap, roots)?;
                 active.set(dst, Reg::from_i64(total));
+            }
+            // #1896 — a call parks in a bounce out of a leaf whose host suspends the emitted frames
+            // beneath this drive. The drive stops here and hands back its continuation, the op
+            // rewound to re-execute, with the state the task parks in; the pump runs the rest once
+            // the park clears. A park anywhere else faults, as ever: nothing beneath could wait.
+            park @ (Outcome::PipeRead { .. } | Outcome::PipeWrite { .. } | Outcome::StdinPark) => {
+                let slot = run_meta
+                    .as_mut()
+                    .and_then(|c| c.park.as_deref_mut())
+                    .filter(|_| chain.is_empty())
+                    .ok_or(Trap::CapFault)?;
+                let state = match park {
+                    Outcome::PipeRead { pipe } => TaskState::BlockedPipeRead { pipe },
+                    Outcome::PipeWrite { pipe } => TaskState::BlockedPipeWrite { pipe },
+                    _ => TaskState::BlockedStdin,
+                };
+                *slot = Some((active, state));
+                return Ok(Vec::new());
             }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
             // whole `Instantiator` is unavailable inside it — named here rather than left to the
@@ -11517,6 +11581,7 @@ fn coop_start_child(
         threads: Vec::new(),
         env: Some(eidx),
         state: TaskState::Runnable,
+        suspended: None,
         lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -11536,6 +11601,9 @@ struct TaskSlot {
     /// (and any threads it spawns, which share its window — they inherit the same env index).
     env: Option<usize>,
     state: TaskState,
+    /// #1896 — the rest of a call that parked in a bounce out of this task's emitted leaf, run once
+    /// the park clears.
+    suspended: Option<Box<Suspended>>,
     /// A detached child's window lease `(spawner env, budget, bytes)`, on the child's root task:
     /// once the task is `Done` the scheduler returns the bytes to the spawner's budget
     /// ([`refund_ended_windows`]).
@@ -11662,7 +11730,9 @@ fn drive(
     match sched.pump(&dom, mem, host, fuel, budget)? {
         CoopStep::Done(vals) => Ok(vals),
         CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
-        CoopStep::TierUp { .. } => unreachable!("tier-up not enabled on the native driver"),
+        CoopStep::TierUp { .. } | CoopStep::Resume { .. } => {
+            unreachable!("tier-up not enabled on the native driver")
+        }
         CoopStep::JitInvoke { .. } => {
             unreachable!("Jit.invoke surfacing not enabled on the native driver")
         }
@@ -11692,6 +11762,9 @@ enum CoopStep {
         argv: Box<[i64]>,
         mapped: u64,
     },
+    /// #1896 — a leaf's call that parked in a bounce returned these raw i64 result slots: the host
+    /// resumes the leaf's suspended frames with them ([`CoopEvent::Resume`]).
+    Resume { results: Box<[i64]> },
     /// A task paused on a §22 `Jit.invoke` of a runtime-compiled unit that has **emitted wasm**, an
     /// all-scalar signature, and a representable window — the host runs the unit's `f0` and delivers
     /// the results back ([`CoopSched::deliver_jit_invoke_vals`]). `code` is the unit's code handle,
@@ -11713,8 +11786,20 @@ enum CoopStep {
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
     Frame(usize),
-    /// No frame: the task tiered up at its entry (#1896), so its results end it.
-    Entry,
+    /// No frame: the task tiered up at its entry (#1896), so its results end it. `parks`: its host
+    /// suspends its emitted frames where a call parks ([`LeafOffer::parks`]).
+    Entry { parks: bool },
+}
+
+/// #1896 — a leaf running emitted whose call parked in a bounce ([`LeafOffer::parks`]): its host
+/// holds the emitted frames, suspended, and this is the rest of the call, which the pump runs once
+/// the park clears ([`CoopStep::Resume`]).
+struct Suspended {
+    /// The call's interpreted continuation, its parked op rewound.
+    vm: Vm,
+    /// Where the leaf's results land, and their types ([`CoopSched::pending_tierup`]).
+    dst: TierUpDst,
+    results: Box<[ValType]>,
 }
 
 /// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
@@ -11876,6 +11961,7 @@ impl CoopSched {
             threads: Vec::new(),
             env: None,
             state: TaskState::Runnable,
+            suspended: None,
             lease: None,
         }];
         // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
@@ -12186,6 +12272,7 @@ impl CoopSched {
                 env.fibers = FiberTables::default();
                 for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
                     t.vt.release();
+                    t.suspended = None;
                 }
             }
             // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
@@ -12609,6 +12696,42 @@ impl CoopSched {
                     )
                 }
             };
+            // #1896 — a leaf's call that parked in a bounce: run the rest of it in the task's env.
+            // When it returns, its host resumes the leaf's suspended frames with its results; when
+            // it parks again, the task waits again. A trap ends the process, whose frames the host
+            // never resumes.
+            if let Some(s) = tasks[ti].suspended.take() {
+                let Suspended { vm, dst, results } = *s;
+                let mut parked = None;
+                let meta = BounceRunCtx {
+                    jit_mirror: None, // a leaf's env is its own
+                    park: Some(&mut parked),
+                };
+                let done = drive_nested(
+                    &dom.source,
+                    ctx.table,
+                    vm,
+                    ctx.fuel,
+                    ctx.mem,
+                    &mut ctx.host,
+                    &mut fcell,
+                    Some(meta),
+                    None,
+                );
+                match (done, parked) {
+                    (Err(trap), _) => complete(tasks, ti, Err(trap)),
+                    (Ok(_), Some((vm, state))) => {
+                        tasks[ti].state = state;
+                        tasks[ti].suspended = Some(Box::new(Suspended { vm, dst, results }));
+                    }
+                    (Ok(vals), None) => {
+                        *pending_tierup = Some((ti, dst, results));
+                        let results = vals.iter().map(|v| val_to_slot(*v)).collect();
+                        return Ok(CoopStep::Resume { results });
+                    }
+                }
+                continue;
+            }
             let stop = step_vcpu(
                 &mut tasks[ti].vt,
                 &mut fcell,
@@ -12931,6 +13054,7 @@ impl CoopSched {
                             threads: Vec::new(),
                             env: Some(twin_eidx),
                             state: TaskState::Runnable,
+                            suspended: None,
                             lease: None,
                         });
                         // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
@@ -13139,7 +13263,8 @@ impl CoopSched {
                             false => m.scalar_extent(),
                         });
                         if let Some(mapped) = mapped {
-                            *pending_tierup = Some((ti, TierUpDst::Entry, start.results));
+                            *pending_tierup =
+                                Some((ti, TierUpDst::Entry { parks: start.parks }, start.results));
                             return Ok(CoopStep::TierUp {
                                 module: start.module,
                                 func: start.entry,
@@ -13265,6 +13390,7 @@ impl CoopSched {
                                 threads: Vec::new(),
                                 env: Some(twin_eidx),
                                 state: TaskState::Runnable,
+                                suspended: None,
                                 lease: None,
                             });
                             forked_twins.insert(twin_ti);
@@ -13374,6 +13500,7 @@ impl CoopSched {
                         threads: Vec::new(),
                         env,
                         state: TaskState::Runnable,
+                        suspended: None,
                         lease: None,
                     });
                     let handle = tasks[ti].threads.len() as i32;
@@ -13927,7 +14054,7 @@ impl CoopSched {
                 }
             }
             // #1896: the process ran whole: it returned from its entry.
-            TierUpDst::Entry => complete(&mut self.tasks, ti, Ok(vals.collect())),
+            TierUpDst::Entry { .. } => complete(&mut self.tasks, ti, Ok(vals.collect())),
         }
     }
 
@@ -13987,18 +14114,33 @@ pub struct TierUpConfig {
     /// #750 paged tier-up: the emitted region carries a per-access page check, so an unrepresentable
     /// window surfaces with the reserved size instead of declining.
     pub page_checked: bool,
-    /// #1896 — the host's emitter for **leaf images**: an image a process `execve`s that cannot park
-    /// ([`image_may_park`]) is offered to it, and runs whole on the emitted tier if it emits it.
-    /// `None`: every exec'd image interprets.
+    /// #1896 — the host's emitter for **leaf images**: an image a process `execve`s that cannot park,
+    /// or parks only in a stream call ([`image_parks`]), is offered to it, and runs whole on the
+    /// emitted tier if it emits it. `None`: every exec'd image interprets.
     pub leaf: Option<LeafEmitter>,
 }
 
-/// The host's emitter for leaf images ([`TierUpConfig::leaf`]). Offered `(module, image, entry,
-/// paged)` — `module` the index the image's [`CoopEvent::TierUp`] names — it emits `image` to run
-/// whole from `entry`, with the per-access page check (#750) iff `paged`, and answers whether it
-/// did. `paged` is the engine's to decide: whether the image can change its page state is a fact
-/// of the imports it is bound to, which the image alone does not show.
-pub type LeafEmitter = std::sync::Arc<dyn Fn(usize, &Module, u32, bool) -> bool + Send + Sync>;
+/// The host's emitter for leaf images ([`TierUpConfig::leaf`]). Offered one ([`LeafOffer`]), it
+/// emits the image to run whole from its entry, and answers whether it did.
+pub type LeafEmitter = std::sync::Arc<dyn Fn(&LeafOffer) -> bool + Send + Sync>;
+
+/// A leaf image the engine offers the host's emitter ([`LeafEmitter`]). `paged` and `parks` are the
+/// engine's to decide: they are facts of the imports the image is bound to and of what its process
+/// holds, which the image alone does not show.
+pub struct LeafOffer<'a> {
+    /// The program index the image's [`CoopEvent::TierUp`] names.
+    pub module: usize,
+    pub image: &'a Module,
+    /// The function it runs whole from.
+    pub entry: u32,
+    /// It can change its page state: emit it with the per-access page check (#750).
+    pub paged: bool,
+    /// It can park, in a stream call (a read of an empty pipe, say). Emit it only if the host can
+    /// **suspend** its emitted frames there: the call's bounce ([`CoopRun::bounce`]) then answers
+    /// that it parked, and the host holds the frames until [`CoopEvent::Resume`] hands it the call's
+    /// results.
+    pub parks: bool,
+}
 
 /// What a [`CoopRun`] holds ([`CoopRun::footprint`]): the memory a process tree costs its embedder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14038,6 +14180,12 @@ pub enum CoopEvent {
         argv: Box<[i64]>,
         mapped: u64,
     },
+    /// #1896 — a call that parked in a bounce out of a leaf running emitted ([`LeafOffer::parks`],
+    /// [`CoopRun::bounce`]) has returned these raw i64 result slots. The host resumes that leaf's
+    /// suspended frames (the round-trip is its task's again: [`CoopRun::pending_task`]) as the
+    /// bounce's return, then serves the leaf's further bounces and delivers its end as for a
+    /// [`CoopEvent::TierUp`].
+    Resume { results: Box<[i64]> },
     /// A task paused on a §22 `Jit.invoke` of a runtime-compiled unit with emitted `wasm`: the host
     /// runs the unit's `f0(win, env, ...argv)` (marshalling by `params`/`results`, `mapped` into its
     /// `"mapped"` global) and calls [`CoopRun::deliver_jit_invoke_vals`] /
@@ -14215,6 +14363,13 @@ impl CoopRun {
     /// (the one the driver is currently serving), if any. The same resolution [`bounce`](Self::bounce)
     /// performs — at most one round-trip is outstanding, so this names *the* task every per-event
     /// driver read (`win`, mapped extent, page state) must be answered for.
+    /// #1896 — the task the outstanding round-trip is for. A host that suspends leaves' frames
+    /// ([`LeafOffer::parks`]) keys them by it: a [`CoopEvent::TierUp`] starts that task's leaf, and a
+    /// [`CoopEvent::Resume`] resumes it.
+    pub fn pending_task(&self) -> Option<usize> {
+        self.pending_ti()
+    }
+
     fn pending_ti(&self) -> Option<usize> {
         self.sched
             .pending_tierup
@@ -14363,6 +14518,7 @@ impl CoopRun {
                 argv,
                 mapped,
             },
+            Ok(CoopStep::Resume { results }) => CoopEvent::Resume { results },
             Ok(CoopStep::JitInvoke {
                 code,
                 wasm,
@@ -14425,12 +14581,17 @@ impl CoopRun {
     /// frames, the run's fibers, and those words. With `None` — or during a `Jit.invoke`, whose emitted
     /// unit frames never spill — something live below is out of view and the op fails closed
     /// (`CapFault`, #1660).
+    ///
+    /// #1896 — `Ok(None)`: the call **parked**, in a leaf whose host suspends its emitted frames
+    /// ([`LeafOffer::parks`]). The task parks as an interpreted one would, the round-trip is no longer
+    /// outstanding, and the host holds the frames and runs on; [`CoopEvent::Resume`] hands them the
+    /// call's results once it returns.
     pub fn bounce(
         &mut self,
         target: u32,
         io: &mut [i64],
         spill: Option<&[u64]>,
-    ) -> Result<usize, Trap> {
+    ) -> Result<Option<usize>, Trap> {
         // The paused task is whichever host round-trip is outstanding — a tier-up region or a
         // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
         let ti = self.pending_ti().ok_or(Trap::Malformed)?;
@@ -14453,8 +14614,16 @@ impl CoopRun {
             invoke_fibers,
             slot_units,
             table_gen,
+            pending_tierup,
             ..
         } = sched;
+        // #1896: a leaf whose host suspends its frames can park in a bounce.
+        let parks = !in_invoke
+            && matches!(
+                pending_tierup,
+                Some((_, TierUpDst::Entry { parks: true }, _))
+            );
+        let mut parked = None;
         // The registry `coop_bounce` threads into `drive_nested`: invoke-confined (`invoke_fibers`, no
         // shadow-SP/freeze halves — invoke fibers are transient) during an emitted `Jit.invoke`, else the
         // run-level registry with its parallel arrays. One of the two `match` arms below moves it.
@@ -14481,6 +14650,7 @@ impl CoopRun {
                         units: slot_units,
                         gen: table_gen,
                     }),
+                    park: parks.then_some(&mut parked),
                 }),
             )
         };
@@ -14491,7 +14661,7 @@ impl CoopRun {
             b.words.push(words);
             b
         });
-        match tasks[ti].env {
+        let n = match tasks[ti].env {
             // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
             None => {
                 let mut cell = HostCell::Excl(host);
@@ -14529,7 +14699,18 @@ impl CoopRun {
                     beneath.as_ref(),
                 )
             }
-        }
+        }?;
+        drop(beneath);
+        let Some((vm, state)) = parked else {
+            return Ok(Some(n));
+        };
+        // #1896: the call parked. Its task waits with the rest of the call, and its host with the
+        // emitted frames.
+        let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
+        let t = &mut tasks[ti];
+        t.state = state;
+        t.suspended = Some(Box::new(Suspended { vm, dst, results }));
+        Ok(None)
     }
 }
 

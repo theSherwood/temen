@@ -2229,8 +2229,9 @@ impl SignalSource for SignalDoor {
 
     /// #1896 — whether this personality's op `import` can park the process. The ops in
     /// [`NEVER_PARKS`] never do; a `read` or `write` does when the process holds something it could
-    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. `None` for an
-    /// import that is not this personality's.
+    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. A core pipe end
+    /// is not one: the op redirects to the core pipe's stream call, which parks in its place and
+    /// which the engine answers for. `None` for an import that is not this personality's.
     fn import_parks(&self, import: &str) -> Option<bool> {
         let op = resolve_import(import)?.op;
         if op != OP_READ && op != OP_WRITE {
@@ -2244,7 +2245,7 @@ impl SignalSource for SignalDoor {
             .is_some();
         let p = self.0.lock().unwrap_or_else(|e| e.into_inner());
         Some(p.fds.iter().flatten().any(|f| match f {
-            FdEntry::File(_) => false,
+            FdEntry::File(_) | FdEntry::CorePipe(_) => false,
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => terminal,
             _ => true,
         }))

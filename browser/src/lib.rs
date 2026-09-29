@@ -15109,6 +15109,11 @@ pub const COOP_RUN_DONE: i32 = 0;
 pub const COOP_RUN_TIERUP: i32 = 1;
 pub const COOP_RUN_TRAP: i32 = 2;
 pub const COOP_RUN_JIT_INVOKE: i32 = 3;
+/// #1896: a call that parked in a bounce out of a leaf returned ([`bytecode::CoopEvent::Resume`]).
+/// Its results are staged as the argv ([`temen_coop_argv_ptr`]); the host writes them into the
+/// parked `call_interp`'s scratch and resumes the leaf's suspended frames ([`temen_coop_task`]
+/// names the leaf).
+pub const COOP_RUN_RESUME: i32 = 4;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
 /// (mirrors the relevant fields of `TierupRun`). The window `Region` is shared with `CoopRun`'s
@@ -15602,6 +15607,14 @@ pub extern "C" fn temen_coop_run() -> i32 {
             }
             return COOP_RUN_TIERUP;
         }
+        bytecode::CoopEvent::Resume { results } => {
+            // The rest of the call may have grown the window: refresh as after a bounce.
+            if s.event_paged() {
+                s.sync_pagestate();
+            }
+            s.argv = results.into_vec();
+            return COOP_RUN_RESUME;
+        }
         bytecode::CoopEvent::JitInvoke {
             code,
             wasm,
@@ -15703,6 +15716,15 @@ pub extern "C" fn temen_coop_run() -> i32 {
         LAST_STATUS = status;
     }
     ev
+}
+
+/// #1896: the task the pending TIERUP or RESUME is for, or `-1`. A driver that suspends a leaf's
+/// frames where a call parks keys them by it.
+#[no_mangle]
+pub extern "C" fn temen_coop_task() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.run.pending_task())
+        .map_or(-1, |t| t as i32)
 }
 
 /// #1896: the program the pending TIERUP's `func` is in — `0`, this run's own emit
@@ -15947,7 +15969,9 @@ pub extern "C" fn temen_coop_deliver_jit_trap() {
 /// The emitted tier-up region's cross-tier `env.call_interp(target, args_ptr)`: bounce into the
 /// interp-resident leaf `target` over the **tiering-up task's** window/powerbox (routed by
 /// [`CoopRun::bounce`]). `args_ptr` is the env scratch (i64 slots, args→results in place). Returns
-/// `0` on success, `1` on a callback trap (staged for [`temen_coop_deliver_trap`]).
+/// `0` on success, `1` on a callback trap (staged for [`temen_coop_deliver_trap`]), `2` when the call
+/// parked (#1896, a leaf whose host suspends): the host suspends the leaf's frames and runs on, and
+/// [`COOP_RUN_RESUME`] brings the call's results.
 ///
 /// #1627: `spill_len` is how many words the emitted frames beneath this bounce have pushed — the
 /// driver reads the env cell's cursor and passes `(cursor - base) / 8` of [`temen_coop_spill_ptr`]'s
@@ -15969,7 +15993,8 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8, spill_l
         .then(|| s.spill.get(..spill_len))
         .flatten();
     match s.run.bounce(target, io, spill) {
-        Ok(_) => {
+        Ok(None) => 2,
+        Ok(Some(_)) => {
             // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
             // page-state table (version-guarded) so the post-bounce emitted access admits the growth
             // (the paged twin of the #717 scalar fan-out).

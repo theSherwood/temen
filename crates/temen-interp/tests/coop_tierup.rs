@@ -91,6 +91,9 @@ fn coop_tierup_run(
             bytecode::CoopEvent::Idle => {
                 panic!("unexpected Idle (suspend_on_idle is never armed here)")
             }
+            bytecode::CoopEvent::Resume { .. } => {
+                panic!("unexpected Resume (no leaf image here)")
+            }
             bytecode::CoopEvent::JitInvoke { .. } => {
                 panic!("unexpected JitInvoke (no vm_jit guest here)")
             }
@@ -277,6 +280,9 @@ fn coop_tierup_bounce_matches_pure_interp() {
             bytecode::CoopEvent::Idle => {
                 panic!("unexpected Idle (suspend_on_idle is never armed here)")
             }
+            bytecode::CoopEvent::Resume { .. } => {
+                panic!("unexpected Resume (no leaf image here)")
+            }
             bytecode::CoopEvent::JitInvoke { .. } => {
                 panic!("unexpected JitInvoke (no vm_jit guest here)")
             }
@@ -286,7 +292,8 @@ fn coop_tierup_bounce_matches_pure_interp() {
                 let mut io: Vec<i64> = argv.to_vec();
                 let n = run
                     .bounce(2, &mut io, None)
-                    .expect("bounce resolves + runs");
+                    .expect("bounce resolves + runs")
+                    .expect("the call returns: nothing here parks");
                 bounces += 1;
                 assert_eq!(n, 1, "C returns exactly one result");
                 run.deliver_tierup(&io[..n]);
@@ -529,6 +536,9 @@ fn coop_tierup_child_env_tasks_tier_up() {
                 bytecode::CoopEvent::Idle => {
                     panic!("unexpected Idle (suspend_on_idle is never armed here)")
                 }
+                bytecode::CoopEvent::Resume { .. } => {
+                    panic!("unexpected Resume (no leaf image here)")
+                }
                 bytecode::CoopEvent::JitInvoke { .. } => {
                     panic!("unexpected JitInvoke (no vm_jit guest here)")
                 }
@@ -677,6 +687,9 @@ block 0 (vx: i64) {
             bytecode::CoopEvent::Trapped(t) => break Err(t),
             bytecode::CoopEvent::Idle => {
                 panic!("unexpected Idle (suspend_on_idle is never armed here)")
+            }
+            bytecode::CoopEvent::Resume { .. } => {
+                panic!("unexpected Resume (no leaf image here)")
             }
             bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
             bytecode::CoopEvent::TierUp { func, argv, .. } => {
@@ -923,6 +936,9 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
                     bytecode::CoopEvent::Idle => {
                         panic!("unexpected Idle (suspend_on_idle is never armed here)")
                     }
+                    bytecode::CoopEvent::Resume { .. } => {
+                        panic!("unexpected Resume (no leaf image here)")
+                    }
                     bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
                     bytecode::CoopEvent::TierUp { func, argv, .. } => {
                         assert_eq!(func, 5, "only the leaf is eligible");
@@ -1047,6 +1063,9 @@ block 0 (vx: i64) {
                 bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
                 bytecode::CoopEvent::Idle => {
                     panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                }
+                bytecode::CoopEvent::Resume { .. } => {
+                    panic!("unexpected Resume (no leaf image here)")
                 }
                 bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
                 bytecode::CoopEvent::TierUp { func, argv, .. } => {

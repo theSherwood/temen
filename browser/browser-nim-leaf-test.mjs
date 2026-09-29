@@ -1,24 +1,30 @@
 // #1896 — a process tree's **leaf processes** run whole on the emitted tier, checked through the real
 // JS driver. `temen_nim_open` opens a POSIX build as a cooperative tier-up session: the tree forks,
 // execs and waits on the interpreter, and an exec'd image that cannot park pauses the run as a TIERUP
-// of its own program, which `driveCoopTierupRun` instantiates and runs whole. The native pin is
+// of its own program, which `driveCoopTierupRun` instantiates and runs whole. So does one that parks
+// only on its core pipes, where the host can suspend its emitted frames (JSPI): a call that parks
+// suspends them, and `COOP_RUN_RESUME` resumes them once it returns. The native pins are
 // `temen-posix/tests/leaf_tierup.rs` (the entry served by a bounce); this is the shipped path.
 //
-// The tree: the driver forks, the child execs `/bin/leaf`, and the driver exits with the child's
-// status. `/bin/leaf` writes `leaf` to `out.txt` and exits 5. Asserts, for a leaf child: one tier-up,
-// of a program other than 0, unpaged, and the tree ends with exit 5 and the file written. A leaf that
-// makes a page read-only, then reads memory from emitted code, tiers up page-checked and ends the
-// same way. With a pipe made before the fork, the child holds pipe ends it could block on, so it runs
-// interpreted — no tier-up — and the tree ends the same way. A leaf that loads through a null
-// pointer crashes the same way on both tiers.
+// The cases are `nim-leaf-cases.mjs`'s, run under Node and then in Chromium through Playwright when
+// it is at hand. A leaf child tiers up once, of a program other than 0, unpaged, and the tree ends
+// with exit 5 and the file written. A leaf that makes a page read-only, then reads memory from
+// emitted code, tiers up page-checked and ends the same way. With one of the personality's pipes made
+// before the fork, the child holds pipe ends it may park on, so it runs interpreted: no tier-up, and
+// the tree ends the same way. A leaf that loads through a null pointer crashes the same way on both
+// tiers. A leaf that pings its parent over core pipes and parks on its reply — reading an empty pipe,
+// or first writing to a full one — ends with exit 14 and the reply written: where the host suspends
+// (Chromium), after one tier-up and one resume; where it cannot (Node), interpreted.
 //
 // Usage:  node browser-nim-leaf-test.mjs [module.wasm]   (build the threads cdylib first)
 
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { driveCoopTierupRun } from './web/wasmjit-module.js';
+import { driveCoopTierupRun, suspendsLeaves } from './web/wasmjit-module.js';
 import { engineImports } from './engine-imports.mjs';
+import { runCases } from './nim-leaf-cases.mjs';
+import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const wasmPath = process.argv[2]
@@ -28,191 +34,82 @@ if (!existsSync(wasmPath)) {
   process.exit(0);
 }
 
+const fail = (msg) => { console.error(`FAIL: ${msg}`); process.exitCode = 1; };
+// What `runCases` must report in `host`, which suspends a leaf's frames iff `suspends`.
+const check = (host, r, suspends) => {
+  const ended = (name, x, exit, wrote) => {
+    if (x.exit !== exit || x.wrote !== wrote) {
+      fail(`${host}: ${name} tree: exit ${x.exit}, wrote ${x.wrote} (want ${exit}, ${wrote})`);
+    }
+  };
+  ended('leaf', r.leaf, 5, 'leaf');
+  if (r.leaf.leafTierups.length !== 1 || r.leaf.paged) {
+    fail(`${host}: the leaf child tiers up once, unpaged: ${r.leaf.leafTierups}, paged ${r.leaf.paged}`);
+  }
+  ended('read-only page', r.ro, 5, 'leaf');
+  if (r.ro.leafTierups.length !== 1 || !r.ro.paged) {
+    fail(`${host}: the protecting leaf tiers up once, paged: ${r.ro.leafTierups}, paged ${r.ro.paged}`);
+  }
+  ended('piped', r.piped, 5, 'leaf');
+  if (r.piped.leafTierups.length !== 0) {
+    fail(`${host}: a child holding a personality pipe runs interpreted: ${r.piped.leafTierups}`);
+  }
+  ended('null leaf, emitted', r.nul, 128, null);
+  ended('null leaf, interpreted', r.nulPiped, 128, null);
+  if (r.nul.leafTierups.length !== 1 || r.nulPiped.leafTierups.length !== 0) {
+    fail(`${host}: the null leaf tiers up only without the pipe: `
+      + `${r.nul.leafTierups} / ${r.nulPiped.leafTierups}`);
+  }
+  for (const [name, x] of [['parks on a read', r.parkRead], ['parks on a write', r.parkWrite]]) {
+    ended(`a leaf that ${name}`, x, 14, 'pong');
+    const [tierups, resumes] = suspends ? [1, 1] : [0, 0];
+    if (x.leafTierups.length !== tierups || x.resumes !== resumes) {
+      fail(`${host}: a leaf that ${name}: ${x.leafTierups.length} tier-ups and ${x.resumes} resumes `
+        + `(want ${tierups} and ${resumes})`);
+    }
+  }
+};
+
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
-const u8 = () => new Uint8Array(memory.buffer);
-const enc = new TextEncoder();
-const dec = new TextDecoder();
+check('node', await runCases({ ex, memory, drive: driveCoopTierupRun, suspends: suspendsLeaves }),
+  suspendsLeaves);
 
-// A leaf image. The entry is compute the emitter takes; the helper it calls makes the `__px_*`
-// calls, which the emitted entry bounces to the interpreter — the shape of a real nim module's
-// `_start`. It writes `leaf` to `out.txt` and exits 5, but for its `kind`:
-// - `ro`: a second helper first makes a page of the window read-only (`vm_protect`) and returns
-//   where the status' source byte is, and the entry reads it itself ('l' − 103 = 5) — an access the
-//   emitter cannot prove in bounds, after the page state went past one bound: only a page-checked
-//   emit (#1896: the engine offers an image that can change its page state paged) runs it without a
-//   false fault;
-// - `null`: the entry first loads through a null pointer, which faults on both tiers — an exec'd
-//   image starts behind the NULL guard (#1094), as the emitted code's baked guard does — so the
-//   process crashes and its parent reaps 128.
-const leafImage = (kind) => `memory 17
-import 0 "__px_open" (i64, i64, i64) -> (i64)
-import 1 "__px_write" (i64, i64, i64) -> (i64)
-import 2 "__px_close" (i64) -> (i64)
-import 3 "__px_exit" (i64) -> ()
-${kind === 'ro' ? 'import 4 "vm_protect" (i64, i64, i64) -> (i64)\nimport 5 "vm_page_size" () -> (i64)\n' : ''}data 40000 "out.txt"
-data 40100 "leaf"
-func (i64) -> (i64) {
-block 0 (vcap: i64) {
-${{
-  ro: `  vp = call 2 ()
-  vb = i32.load8_u vp
-  vbl = i64.extend_i32_u vb
-  vk = i64.const 103
-  vfive = i64.sub vbl vk
-`,
-  null: '  vnull = i64.const 8\n  vx = i64.load vnull\n  vfive = i64.const 5\n',
-  plain: '  vfive = i64.const 5\n',
-}[kind]}  vr = call 1 (vfive)
-  return vr
+async function loadChromium() {
+  for (const s of ['playwright', '/opt/node22/lib/node_modules/playwright/index.js']) {
+    try { const m = await import(s); return m.chromium ?? m.default?.chromium; } catch {}
   }
+  return null;
 }
-func (i64) -> (i64) {
-block 0 (vstatus: i64) {
-  vpath = i64.const 40000
-  vplen = i64.const 7
-  vflags = i64.const 577
-  vfd = call.import 0 (vpath, vplen, vflags)
-  vbuf = i64.const 40100
-  vn = i64.const 4
-  vw = call.import 1 (vfd, vbuf, vn)
-  vc = call.import 2 (vfd)
-  call.import 3 (vstatus)
-  unreachable
+const chromium = await loadChromium();
+if (chromium === null) {
+  console.log('– the Chromium pass is skipped (playwright not found)');
+} else {
+  const { server, port } = await startServer(ROOT);
+  const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] : [] });
+  try {
+    const page = await browser.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(String(e)));
+    await page.goto(`http://127.0.0.1:${port}/web/play.html`);
+    const { results, suspends } = await page.evaluate(async () => {
+      const par = await import('./par.js');
+      const { driveCoopTierupRun: drive, suspendsLeaves: suspends } = await import('./wasmjit-module.js');
+      const cases = await import('../nim-leaf-cases.mjs');
+      const { ex, memory } = await par.loadEngine(null);
+      return { results: await cases.runCases({ ex, memory, drive, suspends }), suspends };
+    });
+    if (!suspends) fail('chromium: no JSPI (WebAssembly.Suspending / WebAssembly.promising)');
+    check('chromium', results, suspends);
+    if (errors.length) fail(`chromium: page errors: ${errors}`);
+  } finally {
+    await browser.close();
+    server.close();
   }
-}
-${kind === 'ro' ? `func () -> (i64) {
-block 0 () {
-  vpg = call.import 5 ()
-  vtwenty = i64.const 20
-  vat = i64.mul vpg vtwenty
-  vread = i64.const 1
-  vr = call.import 4 (vat, vpg, vread)
-  vl = i64.const 40100
-  vsrc = i64.add vl vr
-  return vsrc
-  }
-}
-` : ''}`;
-
-const driver = (pipe) => `memory 17
-import 0 "__px_execve" (i64, i64, i64) -> (i64)
-import 1 "__px_exit" (i64) -> ()
-import 2 "__px_fork" () -> (i64)
-import 3 "__px_wait4" (i64, i64, i64, i64) -> (i64)
-import 4 "__px_pipe" (i64) -> (i64)
-data 40000 "/bin/leaf\\x00"
-func () -> () {
-block 0 () {
-${pipe ? '  vfds = i64.const 42000\n  vpp = call.import 4 (vfds)\n' : ''}  vpid = call.import 2 ()
-  vz = i64.const 0
-  vchild = i64.eq vpid vz
-  br_if vchild 1() 2(vpid)
-  }
-block 1 () {
-  vp = i64.const 40000
-  vz = i64.const 0
-  vr = call.import 0 (vp, vz, vz)
-  vnine = i64.const 9
-  call.import 1 (vnine)
-  unreachable
-  }
-block 2 (xpid: i64) {
-  vst = i64.const 41000
-  vz = i64.const 0
-  vw = call.import 3 (xpid, vst, vz, vz)
-  vhi = i64.const 41001
-  vsw = i32.load8_u vhi
-  vs = i64.extend_i32_u vsw
-  call.import 1 (vs)
-  unreachable
-  }
-}
-export 0 func "_start" 0
-`;
-
-const put = (bytes) => {
-  const p = Number(ex.temen_alloc(bytes.length));
-  u8().set(bytes, p);
-  return [p, bytes.length];
-};
-const parse = (text) => {
-  const [p, n] = put(enc.encode(text));
-  if (ex.temen_parse(p, n) !== 1) throw new Error('the IR does not parse');
-  return u8().slice(Number(ex.temen_parse_ptr()), Number(ex.temen_parse_ptr()) + ex.temen_parse_len());
-};
-// A registry blob: u32 count, then per entry u32 name length, the name, u32 length, the bytes.
-const blob = (entries) => {
-  const named = entries.map(([n, b]) => [enc.encode(n), b]);
-  const out = new Uint8Array(named.reduce((t, [n, b]) => t + 8 + n.length + b.length, 4));
-  const dv = new DataView(out.buffer);
-  let o = 0;
-  dv.setUint32(o, named.length, true); o += 4;
-  for (const [n, b] of named) {
-    dv.setUint32(o, n.length, true); o += 4; out.set(n, o); o += n.length;
-    dv.setUint32(o, b.length, true); o += 4; out.set(b, o); o += b.length;
-  }
-  return out;
-};
-
-// Build the tree and drive it, counting the tier-ups of programs other than 0 (each TIERUP service
-// reads `temen_coop_module` once) and whether any event ran page-checked (`temen_coop_paged`).
-const run = async (pipe, kind) => {
-  const leafTierups = [];
-  let paged = false;
-  const watch = {
-    temen_coop_module: (m) => { if (m !== 0) leafTierups.push(m); },
-    temen_coop_paged: (p) => { paged ||= p !== 0; },
-  };
-  const counted = Object.fromEntries(
-    Object.entries(Object.getOwnPropertyDescriptors(ex)).map(([k, d]) => {
-      const v = d.value;
-      const seen = watch[k];
-      return [k, seen ? (...a) => { const r = v(...a); seen(r); return r; } : v];
-    }));
-  const args = [
-    put(parse(driver(pipe))),
-    put(blob([['/w/bin/leaf\n/bin/leaf', parse(leafImage(kind))]])),
-    put(blob([])),
-    put(enc.encode('bin/driver\0')),
-    put(enc.encode('/w')),
-  ].flat();
-  if (ex.temen_nim_open(...args) !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
-  await driveCoopTierupRun(counted, memory);
-  const [pp, pl] = put(enc.encode('/w/out.txt'));
-  const n = Number(ex.temen_nim_file(pp, pl));
-  const wrote = n >= 0 ? dec.decode(u8().slice(Number(ex.temen_nim_file_ptr()), Number(ex.temen_nim_file_ptr()) + n)) : null;
-  return { exit: ex.temen_exit_code(), wrote, leafTierups, paged };
-};
-
-const fail = (msg) => { console.error(`FAIL: ${msg}`); process.exitCode = 1; };
-const ended = (name, r, exit, wrote) => {
-  if (r.exit !== exit || r.wrote !== wrote) {
-    fail(`${name} tree: exit ${r.exit}, wrote ${r.wrote} (want ${exit}, ${wrote})`);
-  }
-};
-const leaf = await run(false, 'plain');
-ended('leaf', leaf, 5, 'leaf');
-if (leaf.leafTierups.length !== 1 || leaf.paged) {
-  fail(`the leaf child tiers up once, unpaged: ${leaf.leafTierups}, paged ${leaf.paged}`);
-}
-const ro = await run(false, 'ro');
-ended('read-only page', ro, 5, 'leaf');
-if (ro.leafTierups.length !== 1 || !ro.paged) {
-  fail(`the protecting leaf tiers up once, paged: ${ro.leafTierups}, paged ${ro.paged}`);
-}
-const piped = await run(true, 'plain');
-ended('piped', piped, 5, 'leaf');
-if (piped.leafTierups.length !== 0) fail(`a child holding a pipe runs interpreted: ${piped.leafTierups}`);
-const nul = await run(false, 'null');
-const nulPiped = await run(true, 'null');
-ended('null leaf, emitted', nul, 128, null);
-ended('null leaf, interpreted', nulPiped, 128, null);
-if (nul.leafTierups.length !== 1 || nulPiped.leafTierups.length !== 0) {
-  fail(`the null leaf tiers up only without the pipe: ${nul.leafTierups} / ${nulPiped.leafTierups}`);
 }
 if (process.exitCode) process.exit(process.exitCode);
-console.log(`ok — the leaf child ran on the emitted tier (program ${leaf.leafTierups[0]}); the one `
-  + 'that protects a page ran page-checked; the piped one interpreted, each ending with exit 5 and '
-  + 'the file written; a null load crashed the child on both tiers alike');
+console.log('ok — a leaf child ran on the emitted tier; the one that protects a page ran page-checked; '
+  + 'the one holding a personality pipe interpreted, each ending with exit 5 and the file written; a '
+  + 'null load crashed the child on both tiers alike; and a leaf that parks on its core pipes ran '
+  + `interpreted under Node${chromium ? ', and emitted in Chromium, suspended and resumed' : ''}`);
