@@ -29640,23 +29640,6 @@ impl MemLayout {
         }
     }
 
-    /// #1733 — a detached child's captured `image` under the page map its window was built with
-    /// ([`Mem::detached`]: the NULL guard, the `readonly` data segments), for a capture that cannot
-    /// read the live map (the JIT's harvest). Protections its guest changed through the Memory
-    /// capability are not recorded.
-    pub fn detached_image(module: &Module, image: Vec<u8>, mapped_log2: u8) -> MemLayout {
-        let m = Mem::detached(mapped_log2, mapped_log2, None, &module.data, None);
-        let space = m.space.read_unpoisoned();
-        MemLayout {
-            bytes: image,
-            map: PageMap {
-                prot: space.prot.clone(),
-                page: m.page,
-                mapped: m.window.mapped(),
-            },
-        }
-    }
-
     /// The protection map in the §12 codec's **dense** form: one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over the captured bytes — the same rule [`Mem::snapshot_prots`]
     /// uses, so an absent page is `Rw` below `mapped` and `Unmapped` above (an uncommitted hole

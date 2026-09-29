@@ -724,8 +724,20 @@ impl ChildExec {
             let unwound =
                 trap == 0 && unsafe { fiber_rt::window_is_unwinding(task.window.base() as u64) };
             if unwound {
-                *d.image.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(task.window.rw_mut().to_vec());
+                // #1854 — up to the child's high-water, as the root's capture reaches its own, so a
+                // page it grew through the Memory capability rides the artifact.
+                let mapped = task.window.rw_mut().len();
+                let reserved = 1usize << d.reserved_log2;
+                // SAFETY: the hook reads the child's own powerbox, alive until `teardown` below.
+                let high = d.high_water.map_or(0, |(f, ctx)| unsafe {
+                    f(ctx as *mut core::ffi::c_void, task.window.base() as usize) as usize
+                });
+                let image = if high > mapped {
+                    task.window.read_low(high.min(reserved))
+                } else {
+                    task.window.rw_mut().to_vec()
+                };
+                *d.image.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
             }
         }
         if let Some(c) = task.copy_back.take() {

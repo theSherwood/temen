@@ -1828,11 +1828,14 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             launch,
             ..
         } = td;
-        let Some(r) = host.prepare_detached_relaunch(&launch, child) else {
+        let Some(mut r) = host.prepare_detached_relaunch(&launch, child) else {
             return Err(temen_jit::JitError::Unsupported(
                 "durable JIT thaw: a detached child's imports no longer bind",
             ));
         };
+        // #1854 — its Memory capability sees the pages its window is restored with, as a thawed
+        // root's does (`jit_cap_run`).
+        r.host.reset_cap_pages(window.page_map());
         if !host.try_grant_lane(launch.lane) {
             // As the interpreter's re-launch: a lane the thawing parent's cap no longer fits is not
             // re-drawn; the child keeps its own cap either way.
@@ -1912,7 +1915,13 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
         });
         match (h.image, outcome) {
             (Some(image), _) => {
-                let window = temen_interp::MemLayout::detached_image(&module, image, h.mapped_log2);
+                // The page map the child's Memory capability kept, as the root's capture reads its
+                // own (#1854): a page the guest grew or protected rides the artifact.
+                let window = jit_layout(
+                    &module,
+                    &child.lock().unwrap_or_else(|e| e.into_inner()),
+                    image,
+                );
                 captured.push(temen_interp::CapturedDetached {
                     parent_task: 0,
                     slot: h.slot,
@@ -2858,6 +2867,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             premap_stage
         },
         premap_apply,
+        high_water: high_water_locked,
         release: grant_child_release,
         bind_imports: if locked {
             child_bind_imports_locked
