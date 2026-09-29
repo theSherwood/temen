@@ -2503,7 +2503,11 @@ fn c_the_line_after_an_initializer_starts_after_its_last_store() {
             .unwrap_or_else(|| panic!("no debug.loc for line {line}:\n{ir}"))
     };
     let (init, ret) = (row(2), row(3));
-    assert_eq!((init.func, init.block), (ret.func, ret.block), "one block:\n{ir}");
+    assert_eq!(
+        (init.func, init.block),
+        (ret.func, ret.block),
+        "one block:\n{ir}"
+    );
     let insts = &m.funcs[ret.func as usize].blocks[ret.block as usize].insts;
     let last_store = insts
         .iter()
