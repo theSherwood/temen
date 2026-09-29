@@ -58,7 +58,7 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
 /// One shared in-window `fs` store across every phase: seed it once, hand each guest run its own grant
 /// over the same store (`Arc<factory>`), and read produced files back through `handle.seed()`.
 struct Memfs {
-    factory: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    factory: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
     handle: temen_run::fs::MemFsHandle,
 }
 
@@ -67,7 +67,8 @@ impl Memfs {
         let (factory, handle) =
             temen_run::fs::mem_fs_shared_factory(files, vec!["nimcache".into()]);
         Memfs {
-            factory: Arc::new(factory) as Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+            factory: Arc::new(factory)
+                as Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
             handle,
         }
     }

@@ -417,10 +417,13 @@ mod tests {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u32, Vec<i64>)>::new()));
         let sink = events.clone();
         let mut h = temen_interp::Host::new();
-        let handle = h.grant_host_proc(Box::new(move |op, args, _mem, _| {
-            sink.lock().unwrap().push((op, args.to_vec()));
-            Ok(vec![])
-        }));
+        let handle = h.grant_host_proc(
+            Box::new(move |op, args, _mem, _| {
+                sink.lock().unwrap().push((op, args.to_vec()));
+                Ok(vec![])
+            }),
+            temen_interp::CapState::Stateless,
+        );
         assert_eq!(
             handle, SPEC.handle,
             "first grant on a fresh Host mints the baked handle"

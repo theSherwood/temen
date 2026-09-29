@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use temen_interp::{
-    run_capture_reserved_with_host, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value,
+    run_capture_reserved_with_host, ForkedProc, Host, HostProcFork, StreamRole, Value,
 };
 
 const NIFLER_CE_GZ: &[u8] = include_bytes!("../../temen-run/demos/nifler_temen/nifler_ce.temen.gz");
@@ -301,12 +301,15 @@ fn rust_driver_guest_crawls_an_import_closure_to_fixpoint() {
     let win = 1u64 << t.module.memory.expect("driver window").size_log2;
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&nifler);
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     host.register_cap_name("inst", inst);

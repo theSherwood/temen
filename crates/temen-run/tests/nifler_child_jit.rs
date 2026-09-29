@@ -23,7 +23,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, StreamRole};
+use temen_interp::{ForkedProc, Host, HostProcFork, StreamRole};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 const ASSET_GZ: &[u8] = include_bytes!("../demos/nifler_temen/nifler_ce.temen.gz");
@@ -136,12 +136,15 @@ fn nifler_child_runs_on_the_jit_byte_identical() {
     let factory = Arc::new(factory);
 
     let mut host = Host::new();
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     let inst = host.grant_instantiator(0, 1u64 << (child_sl + 1));

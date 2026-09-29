@@ -487,9 +487,11 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             },
             Cell {
                 status: Status::Conditional,
-                note: "durable iff the grant carries a registered **name** (#1455): the closure \
-                       cannot be serialized, but the name is a reconstruction rule the thaw's \
-                       registrar acts on. An unnamed one is still NonDurableKind::HostProc",
+                note: "durable iff the grant carries a registered **name** (#1455) and its \
+                       provider's `CapState` isn't `Uncaptured` (#1699): the closure cannot be \
+                       serialized, but the name is a reconstruction rule the thaw's registrar acts \
+                       on, and the provider says what state crosses with it. Otherwise \
+                       NonDurableKind::HostProc",
             },
             B,
             U,

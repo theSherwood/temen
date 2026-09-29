@@ -283,11 +283,14 @@ fn counting_host() -> (temen_interp::Host, i32) {
     let mut host = temen_interp::Host::new();
     host.record_caps();
     let n = Arc::new(Mutex::new(0i64));
-    let h = host.grant_host_proc(Box::new(move |_op, _args, _mem, _minter| {
-        let mut g = n.lock().unwrap();
-        *g += 1;
-        Ok(vec![*g])
-    }));
+    let h = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _minter| {
+            let mut g = n.lock().unwrap();
+            *g += 1;
+            Ok(vec![*g])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     (host, h)
 }
 
@@ -348,15 +351,19 @@ fn stateful_counter_host(
     }
     let n = Arc::new(Mutex::new(0i64));
     let cap = Arc::clone(&n);
-    let h = host.grant_host_proc(Box::new(move |_op, _args, _mem, _minter| {
-        let mut g = cap.lock().unwrap();
-        *g += 1;
-        Ok(vec![*g])
-    }));
-    let get = Arc::clone(&n);
-    host.set_cap_state_capture(
-        h,
-        Box::new(move || get.lock().unwrap().to_le_bytes().to_vec()),
+    let (get, set) = (Arc::clone(&n), Arc::clone(&n));
+    let h = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _minter| {
+            let mut g = cap.lock().unwrap();
+            *g += 1;
+            Ok(vec![*g])
+        }),
+        temen_interp::CapState::Captured {
+            capture: Box::new(move || get.lock().unwrap().to_le_bytes().to_vec()),
+            restore: Box::new(move |b| {
+                *set.lock().unwrap() = i64::from_le_bytes(b.try_into().expect("8 bytes"));
+            }),
+        },
     );
     (host, h, n)
 }

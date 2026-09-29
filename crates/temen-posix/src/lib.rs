@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{
-    cap_id, ForkedProc, GuestMem, Host, HostProc, HostProcFork, SignalSource, Trap,
+    cap_id, CapState, ForkedProc, GuestMem, Host, HostProc, HostProcFork, SignalSource, Trap,
 };
 use temen_ir::ResolvedCap;
 
@@ -2206,9 +2206,13 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     // semantics. `Host::fork_powerbox` calls this factory to carry libc into the twin, instead of
     // failing closed on an opaque closure.
     let root_for_remap = Arc::clone(&root);
+    // #1699 — the personality holds a process's fd table, cwd, env and signal state, which the
+    // guest observes and nothing serializes yet: `Uncaptured`, so a freeze refuses it rather than
+    // thaw a fresh process under the guest.
     let handle = host.grant_host_proc_forkable(
         handler(Arc::clone(&world), Arc::clone(&root)),
         fork_factory(world, root),
+        CapState::Uncaptured,
     );
     // #801 — publish the op vtable on the grant: what lets an exec'd/spawned `__px_`-linked
     // image's manifest bind through the §3.5 coverage walk, signature-checked, with no external
@@ -2299,6 +2303,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                     refork: Some(fork_factory(Arc::clone(&world), existing)),
                     exit: None,
                     exec_remap: None,
+                    state: CapState::Uncaptured,
                 };
             }
         }
@@ -2375,6 +2380,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
             refork: Some(fork_factory(Arc::clone(&world), Arc::clone(&child))),
             exit: Some(exit),
             exec_remap: Some(exec_remap_hook(child)),
+            state: CapState::Uncaptured,
         }
     })
 }
@@ -2386,11 +2392,17 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
 /// so the interp and JIT hosts share one personality state). This is how the **LLVM on-ramp** reaches
 /// the personality: the embedder wraps `make` in a `HostCap` at [`cap_id::HOST_PROC`] and grants it under a
 /// name (e.g. `"posix"`), and an on-ramp guest calls `__vm_host_call(__vm_cap_resolve("posix"), op, …)`.
+///
+/// Each mint comes with its [`CapState`]: `Uncaptured` (#1699) — the process's fd table, cwd, env
+/// and signal state are guest-observable, and nothing serializes them yet.
 pub fn cap(
     heap_base: u64,
     heap_end: u64,
     stdin: Vec<u8>,
-) -> (Posix, impl Fn() -> HostProc + Send + Sync + 'static) {
+) -> (
+    Posix,
+    impl Fn() -> (HostProc, CapState) + Send + Sync + 'static,
+) {
     let world = Arc::new(Mutex::new(new_world(stdin)));
     let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
     let posix = Posix {
@@ -2406,7 +2418,12 @@ pub fn cap(
         .insert(1, ProcEntry::Live(Arc::clone(&root)));
     // Per-backend mint over the SAME world+proc: the interp and JIT hosts are two engines of one
     // process, so they share both sides (unlike a fork, which clones the proc side).
-    let make = move || handler(Arc::clone(&world), Arc::clone(&root));
+    let make = move || {
+        (
+            handler(Arc::clone(&world), Arc::clone(&root)),
+            CapState::Uncaptured,
+        )
+    };
     (posix, make)
 }
 
@@ -2455,10 +2472,16 @@ pub fn cap_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
 /// shape as [`cap`], granted under its **own name** (e.g. `"net"`). Each call produces a `HostProc`
 /// over the *same* shared state, so the socket fds it mints live in the same fd table the libc
 /// `read`/`write`/`close`/`dup2` ops serve — the data plane needs no new surface.
-pub fn net_cap_factory(posix: &Posix) -> impl Fn() -> HostProc + Send + Sync + 'static {
+pub fn net_cap_factory(posix: &Posix) -> impl Fn() -> (HostProc, CapState) + Send + Sync + 'static {
     let world = Arc::clone(&posix.world);
     let root = Arc::clone(&posix.root);
-    move || net_handler(Arc::clone(&world), Arc::clone(&root))
+    // The process's sockets live in the world it shares with the personality: `Uncaptured`.
+    move || {
+        (
+            net_handler(Arc::clone(&world), Arc::clone(&root)),
+            CapState::Uncaptured,
+        )
+    }
 }
 
 /// Build the `net` capability's [`HostProc`] handler over shared `inner`: the tiny authority surface
@@ -7650,7 +7673,8 @@ block 0 (vph: i32) {\n\
         let (posix, make) = cap(HEAP_BASE, HEAP_END, Vec::new());
         posix.write_file("greet", b"hi!"); // host writes into the shared memfs
         let mut host = Host::new();
-        let h = host.grant_host_proc(make()); // a factory-minted libc handler (the twin's libc)
+        let (f, state) = make(); // a factory-minted libc handler (the twin's libc)
+        let h = host.grant_host_proc(f, state);
         let mut fuel = 5_000_000u64;
         let ir = run_capture_reserved_with_host(
             &m,

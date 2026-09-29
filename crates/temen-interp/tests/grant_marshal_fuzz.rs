@@ -49,9 +49,12 @@ fn parent_host() -> (Host, i32) {
     let mut host = Host::new();
     let handler: HostProc = Box::new(|_op, _args, _mem, _| Ok(vec![0]));
     let fork = std::sync::Arc::new(|_pid: u64| {
-        ForkedProc::shared(Box::new(|_op, _args, _mem, _| Ok(vec![0])))
+        ForkedProc::shared(
+            Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+            temen_interp::CapState::Stateless,
+        )
     });
-    let h = host.grant_host_proc_forkable(handler, fork);
+    let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless);
     (host, h)
 }
 

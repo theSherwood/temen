@@ -24,7 +24,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, StreamRole};
+use temen_interp::{ForkedProc, Host, HostProcFork, StreamRole};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// What the child writes through the granted `fs`, and through the granted `stdout`.
@@ -134,12 +134,15 @@ fn multi_record_grant_list_marshals_on_the_jit() {
     let factory = Arc::new(factory);
 
     let mut host = Host::new();
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
-        Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
     let sink = host.shared_stdout();
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();

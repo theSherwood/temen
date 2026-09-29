@@ -5585,7 +5585,9 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 pub fn nim_posix_imports(
     module: &Module,
     posix: &temen_posix::Posix,
-    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    make: std::sync::Arc<
+        dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+    >,
 ) -> (Imports, Vec<String>, SharedHostProc) {
     // #1645 — every personality-served slot binds to **one** entry ([`SharedHostProc`]), at its own
     // op. This lane used to grant an entry per import — sixteen for nimsem — which is what made
@@ -5655,7 +5657,9 @@ pub struct ExecGrants<'a> {
 pub fn nim_noc_run(
     module: Module,
     posix: &temen_posix::Posix,
-    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    make: std::sync::Arc<
+        dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+    >,
     argv: &[String],
     exec: &ExecGrants,
     backend: Backend,
@@ -6455,7 +6459,7 @@ struct OfferBinding {
 /// cheap `Arc` bump and shares the memo — clones of one slot are one slot.
 #[derive(Clone)]
 pub struct SharedHostProc {
-    make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    make: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
     fork: temen_interp::HostProcFork,
     /// `(domain_id, handle)` per `Host` this slot has been granted on. A `Vec` because the count is
     /// one or two (interp, JIT) for the life of an `Imports`, and a linear scan says so.
@@ -6463,10 +6467,13 @@ pub struct SharedHostProc {
 }
 
 impl SharedHostProc {
-    /// A slot over `make` (the provider's handler factory) and `fork` (its own fork factory — the
-    /// per-process split a personality needs; see [`HostCap::host_proc_forkable`]).
+    /// A slot over `make` (the provider's handler factory, each mint with its [`CapState`], #1699)
+    /// and `fork` (its own fork factory — the per-process split a personality needs; see
+    /// [`HostCap::host_proc_forkable`]).
+    ///
+    /// [`CapState`]: temen_interp::CapState
     pub fn new(
-        make: impl Fn() -> temen_interp::HostProc + Send + Sync + 'static,
+        make: impl Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync + 'static,
         fork: temen_interp::HostProcFork,
     ) -> Self {
         Self {
@@ -6487,7 +6494,8 @@ impl SharedHostProc {
         if let Some((_, h)) = g.iter().find(|(d, _)| *d == dom) {
             return *h;
         }
-        let handle = host.grant_host_proc_forkable((self.make)(), Arc::clone(&self.fork));
+        let (f, state) = (self.make)();
+        let handle = host.grant_host_proc_forkable(f, Arc::clone(&self.fork), state);
         g.push((dom, handle));
         handle
     }
@@ -6570,8 +6578,13 @@ impl HostCap {
     /// A **host-defined** capability (iface [`cap_id::HOST_PROC`]) — arbitrary semantics behind a named
     /// import, the wasm-like escape hatch. `op` is the operation this name selects; `make` builds a
     /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
-    /// `(op, args, guest_mem) -> result slots | Trap`.
-    pub fn host_proc(op: u32, make: impl Fn() -> HostProc + Send + Sync + 'static) -> HostCap {
+    /// `(op, args, guest_mem) -> result slots | Trap`. Each mint comes with the provider's
+    /// [`CapState`](temen_interp::CapState) for it (#1699): the handler's host-side state, stated
+    /// where the handler is made.
+    pub fn host_proc(
+        op: u32,
+        make: impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+    ) -> HostCap {
         let make = Arc::new(make);
         // FORK.md PR 5 / #863: with no provider-supplied fork factory, `make` doubles as a
         // shared-state one — a `fork()` twin re-mints a fresh closure over the SAME provider state
@@ -6580,7 +6593,10 @@ impl HostCap {
         // via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`).
         let fork: temen_interp::HostProcFork = Arc::new({
             let make = Arc::clone(&make);
-            move |_pid| temen_interp::ForkedProc::shared(make())
+            move |_pid| {
+                let (h, state) = make();
+                temen_interp::ForkedProc::shared(h, state)
+            }
         });
         Self::host_proc_forkable(op, move || make(), fork)
     }
@@ -6591,13 +6607,16 @@ impl HostCap {
     /// re-mints through this factory (`Host::fork_powerbox`).
     pub fn host_proc_forkable(
         op: u32,
-        make: impl Fn() -> HostProc + Send + Sync + 'static,
+        make: impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
         fork: temen_interp::HostProcFork,
     ) -> HostCap {
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
-            grant: Arc::new(move |h, _| h.grant_host_proc_forkable(make(), Arc::clone(&fork))),
+            grant: Arc::new(move |h, _| {
+                let (f, state) = make();
+                h.grant_host_proc_forkable(f, Arc::clone(&fork), state)
+            }),
             unbound: false,
             offer: None,
             iface: None,
@@ -6624,13 +6643,16 @@ impl HostCap {
     /// like a plain `host_proc`.
     pub fn host_proc_region(
         op: u32,
-        make: impl Fn() -> temen_interp::HostProc + Send + Sync + 'static,
+        make: impl Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
-            grant: Arc::new(move |h, _| h.grant_host_proc_region(make())),
+            grant: Arc::new(move |h, _| {
+                let (f, state) = make();
+                h.grant_host_proc_region(f, state)
+            }),
             unbound: false,
             offer: None,
             iface: None,
@@ -7168,7 +7190,10 @@ impl Instance {
         // the value the instrumented code must bake in as its `call.cap` handle constant.
         let handle = {
             let mut scratch = Host::new();
-            scratch.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![])))
+            scratch.grant_host_proc(
+                Box::new(|_, _, _, _| Ok(vec![])),
+                temen_interp::CapState::Stateless,
+            )
         };
         let spec = temen_opt::instrument::MemHookSpec {
             type_id: cap_id::HOST_PROC,
@@ -7201,13 +7226,17 @@ impl Instance {
     fn grant_mem_hooks(&self, h: &mut Host) {
         let Some(hooks) = &self.hooks else { return };
         let mut hook = (hooks.make)();
-        let handle = h.grant_host_proc(Box::new(
-            move |op, args, _mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
-                hook(ev)?;
-                Ok(vec![])
-            },
-        ));
+        let handle = h.grant_host_proc(
+            Box::new(
+                move |op, args, _mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                    let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
+                    hook(ev)?;
+                    Ok(vec![])
+                },
+            ),
+            // The hook observes; the guest reads nothing back from it.
+            temen_interp::CapState::Stateless,
+        );
         assert_eq!(
             handle, hooks.handle,
             "mem-hook grant must be the first grant on a fresh Host (deterministic handles)"
@@ -7414,7 +7443,7 @@ impl Instance {
     ///
     /// This is what makes the debug engine usable on a *real* guest rather than on hand-written test
     /// modules. #1455 lifted `Host::checkpoint_safe`'s refusal of cap-using guests (it reads
-    /// `every_host_proc_named()` now), but nothing assembled the powerbox for a `ScheduledDebugRun`,
+    /// `every_host_proc_reconstructible()` now), but nothing assembled the powerbox for a `ScheduledDebugRun`,
     /// so the "debug-tier time travel on cap-using guests" cell of #1454 stayed theoretical. The host
     /// setup here is deliberately the *same code path* as `run_with_caps_and_host`'s — a second way to
     /// grant a powerbox would be a second answer to what a guest is allowed to do (INVARIANTS #15).

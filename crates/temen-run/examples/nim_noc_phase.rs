@@ -83,8 +83,9 @@ fn main() {
 
     // One personality shared across every bound name: one fd table, one memfs, one stdout buffer.
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-        std::sync::Arc::new(make);
+    let make: std::sync::Arc<
+        dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+    > = std::sync::Arc::new(make);
     let (imports, unbound, _slot) = temen_run::nim_posix_imports(&module, &posix, make);
     assert!(
         unbound.is_empty(),

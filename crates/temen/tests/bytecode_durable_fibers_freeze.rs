@@ -288,15 +288,18 @@ fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
     // A durable host whose host proc writes `UNWINDING` when `freeze`, seeded with `frozen`.
     let host = |freeze: bool, frozen: Vec<FrozenFiber>| -> (Host, i32) {
         let mut h = durable_host(frozen);
-        let hf = h.grant_host_proc(Box::new(move |_op, _args, mem, _| {
-            if freeze {
-                if let Some(m) = mem {
-                    m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                        .expect("the state word is in the window");
+        let hf = h.grant_host_proc(
+            Box::new(move |_op, _args, mem, _| {
+                if freeze {
+                    if let Some(m) = mem {
+                        m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                            .expect("the state word is in the window");
+                    }
                 }
-            }
-            Ok(vec![0])
-        }));
+                Ok(vec![0])
+            }),
+            temen_interp::CapState::Stateless,
+        );
         (h, hf)
     };
     let want = Ok(vec![Value::I64(1), Value::I64(11)]);
@@ -425,15 +428,18 @@ fn a_wait_parked_fiber_freezes_and_thaws_on_the_bytecode_engine() {
 fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) {
     let run = |bytecode_engine: bool, win: &[u8], freeze: bool, frozen: Vec<FrozenFiber>| {
         let mut h = durable_host(frozen);
-        let hf = h.grant_host_proc(Box::new(move |_op, _args, mem, _| {
-            if freeze {
-                if let Some(m) = mem {
-                    m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                        .expect("the state word is in the window");
+        let hf = h.grant_host_proc(
+            Box::new(move |_op, _args, mem, _| {
+                if freeze {
+                    if let Some(m) = mem {
+                        m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                            .expect("the state word is in the window");
+                    }
                 }
-            }
-            Ok(vec![0])
-        }));
+                Ok(vec![0])
+            }),
+            temen_interp::CapState::Stateless,
+        );
         let mut fuel = 1_000_000u64;
         let (r, w) = if bytecode_engine {
             bytecode::compile_and_run_capture_reserved_with_host(

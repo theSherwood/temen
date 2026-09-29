@@ -1023,20 +1023,19 @@ impl MemFsHandle {
         ) as HostProc
     }
 
-    /// Declare this store as the state of the capability granted at `handle` (#1455's pair), so a
-    /// checkpoint, a moment, a cap tape and a §12 artifact all carry it, and an in-session rewind
-    /// puts it back. One definition of the store's state, read every way.
-    pub fn declare_state(&self, host: &mut temen_interp::Host, handle: i32) {
+    /// This store as the state of a capability over it (#1455's pair, #1699), so a checkpoint, a
+    /// moment, a cap tape and a §12 artifact all carry it, and an in-session rewind puts it back.
+    /// One definition of the store's state, read every way.
+    pub fn cap_state(&self) -> temen_interp::CapState {
         let (c, r) = (self.clone(), self.clone());
-        host.set_cap_state_capture(handle, Box::new(move || c.capture_state()));
-        host.set_cap_state_restore(
-            handle,
-            Box::new(move |b| {
+        temen_interp::CapState::Captured {
+            capture: Box::new(move || c.capture_state()),
+            restore: Box::new(move |b| {
                 // The bytes are this store's own capture, so a decode failure is a bug, not input.
                 let restored = r.restore_state(b);
                 debug_assert!(restored.is_ok(), "memfs state restore: {restored:?}");
             }),
-        );
+        }
     }
 
     /// The current filesystem as a `(files, dirs)` seed (see [`MemFsState::snapshot`]).
@@ -1060,7 +1059,7 @@ pub fn mem_fs_seeded_shared(
     dirs: Vec<String>,
 ) -> (HostProc, MemFsHandle) {
     let (factory, handle) = mem_fs_shared_factory(files, dirs);
-    (factory(), handle)
+    (factory().0, handle)
 }
 
 /// Like [`mem_fs_seeded_shared`] but returns a **reusable factory** granting the *same* live store to
@@ -1071,15 +1070,19 @@ pub fn mem_fs_seeded_shared(
 /// multi-phase pipeline needs (NIM.md §3c, W4: phase N writes `x.nif`, phase N+1 reads it). The
 /// returned [`MemFsHandle`] observes the same store (snapshot/seed it host-side). Granting this to a
 /// spawned *child* (vs. a top-level domain) is a separate, security-shaped decision — what fs
-/// authority a child inherits — and lives in the spawn path, not here.
+/// authority a child inherits — and lives in the spawn path, not here. Each mint carries the
+/// store's [`MemFsHandle::cap_state`] (#1699).
 pub fn mem_fs_shared_factory(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
-) -> (impl Fn() -> HostProc + Send + Sync + 'static, MemFsHandle) {
+) -> (
+    impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+    MemFsHandle,
+) {
     let handle = MemFsHandle::seeded(&files, &dirs);
     let factory = {
         let handle = handle.clone();
-        move || handle.handler()
+        move || (handle.handler(), handle.cap_state())
     };
     (factory, handle)
 }
@@ -1095,9 +1098,8 @@ pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 
         Some((files, dirs)) => MemFsHandle::seeded(files, dirs),
         None => MemFsHandle::new(false),
     };
-    let h = host.grant_host_proc_forkable(vm_fs_handler(&fs), vm_fs_fork(&fs));
+    let h = host.grant_host_proc_forkable(vm_fs_handler(&fs), vm_fs_fork(&fs), fs.cap_state());
     host.register_cap_name("vm_fs", h);
-    fs.declare_state(host, h);
     h
 }
 
@@ -1108,7 +1110,7 @@ pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 
 /// `vm_fs` is exactly as re-grantable as a fresh one.
 pub fn vm_fs_fork(fs: &MemFsHandle) -> temen_interp::HostProcFork {
     let fs = fs.clone();
-    Arc::new(move |_pid| temen_interp::ForkedProc::shared(vm_fs_handler(&fs)))
+    Arc::new(move |_pid| temen_interp::ForkedProc::shared(vm_fs_handler(&fs), fs.cap_state()))
 }
 
 /// The `vm_fs` seam's handler over `fs`: the fs op in `args[0]`, its arguments after. What
@@ -1425,8 +1427,8 @@ mod tests {
     #[test]
     fn two_grants_from_the_factory_share_one_store() {
         let (factory, _handle) = mem_fs_shared_factory(vec![], vec![]);
-        let mut phase_a: HostProc = factory();
-        let mut phase_b: HostProc = factory();
+        let mut phase_a: HostProc = factory().0;
+        let mut phase_b: HostProc = factory().0;
         let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
             fs(op, args, Some(mem), None).expect("host fn")[0]
         };

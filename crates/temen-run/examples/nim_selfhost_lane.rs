@@ -136,7 +136,7 @@ fn command_module(path: &str, what: &str) -> temen_ir::Module {
 fn relower(
     hexer: &temen_ir::Module,
     posix: &temen_posix::Posix,
-    make: &Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    make: &Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
     cache: &str,
     main: &str,
     engine: temen_run::Backend,
@@ -423,7 +423,8 @@ fn main() {
 
     // One personality for every process: one memfs, one fd table, one stdout.
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> = Arc::new(make);
+    let make: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync> =
+        Arc::new(make);
     posix.set_env("PATH", "/bin");
     posix.set_cwd(&dir);
 

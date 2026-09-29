@@ -64,13 +64,16 @@ fn granted_host() -> (Host, Arc<Mutex<i64>>) {
     let c2 = Arc::clone(&counter);
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
-        ForkedProc::shared(Box::new(move |_op, _args, _mem, _| {
-            let mut c = c.lock().unwrap();
-            *c += 1;
-            Ok(vec![*c])
-        }))
+        ForkedProc::shared(
+            Box::new(move |_op, _args, _mem, _| {
+                let mut c = c.lock().unwrap();
+                *c += 1;
+                Ok(vec![*c])
+            }),
+            temen_interp::CapState::Stateless,
+        )
     });
-    let h = host.grant_host_proc_forkable(handler, fork);
+    let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless);
     host.register_cap_name("fs", h);
     (host, counter)
 }

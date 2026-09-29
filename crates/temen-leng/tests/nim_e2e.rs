@@ -2443,8 +2443,9 @@ fn nim_shells_out_through_the_posix_sh() {
         temen_run::Backend::Jit,
     ] {
         let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-            std::sync::Arc::new(make);
+        let make: std::sync::Arc<
+            dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+        > = std::sync::Arc::new(make);
         let run = temen_run::nim_noc_run(
             parent.clone(),
             &posix,
@@ -2530,8 +2531,9 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
         temen_run::Backend::Jit,
     ] {
         let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-            std::sync::Arc::new(make);
+        let make: std::sync::Arc<
+            dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+        > = std::sync::Arc::new(make);
         let run = temen_run::nim_noc_run(
             parent.clone(),
             &posix,
@@ -2600,8 +2602,9 @@ fn nim_reads_a_commands_output_through_execcmdex() {
         temen_run::Backend::Jit,
     ] {
         let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-            std::sync::Arc::new(make);
+        let make: std::sync::Arc<
+            dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+        > = std::sync::Arc::new(make);
         let run = temen_run::nim_noc_run(
             parent.clone(),
             &posix,
@@ -2673,8 +2676,9 @@ fn nim_forks_and_execs_a_nim_program() {
         temen_run::Backend::Jit,
     ] {
         let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-            std::sync::Arc::new(make);
+        let make: std::sync::Arc<
+            dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+        > = std::sync::Arc::new(make);
         let run = temen_run::nim_noc_run(
             parent.clone(),
             &posix,

@@ -239,15 +239,15 @@ impl WebGpuState {
 pub fn webgpu_cap() -> HostCap {
     HostCap::host_proc(0, || {
         let mut st = WebGpuState::default();
-        Box::new(
+        let h: temen_interp::HostProc = Box::new(
             move |op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn GuestMem>,
                   _minter: Option<&mut dyn RegionMinter>|
-                  -> Result<Vec<i64>, Trap> {
-                Ok(vec![st.handle(op, args, mem)])
-            },
-        )
+                  -> Result<Vec<i64>, Trap> { Ok(vec![st.handle(op, args, mem)]) },
+        );
+        // The guest's buffers and pipelines live on the GPU, which nothing here serializes (#1699).
+        (h, temen_interp::CapState::Uncaptured)
     })
 }
 

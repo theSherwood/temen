@@ -96,7 +96,7 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
 
     // Tree-walk oracle — parking-aware (the pending face; punts wait without the lock).
     let mut hi = Host::new();
-    let h = hi.grant_host_proc_offloadable(handler());
+    let h = hi.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
     let comps_i = hi.completions();
     let mut fuel = 1_000_000u64;
     let iv = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut hi).expect("interp ok");
@@ -113,7 +113,7 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
     // Bytecode interpreter — parking-aware.
     let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
     let mut hb = Host::new();
-    let hbh = hb.grant_host_proc_offloadable(handler());
+    let hbh = hb.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
     let comps_b = hb.completions();
     let mut vcpu =
         bytecode::Vcpu::new_root_reserved_with_powerbox(&prog, 0, &[Value::I32(hbh)], &[], hb, 20)
@@ -134,7 +134,7 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
     // Cranelift JIT — sync face only (generic `cap_thunk`): punts run inline, same results
     // (decline-never-diverge). Must mint nothing.
     let mut hj = Host::new();
-    let hjh = hj.grant_host_proc_offloadable(handler());
+    let hjh = hj.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
     let comps_j = hj.completions();
     let jo = temen_jit::compile_and_run_with_host(
         &m,
@@ -198,9 +198,10 @@ fn sync_ops_never_touch_parking_machinery() {
     // A plain (synchronous) host proc through the same guest loop: the parking odometer must
     // read zero — no completion id, no table touch (the §12 pin).
     let mut host = Host::new();
-    let h = host.grant_host_proc(Box::new(|_op, args, _mem, _minter| {
-        Ok(vec![mix(*args.first().unwrap_or(&0))])
-    }));
+    let h = host.grant_host_proc(
+        Box::new(|_op, args, _mem, _minter| Ok(vec![mix(*args.first().unwrap_or(&0))])),
+        temen_interp::CapState::Stateless,
+    );
     let comps = host.completions();
     let mut fuel = 1_000_000u64;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("interp ok");

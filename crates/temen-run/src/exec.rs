@@ -18,12 +18,14 @@ use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use temen_interp::{GuestMem, HostProc, Value};
+use temen_interp::{CapState, GuestMem, HostProc, Value};
 
 /// The deterministic **scripted** backend as a [`HostCap`]: a `(argv-prefix → {stdout, stderr,
 /// exit})` table, no host processes. What differential tests and wasm/browser embedders grant.
 pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
-    HostCap::host_proc(0, temen_exec::scripted_exec_handler(table))
+    let make = temen_exec::scripted_exec_handler(table);
+    // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
+    HostCap::host_proc(0, move || (make(), CapState::Uncaptured))
 }
 
 /// The **real subprocess** backend: spawn via the host, attenuated by an explicit program
@@ -34,7 +36,9 @@ pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
 /// the POSIX-shell way (0-255; signal death as `128 + signo`).
 pub fn host_exec(allowlist: &[&str]) -> HostCap {
     let allow: Arc<Vec<String>> = Arc::new(allowlist.iter().map(|s| s.to_string()).collect());
-    HostCap::host_proc(0, host_exec_handler(allow))
+    let make = host_exec_handler(allow);
+    // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
+    HostCap::host_proc(0, move || (make(), CapState::Uncaptured))
 }
 
 /// One program in a [`domain_exec`] registry: the name a `run`'s `argv[0]` selects (exact
@@ -84,7 +88,7 @@ fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) ->
         let programs = Arc::clone(&programs);
         let child_fs = Arc::clone(&child_fs);
         let mut jobs = JobTable::default();
-        Box::new(
+        let h = Box::new(
             move |op: u32,
                   args: &[i64],
                   mem: Option<&mut dyn GuestMem>,
@@ -98,7 +102,9 @@ fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) ->
                     mem,
                 )])
             },
-        ) as HostProc
+        ) as HostProc;
+        // A job table the guest drains output from: `Uncaptured` (#1699).
+        (h, CapState::Uncaptured)
     })
 }
 

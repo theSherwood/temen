@@ -346,10 +346,13 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
     let m = temen_text::parse_module(PUNT_IN_FIBER).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(Box::new(|_op, args| {
-        let a = *args.first().unwrap_or(&0);
-        OffloadOutcome::Offload(Box::new(move || a + 100))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(|_op, args| {
+            let a = *args.first().unwrap_or(&0);
+            OffloadOutcome::Offload(Box::new(move || a + 100))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let comps = host.completions();
     // Bounded fuel: a lost completion wake leaves the poll loop spinning forever — convert
     // that into a loud OutOfFuel instead of a hang.
@@ -574,13 +577,16 @@ fn root_return_abandons_a_cap_parked_fiber() {
     let m = temen_text::parse_module(RESUME_ONCE).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(Box::new(|_op, args| {
-        let a = *args.first().unwrap_or(&0);
-        OffloadOutcome::Offload(Box::new(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            a + 100
-        }))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(|_op, args| {
+            let a = *args.first().unwrap_or(&0);
+            OffloadOutcome::Offload(Box::new(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                a + 100
+            }))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let comps = host.completions();
     let t0 = std::time::Instant::now();
     let mut fuel = 2_000_000_000;
@@ -607,10 +613,13 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
     host.set_durable(true);
-    let h = host.grant_host_proc_offloadable(Box::new(|_op, args| {
-        let a = *args.first().unwrap_or(&0);
-        OffloadOutcome::Offload(Box::new(move || a + 100))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(|_op, args| {
+            let a = *args.first().unwrap_or(&0);
+            OffloadOutcome::Offload(Box::new(move || a + 100))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let comps = host.completions();
     let mut fuel = 2_000_000_000;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");
@@ -639,29 +648,32 @@ fn ordered_delivery_holds_a_ready_later_completion_for_an_earlier_park() {
     let gate_job = std::sync::Arc::clone(&gate);
     let gate_rel = std::sync::Arc::clone(&gate);
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(Box::new(move |op, args| {
-        if op == 1 {
-            // The release (inline `Done` — never punts): open the latch.
-            let (m, cv) = &*gate_rel;
-            *m.lock().unwrap() = true;
-            cv.notify_all();
-            return OffloadOutcome::Done(Ok(vec![0]));
-        }
-        let a = *args.first().unwrap_or(&0);
-        if a == 0 {
-            let g = std::sync::Arc::clone(&gate_job);
-            OffloadOutcome::Offload(Box::new(move || {
-                let (m, cv) = &*g;
-                let mut open = m.lock().unwrap();
-                while !*open {
-                    open = cv.wait(open).unwrap();
-                }
-                111
-            }))
-        } else {
-            OffloadOutcome::Offload(Box::new(move || 222))
-        }
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            if op == 1 {
+                // The release (inline `Done` — never punts): open the latch.
+                let (m, cv) = &*gate_rel;
+                *m.lock().unwrap() = true;
+                cv.notify_all();
+                return OffloadOutcome::Done(Ok(vec![0]));
+            }
+            let a = *args.first().unwrap_or(&0);
+            if a == 0 {
+                let g = std::sync::Arc::clone(&gate_job);
+                OffloadOutcome::Offload(Box::new(move || {
+                    let (m, cv) = &*g;
+                    let mut open = m.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                    111
+                }))
+            } else {
+                OffloadOutcome::Offload(Box::new(move || 222))
+            }
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let comps = host.completions();
     let mut fuel = 2_000_000_000;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");

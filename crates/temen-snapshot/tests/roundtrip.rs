@@ -1501,9 +1501,14 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    let h = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    let h = host.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Captured {
+            capture: Box::new(|| b"cursor=7".to_vec()),
+            restore: Box::new(|_| {}),
+        },
+    );
     host.register_cap_name("fs", h);
-    host.set_cap_state_capture(h, Box::new(|| b"cursor=7".to_vec()));
 
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("a named host capability is freezable");
@@ -1513,7 +1518,11 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let mut thost = Host::new();
     thost.set_named_cap_registrar(Box::new(move |name, state| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
-        Some((Box::new(|_op, _args, _mem, _| Ok(vec![99])), None))
+        Some(temen_interp::NamedCapGrant {
+            handler: Box::new(|_op, _args, _mem, _| Ok(vec![99])),
+            fork: None,
+            state: temen_interp::CapState::Stateless,
+        })
     }));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `fs`");
 
@@ -1580,14 +1589,20 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
         (name == "vm_fs")
             .then(|| temen_fs::MemFsHandle::from_state(state).ok())
             .flatten()
-            .map(|fs| {
-                (
-                    temen_fs::vm_fs_handler(&fs),
-                    Some(temen_fs::vm_fs_fork(&fs)),
-                )
+            .map(|fs| temen_interp::NamedCapGrant {
+                handler: temen_fs::vm_fs_handler(&fs),
+                fork: Some(temen_fs::vm_fs_fork(&fs)),
+                state: fs.cap_state(),
             })
     }));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `vm_fs`");
+    // #1699 — the registrar re-granted the store's state with its handler, so the next capture
+    // (a freeze, a moment) reads it as the first did.
+    assert_eq!(
+        thost.capture_cap_states(),
+        host.capture_cap_states(),
+        "a thawed memfs is captured again, not frozen empty"
+    );
 
     // The descriptor survived, cursor and all: reading from it picks up after the "h".
     let mut mem = VecMem(vec![0u8; 32]);
@@ -1608,7 +1623,10 @@ fn restore_refuses_an_artifact_naming_a_cap_the_embedder_does_not_serve() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    let h = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    let h = host.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    );
     host.register_cap_name("fs", h);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
@@ -1627,7 +1645,10 @@ fn freeze_still_refuses_an_unnamed_host_cap() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // never named
+    host.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    ); // never named
     let win = init_durable_window(WINDOW, TEST_ARENA);
     match freeze(&inst, &win, &host) {
         Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
@@ -1647,7 +1668,10 @@ fn a_cap_free_domain_elides_the_named_section() {
 
     let mut with = Host::new();
     with.grant_clock();
-    let h = with.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    let h = with.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    );
     with.register_cap_name("fs", h);
     let named = freeze(&inst, &win, &with).expect("freeze");
 

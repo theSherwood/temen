@@ -1053,15 +1053,18 @@ const SRC_CONSUMED_PARK: &str = "memory 18 shadow 16448 65536\n\
 fn consumed_park_host(freeze: bool) -> (Host, i32) {
     let mut h = Host::new();
     h.set_durable(true);
-    let hf = h.grant_host_proc(Box::new(move |_op, _args, mem, _| {
-        if freeze {
-            if let Some(m) = mem {
-                m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                    .expect("the state word is in the window");
+    let hf = h.grant_host_proc(
+        Box::new(move |_op, _args, mem, _| {
+            if freeze {
+                if let Some(m) = mem {
+                    m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                        .expect("the state word is in the window");
+                }
             }
-        }
-        Ok(vec![0])
-    }));
+            Ok(vec![0])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     (h, hf)
 }
 

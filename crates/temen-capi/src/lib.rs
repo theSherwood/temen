@@ -372,9 +372,11 @@ pub unsafe extern "C" fn temen_imports_provide_host_proc(
 ) -> i32 {
     let ctx = CtxPtr(ctx);
     // `make` is called once per backend host; each builds a fresh `HostProc` that trampolines into `f`.
-    let cap = HostCap::host_proc(op, move || -> HostProc {
+    // #1699 — `ctx` is C state nothing here can serialize: `Uncaptured`, so a freeze refuses the
+    // capability rather than thaw it with its state lost.
+    let cap = HostCap::host_proc(op, move || -> (HostProc, temen_interp::CapState) {
         let ctx = ctx;
-        Box::new(
+        let h: HostProc = Box::new(
             move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
                 // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
                 // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
@@ -407,7 +409,8 @@ pub unsafe extern "C" fn temen_imports_provide_host_proc(
                 let n = (n as usize).min(buf.len());
                 Ok(buf[..n].to_vec())
             },
-        )
+        );
+        (h, temen_interp::CapState::Uncaptured)
     });
     provide(i, name, cap)
 }

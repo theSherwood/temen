@@ -26,7 +26,7 @@
 
 #![cfg(target_os = "linux")]
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, Value};
+use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, Value};
 
 // A child-entry `main(argc, argv)` mini-nifler: resolve `"fs"`, open `argv[1]` (O_READ), read up to 256
 // bytes, open `argv[2]` (O_WRITE|O_CREATE|O_TRUNC = 26), write them back, close both, return the byte
@@ -187,12 +187,15 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
     let factory = std::sync::Arc::new(factory);
 
     let mut host = Host::new();
-    let init: HostProc = (*factory)();
+    let (init, init_state) = (*factory)();
     let fork: HostProcFork = {
         let factory = std::sync::Arc::clone(&factory);
-        std::sync::Arc::new(move |_pid| ForkedProc::shared((*factory)()))
+        std::sync::Arc::new(move |_pid| {
+            let (h, s) = (*factory)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(init, fork);
+    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
     let inst = host.grant_instantiator(0, 1u64 << (sl + 1));
     let modh = host.grant_module(&child);
 

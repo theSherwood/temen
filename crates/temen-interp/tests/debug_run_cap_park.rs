@@ -40,14 +40,17 @@ fn recording_host(recorded: &Recorded) -> (Host, i32) {
     let mut host = Host::new();
     host.record_caps();
     let rec = Arc::clone(recorded);
-    let h = host.grant_host_proc_offloadable(Box::new(move |op, args| {
-        let a = *args.first().unwrap_or(&0);
-        if op == 0 {
-            return OffloadOutcome::Done(Ok(vec![a + 100]));
-        }
-        let rec = Arc::clone(&rec);
-        OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
-    }));
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            let a = *args.first().unwrap_or(&0);
+            if op == 0 {
+                return OffloadOutcome::Done(Ok(vec![a + 100]));
+            }
+            let rec = Arc::clone(&rec);
+            OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
+        }),
+        temen_interp::CapState::Stateless,
+    );
     (host, h)
 }
 

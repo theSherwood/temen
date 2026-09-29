@@ -12,7 +12,7 @@
 //! * a registered **name** — the reconstruction rule, since the powerbox mints by name in a fixed
 //!   order, so a rebuilt run grants the same set in the same order and restored frames' handle values
 //!   stay valid. An unnamed host-fn has no such rule and still disqualifies the run;
-//! * its **own declared state** (`set_cap_state_capture`/`_restore`) riding the checkpoint, so a
+//! * its **own declared state** (its `CapState`) riding the checkpoint, so a
 //!   capability with guest-observable state of its own does not come back at its initial value under a
 //!   guest resumed at logical time `c`. That is the identical pair a freeze writes into the artifact's
 //!   named-capability section — one definition, read two ways.
@@ -69,21 +69,33 @@ fn module() -> Arc<temen_ir::Module> {
 }
 
 /// Grant a **stateful** host capability on `host`: each call returns the next integer. Its state is the
-/// counter, declared through the #1455 capture/restore pair, so a checkpoint carries it. `named`
+/// counter, declared as its `CapState` (#1455, #1699), so a checkpoint carries it. `named`
 /// selects whether the grant is registered under a name — the reconstruction rule the ladder requires.
 fn grant_counter(host: &mut Host, named: bool) {
     let n = Arc::new(Mutex::new(0i64));
     let call = Arc::clone(&n);
-    let h = host.grant_host_proc(Box::new(
-        move |_op: u32,
-              _args: &[i64],
-              _mem: Option<&mut dyn GuestMem>,
-              _minter: Option<&mut dyn RegionMinter>| {
-            let mut c = call.lock().unwrap();
-            *c += 1;
-            Ok(vec![*c])
+    let (cap, put) = (Arc::clone(&n), Arc::clone(&n));
+    let h = host.grant_host_proc(
+        Box::new(
+            move |_op: u32,
+                  _args: &[i64],
+                  _mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn RegionMinter>| {
+                let mut c = call.lock().unwrap();
+                *c += 1;
+                Ok(vec![*c])
+            },
+        ),
+        temen_interp::CapState::Captured {
+            capture: Box::new(move || cap.lock().unwrap().to_le_bytes().to_vec()),
+            restore: Box::new(move |b| {
+                let mut buf = [0u8; 8];
+                let k = b.len().min(8);
+                buf[..k].copy_from_slice(&b[..k]);
+                *put.lock().unwrap() = i64::from_le_bytes(buf);
+            }),
         },
-    ));
+    );
     if named {
         host.register_cap_name("cnt", h);
     }
@@ -94,21 +106,6 @@ fn grant_counter(host: &mut Host, named: bool) {
         0,
         h,
     )]);
-    let cap = Arc::clone(&n);
-    host.set_cap_state_capture(
-        h,
-        Box::new(move || cap.lock().unwrap().to_le_bytes().to_vec()),
-    );
-    let put = Arc::clone(&n);
-    host.set_cap_state_restore(
-        h,
-        Box::new(move |b| {
-            let mut buf = [0u8; 8];
-            let k = b.len().min(8);
-            buf[..k].copy_from_slice(&b[..k]);
-            *put.lock().unwrap() = i64::from_le_bytes(buf);
-        }),
-    );
 }
 
 fn session(named: bool) -> ScheduledDebugRun {

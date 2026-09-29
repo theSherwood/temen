@@ -373,10 +373,13 @@ fn a_freeze_request_the_root_never_polled_leaves_the_run_unfrozen() {
     let fc = Arc::clone(&freeze);
     let mut h = Host::new();
     h.set_durable(true);
-    let hf = h.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
-        fc.request_freeze();
-        Err(temen_interp::Trap::CapFault)
-    }));
+    let hf = h.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _| {
+            fc.request_freeze();
+            Err(temen_interp::Trap::CapFault)
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let (out, snap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,

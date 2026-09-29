@@ -82,7 +82,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`HostProc`**
 - *nesting* 🔶 — only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot
-- *durability* 🔶 — durable iff the grant carries a registered **name** (#1455): the closure cannot be serialized, but the name is a reconstruction rule the thaw's registrar acts on. An unnamed one is still NonDurableKind::HostProc
+- *durability* 🔶 — durable iff the grant carries a registered **name** (#1455) and its provider's `CapState` isn't `Uncaptured` (#1699): the closure cannot be serialized, but the name is a reconstruction rule the thaw's registrar acts on, and the provider says what state crosses with it. Otherwise NonDurableKind::HostProc
 
 **`Offer`**
 - *durability* ⛔ — NonDurableKind::Offer — an out-of-line reference to the offering domain

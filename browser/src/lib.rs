@@ -3422,6 +3422,7 @@ impl OnrampCaps {
             temen_interp::ForkedProc::shared(
                 caps.handler(&name)
                     .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
+                caps.cap_state(&name),
             )
         })
     }
@@ -3434,14 +3435,18 @@ impl OnrampCaps {
         Box::new(move |name, state| {
             let handler = caps.handler(name)?;
             caps.set_state(name, state); // re-seed before the guest can call it
-            Some((handler, Some(caps.fork(name))))
+            Some(temen_interp::NamedCapGrant {
+                handler,
+                fork: Some(caps.fork(name)),
+                state: caps.cap_state(name),
+            })
         })
     }
 
     /// `name`'s guest-observable state, as the provider that owns it chooses to serialize it — see
     /// the note above [`encode_events`] for what each capability declares and why `display` declares
-    /// nothing. The one definition; [`declare_state`](Self::declare_state) registers it with the host
-    /// and a thaw's registrar re-seeds through it.
+    /// nothing. The one definition; [`cap_state`](Self::cap_state) hands it to the host and a thaw's
+    /// registrar re-seeds through it.
     fn get_state(&self, name: &str) -> Option<Vec<u8>> {
         match name {
             "keyboard" => Some(encode_events(&self.keys.lock().unwrap())),
@@ -3479,54 +3484,41 @@ impl OnrampCaps {
         }
     }
 
-    /// Register `name`'s state hooks on the handle it was granted at (#1455/#1458), so a freeze
-    /// captures it and an in-session rewind puts it back — both through
-    /// [`get_state`](Self::get_state)/[`set_state`](Self::set_state).
-    ///
-    /// Called both when granting fresh and **after a thaw**: `restore_durable_named` re-grants the
-    /// handler but not the hooks, so a thawed reactor would otherwise be un-re-freezable — its `fs`
-    /// cursors would silently stop riding the next artifact.
-    fn declare_state(&self, host: &mut Host, name: &str, handle: i32) {
+    /// `name`'s [`CapState`](temen_interp::CapState) (#1455/#1458/#1699), so a freeze captures it and
+    /// an in-session rewind puts it back — both through [`get_state`](Self::get_state)/
+    /// [`set_state`](Self::set_state). Given at every grant, fork and thaw re-grant, so a thawed
+    /// capability is captured by the next freeze as the original was.
+    fn cap_state(&self, name: &str) -> temen_interp::CapState {
         if self.get_state(name).is_none() {
-            return; // a capability with nothing the guest can observe about it
+            // Nothing the guest can observe about it: `display` and `webgpu` only produce output.
+            return temen_interp::CapState::Stateless;
         }
         let (c, r) = (self.clone(), self.clone());
         let (cn, rn) = (name.to_string(), name.to_string());
-        host.set_cap_state_capture(
-            handle,
-            Box::new(move || c.get_state(&cn).unwrap_or_default()),
-        );
-        host.set_cap_state_restore(handle, Box::new(move |b| r.set_state(&rn, b)));
-    }
-
-    /// Every capability this powerbox can serve, **in grant order** — one list, read by the fresh-open
-    /// grant loop and by a thaw's state re-declaration. A capability added here therefore cannot be
-    /// granted on an open without also coming back on a save-state; two hand-kept lists could drift,
-    /// and the drift would be silent (a thawed reactor that can never be frozen again).
-    const NAMES: [&'static str; 5] = ["display", "keyboard", "mouse", "webgpu", "fs"];
-
-    /// Re-attach the state hooks for every capability `host` holds by name — what a thaw owes after the
-    /// registrar has re-granted the *handlers* but not the hooks that let them be captured again.
-    fn redeclare_states(&self, host: &mut Host) {
-        for name in Self::NAMES {
-            if let Some(h) = host.resolve_cap_name(name) {
-                self.declare_state(host, name, h);
-            }
+        temen_interp::CapState::Captured {
+            capture: Box::new(move || c.get_state(&cn).unwrap_or_default()),
+            restore: Box::new(move |b| r.set_state(&rn, b)),
         }
     }
 
-    /// Grant `name` onto `host` — handler, canonical name, and state hooks — returning its handle.
+    /// Every capability this powerbox can serve, **in grant order**.
+    const NAMES: [&'static str; 5] = ["display", "keyboard", "mouse", "webgpu", "fs"];
+
+    /// Grant `name` onto `host` — handler, canonical name, and state — returning its handle.
     /// `None` for a name this powerbox does not serve (an `fs` with no file, say).
     fn grant(&self, host: &mut Host, name: &str) -> Option<i32> {
-        let handle = host.grant_host_proc_forkable(self.handler(name)?, self.fork(name));
+        let handle = host.grant_host_proc_forkable(
+            self.handler(name)?,
+            self.fork(name),
+            self.cap_state(name),
+        );
         host.register_cap_name(name, handle);
-        self.declare_state(host, name, handle);
         Some(handle)
     }
 }
 
 // The capability-side half of a moment is **each capability's own state**, declared once by the
-// provider that owns it (`Host::set_cap_state_capture`/`_restore`) and read two ways: an in-session
+// provider that owns it (its `CapState`) and read two ways: an in-session
 // rewind puts it straight back into the live handler, and a freeze writes it into the artifact's
 // named-capability section (#1455). Before that pairing existed, a moment hand-rolled its own idea of
 // "the cap state" — which would have become a second, drifting definition the moment a reactor could
@@ -3582,7 +3574,7 @@ pub use temen_interp::moment::{
 };
 
 // The capability-side half of a moment is **each capability's own state**, declared once by the
-// provider that owns it (`Host::set_cap_state_capture`/`_restore`) and read two ways: an in-session
+// provider that owns it (its `CapState`) and read two ways: an in-session
 // rewind puts it straight back into the live handler, and a freeze writes it into the artifact's
 // named-capability section (#1455). `ReactorMoment::capture` takes both halves at one instant, so
 // they always describe the same one.
@@ -4466,7 +4458,7 @@ fn pg_setup(
     // later ([`temen_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
     let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
-    let fsh = host.grant_host_proc(fs_hostfn);
+    let fsh = host.grant_host_proc(fs_hostfn, fs_handle.cap_state());
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
     // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964/#1094: a module reads its args
@@ -6239,9 +6231,6 @@ impl OnrampReactor {
 
         let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
             .map_err(|_| STATUS_UNSUPPORTED)?;
-        // The registrar re-granted the handlers but not their state *hooks* — re-declare them, or this
-        // reactor could never be frozen again.
-        caps.redeclare_states(&mut host);
 
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
         if !inst.restore_window(&layout) {
@@ -6667,9 +6656,6 @@ impl JitOnrampReactor {
                 let (bytes, _prots, _reserved) =
                     temen_snapshot::restore_with_prots(artifact, m, &mut host)
                         .map_err(|_| STATUS_UNSUPPORTED)?;
-                // The registrar re-granted the handlers but not their state *hooks* — re-declare them,
-                // or this reactor could never be frozen again.
-                caps.redeclare_states(&mut host);
                 // A window image is only meaningful in a window its own size: this tier reserves more
                 // than the interpreter does, so an artifact frozen on the other tier lands here and is
                 // refused rather than splatted over a prefix (INVARIANTS #9c).
@@ -12060,18 +12046,22 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     let c2 = std::sync::Arc::clone(&counter);
     let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
         let c = std::sync::Arc::clone(&c2);
-        temen_interp::ForkedProc::shared(Box::new(move |_op, _a, _m, _| {
-            let mut c = c.lock().unwrap();
-            *c += 1;
-            Ok(vec![*c])
-        }))
+        temen_interp::ForkedProc::shared(
+            Box::new(move |_op, _a, _m, _| {
+                let mut c = c.lock().unwrap();
+                *c += 1;
+                Ok(vec![*c])
+            }),
+            temen_interp::CapState::Uncaptured,
+        )
     });
 
     let mut host = Host::new();
     let win = 1u64 << driver.memory.map_or(16, |mc| mc.size_log2); // the built-in driver: `memory 16`
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);
-    let fs_h = host.grant_host_proc_forkable(handler, fork);
+    // A counter the guest reads back, which nothing serializes (#1699).
+    let fs_h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
     host.register_cap_name("fs", fs_h);
     // #1296 — the driver holds a §22 `Jit` (validator + wasm emitter armed, the browser's) under the
     // name `"jit"`, so a driver program may re-grant it into an op-13 child by name; the child then
@@ -12489,8 +12479,9 @@ unsafe fn op13_phase_open_impl(
     // The shared memfs the child reads its inputs from + writes its output into. Typed as the `dyn`
     // factory (nimc's `FsFactory`) so it re-grants to the child AND feeds `make_exec` (the exec cap).
     let (factory, handle) = temen_fs::mem_fs_shared_factory(seeds, vec!["nimcache".into()]);
-    let factory: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-        std::sync::Arc::new(factory);
+    let factory: std::sync::Arc<
+        dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+    > = std::sync::Arc::new(factory);
 
     // 3-cap {fs,stdout,exit}, or 4-cap {+exec} when the phase (nimsem) shells out to nifler. The exec is
     // a HOST_PROC cap — a tiered-up child's `exec` call bounces to `call_interp` over this granted host
@@ -12516,12 +12507,15 @@ unsafe fn op13_phase_open_impl(
     let prog = Box::into_raw(Box::new(prog));
 
     let mut host = Host::new();
-    let fs_init: temen_interp::HostProc = (*factory)();
+    let (fs_init, fs_state) = (*factory)();
     let fs_fork: temen_interp::HostProcFork = {
         let f = std::sync::Arc::clone(&factory);
-        std::sync::Arc::new(move |_pid| temen_interp::ForkedProc::shared((*f)()))
+        std::sync::Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            temen_interp::ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     let mut cap_handles = vec![fs_h, stdout_h, exit_h];
@@ -12551,15 +12545,20 @@ unsafe fn op13_phase_open_impl(
             let factory = std::sync::Arc::clone(&factory);
             let handle = handle.clone();
             std::sync::Arc::new(move |_pid| {
-                temen_interp::ForkedProc::shared(nimc::make_exec(
-                    nimc::ExecNifler::Shared(first.clone()),
-                    ce.clone(),
-                    std::sync::Arc::clone(&factory),
-                    handle.clone(),
-                ))
+                temen_interp::ForkedProc::shared(
+                    nimc::make_exec(
+                        nimc::ExecNifler::Shared(first.clone()),
+                        ce.clone(),
+                        std::sync::Arc::clone(&factory),
+                        handle.clone(),
+                    ),
+                    temen_interp::CapState::Uncaptured,
+                )
             })
         };
-        let exec_h = host.grant_host_proc_forkable(exec_init, exec_fork);
+        // A job table the phase drains output from: `Uncaptured` (#1699).
+        let exec_h =
+            host.grant_host_proc_forkable(exec_init, exec_fork, temen_interp::CapState::Uncaptured);
         cap_handles.push(exec_h);
     }
     // The driver's Instantiator, the child `Module` and the budget its window is minted from (quota = the
@@ -13478,7 +13477,10 @@ pub extern "C" fn temen_mem_profile(
     // grants the hook first, so a scratch first-grant yields the exact baked-in value).
     let handle = {
         let mut scratch = Host::new();
-        scratch.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![])))
+        scratch.grant_host_proc(
+            Box::new(|_, _, _, _| Ok(vec![])),
+            temen_interp::CapState::Stateless,
+        )
     };
     let spec = temen_opt::instrument::MemHookSpec {
         type_id: temen_interp::cap_id::HOST_PROC,
@@ -13520,15 +13522,19 @@ pub extern "C" fn temen_mem_profile(
     let feed = Arc::clone(&model);
     let mut host = Host::new();
     let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
-    let h = host.grant_host_proc(Box::new(move |op, args, _mem, _| {
-        if let Some(ev) = decode_mem_event(op, args) {
-            n += 1;
-            feed.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .observe(n, 0, ev);
-        }
-        Ok(vec![])
-    }));
+    let h = host.grant_host_proc(
+        Box::new(move |op, args, _mem, _| {
+            if let Some(ev) = decode_mem_event(op, args) {
+                n += 1;
+                feed.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(n, 0, ev);
+            }
+            Ok(vec![])
+        }),
+        // The profile observes; the guest reads nothing back from it.
+        temen_interp::CapState::Stateless,
+    );
     debug_assert_eq!(h, handle, "the hook grant is the first grant");
     let mut fuel = u64::MAX;
     let res = bytecode::compile_and_run_with_host(&im, 0, &[], &mut fuel, &mut host);
@@ -13775,7 +13781,11 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
     let mut host = Host::new();
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
-    let _ = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // handle 2, type_id 13
+                               // handle 2, type_id 13
+    let _ = host.grant_host_proc(
+        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+        temen_interp::CapState::Stateless,
+    );
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: Vec<Value> = if arity >= 1 {
         vec![Value::I32(arg as i32)]
@@ -16159,13 +16169,17 @@ block 0 () {
         let c2 = Arc::clone(&counter);
         let fork = Arc::new(move |_pid: u64| {
             let c = Arc::clone(&c2);
-            ForkedProc::shared(Box::new(move |_op, _a, _m, _| {
-                let mut c = c.lock().unwrap();
-                *c += 1;
-                Ok(vec![*c])
-            }))
+            ForkedProc::shared(
+                Box::new(move |_op, _a, _m, _| {
+                    let mut c = c.lock().unwrap();
+                    *c += 1;
+                    Ok(vec![*c])
+                }),
+                temen_interp::CapState::Uncaptured,
+            )
         });
-        let h = host.grant_host_proc_forkable(handler, fork);
+        // A counter the guest reads back, which nothing serializes (#1699).
+        let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
         host.register_cap_name(name, h);
         counter
     }
@@ -16182,13 +16196,17 @@ block 0 () {
         let c2 = Arc::clone(&counter);
         let fork = Arc::new(move |_pid: u64| {
             let c = Arc::clone(&c2);
-            ForkedProc::shared(Box::new(move |_op, _a, _m, _| {
-                let mut c = c.lock().unwrap();
-                *c += 1;
-                Ok(vec![*c])
-            }))
+            ForkedProc::shared(
+                Box::new(move |_op, _a, _m, _| {
+                    let mut c = c.lock().unwrap();
+                    *c += 1;
+                    Ok(vec![*c])
+                }),
+                temen_interp::CapState::Uncaptured,
+            )
         });
-        let h = host.grant_host_proc_forkable(handler, fork);
+        // A counter the guest reads back, which nothing serializes (#1699).
+        let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
         host.register_cap_name("fs", h);
         (host, counter)
     }

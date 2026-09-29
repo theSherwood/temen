@@ -610,7 +610,8 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         Cmd::Corrupt => posix.write_file("/bin/c", &image[..image.len() / 2]),
         Cmd::Absent | Cmd::Registered => {}
     }
-    let make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> = Arc::new(make);
+    let make: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync> =
+        Arc::new(make);
     // #1826 — the embedder's pipe ([`Body::PipeImported`]): minted once per run by whichever of its
     // three imports binds first, each import bound to its end's op.
     let pipe: Arc<Mutex<Option<(i32, i32)>>> = Arc::default();

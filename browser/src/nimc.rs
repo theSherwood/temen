@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use temen_interp::{
-    bytecode, ForkedProc, Host, HostProc, HostProcFork, Region, StreamRole, Trap, Value,
+    bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, Region, StreamRole, Trap, Value,
 };
 use temen_ir::Module;
 
@@ -232,7 +232,7 @@ pub(crate) fn parse_includes(deps_nif: &str, includer_dir: &str) -> Vec<String> 
 // ---- run a phase guest (nifler/nimsem/hexer) on the bytecode engine, granting the powerbox + caps --
 
 /// A fresh `fs` `HostProc` over the shared memfs store (a new grant per phase run / per exec spawn).
-type FsFactory = Arc<dyn Fn() -> HostProc + Send + Sync>;
+type FsFactory = Arc<dyn Fn() -> (HostProc, CapState) + Send + Sync>;
 
 /// A phase module with its bytecode program compiled **once** and shared by every run of it. The card
 /// runs nifler once per stdlib import nimsem resolves (21 times on the bench program), and each run's
@@ -285,7 +285,12 @@ fn diag_tail(out: &[u8]) -> String {
     format!(": {}", String::from_utf8_lossy(&out[start..]).trim())
 }
 
-fn run_phase(phase: &Phase, argv: &[&str], fs: HostProc, exec: Option<HostProc>) -> (Vec<u8>, i64) {
+fn run_phase(
+    phase: &Phase,
+    argv: &[&str],
+    fs: (HostProc, CapState),
+    exec: Option<HostProc>,
+) -> (Vec<u8>, i64) {
     let m: &Module = &phase.module;
     if onramp_check(m).is_err() {
         return (b"phase module is not a manifest module".to_vec(), -1);
@@ -299,10 +304,11 @@ fn run_phase(phase: &Phase, argv: &[&str], fs: HostProc, exec: Option<HostProc>)
     host.register_cap_name("exit", exit);
     let memory = host.grant_memory();
     host.register_cap_name("memory", memory);
-    let fsh = host.grant_host_proc(fs);
+    let fsh = host.grant_host_proc(fs.0, fs.1);
     host.register_cap_name("fs", fsh);
     if let Some(e) = exec {
-        let eh = host.grant_host_proc(e);
+        // The exec cap keeps a job table the phase drains output from: `Uncaptured` (#1699).
+        let eh = host.grant_host_proc(e, CapState::Uncaptured);
         host.register_cap_name("exec", eh);
     }
     // Manifest slot bindings for the on-ramp powerbox imports (stdout/stdin/exit/memory) — fs/exec are
@@ -529,12 +535,15 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     };
     let plan = crate::plan::Plan::single(decl, argv, &["fs", "stdout", "exit"]);
     let mut host = Host::new();
-    let fs_init: HostProc = (*factory)();
+    let (fs_init, fs_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = std::sync::Arc::clone(factory);
-        std::sync::Arc::new(move |_pid| ForkedProc::shared((*f)()))
+        std::sync::Arc::new(move |_pid| {
+            let (h, s) = (*f)();
+            ForkedProc::shared(h, s)
+        })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
+    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_state);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     match crate::plan::run(&plan, &[child], host, &[fs_h, stdout_h, exit_h]) {

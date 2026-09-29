@@ -43,10 +43,13 @@ fn parse(src: &str) -> temen_ir::Module {
 /// after) identically either way.
 fn run(m: &temen_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
-    let handle = host.grant_host_proc(Box::new(|op, args, _mem, _| {
-        assert_eq!(op, 0, "the guest calls op 0");
-        Ok(vec![args[0] + args[1]])
-    }));
+    let handle = host.grant_host_proc(
+        Box::new(|op, args, _mem, _| {
+            assert_eq!(op, 0, "the guest calls op 0");
+            Ok(vec![args[0] + args[1]])
+        }),
+        temen_interp::CapState::Stateless,
+    );
     let mut r = bytecode::Reactor::open(m).expect("open reactor");
     let mut fuel = u64::MAX;
     r.call(0, &[Value::I32(handle)], &mut fuel, &mut host)

@@ -68,10 +68,13 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
     let sink = Arc::clone(&probes);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(Box::new(move |_op, args, _mem, _| {
-        sink.lock().unwrap().push(args[0] as u64);
-        Ok(vec![0])
-    }));
+    let hf = host.grant_host_proc(
+        Box::new(move |_op, args, _mem, _| {
+            sink.lock().unwrap().push(args[0] as u64);
+            Ok(vec![0])
+        }),
+        temen_interp::CapState::Stateless,
+    );
 
     // A zeroed window (state = NORMAL); the per-context shadow-base comes from the runtime register,
     // not the window, so no seed is needed.
