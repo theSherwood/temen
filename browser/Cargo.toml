@@ -38,6 +38,12 @@ path = "src/genlibc.rs"
 name = "benchdebug"
 path = "src/benchdebug.rs"
 
+# nimony's own driver on the interpreter tier, natively (#958): the time and memory of a lane build
+# through the code the wasm export runs. A measurement, not a gate.
+[[bin]]
+name = "nimbuild"
+path = "src/nimbuild.rs"
+
 [features]
 # Opt-in per-function call profiler (tier-up break-even measurement) — surfaces `temen_callprof_*`
 # and enables the interp's counter. Never in a shipped build; a measurement cdylib only.

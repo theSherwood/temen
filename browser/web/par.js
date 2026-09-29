@@ -29,16 +29,16 @@ export async function fetchBytes(url) {
 // window, the vCPUs' stacks — some allocated inside Workers the page can only `terminate()`, with no
 // signal that they have stopped), so the host drops the whole engine after a run and takes a fresh
 // one for the next; the old memory goes with its Workers.
-export async function loadEngine(prev = null) {
+export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
   const bytes = prev ? prev.bytes : await fetchBytes(WASM);
   const module = prev ? prev.module : await WebAssembly.compile(bytes);
   if (!WebAssembly.Module.imports(module).some((i) => i.kind === 'memory')) {
     throw new Error('not a threads build (no imported memory)');
   }
-  // The engine's ceiling is the host's call, not the build's (`web/engine-mem.js`): the requested
-  // maximum is clamped to the `--max-memory` this build declares, so asking for more than an older
-  // build allows yields that build's ceiling instead of a `LinkError`.
-  const { memory, maxPages } = engineMemory(bytes);
+  // The engine's ceiling is the host's call, not the build's (`web/engine-mem.js`): `maxPages` asks
+  // for one (the default otherwise), clamped to the `--max-memory` this build declares, so asking for
+  // more than an older build allows yields that build's ceiling instead of a `LinkError`.
+  const { memory, maxPages } = engineMemory(bytes, { maxPages: askPages });
   // The wasm imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
   // page installs a real servicer on `globalThis.__temen_webgpu_op` (play.js does, backed by the page's
   // <canvas> + `navigator.gpu`). i64 args arrive as BigInt; the handler gets the shared `memory` so it

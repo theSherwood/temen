@@ -21,10 +21,10 @@
 use temen_browser::{bash_exec, bash_exec_with, STATUS_EXIT};
 
 /// The committed `/bin` coreutils (repo-owned C — unlike GPLv3 bash, these ARE vendored). Decode each
-/// and return `(path, module, window_log2)` for `bash_exec_with` to register as filesystem
-/// executables, so bash resolves an external command (`seq` → `/bin/seq`) and fork → execve's it.
+/// and return `(path, module)` for `bash_exec_with` to register as filesystem executables, so bash
+/// resolves an external command (`seq` → `/bin/seq`) and fork → execve's it.
 /// Regenerate the fixtures with the `gen_browser_bash_coreutils` ignored test (see c_shell.rs).
-fn load_coreutils() -> Vec<(&'static str, temen_ir::Module, u8)> {
+fn load_coreutils() -> Vec<(&'static str, temen_ir::Module)> {
     let raw: &[(&str, &[u8])] = &[
         ("/bin/true", include_bytes!("fixtures/bin_true.temen")),
         ("/bin/false", include_bytes!("fixtures/bin_false.temen")),
@@ -60,9 +60,10 @@ fn load_coreutils() -> Vec<(&'static str, temen_ir::Module, u8)> {
     ];
     raw.iter()
         .map(|(path, bytes)| {
-            let m = temen_encode::decode_module(bytes).expect("decode coreutil");
-            let wl = m.memory.map_or(0, |mc| mc.size_log2);
-            (*path, m, wl)
+            (
+                *path,
+                temen_encode::decode_module(bytes).expect("decode coreutil"),
+            )
         })
         .collect()
 }
@@ -151,8 +152,7 @@ fn bash_dash_c_external_seq_last() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let out = bash_exec_with(&bash, &[b"bash", b"-c", b"seq 3"], b"", &bin_refs);
     // The last command is exec'd on the root, so `seq` *returns* its status (STATUS_OK, value 0) —
     // it did not go through bash's own `exit_shell` (which would be STATUS_EXIT).
@@ -184,8 +184,7 @@ fn bash_dash_c_external_seq_forked() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let out = bash_exec_with(
         &bash,
         &[b"bash", b"-c", b"seq 2; echo done"],
@@ -228,8 +227,7 @@ fn bash_dash_c_pipeline_echo_cat() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let out = bash_exec_with(&bash, &[b"bash", b"-c", b"echo hi | cat"], b"", &bin_refs);
     assert_eq!(
         out.status,
@@ -254,8 +252,7 @@ fn bash_dash_c_cut_pipeline() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let script = "echo 'a:b:c:d' | cut -d: -f2,4; \
                   echo abcdef | cut -c2-4; \
                   echo 'p q r s' | cut -d' ' -f3-; \
@@ -287,8 +284,7 @@ fn bash_dash_c_tier1_tier2_coreutils() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let script = "seq 1 5 | tail -n 2; \
                   echo 'x y z' | rev; \
                   printf 'a\\nb\\nc\\n' | tac; \
@@ -326,8 +322,7 @@ fn bash_dash_c_fs_writers() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     // tee echoes "one" and writes it to `a`; cp→b, mv b→c, cat each; touch an empty `t` (cat prints
     // nothing); rm/mkdir/rmdir mutate silently; the builtin `echo done` ends the run via exit_shell.
     let script = "echo one | tee a; cp a b; cat b; mv b c; cat c; \
@@ -358,8 +353,7 @@ fn bash_dash_c_recursive_fs() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let script = "mkdir -p d/sub; printf 'A\\n' > d/a; printf 'C\\n' > d/sub/c; \
                   cp -r d e; cat e/a; cat e/sub/c; \
                   rm -rf d; cat e/sub/c; echo done";
@@ -390,8 +384,7 @@ fn bash_dash_c_pipeline_seq_head_wc() {
         return;
     };
     let bins = load_coreutils();
-    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
-        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let bin_refs: Vec<(&str, &temen_ir::Module)> = bins.iter().map(|(p, m)| (*p, m)).collect();
     let out = bash_exec_with(
         &bash,
         &[b"bash", b"-c", b"seq 5 | head -n 3 | wc -l"],

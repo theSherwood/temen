@@ -802,7 +802,16 @@ impl SharedSlots {
 /// is the primary; `k≥1` is an installed unit. A §14 child / coroutine shares the root's `ModuleSource`
 /// (so its table's module indices resolve) but carries its own [`SharedSlots`].
 struct ModuleSource {
-    mods: std::sync::Mutex<Vec<std::sync::Arc<Compiled>>>,
+    mods: std::sync::Mutex<Units>,
+}
+
+/// A [`ModuleSource`]'s units, and which of them are `execve`'d commands.
+struct Units {
+    code: Vec<std::sync::Arc<Compiled>>,
+    /// Each unit an `execve` compiled, by its module's content digest ([`super::module_digest`]) —
+    /// `(digest, index)`. A command is compiled once per run, however many processes exec it, as a
+    /// JIT tree compiles it once per digest (#1825).
+    commands: Vec<([u8; 32], usize)>,
 }
 
 impl ModuleSource {
@@ -814,47 +823,135 @@ impl ModuleSource {
     /// #1144): the shared `Arc<Compiled>` becomes `mods[0]` of a fresh source.
     fn over(primary: std::sync::Arc<Compiled>) -> ModuleSource {
         ModuleSource {
-            mods: std::sync::Mutex::new(vec![primary]),
+            mods: std::sync::Mutex::new(Units {
+                code: vec![primary],
+                commands: Vec::new(),
+            }),
         }
     }
 
     /// A fresh clone of the module `Arc`s — a vCPU's lock-free local cache (cheap refcount bumps),
     /// refreshed on a miss. The lock acquire pairs with `install`'s push, so the snapshot sees it.
     fn snapshot(&self) -> Vec<std::sync::Arc<Compiled>> {
-        self.mods.lock_unpoisoned().clone()
+        self.mods.lock_unpoisoned().code.clone()
     }
 
     /// The primary program (module 0).
     fn primary(&self) -> std::sync::Arc<Compiled> {
-        std::sync::Arc::clone(&self.mods.lock_unpoisoned()[0])
+        std::sync::Arc::clone(&self.mods.lock_unpoisoned().code[0])
     }
 
     /// Module `i` (`0` = primary, `k≥1` = an installed unit), or `None` if out of range.
     fn get(&self, i: usize) -> Option<std::sync::Arc<Compiled>> {
-        self.mods.lock_unpoisoned().get(i).cloned()
+        self.mods.lock_unpoisoned().code.get(i).cloned()
     }
 
     /// Append a module (a §14 `instantiate_module` child's program) and return its index. (§22
     /// `Jit.install` instead goes through [`Domain::install`], which also fills a dispatch slot.)
     fn push(&self, unit: Compiled) -> usize {
         let mut mods = self.mods.lock_unpoisoned();
-        mods.push(std::sync::Arc::new(unit));
-        mods.len() - 1
+        mods.code.push(std::sync::Arc::new(unit));
+        mods.code.len() - 1
+    }
+
+    /// The unit of the `execve`'d command whose module has content digest `digest`: the one this
+    /// run already compiled, or `compile()`'s, appended. `None` when `compile` refuses. The compile
+    /// runs outside the lock; a racing exec of the same command keeps the unit that landed first.
+    fn command(
+        &self,
+        digest: &[u8; 32],
+        compile: impl FnOnce() -> Option<Compiled>,
+    ) -> Option<usize> {
+        let find = |u: &Units| {
+            u.commands
+                .iter()
+                .find(|(d, _)| d == digest)
+                .map(|&(_, i)| i)
+        };
+        if let Some(i) = find(&self.mods.lock_unpoisoned()) {
+            return Some(i);
+        }
+        let unit = compile()?;
+        let mut mods = self.mods.lock_unpoisoned();
+        if let Some(i) = find(&mods) {
+            return Some(i);
+        }
+        mods.code.push(std::sync::Arc::new(unit));
+        let i = mods.code.len() - 1;
+        mods.commands.push((*digest, i));
+        Some(i)
     }
 
     /// The **non-primary** units (`mods[1..]`) — a time-travel checkpoint captures these (cheap `Arc`
     /// refcount bumps) so a reverse-`seek` restore can re-push them and a separate-module coroutine/child
     /// frame's `module` index resolves as it did at capture. Paired with [`reset_extra`].
     fn extra_units(&self) -> Vec<std::sync::Arc<Compiled>> {
-        self.mods.lock_unpoisoned()[1..].to_vec()
+        self.mods.lock_unpoisoned().code[1..].to_vec()
     }
 
     /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
-    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe.
+    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe. The command index
+    /// is dropped with them: a later exec compiles its command again rather than trust an index into
+    /// units it did not see pushed.
     fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
         let mut mods = self.mods.lock_unpoisoned();
-        mods.truncate(1);
-        mods.extend(units.iter().cloned());
+        mods.code.truncate(1);
+        mods.code.extend(units.iter().cloned());
+        mods.commands.clear();
+    }
+}
+
+#[cfg(test)]
+mod module_source_tests {
+    use super::*;
+
+    fn unit() -> Compiled {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        compile_module(&m.funcs, &m.types, None).expect("compile")
+    }
+
+    #[test]
+    fn an_execd_command_compiles_once_per_run() {
+        let src = ModuleSource::new(unit());
+        let mut compiles = 0;
+        let mut exec = |digest: [u8; 32]| {
+            src.command(&digest, || {
+                compiles += 1;
+                Some(unit())
+            })
+            .expect("compiles")
+        };
+        let a = exec([1; 32]);
+        assert_eq!(
+            exec([1; 32]),
+            a,
+            "an exec of the same command runs its unit"
+        );
+        let b = exec([2; 32]);
+        assert_ne!(a, b, "another command has its own unit");
+        assert_eq!(compiles, 2, "each command compiled once");
+        assert_eq!(
+            src.snapshot().len(),
+            3,
+            "the primary and a unit per command"
+        );
+    }
+
+    #[test]
+    fn a_restore_forgets_which_units_are_commands() {
+        let src = ModuleSource::new(unit());
+        let a = src.command(&[1; 32], || Some(unit())).expect("compiles");
+        src.reset_extra(&[]);
+        let mut compiled = false;
+        let b = src
+            .command(&[1; 32], || {
+                compiled = true;
+                Some(unit())
+            })
+            .expect("compiles");
+        assert!(compiled, "the command is compiled again after a restore");
+        assert_eq!((a, b), (1, 1), "into the restored units");
     }
 }
 
@@ -961,8 +1058,8 @@ fn jit_install_into(source: &ModuleSource, table: &SharedSlots, unit: Compiled) 
         .slots
         .iter()
         .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
-    mods.push(std::sync::Arc::new(unit));
-    let module = (mods.len() - 1) as u32;
+    mods.code.push(std::sync::Arc::new(unit));
+    let module = (mods.code.len() - 1) as u32;
     table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
     Some(slot)
 }
@@ -9240,15 +9337,14 @@ fn exec_image_build(
 ) -> Result<(Host, SharedSlots, VTask), i64> {
     // Resolve and compile the command first: `Host::exec_image` is the commit point (it hands the
     // caller's personality to the new powerbox), so everything that can still refuse must come
-    // before it.
+    // before it. A command this run already compiled is not compiled again.
     let command = cur_host.exec_module(cmd)?;
-    let cmodule = std::sync::Arc::clone(&command.0.module);
-    let child_compiled = compile_module(
-        &command.0.funcs,
-        &cmodule.types,
-        cmodule.memory.and_then(|x| x.shadow),
-    )
-    .ok_or(super::EINVAL)?;
+    let cm = dom
+        .source
+        .command(&command.0.digest, || {
+            compile_module(&command.0.funcs, &command.0.types, command.0.shadow)
+        })
+        .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
     // layout) from the caller window, then admit + build through the one rule every engine shares:
     // the command's entry, its fit in the caller's backed prefix, the grants' regrantability, the
@@ -9290,12 +9386,10 @@ fn exec_image_build(
     // `exec_image` released the old image's own pipe ends (the fork-inherited ones the exec did not
     // carry). Empty for a command that inherited no CorePipe ends (the rung-1/2a case); non-empty
     // ends need the pipe-EOF wake the cooperative engine does not yet drive — a later rung.
-    // Push the command as a new domain unit + build its natural table + activation.
+    // Build the command's natural table + activation over its unit.
     let child_host = img.host;
-    let progs_len = child_compiled.progs.len();
-    let cm = dom.source.push(child_compiled);
-    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
+    let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     new_vt.active.module = cm;
     new_vt.active.home = cm;
@@ -9910,6 +10004,19 @@ impl VTask {
             root_shadow_sp: c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0), // §12.8 4A.5: empty root = frame base
             active_invoke: None,
         })
+    }
+
+    /// Free a finished task's frames: its register file, call stack and parked fibers. It never
+    /// runs again; its result lives in its [`TaskState::Done`].
+    fn release(&mut self) {
+        let vm = &mut self.active;
+        vm.regs = Vec::new();
+        vm.stack = Vec::new();
+        vm.scratch = Vec::new();
+        vm.setjmp_points = std::collections::BTreeMap::new();
+        vm.sig_handler_stack = Vec::new();
+        self.chain = Vec::new();
+        self.active_invoke = None;
     }
 
     /// The continuation a debug engine is currently stepping: a §22 invoked unit's `Vm`
@@ -12151,9 +12258,11 @@ impl CoopSched {
                     live[k] |= !matches!(t.state, TaskState::Done(_));
                 }
             }
+            let mut finished: Vec<usize> = Vec::new();
             for k in 0..extra_envs.len() {
                 if seen[k] && !live[k] && released_envs.insert(k) {
                     extra_envs[k].host.lock_unpoisoned().release_pipe_ends();
+                    finished.push(k);
                 }
             }
             // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
@@ -12180,6 +12289,19 @@ impl CoopSched {
                     h(status);
                 }
                 hooked_twins.insert(ti2);
+            }
+            // A finished domain gives back what it held — its window, its powerbox, its frames — now
+            // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
+            // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
+            // build that forks and execs a compiler per module grew by a window per process.
+            for k in finished {
+                let env = &mut extra_envs[k];
+                env.mem = None;
+                env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+                env.fibers = FiberTables::default();
+                for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
+                    t.vt.release();
+                }
             }
             // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
             // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
@@ -13945,6 +14067,17 @@ pub struct TierUpConfig {
     pub page_checked: bool,
 }
 
+/// What a [`CoopRun`] holds ([`CoopRun::footprint`]): the memory a process tree costs its embedder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Footprint {
+    /// Process windows: the root's, and each child's that has not finished. A finished process
+    /// gives its window back.
+    pub windows: usize,
+    /// Compiled programs: the root's, one per command the run's processes exec'd, and any unit
+    /// installed or spawned. A command exec'd again runs the program its first exec compiled.
+    pub units: usize,
+}
+
 /// A pause of the cooperative tier-up driver [`CoopRun`], mirroring the single-vCPU [`VcpuEvent`]'s
 /// tier-up-relevant subset. The cooperative driver services concurrency (`thread.spawn`, join, futex
 /// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
@@ -14255,6 +14388,15 @@ impl CoopRun {
     /// no SharedArrayBuffer), keeps the deterministic cooperative schedule.
     pub fn set_suspend_on_idle(&mut self, on: bool) {
         self.sched.suspend_on_idle = on;
+    }
+
+    /// What the run holds now ([`Footprint`]).
+    pub fn footprint(&self) -> Footprint {
+        let children = self.sched.extra_envs.iter().filter(|e| e.mem.is_some());
+        Footprint {
+            windows: usize::from(self.mem.is_some()) + children.count(),
+            units: self.dom.source.snapshot().len(),
+        }
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
