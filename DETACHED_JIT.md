@@ -593,7 +593,10 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    driver: a detached vCPU's nested **carve** (op 13) or `thread.spawn` traps (the sibling Worker
    would alias the engine memory at `win`), and a spawn with a re-granted cap list traps (no
    cross-Worker path for the powerbox; the op-13 arm has the same shape). Threads inside a detached
-   child are the natural follow-up (a `temen_par_child` over the same foreign id).
+   child are the natural follow-up (a `temen_par_child` over the same foreign id). *(Since #1414's
+   E2 the admitted child crosses to its Worker whole, as a ticket: the engine seeds the window, the
+   event carries no segment blob, and a spawn with re-grants or a pre-mapped region runs rather than
+   trapping, on both arms.)*
 4. **#1287 — Native JIT hosting of op 15** (**done**): the `instantiate_detached` thunk, the
    decoupled-window child compile, the copy-free detached runner, the `build_detached` /
    `minter_take` hooks; `detached_child_jit.rs` is the differential vs the tree-walker.

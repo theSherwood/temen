@@ -7,14 +7,14 @@
 //! admit exactly what the interpreter admits once the driver advances `"mapped"` past the grow, and
 //! fault where an un-grown `"mapped"` would.
 //!
-//! The oracle is [`bytecode::Vcpu::new_confined_child_grow`] — the growable-confined-child primitive
-//! (the parent grants the AddressSpace over the carve, `mapped` starts at the declared window and grows
-//! into it). The emitted side services the child's `map` bounce by advancing `"mapped"` (the #717
+//! The oracle is the interpreter running the child with starter caps over the carve: its window
+//! commits the declared size and `vm_map` grows it into the carve, the window an op-13 child started
+//! with `committed_log2` gets (`PendingChild::start`). The emitted side services the child's `map` bounce by advancing `"mapped"` (the #717
 //! driver contract, applied to a nested child's grow). This pins the confinement property the growable
 //! op-13 nim phases rest on, and is the harness slice 4b/4c (fuzz + browser backing-grow) extend.
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Region, Trap, Value};
+use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_wasm_jit::{compile_module_nested, outline_nested_cap_calls, TRAP_MEMORY_FAULT};
 use wasmi::{Caller, Engine, Global, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -64,9 +64,11 @@ enum Outcome {
     Trap,
 }
 
-/// The interpreter oracle: run `child` as a **growable** confined child — the parent grants a
-/// `1<<CARVE` carve, the committed window starts at the declared `1<<DECL` and grows on `vm_map`. The
-/// backing covers the whole carve. Returns the entry's result or a trap.
+/// The interpreter oracle: run `child` as a **growable** confined child — its starter
+/// `Instantiator`/`AddressSpace` span a `1<<CARVE` carve, the committed window starts at the declared
+/// `1<<DECL` and grows on `vm_map`. The backing covers the whole carve; a window over it is a root
+/// vCPU's, since a sub-window is indistinguishable from a top-level window (DESIGN.md §14). Returns the
+/// entry's result or a trap.
 fn interp_confined(child: &temen_ir::Module) -> Outcome {
     let prog = bytecode::VcpuProgram::compile(child).expect("compile");
     let carve = 1usize << CARVE;
@@ -77,16 +79,12 @@ fn interp_confined(child: &temen_ir::Module) -> Outcome {
     // SAFETY: `base` is `carve` valid bytes, exclusively this child's window, freed only after the vCPU.
     let back = Arc::new(unsafe { Region::shared(base, carve as u64) });
     let out = {
-        let mut vcpu = bytecode::Vcpu::new_confined_child_grow(
-            &prog,
-            0,
-            0,
-            Arc::clone(&back),
-            DECL,
-            CARVE,
-            u64::MAX,
-        )
-        .expect("growable confined child builds");
+        let mut host = Host::new();
+        let (inst, space) = host.grant_starter_caps(1 << CARVE);
+        let args = [Value::I64(inst.into()), Value::I64(space.into())];
+        let mut vcpu =
+            bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, Arc::clone(&back), &[], host)
+                .expect("growable confined child builds");
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => Outcome::Val(match v.first() {
                 Some(Value::I64(x)) => *x,

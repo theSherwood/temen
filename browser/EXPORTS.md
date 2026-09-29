@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**365 exports** in 37 families — 314 referenced from JS, 51 referenced by nothing, 9 behind a `cfg`.
+**363 exports** in 37 families — 312 referenced from JS, 51 referenced by nothing, 9 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -28,7 +28,7 @@
 | `nim` | 12 | 12 | 0 |
 | `onramp` | 67 | 56 | 0 |
 | `op13jit` | 18 | 17 | 0 |
-| `par` | 72 | 72 | 1 |
+| `par` | 70 | 70 | 1 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
@@ -350,8 +350,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_deliver_join`
 - `temen_par_deliver_tierup`
 - `temen_par_deliver_tierup_trap`
-- `temen_par_det_seed_len`
-- `temen_par_det_seed_ptr`
 - `temen_par_enable_inst_codegen`
 - `temen_par_enable_jit`
 - `temen_par_enable_jit_codegen`
@@ -363,7 +361,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_free`
 - `temen_par_inst_call_interp`
 - `temen_par_inst_eligible`
-- `temen_par_inst_nparams`
+- `temen_par_inst_instantiate`
 - `temen_par_inst_paged`
 - `temen_par_inst_pagestate_sync`
 - `temen_par_inst_unit_wasm_len`

@@ -1064,7 +1064,7 @@ The guard holds for **every window**, not just the root's (#1206): a §14
 confined child's carve (retiring, 2026-09-29 — a detached child seeds it as a root does) and a
 spawned thread's view of its window seed it too
 (`Mem::nested_view` — the chokepoint every engine's nested arm shares — and the
-resumable `Vcpu::new_confined_child*` / thread-spawn constructors), so a child
+resumable `Vcpu`'s child start, `PendingChild::start`, and thread-spawn constructors), so a child
 storing at NULL traps identically on the interpreter and the emitted tier. A
 carve smaller than the guard skips the seed (it would unmap the whole window),
 so a sub-guard grandchild stays fully usable and its own carves may sit low.

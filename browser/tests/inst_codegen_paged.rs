@@ -17,8 +17,8 @@ use std::sync::Mutex;
 
 use temen_browser::{
     temen_par_child_confined, temen_par_compile, temen_par_deliver_handle, temen_par_deliver_join,
-    temen_par_enable_inst_codegen, temen_par_ev_a, temen_par_ev_b, temen_par_ev_c, temen_par_ev_d,
-    temen_par_free, temen_par_inst_call_interp, temen_par_inst_eligible, temen_par_inst_paged,
+    temen_par_enable_inst_codegen, temen_par_ev_a, temen_par_ev_b, temen_par_ev_c, temen_par_free,
+    temen_par_inst_call_interp, temen_par_inst_eligible, temen_par_inst_paged,
     temen_par_inst_pagestate_sync, temen_par_inst_unit_wasm_len, temen_par_inst_unit_wasm_ptr,
     temen_par_powerbox_inst, temen_par_root, temen_par_run, temen_par_tierup_argv_len,
     temen_par_tierup_argv_ptr, temen_par_tierup_pagestate_len, temen_par_tierup_pagestate_ptr,
@@ -364,18 +364,16 @@ fn drive(root: &temen_ir::Module, unit: &temen_ir::Module) -> Outcome {
             PAR_DONE => break Ok(temen_par_ev_a(root_v)),
             PAR_TRAP => break Err(()),
             PAR_INSTANTIATE => {
-                let am = temen_par_ev_a(root_v);
-                let (smod, entry) = ((am >> 32) as u32, am as u32);
+                let ticket = temen_par_ev_a(root_v);
                 let carve = temen_par_ev_b(root_v) as usize;
                 let slog = temen_par_ev_c(root_v) as u32;
                 assert_eq!((carve as u64, slog), (CARVE_OFF, CARVE_LOG2), "the carve");
-                let cfuel = temen_par_ev_d(root_v);
                 // SAFETY: the engine validated the carve lies inside the root window.
                 let carve_ptr = unsafe { win_ptr.add(carve) };
-                let child = temen_par_child_confined(prog, carve_ptr, slog, smod, entry, cfuel);
-                assert!(!child.is_null(), "confined child vCPU builds");
+                let child = temen_par_child_confined(prog, ticket, carve_ptr, slog);
+                assert!(!child.is_null(), "confined child vCPU starts");
                 store.data_mut().child = child as usize;
-                // The entry args: the child's starter cap handles, staged by the constructor.
+                // The entry args: the child's starter cap handles, staged by the start.
                 // SAFETY: the stash is stable until the child's next event (none on this path).
                 let args = unsafe {
                     std::slice::from_raw_parts(
