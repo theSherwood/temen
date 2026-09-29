@@ -1,15 +1,15 @@
 //! **#1025 slice 3c — the driver-guest port, step 3: a Rust-on-Temen guest crawls an import closure to
 //! fixpoint.** Steps 1 & 2 (`rust_driver_crawl`) proved the guest can read a phase's fs output and drive
 //! one dependent spawn. This lifts `nimc.rs`'s **whole phase-1 crawl loop** into the guest: a worklist
-//! seeded with the main module, and for each unvisited module — op-13-spawn nifler (`--portablePaths
+//! seeded with the main module, and for each unvisited module — spawn nifler (`--portablePaths
 //! --deps parse`), read its `.p.deps.nif` through the guest's own fs cap, parse **every** `import`
 //! (the `(infix / std x)` form `nimc::parse_imports` handles → `/lib/std/x.nim`), and enqueue each newly
-//! discovered module — until the worklist drains. Sequential spawns alternate two 16 MiB carves.
+//! discovered module — until the worklist drains. Each spawn is a child in its own window.
 //!
 //! The closure here is `main → std/foo → std/bar` (the stdlib-style infix imports the playground uses).
 //! The host asserts the guest crawled all three, and that each module's `.p.nif` landed in the shared
 //! memfs — the full import-closure discovery `nimc::compile_nim` does, now running inside the sandbox on
-//! existing on-ramp builtins (`__vm_instantiate`/`__vm_join`/`__vm_host_call`). Cache-correct stem names
+//! existing on-ramp builtins (`__vm_instantiate_rec`/`__vm_join`/`__vm_host_call`). Cache-correct stem names
 //! (`module_suffix`) and the prefix/`when`-guard import forms are the next slice. Gated Linux + rustc + gzip.
 
 #![cfg(target_os = "linux")]
@@ -32,15 +32,11 @@ fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
 pub extern "C" fn rust_eh_personality() {}
 
 #[repr(C, align(65536))]
-struct Pool([u8; 67043328]); // 64 MiB - 64 KiB → two 16 MiB carves
-static mut POOL: Pool = Pool([0; 67043328]);
+struct Pool([u8; 131072]); // the driver's own scratch (worklist, paths, read buffers)
+static mut POOL: Pool = Pool([0; 131072]);
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32, module: i64, grants_ptr: i64, grants_n: i64,
-        entry: i64, off: i64, size_log2: i64, quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
     fn __vm_host_call(handle: i32, op: i32, a: i64, b: i64, c: i64, d: i64) -> i64;
 }
@@ -48,34 +44,15 @@ extern "C" {
 unsafe fn wr(p: i64, b: u8) { (p as *mut u8).write(b); }
 unsafe fn rd(p: i64) -> u8 { *(p as *const u8) }
 
-unsafe fn put_rec(base: i64, i: i64, name_off: i64, name_len: u32, handle: i32) {
-    let rec = (base + i * 16) as *mut u32;
-    rec.add(0).write(name_off as u32);
-    rec.add(1).write(name_len);
-    rec.add(2).write(handle as u32);
-    rec.add(3).write(0);
-}
-
-// argv `nifler --portablePaths --deps parse <in> <out>` at carve+16512; op-13 spawn + join.
-unsafe fn spawn_nifler(inst: i32, nifler: i32, base: i64, carve: i64, inp: i64, inl: i64, outp: i64, outl: i64) -> i64 {
-    let argv = (carve + 16512) as *mut u8;
-    (argv as *mut u32).add(0).write(6);
-    (argv as *mut u32).add(1).write(0);
-    let mut p = 8i64;
-    let fixed: [&[u8]; 4] = [b"nifler", b"--portablePaths", b"--deps", b"parse"];
-    let mut ai = 0;
-    while ai < 4 {
-        let s = fixed[ai];
-        let mut j = 0;
-        while j < s.len() { wr(carve + 16512 + p, s[j]); p += 1; j += 1; }
-        wr(carve + 16512 + p, 0); p += 1;
-        ai += 1;
-    }
-    let mut j = 0i64; while j < inl { wr(carve + 16512 + p, rd(inp + j)); p += 1; j += 1; }
-    wr(carve + 16512 + p, 0); p += 1;
-    let mut j = 0i64; while j < outl { wr(carve + 16512 + p, rd(outp + j)); p += 1; j += 1; }
-    wr(carve + 16512 + p, 0);
-    let child = __vm_instantiate(inst, nifler as i64, base, 3, 0, carve, 24, 0);
+// `nifler --portablePaths --deps parse <in> <out>` (`in`/`out` byte ranges in the guest window): spawn
+// nifler with the grant list `g` (the shared `vm_spawn`, appended at build) and join it.
+unsafe fn spawn_nifler(inst: i32, budget: i32, nifler: i32, g: &[(&[u8], i32)], inp: i64, inl: i64, outp: i64, outl: i64) -> i64 {
+    let argv: [&[u8]; 6] = [
+        b"nifler", b"--portablePaths", b"--deps", b"parse",
+        core::slice::from_raw_parts(inp as *const u8, inl as usize),
+        core::slice::from_raw_parts(outp as *const u8, outl as usize),
+    ];
+    let child = vm_spawn(inst, budget, nifler, g, &argv);
     __vm_join(inst, child)
 }
 
@@ -101,7 +78,7 @@ fn is_ident(c: u8) -> bool {
 const WLL: i64 = 256; // 16 lengths (i32) at base+256
 const WL: i64 = 512;  // 16 path slots × 96 bytes at base+512
 const SCR: i64 = 2048; // scratch for out/deps/import paths
-const DBUF: i64 = 4096; // deps read buffer (64 KiB, below carve)
+const DBUF: i64 = 4096; // deps read buffer (64 KiB)
 
 // Append `path`(len) to the worklist if not already present. Returns new count.
 unsafe fn add_path(base: i64, nwl: i64, path: i64, plen: i64) -> i64 {
@@ -172,19 +149,10 @@ pub extern "C" fn run() -> i64 {
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
         let out = __vm_cap_resolve(b"stdout".as_ptr(), 6);
         let ex = __vm_cap_resolve(b"exit".as_ptr(), 4);
-        if inst < 0 || nifler < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
+        if inst < 0 || nifler < 0 || budget < 0 || fs < 0 || out < 0 || ex < 0 { return -1; }
         let base = core::ptr::addr_of_mut!(POOL) as i64;
-        let nm = (base + 64) as *mut u8;
-        let fsn = b"fs"; let son = b"stdout"; let exn = b"exit";
-        let mut k = 0; while k < 2 { nm.add(k).write(fsn[k]); k += 1; }
-        let mut k = 0; while k < 6 { nm.add(2 + k).write(son[k]); k += 1; }
-        let mut k = 0; while k < 4 { nm.add(8 + k).write(exn[k]); k += 1; }
-        put_rec(base, 0, base + 64, 2, fs);
-        put_rec(base, 1, base + 66, 6, out);
-        put_rec(base, 2, base + 72, 4, ex);
-        let mask: i64 = (1 << 24) - 1;
-        let carve0 = (base + 128 + mask) & !mask;
-        let carve1 = carve0 + (1 << 24);
+        let g: [(&[u8], i32); 3] = [(b"fs", fs), (b"stdout", out), (b"exit", ex)];
 
         // Seed the worklist with "/main.nim".
         let seed = b"/main.nim";
@@ -203,8 +171,7 @@ pub extern "C" fn run() -> i64 {
             while k < plen - 4 { wr(outp + w, rd(path + k)); w += 1; k += 1; }
             let osuf = b".p.nif"; let mut kk = 0i64; while kk < 6 { wr(outp + w, osuf[kk as usize]); w += 1; kk += 1; }
             let outl = w;
-            let carve = if i % 2 == 0 { carve0 } else { carve1 };
-            let st = spawn_nifler(inst, nifler, base, carve, path, plen, outp, outl);
+            let st = spawn_nifler(inst, budget, nifler, &g, path, plen, outp, outl);
             if st != 0 && st != 5 { return -100 + st; }
 
             // deps key = outp[1..outl-6] + ".p.deps.nif"  (relative; strip leading '/' and ".p.nif")
@@ -221,6 +188,9 @@ pub extern "C" fn run() -> i64 {
     }
 }
 "##;
+
+/// The shared guest-side spawn, appended to every driver guest's source.
+const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
 fn rustc_emit_ll(src: &std::path::Path, ll: &std::path::Path) -> bool {
     Command::new("rustc")
@@ -268,7 +238,7 @@ fn rust_driver_guest_crawls_an_import_closure_to_fixpoint() {
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("g.rs");
     let ll = dir.join("g.ll");
-    std::fs::write(&src, CLOSURE_SRC).unwrap();
+    std::fs::write(&src, format!("{CLOSURE_SRC}\n{VM_SPAWN}")).unwrap();
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc unavailable)");
         return;
@@ -314,6 +284,9 @@ fn rust_driver_guest_crawls_an_import_closure_to_fixpoint() {
     let exit_h = host.grant_exit();
     host.register_cap_name("inst", inst);
     host.register_cap_name("nifler", modh);
+    // nifler's window (one child live at a time), paid from this and returned when it ends.
+    let budget = host.grant_budget(0, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);

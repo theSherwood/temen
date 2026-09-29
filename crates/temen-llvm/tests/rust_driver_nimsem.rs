@@ -1,7 +1,7 @@
-//! **#1025 slice 3c — the driver-guest port, step 9: the real nimsem, op-13-spawned from the guest.**
+//! **#1025 slice 3c — the driver-guest port, step 9: the real nimsem, spawned from the guest.**
 //! Steps 3–8 ported nimc's phase-1 crawl and its dependency order into the sandbox. This runs the first
-//! real *phase* under the guest's own authority: a Rust-on-Temen driver guest `instantiate_module`s (§14
-//! op 13) the real child-entry **nimsem** over a shared memfs, re-granting it four caps `{fs, stdout,
+//! real *phase* under the guest's own authority: a Rust-on-Temen driver guest spawns (§14, the shared
+//! `vm_spawn`: its own window) the real child-entry **nimsem** over a shared memfs, re-granting it four caps `{fs, stdout,
 //! exit, exec}` — the `exec` a `domain_exec` over the *same* store, so nimsem-the-child drives **nifler
 //! grandchildren** to parse the stdlib it imports (nimsem is itself a driver). nimsem semchecks the
 //! system module (`--isSystem`) and writes `sysvq0asl.s.nif`, which the host asserts is **byte-identical**
@@ -12,12 +12,12 @@
 //! import closure the nifler grandchildren parse), `sysvq0asl.p.nif` (the seeded parsed system module),
 //! and `sysvq0asl.s.nif.gz` (the expected sema output — nimsem's is deterministic for a fixed memfs). The
 //! `exec`'s nifler is the already-committed top-level `browser/web/assets/nifler.temen.gz`. If an
-//! IR/ABI/encoder change breaks decode/verify or the op-13 spawn, or a frontend bump changes the emitted
+//! IR/ABI/encoder change breaks decode/verify or the spawn, or a frontend bump changes the emitted
 //! NIF, this gate fails — regenerate the assets and the expected together. The full byte-exact-vs-*native*
 //! chain (and the JIT chain) stays in the toolchain-gated `build_frontend.sh` (issue #1221).
 //!
-//! Heavy: the guest carves nimsem a 256 MiB window (its no-GC system semcheck peaks there), so the guest
-//! runs in a ~1 GiB window and the test takes tens of seconds. Gated Linux + rustc + gzip + tar.
+//! Heavy: nimsem's no-GC system semcheck grows its heap well past its declared window, into the
+//! window's reserved tail, and the test takes tens of seconds. Gated Linux + rustc + gzip + tar.
 
 #![cfg(target_os = "linux")]
 
@@ -41,8 +41,9 @@ const EXPECTED_SNIF_GZ: &[u8] =
 // The exec's nifler: the already-committed top-level parse phase (paramless `_start`, run as a subprocess).
 const NIFLER_TL_GZ: &[u8] = include_bytes!("../../../browser/web/assets/nifler.temen.gz");
 
-/// The driver guest: resolve `{inst, nimsem, fs, stdout, exit, exec}`, build the four-cap op-13 grant
-/// list + the `nimsem … --isSystem nimcache/sysvq0asl.p.nif` argv in a 256 MiB carve, spawn nimsem, join.
+/// The driver guest: resolve `{inst, nimsem, budget, fs, stdout, exit, exec}`, spawn nimsem with the
+/// four caps re-granted and argv `nimsem … --isSystem nimcache/sysvq0asl.p.nif` (the shared `vm_spawn`,
+/// appended), join.
 const GUEST: &str = r##"#![no_std]
 #![allow(internal_features)]
 #[panic_handler]
@@ -50,27 +51,9 @@ fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
-#[repr(C, align(65536))]
-struct Pool([u8; 536870912]); // 512 MiB of static -> a 256 MiB carve for nimsem (window rounds to 1 GiB)
-static mut POOL: Pool = Pool([0; 536870912]);
-
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32, module: i64, grants_ptr: i64, grants_n: i64,
-        entry: i64, off: i64, size_log2: i64, quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
-}
-
-unsafe fn wr(p: i64, b: u8) { (p as *mut u8).write(b); }
-
-unsafe fn put_rec(base: i64, i: i64, name_off: i64, name_len: u32, handle: i32) {
-    let rec = (base + i * 16) as *mut u32;
-    rec.add(0).write(name_off as u32);
-    rec.add(1).write(name_len);
-    rec.add(2).write(handle as u32);
-    rec.add(3).write(0);
 }
 
 #[no_mangle]
@@ -78,55 +61,31 @@ pub extern "C" fn run() -> i64 {
     unsafe {
         let inst = __vm_cap_resolve(b"inst".as_ptr(), 4);
         let nimsem = __vm_cap_resolve(b"nimsem".as_ptr(), 6);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
         let fs = __vm_cap_resolve(b"fs".as_ptr(), 2);
         let out = __vm_cap_resolve(b"stdout".as_ptr(), 6);
         let ex = __vm_cap_resolve(b"exit".as_ptr(), 4);
         let exe = __vm_cap_resolve(b"exec".as_ptr(), 4);
-        if inst < 0 || nimsem < 0 || fs < 0 || out < 0 || ex < 0 || exe < 0 { return -1; }
-        let base = core::ptr::addr_of_mut!(POOL) as i64;
-
-        // Four grant records {fs, stdout, exit, exec} at base+0.., their names packed at base+64.
-        // POOL sits above the module NULL guard, so base+0 is a legal writable address (unlike a
-        // guarded module's low window — see nifler_child_asset.rs / the #1094 driver migration).
-        let nm = (base + 64) as *mut u8;
-        let names: [&[u8]; 4] = [b"fs", b"stdout", b"exit", b"exec"];
-        let mut off = 0usize; let mut ai = 0;
-        let mut noffs: [i64; 4] = [0; 4];
-        while ai < 4 {
-            noffs[ai] = base + 64 + off as i64;
-            let s = names[ai]; let mut j = 0;
-            while j < s.len() { nm.add(off + j).write(s[j]); j += 1; }
-            off += s.len(); ai += 1;
+        if inst < 0 || nimsem < 0 || budget < 0 || fs < 0 || out < 0 || ex < 0 || exe < 0 {
+            return -1;
         }
-        put_rec(base, 0, noffs[0], 2, fs);
-        put_rec(base, 1, noffs[1], 6, out);
-        put_rec(base, 2, noffs[2], 4, ex);
-        put_rec(base, 3, noffs[3], 4, exe);
-
-        // 256 MiB carve, 2^28-aligned within the window.
-        let mask: i64 = (1 << 28) - 1;
-        let carve = (base + 128 + mask) & !mask;
-
-        // argv at carve + 16512 (the child's module_args_base): argc/envc header then the strings.
-        let a = carve + 16512;
-        (a as *mut u32).add(0).write(6);
-        (a as *mut u32).add(1).write(0);
-        let args: [&[u8]; 6] = [
-            b"nimsem", b"--define:nimNativeAlloc", b"--define:nimNativeIo", b"m",
-            b"--isSystem", b"nimcache/sysvq0asl.p.nif",
-        ];
-        let mut p = 8i64; let mut i = 0;
-        while i < 6 {
-            let s = args[i]; let mut j = 0;
-            while j < s.len() { wr(a + p, s[j]); p += 1; j += 1; }
-            wr(a + p, 0); p += 1; i += 1;
-        }
-
-        let child = __vm_instantiate(inst, nimsem as i64, base, 4, 0, carve, 28, 0);
+        let child = vm_spawn(
+            inst,
+            budget,
+            nimsem,
+            &[(b"fs", fs), (b"stdout", out), (b"exit", ex), (b"exec", exe)],
+            &[
+                b"nimsem", b"--define:nimNativeAlloc", b"--define:nimNativeIo", b"m",
+                b"--isSystem", b"nimcache/sysvq0asl.p.nif",
+            ],
+        );
         __vm_join(inst, child)
     }
 }
 "##;
+
+/// The shared guest-side spawn, appended to every driver guest's source.
+const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
 fn rustc_emit_ll(src: &Path, ll: &Path) -> bool {
     Command::new("rustc")
@@ -224,7 +183,7 @@ fn rust_driver_guest_op13_spawns_real_nimsem_byte_exact() {
     // Translate the driver guest.
     let src = dir.join("g.rs");
     let ll = dir.join("g.ll");
-    std::fs::write(&src, GUEST).unwrap();
+    std::fs::write(&src, format!("{GUEST}\n{VM_SPAWN}")).unwrap();
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc unavailable)");
         return;
@@ -283,6 +242,8 @@ fn rust_driver_guest_op13_spawns_real_nimsem_byte_exact() {
     let win = 1u64 << t.module.memory.as_ref().expect("driver window").size_log2;
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&nimsem);
+    // nimsem's window, paid from this and returned when it ends.
+    let budget = host.grant_budget(0, 1 << nimsem.memory.expect("nimsem window").size_log2, 0);
     let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
@@ -297,6 +258,7 @@ fn rust_driver_guest_op13_spawns_real_nimsem_byte_exact() {
     let exec_h = exec_cap.install(&mut host, win);
     host.register_cap_name("inst", inst);
     host.register_cap_name("nimsem", modh);
+    host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);

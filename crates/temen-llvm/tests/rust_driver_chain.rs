@@ -1,7 +1,7 @@
 //! **#1025 slice 3c — the driver-guest port: the whole compile pipeline, nimsem→hexer→link, in one
-//! guest.** Steps 9/10 ran nimsem and hexer each as a single op-13 §14 child; step 11 chained the two.
+//! guest.** Steps 9/10 ran nimsem and hexer each as a single §14 child; step 11 chained the two.
 //! This is the capstone of the *compile* half: one Rust-on-Temen driver guest **orchestrates all three
-//! phases** over one shared memfs — it `instantiate_module`s (op 13) nimsem `{fs, stdout, exit, exec}` to
+//! phases** over one shared memfs — it spawns (the shared `vm_spawn`) nimsem `{fs, stdout, exit, exec}` to
 //! semcheck the system module (`.s.nif`, its nifler grandchildren parsing the stdlib via the re-granted
 //! `exec`), then hexer `{fs, stdout, exit}` to lower that `.s.nif` into the same store (`.x.nif`), then
 //! the **memfs-I/O linker** `{fs}` (`nim-link-fs`, the child-entry `temen_leng::link_nim_powerbox`) to
@@ -23,9 +23,8 @@
 //! toolchain-gated finale (`nimsem`/`nimony` aren't vendored per-PR, so only the system-module chain is
 //! toolchain-free); `examples/nim_chain_op13.rs` is the host-conductor counterpart this guest-drives.
 //!
-//! Heavy: nimsem+hexer at 256 MiB carves; the (opt-in) linker at a 512 MiB carve reusing the joined
-//! phases' region to keep the window at ~1 GiB. nimsem's semcheck dominates. Gated Linux + rustc + gzip
-//! + tar.
+//! Heavy: each phase runs in a window of its own, its heap growing into that window's reserved tail
+//! (the linker's to ~512 MiB). nimsem's semcheck dominates. Gated Linux + rustc + gzip + tar.
 
 #![cfg(target_os = "linux")]
 
@@ -52,13 +51,10 @@ const NIM_LINK_FS_GZ: &[u8] =
     include_bytes!("../../temen-run/demos/nim_frontend/fixtures/nim-link-fs.temen.gz");
 const NIFLER_TL_GZ: &[u8] = include_bytes!("../../../browser/web/assets/nifler.temen.gz");
 
-/// The driver guest = the compiler conductor. It builds four grant records `{fs, stdout, exit, exec}`
-/// once (each phase's spawn passes the `grants_n` it needs — nimsem 4, hexer 3, link 1), then spawns
-/// each phase and joins it: nimsem (`--isSystem`) into carve0, hexer (`c <sys>.s.nif`) into carve1 — a
-/// fresh carve per phase keeps hexer off nimsem's dirtied heap — then the memfs-I/O linker
-/// (`link <sys>.x.nif <sys>.temen <stem>`) into a 512 MiB carve2 (reusing the joined phases' region so
-/// the window stays ~1 GiB). Records live at `base+0` (POOL sits above the NULL guard); each phase's
-/// argv is seeded at `carve + module_args_base`.
+/// The driver guest = the compiler conductor. It spawns each phase (the shared `vm_spawn`, appended)
+/// and joins it, each in a window of its own: nimsem (`--isSystem`, `{fs, stdout, exit, exec}`), then
+/// hexer (`c <sys>.s.nif`, `{fs, stdout, exit}`), then — when a `link` module is granted — the memfs-I/O
+/// linker (`link <sys>.x.nif <sys>.temen <stem>`, `{fs}`).
 const GUEST: &str = r##"#![no_std]
 #![allow(internal_features)]
 #[panic_handler]
@@ -66,46 +62,16 @@ fn ph(_: &core::panic::PanicInfo) -> ! { loop {} }
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
-#[repr(C, align(65536))]
-struct Pool([u8; 939524096]); // 896 MiB static -> nimsem/hexer at disjoint 256 MiB carves (256/512 MiB), link reuses a 512 MiB carve; window 1 GiB
-static mut POOL: Pool = Pool([0; 939524096]);
-
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_instantiate(
-        inst: i32, module: i64, grants_ptr: i64, grants_n: i64,
-        entry: i64, off: i64, size_log2: i64, quota: i64,
-    ) -> i64;
     fn __vm_join(inst: i32, child: i64) -> i64;
-}
-
-unsafe fn wr(p: i64, b: u8) { (p as *mut u8).write(b); }
-
-unsafe fn put_rec(base: i64, i: i64, name_off: i64, name_len: u32, handle: i32) {
-    let rec = (base + i * 16) as *mut u32;
-    rec.add(0).write(name_off as u32);
-    rec.add(1).write(name_len);
-    rec.add(2).write(handle as u32);
-    rec.add(3).write(0);
-}
-
-// Seed argv [argc,envc header][arg0\0…] at `carve + 16512` (the child's module_args_base).
-unsafe fn seed_argv(carve: i64, args: &[&[u8]]) {
-    let a = carve + 16512;
-    (a as *mut u32).add(0).write(args.len() as u32);
-    (a as *mut u32).add(1).write(0);
-    let mut p = 8i64; let mut i = 0;
-    while i < args.len() {
-        let s = args[i]; let mut j = 0;
-        while j < s.len() { wr(a + p, s[j]); p += 1; j += 1; }
-        wr(a + p, 0); p += 1; i += 1;
-    }
 }
 
 #[no_mangle]
 pub extern "C" fn run() -> i64 {
     unsafe {
         let inst = __vm_cap_resolve(b"inst".as_ptr(), 4);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
         let nimsem = __vm_cap_resolve(b"nimsem".as_ptr(), 6);
         let hexer = __vm_cap_resolve(b"hexer".as_ptr(), 5);
         let link = __vm_cap_resolve(b"link".as_ptr(), 4);
@@ -115,45 +81,21 @@ pub extern "C" fn run() -> i64 {
         let exe = __vm_cap_resolve(b"exec".as_ptr(), 4);
         // `link` is optional: when the driver isn't granted a `link` module (the lighter per-PR gate),
         // the guest stops after hexer. When it is (the full-pipeline test), it runs the link phase too.
-        if inst < 0 || nimsem < 0 || hexer < 0 || fs < 0 || out < 0 || ex < 0 || exe < 0 { return -1; }
-        let base = core::ptr::addr_of_mut!(POOL) as i64;
-
-        // Four grant records {fs, stdout, exit, exec}; hexer's spawn passes grants_n=3 to drop exec.
-        let nm = (base + 64) as *mut u8;
-        let names: [&[u8]; 4] = [b"fs", b"stdout", b"exit", b"exec"];
-        let mut off = 0usize; let mut ai = 0;
-        let mut noffs: [i64; 4] = [0; 4];
-        while ai < 4 {
-            noffs[ai] = base + 64 + off as i64;
-            let s = names[ai]; let mut j = 0;
-            while j < s.len() { nm.add(off + j).write(s[j]); j += 1; }
-            off += s.len(); ai += 1;
+        if inst < 0 || budget < 0 || nimsem < 0 || hexer < 0 || fs < 0 || out < 0 || ex < 0 || exe < 0 {
+            return -1;
         }
-        put_rec(base, 0, noffs[0], 2, fs);
-        put_rec(base, 1, noffs[1], 6, out);
-        put_rec(base, 2, noffs[2], 4, ex);
-        put_rec(base, 3, noffs[3], 4, exe);
-
-        // Two disjoint 256 MiB carves within the ~1 GiB window: hexer gets a fresh, zeroed sub-window
-        // rather than one dirtied by nimsem's heap (reusing the same carve makes hexer thrash over
-        // nimsem's committed pages — an order-of-magnitude slower). Both fit: base is low, so carve1's
-        // top (~768 MiB) stays inside the window the instantiator was granted.
-        let mask: i64 = (1 << 28) - 1;
-        let carve0 = (base + 128 + mask) & !mask;
-        let carve1 = carve0 + (1 << 28);
+        let g: [(&[u8], i32); 4] = [(b"fs", fs), (b"stdout", out), (b"exit", ex), (b"exec", exe)];
 
         // Phase 1: nimsem (4-cap) semchecks the system module.
-        seed_argv(carve0, &[
+        let c1 = vm_spawn(inst, budget, nimsem, &g, &[
             b"nimsem", b"--define:nimNativeAlloc", b"--define:nimNativeIo", b"m",
             b"--isSystem", b"nimcache/sysvq0asl.p.nif",
         ]);
-        let c1 = __vm_instantiate(inst, nimsem as i64, base, 4, 0, carve0, 28, 0);
         let s1 = __vm_join(inst, c1);
         if s1 != 0 { return -10 + s1; }
 
         // Phase 2: hexer (3-cap, no exec) lowers the .s.nif nimsem wrote into the shared store.
-        seed_argv(carve1, &[b"hexer", b"c", b"nimcache/sysvq0asl.s.nif"]);
-        let c2 = __vm_instantiate(inst, hexer as i64, base, 3, 0, carve1, 28, 0);
+        let c2 = vm_spawn(inst, budget, hexer, &g[..3], &[b"hexer", b"c", b"nimcache/sysvq0asl.s.nif"]);
         let s2 = __vm_join(inst, c2);
         if s2 != 0 { return -20 + s2; }
 
@@ -161,20 +103,17 @@ pub extern "C" fn run() -> i64 {
         if link < 0 { return s2; }
 
         // Phase 3: link (1-cap {fs}) — the memfs-I/O linker reads the `.x.nif` hexer wrote and writes the
-        // linked `.temen` back into the same store. It needs ~512 MiB (its no-free bump heap), so it gets
-        // a 512 MiB carve (2^29). nimsem+hexer have joined, so it reuses their region (aligned up to
-        // 512 MiB = `carve1`'s offset): a fresh disjoint 512 MiB carve would push the window past 1 GiB;
-        // this is the last phase so the reuse thrash is harmless.
-        let mask29: i64 = (1 << 29) - 1;
-        let carve2 = (base + mask29) & !mask29;
-        seed_argv(carve2, &[
+        // linked `.temen` back into the same store.
+        let c3 = vm_spawn(inst, budget, link, &g[..1], &[
             b"link", b"nimcache/sysvq0asl.x.nif", b"nimcache/sysvq0asl.temen", b"sysvq0asl",
         ]);
-        let c3 = __vm_instantiate(inst, link as i64, base, 1, 0, carve2, 29, 0);
         __vm_join(inst, c3)
     }
 }
 "##;
+
+/// The shared guest-side spawn, appended to every driver guest's source.
+const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
 fn rustc_emit_ll(src: &Path, ll: &Path) -> bool {
     Command::new("rustc")
@@ -274,7 +213,7 @@ fn drive_pipeline(with_link: bool) -> Option<Vec<(String, Vec<u8>)>> {
 
     let src = dir.join("g.rs");
     let ll = dir.join("g.ll");
-    std::fs::write(&src, GUEST).unwrap();
+    std::fs::write(&src, format!("{GUEST}\n{VM_SPAWN}")).unwrap();
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc unavailable)");
         return None;
@@ -353,14 +292,21 @@ fn drive_pipeline(with_link: bool) -> Option<Vec<(String, Vec<u8>)>> {
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);
     host.register_cap_name("exec", exec_h);
+    // The phases run one at a time, and each child's window returns to the budget when it ends, so the
+    // budget holds the largest window.
+    let window = |m: &temen_ir::Module| 1i64 << m.memory.as_ref().expect("phase window").size_log2;
+    let mut largest = window(&nimsem).max(window(&hexer));
     // Only the full-pipeline run grants the linker (the guest runs the link phase iff `link` resolves).
     if with_link {
         let link_bytes = inflate(NIM_LINK_FS_GZ).expect("inflate nim-link-fs");
         let link = temen_encode::decode_module(&link_bytes).expect("decode nim-link-fs");
         temen_verify::verify_module(&link).expect("nim-link-fs verifies");
+        largest = largest.max(window(&link));
         let link_h = host.grant_module(&link);
         host.register_cap_name("link", link_h);
     }
+    let budget = host.grant_budget(0, largest, 0);
+    host.register_cap_name("budget", budget);
 
     let mut fuel = 3_000_000_000_000u64;
     let r = run_with_host(&t.module, entry, &[Value::I64(sp)], &mut fuel, &mut host);
