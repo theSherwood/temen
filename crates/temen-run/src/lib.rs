@@ -5742,7 +5742,7 @@ pub fn nim_noc_run(
 /// `__vm_cap_at` reflection — so the authority check stays where it belongs, on `Host::resolve`
 /// against a handle the guest actually holds.
 ///
-/// **For the default (op-13) build, linking is not optional.** An unlinked `call.sym "__spawn"`
+/// **For the default (op-17) build, linking is not optional.** An unlinked `call.sym "__spawn_rec"`
 /// is an import slot no resolver anywhere knows, and an unbound slot is refused at bind — or, when
 /// #1628 bound exec'd images leniently, a `Trap::CapFault` at first use. The POSIX build
 /// (`-DTEMEN_SHELL_POSIX`, #1662) calls none of these names: its imports are all `__px_*`, which
@@ -5750,7 +5750,7 @@ pub fn nim_noc_run(
 pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
     let cap = match name {
         // The shell's own `Instantiator` ops (STAGE1.md §5).
-        "__spawn" => temen_ir::ResolvedCap { type_id: 6, op: 13 },
+        "__spawn_rec" => temen_ir::ResolvedCap { type_id: 6, op: 17 },
         "__join" => temen_ir::ResolvedCap { type_id: 6, op: 1 },
         // The ring-pipeline surface (STAGE1.md item 6): mint a region (`AddressSpace` op 5) and
         // alias/query it (`SharedRegion` ops 0/1/3) — the shell pumps stage-0 output into a mapped

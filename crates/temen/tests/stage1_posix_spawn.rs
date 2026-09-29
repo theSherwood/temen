@@ -1,22 +1,21 @@
 //! Stage 1 (STAGE1.md §5) — **`spawn` in the POSIX personality**: a compiled-C shell running on the
 //! real `temen-posix` personality dispatches an *unknown* command to a spawned external child instead of
-//! printing `<cmd>: not found`. This folds the op-13 exec path (`c_shell_exec.rs`) onto the personality:
+//! printing `<cmd>: not found`. This folds the exec path (`c_shell_exec.rs`) onto the personality:
 //! the shell reads its own `argv` through the personality (`argc`/`argv`), writes its own output through
 //! the personality (`write`), looks a command up in the personality's **PATH registry** (`exec_lookup`),
 //! and re-grants the personality's forwardable stdout (`exec_stdout`) to the child — but the spawn
-//! itself is the shell's own `Instantiator.instantiate_module_named` (op 13) + `join`, driven through
+//! itself is the shell's own `Instantiator.instantiate_rec` (op 17, a v1 detached record) + `join`, driven through
 //! capability imports (`Resolved::Cap`, link-time symbol resolution; the guest discovers the
 //! `Instantiator`/personality handles itself via `cap.self` reflection).
 //!
 //! The two stdout models are **unified**: the personality's fd-1 writes and the child's re-granted
 //! `Stream` writes both land in the `Host`'s shared sink (`Host::shared_stdout` + `Posix::set_stdout_sink`),
 //! so the shell's own output and the command's output interleave in one stream. Differential
-//! interp==JIT (the JIT is given the module resolver *and* the named-grant hooks op 13 needs).
+//! interp==JIT (the JIT is given the module resolver *and* the named-grant hooks the spawn needs).
 //!
 //! Three paths exercised: a **builtin** (handled without spawning), an **external command** (spawned,
 //! its argv echoed to the shared sink, its `argc` the shell's status), and a **not-found** command
-//! (`exec_lookup` returns `-1` → status 127). *Follow-up:* the full `c_shell.rs` builtin dispatch (its
-//! 128 KiB window / personality-heap-at-`win/2` layout vs. a 128 KiB command carve).
+//! (`exec_lookup` returns `-1` → status 127).
 //!
 //! Gated `#![cfg(unix)]` (needs the chibicc toolchain).
 #![cfg(unix)]
@@ -73,15 +72,17 @@ int main(int argc, char **argv){
 /// (`__px_argc`/`__px_argv`), writes its own output via the personality (`__px_write`), and — for a
 /// command that is not the `hi` builtin — looks it up (`__px_exec_lookup`) and either reports
 /// `not found` or spawns it. The spawn re-grants the personality's forwardable stdout
-/// (`__px_exec_stdout`) under the name `"stdout"` and drives `Instantiator` op 13 (`__spawn`) + `join`.
-/// `pool` (a big writable global) forces a window large enough to hold a 128 KiB-aligned command carve.
+/// (`__px_exec_stdout`) under the name `"stdout"` and drives `Instantiator` op 17 (`__spawn_rec`, a v1
+/// detached record: the command's own window, paid from the `Budget`) + `join`. Its argv travels as the
+/// spawn's args payload.
 const SHELL: &str = r#"
 long __px_write(int h, long fd, void *buf, long n);
 long __px_exec_lookup(int h, void *name, long len);
 long __px_exec_stdout(int h);
 int  __px_argc(int h);
 long __px_argv(int h, long i, void *buf, long cap);
-long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
+long __px_exec_win(int h, long module);
+long __spawn_rec(int inst, long rec);
 long __join(int inst, long child);
 int __vm_cap_count(void);
 int __vm_cap_at(int i, int *type_id_out);
@@ -103,9 +104,13 @@ static int __h_px = -1;
 static int __px(void) { if (__h_px < 0) __h_px = __capof(13); return __h_px; }   /* HOST_PROC = 13 */
 static int __h_inst = -1;
 static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
+static int __h_budget = -1;
+static int __budget(void) { if (__h_budget < 0) __h_budget = __capof(14); return __h_budget; } /* Budget = 14 */
 static int  seq(char *a, char *b){ long i=0; for(;;){ if(a[i]!=b[i]) return 0; if(!a[i]) return 1; i++; } }
-/* 384 KiB: room for the grant record/name low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
-static char pool[393216];
+static int rec[4];
+static char nm[8];
+static long spawn[11];      /* the 88-byte op-17 v1 record */
+static char args[4096];
 int main(void){
   int n = __px_argc(__px());
   if (n < 2){ __px_write(__px(), 1, "usage\n", 6); return 2; }
@@ -119,47 +124,47 @@ int main(void){
     return 127;
   }
   long out = __px_exec_stdout(__px());
-  long base = (long)pool;
-  long carve = (base + 131071) & ~131071;
-  /* grant record at base: {name_off, name_len, out, flags} ; "stdout" name follows at base+16 */
-  int *rec = (int *)base;
-  rec[0] = (int)(base + 16);
+  /* grant record: {name_off, name_len, out, flags} */
+  rec[0] = (int)(long)nm;
   rec[1] = 6;
   rec[2] = (int)out;
   rec[3] = 0;
-  char *nm = (char *)(base + 16);
   nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
-  /* the command's args buffer at carve + guard + 128 (#1059: chibicc reads argv one 16 KiB NULL
-     guard up, module_args_base): {argc-1, envc=0} then packed argv[1..] */
-  char *ab = (char *)(carve + 16384 + 128);
-  int *hdr = (int *)ab;
+  /* the args payload (lands at the command's module_args_base): {argc-1, envc=0} then packed argv[1..] */
+  int *hdr = (int *)args;
   hdr[0] = n - 1;
   hdr[1] = 0;
-  char *p = ab + 8;
+  char *p = args + 8;
   for (int i = 1; i < n; i++){
     char tmp[256];
     long L = __px_argv(__px(), i, tmp, 256);
     for (long k = 0; k < L; k++) *p++ = tmp[k];
     *p++ = 0;
   }
-  long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
+  int *w = (int *)spawn;
+  w[0] = 1;                                   /* version 1: detached; entry 0 */
+  w[4] = (int)__px_exec_win(__px(), mod);     /* size_log2 = the command's declared window */
+  w[5] = -1;                                  /* no pager */
+  w[6] = (int)mod;
+  w[7] = __budget();
+  spawn[5] = (long)rec;                       /* grants */
+  spawn[6] = 1;
+  spawn[7] = (long)args;                      /* args payload */
+  spawn[8] = p - args;
+  w[18] = -1;                                 /* no pre-mapped region */
+  long child = __spawn_rec(__inst(), (long)spawn);
+  if (child < 0) return 126;
   return __join(__inst(), child);
 }
 "#;
 
-/// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
-/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
-/// through [`temen_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
-/// `Instantiator` ops (13 / 1). No handle is baked at link: each lowered `call.cap` dispatches on
-/// the guest's own handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at`
-/// reflection (§3c protection at the boundary, IMPORTS.md §2.3 dynamic mode).
+/// Link the shim's import names — the shell demo's one resolver ([`temen_run::shell_demo_resolver`]):
+/// `__px_*` through [`temen_posix::resolve`], `__spawn_rec`/`__join` the shell's own `Instantiator`
+/// ops (17 / 1). No handle is baked at link: each lowered `call.cap` dispatches on the guest's own
+/// handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at` reflection (§3c
+/// protection at the boundary, IMPORTS.md §2.3 dynamic mode).
 fn link_shim(name: &str) -> Option<Resolved> {
-    let cap = match name {
-        "__spawn" => temen_ir::ResolvedCap { type_id: 6, op: 13 },
-        "__join" => temen_ir::ResolvedCap { type_id: 6, op: 1 },
-        n => temen_posix::resolve_import(n)?,
-    };
-    Some(Resolved::Cap(cap))
+    temen_run::shell_demo_resolver(name)
 }
 
 /// Run the shell with `argv` (`argv[0]` = shell name, `argv[1]` = command, `argv[2..]` = its args);
@@ -177,8 +182,9 @@ fn run(
     let out_h = host.grant_stream(StreamRole::Out);
     let _inst_h = host.grant_instantiator(0, win as u64);
     let echo_h = host.grant_module(cmd);
-    // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack and the command
-    // carve (a lean shell never `malloc`s, so this region stays untouched).
+    let _budget_h = host.grant_budget(0, 1 << 20, 0); // the command's window is paid from this
+                                                      // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack (a lean shell
+                                                      // never `malloc`s, so this region stays untouched).
     let (_px_h, posix) =
         temen_posix::grant(&mut host, (win - (64 << 10)) as u64, win as u64, Vec::new());
     posix.set_stdout_sink(sink); // …and the shell's own fd-1 writes land in the same sink.
@@ -227,12 +233,12 @@ fn run(
 
 /// A shell on the real POSIX personality dispatches an unknown command to a spawned external child
 /// (echoing its argv to the shared sink, its `argc` the shell's status), handles a builtin without
-/// spawning, and reports `not found` — identically on both backends. This is op 13 folded onto the
+/// spawning, and reports `not found` — identically on both backends. This is op 17 folded onto the
 /// personality's `exec` surface, stdout unified through the `Host` sink.
 #[test]
 fn posix_shell_spawns_external_command() {
     let shell = parse_module_raw(&c_to_ir(SHELL, false)).expect("parse shell");
-    // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+    // Phase 3: keep the manifest — the spawn binds the child's slots.
     let cmd = parse_module_raw(&c_to_ir(CMD, true)).expect("parse cmd");
     verify_module(&cmd).expect("verify cmd");
 
