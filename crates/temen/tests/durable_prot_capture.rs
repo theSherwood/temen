@@ -604,6 +604,7 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
         PAGE_OPS_RESERVED_LOG2,
         0,
         &mut hj,
+        None,
     )
     .expect("jit");
     assert_eq!(jo, temen_jit::JitOutcome::Returned(vec![0]));
@@ -654,6 +655,7 @@ fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
         PAGE_OPS_RESERVED_LOG2,
         0,
         &mut h,
+        None,
     )
     .expect("jit");
     assert_eq!(o, temen_jit::JitOutcome::Returned(vec![0]));
@@ -689,7 +691,7 @@ fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
             temen_snapshot::restore_layout(&art, &m, &mut hj).expect("restore");
         let jh = hj.grant_memory();
         let (jo, jlayout) =
-            temen_run::jit_cap_run(&m, entry, &[jh as i64], &layout, reserved, 0, &mut hj)
+            temen_run::jit_cap_run(&m, entry, &[jh as i64], &layout, reserved, 0, &mut hj, None)
                 .expect("jit");
         let jout = match jo {
             temen_jit::JitOutcome::Returned(v) => format!("{:?}", [Value::I64(v[0])]),

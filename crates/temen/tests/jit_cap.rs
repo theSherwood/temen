@@ -83,6 +83,7 @@ fn diff_run_t(
         DEFAULT_RESERVED_LOG2,
         table_log2,
         &mut host_j,
+        None,
     )
     .expect("jit run");
 
@@ -159,6 +160,7 @@ fn diff_run_fibers(guest_src: &str, blob_bytes: &[u8], user_args: &[i64]) -> (Ji
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host_j,
+        None,
     )
     .expect("jit run");
 
@@ -231,6 +233,7 @@ fn diff_run_threads(
         DEFAULT_RESERVED_LOG2,
         table_log2,
         &mut host_j,
+        None,
     )
     .expect("jit run");
 
@@ -398,6 +401,7 @@ fn submitted_unit_threads_compile_split_by_tier() {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host_j,
+        None,
     )
     .expect("jit run");
     assert!(
@@ -456,6 +460,7 @@ func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = suspend v1\n  v
         DEFAULT_RESERVED_LOG2,
         3,
         &mut host_j,
+        None,
     )
     .expect("jit run");
 
@@ -723,6 +728,7 @@ fn compile_quota_enforced_identically() {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host_j,
+        None,
     )
     .expect("jit run");
     assert!(
@@ -1330,6 +1336,7 @@ fn diff_serve(
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host_j,
+        None,
     )
     .expect("jit run");
     let jvals = match jout {
@@ -1416,6 +1423,7 @@ fn a_jit_svc_wait_with_an_empty_queue_fails_closed() {
         DEFAULT_RESERVED_LOG2,
         0,
         &mut host,
+        None,
     )
     .expect("jit run");
     assert_eq!(

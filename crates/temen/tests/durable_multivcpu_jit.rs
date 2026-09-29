@@ -1211,6 +1211,7 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
         SIZE_LOG2,
         0,
         &mut h,
+        None,
     ) {
         Ok((_, snap)) => snap.bytes().to_vec(),
         Err(JitError::Unsupported(_)) => return, // a target without the threads runtime
@@ -1258,6 +1259,7 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
         SIZE_LOG2,
         0,
         &mut th,
+        None,
     )
     .expect("JIT thaw");
     let want = match iresult {
@@ -1305,6 +1307,7 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
         SIZE_LOG2,
         0,
         &mut h,
+        None,
     );
     assert!(
         matches!(r, Err(JitError::Unsupported(_))),

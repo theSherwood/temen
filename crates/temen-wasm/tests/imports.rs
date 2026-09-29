@@ -65,6 +65,7 @@ fn run_import(
         temen_ir::DEFAULT_RESERVED_LOG2,
         0,
         &mut hj,
+        None,
     )
     .expect("jit compile")
     .0

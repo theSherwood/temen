@@ -212,6 +212,7 @@ fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_bot
             temen_ir::DEFAULT_RESERVED_LOG2,
             0,
             &mut host,
+            None,
         )
         .expect("jit run");
         let r = match jo {
