@@ -1603,6 +1603,14 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
         host.capture_cap_states(),
         "a thawed memfs is captured again, not frozen empty"
     );
+    // #1859 — the restore re-registered the carried name, so the thawed domain re-freezes to the same
+    // artifact (a bare host has no powerbox to name the capability otherwise).
+    assert_eq!(thost.resolve_cap_name("vm_fs"), Some(h));
+    assert_eq!(
+        freeze(&inst, &win, &thost).expect("a thawed named memfs is freezable"),
+        artifact,
+        "a thawed domain re-freezes to the artifact it came from"
+    );
 
     // The descriptor survived, cursor and all: reading from it picks up after the "h".
     let mut mem = VecMem(vec![0u8; 32]);

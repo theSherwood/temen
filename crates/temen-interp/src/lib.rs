@@ -21413,6 +21413,9 @@ pub struct Host {
     /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
     /// for [`Host::restore_durable_handles`] to re-open ends on. A thawed nested child is handed a copy.
     thaw_pipes: BTreeMap<u32, PipeBacking>,
+    /// #1859 — the names [`Host::restore_durable_named`] rebuilt `host_procs` under, by index, for
+    /// [`Host::restore_durable_handles`] to register at each re-pinned `Named { idx }` handle.
+    thaw_names: Vec<Option<String>>,
     /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
     /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
     /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
@@ -21861,6 +21864,7 @@ impl Host {
             frozen_child_state: Vec::new(),
             frozen_pipes: BTreeMap::new(),
             thaw_pipes: BTreeMap::new(),
+            thaw_names: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
             named_cap_registrar: None,
@@ -24005,8 +24009,18 @@ impl Host {
                 // #1455: re-pin the named capability at its captured index. The handler behind it was
                 // re-granted by `restore_durable_named` (positionally, before this), so the index
                 // resolves — and a name the registrar declined never reaches here, because that
-                // restore fails closed before any handle is pinned.
-                DurableBinding::Named { idx } => Binding::HostProc(idx),
+                // restore fails closed before any handle is pinned. #1859: its name goes back in the
+                // directory with it, so the thawed domain resolves it and can freeze again. First
+                // registration wins, so a name the embedder granted before restoring keeps its handle.
+                DurableBinding::Named { idx } => {
+                    if let Some(Some(name)) = self.thaw_names.get(idx as usize) {
+                        let handle = (((h.generation & GEN_MASK) << CAP_LOG2) | h.slot) as i32;
+                        if self.resolve_cap_name(name) != Some(handle) {
+                            self.cap_names.push((name.clone(), handle));
+                        }
+                    }
+                    Binding::HostProc(idx)
+                }
                 // #1502: re-mint the carried remaining quotas as a fresh `budgets` entry and bind the
                 // captured slot to it — the guest's handle value resolves to exactly what it had left
                 // at freeze. Any attenuation the embedder asked for has already been applied to the
@@ -24161,6 +24175,8 @@ impl Host {
     /// and its fork factory, which the rebuilt entry keeps (#1718: a thaw never narrows a capability
     /// to un-forkable). Entries are rebuilt **positionally** (a `None`, or a name the registrar
     /// declines, leaves a placeholder that traps if ever dispatched), so indices re-resolve exactly.
+    /// The names are kept for [`Self::restore_durable_handles`] to register at the handles it re-pins
+    /// (#1859).
     ///
     /// Fail-closed, and this is the security-relevant part: with no registrar set, or for a name the
     /// registrar does not know, nothing is granted and the restore reports the offending name. An
@@ -24207,6 +24223,10 @@ impl Host {
             Some(name) => Err(NamedCapRestoreError { name }),
             None => {
                 self.host_procs = out;
+                self.thaw_names = caps
+                    .iter()
+                    .map(|c| c.as_ref().map(|c| c.name.clone()))
+                    .collect();
                 Ok(())
             }
         }
