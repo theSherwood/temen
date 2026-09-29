@@ -530,12 +530,33 @@ fn a_durable_domain_refuses_a_detached_spawn_until_the_capture_lands() {
     );
 }
 
-/// The same module in a **non-durable** domain still spawns and still charges — so the test above
+/// [`SPAWN_ONLY_PARENT`] that then reads what is left of `Budget.mem` while its child is still live,
+/// returning `(slot, remaining)`. The charge has to be observed from inside: the child's window goes
+/// back to the budget when the child ends (INVARIANTS #3, 2026-09-29), which the run's teardown does.
+const SPAWN_THEN_READ_PARENT: &str = r#"memory 17
+func (i32, i32, i32) -> (i64, i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 12
+  vq = i64.const 0
+  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vr = i64.extend_i32_s vs
+  fld = i64.const 1
+  vleft = call.cap 14 1 (i64) -> (i64) v2 (fld)
+  return vr, vleft
+  }
+}
+"#;
+
+/// The same spawn in a **non-durable** domain still spawns and still charges — so the test above
 /// pins the `durable` gate specifically, not a broken op 15. Without this pair, a change that broke
 /// detached spawns outright would leave the refusal test passing for the wrong reason.
 #[test]
 fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
-    let a = module(SPAWN_ONLY_PARENT);
+    let a = module(SPAWN_THEN_READ_PARENT);
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
@@ -551,11 +572,12 @@ fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
     )
     .expect("run");
     assert!(
-        matches!(r.as_slice(), [Value::I64(s)] if *s >= 0),
-        "a non-durable domain spawns the detached child, returning its slot: {r:?}"
+        matches!(r.as_slice(), [Value::I64(s), Value::I64(0)] if *s >= 0),
+        "a non-durable domain spawns the detached child, returning its slot, and the live child's \
+         window has used up Budget.mem: {r:?}"
     );
     assert!(
-        !host.budget_mem_take(hw, 1 << 12),
-        "the spawn charged the child's window to Budget.mem — the quota is now exhausted"
+        host.budget_mem_take(hw, 1 << 12),
+        "the child ended with the run, so its window went back to Budget.mem"
     );
 }

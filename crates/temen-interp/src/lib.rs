@@ -7266,6 +7266,11 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         trap_fault: None,
     };
     let id = v.id;
+    // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
+    // back to the budget that paid for them (lock order sched → host).
+    if let Some((cell, budget, bytes)) = v.window_lease.take() {
+        cell.lock_unpoisoned().budget_mem_give(budget, bytes);
+    }
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
     twin_finished_locked(s, id, &v.host, &outcome.result);
@@ -8534,6 +8539,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
                 let gone = client_gone_targets(&v);
+                // A detached child's window goes back to the budget that paid for it (no lock held
+                // here). Never during a freeze unwind: the child is captured, not ended.
+                if !froze {
+                    if let Some((cell, budget, bytes)) = v.window_lease.take() {
+                        cell.lock_unpoisoned().budget_mem_give(budget, bytes);
+                    }
+                }
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
                 // until it is joined.
                 let finished_thread = match &v.spawn_residue {
@@ -11507,6 +11519,11 @@ struct VCpu {
     /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
     /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
     freeze_bell: Option<Arc<AtomicBool>>,
+    /// The window a detached spawn spent on this vCPU — `(parent powerbox, budget, bytes)` — on a
+    /// detached child's root only. Its bytes go back to that budget when the child ends (the `Done`
+    /// arm, or [`reap`] at a teardown): `Budget.mem` accounts live windows (owner, 2026-09-29), the
+    /// same moment the Cranelift executor's teardown gives them back.
+    window_lease: Option<(Arc<Mutex<Host>>, i32, u64)>,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
     /// (a different unmasked signal can interrupt a running handler — the source blocks the
@@ -11677,6 +11694,7 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            window_lease: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -11755,6 +11773,7 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            window_lease: None,
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -11855,6 +11874,7 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            window_lease: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -12610,6 +12630,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         offer_parked,
         admit_retry,
         unit_ref_cache,
+        window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -14808,6 +14829,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // lifecycle"). A freeze is a lifecycle action.
                                     let bell = Arc::new(AtomicBool::new(false));
                                     let bell_child = Arc::clone(&bell);
+                                    let lease = (Arc::clone(host), budget, child_size);
                                     // D66 — the child's lane chain: its own domain at its own cap, then
                                     // ours, so its tasks count against both (INVARIANTS #3 ruling).
                                     let chain_child = {
@@ -14851,6 +14873,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
                                         child.freeze_bell = Some(bell_child); // and so does the freeze
+                                        child.window_lease = Some(lease); // its window's bytes, until it ends
                                         if let Some((cell, export)) = pager_for_child {
                                             child.pager = Some(PagerRef { cell, export });
                                             child.fault_pager = true;

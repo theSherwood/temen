@@ -1402,9 +1402,11 @@ fn admit_detached_child(
         || !premap_ok
         || host.is_durable()
         || match host.admit_detached_spawn(budget, child_size) {
-            // D66 — see the resumable arm: single-spawn lane parity, lane returned at once.
+            // D66 — see the resumable arm: single-spawn lane parity, lane (and window bytes)
+            // returned at once.
             Some(lane) => {
                 host.give_lane(lane);
+                host.budget_mem_give(budget, child_size);
                 false
             }
             None => true,
@@ -4813,11 +4815,15 @@ impl<'p> Vcpu<'p> {
         // This engine's detached children are serviced by the embedder's driver, whose join/detach
         // does not yet return a lane, so the lane is given straight back here: the engines agree on
         // the single-spawn answer (a lane wider than the cap refuses) and the lasting Σ accounting
-        // lands with that driver's lane slice (#1600).
+        // lands with that driver's lane slice (#1600). The window's `Budget.mem` bytes likewise:
+        // `Budget.mem` accounts live windows (owner, 2026-09-29) and this driver cannot yet tell
+        // when a child's window goes, so the bytes are checked here and returned at once — the same
+        // #1600 slice makes them lasting, as the tree-walker and the Cranelift executor already do.
         let admit = |h: &mut Host| -> bool {
             match h.admit_detached_spawn(budget, child_size) {
                 Some(lane) => {
                     h.give_lane(lane);
+                    h.budget_mem_give(budget, child_size);
                     true
                 }
                 None => false,

@@ -1201,24 +1201,25 @@ int main(void) {
     mode: 'io',
     desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
       '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
-      'record into one call — `vm_spawn(module, entry, carve, size_log2, quota, grants, n, scratch)` — ' +
-      'so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns `child` (a ' +
-      'function of this same program, by funcref) twice into two 64 KiB carves: A with `{"stdout"}`, B ' +
-      'with none. A resolves the re-granted stream and prints "granted"; B finds nothing. main() prints ' +
-      'both results and returns A·10 + B = 10. A same-module child starts in a zeroed carve and receives ' +
-      'its starter handles where a C function expects its data-stack pointer, so `child` is written ' +
-      '**stackless** (no address-taken locals, no string literals, VM builtins only).',
+      'record into one call — `vm_spawn(module, entry, size_log2, quota, grants, n, args, args_len, ' +
+      'scratch)` — so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns ' +
+      '`child` (a function of this same program, by funcref) twice, each into a **window of its own** ' +
+      '(the program\'s size, paid from the `budget` grant and returned when the child ends): A with ' +
+      '`{"stdout"}`, B with none. A resolves the re-granted stream and prints "granted"; B finds nothing. ' +
+      'main() prints both results and returns A·10 + B = 10. A child entry receives its starter handles ' +
+      'where a C function expects its data-stack pointer, so `child` is written **stackless** (no ' +
+      'address-taken locals, VM builtins only).',
     src: `// Two children, two powerboxes — attenuation is the grant list (#1509).
 #include <stdio.h>
+#include <temen.h>
 #include <temen/spawn.h>
 
 long __vm_resolve(const char *name, long len);
 long __vm_write(int h, void *buf, long len);
 
-/* The child entry, spawned into a 64 KiB carve of this window (seen by the child as its own
-   window at 0, zeroed — no data image). Stackless on purpose: a same-module child entry gets its
-   two starter handles where a C function expects its data-stack pointer, so no address-taken
-   locals, no string literals (they live in the parent's data image) and no calls into C here —
+/* The child entry, spawned into a window of its own (this program's size and data image, none of
+   the parent's memory). Stackless on purpose: a child entry gets its two starter handles where a C
+   function expects its data-stack pointer, so no address-taken locals and no calls into C here —
    only VM builtins over two strings it writes itself, just above the NULL guard. */
 long child(long addrspace) {
   *(long *)16384 = 128047728850035L;            /* "stdout" packed little-endian */
@@ -1229,19 +1230,20 @@ long child(long addrspace) {
   return 1;
 }
 
-static char pool[3 * 65536]; /* room for two 64 KiB-aligned 64 KiB carves */
 static long scratch[16];     /* the spawn record + one grant record (8-byte aligned) */
 
 int main(void) {
   int out = (int)__vm_resolve("stdout", 6);   /* this program's own stdout handle */
-  long ca = ((long)pool + 65535) & ~65535L;
-  long cb = ca + 65536;
+  /* A child's window is this program's declared memory; the budget grant is one window's worth. */
+  long win = __vm_budget_read((int)__vm_resolve("budget", 6), 1);
+  int lg = 0;
+  while ((1L << lg) < win) lg++;
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
-  long a = vm_spawn(-1, (long)child, ca, 16, 0, g, 1, scratch);   /* A: stdout re-granted */
+  long a = vm_spawn(-1, (long)child, lg, 0, g, 1, 0, 0, scratch);   /* A: stdout re-granted */
   long ra = vm_join(a);
-  long b = vm_spawn(-1, (long)child, cb, 16, 0, g, 0, scratch);   /* B: empty grant list */
+  long b = vm_spawn(-1, (long)child, lg, 0, g, 0, 0, 0, scratch);   /* B: empty grant list */
   long rb = vm_join(b);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);

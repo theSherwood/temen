@@ -67,6 +67,12 @@ let it spend that again — the conservation break the earlier "harmless for a p
 note missed). The thaw may **attenuate** a carried budget through an embedder hook
 (`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never raise it; no hook
 ⇒ verbatim. Minting authority therefore survives a freeze exactly as it was left.
+*Refund on child end (2026-09-29, #1864, owner decision):* `Budget.mem` accounts **live** windows, not
+lifetime mints — when a detached child ends (joined or reaped), its window's bytes return to the
+budget that paid for them, so a parent can spawn, join and spawn again within one window's worth. A
+child frozen with its parent stays charged (the artifact carries the deduction). Conservation holds:
+the bytes return to the same budget they left. The bytecode tier still returns them at admission, like
+its lanes — a tracked gap (#1600), not a second rule.
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

@@ -3574,7 +3574,8 @@ impl Func {
         })
     }
 
-    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`).
+    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`)
+    /// or `instantiate_rec` (`call.cap 6 17` — the one spawn form, placed detached, #1863).
     /// See [`Module::spawns_detached`].
     pub fn spawns_detached(&self) -> bool {
         self.blocks.iter().any(|b| {
@@ -3583,7 +3584,7 @@ impl Func {
                     i,
                     Inst::CapCall {
                         type_id: cap_id::INSTANTIATOR,
-                        op: 15,
+                        op: 15 | 17,
                         ..
                     }
                 )

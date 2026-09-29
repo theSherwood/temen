@@ -300,14 +300,19 @@ unsafe fn file_carve_task(
 
 /// D66 — a granted child's teardown: release its powerbox and, for a detached child, return its
 /// lane to the parent through the `lane_give` hook (`-1` for a carve child: a no-op, it holds none).
+/// `window` is the `(budget, bytes)` a detached spawn spent on the child's window: they go back to
+/// that budget here, when the window goes (owner, 2026-09-29 — `Budget.mem` accounts live windows).
+/// `None` for a carve child and for a thaw's re-launch, which spent nothing in this life.
 unsafe fn granted_teardown(
     rt: &Nursery,
     release: crate::GrantChildReleaser,
     gc_ctx: *mut core::ffi::c_void,
     lane: i64,
+    window: Option<(i32, u64)>,
 ) -> crate::child_exec::Teardown {
     let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
     let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
+    let mem_give = rt.grant_budget_mem_give.load(Ordering::Acquire);
     Box::new(move || {
         let (ctx, parent_ctx) = (ctx, parent_ctx);
         // SAFETY: the powerbox is freed exactly once, here, by the task that owned it.
@@ -317,6 +322,12 @@ unsafe fn granted_teardown(
             // the parent host it was registered with.
             let give: crate::LaneGiver = unsafe { core::mem::transmute(lane_give) };
             unsafe { give(parent_ctx.0, lane) };
+        }
+        if let (Some((budget, bytes)), true) = (window, mem_give != 0) {
+            // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`, over the
+            // parent host it was registered with.
+            let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(mem_give) };
+            unsafe { give(parent_ctx.0, budget, bytes) };
         }
     })
 }
@@ -347,7 +358,7 @@ unsafe fn file_granted_carve_task(
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, -1);
+    let teardown = granted_teardown(rt, release, gc.ctx, -1, None);
     match file_carve_task(
         rt,
         code,
@@ -943,7 +954,7 @@ impl Nursery {
         let n_results = funcs.get(entry as usize).map_or(1, |f| f.results.len());
         let code = std::sync::Arc::new(code);
         register_serve(self, gc.ctx, &code);
-        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap);
+        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, None);
         let thaw_off = shadow.thaw_state_off(0) as usize;
         let filed = file_task(
             self,
@@ -2020,7 +2031,7 @@ unsafe fn spawn_detached_child(
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap);
+    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some((budget, child_size)));
     let premap_ctx = SendRaw(gc.ctx);
     let filed = file_task(
         rt,
@@ -2076,17 +2087,10 @@ unsafe fn spawn_detached_child(
             0
         }
         // The child never ran (a refused pre-map alias or task stack) — the one refusal on this
-        // path that happens *after* `budget_mem_take` committed, so un-spend the window bytes
-        // (#1587) and answer `-EINVAL` like every other admission failure (INVARIANTS #5).
-        Filed::Refused => {
-            let give_addr = rt.grant_budget_mem_give.load(Ordering::Acquire);
-            if give_addr != 0 {
-                // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`.
-                let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(give_addr) };
-                unsafe { give(rt.grant_ctx(), budget, child_size) };
-            }
-            EINVAL as i32
-        }
+        // path that happens *after* `budget_mem_take` committed. Its teardown already ran, and that
+        // un-spent the window bytes (#1587), so answer `-EINVAL` like every other admission failure
+        // (INVARIANTS #5).
+        Filed::Refused => EINVAL as i32,
     }
 }
 

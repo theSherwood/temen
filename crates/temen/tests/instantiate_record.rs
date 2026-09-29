@@ -1527,6 +1527,11 @@ block 0 (v0: i64) {{
 
 /// Run with the Instantiator plus a detached-window budget (`"budget"`, 1 MiB of `Budget.mem`).
 fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
+    run_detached_with(backend, src, 1 << 20)
+}
+
+/// [`run_detached`] with a `mem`-byte budget.
+fn run_detached_with(backend: Backend, src: &str, mem: u64) -> Result<i32, String> {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let registry = Imports::new().provide("exit", HostCap::exit());
@@ -1540,7 +1545,7 @@ fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
                     "vm",
                     HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
                 ),
-                ("budget", HostCap::detached_budget(1 << 20)),
+                ("budget", HostCap::detached_budget(mem)),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1617,5 +1622,26 @@ block 0 (vaddr: i64) {
     );
     for b in BACKENDS {
         assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+    }
+}
+
+/// Owner, 2026-09-29: `Budget.mem` accounts **live** windows — a detached child's window goes back to
+/// the budget that paid for it when the child ends. With a budget of exactly one window (2^17), the
+/// program spawns itself, joins, and spawns itself again: both run (`142 + 142`). Before, the first
+/// spawn spent the budget for good and the second was refused — a program could copy itself once,
+/// ever.
+#[test]
+fn a_joined_detached_childs_window_returns_to_its_budget() {
+    let src = detached_record_program().replace(
+        "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
+        "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vch2 = call.cap 6 17 (i64) -> (i32) vh (vrp)\n  vj2 = call.cap 6 1 (i32) -> (i64) vh (vch2)\n  vjs = i64.add vj vj2\n  vc = i32.wrap_i64 vjs\n",
+    );
+    assert!(src.contains("vch2"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(
+            run_detached_with(b, &src, 1 << 17).expect("run"),
+            284,
+            "{b:?}: the second child fits the window the first gave back"
+        );
     }
 }
