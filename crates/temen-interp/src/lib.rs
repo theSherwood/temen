@@ -3295,11 +3295,13 @@ fn drive_over_cell(
                        // trap/exit anywhere in the shared-powerbox domain ends the whole run, not
                        // just the trapping vCPU (the batch activation's owner is gone).
         s.root_domain = host_shared.lock_unpoisoned().domain_id() as usize;
-        // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once.
-        s.freeze_on_quiesce = mem
-            .as_ref()
-            .map(|m| m.durable_freeze_on_quiesce())
-            .unwrap_or(false);
+        // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once. Only a
+        // durable run has the control words; any other keeps its own data there (#1851).
+        s.freeze_on_quiesce = durable
+            && mem
+                .as_ref()
+                .map(|m| m.durable_freeze_on_quiesce())
+                .unwrap_or(false);
         // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
         // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
         // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
