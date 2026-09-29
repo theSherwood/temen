@@ -7,7 +7,10 @@
 //!   runs the same code on another thread;
 //! * shared code cannot be **extended**: a unit defined into it would run in every instance;
 //! * code that names an object one instance owns is **not shared** — but a §14 nursery stood up only
-//!   for units the module may install (#1726) is not named by its code.
+//!   for units the module may install (#1726) is not named by its code;
+//! * code that only waits and notifies **is** shared: its sites load the thread domain from the
+//!   instance's context, and each instance gets one of its own. (Before, the sites baked the domain,
+//!   so a process that could sleep could not fork.)
 
 use core::ffi::c_void;
 use temen_jit::{CompiledModule, JitError, JitOutcome, Quota, INERT_CAP_THUNK};
@@ -142,4 +145,67 @@ block 0 (v0: i32) {
     // module's own code names none, and shared code takes no unit.
     let roomy = compile(ASKS_ITS_POWERBOX, INERT_CAP_THUNK, core::ptr::null_mut(), 4);
     assert!(roomy.share().is_some());
+}
+
+#[test]
+fn code_that_only_waits_is_shared_and_each_instance_waits_on_its_own_domain() {
+    // The JIT waits only where its thread runtime runs (the fiber runtime's targets).
+    if !temen_fiber::supported() {
+        return;
+    }
+    // Waits 1 ms on a word nobody notifies, and answers the wait's status.
+    let waits = "memory 16
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 60000
+  v2 = i32.const 0
+  v3 = i64.const 1000000
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.extend_i32_u v4
+  return v5
+  }
+}
+";
+    const TIMED_OUT: i64 = 2;
+    let mut first = compile(waits, INERT_CAP_THUNK, core::ptr::null_mut(), 0);
+    let code = first
+        .share()
+        .expect("waiting needs no runtime but a domain");
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            let code = &code;
+            s.spawn(move || {
+                let mut cm = code.instance(core::ptr::null_mut());
+                for _ in 0..20 {
+                    assert_eq!(answer(&mut cm), TIMED_OUT);
+                }
+            });
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                answer(&mut first),
+                TIMED_OUT,
+                "the module shared from runs on as the first instance"
+            );
+        }
+    });
+
+    // A spawned vCPU runs on the runtime the compile stands up, which an instance does not get.
+    let spawns = "func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 0
+  v2 = thread.spawn 1 v1 v1
+  v3 = thread.join v2
+  return v3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  return v1
+  }
+}
+";
+    assert!(compile(spawns, INERT_CAP_THUNK, core::ptr::null_mut(), 0)
+        .share()
+        .is_none());
 }

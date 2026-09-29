@@ -6241,7 +6241,10 @@ fn jit_run(
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
     let quota = limits.quota();
-    let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
+    // §12 threads and fibers run on the serialized arm. Waiting and notifying alone make no second
+    // caller: a guest that only sleeps on a futex (nim's `nanosleep`) is single-threaded, and runs
+    // as a process, which can fork.
+    let concurrent = m.funcs.iter().any(|f| f.uses_fibers_or_threads());
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
     // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.
     let (run, results) = with_deadline(limits.deadline, |interrupt| {

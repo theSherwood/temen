@@ -546,6 +546,12 @@ pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
 }
 
 impl Domain {
+    /// A new domain with this one's §15 vCPU quota and nothing else: what another instance of the
+    /// same code runs on (#1825).
+    pub(crate) fn fresh(&self) -> Domain {
+        Domain::new(self.max_vcpus)
+    }
+
     pub(crate) fn new(max_vcpus: usize) -> Domain {
         Domain {
             env: Mutex::new(None),
