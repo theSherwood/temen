@@ -153,15 +153,24 @@ static void close_block(void) {
   }
 }
 
-static void cg(const char *fmt, ...) {
-  if (fmt[0] == ' ' && fmt[1] == ' ') {
-    const char *p = fmt + 2;
-    bool is_term = !strncmp(p, "br ", 3) || !strncmp(p, "br_if ", 6) ||
-                   !strncmp(p, "br_table", 8) || !strncmp(p, "return", 6) ||
-                   !strncmp(p, "unreachable", 11);
+// Advance `cur_inst` past the instructions in `text`: one per `  `-indented line, terminators
+// aside. Counted per emitted line, not per `cg` call — a call that emits two instructions must
+// count two, or every later `debug.loc` / SSA location in the block lands that many instructions
+// early (a breakpoint stopping before the previous line's last store).
+static void count_insts(const char *text) {
+  for (const char *p = text; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
+    if (p[0] != ' ' || p[1] != ' ')
+      continue;
+    const char *q = p + 2;
+    bool is_term = !strncmp(q, "br ", 3) || !strncmp(q, "br_if ", 6) ||
+                   !strncmp(q, "br_table", 8) || !strncmp(q, "return", 6) ||
+                   !strncmp(q, "unreachable", 11);
     if (!is_term)
       cur_inst++;
   }
+}
+
+static void cg(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   if (cur_block != -1) {
@@ -169,6 +178,8 @@ static void cg(const char *fmt, ...) {
     int n = vsnprintf(line, sizeof line, fmt, ap);
     if (n > (int)sizeof line - 1)
       n = (int)sizeof line - 1;
+    line[n] = '\0';
+    count_insts(line);
     blk_append(blk_of(cur_block), line, (size_t)n);
   } else {
     vfprintf(o, fmt, ap);

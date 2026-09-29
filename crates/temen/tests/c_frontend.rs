@@ -2476,6 +2476,46 @@ fn c_thread_local_debug_info_locates_the_root_copy() {
     assert_eq!(seg.bytes[at..at + 8], 100i64.to_le_bytes());
 }
 
+/// The line table keys each `debug.loc` to an instruction index, which chibicc counts as it emits.
+/// A zero-filled local's initializer (`ND_MEMZERO`) emitted each chunk's `const` and `store` from one
+/// emit call and was counted as one instruction, so every later row in the block landed a chunk-count
+/// early: a breakpoint on the line after `int nums[4] = {…};` stopped before its last element was
+/// stored. The line after the initializer must start after every store the initializer makes.
+#[test]
+fn c_the_line_after_an_initializer_starts_after_its_last_store() {
+    let ir = c_to_ir_g(
+        "int main(void) {\n\
+         \x20 int nums[4] = {0x41, 0x42, 0x43, 0x44};\n\
+         \x20 return nums[3];\n\
+         }\n",
+    );
+    let m = parse_module(&ir).expect("parse");
+    let dbg = m.debug_info.as_ref().expect("-g emits debug info");
+    let file = dbg
+        .files
+        .iter()
+        .position(|f| f.ends_with(".c"))
+        .expect("the source file is in the line table") as u32;
+    let row = |line: u32| {
+        dbg.locs
+            .iter()
+            .find(|l| l.file == file && l.line == line)
+            .unwrap_or_else(|| panic!("no debug.loc for line {line}:\n{ir}"))
+    };
+    let (init, ret) = (row(2), row(3));
+    assert_eq!((init.func, init.block), (ret.func, ret.block), "one block:\n{ir}");
+    let insts = &m.funcs[ret.func as usize].blocks[ret.block as usize].insts;
+    let last_store = insts
+        .iter()
+        .rposition(|i| matches!(i, temen_ir::Inst::Store { .. }))
+        .expect("the initializer stores");
+    assert!(
+        ret.inst as usize > last_store,
+        "line 3 starts at instruction {} but the initializer's last store is instruction {last_store}:\n{ir}",
+        ret.inst
+    );
+}
+
 /// What C forbids is refused with a diagnostic: a thread-local's address as a constant initializer
 /// (each thread has its own copy), a block-scope `_Thread_local` that is neither `static` nor
 /// `extern`, and an alignment the per-thread block cannot honor.
