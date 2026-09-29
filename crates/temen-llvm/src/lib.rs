@@ -284,6 +284,10 @@ pub struct TranslateOptions {
     /// [`temen_ir::durable_abi::MAX_SHADOW_CONTEXTS`]; a durable run needs one region for the root
     /// plus one per concurrent fiber or vCPU.
     pub shadow_contexts: Option<u32>,
+    /// Bytes per shadow region when [`Self::shadow_contexts`] declares an arena: a power of two
+    /// `>=` [`temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE`] (the default). A context's call chain
+    /// must fit its region to freeze, so a guest that recurses deep declares a wider one (#1872).
+    pub shadow_stride: u64,
 }
 
 impl Default for TranslateOptions {
@@ -295,6 +299,7 @@ impl Default for TranslateOptions {
             stack_page: DEFAULT_STACK_PAGE,
             child_entry: false,
             shadow_contexts: None,
+            shadow_stride: temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE,
         }
     }
 }
@@ -1054,10 +1059,18 @@ fn translate_impl(
             // during freeze/thaw, D40 protects read-only segments page-granularly, and `top` can
             // land inside the last read-only global's page — a shadow push there faults. `stack_page`
             // is the target host's page, so the isolation holds on whatever host runs the artifact.
+            let stride = opts.shadow_stride;
+            if !stride.is_power_of_two() || stride < temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE {
+                return Err(Error::Unsupported(format!(
+                    "shadow region of {stride} bytes: must be a power of two >= {}",
+                    temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE
+                )));
+            }
             let base = top.next_multiple_of(stack_page);
             Some(temen_ir::durable_abi::ShadowArena {
                 base,
-                end: base + n as u64 * temen_ir::durable_abi::SHADOW_STRIDE,
+                end: base + n as u64 * stride,
+                stride,
             })
         }
     };

@@ -3500,7 +3500,8 @@ per-context shadow regions. #1503 made that placement a module-declared, verifie
 translated module was.
 
 `temen-llvm-translate --shadow-arena <contexts>` (`TranslateOptions::shadow_contexts`) reserves
-`contexts × SHADOW_STRIDE` bytes and declares them. Placement follows R9's "a toolchain points the
+`contexts × stride` bytes and declares them; `--shadow-region <bytes>` (`shadow_stride`, a power of
+two, default and minimum 4096) widens each region for a guest whose call chains run deeper (#1872). Placement follows R9's "a toolchain points the
 arena at a BSS array": it goes on top of whatever the window already holds — the data-stack reserve
 when some function uses it, the float scratch, the C++ EH region — and below the heap, so the
 allocator never manages it and no data segment can alias it (the R9 contract as a static verifier

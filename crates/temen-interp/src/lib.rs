@@ -9960,7 +9960,7 @@ impl SchedDriver {
 // (#915), so TCB `temen-interp` never depends on the tooling-tier `temen-durable`.
 //
 // Per-context layout has **one definition**: `temen_ir::durable_abi::ShadowArena` (#1503) —
-// context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)`, the arena being the module's own
+// context `i` owns `[arena.region_base(i), +arena.stride)`, the arena being the module's own
 // declaration (`Memory::shadow`, carried by this window's `Mem`). The root computation is context 0; a `cont.new`-created
 // fiber in registry slot `s` is context `s + 1`.
 
@@ -10004,16 +10004,16 @@ pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
 /// Must equal `temen_durable::ARM_QUIESCE_OFF`.
 pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
+/// The region stride an arena declares unless it names its own: context `i` occupies
+/// `[ShadowArena::region_base(i), +stride)`, 4 KiB by default. The transform's shadow-overflow
+/// guard bounds each push by the arena's stride (#1683), so a context recursed deeper than one
+/// region traps the freeze instead of writing its neighbour's frames; a module whose chains run
+/// deeper declares a wider stride (#1872).
+pub use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
 /// The legacy global shadow-SP word's slot in the fixed control block — **unused since §12.8
 /// 4A.5** (each context's SP word is the first 8 bytes of its own region); kept as a reserved ABI
 /// offset. Must equal `temen_durable::SHADOW_SP_OFF`.
 pub use temen_ir::durable_abi::SHADOW_SP_OFF;
-/// Per-context shadow-stack stride: context `i` occupies `[ShadowArena::region_base(i), +
-/// SHADOW_STRIDE)`. 4 KiB per context (a 48 KiB arena holds 12) — a provisional
-/// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
-/// The transform's shadow-overflow guard bounds each push by this stride (#1683), so a context
-/// recursed deeper than one region traps the freeze instead of writing its neighbour's frames.
-pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// The shadow arena: where the per-context shadow regions sit (one definition of placement).
 pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 

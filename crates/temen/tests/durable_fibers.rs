@@ -13,15 +13,15 @@
 //! second fiber into the first's freed region.)
 
 use std::sync::{Arc, Mutex};
-use temen_interp::{run_capture_reserved_with_host, Host, Value, SHADOW_SP_OFF, SHADOW_STRIDE};
+use temen_interp::{
+    run_capture_reserved_with_host, Host, Value, DEFAULT_SHADOW_STRIDE, SHADOW_SP_OFF,
+};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ TEST_ARENA.end (64 KiB)
 const WINDOW: usize = 1 << WINDOW_LOG2;
@@ -109,7 +109,7 @@ fn durable_fiber_switch_routes_shadow_sp_per_context() {
         "per-context regions are distinct (no collision)"
     );
     assert!(
-        b + SHADOW_STRIDE <= TEST_ARENA.end,
+        b + DEFAULT_SHADOW_STRIDE <= TEST_ARENA.end,
         "every assigned region fits within the durable reserve"
     );
 }

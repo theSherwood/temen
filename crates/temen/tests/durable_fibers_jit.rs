@@ -31,10 +31,8 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 /// A pure-arithmetic fiber module the cross-backend freeze/thaw tests share: root resumes a fiber
 /// twice (the fiber suspends once, yielding 42, then returns 7 + 100 = 107). No caps ⇒ deterministic.

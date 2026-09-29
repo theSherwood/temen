@@ -13,10 +13,7 @@ use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, MemLayout,
 use temen_ir::durable_abi::ShadowArena;
 use temen_jit::{JitError, JitOutcome};
 
-const ARENA: ShadowArena = ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
 /// Spawn the child detached (op 15, 7-arg form: budget, module, no grants, entry 0, `size_log2` 17,

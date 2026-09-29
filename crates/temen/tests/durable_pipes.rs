@@ -19,10 +19,8 @@ use temen_ir::Module;
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 /// func 0 (parent, `(Instantiator, read_end, write_end)`): spawn func 1 through an op-17 record in the
 /// carve `[128 KiB, 256 KiB)`, re-granting the write end as `"g"`; join; read 2 bytes from the read

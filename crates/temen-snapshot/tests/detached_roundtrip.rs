@@ -18,10 +18,7 @@ use temen_ir::durable_abi::ShadowArena;
 use temen_ir::Module;
 use temen_snapshot::{freeze_with_prots, restore_with_prots, FreezeError, PageProt, RestoreError};
 
-const ARENA: ShadowArena = ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 
 fn instrument(src: &str) -> Module {
     let m = temen_text::parse_module(src).expect("parse");

@@ -497,7 +497,9 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         0,
     );
     // Memory descriptor: presence flag, then `size_log2`, then the shadow-arena flag and (if set)
-    // its `[base, end)` as two ulebs (v11: the arena is module-declared, INVARIANTS.md #16).
+    // its `[base, end)` as two ulebs (v11: the arena is module-declared, INVARIANTS.md #16). Flag `2`
+    // adds the region stride as a third uleb (#1872); `1` is the default stride, so a module that
+    // keeps it encodes as before.
     match &m.memory {
         None => out.push(0),
         Some(mem) => {
@@ -506,9 +508,13 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
             match mem.shadow {
                 None => out.push(0),
                 Some(a) => {
-                    out.push(1);
+                    let default = a.stride == temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
+                    out.push(if default { 1 } else { 2 });
                     write_uleb(&mut out, a.base);
                     write_uleb(&mut out, a.end);
+                    if !default {
+                        write_uleb(&mut out, a.stride);
+                    }
                 }
             }
         }
@@ -1949,10 +1955,18 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             let size_log2 = c.byte()?;
             let shadow = match c.byte()? {
                 0 => None,
-                1 => Some(temen_ir::durable_abi::ShadowArena {
-                    base: c.uleb()?,
-                    end: c.uleb()?,
-                }),
+                1 => Some(temen_ir::durable_abi::ShadowArena::new(
+                    c.uleb()?,
+                    c.uleb()?,
+                )),
+                2 => {
+                    let (base, end, stride) = (c.uleb()?, c.uleb()?, c.uleb()?);
+                    // One encoding per arena: the default stride is flag `1`'s.
+                    if stride == temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE {
+                        return Err(DecodeError::BadMemoryFlag(2));
+                    }
+                    Some(temen_ir::durable_abi::ShadowArena { base, end, stride })
+                }
                 other => return Err(DecodeError::BadMemoryFlag(other)),
             };
             Some(Memory { size_log2, shadow })
@@ -2912,7 +2926,7 @@ mod window_peek_tests {
         for size_log2 in [0, 16, 25, 40] {
             let m = with_window(Some(Memory {
                 size_log2,
-                shadow: Some(temen_ir::durable_abi::ShadowArena { base: 64, end: 128 }),
+                shadow: Some(temen_ir::durable_abi::ShadowArena::new(64, 128)),
             }));
             assert_eq!(module_window_log2(&encode_module(&m)), Some(size_log2));
         }
@@ -3064,13 +3078,12 @@ mod object_tests {
         };
         for shadow in [
             None,
+            Some(ShadowArena::new(16448, 65536)),
+            Some(ShadowArena::new(0x74000, 0x80000)),
             Some(ShadowArena {
-                base: 16448,
-                end: 65536,
-            }),
-            Some(ShadowArena {
-                base: 0x74000,
-                end: 0x80000,
+                base: 0x10000,
+                end: 0x30000,
+                stride: 1 << 15,
             }),
         ] {
             let m = Module {
@@ -3082,6 +3095,47 @@ mod object_tests {
             };
             assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m);
         }
+    }
+
+    /// #1872: an arena of default-stride regions keeps the pre-stride encoding (flag `1`), so
+    /// existing artifacts decode unchanged, and flag `2` naming the default stride is refused.
+    #[test]
+    fn a_default_stride_arena_has_one_encoding() {
+        use temen_ir::durable_abi::{ShadowArena, DEFAULT_SHADOW_STRIDE};
+        let (base, end) = (0x10000u64, 0x30000u64);
+        let m = Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
+            data_funcref_slots: Vec::new(),
+            tls: Vec::new(),
+            types: vec![],
+            funcs: vec![],
+            memory: Some(Memory {
+                size_log2: 20,
+                shadow: Some(ShadowArena::new(base, end)),
+            }),
+            data: vec![],
+            imports: vec![],
+            exports: vec![],
+            data_exports: vec![],
+            impl_exports: vec![],
+            debug_info: None,
+        };
+        let plain = encode_module(&m);
+        // The arena is `flag, uleb(base), uleb(end)`: find it, then forge flag 2 + the default stride.
+        let mut arena = vec![1u8];
+        write_uleb(&mut arena, base);
+        write_uleb(&mut arena, end);
+        let at = plain
+            .windows(arena.len())
+            .position(|w| w == arena.as_slice())
+            .expect("arena bytes");
+        let mut forged = plain.clone();
+        forged[at] = 2;
+        let mut stride = Vec::new();
+        write_uleb(&mut stride, DEFAULT_SHADOW_STRIDE);
+        forged.splice(at + arena.len()..at + arena.len(), stride);
+        assert_eq!(decode_module(&forged), Err(DecodeError::BadMemoryFlag(2)));
     }
 
     #[test]

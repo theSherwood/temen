@@ -64,7 +64,7 @@ fn the_strict_transform_refuses_the_kernel_for_aliasing_the_durable_reserve() {
 /// fibers.
 #[test]
 fn the_kernel_declares_an_arena_clear_of_its_data() {
-    use temen_ir::durable_abi::{ShadowArena, SHADOW_STRIDE};
+    use temen_ir::durable_abi::{ShadowArena, DEFAULT_SHADOW_STRIDE};
     let m = kernel(); // `kernel()` already ran the verifier, which rejects a data/arena overlap
     let arena = m
         .memory
@@ -72,10 +72,7 @@ fn the_kernel_declares_an_arena_clear_of_its_data() {
         .expect("forth.temt declares a shadow arena");
     assert_eq!(
         arena,
-        ShadowArena {
-            base: 0x74000,
-            end: 0x80000
-        },
+        ShadowArena::new(0x74000, 0x80000),
         "the arena lives in the sandbox spawn-scratch page, below the child carve"
     );
     for (i, d) in m.data.iter().enumerate() {
@@ -90,7 +87,7 @@ fn the_kernel_declares_an_arena_clear_of_its_data() {
     }
     assert!(
         arena.contexts() >= 8,
-        "a REPL with a root and a few task fibers needs several contexts; got {} (stride {SHADOW_STRIDE})",
+        "a REPL with a root and a few task fibers needs several contexts; got {} (stride {DEFAULT_SHADOW_STRIDE})",
         arena.contexts()
     );
 }
