@@ -3586,15 +3586,26 @@ impl Func {
     /// or `instantiate_rec` (`call.cap 6 17` — the one spawn form, placed detached, #1863).
     /// See [`Module::spawns_detached`].
     pub fn spawns_detached(&self) -> bool {
+        self.issues_instantiator(&[15, 17])
+    }
+
+    /// Whether this function issues op 15, whose module operand must be a `Module` handle. See
+    /// [`spawns_by_module_handle`].
+    pub fn spawns_by_module_handle(&self) -> bool {
+        self.issues_instantiator(&[15])
+    }
+
+    /// Whether this function issues a static `Instantiator` op among `ops`.
+    fn issues_instantiator(&self, ops: &[u32]) -> bool {
         self.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
                     Inst::CapCall {
                         type_id: cap_id::INSTANTIATOR,
-                        op: 15 | 17,
+                        op,
                         ..
-                    }
+                    } if ops.contains(op)
                 )
             })
         })
@@ -3758,6 +3769,14 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// a powerbox a warm snapshot can freeze.
 pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
+}
+
+/// Whether `module` issues op 15 (`instantiate_detached`), whose module operand must be a `Module`
+/// handle — the one spawn a by-name `"module"` grant serves. The op-17 record names the spawner's own
+/// program as `-1`, so an op-17-only guest is granted its `"budget"` alone, and keeps a powerbox a
+/// warm snapshot can freeze (a `Module` grant is non-durable).
+pub fn spawns_by_module_handle(module: &Module) -> bool {
+    module.funcs.iter().any(Func::spawns_by_module_handle)
 }
 
 /// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle),

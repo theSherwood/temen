@@ -26037,14 +26037,29 @@ impl Host {
             .is_some_and(|m| temen_ir::spawns_detached(m))
     }
 
-    pub fn grant_detached_spawn_caps(&mut self, win: u64) {
+    /// [`temen_ir::spawns_by_module_handle`] over the running module; `false` with none registered.
+    pub fn self_module_spawns_by_module_handle(&self) -> bool {
+        self.self_module
+            .as_ref()
+            .is_some_and(|m| temen_ir::spawns_by_module_handle(m))
+    }
+
+    /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
+    /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
+    /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), and `"budget"`
+    /// (one `win` of `Budget.mem`).
+    pub fn grant_detached_spawn_caps(&mut self, win: u64, by_module_handle: bool) {
         let Some(m) = self.self_module.clone() else {
             return;
         };
-        let module = self.grant_module_shared(m, false);
-        self.register_cap_name("module", module);
-        let budget = self.grant_budget(0, win as i64, 0);
-        self.register_cap_name("budget", budget);
+        if by_module_handle && self.resolve_cap_name("module").is_none() {
+            let module = self.grant_module_shared(m, false);
+            self.register_cap_name("module", module);
+        }
+        if self.resolve_cap_name("budget").is_none() {
+            let budget = self.grant_budget(0, win as i64, 0);
+            self.register_cap_name("budget", budget);
+        }
     }
 
     /// [`Host::grant_module`], additionally attesting the module is **freezable** (DURABILITY.md
@@ -26843,6 +26858,7 @@ impl Host {
         // a spawner appears, which is the same least-authority rule, just evaluated at install
         // instead of at powerbox build.
         let unit_spawns_detached = funcs.iter().any(temen_ir::Func::spawns_detached);
+        let unit_by_handle = funcs.iter().any(temen_ir::Func::spawns_by_module_handle);
         let unit = d.units.len() as u32;
         // No wasm yet: the browser tier emits a unit **lazily**, on its first read through
         // [`Self::jit_unit_wasm_or_emit`] — the one emit path for a `compile`d, a `compile_linked`,
@@ -26856,7 +26872,7 @@ impl Host {
             wasm: None,
         });
         // #1529 (see above): the unit installed and it spawns detached, so grant the set now —
-        // once (a later spawning unit finds `"module"` already registered). Three conditions keep it
+        // each name once (`grant_detached_spawn_caps` skips a name already registered). Three conditions keep it
         // a strict subset of what this guest already holds, never a new frontier:
         //
         // - a named `"instantiator"` must be present — the embedder's own decision to hand this
@@ -26871,13 +26887,13 @@ impl Host {
         //
         // The decision lives here, not in the powerbox tier, because this is the only point that sees
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.
-        if unit_spawns_detached && !self.durable && self.resolve_cap_name("module").is_none() {
+        if unit_spawns_detached && !self.durable {
             if let Some(win) = self
                 .resolve_cap_name("instantiator")
                 .and_then(|h| self.resolve_instantiator(h).ok())
                 .map(|(_, size)| size)
             {
-                self.grant_detached_spawn_caps(win);
+                self.grant_detached_spawn_caps(win, unit_by_handle);
             }
         }
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The

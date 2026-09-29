@@ -3713,7 +3713,7 @@ fn grant_onramp_caps(
         // non-durable, so granting it everywhere would make every reactor that saves a warm
         // snapshot unfreezable.
         if temen_ir::spawns_detached(m) {
-            host.grant_detached_spawn_caps(win);
+            host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
         }
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
