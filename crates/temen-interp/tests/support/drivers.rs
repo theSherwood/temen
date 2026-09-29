@@ -168,11 +168,7 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
                 let id = {
                     let mut n = orch.next.lock().unwrap();
@@ -183,14 +179,10 @@ fn drive<'s, 'e>(
                 let child_win = WinPtr(unsafe { win.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve, alive for the scope.
                 let back = Arc::new(unsafe { Region::shared(child_win.0, 1u64 << size_log2) });
-                let child = match vcpu.take_granted_host() {
-                    Some(h) => bytecode::Vcpu::new_confined_child_over_host(
-                        prog, module, entry, back, size_log2, fuel, h,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child(
-                        prog, module, entry, back, size_log2, fuel,
-                    ),
-                }?;
+                let Some(pending) = vcpu.take_child() else {
+                    panic!("an Instantiate carries its admitted child");
+                };
+                let child = pending.start(prog, back, None)?;
                 scope.spawn(move || {
                     let r = drive(scope, prog, child_win, orch, child);
                     orch.done.lock().unwrap().insert(id, r);
