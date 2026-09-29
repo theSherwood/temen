@@ -934,9 +934,13 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   runs it instantiates (`temen_jit::SharedCode`), with its own powerbox, function table and run
   state: the process that compiled it, its twins, and every later `execve` of the same command. The
   tree finds a command's compile by what the code depends on besides the module: the grant, the
-  window, the entry, whether it polls the tree's kill-path cell, and its fork sites. Code that names
-  an object one instance owns (a thread domain, a §14 nursery, a `setjmp` table), or that a program
-  able to drive the §22 `Jit` could extend, is compiled per process.
+  window, the entry, whether it polls the tree's kill-path cell, and its fork sites. Code that needs
+  a runtime one instance owns (a §14 nursery, a `setjmp` table, the fiber and thread runtime), or
+  that a program able to drive the §22 `Jit` could extend, is compiled per process. Code that only
+  waits and notifies is shared: its futex sites load the thread domain from the `vmctx`, and each
+  instance gets a domain of its own. Such a program is single-threaded, so it also runs as a process
+  when it is the tree's root, and it forks. Before, the sites baked the domain, and a program that
+  could wait (nim's `nanosleep` is a timed wait, #1930) could not fork.
 - **Fork again.** Every fork after a process's first unwinds through frames the previous fork's
   rewind rebuilt, each by re-issuing its call. The transform's thaw arms now poll after an op they
   re-run, as the forward path does (`temen-durable`'s `poll`). Before, an arm ran on into its

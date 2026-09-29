@@ -69,7 +69,7 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
             bytecode::CoopEvent::TierUp { func, .. } => {
                 assert_eq!(func, 1, "only func 1 is eligible");
                 let mut io = vec![0i64; 8];
-                let n = run.bounce(2, &mut io, spill)?;
+                let n = run.bounce(2, &mut io, spill)?.expect("nothing here parks");
                 run.deliver_tierup(&io[..n]);
             }
             _ => panic!("unexpected event (no fibers, threads or JIT units in this guest)"),

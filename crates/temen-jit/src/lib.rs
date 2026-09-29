@@ -2846,11 +2846,13 @@ pub struct CompiledModule {
     /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
     /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
     debug_types: Vec<temen_ir::TypeDef>,
-    /// #1825 — whether the compiled code names an object only this instance owns: the thread domain
-    /// its `thread.*`/fiber sites bake, the §14 nursery its `Instantiator` sites bake, the `setjmp`
-    /// table its `SetJmp`/`LongJmp` sites bake. (A nursery stood up only for units this module may
-    /// install, #1726, is not named by the module's own code.) Such code cannot be shared.
-    code_names_objects: bool,
+    /// #1825 — whether an instance of the code needs a runtime [`Self::instance`] does not make, so
+    /// the code cannot be shared: the §14 nursery its `Instantiator` sites bake, the `setjmp` table
+    /// its `SetJmp`/`LongJmp` sites bake, the fiber table and runtimes its `cont.*` and `thread.*`
+    /// sites run on, or one a §22 hosting entry stood up after the compile. (A nursery stood up only
+    /// for units this module may install, #1726, is not named by the module's own code.) Code that
+    /// only waits and notifies needs nothing but a thread domain, and each instance gets its own.
+    needs_runtime: bool,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it — and the drop **releases** the
     /// code arena back to the OS (see [`OwnedJit`]; a bare `JITModule` would leak it). Shared by every
@@ -3168,13 +3170,15 @@ impl CompiledModule {
             take_thunk: s.take as usize as i64,
             return_thunk: s.ret as usize as i64,
         });
-        let instance = InstanceAddrs {
+        // The thread domain, if any, is stood up below.
+        #[cfg_attr(not(fiber_rt), allow(unused_mut))]
+        let mut instance = InstanceAddrs {
             cap_ctx,
             epoch: epoch_addr as *const AtomicU64,
             fuel: fuel_addr as *mut u64,
             sig_armed: signal.as_ref().map_or(core::ptr::null(), |s| s.armed),
             sig_ctx: signal.as_ref().map_or(core::ptr::null_mut(), |s| s.ctx),
-            embedder: core::ptr::null_mut(),
+            ..InstanceAddrs::NONE
         };
         // Calls can reach any function, so every function must be lowerable.
         for f in &m.funcs {
@@ -3373,8 +3377,8 @@ impl CompiledModule {
             };
         #[cfg(fiber_rt)]
         let thread = if let Some(d) = &domain {
+            instance.sched = &**d as *const os_thread_rt::Domain as *const core::ffi::c_void;
             ThreadEnv {
-                sched_addr: (&**d as *const os_thread_rt::Domain) as i64,
                 spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
                 join_thunk: os_thread_rt::thread_join as *const () as i64,
                 wait_thunk: os_thread_rt::thread_wait as *const () as i64,
@@ -3839,14 +3843,16 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let _ = &quota;
         #[cfg(fiber_rt)]
-        let code_names_objects = domain.is_some() || module_uses_instantiator(m);
+        let needs_runtime = uses_fibers
+            || m.funcs.iter().any(temen_ir::Func::uses_threads)
+            || module_uses_instantiator(m);
         #[cfg(not(fiber_rt))]
-        let code_names_objects = false;
+        let needs_runtime = false;
         #[cfg(setjmp_rt)]
-        let code_names_objects = code_names_objects || setjmp_runtime.is_some();
+        let needs_runtime = needs_runtime || setjmp_runtime.is_some();
         MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         Ok(CompiledModule {
-            code_names_objects,
+            needs_runtime,
             fn_table,
             tramp_code,
             tramp_code_limited: core::ptr::null(), // a root is never a child-domain task
@@ -4031,10 +4037,9 @@ impl CompiledModule {
     }
 
     /// #1825 — this module's code as [`SharedCode`], for more instances to run. `None` unless the code
-    /// is **only code**: it names no object one instance owns (see `code_names_objects`), no runtime
-    /// was stood up on it after its compile (the §22 hosting entries), and nothing was defined past
-    /// it. From here on no instance can extend it ([`arena_mut`]) — this module included, which goes
-    /// on running as the first instance.
+    /// is **only code**: an instance of it needs no runtime but a thread domain (see `needs_runtime`),
+    /// and nothing was defined past it. From here on no instance can extend it ([`arena_mut`]) — this
+    /// module included, which goes on running as the first instance.
     pub fn share(&self) -> Option<SharedCode> {
         self.is_only_code().then(|| {
             SharedCode(self.instance(InstanceAddrs {
@@ -4047,22 +4052,26 @@ impl CompiledModule {
 
     /// See [`Self::share`].
     fn is_only_code(&self) -> bool {
-        // A runtime stood up after the compile (the §22 hosting entries) is per-instance run state.
-        #[cfg(fiber_rt)]
-        let hosting = self.fiber_rt.is_some() || self.domain.is_some();
-        #[cfg(not(fiber_rt))]
-        let hosting = false;
-        !self.code_names_objects && !hosting && self.next_extra == 0
+        !self.needs_runtime && self.next_extra == 0
     }
 
     /// A new instance of this module's code at `addrs` ([`SharedCode::instance`]): the compile's
     /// products, the function table copied (a run is handed its address; nothing bakes it), and fresh
-    /// run state. Only for code [`Self::is_only_code`] admits, so it carries no runtime — not even the
-    /// §14 nursery a module with install room gets for its units (#1726): no unit can be defined
-    /// into shared code.
-    fn instance(&self, addrs: InstanceAddrs) -> CompiledModule {
+    /// run state. Only for code [`Self::is_only_code`] admits, so it carries no runtime but a thread
+    /// domain of its own, when the code waits or notifies — not even the §14 nursery a module with
+    /// install room gets for its units (#1726): no unit can be defined into shared code.
+    #[cfg_attr(not(fiber_rt), allow(unused_mut))]
+    fn instance(&self, mut addrs: InstanceAddrs) -> CompiledModule {
+        #[cfg(fiber_rt)]
+        let domain = self.domain.as_ref().map(|d| Box::new(d.fresh()));
+        #[cfg(fiber_rt)]
+        {
+            addrs.sched = domain.as_ref().map_or(core::ptr::null(), |d| {
+                &**d as *const os_thread_rt::Domain as *const core::ffi::c_void
+            });
+        }
         CompiledModule {
-            code_names_objects: self.code_names_objects,
+            needs_runtime: self.needs_runtime,
             fn_table: self
                 .fn_table
                 .iter()
@@ -4120,7 +4129,7 @@ impl CompiledModule {
             #[cfg(fiber_rt)]
             fiber_rt: None,
             #[cfg(fiber_rt)]
-            domain: None,
+            domain,
             #[cfg(fiber_rt)]
             _nursery: None,
             #[cfg(fiber_rt)]
@@ -5309,6 +5318,7 @@ impl CompiledModule {
         };
         rt.set_call_tramp(tramp);
         self.fiber_rt = Some(rt);
+        self.needs_runtime = true;
         self.call_tramp = Some(tramp);
         self.fiber_cfg = Some((fiber_type_id, fiber_mask));
         self.fiber = FiberEnv {
@@ -5395,18 +5405,19 @@ impl CompiledModule {
                 unsafe { std::mem::transmute::<*const u8, fiber_rt::FiberCallTramp>(addr) }
             }
         };
-        // Stand up the executor `Domain` whose stable address is baked into the unit's `thread.*` sites.
+        // Stand up the executor `Domain` the unit's `thread.*` sites load from this instance's context.
         // Its per-run `Env` (window / fn-table / trap cell / this trampoline) is supplied later by the
-        // run entry's `set_env`; the address is stable now, which is all the baked constant needs.
+        // run entry's `set_env`; the address is stable now, which is all the context needs.
         let domain = Box::new(os_thread_rt::Domain::new(quota.max_vcpus));
+        self.instance.sched = &*domain as *const os_thread_rt::Domain as *const core::ffi::c_void;
         self.thread = ThreadEnv {
-            sched_addr: (&*domain as *const os_thread_rt::Domain) as i64,
             spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
             join_thunk: os_thread_rt::thread_join as *const () as i64,
             wait_thunk: os_thread_rt::thread_wait as *const () as i64,
             notify_thunk: os_thread_rt::thread_notify as *const () as i64,
         };
         self.domain = Some(domain);
+        self.needs_runtime = true;
         self.call_tramp = Some(tramp);
         // `fiber_table` set above; `fiber_cfg` left as-is (None ⇒ pure-thread host, matching a
         // fiber-free threaded module — spawned vCPUs then build no per-vCPU fiber runtime).
@@ -6102,8 +6113,9 @@ pub(crate) enum ChildRun {
     /// own for `thread.spawn`/`join`.
     Task,
     /// As a **durable** task (a durable parent's detached child, or a thawed one): a fiber runtime
-    /// of its own; `thread.spawn` stays refused — its vCPUs would run outside the freeze that
-    /// captures the child.
+    /// of its own, and a domain of its own, whose window's freeze word ends its waits (#1937);
+    /// `thread.spawn` stays refused — its vCPUs would run outside the freeze that captures the
+    /// child.
     DurableTask,
 }
 
@@ -6141,7 +6153,7 @@ fn compile_child_windowed(
     // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     shadow: temen_ir::durable_abi::ShadowArena,
     // How the child runs (see [`ChildRun`]): only a task has a fiber runtime of its own, and only a
-    // non-durable one a thread domain.
+    // non-durable one spawns threads.
     run: ChildRun,
 ) -> Result<CompiledModule, JitError> {
     let in_task = run != ChildRun::Inline;
@@ -6246,7 +6258,6 @@ fn compile_child_windowed(
     let thread_env = if futex_sched != 0 {
         let if_threads = |t: i64| if uses_threads { t } else { 0 };
         ThreadEnv {
-            sched_addr: futex_sched as i64,
             spawn_thunk: if_threads(os_thread_rt::thread_spawn as *const () as i64),
             join_thunk: if_threads(os_thread_rt::thread_join as *const () as i64),
             wait_thunk: os_thread_rt::thread_wait as *const () as i64,
@@ -6429,7 +6440,7 @@ fn compile_child_windowed(
     Ok(CompiledModule {
         // A §14 child's code is shared its own way — the nursery's per-carve cache — never through
         // `share`.
-        code_names_objects: true,
+        needs_runtime: true,
         fn_table,
         tramp_code: code,
         tramp_code_limited: code_limited,
@@ -6454,6 +6465,8 @@ fn compile_child_windowed(
             cap_ctx,
             epoch: epoch_addr as *const AtomicU64,
             fuel: fuel_addr as *mut u64,
+            // Its `thread.*` and futex sites run on the parent's domain (null when it has none).
+            sched: futex_sched as *const core::ffi::c_void,
             ..InstanceAddrs::NONE
         },
         fn_table_mask,
@@ -6885,7 +6898,7 @@ struct FiberEnv {
     resume_thunk: i64,
     /// I48 — the `cont.resume.block` thunk (`os_thread_rt::fiber_resume_block`): resume that idles
     /// the OS thread on a still-parked fiber instead of returning `FIBER_PARKED`. Takes the domain
-    /// pointer as its first arg (`lower.thread.sched_addr`), like the `thread.*` thunks.
+    /// pointer as its first arg (the instance's, [`vmctx::SCHED`]), like the `thread.*` thunks.
     block_resume_thunk: i64,
     suspend_thunk: i64,
     /// The `gc.roots` thunk (conservative root enumeration over the live fiber stacks). `0` when the
@@ -6911,12 +6924,13 @@ impl FiberEnv {
     }
 }
 
-/// The §12 thread scheduler address + the two thunk addresses, baked into `thread.spawn`/`thread.join`
-/// sites as constants. All `0` when the module uses no threads or the target has no stack-switch
-/// support (in which case `ensure_supported` has already rejected any thread op).
+/// The §12 `thread.*` and futex thunk addresses, baked into `thread.spawn`/`thread.join` and
+/// `atomic.wait`/`notify` sites as constants. The domain they run on is the instance's, which the
+/// sites load from its [`VmCtx`] ([`vmctx::SCHED`]). All `0` when no domain is stood up for the module:
+/// it uses no threads or futex, or the target has no stack-switch support (in which case
+/// `ensure_supported` has already rejected any thread op).
 #[derive(Clone, Copy)]
 struct ThreadEnv {
-    sched_addr: i64,
     spawn_thunk: i64,
     join_thunk: i64,
     wait_thunk: i64,
@@ -6926,7 +6940,6 @@ struct ThreadEnv {
 impl ThreadEnv {
     fn null() -> ThreadEnv {
         ThreadEnv {
-            sched_addr: 0,
             spawn_thunk: 0,
             join_thunk: 0,
             wait_thunk: 0,
@@ -6938,7 +6951,7 @@ impl ThreadEnv {
     /// `thread.spawn` would `call.dyn` through a null thunk. `enable_thread_hosting` clears this
     /// (CONSOLIDATION.md §11) — the twin of [`FiberEnv::is_null`] / `enable_fiber_hosting`.
     fn is_null(&self) -> bool {
-        self.sched_addr == 0
+        self.wait_thunk == 0
     }
 }
 
@@ -7799,7 +7812,7 @@ fn lower_block(
             let trap_out = b.use_var(lower.vmctx_var);
             let call = if blocking {
                 // fiber_resume_block(sched, handle, arg, status_out, trap_out) -> value:i64.
-                let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+                let sched = vmctx_load(b, lower, vmctx::SCHED);
                 let mut tsig = module.make_signature();
                 for t in [I64, I64, I64, I64, I64] {
                     tsig.params.push(AbiParam::new(t));
@@ -8011,7 +8024,7 @@ fn lower_block(
         // like `call.cap`. A thunk that sets the trap cell (forged handle, thread-bomb) propagates here.
         if let Inst::ThreadSpawn { func, sp, arg } = inst {
             // thread_spawn(sched, mem_base, fn_table_base, trap_out, func_idx:i32, sp:i64, arg:i64) -> i32
-            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let sched = vmctx_load(b, lower, vmctx::SCHED);
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
             let trap_out = b.use_var(lower.vmctx_var);
@@ -8046,7 +8059,7 @@ fn lower_block(
         }
         if let Inst::ThreadJoin { handle } = inst {
             // thread_join(sched, handle:i32, trap_out:i64) -> result:i64
-            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let sched = vmctx_load(b, lower, vmctx::SCHED);
             let h = get(&vals, *handle)?;
             let trap_out = b.use_var(lower.vmctx_var);
             let mut tsig = module.make_signature();
@@ -8074,7 +8087,7 @@ fn lower_block(
             let w = atomic_width(*ty);
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, w);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
-            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let sched = vmctx_load(b, lower, vmctx::SCHED);
             let exp_raw = get(&vals, *expected)?;
             let exp = if w < 8 {
                 b.ins().uextend(I64, exp_raw) // compare is bit-equality on the low `w` bytes
@@ -8102,7 +8115,7 @@ fn lower_block(
             // thread_notify(sched, phys:i64, count:i32) -> woken:i32. Accesses no memory (the address
             // is only confined, no alignment requirement — matching the interpreter).
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
-            let sched = b.ins().iconst(I64, lower.thread.sched_addr);
+            let sched = vmctx_load(b, lower, vmctx::SCHED);
             let cnt = get(&vals, *count)?;
             let mut tsig = module.make_signature();
             for t in [I64, I64, I32] {

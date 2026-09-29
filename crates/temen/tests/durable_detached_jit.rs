@@ -32,10 +32,15 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 ";
 
-/// Sums `0..100` with a back-edge poll per iteration — 4950 uninterrupted.
+/// Sums `0..100` with a back-edge poll per iteration — 4950 uninterrupted. The zero-length `unmap`
+/// through its `AddressSpace` (refused, its answer unused) is what gives the loop its poll: a function
+/// that cannot suspend gets none, and runs to its end under a freeze rather than unwinding (#1937).
 const CHILD: &str = "memory 17 shadow 16448 65536
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, va: i64) {
+  vas = i32.wrap_i64 va
+  vz = i64.const 0
+  vu = call.cap 5 1 (i64, i64) -> (i64) vas (vz, vz)
   v1 = i64.const 0
   v2 = i64.const 0
   br 1(v1, v2)

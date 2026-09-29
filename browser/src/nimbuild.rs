@@ -162,14 +162,15 @@ fn main() {
         .find(|n| n.starts_with(&format!("{dir}/nimcache/")) && n.ends_with(&out))
         .and_then(|n| b.posix.read_file(&n));
     eprintln!(
-        "status {} exit {} in {secs:.1} s, peak RSS {} MiB, {:?}, {} files seeded ({} from the library pack), {} leaf processes",
+        "status {} exit {} in {secs:.1} s, peak RSS {} MiB, {:?}, {} files seeded ({} from the library pack), {} leaf processes, {} parked calls resumed",
         b.status,
         b.exit_code,
         peak_rss_mib(),
         b.footprint,
         files.len(),
         lib.len(),
-        b.leaves
+        b.leaves,
+        b.resumes
     );
     let Some(built) = built else {
         eprint!(

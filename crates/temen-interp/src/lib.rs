@@ -9351,14 +9351,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let mem = v.mem.take();
                 if let Some(m) = mem.as_ref() {
                     m.commit_fresh_image(image_len.min(child_size), null_guard);
-                    let base = m.window.base();
-                    for d in data.iter() {
-                        if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                            for (k, &b) in d.bytes.iter().enumerate() {
-                                m.set_byte(base + d.offset + k as u64, b);
-                            }
-                        }
-                    }
+                    m.write_segments(m.window.base(), &data, child_size);
                 }
                 *v = VCpu::new(
                     funcs,
@@ -14245,15 +14238,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
                                 if let (Some(cm), Some(m)) = (&child_mod, mem.as_ref()) {
-                                    for d in cm.data.iter() {
-                                        if d.offset.saturating_add(d.bytes.len() as u64)
-                                            <= child_size
-                                        {
-                                            for (k, &b) in d.bytes.iter().enumerate() {
-                                                m.set_byte(abs_base + d.offset + k as u64, b);
-                                            }
-                                        }
-                                    }
+                                    m.write_segments(abs_base, &cm.data, child_size);
                                 }
                                 // Attenuated powerbox: the child gets, over its *own* window (a strict
                                 // subset of the parent's authority), an `Instantiator` (so it can
@@ -30751,22 +30736,16 @@ impl Mem {
         let base = self.window.base();
         let args_base = null_guard + EXEC_ARGS_BASE;
         let args_end = null_guard + EXEC_ARGS_END;
-        for off in 0..len.min(args_base) {
-            self.set_byte(base + off, 0);
-        }
-        for off in args_end.min(len)..len {
-            self.set_byte(base + off, 0);
-        }
+        self.zero_run(base, len.min(args_base));
+        let tail = args_end.min(len);
+        self.zero_run(base + tail, len - tail);
     }
 
     /// #1768 — write a committed personality exec's args blob at `module_args_base`, the region
     /// [`Self::commit_fresh_image`] preserves, so the new image's `_start` reads its own argv there.
     /// Only ever called once the exec is committed; the personality bounded the blob to the region.
     fn write_exec_args(&self, blob: &[u8]) {
-        let base = self.window.base() + temen_ir::module_args_base();
-        for (k, &b) in blob.iter().enumerate() {
-            self.set_byte(base + k as u64, b);
-        }
+        self.write_run(self.window.base() + temen_ir::module_args_base(), blob);
     }
 
     /// **Trap-confinement** (§4): bounds-check the `width`-byte access and reject any that leaves the
@@ -31578,6 +31557,41 @@ impl Mem {
                 .map_or(0, |r| r.read_byte(*region_off + idx as u64));
         }
         self.back.byte(off)
+    }
+
+    /// Write `bytes` at the backing-absolute `off`, as [`Self::set_byte`] would byte by byte: in one
+    /// copy when no §13 region is mapped, since then no page is `Backed` and every byte writes
+    /// through to `back` (the [`Self::seed`] fast path).
+    fn write_run(&self, off: u64, bytes: &[u8]) {
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.write_from(off, bytes);
+            return;
+        }
+        for (k, &b) in bytes.iter().enumerate() {
+            self.set_byte(off + k as u64, b);
+        }
+    }
+
+    /// Zero `len` bytes at the backing-absolute `off`, as [`Self::write_run`] writes.
+    fn zero_run(&self, off: u64, len: u64) {
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.zero(off, len);
+            return;
+        }
+        for k in 0..len {
+            self.set_byte(off + k, 0);
+        }
+    }
+
+    /// Materialize a module's data segments over the window whose image starts at the
+    /// backing-absolute `base`: each segment that lies in `[0, limit)`, the child's window. The one
+    /// route an `execve` and a §14 child write their data by, on both engines.
+    pub(crate) fn write_segments(&self, base: u64, data: &[temen_ir::Data], limit: u64) {
+        for d in data {
+            if d.offset.saturating_add(d.bytes.len() as u64) <= limit {
+                self.write_run(base + d.offset, &d.bytes);
+            }
+        }
     }
 
     fn set_byte(&self, off: u64, b: u8) {
