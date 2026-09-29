@@ -2476,6 +2476,118 @@ fn c_thread_local_debug_info_locates_the_root_copy() {
     assert_eq!(seg.bytes[at..at + 8], 100i64.to_le_bytes());
 }
 
+/// The line table keys each `debug.loc` to an instruction index, which chibicc counts as it emits.
+/// A zero-filled local's initializer (`ND_MEMZERO`) emitted each chunk's `const` and `store` from one
+/// emit call and was counted as one instruction, so every later row in the block landed a chunk-count
+/// early: a breakpoint on the line after `int nums[4] = {…};` stopped before its last element was
+/// stored. The line after the initializer must start after every store the initializer makes.
+#[test]
+fn c_the_line_after_an_initializer_starts_after_its_last_store() {
+    let ir = c_to_ir_g(
+        "int main(void) {\n\
+         \x20 int nums[4] = {0x41, 0x42, 0x43, 0x44};\n\
+         \x20 return nums[3];\n\
+         }\n",
+    );
+    let m = parse_module(&ir).expect("parse");
+    let dbg = m.debug_info.as_ref().expect("-g emits debug info");
+    let file = dbg
+        .files
+        .iter()
+        .position(|f| f.ends_with(".c"))
+        .expect("the source file is in the line table") as u32;
+    let row = |line: u32| {
+        dbg.locs
+            .iter()
+            .find(|l| l.file == file && l.line == line)
+            .unwrap_or_else(|| panic!("no debug.loc for line {line}:\n{ir}"))
+    };
+    let (init, ret) = (row(2), row(3));
+    assert_eq!(
+        (init.func, init.block),
+        (ret.func, ret.block),
+        "one block:\n{ir}"
+    );
+    let insts = &m.funcs[ret.func as usize].blocks[ret.block as usize].insts;
+    let last_store = insts
+        .iter()
+        .rposition(|i| matches!(i, temen_ir::Inst::Store { .. }))
+        .expect("the initializer stores");
+    assert!(
+        ret.inst as usize > last_store,
+        "line 3 starts at instruction {} but the initializer's last store is instruction {last_store}:\n{ir}",
+        ret.inst
+    );
+}
+
+/// A function that falls off its end stops on its closing `}` — the implicit return carries that
+/// line — so stepping over the last statement stays in the function, locals in view, before it
+/// returns (as gdb does), instead of landing in the caller.
+#[test]
+fn c_the_closing_brace_of_a_function_is_a_stop_line() {
+    let ir = c_to_ir_g(
+        "void set(int *p) {\n\
+         \x20 *p = 1;\n\
+         }\n\
+         int main(void) { int x; set(&x); return x; }\n",
+    );
+    let m = parse_module(&ir).expect("parse");
+    let dbg = m.debug_info.as_ref().expect("-g emits debug info");
+    let brace = dbg
+        .locs
+        .iter()
+        .find(|l| l.line == 3)
+        .unwrap_or_else(|| panic!("no debug.loc for the closing brace (line 3):\n{ir}"));
+    let block = &m.funcs[brace.func as usize].blocks[brace.block as usize];
+    assert_eq!(
+        brace.inst as usize,
+        block.insts.len(),
+        "the `}}` row is the implicit return (the terminator):\n{ir}"
+    );
+}
+
+/// chibicc's value names must follow definition order. The text parser numbers a block's values by
+/// position — its params, then each result in the order it is defined — while `debug.var` and SSA
+/// location lists name values by chibicc's own number, so an out-of-order name makes the debugger
+/// read the wrong value: integer negation defined `v9 = i32.const 0` before `v8 = i32.sub v9 v7`, and
+/// `int x = -1;` showed `x = 0`.
+#[test]
+fn c_value_names_follow_definition_order() {
+    let ir = c_to_ir_g(
+        "int neg(int a) { return -a; }\n\
+         int not_f(float f) { return !f; }\n\
+         int main(void) {\n\
+         \x20 int x = -1;\n\
+         \x20 long y = -(long)x;\n\
+         \x20 return neg(x) + not_f(0.0f) + (int)y + ~x;\n\
+         }\n",
+    );
+    let mut next = 0usize;
+    for line in ir.lines() {
+        let t = line.trim_start();
+        if let Some(params) = t.strip_prefix("block ") {
+            next = params.matches(": ").count(); // `block N (v0: i64, v1: i32) {`
+            continue;
+        }
+        let Some((lhs, _)) = t.split_once(" = ") else {
+            continue;
+        };
+        if !line.starts_with("  ") || !lhs.starts_with('v') {
+            continue;
+        }
+        for name in lhs.split(", ") {
+            assert_eq!(
+                name,
+                format!("v{next}"),
+                "value defined out of order in `{line}`:\n{ir}"
+            );
+            next += 1;
+        }
+    }
+    let m = parse_module(&ir).expect("parse");
+    assert!(m.debug_info.is_some(), "-g emits debug info");
+}
+
 /// What C forbids is refused with a diagnostic: a thread-local's address as a constant initializer
 /// (each thread has its own copy), a block-scope `_Thread_local` that is neither `static` nor
 /// `extern`, and an alignment the per-thread block cannot honor.

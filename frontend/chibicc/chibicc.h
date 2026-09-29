@@ -259,6 +259,7 @@ struct Node {
 
   // Block or statement expression
   Node *body;
+  Token *end_tok; // a block's closing `}` (the line a function's implicit return stops on)
 
   // Struct member access
   Member *member;
