@@ -504,7 +504,7 @@ impl SignalSource for Stopper {
 /// and parks stopped. (A fiber, not a thread: the stop would halt a sibling before it reached its
 /// wait.) Freeze-on-quiesce fires on the fiber's park, and the stopped root is brought through it:
 /// its write is abandoned, not performed. Continued and thawed, it re-issues the write (`1000 + 1`),
-/// and the byte reaches stdout only then. (A freeze-on-quiesce skips the census today, #1918.)
+/// and the byte reaches stdout only then.
 fn stopped(site: ParkSite) {
     let src = r#"
 memory 17

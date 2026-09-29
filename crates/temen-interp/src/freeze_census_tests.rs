@@ -46,7 +46,7 @@ impl Fixture {
     }
 
     fn census(&self, seat: &Seat) -> Option<DeclineCause> {
-        freeze_census(seat, &self.sched, &self.root).map(|d| d.cause)
+        freeze_census(Some(seat), &self.sched, &self.root).map(|d| d.cause)
     }
 
     /// A live detached child at slot 0, task 7 — with a doorbell when `bell`.
@@ -238,4 +238,77 @@ fn a_vcpu_parked_at_a_decline_site_declines() {
         .or_default()
         .push(Waiter::VCpu(parked_vcpu(&f, 6)));
     assert_eq!(f.census(&f.root_seat()), None, "a stream read re-issues");
+}
+
+/// A vCPU parked in an indefinite `atomic.wait`: the park that lets freeze-on-quiesce fire.
+fn park_on_futex(s: &mut Sched, f: &Fixture, id: TaskId) {
+    let mut v = parked_vcpu(f, id);
+    v.wait_indefinite = true;
+    s.wait_waiters
+        .entry(FutexKey::Anon(0, 64))
+        .or_default()
+        .push((0, Waiter::VCpu(v)));
+}
+
+/// #1918 — freeze-on-quiesce asks the census before it fires. With a reply park beside the futex
+/// park, it declines: the decline lands on the run root's powerbox, the arm is spent, and nothing is
+/// re-admitted or phased, so the run carries on as if it was never armed.
+#[test]
+fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    {
+        let mut s = rs.lock();
+        park_on_futex(&mut s, &f, 4);
+        s.ticket_waiters
+            .insert((1, 2), Waiter::VCpu(parked_vcpu(&f, 5)));
+        s.freeze_on_quiesce = Some(Arc::clone(&f.root));
+    }
+    let (s, acted) = freeze_step(rs, rs.lock());
+    assert!(acted);
+    assert!(s.freeze_on_quiesce.is_none(), "the one-shot arm is spent");
+    assert!(s.runnable.is_empty(), "nothing re-admitted");
+    assert!(
+        s.parked(ParkSite::Futex)
+            .iter()
+            .all(|v| v.dstate != STATE_UNWINDING),
+        "nothing phased"
+    );
+    drop(s);
+    assert_eq!(
+        f.root.lock_unpoisoned().take_freeze_declined(),
+        Some(FreezeDeclined {
+            cause: DeclineCause::Parked(ParkSite::Reply),
+            task: 5,
+            slot: None
+        })
+    );
+    // Declined, the run is left alone: the next idle look does not try again.
+    let (s, acted) = freeze_step(rs, rs.lock());
+    drop(s);
+    assert!(!acted);
+}
+
+/// And with nothing in the way, freeze-on-quiesce fires as before: the futex waiter is re-admitted
+/// under `UNWINDING`, and nothing is declined.
+#[test]
+fn a_freeze_on_quiesce_with_nothing_in_the_way_fires() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    {
+        let mut s = rs.lock();
+        park_on_futex(&mut s, &f, 4);
+        s.freeze_on_quiesce = Some(Arc::clone(&f.root));
+    }
+    let (s, acted) = freeze_step(rs, rs.lock());
+    assert!(acted);
+    assert!(s.freeze_on_quiesce.is_none());
+    assert_eq!(s.runnable.len(), 1, "the futex waiter is re-admitted");
+    assert!(s.runnable.iter().all(|v| v.dstate == STATE_UNWINDING));
+    drop(s);
+    assert_eq!(f.root.lock_unpoisoned().take_freeze_declined(), None);
 }
