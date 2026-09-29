@@ -1585,16 +1585,7 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
     let artifact = freeze(&inst, &win, &host).expect("a named memfs is freezable");
 
     let mut thost = Host::new();
-    thost.set_named_cap_registrar(Box::new(|name, state| {
-        (name == "vm_fs")
-            .then(|| temen_fs::MemFsHandle::from_state(state).ok())
-            .flatten()
-            .map(|fs| temen_interp::NamedCapGrant {
-                handler: temen_fs::vm_fs_handler(&fs),
-                fork: Some(temen_fs::vm_fs_fork(&fs)),
-                state: fs.cap_state(),
-            })
-    }));
+    thost.set_named_cap_registrar(Box::new(temen_fs::regrant_vm_fs));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `vm_fs`");
     // #1699 — the registrar re-granted the store's state with its handler, so the next capture
     // (a freeze, a moment) reads it as the first did.

@@ -1041,3 +1041,73 @@ fn the_split_form_records_and_seeks_like_the_self_driving_one() {
         "a hand-driven seek lands where the self-driving one does"
     );
 }
+
+/// A reactor over `vm_fs` (#1697): `_start` writes "hi" to a scratch file and rewinds it; each `tick`
+/// reads one byte and writes it to stdout.
+fn vm_fs_reactor() -> temen_ir::Module {
+    let stdout = temen_interp::Host::new().grant_powerbox_prefix(1 << 16)[0];
+    let src = format!(
+        r#"memory 16
+import 0 "vm_fs" (i64, i64, i64, i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  path = i64.const 40960
+  f = i64.const 102
+  i64.store path f
+  buf = i64.const 40968
+  hi = i64.const 26984
+  i64.store buf hi
+  op_open = i64.const 0
+  one = i64.const 1
+  flags = i64.const 19
+  z = i64.const 0
+  fd = call.import 0 (op_open, path, one, flags, z)
+  slot = i64.const 40976
+  i64.store slot fd
+  op_write = i64.const 2
+  two = i64.const 2
+  w = call.import 0 (op_write, fd, buf, two, z)
+  op_seek = i64.const 3
+  s = call.import 0 (op_seek, fd, z, z, z)
+  return z
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (sp: i64) {{
+  slot = i64.const 40976
+  fd = i64.load slot
+  op_read = i64.const 1
+  out = i64.const 40984
+  one = i64.const 1
+  z = i64.const 0
+  n = call.import 0 (op_read, fd, out, one, z)
+  h = i32.const {stdout}
+  w = call.cap 0 1 (i64, i64) -> (i64) h (out, one)
+  return z
+  }}
+}}
+export 0 func "_start" 0
+export 1 func "tick" 1
+"#
+    );
+    temen_text::parse_module(&src).expect("parse the vm_fs reactor")
+}
+
+/// The scratch file a guest wrote through `vm_fs` rides the artifact, cursor and all, and the on-ramp
+/// thaw re-grants `vm_fs` from it: the thawed guest reads on from where it left off (#1697).
+#[test]
+fn a_thawed_reactor_reads_on_from_its_vm_fs_file() {
+    let m = vm_fs_reactor();
+    let mut live = OnrampReactor::open(&m).expect("open the vm_fs reactor");
+    assert_eq!(live.frame(), (STATUS_OK, b"h".to_vec()));
+
+    let artifact = live.freeze(&m).expect("freeze a vm_fs reactor");
+    assert_eq!(live.frame(), (STATUS_OK, b"i".to_vec()));
+
+    let mut thawed = OnrampReactor::thaw(&artifact, &m, None).expect("thaw re-grants vm_fs");
+    assert_eq!(
+        thawed.frame(),
+        (STATUS_OK, b"i".to_vec()),
+        "the thawed guest reads the file it wrote, from its cursor"
+    );
+}
