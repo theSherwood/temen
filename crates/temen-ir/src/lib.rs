@@ -414,6 +414,13 @@ pub mod durable_abi {
     /// status completed before the cut and is delivered as it was.
     pub const WAIT_FROZEN: i32 = -1;
 
+    /// The status a `cont.resume` returns when its fiber **unwound for a freeze** rather than
+    /// suspending or returning (#1835). Like [`WAIT_FROZEN`] it is never observed: the resume's
+    /// trailing poll unwinds first. The durable transform spills a resume's `(status, value)`; its
+    /// thaw reloads them when the fiber returned (1), whose slot is free, and re-issues the resume
+    /// otherwise, so a suspended or frozen fiber rewinds.
+    pub const FIBER_FROZEN: i32 = -1;
+
     /// `svc.poll` / `svc.wait` op indices on the durable service interface (§13.4) — the two the
     /// quiesce-freeze arming (`ARM_QUIESCE_OFF`) keys on.
     pub const SVC_POLL_OP: u32 = 9;

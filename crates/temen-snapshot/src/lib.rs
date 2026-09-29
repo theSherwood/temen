@@ -231,7 +231,10 @@ use temen_ir::Module;
 /// that finished unjoined rides as a completed record (its `func`/`args`/`shadow_sp` inert zeros). The
 /// thaw seeds each handle at its slot instead of by push, so a slot joined before the freeze stays
 /// empty rather than shifting every later handle down.
-const FORMAT_VERSION: u16 = 33;
+/// v34 (#1835): a `cont.resume`'s shadow frame also carries the resume's `(status, value)`, which
+/// only the instrumented code reads: a thaw reloads them when the fiber returned, whose slot is free,
+/// instead of re-issuing the resume.
+const FORMAT_VERSION: u16 = 34;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.

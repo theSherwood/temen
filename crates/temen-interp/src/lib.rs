@@ -5050,6 +5050,7 @@ pub use temen_ir::Quota;
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
 const FIBER_RETURNED: i32 = 1;
+use temen_ir::durable_abi::FIBER_FROZEN;
 /// §3.6 slice 5a — the third `cont.resume` status (beside suspended/returned; `2` was the retired
 /// coroutine `CORO_FAULTED`, kept unassigned): the fiber hit an event park (`memory.wait`, a
 /// blocking read, a live-callee call) and was set aside — **the fiber parked, not the vCPU**
@@ -17157,7 +17158,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                     } else {
-                        frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
+                        // #1835: a fiber that unwound for the freeze did not return; its resumer
+                        // re-issues the resume on thaw.
+                        let status = if freezing {
+                            FIBER_FROZEN
+                        } else {
+                            FIBER_RETURNED
+                        };
+                        frames[rtop].vals.push(Reg::from_i32(status));
                         frames[rtop]
                             .vals
                             .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));

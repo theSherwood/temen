@@ -11151,13 +11151,27 @@ fn step_vcpu(
                     fibers.with(|f, _, _| f[id] = FiberState::Done);
                     // Fiber switch (returning fiber → its resumer): re-point the durable shadow-SP.
                     fibers.shadow_switch(ctx, vt, id, rid);
+                    // #1835: a fiber that unwound for the freeze (frames in its region) did not
+                    // return. This driver does not keep it as residue, so its resumer's re-issue on
+                    // thaw faults rather than reload a placeholder.
+                    let frozen = ctx.durable
+                        && ctx.mem.as_ref().is_some_and(|m| {
+                            m.durable_state() == super::STATE_UNWINDING
+                                && fibers.with(|_, sp, _| sp[id])
+                                    > m.shadow_arena().frame_base(id + 1)
+                        });
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
                     let tls = vt.active.tls;
                     vt.active = resumer;
                     vt.active.tls = tls;
                     vt.active_id = rid;
-                    vt.active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
+                    let status = if frozen {
+                        super::FIBER_FROZEN
+                    } else {
+                        super::FIBER_RETURNED
+                    };
+                    vt.active.set(rdst, Reg::from_i32(status));
                     vt.active.set(rdst + 1, Reg::from_value(retval));
                 }
             },
