@@ -122,7 +122,7 @@ const FIBER_STACK: usize = 1 << 18;
 // ---- Durable per-fiber shadow-stack layout (DURABILITY.md §12.8, D-fiber-cont option A) ----
 //
 // Placement has **one definition**: `temen_ir::durable_abi::ShadowArena` (#1503). On a **durable** run
-// context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)` — the root is context 0, a fiber in
+// context `i` owns `[arena.region_base(i), +arena.stride)` — the root is context 0, a fiber in
 // registry slot `s` is context `s+1` — and both backends call the same methods, so there is nothing
 // to keep in sync by hand (the cross-backend fiber freeze/thaw property still catches a *runtime*
 // divergence). §12.8 4A.5: each context's shadow-SP word is the
@@ -1859,10 +1859,7 @@ mod vcpu_ctx_tests {
     use temen_ir::durable_abi::ShadowArena;
 
     /// The arena these tests place contexts in: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-    const TEST_ARENA: ShadowArena = ShadowArena {
-        base: 16448,
-        end: 65536,
-    };
+    const TEST_ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 
     /// The highest context the allocator hands out — the arena's ceiling (every index up to it fits).
     fn top_ctx() -> usize {

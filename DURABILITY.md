@@ -1389,11 +1389,12 @@ including the §12.6 canonical re-serialize invariant). Remaining Phase-3 contro
 ### 12.7 Shadow-frame layout
 
 **Placement is the module's declaration (2026-09-16, #1503; INVARIANTS.md #16).** Where the
-per-context shadow regions sit is `Memory::shadow: Option<ShadowArena { base, end }>` — declared in the
-module (`memory N shadow BASE END` in text; the memory descriptor on the wire, module format v11) and
-held by `temen-verify` to the geometry every backend assumes: `base ≥ DURABLE_CONTROL_END` (the
-always-polled control words end at guard+64), 8-aligned, at least one `SHADOW_STRIDE` region and at
-most 64, `end ≤ window`, and **no data segment overlaps it** (the R9 "guest bytes never alias the
+per-context shadow regions sit is `Memory::shadow: Option<ShadowArena { base, end, stride }>` —
+declared in the module (`memory N shadow BASE END [stride S]` in text; the memory descriptor on the
+wire, module format v11, whose arena flag `2` adds a non-default stride) and held by `temen-verify` to
+the geometry every backend assumes: `base ≥ DURABLE_CONTROL_END` (the always-polled control words end
+at guard+64), 8-aligned, a power-of-two `stride ≥ DEFAULT_SHADOW_STRIDE` (4 KiB), at least one region
+and at most 64, `end ≤ window`, and **no data segment overlaps it** (the R9 "guest bytes never alias the
 arena" contract, now static). `temen_ir::durable_abi::ShadowArena` is the one implementation of the
 placement arithmetic (`region_base`/`region_fits`/`frame_base`/`thaw_state_off`/`ctx_of_sp`/
 `ctx_ceiling`); the transform's overflow guard bounds each push by the running context's own region (#1683), both interpreter tiers carry
@@ -2521,10 +2522,11 @@ each a small reviewable commit on the interpreter only:
    **distinct** regions (a host-fn probes the active shadow-SP from inside each context) and
    that a non-durable run leaves the reserve untouched. *Touched only `temen-interp` (the swap +
    region tracking) — the transform is unchanged.* The transform's shadow-overflow guard
-   bounds each push by the running context's own region `[region_base, +SHADOW_STRIDE)` (#1683;
-   it tripped at the arena `end` before, so a context recursed past `SHADOW_STRIDE` overwrote
-   its neighbour's frames). A deeper chain traps the freeze; sizing regions to the live
-   contexts instead of a fixed stride is still open.
+   bounds each push by the running context's own region `[region_base, +stride)` (#1683;
+   it tripped at the arena `end` before, so a context recursed past its region overwrote
+   its neighbour's frames). A deeper chain traps the freeze. The stride is the module's (#1872):
+   a module whose chains run deeper than the 4 KiB default declares wider regions, so a deep stack
+   costs arena space rather than the freeze.
 
 2. **[DONE] `Resume` thaw arm** (`cont.resume`, resumer side). Mirrors `SuspendKind::Propagated`'s
    re-issue, but emits `Inst::ContResume { k, arg }` (operands reloaded from the spilled slots —
@@ -2590,12 +2592,13 @@ each a small reviewable commit on the interpreter only:
 
 Then 3.2 (multi-vCPU) and 3.3 (JIT parity) as above. **Slice-1 sub-questions, now settled:**
 a fiber handle maps to its region by **dense slot index × stride** (`context i = slot+1`,
-base `SHADOW_BASE + i*SHADOW_STRIDE`); the resume chain depth needs **no explicit recording**
+base `arena.base + i*arena.stride`); the resume chain depth needs **no explicit recording**
 — each fiber's saved-SP is tracked independently (registry `shadow` table + the root's
-`root_shadow_sp`), so per-fiber rewind falls out. **Still open:** per-fiber shadow-stack
-*size* + quota accounting (slice 1 uses a provisional 4 KiB `SHADOW_STRIDE`, ~15 contexts).
-The overflow guard is per-region (#1683), so a chain deeper than one stride traps the freeze
-rather than corrupting a neighbour.
+`root_shadow_sp`), so per-fiber rewind falls out. **Sizing:** the module declares the region
+stride (#1872; 4 KiB by default, ~15 contexts in the test arena), and the overflow guard is
+per-region (#1683), so a chain deeper than its region traps the freeze rather than corrupting a
+neighbour. Regions are uniform: a context cannot borrow a sibling's unused space. **Still open:**
+quota accounting.
 
 ## 13. Durable serving domains — design map (2026-07-24)
 

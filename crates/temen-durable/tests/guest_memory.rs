@@ -16,10 +16,8 @@ use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 const SIZE_LOG2: u8 = 18; // 256 KiB window: 64 KiB reserve + ~192 KiB guest-usable
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -117,7 +115,7 @@ fn strict_path_rejects_the_same_memory_using_guest() {
 #[test]
 fn a_window_too_small_for_any_arena_is_refused() {
     // A 4 KiB window cannot hold a shadow arena at all — the verifier requires one to start at or
-    // above `DURABLE_CONTROL_END` (guard+64) and hold a whole `SHADOW_STRIDE` region — so such a
+    // above `DURABLE_CONTROL_END` (guard+64) and hold a whole `DEFAULT_SHADOW_STRIDE` region — so such a
     // module can only declare none, and a module that declares none is not freezable: the transform
     // fails closed rather than inventing a placement (INVARIANTS.md #16).
     let mut m = temen_text::parse_module(

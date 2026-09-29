@@ -12,10 +12,7 @@ use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Inst, Memory, Module, Terminator};
 
-const TEST_ARENA: ShadowArena = ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 

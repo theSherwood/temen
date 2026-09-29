@@ -10,10 +10,7 @@ use super::*;
 use temen_durable::{begin_thaw, init_durable_window, read_state, transform_module, write_state};
 use temen_ir::durable_abi::ShadowArena;
 
-const ARENA: ShadowArena = ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
 /// The parent: spawn the child detached (op 15, 7-arg form: budget, module, no grants, entry 0,

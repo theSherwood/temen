@@ -18,6 +18,9 @@
 //! Each case runs on every engine that can run it here — the interpreter, the JIT (native stack
 //! switching), and for fibers the bytecode engine — and each is thawed on the clock its freeze left
 //! behind (a re-issued read would move it on). Every engine must thaw to the uninterrupted answer.
+//!
+//! **Deep chains (#1872).** A context's unwound call chain must fit its shadow region. A module whose
+//! chains run deeper than the default region declares a wider stride, and freezes whole.
 
 use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module_assume_confined,
@@ -26,13 +29,12 @@ use temen_durable::{
 use temen_interp::{
     bytecode, run_capture_reserved_with_host, FrozenFiber, FrozenVCpu, Host, Value,
 };
+use temen_ir::durable_abi::{ShadowArena, DEFAULT_SHADOW_STRIDE};
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -285,15 +287,111 @@ block 0 (v0: i64, v1: i64) {
 }
 "#;
 
+/// #1872: a root and a fiber that each recurse [`DEPTH`] deep, eight `i64`s live across every call,
+/// so each context's unwound chain is about twice a default (4 KiB) region. The fiber reads the clock
+/// at the bottom, where a freeze from the start lands; both chains unwind whole. Its arena declares
+/// 16 KiB regions: root, the fiber, and one spare.
+const DEEP: &str = r#"
+memory 17 shadow 16448 65600 stride 16384
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  d = i64.const 100
+  h = i64.extend_i32_u v0
+  r = call 1 (d, h)
+  return r
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (n: i64, h: i64) {
+  c = i64.eqz n
+  br_if c 1(h) 2(n, h)
+}
+block 1 (h: i64) {
+  f = ref.func 2
+  sp = i64.const 4096
+  k = cont.new f sp
+  s, x = cont.resume k h
+  s64 = i64.extend_i32_u s
+  c10 = i64.const 10
+  t = i64.mul s64 c10
+  r = i64.add x t
+  return r
+}
+block 2 (n: i64, h: i64) {
+  k3 = i64.const 3
+  t1 = i64.mul n k3
+  t2 = i64.add t1 n
+  t3 = i64.mul t2 k3
+  t4 = i64.add t3 t1
+  t5 = i64.mul t4 k3
+  t6 = i64.add t5 t2
+  one = i64.const 1
+  m = i64.sub n one
+  r = call 1 (m, h)
+  s1 = i64.add r t1
+  s2 = i64.add s1 t2
+  s3 = i64.add s2 t3
+  s4 = i64.add s3 t4
+  s5 = i64.add s4 t5
+  s6 = i64.add s5 t6
+  return s6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  d = i64.const 100
+  r = call 3 (d, v1)
+  return r
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (n: i64, h: i64) {
+  c = i64.eqz n
+  br_if c 1(h) 2(n, h)
+}
+block 1 (h: i64) {
+  w = i32.wrap_i64 h
+  z = i32.const 0
+  c = call.cap 2 0 (i32) -> (i64) w (z)
+  return c
+}
+block 2 (n: i64, h: i64) {
+  k3 = i64.const 3
+  t1 = i64.mul n k3
+  t2 = i64.add t1 n
+  t3 = i64.mul t2 k3
+  t4 = i64.add t3 t1
+  t5 = i64.mul t4 k3
+  t6 = i64.add t5 t2
+  one = i64.const 1
+  m = i64.sub n one
+  r = call 3 (m, h)
+  s1 = i64.add r t1
+  s2 = i64.add s1 t2
+  s3 = i64.add s2 t3
+  s4 = i64.add s3 t4
+  s5 = i64.add s4 t5
+  s6 = i64.add s5 t6
+  return s6
+  }
+}
+"#;
+
+/// Parse and instrument `src`. A source without a `memory` line declares [`TEST_ARENA`].
 fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
-    m.memory = Some(Memory {
+    m.memory.get_or_insert(Memory {
         size_log2: SIZE_LOG2,
         shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR verifies");
     inst
+}
+
+/// The shadow arena `inst` declares.
+fn arena(inst: &Module) -> ShadowArena {
+    inst.memory.and_then(|m| m.shadow).expect("a shadow arena")
 }
 
 /// The residue a freeze records and a thaw re-seeds, in the interpreter's types.
@@ -408,7 +506,7 @@ mod jit {
                 ..Default::default()
             },
             None => DurableResidue {
-                root_sp: Some(TEST_ARENA.region_base(0)),
+                root_sp: Some(arena(inst).region_base(0)),
                 ..Default::default()
             },
         };
@@ -515,7 +613,7 @@ fn freeze_thaw(engines: &[Engine], src: &str, arm: fn(&mut [u8])) -> Vec<(Engine
     let inst = instrument(src);
     let mut out = Vec::new();
     for &engine in engines {
-        let fresh = init_durable_window(WINDOW, TEST_ARENA);
+        let fresh = init_durable_window(WINDOW, arena(&inst));
         let Some(whole) = run(engine, &inst, &fresh, 42, None) else {
             continue;
         };
@@ -531,7 +629,7 @@ fn freeze_thaw(engines: &[Engine], src: &str, arm: fn(&mut [u8])) -> Vec<(Engine
         );
 
         let mut win = frozen.window;
-        begin_thaw(&mut win, TEST_ARENA, 0);
+        begin_thaw(&mut win, arena(&inst), 0);
         let thawed =
             run(engine, &inst, &win, frozen.clock, Some(&frozen.residue)).expect("ran the freeze");
         assert_eq!(thawed.result, whole.result, "{engine:?}: thaw");
@@ -640,4 +738,42 @@ fn a_resume_whose_fiber_returned_reloads_its_result() {
 #[test]
 fn a_resume_whose_fiber_unwound_is_re_issued() {
     freeze_thaw(ARMED_ENGINES, UNWINDS, |w| write_state(w, STATE_UNWINDING));
+}
+
+/// #1872: each context's chain is deeper than a default region, so with 4 KiB regions the freeze
+/// traps (#1683: it would otherwise write the next context's frames). The module that declares
+/// 16 KiB regions freezes both chains whole and thaws to the uninterrupted answer. The thaw runs on
+/// the engines that keep a fiber which unwinds mid-resume; the bytecode engine drops it (#1873).
+#[test]
+fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
+    let narrow = DEEP.replace(" stride 16384", "").replace("65600", "65536");
+    let inst = instrument(&narrow);
+    assert_eq!(
+        arena(&inst).stride,
+        temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE
+    );
+    for &engine in ALL_ENGINES {
+        let mut win = init_durable_window(WINDOW, arena(&inst));
+        write_state(&mut win, STATE_UNWINDING);
+        if let Some(frozen) = run(engine, &inst, &win, 42, None) {
+            assert!(frozen.result.is_err(), "{engine:?}: {:?}", frozen.result);
+        }
+    }
+
+    let a = arena(&instrument(DEEP));
+    for (engine, r) in freeze_thaw(ARMED_ENGINES, DEEP, |w| write_state(w, STATE_UNWINDING)) {
+        // Both chains unwound whole, each past what a default region holds.
+        let depth = |sp: u64, ctx: usize| sp - a.frame_base(ctx);
+        let fiber = r
+            .fibers
+            .iter()
+            .find(|f| !f.is_free())
+            .expect("the fiber rides");
+        assert!(
+            depth(fiber.shadow_sp, 1) > DEFAULT_SHADOW_STRIDE,
+            "{engine:?}: fiber"
+        );
+        let root = r.root_sp.expect("the root rides");
+        assert!(depth(root, 0) > DEFAULT_SHADOW_STRIDE, "{engine:?}: root");
+    }
 }

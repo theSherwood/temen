@@ -16,10 +16,8 @@
 //!   4. thawing the bytecode artifact (REWINDING) reproduces the uninterrupted result and ends NORMAL.
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,

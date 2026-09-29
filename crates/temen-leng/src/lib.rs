@@ -781,11 +781,11 @@ const SHADOW_CONTEXTS: u64 = 16;
 /// the heap floor [`temen_ir::link`] sized it for ([`temen_ir::POWERBOX_HEAP_RESERVE`]).
 fn place_shadow_arena(m: &mut Module) {
     let base = temen_ir::powerbox_entry_sp(m) + temen_ir::POWERBOX_STACK_RESERVE;
-    let end = base + SHADOW_CONTEXTS * temen_ir::durable_abi::SHADOW_STRIDE;
+    let end = base + SHADOW_CONTEXTS * temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
     let Some(mem) = m.memory.as_mut() else { return };
     let need = end + temen_ir::POWERBOX_HEAP_RESERVE;
     mem.size_log2 = mem.size_log2.max((64 - (need - 1).leading_zeros()) as u8);
-    mem.shadow = Some(temen_ir::durable_abi::ShadowArena { base, end });
+    mem.shadow = Some(temen_ir::durable_abi::ShadowArena::new(base, end));
 }
 
 /// Seed the guest **heap bump-pointer words** into a linked powerbox module's data image:

@@ -21,7 +21,9 @@ use temen_durable::{
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, BoundImport, Host, MemLayout, StreamRole,
 };
-use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, MAX_SHADOW_CONTEXTS, SHADOW_STRIDE};
+use temen_ir::durable_abi::{
+    ShadowArena, DEFAULT_SHADOW_STRIDE, DURABLE_CONTROL_END, MAX_SHADOW_CONTEXTS,
+};
 use temen_ir::Module;
 
 /// The probe's five lines, the uninterrupted run's stdout.
@@ -92,7 +94,7 @@ fn the_flag_declares_a_verified_arena_clear_of_the_guest_image() {
     );
     assert_eq!(a.base % 8, 0, "arena base must be 8-aligned");
     assert_eq!(a.contexts(), 4, "four regions were asked for");
-    assert_eq!(a.size(), 4 * SHADOW_STRIDE);
+    assert_eq!(a.size(), 4 * DEFAULT_SHADOW_STRIDE);
     assert!(
         a.end <= win,
         "arena [{:#x}, {:#x}) outside the window {win:#x}",
@@ -195,6 +197,34 @@ fn the_context_count_is_range_checked() {
         );
     }
     translated(Some(MAX_SHADOW_CONTEXTS as u32)).expect("the cap itself is accepted");
+}
+
+/// `--shadow-region` (#1872) widens each region: the declared arena holds the same contexts at the
+/// wider stride, and a stride the verifier would refuse is refused where it is declared.
+#[test]
+fn the_region_stride_is_declared_and_range_checked() {
+    let with = |stride: u64| {
+        temen_llvm::translate_ll_path_with_options(
+            PROBE,
+            temen_llvm::TranslateOptions {
+                shadow_contexts: Some(4),
+                shadow_stride: stride,
+                ..Default::default()
+            },
+        )
+        .map(|t| t.module)
+    };
+    let wide = with(8 * DEFAULT_SHADOW_STRIDE).expect("translate");
+    temen_verify::verify_module(&wide).expect("a wide-region guest verifies");
+    let a = arena_of(&wide);
+    assert_eq!(a.stride, 8 * DEFAULT_SHADOW_STRIDE);
+    assert_eq!(a.contexts(), 4);
+    for bad in [DEFAULT_SHADOW_STRIDE / 2, DEFAULT_SHADOW_STRIDE + 8] {
+        assert!(
+            matches!(with(bad), Err(temen_llvm::Error::Unsupported(_))),
+            "a {bad}-byte region must be refused at translate time"
+        );
+    }
 }
 
 /// The engines a durable translated guest runs on. `jit_cap_run` is the Cranelift tier; the
