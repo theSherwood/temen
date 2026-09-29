@@ -612,8 +612,8 @@ mod jit {
 
 /// Freeze `src` on each of `engines` (`arm` sets the trigger), then thaw it on the same engine with
 /// the clock where the freeze left it. Every engine that runs here must thaw to its own uninterrupted
-/// answer; returns each one's freeze residue.
-fn freeze_thaw(engines: &[Engine], src: &str, arm: fn(&mut [u8])) -> Vec<(Engine, Residue)> {
+/// answer; returns each one's freeze run (its window and residue).
+fn freeze_thaw(engines: &[Engine], src: &str, arm: fn(&mut [u8])) -> Vec<(Engine, Ran)> {
     let inst = instrument(src);
     let mut out = Vec::new();
     for &engine in engines {
@@ -632,12 +632,12 @@ fn freeze_thaw(engines: &[Engine], src: &str, arm: fn(&mut [u8])) -> Vec<(Engine
             frozen.result
         );
 
-        let mut win = frozen.window;
+        let mut win = frozen.window.clone();
         begin_thaw(&mut win, arena(&inst), 0);
         let thawed =
             run(engine, &inst, &win, frozen.clock, Some(&frozen.residue)).expect("ran the freeze");
         assert_eq!(thawed.result, whole.result, "{engine:?}: thaw");
-        out.push((engine, frozen.residue));
+        out.push((engine, frozen));
     }
     out
 }
@@ -660,7 +660,7 @@ fn threads(r: &Residue) -> Vec<(usize, usize, Option<i64>)> {
 
 fn check_threads(root: &str, arm: fn(&mut [u8]), want: &[(usize, usize, Option<i64>)]) {
     for (engine, r) in freeze_thaw(ARMED_ENGINES, &format!("{root}{THREADS}"), arm) {
-        assert_eq!(threads(&r), want, "{engine:?}: residue");
+        assert_eq!(threads(&r.residue), want, "{engine:?}: residue");
     }
 }
 
@@ -695,6 +695,7 @@ fn a_fresh_fiber_and_a_free_slot_keep_their_places() {
     let fresh = TEST_ARENA.frame_base(2);
     for (engine, r) in freeze_thaw(ARMED_ENGINES, FIBERS, |w| arm_freeze_after(w, 4)) {
         let mut fibers: Vec<_> = r
+            .residue
             .fibers
             .iter()
             .map(|f| (f.slot, f.is_free(), f.shadow_sp == fresh, f.generation))
@@ -719,6 +720,7 @@ fn fresh_fibers_start_from_their_entries() {
     let frame_base = |slot| TEST_ARENA.frame_base(slot + 1);
     for (engine, r) in freeze_thaw(ALL_ENGINES, FRESH, |w| write_state(w, STATE_UNWINDING)) {
         let mut fibers: Vec<_> = r
+            .residue
             .fibers
             .iter()
             .map(|f| (f.slot, f.shadow_sp == frame_base(f.slot)))
@@ -747,8 +749,7 @@ fn a_resume_whose_fiber_unwound_is_re_issued() {
 
 /// #1872: each context's chain is deeper than a default region, so with 4 KiB regions the freeze
 /// traps (#1683: it would otherwise write the next context's frames). The module that declares
-/// 16 KiB regions freezes both chains whole and thaws to the uninterrupted answer. The thaw runs on
-/// the engines that keep a fiber which unwinds mid-resume; the bytecode engine drops it (#1873).
+/// 16 KiB regions freezes both chains whole and thaws to the uninterrupted answer, on every engine.
 #[test]
 fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
     let narrow = DEEP.replace(" stride 16384", "").replace("65600", "65536");
@@ -766,10 +767,11 @@ fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
     }
 
     let a = arena(&instrument(DEEP));
-    for (engine, r) in freeze_thaw(ARMED_ENGINES, DEEP, |w| write_state(w, STATE_UNWINDING)) {
+    for (engine, r) in freeze_thaw(ALL_ENGINES, DEEP, |w| write_state(w, STATE_UNWINDING)) {
         // Both chains unwound whole, each past what a default region holds.
         let depth = |sp: u64, ctx: usize| sp - a.frame_base(ctx);
         let fiber = r
+            .residue
             .fibers
             .iter()
             .find(|f| !f.is_free())
@@ -778,7 +780,11 @@ fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
             depth(fiber.shadow_sp, 1) > DEFAULT_SHADOW_STRIDE,
             "{engine:?}: fiber"
         );
-        let root = r.root_sp.expect("the root rides");
+        // A single-vCPU freeze records no root extent: it is the root region's SP word.
+        let root = r.residue.root_sp.unwrap_or_else(|| {
+            let at = a.region_base(0) as usize;
+            u64::from_le_bytes(r.window[at..at + 8].try_into().unwrap())
+        });
         assert!(depth(root, 0) > DEFAULT_SHADOW_STRIDE, "{engine:?}: root");
     }
 }
