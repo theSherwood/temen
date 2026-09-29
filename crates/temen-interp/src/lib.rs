@@ -8672,8 +8672,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // *also* releases its read ends — a consumer that exits (e.g. `head`) drops the reader
                 // count, so a parked upstream producer wakes to `-EPIPE` rather than hang forever.
                 // A vCPU that unwound for a freeze has not exited (#1672): its ends stay open for the
-                // cut, or a reader elsewhere in the tree would see a false EOF mid-freeze.
-                let (pipe_eofs, pipe_epipes) = if froze {
+                // cut, or a reader elsewhere in the tree would see a false EOF mid-freeze. Nor has a
+                // domain whose *thread* finished (#1917): a `thread.spawn` child shares its domain's
+                // powerbox and so its pipe ends, and a thread's exit closes nothing. The domain's main
+                // vCPU finishing ends the domain, and releases them.
+                let (pipe_eofs, pipe_epipes) = if froze || v.spawn_residue.is_some() {
                     (Vec::new(), Vec::new())
                 } else {
                     v.host.lock_unpoisoned().release_pipe_ends()
@@ -11501,10 +11504,11 @@ struct VCpu {
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
-    /// `Some` on a **spawned** (`thread.spawn`) vCPU: its `(entry, [sp, arg], join slot)`, retained so
-    /// that when it unwinds under a freeze it can emit its [`FrozenVCpu`] residue (its frames are gone
-    /// by then), or, finishing unjoined, its completed residue (#1685).
-    /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
+    /// `Some` on a **spawned** (`thread.spawn`) vCPU, durable or not: its `(entry, [sp, arg], join
+    /// slot)`, retained so that when it unwinds under a freeze it can emit its [`FrozenVCpu`] residue
+    /// (its frames are gone by then), or, finishing unjoined, its completed residue (#1685). Its
+    /// presence is also what marks a vCPU as a thread of its domain, not the domain's main vCPU
+    /// (#1917). `None` on a domain's main vCPU, whose entry/args the thaw caller supplies.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>, usize)>,
     /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at

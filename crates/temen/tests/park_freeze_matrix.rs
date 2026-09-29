@@ -370,9 +370,7 @@ block 2 (va2: i64) {{
 
 /// A pipe write — the root fills the pipe (its capacity is the guest's whole 64 KiB) and then
 /// writes one more byte, which parks until the sibling drains it after its loop: `1000·1 + 7`, the
-/// second write's count. The sibling then waits for the root's write to finish before it returns:
-/// a thread's exit releases its whole domain's pipe ends (#1917), which would otherwise answer the
-/// write `-EPIPE`.
+/// second write's count.
 fn pipe_write(site: ParkSite) {
     let src = format!(
         r#"
@@ -387,10 +385,6 @@ block 0 (vr: i32, vw: i32) {{
   vfill = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vcap)
   vone = i64.const 1
   vn = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vone)
-  vdone = i64.const 66000
-  vset = i32.const 1
-  i32.atomic.store vdone vset
-  vwoke = atomic.notify vdone vset
   vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
@@ -405,10 +399,6 @@ block 2 (va2: i64) {{
   vbuf = i64.const 65536
   vcap = i64.const 65536
   vn = call.cap 0 0 (i64, i64) -> (i64) vrd (vbuf, vcap)
-  vdone = i64.const 66000
-  vexp = i32.const 0
-  vinf = i64.const -1
-  vst = i32.atomic.wait vdone vexp vinf
   vr = i64.const 7
   return vr
   }}
