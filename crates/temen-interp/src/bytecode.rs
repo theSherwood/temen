@@ -6354,6 +6354,27 @@ pub enum ScheduledWrite {
     },
 }
 
+/// Write a debugger edit into the window, journaling its pre-image at `turn` first. An edit is not an
+/// op, so [`journal_op`] never sees it; without this an `undo_to` past the edit left the edited bytes
+/// in place wherever the guest had not itself stored since (#1871). Journaled before the op at
+/// `turn` records its own pre-images, so undo — newest-first — unwinds the op, then the edit.
+fn journaled_write(
+    journal: &mut super::journal::Journal,
+    turn: u64,
+    m: &mut Mem,
+    addr: u64,
+    bytes: &[u8],
+) -> bool {
+    let Ok(width) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    let Ok(abs) = m.confine_checked(addr, 0, width) else {
+        return false;
+    };
+    journal.record_write(turn, abs, width, m);
+    m.write_bytes(addr, bytes).is_some()
+}
+
 /// Coerce + store `value` into the typed regs slot / window target. Best-effort like the live
 /// write: an unresolvable or float target is skipped.
 fn apply_target(
@@ -6362,6 +6383,8 @@ fn apply_target(
     width: usize,
     vm_regs: &mut [Reg],
     mem: &mut Option<Mem>,
+    journal: &mut super::journal::Journal,
+    turn: u64,
 ) {
     match target {
         Some(WriteTarget::Ssa { reg, ty }) => {
@@ -6377,7 +6400,7 @@ fn apply_target(
         Some(WriteTarget::Win { addr }) => {
             let w = width.clamp(1, 8);
             if let Some(m) = mem.as_mut() {
-                let _ = m.write_bytes(addr, &value.to_le_bytes()[..w]);
+                journaled_write(journal, turn, m, addr, &value.to_le_bytes()[..w]);
             }
         }
         None => {}
@@ -6398,6 +6421,7 @@ fn apply_due_writes(
     debug: Option<&DebugInfo>,
     fn_block_base: &[Vec<u32>],
     fn_block_types: &[Vec<Vec<ValType>>],
+    journal: &mut super::journal::Journal,
 ) {
     while *cursor < writes.len() && writes[*cursor].0 < turn {
         *cursor += 1;
@@ -6406,7 +6430,7 @@ fn apply_due_writes(
         match &writes[*cursor].1 {
             ScheduledWrite::Window { addr, bytes } => {
                 if let Some(m) = mem.as_mut() {
-                    let _ = m.write_bytes(*addr, bytes);
+                    journaled_write(journal, turn, m, *addr, bytes);
                 }
             }
             ScheduledWrite::Var {
@@ -6429,7 +6453,15 @@ fn apply_due_writes(
                             finished: matches!(t.state, DbgTaskState::Done(Ok(_))),
                         }
                         .write_target(*frame, name);
-                        apply_target(target, *value, *width, &mut t.vt.active.regs, mem);
+                        apply_target(
+                            target,
+                            *value,
+                            *width,
+                            &mut t.vt.active.regs,
+                            mem,
+                            journal,
+                            turn,
+                        );
                     }
                 }
             }
@@ -8646,6 +8678,7 @@ impl ScheduledDebugRun {
                 debug.as_ref(),
                 fn_block_base,
                 fn_block_types,
+                journal,
             );
             if let Some(sink) = access_sink.as_mut() {
                 let cur_vm = tasks[ti].vt.debug_active();
@@ -8791,6 +8824,7 @@ impl ScheduledDebugRun {
             debug.as_ref(),
             fn_block_base,
             fn_block_types,
+            journal,
         );
         if let Some(sink) = access_sink.as_mut() {
             let cur_vm = tasks[ti].vt.debug_active();
@@ -9259,10 +9293,10 @@ impl ScheduledDebugRun {
     /// **Write bytes into the shared guest window** (slice 8, the DAP `writeMemory` backend). `false`
     /// if the range is unmapped or the module has no memory.
     pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        let turn = self.turn;
         self.mem
             .as_mut()
-            .and_then(|m| m.write_bytes(addr, bytes))
-            .is_some()
+            .is_some_and(|m| journaled_write(&mut self.journal, turn, m, addr, bytes))
     }
 
     /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's

@@ -122,6 +122,47 @@ fn window_write_survives_seek_and_predates_nothing() {
     );
 }
 
+/// **Stepping back past a window write undoes it** (#1871): `step_back` rewinds through the undo
+/// journal, which restores window bytes from the pre-images it holds. A debugger write is not an op,
+/// so it used to leave none, and the rewind left the written bytes in place wherever the guest had
+/// not stored since. Break before the load, write the untouched cell, step back — served by undo, not
+/// a replay — and the cell reads its original zeros; step forward and the write is re-applied.
+#[test]
+fn step_back_undoes_a_window_write() {
+    let mut b = backend(LOAD_CELL, &[]);
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 1,
+    };
+    Debuggee::set_breakpoint(&mut b, bp);
+    let Stop::Break { .. } = Debuggee::run_until_stop(&mut b) else {
+        panic!("expected the pre-load breakpoint");
+    };
+    assert!(
+        Debuggee::write_window(&mut b, 16392, &42i64.to_le_bytes()),
+        "the write lands"
+    );
+    let _ = Debuggee::step_back(&mut b);
+    assert_eq!(
+        b.backward_counts(),
+        (1, 0),
+        "the step back is served by undo"
+    );
+    assert_eq!(
+        Debuggee::read_window(&b, 16392, 8).expect("readable"),
+        vec![0u8; 8],
+        "stepping back past the write shows the original zeros"
+    );
+    Debuggee::clear_breakpoint(&mut b, bp);
+    assert_eq!(
+        finish(&mut b),
+        vec![Value::I64(42)],
+        "passing the write's clock again re-applies it"
+    );
+}
+
 /// Two workers each `mem[16384] += 1` (counter cell shifted above the #1094 NULL guard); the root
 /// joins both and returns the count — the threaded twin.
 const RACY_COUNTER: &str = r#"
