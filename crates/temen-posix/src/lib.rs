@@ -2073,8 +2073,49 @@ pub fn bind_with_fork(
 /// proc-only lock, never the world — see [`World`]'s lock order) and returns the next deliverable
 /// handler, keeping POSIX signal *policy* (dispositions, mask, pending) inside this personality
 /// while the interp only performs the *mechanism* (the safepoint redirect, invariant 4). #863: one
-/// door per process — a fork twin's door locks the twin's `Proc`, so its signals are its own.
-struct SignalDoor(Arc<Mutex<Proc>>);
+/// door per process — a fork twin's door locks the twin's `Proc`, so its signals are its own. It holds
+/// the shared [`World`] too, which only [`SignalSource::import_parks`] reads — at an exec, where no
+/// personality lock is held, taking the world before the process as every op does (#1896).
+struct SignalDoor(Arc<Mutex<Proc>>, Arc<Mutex<World>>);
+
+/// #1896 — the ops that never park a process, whatever it holds: the file, directory, environment
+/// and identity ops. [`SignalDoor::import_parks`] answers `read`/`write` by what the process holds,
+/// and every op not here — a `fork`, a `wait`, a pipe, a signal, job control, a terminal — may park.
+const NEVER_PARKS: &[u32] = &[
+    OP_MALLOC,
+    OP_FREE,
+    OP_EXIT,
+    OP_OPEN,
+    OP_CLOSE,
+    OP_LSEEK,
+    OP_UNLINK,
+    OP_GETCWD,
+    OP_CHDIR,
+    OP_GETENV,
+    OP_SETENV,
+    OP_STAT,
+    OP_OPENDIR,
+    OP_READDIR,
+    OP_CLOSEDIR,
+    OP_ARGC,
+    OP_ARGV,
+    OP_DUP2,
+    OP_DUP,
+    OP_FCNTL,
+    OP_CLOCK,
+    OP_GETENV_R,
+    OP_UNSETENV,
+    OP_ENVIRON,
+    OP_MKDIR,
+    OP_RENAME,
+    OP_RMDIR,
+    OP_GETPID,
+    OP_GETPGID,
+    OP_ISATTY,
+    OP_GETPPID,
+    OP_FSTAT,
+    OP_STATP,
+];
 
 impl SignalSource for SignalDoor {
     fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
@@ -2186,6 +2227,29 @@ impl SignalSource for SignalDoor {
             .clone()
     }
 
+    /// #1896 — whether this personality's op `import` can park the process. The ops in
+    /// [`NEVER_PARKS`] never do; a `read` or `write` does when the process holds something it could
+    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. `None` for an
+    /// import that is not this personality's.
+    fn import_parks(&self, import: &str) -> Option<bool> {
+        let op = resolve_import(import)?.op;
+        if op != OP_READ && op != OP_WRITE {
+            return Some(!NEVER_PARKS.contains(&op));
+        }
+        let terminal = self
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .is_some();
+        let p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Some(p.fds.iter().flatten().any(|f| match f {
+            FdEntry::File(_) => false,
+            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => terminal,
+            _ => true,
+        }))
+    }
+
     /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
     /// interrupt want the blocking call restarted?
     fn syscall_restart(&self) -> bool {
@@ -2292,7 +2356,10 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         .unwrap_or_else(|e| e.into_inner())
         .sig_armed
         .clone();
-    host.set_signal_source(Arc::new(SignalDoor(Arc::clone(&root))), armed);
+    host.set_signal_source(
+        Arc::new(SignalDoor(Arc::clone(&root), Arc::clone(&world))),
+        armed,
+    );
     // FORK.md PR 5 / #863 — grant **forkable**: the factory clones the per-process side by POSIX's
     // rules ([`Proc::fork`]) and shares the [`World`], so a `fork()` twin gets its own fd table /
     // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
@@ -2469,7 +2536,10 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
-            signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
+            signal: Some((
+                Arc::new(SignalDoor(Arc::clone(&child), Arc::clone(&world))),
+                armed,
+            )),
             refork: Some(fork_factory(Arc::clone(&world), Arc::clone(&child))),
             exit: Some(exit),
             exec_remap: Some(exec_remap_hook(child)),
@@ -2545,7 +2615,13 @@ pub fn cap_signal_source(
         .unwrap_or_else(|e| e.into_inner())
         .sig_armed
         .clone();
-    (Arc::new(SignalDoor(Arc::clone(&posix.root))), armed)
+    (
+        Arc::new(SignalDoor(
+            Arc::clone(&posix.root),
+            Arc::clone(&posix.world),
+        )),
+        armed,
+    )
 }
 
 /// The #972 **exec-remap hook** over an existing personality's root process (see

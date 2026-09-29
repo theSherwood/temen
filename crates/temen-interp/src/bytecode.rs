@@ -3132,17 +3132,17 @@ impl SharedProgram {
             None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
                 let info = m.map_info();
-                let reserved = info.2;
                 // The committed **scalar extent** — not `map_info`'s `window.mapped()`, which counts
                 // only the demand-committed prefix and misses a `vm_map`-grown tail (the pages live in
                 // the page map). `scalar_extent` folds the contiguous grown tail into the high-water so
                 // a cross-tier driver can re-sync the emitted `"mapped"` bound to admit a store into the
-                // grown page (#1153). It is `None` for a non-representable layout (an `Ro`/`Unmapped`
-                // hole, or `Rw` past a hole) — the single live bound can't model that, so fall back to
-                // the reservation (the whole owned backing, as the pre-#1153 flat pre-size did): reads
-                // of a self-`protect`ed rodata page still admit, and the interpreter page map (returned
-                // in `entries`, re-seeded next bounce) keeps per-page state authoritative on that tier.
-                let mapped = m.scalar_extent().unwrap_or(reserved);
+                // grown page (#1153). It is `None` for a layout one bound cannot describe over this
+                // backing (an `Ro`/`Unmapped` hole, `Rw` past a hole, or pages committed past a fixed
+                // backing): then `0`, which admits nothing, so the emitted run's next access faults and
+                // the driver declines to the interpreter. (#1919: this fell back to the reservation — the
+                // whole backing while the backing was pre-sized to it, before #1153; since, 2^40 bytes
+                // of the embedder's memory past a backing that holds far less.)
+                let mapped = m.scalar_extent().unwrap_or(0);
                 if info.3.iter().any(|&(_, kind)| kind == 3) {
                     (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed
                 } else {
@@ -4320,6 +4320,13 @@ impl<'p> Vcpu<'p> {
     /// reachable through a cross-tier leaf). `None` for a memory-less module.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
+    }
+
+    /// The bytes this vCPU's window backing holds, window-relative ([`Mem::win_flat_len`]): the
+    /// `backed` a page-checked driver passes to [`build_pagestate_table`], past which no emitted
+    /// access may be admitted. `0` for a memory-less module.
+    pub fn win_flat_len(&self) -> u64 {
+        self.mem.as_ref().map_or(0, |m| m.win_flat_len())
     }
 
     /// The entry's initial arguments (see [`entry_args`](Self::entry_args) on the struct) — a §14
@@ -5774,7 +5781,10 @@ pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
 
 /// Build the #750 paged-driver **page-state table** from a window's [`MemMapInfo`]: one byte per
 /// page over `[0, coverage)` — `0 = Unmapped`, `1 = Rw`, `2 = Ro` (the emitted check's encoding) —
-/// where `coverage` (also returned) is `max(mapped prefix, highest explicit entry end)` in bytes.
+/// where `coverage` (also returned) is `max(mapped prefix, highest explicit entry end)` in bytes,
+/// cut at `backed`, the bytes the window's backing holds ([`Vcpu::win_flat_len`],
+/// [`CoopRun::pending_win`]): the emitted access addresses the backing directly, so no page past
+/// its end may be admitted, whatever the page map says (a `map` past a fixed backing, #1153).
 ///
 /// This is THE per-emitted-call driver contract for a page-checked run (refresh from
 /// [`Vcpu::mem_map_info`], write the table where emitted code can read it, its base to the
@@ -5784,14 +5794,15 @@ pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
 /// table is what makes the contract hard to get wrong. A `Backed` (§13 region-aliased) page is
 /// marked `Unmapped` — fail-closed (the emitted tier cannot read a region's bytes), and
 /// unreachable for a paged module anyway (SharedRegion gates the whole module off the paged tier).
-pub fn build_pagestate_table(info: &MemMapInfo) -> (Vec<u8>, u64) {
+pub fn build_pagestate_table(info: &MemMapInfo, backed: u64) -> (Vec<u8>, u64) {
     let (page, mapped, _reserved, entries) = info;
     let top = entries
         .iter()
         .map(|(off, _)| off / page + 1)
         .max()
         .unwrap_or(0)
-        .max(mapped / page);
+        .max(mapped / page)
+        .min(backed / page);
     let mut t = vec![0u8; top as usize];
     for (i, b) in t.iter_mut().enumerate() {
         if (i as u64) * page < *mapped {
@@ -5799,8 +5810,11 @@ pub fn build_pagestate_table(info: &MemMapInfo) -> (Vec<u8>, u64) {
         }
     }
     for (off, kind) in entries {
+        let Some(state) = t.get_mut((off / page) as usize) else {
+            continue; // past the backing: outside the table, so the bound check traps it
+        };
         // `map_info` kinds: 0 = Ro, 1 = Rw, 2 = Unmapped, 3 = Backed (§13 alias).
-        t[(off / page) as usize] = match kind {
+        *state = match kind {
             0 => 2,
             1 => 1,
             _ => 0, // Unmapped, and Backed fail-closed (see above)
@@ -9054,19 +9068,113 @@ pub fn compile_and_run_sliced(
     ))
 }
 
+/// What an exec rebuilt its process into ([`exec_image_build`]).
+struct ExecBuilt {
+    host: Host,
+    table: SharedSlots,
+    vt: VTask,
+    /// #1896 — a leaf image the host emitted: the window it runs over (a flat copy of the caller's,
+    /// where emitted code can address it) and how it tiers up at its entry. `None`: the image runs
+    /// in the caller's window, interpreted.
+    leaf: Option<(Mem, LeafStart)>,
+}
+
+/// How a leaf image tiers up at its entry ([`CoopStep::TierUp`]).
+struct LeafStart {
+    module: u32,
+    entry: u32,
+    argv: Box<[i64]>,
+    results: Box<[ValType]>,
+    /// The image was emitted with the per-access page check (#750), because it can change its page
+    /// state ([`image_pages`]): its `"mapped"` is the window's reservation, and the host keeps the
+    /// page-state table.
+    paged: bool,
+}
+
+/// #1896 — may a process running image `m` **park**: block in an op until another process, or
+/// another of its own threads, acts? A frame on the emitted tier cannot be suspended, so only an
+/// image that cannot runs there ([`TierUpConfig::leaf`]). The process's signal source answers for
+/// the ops bound to it ([`super::SignalSource::import_parks`]); the address-space ops cannot park;
+/// a stream op parks only on a pipe end, or reading a blocking stdin; a §12 concurrency op may (a
+/// join or a futex wait parks, and a thread or a fiber needs the interpreter to schedule it); an
+/// import `import.attach` may retarget may; any other import or inline capability call may. (A
+/// linked program has no `call.sym` left: linking rewrote each to one of these.)
+fn image_may_park(host: &Host, m: &Module) -> bool {
+    use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
+    let source = host.signal_poll().map(|(_, s)| s);
+    let import_parks = |(import, b): (&temen_ir::Import, &super::BoundImport)| match b.type_id {
+        _ if b.rebindable => true,
+        ADDRESS_SPACE => false,
+        HOST_PROC => source
+            .as_ref()
+            .and_then(|s| s.import_parks(&import.name))
+            .unwrap_or(true),
+        _ => true,
+    };
+    let holds_pipe = host
+        .table
+        .iter()
+        .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })));
+    let cap_parks = |i: &Inst| match *i {
+        Inst::CapCall {
+            type_id: STREAM,
+            op,
+            ..
+        } => match op {
+            0 => holds_pipe || host.stdin_block,
+            1 => holds_pipe,
+            2 => false,
+            _ => true,
+        },
+        Inst::CapCall {
+            type_id: ADDRESS_SPACE,
+            ..
+        } => false,
+        Inst::CapCall { .. } => true,
+        _ => false,
+    };
+    m.imports.len() != host.import_bindings.len()
+        || m.imports
+            .iter()
+            .zip(&host.import_bindings)
+            .any(import_parks)
+        || m.funcs.iter().any(temen_ir::Func::uses_concurrency)
+        || m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(cap_parks)
+}
+
+/// #1896 — can a process running image `m` change its **page state**: reach an address-space
+/// `map`, `unmap` or `protect`, inline or through an import? A map that leaves a hole, or a change
+/// of protection, takes its window past what one bound describes ([`Mem::scalar_extent`]), and an
+/// image that runs whole on the emitted tier cannot decline there: it checks every access against
+/// the page state instead ([`LeafStart::paged`]).
+fn image_pages(host: &Host, m: &Module) -> bool {
+    let pages = |type_id, op| type_id == temen_ir::cap_id::ADDRESS_SPACE && op <= 2;
+    host.import_bindings.iter().any(|b| pages(b.type_id, b.op))
+        || m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(*i, Inst::CapCall { type_id, op, .. } if pages(type_id, op)))
+}
+
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
 /// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
 /// window, reused in place). Resolves + compiles the command, admits it (entry sig, command window
-/// `<=` the caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] — the
-/// same personality carry the tree-walker uses), materializes the command image into `cur_mem`, and
-/// pushes the compiled command as a new domain unit. Returns `(child_host, child_table, new_vt)` for
-/// the caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
-/// caller then writes a probeable `-EINVAL` and lets the task run on — POSIX: execve returns only on
-/// failure). The old image's pipe ends are released here ([`Host::release_pipe_ends`]) so the shared
-/// counts do not leak; waking any pipe that thereby reached EOF is the tree-walker's job (the
-/// cooperative engine has no CorePipe park — pipe-through-exec is a later rung), and is a no-op for a
-/// command that inherited none.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// `<=` the caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] —
+/// the same personality carry the tree-walker uses), materializes the command image into `cur_mem`
+/// (or, for a leaf image the host emitted, into a flat copy of it: [`ExecBuilt::leaf`]), and pushes
+/// the compiled command as a new domain unit. Returns the rebuilt process ([`ExecBuilt`]) for the
+/// caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
+/// caller then writes a probeable `-EINVAL` and lets the task run on — POSIX: execve returns only
+/// on failure). The old image's pipe ends are released here ([`Host::release_pipe_ends`]) so the
+/// shared counts do not leak; waking any pipe that thereby reached EOF is the tree-walker's job
+/// (the cooperative engine has no CorePipe park — pipe-through-exec is a later rung), and is a
+/// no-op for a command that inherited none.
+#[allow(clippy::too_many_arguments)] // the exec op's operands, plus where the image may run
 fn exec_image_build(
     cur_host: &mut Host,
     cur_mem: Option<&Mem>,
@@ -9077,7 +9185,8 @@ fn exec_image_build(
     entry: u64,
     size_log2: i64,
     personality: bool,
-) -> Result<(Host, SharedSlots, VTask), i64> {
+    leaf: Option<&LeafEmitter>,
+) -> Result<ExecBuilt, i64> {
     // Resolve and compile the command first: `Host::exec_image` is the commit point (it hands the
     // caller's personality to the new powerbox), so everything that can still refuse must come
     // before it. A command this run already compiled is not compiled again.
@@ -9104,6 +9213,18 @@ fn exec_image_build(
         m.window.reserved(),
     )?;
     let child_args: Vec<Value> = img.entry_args.iter().map(|&h| Value::I64(h)).collect();
+    // #1896 — a leaf image the host emitted runs over a flat copy of the caller's window, where
+    // emitted code can address it, materialized exactly as it would be in place. Chosen only after
+    // the commit, and only where the image runs: without such a window it runs in place, interpreted.
+    let leaf = leaf
+        .filter(|_| !image_may_park(&img.host, &img.module))
+        .map(|emit| (emit, image_pages(&img.host, &img.module)))
+        .filter(|(emit, paged)| emit(cm, &img.module, entry as u32, *paged))
+        .and_then(|(_, paged)| {
+            let flat = |_| super::Region::growable(m.window.mapped(), m.page);
+            Some((m.fork_private_over(flat)?, paged))
+        });
+    let m = leaf.as_ref().map_or(m, |(win, _)| win);
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
     {
@@ -9136,7 +9257,22 @@ fn exec_image_build(
     let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     new_vt.active.module = cm;
     new_vt.active.home = cm;
-    Ok((child_host, child_table, new_vt))
+    let leaf = leaf.map(|(win, paged)| {
+        let start = LeafStart {
+            module: cm as u32,
+            entry: entry as u32,
+            argv: img.entry_args.iter().copied().collect(),
+            results: cunit.result_types[entry as usize].clone().into(),
+            paged,
+        };
+        (win, start)
+    });
+    Ok(ExecBuilt {
+        host: child_host,
+        table: child_table,
+        vt: new_vt,
+        leaf,
+    })
 }
 
 fn run(
@@ -11560,9 +11696,11 @@ enum CoopStep {
     /// scheduler state stays inside the `CoopSched`. Without the flag this state blocks on the bell
     /// (or is the deadlock it always was).
     Idle,
-    /// A task paused on an eligible module-0 `Call` to `func` with raw i64 arg slots `argv`; `mapped`
-    /// is the window's committed scalar extent for the emitted `"mapped"` global (#717 host sync).
+    /// A task paused to run `func` of program `module` emitted ([`CoopEvent::TierUp`]) with raw i64
+    /// arg slots `argv`; `mapped` is the window's committed scalar extent for the emitted `"mapped"`
+    /// global (#717 host sync).
     TierUp {
+        module: u32,
         func: u32,
         argv: Box<[i64]>,
         mapped: u64,
@@ -11581,6 +11719,15 @@ enum CoopStep {
         results: Box<[ValType]>,
         mapped: u64,
     },
+}
+
+/// Where a surfaced tier-up's results land ([`CoopSched::pending_tierup`]).
+#[derive(Clone, Copy)]
+enum TierUpDst {
+    /// The paused caller frame's result slots, from this one on.
+    Frame(usize),
+    /// No frame: the task tiered up at its entry (#1896), so its results end it.
+    Entry,
 }
 
 /// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
@@ -11628,11 +11775,13 @@ struct CoopSched {
     /// #750 paged tier-up: the eligible set is page-checked (the emitted region carries a per-access
     /// page check), so an unrepresentable window surfaces with the reserved size instead of declining.
     page_checked: bool,
+    /// #1896: the host's emitter for leaf images ([`TierUpConfig::leaf`]); `None` interprets them.
+    leaf: Option<LeafEmitter>,
     /// The task currently paused on a surfaced tier-up, awaiting [`deliver_tierup`](Self::deliver_tierup):
-    /// `(task index, caller-frame-relative dst slot, result types)`. At most one is ever outstanding —
+    /// `(task index, where its results land, result types)`. At most one is ever outstanding —
     /// the driver services one tier-up round-trip before pumping again — so a single slot suffices.
     /// `None` between round-trips (and always, on the native driver).
-    pending_tierup: Option<(usize, usize, Box<[ValType]>)>,
+    pending_tierup: Option<(usize, TierUpDst, Box<[ValType]>)>,
     /// The task currently paused on a surfaced §22 `Jit.invoke`, awaiting
     /// [`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals): `(task index, dst slot, result
     /// types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a tier-up and an
@@ -11720,8 +11869,9 @@ impl CoopSched {
         tierup: Option<TierUpConfig>,
     ) -> Result<CoopSched, Trap> {
         // `page_checked` is meaningful only with a bitmap, so it rides in the same `Option`.
-        let (eligible, page_checked) =
-            tierup.map_or((None, false), |t| (Some(t.eligible), t.page_checked));
+        let (eligible, page_checked, leaf) = tierup.map_or((None, false, None), |t| {
+            (Some(t.eligible), t.page_checked, t.leaf)
+        });
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
@@ -11835,6 +11985,7 @@ impl CoopSched {
             clock,
             eligible,
             page_checked,
+            leaf,
             pending_tierup: None,
             pending_jit: None,
             // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
@@ -11874,6 +12025,7 @@ impl CoopSched {
             clock,
             eligible,
             page_checked,
+            leaf,
             pending_tierup,
             pending_jit,
             slot_units,
@@ -12516,8 +12668,13 @@ impl CoopSched {
                         pending_tierup.is_none(),
                         "a tier-up is already outstanding — deliver_tierup was skipped"
                     );
-                    *pending_tierup = Some((ti, dst, results));
-                    return Ok(CoopStep::TierUp { func, argv, mapped });
+                    *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
+                    return Ok(CoopStep::TierUp {
+                        module: 0,
+                        func,
+                        argv,
+                        mapped,
+                    });
                 }
                 // #1146 (deeper) — park this task on a blocking `Stream{In}` read (the op was rewound);
                 // the settle scan re-admits it on `stdin_ready` and the all-parked signal sweep
@@ -12906,7 +13063,9 @@ impl CoopSched {
                     // The build (resolve + compile + admit + powerbox + personality carry + image
                     // materialize) runs against the exec'ing task's own window + powerbox, then the
                     // rebuilt activation is installed where its `env` points.
-                    match tasks[ti].env {
+                    // The rebuilt activation lands where the task's `env` points; a leaf image
+                    // brings its own window, which replaces the caller's (#1896).
+                    let start = match tasks[ti].env {
                         None => {
                             // Root: build against the driver window/host, then migrate the task into a
                             // confined env holding the command powerbox + its module table (the shared
@@ -12921,22 +13080,30 @@ impl CoopSched {
                                 entry,
                                 size_log2,
                                 personality,
+                                leaf.as_ref(),
                             );
                             match built {
                                 Err(e) => refuse!(e),
-                                Ok((child_host, child_table, new_vt)) => {
-                                    tasks[ti].vt = new_vt;
+                                Ok(built) => {
+                                    tasks[ti].vt = built.vt;
+                                    // The driver window moves into the env, or is released for
+                                    // the leaf image's own.
+                                    let (win, start) = match (built.leaf, mem.take()) {
+                                        (Some((win, start)), _) => (Some(win), Some(start)),
+                                        (None, win) => (win, None),
+                                    };
                                     let eidx = extra_envs.len();
                                     extra_envs.push(ChildEnv {
-                                        mem: mem.take(),
+                                        mem: win,
                                         host: std::sync::Arc::new(std::sync::Mutex::new(
-                                            child_host,
+                                            built.host,
                                         )),
-                                        table: child_table,
+                                        table: built.table,
                                         fuel: *fuel,
                                         fibers: FiberTables::default(),
                                     });
                                     tasks[ti].env = Some(eidx);
+                                    start
                                 }
                             }
                         }
@@ -12957,17 +13124,41 @@ impl CoopSched {
                                     entry,
                                     size_log2,
                                     personality,
+                                    leaf.as_ref(),
                                 )
                             };
                             match built {
                                 Err(e) => refuse!(e),
-                                Ok((child_host, child_table, new_vt)) => {
-                                    tasks[ti].vt = new_vt;
+                                Ok(built) => {
+                                    tasks[ti].vt = built.vt;
                                     extra_envs[k].host =
-                                        std::sync::Arc::new(std::sync::Mutex::new(child_host));
-                                    extra_envs[k].table = child_table;
+                                        std::sync::Arc::new(std::sync::Mutex::new(built.host));
+                                    extra_envs[k].table = built.table;
+                                    built.leaf.map(|(win, start)| {
+                                        extra_envs[k].mem = Some(win);
+                                        start
+                                    })
                                 }
                             }
+                        }
+                    };
+                    // #1896 — a leaf image tiers up at its entry: the host runs it whole, emitted, and
+                    // its delivery ends the process. Over a window one bound cannot describe, an image
+                    // emitted without the page check runs interpreted instead, over the same window.
+                    if let Some(start) = start {
+                        let win = tasks[ti].env.and_then(|k| extra_envs[k].mem.as_ref());
+                        let mapped = win.and_then(|m| match start.paged {
+                            true => Some(m.reserved_size()),
+                            false => m.scalar_extent(),
+                        });
+                        if let Some(mapped) = mapped {
+                            *pending_tierup = Some((ti, TierUpDst::Entry, start.results));
+                            return Ok(CoopStep::TierUp {
+                                module: start.module,
+                                func: start.entry,
+                                argv: start.argv,
+                                mapped,
+                            });
                         }
                     }
                 }
@@ -13738,11 +13929,18 @@ impl CoopSched {
             complete(&mut self.tasks, ti, Err(Trap::Malformed));
             return;
         }
-        for (i, ty) in results.iter().enumerate() {
-            self.tasks[ti].vt.active.set(
-                dst as u32 + i as u32,
-                Reg::from_value(slot_to_val(*ty, vals[i])),
-            );
+        let vals = results.iter().zip(vals).map(|(ty, v)| slot_to_val(*ty, *v));
+        match dst {
+            TierUpDst::Frame(dst) => {
+                for (i, v) in vals.enumerate() {
+                    self.tasks[ti]
+                        .vt
+                        .active
+                        .set(dst as u32 + i as u32, Reg::from_value(v));
+                }
+            }
+            // #1896: the process ran whole: it returned from its entry.
+            TierUpDst::Entry => complete(&mut self.tasks, ti, Ok(vals.collect())),
         }
     }
 
@@ -13802,7 +14000,18 @@ pub struct TierUpConfig {
     /// #750 paged tier-up: the emitted region carries a per-access page check, so an unrepresentable
     /// window surfaces with the reserved size instead of declining.
     pub page_checked: bool,
+    /// #1896 — the host's emitter for **leaf images**: an image a process `execve`s that cannot park
+    /// ([`image_may_park`]) is offered to it, and runs whole on the emitted tier if it emits it.
+    /// `None`: every exec'd image interprets.
+    pub leaf: Option<LeafEmitter>,
 }
+
+/// The host's emitter for leaf images ([`TierUpConfig::leaf`]). Offered `(module, image, entry,
+/// paged)` — `module` the index the image's [`CoopEvent::TierUp`] names — it emits `image` to run
+/// whole from `entry`, with the per-access page check (#750) iff `paged`, and answers whether it
+/// did. `paged` is the engine's to decide: whether the image can change its page state is a fact
+/// of the imports it is bound to, which the image alone does not show.
+pub type LeafEmitter = std::sync::Arc<dyn Fn(usize, &Module, u32, bool) -> bool + Send + Sync>;
 
 /// What a [`CoopRun`] holds ([`CoopRun::footprint`]): the memory a process tree costs its embedder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13830,10 +14039,14 @@ pub enum CoopEvent {
     Done(Vec<Value>),
     /// The run trapped (the root task, or a fatal driver fault).
     Trapped(Trap),
-    /// A module-0 task paused on an eligible direct `Call` to `func` with raw i64 arg slots `argv`;
-    /// `mapped` is the committed scalar window extent for the emitted `"mapped"` global. The host runs
-    /// the emitted `f{func}` and calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`].
+    /// A task paused to run `func` of program `module` emitted, with raw i64 arg slots `argv`: a
+    /// module-0 task on an eligible direct `Call` (`module` 0), or a process whose exec'd image is a
+    /// leaf the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
+    /// window extent for the emitted `"mapped"` global. The host runs the emitted `f{func}` and calls
+    /// [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`]; for an entry, the delivery ends
+    /// the process as a return from its entry, or a trap in it, would.
     TierUp {
+        module: u32,
         func: u32,
         argv: Box<[i64]>,
         mapped: u64,
@@ -14152,7 +14365,17 @@ impl CoopRun {
         ) {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
             Ok(CoopStep::Idle) => CoopEvent::Idle,
-            Ok(CoopStep::TierUp { func, argv, mapped }) => CoopEvent::TierUp { func, argv, mapped },
+            Ok(CoopStep::TierUp {
+                module,
+                func,
+                argv,
+                mapped,
+            }) => CoopEvent::TierUp {
+                module,
+                func,
+                argv,
+                mapped,
+            },
             Ok(CoopStep::JitInvoke {
                 code,
                 wasm,
@@ -14223,13 +14446,7 @@ impl CoopRun {
     ) -> Result<usize, Trap> {
         // The paused task is whichever host round-trip is outstanding — a tier-up region or a
         // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
-        let ti = self
-            .sched
-            .pending_tierup
-            .as_ref()
-            .or(self.sched.pending_jit.as_ref())
-            .map(|(ti, ..)| *ti)
-            .ok_or(Trap::Malformed)?;
+        let ti = self.pending_ti().ok_or(Trap::Malformed)?;
         // Mid-invoke iff a `Jit.invoke` (not a tier-up) is the outstanding round-trip — never both at
         // once (the one-round-trip discipline). Selects the invoke-confined registry below.
         let in_invoke = self.sched.pending_jit.is_some();
@@ -15181,13 +15398,19 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         entry,
                         size_log2,
                         personality,
+                        None,
                     )
                 } else {
                     Err(super::EINVAL)
                 };
                 match built {
                     Err(e) => vt.active.set(dst, Reg::from_i32(e as i32)),
-                    Ok((child_host, child_table, new_vt)) => {
+                    Ok(ExecBuilt {
+                        host: child_host,
+                        table: child_table,
+                        vt: new_vt,
+                        leaf: _,
+                    }) => {
                         // Replace the powerbox INSIDE this vCPU's cell, not the `Arc` itself: a
                         // fork twin's exit-hook holder kept a clone of the cell at spawn, so the
                         // post-exec exit must find the CARRIED hooks (`exec_carry`) behind the

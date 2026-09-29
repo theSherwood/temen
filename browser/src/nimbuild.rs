@@ -1,13 +1,13 @@
 //! **nimony's own driver on the browser's interpreter tier, natively** (#958). Runs
-//! [`temen_browser::nim_build`], the function the wasm export `temen_nim_build` runs, over the
-//! self-hosted lane's toolchain and a program tree, and reports how long the build took, the
-//! process's peak resident memory, and what the run held at its end. A measurement, not a gate: the
-//! engine's cost before the wasm factor, from the code the browser runs. It also writes the library
-//! pack the browser seeds ([`temen_browser::library_pack`]).
+//! [`temen_browser::nim_build`] — the session the wasm export `temen_nim_open` opens, driven to its
+//! end — over the self-hosted lane's toolchain and a program tree, and reports how long the build
+//! took, the process's peak resident memory, and what the run held at its end. A measurement, not a
+//! gate: the engine's cost before the wasm factor, from the code the browser runs. It also writes
+//! the library pack the browser seeds ([`temen_browser::library_pack`]).
 //!
 //! ```text
 //! nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] [--pack <pack>]
-//!          [--expect <module.temen>]
+//!          [--expect <module.temen>] [--leaves]
 //! ```
 //!
 //! `<toolchain-dir>` holds what `scripts/ci/nim-selfhost-lane.sh` builds: `nimony.temen`,
@@ -20,6 +20,8 @@
 //! - `--pack <pack>` writes the library pack of this build: build a program that imports the
 //!   library, and the pack holds everything it compiled of the library.
 //! - `--expect <module.temen>` is the module the build must link.
+//! - `--leaves` tiers up each leaf process at its entry and serves it by bouncing the entry, the
+//!   native stand-in for running it emitted (#1896).
 
 use std::path::Path;
 use std::time::Instant;
@@ -61,6 +63,11 @@ fn peak_rss_mib() -> u64 {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let leaves = args
+        .iter()
+        .position(|a| a == "--leaves")
+        .map(|i| args.remove(i))
+        .is_some();
     let mut flag = |name: &str| {
         let i = args.iter().position(|a| a == name)?;
         let value = args
@@ -79,7 +86,7 @@ fn main() {
     let [tools, tree, prog] = &args[..] else {
         panic!(
             "usage: nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] \
-             [--pack <pack>] [--expect <module.temen>]"
+             [--pack <pack>] [--expect <module.temen>] [--leaves]"
         );
     };
     let tools = Path::new(tools);
@@ -139,7 +146,7 @@ fn main() {
 
     let argv: [&[u8]; 4] = [b"bin/nimony", b"t", b"--isMain", prog.as_bytes()];
     let t0 = Instant::now();
-    let b = temen_browser::nim_build(&modules[0], &commands, &files, &argv, &dir)
+    let b = temen_browser::nim_build(&modules[0], &commands, &files, &argv, &dir, leaves)
         .expect("the interpreter tier runs nimony");
     let secs = t0.elapsed().as_secs_f64();
 
@@ -155,13 +162,14 @@ fn main() {
         .find(|n| n.starts_with(&format!("{dir}/nimcache/")) && n.ends_with(&out))
         .and_then(|n| b.posix.read_file(&n));
     eprintln!(
-        "status {} exit {} in {secs:.1} s, peak RSS {} MiB, {:?}, {} files seeded ({} from the library pack)",
+        "status {} exit {} in {secs:.1} s, peak RSS {} MiB, {:?}, {} files seeded ({} from the library pack), {} leaf processes",
         b.status,
         b.exit_code,
         peak_rss_mib(),
         b.footprint,
         files.len(),
-        lib.len()
+        lib.len(),
+        b.leaves
     );
     let Some(built) = built else {
         eprint!(

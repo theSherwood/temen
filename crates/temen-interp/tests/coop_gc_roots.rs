@@ -56,6 +56,7 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
     let tierup = TierUpConfig {
         eligible: std::sync::Arc::from(vec![false, true, false]),
         page_checked: false,
+        leaf: None,
     };
     let mut run =
         bytecode::CoopRun::new(&m, 0, &[Value::I64(root)], FUEL, Host::new(), Some(tierup))

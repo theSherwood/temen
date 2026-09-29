@@ -1551,7 +1551,7 @@ pub extern "C" fn temen_par_inst_paged() -> i32 {
 /// value for `"mapped"`).
 fn inst_sync_pagestate(v: &mut ParVcpu) {
     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-    let (table, cover) = bytecode::build_pagestate_table(&info);
+    let (table, cover) = bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
     v.pagestate = table;
     v.b = cover as i64;
 }
@@ -2530,7 +2530,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     // `temen_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
                     // memory IS the `"pagestate"` global's value: one shared memory, zero copies).
                     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                    let (table, cover) = bytecode::build_pagestate_table(&info);
+                    let (table, cover) =
+                        bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
                     v.pagestate = table;
                     v.b = cover as i64;
                 } else {
@@ -2655,7 +2656,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 if let Some(h) = mapped {
                     if par_jit_paged() {
                         let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        let (table, cover) =
+                            bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
                         v.pagestate = table;
                         v.b = cover as i64;
                     } else {
@@ -7520,7 +7522,7 @@ impl JitOnrampRun {
         let paged = temen_wasm_jit::module_uses_unmap_protect(&module);
         let (pagestate, mapped) = if paged {
             let page = temen_interp::host_page_size();
-            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()))
+            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()), back.len())
         } else {
             (Vec::new(), declared_extent)
         };
@@ -7728,10 +7730,11 @@ impl JitOnrampRun {
                 Some(info) => {
                     if self.paged {
                         // #1201: the paged contract — the table from the live map, `"mapped"` = its
-                        // coverage (never the reserved domain), so the emitted bound check traps
-                        // everything above the table where the interpreter faults and the page states
-                        // refine within it.
-                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        // coverage (never the reserved domain, nor past the backing), so the emitted
+                        // bound check traps everything above the table where the interpreter faults
+                        // and the page states refine within it.
+                        let (table, cover) =
+                            bytecode::build_pagestate_table(&info, self.back.len());
                         self.pagestate = table;
                         self.mapped = cover;
                     } else {
@@ -8937,6 +8940,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     let tierup = bytecode::TierUpConfig {
         eligible: std::sync::Arc::clone(&wc.eligible),
         page_checked: wc.paged,
+        leaf: None,
     };
     // The resumable twin of the warm interp path's `run_over_grown`: the image bytes already
     // restored (no data seed), the captured page map re-established (`seed_pages`) so the grown heap
@@ -8964,7 +8968,9 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             run,
-            back: s.back.clone(),
+            back: Some(s.back.clone()),
+            nim: None,
+            module: 0,
             warm: true,
             emitted_wasm: std::sync::Arc::clone(&wc.wasm),
             func: 0,
@@ -15120,7 +15126,15 @@ struct CoopTierupRun {
     /// reallocates, so the base moves. That is what [`temen_coop_win_ptr`] /
     /// [`temen_coop_tierup_win_ptr`] are for, and why the JS driver re-reads them after every
     /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global).
-    back: std::sync::Arc<temen_interp::Region>,
+    ///
+    /// `None` for a nimony build ([`nimony::temen_nim_open`]): its root window is the engine's own,
+    /// and each process it tiers up runs over a window of that process's.
+    back: Option<std::sync::Arc<temen_interp::Region>>,
+    /// #1896 — a nimony build's session: its personality and the leaf images it emitted. `None` for
+    /// every other run.
+    nim: Option<nimony::NimSession>,
+    /// The program the pending TIERUP runs: `0`, this run's own emit, or a nim session's leaf image.
+    module: u32,
     /// #816 item 4: a warm-coop run — at DONE/TRAP the warm session's heap high-water advances (so
     /// the next restore zeroes what this eval dirtied), and [`temen_warm_close`] must drop this run
     /// before freeing the window it borrows.
@@ -15170,6 +15184,47 @@ struct CoopTierupRun {
 }
 
 impl CoopTierupRun {
+    /// #1896 — a nimony build's session over `run`: nothing of its own emitted, so every field but
+    /// the run and the nim session starts empty.
+    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession) -> Self {
+        CoopTierupRun {
+            run,
+            back: None,
+            nim: Some(nim),
+            module: 0,
+            warm: false,
+            emitted_wasm: std::sync::Arc::from([]),
+            func: 0,
+            mapped: 0,
+            argv: Vec::new(),
+            jit_code: 0,
+            jit_wasm: None,
+            jit_param_types: Vec::new(),
+            jit_result_types: Vec::new(),
+            sigs: Vec::new(),
+            shim_wasm: Vec::new(),
+            jit_wasm_by_handle: None,
+            pending_bounce_trap: None,
+            value: 0,
+            frame: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            paged: false,
+            pagestate: Vec::new(),
+            pagestate_version: u64::MAX,
+            pagestate_env: i64::MIN,
+            pagestate_cover: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Whether the pending event's program carries the page check (#1009): this run's own emit's
+    /// mode, or a leaf image's own (#1896).
+    fn event_paged(&self) -> bool {
+        match (&self.nim, self.module) {
+            (Some(nim), m) if m != 0 => nim.leaf(m).is_some_and(|(_, paged)| paged),
+            _ => self.paged,
+        }
+    }
+
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
     /// — the [`TierupRun::sync_pagestate`] twin over the cooperative run — then stage its coverage
     /// for `"mapped"`. #816: the engine routes `mem_map_info`/`mem_map_version` to the pending
@@ -15180,7 +15235,8 @@ impl CoopTierupRun {
         let ver = self.run.mem_map_version();
         if ver != self.pagestate_version || env != self.pagestate_env {
             let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-            let (table, cover) = bytecode::build_pagestate_table(&info);
+            let backed = self.run.pending_win().map_or(0, |(_, len)| len);
+            let (table, cover) = bytecode::build_pagestate_table(&info, backed);
             self.pagestate = table;
             self.pagestate_cover = cover;
             self.pagestate_version = ver;
@@ -15287,11 +15343,16 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // non-one-bound-representable, so the per-call #717 `scalar_extent` sync would decline EVERY
     // tier-up. Paged mode replaces the decline with a per-access page check that traps
     // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does (fail-closed). A guest that
-    // reaches `unmap`/`protect` itself needs the same treatment even with no rodata — non-paged the
-    // emitter module-gates it to emit-nothing (decline), paged it tiers up (the `sync_pagestate`
-    // per-event/-bounce refresh carries the runtime remaps).
+    // can change its own page state needs the same treatment even with no rodata: an `unmap` or
+    // `protect`, and a `map` too, which can leave a hole below the page it commits. A region cannot
+    // decline mid-flight, and past a bounce that leaves the window more than one bound the scalar
+    // tier could only deny every access (`"mapped"` = 0: the run traps and the whole of it declines
+    // to the interpreter); paged, it stays emitted and the `sync_pagestate` per-event/-bounce
+    // refresh carries the remaps exactly — the §14 codegen entry's rule
+    // (`module_uses_addr_space_page_ops`), one rule for both (#1919).
     let paged = all_shimmable
-        && (m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_unmap_protect(&m));
+        && (m.data.iter().any(|d| d.readonly)
+            || temen_wasm_jit::module_uses_addr_space_page_ops(&m));
     // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
     // The local-table fallback has no spill path, so it keeps #1546's veto.
     let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);
@@ -15447,6 +15508,7 @@ pub extern "C" fn temen_coop_open(
         // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
         // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
         page_checked: paged,
+        leaf: None,
     };
     // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
     // (#1312). It used to be clamped to `win_log2`, which made a `vm_map` past the declared window
@@ -15478,7 +15540,9 @@ pub extern "C" fn temen_coop_open(
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             run,
-            back,
+            back: Some(back),
+            nim: None,
+            module: 0,
             warm: false,
             emitted_wasm: wasm.into(),
             func: 0,
@@ -15522,10 +15586,16 @@ pub extern "C" fn temen_coop_run() -> i32 {
         return COOP_RUN_TRAP;
     };
     let (status, value, exit_code, ev) = match s.run.run() {
-        bytecode::CoopEvent::TierUp { func, argv, mapped } => {
+        bytecode::CoopEvent::TierUp {
+            module,
+            func,
+            argv,
+            mapped,
+        } => {
+            s.module = module;
             s.func = func;
             s.argv = argv.into_vec();
-            if s.paged {
+            if s.event_paged() {
                 s.sync_pagestate();
             } else {
                 s.mapped = mapped;
@@ -15604,9 +15674,18 @@ pub extern "C" fn temen_coop_run() -> i32 {
                 .max(grown);
         }
     }
-    let host = s.run.host_mut();
-    let stdout = std::mem::take(&mut host.stdout);
-    let stderr = std::mem::take(&mut host.stderr);
+    // #1896: a nimony build's output is its personality's, and its memfs outlives the run for
+    // `temen_nim_file` to read.
+    let (stdout, stderr) = match s.nim.take() {
+        Some(nim) => nimony::finish(nim),
+        None => {
+            let host = s.run.host_mut();
+            (
+                std::mem::take(&mut host.stdout),
+                std::mem::take(&mut host.stderr),
+            )
+        }
+    };
     let fb = s.frame.lock().unwrap().take();
     let (fb_rgba, fb_w, fb_h) = match fb {
         Some(f) => (f.rgba, f.width, f.height),
@@ -15624,6 +15703,30 @@ pub extern "C" fn temen_coop_run() -> i32 {
         LAST_STATUS = status;
     }
     ev
+}
+
+/// #1896: the program the pending TIERUP's `func` is in — `0`, this run's own emit
+/// ([`temen_coop_wasm_ptr`]), or a leaf image a nimony build emitted ([`temen_coop_leaf_wasm_ptr`]).
+#[no_mangle]
+pub extern "C" fn temen_coop_module() -> u32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
+}
+
+/// #1896: the emitted wasm of leaf image `module` of a nimony build (`null` when there is none). The
+/// bytes live as long as the session.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.nim.as_ref()?.leaf(module))
+        .map_or(core::ptr::null(), |(wasm, _)| wasm.as_ptr())
+}
+
+/// #1896: the byte length of [`temen_coop_leaf_wasm_ptr`]'s wasm.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_wasm_len(module: u32) -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.nim.as_ref()?.leaf(module))
+        .map_or(0, |(wasm, _)| wasm.len())
 }
 
 /// The pending TIERUP's function index.
@@ -15644,7 +15747,7 @@ pub extern "C" fn temen_coop_mapped() -> i64 {
 /// `"mapped"` write). `0` on an unpaged run.
 #[no_mangle]
 pub extern "C" fn temen_coop_paged() -> i32 {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.event_paged() as i32)
 }
 
 /// #1009 paged: the pending TIERUP's page-state table base (its bytes live in this module's linear
@@ -15702,18 +15805,18 @@ pub extern "C" fn temen_coop_wasm_len() -> usize {
 /// freed memory (the emitted tier gets the fresh base through the `"win"` global).
 #[no_mangle]
 pub extern "C" fn temen_coop_win_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
-        s.back
-            .raw_base()
-            .map_or(core::ptr::null(), |p| p as *const u8)
-    })
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.back.as_ref()?.raw_base())
+        .map_or(core::ptr::null(), |p| p as *const u8)
 }
 
 /// The run window's byte length — the initial `1 << win_log2`, plus whatever the guest has
 /// `vm_map`-grown since (#1312). Like the base, re-read it rather than caching it.
 #[no_mangle]
 pub extern "C" fn temen_coop_win_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.back.len() as usize)
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.back.as_ref())
+        .map_or(0, |b| b.len() as usize)
 }
 
 /// #816 env-routed tier-up: the **pending event's** window base — the emitted `f{i}`s' `win` arg
@@ -15870,7 +15973,7 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8, spill_l
             // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
             // page-state table (version-guarded) so the post-bounce emitted access admits the growth
             // (the paged twin of the #717 scalar fan-out).
-            if s.paged {
+            if s.event_paged() {
                 s.sync_pagestate();
             }
             0

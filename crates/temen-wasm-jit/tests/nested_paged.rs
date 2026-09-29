@@ -131,7 +131,7 @@ fn refresh_pagestate(mut ctx: impl wasmi::AsContextMut<Data = DriverData>) {
     let mem = cx.data().mem.unwrap();
     let pg = cx.data().pagestate_global.unwrap();
     let mg = cx.data().mapped_global.unwrap();
-    let (table, cover) = build_pagestate_table(&(PAGE, WIN, WIN, entries));
+    let (table, cover) = build_pagestate_table(&(PAGE, WIN, WIN, entries), WIN);
     mem.write(&mut ctx, table_base(), &table).unwrap();
     pg.set(&mut ctx, Val::I32(table_base() as i32)).unwrap();
     mg.set(&mut ctx, Val::I64(cover as i64)).unwrap();

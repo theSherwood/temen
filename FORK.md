@@ -758,7 +758,9 @@ track." (History note: fork substrate is where the I68 lost-wakeup race lived; r
 what produced that — so this track is TDD-first, differential-pinned, small increments.)
 
 **Order: bytecode first, then Cranelift; wasm-JIT never** (it is a leaf accelerator — DESIGN §3 —
-and folds every cap op by design). Bytecode is far closer: `Mem::fork_private` and
+and folds every cap op by design). (#1896: what a process tree runs on the wasm-JIT is a **leaf
+process** — an exec'd image that cannot park, so cannot fork — whole from its entry, while the tree
+forks, execs and waits on the interpreter; DESIGN.md "wasm-JIT tier coverage".) Bytecode is far closer: `Mem::fork_private` and
 `Host::fork_powerbox` are engine-agnostic and already exist; and the load-bearing continuation copy
 is cheap because the bytecode vCPU (`Vm`) already derives `Clone` — a parked caller is a bare root
 `Vm` at its post-call resume point, so cloning it *is* the twin's continuation.
