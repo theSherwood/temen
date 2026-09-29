@@ -733,7 +733,8 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
         ]),
     ));
     s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // stop at the loop body, i=3
-    let back = s.handle(&req(5, "stepBack", Json::obj(vec![])));
+    let one_op = Json::obj(vec![("granularity", Json::s("instruction"))]);
+    let back = s.handle(&req(5, "stepBack", one_op));
     assert_eq!(
         response(&back).get("success"),
         Some(&Json::Bool(true)),
@@ -763,6 +764,94 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
         .as_array()
         .unwrap();
     assert!(!frames.is_empty(), "a live frame after stepBack");
+}
+
+/// Three source lines of two ops each.
+const THREE_LINES: &str = r#"
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 1
+  v1 = i32.const 2
+  v2 = i32.add v0 v1
+  v3 = i32.const 3
+  v4 = i32.add v2 v3
+  return v4
+  }
+}
+
+debug.file 0 "lines.c"
+debug.fname 0 "f"
+debug.loc 0 0 0 0 1 1
+debug.loc 0 0 2 0 2 1
+debug.loc 0 0 4 0 3 1
+"#;
+
+/// **`stepBack` is the reverse of `next`**: one source line back, landing on the line's first op
+/// where a forward `next` stopped — so two step-backs from line 3 reach line 1. With
+/// `granularity: "instruction"` it stays a single op, and two from line 3 are still on line 2.
+#[test]
+fn dap_step_back_reverses_a_source_line_unless_asked_for_one_op() {
+    let line_after = |steps_back: &[Json]| -> i64 {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(THREE_LINES)),
+                ("function", Json::i(0)),
+                ("engine", Json::s("bytecode")),
+            ]),
+        ));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                (
+                    "source",
+                    Json::obj(vec![("path", Json::s("/work/lines.c"))]),
+                ),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(1))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // line 1
+        s.handle(&req(5, "next", Json::obj(vec![]))); // line 2
+        s.handle(&req(6, "next", Json::obj(vec![]))); // line 3
+        for (i, args) in steps_back.iter().enumerate() {
+            s.handle(&req(10 + i as i64, "stepBack", args.clone()));
+        }
+        let out = s.handle(&req(
+            30,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        response(&out)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("line")
+            .and_then(|l| l.as_i64())
+            .unwrap()
+    };
+    let by_line = Json::obj(vec![]);
+    let by_op = Json::obj(vec![("granularity", Json::s("instruction"))]);
+    assert_eq!(
+        line_after(std::slice::from_ref(&by_line)),
+        2,
+        "one line back"
+    );
+    assert_eq!(line_after(&[by_line.clone(), by_line]), 1, "two lines back");
+    assert_eq!(
+        line_after(&[by_op.clone(), by_op]),
+        2,
+        "two ops back stay on line 2"
+    );
 }
 
 #[test]
@@ -796,14 +885,15 @@ fn dap_over_bytecode_step_back_after_forward_progress_matches_the_tree_walker() 
             ]),
         ));
         s.handle(&req(4, "configurationDone", Json::obj(vec![]))); // hit 1: i=3
-        s.handle(&req(5, "stepBack", Json::obj(vec![]))); // builds the trace (high-water at i=3)
-                                                          // Forward again, well past that high-water: the first `continue` re-hits i=3 (we rewound to
-                                                          // before it), then i=2, then i=1 — the furthest-forward position of the session.
+        let one_op = || Json::obj(vec![("granularity", Json::s("instruction"))]);
+        s.handle(&req(5, "stepBack", one_op())); // builds the trace (high-water at i=3)
+                                                 // Forward again, well past that high-water: the first `continue` re-hits i=3 (we rewound to
+                                                 // before it), then i=2, then i=1 — the furthest-forward position of the session.
         s.handle(&req(6, "continue", Json::obj(vec![]))); // hit: i=3 (re-hit)
         s.handle(&req(7, "continue", Json::obj(vec![]))); // hit: i=2
         s.handle(&req(8, "continue", Json::obj(vec![]))); // hit: i=1
         let at1 = read_locals(&mut s, 9); // (i=1, acc=5)
-        let back = s.handle(&req(10, "stepBack", Json::obj(vec![]))); // now > high-water ⇒ rebuild, then seek
+        let back = s.handle(&req(10, "stepBack", one_op())); // now > high-water ⇒ rebuild, then seek
         let reason = event(&back, "stopped")
             .unwrap()
             .get("body")
