@@ -126,8 +126,9 @@ wasm?" answer lives in one place:
   page supply, and lending sub-ranges out. Large or sparse programs that fight
   wasm's flat linear memory are the target.
 - **Nested sandboxes (VM-in-VM) + composition (VM-beside-VM)** — a guest can use an
-  `Instantiator` capability to spawn a child domain in a power-of-two **sub-window**
-  with an **attenuated** subset of its own capabilities (§13/§14); confinement
+  `Instantiator` capability to spawn a child domain in its own window (the power-of-two
+  **sub-window** placement is retiring, 2026-09-29) with an **attenuated** subset of its own
+  capabilities (§13/§14); confinement
   composes to any depth at depth-independent per-access cost. wasm has no native
   *runtime* nesting (only interpreter-in-wasm or link-time component composition),
   so multi-tenant hosts and plugin-in-plugin fall out for free.
@@ -1060,7 +1061,8 @@ NULL semantics. The `__null_guard` marker export that once gated the layout is
 **retired** (#1094), and `temen-llvm-translate --null-guard` is a redundant
 no-op. The host seeds args at `temen_ir::module_args_base` (`guard + 128`).
 The guard holds for **every window**, not just the root's (#1206): a §14
-confined child's carve and a spawned thread's view of its window seed it too
+confined child's carve (retiring, 2026-09-29 — a detached child seeds it as a root does) and a
+spawned thread's view of its window seed it too
 (`Mem::nested_view` — the chokepoint every engine's nested arm shares — and the
 resumable `Vcpu::new_confined_child*` / thread-spawn constructors), so a child
 storing at NULL traps identically on the interpreter and the emitted tier. A
@@ -2223,6 +2225,14 @@ default above still stands for every handle-gated capability.
   (§13). Cross-domain structured transfer = deferred channels (§7).
 
 ### VM-in-VM (nesting), transparent & zero-overhead
+
+> **Retiring (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289):** the sub-window placement
+> described here is being deleted. Every child gets a **detached** window (its own reservation, op 15;
+> PROCESS.md §5): the child still sees a zero-based `[0, size)` and cannot learn it is nested, but the
+> parent no longer sees child memory as a superset. Lending memory is a pre-mapped `SharedRegion` (§13);
+> lazy page supply becomes a pager that *supplies* bytes rather than writing through the parent's
+> window. The two placements had diverged into two mechanisms (a live alias on the interpreters and the
+> wasm-JIT, a private copy on the Cranelift JIT — #1814); R3's escape hatch deletes one.
 - A child's **window is a power-of-two sub-region of the parent's window** (§4).
   Confinement `child_base + (offset & (size−1))` is one AND + ADD with constant
   base/size, so the child sees a zero-based space `[0, size)` and **cannot learn
@@ -2247,10 +2257,12 @@ default above still stands for every handle-gated capability.
 - **`AddressSpace`** (memory-management) capability, attenuable to a window
   sub-range: `map` / `unmap` / `protect` within scope; can mint a sub-range
   capability for a child.
-- **`Instantiator`**: spawn child domain (sub-window + attenuated caps + quota).
+- **`Instantiator`**: spawn child domain (sub-window + attenuated caps + quota) — its own detached
+  window once the carve placement is retired (2026-09-29).
 
 ### Honest bounds on "zero overhead"
-- Power-of-two, aligned sub-windows → a buddy-style carve of the parent window.
+- Power-of-two, aligned sub-windows → a buddy-style carve of the parent window. *(The carve and the
+  VA-subdivision tradeoff below go with the sub-window placement — retiring, 2026-09-29.)*
 - Deep nesting subdivides VA: a real **window-size vs. nesting-depth** tradeoff
   (a 2^40 window nests many levels, but it is finite).
 - "Zero slowdown" = zero *marginal, steady-state* cost for pass-through caps and
@@ -2356,7 +2368,7 @@ powerbox `CapFault`s / writes a fresh window where the interpreter succeeds.
 The browser's §14 codegen entry
 (`temen_par_enable_inst_codegen`) routes a unit that reaches any ADDRESS_SPACE page op through
 `compile_nested_paged` and services its `env.call_interp` leaves on the **child's own vCPU over its
-carve** (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
+carve** (over its own detached `Memory` once the carve placement is retired, 2026-09-29) (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
 the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mapped"` from that vCPU
 after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
 wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
@@ -3505,7 +3517,8 @@ until their children become scheduler tasks (slices 2–3), which is when their 
 as a value with the budget un-spent (#1587).
 
 *The child-domain executor on the JIT* (#1600 slices 2 and 5, `temen-jit/src/child_exec.rs`): every
-non-durable §14 child — the **carve** children of ops 0/5/8/11/13 and the **detached** children of
+non-durable §14 child — the **carve** children of ops 0/5/8/11/13 (retiring with the carve
+placement, 2026-09-29; the copy-in/`copy_back` below goes with them) and the **detached** children of
 op 15 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
 on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
@@ -3770,7 +3783,7 @@ as open-ended, not a byproduct of the build.
 | D16 | Module ⊥ domain ⊥ thread; mapping to OS process/thread is invisible host policy | Settled | Enables transparent, zero-overhead nesting; domain↔one process |
 | D17 | Shared memory = `SharedRegion` mapped into multiple windows; region-relative offsets | Settled | One mechanism for all sharing; zero-overhead masked access; data plane for composition |
 | D18 | Nesting cost paid at setup not runtime; pass-through caps + sub-window memory are depth-independent | Settled | Transparent + zero steady-state overhead; cost only where parent interposes |
-| D19 | Child window = power-of-two sub-region of parent; `Instantiator` grants sub-window + attenuated caps + quota | Settled | Child can't tell it's nested; tier can't exceed parent's |
+| D19 | Child window = power-of-two sub-region of parent; `Instantiator` grants sub-window + attenuated caps + quota | **Amended 2026-09-29 — retiring** (INVARIANTS #13 ruling; #1289): every child gets a detached window of its own; the sub-region placement is deleted. Attenuation (caps, quota, tier ≤ parent's) is unchanged | Child can't tell it's nested; tier can't exceed parent's |
 | D20 | Split host: secret-less in-process fast runtime + out-of-process privileged supervisor | Settled | Fast where it's safe to be fast; flush tax only at distrust boundaries, amortized per quantum |
 | D21 | Direct confined syscalls by default; broker (gVisor-style) only when distrusting the kernel | Settled | Native syscall speed for granted resources; surface-reduction is an opt-in dial |
 | D22 | Mechanism-only concurrency: free uncapped fibers + capped vCPU capabilities; runtime builds the model | Settled | Sane target for every threading model; no built-in scheduler / no double-scheduling |

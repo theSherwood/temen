@@ -5,6 +5,18 @@ rests on **is** built (PROCESS.md §5, 2026-07-23). Written for #1253 / epic #70
 op-13 phase-child sizing work exposed that "grow the window in place" cannot be delivered by
 the sub-window model at all.
 
+**Superseded direction (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289).** Decision B
+below planned detached as the *default* with nested (op 13) "staying the explicit opt-in". That is
+withdrawn: the nested carve placement is **retired**, and every §14 child gets a detached window. The
+two placements had diverged into two mechanisms — a live alias of the parent's backing on the
+tree-walker, bytecode engine and wasm-JIT, a private copy written back at finish on the Cranelift JIT
+— so a parent and child talking through the carve while both run complete on the oracle and deadlock
+on the Cranelift JIT (#1814). R3's escape hatch fires: delete the carve path, never keep both. Read
+the "nested stays" / "opt-in" / "alias grant" passages below as the pre-2026-09-29 plan. Decision A
+(§7 slices 0–5) is built and is the surviving mechanism; what remains is moving the carve-dependent
+features (the §2.2 pager, the nested subtree freeze, every producer of a carve spawn) onto it and
+deleting the carve path — tracked in #1289.
+
 **One-line summary.** The isolated, independently-growable, concurrency-safe child that
 #1253 and the playground need **already exists in the design and the reference
 interpreter** — it is the **detached window** (`Instantiator.instantiate_detached`, op 15,
@@ -256,7 +268,9 @@ mapping on native. So:
 Nothing here removes zero-copy sharing. Two mechanisms exist, both **explicit grants**:
 
 - **§14 nested spawn (op 13)**: the child is a sub-window; the parent aliases it for free.
-  Stays exactly as built, as the *opt-in* placement for tightly-coupled children.
+  ~~Stays exactly as built, as the *opt-in* placement for tightly-coupled children.~~ **Retiring**
+  (2026-09-29): the carve path is being deleted; tightly-coupled children use the `SharedRegion`
+  below.
 - **§13 `SharedRegion`**: lend a region *into* a detached child at some offset; pointers are
   region-relative. This is the designed way for a detached parent and child to share bulk
   data without giving up the child's private window. **Built ergonomically as op 15's optional
@@ -268,6 +282,10 @@ So "sharing is a capability, not a mode" is already how the design is structured
 adds no new primitive for it.
 
 ## 4. The default-spawn question
+
+> **Settled past this section (2026-09-29):** there is no default to choose — the nested placement is
+> retired and detached is the only placement (see the Status block). The argument below for why
+> detached fails safe still stands; the "nested stays opt-in" half does not.
 
 The user-facing worry: *two modes force a decision.* Three observations shrink it.
 
@@ -332,6 +350,9 @@ for the whole direction: an isolated child *removes* window-access surface rathe
 
 ## 5. Platform consistency (R5)
 
+> **Retiring:** the `nested (op 13)` row describes the carve path being deleted (INVARIANTS #13,
+> 2026-09-29); the detached row is the surviving placement.
+
 Both spawns exist on every tier with **platform-independent semantics**:
 
 | Spawn | Semantics | Data plane | Growth bound | Native | wasm-JIT |
@@ -346,6 +367,10 @@ memory," not an inverted incentive, and **memory64** is the lever that closes it
 V8 since early 2025 — BROWSER.md's table64 blocker deserves a concrete re-test).
 
 ## 6. Blast radius
+
+> **Now the deletion's map (2026-09-29):** the "Decision B" column and §6.1's (b)/(c) sites are, under
+> the carve retirement, the list of what moves or is deleted — including the durability and pager
+> rows the withdrawn "durable ⇒ nested" / "pager ⇒ nested" rulings had avoided.
 
 Scope of the change: **add JIT-tier hosting of an existing op**, plus a default-recommendation
 flip. The nested path (op 13) is **not modified** — which bounds the blast radius sharply.
@@ -584,6 +609,9 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
 7. **Revert #1268 slices 1–2** — done (the single top-of-memory grower this retires).
 
 **Decision B — #1289 (gated on the three §4a rulings, recorded in INVARIANTS.md first):**
+
+> **Superseded (2026-09-29):** slice 8's "durable ⇒ nested" and "nested stays opt-in" are withdrawn;
+> #1289 now tracks deleting the carve path outright (INVARIANTS #13 ruling).
 
 8. **Default flip** in the PROCESS.md §3 substrate (`create(window)` defaults to a minted
    detached window; **durable ⇒ nested**), `WindowMinter` quota folded into `Budget.mem`.

@@ -526,7 +526,8 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
 
   The primitives are largely already here — a **process is a confined child domain**: DESIGN.md §14's
   `Instantiator` already spawns a child in an **attenuated power-of-two sub-window** ("a sub-window is
-  indistinguishable from a top-level window"), `thread.spawn` gives OS-thread vCPUs, the `Exit`
+  indistinguishable from a top-level window"; the sub-window placement is retiring for a detached
+  window of its own — INVARIANTS #13 ruling 2026-09-29), `thread.spawn` gives OS-thread vCPUs, the `Exit`
   capability carries an exit *code*, and **F13** (capability revocation) is the cap-level analogue of
   `kill`. And §2/§9 already name **"a separate process" as the robust distrust boundary**, so a
   first-class process model *aligns with* the isolation-tier design rather than fighting it. What a
@@ -548,7 +549,8 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   mechanism (§2a).
 
   *Status (Stage 1, landed):* the `posix_spawn`+`wait` core is proven differentially
-  (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve, spawns a separate host-verified
+  (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve — op 15's args payload once carves
+  retire — spawns a separate host-verified
   `Module` via `Instantiator.instantiate_module` (op 5), and `join`s (op 1) for the child's exit
   status — need (1)'s spawn-with-argv + wait). Stdio inheritance landed as capability forwarding:
   `instantiate_named` (op 11, a named grant list — a parent re-grants its `stdout` by name,

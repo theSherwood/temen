@@ -134,7 +134,7 @@ only to mark the boundary.
 | 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 13 + `join` |
 | 20 | `exec_stdout()` | `-> stream` | host stdout `Stream` | **done** — the handle the shell re-grants to a child under the name `"stdout"` |
 | 21 | `exec_stdin(ptr, len)` | `-> stream` | host input-pipe `Stream` + FIFO | **done** — a filter command's `"stdin"`: pushes `[ptr,len)` into the FIFO, returns the read end |
-| 22 | `exec_win(module)` | `-> size_log2 \| -1` | host PATH registry | **done** — the granted command's declared window, so the shell carves each spawn to match |
+| 22 | `exec_win(module)` | `-> size_log2 \| -1` | host PATH registry | **done** — the granted command's declared window, so the shell carves each spawn to match (a detached window of that size once carves retire — INVARIANTS #13, 2026-09-29) |
 | 23 | `pipe(fds_ptr)` | `-> 0 \| -errno` | host fd table + shared byte FIFO | **done** — stores `[read_fd, write_fd]` (`i32`×2); intra-personality, non-blocking (empty reads `0`). **Superseded for shells by op 52** (#972): the libc `pipe()` shim now composes `__vm_pipe` + `pipe_adopt`; op-23 `PipeBuf` minting retires with #972 slice 3 |
 | 24 | `dup2(oldfd, newfd)` | `-> newfd \| -errno` | host fd table | **done** — the redirect primitive; pipe ends share the buffer, a `File` copies its description |
 | 25 | `dup(oldfd)` | `-> fd \| -errno` | host fd table | **done** — clone onto the lowest free fd |

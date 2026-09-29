@@ -68,7 +68,7 @@ What we're chasing:
   M:N schedulers, async runtimes, and multithreaded code is far less awkward than on
   wasm. The VM ships the primitives, not a scheduler.
 - **Nested sandboxes with no extra virtualization cost.** A guest can spawn a child
-  domain in a sub-window with an attenuated subset of its own capabilities;
+  domain in its own window with an attenuated subset of its own capabilities;
   confinement composes to any depth at depth-independent per-access cost. Multi-tenant
   hosts and plugin-in-plugin fall out for free.
 - **A JIT *inside* the sandbox.** A guest (say, a language runtime) can build IR at
