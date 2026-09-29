@@ -15,7 +15,6 @@ crate-type = ["lib"]
 
 [dependencies]
 temen-leng = { path = "../../../../temen-leng" }
-temen-encode = { path = "../../../../temen-encode" }
 temen-posix-abi = { path = "../../../../temen-posix-abi" }
 
 [profile.release]

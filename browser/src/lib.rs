@@ -31,7 +31,7 @@ use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimc;
 mod nimony;
-pub use nimony::{nim_build, NimBuild};
+pub use nimony::{library_pack, nim_build, NimBuild};
 pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
@@ -9077,12 +9077,26 @@ pub extern "C" fn temen_run_onramp_posix(
     out.value
 }
 
+/// A **registry blob** of `entries` ([`blob_entries`] reads one): the framing a host uses to hand
+/// the cdylib a whole set in one buffer, and that a prebuilt set (the nim library, #958) ships in.
+pub fn registry_blob(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let len = |n: usize| (n as u32).to_le_bytes();
+    let mut out = len(entries.len()).to_vec();
+    for (name, bytes) in entries {
+        out.extend(len(name.len()));
+        out.extend(name.as_bytes());
+        out.extend(len(bytes.len()));
+        out.extend(*bytes);
+    }
+    out
+}
+
 /// The entries of a **registry blob** a host builds: all integers little-endian, a `u32` entry
 /// count, then per entry a `u32` name length + that many UTF-8 name bytes + a `u32` length + that
 /// many bytes. One buffer carries a whole set (a shell's commands, a tree's files) through one pair
 /// of arguments. Defensive: reading stops at the first entry that is truncated or not UTF-8, rather
 /// than trapping.
-fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
+pub fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
     let rd_u32 = |at: usize| -> Option<usize> {
         bytes
             .get(at..at + 4)

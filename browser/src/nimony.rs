@@ -29,6 +29,9 @@ pub struct NimBuild {
 /// processes can exec, each module at its paths: for nimony's toolchain, `<tree>/bin/<tool>`, where
 /// the driver looks for a tool, and `/bin/<tool>`, where the shell's `PATH` walk does. They may also
 /// run the programs they build. `None` when the driver is not a program this tier runs.
+///
+/// `temen-link` is served natively at both of its paths ([`native_link`]), so `commands` need not
+/// carry it.
 pub fn nim_build(
     driver: &Module,
     commands: &[(&Module, Vec<&str>)],
@@ -46,6 +49,12 @@ pub fn nim_build(
         loader: true,
     };
     let (host, posix, init_mem) = posix_host_build(driver, &run)?;
+    for path in [
+        format!("{cwd}/bin/temen-link"),
+        "/bin/temen-link".to_string(),
+    ] {
+        posix.register_host_command(&path, std::sync::Arc::new(native_link));
+    }
     posix.set_cwd(cwd);
     // In the order given: the memfs stamps write order into `st_mtim`, which the freshness checks
     // of nimony's `deps.nim` and of nifmake read, so a tree's sources go in before anything made
@@ -78,6 +87,68 @@ pub fn nim_build(
         footprint: run.footprint(),
         posix,
     })
+}
+
+/// The **library pack** of a build run in `at`: every file it wrote under `<at>/nimcache/` for a
+/// library module, in the order it wrote them, and nimony's memo of the options the cache was built
+/// with. A library module is one whose `.p.nif` records a source under `lib/`; its files include
+/// what a build of it as a program wrote (`<stem>.temen/…`), such as the helper compile-time
+/// evaluation runs. Seeded into a later build in the same directory, after the library's sources
+/// and in this order, they are newer than everything they were made from, so that build compiles
+/// only its own modules (#958).
+pub fn library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8>)> {
+    let cache = format!("{at}/nimcache/");
+    let mut library = std::collections::HashMap::new();
+    let mut pack = Vec::new();
+    for name in posix.file_names_by_write() {
+        let Some(rest) = name.strip_prefix(&cache) else {
+            continue;
+        };
+        let stem = rest.split(['.', '/']).next().unwrap_or(rest).to_string();
+        let keep = rest == OPTIONS_MEMO
+            || *library.entry(stem).or_insert_with_key(|stem| {
+                posix
+                    .read_file(&format!("{cache}{stem}.p.nif"))
+                    .is_some_and(|nif| nif_source(&nif).is_some_and(|src| src.starts_with("lib/")))
+            });
+        if let (true, Some(bytes)) = (keep, posix.read_file(&name)) {
+            pack.push((name, bytes));
+        }
+    }
+    pack
+}
+
+/// nimony's memo of the options its cache was built with (`deps.nim`'s `cachedConfigFile`), compared
+/// by content, not by time. A build that finds it missing or different re-runs every step, so a pack
+/// without it would be rebuilt from its sources.
+const OPTIONS_MEMO: &str = "cachedconfigfile.txt";
+
+/// The source file a `.p.nif` was parsed from: the file of its top `stmts` node's line info
+/// (`(stmts@<col>,<line>,<file>`).
+fn nif_source(nif: &[u8]) -> Option<&str> {
+    const TOP: &[u8] = b"(stmts@";
+    let at = nif.windows(TOP.len()).position(|w| w == TOP)? + TOP.len();
+    let info = nif[at..]
+        .split(|b| b.is_ascii_whitespace() || *b == b')')
+        .next()?;
+    let file = info.splitn(3, |&b| b == b',').nth(2)?;
+    core::str::from_utf8(file).ok()
+}
+
+/// The toolchain's `temen-link`, run natively: [`temen_leng::link_command`], the function the in-guest
+/// `temen-link` is built from, over the files of the process that exec'd it. Interpreted, the same
+/// link of a 7-module program took 30–40 s on this tier; natively it takes a fraction of a second, and
+/// the module it writes is the same (#958).
+fn native_link(argv: &[String], files: &mut dyn temen_posix::CommandFiles) -> i32 {
+    let (names, sigs) = temen_posix::cap_vtable();
+    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    let files = core::cell::RefCell::new(files);
+    temen_leng::link_command(
+        &args,
+        (&names, &sigs),
+        &mut |path| files.borrow_mut().read(path),
+        &mut |path, bytes| files.borrow_mut().write(path, bytes),
+    )
 }
 
 /// The memfs of the most recent [`temen_nim_build`], which [`temen_nim_file`] reads.
