@@ -78,6 +78,7 @@ fn coop_tierup_run(
     let tierup = TierUpConfig {
         eligible,
         page_checked: false,
+        leaf: None,
     };
     let mut run = bytecode::CoopRun::new(m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
@@ -263,6 +264,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
     let tierup = TierUpConfig {
         eligible,
         page_checked: false,
+        leaf: None,
     };
     let mut run = bytecode::CoopRun::new(&m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
@@ -568,6 +570,7 @@ fn coop_tierup_child_env_tasks_tier_up() {
     let (got, tierups) = run_with(Some(TierUpConfig {
         eligible,
         page_checked: false,
+        leaf: None,
     }));
     assert_eq!(
         got, want,
@@ -657,6 +660,7 @@ block 0 (vx: i64) {
         Some(TierUpConfig {
             eligible,
             page_checked: false,
+            leaf: None,
         }),
         &[],
         17,
@@ -959,6 +963,7 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
     let (got, got_out, events) = run_with(Some(TierUpConfig {
         eligible,
         page_checked: false,
+        leaf: None,
     }));
     assert_eq!(got, want, "fork-twin tier-up run diverged from the oracle");
     assert_eq!(got_out, want_out, "stdout parity");
@@ -1028,6 +1033,7 @@ block 0 (vx: i64) {
                 Some(TierUpConfig {
                     eligible: std::sync::Arc::clone(&eligible),
                     page_checked: false,
+                    leaf: None,
                 }),
                 back,
                 17,

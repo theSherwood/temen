@@ -418,11 +418,14 @@ fn run_guest(guest_src: &str, off: u64, len: u64, probe: i64, mode: Mode) -> (Ou
                 // — the driver then narrows the global to its table coverage below.
                 assert_eq!(mapped, info.2, "paged runs surface reserved");
                 let (table, cover) = match mode {
-                    Mode::PagedSynced => bytecode::build_pagestate_table(&info),
-                    // The broken driver: region defaults only, the guest's remaps ignored.
-                    Mode::PagedUnsynced => {
-                        bytecode::build_pagestate_table(&(info.0, info.1, info.2, Vec::new()))
+                    Mode::PagedSynced => {
+                        bytecode::build_pagestate_table(&info, vcpu.win_flat_len())
                     }
+                    // The broken driver: region defaults only, the guest's remaps ignored.
+                    Mode::PagedUnsynced => bytecode::build_pagestate_table(
+                        &(info.0, info.1, info.2, Vec::new()),
+                        vcpu.win_flat_len(),
+                    ),
                     Mode::Interp => unreachable!(),
                 };
                 match run_emitted(&wasm, func, &argv, base, win_size, &table, cover) {
@@ -781,7 +784,7 @@ fn reactor_frame(probe: i64, paged: bool) -> (Result<Vec<Value>, Trap>, u32) {
         |func, argv, _mapped, info| {
             tierups += 1;
             let info = info.expect("a paged reactor hands the live map to every tier-up");
-            let (table, cover) = bytecode::build_pagestate_table(&info);
+            let (table, cover) = bytecode::build_pagestate_table(&info, win_size as u64);
             match run_emitted(&wasm, func, argv, base, win_size, &table, cover) {
                 Outcome::Vals(v) => Ok(v),
                 Outcome::Trap(TrapKind::OutOfFuel) => Err(Trap::OutOfFuel),

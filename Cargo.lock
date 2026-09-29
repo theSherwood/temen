@@ -914,6 +914,7 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-jit",
+ "temen-mask",
  "temen-text",
  "temen-verify",
  "wasmi",

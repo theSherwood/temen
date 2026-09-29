@@ -116,32 +116,42 @@ fn module(text: &str) -> temen_ir::Module {
     m
 }
 
+/// Both ways a build runs its processes: interpreted, and with each leaf process — here the tool and
+/// the built program, which import nothing and so cannot park — tiered up at its entry (#1896).
 #[test]
 fn the_toolchain_runs_at_its_paths_and_runs_what_it_built() {
     let driver = module(&driver(&["/bin/c"], &["./p"]));
     let tool = module(SEVEN);
     // A program the build "wrote": a module's encoding in a file of the directory it runs in.
     let built = temen_encode::encode_module(&module(THREE_AND_FOUR));
-    let b = nim_build(
-        &driver,
-        &[(&tool, vec!["/w/bin/c", "/bin/c"])],
-        &[("/w/p", &built)],
-        &[b"bin/driver"],
-        "/w",
-    )
-    .expect("the interpreter tier runs the driver");
-    assert_eq!(
-        (b.status, b.exit_code),
-        (STATUS_EXIT, 14),
-        "both children ran what they exec'd: the tool at its second path, the built program by a \
-         path relative to the build's directory\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&b.stderr)
-    );
-    assert_eq!(
-        (b.footprint.windows, b.footprint.units),
-        (1, 3),
-        "the driver's window, and three programs: the driver, the tool, and the built program"
-    );
+    for leaves in [false, true] {
+        let b = nim_build(
+            &driver,
+            &[(&tool, vec!["/w/bin/c", "/bin/c"])],
+            &[("/w/p", &built)],
+            &[b"bin/driver"],
+            "/w",
+            leaves,
+        )
+        .expect("the interpreter tier runs the driver");
+        assert_eq!(
+            (b.status, b.exit_code),
+            (STATUS_EXIT, 14),
+            "both children ran what they exec'd: the tool at its second path, the built program by \
+             a path relative to the build's directory (leaves: {leaves})\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&b.stderr)
+        );
+        assert_eq!(
+            (b.footprint.windows, b.footprint.units),
+            (1, 3),
+            "the driver's window, and three programs: the driver, the tool, and the built program"
+        );
+        assert_eq!(
+            b.leaves,
+            if leaves { 2 } else { 0 },
+            "the two children ran as leaves"
+        );
+    }
 }
 
 /// nimony's Temen backend links through `temen-link`, which the engine serves natively ([`nim_build`]
@@ -162,6 +172,7 @@ fn temen_link_is_served_natively_at_its_paths() {
         &[("/w/m.c.nif", unit)],
         &[b"bin/driver"],
         "/w",
+        false,
     )
     .expect("the interpreter tier runs the driver");
     let (names, sigs) = temen_posix::cap_vtable();
