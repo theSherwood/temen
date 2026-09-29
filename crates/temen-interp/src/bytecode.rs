@@ -9803,7 +9803,8 @@ fn sched_wall_deadline(_timeout: u64) -> u64 {
 /// fiber `Vm` shares the one window (snapshotted separately), so a clone is a faithful deep copy.
 #[derive(Clone)]
 enum FiberState {
-    /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`. `consumed`
+    /// Created by `cont.new` but never resumed, or unwound by the freeze mid-resume (its spilled
+    /// frames in its shadow region, #1835): starts by calling `funcref(sp, arg)`. `consumed`
     /// (#1538) is set only for a **thaw-seeded** fiber whose frozen park was already consumed: its
     /// first resume queues the argument for the rewound `suspend` to return instead of re-parking.
     Pending {
@@ -10256,14 +10257,14 @@ fn freeze_drive(
                 (vm, false)
             }
             other => {
-                // Not parked: nothing to flatten. A fresh or finished slot still rides (#1684), so
-                // the thaw rebuilds the table slot for slot.
+                // Not parked: nothing to flatten. A fresh, already-unwound (#1835) or finished slot
+                // still rides (#1684), so the thaw rebuilds the table slot for slot.
                 match &other {
                     FiberState::Pending { funcref, sp, .. } => frozen.push(super::FrozenFiber {
                         slot,
                         func: *funcref,
                         sp: *sp,
-                        shadow_sp: arena.frame_base(slot + 1),
+                        shadow_sp: fiber_sp[slot], // its frame base, or the frames the freeze spilled
                         generation: 0,
                         consumed: false,
                     }),
@@ -11172,21 +11173,36 @@ fn step_vcpu(
             Outcome::Done(vals) => match vt.chain.pop() {
                 // The vCPU's root activation finished.
                 None => return Ok(VcpuStop::Done(vals)),
-                // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
+                // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer —
+                // unless the freeze unwound it (#1835). An instrumented fiber always unwinds at a poll
+                // before a genuine return, so a return under `UNWINDING` that spilled frames (its
+                // shadow-SP past its frame base) is the freeze's: the fiber is residue, back to the
+                // `Pending` state a thaw seeds it in, and the resumer gets `FIBER_FROZEN`, which its
+                // thaw re-issues. Nothing was consumed: with no mid-run trigger, every park in a freeze run
+                // was made under `UNWINDING`.
                 Some((rid, resumer, rdst)) => {
                     let id = vt.active_id;
-                    fibers.with(|f, _, _| f[id] = FiberState::Done);
                     // Fiber switch (returning fiber → its resumer): re-point the durable shadow-SP.
                     fibers.shadow_switch(ctx, vt, id, rid);
-                    // #1835: a fiber that unwound for the freeze (frames in its region) did not
-                    // return. This driver does not keep it as residue, so its resumer's re-issue on
-                    // thaw faults rather than reload a placeholder.
-                    let frozen = ctx.durable
-                        && ctx.mem.as_ref().is_some_and(|m| {
-                            m.durable_state() == super::STATE_UNWINDING
-                                && fibers.with(|_, sp, _| sp[id])
-                                    > m.shadow_arena().frame_base(id + 1)
-                        });
+                    let base = ctx
+                        .mem
+                        .as_ref()
+                        .map_or(0, |m| m.shadow_arena().frame_base(id + 1));
+                    let frozen = ctx.durable && is_unwinding(ctx.mem);
+                    let frozen = fibers.with(|f, sp, meta| {
+                        let frozen = frozen && sp[id] > base;
+                        f[id] = if frozen {
+                            let (funcref, sp) = meta[id];
+                            FiberState::Pending {
+                                funcref,
+                                sp,
+                                consumed: false,
+                            }
+                        } else {
+                            FiberState::Done
+                        };
+                        frozen
+                    });
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
                     let tls = vt.active.tls;

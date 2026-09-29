@@ -15,6 +15,10 @@
 //! (`cont.new`, never resumed) thaws to start from its entry, and a **free** one (finished) thaws
 //! free, at its generation, so the next `cont.new` recycles it into the same handle.
 //!
+//! **Resumes (#1835).** A `cont.resume` the freeze lands at re-issues on thaw only if its fiber is
+//! still residue (it parked, or the freeze unwound it). One whose fiber returned reloads its results:
+//! the slot is free.
+//!
 //! Each case runs on every engine that can run it here — the interpreter, the JIT (native stack
 //! switching), and for fibers the bytecode engine — and each is thawed on the clock its freeze left
 //! behind (a re-issued read would move it on). Every engine must thaw to the uninterrupted answer.
@@ -636,8 +640,9 @@ fn a_resume_whose_fiber_returned_reloads_its_result() {
 }
 
 /// And the case the re-issue is for: the fiber unwinds for the freeze inside the resume, so the thaw
-/// re-issues the resume and the fiber rewinds to its clock read.
+/// re-issues the resume and the fiber rewinds to its clock read. The bytecode engine too: the unwound
+/// fiber rides as residue there, not as a free slot.
 #[test]
 fn a_resume_whose_fiber_unwound_is_re_issued() {
-    freeze_thaw(ARMED_ENGINES, UNWINDS, |w| write_state(w, STATE_UNWINDING));
+    freeze_thaw(ALL_ENGINES, UNWINDS, |w| write_state(w, STATE_UNWINDING));
 }

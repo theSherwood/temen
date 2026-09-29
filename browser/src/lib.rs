@@ -3435,10 +3435,15 @@ impl OnrampCaps {
 
     /// The thaw's **registrar** over these cells: re-grant a named capability the artifact carries —
     /// its handler, re-seeded from the captured state, and its fork factory, so a thawed capability is
-    /// exactly as re-grantable as a fresh one — or refuse a name this powerbox does not serve.
+    /// exactly as re-grantable as a fresh one — or refuse a name this powerbox does not serve. `vm_fs`
+    /// is granted beside these cells ([`grant_onramp_caps`]), so it thaws through its own grant's
+    /// counterpart (#1697).
     fn registrar(&self) -> temen_interp::NamedCapRegistrar {
         let caps = self.clone();
         Box::new(move |name, state| {
+            if let Some(g) = temen_fs::regrant_vm_fs(name, state) {
+                return Some(g);
+            }
             let handler = caps.handler(name)?;
             caps.set_state(name, state); // re-seed before the guest can call it
             Some(temen_interp::NamedCapGrant {
