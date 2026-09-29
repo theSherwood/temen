@@ -24,10 +24,8 @@ use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 use temen_jit::{
     compile_and_run_capture_reserved_with_host, compile_and_run_durable, DurableResidue,
     DurableRun, FreezeController, JitError, JitOutcome,

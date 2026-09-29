@@ -171,10 +171,11 @@ pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
 /// Window byte offset of the `i32` state word.
 pub use temen_ir::durable_abi::STATE_OFF;
 
-/// Per-context shadow-region stride: context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)`
-/// (§12.8 4A.5). The transform itself never addresses a region (it emits `durable.shadow_base`-relative
-/// loads the runtime resolves), but the [`write_thaw_state`] host helper indexes a context's region.
-pub use temen_ir::durable_abi::SHADOW_STRIDE;
+/// The region stride an arena declares unless it names its own: context `i` owns
+/// `[arena.region_base(i), +arena.stride)` (§12.8 4A.5, #1872). The transform never addresses a
+/// region (it emits `durable.shadow_base`-relative loads the runtime resolves); it bounds each
+/// push by the stride.
+pub use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
 /// The shadow arena — one definition of placement (see the region-layout note above) — and the end
 /// of the always-live control words below it.
 pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, FIBER_FROZEN, WAIT_FROZEN};
@@ -414,6 +415,7 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
                 &may_suspend,
                 &tainted_sigs,
                 &m.types,
+                arena.stride,
                 opts,
             )?;
             out.funcs[i] = nf;
@@ -428,7 +430,7 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
         // single shadow frame must fit in one context's region.
         // A live call chain stacks one frame per suspended activation; the region bounds the
         // total depth, and the UNWIND check traps a chain deeper than that (#1683).
-        if mem.size() < arena.end || REGION_HEADER_LEN + max_frame > SHADOW_STRIDE {
+        if mem.size() < arena.end || REGION_HEADER_LEN + max_frame > arena.stride {
             return Err(TransformError::MemoryTooSmall);
         }
     }
@@ -1016,13 +1018,15 @@ struct BlockInfo {
 /// each op unwinds (per-point spill + resume id) or continues to the next segment, and the
 /// prologue's `br_table` dispatch routes a thaw to the in-flight point's arm, which reloads
 /// and resumes into the continuation segment. Branch targets are remapped to segment 0 of
-/// the target block. See the block-layout map near the constants.
+/// the target block. See the block-layout map near the constants. `stride` is the arena's region
+/// size, which bounds each unwind push.
 fn transform_func(
     f: &Func,
     func_results: &[Vec<ValType>],
     may_suspend: &[bool],
     tainted_sigs: &[temen_ir::FuncType],
     type_section: &[TypeEntry],
+    stride: u64,
     opts: &TransformOpts,
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
@@ -1245,14 +1249,14 @@ fn transform_func(
                     // `UNWINDING` must never reload as the served count) — before the
                     // generic `Leaf` arm.
                     Inst::CapCall {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: sop @ (SVC_POLL_OP | SVC_WAIT_OP),
+                        type_id,
+                        op,
                         sig,
                         handle,
                         args,
-                    } => SuspendKind::SvcServe {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: *sop,
+                    } if temen_ir::durable_abi::is_serve_op(*type_id, *op) => SuspendKind::SvcServe {
+                        type_id: *type_id,
+                        op: *op,
                         sig: *sig,
                         handle: *handle,
                         args: args.clone(),
@@ -1474,7 +1478,7 @@ fn transform_func(
         let unwind_blk = unwind_base + 2 * gid as u32;
 
         // UNWIND check: a push of this frame must not run past the running context's own region
-        // `[region base, +SHADOW_STRIDE)` — past it lies the next context's shadow frames, or
+        // `[region base, +stride)` — past it lies the next context's shadow frames, or
         // guest memory for the last region (R9 / DURABILITY.md §12.7, #1683). The shadow stack
         // mirrors the call stack, so this only trips for a chain deeper than a region holds — a
         // clean trap, never silent corruption. It lives on the (cold) freeze path, not the
@@ -1484,7 +1488,7 @@ fn transform_func(
         let sp = cb.one(load(LoadOp::I64, sp_a, 0));
         let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
         let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
-        let stride = cb.one(Inst::ConstI64(SHADOW_STRIDE as i64));
+        let stride = cb.one(Inst::ConstI64(stride as i64));
         let region_end = cb.one(ibin(IntTy::I64, BinOp::Add, sp_a, stride));
         let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, region_end));
         let live: Vec<ValIdx> = (0..pt.out as u32).collect();
@@ -2278,10 +2282,7 @@ fn load_result_ty(op: LoadOp) -> ValType {
 #[cfg(test)]
 mod tests {
     /// The arena every test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-    const TEST_ARENA: ShadowArena = ShadowArena {
-        base: 16448,
-        end: 65536,
-    };
+    const TEST_ARENA: ShadowArena = ShadowArena::new(16448, 65536);
     use super::*;
     use temen_ir::Memory;
 

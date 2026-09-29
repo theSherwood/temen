@@ -100,6 +100,9 @@ pub fn print_module(m: &Module) -> String {
         let _ = write!(s, "memory {}", mem.size_log2);
         if let Some(a) = mem.shadow {
             let _ = write!(s, " shadow {} {}", a.base, a.end);
+            if a.stride != temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE {
+                let _ = write!(s, " stride {}", a.stride);
+            }
         }
         s.push_str("\n\n");
     }
@@ -1463,8 +1466,9 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 let bytes = p.parse_str()?;
                 dbg_blobs.push(ProducerBlob { producer, bytes });
             }
-            // Module-level `memory <size_log2> [shadow <base> <end>]` declaration — the optional
-            // tail is the durable shadow arena `[base, end)` (INVARIANTS.md #16).
+            // Module-level `memory <size_log2> [shadow <base> <end> [stride <bytes>]]` declaration —
+            // the optional tail is the durable shadow arena `[base, end)` (INVARIANTS.md #16) and its
+            // region stride, the default when absent (#1872).
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
                 let n = p.parse_int()?;
@@ -1479,7 +1483,15 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                             "memory shadow arena out of range: {base} {end}"
                         )));
                     };
-                    Some(temen_ir::durable_abi::ShadowArena { base, end })
+                    let mut arena = temen_ir::durable_abi::ShadowArena::new(base, end);
+                    if matches!(p.peek(), Some(Tok::Ident(k)) if k == "stride") {
+                        p.next()?;
+                        let n = p.parse_int()?;
+                        arena.stride = u64::try_from(n).map_err(|_| {
+                            ParseError(format!("memory shadow stride out of range: {n}"))
+                        })?;
+                    }
+                    Some(arena)
                 } else {
                     None
                 };
@@ -1752,6 +1764,10 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                     p.next()?;
                     p.parse_int()?;
                     p.parse_int()?;
+                    if matches!(p.peek(), Some(Tok::Ident(k)) if k == "stride") {
+                        p.next()?;
+                        p.parse_int()?;
+                    }
                 }
             }
             // §7 imports — skip in the header prescan. v7 form: `import <idx> func|interface
@@ -3759,7 +3775,7 @@ block 0 (v0: i32) {
 }
 ";
 
-    /// `memory N [shadow BASE END]`: the optional tail is the module-declared durable shadow arena
+    /// `memory N [shadow BASE END [stride S]]`: the optional tail is the module-declared durable shadow arena
     /// (INVARIANTS.md #16); it parses, prints, and re-parses identically, and its absence is `None`.
     #[test]
     fn memory_shadow_arena_round_trips() {
@@ -3767,10 +3783,7 @@ block 0 (v0: i32) {
         let m = parse_module("memory 17 shadow 16448 65536\n").expect("parse");
         assert_eq!(
             m.memory.and_then(|x| x.shadow),
-            Some(ShadowArena {
-                base: 16448,
-                end: 65536
-            })
+            Some(ShadowArena::new(16448, 65536))
         );
         let printed = print_module(&m);
         assert!(
@@ -3781,6 +3794,18 @@ block 0 (v0: i32) {
         let plain = parse_module("memory 17\n").expect("parse");
         assert_eq!(plain.memory.and_then(|x| x.shadow), None);
         assert_eq!(parse_module(&print_module(&plain)).expect("reparse"), plain);
+        // A non-default region stride (#1872) prints and re-parses; the default is not printed.
+        let wide = parse_module("memory 20 shadow 65536 196608 stride 32768\n").expect("parse");
+        assert_eq!(
+            wide.memory.and_then(|x| x.shadow),
+            Some(ShadowArena {
+                base: 65536,
+                end: 196608,
+                stride: 32768
+            })
+        );
+        assert_eq!(parse_module(&print_module(&wide)).expect("reparse"), wide);
+        assert!(!printed.contains("stride"), "{printed}");
     }
 
     #[test]

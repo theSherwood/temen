@@ -12,10 +12,7 @@ use temen_interp::{
 };
 use temen_ir::durable_abi::ShadowArena;
 
-const ARENA: ShadowArena = ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const SIZE_LOG2: u8 = 18;
 
 fn instrument(src: &str) -> temen_ir::Module {

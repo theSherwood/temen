@@ -391,9 +391,10 @@ pub mod durable_abi {
     /// §12.8: bytes reserved at a context region's base before its shadow frames — the SP word, the
     /// thaw state word at [`STATE_IN_REGION_OFF`] and the re-issue word at [`REISSUE_IN_REGION_OFF`].
     pub const REGION_HEADER_LEN: u64 = 16;
-    /// Per-context shadow-region stride: context `i` owns `[ShadowArena::region_base(i), +stride)`.
-    pub const SHADOW_STRIDE: u64 = 1 << 12;
-    /// The most shadow contexts a declared arena may hold (`(end - base) / SHADOW_STRIDE`): one
+    /// The shadow-region stride an arena declares unless it names its own
+    /// ([`ShadowArena::stride`]): 4 KiB. A deep call chain needs a wider one (#1872).
+    pub const DEFAULT_SHADOW_STRIDE: u64 = 1 << 12;
+    /// The most shadow contexts a declared arena may hold (`(end - base) / stride`): one
     /// machine word of allocator occupancy bits, and far above any fiber quota in the tree. The
     /// verifier holds a declared arena to it; a producer that *places* an arena (the LLVM on-ramp's
     /// `--shadow-arena`, #1534) sizes against the same number rather than a copy of it.
@@ -426,6 +427,14 @@ pub mod durable_abi {
     pub const SVC_POLL_OP: u32 = 9;
     pub const SVC_WAIT_OP: u32 = 10;
 
+    /// Whether a host call `(type_id, op)` is a **serve op** (`svc.poll` / `svc.wait`): the one host
+    /// call the durable transform re-issues unconditionally on thaw (§13.4 slice 4b) rather than
+    /// modelling as a leaf whose result reloads. The one definition the transform, the import
+    /// binding and a landing freeze's abandon all ask.
+    pub const fn is_serve_op(type_id: u32, op: u32) -> bool {
+        type_id == crate::CAP_SELF_TYPE_ID && matches!(op, SVC_POLL_OP | SVC_WAIT_OP)
+    }
+
     /// End of the **always-live** durable control words: the state word, shadow-SP and arm
     /// countdowns occupy `[guard, guard+32)` and are polled at every safepoint, so their offsets
     /// are fixed ABI; `[guard+32, guard+64)` is the powerbox heap words and empty argv/envp, which a
@@ -435,11 +444,12 @@ pub mod durable_abi {
     pub const DURABLE_CONTROL_END: u64 = super::POWERBOX_NULL_GUARD + 64;
 
     /// The **shadow arena**: the window byte range `[base, end)` holding a durable domain's
-    /// per-context shadow regions (context `i` owns `[base + i*SHADOW_STRIDE, +SHADOW_STRIDE)`).
+    /// per-context shadow regions (context `i` owns `[base + i*stride, +stride)`).
     /// This is the one durable-runtime structure whose *placement* is not a fixed ABI offset —
     /// the instrumented IR addresses it through `durable.shadow_base`, so where it sits is a
-    /// property of the module, not of the substrate (INVARIANTS.md #16). The intra-region shape
-    /// ([`SHADOW_STRIDE`], [`REGION_HEADER_LEN`], [`STATE_IN_REGION_OFF`]) stays ABI.
+    /// property of the module, not of the substrate (INVARIANTS.md #16). So is the region size
+    /// ([`Self::stride`], #1872); the intra-region header ([`REGION_HEADER_LEN`],
+    /// [`STATE_IN_REGION_OFF`]) stays ABI.
     ///
     /// **One definition of placement.** Every consumer — the transform's overflow guard and window
     /// seed, both interpreter tiers' fiber registries, the Cranelift fiber runtime, the snapshot
@@ -451,11 +461,23 @@ pub mod durable_abi {
     pub struct ShadowArena {
         /// First byte of the arena (context 0's region base). 8-aligned, `>= DURABLE_CONTROL_END`.
         pub base: u64,
-        /// One past the last byte; the shadow-overflow trap line (a push that would cross it traps).
+        /// One past the last byte.
         pub end: u64,
+        /// Bytes per context region, a power of two `>=` [`DEFAULT_SHADOW_STRIDE`]. A context's
+        /// unwound call chain must fit its region: a push past it traps the freeze.
+        pub stride: u64,
     }
 
     impl ShadowArena {
+        /// An arena of [`DEFAULT_SHADOW_STRIDE`] regions.
+        pub const fn new(base: u64, end: u64) -> Self {
+            ShadowArena {
+                base,
+                end,
+                stride: DEFAULT_SHADOW_STRIDE,
+            }
+        }
+
         /// Bytes in the arena (mirrors [`Memory::size`]).
         pub const fn size(self) -> u64 {
             self.end - self.base
@@ -464,13 +486,13 @@ pub mod durable_abi {
         /// The shadow-region base (window offset) of context `ctx` (root = 0; a fiber in registry
         /// slot `s` is context `s + 1`).
         pub const fn region_base(self, ctx: usize) -> u64 {
-            self.base + ctx as u64 * SHADOW_STRIDE
+            self.base + ctx as u64 * self.stride
         }
 
         /// Whether context `ctx`'s whole region lies inside the arena — the capacity bound a fiber
         /// or vCPU allocator checks before handing the context out.
         pub const fn region_fits(self, ctx: usize) -> bool {
-            self.region_base(ctx) + SHADOW_STRIDE <= self.end
+            self.region_base(ctx) + self.stride <= self.end
         }
 
         /// The empty shadow-SP / frame base of context `ctx`: just past its in-region SP + thaw
@@ -500,14 +522,11 @@ pub mod durable_abi {
         /// can be placed in it ([`Self::region_fits`] is false for every context), so a durable run
         /// of such a module is refused at setup rather than defaulted — there is no default
         /// placement (INVARIANTS.md #16).
-        pub const EMPTY: ShadowArena = ShadowArena {
-            base: DURABLE_CONTROL_END,
-            end: DURABLE_CONTROL_END,
-        };
+        pub const EMPTY: ShadowArena = ShadowArena::new(DURABLE_CONTROL_END, DURABLE_CONTROL_END);
 
         /// How many whole regions the arena holds (context indices `0..contexts()`).
         pub const fn contexts(self) -> usize {
-            (self.size() / SHADOW_STRIDE) as usize
+            (self.size() / self.stride) as usize
         }
 
         /// The highest context index an allocator may hand out — the top of the spawned-vCPU
@@ -521,7 +540,7 @@ pub mod durable_abi {
         /// [`Self::region_base`], for a runtime recovering a frozen fiber's context from its
         /// saved SP.
         pub const fn ctx_of_sp(self, sp: u64) -> usize {
-            ((sp - self.base) / SHADOW_STRIDE) as usize
+            ((sp - self.base) / self.stride) as usize
         }
     }
 }

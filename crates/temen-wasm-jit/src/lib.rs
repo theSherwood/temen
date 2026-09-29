@@ -328,6 +328,51 @@ fn fcmp_opcode(ty: temen_ir::FloatTy, op: temen_ir::FCmpOp) -> u8 {
     }
 }
 
+/// #1856: turn a NaN `min`/`max` result into the IR's canonical quiet NaN, `0x7FC0_0000` (f32) /
+/// `0x7FF8_0000_0000_0000` (f64). The IR defines `min`/`max` to yield it on any NaN input (the
+/// interpreter's `fmin`/`fmax`, which the JIT's `canonicalize_nan` matches), but wasm's `min`/`max`
+/// may return an input NaN with its payload and sign, and a reinterpret or a store makes those bits
+/// observable. Expects the result on the stack and leaves the canonical value there, using `tmp` (the
+/// result's own local) as scratch. `x != x` holds exactly on NaN: a flag for `select` on a scalar, a
+/// lane mask for `v128.bitselect` when `lanes`.
+fn emit_canonical_nan(code: &mut Vec<u8>, tmp: u32, ty: temen_ir::FloatTy, lanes: bool) {
+    code.push(OP_LOCAL_SET);
+    uleb(code, tmp as u64);
+    let (canon, shape) = match ty {
+        temen_ir::FloatTy::F32 => (0x7FC0_0000u32.to_le_bytes().to_vec(), VShape::F32x4),
+        temen_ir::FloatTy::F64 => (
+            0x7FF8_0000_0000_0000u64.to_le_bytes().to_vec(),
+            VShape::F64x2,
+        ),
+    };
+    if lanes {
+        emit_simd(code, 12); // v128.const
+        for _ in 0..16 / canon.len() {
+            code.extend_from_slice(&canon);
+        }
+    } else {
+        code.push(match ty {
+            temen_ir::FloatTy::F32 => 0x43, // f32.const
+            temen_ir::FloatTy::F64 => 0x44, // f64.const
+        });
+        code.extend_from_slice(&canon);
+    }
+    for _ in 0..3 {
+        code.push(OP_LOCAL_GET);
+        uleb(code, tmp as u64);
+    }
+    if lanes {
+        emit_simd(
+            code,
+            vfloatcmp_sub(shape, VFCmpOp::Ne).expect("a float shape"),
+        );
+        emit_simd(code, 82); // v128.bitselect
+    } else {
+        code.push(fcmp_opcode(ty, temen_ir::FCmpOp::Ne));
+        code.push(OP_SELECT);
+    }
+}
+
 /// `i32/i64.trunc_sat_f32/f64_{s,u}` — the `0xFC` prefix + subopcode (saturating float→int).
 fn ftoisat_subop(op: temen_ir::FToI) -> u8 {
     let (fty, ity, signed) = op.parts();
@@ -6439,6 +6484,9 @@ fn emit_block_body(
                 get(code, cx, *a);
                 get(code, cx, *rb);
                 code.push(fbin_opcode(*ty, *op));
+                if matches!(op, temen_ir::FBinOp::Min | temen_ir::FBinOp::Max) {
+                    emit_canonical_nan(code, cx.local_of[k][next_val], *ty, false);
+                }
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::FUn { ty, op, a } => {
@@ -6898,6 +6946,13 @@ fn emit_block_body(
                     code,
                     vfloatbin_sub(*shape, *op).ok_or(Error::Unsupported("v128 float bin shape"))?,
                 );
+                if matches!(op, VFloatBinOp::Min | VFloatBinOp::Max) {
+                    let ty = match shape {
+                        VShape::F32x4 => temen_ir::FloatTy::F32,
+                        _ => temen_ir::FloatTy::F64, // `vfloatbin_sub` admits only F32x4/F64x2
+                    };
+                    emit_canonical_nan(code, cx.local_of[k][next_val], ty, true);
+                }
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::VFloatUn { shape, op, a } => {

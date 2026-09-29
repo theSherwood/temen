@@ -14,14 +14,12 @@ use temen_durable::{
     begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
     write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_STRIDE};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value, DEFAULT_SHADOW_STRIDE};
 use temen_ir::{Inst, Memory, Module, Terminator};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -219,7 +217,7 @@ block 0 (v0: i64, v1: i64) {
     let fiber_base = TEST_ARENA.region_base(1);
 
     // The root unwound its `cont.resume` frame into context 0's region.
-    let root_region = &snap[root_base as usize..(root_base + SHADOW_STRIDE) as usize];
+    let root_region = &snap[root_base as usize..(root_base + DEFAULT_SHADOW_STRIDE) as usize];
     assert!(
         root_region.iter().any(|&b| b != 0),
         "the root unwound a frame into context 0's region"
@@ -232,7 +230,7 @@ block 0 (v0: i64, v1: i64) {
     assert_eq!(frozen[0].slot, 0, "the single fiber holds handle 0");
     let fiber_sp = frozen[0].shadow_sp;
     assert!(
-        fiber_sp > fiber_base && fiber_sp <= fiber_base + SHADOW_STRIDE,
+        fiber_sp > fiber_base && fiber_sp <= fiber_base + DEFAULT_SHADOW_STRIDE,
         "the fiber flattened a frame into its own region [{fiber_base}, +stride): sp={fiber_sp}"
     );
     // §12.8 4A.5: the root's shadow-SP word is the first 8 bytes of its own region (at `root_base`),

@@ -1,13 +1,10 @@
-//! **#1011 slice 3a — production wiring: a §14 op-13 grant list runs on the resumable engine.** The
-//! sibling test `confined_child_grant.rs` drives the *constructor* (`new_confined_child_granted`) with a
-//! hand-built installer closure. This proves the real path: a guest issues
-//! `instantiate_module_named` (op 13) with a grant list, the **resumable `Vcpu` engine** re-grants the
-//! named cap out of the *parent's own powerbox* (`read_grant_list` + `regrant_list_into_child`), stashes
-//! the child powerbox, and the driver runs the granted child with `take_granted_host()` +
-//! `new_confined_child_over_host` — the exact seam a JIT-tier nim phase child (a shared `fs`) uses. A
-//! grant-less child would run with the plain `new_confined_child`; the driver picks by whether a stash
-//! is present. Window confinement (§2) is untouched: the grant is authority (§3), a cross-tier
-//! `call.cap`, not a window access.
+//! **#1011 slice 3a — production wiring: a §14 op-13 grant list runs on the resumable engine.** A
+//! guest issues `instantiate_module_named` (op 13) with a grant list, and the **resumable `Vcpu`
+//! engine** admits it through the one admission every driver uses (`admit_confined_child`),
+//! re-granting the named cap out of the *parent's own powerbox* into the child's. The driver only
+//! starts the admitted child over its carve (`take_child` + `PendingChild::start`) — the exact seam a
+//! JIT-tier nim phase child (a shared `fs`) uses. Window confinement (§2) is untouched: the grant is
+//! authority (§3), a cross-tier `call.cap`, not a window access.
 
 use std::sync::{Arc, Mutex};
 use temen_interp::{bytecode, ForkedProc, Host, HostProc, Region, Trap, Value};
@@ -99,9 +96,8 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
 struct WinPtr(*mut u8);
 
 /// Drive one vCPU of the run to completion, servicing §14 instantiate events. On an `Instantiate` the
-/// driver asks the engine for a stashed granted powerbox (`take_granted_host`): `Some` → run the child
-/// over it (`new_confined_child_over_host` — the op-13 grant path); `None` → the plain confined child.
-/// A leaf child runs synchronously (recursively drivable), its result delivered at the join.
+/// driver starts the child the engine admitted (its powerbox already built, the grant included) over
+/// the carve. A leaf child runs synchronously (recursively drivable), its result delivered at the join.
 fn drive(
     prog: &bytecode::VcpuProgram,
     base: WinPtr,
@@ -113,27 +109,18 @@ fn drive(
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
-                let granted = vcpu.take_granted_host();
                 // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
                 // child here); the child's region aliases that sub-window — the §14 shared data plane.
                 let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
                 // SAFETY: as above — `2^size_log2` valid bytes at the validated carve.
                 let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
-                let child = match granted {
-                    Some(host) => bytecode::Vcpu::new_confined_child_over_host(
-                        prog, module, entry, back, size_log2, fuel, host,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child(
-                        prog, module, entry, back, size_log2, fuel,
-                    ),
-                }
-                .expect("confined child builds");
+                let child = vcpu
+                    .take_child()
+                    .expect("an Instantiate carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("confined child builds");
                 let r = drive(prog, child_base, child);
                 let handle = children.len() as i32;
                 children.push(r);

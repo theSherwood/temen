@@ -9,16 +9,15 @@
 //! large-frame guest recursing near the cap must trap here, never write past its region.
 
 use temen_durable::{
-    init_durable_window, transform_module, write_state, SHADOW_STRIDE, STATE_UNWINDING,
+    init_durable_window, transform_module, write_state, DEFAULT_SHADOW_STRIDE, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -36,10 +35,14 @@ block 0 (v0: i32) {
 "#;
 
 fn instrument() -> Module {
+    instrument_in(TEST_ARENA)
+}
+
+fn instrument_in(arena: ShadowArena) -> Module {
     let mut m = temen_text::parse_module(LEAF).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
-        shadow: Some(TEST_ARENA),
+        shadow: Some(arena),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -48,11 +51,12 @@ fn instrument() -> Module {
 
 /// Freeze with the shadow-SP pre-seeded to `sp` (simulating an already-`sp`-deep stack).
 fn freeze_with_sp(inst: &Module, sp: u64) -> Result<Vec<Value>, Trap> {
-    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    let arena = inst.memory.and_then(|m| m.shadow).expect("an arena");
+    let mut win = init_durable_window(WINDOW, arena);
     write_state(&mut win, STATE_UNWINDING);
     // §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at
     // `ShadowArena::region_base(0)`), not the legacy global `SHADOW_SP_OFF`.
-    win[TEST_ARENA.region_base(0) as usize..TEST_ARENA.region_base(0) as usize + 8]
+    win[arena.region_base(0) as usize..arena.region_base(0) as usize + 8]
         .copy_from_slice(&sp.to_le_bytes());
     let mut host = Host::new();
     host.clock_ns = 42;
@@ -94,7 +98,7 @@ fn shadow_overflow_traps_instead_of_corrupting() {
 #[test]
 fn shadow_overflow_into_the_next_context_traps() {
     let inst = instrument();
-    let region_end = TEST_ARENA.region_base(0) + SHADOW_STRIDE;
+    let region_end = TEST_ARENA.region_base(0) + DEFAULT_SHADOW_STRIDE;
     assert_eq!(region_end, TEST_ARENA.region_base(1));
     assert!(region_end < TEST_ARENA.end);
     assert!(
@@ -104,5 +108,25 @@ fn shadow_overflow_into_the_next_context_traps() {
     assert!(
         freeze_with_sp(&inst, region_end - 64).is_ok(),
         "a frame that still fits in the region pushes"
+    );
+}
+
+/// #1872: the bound is the region the arena declares. With 16 KiB regions a push well past the
+/// default 4 KiB still fits, and a push across the wide region's end traps.
+#[test]
+fn the_bound_is_the_declared_stride() {
+    let wide = ShadowArena {
+        stride: 4 * DEFAULT_SHADOW_STRIDE,
+        ..ShadowArena::new(16448, 16448 + 3 * 4 * DEFAULT_SHADOW_STRIDE)
+    };
+    let inst = instrument_in(wide);
+    let region_end = wide.region_base(1);
+    assert!(
+        freeze_with_sp(&inst, wide.region_base(0) + 2 * DEFAULT_SHADOW_STRIDE).is_ok(),
+        "a push past a default region but inside the declared one fits"
+    );
+    assert!(
+        freeze_with_sp(&inst, region_end - 8).is_err(),
+        "a push past the declared region traps"
     );
 }

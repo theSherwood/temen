@@ -62,7 +62,7 @@ fn emit_ll(src: &std::path::Path, ll: &std::path::Path) -> bool {
 struct WinPtr(*mut u8);
 
 /// Drive one vCPU of the run to completion, servicing §14 instantiate events (op-5 here: no grant list,
-/// so `take_granted_host` is `None` and the child runs with the plain confined constructor).
+/// so the admitted child's powerbox holds only its starter caps).
 fn drive(
     prog: &bytecode::VcpuProgram,
     base: WinPtr,
@@ -74,27 +74,18 @@ fn drive(
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
-                let granted = vcpu.take_granted_host();
                 // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
                 // child); the child's region aliases that sub-window — the §14 shared data plane.
                 let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve.
                 let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
-                let child = match granted {
-                    Some(host) => bytecode::Vcpu::new_confined_child_over_host(
-                        prog, module, entry, back, size_log2, fuel, host,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child(
-                        prog, module, entry, back, size_log2, fuel,
-                    ),
-                }
-                .expect("confined child builds");
+                let child = vcpu
+                    .take_child()
+                    .expect("an Instantiate carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("confined child builds");
                 let r = drive(prog, child_base, child);
                 let handle = children.len() as i32;
                 children.push(r);

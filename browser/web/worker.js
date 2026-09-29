@@ -271,7 +271,7 @@ self.onmessage = async (e) => {
           if (paged) syncPaged();
         },
         // §14 VM-in-VM spawn bounce. The emitted parent does no confinement itself, so the engine's
-        // `event_instantiate` carve checks are replicated here: the grandchild's power-of-two carve
+        // carve checks (`admit_confined_child`) are replicated here: the grandchild's power-of-two carve
         // must be aligned and lie inside THIS child's own window (confinement composes); a violation
         // throws → this child's slot reads trapped, exactly as the interpreter traps the parent.
         // The `inst` handle arg is inert (0n) on the emitted tier — authority is this child's §14

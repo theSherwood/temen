@@ -1103,6 +1103,21 @@ pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 
     h
 }
 
+/// #1697 — [`grant_vm_fs`]'s thaw half: a [`temen_interp::NamedCapRegistrar`] that serves `vm_fs`,
+/// rebuilding the store from the state the artifact carries, and refuses every other name. An
+/// embedder that grants `vm_fs` gives its registrar this too (first, or as its fallback), so what it
+/// grants a fresh run it can also thaw.
+pub fn regrant_vm_fs(name: &str, state: &[u8]) -> Option<temen_interp::NamedCapGrant> {
+    let fs = (name == "vm_fs")
+        .then(|| MemFsHandle::from_state(state).ok())
+        .flatten()?;
+    Some(temen_interp::NamedCapGrant {
+        handler: vm_fs_handler(&fs),
+        fork: Some(vm_fs_fork(&fs)),
+        state: fs.cap_state(),
+    })
+}
+
 /// #1718 — the `vm_fs` seam's **fork factory** over `fs`: a §14 child the capability is re-granted
 /// to, or a `fork()` twin, gets a handler over the **same** store — the shared-store posture
 /// [`mem_fs_shared_factory`] gives a phase and the children it spawns. What [`grant_vm_fs`] grants

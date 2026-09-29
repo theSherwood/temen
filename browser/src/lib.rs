@@ -2725,13 +2725,15 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 size_log2,
                 fuel,
             } => {
-                // A carve of a detached window is not addressable as `win + carve` in the engine
-                // memory (see [`ParVcpu::detached`]): fail closed. So is a spawn whose by-name grant
-                // list the engine re-granted and stashed (op 13, a §3d record's): the child's powerbox
-                // is rebuilt from these inert integers in its own Worker, so the grants have no path
-                // there, and running the child without them would be a silent answer — the detached
-                // arm below refuses the same way.
-                if v.detached || v.inner.take_granted_host().is_some() {
+                // The engine admitted the child and built its powerbox, but this driver rebuilds the
+                // child in its own Worker from these inert integers (`temen_par_child_confined` →
+                // `Vcpu::new_confined_child`), which carries only the starter caps. So a spawn that
+                // re-granted named caps (op 13, a §3d record's) fails closed rather than run the child
+                // without them — the detached arm below refuses the same way — and so does a carve of a
+                // detached window, which is not addressable as `win + carve` in the engine memory (see
+                // [`ParVcpu::detached`]). A grant-less op-13 spawn is not refused: its list is empty.
+                let admitted = v.inner.take_child();
+                if v.detached || admitted.is_some_and(|c| c.granted()) {
                     return PAR_TRAP;
                 }
                 v.a = ((module as i64) << 32) | entry as i64;
@@ -3422,10 +3424,15 @@ impl OnrampCaps {
 
     /// The thaw's **registrar** over these cells: re-grant a named capability the artifact carries —
     /// its handler, re-seeded from the captured state, and its fork factory, so a thawed capability is
-    /// exactly as re-grantable as a fresh one — or refuse a name this powerbox does not serve.
+    /// exactly as re-grantable as a fresh one — or refuse a name this powerbox does not serve. `vm_fs`
+    /// is granted beside these cells ([`grant_onramp_caps`]), so it thaws through its own grant's
+    /// counterpart (#1697).
     fn registrar(&self) -> temen_interp::NamedCapRegistrar {
         let caps = self.clone();
         Box::new(move |name, state| {
+            if let Some(g) = temen_fs::regrant_vm_fs(name, state) {
+                return Some(g);
+            }
             let handler = caps.handler(name)?;
             caps.set_state(name, state); // re-seed before the guest can call it
             Some(temen_interp::NamedCapGrant {
@@ -11843,8 +11850,8 @@ pub extern "C" fn temen_onramp_jit_run_close() {
 // ==== #1025 Path 1: the JS-orchestrated §14 op-13 loop — a nested child on the EMITTED tier ==========
 // The browser realization of `nimc.rs::drive_op13`, but the confined child runs on **emitted wasm** over
 // its carve instead of the interpreter. The resumable driver vCPU runs Rust-side; at an op-13
-// `instantiate` the engine has already **marshaled** the parent's grant list into the child's powerbox
-// (`take_granted_host`) — this loop hands that granted host + the child module + the carve to a
+// `instantiate` the engine has already admitted the child and **marshaled** the parent's grant list into
+// its powerbox (`take_child`) — this loop hands that powerbox + the child module + the carve to a
 // [`JitOnrampRun`] (`open_shared_run_over_host`, stashed in `JIT_RUN`), so JS drives the child's emitted
 // `_start` via `driveJitRun` (its `call.cap` leaves resolving over the marshaled host on the reactor
 // cross-tier bounce). The child's returned value is delivered back to the driver's `join`. Single-Worker
@@ -12770,19 +12777,14 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
-                let Some(mut host) = d.root.take_granted_host() else {
-                    return OP13JIT_TRAP; // the driver always marshals; a grant-less child is off-contract
+                // The engine admitted the child through the one admission every driver uses: its
+                // powerbox carries the marshaled caps, the starter `Instantiator`/`AddressSpace` over the
+                // carve, the child module as its own (§3.5 / #1296) and its import manifest bound.
+                let Some(child) = d.root.take_child() else {
+                    return OP13JIT_TRAP;
                 };
-                // §3.5 / #1296: the child's self-referential surface is ITS module — a re-granted `Jit`
-                // table's memory-match precondition resolves against the child's declared memory (the
-                // tree-walker's op-13 arm and the coop pump register it the same way).
-                host.set_self_module(&d.child);
                 let child_size = 1u64 << size_log2;
                 // SAFETY: the engine validated the carve within the driver's window; the child window
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
@@ -12817,10 +12819,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         Ok(e) => e,
                         Err(_) => {
                             // #1151: the emit declined (a child that `unmap`s/`protect`s its pages, an
-                            // out-of-subset entry, a suspending reachable set). Run the child on the
-                            // interpreter over the same carve and powerbox instead of trapping the driver:
-                            // `new_confined_child_over_host` grants the starter caps and binds the manifest
-                            // exactly as the native `drive_op13` does, and the result is banked for the
+                            // out-of-subset entry, a suspending reachable set). Run the admitted child on
+                            // the interpreter over the same carve and powerbox instead of trapping the
+                            // driver, exactly as the native `drive_op13` does, and bank the result for the
                             // driver's `join` like an emitted child's. Fail-closed, byte-identical.
                             // SAFETY: `prog` outlives the driver (freed in `close`, after the root and this
                             // child are dropped); the carve region aliases the driver's live window.
@@ -12832,12 +12833,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             // at the child's declared window over the carve-sized backing, exactly as
                             // the emit's `"mapped"` does, so the decline runs byte-identical.
                             let decl = d.child.memory.as_ref().map_or(size_log2, |m| m.size_log2);
-                            let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
-                                prog, module, entry, back, decl, size_log2, fuel, host,
-                            ) {
-                                Ok(c) => nimc::drive_op13(prog, carve_ptr, c, None),
-                                Err(t) => Err(t),
-                            };
+                            let r = child
+                                .start(prog, back, Some(decl))
+                                .and_then(|c| nimc::drive_op13(prog, carve_ptr, c, None));
                             let handle = d.children.len() as i32;
                             d.children.push(Some(r));
                             d.root.deliver_handle(handle);
@@ -12845,23 +12843,17 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         }
                     },
                 };
-                // Replicate the confined child-entry setup `new_confined_child_over_host` does, so the
-                // child runs EMITTED over the same powerbox it would on the interpreter: grant the starter
-                // Instantiator + AddressSpace over the carve, bind the child's import manifest (write/read/
-                // exit/fs) against the re-granted caps, and pass the child-entry its `Instantiator` handle
-                // as `f{entry}`'s first param (`[I64]->[I64]`, `child_entry_ok`). An import-free child
-                // (empty manifest) is unaffected; a manifest phase (nifler_ce) resolves its caps via it.
-                let (cinst, cas) = host.grant_starter_caps(child_size);
-                if host
-                    .bind_child_manifest(&d.child.imports, &d.child.types)
-                    .is_err()
-                {
-                    return OP13JIT_TRAP;
-                }
-                let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
-                               // The child-entry's starter handles, exactly as the interpreter passes them
-                               // (`[Instantiator, AddressSpace]` for the two-param shape) — #1201: a page-op child's
-                               // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`.
+                // The child runs EMITTED over the same powerbox it would on the interpreter, and its
+                // entry gets the same starter handles the interpreter passes (`[Instantiator,
+                // AddressSpace]` for the two-param shape, `child_entry_ok`) — #1201: a page-op child's
+                // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`. The
+                // emitted entry is `f{entry}` (0 for the phase drivers here).
+                let (host, args) = child.into_powerbox();
+                let handle = |i: usize| match args.get(i) {
+                    Some(Value::I64(h)) => *h as u64,
+                    _ => 0,
+                };
+                let (cinst, cas) = (handle(0), handle(1));
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
@@ -12872,8 +12864,8 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         host,
                         Vec::new(),
                         None,
-                        cinst as u64,
-                        cas as u64,
+                        cinst,
+                        cas,
                         Some(emit),
                     )
                 };

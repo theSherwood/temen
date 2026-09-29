@@ -11,10 +11,8 @@ use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
-const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
-    base: 16448,
-    end: 65536,
-};
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
+    temen_ir::durable_abi::ShadowArena::new(16448, 65536);
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -1585,16 +1583,7 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
     let artifact = freeze(&inst, &win, &host).expect("a named memfs is freezable");
 
     let mut thost = Host::new();
-    thost.set_named_cap_registrar(Box::new(|name, state| {
-        (name == "vm_fs")
-            .then(|| temen_fs::MemFsHandle::from_state(state).ok())
-            .flatten()
-            .map(|fs| temen_interp::NamedCapGrant {
-                handler: temen_fs::vm_fs_handler(&fs),
-                fork: Some(temen_fs::vm_fs_fork(&fs)),
-                state: fs.cap_state(),
-            })
-    }));
+    thost.set_named_cap_registrar(Box::new(temen_fs::regrant_vm_fs));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `vm_fs`");
     // #1699 — the registrar re-granted the store's state with its handler, so the next capture
     // (a freeze, a moment) reads it as the first did.
@@ -1602,6 +1591,14 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
         thost.capture_cap_states(),
         host.capture_cap_states(),
         "a thawed memfs is captured again, not frozen empty"
+    );
+    // #1859 — the restore re-registered the carried name, so the thawed domain re-freezes to the same
+    // artifact (a bare host has no powerbox to name the capability otherwise).
+    assert_eq!(thost.resolve_cap_name("vm_fs"), Some(h));
+    assert_eq!(
+        freeze(&inst, &win, &thost).expect("a thawed named memfs is freezable"),
+        artifact,
+        "a thawed domain re-freezes to the artifact it came from"
     );
 
     // The descriptor survived, cursor and all: reading from it picks up after the "h".

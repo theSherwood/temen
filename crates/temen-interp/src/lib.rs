@@ -7687,13 +7687,14 @@ fn freeze_in_flight(s: &Sched) -> bool {
             .any(|v| unwinding(v))
 }
 
-/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe and
-/// reap **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
+/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe, reap
+/// and stop **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
 /// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
 /// would spin the worker loop instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
     !s.svc_waiters.is_empty()
         || !s.posix_reap_waiters.is_empty()
+        || !s.stopped.is_empty()
         || s.wait_waiters
             .values()
             .flatten()
@@ -7721,7 +7722,8 @@ fn freeze_can_admit(s: &Sched) -> bool {
 /// same `WAIT_WOKEN` the JIT's own freeze arm delivers: discarded by the safepoint that unwinds
 /// before the guest can observe it, and the thaw re-issues the wait. A pipe read/write or reap bench
 /// is re-admitted too (#1672): its rewound op re-executes under the freeze and is abandoned
-/// ([`Decision::Abandon`]), and the thaw re-issues the call.
+/// ([`Decision::Abandon`]), and the thaw re-issues the call. So is a stopped vCPU: it sees through
+/// its stop to its next freeze point, abandoning any host call on the way.
 ///
 /// A joiner or lane waiter *will* be woken by something else — its child completing (here, by
 /// unwinding), a lane coming free — so it takes the phase without re-admission. Without the phase
@@ -7759,6 +7761,15 @@ fn admit_parks_for_freeze(s: &mut Sched) {
         waiters.retain(|_, q| !q.is_empty());
     }
     for (_, q) in std::mem::take(&mut s.posix_reap_waiters) {
+        for mut v in q {
+            v.dstate = STATE_UNWINDING;
+            s.runnable.push_back(v);
+        }
+    }
+    // #1672 — a stopped vCPU is re-admitted too: under the freeze it sees through its stop, runs on
+    // to its freeze point without leaving the domain (a host call on the way is abandoned), and
+    // unwinds there.
+    for (_, q) in std::mem::take(&mut s.stopped) {
         for mut v in q {
             v.dstate = STATE_UNWINDING;
             s.runnable.push_back(v);
@@ -10053,7 +10064,7 @@ impl SchedDriver {
 // (#915), so TCB `temen-interp` never depends on the tooling-tier `temen-durable`.
 //
 // Per-context layout has **one definition**: `temen_ir::durable_abi::ShadowArena` (#1503) —
-// context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)`, the arena being the module's own
+// context `i` owns `[arena.region_base(i), +arena.stride)`, the arena being the module's own
 // declaration (`Memory::shadow`, carried by this window's `Mem`). The root computation is context 0; a `cont.new`-created
 // fiber in registry slot `s` is context `s + 1`.
 
@@ -10097,16 +10108,16 @@ pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
 /// Must equal `temen_durable::ARM_QUIESCE_OFF`.
 pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
+/// The region stride an arena declares unless it names its own: context `i` occupies
+/// `[ShadowArena::region_base(i), +stride)`, 4 KiB by default. The transform's shadow-overflow
+/// guard bounds each push by the arena's stride (#1683), so a context recursed deeper than one
+/// region traps the freeze instead of writing its neighbour's frames; a module whose chains run
+/// deeper declares a wider stride (#1872).
+pub use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
 /// The legacy global shadow-SP word's slot in the fixed control block — **unused since §12.8
 /// 4A.5** (each context's SP word is the first 8 bytes of its own region); kept as a reserved ABI
 /// offset. Must equal `temen_durable::SHADOW_SP_OFF`.
 pub use temen_ir::durable_abi::SHADOW_SP_OFF;
-/// Per-context shadow-stack stride: context `i` occupies `[ShadowArena::region_base(i), +
-/// SHADOW_STRIDE)`. 4 KiB per context (a 48 KiB arena holds 12) — a provisional
-/// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
-/// The transform's shadow-overflow guard bounds each push by this stride (#1683), so a context
-/// recursed deeper than one region traps the freeze instead of writing its neighbour's frames.
-pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// The shadow arena: where the per-context shadow regions sit (one definition of placement).
 pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 
@@ -13306,8 +13317,39 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // positive (nothing rewound; a resume executes the current inst). Checked after
             // `kill`/terminate (death beats stop) and before signal delivery (a stopped process
             // handles its signals at continue, not while stopped — POSIX).
-            if stop_depth.load(Ordering::Relaxed) > 0 {
-                return Ok(Inner::Park(Blocked::Stopped));
+            let stopped = stop_depth.load(Ordering::Relaxed) > 0;
+            if stopped {
+                // #1672 — a landing freeze sees through the stop. A stop lands asynchronously, so
+                // landing at the next freeze point instead of here is indistinguishable to the guest,
+                // provided nothing leaves the domain meanwhile: the ops on the way touch only its own
+                // window (every vCPU of the domain is stopped), and a host call is abandoned rather
+                // than performed, for the thaw to re-issue. A serve op is not abandoned: the thaw
+                // re-issues it anyway, and under the freeze it drains nothing.
+                let freezing = durable
+                    && mem
+                        .as_ref()
+                        .is_some_and(|m| m.durable_state() == STATE_UNWINDING);
+                if !freezing {
+                    return Ok(Inner::Park(Blocked::Stopped));
+                }
+                let host_call = match &block.insts[frames[top].inst] {
+                    Inst::CapCall {
+                        type_id, op, sig, ..
+                    } if !temen_ir::durable_abi::is_serve_op(*type_id, *op) => Some(*sig),
+                    Inst::CallImport { sig, .. }
+                    | Inst::CallImportDyn { sig, .. }
+                    | Inst::CallSym { sig, .. } => Some(*sig),
+                    _ => None,
+                };
+                if let Some(sig) = host_call {
+                    frames[top].inst += 1;
+                    abandon_for_freeze(mem, *durable_sp_ctx);
+                    let n = call_sig(&cur_types, sig).results.len();
+                    frames[top]
+                        .vals
+                        .extend(std::iter::repeat_n(Reg::default(), n));
+                    continue;
+                }
             }
             // #796 L2 async signal delivery (PROCESS.md §9). At this per-op safepoint, if a personality
             // has a caught, unmasked signal pending (its cheap `armed` flag is set) and we are not already
@@ -13315,7 +13357,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // dedicated signal stack — exactly like a `call.dyn`. The interrupted instruction is
             // **not** advanced, so it re-executes when the handler returns (the empty `Return` restores the
             // interrupted frame untouched). Same interrupt-at-safepoint shape as `kill`, but non-lethal.
-            if sig_handler_stack.len() < MAX_SIG_HANDLER_NEST {
+            if !stopped && sig_handler_stack.len() < MAX_SIG_HANDLER_NEST {
                 if let Some((armed, source)) = &signal_poll {
                     if armed.load(Ordering::Relaxed) {
                         // The source owns its own locking; the interp holds no personality lock here.
@@ -21593,6 +21635,9 @@ pub struct Host {
     /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
     /// for [`Host::restore_durable_handles`] to re-open ends on. A thawed nested child is handed a copy.
     thaw_pipes: BTreeMap<u32, PipeBacking>,
+    /// #1859 — the names [`Host::restore_durable_named`] rebuilt `host_procs` under, by index, for
+    /// [`Host::restore_durable_handles`] to register at each re-pinned `Named { idx }` handle.
+    thaw_names: Vec<Option<String>>,
     /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
     /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
     /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
@@ -22042,6 +22087,7 @@ impl Host {
             frozen_child_state: Vec::new(),
             frozen_pipes: BTreeMap::new(),
             thaw_pipes: BTreeMap::new(),
+            thaw_names: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
             named_cap_registrar: None,
@@ -22653,14 +22699,7 @@ impl Host {
             // result reloads on thaw). A serve op must *re-issue* instead (§13.4 slice 4b), and the
             // transform cannot see a runtime binding — so a durable domain never resolves an import
             // to one: the call fails closed (`CapFault`), on every engine, through this one getter.
-            .filter(|b| {
-                !(self.durable
-                    && b.type_id == temen_ir::CAP_SELF_TYPE_ID
-                    && matches!(
-                        b.op,
-                        temen_ir::durable_abi::SVC_POLL_OP | temen_ir::durable_abi::SVC_WAIT_OP
-                    ))
-            })
+            .filter(|b| !(self.durable && temen_ir::durable_abi::is_serve_op(b.type_id, b.op)))
     }
 
     pub fn set_import_bindings(&mut self, mut bindings: Vec<BoundImport>) {
@@ -24186,8 +24225,18 @@ impl Host {
                 // #1455: re-pin the named capability at its captured index. The handler behind it was
                 // re-granted by `restore_durable_named` (positionally, before this), so the index
                 // resolves — and a name the registrar declined never reaches here, because that
-                // restore fails closed before any handle is pinned.
-                DurableBinding::Named { idx } => Binding::HostProc(idx),
+                // restore fails closed before any handle is pinned. #1859: its name goes back in the
+                // directory with it, so the thawed domain resolves it and can freeze again. First
+                // registration wins, so a name the embedder granted before restoring keeps its handle.
+                DurableBinding::Named { idx } => {
+                    if let Some(Some(name)) = self.thaw_names.get(idx as usize) {
+                        let handle = (((h.generation & GEN_MASK) << CAP_LOG2) | h.slot) as i32;
+                        if self.resolve_cap_name(name) != Some(handle) {
+                            self.cap_names.push((name.clone(), handle));
+                        }
+                    }
+                    Binding::HostProc(idx)
+                }
                 // #1502: re-mint the carried remaining quotas as a fresh `budgets` entry and bind the
                 // captured slot to it — the guest's handle value resolves to exactly what it had left
                 // at freeze. Any attenuation the embedder asked for has already been applied to the
@@ -24342,6 +24391,8 @@ impl Host {
     /// and its fork factory, which the rebuilt entry keeps (#1718: a thaw never narrows a capability
     /// to un-forkable). Entries are rebuilt **positionally** (a `None`, or a name the registrar
     /// declines, leaves a placeholder that traps if ever dispatched), so indices re-resolve exactly.
+    /// The names are kept for [`Self::restore_durable_handles`] to register at the handles it re-pins
+    /// (#1859).
     ///
     /// Fail-closed, and this is the security-relevant part: with no registrar set, or for a name the
     /// registrar does not know, nothing is granted and the restore reports the offending name. An
@@ -24388,6 +24439,10 @@ impl Host {
             Some(name) => Err(NamedCapRestoreError { name }),
             None => {
                 self.host_procs = out;
+                self.thaw_names = caps
+                    .iter()
+                    .map(|c| c.as_ref().map(|c| c.name.clone()))
+                    .collect();
                 Ok(())
             }
         }

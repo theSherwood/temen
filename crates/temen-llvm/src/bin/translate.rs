@@ -48,7 +48,10 @@ fn try_main() -> Result<(), String> {
              \n  --shadow-arena <contexts> reserves a durable shadow arena of that many per-context\n\
              \n  regions and declares it in the memory descriptor, making the guest freezable\n\
              \n  (one region for the root plus one per concurrent fiber/vCPU; 1..=64). Omit it for\n\
-             \n  a non-durable guest, which reserves nothing."
+             \n  a non-durable guest, which reserves nothing.\n\
+             \n  --shadow-region <bytes> sizes each of those regions (a power of two, default and\n\
+             \n  minimum 4096). A context's call chain must fit its region to freeze, so a guest\n\
+             \n  that recurses deep needs a wider one."
         );
         return Err("no input file".into());
     }
@@ -60,6 +63,7 @@ fn try_main() -> Result<(), String> {
     let mut stub_externs = false;
     let mut child_entry = false;
     let mut shadow_contexts: Option<u32> = None;
+    let mut shadow_stride = temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -92,6 +96,15 @@ fn try_main() -> Result<(), String> {
                         .map_err(|e| format!("--shadow-arena: {e}"))?,
                 )
             }
+            // #1872: the bytes per shadow region, for a guest whose call chains run deeper than the
+            // default region holds.
+            "--shadow-region" => {
+                shadow_stride = it
+                    .next()
+                    .ok_or("--shadow-region needs a byte-count argument")?
+                    .parse()
+                    .map_err(|e| format!("--shadow-region: {e}"))?
+            }
             _ if a.starts_with('-') => return Err(format!("unknown flag `{a}`")),
             _ => {
                 if input.replace(a.clone()).is_some() {
@@ -116,6 +129,7 @@ fn try_main() -> Result<(), String> {
         stack_page: host_page,
         child_entry,
         shadow_contexts,
+        shadow_stride,
     };
     let is_ll = Path::new(&input).extension().is_some_and(|e| e == "ll");
     let translated = if is_ll {
