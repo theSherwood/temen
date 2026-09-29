@@ -69,6 +69,9 @@ pub(crate) struct DurableCell {
     pub(crate) entry: u32,
     pub(crate) mapped_log2: u8,
     pub(crate) reserved_log2: u8,
+    /// #1854 — how far the child grew its window, asked of its own powerbox (`(hook, child ctx)`),
+    /// so its image reaches its grown pages; `None` when no hook is installed.
+    pub(crate) high_water: Option<(crate::HighWater, usize)>,
 }
 
 impl DurableCell {
@@ -77,6 +80,7 @@ impl DurableCell {
         entry: u32,
         mapped_log2: u8,
         reserved_log2: u8,
+        high_water: Option<(crate::HighWater, usize)>,
     ) -> DurableCell {
         DurableCell {
             base: Mutex::new(0),
@@ -85,6 +89,7 @@ impl DurableCell {
             entry,
             mapped_log2,
             reserved_log2,
+            high_water,
         }
     }
 }
@@ -502,6 +507,8 @@ pub(crate) struct Nursery {
     grant_premap_admit: std::sync::atomic::AtomicUsize,
     grant_premap_stage: std::sync::atomic::AtomicUsize,
     grant_premap_apply: std::sync::atomic::AtomicUsize,
+    /// #1854 — the installed child [`crate::HighWater`] (0 = none).
+    grant_high_water: std::sync::atomic::AtomicUsize,
     /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
     grant_budget_take: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
@@ -598,6 +605,7 @@ impl Nursery {
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
+            grant_high_water: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
@@ -658,6 +666,10 @@ impl Nursery {
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
+        self.grant_high_water.store(
+            hooks.map_or(0, |h| h.high_water as usize),
+            Ordering::Release,
+        );
         self.grant_register_serve.store(rs, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
@@ -672,6 +684,18 @@ impl Nursery {
     /// so it must be given the shape its own family was built for.
     fn grant_ctx(&self) -> *mut core::ffi::c_void {
         self.grant_parent_ctx.load(Ordering::Acquire) as *mut core::ffi::c_void
+    }
+
+    /// #1854 — the installed child [`crate::HighWater`] over child powerbox `ctx`, for its freeze cell.
+    fn child_high_water(&self, ctx: *mut core::ffi::c_void) -> Option<(crate::HighWater, usize)> {
+        match self.grant_high_water.load(Ordering::Acquire) {
+            0 => None,
+            // SAFETY: a nonzero value is a `HighWater` stored by `set_grant_hooks`.
+            f => Some((
+                unsafe { core::mem::transmute::<usize, crate::HighWater>(f) },
+                ctx as usize,
+            )),
+        }
     }
 
     /// D66 — the lane chain a **plain** carve child (op 0/5) is gated on: its parent's lane alone.
@@ -973,7 +997,13 @@ impl Nursery {
             gc.retained_ctx as usize,
             teardown,
             Some(slot),
-            Some(DurableCell::new(shadow, entry, mapped_log2, reserved_log2)),
+            Some(DurableCell::new(
+                shadow,
+                entry,
+                mapped_log2,
+                reserved_log2,
+                self.child_high_water(gc.retained_ctx),
+            )),
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -2006,7 +2036,15 @@ unsafe fn spawn_detached_child(
         gc.retained_ctx as usize,
         teardown,
         None,
-        durable.map(|a| DurableCell::new(a, entry, mapped_log2, reserved_log2)),
+        durable.map(|a| {
+            DurableCell::new(
+                a,
+                entry,
+                mapped_log2,
+                reserved_log2,
+                rt.child_high_water(gc.retained_ctx),
+            )
+        }),
     );
     match filed {
         Filed::Slot(slot) => slot,
