@@ -11,7 +11,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 use temen_browser::{
     onramp_exec, onramp_exec_with_tee, temen_par_alloc, temen_par_child, temen_par_compile,
-    temen_par_deliver_code, temen_par_deliver_handle, temen_par_deliver_join, temen_par_ev_a,
+    temen_par_deliver_child, temen_par_deliver_code, temen_par_deliver_join, temen_par_ev_a,
     temen_par_ev_b, temen_par_ev_c, temen_par_ev_d, temen_par_free, temen_par_powerbox_onramp,
     temen_par_root, temen_par_run, temen_par_stdout_len, temen_par_stdout_ptr, temen_set_run_env,
     ParVcpu, PAR_DONE, PAR_JOIN, PAR_NOTIFY, PAR_SPAWN, PAR_TRAP, PAR_WAIT, STATUS_EXIT, STATUS_OK,
@@ -168,11 +168,11 @@ fn drive(run: Run, v: *mut ParVcpu) -> End {
                     drive(run, c)
                 });
                 children.push(h);
-                temen_par_deliver_handle(v, (children.len() - 1) as i32);
+                temen_par_deliver_child(v, (children.len() - 1) as i64);
             }
             PAR_JOIN => {
                 let i = temen_par_ev_a(v) as usize;
-                // Each handle is joined once (the guest's `thread.join`); swap in a finished stub.
+                // The engine hands each child's token back once; swap in a finished stub.
                 let h = std::mem::replace(&mut children[i], std::thread::spawn(|| End::Done(0)));
                 match h.join().expect("child thread panicked") {
                     End::Done(r) => temen_par_deliver_join(v, r, 0),

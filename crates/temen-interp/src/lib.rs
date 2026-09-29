@@ -11386,10 +11386,9 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 
 /// Join child `handle`: take its entry out of `children` and retire the slot, by the
 /// [`resolve_thread`] rule: a negative handle, or one whose masked slot is spent or was never issued,
-/// is `ThreadFault`. For drivers that
-/// keep their own child table (the browser's op-13 loops) so they answer a join as the oracle does
-/// (#1728).
-pub fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T, Trap> {
+/// is `ThreadFault`. The join rule of the child tables kept outside the tree-walker's task list — the
+/// parallel driver's and [`bytecode::Vcpu`]'s — so they answer a join as the oracle does (#1728).
+pub(crate) fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T, Trap> {
     let slot = resolve_thread(children, handle)?;
     Ok(children[slot]
         .take()

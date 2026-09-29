@@ -122,12 +122,12 @@ fn drive(
                     .start(prog, back, None)
                     .expect("confined child builds");
                 let r = drive(prog, child_base, child);
-                let handle = children.len() as i32;
+                let token = children.len() as u64;
                 children.push(r);
-                vcpu.deliver_handle(handle);
+                vcpu.deliver_child(token);
             }
-            bytecode::VcpuEvent::Join { handle } => {
-                vcpu.deliver_join(children[handle as usize].clone());
+            bytecode::VcpuEvent::Join { child } => {
+                vcpu.deliver_join(children[child as usize].clone());
             }
             _ => panic!("unexpected event in the op-13 grant kernel"),
         }

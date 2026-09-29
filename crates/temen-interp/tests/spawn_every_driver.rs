@@ -626,3 +626,125 @@ fn a_detached_spawn_beyond_the_budget_is_refused() {
     let setup = op15_setup(&child, (1 << 15) - 1);
     agree_on_every_driver("op 15, a budget one byte short", &m, &setup, &ok(-22));
 }
+
+/// A detached child that returns its payload word.
+const CHILD_RETURNS_PAYLOAD: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 16512
+  vp = i64.load va
+  return vp
+  }
+}
+";
+
+/// An op-15 parent `(i32 inst, i32 module, i32 budget) -> i64`: spawns three detached children
+/// `vh0..vh2`, child `k` handed payload word `100 + k`, then runs `joins`, which must leave the result
+/// in `vr`.
+fn three_children_then(joins: &str) -> String {
+    let spawns: String = (0..3)
+        .map(|k| {
+            format!(
+                "  pa{k} = i64.const {at}\n  pw{k} = i64.const {w}\n  i64.store pa{k} pw{k}\n\
+                 \x20 vh{k} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gz, gz, gz, sl, gz, pa{k}, al)\n",
+                at = 20480 + 8 * k,
+                w = 100 + k,
+            )
+        })
+        .collect();
+    format!(
+        "memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32) {{
+  vm = i64.extend_i32_s vmod
+  vb = i64.extend_i32_s vbud
+  gz = i64.const 0
+  sl = i64.const 15
+  al = i64.const 8
+{spawns}{joins}
+  return vr
+  }}
+}}
+"
+    )
+}
+
+/// Join handle `h` (a text-IR operand) into `dst`.
+fn join(dst: &str, h: &str) -> String {
+    format!("  {dst} = call.cap 6 1 (i32) -> (i64) vinst ({h})\n")
+}
+
+/// Run `joins` after three detached spawns on every driver. A join's handle is resolved by the
+/// oracle's rule (`resolve_thread`): negative traps, any other is masked to the table's power-of-two
+/// span, and a spent or never-issued slot traps. The `Vcpu`'s hosts each kept their own table and
+/// rule until the engine took it over: the test orchestrator waited forever on a re-join.
+fn joins_agree(what: &str, joins: &str, want: &Ran) {
+    let m = module(&three_children_then(joins));
+    let child = module(CHILD_RETURNS_PAYLOAD);
+    let setup = |h: &mut Host| {
+        let i = h.grant_instantiator(0, 1 << 17);
+        let c = h.grant_module(&child);
+        let b = h.grant_budget(0, 1 << 20, 0);
+        vec![Value::I32(i), Value::I32(c), Value::I32(b)]
+    };
+    let setup = || {
+        let mut h = Host::new();
+        let args = setup(&mut h);
+        (h, args)
+    };
+    agree_on_every_driver(what, &m, &setup, want);
+}
+
+fn thread_fault() -> Ran {
+    Ran {
+        result: Err(Trap::ThreadFault),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+#[test]
+fn each_child_joins_once_by_its_handle() {
+    let joins = format!(
+        "{}{}{}  vs = i64.add vr0 vr1\n  vr = i64.add vs vr2\n",
+        join("vr0", "vh0"),
+        join("vr1", "vh1"),
+        join("vr2", "vh2")
+    );
+    joins_agree("three joins", &joins, &ok(303));
+}
+
+#[test]
+fn a_second_join_of_a_child_traps() {
+    let joins = format!("{}{}", join("vr0", "vh0"), join("vr", "vh0"));
+    joins_agree("a re-join", &joins, &thread_fault());
+}
+
+#[test]
+fn a_negative_handle_traps() {
+    joins_agree(
+        "join(-1)",
+        &format!("  vn = i32.const -1\n{}", join("vr", "vn")),
+        &thread_fault(),
+    );
+}
+
+#[test]
+fn a_handle_past_the_table_traps() {
+    // Three children: the span is 4, and slot 3 was never issued.
+    joins_agree(
+        "join(3)",
+        &format!("  vn = i32.const 3\n{}", join("vr", "vn")),
+        &thread_fault(),
+    );
+}
+
+#[test]
+fn a_handle_masks_onto_the_table() {
+    // 5 & (4 - 1) is slot 1: the second child.
+    joins_agree(
+        "join(5)",
+        &format!("  vn = i32.const 5\n{}", join("vr", "vn")),
+        &ok(101),
+    );
+}
