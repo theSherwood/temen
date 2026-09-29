@@ -60,17 +60,14 @@ fn row(site: ParkSite, engine: Engine) -> Row {
         ParkSite::PipeWrite => Row::Case(pipe_write),
         ParkSite::StreamRead => Row::Case(stream_read),
         ParkSite::Stopped => Row::Case(stopped),
-        ParkSite::Svc => Row::Pending {
-            issue: 1903,
-            why: "a serving domain parked in `svc.wait`",
+        ParkSite::Svc => Row::Case(svc),
+        ParkSite::Reap => Row::Unreachable {
+            why: "a blocking `waitpid` waits on a fork twin, which declines the freeze first (#1688); \
+                  `posix_spawn` runs its child through a host delegate and never parks",
         },
-        ParkSite::Reap => Row::Pending {
-            issue: 1903,
-            why: "a POSIX personality benched in `waitpid`",
-        },
-        ParkSite::Lane => Row::Pending {
-            issue: 1903,
-            why: "a vCPU whose lane is full (D66)",
+        ParkSite::Lane => Row::Unreachable {
+            why: "a run that can freeze is serialized onto one worker, and a task gives its lane back \
+                  when it parks, so no lane is ever full",
         },
         ParkSite::Reply | ParkSite::Completion => Row::Pending {
             issue: 1901,
@@ -556,4 +553,53 @@ block 0 (vsp: i64, varg: i64) {
         1001,
     );
     assert_eq!(h.stdout, b"x", "{site:?}: the thaw re-issued the write");
+}
+
+/// `svc.wait` — the root is a server idle in its accept loop: its queue is empty, so it parks, and
+/// freeze-on-quiesce fires on that park (no countdown can reach it). A dispatch arrives only after the
+/// freeze; the thawed server re-issues its `svc.wait`, drains it (the handler stores 41 and replies
+/// 42) and returns `served·1000 + stored`: `1041`.
+fn svc(site: ParkSite) {
+    let src = r#"
+memory 17
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 1 }
+func () -> (i64) {
+block 0 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  vc = i64.const 65600
+  vafter = i64.load vc
+  vk = i64.const 1000
+  vm = i64.mul vn vk
+  vr = i64.add vm vafter
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vc = i64.const 65600
+  i64.store vc vx
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }
+}
+"#;
+    let ticket = Arc::new(Mutex::new(None));
+    let mut h = freeze_parked_then_thaw(
+        site,
+        src,
+        |_| vec![],
+        Uninterrupted::WaitsOnTheOutside,
+        arm_freeze_on_quiesce,
+        |h| {
+            let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
+            *ticket.lock().unwrap() = Some(t);
+        },
+        1041,
+    );
+    let t = ticket.lock().unwrap().expect("enqueued");
+    assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
 }
