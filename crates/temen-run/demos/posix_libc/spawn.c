@@ -4,7 +4,7 @@
  * Per-child attenuation is the grant list: a parent narrows handles in its own table first
  * (`AddressSpace.sub`, `Budget.split`, an exported wrapper) and lists a different subset for each
  * child — the child's powerbox is exactly what it is handed here (DESIGN.md §3c "Attenuation needs
- * no new IR"). This file only removes the byte-laying: the 56-byte record (`temen_ir::SpawnRec`) and
+ * no new IR"). This file only removes the byte-laying: the 88-byte record (`temen_ir::SpawnRec`) and
  * the `{name_off, name_len, handle, flags}` grant records that every C consumer used to write by hand.
  *
  * Reaches the Instantiator through two frontend builtins (`__vm_instantiate_rec` = op 17,
@@ -12,12 +12,14 @@
  * reaches its seam only through a static `call.cap`) on the handle the guest discovers itself via
  * `cap.self` reflection — no new IR op.
  *
- * Record contract (little-endian, window-relative pointers; fails closed on any other version):
- *   { version: u32 = 0, entry: u32, off: u64, size_log2: u32, pager: u32 = MAX (none),
- *     module: i32 (-1 = self), budget: i32 = 0 (quota-funded), quota: i64,
- *     grants_ptr: u64, grants_n: u64 }
+ * Record contract (little-endian, window-relative pointers; fails closed on any other layout) — the
+ * v1 **detached** record (#1863): the child gets a window of its own, funded by a `Budget`:
+ *   { version: u32 = 1, entry: u32, off: u64 = 0 (reserved), size_log2: u32, pager: u32 = MAX,
+ *     module: i32 (-1 = self), budget: i32 (Budget handle), quota: i64,
+ *     grants_ptr: u64, grants_n: u64, args_ptr: u64, args_len: u64,
+ *     region: i32 = -1 (none), reserved: u32 = 0, child_off: u64 = 0 }
  * followed here by `n` × 16-byte grant records. `scratch` must be 8-byte aligned and hold
- * `56 + 16 * n` bytes; the names are referenced in place (window pointers), not copied.
+ * `88 + 16 * n` bytes; the names are referenced in place (window pointers), not copied.
  *
  * Self-contained (freestanding, own externs) for the chibicc harnesses; every helper is
  * `static inline` so the frontend's dead-code pass drops what a program never calls.
@@ -61,23 +63,32 @@ static inline int vm_instantiator_(void) {
   return vm_inst_;
 }
 
-/* vm_spawn(module, entry, off, size_log2, quota, grants, n, scratch) -> child handle | -errno.
- * `module`: a granted `Module` handle, or -1 for this program. `off`/`size_log2`: the carve, a
- * `1 << size_log2`-aligned sub-range of this window at least the child's declared window.
+static int vm_budget_ = -1;
+static inline int vm_budget_of_(void) {
+  if (vm_budget_ < 0) vm_budget_ = vm_cap_of(14); /* Budget = interface 14 */
+  return vm_budget_;
+}
+
+/* vm_spawn(module, entry, size_log2, quota, grants, n, args, args_len, scratch) -> child | -errno.
+ * `module`: a granted `Module` handle, or -1 for this program. The child runs in a window of its
+ * own — its module's declared memory, spent from this domain's `Budget`. `size_log2` 0 asks for
+ * exactly that; any other value must equal it (else the spawn refuses, -EINVAL).
+ * `args`/`args_len`: the spawn-time args payload, copied to the child's args buffer before it starts
+ * (the §3e `{argc, envc}` + packed strings a `main(argc, argv)` reads); `args_len` 0 = none.
  * `quota`: raw fuel (0 = the parent's). The child starts immediately; `vm_join` collects it. */
-static inline long vm_spawn(long module, long entry, long off, long size_log2, long quota,
-                            vm_grant *grants, long n, void *scratch) {
+static inline long vm_spawn(long module, long entry, long size_log2, long quota, vm_grant *grants,
+                            long n, void *args, long args_len, void *scratch) {
   int *w = (int *)scratch;
   long *q = (long *)scratch;
-  w[0] = 0;                /* version */
+  w[0] = 1;                /* version: the detached record */
   w[1] = (int)entry;       /* @4 */
-  q[1] = off;              /* @8 */
+  q[1] = 0;                /* @8 off: reserved */
   w[4] = (int)size_log2;   /* @16 */
   w[5] = -1;               /* @20 pager: u32::MAX = none */
   w[6] = (int)module;      /* @24 */
-  w[7] = 0;                /* @28 budget: none — quota-funded */
+  w[7] = vm_budget_of_();  /* @28 the Budget the window spends */
   q[4] = quota;            /* @32 */
-  int *g = (int *)((char *)scratch + 56);
+  int *g = (int *)((char *)scratch + 88);
   for (long i = 0; i < n; i = i + 1) {
     g[i * 4 + 0] = (int)(long)grants[i].name;
     g[i * 4 + 1] = (int)vm_strlen_(grants[i].name);
@@ -86,6 +97,11 @@ static inline long vm_spawn(long module, long entry, long off, long size_log2, l
   }
   q[5] = (long)g;          /* @40 */
   q[6] = n;                /* @48 */
+  q[7] = (long)args;       /* @56 */
+  q[8] = args_len;         /* @64 */
+  w[18] = -1;              /* @72 region: none */
+  w[19] = 0;               /* @76 reserved */
+  q[10] = 0;               /* @80 child_off */
   return __vm_instantiate_rec(vm_instantiator_(), (long)scratch);
 }
 

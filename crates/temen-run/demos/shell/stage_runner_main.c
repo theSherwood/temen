@@ -5,8 +5,8 @@ long write(long fd, void *buf, long n);
 long __vm_region_map(int r, long win_off, long region_off, long len, int prot);
 long __vm_region_page_size(int r);
 
-/* The stage window: `1 << TEMEN_STAGE_LOG2` bytes — equal to the carve the shell spawns each stage into
-   (a §14 child's carve must equal its declared memory). Default 18 (256 KiB), the size chibicc lands
+/* The stage window: `1 << TEMEN_STAGE_LOG2` bytes — this runner's declared memory, which the shell's
+   spawn sizes the detached window to (`exec_win`). Default 18 (256 KiB), the size chibicc lands
    at under the native differential's 16 KiB data page (with `window_pin_` below); the browser's 64 KiB
    page rounds the data sections up so the window is naturally 19 (512 KiB), and the fixture builds with
    `-D TEMEN_STAGE_LOG2=19` so the ring maps below sit at the right half-window offset. */

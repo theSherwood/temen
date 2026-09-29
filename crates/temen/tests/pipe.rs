@@ -139,3 +139,45 @@ fn empty_read_and_wrong_direction_on_both() {
         "jit: must match interp, got {jo:?}"
     );
 }
+
+/// func 0 `(write_end, read_end)`: spawn a thread that returns at once and join it, then write `x` to
+/// the write end and read it back. A thread shares its domain's powerbox, and so its pipe ends: its
+/// exit closes nothing (#1917). Encode `written * 1000 + read` = `1001`; with the domain's ends
+/// released by the thread's exit the write would fail `-EPIPE` (`-32000` or below).
+const THREAD_EXIT_KEEPS_THE_ENDS: &str = "memory 17\n\
+func (i32, i32) -> (i64) {\n\
+block 0 (vw: i32, vr: i32) {\n\
+  vz = i64.const 0\n\
+  vt = thread.spawn 1 vz vz\n\
+  vj = thread.join vt\n\
+  a0 = i64.const 16384\n\
+  cx = i32.const 120\n\
+  i32.store8 a0 cx\n\
+  vlen = i64.const 1\n\
+  vn = call.cap 0 1 (i64, i64) -> (i64) vw (a0, vlen)\n\
+  a1 = i64.const 16400\n\
+  vread = call.cap 0 0 (i64, i64) -> (i64) vr (a1, vlen)\n\
+  k1000 = i64.const 1000\n\
+  vt1 = i64.mul vn k1000\n\
+  vsum = i64.add vt1 vread\n\
+  return vsum\n\
+  }\n\
+}\n\
+func (i64, i64) -> (i64) {\n\
+block 0 (vsp: i64, varg: i64) {\n\
+  vr = i64.const 0\n\
+  return vr\n\
+  }\n\
+}\n";
+
+/// #1917 — a thread finishing leaves its domain's pipe ends open: only the domain ending releases
+/// them, as the bytecode engine (per domain) and the JIT (per process) already do.
+#[test]
+fn a_finishing_thread_leaves_its_domains_pipe_ends_open() {
+    let (ir, jo) = both(THREAD_EXIT_KEEPS_THE_ENDS);
+    assert_eq!(ir, Ok(vec![Value::I64(1001)]), "interp");
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[1001]),
+        "jit: {jo:?}"
+    );
+}

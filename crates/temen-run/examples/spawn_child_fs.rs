@@ -1,22 +1,19 @@
-//! **Drive a §14 child-entry phase (e.g. `nifler`/`hexer` `--child-entry`) via op-13 over a shared
-//! memfs.** The guest half of the "nimony in the browser" driver: op-13-spawn a child-entry `.temen`
-//! with argv seeded into its carve, a memfs seeded from a fixture dir and re-granted as `"fs"`, plus a
-//! `stdout` Stream and an `exit` cap for its `write`/`read`/`exit` imports, then dump every file the
-//! phase *wrote* to an output dir. The mechanism proven in `child_entry_argv_fs` / `rust_driver_nifler`
-//! (temen-llvm tests), on a real compiled phase.
+//! **Drive a §14 child-entry phase (e.g. `nifler`/`hexer` `--child-entry`) over a shared memfs.** The
+//! guest half of the "nimony in the browser" driver: spawn a child-entry `.temen` through the
+//! [`temen_run::conductor`] — its own window, argv as the spawn's args payload — with a memfs seeded
+//! from a fixture dir and re-granted as `"fs"`, plus a `stdout` Stream and an `exit` cap for its
+//! `write`/`read`/`exit` imports, then dump every file the phase *wrote* to an output dir. The mechanism
+//! proven in `child_entry_argv_fs` / `rust_driver_nifler` (temen-llvm tests), on a real compiled phase.
 //!
 //! ```text
 //! cargo run -q --release -p temen-run --example spawn_child_fs -- \
 //!     <child.temen> <fixture-dir> <out-dir> -- <argv0> <argv1> ...
 //! ```
 //!
-//! Like `nimphase_run`, but the phase runs as a **confined op-13 child** (verify_module + spawn) rather
-//! than a top-level powerbox program — so a Rust-on-Temen driver guest can fan phases out the same way.
-//! The child's imports `exit`/`read`/`write`/`vm_map` bind by the reference policy to the re-granted
-//! Exit/Stream and the auto-granted AddressSpace; `fs` resolves by name from the grant list. #964/#1094:
-//! argv seeds at `carve + module_args_base()` — one guard up, the unconditional guarded layout;
-//! the grant records/cap-names stay in the parent window (the op-13 handler reads them in the parent's
-//! context, so the child's guard never touches them).
+//! Like `nimphase_run`, but the phase runs as a **confined child** (verify_module + spawn) rather than a
+//! top-level powerbox program — so a Rust-on-Temen driver guest can fan phases out the same way. The
+//! child's imports `exit`/`read`/`write`/`vm_map` bind by the reference policy to the re-granted
+//! Exit/Stream and the auto-granted AddressSpace; `fs` resolves by name from the grant list.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -49,74 +46,6 @@ fn seed_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Build the text-IR op-13 parent that spawns `child` (window `child_sl`, carve at `carve_off`) with the
-/// three-entry grant list `{fs, stdout, exit}` and `argv` seeded at `carve + args_base`. #964/#1094:
-/// `args_base` is the child's [`temen_ir::module_args_base`] — one guard up (the unconditional guarded
-/// layout) — since the child's `_start` reads argv there. The grant records and
-/// cap-names stay at their parent-window offsets: the op-13 handler reads those in the *parent's*
-/// context (`m.read_window`), so the child's guard never touches them.
-fn parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[String]) -> String {
-    let parent_sl = child_sl + 1;
-    let argv_off = carve_off + args_base;
-    // The parent is guarded too (#1094): its records/cap-names sit above the NULL guard, as in
-    // `tests/nifler_child_asset.rs` (records at guard + 1024.., names at guard + 2048..).
-    let guard = temen_ir::POWERBOX_NULL_GUARD;
-    let (rb, nb) = (guard + 1024, guard + 2048);
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
-    blob.extend_from_slice(&0u32.to_le_bytes()); // envc
-    for s in argv {
-        blob.extend_from_slice(s.as_bytes());
-        blob.push(0);
-    }
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-    let rec = |off: u64, name_off: u64, name_len: u64| -> String {
-        let w0 = name_off | (name_len << 32);
-        format!(
-            "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n"
-        )
-    };
-    format!(
-        r#"memory {parent_sl}
-data {nb} "fs"
-data {nb1} "stdout"
-data {nb2} "exit"
-data {argv_off} "{argv_esc}"
-func (i32, i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
-{r0}  hf = i64.extend_i32_u v2
-  ohf = i64.const {rec8}
-  i64.store ohf hf
-{r1}  hs = i64.extend_i32_u v3
-  ohs = i64.const {rec24}
-  i64.store ohs hs
-{r2}  he = i64.extend_i32_u v4
-  ohe = i64.const {rec40}
-  i64.store ohe he
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const {rb}
-  vgn = i64.const 3
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-        r0 = rec(rb, nb, 2),
-        r1 = rec(rb + 16, nb + 16, 6),
-        r2 = rec(rb + 32, nb + 32, 4),
-        nb1 = nb + 16,
-        nb2 = nb + 32,
-        rec8 = rb + 8,
-        rec24 = rb + 24,
-        rec40 = rb + 40,
-    )
-}
-
 fn main() {
     let mut a = std::env::args().skip(1);
     let temen = a
@@ -134,19 +63,8 @@ fn main() {
     let child = temen_encode::decode_module(&bytes).expect("decode child .temen");
     temen_verify::verify_module(&child).expect("child verifies");
 
-    // Carve at least the declared window, generously larger for `malloc` heap room; the carve in the
-    // parent window's upper half.
-    let decl = child.memory.as_ref().expect("child window").size_log2 as u32;
-    let child_sl = (decl + 3).max(24);
-    let carve_off = 1u64 << child_sl;
-    let parent = temen_text::parse_module(&parent_src(
-        child_sl,
-        carve_off,
-        temen_ir::module_args_base(),
-        &argv,
-    ))
-    .expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let parent = temen_run::conductor(&["fs", "stdout", "exit"], &argv);
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(seed, vec![]);
     let factory = Arc::new(factory);
@@ -164,8 +82,7 @@ fn main() {
     let sink = host.shared_stdout();
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let inst = host.grant_instantiator(0, 1u64 << (child_sl + 1));
-    let modh = host.grant_module(&child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
     let mut fuel = 400_000_000_000u64;
     let r = run_with_host(
@@ -174,6 +91,7 @@ fn main() {
         &[
             Value::I32(inst),
             Value::I32(modh),
+            Value::I32(budget),
             Value::I32(fs_h),
             Value::I32(stdout_h),
             Value::I32(exit_h),

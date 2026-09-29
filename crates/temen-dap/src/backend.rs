@@ -123,7 +123,7 @@ fn grant_io_powerbox(
     let inst = host.grant_instantiator(0, win);
     host.register_cap_name("instantiator", inst);
     if temen_ir::spawns_detached(m) {
-        host.grant_detached_spawn_caps(win);
+        host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
     }
     // The one shared powerbox binder (#1524): the `#912` name→cap table plus this session's raw
     // `HostProc` seams — the #1366 slice (c) host-completed caps declared above, and the #1323

@@ -88,24 +88,24 @@ else
   echo "FAILED: residual semantic differences after path normalization:"; diff <(norm "$CACHE/native.s.nif") <(norm /tmp/temen_sys.s.nif) | head -20; exit 1
 fi
 
-# ---- [5/5] the same front-end as a confined §14 op-13 child (the Rust-on-Temen driver-guest shape) ---
-# nimsem is itself a driver (it `system("nifler …")`s to parse stdlib), so running it as an op-13 child
-# needs the `exec` cap **re-granted into the child** — the op-13 grant list carries {fs, stdout, exit,
+# ---- [5/5] the same front-end as a confined §14 child (the Rust-on-Temen driver-guest shape) ---
+# nimsem is itself a driver (it `system("nifler …")`s to parse stdlib), so running it as a child
+# needs the `exec` cap **re-granted into the child** — the grant list carries {fs, stdout, exit,
 # exec}, and nimsem-the-child spawns nifler grandchildren via that re-granted exec over the same memfs.
 # `nimsem_child_driver` proves it: byte-identical (path-normalized) to native, the same oracle.
-echo "=== [5/5] child-entry: nimsem as an op-13 child, exec re-granted (drives nifler grandchildren) ==="
+echo "=== [5/5] child-entry: nimsem as a child, exec re-granted (drives nifler grandchildren) ==="
 "$TR" "$CACHE/c_nimsem/linked.bc" -o "$CACHE/nimsem_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
 ceout="$CACHE/ce_out"; rm -rf "$ceout"; mkdir -p "$ceout"
 cargo run -q --release -p temen-run --example nimsem_child_driver -- \
   "$CACHE/nimsem_ce_raw.temen" "$CACHE/nifler.temen" "$BIN/../lib" "$W/nimcache/$sys.p.nif" "$sys" "$ceout"
 if diff -q <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") >/dev/null; then
-  echo "CHILD-ENTRY MATCHES NATIVE — nimsem runs as a confined op-13 §14 child, spawning nifler grandchildren via the re-granted exec cap, byte-exact (path-normalized)"
+  echo "CHILD-ENTRY MATCHES NATIVE — nimsem runs as a confined §14 child, spawning nifler grandchildren via the re-granted exec cap, byte-exact (path-normalized)"
 else
   echo "FAILED (child-entry): residual diff:"; diff <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") | head -20; exit 1
 fi
 
 # ---- emit the committed driver-guest fixtures (crates/temen-llvm/tests/rust_driver_nimsem.rs) --------
-# The step-9 guest op-13-spawns THIS nimsem_ce over the system import closure, reproducing the .s.nif
+# The step-9 guest spawns THIS nimsem_ce over the system import closure, reproducing the .s.nif
 # above (nimsem is deterministic for a fixed memfs; either nifler yields identical output). Opt-in so a
 # normal demo run doesn't rewrite committed assets. The test hardcodes the system stem `sysvq0asl`, so
 # guard on it — if a frontend bump changes the stem, bump the test's argv/filenames in lockstep.
@@ -123,14 +123,14 @@ if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
   echo "  emitted driver-guest fixtures -> $FX ($(du -sh "$FX" | cut -f1), sys=$sys)"
 fi
 
-# ---- [6/6] the front-end CHAIN, both phases op-13 children over ONE shared memfs (nimsem -> hexer) ---
-# The compiler driver on Temen: a native conductor op-13-spawns nimsem then hexer, handing the `.s.nif`
+# ---- [6/6] the front-end CHAIN, both phases children over ONE shared memfs (nimsem -> hexer) ---
+# The compiler driver on Temen: a native conductor spawns nimsem then hexer, handing the `.s.nif`
 # between them through one shared memfs (nifler runs as nimsem's exec grandchildren). Oracle: native
-# hexer on the SAME `.s.nif` the op-13 nimsem produced, so only hexer's lowering is compared (the two
+# hexer on the SAME `.s.nif` the child nimsem produced, so only hexer's lowering is compared (the two
 # nimsems' outputs differ only in embedded paths). `nim_chain_op13` is the driver.
 HEXER_BIN="${HEXER_BIN:-$BIN/hexer}"
 if [ -x "$HEXER_BIN" ]; then
-  echo "=== [6/6] the front-end chain: nimsem -> hexer, both op-13 children over one memfs ==="
+  echo "=== [6/6] the front-end chain: nimsem -> hexer, both children over one memfs ==="
   build_temen "$REPO/nimony/src/hexer/hexer.nim" "$CACHE/hexer.temen"
   "$TR" "$CACHE/c_hexer/linked.bc" -o "$CACHE/hexer_ce_raw.temen" --binary --host-page 65536 --stub-externs --child-entry
   chainout="$CACHE/chain_out"; rm -rf "$chainout"; mkdir -p "$chainout"
@@ -141,13 +141,13 @@ if [ -x "$HEXER_BIN" ]; then
   cp "$chainout/nimcache/$sys.s.nif" "$chainout/nimcache/$sys.s.idx.nif" "$od/" 2>/dev/null
   ( cd "$od" && "$HEXER_BIN" c "$sys.s.nif" >/dev/null 2>&1 )
   if diff -q "$od/$sys.x.nif" "$chainout/nimcache/$sys.x.nif" >/dev/null; then
-    echo "CHAIN MATCHES NATIVE — nimsem->hexer both op-13 §14 children over one memfs; the Leng .x.nif is byte-identical to native hexer on the same semchecked input. The nimony front-end runs on Temen as a chain of confined op-13 phases."
+    echo "CHAIN MATCHES NATIVE — nimsem->hexer both §14 children over one memfs; the Leng .x.nif is byte-identical to native hexer on the same semchecked input. The nimony front-end runs on Temen as a chain of confined phases."
   else
     echo "FAILED (chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$chainout/nimcache/$sys.x.nif" | head -1; exit 1
   fi
 
   # emit the step-10 hexer driver-guest fixtures (crates/temen-llvm/tests/rust_driver_hexer.rs): the
-  # guest op-13-spawns THIS hexer_ce over the .s.nif nimsem produced, reproducing this .x.nif (hexer is
+  # guest spawns THIS hexer_ce over the .s.nif nimsem produced, reproducing this .x.nif (hexer is
   # deterministic for a fixed input). The .s.nif/.s.idx.nif are the same nimsem output step 9 committed.
   if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
     FX="$HERE/fixtures"; mkdir -p "$FX"
@@ -157,29 +157,23 @@ if [ -x "$HEXER_BIN" ]; then
     echo "  emitted hexer driver-guest fixtures -> $FX (hexer_ce + $sys.s.idx.nif + $sys.x.nif.gz)"
   fi
 
-  # ---- [7/7] the SAME chain, but every phase op-13-spawned on the CRANELIFT JIT --------------------
-  # The tier-up-capable engine a browser wasm-JIT compile card uses. The op-13 `mod_ok` relaxation
-  # (`declared <= carve`, matching the interpreter — FORK.md §8.6 / #773) is what lets these
-  # malloc-heavy phases carve heap room on emitted code. Oracle: the SAME native hexer `.x.nif` as
-  # [6/6] (the two nimsems' `.s.nif` differ only in embedded paths, so hexer's lowering is compared).
-  echo "=== [7/7] the front-end chain on the JIT: nimsem -> hexer, both op-13 children on emitted code ==="
+  # ---- [7/7] the SAME chain, but every phase spawned on the CRANELIFT JIT --------------------------
+  # The tier-up-capable engine a browser wasm-JIT compile card uses. Each phase runs in a detached
+  # window of its own, its heap growing into the window's reserved tail. Oracle: the SAME native
+  # hexer `.x.nif` as [6/6] (the two nimsems' `.s.nif` differ only in embedded paths, so hexer's
+  # lowering is compared).
+  echo "=== [7/7] the front-end chain on the JIT: nimsem -> hexer, both children on emitted code ==="
   jchainout="$CACHE/jit_chain_out"; rm -rf "$jchainout"; mkdir -p "$jchainout"
-  # Exit 3 is the driver's "this engine cannot run this workload" (its carve exceeds the reference
-  # JIT's window cap, #1591). Skip the diff rather than comparing against an output it never wrote —
-  # that read as "FAILED: .x.nif differs" and kept `rebuild-assets.sh`'s nim_driver_guest step
-  # blocked even with [1/6] .. [6/6] green.
   set +e
   cargo run -q --release -p temen-run --example nim_chain_op13_jit -- \
     "$CACHE/nimsem_ce_raw.temen" "$CACHE/hexer_ce_raw.temen" "$CACHE/nifler.temen" "$BIN/../lib" \
     "$W/nimcache/$sys.p.nif" "$sys" "$jchainout"
   jrc=$?
   set -e
-  if [ "$jrc" = 3 ]; then
-    echo "SKIP [7/7] JIT chain: the phase outgrew the reference JIT's window cap (see #1591)"
-  elif [ "$jrc" != 0 ]; then
+  if [ "$jrc" != 0 ]; then
     echo "FAILED (JIT chain): driver exited $jrc"; exit 1
   elif diff -q "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" >/dev/null; then
-    echo "JIT CHAIN MATCHES NATIVE — nimsem->hexer both op-13 §14 children on the Cranelift JIT; the Leng .x.nif is byte-identical to native hexer. The nimony front-end self-hosts on Temen's JIT as a chain of confined op-13 phases — the enabler for the browser wasm-JIT compile card."
+    echo "JIT CHAIN MATCHES NATIVE — nimsem->hexer both §14 children on the Cranelift JIT; the Leng .x.nif is byte-identical to native hexer. The nimony front-end self-hosts on Temen's JIT as a chain of confined phases — the enabler for the browser wasm-JIT compile card."
   else
     echo "FAILED (JIT chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" | head -1; exit 1
   fi

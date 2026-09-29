@@ -394,17 +394,18 @@ block 0 (v0: i64) {
     desc: 'A parent spawns the **same child function twice** with **different grant lists** — that is ' +
       'the whole mechanism of per-child attenuation (DESIGN.md §3c "attenuation needs no new IR"): a ' +
       'child\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
-      '`instantiator` and `stdout` by name, fills the op-17 spawn record (entry = the child function, a ' +
-      '64 KiB carve of its window, no fuel cap) and a 16-byte grant record, and spawns child A with ' +
-      '`{"stdout" → its stdout}` and child B with an empty list. Each child `self.resolve`s `"stdout"`: A ' +
-      'finds a re-grant of the parent\'s stream and prints through it; B finds nothing and returns 0. ' +
-      'Result 10 (= A·10 + B), stdout "granted" once. Edit the grant count (`vn1`/`vn0`) or the carve to ' +
-      'explore; runs on the bytecode engine with in-process confined children.',
+      '`instantiator`, `budget` and `stdout` by name, fills the op-17 spawn record (entry = the child ' +
+      'function, a detached window of its own paid from the budget, no fuel cap) and a 16-byte grant ' +
+      'record, and spawns child A with `{"stdout" → its stdout}` and child B with an empty list. Each ' +
+      'child `self.resolve`s `"stdout"`: A finds a re-grant of the parent\'s stream and prints through ' +
+      'it; B finds nothing and returns 0. Result 10 (= A·10 + B), stdout "granted" once. Edit the grant ' +
+      'count (`vn1`/`vn0`) to explore; runs on the bytecode engine with in-process confined children.',
     src: `; Two children, two powerboxes — attenuation is the grant list (#1509).
 memory 20
 data 16384 "instantiator"
 data 16400 "stdout"
 data 16408 "granted\\n"
+data 16424 "budget"
 export 0 func "_start" 0    ; the powerbox entry shape: both reference hosts grant the named powerbox
 
 ; parent: spawn the child (func 1) twice — A with {"stdout"}, B with nothing — return A*10 + B
@@ -416,46 +417,42 @@ block 0 () {
   vop = i64.const 16400
   vol = i64.const 6
   vout = self.resolve vop vol           ; this domain's stdout, by name
-  ; the grant record at 17472: {name_off: "stdout", name_len: 6, handle: stdout, flags: 0}
-  vg0 = i64.const 17472
+  vbp = i64.const 16424
+  vbud = self.resolve vbp vol           ; the Budget each child's window is paid from
+  ; the grant record at 17536: {name_off: "stdout", name_len: 6, handle: stdout, flags: 0}
+  vg0 = i64.const 17536
   vopn = i32.const 16400
   i32.store vg0 vopn
-  vg1 = i64.const 17476
+  vg1 = i64.const 17540
   vln = i32.const 6
   i32.store vg1 vln
-  vg2 = i64.const 17480
+  vg2 = i64.const 17544
   i32.store vg2 vout
-  vg3 = i64.const 17484
-  vz = i32.const 0
-  i32.store vg3 vz
-  ; the spawn record at 17408 (temen_ir::SpawnRec): version 0 | entry 1, carve off/size_log2 16,
-  ; pager none, module -1 (self) | budget 0, quota 0, grants_ptr 17472, grants_n
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; 1, size_log2 20 (the declared window) | pager none, module -1 (self) | budget, grants_ptr,
+  ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 4294967296            ; version 0, entry 1
+  vf0 = i64.const 4294967297            ; version 1, entry 1
   i64.store vr0 vf0
   vr2 = i64.const 17424
-  vf2 = i64.const -4294967280           ; size_log2 16, pager u32::MAX
+  vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
   i64.store vr2 vf2
   vr3 = i64.const 17432
-  vf3 = i64.const 4294967295            ; module -1 (self), budget 0
-  i64.store vr3 vf3
-  vr4 = i64.const 17440
-  vq = i64.const 0
-  i64.store vr4 vq                      ; quota 0
+  vself = i32.const -1
+  i32.store vr3 vself                   ; module -1 (self)
+  vr3b = i64.const 17436
+  i32.store vr3b vbud                   ; budget
   vr5 = i64.const 17448
   i64.store vr5 vg0                     ; grants_ptr
-  ; child A: carve [64K, 128K), one grant
-  vr1 = i64.const 17416
-  voffa = i64.const 65536
-  i64.store vr1 voffa
+  vr9 = i64.const 17480
+  i32.store vr9 vself                   ; region -1 (none)
+  ; child A: one grant
   vr6 = i64.const 17456
   vn1 = i64.const 1
   i64.store vr6 vn1
   vha = call.cap 6 17 (i64) -> (i32) vinst (vr0)
   vra = call.cap 6 1 (i32) -> (i64) vinst (vha)
-  ; child B: carve [128K, 192K), no grants
-  voffb = i64.const 131072
-  i64.store vr1 voffb
+  ; child B: no grants — A's window went back to the budget when A ended, so B fits
   vn0 = i64.const 0
   i64.store vr6 vn0
   vhb = call.cap 6 17 (i64) -> (i32) vinst (vr0)
@@ -467,17 +464,11 @@ block 0 () {
   }
 }
 
-; child: its carve starts zeroed (a same-module child gets no data image), so it writes the two
-; strings it needs itself, then resolves "stdout" — a re-grant if the parent listed it — and
-; prints through it, else returns 0
+; child: its own window starts with this module's data segments, so the strings are already there;
+; it resolves "stdout" — a re-grant if the parent listed it — and prints through it, else returns 0
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vop = i64.const 16400
-  vname = i64.const 128047728850035        ; "stdout" packed little-endian
-  i64.store vop vname
-  vtx = i64.const 16408
-  vtext = i64.const 748834988792836711    ; "granted\\n"
-  i64.store vtx vtext
   vol = i64.const 6
   vh = self.resolve vop vol
   vz = i32.const 0
@@ -1201,24 +1192,25 @@ int main(void) {
     mode: 'io',
     desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
       '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
-      'record into one call — `vm_spawn(module, entry, carve, size_log2, quota, grants, n, scratch)` — ' +
-      'so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns `child` (a ' +
-      'function of this same program, by funcref) twice into two 64 KiB carves: A with `{"stdout"}`, B ' +
-      'with none. A resolves the re-granted stream and prints "granted"; B finds nothing. main() prints ' +
-      'both results and returns A·10 + B = 10. A same-module child starts in a zeroed carve and receives ' +
-      'its starter handles where a C function expects its data-stack pointer, so `child` is written ' +
-      '**stackless** (no address-taken locals, no string literals, VM builtins only).',
+      'record into one call — `vm_spawn(module, entry, size_log2, quota, grants, n, args, args_len, ' +
+      'scratch)` — so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns ' +
+      '`child` (a function of this same program, by funcref) twice, each into a **window of its own** ' +
+      '(the program\'s size, paid from the `budget` grant and returned when the child ends): A with ' +
+      '`{"stdout"}`, B with none. A resolves the re-granted stream and prints "granted"; B finds nothing. ' +
+      'main() prints both results and returns A·10 + B = 10. A child entry receives its starter handles ' +
+      'where a C function expects its data-stack pointer, so `child` is written **stackless** (no ' +
+      'address-taken locals, VM builtins only).',
     src: `// Two children, two powerboxes — attenuation is the grant list (#1509).
 #include <stdio.h>
+#include <temen.h>
 #include <temen/spawn.h>
 
 long __vm_resolve(const char *name, long len);
 long __vm_write(int h, void *buf, long len);
 
-/* The child entry, spawned into a 64 KiB carve of this window (seen by the child as its own
-   window at 0, zeroed — no data image). Stackless on purpose: a same-module child entry gets its
-   two starter handles where a C function expects its data-stack pointer, so no address-taken
-   locals, no string literals (they live in the parent's data image) and no calls into C here —
+/* The child entry, spawned into a window of its own (this program's size and data image, none of
+   the parent's memory). Stackless on purpose: a child entry gets its two starter handles where a C
+   function expects its data-stack pointer, so no address-taken locals and no calls into C here —
    only VM builtins over two strings it writes itself, just above the NULL guard. */
 long child(long addrspace) {
   *(long *)16384 = 128047728850035L;            /* "stdout" packed little-endian */
@@ -1229,19 +1221,17 @@ long child(long addrspace) {
   return 1;
 }
 
-static char pool[3 * 65536]; /* room for two 64 KiB-aligned 64 KiB carves */
 static long scratch[16];     /* the spawn record + one grant record (8-byte aligned) */
 
 int main(void) {
   int out = (int)__vm_resolve("stdout", 6);   /* this program's own stdout handle */
-  long ca = ((long)pool + 65535) & ~65535L;
-  long cb = ca + 65536;
+  /* size 0: each child's window is its module's declared memory, paid from the "budget" grant. */
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
-  long a = vm_spawn(-1, (long)child, ca, 16, 0, g, 1, scratch);   /* A: stdout re-granted */
+  long a = vm_spawn(-1, (long)child, 0, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
   long ra = vm_join(a);
-  long b = vm_spawn(-1, (long)child, cb, 16, 0, g, 0, scratch);   /* B: empty grant list */
+  long b = vm_spawn(-1, (long)child, 0, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
   long rb = vm_join(b);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);

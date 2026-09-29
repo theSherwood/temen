@@ -219,7 +219,7 @@ fn run_guest_argv_bytes(guest_src: &str, tail: &[i64], mode: Mode) -> (Outcome, 
             bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
                 let info = vcpu.mem_map_info().expect("window");
                 assert_eq!(mapped, info.2, "paged runs surface reserved");
-                let (table, cover) = bytecode::build_pagestate_table(&info);
+                let (table, cover) = bytecode::build_pagestate_table(&info, vcpu.win_flat_len());
                 match run_emitted(&wasm, func, &argv, base, win_size, &table, cover) {
                     Outcome::Vals(v) => vcpu.deliver_tierup(&v),
                     Outcome::Trap(TrapKind::OutOfFuel) => vcpu.deliver_tierup_trap(Trap::OutOfFuel),

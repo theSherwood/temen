@@ -1206,7 +1206,19 @@ unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
     &*(if cur.is_null() { sched } else { cur })
 }
 
+std::thread_local! {
+    /// #1166 — whether this OS thread runs a `thread.spawn`ed vCPU. [`run_child`] sets it on the
+    /// fresh thread each such vCPU gets, which ends with the vCPU. Read by [`crate::on_spawned_vcpu`].
+    static SPAWNED_VCPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`SPAWNED_VCPU`].
+pub(crate) fn on_spawned_vcpu() -> bool {
+    SPAWNED_VCPU.with(|c| c.get())
+}
+
 fn run_child(a: SpawnArgs) {
+    SPAWNED_VCPU.with(|c| c.set(true));
     let env = a.env;
     // #1469 — this vCPU's thunks act in the domain that spawned it (a §14 child's, or the run's).
     set_current_domain(a.dom);

@@ -1,17 +1,21 @@
 //! **nimony's own driver, in the browser** (#958). `nimony t` builds a program as it does on a host:
 //! it parses the program's dependency graph, writes a build plan and runs nifmake over it, which
 //! forks and execs every step through `/bin/sh` — nifler2 and nimsem per module, hexer, then
-//! temen-link — and nimsem's compile-time evaluation builds and runs programs of its own. Every one
-//! of those processes runs on the browser's interpreter tier, over one POSIX personality and its
-//! memfs, as the self-hosted lane runs them natively (`scripts/ci/nim-selfhost-lane.sh`).
+//! temen-link — and nimsem's compile-time evaluation builds and runs programs of its own. The process
+//! tree runs on the browser's interpreter tier, over one POSIX personality and its memfs, as the
+//! self-hosted lane runs it natively (`scripts/ci/nim-selfhost-lane.sh`); a **leaf** process — one
+//! that cannot park, such as hexer and nifler2 — runs whole on the emitted tier (#1896).
 
-use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint, LeafEmitter, TierUpConfig};
 use temen_interp::Trap;
 use temen_ir::Module;
 
 use crate::{
-    blob_entries, posix_host_build, stash, PosixRun, ERR, EXIT_CODE, LAST_STATUS, OUT,
-    STATUS_DECODE_ERR, STATUS_EXIT, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    blob_entries, posix_host_build, stash, PosixRun, LAST_STATUS, STATUS_DECODE_ERR, STATUS_EXIT,
+    STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 
 /// What a build left: how the driver ended, what it printed, what the run held at its end, and the
@@ -23,22 +27,27 @@ pub struct NimBuild {
     pub stderr: Vec<u8>,
     pub footprint: Footprint,
     pub posix: temen_posix::Posix,
+    /// How many processes ran whole as leaves, tiered up at their entry (#1896).
+    pub leaves: usize,
 }
 
-/// Run `driver` (nimony) with `argv`, in `cwd`, over a memfs holding `files`. `commands` are what its
-/// processes can exec, each module at its paths: for nimony's toolchain, `<tree>/bin/<tool>`, where
-/// the driver looks for a tool, and `/bin/<tool>`, where the shell's `PATH` walk does. They may also
-/// run the programs they build. `None` when the driver is not a program this tier runs.
+/// Open `driver` (nimony) with `argv`, in `cwd`, over a memfs holding `files`. `commands` are what
+/// its processes can exec, each module at its paths: for nimony's toolchain, `<tree>/bin/<tool>`,
+/// where the driver looks for a tool, and `/bin/<tool>`, where the shell's `PATH` walk does. They may
+/// also run the programs they build. The run pauses to tier up each leaf process `leaf` emits
+/// ([`CoopEvent::TierUp`]); without `leaf` every process interprets. `None` when the driver is not a
+/// program this tier runs.
 ///
 /// `temen-link` is served natively at both of its paths ([`native_link`]), so `commands` need not
 /// carry it.
-pub fn nim_build(
+pub fn nim_open(
     driver: &Module,
     commands: &[(&Module, Vec<&str>)],
     files: &[(&str, &[u8])],
     argv: &[&[u8]],
     cwd: &str,
-) -> Option<NimBuild> {
+    leaf: Option<LeafEmitter>,
+) -> Option<(CoopRun, temen_posix::Posix)> {
     let env = [("PATH", "/bin")];
     let run = PosixRun {
         argv,
@@ -53,7 +62,7 @@ pub fn nim_build(
         format!("{cwd}/bin/temen-link"),
         "/bin/temen-link".to_string(),
     ] {
-        posix.register_host_command(&path, std::sync::Arc::new(native_link));
+        posix.register_host_command(&path, Arc::new(native_link));
     }
     posix.set_cwd(cwd);
     // In the order given: the memfs stamps write order into `st_mtim`, which the freshness checks
@@ -62,18 +71,58 @@ pub fn nim_build(
     for (path, bytes) in files {
         posix.write_file(path, bytes);
     }
-    let mut run = CoopRun::new_reserved(
+    // No function of the driver tiers up: it forks and waits, and a tiered-up function cannot park.
+    let tierup = leaf.map(|leaf| TierUpConfig {
+        eligible: Arc::from([]),
+        page_checked: false,
+        leaf: Some(leaf),
+    });
+    let run = CoopRun::new_reserved(
         driver,
         0,
         &[],
         u64::MAX,
         host,
-        None,
+        tierup,
         &init_mem,
         temen_ir::DEFAULT_RESERVED_LOG2,
     )?
     .ok()?;
-    let (status, exit_code) = match run.run() {
+    Some((run, posix))
+}
+
+/// Run nimony's driver to its end ([`nim_open`]). With `leaves`, each leaf process tiers up at its
+/// entry, and this serves it by bouncing the entry: the nested interpretation an emitted image's own
+/// ops bounce into, so the native stand-in for running it emitted.
+pub fn nim_build(
+    driver: &Module,
+    commands: &[(&Module, Vec<&str>)],
+    files: &[(&str, &[u8])],
+    argv: &[&[u8]],
+    cwd: &str,
+    leaves: bool,
+) -> Option<NimBuild> {
+    let leaf: Option<LeafEmitter> = match leaves {
+        true => Some(Arc::new(|_, _: &Module, _, _| true)),
+        false => None,
+    };
+    let (mut run, posix) = nim_open(driver, commands, files, argv, cwd, leaf)?;
+    let mut ran = 0;
+    let end = loop {
+        match run.run() {
+            CoopEvent::TierUp { func, argv, .. } => {
+                ran += 1;
+                let mut io = argv.to_vec();
+                io.resize(io.len().max(1), 0);
+                match run.bounce(func, &mut io, None) {
+                    Ok(n) => run.deliver_tierup(&io[..n]),
+                    Err(t) => run.deliver_tierup_trap(t),
+                }
+            }
+            end => break end,
+        }
+    };
+    let (status, exit_code) = match end {
         CoopEvent::Done(_) => (STATUS_OK, 0),
         CoopEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, code),
         CoopEvent::Trapped(_) => (STATUS_TRAP, 0),
@@ -86,6 +135,7 @@ pub fn nim_build(
         stderr: posix.stderr(),
         footprint: run.footprint(),
         posix,
+        leaves: ran,
     })
 }
 
@@ -151,22 +201,78 @@ fn native_link(argv: &[String], files: &mut dyn temen_posix::CommandFiles) -> i3
     )
 }
 
-/// The memfs of the most recent [`temen_nim_build`], which [`temen_nim_file`] reads.
+/// #1896 — a nimony build open as a cooperative tier-up session ([`temen_nim_open`]): the
+/// personality whose memfs holds the tree, and the leaf images the build emitted.
+pub(crate) struct NimSession {
+    posix: temen_posix::Posix,
+    leaves: Leaves,
+}
+
+/// The emitted wasm of each leaf image a build offered, by program index, and whether it carries the
+/// page check; `None` for an image the emitter declined (it runs interpreted).
+type Leaves = Arc<Mutex<HashMap<u32, Option<(Arc<[u8]>, bool)>>>>;
+
+impl NimSession {
+    /// Leaf image `module`'s emitted wasm and whether it is paged.
+    pub(crate) fn leaf(&self, module: u32) -> Option<(Arc<[u8]>, bool)> {
+        self.leaves.lock().ok()?.get(&module).cloned().flatten()
+    }
+}
+
+/// The session's leaf emitter: emit an image whole, wasm-driven from its entry — page-checked when
+/// the engine says its page state can change — once per program. An image that is not wasm-drivable
+/// (it could suspend a frame) runs interpreted.
+fn leaf_emitter(leaves: Leaves) -> LeafEmitter {
+    Arc::new(move |module, m: &Module, entry, paged| {
+        let Ok(mut leaves) = leaves.lock() else {
+            return false;
+        };
+        let leaf = leaves.entry(module as u32).or_insert_with(|| {
+            let shape = temen_wasm_jit::Shape::Batch { entry };
+            let a = match paged {
+                true => {
+                    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+                    temen_wasm_jit::compile_jit_page_checked(m, shape, true, page_log2)
+                }
+                false => temen_wasm_jit::compile_jit(m, shape, true),
+            }
+            .ok()?;
+            let temen_wasm_jit::DriveMode::WasmDriven { .. } = a.drive else {
+                return None;
+            };
+            Some((a.wasm.into(), paged))
+        });
+        leaf.is_some()
+    })
+}
+
+/// The memfs of the most recent nimony build, which [`temen_nim_file`] reads.
 static mut LAST_BUILD: Option<temen_posix::Posix> = None;
 /// The file the most recent [`temen_nim_file`] read ([`temen_nim_file_ptr`]).
 static mut FILE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
-/// Run nimony's driver ([`nim_build`]). `[driver)` is nimony's module; `[cmds)` the commands, a
-/// registry blob ([`blob_entries`]) whose entry names list a module's paths, one per line; `[files)`
-/// the tree it builds in, a blob of `path → bytes`; `[argv)` its arguments, each NUL-terminated;
-/// `[cwd)` the directory it runs in. Returns the status ([`crate::temen_status`]); the exit code,
+/// A nim session's run ended: keep its memfs for [`temen_nim_file`] and hand back what it printed.
+pub(crate) fn finish(nim: NimSession) -> (Vec<u8>, Vec<u8>) {
+    let out = (nim.posix.stdout(), nim.posix.stderr());
+    // SAFETY: single-threaded wasm; the build's memfs is read only through `temen_nim_file`.
+    unsafe { *core::ptr::addr_of_mut!(LAST_BUILD) = Some(nim.posix) };
+    out
+}
+
+/// Open nimony's driver ([`nim_open`]) as the cooperative tier-up session the `temen_coop_*` exports
+/// drive (`driveCoopTierupRun`): the process tree runs on the interpreter, and each leaf process
+/// pauses the run as a `COOP_RUN_TIERUP` of its own program ([`crate::temen_coop_module`]) to run whole
+/// on the emitted tier (#1896). `[driver)` is nimony's module; `[cmds)` the commands, a registry blob
+/// ([`blob_entries`]) whose entry names list a module's paths, one per line; `[files)` the tree it
+/// builds in, a blob of `path → bytes`; `[argv)` its arguments, each NUL-terminated; `[cwd)` the
+/// directory it runs in. Returns `0`, or a negative status. When the run is done the exit code,
 /// stdout and stderr read back as after any run, and [`temen_nim_file`] reads what the build wrote.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live [`crate::temen_alloc`]ation the host filled, or `(null, 0)`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn temen_nim_build(
+pub unsafe extern "C" fn temen_nim_open(
     driver_ptr: *const u8,
     driver_len: usize,
     cmds_ptr: *const u8,
@@ -178,6 +284,7 @@ pub unsafe extern "C" fn temen_nim_build(
     cwd_ptr: *const u8,
     cwd_len: usize,
 ) -> i32 {
+    crate::temen_coop_close();
     // SAFETY: the caller's contract.
     let (driver, cmds, files, argv, cwd) = unsafe {
         (
@@ -206,23 +313,27 @@ pub unsafe extern "C" fn temen_nim_build(
         let mut argv: Vec<&[u8]> = argv.split(|&b| b == 0).collect();
         argv.pop();
         let cwd = core::str::from_utf8(cwd).map_err(|_| STATUS_DECODE_ERR)?;
-        let b = nim_build(&driver, &commands, &files, &argv, cwd).ok_or(STATUS_UNSUPPORTED)?;
-        // SAFETY: single-threaded wasm; the slots are read back only through the accessors.
+        let leaves = Leaves::default();
+        let emit = leaf_emitter(Arc::clone(&leaves));
+        let (run, posix) = nim_open(&driver, &commands, &files, &argv, cwd, Some(emit))
+            .ok_or(STATUS_UNSUPPORTED)?;
+        // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
         unsafe {
-            stash(&mut *core::ptr::addr_of_mut!(OUT), b.stdout);
-            stash(&mut *core::ptr::addr_of_mut!(ERR), b.stderr);
-            EXIT_CODE = b.exit_code;
-            *core::ptr::addr_of_mut!(LAST_BUILD) = Some(b.posix);
+            *core::ptr::addr_of_mut!(crate::COOP_RUN) =
+                Some(crate::CoopTierupRun::nim(run, NimSession { posix, leaves }));
         }
-        Ok(b.status)
+        Ok(STATUS_OK)
     })()
     .unwrap_or_else(|s| s);
     // SAFETY: as above.
     unsafe { LAST_STATUS = status };
-    status
+    match status {
+        STATUS_OK => 0,
+        s => -s,
+    }
 }
 
-/// Read `[path)` from the memfs of the most recent [`temen_nim_build`]: its length, or `-1` when
+/// Read `[path)` from the memfs of the most recent nimony build: its length, or `-1` when
 /// there is no such file. The bytes are at [`temen_nim_file_ptr`] until the next read.
 ///
 /// # Safety

@@ -192,6 +192,14 @@ pub unsafe extern "C" fn cap_thunk(
     n_results: u64,
     trap_out: *mut i64,
 ) {
+    // #1166: this thunk takes the `Host` as a raw `&mut`, so it serves one caller at a time. A call
+    // from a `thread.spawn`ed vCPU means the guest is concurrent, and a concurrent guest runs
+    // [`cap_thunk_locked`] (`jit_cap_run` picks it on `uses_concurrency`). Refuse rather than race the
+    // `Host`: six workers entering here at once raced its lazily built page map (#1166).
+    if temen_jit::on_spawned_vcpu() {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return;
+    }
     // F3 (FIBER_PARK.md) — a punt INSIDE A FIBER parks the fiber, not this OS thread: route
     // through the pending face so the dispatch can punt to the pool, then park-poll on the
     // completion cell (`fiber_cap_wait`) — the §3.6 slice-5a contract, completion form, the
@@ -5432,7 +5440,8 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // a `Module` grant is non-durable, so granting it everywhere would make every snapshot-taking
     // guest unfreezable.
     if h.self_module_spawns_detached() {
-        h.grant_detached_spawn_caps(win);
+        let by_handle = h.self_module_spawns_by_module_handle();
+        h.grant_detached_spawn_caps(win, by_handle);
     }
     v
 }
@@ -5758,7 +5767,7 @@ pub fn nim_noc_run(
 /// `__vm_cap_at` reflection — so the authority check stays where it belongs, on `Host::resolve`
 /// against a handle the guest actually holds.
 ///
-/// **For the default (op-13) build, linking is not optional.** An unlinked `call.sym "__spawn"`
+/// **For the default (op-17) build, linking is not optional.** An unlinked `call.sym "__spawn_rec"`
 /// is an import slot no resolver anywhere knows, and an unbound slot is refused at bind — or, when
 /// #1628 bound exec'd images leniently, a `Trap::CapFault` at first use. The POSIX build
 /// (`-DTEMEN_SHELL_POSIX`, #1662) calls none of these names: its imports are all `__px_*`, which
@@ -5766,7 +5775,7 @@ pub fn nim_noc_run(
 pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
     let cap = match name {
         // The shell's own `Instantiator` ops (STAGE1.md §5).
-        "__spawn" => temen_ir::ResolvedCap { type_id: 6, op: 13 },
+        "__spawn_rec" => temen_ir::ResolvedCap { type_id: 6, op: 17 },
         "__join" => temen_ir::ResolvedCap { type_id: 6, op: 1 },
         // The ring-pipeline surface (STAGE1.md item 6): mint a region (`AddressSpace` op 5) and
         // alias/query it (`SharedRegion` ops 0/1/3) — the shell pumps stage-0 output into a mapped
@@ -5778,6 +5787,110 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
         n => temen_posix::resolve_import(n)?,
     };
     Some(temen_ir::Resolved::Cap(cap))
+}
+
+/// A §14 **conductor**: spawn a granted `Module` as a detached child — an op-17 v1 record,
+/// so the child runs in a window of its own (its declared memory: `size_log2 = 0`), paid from a `Budget`
+/// and returned to it when the child ends — with `caps` re-granted to it by name and `argv` as the
+/// spawn's args payload (`{argc, envc = 0}` + packed NUL-terminated strings, landing at the child's
+/// [`temen_ir::module_args_base`]), then join it and return its status. A refused spawn returns its
+/// `-errno` instead of joining.
+///
+/// Entry: `(Instantiator, Module, Budget, cap_0, …, cap_{n-1}) -> i64`, where `cap_i` is the handle
+/// re-granted as `caps[i]`. Every nested-phase harness (the nim chain, nifler, the child-entry tests)
+/// spawns through this one program (INVARIANTS #15); [`grant_conductor`] grants its first three args.
+/// Its own scratch — the record, the grant records and their names, the payload — sits above the
+/// NULL guard of its [`CONDUCTOR_LOG2`] window.
+pub fn conductor(caps: &[&str], argv: &[&str]) -> temen_ir::Module {
+    let m =
+        temen_text::parse_module(&conductor_src(caps, argv)).expect("the conductor's text parses");
+    temen_verify::verify_module(&m).expect("the conductor verifies");
+    m
+}
+
+/// Grant [`conductor`]'s first three args on `host`: an `Instantiator`, `child` as a `Module`, and a
+/// `Budget` holding exactly `child`'s declared window.
+pub fn grant_conductor(host: &mut Host, child: &temen_ir::Module) -> (i32, i32, i32) {
+    let log2 = child.memory.as_ref().map_or(0, |m| m.size_log2);
+    let inst = host.grant_instantiator(0, 1u64 << CONDUCTOR_LOG2);
+    let modh = host.grant_module(child);
+    let budget = host.grant_budget(0, 1i64 << log2, 0);
+    (inst, modh, budget)
+}
+
+/// The [`conductor`]'s own declared window.
+pub const CONDUCTOR_LOG2: u8 = 17;
+
+fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
+    let guard = temen_ir::POWERBOX_NULL_GUARD;
+    let (rec, grants, names, args) = (guard + 512, guard + 1024, guard + 2048, guard + 4096);
+    assert!(caps.len() <= 64, "conductor: at most 64 re-granted caps");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(argv.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes()); // envc
+    for s in argv {
+        payload.extend_from_slice(s.as_bytes());
+        payload.push(0);
+    }
+    let esc = |b: &[u8]| -> String { b.iter().map(|b| format!("\\x{b:02x}")).collect() };
+    let n = 3 + caps.len();
+    let sig = vec!["i32"; n].join(", ");
+    let params: Vec<String> = (0..n).map(|i| format!("v{i}: i32")).collect();
+    let mut data = format!("data {args} \"{}\"\n", esc(&payload));
+    let mut body = String::new();
+    for (i, name) in caps.iter().enumerate() {
+        let (noff, goff) = (names + 16 * i as u64, grants + 16 * i as u64);
+        data.push_str(&format!("data {noff} \"{}\"\n", esc(name.as_bytes())));
+        // {name_off: u32, name_len: u32} then {handle: i32, flags: u32 = 0}
+        body.push_str(&format!(
+            "  g{i}a = i64.const {goff}\n  g{i}n = i64.const {w}\n  i64.store g{i}a g{i}n\n  \
+             g{i}h = i64.extend_i32_u v{vi}\n  i64.store g{i}a g{i}h offset=8\n",
+            w = noff | ((name.len() as u64) << 32),
+            vi = 3 + i,
+        ));
+    }
+    format!(
+        r#"memory {CONDUCTOR_LOG2}
+{data}func ({sig}) -> (i64) {{
+block 0 ({params}) {{
+{body}  r = i64.const {rec}
+  w0 = i64.const 1
+  i64.store r w0
+  w2 = i64.const {w2}
+  i64.store r w2 offset=16
+  i32.store r v1 offset=24
+  i32.store r v2 offset=28
+  gp = i64.const {grants}
+  i64.store r gp offset=40
+  gn = i64.const {gn}
+  i64.store r gn offset=48
+  ap = i64.const {args}
+  i64.store r ap offset=56
+  al = i64.const {al}
+  i64.store r al offset=64
+  none = i32.const -1
+  i32.store r none offset=72
+  h = call.cap 6 17 (i64) -> (i32) v0 (r)
+  z = i32.const 0
+  refused = i32.lt_s h z
+  br_if refused 1(h) 2(v0, h)
+  }}
+block 1 (e: i32) {{
+  e64 = i64.extend_i32_s e
+  return e64
+  }}
+block 2 (inst: i32, c: i32) {{
+  st = call.cap 6 1 (i32) -> (i64) inst (c)
+  return st
+  }}
+}}
+"#,
+        params = params.join(", "),
+        // size_log2 0 (the module's declared window) | pager u32::MAX (none)
+        w2 = (0xFFFF_FFFFu64 << 32) as i64,
+        gn = caps.len(),
+        al = payload.len(),
+    )
 }
 
 /// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
@@ -5875,54 +5988,6 @@ pub fn nim_program_units(
         ));
     }
     Ok(units)
-}
-
-/// The window `size_log2` an op-13 **nimony phase child** (nimsem, hexer) needs for its carve.
-///
-/// A child carve is a **hard** ceiling. `Mem::nested_view` builds `Window::sub(.., 1 << size_log2)`
-/// with mapped == reserved, so unlike a top-level run — which gets `DEFAULT_RESERVED_LOG2` (1 TiB)
-/// of reserved tail to grow into — a child cannot grow one byte past what it was given. Guess low
-/// and the phase dies partway through real work.
-///
-/// **Measured** (#1591), sweeping the op-13 nimsem child over nimony's system semcheck:
-///
-/// | carve | outcome |
-/// |---|---|
-/// | 256 MiB | fault at `0x10003f10` (+16144 past the end) |
-/// | 512 MiB | fault at `0x20010460` (+66656) |
-/// | 1 GiB | fault at `0x40000000` (+0) |
-/// | 2 GiB | joined 0, output byte-identical (path-normalized) to native |
-///
-/// Those numbers were taken against a guest built with `-d:useMalloc`, which made Nim bypass its own
-/// allocator and send every object to the on-ramp's `synth_malloc` — whose `free` is a no-op, so the
-/// peak was total allocation *churn* rather than the live set. That flag existed to dodge a crash in
-/// `rawDealloc` that was really an unaligned `mmap` (#1595's bug in a second shim). With the
-/// alignment fixed and the flag dropped, the same work peaks at **666 MiB** instead of 2007 MiB, for
-/// byte-identical output — so the floor is 30 (1 GiB), the first power of two that clears it.
-///
-/// Worth stating why the measurement came first: raising a constant until a failure stops is how a
-/// leak gets buried. Here the top-level run and the op-13 child agreed at every step, which is what
-/// said the child wasted nothing — and what left the allocator as the only remaining explanation.
-///
-/// **One floor, not six.** This formula was copied into `nimsem_child_driver`, `nim_chain_op13`
-/// (twice), `nim_chain_op13_jit` (twice) and `nim_link_fs_asset`, each with its own comment
-/// asserting its own peak, and each went stale independently — `nim_chain_op13`'s pair still said
-/// "256 MiB (no-GC peak)" while the phase it sized had long outgrown it, which is what made
-/// `build_frontend.sh` step 6 trap. A number that must be re-measured when the allocator moves can
-/// only live in one place (INVARIANTS #15).
-///
-/// `TEMEN_NIM_PHASE_SL` overrides the floor, for re-measuring. (It replaces the narrower
-/// `TEMEN_NIMSEM_CHILD_SL`, which named only one of the phases that share this budget.)
-pub fn nim_phase_carve_log2(declared_size_log2: u32) -> u32 {
-    /// The measured floor; see the table above. 1 GiB clears the 666 MiB peak.
-    const FLOOR: u32 = 30;
-    let floor = std::env::var("TEMEN_NIM_PHASE_SL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(FLOOR);
-    // `+3` keeps the carve comfortably above whatever the module itself declares, for the phases
-    // whose declared window is already large.
-    (declared_size_log2 + 3).max(floor)
 }
 
 /// Append a trap-time backtrace, and the address the guest faulted on, to a trap message — innermost
