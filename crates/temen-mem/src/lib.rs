@@ -1688,15 +1688,23 @@ impl Paged {
         }
     }
 
+    // Page by page, like `write_from`: one map lookup and one slice copy per page, not per byte. Bytes
+    // past `size` are left as they are (audit #6: inert past range; `n` keeps `off + i` from
+    // overflowing).
     fn read_into(&self, off: u64, out: &mut [u8]) {
         let map = self.lock();
-        for (k, slot) in out.iter_mut().enumerate() {
-            let o = off.saturating_add(k as u64); // audit #6: inert past range, no overflow
-            if o >= self.size {
-                break;
-            }
+        let n = self.size.saturating_sub(off).min(out.len() as u64) as usize;
+        let mut i = 0usize;
+        while i < n {
+            let o = off + i as u64;
             let idx = (o % self.page) as usize;
-            *slot = map.get(&(o / self.page)).map_or(0, |p| p[idx]);
+            let take = (self.page as usize - idx).min(n - i);
+            let dst = &mut out[i..i + take];
+            match map.get(&(o / self.page)) {
+                Some(p) => dst.copy_from_slice(&p[idx..idx + take]),
+                None => dst.fill(0),
+            }
+            i += take;
         }
     }
 
@@ -1849,6 +1857,13 @@ mod tests {
             let mut out = [0u8; 4];
             r.read_into(4094, &mut out);
             assert_eq!(out, [0, 1, 2, 0]);
+            // A read that runs past the end fills the in-range prefix and leaves the rest as it was.
+            r.set_byte((1 << 16) - 1, 3);
+            let mut tail = [9u8; 4];
+            r.read_into((1 << 16) - 2, &mut tail);
+            assert_eq!(tail, [0, 3, 9, 9]);
+            r.read_into(1 << 16, &mut tail);
+            assert_eq!(tail, [0, 3, 9, 9], "a read from the end touches nothing");
         });
     }
 
