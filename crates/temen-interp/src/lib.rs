@@ -3298,11 +3298,12 @@ fn drive_over_cell(
         s.root_domain = host_shared.lock_unpoisoned().domain_id() as usize;
         // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once. Only a
         // durable run has the control words; any other keeps its own data there (#1851).
-        s.freeze_on_quiesce = durable
+        let armed = durable
             && mem
                 .as_ref()
                 .map(|m| m.durable_freeze_on_quiesce())
                 .unwrap_or(false);
+        s.freeze_on_quiesce = armed.then(|| Arc::clone(&host_shared));
         // The domain's shared dispatch table (B2 `install` reserves `jit_table_log2` slots; no
         // effect when `0`). Every vCPU of the run shares this one `Arc`, so an install is visible
         // across `thread.spawn`/`Jit.invoke` children (DESIGN.md §22).
@@ -6181,8 +6182,9 @@ struct Sched {
     /// `svc.wait`, it promotes each parked vCPU's window to `UNWINDING` and re-admits it: the
     /// re-executed `svc.wait` observes the freeze and takes the 4b sentinel, so the domain unwinds
     /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
-    /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]).
-    freeze_on_quiesce: bool,
+    /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]). Holds the run root's powerbox while armed:
+    /// the census runs before the freeze fires, and a decline is recorded there (#1918).
+    freeze_on_quiesce: Option<Arc<Mutex<Host>>>,
     /// #1584 — some vCPU of this run has finished by **unwinding for a freeze**. From then on the
     /// freeze is in flight, and the worker loop brings every park the scheduler owns through it
     /// ([`admit_parks_for_freeze`]) instead of reaping them as deadlocked.
@@ -7944,7 +7946,8 @@ fn scheduled_vcpus(s: &Sched) -> Vec<&VCpu> {
 }
 
 /// #1671 — the **freeze census**: at the instant a freeze trigger fires, before anything unwinds, can
-/// the cut complete? `me` is the vCPU whose poll the trigger fired on, `root` the run root's powerbox
+/// the cut complete? `me` is the vCPU whose poll the trigger fired on (`None` for freeze-on-quiesce,
+/// which fires with every vCPU at rest in the scheduler, [`freeze_step`]), `root` the run root's powerbox
 /// (whose own handles are the codec's to answer, since its embedder can still drain them). Walks every
 /// vCPU of the run. `None` = go ahead; `Some` = decline, and the caller leaves the run untouched.
 ///
@@ -7952,7 +7955,11 @@ fn scheduled_vcpus(s: &Sched) -> Vec<&VCpu> {
 /// `detached_live_refused`, `freeze_drive`), which stay as the backstop for a cause that arises after
 /// this — the census is what makes them unreachable for everything visible here. Each cause is a gap
 /// filed to be closed (#1703); this is the fallback, not the design point.
-fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option<FreezeDeclined> {
+fn freeze_census(
+    me: Option<&Seat>,
+    sched: &SchedRef,
+    root: &Arc<Mutex<Host>>,
+) -> Option<FreezeDeclined> {
     let SchedRef::Real(rs) = sched else {
         return None; // the deterministic explorer has no durable freeze
     };
@@ -7975,7 +7982,7 @@ fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option
             }
         }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
-        for seat in std::iter::once(me).chain(others.iter()) {
+        for seat in me.into_iter().chain(others.iter()) {
             if seat.handler_parked {
                 return declined(DeclineCause::ServeHandlerParked, seat.id, None);
             }
@@ -8073,6 +8080,45 @@ fn futex_parks_unsatisfiable(s: &Sched) -> bool {
         })
 }
 
+/// The worker loop's freeze step, with nothing runnable (see the comment at its call). Returns the
+/// guard, and whether it acted, so the loop looks at the queue again.
+///
+/// **#1918 — freeze-on-quiesce asks the census first.** Every other freeze starts at a countdown
+/// firing inside a running vCPU, which runs the census there ([`freeze_census`], #1671). This one
+/// starts here, with every vCPU at rest, so the census runs here too, with no triggering vCPU. A
+/// decline is recorded on the run root's powerbox and spends the one-shot arm; nothing has been
+/// touched, so the run carries on as if it was never armed. The census takes the scheduler lock
+/// itself and a powerbox lock after it, so it runs with this guard released; if anything woke in
+/// that window, the run is no longer quiesced and the arm is kept for the next time it is.
+fn freeze_step<'a>(
+    sched: &'a Arc<Scheduler>,
+    mut s: std::sync::MutexGuard<'a, Sched>,
+) -> (std::sync::MutexGuard<'a, Sched>, bool) {
+    let quiesced = |s: &Sched| s.svc_timers.is_empty() && quiesced_parks_only(s);
+    if quiesced(&s) {
+        if let Some(root) = s.freeze_on_quiesce.take() {
+            drop(s);
+            if let Some(d) = freeze_census(None, &SchedRef::Real(Arc::clone(sched)), &root) {
+                root.lock_unpoisoned().freeze_declined = Some(d);
+                return (sched.lock(), true);
+            }
+            s = sched.lock();
+            if quiesced(&s) {
+                admit_parks_for_freeze(&mut s);
+            } else {
+                s.freeze_on_quiesce = Some(root);
+            }
+            return (s, true);
+        }
+    }
+    if freeze_in_flight(&s) && freeze_can_admit(&s) {
+        s.freeze_on_quiesce = None; // this run is freezing either way
+        admit_parks_for_freeze(&mut s);
+        return (s, true);
+    }
+    (s, false)
+}
+
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
 /// idle. Returns when the run is shutting down and nothing is left to do.
 fn worker_loop(sched: &Arc<Scheduler>) {
@@ -8103,11 +8149,9 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 //   is the oracle's form of the same rule, reached through the one body.
                 //
                 // Checked ahead of the deadlock predicate below: a freeze is not a deadlock.
-                let quiesce_fires =
-                    s.freeze_on_quiesce && s.svc_timers.is_empty() && quiesced_parks_only(&s);
-                if quiesce_fires || (freeze_in_flight(&s) && freeze_can_admit(&s)) {
-                    s.freeze_on_quiesce = false; // one-shot, and this run is freezing either way
-                    admit_parks_for_freeze(&mut s);
+                let acted;
+                (s, acted) = freeze_step(sched, s);
+                if acted {
                     continue;
                 }
                 // #1624: every futex park is indefinite and nothing else can wake the run, so the
@@ -8628,8 +8672,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // *also* releases its read ends — a consumer that exits (e.g. `head`) drops the reader
                 // count, so a parked upstream producer wakes to `-EPIPE` rather than hang forever.
                 // A vCPU that unwound for a freeze has not exited (#1672): its ends stay open for the
-                // cut, or a reader elsewhere in the tree would see a false EOF mid-freeze.
-                let (pipe_eofs, pipe_epipes) = if froze {
+                // cut, or a reader elsewhere in the tree would see a false EOF mid-freeze. Nor has a
+                // domain whose *thread* finished (#1917): a `thread.spawn` child shares its domain's
+                // powerbox and so its pipe ends, and a thread's exit closes nothing. The domain's main
+                // vCPU finishing ends the domain, and releases them.
+                let (pipe_eofs, pipe_epipes) = if froze || v.spawn_residue.is_some() {
                     (Vec::new(), Vec::new())
                 } else {
                     v.host.lock_unpoisoned().release_pipe_ends()
@@ -11457,10 +11504,11 @@ struct VCpu {
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
-    /// `Some` on a **spawned** (`thread.spawn`) vCPU: its `(entry, [sp, arg], join slot)`, retained so
-    /// that when it unwinds under a freeze it can emit its [`FrozenVCpu`] residue (its frames are gone
-    /// by then), or, finishing unjoined, its completed residue (#1685).
-    /// `None` on the root (whose entry/args the thaw caller supplies) and on every non-durable vCPU.
+    /// `Some` on a **spawned** (`thread.spawn`) vCPU, durable or not: its `(entry, [sp, arg], join
+    /// slot)`, retained so that when it unwinds under a freeze it can emit its [`FrozenVCpu`] residue
+    /// (its frames are gone by then), or, finishing unjoined, its completed residue (#1685). Its
+    /// presence is also what marks a vCPU as a thread of its domain, not the domain's main vCPU
+    /// (#1917). `None` on a domain's main vCPU, whose entry/args the thaw caller supplies.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>, usize)>,
     /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
@@ -12771,7 +12819,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 registry: &*registry,
             };
             let root = freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
-            if let Some(d) = freeze_census(&seat, sched, &root) {
+            if let Some(d) = freeze_census(Some(&seat), sched, &root) {
                 $m.durable_set_state(STATE_NORMAL);
                 root.lock_unpoisoned().freeze_declined = Some(d);
             }
