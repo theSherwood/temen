@@ -69,3 +69,51 @@ fn generator_reaches_the_wasm_memory_oracle() {
         "too few wasm-emittable memory modules ({oracle}) — the escape-oracle is near-vacuous"
     );
 }
+
+/// #1856: `min`/`max` of a NaN yield the IR's canonical NaN (the interpreter's `fmin`/`fmax`, and the
+/// JIT's `canonicalize_nan`). The wasm tier emitted the native op, which may return an input NaN's
+/// payload and sign, and a reinterpret makes those bits observable. The nightly's module was
+/// `f64.max(x, x)` of a negative payload NaN; this pins it and its siblings.
+#[test]
+fn min_max_of_a_nan_is_the_canonical_nan() {
+    // A negative quiet NaN with a payload, per float width (the nightly's f64 is the first).
+    let (nan64, nan32) = (0xFFFF_FFAD_ADAD_ADADu64, 0xFFAD_ADADu32);
+    let mut srcs = Vec::new();
+    for op in ["min", "max"] {
+        for (f, i, nan) in [("f64", "i64", nan64), ("f32", "i32", nan32.into())] {
+            let k = |v: &str| {
+                if v == "n" {
+                    format!("nan:{nan}")
+                } else {
+                    v.to_string()
+                }
+            };
+            for (x, y) in [("n", "n"), ("n", "1.5"), ("1.5", "n")] {
+                srcs.push(format!(
+                    "func () -> ({i}) {{\nblock 0 () {{\n  v0 = {f}.const {}\n  v1 = {f}.const {}\n  \
+                     v2 = {f}.{op} v0 v1\n  v3 = {i}.reinterpret_{f} v2\n  return v3\n  }}\n}}\n",
+                    k(x),
+                    k(y)
+                ));
+            }
+        }
+        // Lane-wise: every lane a payload NaN, against itself.
+        for (shape, bytes) in [
+            ("f64x2", nan64.to_le_bytes().repeat(2)),
+            ("f32x4", nan32.to_le_bytes().repeat(4)),
+        ] {
+            let bytes: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+            srcs.push(format!(
+                "func () -> (i64) {{\nblock 0 () {{\n  v0 = v128.const {}\n  v1 = {shape}.{op} v0 v0\n  \
+                 v2 = i64x2.extract_lane 0 v1\n  return v2\n  }}\n}}\n",
+                bytes.join(" ")
+            ));
+        }
+    }
+    assert_eq!(srcs.len(), 16);
+    for src in &srcs {
+        let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+        wasmdiff::run_differential_wasm(&m, &[]);
+    }
+}
