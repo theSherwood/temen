@@ -112,7 +112,11 @@ fn launch(child: &Module) -> DetachedLaunch {
 
 /// The parent's frozen window and a powerbox that granted `child` durable and captured it live.
 fn parent_with_child(c: &Module) -> (Vec<u8>, Host) {
-    let (window, chost) = frozen_root(c);
+    parent_with(c, frozen_root(c))
+}
+
+/// [`parent_with_child`] over a given frozen child.
+fn parent_with(c: &Module, (window, chost): (MemLayout, Host)) -> (Vec<u8>, Host) {
     let mut host = Host::new();
     host.set_durable(true);
     host.grant_durable_module(c);
@@ -207,4 +211,33 @@ fn a_child_whose_module_is_not_re_granted_refuses_the_restore() {
         restore_with_prots(&art, &p, &mut rhost).map(|_| ()),
         Err(RestoreError::ModuleUnresolved(module_digest(&c)))
     );
+}
+
+/// A child's own restore failing fails the parent's (#1698): never swallowed into a child that thaws
+/// short of what it froze with. Here the child holds a named `vm_fs`, so its restore needs the
+/// registrar the restoring host lends it.
+#[test]
+fn a_child_whose_restore_fails_refuses_the_parents() {
+    let (p, c) = (parent(), child());
+    let (window, mut chost) = frozen_root(&c);
+    temen_fs::grant_vm_fs(&mut chost, None);
+    let (win, host) = parent_with(&c, (window, chost));
+    let art = freeze(&p, &win, &host).expect("freeze the tree");
+
+    let restoring = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_durable_module(&c);
+        h
+    };
+    assert_eq!(
+        restore_with_prots(&art, &p, &mut restoring()).map(|_| ()),
+        Err(RestoreError::NamedCapRefused("vm_fs".to_string())),
+        "no registrar serves the child's capability"
+    );
+    let mut rhost = restoring();
+    rhost.set_named_cap_registrar(Box::new(temen_fs::regrant_vm_fs));
+    restore_with_prots(&art, &p, &mut rhost)
+        .expect("a registrar serving `vm_fs` restores the tree");
+    assert_eq!(rhost.take_thawed_detached().len(), 1);
 }
