@@ -2,11 +2,11 @@
 //! **confined executor children** (`Instantiator.instantiate` / `instantiate_module`) the way the
 //! JS/Worker host will in the browser. The parent vCPU (carrying a powerbox, since §14 resolves its
 //! `Instantiator` authority in-Vm) does all the authority-bearing work — carve validation, module
-//! resolve + compile + push to the shared source, data-segment materialization — and surfaces a purely
-//! mechanical [`VcpuEvent::Instantiate`]. The host's job is exactly the [`Spawn`] protocol: start a new
-//! vCPU (here a scoped `std::thread`; in the browser a Worker) running
-//! [`Vcpu::new_confined_child`] over `[win + carve, win + carve + 2^size_log2)`, and wire its
-//! completion into `join`.
+//! resolve + compile + push to the shared source, data-segment materialization, the child's powerbox —
+//! and surfaces a purely mechanical [`VcpuEvent::Instantiate`]. The host's job is exactly the [`Spawn`]
+//! protocol: start the admitted child (`Vcpu::take_child` + `PendingChild::start`) on a new thread
+//! (here a scoped `std::thread`; in the browser a Worker) over `[win + carve, win + carve +
+//! 2^size_log2)`, and wire its completion into `join`.
 //!
 //! Per DESIGN.md §14, *a sub-window is indistinguishable from a top-level window* — so the confined
 //! child is literally a plain child whose window pointer is shifted and smaller (a fresh
@@ -323,11 +323,7 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::Done(vals) => return Ok(vals),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
                 let id = orch.fresh_id();
                 // SAFETY: the engine validated the carve inside this vCPU's window, which outlives the
@@ -336,9 +332,11 @@ fn drive<'s, 'e>(
                 let child_win = WinPtr(unsafe { win.0.add(carve as usize) });
                 // SAFETY: as above — `2^size_log2` valid bytes at the validated carve.
                 let back = Arc::new(unsafe { Region::shared(child_win.0, 1u64 << size_log2) });
-                let child =
-                    bytecode::Vcpu::new_confined_child(prog, module, entry, back, size_log2, fuel)
-                        .expect("confined child vcpu");
+                let child = vcpu
+                    .take_child()
+                    .expect("an Instantiate carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("confined child vcpu");
                 scope.spawn(move || {
                     let r = drive(scope, prog, child_win, orch, child);
                     orch.publish(id, r);

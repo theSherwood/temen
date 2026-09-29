@@ -1,9 +1,9 @@
 //! **#1011 slice 3c — a §14 child-entry phase binds its imports on the *resumable* (tier-up) engine.**
 //! `child_entry_io.rs` proved a child-entry guest's `write` binds to a re-granted `stdout` on the
 //! **cooperative** engine (which binds the child manifest inline). But a nim phase child JITs only on
-//! the **resumable** engine (`new_confined_child` / `new_confined_child_over_host`), which previously
-//! did *not* bind the child manifest — so a phase child with a `write`/`fs` import would `CapFault`.
-//! This proves the wiring: `new_confined_child_core` now calls `bind_child_manifest`, so the same
+//! the **resumable** engine, which previously did *not* bind the child manifest — so a phase child with
+//! a `write`/`fs` import would `CapFault`. This proves the wiring: the resumable engine admits the spawn
+//! through the one admission every driver uses (`admit_confined_child`, which binds it), so the same
 //! child-entry `write` guest, `instantiate_module_named` (op 13)'d over the **resumable drive loop**
 //! with `stdout` re-granted, reaches the shared sink. Window confinement (§2) is untouched: the grant
 //! is authority (§3), a cross-tier `call.cap`, not a window access.
@@ -55,9 +55,8 @@ fn emit_ll(src: &std::path::Path, ll: &std::path::Path) -> bool {
 #[derive(Clone, Copy)]
 struct WinPtr(*mut u8);
 
-/// The resumable-engine drive loop: on `Instantiate`, take the op-13 re-granted powerbox
-/// (`take_granted_host`) and run the child over it (`new_confined_child_over_host`, which binds the
-/// child manifest against that powerbox); a grant-less child would use the plain constructor.
+/// The resumable-engine drive loop: on `Instantiate`, start the admitted child over its carve — its
+/// powerbox already carries the op-13 re-grant, with the child manifest bound against it.
 fn drive(
     prog: &bytecode::VcpuProgram,
     base: WinPtr,
@@ -69,27 +68,18 @@ fn drive(
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
-                let granted = vcpu.take_granted_host();
                 // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
                 // child); the child's region aliases that sub-window — the §14 shared data plane.
                 let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve.
                 let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
-                let child = match granted {
-                    Some(host) => bytecode::Vcpu::new_confined_child_over_host(
-                        prog, module, entry, back, size_log2, fuel, host,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child(
-                        prog, module, entry, back, size_log2, fuel,
-                    ),
-                }
-                .expect("confined child builds");
+                let child = vcpu
+                    .take_child()
+                    .expect("an Instantiate carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("confined child builds");
                 let r = drive(prog, child_base, child);
                 let handle = children.len() as i32;
                 children.push(r);
@@ -203,6 +193,6 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
     assert_eq!(
         &*sink.lock().unwrap(),
         b"hi",
-        "the child-entry write bound to the re-granted stdout on the resumable engine (manifest bound in new_confined_child)"
+        "the child-entry write bound to the re-granted stdout on the resumable engine (manifest bound at admission)"
     );
 }

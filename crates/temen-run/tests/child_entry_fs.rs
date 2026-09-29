@@ -227,22 +227,21 @@ fn child_entry_copies_a_parent_seeded_file_through_a_regranted_memfs() {
 // --- The same hand-off on the *resumable* (tier-up / JIT-capable) engine --------------------------
 //
 // The tests above run on `run_with_host` — the tree-walker oracle. But a real nim phase JITs, and only
-// the **resumable** engine tiers up: its op-13 path re-grants caps into `take_granted_host` and runs
-// the child over `new_confined_child_over_host`. `child_entry_io_resumable.rs` proved that path binds a
-// re-granted `stdout` **Stream**; this proves it also carries a **forkable memfs host proc** — the fs
-// re-grant nifler's emit rides — so the child resolves `"fs"` and writes a file the parent reads back,
-// on the engine that matters for performance. Surfaces any carve/regrant divergence from the oracle
-// now, on a text-IR child, rather than during the real-nifler integration.
+// the **resumable** engine tiers up: its admission re-grants caps into the child's powerbox and the
+// host starts the admitted child (`take_child` + `start`). `child_entry_io_resumable.rs` proved that
+// path binds a re-granted `stdout` **Stream**; this proves it also carries a **forkable memfs host
+// proc** — the fs re-grant nifler's emit rides — so the child resolves `"fs"` and writes a file the
+// parent reads back, on the engine that matters for performance. Surfaces any carve/regrant
+// divergence from the oracle now, on a text-IR child, rather than during the real-nifler integration.
 
 /// A raw window base carrying derived provenance (offset into the one live allocation).
 #[derive(Clone, Copy)]
 struct WinPtr(*mut u8);
 
-/// The resumable-engine drive loop (mirrors `child_entry_io_resumable`): on `Instantiate`, take the
-/// op-13 re-granted powerbox (`take_granted_host`) and run the child over it
-/// (`new_confined_child_over_host`, which binds the child manifest against that powerbox); `Join`
-/// delivers the child's result. The re-granted `"fs"` lives in that taken powerbox, so the child's
-/// `self.resolve "fs"` finds it.
+/// The resumable-engine drive loop (mirrors `child_entry_io_resumable`): on `Instantiate`, start the
+/// admitted child over its carve — its powerbox already carries the op-13 re-grant and its bound
+/// manifest — and `Join` delivers the child's result. The re-granted `"fs"` lives in that powerbox, so
+/// the child's `self.resolve "fs"` finds it.
 fn drive(
     prog: &bytecode::VcpuProgram,
     base: WinPtr,
@@ -254,27 +253,18 @@ fn drive(
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
-                let granted = vcpu.take_granted_host();
                 // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
                 // child); the child's region aliases that sub-window — the §14 shared data plane.
                 let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve.
                 let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
-                let child = match granted {
-                    Some(host) => bytecode::Vcpu::new_confined_child_over_host(
-                        prog, module, entry, back, size_log2, fuel, host,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child(
-                        prog, module, entry, back, size_log2, fuel,
-                    ),
-                }
-                .expect("confined child builds");
+                let child = vcpu
+                    .take_child()
+                    .expect("an Instantiate carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("confined child builds");
                 let r = drive(prog, child_base, child);
                 let handle = children.len() as i32;
                 children.push(r);

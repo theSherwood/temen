@@ -384,18 +384,20 @@ fn run_phase(
 // ---- run a phase as a confined §14 op-13 child on the resumable (tier-up-capable) engine (#1025) ---
 // A phase run this way executes as a **separate-module confined child** over a sub-window carve instead
 // of inline in the driver's own powerbox: the same resumable bytecode engine `run_phase` uses, but on
-// the tier-up-capable path (`new_confined_child_over_host`) a JIT'd phase rides — matching the native
-// op-13 conductor (`temen-run/examples/nim_chain_op13.rs`). `child` is a **child-entry** phase module
-// (func 0 = `[I64]->[I64]`, built `--child-entry`); `{fs, stdout, exit}` are re-granted into it (`vm_map`
-// auto-binds to the child's AddressSpace), argv is seeded into its carve, and its joined status returns.
+// the tier-up-capable path (the admitted child, `PendingChild::start`) a JIT'd phase rides — matching
+// the native op-13 conductor (`temen-run/examples/nim_chain_op13.rs`). `child` is a **child-entry**
+// phase module (func 0 = `[I64]->[I64]`, built `--child-entry`); `{fs, stdout, exit}` are re-granted
+// into it (`vm_map` auto-binds to the child's AddressSpace), argv is seeded into its carve, and its
+// joined status returns.
 
 /// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`). On a **detached**
 /// spawn (op 15, #1288 — how the phases are spawned) the host owns the fresh window: a root-sized
 /// lazily-reserved `Region::new` (an `mmap` natively; the sparse `Paged` fallback on wasm32), seeded with
 /// the child's data segments and the spawn-time args payload, run with
 /// `new_confined_child_grow_over_host` (committed window = the declared size, starter caps over the
-/// reservation, so `vm_map` grows it). On a nested `Instantiate` (op 13 — a grandchild carve) the child
-/// aliases the sub-window at `base + carve`. `Join` delivers the child's result. Single-threaded here,
+/// reservation, so `vm_map` grows it). On a nested `Instantiate` (op 13 — a grandchild carve) the engine
+/// has admitted the child, its powerbox built; this loop starts it over the sub-window at `base + carve`,
+/// committing the declared window the same way. `Join` delivers the child's result. Single-threaded here,
 /// so the window base travels as a raw ptr. `child` is the module the *root* driver spawns (its
 /// declared size starts a nested carve); `None` for a grandchild. A detached spawn needs no module in
 /// hand — the event carries the segments — so it works at any depth.
@@ -446,18 +448,13 @@ pub(crate) fn drive_op13<'p>(
                 vcpu.deliver_handle(handle);
             }
             bytecode::VcpuEvent::Instantiate {
-                module,
-                entry,
-                carve,
-                size_log2,
-                fuel,
+                carve, size_log2, ..
             } => {
                 if base.is_null() {
                     // A nested carve needs an addressable parent window — the driver's decline
                     // (see `crate::declined_child`), not a trap for the parent.
                     return crate::declined_child();
                 }
-                let granted = vcpu.take_granted_host();
                 let declared = child
                     .and_then(|m| m.memory.as_ref().map(|mc| mc.size_log2))
                     .unwrap_or(size_log2);
@@ -466,18 +463,13 @@ pub(crate) fn drive_op13<'p>(
                 let child_base = unsafe { base.add(carve as usize) };
                 let back =
                     std::sync::Arc::new(unsafe { Region::shared(child_base, 1u64 << size_log2) });
-                let child = match granted {
-                    Some(host) => bytecode::Vcpu::new_confined_child_grow_over_host(
-                        prog, module, entry, back, declared, size_log2, fuel, host,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child_grow(
-                        prog, module, entry, back, declared, size_log2, fuel,
-                    ),
-                };
-                let r = match child {
-                    Ok(c) => drive_op13(prog, child_base, c, None),
-                    Err(t) => Err(t),
-                };
+                // An `Instantiate` always carries its admitted child; `Malformed` rather than a panic
+                // if it somehow did not.
+                let r = vcpu
+                    .take_child()
+                    .ok_or(Trap::Malformed)
+                    .and_then(|c| c.start(prog, back, Some(declared)))
+                    .and_then(|c| drive_op13(prog, child_base, c, None));
                 let handle = children.len() as i32;
                 children.push(Some(r));
                 vcpu.deliver_handle(handle);

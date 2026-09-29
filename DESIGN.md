@@ -3088,7 +3088,7 @@ inert `CapFault`). The supported path is **`install` + `call.dyn`**: installed c
 the calling vCPU's own frames, where `thread.spawn` is an ordinary **module-aware** spawn — the func
 index resolves in the spawning frame's module and the spawned vCPU's root frame starts there
 (`VcpuEvent::Spawn` carries the module; every driver constructs the child from
-`source.get(module)`, the `event_instantiate` pattern). `wait`/`notify`/atomics are window-global and
+`source.get(module)`, as for a confined `Instantiate`). `wait`/`notify`/atomics are window-global and
 module-agnostic. Pinned by `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`
 (cooperative ≡ parallel, 8 dispatches each spawning the unit's own worker) and, on the tree-walker
 oracle, by the `jit_cap.rs` native differentials below (its `run_inner` spawn started the child in

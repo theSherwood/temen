@@ -21,7 +21,7 @@ use temen_browser::{
     temen_par_ev_b, temen_par_ev_c, temen_par_ev_d, temen_par_free, temen_par_powerbox_inst,
     temen_par_root, temen_par_run, temen_par_tierup_argv_len, temen_par_tierup_argv_ptr,
     temen_par_tierup_pagestate_len, temen_par_tierup_pagestate_ptr, PAR_DONE, PAR_INSTANTIATE,
-    PAR_JOIN, PAR_TIERUP,
+    PAR_JOIN, PAR_TIERUP, PAR_TRAP,
 };
 use temen_interp::{bytecode, host_page_size, Host, Value};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -957,4 +957,81 @@ block 0 (v0: i32) {{
         gen0,
         "the install must advance the mirror generation so a Worker rebuilds"
     );
+}
+
+/// An op-13 spawn on the per-Worker driver is refused only when it re-grants named caps. The engine
+/// admits the child with its whole powerbox, but this driver rebuilds the child in its own Worker from
+/// the event's integers, which cannot carry a grant — so a spawn that re-grants its `Module` handle by
+/// name fails closed. Op 13 always carries a grant list, empty when the guest re-grants nothing, and a
+/// grant-less spawn must still reach `PAR_INSTANTIATE` (#1876 briefly refused that too).
+#[test]
+fn par_op13_refuses_only_a_spawn_that_carries_grants() {
+    let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // #1182 — serial single-run
+    let unit = temen_text::parse_module(
+        "memory 12\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  vr = i64.const 42\n  return vr\n  }\n}\n",
+    )
+    .expect("parse unit");
+    temen_verify::verify_module(&unit).expect("verify unit");
+    let unit_bytes = temen_encode::encode_module(&unit);
+    for (grants_n, want) in [(0, PAR_INSTANTIATE), (1, PAR_TRAP)] {
+        // Root `(instantiator, module) -> i64`: a grant record at 16384 naming the module handle `mod`
+        // (read only when `grants_n` is 1), then op 13 of the unit's entry into a 4 KiB carve at 64 KiB.
+        let src = format!(
+            r#"memory 17
+func (i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32) {{
+  vr0 = i64.const 16384
+  vn0 = i32.const 16484
+  i32.store vr0 vn0
+  vr1 = i64.const 16388
+  vn1 = i32.const 3
+  i32.store vr1 vn1
+  vr2 = i64.const 16392
+  i32.store vr2 vmod
+  vr3 = i64.const 16396
+  vn3 = i32.const 0
+  i32.store vr3 vn3
+  va0 = i64.const 16484
+  vb0 = i32.const 109
+  i32.store8 va0 vb0
+  va1 = i64.const 16485
+  vb1 = i32.const 111
+  i32.store8 va1 vb1
+  va2 = i64.const 16486
+  vb2 = i32.const 100
+  i32.store8 va2 vb2
+  vm = i64.extend_i32_s vmod
+  gp = i64.const 16384
+  gn = i64.const {grants_n}
+  en = i64.const 0
+  off = i64.const 65536
+  sl = i64.const 12
+  q = i64.const 0
+  vch = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vm, gp, gn, en, off, sl, q)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  return vr
+  }}
+}}
+"#
+        );
+        let root = temen_text::parse_module(&src).expect("parse root");
+        temen_verify::verify_module(&root).expect("verify root");
+        let root_bytes = temen_encode::encode_module(&root);
+        assert_eq!(
+            temen_par_powerbox_inst(1 << 17, unit_bytes.as_ptr(), unit_bytes.len(), 0),
+            1,
+            "publish the §14 run recipe with the granted unit"
+        );
+        let prog = temen_par_compile(root_bytes.as_ptr(), root_bytes.len());
+        assert!(!prog.is_null(), "root program compiles");
+        let mut win = vec![0u8; 1 << 17];
+        let v = temen_par_root(prog, win.as_mut_ptr(), win.len(), 0);
+        assert!(!v.is_null(), "root vCPU builds");
+        assert_eq!(
+            temen_par_run(v),
+            want,
+            "op 13 with {grants_n} grant record(s)"
+        );
+        temen_par_free(v);
+    }
 }

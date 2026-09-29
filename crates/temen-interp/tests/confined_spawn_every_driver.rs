@@ -201,6 +201,17 @@ block 0 (v0: i64) {{
     )
 }
 
+/// A separate child module that imports `exit` — a required slot the spawn must bind or refuse.
+const CHILD_IMPORTS_EXIT: &str = "memory 12
+import 0 \"exit\" (i32) -> ()
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vr = i64.const 42
+  return vr
+  }
+}
+";
+
 /// An op-13 parent `(i32 inst, i32 module, i32 out) -> i64` spawning `module`'s entry 0 into a 4 KiB
 /// carve at 64 KiB, re-granting `stdout` by name iff `grant`. Op 13 always carries a grant list; with
 /// `grant` false it is empty.
@@ -389,4 +400,21 @@ fn a_nested_holder_carves_below_the_roots_guard() {
         (h, vec![Value::I32(i)])
     };
     agree_on_every_driver("depth-2 carve at offset 0", &m, &setup, &ok(42));
+}
+
+/// A module child whose required import nothing binds is refused `-EINVAL` before any child code runs
+/// (IMPORTS.md §3.3 withhold) — on every driver. The resumable `Vcpu` used to surface the spawn and
+/// trap `Malformed` when its host built the child; it now admits through the same function as the rest.
+#[test]
+fn a_module_child_whose_import_is_unbound_is_refused() {
+    let m = module(&op13(false));
+    let child = module(CHILD_IMPORTS_EXIT);
+    let setup = || {
+        let mut h = Host::new();
+        let i = h.grant_instantiator(0, 1 << 17);
+        let c = h.grant_module(&child);
+        let o = h.grant_stream(StreamRole::Out);
+        (h, vec![Value::I32(i), Value::I32(c), Value::I32(o)])
+    };
+    agree_on_every_driver("op 13, an unbound required import", &m, &setup, &ok(-22));
 }
