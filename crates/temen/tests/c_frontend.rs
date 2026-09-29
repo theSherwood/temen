@@ -2520,6 +2520,32 @@ fn c_the_line_after_an_initializer_starts_after_its_last_store() {
     );
 }
 
+/// A function that falls off its end stops on its closing `}` — the implicit return carries that
+/// line — so stepping over the last statement stays in the function, locals in view, before it
+/// returns (as gdb does), instead of landing in the caller.
+#[test]
+fn c_the_closing_brace_of_a_function_is_a_stop_line() {
+    let ir = c_to_ir_g(
+        "void set(int *p) {\n\
+         \x20 *p = 1;\n\
+         }\n\
+         int main(void) { int x; set(&x); return x; }\n",
+    );
+    let m = parse_module(&ir).expect("parse");
+    let dbg = m.debug_info.as_ref().expect("-g emits debug info");
+    let brace = dbg
+        .locs
+        .iter()
+        .find(|l| l.line == 3)
+        .unwrap_or_else(|| panic!("no debug.loc for the closing brace (line 3):\n{ir}"));
+    let block = &m.funcs[brace.func as usize].blocks[brace.block as usize];
+    assert_eq!(
+        brace.inst as usize,
+        block.insts.len(),
+        "the `}}` row is the implicit return (the terminator):\n{ir}"
+    );
+}
+
 /// chibicc's value names must follow definition order. The text parser numbers a block's values by
 /// position — its params, then each result in the order it is defined — while `debug.var` and SSA
 /// location lists name values by chibicc's own number, so an out-of-order name makes the debugger

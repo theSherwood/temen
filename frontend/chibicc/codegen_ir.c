@@ -3046,8 +3046,11 @@ static void gen_func(Obj *fn) {
 
   gen_stmt(fn->body);
   // Falling off the end: C `main` returns 0; for other paths it is UB, and returning a
-  // zero is a safe, defined value. Every block needs a terminator (§3b).
+  // zero is a safe, defined value. Every block needs a terminator (§3b). The implicit return
+  // sits on the closing `}` line, so stepping out of a function's last statement stops there,
+  // with its locals still in view, before returning to the caller (as gdb does).
   if (!term) {
+    dbg_loc(fn->body->end_tok);
     if (ret->kind == TY_VOID || is_agg(ret)) {
       cg("  return\n"); // void, or a struct-returning func that wrote via sret
     } else {
