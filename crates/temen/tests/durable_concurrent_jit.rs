@@ -10,9 +10,8 @@
 //! has spawned its children, and the controller thread only then requests the freeze — so the children
 //! are already running OS threads when it lands.
 
-use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
     STATE_UNWINDING,
@@ -23,6 +22,7 @@ use temen_jit::{
     compile_and_run_durable, DurableResidue, DurableRun, FreezeController, FrozenFiber, FrozenVCpu,
     JitError, JitOutcome, TrapKind,
 };
+use temen_run::CapCtx;
 use temen_snapshot::{freeze as codec_freeze, restore as codec_restore};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -108,25 +108,35 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
         temen_interp::CapState::Stateless,
     );
 
+    // Set when the run returns. A run that ends without the signal (a child trapped, say) must not leave
+    // the controller spinning: the test would hang instead of failing.
+    let over = Arc::new(AtomicBool::new(false));
     let controller = matches!(from, FreezeFrom::Controller).then(|| {
         let fc = Arc::clone(&freeze);
+        let over = Arc::clone(&over);
         std::thread::spawn(move || {
             // Wait until the children are spawned (so they run concurrently, not deferred), then freeze.
             while !spawned.load(Ordering::SeqCst) {
+                if over.load(Ordering::SeqCst) {
+                    return;
+                }
                 std::hint::spin_loop();
             }
             fc.request_freeze();
         })
     });
 
+    // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
+    let host = Mutex::new(host);
+    let cc = CapCtx::Locked(&host);
     let res = compile_and_run_durable(
         inst,
         0,
         &[clk as i64, hf as i64],
         &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut c_void,
+        cc.thunk(),
+        cc.ptr(),
         DurableRun {
             seed: DurableResidue {
                 root_sp: Some(TEST_ARENA.frame_base(0)),
@@ -136,6 +146,7 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
             ..Default::default()
         },
     );
+    over.store(true, Ordering::SeqCst);
     if let Some(c) = controller {
         c.join().unwrap();
     }
@@ -164,14 +175,17 @@ fn thaw(
         Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])),
         temen_interp::CapState::Stateless,
     );
+    // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
+    let thost = Mutex::new(thost);
+    let cc = CapCtx::Locked(&thost);
     let (tout, tfinal, ..) = compile_and_run_durable(
         inst,
         0,
         &[tclk as i64, 0],
         &twin,
         SIZE_LOG2,
-        temen_run::cap_thunk,
-        &mut thost as *mut Host as *mut c_void,
+        cc.thunk(),
+        cc.ptr(),
         DurableRun {
             seed: DurableResidue {
                 fibers: fibers.to_vec(),
@@ -692,14 +706,17 @@ fn nested_concurrent_spawn_returns_grandchild_value() {
     let _clk = host.grant_clock();
     // A controller is required by the entry but never triggered — this is a pure NORMAL nested spawn.
     let freeze = FreezeController::new();
+    // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
+    let host = Mutex::new(host);
+    let cc = CapCtx::Locked(&host);
     let res = compile_and_run_durable(
         &inst,
         0,
         &[0],
         &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut c_void,
+        cc.thunk(),
+        cc.ptr(),
         DurableRun {
             seed: DurableResidue {
                 root_sp: Some(TEST_ARENA.frame_base(0)),
@@ -1139,14 +1156,17 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
         Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])),
         temen_interp::CapState::Stateless,
     );
+    // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
+    let host = Mutex::new(host);
+    let cc = CapCtx::Locked(&host);
     let (out, win, ..) = compile_and_run_durable(
         inst,
         0,
         &[clk as i64, 0],
         &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut c_void,
+        cc.thunk(),
+        cc.ptr(),
         DurableRun {
             seed: DurableResidue {
                 root_sp: Some(TEST_ARENA.frame_base(0)),

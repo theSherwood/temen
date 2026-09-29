@@ -8,22 +8,11 @@
 //! asserting they agree — and against a hand-computed oracle.
 //!
 //! Unlike `transpile.rs`'s capability-free `run`/`eval`, these need a powerbox: the interpreter via
-//! `run_with_host`, the JIT via `compile_and_run_with_host` over the production `temen_run::cap_thunk`.
+//! `run_with_host`, the JIT via the embedder's `temen_run::jit_cap_run` (which gives a concurrent
+//! module the serialized thunk, #1166).
 
-use std::ffi::c_void;
-use temen_interp::{run_with_host, BoundImport, Host, Value};
-use temen_jit::{compile_and_run_with_host, JitOutcome};
-
-/// Serialize this binary's tests (ISSUES.md I4). `spawn_alongside_capability_import` runs 6 real
-/// OS-thread workers doing futex park/notify; on macOS CI the binary intermittently died `SIGABRT`
-/// in that path while *sibling* tests ran concurrently in the same process — and because tests
-/// interleave, the abort could never be attributed to one test. Every test takes this lock, so the
-/// threaded run has the process to itself and any recurrence is localized to the single test that
-/// held the lock. A poisoned lock (an earlier test failed) is fine to reuse — take the inner guard.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+use temen_interp::{run_with_host, BoundImport, Host, MemLayout, Value};
+use temen_jit::JitOutcome;
 
 /// Transpile WAT with capability imports, verify, then run export `entry` on interp + JIT under a
 /// `Host` the same `bind` populates on each — granting the capabilities and returning the manifest
@@ -53,8 +42,9 @@ fn run_import(
     let mut fuel = 100_000_000u64;
     let interp = run_with_host(&t.module, idx, args, &mut fuel, &mut hi).expect("interp run");
 
-    // JIT: the same grants + bindings (so the handle encoding matches), driven through the
-    // production cap thunk — `call.import` dispatches host-side through the same bindings.
+    // JIT: the same grants + bindings (so the handle encoding matches), run the embedder's way —
+    // `call.import` dispatches host-side through the same bindings. `jit_cap_run` gives a module that
+    // spawns threads the locked thunk; the unlocked one raced the `Host` across workers (#1166).
     let mut hj = Host::new();
     let bj = bind(&mut hj);
     assert_eq!(bi, bj, "binding encoding must match across hosts");
@@ -67,14 +57,17 @@ fn run_import(
             other => panic!("unsupported arg {other:?}"),
         })
         .collect();
-    let jit = match compile_and_run_with_host(
+    let jit = match temen_run::jit_cap_run(
         &t.module,
         idx,
         &slots,
-        temen_run::cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
+        &MemLayout::image(Vec::new()),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        0,
+        &mut hj,
     )
     .expect("jit compile")
+    .0
     {
         JitOutcome::Returned(v) => v,
         other => panic!("jit did not return: {other:?}"),
@@ -115,7 +108,6 @@ fn bind_blocking(h: &mut Host) -> Vec<BoundImport> {
 /// `0+1+…+(N-1)` on both backends.
 #[test]
 fn import_clock_now_loop_sum() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
@@ -144,7 +136,6 @@ fn import_clock_now_loop_sum() {
 /// marshalling through the `call.import` (the `hostcall` bench shape) on both backends.
 #[test]
 fn import_blocking_work_sum() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))
@@ -169,7 +160,6 @@ fn import_blocking_work_sum() {
 /// `call.import` dispatches through the same instance bindings as the entry's would.
 #[test]
 fn import_reaches_through_defined_call() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))
@@ -189,7 +179,6 @@ fn import_reaches_through_defined_call() {
 /// `work(arg)` vs `work(arg)+1` by index.
 #[test]
 fn import_reaches_through_call_indirect() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))
@@ -213,7 +202,6 @@ fn import_reaches_through_call_indirect() {
 /// import manifest as `"<module>.<name>"`, in import order (slot `i` = import `i`).
 #[test]
 fn imports_declare_manifest_entries() {
-    let _serial = serial();
     let wasm = wat::parse_str(
         r#"(module
              (import "2" "0" (func (result i64)))
@@ -239,7 +227,6 @@ fn imports_declare_manifest_entries() {
 /// both in one function.
 #[test]
 fn import_multiple_interfaces_bind_distinct_slots() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
@@ -270,7 +257,6 @@ fn import_multiple_interfaces_bind_distinct_slots() {
 /// twice.
 #[test]
 fn import_two_slots_reach_through_defined_call() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "2" "0" (func $now (result i64)))
@@ -305,7 +291,6 @@ fn import_two_slots_reach_through_defined_call() {
 /// executor and the JIT's real OS threads must agree).
 #[test]
 fn spawn_alongside_capability_import() {
-    let _serial = serial();
     let wat = r#"
 (module
   (import "10" "0" (func $work (param i64) (result i64)))     ;; Blocking cap (manifest slot 0)
@@ -343,7 +328,6 @@ fn spawn_alongside_capability_import() {
 /// 0. (Imported table/global/tag stay unsupported.)
 #[test]
 fn import_memory_is_supported() {
-    let _serial = serial();
     let wasm = wat::parse_str(
         r#"(module (import "env" "memory" (memory 1)) (func (export "f") (result i32)
              (i32.store (i32.const 16384) (i32.const 42)) (i32.load (i32.const 16384))))"#,
