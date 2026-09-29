@@ -3154,17 +3154,17 @@ impl SharedProgram {
             None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
                 let info = m.map_info();
-                let reserved = info.2;
                 // The committed **scalar extent** — not `map_info`'s `window.mapped()`, which counts
                 // only the demand-committed prefix and misses a `vm_map`-grown tail (the pages live in
                 // the page map). `scalar_extent` folds the contiguous grown tail into the high-water so
                 // a cross-tier driver can re-sync the emitted `"mapped"` bound to admit a store into the
-                // grown page (#1153). It is `None` for a non-representable layout (an `Ro`/`Unmapped`
-                // hole, or `Rw` past a hole) — the single live bound can't model that, so fall back to
-                // the reservation (the whole owned backing, as the pre-#1153 flat pre-size did): reads
-                // of a self-`protect`ed rodata page still admit, and the interpreter page map (returned
-                // in `entries`, re-seeded next bounce) keeps per-page state authoritative on that tier.
-                let mapped = m.scalar_extent().unwrap_or(reserved);
+                // grown page (#1153). It is `None` for a layout one bound cannot describe over this
+                // backing (an `Ro`/`Unmapped` hole, `Rw` past a hole, or pages committed past a fixed
+                // backing): then `0`, which admits nothing, so the emitted run's next access faults and
+                // the driver declines to the interpreter. (#1919: this fell back to the reservation — the
+                // whole backing while the backing was pre-sized to it, before #1153; since, 2^40 bytes
+                // of the embedder's memory past a backing that holds far less.)
+                let mapped = m.scalar_extent().unwrap_or(0);
                 if info.3.iter().any(|&(_, kind)| kind == 3) {
                     (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed
                 } else {
@@ -4388,6 +4388,13 @@ impl<'p> Vcpu<'p> {
     /// reachable through a cross-tier leaf). `None` for a memory-less module.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
+    }
+
+    /// The bytes this vCPU's window backing holds, window-relative ([`Mem::win_flat_len`]): the
+    /// `backed` a page-checked driver passes to [`build_pagestate_table`], past which no emitted
+    /// access may be admitted. `0` for a memory-less module.
+    pub fn win_flat_len(&self) -> u64 {
+        self.mem.as_ref().map_or(0, |m| m.win_flat_len())
     }
 
     /// The entry's initial arguments (see [`entry_args`](Self::entry_args) on the struct) — a §14
@@ -5796,7 +5803,10 @@ pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
 
 /// Build the #750 paged-driver **page-state table** from a window's [`MemMapInfo`]: one byte per
 /// page over `[0, coverage)` — `0 = Unmapped`, `1 = Rw`, `2 = Ro` (the emitted check's encoding) —
-/// where `coverage` (also returned) is `max(mapped prefix, highest explicit entry end)` in bytes.
+/// where `coverage` (also returned) is `max(mapped prefix, highest explicit entry end)` in bytes,
+/// cut at `backed`, the bytes the window's backing holds ([`Vcpu::win_flat_len`],
+/// [`CoopRun::pending_win`]): the emitted access addresses the backing directly, so no page past
+/// its end may be admitted, whatever the page map says (a `map` past a fixed backing, #1153).
 ///
 /// This is THE per-emitted-call driver contract for a page-checked run (refresh from
 /// [`Vcpu::mem_map_info`], write the table where emitted code can read it, its base to the
@@ -5806,14 +5816,15 @@ pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
 /// table is what makes the contract hard to get wrong. A `Backed` (§13 region-aliased) page is
 /// marked `Unmapped` — fail-closed (the emitted tier cannot read a region's bytes), and
 /// unreachable for a paged module anyway (SharedRegion gates the whole module off the paged tier).
-pub fn build_pagestate_table(info: &MemMapInfo) -> (Vec<u8>, u64) {
+pub fn build_pagestate_table(info: &MemMapInfo, backed: u64) -> (Vec<u8>, u64) {
     let (page, mapped, _reserved, entries) = info;
     let top = entries
         .iter()
         .map(|(off, _)| off / page + 1)
         .max()
         .unwrap_or(0)
-        .max(mapped / page);
+        .max(mapped / page)
+        .min(backed / page);
     let mut t = vec![0u8; top as usize];
     for (i, b) in t.iter_mut().enumerate() {
         if (i as u64) * page < *mapped {
@@ -5821,8 +5832,11 @@ pub fn build_pagestate_table(info: &MemMapInfo) -> (Vec<u8>, u64) {
         }
     }
     for (off, kind) in entries {
+        let Some(state) = t.get_mut((off / page) as usize) else {
+            continue; // past the backing: outside the table, so the bound check traps it
+        };
         // `map_info` kinds: 0 = Ro, 1 = Rw, 2 = Unmapped, 3 = Backed (§13 alias).
-        t[(off / page) as usize] = match kind {
+        *state = match kind {
             0 => 2,
             1 => 1,
             _ => 0, // Unmapped, and Backed fail-closed (see above)

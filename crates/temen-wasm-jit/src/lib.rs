@@ -34,16 +34,20 @@
 //! ## Confinement (the load-bearing part)
 //!
 //! Every guest access replicates the trap-confinement `temen_mask::Window::checked` **exactly**
-//! (§4, D38): with `mask = (1 << DEFAULT_RESERVED_LOG2) - 1` and `mapped = 1 << size_log2`,
+//! (§4, D38): with `mask = (1 << DEFAULT_RESERVED_LOG2) - 1`, `k = offset + width` baked at compile
+//! time, and `mapped` the live window size the host keeps in the `"mapped"` global (#717),
 //!
 //! ```text
-//! eff = addr + offset;   if eff > mapped - width { trap(MemoryFault) }   // unmasked check
-//! access linear memory at win + (eff & mask)   // clamp: no-op past the check
+//! if mapped < k || addr > mapped - k { trap(MemoryFault) }   // overflow-free: addr + k <= mapped
+//! eff = addr + offset                                        // exact past the check
+//! access linear memory at win + (eff & mask)                 // clamp: no-op past the check
 //! ```
 //!
-//! both constants baked at compile time. An out-of-window address **faults at the offending
-//! access** — it is never wrapped back into the window (the `& mask` after the check mirrors the
-//! native JIT's check+clamp lowering and cannot change a passing address). TEMEN-specific traps (memory fault, fuel) route through the
+//! An out-of-window address **faults at the offending access** — it is never wrapped back into the
+//! window (the `& mask` after the check mirrors the native JIT's check+clamp lowering and cannot
+//! change a passing address). No value of `mapped` can make the check admit more than `[0, mapped)`:
+//! the module's memory is the embedder's whole linear memory, so this check, not the mask, is what
+//! keeps an access inside the window's backing. TEMEN-specific traps (memory fault, fuel) route through the
 //! imported `env.trap(code)` (the host records the code; the following `unreachable` aborts);
 //! div/rem-by-zero, signed-overflow, and `unreachable` map to wasm's own identical traps.
 //!
@@ -1342,10 +1346,12 @@ pub fn module_uses_unmap_protect(m: &Module) -> bool {
 }
 
 /// Whether any function reaches an `ADDRESS_SPACE` page op at all — `map`/`unmap`/`protect` (iface 5
-/// ops 0–2). The browser's §14 codegen entry keys its **paged** routing on this (#1151 Slice 2c): a
-/// unit whose leaves can remap pages must emit with the per-access page check, since a `map` inside
-/// a bounced leaf is carried only by the post-bounce `"pagestate"`/`"mapped"` refresh (the mask-only
-/// tier's scalar `"mapped"` cannot represent an `Ro`/hole state and would deny everything).
+/// ops 0–2). The browser's §14 codegen entry and its cooperative tier-up key their **paged** routing
+/// on this (#1151 Slice 2c; the coop tier since #1919): a unit whose leaves can
+/// remap pages must emit with the per-access page check, since a `map` inside a bounced leaf is
+/// carried only by the post-bounce `"pagestate"`/`"mapped"` refresh (the mask-only tier's scalar
+/// `"mapped"` cannot represent an `Ro`/hole state and would deny everything). A linked `vm_map` is
+/// one of these: linking rewrites the `call.sym` to this `call.cap`.
 pub fn module_uses_addr_space_page_ops(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
@@ -5544,13 +5550,6 @@ fn emit_trap(code: &mut Vec<u8>, trap_code: i32) {
     code.push(OP_UNREACHABLE);
 }
 
-/// Confine the effective address for a `width`-byte access under **trap-confinement** (§4, D38),
-/// leaving the confined 32-bit linear-memory address on the stack: bounds-check the *unmasked*
-/// `eff = addr + offset` (trap `MemoryFault` unless `eff <= mapped - width` — exactly the
-/// trap-confinement `temen_mask::Window::checked`, so an out-of-window address faults instead of
-/// wrapping back in), then compute `win + (eff & MASK)`. The `& MASK` clamp is a no-op past the
-/// check (`eff < mapped ≤ reserved`), kept to mirror the native JIT's check+clamp lowering and to
-/// keep the following `i32.wrap` in-window as defense-in-depth.
 /// Slice-3 elision decision for one memory access: is `[addr+offset, addr+offset+width)` **provably**
 /// within `[0, mapped)` given the block-local upper bound tracked for the address SSA value? Uses the
 /// shared [`temen_ir::bounds`] proof — the same predicate the native JIT uses to elide (there it also
@@ -5560,6 +5559,13 @@ fn elide_access(ubs: &[u64], addr: ValIdx, offset: u64, width: u64, mapped: u64)
     in_window(ub_at(ubs, addr), offset, width as u32, mapped)
 }
 
+/// Confine the effective address for a `width`-byte access under **trap-confinement** (§4, D38),
+/// leaving the confined 32-bit linear-memory address on the stack: trap `MemoryFault` unless
+/// `[addr + offset, addr + offset + width)` lies within `[0, mapped)` — exactly the trap-confinement
+/// `temen_mask::Window::checked`, overflow-free, so an out-of-window address faults instead of
+/// wrapping back in — then compute `win + (eff & MASK)`. The `& MASK` clamp is a no-op past the
+/// check (`eff < mapped ≤ reserved`), kept to mirror the native JIT's check+clamp lowering and to
+/// keep the following `i32.wrap` in-window as defense-in-depth.
 fn emit_confine(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
@@ -5578,22 +5584,119 @@ fn emit_confine(
 /// two for the atomic types (4 or 8), so `width - 1` is the alignment mask.
 ///
 /// **`elide` — the slice-3 redundant-bounds-check elision.** When the caller has *proven* the access
-/// in-window ([`temen_ir::bounds::in_window`] over the address's upper bound), the `eff > mapped - width`
-/// bounds-trap branch is redundant and skipped. The **`& MASK` clamp is always emitted** regardless of
+/// in-window ([`temen_ir::bounds::in_window`] over the address's upper bound), the bounds-trap branch
+/// is redundant and skipped. The **`& MASK` clamp is always emitted** regardless of
 /// `elide` (escape safety, INVARIANTS #2): so a *wrong* proof here can only skip a trap the oracle
 /// would raise — a trap-parity divergence the interpreter differential catches — never a
 /// confinement escape. (The native JIT, which also drops the clamp on proof, is the escape-critical
 /// consumer of the same predicate; here we keep the clamp, a strictly safer subset.) The alignment
 /// trap is **independent of bounds** and is emitted whenever `align`, elided or not. The elision proof
-/// uses the emit-time `mapped` (`elide_access`), a *lower* bound on the live [`MAPPED_GLOBAL_IDX`] size
-/// the trap branch actually reads (#717) — the window only grows, so a proven-bounded access stays
-/// bounded.
+/// uses the emit-time `mapped` (`elide_access`): the declared window, which is always backed, so a
+/// proven access stays inside the window's bytes whatever the live [`MAPPED_GLOBAL_IDX`] size later
+/// says (#717). A live size that drops below it (a host denying a window one bound no longer
+/// describes) does not stop an elided access: what changed is page state inside the backed window,
+/// which only the paged check carries.
+#[allow(clippy::too_many_arguments)]
+fn emit_confine_maybe_aligned(
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    addr_local: u32,
+    offset: u64,
+    width: u64,
+    align: bool,
+    elide: bool,
+    write: bool,
+) {
+    if !elide {
+        // Trap unless `addr + offset + width <= mapped`, with no overflow (`Window::checked`): with
+        // `k = offset + width`, trap iff `mapped < k` or `addr > mapped - k`. The bound is the
+        // **live** window size (#717: the `mapped` global, which the host re-syncs as the window
+        // grows), and no value the host writes there can wrap `mapped - k` into admitting more than
+        // the window — `mapped < k` is its own trap, not a subtraction that wraps (#1919). An access
+        // whose `offset + width` overflows is never admitted.
+        match offset.checked_add(width) {
+            Some(k) => {
+                code.push(0x23); // global.get
+                uleb(code, cx.mapped_global_idx as u64);
+                code.push(OP_I64_CONST);
+                sleb64(code, k as i64);
+                code.push(0x54); // i64.lt_u: mapped < k ?
+                code.push(OP_LOCAL_GET);
+                uleb(code, addr_local as u64);
+                code.push(0x23); // global.get
+                uleb(code, cx.mapped_global_idx as u64);
+                code.push(OP_I64_CONST);
+                sleb64(code, k as i64);
+                code.push(0x7d); // i64.sub → mapped - k (read only when mapped >= k)
+                code.push(0x56); // i64.gt_u: addr > mapped - k ?
+                code.push(0x72); // i32.or
+                code.push(OP_IF);
+                code.push(BLOCKTYPE_VOID);
+                cx.depth += 1;
+                emit_trap(code, TRAP_MEMORY_FAULT);
+                code.push(OP_END);
+                cx.depth -= 1;
+            }
+            None => emit_trap(code, TRAP_MEMORY_FAULT),
+        }
+    }
+    // eff = addr + offset — exact, not wrapped: past the check `addr <= mapped - k`, and a proof
+    // (`elide`) fails on any overflow.
+    code.push(OP_LOCAL_GET);
+    uleb(code, addr_local as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, offset as i64);
+    code.push(0x7c); // i64.add → eff
+    code.push(OP_LOCAL_SET);
+    uleb(code, cx.ea_l as u64);
+    if align {
+        // `eff & (width - 1) != 0` ⇒ misaligned ⇒ trap (matches `check_align`).
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.ea_l as u64);
+        code.push(OP_I64_CONST);
+        sleb64(code, (width - 1) as i64);
+        code.push(0x83); // i64.and
+        code.push(OP_I64_CONST);
+        sleb64(code, 0);
+        code.push(0x52); // i64.ne → misaligned?
+        code.push(OP_IF);
+        code.push(BLOCKTYPE_VOID);
+        cx.depth += 1;
+        emit_trap(code, TRAP_MEMORY_FAULT);
+        code.push(OP_END);
+        cx.depth -= 1;
+    }
+    // #750 (paged modules only): the software page-check — first and, when the access can straddle
+    // a page boundary, last touched page, exactly the pages the oracle's `check_prot` walks. An
+    // `align`ed access never straddles (the align trap above already fired for a misaligned
+    // address, and a `width`-aligned access of power-of-two `width` ≤ page size lies in one page),
+    // so only unaligned multi-byte accesses consult the second page. NEVER elided: `elide` proves
+    // the access in-window, but page *state* is dynamic, so an in-window proof says nothing about
+    // mapped/RW (#750's honest-limits note). No-op when unpaged.
+    emit_page_check_one(cx, code, 0, write);
+    if width > 1 && !align {
+        emit_page_check_one(cx, code, width - 1, write);
+    }
+    // NULL-page guard (experimental measurement mode) — like the page check, never elided.
+    emit_null_guard(cx, code);
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.ea_l as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, MASK as i64);
+    code.push(0x83); // i64.and → clamp (no-op past the check)
+    code.push(0xa7); // i32.wrap_i64
+    code.push(OP_LOCAL_GET);
+    uleb(code, 0); // win
+    code.push(0x6a); // i32.add → the confined linear-memory address
+}
+
 /// One page-state consultation of the #750 software page-check: the state byte of the page holding
 /// `(ea_l + delta) & MASK` is loaded from the host-maintained table (base in the `"pagestate"`
 /// global) and mismatches trap through the existing [`TRAP_MEMORY_FAULT`] seam — a read of an
 /// `Unmapped` page, or a write to anything but `Rw`. Emitted only for paged modules
-/// ([`FnCtx::page_check`]); the trap decision happens strictly **inside** the already-masked
-/// window, so a wrong table is a trap-parity divergence (INVARIANTS #9), never an escape (#2).
+/// ([`FnCtx::page_check`]); the trap decision happens strictly **inside** `[0, mapped)` — the
+/// bounds check came first — so a wrong table is a trap-parity divergence (INVARIANTS #9), never an
+/// escape (#2).
 fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bool) {
     let Some((page_log2, ps_gidx)) = cx.page_check else {
         return;
@@ -5635,12 +5738,6 @@ fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bo
     cx.depth -= 1;
 }
 
-/// The experimental **NULL-page guard** check ([`compile_module_tierup_nullguard`], a measurement
-/// mode): trap when the access's first byte lands below `guard`. A *bottom* guard needs no
-/// last-byte consultation — an access starting at or above `guard` cannot reach down into
-/// `[0, guard)` — so this is one compare + never-taken branch, the cheap lowering the NULL-trap
-/// design weighs against full paged mode. Masked into the same clamp domain as the access itself
-/// (matching [`emit_page_check_one`]'s defensive style). No-op when unguarded.
 /// The NULL-guard extent to **emit** for `m`: [`temen_ir::module_null_guard`] (unconditional, #1094),
 /// but no-op'd (→ `None`) for a window smaller than the guard — mirroring `Mem::seed_null_guard`, which
 /// skips the seed there. Without this a sub-guard confined child (e.g. a 1 KiB carve declared
@@ -5652,6 +5749,12 @@ fn emit_null_guard_extent(m: &temen_ir::Module) -> Option<u64> {
     (g <= win).then_some(g)
 }
 
+/// The experimental **NULL-page guard** check ([`compile_module_tierup_nullguard`], a measurement
+/// mode): trap when the access's first byte lands below `guard`. A *bottom* guard needs no
+/// last-byte consultation — an access starting at or above `guard` cannot reach down into
+/// `[0, guard)` — so this is one compare + never-taken branch, the cheap lowering the NULL-trap
+/// design weighs against full paged mode. Masked into the same clamp domain as the access itself
+/// (matching [`emit_page_check_one`]'s defensive style). No-op when unguarded.
 fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     let Some(guard) = cx.null_guard else {
         return;
@@ -5670,87 +5773,6 @@ fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     emit_trap(code, TRAP_MEMORY_FAULT);
     code.push(OP_END);
     cx.depth -= 1;
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_confine_maybe_aligned(
-    cx: &mut FnCtx,
-    code: &mut Vec<u8>,
-    addr_local: u32,
-    offset: u64,
-    width: u64,
-    align: bool,
-    elide: bool,
-    write: bool,
-) {
-    code.push(OP_LOCAL_GET);
-    uleb(code, addr_local as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, offset as i64);
-    code.push(0x7c); // i64.add → eff (unmasked)
-    code.push(OP_LOCAL_TEE);
-    uleb(code, cx.ea_l as u64);
-    if !elide {
-        // eff > live_mapped - width ?  — #717: the bound is the **live** window size, read from the
-        // `mapped` global (default = the emit-time `1 << size_log2`) rather than a baked constant, so
-        // an access into a `vm_map`-grown region no longer faults on the JIT where the interpreter
-        // admits it. `i64.sub` wraps exactly like the old `mapped.wrapping_sub(width)` constant did.
-        code.push(0x23); // global.get
-        uleb(code, cx.mapped_global_idx as u64);
-        code.push(OP_I64_CONST);
-        sleb64(code, width as i64);
-        code.push(0x7d); // i64.sub → live_mapped - width
-        code.push(0x56); // i64.gt_u: eff > live_mapped - width ?
-        code.push(OP_IF);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
-        code.push(OP_END);
-        cx.depth -= 1;
-    } else {
-        // Proven in-window: drop the bounds-trap branch. `ea_l` still holds `eff` for the mask below;
-        // pop the value the `local.tee` left on the stack (the un-elided path consumes it in `gt_u`).
-        code.push(0x1a); // drop
-    }
-    if align {
-        // `eff & (width - 1) != 0` ⇒ misaligned ⇒ trap (matches `check_align`).
-        code.push(OP_LOCAL_GET);
-        uleb(code, cx.ea_l as u64);
-        code.push(OP_I64_CONST);
-        sleb64(code, (width - 1) as i64);
-        code.push(0x83); // i64.and
-        code.push(OP_I64_CONST);
-        sleb64(code, 0);
-        code.push(0x52); // i64.ne → misaligned?
-        code.push(OP_IF);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
-        code.push(OP_END);
-        cx.depth -= 1;
-    }
-    // #750 (paged modules only): the software page-check — first and, when the access can straddle
-    // a page boundary, last touched page, exactly the pages the oracle's `check_prot` walks. An
-    // `align`ed access never straddles (the align trap above already fired for a misaligned
-    // address, and a `width`-aligned access of power-of-two `width` ≤ page size lies in one page),
-    // so only unaligned multi-byte accesses consult the second page. NEVER elided: `elide` proves
-    // the access in-window, but page *state* is dynamic, so an in-window proof says nothing about
-    // mapped/RW (#750's honest-limits note). No-op when unpaged.
-    emit_page_check_one(cx, code, 0, write);
-    if width > 1 && !align {
-        emit_page_check_one(cx, code, width - 1, write);
-    }
-    // NULL-page guard (experimental measurement mode) — like the page check, never elided.
-    emit_null_guard(cx, code);
-    code.push(OP_LOCAL_GET);
-    uleb(code, cx.ea_l as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, MASK as i64);
-    code.push(0x83); // i64.and → clamp (no-op past the check)
-    code.push(0xa7); // i32.wrap_i64
-    code.push(OP_LOCAL_GET);
-    uleb(code, 0); // win
-    code.push(0x6a); // i32.add → the confined linear-memory address
 }
 
 /// Open `if len != 0 {` for a bulk op — the caller emits the confined op inside and closes with a
@@ -5841,7 +5863,8 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
 /// bulk-memory function tier up under paged mode (it was excluded before — the per-page walk being the
 /// missing piece). No-op when `page_check` is `None` (unpaged: byte-identical to before). The masking
 /// is unchanged and unconditional; a wrong page table is a trap-parity divergence the coop differential
-/// catches (INVARIANTS #9), never a confinement escape (#2 — the bytes stay inside the masked window).
+/// catches (INVARIANTS #9), never a confinement escape (#2 — the span check has already confined the
+/// bytes to `[0, mapped)`).
 fn emit_span_page_check(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,

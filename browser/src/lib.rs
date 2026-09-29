@@ -1573,7 +1573,7 @@ pub extern "C" fn temen_par_inst_paged() -> i32 {
 /// value for `"mapped"`).
 fn inst_sync_pagestate(v: &mut ParVcpu) {
     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-    let (table, cover) = bytecode::build_pagestate_table(&info);
+    let (table, cover) = bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
     v.pagestate = table;
     v.b = cover as i64;
 }
@@ -2521,7 +2521,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     // `temen_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
                     // memory IS the `"pagestate"` global's value: one shared memory, zero copies).
                     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                    let (table, cover) = bytecode::build_pagestate_table(&info);
+                    let (table, cover) =
+                        bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
                     v.pagestate = table;
                     v.b = cover as i64;
                 } else {
@@ -2646,7 +2647,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 if let Some(h) = mapped {
                     if par_jit_paged() {
                         let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        let (table, cover) =
+                            bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
                         v.pagestate = table;
                         v.b = cover as i64;
                     } else {
@@ -7558,7 +7560,7 @@ impl JitOnrampRun {
         let paged = temen_wasm_jit::module_uses_unmap_protect(&module);
         let (pagestate, mapped) = if paged {
             let page = temen_interp::host_page_size();
-            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()))
+            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()), back.len())
         } else {
             (Vec::new(), declared_extent)
         };
@@ -7766,10 +7768,11 @@ impl JitOnrampRun {
                 Some(info) => {
                     if self.paged {
                         // #1201: the paged contract — the table from the live map, `"mapped"` = its
-                        // coverage (never the reserved domain), so the emitted bound check traps
-                        // everything above the table where the interpreter faults and the page states
-                        // refine within it.
-                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        // coverage (never the reserved domain, nor past the backing), so the emitted
+                        // bound check traps everything above the table where the interpreter faults
+                        // and the page states refine within it.
+                        let (table, cover) =
+                            bytecode::build_pagestate_table(&info, self.back.len());
                         self.pagestate = table;
                         self.mapped = cover;
                     } else {
@@ -15272,7 +15275,8 @@ impl CoopTierupRun {
         let ver = self.run.mem_map_version();
         if ver != self.pagestate_version || env != self.pagestate_env {
             let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-            let (table, cover) = bytecode::build_pagestate_table(&info);
+            let backed = self.run.pending_win().map_or(0, |(_, len)| len);
+            let (table, cover) = bytecode::build_pagestate_table(&info, backed);
             self.pagestate = table;
             self.pagestate_cover = cover;
             self.pagestate_version = ver;
@@ -15379,11 +15383,16 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // non-one-bound-representable, so the per-call #717 `scalar_extent` sync would decline EVERY
     // tier-up. Paged mode replaces the decline with a per-access page check that traps
     // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does (fail-closed). A guest that
-    // reaches `unmap`/`protect` itself needs the same treatment even with no rodata — non-paged the
-    // emitter module-gates it to emit-nothing (decline), paged it tiers up (the `sync_pagestate`
-    // per-event/-bounce refresh carries the runtime remaps).
+    // can change its own page state needs the same treatment even with no rodata: an `unmap` or
+    // `protect`, and a `map` too, which can leave a hole below the page it commits. A region cannot
+    // decline mid-flight, and past a bounce that leaves the window more than one bound the scalar
+    // tier could only deny every access (`"mapped"` = 0: the run traps and the whole of it declines
+    // to the interpreter); paged, it stays emitted and the `sync_pagestate` per-event/-bounce
+    // refresh carries the remaps exactly — the §14 codegen entry's rule
+    // (`module_uses_addr_space_page_ops`), one rule for both (#1919).
     let paged = all_shimmable
-        && (m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_unmap_protect(&m));
+        && (m.data.iter().any(|d| d.readonly)
+            || temen_wasm_jit::module_uses_addr_space_page_ops(&m));
     // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
     // The local-table fallback has no spill path, so it keeps #1546's veto.
     let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);

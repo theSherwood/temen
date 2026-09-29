@@ -30226,14 +30226,25 @@ impl Mem {
 
     /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
     /// admitted byte set — for loads and stores alike — is exactly `[0, H)`, i.e. the fixed mapped
-    /// prefix extended by a contiguous run of explicitly-`Rw` pages. Any other explicit page state
-    /// breaks the single-bound shape (`Ro` splits the read/write sets, `Unmapped`/`Backed` change
-    /// admitted-or-bytes anywhere, an `Rw` page beyond a hole leaves the set non-contiguous) and
-    /// returns `None`, telling the tier-up driver to **decline** emitted code for the call and
-    /// interpret it instead — fail-closed, the interpreter is always right. An `Rw` re-commit
-    /// inside the prefix is set-neutral and ignored. The value is window-relative, matching the
-    /// emitted tier's `win`-relative bounds check (its `"mapped"` global).
+    /// prefix extended by a contiguous run of explicitly-`Rw` pages, **and** the backing holds all
+    /// of it ([`win_flat_len`](Mem::win_flat_len)). Any other explicit page state breaks the
+    /// single-bound shape (`Ro` splits the read/write sets, `Unmapped`/`Backed` change
+    /// admitted-or-bytes anywhere, an `Rw` page beyond a hole leaves the set non-contiguous), and a
+    /// fixed backing shorter than the reservation cannot serve the pages a `map` committed past it
+    /// (#1153: the interpreter drops those accesses) — each returns `None`, telling the tier-up
+    /// driver to **decline** emitted code for the call and interpret it instead, fail-closed. The
+    /// bound goes to emitted code that addresses the backing directly, so it must never pass the
+    /// backing's end. An `Rw` re-commit inside the prefix is set-neutral and ignored. The value is
+    /// window-relative, matching the emitted tier's `win`-relative bounds check (its `"mapped"`
+    /// global).
     pub(crate) fn scalar_extent(&self) -> Option<u64> {
+        let extent = self.admitted_prefix()?;
+        (extent <= self.win_flat_len()).then_some(extent)
+    }
+
+    /// The admitted byte set as one bound `[0, H)`, whatever the backing holds
+    /// ([`scalar_extent`](Mem::scalar_extent)'s shape test).
+    fn admitted_prefix(&self) -> Option<u64> {
         // Lock-free fast path: the address space has never been mutated, so the admitted set is
         // the region default — exactly the mapped prefix.
         if !self.prot_dirty.load(Ordering::Acquire) {
