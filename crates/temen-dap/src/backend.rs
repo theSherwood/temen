@@ -189,6 +189,12 @@ fn build_run(
 pub trait Debuggee {
     // --- execution -------------------------------------------------------------------------------
     fn run_until_stop(&mut self) -> Stop;
+    /// Run until a stop, or until logical time [`turn`](Self::turn) reaches `until` — then a live
+    /// [`StopReason::Pause`] stop. A backend without budgeted runs just runs to the next stop.
+    fn run_until_turn(&mut self, until: u64) -> Stop {
+        let _ = until;
+        self.run_until_stop()
+    }
     fn step(&mut self) -> Stop;
     fn step_over(&mut self) -> Stop;
     fn step_out(&mut self) -> Stop;
@@ -972,6 +978,7 @@ impl BytecodeBackend {
                         StopReason::Watchpoint { addr, write }
                     }
                     SchedBreak::Step => StopReason::Step,
+                    SchedBreak::Pause => StopReason::Pause,
                 };
                 Stop::Break { reason, pc }
             }
@@ -997,6 +1004,9 @@ impl BytecodeBackend {
 impl Debuggee for BytecodeBackend {
     fn run_until_stop(&mut self) -> Stop {
         self.resume(ScheduledDebugRun::run_until_stop)
+    }
+    fn run_until_turn(&mut self, until: u64) -> Stop {
+        self.resume(|run, fuel| run.run_until_turn(fuel, until))
     }
     fn step(&mut self) -> Stop {
         self.resume(ScheduledDebugRun::step)

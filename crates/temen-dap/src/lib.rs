@@ -190,7 +190,7 @@ impl DapServer {
             "stackTrace" => self.on_stack_trace(args),
             "scopes" => self.on_scopes(args),
             "variables" => self.on_variables(args),
-            "continue" => self.on_continue(),
+            "continue" => self.on_continue(args),
             "next" => self.on_step(StepKind::Over),
             "stepIn" => self.on_step(StepKind::In),
             "stepOut" => self.on_step(StepKind::Out),
@@ -679,7 +679,7 @@ impl DapServer {
         } else if self.session.is_none() {
             (false, Json::Null, vec![])
         } else {
-            let stop = self.run_with_conditions();
+            let stop = self.run_with_conditions(None);
             (true, Json::Null, self.stop_events(stop))
         }
     }
@@ -1364,11 +1364,19 @@ impl DapServer {
         (true, body, vec![])
     }
 
-    fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
-        if self.session.is_none() {
-            return (false, Json::Null, vec![]);
-        }
-        let stop = self.run_with_conditions();
+    fn on_continue(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // `budget` (a Temen extension): run at most this many turns, then stop with reason `pause` —
+        // so a single-threaded embedder can run a long program in slices, streaming its output and
+        // honoring a Pause between them, where one `continue` would otherwise run to the end.
+        let budget = args
+            .and_then(|a| a.get("budget"))
+            .and_then(|b| b.as_i64())
+            .map(|b| b.max(1) as u64);
+        let until = match self.session.as_ref() {
+            Some(s) => budget.map(|b| s.inspector.turn().saturating_add(b)),
+            None => return (false, Json::Null, vec![]),
+        };
+        let stop = self.run_with_conditions(until);
         (
             true,
             Json::obj(vec![("allThreadsContinued", Json::Bool(true))]),
@@ -1378,11 +1386,14 @@ impl DapServer {
 
     /// Resume until a stop, transparently skipping conditional breakpoints whose condition is false
     /// (DEBUGGING.md W5) — so `continue` lands only on breakpoints that actually fire.
-    fn run_with_conditions(&mut self) -> Stop {
+    ///
+    /// `until` bounds the run at that turn (a `pause` stop), for a budgeted `continue`.
+    fn run_with_conditions(&mut self, until: Option<u64>) -> Stop {
         loop {
-            let stop = match self.session.as_mut() {
-                Some(s) => s.inspector.run_until_stop(),
-                None => return Stop::Blocked,
+            let stop = match (self.session.as_mut(), until) {
+                (Some(s), Some(t)) => s.inspector.run_until_turn(t),
+                (Some(s), None) => s.inspector.run_until_stop(),
+                (None, _) => return Stop::Blocked,
             };
             match stop {
                 Stop::Break {
@@ -1954,6 +1965,7 @@ fn dap_reason(r: StopReason) -> &'static str {
         // and resumes after `provideStdin`.
         StopReason::StdinPark => "stdin",
         StopReason::CapPark { .. } => "cap",
+        StopReason::Pause => "pause",
     }
 }
 

@@ -50,6 +50,86 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
 }
 
+/// **A release run pumped in slices** (`temen_release_open` / `temen_release_run`): each slice hands
+/// back the output it produced, a program that never ends keeps reporting `RELEASE_RUNNING` (so the
+/// embedder can stream it and stop pumping on Pause), and a finite program pumped in small slices ends
+/// with exactly the one-shot run's output and exit code.
+#[test]
+fn a_release_run_pumps_in_slices() {
+    use temen_browser::{
+        temen_alloc, temen_exit_code, temen_release_close, temen_release_open, temen_release_run,
+        temen_status, temen_stdout_len, temen_stdout_ptr, RELEASE_DONE, RELEASE_RUNNING,
+    };
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let open = |m: &temen_ir::Module| {
+        let bytes = temen_encode::encode_module(m);
+        let p = temen_alloc(bytes.len());
+        // SAFETY: `temen_alloc` returned a live allocation of that length.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+        assert_eq!(
+            temen_release_open(p, bytes.len(), core::ptr::null(), 0),
+            STATUS_OK
+        );
+    };
+    let slice_out = || {
+        let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
+        if p.is_null() || n == 0 {
+            return Vec::new(); // a slice that printed nothing
+        }
+        // SAFETY: the stash stays live until the next call that replaces it.
+        unsafe { core::slice::from_raw_parts(p, n) }.to_vec()
+    };
+
+    let spin = compile(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  for (int i = 0; i < 3; i++) printf(\"line %d\\n\", i);\n  for (;;) {}\n}\n",
+    );
+    open(&spin);
+    let mut out = Vec::new();
+    for _ in 0..50 {
+        assert_eq!(
+            temen_release_run(100_000),
+            RELEASE_RUNNING,
+            "an endless loop keeps running"
+        );
+        out.extend(slice_out());
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "line 0\nline 1\nline 2\n",
+        "streamed as it ran"
+    );
+    temen_release_close();
+
+    let finite = compile(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  long s = 0;\n  for (int i = 0; i < 20000; i++) { s += i; if (i % 5000 == 0) printf(\"%d\\n\", i); }\n  printf(\"sum %ld\\n\", s);\n  return 3;\n}\n",
+    );
+    let one_shot = onramp_exec(&finite, b"");
+    open(&finite);
+    let mut out = Vec::new();
+    let mut slices = 0;
+    loop {
+        let r = temen_release_run(1_000);
+        out.extend(slice_out());
+        slices += 1;
+        if r == RELEASE_DONE {
+            break;
+        }
+        assert_eq!(r, RELEASE_RUNNING);
+    }
+    assert!(slices > 10, "it took many slices ({slices})");
+    assert_eq!(out, one_shot.stdout, "the same output as the one-shot run");
+    assert_eq!(
+        (temen_status(), temen_exit_code()),
+        (one_shot.status, one_shot.exit_code),
+        "and the same ending"
+    );
+}
+
 /// **The scanf family** (`sscanf`/`scanf`), which the playground libc lacked: c_interpret's `scanf`
 /// lessons failed to link. One scanner serves both, with C's return rules — the count of
 /// assignments, or EOF for an input failure before the first — and one byte of `ungetc` lookahead,

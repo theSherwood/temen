@@ -428,6 +428,9 @@ pub enum StopReason {
     /// #1366 — parked on a **host-completed cap call** with this completion id: the embedder
     /// services the request it recorded under `id`, then `deliver_cap`/`provideCap` resumes.
     CapPark { id: u64 },
+    /// A budgeted run reached the end of its budget with no other stop (the bytecode engine's
+    /// `run_until_turn`). Live and resumable: the embedder runs a long program in slices.
+    Pause,
 }
 
 /// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).

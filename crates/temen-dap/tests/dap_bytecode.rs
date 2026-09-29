@@ -766,6 +766,73 @@ fn dap_over_bytecode_step_back_rewinds_one_op() {
     assert!(!frames.is_empty(), "a live frame after stepBack");
 }
 
+/// An endless loop: `i` counts up forever.
+const SPIN: &str = r#"
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 0
+  br 1(v0)
+  }
+block 1 (v0: i32) {
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  br 1(v2)
+  }
+}
+"#;
+
+/// **A budgeted `continue` runs in slices.** With `budget: n` the run stops after about `n` turns,
+/// reason `pause` — live, so it can be inspected and resumed, again and again. This is what lets a
+/// single-threaded embedder (c_interpret's worker) stream a long program's output and honor Pause,
+/// where one `continue` into an endless loop never returned. A program that ends within its budget
+/// just terminates.
+#[test]
+fn dap_budgeted_continue_pauses_and_resumes() {
+    let launch = |src: &str| {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(src)),
+                ("function", Json::i(0)),
+                ("engine", Json::s("bytecode")),
+                ("stopOnEntry", Json::Bool(true)),
+            ]),
+        ));
+        s.handle(&req(3, "configurationDone", Json::obj(vec![]))); // parked at the entry
+        s
+    };
+    let budget = |n: i64| Json::obj(vec![("budget", Json::i(n))]);
+
+    let mut s = launch(SPIN);
+    for i in 0..3 {
+        let out = s.handle(&req(10 + i, "continue", budget(1000)));
+        let reason = event(&out, "stopped")
+            .and_then(|e| e.get("body").and_then(|b| b.get("reason")).cloned());
+        assert_eq!(reason, Some(Json::s("pause")), "slice {i} pauses: {out:?}");
+        assert!(event(&out, "terminated").is_none(), "and the run is live");
+        let st = s.handle(&req(
+            20 + i,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        assert_eq!(
+            response(&st).get("success"),
+            Some(&Json::Bool(true)),
+            "inspectable"
+        );
+    }
+
+    let mut s = launch(THREE_LINES);
+    let out = s.handle(&req(10, "continue", budget(1_000_000)));
+    assert!(
+        event(&out, "terminated").is_some(),
+        "a short program finishes: {out:?}"
+    );
+}
+
 /// Three source lines of two ops each.
 const THREE_LINES: &str = r#"
 func () -> (i32) {
