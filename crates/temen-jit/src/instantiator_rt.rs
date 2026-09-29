@@ -1040,6 +1040,25 @@ impl Nursery {
             let (funcs, types) = self.self_program(self_prog);
             return Some((funcs, types, None, &[], self.shadow));
         }
+        self.resolve_granted(module, trap_out)
+    }
+
+    /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) — including
+    /// `SELF_MODULE` (`-1`), which the host resolves to the running module *with* its data segments
+    /// and declared memory. A detached child needs those (its window is fresh), where a carve child
+    /// of `-1` runs over the parent's bytes and takes only [`Self::self_program`] (#1863).
+    #[allow(clippy::type_complexity)]
+    unsafe fn resolve_granted(
+        &self,
+        module: i64,
+        trap_out: *mut i64,
+    ) -> Option<(
+        &[Func],
+        &[TypeEntry],
+        Option<i32>,
+        &[Data],
+        temen_ir::durable_abi::ShadowArena,
+    )> {
         let Some(resolver) = self.resolve_module else {
             *trap_out = TrapKind::CapFault as i64;
             return None;
@@ -1591,15 +1610,30 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     // #826: `mem_size` is the reserved span, so a record in a `map`-grown tail page is read where
     // the interpreter's live page map reads it; a record on a still-uncommitted page faults the
     // copy below through the SIGSEGV guard (`MemoryFault`), exactly like a guest load.
-    if rp.checked_add(56).is_none_or(|e| e > mem_size) {
-        *trap_out = TrapKind::MemoryFault as i64;
-        return 0;
-    }
     let base = (mem_base + rp) as *const u8;
-    // Copy the 56 bytes out of the guest window once, then share the layout decode with the two
-    // interpreter tiers (#911). `parse` returns `None` on a nonzero version word — fail closed.
-    let mut buf = [0u8; 56];
-    core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), 56);
+    let read = |len: usize, trap_out: *mut i64| -> Option<Vec<u8>> {
+        if rp.checked_add(len as u64).is_none_or(|e| e > mem_size) {
+            *trap_out = TrapKind::MemoryFault as i64;
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), len);
+        Some(buf)
+    };
+    // Copy the record out of the guest window, then share the layout decode with the two
+    // interpreter tiers (#911): the version word says its length (v0 carve, v1 detached); an
+    // unknown version or a nonzero reserved field fails closed.
+    let Some(head) = read(56, trap_out) else {
+        return 0;
+    };
+    let head: &[u8; 56] = head.as_slice().try_into().expect("56 bytes");
+    let Some(len) = SpawnRec::len_for(head) else {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    };
+    let Some(buf) = read(len, trap_out) else {
+        return 0;
+    };
     let sr = match SpawnRec::parse(&buf) {
         Some(s) => s,
         None => {
@@ -1607,6 +1641,33 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
             return 0;
         }
     };
+    if sr.detached {
+        // #1863: a v1 record is op 15 as data — the op-15 thunk spawns it. No pager on this tier
+        // (the v0 rule below).
+        if sr.pager != u32::MAX {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+        return instantiate_detached(
+            rt,
+            self_prog,
+            mem_base,
+            mem_size,
+            handle,
+            sr.budget as i64,
+            sr.modh as i64,
+            sr.grants_ptr as i64,
+            sr.grants_n as i64,
+            sr.entry as i64,
+            sr.size_log2,
+            sr.quota,
+            sr.args.0 as i64,
+            sr.args.1 as i64,
+            sr.region as i64,
+            sr.child_off as i64,
+            trap_out,
+        );
+    }
     let entry = sr.entry as i64;
     let off = sr.off as i64;
     let size_log2 = sr.size_log2;
@@ -2080,7 +2141,7 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_detached(
     rt: *const Nursery,
-    self_prog: i64,
+    _self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -2125,7 +2186,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         return 0;
     }
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, self_prog, trap_out)
+        rt.resolve_granted(module, trap_out)
     else {
         return 0;
     };

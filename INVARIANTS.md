@@ -272,6 +272,10 @@ frontier's own repair, never parked. Until it is gone:
   read it after the join. Parent and child using the carve concurrently — stores, futex rendezvous —
   is not a supported channel; #1814 is the tracked divergence (invariant 9's "tracked debt with a
   convergence plan", the plan being this deletion).
+- **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
+  detached, with the spawn-time args payload and the pre-mapped region as fields, `module = -1` the
+  spawner's own program. Op 15's positional form and the v0 carve record retire with the carve path
+  (#1867); the version word is that migration's scaffolding.
 - **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
   `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
   spawn-time args payload; results ride the join and the region.

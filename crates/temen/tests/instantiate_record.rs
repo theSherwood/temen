@@ -1445,3 +1445,177 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
         assert!(e.contains("MemoryFault"), "{b:?}: {e}");
     }
 }
+
+// ---- #1863: the v1 (detached) record — op 15 as data ----
+
+/// Stores building an 88-byte v1 record at `at` from the i64 values `vr0`..`vr80` in scope (one per
+/// 8-byte word, named by offset).
+fn store_record_v1(at: u64) -> String {
+    (0..11)
+        .map(|k| {
+            let o = k * 8;
+            format!(
+                "  vra{o} = i64.const {a}\n  i64.store vra{o} vr{o}\n",
+                a = at + o
+            )
+        })
+        .collect()
+}
+
+/// A root that spawns **its own module** (`module = -1`) detached through a v1 record: the child's
+/// window is its own (`size_log2` 17, the module's declared memory), funded by the `"budget"` grant,
+/// with a one-byte args payload (`*` = 42) the child reads back at `module_args_base`. The child
+/// (func 1) returns `payload + 100`; the root exits with the join result. `pager` is `u32::MAX` here;
+/// `extra` rewrites let a test vary the record.
+fn detached_record_program() -> String {
+    let args_base = temen_ir::module_args_base();
+    format!(
+        "\
+memory 17
+data 16384 \"vm\"
+data 16400 \"budget\"
+data 16416 \"*\"
+import 0 \"exit\" (i32) -> ()
+
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 2
+  vh = self.resolve vp vl
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vb64 = i64.extend_i32_u vb
+  v32 = i64.const 32
+  vbsh = i64.shl vb64 v32
+  vself = i64.const 4294967295
+  vr0 = i64.const 4294967297
+  vr8 = i64.const 0
+  vr16 = i64.const -4294967279
+  vr24 = i64.or vbsh vself
+  vr32 = i64.const 0
+  vr40 = i64.const 0
+  vr48 = i64.const 0
+  vr56 = i64.const 16416
+  vr64 = i64.const 1
+  vr72 = i64.const 4294967295
+  vr80 = i64.const 0
+{stores}
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vc = i32.wrap_i64 vj
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+
+func 1 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  va = i64.const {args_base}
+  vb = i32.load8_u va
+  vbw = i64.extend_i32_u vb
+  vk = i64.const 100
+  vr = i64.add vbw vk
+  return vr
+  }}
+}}
+",
+        stores = store_record_v1(17408),
+    )
+}
+
+/// Run with the Instantiator plus a detached-window budget (`"budget"`, 1 MiB of `Budget.mem`).
+fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let registry = Imports::new().provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(m, registry).expect("instantiate");
+    let r = inst
+        .run_with_caps(
+            backend,
+            &RunConfig::default(),
+            &[
+                (
+                    "vm",
+                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                ),
+                ("budget", HostCap::detached_budget(1 << 20)),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    match r.outcome {
+        Outcome::Exited(code) => Ok(code),
+        other => Err(format!("unexpected outcome {other:?}")),
+    }
+}
+
+/// #1863: a v1 record spawns the parent's own module into a window of its own, and the args
+/// payload arrives at the child's `module_args_base` — identically on every tier.
+#[test]
+fn a_v1_record_spawns_self_detached_with_an_args_payload() {
+    let src = detached_record_program();
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 142, "{b:?}");
+    }
+}
+
+/// #1863: v1's `off` is reserved — a record naming a carve offset is malformed, not a carve spawn.
+#[test]
+fn a_v1_record_with_an_offset_fails_closed() {
+    let src =
+        detached_record_program().replace("  vr8 = i64.const 0\n", "  vr8 = i64.const 65536\n");
+    assert!(
+        src.contains("vr8 = i64.const 65536"),
+        "the rewrite must apply"
+    );
+    for b in BACKENDS {
+        let e = run_detached(b, &src).expect_err("a v1 offset is refused");
+        assert!(e.contains("CapFault"), "{b:?}: {e}");
+    }
+}
+
+/// #1862 + #1863: a **detached** demand child — a window the pager cannot address — is served by a
+/// pager that fills its own buffer and replies with its address. The v1 record names impl export 0 as
+/// the pager; the child's first touch (at 20000) faults into a `page(addr)` the root serves from
+/// `svc.wait`; the pager gets `addr` in the child's coordinates, stores 77 at `addr + 40000` in its own
+/// window, and replies with that address. The child reads 77; the root exits `77 + 1 serve * 1000`.
+#[test]
+fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
+    let src = detached_record_program()
+        .replace(
+            "import 0 \"exit\" (i32) -> ()\n",
+            "type 0 func (i64) -> (i64)\ntype 1 interface { page: 0 }\nexport 0 interface \"pager\" 1 { page: 2 }\nimport 0 \"exit\" (i32) -> ()\n",
+        )
+        // pager = impl export 0
+        .replace("  vr16 = i64.const -4294967279\n", "  vr16 = i64.const 17\n")
+        .replace(
+            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
+            "  vz = i32.const 0\n  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vk1 = i64.const 1000\n  vsk = i64.mul vs vk1\n  vt = i64.add vj vsk\n  vc = i32.wrap_i64 vt\n",
+        )
+        .replace(
+            &format!("  va = i64.const {}\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  vk = i64.const 100\n  vr = i64.add vbw vk\n  return vr\n", temen_ir::module_args_base()),
+            "  va = i64.const 20000\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
+        )
+        + "
+func 2 (i64) -> (i64) {
+block 0 (vaddr: i64) {
+  voff = i64.const 40000
+  vsrc = i64.add vaddr voff
+  vb = i32.const 77
+  i32.store8 vsrc vb
+  return vsrc
+  }
+}
+";
+    assert!(
+        src.contains("interface \"pager\"")
+            && src.contains("vr16 = i64.const 17\n")
+            && src.contains("svc.wait")
+            && src.contains("i64.const 20000"),
+        "the rewrites must apply"
+    );
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+    }
+}

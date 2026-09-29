@@ -13585,7 +13585,7 @@ impl CoopSched {
                     // §3.6: a same-module child serves over the shared program — its serve machinery
                     // (enqueue admission, handler resolution) and any `child_offer` shape read the
                     // domain's registered module, exactly the tree-walker's `self_module` handoff.
-                    child_host.self_module = owner.with(|h| h.self_module.clone());
+                    child_host.set_self_module_opt(owner.with(|h| h.self_module.clone()));
                     // #1234: and its import manifest is ours too — bind the *parent's* manifest
                     // against the child's attenuated powerbox, the same binder + `CHILD_BINDABLE`
                     // policy the op-13 separate-module arm uses below (and the tree-walker's op-0
@@ -18189,10 +18189,38 @@ impl Vm {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
-                    let raw = mem.as_ref().ok_or(Trap::Malformed)?.read_window(rp, 56)?;
-                    let raw: &[u8; 56] = raw.as_slice().try_into().map_err(|_| Trap::Malformed)?;
-                    // Shared 56-byte layout decode (#911); pager/budget handling stays tier-local.
-                    let sr = SpawnRec::parse(raw).ok_or(Trap::CapFault)?; // version — fail closed
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let head = m.read_window(rp, 56)?;
+                    let head: &[u8; 56] =
+                        head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
+                    // The version word says how long the record is (v0 carve, v1 detached).
+                    let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
+                    let raw = m.read_window(rp, len)?;
+                    // Shared layout decode (#911); pager/budget handling stays tier-local.
+                    let sr = SpawnRec::parse(&raw).ok_or(Trap::CapFault)?; // version / reserved — fail closed
+                    if sr.detached {
+                        // #1863: a v1 record is op 15 as data — the same outcome op 15 produces,
+                        // served by every driver's detached arm. No pager on this tier (see above).
+                        if sr.pager != u32::MAX {
+                            return Err(Trap::CapFault);
+                        }
+                        let dst = *dst;
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::InstantiateDetached {
+                            budget: sr.budget,
+                            mh: sr.modh,
+                            entry: sr.entry as i64,
+                            size_log2: sr.size_log2,
+                            quota: sr.quota,
+                            dst,
+                            grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
+                            args: (sr.args.1 > 0).then_some(sr.args),
+                            premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
+                        });
+                    }
                     let entry = sr.entry as i64;
                     let off = sr.off as i64;
                     let size_log2 = sr.size_log2;
