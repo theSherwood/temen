@@ -7455,6 +7455,63 @@ long worker(long arg) {
     }
 }
 
+/// #1097 — vCPUs allocating at the same time never share a block. Four threads each `malloc` 2000
+/// blocks and tag them, then check every tag survived. Before the allocation lock, two vCPUs could read
+/// the same `HEAP_BRK` and be handed the same block. Runs on `drive_parallel`, one OS thread per vCPU,
+/// where the race is real: the nightly std lane's parallel atomic-counter smoke trapped on it about one
+/// run in four.
+#[test]
+#[cfg(unix)]
+fn malloc_hands_parallel_threads_distinct_blocks() {
+    let src = r#"
+#include <stdlib.h>
+int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
+long __vm_thread_join(int h);
+#define N 2000
+long worker(long tag) {
+  long **blocks = malloc(N * sizeof(long *));
+  for (long i = 0; i < N; i++) {
+    long *p = malloc(4 * sizeof(long));
+    p[0] = tag;
+    p[1] = i;
+    blocks[i] = p;
+  }
+  long bad = 0;
+  for (long i = 0; i < N; i++)
+    if (blocks[i][0] != tag || blocks[i][1] != i) bad++;
+  return bad;
+}
+int main(void) {
+  int h[4];
+  for (int t = 0; t < 4; t++) h[t] = __vm_thread_spawn(worker, malloc(1 << 16), t + 1);
+  long bad = 0;
+  for (int t = 0; t < 4; t++) bad += __vm_thread_join(h[t]);
+  return bad != 0;
+}
+"#;
+    let Some(ll) = compile_to_ll("malloc_threads", src) else {
+        return;
+    };
+    let t = temen_llvm::translate_ll_path(&ll).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let out = temen_run::instantiate(t.module)
+        .expect("instantiate")
+        .run_with_caps_parallel(&temen_run::RunConfig::default(), &[])
+        .expect("run_with_caps_parallel");
+    let status = match out.outcome {
+        temen_run::Outcome::Exited(c) => c,
+        temen_run::Outcome::Returned(ref v) => match v.first() {
+            Some(Value::I32(x)) => *x,
+            _ => -1,
+        },
+    };
+    assert_eq!(
+        status, 0,
+        "a thread found a block another thread had also been handed ({:?})",
+        out.outcome
+    );
+}
+
 // ---- §GC conservative roots: `__vm_gc_roots` → `gc.roots` --------------------------------------
 
 /// Conservative root enumeration scans the calling computation's live frames for candidate window
