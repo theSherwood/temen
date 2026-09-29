@@ -246,9 +246,8 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    command's exit status (0 = success). */
 #ifdef TEMEN_SHELL_SPAWN
 /* Spawn a command `mod` (STAGE1.md §5): the one spawn every external command and ring stage takes —
-   an op-17 v1 record, so the child runs in a **detached window of its own** (its declared memory, as
-   the personality reports it from the granted `Module`), paid from our `Budget` and returned to it
-   when the child ends. `rec` holds `gn` 16-byte grant records `{name_off, name_len, handle, flags}`;
+   an op-17 v1 record, so the child runs in a **detached window of its own** (its declared memory:
+   size 0 asks for exactly that), paid from our `Budget` and returned to it when the child ends. `rec` holds `gn` 16-byte grant records `{name_off, name_len, handle, flags}`;
    argv travels as the spawn's args payload `{argc, envc=0}` + packed argv, which lands at the child's
    `module_args_base`. Returns the child handle, or -errno (an over-long argv, an exhausted budget). */
 static char spawn_rec_buf[88];
@@ -268,7 +267,7 @@ static long spawn_child(long mod, int *rec, long gn, int argc, char **argv) {
   w[0] = 1;                                  /* @0  version 1: detached */
   w[1] = 0;                                  /* @4  entry 0 */
   q[1] = 0;                                  /* @8  offset: reserved, 0 */
-  w[4] = (int)__px_exec_win(__px(), mod);    /* @16 size_log2 = the command's declared window */
+  w[4] = 0;                                  /* @16 size_log2 0 = the command's declared window */
   w[5] = -1;                                 /* @20 no pager */
   w[6] = (int)mod;                           /* @24 module */
   w[7] = __budget();                         /* @28 the Budget the window spends */

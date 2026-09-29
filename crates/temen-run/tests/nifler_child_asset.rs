@@ -57,10 +57,9 @@ fn inflate_asset() -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
-/// The conductor that spawns `child` with `caps` re-granted and argv `nifler p /in.nim /out.nif`.
-fn conductor(child: &temen_ir::Module, caps: &[&str]) -> temen_ir::Module {
-    let log2 = child.memory.as_ref().expect("child window").size_log2;
-    temen_run::conductor(log2, caps, &["nifler", "p", "/in.nim", "/out.nif"])
+/// The conductor that spawns its child with `caps` re-granted and argv `nifler p /in.nim /out.nif`.
+fn conductor(caps: &[&str]) -> temen_ir::Module {
+    temen_run::conductor(caps, &["nifler", "p", "/in.nim", "/out.nif"])
 }
 
 #[test]
@@ -99,7 +98,7 @@ fn child_entry_asset_parses_nim_byte_identical_to_native_nifler() {
     let child = temen_encode::decode_module(&temen).expect("decode nifler_ce.temen");
     temen_verify::verify_module(&child).expect("verify nifler_ce.temen");
 
-    let parent = conductor(&child, &["fs", "stdout", "exit"]);
+    let parent = conductor(&["fs", "stdout", "exit"]);
 
     for (src, expected) in CORPUS {
         // A cross-domain shared memfs seeded with the source as `in.nim` (the guest's os_shim strips the
@@ -175,7 +174,7 @@ fn child_entry_asset_runs_under_a_four_cap_grant_list() {
     temen_verify::verify_module(&child).expect("verify nifler_ce.temen");
 
     // {fs, stdout, exit} are what nifler imports; `extra` is a spare offered cap it never resolves.
-    let parent = conductor(&child, &["fs", "stdout", "exit", "extra"]);
+    let parent = conductor(&["fs", "stdout", "exit", "extra"]);
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(
         vec![("in.nim".into(), CORPUS[0].0.as_bytes().to_vec())],

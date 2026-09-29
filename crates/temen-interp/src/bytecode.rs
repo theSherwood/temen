@@ -1644,6 +1644,7 @@ fn admit_detached_child(
     let sig = compiled.sigs.get(entry as usize);
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
+    let size_log2 = temen_ir::detached_size_log2(size_log2, cmem_log2);
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
@@ -5041,6 +5042,7 @@ impl<'p> Vcpu<'p> {
             .sigs
             .get(entry as usize)
             .is_some_and(|(p, r)| child_entry_ok(p, r));
+        let size_log2 = temen_ir::detached_size_log2(size_log2, cmem_log2);
         let child_size = if (0..64).contains(&size_log2) {
             1u64 << size_log2
         } else {

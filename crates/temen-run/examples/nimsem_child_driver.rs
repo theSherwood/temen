@@ -101,10 +101,8 @@ fn main() {
     )
     .expect("decode nimsem_ce.temen");
     temen_verify::verify_module(&nimsem).expect("nimsem verifies");
-    let log2 = nimsem.memory.as_ref().expect("nimsem window").size_log2;
     let sys_pnif_key = format!("nimcache/{sys_stem}.p.nif");
     let parent = temen_run::conductor(
-        log2,
         &["fs", "stdout", "exit", "exec"],
         &[
             "nimsem",

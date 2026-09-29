@@ -1565,6 +1565,37 @@ fn a_v1_record_spawns_self_detached_with_an_args_payload() {
     }
 }
 
+/// A v1 record whose `size_log2` is `0` asks for the module's declared window — a spawner holding a
+/// module it did not build need not know its size. A nonzero size that is not the declared memory is
+/// still refused, probeably: the root exits 7 when the spawn returns a negative handle.
+#[test]
+fn a_v1_record_with_size_zero_gets_the_declared_window() {
+    let base = detached_record_program();
+    // size_log2 0 | pager u32::MAX
+    let src = base.replace(
+        "  vr16 = i64.const -4294967279\n",
+        "  vr16 = i64.const -4294967296\n",
+    );
+    assert!(src.contains("-4294967296"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 142, "{b:?}");
+    }
+    // size_log2 16 against a declared 17: refused before any join.
+    let wrong = base
+        .replace(
+            "  vr16 = i64.const -4294967279\n",
+            "  vr16 = i64.const -4294967280\n",
+        )
+        .replace(
+            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
+            "  vz0 = i32.const 0\n  vneg = i32.lt_s vch vz0\n  vseven = i32.const 7\n  vc = select vneg vseven vz0\n",
+        );
+    assert!(wrong.contains("vneg"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &wrong).expect("run"), 7, "{b:?}");
+    }
+}
+
 /// #1863: v1's `off` is reserved — a record naming a carve offset is malformed, not a carve spawn.
 #[test]
 fn a_v1_record_with_an_offset_fails_closed() {

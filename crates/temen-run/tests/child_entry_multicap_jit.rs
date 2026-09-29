@@ -69,7 +69,7 @@ fn grant_hooks(host: *mut Host) -> GrantChildHooks {
 fn multi_record_grant_list_marshals_on_the_jit() {
     let child = temen_text::parse_module(CHILD).expect("parse child");
     temen_verify::verify_module(&child).expect("child verifies");
-    let parent = temen_run::conductor(16, &["extra", "exit", "stdout", "fs"], &[]);
+    let parent = temen_run::conductor(&["extra", "exit", "stdout", "fs"], &[]);
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
     let factory = Arc::new(factory);

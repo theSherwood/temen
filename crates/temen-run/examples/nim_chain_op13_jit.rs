@@ -68,8 +68,7 @@ fn spawn_phase(
     caps: &[&str],
     cap_handles: &[i32],
 ) -> i64 {
-    let log2 = module.memory.as_ref().expect("phase window").size_log2;
-    let parent = temen_run::conductor(log2, caps, argv);
+    let parent = temen_run::conductor(caps, argv);
     let (inst, modh, budget) = temen_run::grant_conductor(host, module);
     let mut args = vec![inst as i64, modh as i64, budget as i64];
     args.extend(cap_handles.iter().map(|h| *h as i64));

@@ -1225,16 +1225,13 @@ static long scratch[16];     /* the spawn record + one grant record (8-byte alig
 
 int main(void) {
   int out = (int)__vm_resolve("stdout", 6);   /* this program's own stdout handle */
-  /* A child's window is this program's declared memory; the budget grant is one window's worth. */
-  long win = __vm_budget_read((int)__vm_resolve("budget", 6), 1);
-  int lg = 0;
-  while ((1L << lg) < win) lg++;
+  /* size 0: each child's window is its module's declared memory, paid from the "budget" grant. */
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
-  long a = vm_spawn(-1, (long)child, lg, 0, g, 1, 0, 0, scratch);   /* A: stdout re-granted */
+  long a = vm_spawn(-1, (long)child, 0, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
   long ra = vm_join(a);
-  long b = vm_spawn(-1, (long)child, lg, 0, g, 0, 0, 0, scratch);   /* B: empty grant list */
+  long b = vm_spawn(-1, (long)child, 0, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
   long rb = vm_join(b);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);

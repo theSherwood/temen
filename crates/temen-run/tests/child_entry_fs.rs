@@ -73,7 +73,7 @@ fn spawn_child_over_memfs(
     seed: Vec<(String, Vec<u8>)>,
 ) -> (Vec<Value>, MemFsHandle) {
     temen_verify::verify_module(child).expect("child verifies");
-    let parent = temen_run::conductor(child.memory.expect("child window").size_log2, &["fs"], &[]);
+    let parent = temen_run::conductor(&["fs"], &[]);
 
     // A cross-domain shared memfs: every `HostProc` the factory yields (the parent's grant and the
     // child's re-mint) closes over one store, which this `MemFsHandle` also observes — so a file the

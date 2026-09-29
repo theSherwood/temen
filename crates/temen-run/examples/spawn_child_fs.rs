@@ -63,9 +63,8 @@ fn main() {
     let child = temen_encode::decode_module(&bytes).expect("decode child .temen");
     temen_verify::verify_module(&child).expect("child verifies");
 
-    let log2 = child.memory.as_ref().expect("child window").size_log2;
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let parent = temen_run::conductor(log2, &["fs", "stdout", "exit"], &argv);
+    let parent = temen_run::conductor(&["fs", "stdout", "exit"], &argv);
 
     let (factory, handle) = temen_run::fs::mem_fs_shared_factory(seed, vec![]);
     let factory = Arc::new(factory);

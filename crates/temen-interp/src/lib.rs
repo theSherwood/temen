@@ -14658,6 +14658,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
+                            let size_log2 = temen_ir::detached_size_log2(size_log2, cm.memory_log2);
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {

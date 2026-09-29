@@ -71,7 +71,8 @@ static inline int vm_budget_of_(void) {
 
 /* vm_spawn(module, entry, size_log2, quota, grants, n, args, args_len, scratch) -> child | -errno.
  * `module`: a granted `Module` handle, or -1 for this program. The child runs in a window of its
- * own of `1 << size_log2` bytes (its module's declared memory), spent from this domain's `Budget`.
+ * own — its module's declared memory, spent from this domain's `Budget`. `size_log2` 0 asks for
+ * exactly that; any other value must equal it (else the spawn refuses, -EINVAL).
  * `args`/`args_len`: the spawn-time args payload, copied to the child's args buffer before it starts
  * (the §3e `{argc, envc}` + packed strings a `main(argc, argv)` reads); `args_len` 0 = none.
  * `quota`: raw fuel (0 = the parent's). The child starts immediately; `vm_join` collects it. */

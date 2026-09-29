@@ -98,12 +98,11 @@ fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
     let child = temen_encode::decode_module(&temen).expect("decode nim-link-fs.temen");
     temen_verify::verify_module(&child).expect("verify nim-link-fs.temen");
 
-    let log2 = child.memory.as_ref().expect("child window").size_log2;
     let (in_path, out_path) = (
         format!("nimcache/{STEM}.x.nif"),
         format!("nimcache/{STEM}.temen"),
     );
-    let parent = temen_run::conductor(log2, &["fs"], &["link", &in_path, &out_path, STEM]);
+    let parent = temen_run::conductor(&["fs"], &["link", &in_path, &out_path, STEM]);
 
     // Shared memfs seeded with the hexer `.x.nif` at `nimcache/<stem>.x.nif` (the key the driver hands
     // off through); the linker writes `nimcache/<stem>.temen` back into the same store.

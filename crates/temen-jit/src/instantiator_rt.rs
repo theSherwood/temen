@@ -2195,6 +2195,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         return 0;
     };
     let entry = entry as u64;
+    let size_log2 = temen_ir::detached_size_log2(size_log2, mod_mem.map(|m| m as u8));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {

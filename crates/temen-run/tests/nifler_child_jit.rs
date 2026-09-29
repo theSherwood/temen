@@ -58,9 +58,7 @@ fn nifler_child_runs_on_the_jit_byte_identical() {
     };
     let child = temen_encode::decode_module(&temen).expect("decode nifler_ce.temen");
     temen_verify::verify_module(&child).expect("child verifies");
-    let log2 = child.memory.as_ref().expect("child window").size_log2;
     let parent = temen_run::conductor(
-        log2,
         &["fs", "stdout", "exit"],
         &["nifler", "p", "/in.nim", "/out.nif"],
     );

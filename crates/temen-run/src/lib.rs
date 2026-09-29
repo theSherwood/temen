@@ -5766,7 +5766,7 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
 }
 
 /// A §14 **conductor**: spawn a granted `Module` as a detached child — an op-17 v1 record,
-/// so the child runs in its own `1 << child_log2` window (its declared memory), paid from a `Budget`
+/// so the child runs in a window of its own (its declared memory: `size_log2 = 0`), paid from a `Budget`
 /// and returned to it when the child ends — with `caps` re-granted to it by name and `argv` as the
 /// spawn's args payload (`{argc, envc = 0}` + packed NUL-terminated strings, landing at the child's
 /// [`temen_ir::module_args_base`]), then join it and return its status. A refused spawn returns its
@@ -5777,9 +5777,9 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
 /// spawns through this one program (INVARIANTS #15); [`grant_conductor`] grants its first three args.
 /// Its own scratch — the record, the grant records and their names, the payload — sits above the
 /// NULL guard of its [`CONDUCTOR_LOG2`] window.
-pub fn conductor(child_log2: u8, caps: &[&str], argv: &[&str]) -> temen_ir::Module {
-    let m = temen_text::parse_module(&conductor_src(child_log2, caps, argv))
-        .expect("the conductor's text parses");
+pub fn conductor(caps: &[&str], argv: &[&str]) -> temen_ir::Module {
+    let m =
+        temen_text::parse_module(&conductor_src(caps, argv)).expect("the conductor's text parses");
     temen_verify::verify_module(&m).expect("the conductor verifies");
     m
 }
@@ -5797,7 +5797,7 @@ pub fn grant_conductor(host: &mut Host, child: &temen_ir::Module) -> (i32, i32, 
 /// The [`conductor`]'s own declared window.
 pub const CONDUCTOR_LOG2: u8 = 17;
 
-fn conductor_src(child_log2: u8, caps: &[&str], argv: &[&str]) -> String {
+fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
     let guard = temen_ir::POWERBOX_NULL_GUARD;
     let (rec, grants, names, args) = (guard + 512, guard + 1024, guard + 2048, guard + 4096);
     assert!(caps.len() <= 64, "conductor: at most 64 re-granted caps");
@@ -5862,8 +5862,8 @@ block 2 (inst: i32, c: i32) {{
 }}
 "#,
         params = params.join(", "),
-        // size_log2 | pager u32::MAX (none)
-        w2 = (child_log2 as u64 | (0xFFFF_FFFFu64 << 32)) as i64,
+        // size_log2 0 (the module's declared window) | pager u32::MAX (none)
+        w2 = (0xFFFF_FFFFu64 << 32) as i64,
         gn = caps.len(),
         al = payload.len(),
     )

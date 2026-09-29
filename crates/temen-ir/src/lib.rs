@@ -3771,6 +3771,17 @@ pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
 }
 
+/// The window a detached spawn asks for, `log2`: `0` means "the module's declared window" (owner,
+/// 2026-09-29) — a spawner holding a module it did not build cannot know that size. Any other value
+/// is passed through, and every tier still refuses it unless it equals the declared memory (§14
+/// transparency). The one reading every tier's detached admission applies.
+pub fn detached_size_log2(requested: i64, declared: Option<u8>) -> i64 {
+    match (requested, declared) {
+        (0, Some(d)) => d as i64,
+        _ => requested,
+    }
+}
+
 /// Whether `module` issues op 15 (`instantiate_detached`), whose module operand must be a `Module`
 /// handle — the one spawn a by-name `"module"` grant serves. The op-17 record names the spawner's own
 /// program as `-1`, so an op-17-only guest is granted its `"budget"` alone, and keeps a powerbox a
