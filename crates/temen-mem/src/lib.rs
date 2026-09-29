@@ -1636,29 +1636,32 @@ impl Paged {
         self.lock().entry(key).or_insert_with(|| vec![0u8; page])[idx] = b;
     }
 
+    /// Walk `[off, off+len)`, clamped to `size`, one page at a time: `f(page key, offset in the page,
+    /// bytes, bytes already walked)`. Every bulk op goes through here, so each costs one map lookup
+    /// and one slice op per page. A lookup per byte made `Paged` nearly all of each differential's
+    /// Miri time, and more of it the larger the region.
+    fn for_pages(&self, off: u64, len: u64, mut f: impl FnMut(u64, usize, usize, usize)) {
+        let len = len.min(self.size.saturating_sub(off));
+        let mut done = 0;
+        while done < len {
+            let o = off + done;
+            let idx = o % self.page;
+            let take = (self.page - idx).min(len - done);
+            f(o / self.page, idx as usize, take as usize, done as usize);
+            done += take;
+        }
+    }
+
     fn zero(&self, off: u64, len: u64) {
         let mut map = self.lock();
-        // Whole pages of the range are dropped (an absent page reads zero); partial edges are
-        // overwritten byte-wise.
-        let mut o = off;
-        let end = off + len;
-        let page_sz = self.page as usize;
-        while o < end {
-            let key = o / self.page;
-            let page_start = key * self.page;
-            let page_end = page_start + self.page;
-            if o == page_start && end >= page_end {
+        // A whole page is dropped (an absent page reads zero); a partial one is cleared in place.
+        self.for_pages(off, len, |key, idx, take, _| {
+            if take as u64 == self.page {
                 map.remove(&key);
-                o = page_end;
-            } else {
-                let stop = end.min(page_end);
-                let p = map.entry(key).or_insert_with(|| vec![0u8; page_sz]);
-                for b in o..stop {
-                    p[(b % self.page) as usize] = 0;
-                }
-                o = stop;
+            } else if let Some(p) = map.get_mut(&key) {
+                p[idx..idx + take].fill(0);
             }
-        }
+        });
     }
 
     fn fill(&self, off: u64, len: u64, b: u8) {
@@ -1667,10 +1670,9 @@ impl Paged {
         }
         let page_sz = self.page as usize;
         let mut map = self.lock();
-        for o in off..off + len {
-            let key = o / self.page;
-            map.entry(key).or_insert_with(|| vec![0u8; page_sz])[(o % self.page) as usize] = b;
-        }
+        self.for_pages(off, len, |key, idx, take, _| {
+            map.entry(key).or_insert_with(|| vec![0u8; page_sz])[idx..idx + take].fill(b)
+        });
     }
 
     fn copy_within(&self, dst: u64, src: u64, len: u64) {
@@ -1679,57 +1681,33 @@ impl Paged {
         // rare-fallback cost.
         let mut buf = vec![0u8; len as usize];
         self.read_into(src, &mut buf);
-        let page_sz = self.page as usize;
-        let mut map = self.lock();
-        for (k, &byte) in buf.iter().enumerate() {
-            let o = dst + k as u64;
-            let key = o / self.page;
-            map.entry(key).or_insert_with(|| vec![0u8; page_sz])[(o % self.page) as usize] = byte;
-        }
+        self.write_from(dst, &buf);
     }
 
-    // Page by page, like `write_from`: one map lookup and one slice copy per page, not per byte. Bytes
-    // past `size` are left as they are (audit #6: inert past range; `n` keeps `off + i` from
-    // overflowing).
+    // Bytes past `size` are left as they are (audit #6: inert past range).
     fn read_into(&self, off: u64, out: &mut [u8]) {
         let map = self.lock();
-        let n = self.size.saturating_sub(off).min(out.len() as u64) as usize;
-        let mut i = 0usize;
-        while i < n {
-            let o = off + i as u64;
-            let idx = (o % self.page) as usize;
-            let take = (self.page as usize - idx).min(n - i);
-            let dst = &mut out[i..i + take];
-            match map.get(&(o / self.page)) {
+        self.for_pages(off, out.len() as u64, |key, idx, take, done| {
+            let dst = &mut out[done..done + take];
+            match map.get(&key) {
                 Some(p) => dst.copy_from_slice(&p[idx..idx + take]),
                 None => dst.fill(0),
             }
-            i += take;
-        }
+        });
     }
 
-    // The bulk slice-store (the write counterpart of `read_into`): locks the page map ONCE and
-    // copies whole page-aligned chunks with `copy_from_slice`, instead of the per-byte `set_byte`
-    // (a lock + `BTreeMap` entry per byte). The hot fork/checkpoint `seed` copies the whole 2 MB
-    // window through here, so on the non-mmap `Paged` path this is the difference between ~2 M
-    // locked map ops and ~32 page inserts (#1080 browser bash-fork perf).
+    // The bulk slice-store (the write counterpart of `read_into`), instead of the per-byte
+    // `set_byte` (a lock + `BTreeMap` entry per byte). The hot fork/checkpoint `seed` copies the whole
+    // 2 MB window through here, so on the non-mmap `Paged` path this is the difference between ~2 M
+    // locked map ops and ~32 page inserts (#1080 browser bash-fork perf). Bytes past `size` are
+    // dropped.
     fn write_from(&self, off: u64, data: &[u8]) {
         let page_sz = self.page as usize;
         let mut map = self.lock();
-        let mut i = 0usize;
-        while i < data.len() {
-            let o = off.saturating_add(i as u64);
-            if o >= self.size {
-                break;
-            }
-            let idx = (o % self.page) as usize;
-            let take = (page_sz - idx).min(data.len() - i);
-            let p = map
-                .entry(o / self.page)
-                .or_insert_with(|| vec![0u8; page_sz]);
-            p[idx..idx + take].copy_from_slice(&data[i..i + take]);
-            i += take;
-        }
+        self.for_pages(off, data.len() as u64, |key, idx, take, done| {
+            map.entry(key).or_insert_with(|| vec![0u8; page_sz])[idx..idx + take]
+                .copy_from_slice(&data[done..done + take])
+        });
     }
 
     // The atomic ops hold the lock across the whole read-modify-write, so they are atomic with
