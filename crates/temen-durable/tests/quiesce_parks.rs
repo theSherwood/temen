@@ -772,3 +772,133 @@ fn a_vcpu_stopped_before_the_freeze_is_brought_through_it() {
     );
     assert_eq!(h.stdout, b"x");
 }
+
+/// Run `inst` on `h` over `win` on a thread, failing (not hanging) after 20 s.
+fn within_20s(
+    inst: &Inst,
+    args: &[Value],
+    win: &[u8],
+    mut h: Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u8>, Host) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (inst, args, win) = (inst.clone(), args.to_vec(), win.to_vec());
+    std::thread::spawn(move || {
+        let mut fuel = 1_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
+        let _ = tx.send((r, snap, h));
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("the run completes")
+}
+
+/// The root spawns a sibling, reads one byte from stdin, joins the sibling and returns
+/// `1000·read + byte + joined`. The sibling loops, writes `y` to stdout and returns 7.
+const SRC_STDIN_PARKED_ROOT: &str = r#"
+memory 17
+func (i32, i32) -> (i64) {
+block 0 (vin: i32, vout: i32) {
+  vz = i64.const 0
+  vo64 = i64.extend_i32_u vout
+  vt = thread.spawn 1 vz vo64
+  vbuf = i64.const 66100
+  vlen = i64.const 1
+  vn = call.cap 0 0 (i64, i64) -> (i64) vin (vbuf, vlen)
+  vj = thread.join vt
+  vk = i64.const 1000
+  vnk = i64.mul vn vk
+  vb = i32.load8_u vbuf
+  vb64 = i64.extend_i32_u vb
+  vs = i64.add vnk vb64
+  vres = i64.add vs vj
+  return vres
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vi0 = i64.const 0
+  br 1(varg, vi0)
+}
+block 1 (va: i64, vi: i64) {
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 1000
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(va, vi2) 2(va)
+}
+block 2 (va2: i64) {
+  vw = i32.wrap_i64 va2
+  vbuf = i64.const 66200
+  vy = i32.const 121
+  i32.store8 vbuf vy
+  vlen = i64.const 1
+  vn = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vlen)
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+/// A durable powerbox whose stdin blocks when empty (an interactive session), and the root's args:
+/// its stdin and stdout handles.
+fn stdin_host(inst: &Inst) -> (Host, [Value; 2]) {
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_self_module(inst);
+    let vin = h.grant_stream(temen_interp::StreamRole::In);
+    let vout = h.grant_stream(temen_interp::StreamRole::Out);
+    h.set_stdin_blocking(true);
+    (h, [Value::I32(vin), Value::I32(vout)])
+}
+
+/// **#1899 — a vCPU parked on a stream read is brought through a freeze, and its read re-issued.**
+/// The root parks reading an empty stdin, then the freeze lands in its sibling. The stream read
+/// was not rewound (its wake delivers the result), and no rule re-admitted it, so the freeze waited
+/// for input that might never come. Now it is re-admitted with its read abandoned, and unwinds;
+/// thawed with input waiting, it re-issues the read and gets the byte: `1000 + 'x' + 7`.
+#[test]
+fn a_stdin_parked_root_is_abandoned_and_its_read_reissued_on_thaw() {
+    let inst = instrumented(SRC_STDIN_PARKED_ROOT);
+    let (h, args) = stdin_host(&inst);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after_backedges(&mut win, 5);
+    let (res, snap, mut h) = within_20s(&inst, &args, &win, h);
+    assert_eq!(
+        res,
+        Ok(vec![Value::I64(0)]),
+        "the root unwinds for the freeze"
+    );
+    assert_eq!(h.frozen_vcpus().len(), 1, "the sibling is in the cut");
+
+    h.push_stdin(b"x");
+    let mut win2 = snap;
+    begin_thaw(&mut win2, TEST_ARENA, 0);
+    let (res2, _, _) = within_20s(&inst, &args, &win2, h);
+    assert_eq!(
+        res2,
+        Ok(vec![Value::I64(1000 + i64::from(b'x') + 7)]),
+        "the thawed root re-issues its read and gets the byte"
+    );
+}
+
+/// The same read reached under a landing freeze parks with the phase, and the freeze in flight
+/// re-admits it the same way.
+#[test]
+fn a_stdin_read_under_a_landing_freeze_is_abandoned_and_reissued() {
+    let inst = instrumented(SRC_STDIN_PARKED_ROOT);
+    let (h, args) = stdin_host(&inst);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+    let (res, snap, mut h) = within_20s(&inst, &args, &win, h);
+    assert_eq!(
+        res,
+        Ok(vec![Value::I64(0)]),
+        "the root unwinds for the freeze"
+    );
+
+    h.push_stdin(b"x");
+    let mut win2 = snap;
+    begin_thaw(&mut win2, TEST_ARENA, 0);
+    let (res2, _, _) = within_20s(&inst, &args, &win2, h);
+    assert_eq!(res2, Ok(vec![Value::I64(1000 + i64::from(b'x') + 7)]));
+}

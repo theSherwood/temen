@@ -317,6 +317,17 @@ where it sits, not what kind it is:
   either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
   case that needs per-operation semantics.
 
+**One rule per park site (#1898).** The oracle's scheduler parks a vCPU in one of thirteen waiter
+collections, each a `ParkSite` with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
+freeze; its op is abandoned and the thaw re-issues it), **phase** (it stays parked and another
+vCPU's unwind wakes it), or **decline** (no rule yet: the census refuses the freeze up front,
+`DeclineCause::Parked(site)`, rather than start one that would stall). Every list that walks the
+parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a new
+collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
+`waitpid`, a job-control stop, and a stream read. Phase: `thread.join`, a lane. Decline: a fork-twin
+`wait(-1)` (#1688), a reply or completion in flight (#1901), and an offer admission, which a durable
+caller never reaches (#1681).
+
 So a freeze fails only while one of these rules is unimplemented. Each `DeclineCause` (#1671) and
 each `NonDurableKind` (§12.5) is a gap against this rule, tracked in #1703, not a permanent carve-out.
 The exceptions are the by-design ones #1703 lists, such as an un-attested `Module` grant: those

@@ -1,12 +1,12 @@
 //! #1286 — **`instantiate_detached` (op 15) on the resumable `Vcpu` engine.** The tree-walker hosts
 //! detached windows itself (`detached_windows.rs`); the resumable engine instead **surfaces** the spawn
 //! as [`bytecode::VcpuEvent::InstantiateDetached`] — no carve, the host mints the window — after doing
-//! the authority-bearing work in-engine: the `Instantiator` resolved, the module compiled + pushed to the
-//! shared source, the detached-spawn `Budget` quota taken (a miss lands `-EINVAL` probeably), the grant list
-//! re-granted and stashed, and the optional spawn-time **args payload** read out of the parent's window.
-//! The host here seeds the fresh window (data segments + payload at `module_args_base()`) and runs the
-//! child with `new_confined_child_grow_over_host` — exactly what the browser's op-13 servicer does over a
-//! detached child's own `WebAssembly.Memory`.
+//! the authority-bearing work in-engine, in the one admission every driver uses: the `Instantiator`
+//! resolved, the module compiled + pushed to the shared source, the detached-spawn `Budget` quota taken
+//! (a miss lands `-EINVAL` probeably), the child's powerbox built, and the optional spawn-time **args
+//! payload** read out of the parent's window. The host here only mints a backing for the window and
+//! starts the admitted child over it (`take_child` + `PendingChild::start`, which seeds the data
+//! segments and the payload at `module_args_base()`).
 
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
@@ -82,9 +82,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
     )
 }
 
-/// The host side of the protocol: mint a window of the child's declared size, seed the module's data
-/// segments and the payload, run the child (granted powerbox if the engine stashed one), deliver the
-/// join handle. Records the payload the event carried for the assertions.
+/// The host side of the protocol: mint a backing of the child's declared size, start the admitted
+/// child over it, deliver the join handle. Records the payload the event carried for the assertions.
 fn drive(
     prog: &bytecode::VcpuProgram,
     child_mod: &temen_ir::Module,
@@ -97,12 +96,10 @@ fn drive(
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
             bytecode::VcpuEvent::InstantiateDetached {
-                module,
-                entry,
                 size_log2,
-                fuel,
                 args,
                 data,
+                ..
             } => {
                 seen_payload.push(args.clone());
                 assert_eq!(
@@ -112,22 +109,11 @@ fn drive(
                 );
                 // The fresh window: the host's to allocate — nothing of it in the parent's.
                 let back = Arc::new(Region::new(1u64 << size_log2, 4096));
-                for seg in data.iter() {
-                    back.write_from(seg.offset, &seg.bytes);
-                }
-                back.write_from(temen_ir::module_args_base(), &args);
-                // Committed window = the declared size; starter caps span the reservation (a root's
-                // shape), so the child may `vm_map`-grow — the tree-walker's op-15 grants the same.
-                let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
-                let child = match vcpu.take_granted_host() {
-                    Some(host) => bytecode::Vcpu::new_confined_child_grow_over_host(
-                        prog, module, entry, back, size_log2, reserved, fuel, host,
-                    ),
-                    None => bytecode::Vcpu::new_confined_child_grow(
-                        prog, module, entry, back, size_log2, reserved, fuel,
-                    ),
-                }
-                .expect("detached child builds");
+                let child = vcpu
+                    .take_child()
+                    .expect("an InstantiateDetached carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("detached child builds");
                 let r = drive(prog, child_mod, child, seen_payload);
                 let handle = children.len() as i32;
                 children.push(r);
@@ -227,7 +213,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 /// #1299 — the resumable engine's op-15 arm had **no durable gate** (the tree-walker's and the native
 /// thunk's refuse): a durable domain could mint a detached child no freeze can see. Now it lands
-/// `-EINVAL` before the quota take, exactly like the other refusals in `event_instantiate_detached`.
+/// `-EINVAL` before the quota take, exactly like the other refusals in `admit_detached_child`.
 #[test]
 fn a_durable_domain_refuses_a_detached_spawn_without_surfacing() {
     let (r, seen) = run_in(SPAWN_ONLY_PARENT, 1 << 16, true);

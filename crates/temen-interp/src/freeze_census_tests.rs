@@ -185,3 +185,57 @@ fn an_unreaped_fork_twin_declines() {
     rs.lock().forked_twins.remove(&9); // reaped
     assert_eq!(f.census(&f.root_seat()), None);
 }
+
+/// A bare vCPU of the fixture's root domain, to park by hand.
+fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
+    let funcs: Arc<[Func]> = Arc::from(vec![Func {
+        params: vec![],
+        results: vec![],
+        blocks: vec![temen_ir::Block {
+            params: vec![],
+            insts: vec![],
+            term: Terminator::Return(vec![]),
+        }],
+    }]);
+    let dt = Arc::new(DomainTable::new(&funcs, 0));
+    Box::new(VCpu::new(
+        funcs,
+        Arc::from(Vec::new()),
+        0,
+        &[],
+        None,
+        Arc::clone(&f.root),
+        0,
+        0,
+        id,
+        f.sched.clone(),
+        Quota::default(),
+        dt,
+    ))
+}
+
+/// #1898 — a vCPU parked where a freeze has no rule yet declines it up front, naming the site; one
+/// parked where the rule is to re-issue does not.
+#[test]
+fn a_vcpu_parked_at_a_decline_site_declines() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    rs.lock()
+        .ticket_waiters
+        .insert((1, 2), Waiter::VCpu(parked_vcpu(&f, 5)));
+    assert_eq!(
+        f.census(&f.root_seat()),
+        Some(DeclineCause::Parked(ParkSite::Reply))
+    );
+    let v = rs.lock().take(ParkSite::Reply, false);
+    assert_eq!(v.len(), 1);
+
+    rs.lock()
+        .cap_waiters
+        .entry((1, 3))
+        .or_default()
+        .push(Waiter::VCpu(parked_vcpu(&f, 6)));
+    assert_eq!(f.census(&f.root_seat()), None, "a stream read re-issues");
+}
