@@ -192,6 +192,14 @@ pub unsafe extern "C" fn cap_thunk(
     n_results: u64,
     trap_out: *mut i64,
 ) {
+    // #1166: this thunk takes the `Host` as a raw `&mut`, so it serves one caller at a time. A call
+    // from a `thread.spawn`ed vCPU means the guest is concurrent, and a concurrent guest runs
+    // [`cap_thunk_locked`] (`jit_cap_run` picks it on `uses_concurrency`). Refuse rather than race the
+    // `Host`: six workers entering here at once raced its lazily built page map (#1166).
+    if temen_jit::on_spawned_vcpu() {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return;
+    }
     // F3 (FIBER_PARK.md) — a punt INSIDE A FIBER parks the fiber, not this OS thread: route
     // through the pending face so the dispatch can punt to the pool, then park-poll on the
     // completion cell (`fiber_cap_wait`) — the §3.6 slice-5a contract, completion form, the

@@ -1,10 +1,11 @@
-// nimony's own driver in a real browser (#958): the wasm export `temen_nim_build` builds a nim program
-// the way `scripts/ci/nim-selfhost-lane.sh`'s step 4 does natively — `nimony t --isMain prog.nim`, which
-// forks and execs nifmake, `/bin/sh`, nifler2, nimsem, hexer and temen-link, and a compile-time
-// evaluation's own build — every process on the interpreter tier inside Chromium, but temen-link, which
-// the engine serves natively. Reports the build's wall-clock and the engine's linear memory after it (a
-// wasm memory only grows, so that is its peak). A measurement, not a gate; it fails only when the build
-// does not link the module it should.
+// nimony's own driver in a real browser (#958): the wasm export `temen_nim_open` opens a build of a nim
+// program the way `scripts/ci/nim-selfhost-lane.sh`'s step 4 builds it natively — `nimony t --isMain
+// prog.nim`, which forks and execs nifmake, `/bin/sh`, nifler2, nimsem, hexer and temen-link, and a
+// compile-time evaluation's own build — and the cooperative driver (`driveCoopTierupRun`) runs it inside
+// Chromium: the process tree on the interpreter tier, each leaf process that cannot park whole on the
+// emitted tier (#1896), and temen-link natively. Reports the build's wall-clock and the engine's linear
+// memory after it (a wasm memory only grows, so that is its peak). A measurement, not a gate; it fails
+// only when the build does not link the module it should.
 //
 //   NIM_LANE_DIR=<dir> NIM_TREE=<tree> NIM_PROG=prog.nim [NIM_AT=<dir>] [NIM_LIB=<pack>] \
 //     [NIM_EXPECT=<module>] [NIM_MAX_PAGES=65536] node bench_nimony.mjs
@@ -99,6 +100,7 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 const maxPages = Number(process.env.NIM_MAX_PAGES || 0) || undefined;
 const res = await page.evaluate(async ({ maxPages }) => {
   const par = await import('./par.js');
+  const { driveCoopTierupRun } = await import('./wasmjit-module.js');
   const eng = await par.loadEngine(null, { maxPages });
   const { ex, memory } = eng;
   const fetchB = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
@@ -134,7 +136,8 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const args = [put(driver), put(cmds), put(tree), put(argv), put(enc.encode(m.dir))].flat();
   const before = memory.buffer.byteLength;
   const t0 = performance.now();
-  const status = ex.temen_nim_build(...args);
+  if (ex.temen_nim_open(...args) !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
+  const status = await driveCoopTierupRun(ex, memory);
   const secs = (performance.now() - t0) / 1000;
   // Reported at once, so a failure reading the results back cannot lose the measurement.
   console.log(`nimbench: status ${status} in ${secs.toFixed(1)} s, linear memory ` +

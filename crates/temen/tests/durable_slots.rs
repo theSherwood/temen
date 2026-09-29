@@ -490,8 +490,9 @@ fn run(
 ))]
 mod jit {
     use super::*;
-    use core::ffi::c_void;
+    use std::sync::Mutex;
     use temen_jit::{compile_and_run_durable, DurableResidue, DurableRun, JitError, JitOutcome};
+    use temen_run::CapCtx;
 
     pub type Out = (Result<i64, String>, Vec<u8>, Residue);
 
@@ -514,19 +515,25 @@ mod jit {
                 ..Default::default()
             },
         };
-        let (out, window, residue) = match compile_and_run_durable(
+        // The guests spawn vCPUs that `call.cap` from their own OS threads: the host goes behind the
+        // serialized thunk's lock for the run, and comes back after (#1166).
+        let hm = Mutex::new(std::mem::take(h));
+        let cc = CapCtx::Locked(&hm);
+        let run = compile_and_run_durable(
             inst,
             0,
             &[clk as i64],
             win,
             SIZE_LOG2,
-            temen_run::cap_thunk,
-            h as *mut Host as *mut c_void,
+            cc.thunk(),
+            cc.ptr(),
             DurableRun {
                 seed,
                 ..Default::default()
             },
-        ) {
+        );
+        *h = hm.into_inner().unwrap_or_else(|e| e.into_inner());
+        let (out, window, residue) = match run {
             Ok(t) => t,
             Err(JitError::Unsupported(_)) => return None,
             Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return None,

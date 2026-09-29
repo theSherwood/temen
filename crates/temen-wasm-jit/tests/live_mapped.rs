@@ -11,8 +11,10 @@
 //! (a byte `< M` is backed → admitted; `>= M` is uncommitted → faults). The default-`M` case
 //! reproduces the old baked-constant behavior, pinned already by the full `differential.rs` suite.
 //!
-//! Escape safety is unchanged: the `& MASK` clamp to `reserved` is always emitted, so a wrong `M`
-//! here is at worst a trap-parity divergence (caught differentially), never a confinement escape.
+//! The check is the whole of escape safety here: the emitted module's memory is the embedder's linear
+//! memory and `& MASK` clamps only to the 2^40 reservation, so whatever `M` the host writes, the check
+//! must admit no more than `[0, M)` — including an `M` smaller than the access (the tests below
+//! drive `M` down to 0).
 
 use temen_wasm_jit::{compile_module, TRAP_MEMORY_FAULT};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -32,67 +34,93 @@ enum R {
     OtherTrap,
 }
 
-/// Compile `src` (TEMEN-text), instantiate under wasmi with the `"mapped"` global forced to
-/// `live_mapped`, and run `f0(win, env, ...args)`. Returns the single i64 result, or the trap class.
-fn run_at_mapped(src: &str, args: &[i64], live_mapped: u64) -> R {
-    let m = temen_text::parse_module(src).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let wasm = compile_module(&m).expect("emit");
+/// A kernel compiled from TEMEN-text and instantiated once under wasmi, run at chosen live extents.
+struct Kernel {
+    store: Store<i32>,
+    instance: wasmi::Instance,
+    results: usize,
+}
 
-    let engine = Engine::default();
-    let module = WModule::new(&engine, &wasm).expect("emitted wasm must validate");
-    let mut store: Store<i32> = Store::new(&engine, 0);
-    let pages = (WIN_BASE + MAX_EXTENT) / 0x1_0000 + 2;
-    let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
-    let mut linker: Linker<i32> = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    linker
-        .func_wrap("env", "trap", |mut caller: Caller<'_, i32>, code: i32| {
-            *caller.data_mut() = code;
-        })
-        .unwrap();
-    linker
-        .func_wrap::<_, ()>(
-            "env",
-            "call_interp",
-            |_: Caller<'_, i32>, _f: i32, _a: i32| unreachable!("in-subset kernel"),
-        )
-        .unwrap();
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .unwrap()
-        .start(&mut store)
-        .unwrap();
-    if let Some(g) = instance.get_global(&store, "fuel") {
-        g.set(&mut store, Val::I64(FUEL)).unwrap();
-    }
-    // The change under test: override the live window size the bounds check reads.
-    instance
-        .get_global(&store, "mapped")
-        .expect("mapped global exported")
-        .set(&mut store, Val::I64(live_mapped as i64))
-        .unwrap();
+impl Kernel {
+    fn new(src: &str) -> Kernel {
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let wasm = compile_module(&m).expect("emit");
 
-    let f = instance.get_func(&store, "f0").expect("f0 exported");
-    let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
-    for a in args {
-        params.push(Val::I64(*a));
+        let engine = Engine::default();
+        let module = WModule::new(&engine, &wasm).expect("emitted wasm must validate");
+        let mut store: Store<i32> = Store::new(&engine, 0);
+        let pages = (WIN_BASE + MAX_EXTENT) / 0x1_0000 + 2;
+        let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+        let mut linker: Linker<i32> = Linker::new(&engine);
+        linker.define("env", "memory", memory).unwrap();
+        linker
+            .func_wrap("env", "trap", |mut caller: Caller<'_, i32>, code: i32| {
+                *caller.data_mut() = code;
+            })
+            .unwrap();
+        linker
+            .func_wrap::<_, ()>(
+                "env",
+                "call_interp",
+                |_: Caller<'_, i32>, _f: i32, _a: i32| unreachable!("in-subset kernel"),
+            )
+            .unwrap();
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .unwrap()
+            .start(&mut store)
+            .unwrap();
+        let results = m.funcs[0].results.len();
+        Kernel {
+            store,
+            instance,
+            results,
+        }
     }
-    let mut results: Vec<Val> = m.funcs[0].results.iter().map(|_| Val::I64(0)).collect();
-    match f.call(&mut store, &params, &mut results) {
-        Ok(()) => R::Val(match results.first() {
-            Some(Val::I64(x)) => *x,
-            Some(Val::I32(x)) => *x as i64,
-            _ => 0,
-        }),
-        Err(_) => {
-            if *store.data() == TRAP_MEMORY_FAULT {
-                R::MemFault
-            } else {
-                R::OtherTrap
+
+    /// Run `f0(win, env, ...args)` with the `"mapped"` global forced to `live_mapped`. Returns the
+    /// single result, or the trap class.
+    fn run(&mut self, args: &[i64], live_mapped: u64) -> R {
+        let store = &mut self.store;
+        *store.data_mut() = 0;
+        if let Some(g) = self.instance.get_global(&*store, "fuel") {
+            g.set(&mut *store, Val::I64(FUEL)).unwrap();
+        }
+        // The change under test: override the live window size the bounds check reads.
+        self.instance
+            .get_global(&*store, "mapped")
+            .expect("mapped global exported")
+            .set(&mut *store, Val::I64(live_mapped as i64))
+            .unwrap();
+
+        let f = self.instance.get_func(&*store, "f0").expect("f0 exported");
+        let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
+        for a in args {
+            params.push(Val::I64(*a));
+        }
+        let mut results = vec![Val::I64(0); self.results];
+        match f.call(&mut *store, &params, &mut results) {
+            Ok(()) => R::Val(match results.first() {
+                Some(Val::I64(x)) => *x,
+                Some(Val::I32(x)) => *x as i64,
+                _ => 0,
+            }),
+            Err(_) => {
+                if *store.data() == TRAP_MEMORY_FAULT {
+                    R::MemFault
+                } else {
+                    R::OtherTrap
+                }
             }
         }
     }
+}
+
+/// Compile `src` (TEMEN-text), instantiate under wasmi with the `"mapped"` global forced to
+/// `live_mapped`, and run `f0(win, env, ...args)`. Returns the single i64 result, or the trap class.
+fn run_at_mapped(src: &str, args: &[i64], live_mapped: u64) -> R {
+    Kernel::new(src).run(args, live_mapped)
 }
 
 /// `memory 16` ⇒ emit-time mapped = 65536. A load of 8 bytes from a param address.
@@ -247,6 +275,116 @@ fn boundary_sweep_bulk_span() {
                 ok, want_ok,
                 "bulk boundary: M={m} dst={dst} len={len} want_ok={want_ok} got={got:?}"
             );
+        }
+    }
+}
+
+/// A load at `addr + 16408`: an offset past the NULL guard, so an address that wraps `addr + offset`
+/// around to a small value lands on backed window bytes rather than on the guard.
+const LOAD8_OFF: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vr = i64.load v0 offset=16400
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_live_extent_below_the_access_width_admits_nothing() {
+    // `M < width` leaves no `width`-byte access inside `[0, M)`. The check once computed
+    // `M - width`, which wrapped to 2^64 - (width - M) and admitted every address — the whole of
+    // the embedder's linear memory, since the clamp is to the reservation, not the window. The
+    // probes sit past the NULL guard, where only the bounds check stands between them and a load.
+    for m in [0, 1, W - 1] {
+        for addr in [16384, (DECLARED - W) as i64, 1 << 19] {
+            assert_eq!(
+                run_at_mapped(LOAD8, &[addr], m),
+                R::MemFault,
+                "M={m} addr={addr}: nothing fits"
+            );
+        }
+    }
+    // At `M = width` the one word `[0, 8)` fits the bound, and the NULL guard faults it.
+    assert_eq!(run_at_mapped(LOAD8, &[0], W), R::MemFault);
+    assert_eq!(run_at_mapped(LOAD8, &[16384], W), R::MemFault);
+}
+
+#[test]
+fn an_address_whose_offset_overflows_faults() {
+    // `Window::checked` faults when `addr + offset` overflows. The emitted `eff = addr + offset`
+    // once wrapped instead, here to 16392, a backed word past the NULL guard, and loaded it.
+    let addr = -8i64; // 2^64 - 8
+    assert_eq!(run_at_mapped(LOAD8_OFF, &[addr], DECLARED), R::MemFault);
+    // The same offset from a real address is admitted up to the window's end, and no further.
+    assert_eq!(run_at_mapped(LOAD8_OFF, &[0], DECLARED), R::Val(0));
+    let last = (DECLARED - W - 16400) as i64;
+    assert_eq!(run_at_mapped(LOAD8_OFF, &[last], DECLARED), R::Val(0));
+    assert_eq!(run_at_mapped(LOAD8_OFF, &[last + 1], DECLARED), R::MemFault);
+}
+
+#[test]
+fn the_check_is_window_checked_at_every_live_extent() {
+    // The emitted check against `temen_mask::Window::checked` itself, the one definition: over
+    // scalar widths, offsets (none, small, past the NULL guard, past 32 bits), and every edge of
+    // the live extent — below the widest access, around the guard and the declared window — and of
+    // the address, where `addr + offset` and `addr + offset + width` overflow. Admitted means the
+    // bytes are inside `[0, M)` and past the NULL guard, which faults every access below it.
+    let guard = 16384u64;
+    let loads = [
+        (1u64, "i32.load8_u", "i32"),
+        (2, "i32.load16_u", "i32"),
+        (4, "i32.load", "i32"),
+        (8, "i64.load", "i64"),
+    ];
+    let extents: Vec<u64> = (0..=17)
+        .chain([
+            guard - 1,
+            guard,
+            guard + 1,
+            DECLARED - 1,
+            DECLARED,
+            DECLARED + 1,
+        ])
+        .chain([u64::from(MAX_EXTENT)])
+        .collect();
+    for (width, op, ty) in loads {
+        for offset in [0u64, 3, 16400, (1 << 32) + 7] {
+            let src = format!(
+                "memory 16\nfunc (i64) -> ({ty}) {{\nblock 0 (v0: i64) {{\n  \
+                 vr = {op} v0 offset={offset}\n  return vr\n  }}\n}}\n"
+            );
+            let mut kernel = Kernel::new(&src);
+            for &m in &extents {
+                let fit = m.wrapping_sub(offset).wrapping_sub(width);
+                let addrs = [
+                    0,
+                    1,
+                    guard - 1,
+                    guard,
+                    fit.wrapping_sub(1),
+                    fit,
+                    fit.wrapping_add(1),
+                    m,
+                    0u64.wrapping_sub(offset).wrapping_sub(width),
+                    0u64.wrapping_sub(offset),
+                    u64::MAX - 7,
+                    u64::MAX,
+                    1 << 63,
+                ];
+                for addr in addrs {
+                    let window = temen_mask::Window::with_mapped(40, m);
+                    let admitted = window.checked(addr, offset, width as u32).is_some()
+                        && addr + offset >= guard;
+                    let want = if admitted { R::Val(0) } else { R::MemFault };
+                    assert_eq!(
+                        kernel.run(&[addr as i64], m),
+                        want,
+                        "{op} offset={offset} at {addr:#x}, M={m}"
+                    );
+                }
+            }
         }
     }
 }

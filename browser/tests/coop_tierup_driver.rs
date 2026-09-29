@@ -1231,9 +1231,10 @@ fn drive_coop_b2_session_allow_trap(m: &temen_ir::Module) -> (CoopB2Driver, u32)
 
 /// The `__temen_malloc` shape, reduced: a tier-up-eligible leaf calls a helper that `vm_map`s
 /// `[off, off+len)` RW and returns `off`, then stores through the freshly mapped address and reads
-/// it back. `declared` sets the module's `memory N`; `ro` adds a `readonly` segment, which is what
-/// flips `temen_coop_open` into **paged** mode (every real on-ramp card lays its `.rodata` out that
-/// way, so both modes must carry the grow).
+/// it back. `declared` sets the module's `memory N`; `ro` adds a `readonly` segment (every real
+/// on-ramp card lays its `.rodata` out that way). Either way the run opens **paged**: the helper
+/// `vm_map`s, and a map can leave a hole below the page it commits, which one bound cannot describe
+/// and a region cannot decline mid-flight at (#1919).
 ///
 /// The interpreter oracle reserves `DEFAULT_RESERVED_LOG2` and grows on demand, so every case below
 /// succeeds there. The cooperative tier used to clamp its reservation to the run window, making any
@@ -1291,10 +1292,9 @@ fn assert_grow_case(name: &str, off: u64, len: u64, declared: u8, ro: bool, want
 
     let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(opened, 0, "[{name}] coop open (status {})", temen_status());
-    assert_eq!(
+    assert!(
         temen_coop_paged() != 0,
-        ro,
-        "[{name}] a readonly segment opens the run paged"
+        "[{name}] a guest that maps pages opens the run paged (#1919)"
     );
     let opened_len = temen_coop_win_len();
     let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
@@ -1329,7 +1329,7 @@ fn coop_grow_past_the_run_window_matches_the_oracle() {
     let _g = ffi_guard();
     const WIN: u64 = 1 << 25; // JIT_RUN_WIN_LOG2 — the run window `temen_coop_open` opens with
     for &ro in &[false, true] {
-        let tag = if ro { "paged" } else { "scalar" };
+        let tag = if ro { "rodata" } else { "plain" };
         // A grow that starts inside the window and runs past its end.
         assert_grow_case(
             &format!("{tag}/crosses-the-window"),
@@ -1360,7 +1360,7 @@ fn coop_grow_past_the_run_window_matches_the_oracle() {
         );
     }
     // A grow that stays inside the window keeps working, and does not grow the backing.
-    assert_grow_case("scalar/inside-the-window", 65536, 16384, 16, false, false);
+    assert_grow_case("plain/inside-the-window", 65536, 16384, 16, false, false);
 }
 
 /// Growth is bounded by the **reservation**, not by "whatever the allocator will give us": a map
