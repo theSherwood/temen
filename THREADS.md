@@ -230,9 +230,14 @@ property, so in practice:
     asserts the same in **real Chromium** (the `#jit` work item). Validates std `Mutex<Vec<Arc<…>>>`
     (the `Domain`'s `ModuleSource`) working cross-Worker on wasm atomics. (Invoked units still run over
     the vCPU's deny-all powerbox — a `call.cap`ing unit is out of scope, the C1 limitation.)
-  - **§14 `instantiate` in parallel** — a confined executor child runs as a **nested confined
-    parallel run**: its own `nested_view` sub-window (own page-prot map over the shared backing), its
-    own attenuated powerbox (`Instantiator` + `AddressSpace`), its own natural dispatch table
+  - **§14 `instantiate` in parallel** *(Retiring: this design runs each child over a carve of the
+    shared backing — `nested_view`, `carve_region` — and the carve path is being deleted (INVARIANTS
+    #13, 2026-09-29; #1289). The detached equivalent is op 15: `drive_parallel` and the resumable
+    `Vcpu` (`VcpuEvent::InstantiateDetached`) run the child over its own `Mem`, and the browser runs
+    it on its own Worker over a per-child `WebAssembly.Memory` through `Region::Foreign`
+    (`temen_par_child_detached`; DETACHED_JIT.md §3.1, §3.3).)* — a confined executor child runs as
+    a **nested confined parallel run**: its own `nested_view` sub-window (own page-prot map over the
+    shared backing), its own attenuated powerbox (`Instantiator` + `AddressSpace`), its own natural dispatch table
     (`Domain::child` over the shared source `Arc`, no parent install slots), a quota sub-allocated from
     the parent's fuel, and its **own** thread registry for anything it spawns — on its own scoped
     thread, joinable through the parent's registry. The cooperative driver's single `extra_envs` vec

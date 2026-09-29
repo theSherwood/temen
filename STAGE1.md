@@ -13,6 +13,11 @@ no fork-returns-twice yet.
 
 ## The substrate already exists
 
+> **Retiring:** this section describes the carve path, which is being deleted (INVARIANTS #13,
+> 2026-09-29; #1289). The detached equivalent is op 15 (`instantiate_detached`: its own window,
+> by-name grants), with argv in its spawn-time args payload and the status through `join`
+> (DETACHED_JIT.md §1).
+
 The child-domain machinery is built and CI-gated; Stage 1 is **personality
 glue, not new substrate**:
 
@@ -47,6 +52,12 @@ substrate an "external program" is a verified `Module`; running one is
 map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 ## Slice plan
+
+> **Retiring:** slices 1–6 spawn commands into carves (op 5/13, argv seeded into the child's carve,
+> parent-as-pager output read back from it), and the carve path is being deleted (INVARIANTS #13,
+> 2026-09-29; #1289). The detached equivalent is op 15: argv in its spawn-time args payload, output
+> through inherited stdio or a `SharedRegion` pre-mapped by op 15's `(region, child_off)`, status
+> through `join`. Slice 6's ring already runs between detached stages.
 
 0. **Unmodified `main(argc, argv)` on chibicc** *(done —
    `stage1_argv_main.rs`)* — the "as close to native as the security model
@@ -177,7 +188,8 @@ keystone of self-similarity. It is **not built**. Until it lands:
 - **`cmd` → terminal**: op 13, forwarding the real stdout. **Done.**
 - **`cmd > file`, `cmd | cmd2`** (shell-side interception): needs `Endpoint`
   (Power 2). The stopgap is the parent-as-pager model (`stage1_foreign_command.rs`
-  — the command writes to its carve, the parent forwards), which requires a
+  — the command writes to its carve, the parent forwards; with the carve retired, INVARIANTS #13
+  2026-09-29, that memory becomes a `SharedRegion` pre-mapped by op 15), which requires a
   command written to output to memory rather than an ambient fd, so it is **not**
   a drop-in for unmodified compiled commands. Real redirection/pipelines of
   external commands wait on the endpoint work.
@@ -434,6 +446,10 @@ Roughly ~80% of that is "solved-class" work (compile + libc + wiring, de-risked 
 already running); the ~20% that gates everything is **`fork` + R8**.
 
 ### The browser-only constraint — and how much of it is *already* there
+
+> **Retiring:** the spawn ops this plan brings to bytecode parity (0, 5, 11, 13) are carve spawns,
+> and the carve path is being deleted (INVARIANTS #13, 2026-09-29; #1289). The detached equivalent,
+> op 15, already runs on the bytecode engine (`VcpuEvent::InstantiateDetached`; DETACHED_JIT.md §1).
 
 Running bash *in the playground* is **not** just "native bash + compile for wasm": the playground is
 **bytecode-only** (the tree-walker uses OS threads + a wall clock, and the wasm-JIT tier is a

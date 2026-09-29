@@ -473,7 +473,10 @@ different things depending on which pair you compare:
   module debug metadata) landed in **slice 17** (single-vCPU *and* scheduled); position-level step-into and
   window reads work here.
 
-  **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** `instantiate` (op 0) is
+  **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** *(Retiring: slices
+  15a–15c debug carve children, and the carve path is being deleted — INVARIANTS #13, 2026-09-29;
+  #1289. The detached equivalent is `dbg_instantiate_detached`: op 15's child as a `DbgEnv` over its
+  own `Mem`, joined like a confined child.)* `instantiate` (op 0) is
   no longer declined on the scheduled engine: `ScheduledDebugRun` grew a per-task `env` (the debug-engine
   counterpart of the production `TaskSlot::env`) and an `extra_envs: Vec<DbgEnv>`. A new `dbg_instantiate`
   helper (mirroring the production `drive`'s `Instantiate` arm) builds a **confined executor child** as
@@ -605,7 +608,10 @@ different things depending on which pair you compare:
   *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
   on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping windows**
   (`map`/`unmap`/`protect`/grow) — root *and* child, plus **demand** (`fault_yields`) coroutines — the
-  page-protection map is captured alongside the bytes. Follow-ups: the §3.6 serve/live-call machinery
+  page-protection map is captured alongside the bytes. (The child half rests on the carve, which is
+  being retired — INVARIANTS #13, 2026-09-29: `child_checkpointable` admits a child only inside its
+  parent's captured prefix, so a detached child's env never checkpoints and its runs replay from 0.
+  No detached equivalent yet — tracked in #1289.) Follow-ups: the §3.6 serve/live-call machinery
   inside a confined child, env teardown / D37 revocation, and — if a use case demands it — extending the
   checkpointable subset to §13 **region-aliased** windows (cross-domain shared bytes) and children carved
   beyond the parent's captured prefix — today those fall back to replay-from-0, which stays correct, just
@@ -1753,7 +1759,9 @@ exposing the read-only/control verbs W1–W3/W7 need (breakpoints, watchpoints, 
 read window/locals, record/replay control, model-check/replay). It is **not** a guest-callable
 capability by default — it is a *host* capability (the embedder/debugger holds it), consistent
 with "debugger observes from outside." Nesting (§14) makes a parent a natural debugger of a
-child.
+child. (That rests on the carve child's parent-readable window, which is being retired —
+INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only by grant; no
+detached equivalent yet — tracked in #1289.)
 
 **Dependencies.** None upstream; it is the integration point. Build the shell first so W1/W2/W3
 land verbs onto it incrementally.
