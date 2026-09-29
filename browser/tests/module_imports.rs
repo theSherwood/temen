@@ -177,19 +177,29 @@ block 0 () {
 #[test]
 fn a_name_the_table_resolves_but_the_powerbox_never_grants_is_not_served() {
     let _g = FFI_LOCK.lock().unwrap();
-    // `stderr` is the case that proves the report asks the *binding*, not the name table.
-    // `default_cap_resolver("stderr")` resolves it — it is `Stream` write, op 1, exactly like
-    // `write` — but the on-ramp powerbox grants no `stderr` handle, so `PowerboxHandles::bind`
-    // returns `None` and the slot stays unbound. Calling it served would hand the program to a
-    // runner that fails closed on its first write to it.
-    let (rc, lines) = text(&module_declaring(&["write", "stderr"]));
+    // `vm_region_map` is the case that proves the report asks the *binding*, not the name table.
+    // `default_cap_resolver` resolves it — `SharedRegion` op 0 — but a region is minted at runtime,
+    // never a manifest slot, so `PowerboxHandles::bind` returns `None` and the slot stays unbound.
+    // Calling it served would hand the program to a runner that fails closed on its first call.
+    let (rc, lines) = text(&module_declaring(&["write", "vm_region_map"]));
     assert_eq!(rc, 1);
     assert_eq!(
         lines,
-        vec!["1\twrite", "0\tstderr"],
-        "same capability and op as `write`, but ungranted — only the binding can tell them apart"
+        vec!["1\twrite", "0\tvm_region_map"],
+        "the name table knows it, but no binding exists — only the binding can tell"
     );
     assert!(!all_served(&lines));
+}
+
+#[test]
+fn stderr_is_served_because_declaring_it_is_what_grants_it() {
+    let _g = FFI_LOCK.lock().unwrap();
+    // `stderr` is `Stream` write, op 1, exactly like `write`, but its own handle: the on-ramp grants
+    // it iff the guest imports it (temen#1915, `Host::grant_stderr_if_imported`), so a program that
+    // writes fd 2 is served — and `onramp_granted_shape` must keep mirroring that decision.
+    let (rc, lines) = text(&module_declaring(&["write", "stderr"]));
+    assert_eq!(rc, 1);
+    assert_eq!(lines, vec!["1\twrite", "1\tstderr"]);
 }
 
 #[test]

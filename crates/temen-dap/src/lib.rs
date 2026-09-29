@@ -78,6 +78,8 @@ struct Session {
     /// only when the captured output *changed*. On a reverse `seek` the output shrinks, so the event
     /// carries the **full** current stdout (not an append delta) and the client replaces its view.
     stdout_shown: usize,
+    /// [`stdout_shown`](Self::stdout_shown)'s twin for the guest's stderr stream.
+    stderr_shown: usize,
 }
 
 impl Session {
@@ -188,7 +190,7 @@ impl DapServer {
             "stackTrace" => self.on_stack_trace(args),
             "scopes" => self.on_scopes(args),
             "variables" => self.on_variables(args),
-            "continue" => self.on_continue(),
+            "continue" => self.on_continue(args),
             "next" => self.on_step(StepKind::Over),
             "stepIn" => self.on_step(StepKind::In),
             "stepOut" => self.on_step(StepKind::Out),
@@ -488,6 +490,7 @@ impl DapServer {
             data_watch_ids: Vec::new(),
             scheduled,
             stdout_shown: 0,
+            stderr_shown: 0,
         });
         (true, Json::Null, vec![])
     }
@@ -676,7 +679,7 @@ impl DapServer {
         } else if self.session.is_none() {
             (false, Json::Null, vec![])
         } else {
-            let stop = self.run_with_conditions();
+            let stop = self.run_with_conditions(None);
             (true, Json::Null, self.stop_events(stop))
         }
     }
@@ -1361,11 +1364,19 @@ impl DapServer {
         (true, body, vec![])
     }
 
-    fn on_continue(&mut self) -> (bool, Json, Vec<Event>) {
-        if self.session.is_none() {
-            return (false, Json::Null, vec![]);
-        }
-        let stop = self.run_with_conditions();
+    fn on_continue(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // `budget` (a Temen extension): run at most this many turns, then stop with reason `pause` —
+        // so a single-threaded embedder can run a long program in slices, streaming its output and
+        // honoring a Pause between them, where one `continue` would otherwise run to the end.
+        let budget = args
+            .and_then(|a| a.get("budget"))
+            .and_then(|b| b.as_i64())
+            .map(|b| b.max(1) as u64);
+        let until = match self.session.as_ref() {
+            Some(s) => budget.map(|b| s.inspector.turn().saturating_add(b)),
+            None => return (false, Json::Null, vec![]),
+        };
+        let stop = self.run_with_conditions(until);
         (
             true,
             Json::obj(vec![("allThreadsContinued", Json::Bool(true))]),
@@ -1375,11 +1386,14 @@ impl DapServer {
 
     /// Resume until a stop, transparently skipping conditional breakpoints whose condition is false
     /// (DEBUGGING.md W5) — so `continue` lands only on breakpoints that actually fire.
-    fn run_with_conditions(&mut self) -> Stop {
+    ///
+    /// `until` bounds the run at that turn (a `pause` stop), for a budgeted `continue`.
+    fn run_with_conditions(&mut self, until: Option<u64>) -> Stop {
         loop {
-            let stop = match self.session.as_mut() {
-                Some(s) => s.inspector.run_until_stop(),
-                None => return Stop::Blocked,
+            let stop = match (self.session.as_mut(), until) {
+                (Some(s), Some(t)) => s.inspector.run_until_turn(t),
+                (Some(s), None) => s.inspector.run_until_stop(),
+                (None, _) => return Stop::Blocked,
             };
             match stop {
                 Stop::Break {
@@ -1770,28 +1784,36 @@ impl DapServer {
         events
     }
 
-    /// A DAP `output` event carrying the guest's captured stdout when a powerbox session's output has
-    /// **changed** since the last stop. The event carries the *full* current stdout — on a reverse `seek`
-    /// the output shrinks, so the client **replaces** its view rather than appending. Empty when there is
-    /// no powerbox output, or it is unchanged (a compute-only / deny-all session never emits one).
+    /// DAP `output` events carrying the guest's captured stdout and stderr, each when a powerbox
+    /// session's stream has **changed** since the last stop (category `stdout` / `stderr`). An event
+    /// carries the stream's *full* current text — on a reverse `seek` the output shrinks, so the client
+    /// **replaces** its view rather than appending. None when there is no powerbox output, or it is
+    /// unchanged (a compute-only / deny-all session never emits one).
     fn output_events(&mut self) -> Vec<Event> {
         let Some(s) = self.session.as_mut() else {
             return vec![];
         };
-        let out = s.inspector.stdout();
-        if out.len() == s.stdout_shown {
-            return vec![];
+        let mut events = Vec::new();
+        for (category, text, shown) in [
+            ("stdout", s.inspector.stdout(), &mut s.stdout_shown),
+            ("stderr", s.inspector.stderr(), &mut s.stderr_shown),
+        ] {
+            if text.len() == *shown {
+                continue;
+            }
+            *shown = text.len();
+            events.push((
+                "output",
+                Json::obj(vec![
+                    ("category", Json::s(category)),
+                    (
+                        "output",
+                        Json::s(String::from_utf8_lossy(text).into_owned()),
+                    ),
+                ]),
+            ));
         }
-        let len = out.len();
-        let text = String::from_utf8_lossy(out).into_owned();
-        s.stdout_shown = len;
-        vec![(
-            "output",
-            Json::obj(vec![
-                ("category", Json::s("stdout")),
-                ("output", Json::s(&text)),
-            ]),
-        )]
+        events
     }
 
     /// The DAP thread id of the stopped thread (vCPU id + 1); `1` in single-threaded mode.
@@ -1943,6 +1965,7 @@ fn dap_reason(r: StopReason) -> &'static str {
         // and resumes after `provideStdin`.
         StopReason::StdinPark => "stdin",
         StopReason::CapPark { .. } => "cap",
+        StopReason::Pause => "pause",
     }
 }
 

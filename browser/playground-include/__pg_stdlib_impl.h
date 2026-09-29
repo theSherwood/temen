@@ -5,11 +5,28 @@
 // file, and `__pg_linkage.h` for what `__PG_FN` means in each of the three compile modes.
 
 #include <stdlib.h>
+#include <unistd.h>
 
 static long __pg_brk = __PG_HEAP_BASE;       // next free byte (bump pointer)
 static long __pg_committed = __PG_HEAP_BASE;  // first byte past committed
 static long __pg_page = 0;                     // cached host page granularity
 static int __pg_grow_lock = 0;                 // spinlock for heap *growth* only
+
+// A block's header: the payload size, then its state. The tag lets `free` refuse what it must not
+// release: a pointer already freed (a double free) or one `malloc` never returned. Memory is still
+// never reused — the tag is bookkeeping, not a free list — so `calloc`'s payload stays zero.
+#define __PG_LIVE 0x6576696c6c6f6d5fL  // "_mollive"
+#define __PG_FREED 0x6465657266676d5fL // "_mgfreed"
+
+// glibc's shape: name the misuse on stderr, then abort. `exit(134)` is what `abort` does (as SIGABRT
+// reads); it is called directly because `abort` is defined further down, and a whole-program compile
+// sees no prototypes.
+static void __pg_heap_abort(const char *msg) {
+  long n = 0;
+  while (msg[n]) n++;
+  write(2, (char *)msg, n);
+  exit(134);
+}
 
 static inline long __pg_pagesize(void) {
   if (__pg_page == 0) {
@@ -44,9 +61,20 @@ __PG_FN void *malloc(size_t n) {
     __vm_atomic_store32(&__pg_grow_lock, 0);
   }
   *(size_t *)hdr = n;
+  ((long *)hdr)[1] = __PG_LIVE;
   return (void *)payload;
 }
-__PG_FN void free(void *p) { (void)p; }
+__PG_FN void free(void *p) {
+  if (!p) return;
+  long a = (long)p;
+  // Only a payload inside the claimed heap has a header to read.
+  if (a < __PG_HEAP_BASE + __PG_HDR || a >= __vm_atomic_load(&__pg_brk) || (a & 15))
+    __pg_heap_abort("free(): invalid pointer\n");
+  long *tag = (long *)(a - __PG_HDR) + 1;
+  if (*tag == __PG_FREED) __pg_heap_abort("free(): double free detected\n");
+  if (*tag != __PG_LIVE) __pg_heap_abort("free(): invalid pointer\n");
+  *tag = __PG_FREED;
+}
 __PG_FN void *calloc(size_t nm, size_t sz) {
   // Fresh window pages are zero-filled by `map` and the bump allocator never reuses a byte, so the
   // payload is already zero.
@@ -59,6 +87,7 @@ __PG_FN void *realloc(void *old, size_t n) {
   if (p) {
     size_t c = oldn < n ? oldn : n;
     for (size_t i = 0; i < c; i++) p[i] = ((char *)old)[i];
+    free(old); // the old block is released, as a real realloc's is
   }
   return p;
 }

@@ -3114,6 +3114,9 @@ fn onramp_granted_shape(m: &temen_ir::Module) -> temen_ir::PowerboxHandles {
     if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
         granted.jit = Some(0);
     }
+    if m.imports.iter().any(|im| im.name == "stderr") {
+        granted.stderr = Some(0); // `grant_onramp_caps` grants it for such a module
+    }
     granted
 }
 
@@ -3637,6 +3640,7 @@ fn grant_onramp_caps(
     // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
     // debugger give it. This host's own capabilities (`Jit`, `vm_fs`, the graphical ones) follow.
     let mut granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
+    granted.stderr = host.grant_stderr_if_imported(&m.imports);
     // §22 guest-driven JIT: grant the `Jit` cap **iff** the guest declares a `__vm_jit_*` import
     // (principle of least authority — a plain on-ramp guest gets no Jit). The JACL self-hosted
     // compiler uses it to expand macros in-guest. Match temen-run's powerbox grant so a self-hosted
@@ -3732,8 +3736,9 @@ pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
 /// The on-ramp capabilities a card can be re-granted as a §14 child (#1720), by the names the
 /// powerbox registers them under. The rest stay with the root: `memory`/`addrspace`/`instantiator` are
 /// minted fresh for the child over its own window (a parent's names coordinates the child cannot use).
-const ONRAMP_NESTED_CAPS: [&str; 10] = [
-    "stdout", "stdin", "exit", "display", "keyboard", "mouse", "webgpu", "fs", "vm_fs", "jit",
+const ONRAMP_NESTED_CAPS: [&str; 11] = [
+    "stdout", "stdin", "stderr", "exit", "display", "keyboard", "mouse", "webgpu", "fs", "vm_fs",
+    "jit",
 ];
 
 /// Wrap `m` for a nested on-ramp run (#1720): the one-node plan that spawns it as a §14 child of a
@@ -4456,8 +4461,9 @@ fn pg_setup(
     // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
         // The shared powerbox ABI (#912). This headless powerbox grants no *sized* address space, so
-        // the whole-window `memory` grant serves both address-space roles; `Jit`/`stderr` are not
-        // granted at all, and an import naming one leaves its slot unbound (fail-closed at dispatch).
+        // the whole-window `memory` grant serves both address-space roles; `Jit` is not granted at
+        // all, and an import naming it leaves its slot unbound (fail-closed at dispatch). `stderr` is
+        // granted as every host running the playground libc grants it: iff imported.
         let granted = temen_ir::PowerboxHandles {
             stdout: out,
             stdin: inp,
@@ -4465,7 +4471,7 @@ fn pg_setup(
             memory,
             addrspace: memory,
             jit: None,
-            stderr: None,
+            stderr: host.grant_stderr_if_imported(&m.imports),
         };
         // The one shared powerbox binder (#1524).
         host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
@@ -8181,6 +8187,129 @@ pub extern "C" fn temen_run_onramp_stream(
         FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
+}
+
+// ===== sliced release run: the on-ramp run, pumped a slice at a time ==============================
+//
+// [`temen_run_onramp`] runs to the end in one call, so an embedder that owns its thread (a browser
+// Worker) can neither show output as it is produced nor stop a program that never ends. This is the
+// same run — the on-ramp powerbox, the same window, the same engine — held open between calls and
+// pumped in op-budgeted slices ([`bytecode::CoopRun::run_for`]): each slice hands back the output it
+// produced, and between slices the embedder can stream it, and honor a Pause by simply not pumping.
+
+struct ReleaseSession {
+    run: bytecode::CoopRun,
+}
+static mut RELEASE: Option<ReleaseSession> = None;
+static mut RELEASE_VALUE: i64 = 0;
+
+/// `temen_release_run`: the run finished — its status, exit code, trap and value are in the read-back
+/// slots, as after [`temen_run_onramp`].
+pub const RELEASE_DONE: i32 = 0;
+/// `temen_release_run`: the slice was spent and the program is still running; pump again.
+pub const RELEASE_RUNNING: i32 = 1;
+
+/// Open a sliced release run of the encoded module `[mod_ptr, mod_len)` with `stdin` seeded — the
+/// on-ramp powerbox and environment [`temen_run_onramp`] gives it (run at the root, as
+/// [`onramp_exec_root`] does). Nothing runs yet: pump with [`temen_release_run`]. Returns
+/// `STATUS_OK`, or the status the one-shot run would have failed with (`STATUS_DECODE_ERR`,
+/// `STATUS_UNSUPPORTED`, `STATUS_TRAP` if seeding trapped). Closes any open session first.
+#[no_mangle]
+pub extern "C" fn temen_release_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i32 {
+    temen_release_close();
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let Ok(m) = temen_encode::decode_module(bytes) else {
+        return STATUS_DECODE_ERR;
+    };
+    if onramp_check(&m).is_err() {
+        return STATUS_UNSUPPORTED;
+    }
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    grant_onramp_caps(&mut host, &m, None);
+    let init = onramp_env_init(&run_env());
+    match bytecode::CoopRun::new_seeded(&m, 0, &[], u64::MAX, host, &init) {
+        Some(Ok(run)) => {
+            // SAFETY: single-threaded access to the session statics (one Worker owns this driver).
+            unsafe { *core::ptr::addr_of_mut!(RELEASE) = Some(ReleaseSession { run }) };
+            STATUS_OK
+        }
+        Some(Err(_)) => STATUS_TRAP,
+        None => STATUS_UNSUPPORTED,
+    }
+}
+
+/// Pump the open release run for at most about `budget` ops. The output this slice produced is in
+/// the stdout/stderr read-back slots (only this slice's — the caller accumulates). Returns
+/// [`RELEASE_RUNNING`] if the slice was spent, or [`RELEASE_DONE`] when the program ended, with
+/// `temen_status`/`temen_exit_code`/`temen_trap_*`/`temen_fault_addr` and [`temen_release_value`]
+/// set as [`temen_run_onramp`] sets them, and the session closed. `-1` with no open session.
+#[no_mangle]
+pub extern "C" fn temen_release_run(budget: u64) -> i32 {
+    // SAFETY: single-threaded access to the session statics.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(RELEASE)).as_mut() }) else {
+        return -1;
+    };
+    let ev = s.run.run_for(budget);
+    let host = s.run.host_mut();
+    let (out, err) = (host.take_stdout(), host.take_stderr());
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), err);
+    }
+    let (status, value, exit_code, trap) = match ev {
+        bytecode::CoopEvent::Paused => return RELEASE_RUNNING,
+        bytecode::CoopEvent::Done(vals) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0, None),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0, None),
+            _ => (STATUS_BAD_RESULT, 0, 0, None),
+        },
+        bytecode::CoopEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, 0, code, None),
+        bytecode::CoopEvent::Trapped(t) => (STATUS_TRAP, 0, 0, Some(t)),
+        // Idle suspension and tier-up surfacing are never enabled on this session.
+        _ => (STATUS_UNSUPPORTED, 0, 0, None),
+    };
+    // SAFETY: as above.
+    unsafe {
+        LAST_STATUS = status;
+        EXIT_CODE = exit_code;
+        RELEASE_VALUE = value;
+        LAST_TRAP = trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = match trap {
+            Some(Trap::MemoryFault) => {
+                temen_interp::last_capture_fault_addr().map_or(-1, |a| a as i64)
+            }
+            _ => -1,
+        };
+    }
+    temen_release_close();
+    RELEASE_DONE
+}
+
+/// The finished release run's entry result (a C `main`'s return value under `STATUS_OK`).
+#[no_mangle]
+pub extern "C" fn temen_release_value() -> i64 {
+    // SAFETY: single-threaded wasm.
+    unsafe { RELEASE_VALUE }
+}
+
+/// Drop the open release run, if any (a Stop, or a new compile).
+#[no_mangle]
+pub extern "C" fn temen_release_close() {
+    // SAFETY: single-threaded access to the session statics.
+    unsafe { *core::ptr::addr_of_mut!(RELEASE) = None };
 }
 
 // ===== warm-runtime snapshot: init once, restore-per-Run for a two-phase on-ramp guest ============
@@ -15643,7 +15772,10 @@ pub extern "C" fn temen_coop_run() -> i32 {
         bytecode::CoopEvent::Trapped(_) => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
         // Never surfaced here: the tier-up driver does not arm `set_suspend_on_idle` (#1122 route (a)
         // is the bash coop session's driver, below). Fail closed rather than spin.
-        bytecode::CoopEvent::Idle => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
+        // Neither suspension nor slicing is enabled on this session.
+        bytecode::CoopEvent::Idle | bytecode::CoopEvent::Paused => {
+            (STATUS_TRAP, 0, 0, COOP_RUN_TRAP)
+        }
     };
     s.value = value;
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next

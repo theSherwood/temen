@@ -18,6 +18,15 @@ fn chibicc_temen() -> Option<temen_ir::Module> {
 
 /// Compile `src` with the seeded playground headers, run the result, return its captured stdout.
 fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
+    let run = onramp_exec(&compile(chibicc, src), b"");
+    (
+        run.status,
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+    )
+}
+
+/// Compile `src` with the seeded playground headers into a runnable module.
+fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
     let dirs = vec!["include".to_string()];
@@ -38,12 +47,209 @@ fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
     assert!(ir.contains("func"), "expected Temen IR, got: {ir:.200}");
 
-    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
-    let run = onramp_exec(&m, b"");
-    (
-        run.status,
-        String::from_utf8_lossy(&run.stdout).into_owned(),
-    )
+    temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
+}
+
+/// **A release run pumped in slices** (`temen_release_open` / `temen_release_run`): each slice hands
+/// back the output it produced, a program that never ends keeps reporting `RELEASE_RUNNING` (so the
+/// embedder can stream it and stop pumping on Pause), and a finite program pumped in small slices ends
+/// with exactly the one-shot run's output and exit code.
+#[test]
+fn a_release_run_pumps_in_slices() {
+    use temen_browser::{
+        temen_alloc, temen_exit_code, temen_release_close, temen_release_open, temen_release_run,
+        temen_status, temen_stdout_len, temen_stdout_ptr, RELEASE_DONE, RELEASE_RUNNING,
+    };
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let open = |m: &temen_ir::Module| {
+        let bytes = temen_encode::encode_module(m);
+        let p = temen_alloc(bytes.len());
+        // SAFETY: `temen_alloc` returned a live allocation of that length.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+        assert_eq!(
+            temen_release_open(p, bytes.len(), core::ptr::null(), 0),
+            STATUS_OK
+        );
+    };
+    let slice_out = || {
+        let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
+        if p.is_null() || n == 0 {
+            return Vec::new(); // a slice that printed nothing
+        }
+        // SAFETY: the stash stays live until the next call that replaces it.
+        unsafe { core::slice::from_raw_parts(p, n) }.to_vec()
+    };
+
+    let spin = compile(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  for (int i = 0; i < 3; i++) printf(\"line %d\\n\", i);\n  for (;;) {}\n}\n",
+    );
+    open(&spin);
+    let mut out = Vec::new();
+    for _ in 0..50 {
+        assert_eq!(
+            temen_release_run(100_000),
+            RELEASE_RUNNING,
+            "an endless loop keeps running"
+        );
+        out.extend(slice_out());
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "line 0\nline 1\nline 2\n",
+        "streamed as it ran"
+    );
+    temen_release_close();
+
+    let finite = compile(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  long s = 0;\n  for (int i = 0; i < 20000; i++) { s += i; if (i % 5000 == 0) printf(\"%d\\n\", i); }\n  printf(\"sum %ld\\n\", s);\n  return 3;\n}\n",
+    );
+    let one_shot = onramp_exec(&finite, b"");
+    open(&finite);
+    let mut out = Vec::new();
+    let mut slices = 0;
+    loop {
+        let r = temen_release_run(1_000);
+        out.extend(slice_out());
+        slices += 1;
+        if r == RELEASE_DONE {
+            break;
+        }
+        assert_eq!(r, RELEASE_RUNNING);
+    }
+    assert!(slices > 10, "it took many slices ({slices})");
+    assert_eq!(out, one_shot.stdout, "the same output as the one-shot run");
+    assert_eq!(
+        (temen_status(), temen_exit_code()),
+        (one_shot.status, one_shot.exit_code),
+        "and the same ending"
+    );
+}
+
+/// **The scanf family** (`sscanf`/`scanf`), which the playground libc lacked: c_interpret's `scanf`
+/// lessons failed to link. One scanner serves both, with C's return rules — the count of
+/// assignments, or EOF for an input failure before the first — and one byte of `ungetc` lookahead,
+/// so a number read by one call leaves the byte that ended it for the next.
+///
+/// (Read from a file: this harness's `onramp_exec` delivers no stdin to the program — even `getchar`
+/// reads EOF there, with or without this change.)
+#[test]
+fn scanf_family_converts_like_c() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let run = |body: &str, stdin: &[u8]| {
+        let src = format!("#include <stdio.h>\nint main(void) {{\n{body}\n  return 0;\n}}\n");
+        let out = onramp_exec(&compile(&chibicc, &src), stdin);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let out = run(
+        r#"  int a, n; unsigned u; long l; short h; char c, w[8], line[32]; double d; float f;
+  int r = sscanf(" -42 7 0x1F 3.25 1e3 xyz! hello world", "%d %u %li %lf %f %c%3s%*c %[^\n]%n",
+                 &a, &u, &l, &d, &f, &c, w, line, &n);
+  printf("%d|%d %u %ld %.2f %.1f %c %s [%s] %d\n", r, a, u, l, d, f, c, w, line, n);
+  printf("%d\n", sscanf("12abc", "%d%hd", &a, &h));
+  printf("%d\n", sscanf("", "%d", &a));
+  printf("%d\n", sscanf("x", "%d", &a));
+  printf("%d\n", sscanf("5,6", "%d,%d", &a, &n));
+  printf("%d %d\n", a, n);
+  printf("%d\n", sscanf("077 10", "%i %o", &a, &n));
+  printf("%d %d\n", a, n);"#,
+        b"",
+    );
+    assert_eq!(
+        out, "8|-42 7 31 3.25 1000.0 x yz! [hello world] 37\n1\n-1\n0\n2\n5 6\n2\n63 8\n",
+        "sscanf"
+    );
+
+    // `fscanf` from a stream, three times: the newline after `17` is left for the next call to skip,
+    // and the third call reaches the end — EOF. (A stream exercises `fgetc`/`ungetc`, the same path
+    // `scanf` takes on stdin.)
+    let out = run(
+        r#"  FILE *w = fopen("nums.txt", "w");
+  fputs("17\n  25\n", w);
+  fclose(w);
+  FILE *f = fopen("nums.txt", "r");
+  int a = 0, b = 0;
+  int r1 = fscanf(f, "%d", &a);
+  int r2 = fscanf(f, "%d", &b);
+  int r3 = fscanf(f, "%d", &b);
+  int c = fgetc(f);
+  printf("%d %d %d %d %d %d\n", r1, r2, r3, a, b, c);"#,
+        b"",
+    );
+    assert_eq!(out, "1 1 -1 17 25 -1\n", "fscanf over a stream");
+}
+
+/// **`free` refuses what it must not release**, the way glibc does: a double free, or a pointer
+/// `malloc` never returned, names the misuse on **stderr** — its own stream, not stdout — and aborts
+/// (exit 134). `free` used to be a
+/// no-op, so c_interpret's double-free lesson ran straight past the bug it teaches.
+#[test]
+fn free_detects_a_double_free_and_an_invalid_pointer() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let run = |body: &str| {
+        let src = format!(
+            "#include <stdio.h>\n#include <stdlib.h>\nint main(void) {{\n{body}\n  return 0;\n}}\n"
+        );
+        let out = onramp_exec(&compile(&chibicc, &src), b"");
+        (
+            out.exit_code,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // Ordinary use is untouched: free(NULL), a free per block, and a realloc that moves.
+    let (code, out, err) = run("  free(NULL);\n\
+           int *a = malloc(8), *b = malloc(8);\n\
+           a[0] = 7;\n\
+           a = realloc(a, 64);\n\
+           printf(\"%d\\n\", a[0]);\n\
+           free(a);\n\
+           free(b);");
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "7\n", ""),
+        "ordinary use"
+    );
+
+    // A double free names itself on stderr and aborts right there: `after` never prints.
+    let (code, out, err) = run("  int *p = malloc(sizeof(int));\n\
+           printf(\"before\\n\");\n\
+           free(p);\n\
+           free(p);\n\
+           printf(\"after\\n\");");
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (134, "before\n", "free(): double free detected\n"),
+        "a double free"
+    );
+
+    let (code, out, err) = run("  int x;\n  free(&x);");
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (134, "", "free(): invalid pointer\n"),
+        "a stack pointer"
+    );
+
+    // realloc releases the old block, so freeing it afterwards is a double free too.
+    let (code, out, err) =
+        run("  char *p = malloc(8);\n  char *q = realloc(p, 4096);\n  free(q);\n  free(p);");
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (134, "", "free(): double free detected\n"),
+        "a realloc'd-away block"
+    );
 }
 
 /// A real ~90-line program: parse a delimited list of numbers, compute summary statistics (mean,
