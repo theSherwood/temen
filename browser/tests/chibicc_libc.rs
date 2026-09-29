@@ -18,6 +18,15 @@ fn chibicc_temen() -> Option<temen_ir::Module> {
 
 /// Compile `src` with the seeded playground headers, run the result, return its captured stdout.
 fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
+    let run = onramp_exec(&compile(chibicc, src), b"");
+    (
+        run.status,
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+    )
+}
+
+/// Compile `src` with the seeded playground headers into a runnable module.
+fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
     let dirs = vec!["include".to_string()];
@@ -38,12 +47,66 @@ fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
     assert!(ir.contains("func"), "expected Temen IR, got: {ir:.200}");
 
-    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
-    let run = onramp_exec(&m, b"");
-    (
-        run.status,
-        String::from_utf8_lossy(&run.stdout).into_owned(),
-    )
+    temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
+}
+
+/// **`free` refuses what it must not release**, the way glibc does: a double free, or a pointer
+/// `malloc` never returned, names the misuse on stderr and aborts (exit 134). `free` used to be a
+/// no-op, so c_interpret's double-free lesson ran straight past the bug it teaches.
+#[test]
+fn free_detects_a_double_free_and_an_invalid_pointer() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let run = |body: &str| {
+        let src = format!(
+            "#include <stdio.h>\n#include <stdlib.h>\nint main(void) {{\n{body}\n  return 0;\n}}\n"
+        );
+        // The on-ramp console is one stream: stderr's text lands in order with stdout's.
+        let out = onramp_exec(&compile(&chibicc, &src), b"");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.exit_code, text)
+    };
+
+    // Ordinary use is untouched: free(NULL), a free per block, and a realloc that moves.
+    let (code, out) = run("  free(NULL);\n\
+           int *a = malloc(8), *b = malloc(8);\n\
+           a[0] = 7;\n\
+           a = realloc(a, 64);\n\
+           printf(\"%d\\n\", a[0]);\n\
+           free(a);\n\
+           free(b);");
+    assert_eq!((code, out.as_str()), (0, "7\n"), "ordinary use");
+
+    // A double free names itself and aborts right there: `after` never prints.
+    let (code, out) = run("  int *p = malloc(sizeof(int));\n\
+           printf(\"before\\n\");\n\
+           free(p);\n\
+           free(p);\n\
+           printf(\"after\\n\");");
+    assert_eq!(
+        (code, out.as_str()),
+        (134, "before\nfree(): double free detected\n"),
+        "a double free"
+    );
+
+    let (code, out) = run("  int x;\n  free(&x);");
+    assert_eq!(
+        (code, out.as_str()),
+        (134, "free(): invalid pointer\n"),
+        "a stack pointer"
+    );
+
+    // realloc releases the old block, so freeing it afterwards is a double free too.
+    let (code, out) =
+        run("  char *p = malloc(8);\n  char *q = realloc(p, 4096);\n  free(q);\n  free(p);");
+    assert_eq!(
+        (code, out.as_str()),
+        (134, "free(): double free detected\n"),
+        "a realloc'd-away block"
+    );
 }
 
 /// A real ~90-line program: parse a delimited list of numbers, compute summary statistics (mean,
