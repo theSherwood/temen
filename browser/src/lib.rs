@@ -2737,8 +2737,12 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 fuel,
             } => {
                 // A carve of a detached window is not addressable as `win + carve` in the engine
-                // memory (see [`ParVcpu::detached`]): fail closed.
-                if v.detached {
+                // memory (see [`ParVcpu::detached`]): fail closed. So is a spawn whose by-name grant
+                // list the engine re-granted and stashed (op 13, a §3d record's): the child's powerbox
+                // is rebuilt from these inert integers in its own Worker, so the grants have no path
+                // there, and running the child without them would be a silent answer — the detached
+                // arm below refuses the same way.
+                if v.detached || v.inner.take_granted_host().is_some() {
                     return PAR_TRAP;
                 }
                 v.a = ((module as i64) << 32) | entry as i64;

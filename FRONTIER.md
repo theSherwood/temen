@@ -61,7 +61,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
 - *backend* 🚧 — instantiate_module (op 13) answers -EINVAL on the oracle and CapFault under the Cranelift probe (#1821)
 - *code origin* ⛔ — an installed unit answers as the base module does (#1726); an invoked unit is a seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)
-- *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
+- *debugger* 🔶 — instantiate/join/instantiate_module(_named)/instantiate_rec/instantiate_detached run on the debug scheduler through the executor's admission (#1855); the coroutine spawns fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**
 - *nesting* ⛔ — index-carrying: the child is granted a sub-budget by split/transfer, not the handle
