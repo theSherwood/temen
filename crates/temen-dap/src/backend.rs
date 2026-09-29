@@ -1070,6 +1070,7 @@ impl Debuggee for BytecodeBackend {
             }
         }
         self.drive_to(&mut run, t, &mut fuel);
+        run.apply_writes_due_now(); // a write made at `t` is part of the state at `t`
         run.locate();
         // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
         // here makes progress instead of immediately re-reporting this stop.

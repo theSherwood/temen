@@ -8379,6 +8379,7 @@ impl ScheduledDebugRun {
         }
         self.host.restore_journal_cursor(&cursor);
         self.turn = anchor;
+        self.rewind_write_cursor(); // re-execution re-applies the writes it passes
         self.clock = cont.clock;
         self.locate();
         self.last_watch = None;
@@ -8401,6 +8402,7 @@ impl ScheduledDebugRun {
             self.locate();
             self.last_watch = None;
         }
+        self.apply_writes_due_now();
         self.turn == turn
     }
 
@@ -8436,8 +8438,48 @@ impl ScheduledDebugRun {
     /// travel stays truthful. The cursor lands past entries at turns already passed.
     pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
         writes.sort_by_key(|(c, _)| *c);
-        self.write_cursor = writes.partition_point(|(c, _)| *c < self.turn);
         self.scheduled_writes = writes;
+        self.rewind_write_cursor();
+    }
+
+    /// Put the scheduled-write cursor at the first write not yet passed — those at turns before the
+    /// run's own. Called wherever the run's turn moves other than by a tick.
+    fn rewind_write_cursor(&mut self) {
+        let turn = self.turn;
+        self.write_cursor = self.scheduled_writes.partition_point(|(c, _)| *c < turn);
+    }
+
+    /// Apply the scheduled writes due at the run's **current** turn. A write made while stopped at turn
+    /// `t` is part of the state at `t` — the live run shows it there — but the landing replay of a
+    /// `seek` or `undo_to` stops *before* the op at `t`, where a tick would have applied it. Every
+    /// landing calls this so the state at `t` is the same on every path (#1871). A no-op when nothing
+    /// is due, and idempotent: the cursor moves past what it applies, so the tick at `t` won't repeat it.
+    pub fn apply_writes_due_now(&mut self) {
+        let Self {
+            source,
+            mem,
+            tasks,
+            turn,
+            fn_block_base,
+            fn_block_types,
+            debug,
+            journal,
+            scheduled_writes,
+            write_cursor,
+            ..
+        } = self;
+        apply_due_writes(
+            scheduled_writes,
+            write_cursor,
+            *turn,
+            tasks,
+            source,
+            mem,
+            debug.as_ref(),
+            fn_block_base,
+            fn_block_types,
+            journal,
+        );
     }
 
     /// The focused task index (the one a `write_var` resolves in) — the backend records it on a

@@ -163,6 +163,49 @@ fn step_back_undoes_a_window_write() {
     );
 }
 
+/// **A write made at turn `t` is part of the state at `t` on every path** (#1871). The live run shows
+/// it there; stepping forward and back onto `t` (undo) and seeking to `t` (rebuild) must too. Both
+/// landings used to stop just before the op at `t`, where a tick applies the writes due at `t`, and
+/// the undo left its write cursor past the edit so its re-execution never re-applied it.
+#[test]
+fn a_write_is_part_of_the_state_at_its_turn_on_every_path() {
+    let mut b = backend(LOOP_SUM_DBG, &[Value::I32(3)]);
+    let bp = IrPc {
+        module: 0,
+        func: 0,
+        block: 1,
+        inst: 0,
+    };
+    Debuggee::set_breakpoint(&mut b, bp);
+    let Stop::Break { .. } = Debuggee::run_until_stop(&mut b) else {
+        panic!("expected the loop-head breakpoint");
+    };
+    let t = Debuggee::turn(&b);
+    assert!(
+        Debuggee::write_var(&mut b, 0, "acc", 100, 4),
+        "the write lands"
+    );
+    let acc = |b: &BytecodeBackend| Debuggee::read_var(b, 0, "acc", 4);
+    let written = Some(VarValue::Value(Value::I32(100)));
+
+    // Forward one op and back onto `t`, served by undo.
+    let _ = Debuggee::step(&mut b);
+    let _ = Debuggee::step_back(&mut b);
+    assert_eq!(
+        Debuggee::turn(&b),
+        t,
+        "the step back lands on the write's turn"
+    );
+    assert_eq!(b.backward_counts(), (1, 0), "served by undo");
+    assert_eq!(acc(&b), written, "undo onto `t` keeps the write");
+
+    // Run out, then seek to `t`, served by a rebuild.
+    Debuggee::clear_breakpoint(&mut b, bp);
+    assert_eq!(finish(&mut b), vec![Value::I32(106)], "3+2+1 on top of 100");
+    let _ = Debuggee::seek(&mut b, t);
+    assert_eq!(acc(&b), written, "seek to `t` keeps the write");
+}
+
 /// Two workers each `mem[16384] += 1` (counter cell shifted above the #1094 NULL guard); the root
 /// joins both and returns the count — the threaded twin.
 const RACY_COUNTER: &str = r#"
