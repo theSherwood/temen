@@ -50,6 +50,63 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
 }
 
+/// **The scanf family** (`sscanf`/`scanf`), which the playground libc lacked: c_interpret's `scanf`
+/// lessons failed to link. One scanner serves both, with C's return rules — the count of
+/// assignments, or EOF for an input failure before the first — and one byte of `ungetc` lookahead,
+/// so a number read by one call leaves the byte that ended it for the next.
+///
+/// (Read from a file: this harness's `onramp_exec` delivers no stdin to the program — even `getchar`
+/// reads EOF there, with or without this change.)
+#[test]
+fn scanf_family_converts_like_c() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let run = |body: &str, stdin: &[u8]| {
+        let src = format!("#include <stdio.h>\nint main(void) {{\n{body}\n  return 0;\n}}\n");
+        let out = onramp_exec(&compile(&chibicc, &src), stdin);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let out = run(
+        r#"  int a, n; unsigned u; long l; short h; char c, w[8], line[32]; double d; float f;
+  int r = sscanf(" -42 7 0x1F 3.25 1e3 xyz! hello world", "%d %u %li %lf %f %c%3s%*c %[^\n]%n",
+                 &a, &u, &l, &d, &f, &c, w, line, &n);
+  printf("%d|%d %u %ld %.2f %.1f %c %s [%s] %d\n", r, a, u, l, d, f, c, w, line, n);
+  printf("%d\n", sscanf("12abc", "%d%hd", &a, &h));
+  printf("%d\n", sscanf("", "%d", &a));
+  printf("%d\n", sscanf("x", "%d", &a));
+  printf("%d\n", sscanf("5,6", "%d,%d", &a, &n));
+  printf("%d %d\n", a, n);
+  printf("%d\n", sscanf("077 10", "%i %o", &a, &n));
+  printf("%d %d\n", a, n);"#,
+        b"",
+    );
+    assert_eq!(
+        out, "8|-42 7 31 3.25 1000.0 x yz! [hello world] 37\n1\n-1\n0\n2\n5 6\n2\n63 8\n",
+        "sscanf"
+    );
+
+    // `fscanf` from a stream, three times: the newline after `17` is left for the next call to skip,
+    // and the third call reaches the end — EOF. (A stream exercises `fgetc`/`ungetc`, the same path
+    // `scanf` takes on stdin.)
+    let out = run(
+        r#"  FILE *w = fopen("nums.txt", "w");
+  fputs("17\n  25\n", w);
+  fclose(w);
+  FILE *f = fopen("nums.txt", "r");
+  int a = 0, b = 0;
+  int r1 = fscanf(f, "%d", &a);
+  int r2 = fscanf(f, "%d", &b);
+  int r3 = fscanf(f, "%d", &b);
+  int c = fgetc(f);
+  printf("%d %d %d %d %d %d\n", r1, r2, r3, a, b, c);"#,
+        b"",
+    );
+    assert_eq!(out, "1 1 -1 17 25 -1\n", "fscanf over a stream");
+}
+
 /// **`free` refuses what it must not release**, the way glibc does: a double free, or a pointer
 /// `malloc` never returned, names the misuse on stderr and aborts (exit 134). `free` used to be a
 /// no-op, so c_interpret's double-free lesson ran straight past the bug it teaches.
