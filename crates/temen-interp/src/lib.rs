@@ -17155,7 +17155,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                         }
                     } else {
-                        frames[rtop].vals.push(Reg::from_i32(FIBER_RETURNED));
+                        // A fiber the freeze unwound did not return: its resumer gets `SUSPENDED`,
+                        // which its thaw re-issues; a genuine return's `RETURNED` is reloaded (#1835).
+                        let status = if freezing {
+                            FIBER_SUSPENDED
+                        } else {
+                            FIBER_RETURNED
+                        };
+                        frames[rtop].vals.push(Reg::from_i32(status));
                         frames[rtop]
                             .vals
                             .push(ret_buf.first().copied().unwrap_or(Reg::from_i64(0)));

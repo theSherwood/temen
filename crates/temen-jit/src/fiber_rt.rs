@@ -1214,10 +1214,10 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word is the region's
             // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
-            if durable
+            let frozen = durable
                 && flat_sp > (&*current()).table.shadow.frame_base(slot_idx + 1)
-                && window_is_unwinding(mem_base)
-            {
+                && window_is_unwinding(mem_base);
+            if frozen {
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,
                     func: slot.func,
@@ -1236,7 +1236,9 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.finish();
             (*current()).table.free_slot(slot_idx);
-            *status_out = 1;
+            // A fiber the freeze unwound did not return: its resumer gets `SUSPENDED` (0), which its
+            // thaw re-issues; a genuine return's `RETURNED` (1) is reloaded (#1835).
+            *status_out = if frozen { 0 } else { 1 };
             v as i64
         }
     }

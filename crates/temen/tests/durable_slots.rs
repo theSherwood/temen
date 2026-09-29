@@ -15,6 +15,10 @@
 //! (`cont.new`, never resumed) thaws to start from its entry, and a **free** one (finished) thaws
 //! free, at its generation, so the next `cont.new` recycles it into the same handle.
 //!
+//! **Resumes (#1835).** A `cont.resume` the freeze lands at re-issues on thaw only if its fiber is
+//! still residue (it parked, or the freeze unwound it). One whose fiber returned reloads its results:
+//! the slot is free.
+//!
 //! Each case runs on every engine that can run it here — the interpreter, the JIT (native stack
 //! switching), and for fibers the bytecode engine — and each is thawed on the clock its freeze left
 //! behind (a re-issued read would move it on). Every engine must thaw to the uninterrupted answer.
@@ -566,4 +570,69 @@ fn fresh_fibers_start_from_their_entries() {
         fibers.sort();
         assert_eq!(fibers, [(0, true), (1, true)], "{engine:?}: residue");
     }
+}
+
+/// The root resumes fiber `func {0}` with 6 and returns `status * 10^6 + value`. Func 1 returns its
+/// argument + 1 at once; func 2 reads the clock and returns it + its argument.
+fn resume_root(fiber: u32) -> String {
+    format!(
+        r#"
+func (i32) -> (i64) {{
+block 0 (v0: i32) {{
+  v1 = i64.const 65536
+  i32.store v1 v0
+  f = ref.func {fiber}
+  sp = i64.const 4096
+  k = cont.new f sp
+  a = i64.const 6
+  s, x = cont.resume k a
+  s64 = i64.extend_i32_u s
+  m = i64.const 1000000
+  t = i64.mul s64 m
+  r = i64.add t x
+  return r
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  v2 = i64.const 1
+  v3 = i64.add v1 v2
+  return v3
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  v2 = i64.const 65536
+  v3 = i32.load v2
+  v4 = i32.const 0
+  v5 = call.cap 2 0 (i32) -> (i64) v3 (v4)
+  v6 = i64.add v5 v1
+  return v6
+  }}
+}}
+"#
+    )
+}
+
+/// Frozen from the start, the root unwinds at a resume whose fiber already returned: its slot is free,
+/// so the thaw reloads `(RETURNED, 7)` rather than resuming a finished fiber (#1835).
+#[test]
+fn a_resume_whose_fiber_returned_reloads_its_results() {
+    for (engine, r) in freeze_thaw(ALL_ENGINES, &resume_root(1), |w| {
+        write_state(w, STATE_UNWINDING)
+    }) {
+        assert!(
+            r.fibers.iter().all(FrozenFiber::is_free),
+            "{engine:?}: residue"
+        );
+    }
+}
+
+/// Frozen from the start, the fiber unwinds at its clock read: the thaw re-issues the resume, which
+/// rewinds it.
+#[test]
+fn a_resume_whose_fiber_unwound_is_reissued() {
+    freeze_thaw(ALL_ENGINES, &resume_root(2), |w| {
+        write_state(w, STATE_UNWINDING)
+    });
 }

@@ -1552,7 +1552,9 @@ guest).
 recognizes `cont.new`/`cont.resume`/`suspend` as may-suspend points and a fiber'd module is
 **NORMAL-inert** under instrumentation + verifies (`temen-durable/tests/fiber.rs`); the
 **per-fiber shadow-stack layout + shadow-SP swap landed** (slice 3.1.1), the **resumer-side
-`cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2), and the **fiber-side
+`cont.resume` thaw arm** re-issues the resume on rewind (slice 3.1.2) — unless its fiber
+returned: a fiber the freeze unwound reports `SUSPENDED`, not `RETURNED`, so a `RETURNED` status
+(spilled with the value) means the slot is free and the arm reloads it (#1835) — and the **fiber-side
 `suspend` re-park arm** flips to `NORMAL` and re-executes `suspend` on rewind (slice 3.1.3) —
 so **both fiber thaw arms are now wired** (no fiber arm fails closed). The **freeze driver
 flattens idle parked fibers** into their shadow regions (slice 3.1.4), and the **end-to-end
