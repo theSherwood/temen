@@ -146,6 +146,9 @@ struct Place {
     tid: u64,
     addr: u64,
     type_id: TypeId,
+    /// For a pointer type: `addr` *is* the pointer's value rather than where it is stored — a
+    /// pointer held in an SSA value has no window location to read it back from.
+    rvalue: bool,
 }
 
 /// Expandable-variable references start here, above the frame references (`frame_refs`, numbered
@@ -953,6 +956,29 @@ impl DapServer {
             let width = scalar_width(self.types(), type_id, &ty);
             let session = self.session.as_ref()?;
             if let Some(val) = session.inspector.read_var(frame_idx, &name, width) {
+                // A pointer held in an SSA value is still followable: render its address like a
+                // window pointer's and expand it to its pointee through an rvalue place.
+                let ptr = match (&val, type_id) {
+                    (VarValue::Value(Value::I64(p)), Some(t))
+                        if matches!(
+                            self.types().get(t as usize),
+                            Some(TypeDef::Pointer { .. })
+                        ) =>
+                    {
+                        Some((*p as u64, t))
+                    }
+                    _ => None,
+                };
+                if let Some((addr, type_id)) = ptr {
+                    let vr = self.push_place(Place {
+                        tid,
+                        addr,
+                        type_id,
+                        rvalue: true,
+                    });
+                    out.push(var_json(&name, &format!("0x{addr:x}"), &ty, vr));
+                    continue;
+                }
                 let rendered = match (&val, type_id) {
                     (VarValue::Bytes(b), Some(tid)) => fmt_scalar(self.types(), tid, b),
                     _ => fmt_var(&val),
@@ -968,7 +994,7 @@ impl DapServer {
     fn expand_place(&mut self, idx: usize) -> Option<Vec<Json>> {
         let session = self.session.as_ref()?;
         let place = session.place_refs.get(idx)?;
-        let (tid, base, type_id) = (place.tid, place.addr, place.type_id);
+        let (tid, base, type_id, rvalue) = (place.tid, place.addr, place.type_id, place.rvalue);
         let types = session.debug.as_ref()?.types.clone();
         self.session.as_mut()?.inspector.select_task(tid);
 
@@ -989,11 +1015,15 @@ impl DapServer {
             // A pointer expands to its pointee under a synthetic `*` child (`*p`).
             TypeDef::Pointer { pointee, .. } => {
                 let session = self.session.as_ref()?;
-                match session
-                    .inspector
-                    .read_window(base, 8)
-                    .map(|b| le_uint(&b, 8))
-                {
+                let ptr = if rvalue {
+                    Ok(base)
+                } else {
+                    session
+                        .inspector
+                        .read_window(base, 8)
+                        .map(|b| le_uint(&b, 8))
+                };
+                match ptr {
                     // A null pointer has no pointee; an unreadable one can't be followed.
                     Ok(0) => return Some(vec![var_json("*", "<null>", "", 0)]),
                     Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0)]),
@@ -1060,8 +1090,17 @@ impl DapServer {
 
     /// Record an expandable `Place` and return its `variablesReference`.
     fn alloc_place(&mut self, tid: u64, addr: u64, type_id: TypeId) -> i64 {
+        self.push_place(Place {
+            tid,
+            addr,
+            type_id,
+            rvalue: false,
+        })
+    }
+
+    fn push_place(&mut self, place: Place) -> i64 {
         let session = self.session.as_mut().expect("session present");
-        session.place_refs.push(Place { tid, addr, type_id });
+        session.place_refs.push(place);
         PLACE_BASE + (session.place_refs.len() - 1) as i64
     }
 

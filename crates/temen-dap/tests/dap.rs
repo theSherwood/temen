@@ -1423,6 +1423,28 @@ fn dap_expands_a_pointer_to_its_pointee() {
     assert_eq!(fields.get("y").map(|(v, _)| v.as_str()), Some("9"));
 }
 
+#[test]
+fn dap_expands_a_pointer_held_in_an_ssa_value() {
+    // The same struct, pointed at by `sp`, a pointer held in SSA value v2 (the address of the struct,
+    // 0x4410) rather than stored in the window. It has no location to read the pointer back from,
+    // and used to render as a bare decimal scalar that could not be expanded.
+    let src = format!("{POINTER_DBG}debug.var 0 \"sp\" ssa 2 \"ptr\" 2\n");
+    let mut s = DapServer::new();
+    let fid = launch_and_break(&mut s, &src, "/work/p.c", 3);
+    let sref = scope_ref(&mut s, fid);
+
+    let locals = variables(&mut s, sref);
+    let (summary, sp_ref) = locals.get("sp").expect("local sp");
+    assert_eq!(summary, "0x4410", "an SSA pointer shows its hex value too");
+    assert!(*sp_ref >= (1 << 20), "and is expandable");
+
+    let deref = variables(&mut s, *sp_ref);
+    let (_, star_ref) = deref.get("*").expect("deref child");
+    let fields = variables(&mut s, *star_ref);
+    assert_eq!(fields.get("x").map(|(v, _)| v.as_str()), Some("7"));
+    assert_eq!(fields.get("y").map(|(v, _)| v.as_str()), Some("9"));
+}
+
 // A `double d = 2.5` stored in the window (typed via the structured table). Param v0 is data-SP;
 // the break (line 3) is after the store.
 const FLOAT_DBG: &str = r#"
