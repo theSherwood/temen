@@ -1645,6 +1645,56 @@ block 4 () {
   }
 }";
 
+/// The **POSIX-personality sleep**: `nanosleep(req, rem) -> int` as a timed wait.
+///
+/// The compute shim's `nanosleep` returns at once (row 47). A playground guest loses nothing by
+/// that: it is alone. A POSIX process is not. A process that waits for another by polling sleeps
+/// between polls, and a sleep that returns at once turns the poll into a spin. nifmake is one: its
+/// `waitForAnyJob` polls `running()` and sleeps 1 ms, so on the cooperative scheduler it took half
+/// of every slice its interpreted child ran, and nimony's build spent over half its time there
+/// (#1930).
+///
+/// This unit parks the process instead: an `atomic.wait` on the first word of the caller's
+/// `timespec`, for the requested duration. That is the IR's one timed park, so each engine parks
+/// the sleeper on its own clock: the threaded drivers until the time has passed, the cooperative
+/// scheduler until its logical clock reaches the deadline, which it advances only when no task can
+/// run. A sleeper there resumes once everything else is blocked or done. Only a `notify` on the
+/// caller's own `timespec` could end the wait early, and no program issues one.
+///
+/// A negative `tv_sec`, or a `tv_nsec` outside `[0, 10^9)`, is `-EINVAL`, and the wait saturates at
+/// `i64::MAX` nanoseconds. `rem` is never written: the wait is not interrupted, and a signal takes
+/// effect after it.
+const POSIX_SLEEP_ADAPTER: &str = "\
+func (i64, i64) -> (i32) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.load v0
+  v3 = i64.load v0 offset=8
+  v4 = i64.const 0
+  v5 = i64.lt_s v2 v4
+  v6 = i64.const 1000000000
+  v7 = i64.ge_u v3 v6
+  v8 = i32.or v5 v7
+  br_if v8 2() 1(v0, v2, v3)
+  }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 1000000000
+  v4 = i64.mul v1 v3
+  v5 = i64.add v4 v2
+  v6 = i64.const 9223372035
+  v7 = i64.gt_s v1 v6
+  v8 = i64.const 9223372036854775807
+  v9 = select v7 v8 v5
+  v10 = i32.load v0
+  v11 = i32.atomic.wait v0 v10 v9
+  v12 = i32.const 0
+  return v12
+  }
+block 2 () {
+  v0 = i32.const -22
+  return v0
+  }
+}";
+
 /// The compute-shim func index for a bottom-edge leaf import `name`, or `None` for a name the shim
 /// doesn't serve (the true syscalls — those go to the adapter / powerbox).
 /// The shim func serving a leaf, or `None` to leave it unbound.
@@ -1974,8 +2024,28 @@ pub fn nim_posix_runtime(
             ..Default::default()
         })
     };
+    // **`nanosleep` changes hands** (#1930): the shim's returns at once, so a process that polls
+    // with it spins ([`POSIX_SLEEP_ADAPTER`]).
+    let sleeps: Vec<(String, u32)> = compute_exports
+        .iter()
+        .filter(|(n, _)| n.starts_with("nanosleep"))
+        .map(|(n, _)| (n.clone(), 0))
+        .collect();
+    let sleep_adapter = if sleeps.is_empty() {
+        // A program that never sleeps links no adapter, and stays the module it was.
+        None
+    } else {
+        compute_exports.retain(|(n, _)| !n.starts_with("nanosleep"));
+        Some(temen_ir::LinkUnit {
+            module: temen_text::parse_module(POSIX_SLEEP_ADAPTER)
+                .map_err(|e| LengError::Malformed(format!("posix sleep adapter parse: {e:?}")))?,
+            exports: sleeps,
+            ..Default::default()
+        })
+    };
     let mut out = vec![compute_shim_unit(compute_exports)?, open_adapter];
     out.extend(mmap_adapter);
+    out.extend(sleep_adapter);
     out.push(heap_grow_unit()?);
     // #1668 — **the POSIX edge**: every leaf nothing above serves, forwarded to the personality op of
     // the same C name. The leaves the pass-1 link retained, and the ones withheld from the shim — less

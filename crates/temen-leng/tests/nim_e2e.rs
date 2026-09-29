@@ -2481,6 +2481,100 @@ fn nim_shells_out_through_the_posix_sh() {
     }
 }
 
+/// **A process that polls its child sleeps between polls; it does not spin.** nifmake waits for its
+/// jobs this way: `running()`, then `sleep 1`, which is `nanosleep`. The bottom edge's `nanosleep`
+/// returned at once, so the poll spun, and on the cooperative scheduler it took half of every slice
+/// its child ran. nimony's build spent over half its time there (#1930). Now `nanosleep` parks the
+/// process (`POSIX_SLEEP_ADAPTER`).
+///
+/// Every engine runs the tree to the child's status. On the cooperative scheduler (the bytecode
+/// engine) the count is exact: its clock reaches the sleeper's deadline only when nothing else can
+/// run, so the parent polls once, sleeps through the child's whole run, and finds it done. The
+/// threaded engines sleep in real time, so their count is the child's run time in milliseconds.
+#[test]
+fn a_nim_process_that_polls_its_child_sleeps() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP a_nim_process_that_polls_its_child_sleeps (no toolchain)");
+        return;
+    };
+    // Long enough to need several of the cooperative scheduler's slices.
+    let child = link_posix_program(
+        &path,
+        "import std/syncio\n\
+         var s = 0\n\
+         for i in 0 ..< 400_000:\n\
+         \x20 s = s xor (i * 7)\n\
+         write(stdout, \"child:\" & $(s and 1) & \"|\")\n\
+         quit(3)\n",
+    );
+    // nifmake's `waitForAnyJob`, with its `sleep` (patches/nimony/nifmake-builds-with-nimony.patch)
+    // and its `startProcess` options.
+    let parent = link_posix_program(
+        &path,
+        "import std/[syncio, osproc]\n\
+         import std/posix/posix\n\
+         proc sleep(ms: int) =\n\
+         \x20 var req = Timespec(tv_sec: posix.Time(ms div 1000), tv_nsec: (ms mod 1000) * 1_000_000)\n\
+         \x20 var rem = Timespec()\n\
+         \x20 discard nanosleep(req, rem)\n\
+         var polls = 0\n\
+         var code = -1\n\
+         try:\n\
+         \x20 let p = startProcess(\"bin/child\", options = {poStdErrToStdOut, poParentStreams, poEvalCommand})\n\
+         \x20 while running(p):\n\
+         \x20   inc polls\n\
+         \x20   sleep 1\n\
+         \x20 code = peekExitCode(p)\n\
+         except:\n\
+         \x20 quit(9)\n\
+         write(stdout, \"polls:\" & $polls & \"|exit:\" & $code)\n",
+    );
+    let sh = posix_sh();
+    for engine in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let make: std::sync::Arc<
+            dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync,
+        > = std::sync::Arc::new(make);
+        let run = temen_run::nim_noc_run(
+            parent.clone(),
+            &posix,
+            make,
+            &["parent".to_string()],
+            &temen_run::ExecGrants {
+                commands: &[
+                    ("/bin/sh".to_string(), sh.clone()),
+                    ("bin/child".to_string(), child.clone()),
+                ],
+                built: false,
+            },
+            engine,
+        );
+        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
+        let polls = out
+            .split("polls:")
+            .nth(1)
+            .and_then(|s| s.split('|').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{engine:?}: no poll count in {out:?}"));
+        assert!(
+            out.starts_with("child:") && out.ends_with("|exit:3"),
+            "{engine:?}: the parent saw its child's own status: {out:?}"
+        );
+        if engine == temen_run::Backend::Bytecode {
+            assert_eq!(
+                polls, 1,
+                "{engine:?}: the parent sleeps through its child's run, and does not spin"
+            );
+        }
+        eprintln!("{engine:?}: {polls} poll(s)");
+    }
+}
+
 /// An `execve`'d nim program's heap **grows past its window** too, and survives a fork: the image
 /// that replaces a process holds the process's own memory authority over its window, not a carve
 /// of its backed prefix (#763). nimsem is such a program — `nifmake` runs it through `/bin/sh` —
