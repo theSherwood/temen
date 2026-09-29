@@ -1,19 +1,19 @@
 //! **#1025 — run-in-guest: `ModuleLoader.from_bytes` (iface 7).** The missing input side of the §14
-//! nesting primitive. Every prior op-13 test spawned a child from a module the *host* granted
+//! nesting primitive. Every prior spawn test spawned a child from a module the *host* granted
 //! (`Host::grant_module`) — but a compiler driver running *on* the sandbox produces its program itself
 //! (the linker emits a module into guest memory) and must be able to run its own output without the
 //! host pre-granting it. This proves the primitive that closes that gap: a guest hands the host a
 //! wire-encoded module from its window, the host **decodes + verifies** it (the trusted floor — the
 //! same `verify_module` a host-granted module passes; the decode is the copy, so no wire byte is ever
 //! executed and the result never aliases the guest's mutable buffer) and mints a `Module` handle the
-//! guest then op-13-spawns exactly like a host-granted one.
+//! guest then spawns exactly like a host-granted one.
 //!
 //! Hand-written text-IR, so it needs **no toolchain**. The child is the same re-granted-memfs writer
 //! `child_entry_fs.rs` proves; the only difference here is *where its module handle comes from* — the
 //! parent's `from_bytes(ptr, len)` over the child's encoded bytes (seeded into the parent window as a
 //! data segment), not a host grant. Window confinement (invariant 2) is untouched: the minted module's
-//! code is host-owned and immutable, its data materializes into the child's carve, and the child's I/O
-//! is masked to that carve.
+//! code is host-owned and immutable, its data materializes into the child's own window, and the
+//! child's I/O is masked to that window.
 
 use std::sync::Arc;
 
@@ -23,21 +23,21 @@ use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
 
 /// Where the parent's `from_bytes` reads the child's encoded module from: above the grant record
-/// (17408) and the `"fs"` name (18432), below the child's carve `[65536, 131072)`. A small module is
-/// well under the ~45 KiB of headroom.
+/// (17408), the `"fs"` name (18432) and the spawn record (17600). A small module is well under the
+/// ~108 KiB of headroom.
 const CHILD_BYTES_OFF: u64 = 20480;
 
-// The parent: `main(inst, loader, fs, blen)`. It (1) `from_bytes(CHILD_BYTES_OFF, blen)` over the
-// child's encoded module in its window — `call.cap MODULE_LOADER(=7) 0` — to mint a `Module` handle,
-// then (2) op-13-spawns that handle into a 64 KiB carve at `[65536, 131072)` with a one-entry grant
-// list `{"fs" -> fs}` (the record at 17408, the name at 18432), and (3) op-1 joins it. Identical to
-// `child_entry_fs.rs`'s parent from step (2) on — only the module handle's *origin* differs (minted
-// from bytes here, host-granted there).
+// The parent: `main(inst, loader, fs, blen, budget)`. It (1) `from_bytes(CHILD_BYTES_OFF, blen)` over
+// the child's encoded module in its window — `call.cap MODULE_LOADER(=7) 0` — to mint a `Module`
+// handle, then (2) spawns that handle through an op-17 v1 record at 17600 — the child's own 64 KiB
+// window, paid from `budget` — with a one-entry grant list `{"fs" -> fs}` (the grant record at 17408,
+// the name at 18432), and (3) op-1 joins it. The same spawn `temen_run::conductor` issues — only the
+// module handle's *origin* differs (minted from bytes here, host-granted there).
 const PARENT: &str = r#"
 memory 17
 data 18432 "fs"
-func (i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vptr = i64.const 20480
   vblen = i64.extend_i32_u v3
   vmh = call.cap 7 0 (i64, i64) -> (i64) v1 (vptr, vblen)
@@ -49,11 +49,19 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   i64.store vrec1off vsh
   vgptr = i64.const 17408
   vgn = i64.const 1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vsl = i64.const 16
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vr0 = i64.const 17600
+  vver = i64.const 1
+  i64.store vr0 vver
+  vslp = i64.const -4294967280
+  i64.store vr0 vslp offset=16
+  vmh32 = i32.wrap_i64 vmh
+  i32.store vr0 vmh32 offset=24
+  i32.store vr0 v4 offset=28
+  i64.store vr0 vgptr offset=40
+  i64.store vr0 vgn offset=48
+  vnone = i32.const -1
+  i32.store vr0 vnone offset=72
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }
@@ -104,8 +112,9 @@ fn parent_with_child_bytes(child_bytes: &[u8]) -> Module {
     parent
 }
 
-/// Run [`PARENT`] over `child_bytes` with a forkable memfs granted as `"fs"`, a `ModuleLoader`, and an
-/// `Instantiator`. Returns the parent's joined result and the shared `MemFsHandle`.
+/// Run [`PARENT`] over `child_bytes` with a forkable memfs granted as `"fs"`, a `ModuleLoader`, an
+/// `Instantiator`, and a `Budget` for the child's 64 KiB window. Returns the parent's joined result and
+/// the shared `MemFsHandle`.
 fn run_parent(child_bytes: &[u8]) -> (Vec<Value>, MemFsHandle) {
     let parent = parent_with_child_bytes(child_bytes);
 
@@ -124,6 +133,7 @@ fn run_parent(child_bytes: &[u8]) -> (Vec<Value>, MemFsHandle) {
     let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let loader = temen_run::grant_module_loader(&mut host);
+    let budget = host.grant_budget(0, 1 << 16, 0);
 
     let mut fuel = 200_000_000u64;
     let r = run_with_host(
@@ -134,6 +144,7 @@ fn run_parent(child_bytes: &[u8]) -> (Vec<Value>, MemFsHandle) {
             Value::I32(loader),
             Value::I32(fs_h),
             Value::I32(child_bytes.len() as i32),
+            Value::I32(budget),
         ],
         &mut fuel,
         &mut host,

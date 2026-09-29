@@ -2761,13 +2761,14 @@ fn seed_domain(
                     cs.svc_results.clone(),
                     cs.svc_next_ticket,
                 );
-                ch.self_module = {
+                let sm = {
                     let hg = host_shared.lock_unpoisoned();
                     match fnr.module_digest {
                         Some(d) => hg.module_arc_by_digest(&d),
                         None => hg.self_module.clone(),
                     }
                 };
+                ch.set_self_module_opt(sm);
                 bytecode::child_entry_args(arity, 0, 0)
             } else {
                 // The starter caps every spawn arm grants (#1720) — so a re-launched child holds the
@@ -5429,6 +5430,53 @@ struct PagerRef {
     export: u32,
 }
 
+/// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
+/// (child-relative) the reply supplies. The pager never addresses the child's memory; the runtime
+/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see.
+struct PageSink {
+    child: Mem,
+    /// The page's child-relative base.
+    page: u64,
+    /// The page's length: one host page, or less when the window is smaller than a page.
+    len: u64,
+    /// The fault address's offset in its page, so the reply (the source of the *faulting byte*)
+    /// locates the start of its page in the pager's window.
+    off: u64,
+}
+
+/// §2.2 / #1862 — settle a `page(addr)` request: copy the page the pager's reply `value` names
+/// out of the **pager's own window** (`pager_mem`, the serving vCPU's) into the faulting child's,
+/// then mark it mapped. `value` is the pager-window address of the faulting byte's source; the
+/// page around it is `[value - off, value - off + len)`. Runs on the pager's vCPU at the settle,
+/// before the reply is delivered, so the pager cannot reuse its buffer before the copy. Returns
+/// the value to deliver: unchanged, or `EFAULT` when the pager's window cannot supply that range
+/// (the child's fault is then fatal, as a pagerless one is). A ticket with no sink (not a page
+/// request) passes through.
+fn supply_page_at_settle(
+    sched: &SchedRef,
+    pager: &Arc<Mutex<Host>>,
+    ticket: u64,
+    value: i64,
+    pager_mem: Option<&Mem>,
+) -> i64 {
+    let Some(sink) = sched.take_page_sink(pager, ticket) else {
+        return value;
+    };
+    if value < 0 {
+        return value;
+    }
+    let bytes = (value as u64)
+        .checked_sub(sink.off)
+        .and_then(|src| pager_mem?.read_bytes_impl(src, sink.len));
+    match bytes {
+        Some(b) => {
+            sink.child.supply_page(sink.page, &b);
+            value
+        }
+        None => EFAULT,
+    }
+}
+
 /// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
 enum Inner {
     Done(Vec<Value>),
@@ -6052,6 +6100,11 @@ struct Sched {
     /// that itself dies (its reply never comes). Bounded by in-flight-calls-across-a-death, not by
     /// call volume.
     orphan_tickets: BTreeSet<(usize, u64)>,
+    /// §2.2 / #1862 — the page each in-flight `page(addr)` request supplies, keyed like
+    /// [`Sched::ticket_waiters`] by `(pager domain id, ticket)`. Filed by the faulting child in
+    /// the same scheduler critical section as its enqueue, so the pager can never settle the
+    /// request before its sink exists; taken at the settle ([`supply_page_at_settle`]).
+    page_sinks: BTreeMap<(usize, u64), PageSink>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -6581,6 +6634,8 @@ impl Scheduler {
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
         let callee_id = callee.lock_unpoisoned().domain_id() as usize;
+        // #1862 — a page request settled without a copy (an error reply) drops its sink here.
+        s.page_sinks.remove(&(callee_id, ticket));
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
@@ -7419,6 +7474,11 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         trap_fault: None,
     };
     let id = v.id;
+    // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
+    // back to the budget that paid for them (lock order sched → host).
+    if let Some((cell, budget, bytes)) = v.window_lease.take() {
+        cell.lock_unpoisoned().budget_mem_give(budget, bytes);
+    }
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
     twin_finished_locked(s, id, &v.host, &outcome.result);
@@ -8577,6 +8637,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
                 let gone = client_gone_targets(&v);
+                // A detached child's window goes back to the budget that paid for it (no lock held
+                // here). Never during a freeze unwind: the child is captured, not ended.
+                if !froze {
+                    if let Some((cell, budget, bytes)) = v.window_lease.take() {
+                        cell.lock_unpoisoned().budget_mem_give(budget, bytes);
+                    }
+                }
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
                 // until it is joined.
                 let finished_thread = match &v.spawn_residue {
@@ -9006,12 +9073,28 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                     return;
                 };
+                // #1862: the pager gets the fault address in the child's own coordinates, and its
+                // reply is copied into the child through the sink filed here. Enqueue and sink are
+                // one scheduler critical section (lock order sched → host), so the pager cannot
+                // settle the request before its sink exists.
                 let (ticket, pager_id) = {
+                    let m = v.mem.as_ref().expect("a demand child has a window");
+                    let rel = addr - m.window.base();
+                    let page = rel / m.page * m.page;
+                    let sink = PageSink {
+                        child: m.fork_for_thread(),
+                        page,
+                        len: m.page.min(m.window.mapped() - page),
+                        off: rel - page,
+                    };
+                    let mut s = sched.lock();
                     let mut cg = pb.cell.lock_unpoisoned();
-                    (
-                        cg.svc_enqueue(pb.export, 0, vec![addr as i64]),
-                        cg.domain_id(),
-                    )
+                    let id = cg.domain_id();
+                    let t = cg.svc_enqueue(pb.export, 0, vec![rel as i64]);
+                    if let Some(t) = t {
+                        s.page_sinks.insert((id as usize, t), sink);
+                    }
+                    (t, id)
                 };
                 let Some(t) = ticket else {
                     // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
@@ -9032,11 +9115,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 // the negative reply and traps; its Done arm tears down as usual).
                                 v.page_fault = Some(addr);
                                 v.pending = Some(Pending::CapResult(r));
-                            } else if let Some(m) = v.mem.as_ref() {
-                                m.supply_page(addr);
                             }
                             // Fast lane: continue this vCPU here and now — the rewound access
-                            // re-executes on this worker with the page in place.
+                            // re-executes on this worker with the page in place (the settle, run
+                            // inline above, supplied it).
                             continue;
                         }
                         // Handler parked mid-service (4d.2): fall through to the ticket park — it
@@ -9262,6 +9344,17 @@ enum SchedRef {
 }
 
 impl SchedRef {
+    /// §2.2 / #1862 — take the page sink filed for `pager`'s dispatch `ticket`, if that dispatch is
+    /// a page request. The explorer runs no demand children, so it never has one.
+    fn take_page_sink(&self, pager: &Arc<Mutex<Host>>, ticket: u64) -> Option<PageSink> {
+        match self {
+            SchedRef::Real(s) => {
+                let id = pager.lock_unpoisoned().domain_id() as usize;
+                s.lock().page_sinks.remove(&(id, ticket))
+            }
+            SchedRef::Det(_) => None,
+        }
+    }
     fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         match self {
             SchedRef::Real(s) => s.spawn(make),
@@ -11524,6 +11617,11 @@ struct VCpu {
     /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
     /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
     freeze_bell: Option<Arc<AtomicBool>>,
+    /// The window a detached spawn spent on this vCPU — `(parent powerbox, budget, bytes)` — on a
+    /// detached child's root only. Its bytes go back to that budget when the child ends (the `Done`
+    /// arm, or [`reap`] at a teardown): `Budget.mem` accounts live windows (owner, 2026-09-29), the
+    /// same moment the Cranelift executor's teardown gives them back.
+    window_lease: Option<(Arc<Mutex<Host>>, i32, u64)>,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
     /// (a different unmasked signal can interrupt a running handler — the source blocks the
@@ -11694,6 +11792,7 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            window_lease: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -11772,6 +11871,7 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            window_lease: None,
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -11872,6 +11972,7 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            window_lease: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -12537,18 +12638,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             v.frames[top].vals.push(Reg::from_i32(status));
         }
         Some(Pending::CapResult(status)) => {
-            if let Some(addr) = v.page_fault.take() {
+            if v.page_fault.take().is_some() {
                 // §2.2: this was a page-fault park, not a guest call.cap — the faulting op was
-                // rewound, so nothing is pushed. A non-negative reply means the pager wrote the
-                // page's bytes: supply it and let the rewound access re-execute over them. A
-                // negative reply (pager error, or CAP_REVOKED from a dead pager — D37
-                // death-is-revocation) is an unserviceable fault: detect-and-kill, exactly as a
-                // pagerless fault would have been.
+                // rewound, so nothing is pushed. A non-negative reply means the page was supplied
+                // at the pager's settle (#1862): the rewound access re-executes over it — and, were
+                // it somehow not, faults again and asks again rather than reading unsupplied bytes.
+                // A negative reply (pager error, an unsuppliable source, or CAP_REVOKED from a dead
+                // pager — D37 death-is-revocation) is an unserviceable fault: detect-and-kill,
+                // exactly as a pagerless fault would have been.
                 if status < 0 {
                     return Err(Trap::MemoryFault);
-                }
-                if let Some(m) = v.mem.as_ref() {
-                    m.supply_page(addr);
                 }
             } else {
                 // §3.6 revocation-unparks: the handle this fiber's capability call was parked
@@ -12634,6 +12733,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         offer_parked,
         admit_retry,
         unit_ref_cache,
+        window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -13794,6 +13894,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // §3b (op 17): the record's Budget handle, validated at parse, consumed
                     // (drained) only at spawn commit.
                     let mut rec_budget_h: Option<i32> = None;
+                    // #1863 (op 17, v1): a **detached** record — op 15 as data. Its fields replace
+                    // the op-15 arm's positional-arg parse; the arm is the one detached spawn path.
+                    let mut rec_detached: Option<SpawnRec> = None;
                     #[allow(clippy::type_complexity)]
                     // `named` carries the re-grant **handles** (not pre-resolved bindings): a pipe
                     // end must alias its shared backing into the child, not copy a parent-local index, so
@@ -13846,75 +13949,97 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as u64;
                             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let raw = m.read_window(rp, 56)?;
-                            let raw: &[u8; 56] =
-                                raw.as_slice().try_into().map_err(|_| Trap::Malformed)?;
-                            // Shared 56-byte layout decode (#911); budget/grant/pager handling below
+                            let head = m.read_window(rp, 56)?;
+                            let head: &[u8; 56] =
+                                head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
+                            // The version word says how long the record is (v0 carve, v1 detached).
+                            let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
+                            let raw = m.read_window(rp, len)?;
+                            // Shared layout decode (#911); budget/grant/pager handling below
                             // stays tier-local (this arm alone validates the budget handle and the
                             // pager export against `self_module`, and parses the grant list).
-                            let sr = SpawnRec::parse(raw).ok_or(Trap::CapFault)?; // version — fail closed
-                            let entry = sr.entry as u64;
-                            let off = sr.off;
-                            let size_log2 = sr.size_log2;
-                            let pager = sr.pager;
-                            let modh = sr.modh;
-                            let budget_h = sr.budget;
-                            let quota = sr.quota;
-                            // §3b: a live Budget handle funds the child — fuel from the budget
-                            // (still capped by the physical remaining), the carve gated by its
-                            // mem quota, the child's vCPU ceiling tightened by its spawn quota.
-                            // Mixing it with a raw quota scalar is ambiguous — fail closed; a
-                            // dangling/mistyped handle likewise. The budget is only *consumed*
-                            // (drained) at spawn commit, so a spawn refused later (bad carve /
-                            // entry) leaves it intact.
-                            if budget_h != 0 {
-                                if quota != 0 {
-                                    return Err(Trap::CapFault);
+                            let sr = SpawnRec::parse(&raw).ok_or(Trap::CapFault)?; // version / reserved — fail closed
+                            if sr.detached {
+                                // #1863: a v1 record is op 15 as data — the detached arm spawns
+                                // it, with the pager binding (#1862) validated here as for v0.
+                                if sr.pager != u32::MAX {
+                                    let hg = host.lock_unpoisoned();
+                                    let ok = hg
+                                        .self_module
+                                        .as_ref()
+                                        .and_then(|sm| sm.impl_exports.get(sr.pager as usize))
+                                        .is_some_and(|e| !e.ops.is_empty());
+                                    if !ok {
+                                        return Err(Trap::CapFault);
+                                    }
+                                    pager_ref = Some((Arc::clone(host), sr.pager));
                                 }
-                                let hg = host.lock_unpoisoned();
-                                if hg.peek_budget(budget_h).is_none() {
-                                    return Err(Trap::CapFault);
-                                }
-                                rec_budget_h = Some(budget_h);
-                            }
-                            let grants_ptr = sr.grants_ptr;
-                            let grants_n = sr.grants_n;
-                            let list = read_grant_records(grants_ptr, grants_n, |o, l| {
-                                m.read_window(o, l)
-                            })?;
-                            authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
-                            if pager != u32::MAX {
-                                let hg = host.lock_unpoisoned();
-                                // A missing/empty pager export fails the spawn closed (§3.3).
-                                let ok = hg
-                                    .self_module
-                                    .as_ref()
-                                    .and_then(|sm| sm.impl_exports.get(pager as usize))
-                                    .is_some_and(|e| !e.ops.is_empty());
-                                if !ok {
-                                    return Err(Trap::CapFault);
-                                }
-                                pager_ref = Some((Arc::clone(host), pager));
-                            }
-                            let g = if modh >= 0 {
-                                let hg = host.lock_unpoisoned();
-                                let g = hg.resolve_module(modh)?;
-                                Some(ChildMod {
-                                    funcs: g.funcs.clone(),
-                                    shadow: g.shadow,
-                                    memory_log2: g.memory_log2,
-                                    data: g.data.clone(),
-                                    durable: g.durable,
-                                    digest: g.digest,
-                                    imports: g.imports.clone(),
-                                    types: g.types.clone(),
-                                    module: Arc::clone(&g.module),
-                                })
+                                rec_detached = Some(sr);
+                                (15, None, 0, Vec::new())
                             } else {
-                                None
-                            };
-                            rec_geo = Some((entry, off, size_log2, quota));
-                            (0, g, 0, list)
+                                let entry = sr.entry as u64;
+                                let off = sr.off;
+                                let size_log2 = sr.size_log2;
+                                let pager = sr.pager;
+                                let modh = sr.modh;
+                                let budget_h = sr.budget;
+                                let quota = sr.quota;
+                                // §3b: a live Budget handle funds the child — fuel from the budget
+                                // (still capped by the physical remaining), the carve gated by its
+                                // mem quota, the child's vCPU ceiling tightened by its spawn quota.
+                                // Mixing it with a raw quota scalar is ambiguous — fail closed; a
+                                // dangling/mistyped handle likewise. The budget is only *consumed*
+                                // (drained) at spawn commit, so a spawn refused later (bad carve /
+                                // entry) leaves it intact.
+                                if budget_h != 0 {
+                                    if quota != 0 {
+                                        return Err(Trap::CapFault);
+                                    }
+                                    let hg = host.lock_unpoisoned();
+                                    if hg.peek_budget(budget_h).is_none() {
+                                        return Err(Trap::CapFault);
+                                    }
+                                    rec_budget_h = Some(budget_h);
+                                }
+                                let grants_ptr = sr.grants_ptr;
+                                let grants_n = sr.grants_n;
+                                let list = read_grant_records(grants_ptr, grants_n, |o, l| {
+                                    m.read_window(o, l)
+                                })?;
+                                authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
+                                if pager != u32::MAX {
+                                    let hg = host.lock_unpoisoned();
+                                    // A missing/empty pager export fails the spawn closed (§3.3).
+                                    let ok = hg
+                                        .self_module
+                                        .as_ref()
+                                        .and_then(|sm| sm.impl_exports.get(pager as usize))
+                                        .is_some_and(|e| !e.ops.is_empty());
+                                    if !ok {
+                                        return Err(Trap::CapFault);
+                                    }
+                                    pager_ref = Some((Arc::clone(host), pager));
+                                }
+                                let g = if modh >= 0 {
+                                    let hg = host.lock_unpoisoned();
+                                    let g = hg.resolve_module(modh)?;
+                                    Some(ChildMod {
+                                        funcs: g.funcs.clone(),
+                                        shadow: g.shadow,
+                                        memory_log2: g.memory_log2,
+                                        data: g.data.clone(),
+                                        durable: g.durable,
+                                        digest: g.digest,
+                                        imports: g.imports.clone(),
+                                        types: g.types.clone(),
+                                        module: Arc::clone(&g.module),
+                                    })
+                                } else {
+                                    None
+                                };
+                                rec_geo = Some((entry, off, size_log2, quota));
+                                (0, g, 0, list)
+                            }
                         }
                         // §14 `instantiate_module_named(module, grants_ptr, grants_n, entry, off,
                         // size_log2, quota)` (STAGE1.md — the shell "exec" primitive): the union of op 5
@@ -14253,10 +14378,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // separate-module child serves its *own* offers; a
                                     // same-module child serves over the shared program (the
                                     // parent's registered module).
-                                    ch.self_module = match &child_mod {
+                                    let sm = match &child_mod {
                                         Some(cm) => Some(Arc::clone(&cm.module)),
                                         None => host.lock_unpoisoned().self_module.clone(),
                                     };
+                                    ch.set_self_module_opt(sm);
                                     let child_host = Arc::new(Mutex::new(ch));
                                     // §3.6 slice 3: keep a live reference past the move into
                                     // the child vCPU, for `child_offer` (op 14).
@@ -14554,7 +14680,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // recorded §5/O6 follow-up). No D38 contact: the child's window is an
                         // ordinary reservation with its own guard, exactly a root run's.
                         15 => {
+                            // #1863: the op-17 v1 record, when that is how the spawn came in, else
+                            // op 15's positional args — one decoded spawn either way.
+                            let rec = rec_detached.take();
                             let argn = |i: usize| -> Result<i64, Trap> {
+                                if let Some(r) = &rec {
+                                    return Ok(match i {
+                                        0 => r.budget as i64,
+                                        1 => r.modh as i64,
+                                        2 => r.grants_ptr as i64,
+                                        3 => r.grants_n as i64,
+                                        4 => r.entry as i64,
+                                        5 => r.size_log2,
+                                        6 => r.quota,
+                                        _ => return Err(Trap::Malformed),
+                                    });
+                                }
                                 Ok(
                                     get(&frames[top].vals, *args.get(i).ok_or(Trap::Malformed)?)?
                                         .i64(),
@@ -14574,6 +14715,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // no analogue across windows. The 7-arg form seeds nothing; an over-long
                             // payload refuses probeably.
                             let payload: Option<Vec<u8>> = match (args.get(7), args.get(8)) {
+                                _ if rec.is_some() => match rec.as_ref().map(|r| r.args) {
+                                    Some((ptr, len)) if len > 0 => {
+                                        let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                        Some(m.read_window(ptr, len as usize)?)
+                                    }
+                                    _ => None,
+                                },
                                 (Some(&p), Some(&l)) => {
                                     let ptr = get(&frames[top].vals, p)?.i64() as u64;
                                     let len = get(&frames[top].vals, l)?.i64() as usize;
@@ -14593,6 +14741,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // ceremony (`Host::premap_admit` / `stage_premap` / `apply_premap`). The
                             // 9-arg form pre-maps nothing.
                             let premap: Option<(i32, u64)> = match (args.get(9), args.get(10)) {
+                                _ if rec.is_some() => rec
+                                    .as_ref()
+                                    .filter(|r| r.region >= 0)
+                                    .map(|r| (r.region, r.child_off)),
                                 (Some(&r), Some(&o)) => Some((
                                     get(&frames[top].vals, r)?.i64() as i32,
                                     get(&frames[top].vals, o)?.i64() as u64,
@@ -14637,6 +14789,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
+                            let size_log2 = temen_ir::detached_size_log2(size_log2, cm.memory_log2);
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {
@@ -14693,6 +14846,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
+                                // #1862/#1863: a v1 record's pager — the whole window starts
+                                // demand-paged and every page arrives through the pager's reply.
+                                let pager_for_child = pager_ref.take();
+                                if pager_for_child.is_some() {
+                                    fm.demand_page();
+                                }
                                 let mut ch = Host::new();
                                 // §4: *a durable domain may only spawn durable children* — the
                                 // detached child inherits the bit exactly as a nested one does (the
@@ -14743,7 +14902,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if bound.is_err() {
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
-                                    ch.self_module = Some(Arc::clone(&cm.module));
+                                    ch.set_self_module_opt(Some(Arc::clone(&cm.module)));
                                     let child_host = Arc::new(Mutex::new(ch));
                                     // #863 slice 3 — a child that inherited a personality signal door
                                     // via the re-grant above gets its own **domain-scoped, weak**
@@ -14806,6 +14965,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // lifecycle"). A freeze is a lifecycle action.
                                     let bell = Arc::new(AtomicBool::new(false));
                                     let bell_child = Arc::clone(&bell);
+                                    let lease = (Arc::clone(host), budget, child_size);
                                     // D66 — the child's lane chain: its own domain at its own cap, then
                                     // ours, so its tasks count against both (INVARIANTS #3 ruling).
                                     let chain_child = {
@@ -14849,6 +15009,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
                                         child.freeze_bell = Some(bell_child); // and so does the freeze
+                                        child.window_lease = Some(lease); // its window's bytes, until it ends
+                                        if let Some((cell, export)) = pager_for_child {
+                                            child.pager = Some(PagerRef { cell, export });
+                                            child.fault_pager = true;
+                                        }
                                         child.lane_chain = chain_child; // D66: own domain (its lane), then ours
                                         Box::new(child)
                                     });
@@ -15001,6 +15166,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // handler's return must **not** clobber the injected value — the
                                 // dispatch still counts as served.
                                 if !run.replied {
+                                    // #1862: a page request's bytes move now, from this serving
+                                    // vCPU's window, before the reply can wake the child.
+                                    let value = supply_page_at_settle(
+                                        sched,
+                                        host,
+                                        run.ticket,
+                                        value,
+                                        mem.as_ref(),
+                                    );
                                     sched.cap_reply_or_stash(run.ticket, value, host);
                                 }
                                 *serve_count += 1;
@@ -21235,6 +21409,9 @@ pub struct Host {
     /// `self.covers`, and `export.handle` resolve through one host-side entry on all three
     /// backends. `None` until registered (the ops then fail closed, probeable).
     self_module: Option<Arc<Module>>,
+    /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, kept in step
+    /// with it by [`Host::set_self_module_opt`], its one writer.
+    self_grant: Option<ModuleGrant>,
     /// The domain's one shared service state for offers it reifies (`export.handle` — all of a
     /// domain's reified offers share it), created lazily on first reification.
     self_instance: Option<Arc<Mutex<ProviderState>>>,
@@ -21943,6 +22120,7 @@ impl Host {
             import_remaps: Vec::new(),
             import_reqs: Vec::new(),
             self_module: None,
+            self_grant: None,
             self_instance: None,
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
@@ -22226,7 +22404,7 @@ impl Host {
         twin.import_reqs = self.import_reqs.clone();
         twin.import_bindings = self.import_bindings.clone();
         twin.cap_names = self.cap_names.clone();
-        twin.self_module = self.self_module.clone();
+        twin.set_self_module_opt(self.self_module.clone());
         twin.self_reified = self.self_reified.clone(); // empty (self_instance is None)
         twin.attestation = self.attestation;
         twin.durable = self.durable;
@@ -23128,7 +23306,7 @@ impl Host {
         host.set_durable(true);
         host.set_lane_cap(launch.lane);
         host.set_channel_cap(launch.channel);
-        host.self_module = Some(Arc::clone(&g.module));
+        host.set_self_module_opt(Some(Arc::clone(&g.module)));
         for (name, h) in &launch.names {
             host.register_cap_name(name, *h);
         }
@@ -25268,7 +25446,15 @@ impl Host {
     /// `self.type_id`, `self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
-        self.self_module = Some(Arc::clone(m));
+        self.set_self_module_opt(Some(Arc::clone(m)));
+    }
+
+    /// Set (or clear) the running module — the one writer of [`Host::self_module`], so the grant
+    /// [`SELF_MODULE`] resolves to ([`Host::resolve_module`]) is always the current module's (#1863:
+    /// a spawn record's `module = -1` means "my own program", on every tier).
+    pub(crate) fn set_self_module_opt(&mut self, m: Option<Arc<Module>>) {
+        self.self_grant = m.as_ref().map(|m| ModuleGrant::of(Arc::clone(m), false));
+        self.self_module = m;
     }
 
     /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
@@ -25999,14 +26185,29 @@ impl Host {
             .is_some_and(|m| temen_ir::spawns_detached(m))
     }
 
-    pub fn grant_detached_spawn_caps(&mut self, win: u64) {
+    /// [`temen_ir::spawns_by_module_handle`] over the running module; `false` with none registered.
+    pub fn self_module_spawns_by_module_handle(&self) -> bool {
+        self.self_module
+            .as_ref()
+            .is_some_and(|m| temen_ir::spawns_by_module_handle(m))
+    }
+
+    /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
+    /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
+    /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), and `"budget"`
+    /// (one `win` of `Budget.mem`).
+    pub fn grant_detached_spawn_caps(&mut self, win: u64, by_module_handle: bool) {
         let Some(m) = self.self_module.clone() else {
             return;
         };
-        let module = self.grant_module_shared(m, false);
-        self.register_cap_name("module", module);
-        let budget = self.grant_budget(0, win as i64, 0);
-        self.register_cap_name("budget", budget);
+        if by_module_handle && self.resolve_cap_name("module").is_none() {
+            let module = self.grant_module_shared(m, false);
+            self.register_cap_name("module", module);
+        }
+        if self.resolve_cap_name("budget").is_none() {
+            let budget = self.grant_budget(0, win as i64, 0);
+            self.register_cap_name("budget", budget);
+        }
     }
 
     /// [`Host::grant_module`], additionally attesting the module is **freezable** (DURABILITY.md
@@ -26112,6 +26313,11 @@ impl Host {
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
     /// module ops. A forged / closed / wrong-type handle is a `CapFault`.
     fn resolve_module(&self, handle: i32) -> Result<&ModuleGrant, Trap> {
+        // #1863: `-1` names the running module — a spawn of "my own program" needs no grant, as
+        // the op-17 record always allowed. With no module registered it faults like a forgery.
+        if handle == SELF_MODULE {
+            return self.self_grant.as_ref().ok_or(Trap::CapFault);
+        }
         match self.resolve(handle, cap_id::MODULE)? {
             Binding::Module(id) => self.modules.get(id as usize).ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
@@ -26800,6 +27006,7 @@ impl Host {
         // a spawner appears, which is the same least-authority rule, just evaluated at install
         // instead of at powerbox build.
         let unit_spawns_detached = funcs.iter().any(temen_ir::Func::spawns_detached);
+        let unit_by_handle = funcs.iter().any(temen_ir::Func::spawns_by_module_handle);
         let unit = d.units.len() as u32;
         // No wasm yet: the browser tier emits a unit **lazily**, on its first read through
         // [`Self::jit_unit_wasm_or_emit`] — the one emit path for a `compile`d, a `compile_linked`,
@@ -26813,7 +27020,7 @@ impl Host {
             wasm: None,
         });
         // #1529 (see above): the unit installed and it spawns detached, so grant the set now —
-        // once (a later spawning unit finds `"module"` already registered). Three conditions keep it
+        // each name once (`grant_detached_spawn_caps` skips a name already registered). Three conditions keep it
         // a strict subset of what this guest already holds, never a new frontier:
         //
         // - a named `"instantiator"` must be present — the embedder's own decision to hand this
@@ -26828,13 +27035,13 @@ impl Host {
         //
         // The decision lives here, not in the powerbox tier, because this is the only point that sees
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.
-        if unit_spawns_detached && !self.durable && self.resolve_cap_name("module").is_none() {
+        if unit_spawns_detached && !self.durable {
             if let Some(win) = self
                 .resolve_cap_name("instantiator")
                 .and_then(|h| self.resolve_instantiator(h).ok())
                 .map(|(_, size)| size)
             {
-                self.grant_detached_spawn_caps(win);
+                self.grant_detached_spawn_caps(win, unit_by_handle);
             }
         }
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
@@ -27143,7 +27350,7 @@ impl Host {
         }
         let mut ch = Host::new();
         // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
-        ch.self_module = self.self_module.clone();
+        ch.set_self_module_opt(self.self_module.clone());
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false, None));
         let (cinst, cas) = ch.grant_starter_caps(child_size);
@@ -27445,7 +27652,7 @@ impl Host {
                                                  // what `offer_shape` and its serve loop resolve against — is the holder's. The interp's
                                                  // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
                                                  // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
-        ch.self_module = self.self_module.clone();
+        ch.set_self_module_opt(self.self_module.clone());
         ch.set_attestation(attestation);
         let (cinst, cas) = ch.grant_starter_caps(child_size);
         for (name, handle) in grants {
@@ -27620,7 +27827,7 @@ impl Host {
         starters: &mut [i32],
     ) -> Result<Vec<(i32, i32)>, ()> {
         // The command serves its OWN offers / resolves `cap.self` against its module.
-        child.self_module = Some(Arc::clone(cmodule));
+        child.set_self_module_opt(Some(Arc::clone(cmodule)));
         // #1662 — the process's **module grants** survive exec at the SAME handle numbers, exactly
         // as they survive fork (`fork_powerbox` clones the table and `modules`). A personality
         // records what a process may `execve` by handle number, in state every process shares
@@ -30359,19 +30566,27 @@ impl Mem {
     fn demand_page(&self) {
         // `div_ceil` so a child smaller than one host page (e.g. a 4 KiB sub-window on a 16 KiB-page
         // host) still gets its single covering page marked — confinement keeps its accesses in-window.
-        let pages = self.window.reserved().div_ceil(self.page).max(1);
+        // The **declared** window, not the reservation: a carve's are equal, but a detached window
+        // reserves 2^40 bytes (#1863) — its tail is growth (`vm_map`), never pager-supplied.
+        let pages = self.window.mapped().div_ceil(self.page).max(1);
         let mut space = self.space_write();
         for p in 0..pages {
             space.prot.insert(p, PageProt::Unmapped);
         }
     }
 
-    /// Supply the page containing the confined `abs_addr` (§14 lazy paging): mark it read-write
-    /// **without zeroing**, so the bytes the parent placed in the shared backing survive — the
-    /// faulting access then re-executes and reads them. Used by `resume` after a fault-driven yield.
-    fn supply_page(&self, abs_addr: u64) {
-        let page = abs_addr.wrapping_sub(self.window.base()) / self.page;
-        self.space_write().prot.insert(page, PageProt::Rw);
+    /// Supply a demand-paged page (§2.2, #1862): write the pager's `bytes` at the window-relative
+    /// page base `page`, then mark the page read-write — in that order, so no vCPU of the child sees
+    /// the page mapped before its bytes are in place. The write goes straight to the backing: the
+    /// page is `Unmapped` until this call maps it.
+    fn supply_page(&self, page: u64, bytes: &[u8]) {
+        let base = self.window.base() + page;
+        for (k, b) in bytes.iter().enumerate() {
+            self.set_byte(base + k as u64, *b);
+        }
+        self.space_write()
+            .prot
+            .insert(page / self.page, PageProt::Rw);
     }
 
     /// #801 `exec` image hygiene — the image-replace reuses the **caller's** window, whose
@@ -32484,7 +32699,7 @@ mod fork_powerbox_tests {
         let cjit = parent
             .regrant_into_child(pjit, &mut child)
             .expect("jit re-grants into the child");
-        child.self_module = Some(Arc::new(unit.clone()));
+        child.set_self_module_opt(Some(Arc::new(unit.clone())));
         assert!(
             child.jit_hosts_durable,
             "the durable hosting authority was inherited"
@@ -32518,7 +32733,7 @@ mod fork_powerbox_tests {
         let cjit2 = plain
             .regrant_into_child(pjit2, &mut child2)
             .expect("jit re-grants");
-        child2.self_module = Some(Arc::new(unit.clone()));
+        child2.set_self_module_opt(Some(Arc::new(unit.clone())));
         assert!(
             matches!(child2.jit_compile(cjit2, &unit_ir), Ok(Err(e)) if e == EINVAL),
             "a durable child of a non-hosting parent refuses compile fail-closed"

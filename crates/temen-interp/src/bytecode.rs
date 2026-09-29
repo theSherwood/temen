@@ -1448,6 +1448,10 @@ struct AdmittedChild {
     args: Vec<Value>,
     /// The child's fuel: a funding budget's, or the op's quota clamped to the parent's remaining.
     fuel: u64,
+    /// A detached child's window lease `(budget, bytes)`: `Budget.mem` accounts live windows
+    /// (INVARIANTS #3, 2026-09-29), so the driver gives these bytes back to the spawner's budget when
+    /// the child ends. `None` for a confined (carve) child, which spends no `Budget.mem`.
+    lease: Option<(i32, u64)>,
 }
 
 /// Admit a §14 confined spawn and build the child. `host` is the spawning task's own powerbox, where
@@ -1554,6 +1558,7 @@ fn admit_confined_child(
         program,
         args: child_entry_args(arity, cinst, cas),
         fuel,
+        lease: None,
     }))
 }
 
@@ -1600,7 +1605,7 @@ fn confined_child_host(
                 .is_ok()
         }
         None => {
-            child_host.self_module = host.self_module.clone();
+            child_host.set_self_module_opt(host.self_module.clone());
             let im = child_host.module_imports(super::SELF_MODULE);
             let ty = child_host.module_types(super::SELF_MODULE);
             match (grants, im, ty) {
@@ -1706,12 +1711,13 @@ fn admit_detached_child(
     let sig = compiled.sigs.get(s.entry as usize);
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let child_size = if (0..64).contains(&s.size_log2) {
-        1u64 << s.size_log2
+    let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
     } else {
         0
     };
-    let mod_ok = cmem_log2 == Some(s.size_log2 as u8);
+    let mod_ok = cmem_log2 == Some(size_log2 as u8);
     let payload: Vec<u8> = match s.args {
         Some((ptr, len)) => pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?,
         None => Vec::new(),
@@ -1744,7 +1750,9 @@ fn admit_detached_child(
         || !durable_ok
         || match host.admit_detached_spawn(s.budget, child_size) {
             // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do
-            // not yet return a lane at their reap, so the lane is given straight back (#1600).
+            // not yet return a lane at their reap, so the lane is given straight back (#1600). The
+            // window's bytes stay spent while the child lives: the driver returns them at its end
+            // (`AdmittedChild::lease`).
             Some(lane) => {
                 host.give_lane(lane);
                 false
@@ -1794,9 +1802,10 @@ fn admit_detached_child(
         program: ChildProgram::Granted(compiled),
         args,
         fuel,
+        lease: Some((s.budget, child_size)),
     };
     let window = FreshWindow {
-        size_log2: s.size_log2 as u8,
+        size_log2: size_log2 as u8,
         shadow: cshadow,
         data: cdata,
         payload,
@@ -3903,6 +3912,15 @@ pub struct Vcpu<'p> {
     /// The child the last [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced
     /// — admitted, and waiting for the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
+    /// Detached children's window leases (INVARIANTS #3: `Budget.mem` accounts live windows). The
+    /// driver runs the child, so this engine sees its end only as the parent's `join`: a lease is
+    /// filed against the handle the driver delivers ([`deliver_handle`](Self::deliver_handle)) and its
+    /// bytes go back to the budget when that handle's join is delivered. `pending_lease` is the
+    /// just-admitted spawn's `(budget, bytes)`, `leases` the live `(handle, budget, bytes)`,
+    /// `joining` the handle whose join is in flight.
+    pending_lease: Option<(i32, u64)>,
+    leases: Vec<(i32, i32, u64)>,
+    joining: Option<i32>,
 }
 
 /// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
@@ -4221,6 +4239,9 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
+            pending_lease: None,
+            leases: Vec::new(),
+            joining: None,
         })
     }
 
@@ -4326,6 +4347,9 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
+            pending_lease: None,
+            leases: Vec::new(),
+            joining: None,
         })
     }
 
@@ -4615,6 +4639,7 @@ impl<'p> Vcpu<'p> {
                 }
                 Ok(VcpuStop::Join { handle, dst }) => {
                     self.pending = Some(dst);
+                    self.joining = Some(handle);
                     return VcpuEvent::Join { handle };
                 }
                 Ok(VcpuStop::CapPending { id, dst }) => {
@@ -4825,6 +4850,8 @@ impl<'p> Vcpu<'p> {
     ) -> Result<u32, Trap> {
         let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
         let (module, _) = child.program.land(source)?;
+        // A detached child's window lease, filed against the handle the host delivers.
+        self.pending_lease = child.lease;
         self.pending = Some(dst);
         self.pending_child = Some(PendingChild {
             host: child.host,
@@ -4840,7 +4867,22 @@ impl<'p> Vcpu<'p> {
 
     /// Deliver a `thread.spawn` handle (after `Spawn`).
     pub fn deliver_handle(&mut self, handle: i32) {
+        if let Some((budget, bytes)) = self.pending_lease.take() {
+            if handle >= 0 {
+                self.leases.push((handle, budget, bytes));
+            } else {
+                self.budget_mem_give(budget, bytes); // the driver refused the spawn
+            }
+        }
         self.deliver_code(handle);
+    }
+
+    /// Give `bytes` back to `budget` in this vCPU's powerbox.
+    fn budget_mem_give(&mut self, budget: i32, bytes: u64) {
+        match self.shared_host {
+            Some(m) => m.lock_unpoisoned().budget_mem_give(budget, bytes),
+            None => self.host.budget_mem_give(budget, bytes),
+        }
     }
 
     /// Take the child the just-surfaced [`VcpuEvent::Instantiate`] or
@@ -4860,6 +4902,12 @@ impl<'p> Vcpu<'p> {
     /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
     /// child trap propagates (the joiner traps on its next `run`).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
+        if let Some(handle) = self.joining.take() {
+            if let Some(i) = self.leases.iter().position(|l| l.0 == handle) {
+                let (_, budget, bytes) = self.leases.swap_remove(i);
+                self.budget_mem_give(budget, bytes);
+            }
+        }
         let dst = self.pending.take().expect("deliver with no pending event");
         match res {
             Ok(vals) => {
@@ -5982,6 +6030,7 @@ fn journal_state(
                 env: t.env,
                 state: t.state.clone(),
                 at_bp: t.at_bp,
+                lease: t.lease,
             })
             .collect(),
         fibers: fibers.to_vec(),
@@ -6716,6 +6765,9 @@ struct DbgTask {
     /// Paused on a just-reported breakpoint — step one op past it before the next scan makes progress
     /// (so a loop-body breakpoint re-fires each iteration).
     at_bp: bool,
+    /// A detached child's window lease `(spawner env, budget, bytes)` — [`TaskSlot::lease`]'s
+    /// counterpart, returned by [`dbg_refund_ended_windows`] once this task is `Done`.
+    lease: Option<(Option<usize>, i32, u64)>,
 }
 
 /// A §14 `instantiate` **confined executor child**'s runtime under the multi-vCPU debug scheduler — the
@@ -6725,6 +6777,21 @@ struct DbgTask {
 /// `Instantiator` + `AddressSpace`, each over `[0, child_size)`), `table` a fresh natural dispatch table
 /// over module 0 (no installed §22 units), and `fuel` a sub-allocated quota. Plain `Host` (the debug
 /// scheduler is single-threaded and the §3.6 live-call/serve machinery is not yet driven here).
+/// [`refund_ended_windows`] on the debugger's scheduler: a finished detached child's window goes back
+/// to the budget that paid for it, in the spawner's own powerbox.
+fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [DbgEnv]) {
+    for t in tasks.iter_mut() {
+        if matches!(t.state, DbgTaskState::Done(_)) {
+            if let Some((env, budget, bytes)) = t.lease.take() {
+                match env {
+                    None => host.budget_mem_give(budget, bytes),
+                    Some(k) => envs[k].host.budget_mem_give(budget, bytes),
+                }
+            }
+        }
+    }
+}
+
 struct DbgEnv {
     mem: Option<Mem>,
     host: Host,
@@ -6751,6 +6818,7 @@ struct DbgTaskSnapshot {
     env: Option<usize>,
     state: DbgTaskState,
     at_bp: bool,
+    lease: Option<(Option<usize>, i32, u64)>,
 }
 
 /// A multi-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
@@ -7102,6 +7170,7 @@ fn dbg_spawn(
         env,
         state: DbgTaskState::Runnable,
         at_bp: false,
+        lease: None,
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -7397,6 +7466,7 @@ fn dbg_start_child(
         program,
         args,
         fuel,
+        lease,
     } = child;
     let (module, prog) = program.land(source)?;
     let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
@@ -7415,6 +7485,7 @@ fn dbg_start_child(
         env: Some(eidx),
         state: DbgTaskState::Runnable,
         at_bp: false,
+        lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -7891,6 +7962,7 @@ impl ScheduledDebugRun {
                 env: None,
                 state: DbgTaskState::Runnable,
                 at_bp: false,
+                lease: None,
             }],
             extra_envs: Vec::new(),
             fibers: Vec::new(),
@@ -8244,6 +8316,7 @@ impl ScheduledDebugRun {
             if let DbgTaskState::Done(res) = &tasks[0].state {
                 return SchedStop::Finished(res.clone());
             }
+            dbg_refund_ended_windows(tasks, host, extra_envs);
             // A task mid-coroutine is pinned (atomic resume); otherwise prefer the stepping thread while
             // it is runnable (so a step stays on it and a step-over runs its own call), else the
             // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
@@ -8762,6 +8835,7 @@ impl ScheduledDebugRun {
                     env: t.env,
                     state: t.state.clone(),
                     at_bp: t.at_bp,
+                    lease: t.lease,
                 })
                 .collect(),
             fibers: self.fibers.clone(),
@@ -8851,6 +8925,7 @@ impl ScheduledDebugRun {
                     (s, _) => s.clone(),
                 },
                 at_bp: ts.at_bp,
+                lease: ts.lease,
             })
             .collect();
     }
@@ -11367,6 +11442,7 @@ fn coop_start_child(
         program,
         args,
         fuel,
+        lease,
     } = child;
     let (module, prog) = program.land(source)?;
     let (mut vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
@@ -11388,6 +11464,7 @@ fn coop_start_child(
         threads: Vec::new(),
         env: Some(eidx),
         state: TaskState::Runnable,
+        lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -11406,6 +11483,24 @@ struct TaskSlot {
     /// (and any threads it spawns, which share its window — they inherit the same env index).
     env: Option<usize>,
     state: TaskState,
+    /// A detached child's window lease `(spawner env, budget, bytes)`, on the child's root task:
+    /// once the task is `Done` the scheduler returns the bytes to the spawner's budget
+    /// ([`refund_ended_windows`]).
+    lease: Option<(Option<usize>, i32, u64)>,
+}
+
+/// Return the window bytes of every detached child whose root task has ended to the budget that paid
+/// for them, in the spawner's own powerbox — `Budget.mem` accounts live windows (INVARIANTS #3,
+/// 2026-09-29). Run at the top of every scheduling round, so the refund lands before any task runs
+/// again.
+fn refund_ended_windows(tasks: &mut [TaskSlot], host: &mut Host, envs: &[ChildEnv]) {
+    for t in tasks.iter_mut() {
+        if matches!(t.state, TaskState::Done(_)) {
+            if let Some((env, budget, bytes)) = t.lease.take() {
+                task_host(host, envs, env).with(|h| h.budget_mem_give(budget, bytes));
+            }
+        }
+    }
 }
 
 enum TaskState {
@@ -11714,6 +11809,7 @@ impl CoopSched {
             threads: Vec::new(),
             env: None,
             state: TaskState::Runnable,
+            lease: None,
         }];
         // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
         // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
@@ -12117,6 +12213,7 @@ impl CoopSched {
             for ci in pipe_wakes {
                 tasks[ci].state = TaskState::Runnable;
             }
+            refund_ended_windows(tasks, host, extra_envs);
             // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
             // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
             // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
@@ -12760,6 +12857,7 @@ impl CoopSched {
                             threads: Vec::new(),
                             env: Some(twin_eidx),
                             state: TaskState::Runnable,
+                            lease: None,
                         });
                         // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
                         // its exit status to the parent (FORK.md §8.6); retired when reaped.
@@ -13059,6 +13157,7 @@ impl CoopSched {
                                 threads: Vec::new(),
                                 env: Some(twin_eidx),
                                 state: TaskState::Runnable,
+                                lease: None,
                             });
                             forked_twins.insert(twin_ti);
                             tasks[ti].vt.active.set(dst, Reg::from_i64(twin_pid as i64));
@@ -13167,6 +13266,7 @@ impl CoopSched {
                         threads: Vec::new(),
                         env,
                         state: TaskState::Runnable,
+                        lease: None,
                     });
                     let handle = tasks[ti].threads.len() as i32;
                     tasks[ti].threads.push(Some(cidx));
@@ -15415,7 +15515,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &mut threads, child, spawn.entry) {
+                match par_start_child(scope, dom, reg, &host, &mut threads, child, spawn.entry) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -15439,7 +15539,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &mut threads, child, spawn.entry) {
+                match par_start_child(scope, dom, reg, &host, &mut threads, child, spawn.entry) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -15457,6 +15557,7 @@ fn par_start_child<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
     reg: &'env ThreadRegistry,
+    parent_host: &std::sync::Arc<std::sync::Mutex<Host>>,
     threads: &mut Vec<Option<u64>>,
     child: AdmittedChild,
     entry: i64,
@@ -15471,10 +15572,12 @@ fn par_start_child<'scope, 'env>(
         program,
         args,
         fuel,
+        lease,
     } = child;
     let (module, prog) = program.land(&dom.source)?;
     let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
     let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), table);
+    let lease = lease.map(|(budget, bytes)| (std::sync::Arc::clone(parent_host), budget, bytes));
     let id = reg
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -15496,6 +15599,11 @@ fn par_start_child<'scope, 'env>(
         });
         // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
         child_host.lock_unpoisoned().release_pipe_ends();
+        // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
+        // the result is published, so a joiner sees the refund.
+        if let Some((parent, budget, bytes)) = lease {
+            parent.lock_unpoisoned().budget_mem_give(budget, bytes);
+        }
         reg.publish(id, r);
     });
     let handle = threads.len() as i32;
@@ -17213,10 +17321,38 @@ impl Vm {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
-                    let raw = mem.as_ref().ok_or(Trap::Malformed)?.read_window(rp, 56)?;
-                    let raw: &[u8; 56] = raw.as_slice().try_into().map_err(|_| Trap::Malformed)?;
-                    // Shared 56-byte layout decode (#911); pager/budget handling stays tier-local.
-                    let sr = SpawnRec::parse(raw).ok_or(Trap::CapFault)?; // version — fail closed
+                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                    let head = m.read_window(rp, 56)?;
+                    let head: &[u8; 56] =
+                        head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
+                    // The version word says how long the record is (v0 carve, v1 detached).
+                    let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
+                    let raw = m.read_window(rp, len)?;
+                    // Shared layout decode (#911); pager/budget handling stays tier-local.
+                    let sr = SpawnRec::parse(&raw).ok_or(Trap::CapFault)?; // version / reserved — fail closed
+                    if sr.detached {
+                        // #1863: a v1 record is op 15 as data — the same outcome op 15 produces,
+                        // served by every driver's detached arm. No pager on this tier (see above).
+                        if sr.pager != u32::MAX {
+                            return Err(Trap::CapFault);
+                        }
+                        let dst = *dst;
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        let spawn = DetachedSpawn {
+                            budget: sr.budget,
+                            module: sr.modh,
+                            entry: sr.entry as i64,
+                            size_log2: sr.size_log2,
+                            quota: sr.quota,
+                            grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
+                            args: (sr.args.1 > 0).then_some(sr.args),
+                            premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
+                        };
+                        return Ok(Outcome::InstantiateDetached { spawn, dst });
+                    }
                     let entry = sr.entry as i64;
                     let off = sr.off as i64;
                     let size_log2 = sr.size_log2;
