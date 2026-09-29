@@ -5328,6 +5328,9 @@ enum Pending {
     /// result — a negative errno the parked fiber probes on its own error path. The fiber is
     /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
     CapResult(i64),
+    /// #1899 — a stream read ([`Blocked::CapRead`]) that a landing freeze abandoned: its result is a
+    /// placeholder, and the re-issue word makes the thaw re-issue the read.
+    Abandoned,
     /// A timed `svc.wait`'s deadline fired with nothing served ([`Blocked::SvcWait`]): the
     /// frame was rewound at the park, so nothing is pushed here — the flag makes the
     /// re-executed serve arm return `0` instead of re-parking (concurrent work that raced the
@@ -5515,6 +5518,10 @@ trait DomainMember {
     /// dropped (its park dies with the domain — never reaped). This is the drop-vs-reap subtlety the
     /// teardown sweep must preserve.
     fn into_victim(self) -> Option<Box<VCpu>>;
+    /// The parked vCPU, or `None` for a parked fiber (#1898: a freeze re-admits vCPUs; a fiber park
+    /// is its owner's `freeze_drive`'s).
+    fn vcpu(&self) -> Option<&VCpu>;
+    fn vcpu_mut(&mut self) -> Option<&mut VCpu>;
 }
 
 impl DomainMember for Box<VCpu> {
@@ -5522,6 +5529,12 @@ impl DomainMember for Box<VCpu> {
         domain_key_of(self)
     }
     fn into_victim(self) -> Option<Box<VCpu>> {
+        Some(self)
+    }
+    fn vcpu(&self) -> Option<&VCpu> {
+        Some(self)
+    }
+    fn vcpu_mut(&mut self) -> Option<&mut VCpu> {
         Some(self)
     }
 }
@@ -5539,26 +5552,36 @@ impl DomainMember for Waiter {
             Waiter::Fiber { .. } => None,
         }
     }
+    fn vcpu(&self) -> Option<&VCpu> {
+        match self {
+            Waiter::VCpu(v) => Some(v),
+            Waiter::Fiber { .. } => None,
+        }
+    }
+    fn vcpu_mut(&mut self) -> Option<&mut VCpu> {
+        match self {
+            Waiter::VCpu(v) => Some(v),
+            Waiter::Fiber { .. } => None,
+        }
+    }
 }
 
 // Tagged waiter entries carry a key alongside the parked thing — the futex value on `wait_waiters`,
-// the completion/ticket id on the single-`Waiter` maps, the joined task id on `join_waiters`. The tag
-// rides along untouched for survivors; membership and the reap victim are the inner value's.
-impl DomainMember for (u64, Waiter) {
+// the completion/ticket id on the single-`Waiter` maps, the joined task id on `join_waiters`, the
+// park reason on `svc_waiters`. The tag rides along untouched for survivors; membership and the reap
+// victim are the inner value's.
+impl<K, T: DomainMember> DomainMember for (K, T) {
     fn domain_key(&self) -> usize {
         self.1.domain_key()
     }
     fn into_victim(self) -> Option<Box<VCpu>> {
         self.1.into_victim()
     }
-}
-
-impl DomainMember for (u64, Box<VCpu>) {
-    fn domain_key(&self) -> usize {
-        domain_key_of(&self.1)
+    fn vcpu(&self) -> Option<&VCpu> {
+        self.1.vcpu()
     }
-    fn into_victim(self) -> Option<Box<VCpu>> {
-        Some(self.1)
+    fn vcpu_mut(&mut self) -> Option<&mut VCpu> {
+        self.1.vcpu_mut()
     }
 }
 
@@ -5573,11 +5596,22 @@ where
     T: DomainMember,
     Q: Default + IntoIterator<Item = T> + FromIterator<T>,
 {
+    drain_where(q, |e: &T| e.domain_key() == key)
+}
+
+/// Move every entry `take` picks out of `q` (survivors keep their order), returning the vCPUs among
+/// them; a picked fiber is dropped ([`DomainMember::into_victim`]).
+#[allow(clippy::vec_box)]
+fn drain_where<Q, T>(q: &mut Q, mut take: impl FnMut(&T) -> bool) -> Vec<Box<VCpu>>
+where
+    T: DomainMember,
+    Q: Default + IntoIterator<Item = T> + FromIterator<T>,
+{
     let mut victims = Vec::new();
     *q = std::mem::take(q)
         .into_iter()
         .filter_map(|e| {
-            if e.domain_key() == key {
+            if take(&e) {
                 victims.extend(e.into_victim());
                 None
             } else {
@@ -5586,6 +5620,186 @@ where
         })
         .collect();
     victims
+}
+
+/// [`drain_where`] over a keyed map of queues, dropping the queues it empties.
+#[allow(clippy::vec_box)]
+fn drain_queues<K: Ord, Q, T>(
+    m: &mut BTreeMap<K, Q>,
+    mut take: impl FnMut(&T) -> bool,
+) -> Vec<Box<VCpu>>
+where
+    T: DomainMember,
+    Q: Default + IntoIterator<Item = T> + FromIterator<T>,
+    for<'a> &'a Q: IntoIterator,
+{
+    let mut victims = Vec::new();
+    for q in m.values_mut() {
+        victims.extend(drain_where(q, &mut take));
+    }
+    m.retain(|_, q| (&*q).into_iter().next().is_some());
+    victims
+}
+
+/// #1898 — where the oracle's scheduler parks a vCPU: one site per waiter collection of [`Sched`].
+/// Every rule a freeze applies to a park reads [`ParkSite::freeze_rule`], and every list that walks
+/// the parked vCPUs is a loop over [`ParkSite::ALL`] through [`Sched::parked`] / [`Sched::take`] —
+/// whose matches are exhaustive, so a new collection cannot be missed by one list (DURABILITY §4,
+/// "One rule per park site").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkSite {
+    /// `svc.wait` consumers and the resumers idling beside them (`svc_waiters`).
+    Svc,
+    /// `atomic.wait` (`wait_waiters`).
+    Futex,
+    /// A pipe read on an empty FIFO (`pipe_waiters`).
+    PipeRead,
+    /// A pipe write to a full FIFO (`pipe_write_waiters`).
+    PipeWrite,
+    /// A blocking `waitpid` bench (`posix_reap_waiters`).
+    Reap,
+    /// A job-control stop (`stopped`).
+    Stopped,
+    /// A blocking stream read, such as stdin (`cap_waiters`).
+    StreamRead,
+    /// `thread.join` and `wait(pid)` (`join_waiters`).
+    Join,
+    /// A lane coming free (`lane_waiters`).
+    Lane,
+    /// A fork-twin `wait(-1)` (`reap_any_waiters`).
+    ReapAny,
+    /// A caller awaiting a served reply (`ticket_waiters`).
+    Reply,
+    /// A caller awaiting a punted completion (`completion_waiters`).
+    Completion,
+    /// A caller awaiting a busy offer instance (`admit_waiters`).
+    Admit,
+}
+
+/// What a freeze does with a vCPU parked at a [`ParkSite`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreezeRule {
+    /// The parked op took no effect: re-admit the vCPU under `UNWINDING`; its op is abandoned and the
+    /// thaw re-issues it.
+    Reissue,
+    /// Set the phase and leave the vCPU parked: another vCPU's completion wakes it, and the freeze
+    /// itself drives that vCPU.
+    Phase,
+    /// No rule yet: the census declines the freeze rather than start one that would stall on it.
+    Decline,
+}
+
+impl ParkSite {
+    pub const ALL: [ParkSite; 13] = [
+        ParkSite::Svc,
+        ParkSite::Futex,
+        ParkSite::PipeRead,
+        ParkSite::PipeWrite,
+        ParkSite::Reap,
+        ParkSite::Stopped,
+        ParkSite::StreamRead,
+        ParkSite::Join,
+        ParkSite::Lane,
+        ParkSite::ReapAny,
+        ParkSite::Reply,
+        ParkSite::Completion,
+        ParkSite::Admit,
+    ];
+
+    pub fn freeze_rule(self) -> FreezeRule {
+        match self {
+            // The re-executed op observes `UNWINDING`: a serve op and a wait unwind at their suspend
+            // points, and a pipe, reap or stream call is abandoned (#1672, #1899). A stopped vCPU sees
+            // through its stop to its next freeze point, abandoning any host call on the way.
+            ParkSite::Svc
+            | ParkSite::Futex
+            | ParkSite::PipeRead
+            | ParkSite::PipeWrite
+            | ParkSite::Reap
+            | ParkSite::Stopped
+            | ParkSite::StreamRead => FreezeRule::Reissue,
+            ParkSite::Join | ParkSite::Lane => FreezeRule::Phase,
+            // A `wait(-1)` needs a live fork twin (#1688); a reply or completion is in flight across
+            // the boundary (#1901); a durable caller never animates an offer, so never waits to enter
+            // one (#1681).
+            ParkSite::ReapAny | ParkSite::Reply | ParkSite::Completion | ParkSite::Admit => {
+                FreezeRule::Decline
+            }
+        }
+    }
+}
+
+impl Sched {
+    /// The vCPUs parked at `site` (a parked fiber is its owner's, not listed).
+    fn parked(&self, site: ParkSite) -> Vec<&VCpu> {
+        fn vcpus<'a, T: DomainMember + 'a>(it: impl IntoIterator<Item = &'a T>) -> Vec<&'a VCpu> {
+            it.into_iter().filter_map(DomainMember::vcpu).collect()
+        }
+        match site {
+            ParkSite::Svc => vcpus(self.svc_waiters.values().flatten()),
+            ParkSite::Futex => vcpus(self.wait_waiters.values().flatten()),
+            ParkSite::PipeRead => vcpus(self.pipe_waiters.values().flatten()),
+            ParkSite::PipeWrite => vcpus(self.pipe_write_waiters.values().flatten()),
+            ParkSite::Reap => vcpus(self.posix_reap_waiters.values().flatten()),
+            ParkSite::Stopped => vcpus(self.stopped.values().flatten()),
+            ParkSite::StreamRead => vcpus(self.cap_waiters.values().flatten()),
+            ParkSite::Join => vcpus(self.join_waiters.values()),
+            ParkSite::Lane => vcpus(&self.lane_waiters),
+            ParkSite::ReapAny => vcpus(&self.reap_any_waiters),
+            ParkSite::Reply => vcpus(self.ticket_waiters.values()),
+            ParkSite::Completion => vcpus(self.completion_waiters.values()),
+            ParkSite::Admit => vcpus(self.admit_waiters.values().flatten()),
+        }
+    }
+
+    /// [`Sched::parked`], mutably.
+    fn parked_mut(&mut self, site: ParkSite) -> Vec<&mut VCpu> {
+        fn vcpus<'a, T: DomainMember + 'a>(
+            it: impl IntoIterator<Item = &'a mut T>,
+        ) -> Vec<&'a mut VCpu> {
+            it.into_iter().filter_map(DomainMember::vcpu_mut).collect()
+        }
+        match site {
+            ParkSite::Svc => vcpus(self.svc_waiters.values_mut().flatten()),
+            ParkSite::Futex => vcpus(self.wait_waiters.values_mut().flatten()),
+            ParkSite::PipeRead => vcpus(self.pipe_waiters.values_mut().flatten()),
+            ParkSite::PipeWrite => vcpus(self.pipe_write_waiters.values_mut().flatten()),
+            ParkSite::Reap => vcpus(self.posix_reap_waiters.values_mut().flatten()),
+            ParkSite::Stopped => vcpus(self.stopped.values_mut().flatten()),
+            ParkSite::StreamRead => vcpus(self.cap_waiters.values_mut().flatten()),
+            ParkSite::Join => vcpus(self.join_waiters.values_mut()),
+            ParkSite::Lane => vcpus(&mut self.lane_waiters),
+            ParkSite::ReapAny => vcpus(&mut self.reap_any_waiters),
+            ParkSite::Reply => vcpus(self.ticket_waiters.values_mut()),
+            ParkSite::Completion => vcpus(self.completion_waiters.values_mut()),
+            ParkSite::Admit => vcpus(self.admit_waiters.values_mut().flatten()),
+        }
+    }
+
+    /// Take the vCPUs parked at `site` out of it; its parked fibers stay, unless `fibers_too`, when
+    /// they are dropped with it (a run's teardown).
+    #[allow(clippy::vec_box)]
+    fn take(&mut self, site: ParkSite, fibers_too: bool) -> Vec<Box<VCpu>> {
+        fn pick<T: DomainMember>(fibers_too: bool) -> impl FnMut(&T) -> bool {
+            move |e| fibers_too || e.vcpu().is_some()
+        }
+        let f = fibers_too;
+        match site {
+            ParkSite::Svc => drain_queues(&mut self.svc_waiters, pick(f)),
+            ParkSite::Futex => drain_queues(&mut self.wait_waiters, pick(f)),
+            ParkSite::PipeRead => drain_queues(&mut self.pipe_waiters, pick(f)),
+            ParkSite::PipeWrite => drain_queues(&mut self.pipe_write_waiters, pick(f)),
+            ParkSite::Reap => drain_queues(&mut self.posix_reap_waiters, pick(f)),
+            ParkSite::Stopped => drain_queues(&mut self.stopped, pick(f)),
+            ParkSite::StreamRead => drain_queues(&mut self.cap_waiters, pick(f)),
+            ParkSite::Join => drain_where(&mut self.join_waiters, pick(f)),
+            ParkSite::Lane => drain_where(&mut self.lane_waiters, pick(f)),
+            ParkSite::ReapAny => drain_where(&mut self.reap_any_waiters, pick(f)),
+            ParkSite::Reply => drain_where(&mut self.ticket_waiters, pick(f)),
+            ParkSite::Completion => drain_where(&mut self.completion_waiters, pick(f)),
+            ParkSite::Admit => drain_queues(&mut self.admit_waiters, pick(f)),
+        }
+    }
 }
 
 /// Why a vCPU is filed in [`Sched::svc_waiters`] (#1815). The map is shared by the `svc.wait`
@@ -5600,15 +5814,6 @@ enum SvcPark {
     Consumer,
     /// Parked as the resumer of a blocked handler or fiber.
     Resumer,
-}
-
-impl DomainMember for (SvcPark, Box<VCpu>) {
-    fn domain_key(&self) -> usize {
-        domain_key_of(&self.1)
-    }
-    fn into_victim(self) -> Option<Box<VCpu>> {
-        Some(self.1)
-    }
 }
 
 /// §3.6 slice 5b — wake a domain's `svc.wait`-parked serve loop from inside a wake path that
@@ -7363,65 +7568,13 @@ fn teardown_run(s: &mut Sched) {
         );
     }
     s.shutdown = true;
+    // Every parked vCPU dies with the run, wherever it is parked (#798 stopped jobs, #802 pipe
+    // readers and `waitpid` benchers a background twin leaves behind, CALLS.md 4c.1 admission
+    // waiters, whose reap drops their `admit_parked`); a parked fiber's stack dies with it.
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
-    victims.extend(std::mem::take(&mut s.join_waiters).into_values());
-    victims.extend(s.lane_waiters.drain(..)); // D66
-                                              // #798 — stopped jobs die with the run like any parked daemon.
-    victims.extend(std::mem::take(&mut s.stopped).into_values().flatten());
-    // parked `wait(-1)` any-child callers.
-    victims.extend(std::mem::take(&mut s.reap_any_waiters));
-    // Members parked as futex/cap/ticket/completion waiters: reap each vCPU, drop each fiber
-    // (`DomainMember::into_victim` — a parked fiber's stack dies with the run).
-    victims.extend(
-        std::mem::take(&mut s.wait_waiters)
-            .into_values()
-            .flatten()
-            .filter_map(|(_, w)| w.into_victim()),
-    );
-    victims.extend(
-        std::mem::take(&mut s.cap_waiters)
-            .into_values()
-            .flatten()
-            .filter_map(|w| w.into_victim()),
-    );
-    victims.extend(
-        std::mem::take(&mut s.ticket_waiters)
-            .into_values()
-            .filter_map(|w| w.into_victim()),
-    );
-    victims.extend(
-        std::mem::take(&mut s.completion_waiters)
-            .into_values()
-            .filter_map(|w| w.into_victim()),
-    );
-    for (_, vs) in std::mem::take(&mut s.svc_waiters) {
-        victims.extend(vs.into_iter().map(|(_, v)| v));
+    for site in ParkSite::ALL {
+        victims.extend(s.take(site, true));
     }
-    // CALLS.md 4c.1 — abandon every parked admission-waiter too (reap drops its `admit_parked`).
-    for (_, q) in std::mem::take(&mut s.admit_waiters) {
-        victims.extend(q);
-    }
-    // #802 interactive rung 3 — blocking PIPE readers/writers and `waitpid` benchers die with the
-    // run too: a background twin parked in a terminal/pipe read at the root's exit (bash leaves a
-    // stopped-or-parked `cat &` behind) otherwise leaks, `live` never reaches 0, and the run
-    // hangs instead of completing.
-    victims.extend(
-        std::mem::take(&mut s.pipe_waiters)
-            .into_values()
-            .flatten()
-            .filter_map(|w| w.into_victim()),
-    );
-    victims.extend(
-        std::mem::take(&mut s.pipe_write_waiters)
-            .into_values()
-            .flatten()
-            .filter_map(|w| w.into_victim()),
-    );
-    victims.extend(
-        std::mem::take(&mut s.posix_reap_waiters)
-            .into_values()
-            .flatten(),
-    );
     s.reap_pending.clear();
     for v in victims {
         let reason = s
@@ -7607,43 +7760,20 @@ fn quiesced_parks_only(s: &Sched) -> bool {
 /// still parks, so a child spawned into an in-flight freeze parks with the phase and nothing else
 /// would ever wake it.
 fn freeze_in_flight(s: &Sched) -> bool {
-    let unwinding = |v: &VCpu| v.dstate == STATE_UNWINDING;
     s.froze
-        || s.svc_waiters.values().flatten().any(|(_, v)| unwinding(v))
-        || s.join_waiters.values().any(|v| unwinding(v))
-        || s.lane_waiters.iter().any(|v| unwinding(v))
-        || s.wait_waiters
-            .values()
-            .flatten()
-            .any(|(_, w)| matches!(w, Waiter::VCpu(v) if unwinding(v)))
-        || s.pipe_waiters
-            .values()
-            .chain(s.pipe_write_waiters.values())
-            .flatten()
-            .any(|w| matches!(w, Waiter::VCpu(v) if unwinding(v)))
-        || s.posix_reap_waiters
-            .values()
-            .flatten()
-            .any(|v| unwinding(v))
+        || ParkSite::ALL
+            .iter()
+            .any(|&site| s.parked(site).iter().any(|v| v.dstate == STATE_UNWINDING))
 }
 
-/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe, reap
-/// and stop **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
-/// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
-/// would spin the worker loop instead of falling through to the deadlock check.
+/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? A vCPU at a [`FreezeRule::Reissue`]
+/// site; a joiner or lane waiter is woken by something else, and a fiber park is its owner's
+/// `freeze_drive`'s. Without this an in-flight freeze with only those left would spin the worker loop
+/// instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
-    !s.svc_waiters.is_empty()
-        || !s.posix_reap_waiters.is_empty()
-        || !s.stopped.is_empty()
-        || s.wait_waiters
-            .values()
-            .flatten()
-            .any(|(_, w)| matches!(w, Waiter::VCpu(_)))
-        || s.pipe_waiters
-            .values()
-            .chain(s.pipe_write_waiters.values())
-            .flatten()
-            .any(|w| matches!(w, Waiter::VCpu(_)))
+    ParkSite::ALL
+        .iter()
+        .any(|&site| site.freeze_rule() == FreezeRule::Reissue && !s.parked(site).is_empty())
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -7653,82 +7783,50 @@ fn freeze_can_admit(s: &Sched) -> bool {
 /// children". A parked vCPU runs no ops and reaches no safepoint, so the scheduler must bring the
 /// freeze to it.
 ///
-/// Every parked vCPU takes the phase. It is set in each vCPU's own durable phase, which the
-/// `dispatch` prologue swaps into the window before the vCPU runs (a direct window write would be
-/// clobbered by that swap); at root context it routes to the global freeze word. The ones nothing
-/// else can wake — `svc.wait` consumers and futex waiters — are also re-admitted, so their
-/// re-executed suspend point observes `UNWINDING` and unwinds. The transform instruments both as
-/// re-issue suspend points (`SuspendKind::MemoryWait` for `atomic.wait`), so a futex waiter gets the
-/// same `WAIT_WOKEN` the JIT's own freeze arm delivers: discarded by the safepoint that unwinds
-/// before the guest can observe it, and the thaw re-issues the wait. A pipe read/write or reap bench
-/// is re-admitted too (#1672): its rewound op re-executes under the freeze and is abandoned
-/// ([`Decision::Abandon`]), and the thaw re-issues the call. So is a stopped vCPU: it sees through
-/// its stop to its next freeze point, abandoning any host call on the way.
+/// Each site does what its [`ParkSite::freeze_rule`] says (#1898). The phase is set in each vCPU's
+/// own durable phase, which the `dispatch` prologue swaps into the window before the vCPU runs (a
+/// direct window write would be clobbered by that swap); at root context it routes to the global
+/// freeze word.
 ///
-/// A joiner or lane waiter *will* be woken by something else — its child completing (here, by
-/// unwinding), a lane coming free — so it takes the phase without re-admission. Without the phase
-/// it would wake `NORMAL`, never observe the freeze at its own safepoint, and run to completion
-/// *through* the freeze its owner asked for. A futex-parked **fiber** stays where it is: its
-/// owner's `freeze_drive` purges and flattens it (§13.4 step 2), and the thaw re-issues its wait.
+/// - **Re-issue:** re-admitted under the phase. A `svc.wait` consumer or futex waiter re-executes
+///   its suspend point, which observes `UNWINDING` and unwinds; a futex waiter gets `WAIT_FROZEN`
+///   (#1769), discarded by that safepoint, and the thaw re-issues the wait. A pipe read/write or reap
+///   bench re-executes its rewound op, which is abandoned ([`Decision::Abandon`], #1672); a stream
+///   read is abandoned on wake ([`Pending::Abandoned`], #1899); a stopped vCPU sees through its stop
+///   to its next freeze point, abandoning any host call on the way. The thaw re-issues each call.
+/// - **Phase:** a joiner or lane waiter *will* be woken by something else — its child completing
+///   (here, by unwinding), a lane coming free — so it takes the phase and stays. Without it, it
+///   would wake `NORMAL` and run *through* the freeze its owner asked for.
+/// - **Decline:** the census refused a freeze with a vCPU parked there, so none is.
+///
+/// A parked **fiber** stays where it is: its owner's `freeze_drive` purges and flattens it (§13.4
+/// step 2), and the thaw re-issues its wait.
 fn admit_parks_for_freeze(s: &mut Sched) {
-    for (_, q) in std::mem::take(&mut s.svc_waiters) {
-        for (_, mut v) in q {
-            v.dstate = STATE_UNWINDING;
-            s.runnable.push_back(v);
-        }
-    }
-    for v in s.join_waiters.values_mut() {
-        v.dstate = STATE_UNWINDING;
-    }
-    for v in s.lane_waiters.iter_mut() {
-        v.dstate = STATE_UNWINDING;
-    }
-    // #1672 — a pipe read/write or a reap bench parked with its op rewound and unperformed. The
-    // re-admitted vCPU re-executes it under the freeze, which abandons it ([`Decision::Abandon`]) for
-    // the thaw to re-issue. A parked fiber stays, as for a futex wait (#1676).
-    for waiters in [&mut s.pipe_waiters, &mut s.pipe_write_waiters] {
-        for q in waiters.values_mut() {
-            for w in std::mem::take(q) {
-                match w {
-                    Waiter::VCpu(mut v) => {
-                        v.dstate = STATE_UNWINDING;
-                        s.runnable.push_back(v);
-                    }
-                    fiber => q.push(fiber),
-                }
-            }
-        }
-        waiters.retain(|_, q| !q.is_empty());
-    }
-    for (_, q) in std::mem::take(&mut s.posix_reap_waiters) {
-        for mut v in q {
-            v.dstate = STATE_UNWINDING;
-            s.runnable.push_back(v);
-        }
-    }
-    // #1672 — a stopped vCPU is re-admitted too: under the freeze it sees through its stop, runs on
-    // to its freeze point without leaving the domain (a host call on the way is abandoned), and
-    // unwinds there.
-    for (_, q) in std::mem::take(&mut s.stopped) {
-        for mut v in q {
-            v.dstate = STATE_UNWINDING;
-            s.runnable.push_back(v);
-        }
-    }
-    for (key, q) in std::mem::take(&mut s.wait_waiters) {
-        for (tag, w) in q {
-            match w {
-                Waiter::VCpu(mut v) => {
-                    v.wait_indefinite = false;
+    for site in ParkSite::ALL {
+        match site.freeze_rule() {
+            FreezeRule::Reissue => {
+                for mut v in s.take(site, false) {
                     v.dstate = STATE_UNWINDING;
-                    // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
-                    v.pending = Some(Pending::Wait(temen_ir::durable_abi::WAIT_FROZEN));
+                    match site {
+                        // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                        ParkSite::Futex => {
+                            v.wait_indefinite = false;
+                            v.pending = Some(Pending::Wait(temen_ir::durable_abi::WAIT_FROZEN));
+                        }
+                        // A stream read is not rewound: its wake delivers the result (#1899).
+                        ParkSite::StreamRead => v.pending = Some(Pending::Abandoned),
+                        _ => {}
+                    }
                     s.runnable.push_back(v);
                 }
-                fiber @ Waiter::Fiber { .. } => {
-                    s.wait_waiters.entry(key).or_default().push((tag, fiber));
+            }
+            FreezeRule::Phase => {
+                for v in s.parked_mut(site) {
+                    v.dstate = STATE_UNWINDING;
                 }
             }
+            // The census declined a freeze with a vCPU parked here before it began.
+            FreezeRule::Decline => {}
         }
     }
 }
@@ -7778,32 +7876,10 @@ fn is_thread_slot(seat: &Seat, slot: usize) -> bool {
 /// Every vCPU the scheduler holds — runnable or parked anywhere. With the durable single worker, that
 /// is every vCPU of the run but the one executing. The collections [`teardown_run`] sweeps.
 fn scheduled_vcpus(s: &Sched) -> Vec<&VCpu> {
-    fn waiter(w: &Waiter) -> Option<&VCpu> {
-        match w {
-            Waiter::VCpu(v) => Some(v),
-            Waiter::Fiber { .. } => None,
-        }
+    let mut out: Vec<&VCpu> = s.runnable.iter().map(|v| &**v).collect();
+    for site in ParkSite::ALL {
+        out.extend(s.parked(site));
     }
-    let mut out: Vec<&VCpu> = Vec::new();
-    out.extend(s.runnable.iter().map(|v| &**v));
-    out.extend(s.join_waiters.values().map(|v| &**v));
-    out.extend(s.lane_waiters.iter().map(|v| &**v));
-    out.extend(s.stopped.values().flatten().map(|v| &**v));
-    out.extend(s.reap_any_waiters.iter().map(|v| &**v));
-    out.extend(
-        s.wait_waiters
-            .values()
-            .flatten()
-            .filter_map(|(_, w)| waiter(w)),
-    );
-    out.extend(s.cap_waiters.values().flatten().filter_map(waiter));
-    out.extend(s.ticket_waiters.values().filter_map(waiter));
-    out.extend(s.completion_waiters.values().filter_map(waiter));
-    out.extend(s.svc_waiters.values().flatten().map(|(_, v)| &**v));
-    out.extend(s.admit_waiters.values().flatten().map(|v| &**v));
-    out.extend(s.pipe_waiters.values().flatten().filter_map(waiter));
-    out.extend(s.pipe_write_waiters.values().flatten().filter_map(waiter));
-    out.extend(s.posix_reap_waiters.values().flatten().map(|v| &**v));
     out
 }
 
@@ -7829,6 +7905,14 @@ fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option
         let s = rs.lock();
         if let Some(&twin) = s.forked_twins.keys().next() {
             return declined(DeclineCause::ForkTwin, twin, None);
+        }
+        // #1898 — a vCPU parked where a freeze has no rule would hold it until its event came.
+        for site in ParkSite::ALL {
+            if site.freeze_rule() == FreezeRule::Decline {
+                if let Some(v) = s.parked(site).first() {
+                    return declined(DeclineCause::Parked(site), v.id, None);
+                }
+            }
         }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in std::iter::once(me).chain(others.iter()) {
@@ -12473,6 +12557,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 let top = v.frames.len() - 1;
                 v.frames[top].vals.push(Reg::from_i64(status));
             }
+        }
+        Some(Pending::Abandoned) => {
+            abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
+            let top = v.frames.len() - 1;
+            v.frames[top].vals.push(Reg::from_i64(0));
         }
         Some(Pending::SvcTimeout) => svc_timed_out = true,
         None => {}
@@ -19339,6 +19428,8 @@ pub enum DeclineCause {
     /// A fork twin has not been reaped: it runs in a window and powerbox of its own that no artifact
     /// records yet, and its exit status would be lost to its parent's `wait` (#1688).
     ForkTwin,
+    /// A vCPU is parked at a site whose [`FreezeRule`] is still `Decline` (#1898).
+    Parked(ParkSite),
 }
 
 /// #1671 — a freeze the run **declined**. At the instant a freeze trigger fires, a census asks
