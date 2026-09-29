@@ -1,11 +1,11 @@
 //! #1234 — **the Forth `sandbox` word**: `s" …" sandbox` runs a program in a confined §14 child.
 //!
-//! The child is this same kernel, nested — a same-module child over a 2^19 sub-carve of the
-//! parent's own window, entered at `child_start` (75). Same-module is what makes it cheap: no
-//! `Module` grant and no `Budget`, only an `Instantiator`. It is born with exactly two capabilities,
+//! The child is this same kernel in a detached window of its own — an op-17 v1 record with
+//! `module = -1` (self), entered at `child_start` (75), its program the spawn's args payload and its
+//! window paid from the powerbox's `budget` (#1864). It is born with exactly two capabilities,
 //! re-granted by name in the spawn record's grant list: `stdout` (so its output joins ours) and
-//! `jit` (so it can define words at all). Its memory is the carve and nothing else — the parent's
-//! dictionary, REPL stack and heap live below it at addresses the child cannot name.
+//! `jit` (so it can define words at all). Its memory is its own window and nothing else — no
+//! address in it names the parent's dictionary, REPL stack or heap.
 
 use temen_run::{Backend, RunConfig};
 
@@ -73,7 +73,8 @@ fn a_sandboxed_definition_does_not_escape() {
 }
 
 /// A sandbox cannot nest one: the child's own `Instantiator` arrives as its entry argument and is
-/// never registered under a name, so the inner `sandbox` finds nothing and says so.
+/// never registered under a name, and it holds no `budget`, so the inner `sandbox` finds nothing and
+/// says so.
 #[test]
 fn a_sandbox_cannot_sandbox() {
     let (out, _) = run(Backend::Bytecode, "s\" 0 0 sandbox . cr\" sandbox drop\n");
