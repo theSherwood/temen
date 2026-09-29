@@ -2377,6 +2377,26 @@ refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned by `browser/tests/inst_c
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 
+**Process trees: leaf processes (#1896).** A cooperative run that drives a process tree (the
+browser's nimony build, `temen_nim_open`) keeps the tree itself on the interpreter — fork, exec,
+wait, pipes — and runs each **leaf process** whole on emitted wasm. An image a process `execve`s is
+offered to the host's emitter (`TierUpConfig::leaf`) when it cannot **park**, i.e. block until
+another process or thread acts (`image_may_park`, the engine's one predicate): the personality
+answers for its own ops (`SignalSource::import_parks` — file, directory, environment and identity
+ops never park, `read`/`write` only when the process holds a pipe, a socket or a terminal), a stream
+cap call parks only on a pipe end or a blocking stdin, the address-space ops never park, and a §12
+concurrency op, a rebindable import, or any other import or cap call may. The leaf runs over a flat
+copy of the caller's window, materialized exactly as the in-place exec would be, and tiers up at its
+entry (`CoopEvent::TierUp` naming its program); its delivery ends the process as a return from the
+entry would. An image that can change its page state — an address-space `map`/`unmap`/`protect`,
+inline or through an import, which the image alone does not show — is emitted page-checked
+(`compile_jit_page_checked`), because a whole run cannot decline when a hole or a protection takes
+its window past one bound. **Scheduling:** a leaf runs as one slice — nothing else in the tree runs
+until it ends, a schedule the interpreter could also have chosen for a leaf that terminates. A leaf
+that instead busy-waits on another process's effect through ops that do not park (polling for a
+file, say) never sees it and spins where the interpreter would complete: tracked debt on #1896,
+converging with resumable emitted frames, which are also what a leaf holding a pipe needs.
+
 ---
 
 ## 15. Resource monitoring & metering  [SETTLED]

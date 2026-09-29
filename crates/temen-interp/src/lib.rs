@@ -21025,6 +21025,16 @@ pub trait SignalSource: Send + Sync {
     fn exec_image(&self) -> Option<Arc<[u8]>> {
         None
     }
+
+    /// #1896 — can this process **park** in the op it imports as `import`: block until another
+    /// process acts (a `fork`, a `wait`, a read of an empty pipe)? An engine runs an image whose ops
+    /// cannot park whole on the emitted wasm tier, where a frame cannot be suspended, so `Some(false)`
+    /// must be sound: the source answers from what the op is and what the process holds that it could
+    /// block on (a pipe end, a terminal). `None` for an import that is not this source's, which the
+    /// engine answers for. Default `None`.
+    fn import_parks(&self, _import: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// One interned interface's identity key: its `(op names, op signatures)` pair (#1109 — names
@@ -30013,6 +30023,14 @@ impl Mem {
     /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
     /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
     fn fork_private(&self) -> Option<Mem> {
+        self.fork_private_over(|reserved| Some(self.twin_backing(reserved)))
+    }
+
+    /// [`fork_private`](Mem::fork_private) over the backing `backing(reserved)` chooses — a
+    /// **growable flat** one for an exec'd image that runs on the emitted tier (#1896), which is grown
+    /// to hold the copied tail pages. `None` where `fork_private` refuses, or when the backing cannot
+    /// be had or grown.
+    fn fork_private_over(&self, backing: impl FnOnce(u64) -> Option<Region>) -> Option<Mem> {
         // §13 region aliasing and externally-`Backed` pages cannot be duplicated blindly — fail
         // closed, as ever. Plain page protections (an `Ro` stack-guard page, an `Unmapped` hole,
         // an explicitly re-`Rw`'d page) *within the snapshotted prefix* are per-domain view
@@ -30057,7 +30075,7 @@ impl Mem {
         let mut twin = Mem::with_reservation_over(
             reserved.trailing_zeros() as u8,
             mapped.trailing_zeros() as u8,
-            Arc::new(self.twin_backing(reserved)),
+            Arc::new(backing(reserved)?),
             Some(self.shadow),
         );
         twin.seed(&self.window_snapshot());
@@ -30069,6 +30087,11 @@ impl Mem {
         // [`snapshot`](Mem::snapshot). The prot entries came over in `prot_copy`.
         let base = self.window.base();
         let tbase = twin.window.base();
+        if let Some(&last) = tail_pages.last() {
+            if !twin.back.grow_to(tbase + (last + 1) * self.page) {
+                return None;
+            }
+        }
         for &pg in &tail_pages {
             let off = pg * self.page;
             twin.back.zero(tbase + off, self.page);
@@ -32890,6 +32913,22 @@ mod mem_fork_tests {
         assert_eq!(twin.byte((1 << 16) + page - 1), 0xA5, "to its last byte");
         twin.set_byte(1 << 16, 0x01);
         assert_eq!(m.byte(1 << 16), 0x5A, "private copy, not aliased");
+    }
+
+    /// #1896 — a copy over a **growable** flat backing (what an exec'd leaf image runs over) grows it
+    /// to hold the tail pages the window `vm_map`-committed past its mapped prefix.
+    #[test]
+    fn fork_private_over_a_growable_backing_grows_it_for_tail_pages() {
+        let mut m = Mem::with_reservation(18, 16, None); // 64 KiB mapped, 256 KiB reserved
+        let page = m.page;
+        let tail = (1 << 16) + 2 * page;
+        assert_eq!(m.map(tail, page, PROT_READ | PROT_WRITE), 0);
+        m.set_byte(tail + page - 1, 0xA5);
+        let copy = m
+            .fork_private_over(|_| Region::growable(1 << 16, page))
+            .expect("a growable backing grows to the tail page");
+        assert!(copy.flat_win_base().is_some(), "the copy is flat");
+        assert_eq!(copy.byte(tail + page - 1), 0xA5, "the tail page came over");
     }
 
     /// #816 item 3 — the flat twin-backing seam, pinned on the non-unix arm (a forced `Paged`

@@ -3533,6 +3533,22 @@ pub fn compile_jit_paged(
     if !module_uses_unmap_protect(m) {
         return compile_jit(m, shape, shared_memory);
     }
+    compile_jit_page_checked(m, shape, shared_memory, page_log2)
+}
+
+/// [`compile_jit_paged`]'s paged emit, for a host that knows the guest's page state can change
+/// where the module does not show it (#1896): a process image that `map`s, `unmap`s or `protect`s
+/// through an **import** (`vm_map`, bound by the engine), which [`module_uses_unmap_protect`] cannot
+/// see. An image that runs whole cannot decline when its window stops being one bound — a `map` that
+/// leaves a hole would take the mask-only tier's `"mapped"` to deny-everything — so it checks every
+/// access against the page state the host keeps instead. The same driver contract, gates and
+/// fallbacks as [`compile_jit_paged`].
+pub fn compile_jit_page_checked(
+    m: &Module,
+    shape: Shape,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<Artifact, Error> {
     if m.funcs.iter().any(func_uses_region_ops) || module_uses_gc_roots(m) {
         return compile_interp_only(m, shared_memory, false);
     }
