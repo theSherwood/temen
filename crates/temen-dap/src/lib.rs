@@ -78,6 +78,8 @@ struct Session {
     /// only when the captured output *changed*. On a reverse `seek` the output shrinks, so the event
     /// carries the **full** current stdout (not an append delta) and the client replaces its view.
     stdout_shown: usize,
+    /// [`stdout_shown`](Self::stdout_shown)'s twin for the guest's stderr stream.
+    stderr_shown: usize,
 }
 
 impl Session {
@@ -488,6 +490,7 @@ impl DapServer {
             data_watch_ids: Vec::new(),
             scheduled,
             stdout_shown: 0,
+            stderr_shown: 0,
         });
         (true, Json::Null, vec![])
     }
@@ -1770,28 +1773,36 @@ impl DapServer {
         events
     }
 
-    /// A DAP `output` event carrying the guest's captured stdout when a powerbox session's output has
-    /// **changed** since the last stop. The event carries the *full* current stdout — on a reverse `seek`
-    /// the output shrinks, so the client **replaces** its view rather than appending. Empty when there is
-    /// no powerbox output, or it is unchanged (a compute-only / deny-all session never emits one).
+    /// DAP `output` events carrying the guest's captured stdout and stderr, each when a powerbox
+    /// session's stream has **changed** since the last stop (category `stdout` / `stderr`). An event
+    /// carries the stream's *full* current text — on a reverse `seek` the output shrinks, so the client
+    /// **replaces** its view rather than appending. None when there is no powerbox output, or it is
+    /// unchanged (a compute-only / deny-all session never emits one).
     fn output_events(&mut self) -> Vec<Event> {
         let Some(s) = self.session.as_mut() else {
             return vec![];
         };
-        let out = s.inspector.stdout();
-        if out.len() == s.stdout_shown {
-            return vec![];
+        let mut events = Vec::new();
+        for (category, text, shown) in [
+            ("stdout", s.inspector.stdout(), &mut s.stdout_shown),
+            ("stderr", s.inspector.stderr(), &mut s.stderr_shown),
+        ] {
+            if text.len() == *shown {
+                continue;
+            }
+            *shown = text.len();
+            events.push((
+                "output",
+                Json::obj(vec![
+                    ("category", Json::s(category)),
+                    (
+                        "output",
+                        Json::s(String::from_utf8_lossy(text).into_owned()),
+                    ),
+                ]),
+            ));
         }
-        let len = out.len();
-        let text = String::from_utf8_lossy(out).into_owned();
-        s.stdout_shown = len;
-        vec![(
-            "output",
-            Json::obj(vec![
-                ("category", Json::s("stdout")),
-                ("output", Json::s(&text)),
-            ]),
-        )]
+        events
     }
 
     /// The DAP thread id of the stopped thread (vCPU id + 1); `1` in single-threaded mode.

@@ -29,7 +29,7 @@ __PG_FN void __pg_fwrite_raw(FILE *f, const char *p, size_t n) {
     if (f->fd > 2)
       __vm_fs(__FS_WRITE, f->fd, (long)p, (long)n, 0); // file fd → the memfs
     else
-      write(f->fd, (char *)p, (long)n); // 0/1/2 → the ambient Stream
+      write(f->fd, (char *)p, (long)n); // 0/1 → stdout, 2 → the stderr stream
   }
 }
 

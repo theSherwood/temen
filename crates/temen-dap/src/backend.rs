@@ -66,7 +66,8 @@ fn grant_io_powerbox(
     // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
     // performs (#912), so a debugged guest sees the same handles in the same order the Run path gives
     // it. This session's own capabilities (`vm_fs`, the declared host-completed ones) follow.
-    let granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
+    let mut granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
+    granted.stderr = host.grant_stderr_if_imported(&m.imports);
     // #1323 (c_interpret #16, file I/O): a debugged program that does file I/O reaches a private,
     // in-memory **read-write** scratch filesystem through the `vm_fs` seam (chibicc `__vm_fs` builtin
     // → `call.sym "vm_fs"`, a flat call with base op 0 and the fs op in arg0). Mirror the browser Run
@@ -335,6 +336,11 @@ pub trait Debuggee {
     /// empty). The server surfaces it as DAP `output` events; on a reverse `seek` it reflects exactly
     /// the output produced up to *here* (the run is rebuilt + replayed), so it rewinds with the program.
     fn stdout(&self) -> &[u8] {
+        &[]
+    }
+    /// The guest's captured stderr at the current stop — [`stdout`](Self::stdout)'s twin, for a
+    /// program that imports the `"stderr"` stream. Rewinds with the program the same way.
+    fn stderr(&self) -> &[u8] {
         &[]
     }
 }
@@ -1416,5 +1422,8 @@ impl Debuggee for BytecodeBackend {
     /// output produced up to *here* — it rewinds with the program. Empty for a deny-all session.
     fn stdout(&self) -> &[u8] {
         &self.run.host().stdout
+    }
+    fn stderr(&self) -> &[u8] {
+        &self.run.host().stderr
     }
 }

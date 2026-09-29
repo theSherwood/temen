@@ -3151,6 +3151,9 @@ fn onramp_granted_shape(m: &temen_ir::Module) -> temen_ir::PowerboxHandles {
     if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
         granted.jit = Some(0);
     }
+    if m.imports.iter().any(|im| im.name == "stderr") {
+        granted.stderr = Some(0); // `grant_onramp_caps` grants it for such a module
+    }
     granted
 }
 
@@ -3674,6 +3677,7 @@ fn grant_onramp_caps(
     // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
     // debugger give it. This host's own capabilities (`Jit`, `vm_fs`, the graphical ones) follow.
     let mut granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
+    granted.stderr = host.grant_stderr_if_imported(&m.imports);
     // §22 guest-driven JIT: grant the `Jit` cap **iff** the guest declares a `__vm_jit_*` import
     // (principle of least authority — a plain on-ramp guest gets no Jit). The JACL self-hosted
     // compiler uses it to expand macros in-guest. Match temen-run's powerbox grant so a self-hosted
@@ -3769,8 +3773,9 @@ pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
 /// The on-ramp capabilities a card can be re-granted as a §14 child (#1720), by the names the
 /// powerbox registers them under. The rest stay with the root: `memory`/`addrspace`/`instantiator` are
 /// minted fresh for the child over its own window (a parent's names coordinates the child cannot use).
-const ONRAMP_NESTED_CAPS: [&str; 10] = [
-    "stdout", "stdin", "exit", "display", "keyboard", "mouse", "webgpu", "fs", "vm_fs", "jit",
+const ONRAMP_NESTED_CAPS: [&str; 11] = [
+    "stdout", "stdin", "stderr", "exit", "display", "keyboard", "mouse", "webgpu", "fs", "vm_fs",
+    "jit",
 ];
 
 /// Wrap `m` for a nested on-ramp run (#1720): the one-node plan that spawns it as a §14 child of a
@@ -4490,8 +4495,9 @@ fn pg_setup(
     // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
         // The shared powerbox ABI (#912). This headless powerbox grants no *sized* address space, so
-        // the whole-window `memory` grant serves both address-space roles; `Jit`/`stderr` are not
-        // granted at all, and an import naming one leaves its slot unbound (fail-closed at dispatch).
+        // the whole-window `memory` grant serves both address-space roles; `Jit` is not granted at
+        // all, and an import naming it leaves its slot unbound (fail-closed at dispatch). `stderr` is
+        // granted as every host running the playground libc grants it: iff imported.
         let granted = temen_ir::PowerboxHandles {
             stdout: out,
             stdin: inp,
@@ -4499,7 +4505,7 @@ fn pg_setup(
             memory,
             addrspace: memory,
             jit: None,
-            stderr: None,
+            stderr: host.grant_stderr_if_imported(&m.imports),
         };
         // The one shared powerbox binder (#1524).
         host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);

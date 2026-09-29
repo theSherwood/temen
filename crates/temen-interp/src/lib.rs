@@ -22238,11 +22238,14 @@ impl Host {
         // spelling (its `<unistd.h>` `write` is a real fd-dispatching definition, not the frontend
         // builtin), and a name missing here does not widen or narrow authority — it fails closed, as a
         // `CapFault` on the child's first `printf`, with nothing to say which spelling was the problem.
+        // `stderr` is the seeded libc's fd 2 (`__vm_stream_write_err`): it binds only to a cap granted
+        // under that name (below), never to the first `Stream` — that would be stdout.
         const CHILD_BINDABLE: &[&str] = &[
             "write",
             "read",
             "stream_write",
             "stream_read",
+            "stderr",
             "exit",
             "vm_map",
             "vm_unmap",
@@ -22422,13 +22425,20 @@ impl Host {
             // **filter** granted both streams binds each libc call to the right end. Fall back to the
             // first cap of the interface type when the conventional name was not granted (e.g. a
             // stdout-only generator command, or a legacy single-stream child).
+            // `stderr` has no fallback: it is a second `Stream`, so "the first of the type" would bind
+            // it to stdout — the wrong endpoint, silently. Not granted ⇒ unmet, as for any name.
             match policy(&im.name).and_then(|(tid, iop)| {
-                let named = match im.name.as_str() {
-                    "write" => self.resolve_cap_name("stdout"),
-                    "read" => self.resolve_cap_name("stdin"),
-                    _ => None,
+                let c = match im.name.as_str() {
+                    "stderr" => self.resolve_cap_name("stderr"),
+                    "write" => self
+                        .resolve_cap_name("stdout")
+                        .or_else(|| first_of(self, tid)),
+                    "read" => self
+                        .resolve_cap_name("stdin")
+                        .or_else(|| first_of(self, tid)),
+                    _ => first_of(self, tid),
                 };
-                named.or_else(|| first_of(self, tid)).map(|c| (tid, iop, c))
+                c.map(|c| (tid, iop, c))
             }) {
                 Some((tid, iop, c)) => {
                     bindings.push(BoundImport::required(tid, iop, c));
@@ -24829,6 +24839,20 @@ impl Host {
             self.register_cap_name(name, *handle);
         }
         handles
+    }
+    /// Grant a **stderr** `Stream` (write-only, [`StreamRole::Err`] → `host.stderr`) iff the module
+    /// imports `"stderr"`, registered under that name — the handle for
+    /// [`temen_ir::PowerboxHandles::stderr`]. One definition for every host that runs the playground
+    /// libc, whose `write(2, …)` reaches it (`__vm_stream_write_err` → `call.sym "stderr"`), so a
+    /// program's diagnostics stay out of its stdout. Granted only when imported (least authority),
+    /// and after the prefix, so the prefix indices are unchanged.
+    pub fn grant_stderr_if_imported(&mut self, imports: &[temen_ir::Import]) -> Option<i32> {
+        if !imports.iter().any(|im| im.name == "stderr") {
+            return None;
+        }
+        let h = self.grant_stream(StreamRole::Err);
+        self.register_cap_name("stderr", h);
+        Some(h)
     }
     pub fn grant_clock(&mut self) -> i32 {
         self.grant(cap_id::CLOCK, Binding::Clock)

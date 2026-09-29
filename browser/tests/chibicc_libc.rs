@@ -108,7 +108,8 @@ fn scanf_family_converts_like_c() {
 }
 
 /// **`free` refuses what it must not release**, the way glibc does: a double free, or a pointer
-/// `malloc` never returned, names the misuse on stderr and aborts (exit 134). `free` used to be a
+/// `malloc` never returned, names the misuse on **stderr** — its own stream, not stdout — and aborts
+/// (exit 134). `free` used to be a
 /// no-op, so c_interpret's double-free lesson ran straight past the bug it teaches.
 #[test]
 fn free_detects_a_double_free_and_an_invalid_pointer() {
@@ -120,48 +121,53 @@ fn free_detects_a_double_free_and_an_invalid_pointer() {
         let src = format!(
             "#include <stdio.h>\n#include <stdlib.h>\nint main(void) {{\n{body}\n  return 0;\n}}\n"
         );
-        // The on-ramp console is one stream: stderr's text lands in order with stdout's.
         let out = onramp_exec(&compile(&chibicc, &src), b"");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        (out.exit_code, text)
+        (
+            out.exit_code,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     };
 
     // Ordinary use is untouched: free(NULL), a free per block, and a realloc that moves.
-    let (code, out) = run("  free(NULL);\n\
+    let (code, out, err) = run("  free(NULL);\n\
            int *a = malloc(8), *b = malloc(8);\n\
            a[0] = 7;\n\
            a = realloc(a, 64);\n\
            printf(\"%d\\n\", a[0]);\n\
            free(a);\n\
            free(b);");
-    assert_eq!((code, out.as_str()), (0, "7\n"), "ordinary use");
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (0, "7\n", ""),
+        "ordinary use"
+    );
 
-    // A double free names itself and aborts right there: `after` never prints.
-    let (code, out) = run("  int *p = malloc(sizeof(int));\n\
+    // A double free names itself on stderr and aborts right there: `after` never prints.
+    let (code, out, err) = run("  int *p = malloc(sizeof(int));\n\
            printf(\"before\\n\");\n\
            free(p);\n\
            free(p);\n\
            printf(\"after\\n\");");
     assert_eq!(
-        (code, out.as_str()),
-        (134, "before\nfree(): double free detected\n"),
+        (code, out.as_str(), err.as_str()),
+        (134, "before\n", "free(): double free detected\n"),
         "a double free"
     );
 
-    let (code, out) = run("  int x;\n  free(&x);");
+    let (code, out, err) = run("  int x;\n  free(&x);");
     assert_eq!(
-        (code, out.as_str()),
-        (134, "free(): invalid pointer\n"),
+        (code, out.as_str(), err.as_str()),
+        (134, "", "free(): invalid pointer\n"),
         "a stack pointer"
     );
 
     // realloc releases the old block, so freeing it afterwards is a double free too.
-    let (code, out) =
+    let (code, out, err) =
         run("  char *p = malloc(8);\n  char *q = realloc(p, 4096);\n  free(q);\n  free(p);");
     assert_eq!(
-        (code, out.as_str()),
-        (134, "free(): double free detected\n"),
+        (code, out.as_str(), err.as_str()),
+        (134, "", "free(): double free detected\n"),
         "a realloc'd-away block"
     );
 }
