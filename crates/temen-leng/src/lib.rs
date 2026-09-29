@@ -1361,6 +1361,7 @@ import 0 \"write\" (i64, i64) -> (i64)
 func (i64, i64, i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) { v5 = i64.const -1 return v5 } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
 func (i32) -> () { block 0 (v0: i32) { return } }
+func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }";
 
 /// The cap names [`LIBC_CAP_STUBS`] serves, in its func order.
@@ -1376,8 +1377,10 @@ func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, 
 /// `stream_write` is the one that is **aliased rather than stubbed**: it resolves to a body that
 /// tail-calls the powerbox `write` cap, the same import [`SYSCALL_ADAPTER`] carries, so the two
 /// coalesce into the single manifest import the program already had. Stubbing it would have kept the
-/// manifest just as narrow while silently swallowing anything the libc ever writes.
-const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "stream_read", "exit", "stream_write"];
+/// manifest just as narrow while silently swallowing anything the libc ever writes. `stderr` (the
+/// libc's fd 2, temen#1915) is aliased the same way: a nim program has one output stream, so the libc's
+/// diagnostics reach it as they did before fd 2 got its own capability.
+const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "stream_read", "exit", "stream_write", "stderr"];
 
 /// Build the **prebuilt guest-libc link units** for a nim program: the libc itself (its functions
 /// exported under the *nim* leaf symbols that import them, so the linker resolves them directly) plus
