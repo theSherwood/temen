@@ -13240,6 +13240,67 @@ fn bash_exit_code(o: &temen_run::Outcome) -> i32 {
     }
 }
 
+/// The engines every bash gate runs on, as [`run_bash`] names them.
+const BASH_ENGINES: [&str; 3] = ["tree-walker", "coop bytecode", "parallel"];
+
+/// How long one bash session may run before the gate calls it stalled. A session is seconds of work
+/// (the typed interactive ones sleep under 3 s in all), so a minute is generous under CI load and
+/// still fails long before the capstone job's own limit.
+const BASH_SESSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `bash` on `engine` (one of [`BASH_ENGINES`]) with `cap` granted as "posix", waiting at most
+/// [`BASH_SESSION_LIMIT`]. A stalled session fails the test with `what`, the engine, and the output
+/// `posix` saw, instead of hanging the job until its timeout (#1926).
+fn run_bash(
+    inst: &std::sync::Arc<temen_run::Instance>,
+    engine: &'static str,
+    config: &temen_run::RunConfig,
+    cap: temen_run::HostCap,
+    posix: &temen_posix::Posix,
+    what: &str,
+) -> Result<temen_run::Run, String> {
+    let (inst, config) = (std::sync::Arc::clone(inst), config.clone());
+    let seen = || {
+        format!(
+            "stdout {:?}, stderr {:?}",
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&posix.stderr())
+        )
+    };
+    bounded(&format!("{what} ({engine})"), seen, move || {
+        let caps = [("posix", cap)];
+        match engine {
+            "tree-walker" => inst.run_with_caps(temen_run::Backend::TreeWalk, &config, &caps),
+            "coop bytecode" => inst.run_with_caps(temen_run::Backend::Bytecode, &config, &caps),
+            "parallel" => inst.run_with_caps_parallel(&config, &caps),
+            other => unreachable!("not a bash engine: {other}"),
+        }
+    })
+}
+
+/// Run `f` on its own thread and wait at most [`BASH_SESSION_LIMIT`] for it. Past that, fail naming
+/// `what` and `seen()`, the output so far; the stalled thread is abandoned, and the test process
+/// ends it.
+fn bounded<T: Send + 'static>(
+    what: &str,
+    seen: impl FnOnce() -> String,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(f()));
+    match rx.recv_timeout(BASH_SESSION_LIMIT) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!(
+                "{what}: stalled, still running after {BASH_SESSION_LIMIT:?}; {}",
+                seen()
+            )
+        }
+        // `f` panicked, and its message is already on stderr.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("{what}: panicked"),
+    }
+}
+
 /// Python-escape `bytes` for `pty_oracle.py`'s argv (it `unicode_escape`-decodes each chunk).
 fn py_escape(bytes: &[u8]) -> String {
     let mut s = String::new();
@@ -13280,12 +13341,11 @@ fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Opti
 /// **The temen half** of the interactive differential: `bash -i` on the #797 controlling terminal
 /// with the personality's interleaved transcript armed ([`temen_posix::Posix::enable_transcript`]);
 /// a feeder thread types each chunk with the oracle's protocol — wait until the transcript has grown
-/// past the last keystroke AND ends with the prompt, then feed. `backend`: `None` = the tree-walker,
-/// `Some(false)` = the cooperative bytecode driver, `Some(true)` = `drive_parallel`. Returns the run's
-/// outcome and the transcript.
+/// past the last keystroke AND ends with the prompt, then feed. Runs on `engine` (one of
+/// [`BASH_ENGINES`]); returns the run's outcome and the transcript.
 fn bash_temen_transcript(
-    inst: &temen_run::Instance,
-    backend: Option<bool>,
+    inst: &std::sync::Arc<temen_run::Instance>,
+    engine: &'static str,
     chunks: &[&str],
 ) -> (temen_run::Outcome, Vec<u8>) {
     let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
@@ -13327,12 +13387,15 @@ fn bash_temen_transcript(
         ],
         ..Default::default()
     };
-    let run = match backend {
-        None => inst.run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)]),
-        Some(false) => inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)]),
-        Some(true) => inst.run_with_caps_parallel(&config, &[("posix", cap)]),
-    }
-    .unwrap_or_else(|e| panic!("bash -i transcript session ({backend:?}): {e}"));
+    let run = run_bash(
+        inst,
+        engine,
+        &config,
+        cap,
+        &posix,
+        "bash -i transcript session",
+    )
+    .unwrap_or_else(|e| panic!("bash -i transcript session ({engine}): {e}"));
     feeder.join().expect("feeder thread");
     (run.outcome, posix.transcript())
 }
@@ -13343,7 +13406,7 @@ fn bash_temen_transcript(
 /// session pumped again; `Done` ends it. The schedule is deterministic, so unlike the threaded
 /// harness there is no feed-timing race at all — which is also why this driver can include `^C`.
 fn bash_temen_transcript_session(
-    inst: &temen_run::Instance,
+    inst: &std::sync::Arc<temen_run::Instance>,
     chunks: &[&str],
 ) -> (temen_run::Outcome, Vec<u8>) {
     let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
@@ -13360,32 +13423,47 @@ fn bash_temen_transcript_session(
         ],
         ..Default::default()
     };
-    let mut session = inst
-        .open_coop_session(&config, &[("posix", cap)])
-        .expect("open the bash -i coop session");
-    let mut typed_at = 0usize;
-    let mut next = 0usize;
-    loop {
-        match session.pump().expect("session pump") {
-            temen_run::SessionStep::Done(outcome) => return (outcome, posix.transcript()),
-            temen_run::SessionStep::Idle => {
-                let t = posix.transcript();
-                assert!(
-                    t.len() > typed_at && t.ends_with(b"$ "),
-                    "the session idles only at a fresh prompt: {:?}",
-                    String::from_utf8_lossy(&t)
-                );
-                assert!(
-                    next < chunks.len(),
-                    "the session idled with no keys left to type: {:?}",
-                    String::from_utf8_lossy(&t)
-                );
-                typed_at = t.len();
-                posix.feed_terminal(chunks[next].as_bytes());
-                next += 1;
+    let (inst, px) = (std::sync::Arc::clone(inst), posix.clone());
+    let chunks: Vec<String> = chunks.iter().map(|c| c.to_string()).collect();
+    let seen = || {
+        format!(
+            "transcript {:?}",
+            String::from_utf8_lossy(&posix.transcript())
+        )
+    };
+    let outcome = bounded(
+        "bash -i transcript session (coop session)",
+        seen,
+        move || {
+            let mut session = inst
+                .open_coop_session(&config, &[("posix", cap)])
+                .expect("open the bash -i coop session");
+            let mut typed_at = 0usize;
+            let mut next = 0usize;
+            loop {
+                match session.pump().expect("session pump") {
+                    temen_run::SessionStep::Done(outcome) => return outcome,
+                    temen_run::SessionStep::Idle => {
+                        let t = px.transcript();
+                        assert!(
+                            t.len() > typed_at && t.ends_with(b"$ "),
+                            "the session idles only at a fresh prompt: {:?}",
+                            String::from_utf8_lossy(&t)
+                        );
+                        assert!(
+                            next < chunks.len(),
+                            "the session idled with no keys left to type: {:?}",
+                            String::from_utf8_lossy(&t)
+                        );
+                        typed_at = t.len();
+                        px.feed_terminal(chunks[next].as_bytes());
+                        next += 1;
+                    }
+                }
             }
-        }
-    }
+        },
+    );
+    (outcome, posix.transcript())
 }
 
 /// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
@@ -13428,7 +13506,8 @@ fn demo_bash_translates_and_verifies() {
     // band 0 resolves it via `__vm_cap_resolve` and drives the op ABI through `__vm_host_call`).
     // Byte-differential against the native oracle the script just built, under the same argv/env.
     let oracle = std::env::temp_dir().join("temen_bash_cache/bash-5.2.21/bash");
-    let inst = temen_run::instantiate(t.module.clone()).expect("instantiate bash");
+    let inst =
+        std::sync::Arc::new(temen_run::instantiate(t.module.clone()).expect("instantiate bash"));
     for script in [
         "echo hi",
         "x=world; echo \"hello $x\"",
@@ -13599,10 +13678,6 @@ fn demo_bash_translates_and_verifies() {
             env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
             ..Default::default()
         };
-        let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
-            .unwrap_or_else(|e| panic!("bash -c {script:?} failed: {e}"));
         let native = Command::new(&oracle)
             .args(["-c", script])
             .env_clear()
@@ -13610,64 +13685,28 @@ fn demo_bash_translates_and_verifies() {
             .env("HOME", "/")
             .output()
             .expect("run the native oracle");
-        let code = match &run.outcome {
-            temen_run::Outcome::Exited(c) => *c,
-            temen_run::Outcome::Returned(v) => match v.first() {
-                Some(temen_run::Value::I32(c)) => *c,
-                Some(temen_run::Value::I64(c)) => *c as i32,
-                _ => -1,
-            },
-        };
-        assert_eq!(
-            code,
-            native.status.code().unwrap_or(-1),
-            "bash -c {script:?}: exit status differs from the oracle (outcome {:?})",
-            run.outcome
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&posix.stdout()),
-            String::from_utf8_lossy(&native.stdout),
-            "bash -c {script:?}: stdout differs from the oracle"
-        );
-
-        // ▶ #1146 / #748 — the **bytecode tiers now match NATIVE too**. With async signal delivery
+        // ▶ #1146 / #748 — the **bytecode tiers match NATIVE too**. With async signal delivery
         // ported to the bytecode engine (the #796 L2 safepoint redirect on both the cooperative
         // browser tier and `drive_parallel`), the kill-based trap scripts run their C handlers on
         // both bytecode drivers exactly as on the tree-walker — so native is the single oracle for
         // all three engines here. (Previously async delivery was interpreter-only, so these printed
         // less on the bytecode tier and were only pinned coop==parallel; #1146 closed that gap.)
-        let native_code = native.status.code().unwrap_or(-1);
-        let native_out = String::from_utf8_lossy(&native.stdout);
-        let (cap_c, posix_c) = temen_run::posix::posix_cap(0, 0, Vec::new());
-        let coop = inst
-            .run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap_c)])
-            .unwrap_or_else(|e| panic!("bash -c {script:?} (coop bytecode) failed: {e}"));
-        assert_eq!(
-            bash_exit_code(&coop.outcome),
-            native_code,
-            "bash -c {script:?}: coop bytecode exit differs from the oracle (outcome {:?})",
-            coop.outcome
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&posix_c.stdout()),
-            native_out,
-            "bash -c {script:?}: coop bytecode stdout differs from the oracle"
-        );
-        let (cap_p, posix_p) = temen_run::posix::posix_cap(0, 0, Vec::new());
-        let par = inst
-            .run_with_caps_parallel(&config, &[("posix", cap_p)])
-            .unwrap_or_else(|e| panic!("bash -c {script:?} (parallel) failed: {e}"));
-        assert_eq!(
-            bash_exit_code(&par.outcome),
-            native_code,
-            "bash -c {script:?}: parallel driver exit differs from the oracle (outcome {:?})",
-            par.outcome
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&posix_p.stdout()),
-            native_out,
-            "bash -c {script:?}: parallel driver stdout differs from the oracle"
-        );
+        for engine in BASH_ENGINES {
+            let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
+            let run = run_bash(&inst, engine, &config, cap, &posix, &format!("bash -c {script:?}"))
+                .unwrap_or_else(|e| panic!("bash -c {script:?} ({engine}) failed: {e}"));
+            assert_eq!(
+                bash_exit_code(&run.outcome),
+                native.status.code().unwrap_or(-1),
+                "bash -c {script:?} ({engine}): exit status differs from the oracle (outcome {:?})",
+                run.outcome
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&posix.stdout()),
+                String::from_utf8_lossy(&native.stdout),
+                "bash -c {script:?} ({engine}): stdout differs from the oracle"
+            );
+        }
     }
 
     // ▶ #1803 — the shell signaled from an untrapped subshell, `(kill -INT $$)`. This one is a race
@@ -13708,24 +13747,20 @@ fn demo_bash_translates_and_verifies() {
         env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
         ..Default::default()
     };
-    for tier in ["tree-walk", "coop bytecode", "parallel"] {
+    for engine in BASH_ENGINES {
         let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
-        let caps = [("posix", cap)];
-        let run = match tier {
-            "tree-walk" => inst.run_with_caps(temen_run::Backend::TreeWalk, &config, &caps),
-            "coop bytecode" => inst.run_with_caps(temen_run::Backend::Bytecode, &config, &caps),
-            _ => inst.run_with_caps_parallel(&config, &caps),
-        };
+        let what = format!("bash -c {SELF_SIGINT:?}");
+        let run = run_bash(&inst, engine, &config, cap, &posix, &what);
         let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
         match run {
             Ok(r) => assert!(
                 survived(bash_exit_code(&r.outcome), &out),
-                "{tier}: {SELF_SIGINT:?} survived with {:?} {out:?}, not bash's `rc=0`/`after`",
+                "{engine}: {SELF_SIGINT:?} survived with {:?} {out:?}, not bash's `rc=0`/`after`",
                 r.outcome
             ),
             Err(e) => assert!(
                 posix.term_signal() == Some(2) && out.is_empty(),
-                "{tier}: {SELF_SIGINT:?} ended in {e} — not bash's SIGINT death \
+                "{engine}: {SELF_SIGINT:?} ended in {e} — not bash's SIGINT death \
                  (term signal {:?}, stdout {out:?})",
                 posix.term_signal()
             ),
@@ -13817,10 +13852,6 @@ fn demo_bash_translates_and_verifies() {
                 });
             (cap, posix)
         };
-        let (cap, posix) = mk_cap();
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
-            .unwrap_or_else(|e| panic!("bash -c {script:?} (external) failed: {e}"));
         let native = Command::new(&oracle)
             .args(["-c", script])
             .env_clear()
@@ -13829,61 +13860,25 @@ fn demo_bash_translates_and_verifies() {
             .current_dir(&native_cwd)
             .output()
             .expect("run the native oracle");
-        let code = match &run.outcome {
-            temen_run::Outcome::Exited(c) => *c,
-            temen_run::Outcome::Returned(v) => match v.first() {
-                Some(temen_run::Value::I32(c)) => *c,
-                Some(temen_run::Value::I64(c)) => *c as i32,
-                _ => -1,
-            },
-        };
-        assert_eq!(
-            code,
-            native.status.code().unwrap_or(-1),
-            "bash -c {script:?} (external): exit status differs from the oracle (outcome {:?})",
-            run.outcome
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&posix.stdout()),
-            String::from_utf8_lossy(&native.stdout),
-            "bash -c {script:?} (external): stdout differs from the oracle"
-        );
-
-        // ▶ #748 dual-driver pin over the EXEC surface: the same exec'd pipeline on both bytecode
-        // drivers — on `drive_parallel` every stage is a real OS thread exec'ing its coreutil
-        // (the in-place host/table swap), piped through level-triggered CorePipe blocks. No
-        // signal scripts in this list, so both drivers must also match the native oracle — pin
-        // stdout against NATIVE for each, which implies coop ≡ parallel too.
-        for (label, run_r, posix_r) in [
-            {
-                let (cap, px) = mk_cap();
-                (
-                    "coop bytecode",
-                    inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)]),
-                    px,
-                )
-            },
-            {
-                let (cap, px) = mk_cap();
-                (
-                    "parallel",
-                    inst.run_with_caps_parallel(&config, &[("posix", cap)]),
-                    px,
-                )
-            },
-        ] {
-            let r = run_r
-                .unwrap_or_else(|e| panic!("bash -c {script:?} ({label}) failed: {e}"));
+        // ▶ #748 all three engines over the EXEC surface: on `drive_parallel` every stage is a real
+        // OS thread exec'ing its coreutil (the in-place host/table swap), piped through
+        // level-triggered CorePipe blocks. No signal scripts in this list, so every engine must
+        // match the native oracle, which implies coop ≡ parallel too.
+        for engine in BASH_ENGINES {
+            let (cap, posix) = mk_cap();
+            let what = format!("bash -c {script:?} (external)");
+            let run = run_bash(&inst, engine, &config, cap, &posix, &what)
+                .unwrap_or_else(|e| panic!("{what} ({engine}) failed: {e}"));
             assert_eq!(
-                bash_exit_code(&r.outcome),
+                bash_exit_code(&run.outcome),
                 native.status.code().unwrap_or(-1),
-                "bash -c {script:?} ({label}): exit status differs from the oracle (outcome {:?})",
-                r.outcome
+                "{what} ({engine}): exit status differs from the oracle (outcome {:?})",
+                run.outcome
             );
             assert_eq!(
-                String::from_utf8_lossy(&posix_r.stdout()),
+                String::from_utf8_lossy(&posix.stdout()),
                 String::from_utf8_lossy(&native.stdout),
-                "bash -c {script:?} ({label}): stdout differs from the oracle"
+                "{what} ({engine}): stdout differs from the oracle"
             );
         }
     }
@@ -13916,8 +13911,7 @@ fn demo_bash_translates_and_verifies() {
             ],
             ..Default::default()
         };
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
+        let run = run_bash(&inst, "tree-walker", &config, cap, &posix, "bash -i")
             .expect("bash -i session");
         feeder.join().expect("feeder thread");
         assert_eq!(
@@ -13960,7 +13954,7 @@ fn demo_bash_translates_and_verifies() {
     // flaky #1252, so the assertion below stays tolerant (the browser E2E is the deterministic proof).
     // The session must still fully work around the race: prompt loop, the typed command runs, `^D`
     // exits with the farewell.
-    for parallel in [false, true] {
+    for engine in ["coop bytecode", "parallel"] {
         let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
         let feeder = {
             let px = posix.clone();
@@ -13981,42 +13975,33 @@ fn demo_bash_translates_and_verifies() {
             ],
             ..Default::default()
         };
-        let label = if parallel {
-            "parallel"
-        } else {
-            "coop bytecode"
-        };
-        let run = if parallel {
-            inst.run_with_caps_parallel(&config, &[("posix", cap)])
-        } else {
-            inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)])
-        }
-        .unwrap_or_else(|e| panic!("bash -i session ({label}): {e}"));
+        let run = run_bash(&inst, engine, &config, cap, &posix, "bash -i")
+            .unwrap_or_else(|e| panic!("bash -i session ({engine}): {e}"));
         feeder.join().expect("feeder thread");
         assert_eq!(
             run.outcome,
             temen_run::Outcome::Exited(0),
-            "bash -i ({label}): the ^D exit carries the last command's status"
+            "bash -i ({engine}): the ^D exit carries the last command's status"
         );
         let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
         let err = String::from_utf8_lossy(&posix.stderr()).into_owned();
         assert!(
             out.contains("echo hi\nhi\n"),
-            "bash -i ({label}): the typed command echoed and ran (stdout: {out:?})"
+            "bash -i ({engine}): the typed command echoed and ran (stdout: {out:?})"
         );
         assert!(
             out.contains("rc=0") || out.contains("rc=130"),
-            "bash -i ({label}): the fed ^C either is absorbed (`rc=0`) or aborts the line \
+            "bash -i ({engine}): the fed ^C either is absorbed (`rc=0`) or aborts the line \
              (`rc=130`) — both legitimate until bytecode-tier async delivery is deterministic \
              (#1146); see the comment above (stdout: {out:?})"
         );
         assert!(
             err.matches("$ ").count() >= 2,
-            "bash -i ({label}): the PS1 prompt re-printed between commands (stderr: {err:?})"
+            "bash -i ({engine}): the PS1 prompt re-printed between commands (stderr: {err:?})"
         );
         assert!(
             err.contains("exit"),
-            "bash -i ({label}): ^D printed bash's `exit` farewell (stderr: {err:?})"
+            "bash -i ({engine}): ^D printed bash's `exit` farewell (stderr: {err:?})"
         );
     }
 
@@ -14048,21 +14033,17 @@ fn demo_bash_translates_and_verifies() {
                     native.ends_with("$ exit\n") && native.contains("$ echo hi\nhi\n$ "),
                     "the pty oracle produced a sane transcript: {native:?}"
                 );
-                for (label, backend) in [
-                    ("tree-walker", None),
-                    ("coop bytecode", Some(false)),
-                    ("parallel", Some(true)),
-                ] {
-                    let (outcome, ours) = bash_temen_transcript(&inst, backend, chunks);
+                for engine in BASH_ENGINES {
+                    let (outcome, ours) = bash_temen_transcript(&inst, engine, chunks);
                     assert_eq!(
                         outcome,
                         temen_run::Outcome::Exited(0),
-                        "bash -i transcript ({label}): ^D exit"
+                        "bash -i transcript ({engine}): ^D exit"
                     );
                     assert_eq!(
                         String::from_utf8_lossy(&ours),
                         native,
-                        "bash -i ({label}): the interleaved terminal transcript differs from native"
+                        "bash -i ({engine}): the interleaved terminal transcript differs from native"
                     );
                 }
                 // #1122 route (a) — the same session on the suspend/resume driver (no thread, no
@@ -14134,9 +14115,15 @@ fn demo_bash_translates_and_verifies() {
             ],
             ..Default::default()
         };
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap2)])
-            .expect("bash -i job-control session");
+        let run = run_bash(
+            &inst,
+            "tree-walker",
+            &config,
+            cap2,
+            &posix2,
+            "bash -i job control",
+        )
+        .expect("bash -i job-control session");
         feeder.join().expect("feeder thread");
         assert_eq!(
             run.outcome,
@@ -14213,9 +14200,15 @@ fn demo_bash_translates_and_verifies() {
             ],
             ..Default::default()
         };
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap3)])
-            .expect("bash -i background-job session");
+        let run = run_bash(
+            &inst,
+            "tree-walker",
+            &config,
+            cap3,
+            &posix3,
+            "bash -i background job",
+        )
+        .expect("bash -i background-job session");
         feeder.join().expect("feeder thread");
         assert_eq!(
             run.outcome,
@@ -14294,8 +14287,7 @@ fn demo_bash_translates_and_verifies() {
             ],
             ..Default::default()
         };
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap4)])
+        let run = run_bash(&inst, "tree-walker", &config, cap4, &posix4, "bash -i bg")
             .expect("bash -i bg session");
         feeder.join().expect("feeder thread");
         assert_eq!(
@@ -14355,7 +14347,9 @@ fn demo_bash_readline_transcript_matches_native() {
         .expect("readline bash translates");
     temen_verify::verify_module(&t.module).expect("readline bash verifies");
     let oracle = cache.join("bash-5.2.21/bash");
-    let inst = temen_run::instantiate(t.module.clone()).expect("instantiate readline bash");
+    let inst = std::sync::Arc::new(
+        temen_run::instantiate(t.module.clone()).expect("instantiate readline bash"),
+    );
 
     // `-c` is untouched by readline (it only runs interactively) — pin that the variant's
     // non-interactive surface still matches ITS oracle, traps included.
@@ -14369,9 +14363,8 @@ fn demo_bash_readline_transcript_matches_native() {
             ..Default::default()
         };
         let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
-        let run = inst
-            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
-            .expect("readline bash -c");
+        let what = format!("readline bash -c {script:?}");
+        let run = run_bash(&inst, "tree-walker", &config, cap, &posix, &what).expect(&what);
         let native = Command::new(&oracle)
             .arg("-c")
             .arg(script)
@@ -14435,21 +14428,17 @@ fn demo_bash_readline_transcript_matches_native() {
             && native.contains(&redrawn),
         "the readline oracle handled ^C, edited, recalled, and redrew the wrapped line: {native:?}"
     );
-    for (label, backend) in [
-        ("tree-walker", None),
-        ("coop bytecode", Some(false)),
-        ("parallel", Some(true)),
-    ] {
-        let (outcome, ours) = bash_temen_transcript(&inst, backend, chunks);
+    for engine in BASH_ENGINES {
+        let (outcome, ours) = bash_temen_transcript(&inst, engine, chunks);
         assert_eq!(
             outcome,
             temen_run::Outcome::Exited(0),
-            "readline bash -i ({label}): ^D exit"
+            "readline bash -i ({engine}): ^D exit"
         );
         assert_eq!(
             String::from_utf8_lossy(&ours),
             native,
-            "readline bash -i ({label}): the terminal transcript differs from native readline"
+            "readline bash -i ({engine}): the terminal transcript differs from native readline"
         );
     }
     // #1122 route (a) — readline on the suspend/resume session driver: `^C`, editing, and history
