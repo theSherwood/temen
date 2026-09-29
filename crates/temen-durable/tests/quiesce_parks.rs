@@ -103,6 +103,50 @@ fn a_futex_parked_vcpu_does_not_veto_its_owners_freeze() {
     );
 }
 
+/// #1851: the quiesce flag and an allocating program's heap pointer (`POWERBOX_HEAP_BRK`, one guard
+/// up) were the same window word. A durable run whose heap pointer had a non-zero low byte came up
+/// armed to freeze on quiesce though nobody armed it, and arming the flag rewrote the pointer.
+#[test]
+fn a_heap_pointer_neither_arms_nor_is_changed_by_the_quiesce_flag() {
+    let brk = (temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK) as usize;
+    // What a C or nim `_start` leaves there: a 16-aligned heap pointer.
+    let heap = 0x2_0010u64.to_le_bytes();
+
+    // Unarmed: the parked root is a deadlock, as without a heap.
+    let inst = instrumented(SRC_FUTEX_PARKED_ROOT);
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_self_module(&inst);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    win[brk..brk + 8].copy_from_slice(&heap);
+    let mut fuel = 1_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert_eq!(r, Err(Trap::ThreadFault), "no one armed a freeze");
+
+    // Nor on a run that is not durable at all, whatever it keeps where the flag would be: it has no
+    // durable control words (the C on-ramp stages names in that scratch).
+    let mut m = temen_text::parse_module(SRC_FUTEX_PARKED_ROOT).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: None,
+    });
+    let mut h = Host::new();
+    let mut plain = vec![0u8; WINDOW];
+    plain[brk..brk + 8].copy_from_slice(&heap);
+    plain[temen_ir::durable_abi::ARM_QUIESCE_OFF as usize] = b'm';
+    let mut fuel = 1_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &plain, SIZE_LOG2, &mut h);
+    assert_eq!(r, Err(Trap::ThreadFault), "a plain run deadlocks");
+
+    // Armed: the heap pointer is the program's, untouched.
+    arm_freeze_on_quiesce(&mut win);
+    assert_eq!(
+        win[brk..brk + 8],
+        heap,
+        "arming leaves the heap pointer alone"
+    );
+}
+
 /// The root spawns a sibling that parks forever in `atomic.wait`, then parks itself in
 /// `thread.join` on it. Two different scheduler-owned parks, stacked. Returns
 /// `2000 + 100·sibling_status` if it ever comes back.

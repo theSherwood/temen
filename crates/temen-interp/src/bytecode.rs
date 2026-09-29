@@ -11150,8 +11150,8 @@ fn step_vcpu(
                 // unless the freeze unwound it (#1835). An instrumented fiber always unwinds at a poll
                 // before a genuine return, so a return under `UNWINDING` that spilled frames (its
                 // shadow-SP past its frame base) is the freeze's: the fiber is residue, back to the
-                // `Pending` state a thaw seeds it in, and the resumer gets `SUSPENDED`, which its thaw
-                // re-issues. Nothing was consumed: with no mid-run trigger, every park in a freeze run
+                // `Pending` state a thaw seeds it in, and the resumer gets `FIBER_FROZEN`, which its
+                // thaw re-issues. Nothing was consumed: with no mid-run trigger, every park in a freeze run
                 // was made under `UNWINDING`.
                 Some((rid, resumer, rdst)) => {
                     let id = vt.active_id;
@@ -11176,17 +11176,17 @@ fn step_vcpu(
                         };
                         frozen
                     });
-                    let status = if frozen {
-                        super::FIBER_SUSPENDED
-                    } else {
-                        super::FIBER_RETURNED
-                    };
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
                     let tls = vt.active.tls;
                     vt.active = resumer;
                     vt.active.tls = tls;
                     vt.active_id = rid;
+                    let status = if frozen {
+                        super::FIBER_FROZEN
+                    } else {
+                        super::FIBER_RETURNED
+                    };
                     vt.active.set(rdst, Reg::from_i32(status));
                     vt.active.set(rdst + 1, Reg::from_value(retval));
                 }

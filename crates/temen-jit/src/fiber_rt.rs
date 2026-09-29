@@ -1236,9 +1236,13 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             slot.running_on.store(NOT_RUNNING, Ordering::Release);
             slot.own.finish();
             (*current()).table.free_slot(slot_idx);
-            // A fiber the freeze unwound did not return: its resumer gets `SUSPENDED` (0), which its
-            // thaw re-issues; a genuine return's `RETURNED` (1) is reloaded (#1835).
-            *status_out = if frozen { 0 } else { 1 };
+            // #1835: a fiber that unwound for the freeze did not return; its resumer re-issues the
+            // resume on thaw.
+            *status_out = if frozen {
+                temen_ir::durable_abi::FIBER_FROZEN as i64
+            } else {
+                1
+            };
             v as i64
         }
     }
