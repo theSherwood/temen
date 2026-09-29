@@ -6642,6 +6642,10 @@ pub enum SchedBreak {
     Watchpoint { addr: u64, write: bool },
     /// A single-step / step-over / step-out landed the stepping thread at its target.
     Step,
+    /// A budgeted run ([`ScheduledDebugRun::run_until_turn`]) reached its turn without another stop.
+    /// A live stop like any other, so an embedder can run a long program in slices — streaming its
+    /// output and honoring a Pause between them — and resume where it left off.
+    Pause,
 }
 
 /// One scheduled vCPU under the multi-vCPU debugger. `Clone` for time-travel checkpointing (W1): a
@@ -8206,7 +8210,13 @@ impl ScheduledDebugRun {
     /// finishes, no thread is runnable (`Blocked`), or a thread hits an unsupported op (`Declined`).
     /// Resumable — the previously stopped thread steps one op past its stop before the scan resumes.
     pub fn run_until_stop(&mut self, fuel: &mut u64) -> SchedStop {
-        self.drive(fuel, None)
+        self.drive(fuel, None, None)
+    }
+
+    /// [`run_until_stop`](Self::run_until_stop), but stop by turn `until` at the latest — reported as
+    /// [`SchedBreak::Pause`] at the next op that can be a stop position. Resumable like any stop.
+    pub fn run_until_turn(&mut self, fuel: &mut u64, until: u64) -> SchedStop {
+        self.drive(fuel, None, Some(until))
     }
 
     /// The unified scheduler pump. `step` selects the mode:
@@ -8216,7 +8226,14 @@ impl ScheduledDebugRun {
     ///   runnable only while `st` is blocked, so a step *over* a `join` can't deadlock), stopping the
     ///   moment `st` reaches a call depth `<= max` at an instruction (`max = None` ⇒ any depth = one
     ///   instruction = step-*in*). Another thread's breakpoint/watchpoint still interrupts a step.
-    fn drive(&mut self, fuel: &mut u64, step: Option<(usize, Option<usize>)>) -> SchedStop {
+    ///
+    /// `pause_at` ends a plain resume at that turn, as a [`SchedBreak::Pause`] stop.
+    fn drive(
+        &mut self,
+        fuel: &mut u64,
+        step: Option<(usize, Option<usize>)>,
+        pause_at: Option<u64>,
+    ) -> SchedStop {
         let Self {
             source,
             table,
@@ -8369,6 +8386,19 @@ impl ScheduledDebugRun {
                 // op the thread must first step off. Depth is cumulative across a coroutine / §22
                 // invoke boundary (`VTask::debug_depth`), so a step-over of a `resume`/`invoke` runs
                 // the child to completion and a step inside its body compares child-local frames.
+                // A budgeted run's turn is up: stop here, as a breakpoint would, so resuming steps off
+                // this op first.
+                if pause_at.is_some_and(|t| *turn >= t) {
+                    if let Some(pc) = tasks[ti].vt.debug_active().cur_ir_pc(source) {
+                        tasks[ti].at_bp = true;
+                        *stopped = Some(ti);
+                        *focus = ti;
+                        return SchedStop::Break {
+                            pc,
+                            reason: SchedBreak::Pause,
+                        };
+                    }
+                }
                 if let Some((st, max_depth)) = step {
                     if ti == st && max_depth.is_none_or(|m| tasks[st].vt.debug_depth() <= m) {
                         if let Some(pc) = tasks[st].vt.debug_active().cur_ir_pc(source) {
@@ -8451,7 +8481,7 @@ impl ScheduledDebugRun {
             return self.run_until_stop(fuel);
         };
         self.tasks[st].at_bp = true; // step *off* the current op first, then seek the next stop
-        self.drive(fuel, Some((st, max_depth)))
+        self.drive(fuel, Some((st, max_depth)), None)
     }
 
     /// **Step** one instruction — descends into a call. Drives the stopped thread; other threads
@@ -11730,6 +11760,7 @@ fn drive(
     match sched.pump(&dom, mem, host, fuel, budget)? {
         CoopStep::Done(vals) => Ok(vals),
         CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
+        CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
         CoopStep::TierUp { .. } | CoopStep::Resume { .. } => {
             unreachable!("tier-up not enabled on the native driver")
         }
@@ -11746,6 +11777,8 @@ fn drive(
 enum CoopStep {
     /// The root task returned; these are the run's results.
     Done(Vec<Value>),
+    /// The slice of a [`CoopRun::run_for`] pump is spent; the run is live and resumable.
+    Paused,
     /// #1122 route (a) — every task is parked, nothing internal can wake one, and at least one park is
     /// externally wakeable (a terminal/pipe read or a blocking stdin read): with
     /// [`CoopSched::suspend_on_idle`] set the pump RETURNS here instead of blocking on the doorbell,
@@ -11888,6 +11921,10 @@ struct CoopSched {
     /// [`CoopStep::Idle`] to the driver instead of blocking on the #1122 doorbell (see
     /// [`CoopRun::set_suspend_on_idle`]). Off on the native `drive` and the blocking browser session.
     suspend_on_idle: bool,
+    /// Ops left in this `pump` call's slice ([`CoopRun::run_for`]), or `None` for an unsliced pump.
+    /// At zero the pump returns [`CoopStep::Paused`], every task's cursor persisted — the next pump
+    /// resumes exactly where this one stopped, as after a #1157 preemption.
+    slice_left: Option<u64>,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -12068,6 +12105,7 @@ impl CoopSched {
             // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
             invoke_fibers: Vec::new(),
             suspend_on_idle: false,
+            slice_left: None,
         })
     }
 
@@ -12107,6 +12145,7 @@ impl CoopSched {
             // callbacks), never touched by the scheduler loop itself.
             invoke_fibers: _,
             suspend_on_idle,
+            slice_left,
         } = self;
         // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
         // (rather than always lowest-index) is what lets the preemption quantum actually rotate: a
@@ -12653,6 +12692,12 @@ impl CoopSched {
             } else {
                 (budget, false)
             };
+            // A sliced pump caps the quantum at what is left of the slice, preemptibly, so the task
+            // yields at the slice's end even when it runs alone.
+            let (quantum, preemptible) = match *slice_left {
+                Some(left) => (quantum.min(left.max(1)), true),
+                None => (quantum, preemptible),
+            };
 
             // Select this vCPU's environment and fiber registry: the shared ones (root + thread
             // siblings), or its own confined `instantiate` env's. `tasks[ti].vt` and the chosen env
@@ -12696,6 +12741,13 @@ impl CoopSched {
                     )
                 }
             };
+            let fuel_before = *ctx.fuel;
+            // Fuel is charged once per op, so what it dropped by is the ops this step ran.
+            let charge_slice = |slice_left: &mut Option<u64>, fuel_after: u64| {
+                if let Some(left) = slice_left.as_mut() {
+                    *left = left.saturating_sub(fuel_before.saturating_sub(fuel_after));
+                }
+            };
             // #1896 — a leaf's call that parked in a bounce: run the rest of it in the task's env.
             // When it returns, its host resumes the leaf's suspended frames with its results; when
             // it parks again, the task waits again. A trap ends the process, whose frames the host
@@ -12718,6 +12770,7 @@ impl CoopSched {
                     Some(meta),
                     None,
                 );
+                charge_slice(slice_left, *ctx.fuel);
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
                     (Ok(_), Some((vm, state))) => {
@@ -12741,6 +12794,7 @@ impl CoopSched {
                 true, // the cooperative scheduler: idle blocking `cont.resume.block` (I48)
                 preemptible, // #1157: yield at the op-count quantum when ≥2 tasks are runnable
             );
+            charge_slice(slice_left, *ctx.fuel);
             match stop {
                 Err(trap) => {
                     // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's
@@ -12757,7 +12811,12 @@ impl CoopSched {
                 // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
                 // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
                 // thread; this task resumes on a later turn.
-                Ok(VcpuStop::Preempted) => {}
+                // A sliced pump whose slice is spent returns here instead, to its embedder.
+                Ok(VcpuStop::Preempted) => {
+                    if *slice_left == Some(0) {
+                        return Ok(CoopStep::Paused);
+                    }
+                }
                 Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
                 // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
                 // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
@@ -14158,6 +14217,11 @@ pub struct Footprint {
 /// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
 /// per-Worker parallel driver, those never surface; only the run's end and tier-up round-trips do.
 pub enum CoopEvent {
+    /// A [`CoopRun::run_for`] slice is spent: the run is live, every task's cursor persisted — call
+    /// `run`/`run_for` again to continue exactly where it stopped. This is how an embedder that owns
+    /// its thread (a browser Worker) runs a long program in slices, streaming its output and honoring
+    /// a Pause between them. Never surfaced by an unsliced `run`.
+    Paused,
     /// #1122 route (a) — the run is **idle**: every task is parked on something only the embedder can
     /// satisfy (a terminal/pipe read, a blocking stdin read) and [`CoopRun::set_suspend_on_idle`] is
     /// on. The run is live and resumable: feed input (e.g. `Posix::feed_terminal`, or a signal) and
@@ -14230,6 +14294,22 @@ impl CoopRun {
     ) -> Option<Result<CoopRun, Trap>> {
         // A fresh engine-sized window built from `m`'s declaration + data (the native/test path).
         Self::assemble(m, entry, args, fuel, host, tierup, build_mem(m, &[]))
+    }
+
+    /// The resumable twin of [`compile_and_run_seeded_with_host`]: the same window (`init_mem` seeded
+    /// under `m`'s data) and the same park-request door, so a run pumped in [`run_for`](Self::run_for)
+    /// slices behaves exactly as that one-shot run.
+    pub fn new_seeded(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        init_mem: &[u8],
+    ) -> Option<Result<CoopRun, Trap>> {
+        host.wire_park_door();
+        super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
+        Self::assemble(m, entry, args, fuel, host, None, build_mem(m, init_mem))
     }
 
     /// Like [`new`](Self::new), but the linear-memory window is built **over a caller-provided
@@ -14491,6 +14571,15 @@ impl CoopRun {
         }
     }
 
+    /// [`run`](Self::run), but return after about `ops` ops with [`CoopEvent::Paused`] if nothing else
+    /// stopped the run first. The slice is counted in ops (fuel), so it is deterministic.
+    pub fn run_for(&mut self, ops: u64) -> CoopEvent {
+        self.sched.slice_left = Some(ops.max(1));
+        let ev = self.run();
+        self.sched.slice_left = None;
+        ev
+    }
+
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
     /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
     pub fn run(&mut self) -> CoopEvent {
@@ -14507,6 +14596,7 @@ impl CoopRun {
         ) {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
             Ok(CoopStep::Idle) => CoopEvent::Idle,
+            Ok(CoopStep::Paused) => CoopEvent::Paused,
             Ok(CoopStep::TierUp {
                 module,
                 func,

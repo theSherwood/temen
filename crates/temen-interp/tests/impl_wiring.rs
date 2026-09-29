@@ -448,6 +448,59 @@ fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
     assert!(child.import_binding(0).is_none(), "slot starts empty");
 }
 
+/// A child's `stderr` import (the seeded libc's fd 2, `__vm_stream_write_err`) binds to the cap
+/// granted under the name `"stderr"` — and **only** to it. It is a second `Stream`, so the reference
+/// policy's "first cap of the interface type" would bind it to stdout: the wrong endpoint, silently.
+/// A child that was not granted stderr therefore refuses a required `stderr` import.
+#[test]
+fn child_manifest_binds_stderr_by_name_only() {
+    use temen_interp::StreamRole;
+    use temen_ir::ImportMode;
+    let manifest = |names: &[&str]| {
+        let mut m = temen_ir::Module::default();
+        for name in names {
+            m.add_func_import(
+                *name,
+                sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]),
+                ImportMode::Required,
+            );
+        }
+        (m.imports, m.types)
+    };
+    let mut parent = Host::new();
+    let out = parent.grant_stream(StreamRole::Out);
+    let err = parent.grant_stream(StreamRole::Err);
+
+    let (mut child, _, _) = parent
+        .spawn_named_child(&[("stdout".into(), out), ("stderr".into(), err)], 1 << 16)
+        .expect("spawn");
+    let (imps, tys) = manifest(&["stream_write", "stderr"]);
+    child.bind_child_manifest(&imps, &tys).expect("both bind");
+    let stdout_h = child.resolve_cap_name("stdout").expect("stdout granted");
+    let stderr_h = child.resolve_cap_name("stderr").expect("stderr granted");
+    assert_ne!(stdout_h, stderr_h);
+    assert_eq!(
+        child.import_binding(0).expect("bound").handle,
+        stdout_h,
+        "stream_write → stdout"
+    );
+    assert_eq!(
+        child.import_binding(1).expect("bound").handle,
+        stderr_h,
+        "stderr → stderr"
+    );
+
+    let (mut child, _, _) = parent
+        .spawn_named_child(&[("stdout".into(), out)], 1 << 16)
+        .expect("spawn");
+    let (imps, tys) = manifest(&["stderr"]);
+    assert_eq!(
+        child.bind_child_manifest(&imps, &tys),
+        Err(0),
+        "no stderr grant: refused, not bound to stdout"
+    );
+}
+
 #[test]
 fn provenance_reports_platform_vs_ancestor_terminated() {
     // §3.1: `self.provenance(handle)` (self-namespace op 5) — 0 for a platform-native
