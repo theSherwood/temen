@@ -7627,13 +7627,14 @@ fn freeze_in_flight(s: &Sched) -> bool {
             .any(|v| unwinding(v))
 }
 
-/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe and
-/// reap **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
+/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe, reap
+/// and stop **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
 /// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
 /// would spin the worker loop instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
     !s.svc_waiters.is_empty()
         || !s.posix_reap_waiters.is_empty()
+        || !s.stopped.is_empty()
         || s.wait_waiters
             .values()
             .flatten()
@@ -7661,7 +7662,8 @@ fn freeze_can_admit(s: &Sched) -> bool {
 /// same `WAIT_WOKEN` the JIT's own freeze arm delivers: discarded by the safepoint that unwinds
 /// before the guest can observe it, and the thaw re-issues the wait. A pipe read/write or reap bench
 /// is re-admitted too (#1672): its rewound op re-executes under the freeze and is abandoned
-/// ([`Decision::Abandon`]), and the thaw re-issues the call.
+/// ([`Decision::Abandon`]), and the thaw re-issues the call. So is a stopped vCPU: it sees through
+/// its stop to its next freeze point, abandoning any host call on the way.
 ///
 /// A joiner or lane waiter *will* be woken by something else — its child completing (here, by
 /// unwinding), a lane coming free — so it takes the phase without re-admission. Without the phase
@@ -7699,6 +7701,15 @@ fn admit_parks_for_freeze(s: &mut Sched) {
         waiters.retain(|_, q| !q.is_empty());
     }
     for (_, q) in std::mem::take(&mut s.posix_reap_waiters) {
+        for mut v in q {
+            v.dstate = STATE_UNWINDING;
+            s.runnable.push_back(v);
+        }
+    }
+    // #1672 — a stopped vCPU is re-admitted too: under the freeze it sees through its stop, runs on
+    // to its freeze point without leaving the domain (a host call on the way is abandoned), and
+    // unwinds there.
+    for (_, q) in std::mem::take(&mut s.stopped) {
         for mut v in q {
             v.dstate = STATE_UNWINDING;
             s.runnable.push_back(v);
@@ -13206,8 +13217,39 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // positive (nothing rewound; a resume executes the current inst). Checked after
             // `kill`/terminate (death beats stop) and before signal delivery (a stopped process
             // handles its signals at continue, not while stopped — POSIX).
-            if stop_depth.load(Ordering::Relaxed) > 0 {
-                return Ok(Inner::Park(Blocked::Stopped));
+            let stopped = stop_depth.load(Ordering::Relaxed) > 0;
+            if stopped {
+                // #1672 — a landing freeze sees through the stop. A stop lands asynchronously, so
+                // landing at the next freeze point instead of here is indistinguishable to the guest,
+                // provided nothing leaves the domain meanwhile: the ops on the way touch only its own
+                // window (every vCPU of the domain is stopped), and a host call is abandoned rather
+                // than performed, for the thaw to re-issue. A serve op is not abandoned: the thaw
+                // re-issues it anyway, and under the freeze it drains nothing.
+                let freezing = durable
+                    && mem
+                        .as_ref()
+                        .is_some_and(|m| m.durable_state() == STATE_UNWINDING);
+                if !freezing {
+                    return Ok(Inner::Park(Blocked::Stopped));
+                }
+                let host_call = match &block.insts[frames[top].inst] {
+                    Inst::CapCall {
+                        type_id, op, sig, ..
+                    } if !temen_ir::durable_abi::is_serve_op(*type_id, *op) => Some(*sig),
+                    Inst::CallImport { sig, .. }
+                    | Inst::CallImportDyn { sig, .. }
+                    | Inst::CallSym { sig, .. } => Some(*sig),
+                    _ => None,
+                };
+                if let Some(sig) = host_call {
+                    frames[top].inst += 1;
+                    abandon_for_freeze(mem, *durable_sp_ctx);
+                    let n = call_sig(&cur_types, sig).results.len();
+                    frames[top]
+                        .vals
+                        .extend(std::iter::repeat_n(Reg::default(), n));
+                    continue;
+                }
             }
             // #796 L2 async signal delivery (PROCESS.md §9). At this per-op safepoint, if a personality
             // has a caught, unmasked signal pending (its cheap `armed` flag is set) and we are not already
@@ -13215,7 +13257,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // dedicated signal stack — exactly like a `call.dyn`. The interrupted instruction is
             // **not** advanced, so it re-executes when the handler returns (the empty `Return` restores the
             // interrupted frame untouched). Same interrupt-at-safepoint shape as `kill`, but non-lethal.
-            if sig_handler_stack.len() < MAX_SIG_HANDLER_NEST {
+            if !stopped && sig_handler_stack.len() < MAX_SIG_HANDLER_NEST {
                 if let Some((armed, source)) = &signal_poll {
                     if armed.load(Ordering::Relaxed) {
                         // The source owns its own locking; the interp holds no personality lock here.
@@ -22479,14 +22521,7 @@ impl Host {
             // result reloads on thaw). A serve op must *re-issue* instead (§13.4 slice 4b), and the
             // transform cannot see a runtime binding — so a durable domain never resolves an import
             // to one: the call fails closed (`CapFault`), on every engine, through this one getter.
-            .filter(|b| {
-                !(self.durable
-                    && b.type_id == temen_ir::CAP_SELF_TYPE_ID
-                    && matches!(
-                        b.op,
-                        temen_ir::durable_abi::SVC_POLL_OP | temen_ir::durable_abi::SVC_WAIT_OP
-                    ))
-            })
+            .filter(|b| !(self.durable && temen_ir::durable_abi::is_serve_op(b.type_id, b.op)))
     }
 
     pub fn set_import_bindings(&mut self, mut bindings: Vec<BoundImport>) {
