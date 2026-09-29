@@ -3077,7 +3077,7 @@ fn relaunch_detached(
     // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
     // `begin_thaw`, on the child's own window.
-    let mut mem = Mem::detached(reserved_log2, memory_log2, shadow, &module.data);
+    let mut mem = Mem::detached(reserved_log2, memory_log2, shadow, &module.data, None);
     mem.restore_layout(&window);
     mem.durable_set_state(STATE_NORMAL);
     let thaw_off = mem.thaw_state_off(0);
@@ -14557,6 +14557,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     size_log2 as u8,
                                     cm.shadow,
                                     &cm.data,
+                                    None,
                                 );
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
@@ -27335,7 +27336,7 @@ impl Host {
     /// Reads `grants_n` × 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
     /// window-relative `grants_ptr` from `window` (the parent's confined, readable window), then re-grants
     /// each `(name, handle)` from `self` via [`Self::spawn_named_child`]. `flags` (bytes 12..16) is
-    /// reserved and ignored, exactly as on the native and interpreter (`read_grant_list`) paths.
+    /// reserved and ignored, exactly as on the native and interpreter (`read_grant_records`) paths.
     ///
     /// Fail-closed ([`GrantMarshalError`]): an out-of-window record/name (`OutOfWindow`), a non-UTF-8 name
     /// (`BadName`), or any non-re-grantable handle (`NotRegrantable`, surfaced by `spawn_named_child`)
@@ -29518,7 +29519,7 @@ impl MemLayout {
     /// read the live map (the JIT's harvest). Protections its guest changed through the Memory
     /// capability are not recorded.
     pub fn detached_image(module: &Module, image: Vec<u8>, mapped_log2: u8) -> MemLayout {
-        let m = Mem::detached(mapped_log2, mapped_log2, None, &module.data);
+        let m = Mem::detached(mapped_log2, mapped_log2, None, &module.data, None);
         let space = m.space.read_unpoisoned();
         MemLayout {
             bytes: image,
@@ -29687,14 +29688,19 @@ struct AddrSpace {
 impl Mem {
     /// A detached (op 15) child's window as it starts: a fresh reservation holding its module's data
     /// segments (the `readonly` ones RO) under the #964 NULL guard. The one build for a spawn and for
-    /// a thaw, which lays its captured image over it (#1733), so the two cannot drift.
+    /// a thaw, which lays its captured image over it (#1733), so the two cannot drift. `back` is a
+    /// backing its host minted (a `Vcpu` embedder's, #1414); `None` reserves one here.
     fn detached(
         reserved_log2: u8,
         mapped_log2: u8,
         shadow: Option<ShadowArena>,
         data: &[Data],
+        back: Option<Arc<Region>>,
     ) -> Mem {
-        let mut m = Mem::with_reservation(reserved_log2, mapped_log2, shadow);
+        let mut m = match back {
+            Some(back) => Mem::with_reservation_over(reserved_log2, mapped_log2, back, shadow),
+            None => Mem::with_reservation(reserved_log2, mapped_log2, shadow),
+        };
         m.init_data(data);
         m.seed_null_guard(temen_ir::module_null_guard());
         m
