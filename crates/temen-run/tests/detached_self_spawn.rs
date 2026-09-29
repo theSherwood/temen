@@ -85,7 +85,7 @@ fn powerbox(m: &temen_ir::Module) -> Host {
     h.grant_powerbox_prefix(win);
     let inst = h.grant_instantiator(0, win);
     h.register_cap_name("instantiator", inst);
-    h.grant_detached_spawn_caps(win);
+    h.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
     h
 }
 

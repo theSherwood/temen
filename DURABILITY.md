@@ -328,6 +328,37 @@ collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe re
 `wait(-1)` (#1688), a reply or completion in flight (#1901), and an offer admission, which a durable
 caller never reaches (#1681).
 
+**How the rule stays enforced (proposed 2026-09-29, for owner sign-off; #1898–#1904).** The rule
+above was first applied one park at a time, by hand, and that is where the gaps came from. Four rules
+make it hold by construction:
+
+1. **One rule per park site, on every engine.** The table above, for the oracle (#1898). The JIT and
+   the bytecode engine apply the same rules (#1904, INVARIANTS #15).
+2. **Every park inside the cut is a re-issue.** A park whose op took no effect is abandoned and
+   re-issued, as the table's re-issue sites already are. A park waiting on an op that *has* taken
+   effect is split in two: the request commits and its ticket rides the artifact as cut data, and the
+   wait on that ticket is an ordinary re-issuable park (a reply, a completion: #1901). An op that has
+   partly taken effect completes short where its semantics allow (a pipe write larger than
+   `PIPE_BUF` may return a short count) and records its progress otherwise.
+3. **A boundary capability declares its freeze behaviour when it is granted.** An effect that has
+   left the VM cannot be made exactly-once by the VM alone. So a capability that can have an
+   operation in flight across the boundary declares one of: *re-issue* (idempotent, or no effect
+   while parked), *resume by request id* (the provider keeps results by id; the thaw re-binds the
+   edge and collects them), *drain* (a bounded wait for completion), or *none*. First-party
+   providers implement one of the first three. Granting a *none* capability marks the domain
+   non-freezable at grant time, so the embedder learns it when it chooses the capability, not when
+   a freeze fails (#1902).
+4. **Freeze liveness.** A freeze completes in bounded time when every vCPU is running instrumented
+   code (the back-edge polls bound the distance to the next poll), parked at a *re-issue* or *phase*
+   site, or inside a host call whose capability declared a freeze behaviour. Anything else is
+   declined by the census when the trigger fires (#1671), never discovered mid-unwind and never a
+   stall. The park × engine matrix pins it: every site on every engine either freezes and thaws to
+   the uninterrupted answer or declines cleanly (#1903).
+
+So the only permanent declines are a *none* capability the embedder chose to grant and the
+authority gaps #1703 lists as by design; the transform's coverage gaps (#1695) are a finite
+engineering list on another axis.
+
 So a freeze fails only while one of these rules is unimplemented. Each `DeclineCause` (#1671) and
 each `NonDurableKind` (§12.5) is a gap against this rule, tracked in #1703, not a permanent carve-out.
 The exceptions are the by-design ones #1703 lists, such as an un-attested `Module` grant: those

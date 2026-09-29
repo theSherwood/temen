@@ -115,8 +115,8 @@ fn parent() -> temen_ir::Module {
 
 /// The child touches memory, so it takes the confined transform: its data sits above the arena, and
 /// its NULL probes are the point.
-fn child_module(probe: &str) -> temen_ir::Module {
-    verified(transform_module_assume_confined(&parse(&child(probe))).expect("transform"))
+fn child_module(src: &str) -> temen_ir::Module {
+    verified(transform_module_assume_confined(&parse(src)).expect("transform"))
 }
 
 fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
@@ -185,9 +185,9 @@ fn run(
     }
 }
 
-/// Fresh: the probe on `engine` with no freeze.
-fn fresh(engine: Engine, probe: &str) -> Option<Out> {
-    let child = child_module(probe);
+/// Fresh: child `src` on `engine` with no freeze.
+fn fresh(engine: Engine, src: &str) -> Option<Out> {
+    let child = child_module(src);
     let (mut host, args) = powerbox(&child);
     let win = init_durable_window(1 << PARENT_LOG2, ARENA);
     run(engine, &parent(), &args, &win, &mut host).map(|(o, _)| o)
@@ -195,9 +195,9 @@ fn fresh(engine: Engine, probe: &str) -> Option<Out> {
 
 /// Freeze from the start on `froze` (the child is cut in its loop, before the probe), carry the tree
 /// through the codec, and thaw it on `thaws`.
-fn thawed(froze: Engine, thaws: Engine, probe: &str) -> Option<Out> {
+fn thawed(froze: Engine, thaws: Engine, src: &str) -> Option<Out> {
     let parent = parent();
-    let child = child_module(probe);
+    let child = child_module(src);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     write_state(&mut win, STATE_UNWINDING);
     // The JIT runs the child on its own thread, so on a loaded runner it can finish its loop (and
@@ -224,17 +224,22 @@ fn thawed(froze: Engine, thaws: Engine, probe: &str) -> Option<Out> {
 
 /// Every fresh and thawed run of `probe` answers `want`; reports every cell that does not.
 fn check(probe: &str, want: Out) {
+    check_child(&child(probe), want);
+}
+
+/// [`check`] over a whole child source.
+fn check_child(src: &str, want: Out) {
     use Engine::*;
     let mut wrong = Vec::new();
     for e in [Interp, Jit] {
-        match fresh(e, probe) {
+        match fresh(e, src) {
             Some(o) if o != want => wrong.push(format!("fresh on {e:?}: {o:?}")),
             _ => {}
         }
     }
     for froze in [Interp, Jit] {
         for thaws in [Interp, Jit] {
-            match thawed(froze, thaws, probe) {
+            match thawed(froze, thaws, src) {
                 Some(o) if o != want => {
                     wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: {o:?}"))
                 }
@@ -267,4 +272,47 @@ fn a_thawed_detached_childs_null_load_faults() {
 #[test]
 fn a_thawed_detached_childs_store_to_its_readonly_segment_faults() {
     check(RO_STORE, Out::Trap("MemoryFault".into()));
+}
+
+/// #1854: a child that grows the first page past its declared 128 KiB (into its window's reserved
+/// tail) and writes `z` there before the freeze cuts it, then resolves the one-byte name at that page
+/// after it. The
+/// name is no capability (`-EINVAL`), which the Memory capability can only answer if it sees the
+/// page: a thawed child whose host page map was not seeded from its restored window read the page as
+/// unmapped (`-EFAULT`).
+const GROWN_CHILD: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vs0 = i32.wrap_i64 v1
+  vt = i64.const 131072
+  vtl = i64.const 16384
+  vrw = i64.const 3
+  vm = call.cap 5 0 (i64, i64, i64) -> (i64) vs0 (vt, vtl, vrw)
+  vzc = i32.const 122
+  i32.store8 vt vzc
+  vz = i64.const 0
+  br 1(vz, vt)
+}
+block 1 (vi: i64, va: i64) {
+  vn = i64.const 1000000
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi, va) 3(va)
+}
+block 2 (vj: i64, vb: i64) {
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk, vb)
+}
+block 3 (vp: i64) {
+  vl = i64.const 1
+  vr = self.resolve vp vl
+  pr = i64.extend_i32_s vr
+  return pr
+  }
+}
+";
+
+#[test]
+fn a_thawed_detached_childs_grown_page_is_seen_by_its_memory_capability() {
+    check_child(GROWN_CHILD, Out::Ret(EINVAL));
 }

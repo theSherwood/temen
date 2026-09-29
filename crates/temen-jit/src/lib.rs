@@ -123,6 +123,13 @@ pub fn fiber_active() -> bool {
     fiber_rt::current_fiber_slot().is_some()
 }
 
+/// #1166 — whether this OS thread runs a `thread.spawn`ed vCPU, which only a concurrent guest has.
+/// A host thunk that takes its host state as a raw `&mut`, and so serves one caller at a time, must
+/// refuse a call made here: a concurrent guest's calls arrive from several threads at once.
+pub fn on_spawned_vcpu() -> bool {
+    os_thread_rt::on_spawned_vcpu()
+}
+
 /// #1768 — whether compiled code on this OS thread is running beneath a **host frame that
 /// re-entered it** over a live window ([`CompiledModule::invoke_extra`]: a `Jit.invoke`d unit, a
 /// serve handler). The embedder's fork gate: a fork is reified by unwinding the caller's instrumented
@@ -989,6 +996,10 @@ pub struct GrantChildHooks {
     pub premap_admit: PremapAdmit,
     pub premap_stage: PremapStage,
     pub premap_apply: PremapApply,
+    /// #1854 — [`HighWater`] over a **child** powerbox (always the shared form): how far a durable
+    /// detached child grew its window, so a freeze's capture of it reaches its grown pages, as the
+    /// root's does.
+    pub high_water: HighWater,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the

@@ -3,14 +3,12 @@
 //!
 //! nimony's Temen backend (`nimony t`) plans this as the one whole-program node after DCE, in the
 //! place `lengc` + `cc` + the linker take in the C backend; nifmake execs it through `/bin/sh`. Every
-//! input is one module's DCE'd Leng (`<stem>.c.nif`). The link is [`temen_leng::link_nim_posix`] —
-//! the call the host makes, which orders the modules itself, so the output depends on the module
-//! set alone — against the personality's vocabulary ([`temen_posix_abi::vtable`]) and the prebuilt
-//! guest libc (`/lib/temen/libc.temeno`, or `--libc:`; linked without one if absent).
+//! input is one module's DCE'd Leng (`<stem>.c.nif`). The command is [`temen_leng::link_command`],
+//! which an embedder may also serve natively: it links with [`temen_leng::link_nim_posix`], the call
+//! the host makes, against the personality's vocabulary ([`temen_posix_abi::vtable`]).
 //!
 //! It reaches the world only through the personality's imports (`__px_*`, #1668), so it binds in an
-//! exec'd powerbox exactly like the nim programs around it. Exit codes: 1 = bad arguments,
-//! 2 = an input unreadable, 3 = the link refused, 4 = the output unwritable.
+//! exec'd powerbox exactly like the nim programs around it.
 //!
 //! Its heap is a size-class allocator over the on-ramp's `malloc` (see [`Heap`]).
 
@@ -159,46 +157,11 @@ fn write_file(path: &str, bytes: &[u8]) -> bool {
     off == bytes.len()
 }
 
-/// A module's stem from its path: `nimcache/x.temen/sysvq0asl.c.nif` → `sysvq0asl`.
-fn stem(path: &str) -> &str {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.split('.').next().unwrap_or(name)
-}
-
 fn run(args: &[&str]) -> i32 {
-    let mut out = None;
-    let mut libc_path = "/lib/temen/libc.temeno";
-    let mut inputs = Vec::new();
-    for &a in args {
-        if let Some(o) = a.strip_prefix("-o:") {
-            out = Some(o);
-        } else if let Some(l) = a.strip_prefix("--libc:") {
-            libc_path = l;
-        } else {
-            inputs.push(a);
-        }
-    }
-    let Some(out) = out.filter(|_| !inputs.is_empty()) else {
-        return 1;
-    };
-    let mut srcs = Vec::new();
-    for &p in &inputs {
-        let Some(bytes) = read_file(p) else { return 2 };
-        srcs.push((stem(p), temen_leng::nif_text(&bytes).into_owned()));
-    }
-    let units: Vec<temen_leng::WholeModule> = srcs
-        .iter()
-        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
-        .collect();
-    let libc = read_file(libc_path);
     let (names, sigs) = temen_posix_abi::vtable();
-    let Ok(module) = temen_leng::link_nim_posix(&units, (&names, &sigs), libc.as_deref()) else {
-        return 3;
-    };
-    if !write_file(out, &temen_encode::encode_module(&module)) {
-        return 4;
-    }
-    0
+    temen_leng::link_command(args, (&names, &sigs), &mut read_file, &mut |path, bytes| {
+        write_file(path, bytes)
+    })
 }
 
 /// `main(argc, argv)`: the on-ramp's powerbox `_start` parses the args region an `execve` wrote.

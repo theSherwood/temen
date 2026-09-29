@@ -2028,6 +2028,60 @@ pub fn link_nim_posix(
     link_whole_powerbox_manifest(units, runtime)
 }
 
+/// **`temen-link -o:<out.temen> [--libc:<path>] <main.c.nif> <dep.c.nif>...`**, the command nimony's
+/// Temen backend plans after dead-code elimination (#1609): link a program's `.c.nif` modules with
+/// [`link_nim_posix`], against the prebuilt guest libc (`/lib/temen/libc.temeno` unless `--libc:`
+/// names another; linked without one if it is absent), and write the encoded module.
+///
+/// It reaches files only through `read` and `write`. The in-guest `temen-link` passes the
+/// personality's file ops; an embedder that serves the command natively passes its filesystem. Either
+/// way it is this function, so a module linked either way is the same module.
+///
+/// Returns the exit status: `0`, `1` bad arguments, `2` an input unreadable, `3` the link refused,
+/// `4` the output unwritable.
+pub fn link_command(
+    args: &[&str],
+    personality: PersonalityVtable,
+    read: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    write: &mut dyn FnMut(&str, &[u8]) -> bool,
+) -> i32 {
+    let mut out = None;
+    let mut libc_path = "/lib/temen/libc.temeno";
+    let mut inputs = Vec::new();
+    for &a in args {
+        if let Some(o) = a.strip_prefix("-o:") {
+            out = Some(o);
+        } else if let Some(l) = a.strip_prefix("--libc:") {
+            libc_path = l;
+        } else {
+            inputs.push(a);
+        }
+    }
+    let Some(out) = out.filter(|_| !inputs.is_empty()) else {
+        return 1;
+    };
+    let mut srcs = Vec::new();
+    for &p in &inputs {
+        let Some(bytes) = read(p) else { return 2 };
+        // A module's stem is its file's name to the first dot: `nimcache/x.temen/sysvq0asl.c.nif`.
+        let name = p.rsplit('/').next().unwrap_or(p);
+        let stem = name.split('.').next().unwrap_or(name);
+        srcs.push((stem, nif_text(&bytes).into_owned()));
+    }
+    let units: Vec<WholeModule> = srcs
+        .iter()
+        .map(|(stem, src)| WholeModule { stem, src })
+        .collect();
+    let libc = read(libc_path);
+    let Ok(module) = link_nim_posix(&units, personality, libc.as_deref()) else {
+        return 3;
+    };
+    if !write(out, &temen_encode::encode_module(&module)) {
+        return 4;
+    }
+    0
+}
+
 /// The personality's published op vocabulary — what `temen_posix::cap_vtable()` returns: each op's
 /// import name (`__px_<op>`) and its exact signature, op number = position.
 ///

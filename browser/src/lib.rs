@@ -31,7 +31,7 @@ use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimc;
 mod nimony;
-pub use nimony::{nim_build, NimBuild};
+pub use nimony::{library_pack, nim_build, NimBuild};
 pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
@@ -215,11 +215,10 @@ pub extern "C" fn run_threads() -> i64 {
 /// runs every multi-domain guest on), over primitives already exercised on wasm32 — the wasm-JIT
 /// tier-up is orthogonal (a per-Worker compute accelerator; cap/serve/fork ops leaf-fold to the
 /// interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
-/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager runs in the
-/// module's 72-KiB window, so its scratch (the queue/spawn-arg structs and the "svc"/"o" name data
-/// segments) sits above the #1094 unconditional NULL guard (`[0, 16 KiB)` faults on any guest
-/// access). The spawned domains run in 4-KiB carves — below the guard's minimum window, so the guard
-/// no-ops there (#1094) and the domain's own name cells + reply slot keep their low `[0, 24)` offsets.
+/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager spawns both
+/// domains through op-17 v1 records (#1864): each is this module in a **detached 2^18 window of its
+/// own** paid from the `Budget` arg, so each starts with the module's data segments — the guest reads
+/// its "svc"/"o" names there, and every scratch cell sits above the #1094 NULL guard.
 const FORK_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
@@ -227,29 +226,25 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 131072
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
+; manager (inst, stdout, budget): spawn the server (func 1), offer its "svc" to the guest (func 4)
+; with our stdout as "o", and return the guest's status
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  ; the op-17 v1 record for the server at 17600: version 1 | entry 1, size_log2 18 | no pager,
+  ; module -1 (self) | budget, no grants, no args, region -1 (none); the rest is zero
   q1a0 = i64.const 17600
+  q1v0 = i64.const 4294967297
   i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
   q1a2 = i64.const 17616
+  q1v2 = i64.const -4294967278
   i64.store q1a2 q1v2
   q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
+  vself = i32.const -1
+  i32.store q1a3 vself
+  q1a3b = i64.const 17628
+  i32.store q1a3b vbud
+  q1a9 = i64.const 17672
+  i32.store q1a9 vself
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -269,27 +264,24 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  q2v0 = i64.const 17179869184
-  q2v1 = i64.const 135168
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2v5 = i64.const 16640
-  q2v6 = i64.const 2
-  q2a0 = i64.const 17664
+  ; the guest's record at 17696: version 1 | entry 4, the two grants above, otherwise as the server's
+  q2a0 = i64.const 17696
+  q2v0 = i64.const 17179869185
   i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
+  q2a2 = i64.const 17712
+  i64.store q2a2 q1v2
+  q2a3 = i64.const 17720
+  i32.store q2a3 vself
+  q2a3b = i64.const 17724
+  i32.store q2a3b vbud
+  q2a5 = i64.const 17736
+  q2v5 = i64.const 16640
   i64.store q2a5 q2v5
-  q2a6 = i64.const 17712
+  q2a6 = i64.const 17744
+  q2v6 = i64.const 2
   i64.store q2a6 q2v6
+  q2a9 = i64.const 17768
+  i32.store q2a9 vself
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
@@ -323,16 +315,10 @@ block 0 (vpid: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
@@ -357,7 +343,7 @@ block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
   br_if visechild 1(vhsvc, vho) 4(vr, vho)
   }
 block 4 (vr: i64, vho: i32) {
-  vp16 = i64.const 16
+  vp16 = i64.const 16704
   i64.store vp16 vr
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
@@ -380,11 +366,12 @@ pub extern "C" fn run_fork() -> i64 {
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let budget = host.grant_budget(0, 2 << 18, 0); // the server's and the guest's windows
     let mut fuel = 40_000_000u64;
     let r = match bytecode::compile_and_run_with_host(
         &m,
         0,
-        &[Value::I32(inst), Value::I32(out_h)],
+        &[Value::I32(inst), Value::I32(out_h), Value::I32(budget)],
         &mut fuel,
         &mut host,
     ) {
@@ -3707,7 +3694,7 @@ fn grant_onramp_caps(
         // non-durable, so granting it everywhere would make every reactor that saves a warm
         // snapshot unfreezable.
         if temen_ir::spawns_detached(m) {
-            host.grant_detached_spawn_caps(win);
+            host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
         }
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
@@ -4358,6 +4345,9 @@ pub fn posix_shell_exec_with(
     let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst = host.grant_instantiator(0, win);
     let _as = host.grant_address_space(0, win);
+    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+    // returned when the child ends: room for the widest pipeline's three concurrent stages.
+    let _budget_h = host.grant_budget(0, 4 << 20, 0);
     let cmd_handles: Vec<(&str, i32, u8)> = cmds
         .iter()
         .map(|(n, cm)| {
@@ -9049,12 +9039,26 @@ pub extern "C" fn temen_run_onramp_posix(
     out.value
 }
 
+/// A **registry blob** of `entries` ([`blob_entries`] reads one): the framing a host uses to hand
+/// the cdylib a whole set in one buffer, and that a prebuilt set (the nim library, #958) ships in.
+pub fn registry_blob(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let len = |n: usize| (n as u32).to_le_bytes();
+    let mut out = len(entries.len()).to_vec();
+    for (name, bytes) in entries {
+        out.extend(len(name.len()));
+        out.extend(name.as_bytes());
+        out.extend(len(bytes.len()));
+        out.extend(*bytes);
+    }
+    out
+}
+
 /// The entries of a **registry blob** a host builds: all integers little-endian, a `u32` entry
 /// count, then per entry a `u32` name length + that many UTF-8 name bytes + a `u32` length + that
 /// many bytes. One buffer carries a whole set (a shell's commands, a tree's files) through one pair
 /// of arguments. Defensive: reading stops at the first entry that is truncated or not UTF-8, rather
 /// than trapping.
-fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
+pub fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
     let rd_u32 = |at: usize| -> Option<usize> {
         bytes
             .get(at..at + 4)

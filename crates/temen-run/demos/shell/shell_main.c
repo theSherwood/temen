@@ -5,22 +5,19 @@
 #define O_APPEND 02000
 
 /* Three builds of one shell, differing in exactly one thing — how a non-builtin command runs:
-     default                  as a §14 op-13 child with an explicit grant list: the capability shell
-                              (STAGE1.md), whose stages get a ring and a stdout and nothing else;
+     default                  as a §14 detached child (op 17 v1) with an explicit grant list: the
+                              capability shell (STAGE1.md), whose stages get a ring and a stdout and
+                              nothing else;
      -D TEMEN_SHELL_SEQUENTIAL it doesn't — `<cmd>: not found` (the browser playground);
      -D TEMEN_SHELL_POSIX      fork + execve + waitpid through the personality (#1662). The command is
                               a process of the same personality, so it inherits fds, cwd and env and
                               nothing is granted. This is the `/bin/sh` a POSIX caller's `system()` /
                               `execShellCmd` expects — register this build there, not the default.
-   The op-13 build is the only one with spawn/ring code; it keys everything below. */
+   The default build is the only one with spawn/ring code; it keys everything below. */
 #if !defined(TEMEN_SHELL_SEQUENTIAL) && !defined(TEMEN_SHELL_POSIX)
-#define TEMEN_SHELL_OP13 1
+#define TEMEN_SHELL_SPAWN 1
 #endif
 
-/* #1059/#1094 NULL guard: chibicc lays the powerbox args buffer one 16 KiB guard up
- * (`temen_ir::module_args_base` == guard + 128), so a command reads its argv at `carve + guard + 128`
- * (the unconditional guarded layout). Every command we spawn is chibicc-compiled, so pack there. */
-#define POWERBOX_NULL_GUARD 16384
 static char cwd[256];
 /* Current stdio for the command in flight: `out_fd` is 1 unless a `>`/`>>` redirect is active,
    `in_fd` is 0 unless a `<` redirect is active. run_line points them at files and restores them. */
@@ -38,7 +35,7 @@ static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++
 static long ring_out = 0;
 static int ring_out_closed = 0;
 static long wr_out(char *b, long n) {
-#ifdef TEMEN_SHELL_OP13
+#ifdef TEMEN_SHELL_SPAWN
   if (out_fd == -2) {
     if (ring_out_closed) return n;
     long r = ring_write(ring_out, b, n);
@@ -247,42 +244,58 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
 /* Execute one command after redirection has been stripped. `line` is tokenized into argv; builtins
    read their input from a path argument or, absent one, the (possibly redirected) in_fd. Returns the
    command's exit status (0 = success). */
-/* Spawn an external command (STAGE1.md §5). `pool` (a big writable global) forces a window large
-   enough to hold a 128 KiB-aligned 128 KiB command carve below the stack, and holds the grant record.
-   The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so
+#ifdef TEMEN_SHELL_SPAWN
+/* Spawn a command `mod` (STAGE1.md §5): the one spawn every external command and ring stage takes —
+   an op-17 v1 record, so the child runs in a **detached window of its own** (its declared memory:
+   size 0 asks for exactly that), paid from our `Budget` and returned to it when the child ends. `rec` holds `gn` 16-byte grant records `{name_off, name_len, handle, flags}`;
+   argv travels as the spawn's args payload `{argc, envc=0}` + packed argv, which lands at the child's
+   `module_args_base`. Returns the child handle, or -errno (an over-long argv, an exhausted budget). */
+static char spawn_rec_buf[88];
+static char spawn_args[LINE_MAX + 16];
+static long spawn_child(long mod, int *rec, long gn, int argc, char **argv) {
+  int *hdr = (int *)spawn_args;
+  hdr[0] = argc; hdr[1] = 0;
+  char *p = spawn_args + 8;
+  for (int i = 0; i < argc; i++) {
+    char *s = argv[i]; long L = slen(s);
+    if (p + L + 1 > spawn_args + sizeof(spawn_args)) return -7;   /* -E2BIG */
+    for (long k = 0; k < L; k++) *p++ = s[k];
+    *p++ = 0;
+  }
+  int *w = (int *)spawn_rec_buf;
+  long *q = (long *)spawn_rec_buf;
+  w[0] = 1;                                  /* @0  version 1: detached */
+  w[1] = 0;                                  /* @4  entry 0 */
+  q[1] = 0;                                  /* @8  offset: reserved, 0 */
+  w[4] = 0;                                  /* @16 size_log2 0 = the command's declared window */
+  w[5] = -1;                                 /* @20 no pager */
+  w[6] = (int)mod;                           /* @24 module */
+  w[7] = __budget();                         /* @28 the Budget the window spends */
+  q[4] = 0;                                  /* @32 no fuel quota */
+  q[5] = (long)rec;                          /* @40 grants */
+  q[6] = gn;                                 /* @48 */
+  q[7] = (long)spawn_args;                   /* @56 args payload */
+  q[8] = p - spawn_args;                     /* @64 */
+  w[18] = -1;                                /* @72 no pre-mapped region */
+  w[19] = 0;                                 /* @76 reserved */
+  q[10] = 0;                                 /* @80 child_off */
+  return __spawn_rec(__inst(), (long)spawn_rec_buf);
+}
+
+/* The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so
    its `write(1, …)` reaches the shell's sink — a `>`/`|` redirect on an external command is not honored
    (that needs the Power-2 `Endpoint`, STAGE1.md); the command always writes to the terminal sink. */
-#ifdef TEMEN_SHELL_OP13
-/* The size a ring stage is spawned into — equal to the `__stage` runner's declared window (a §14
-   child's carve must equal its declared memory). Default 18 (256 KiB), the size chibicc lands the
-   runner at under the native 16 KiB data page; the browser's 64 KiB page rounds the runner up to 19
-   (512 KiB), so the browser fixture builds the shell with `-D TEMEN_STAGE_LOG2=19` to match. */
-#ifndef TEMEN_STAGE_LOG2
-#define TEMEN_STAGE_LOG2 18
-#endif
-#define TEMEN_STAGE_WIN (1L << TEMEN_STAGE_LOG2)
-/* Forces a window large enough for the ring carves (3 stages × `TEMEN_STAGE_WIN`) + the parent's ring-0
-   map slot + the spawn grant-record scratch (all kept in `pool`, below the stack), and the smaller
-   128 KiB-aligned external-command carve. Only the (guarded-out) external-command / ring paths use it,
-   so the sequential build omits it — its window then fits the shell's own globals + stack. */
-static char pool[4 * TEMEN_STAGE_WIN + 131072];
 /* A command's stdin buffer: when the command runs with input (a `< file` redirect or a pipe stage,
    so `in_fd != 0`), the shell drains that fd here and hands the bytes to `exec_stdin`, which returns a
    read-only pipe end the child reads as `"stdin"`. Bounded — a demo filter's input is small. */
 static char filter_in[65536];
 static int spawn_cmd(long mod, int argc, char **argv) {
   long out = __px_exec_stdout(__px());
-  long base = (long)pool;
-  /* The carve must equal the command's declared window (§14), which varies per command — the
-     personality reports it from the granted `Module`. Carve it (window-aligned) out of `pool`. */
-  long wl = __px_exec_win(__px(), mod);
-  long cwin = 1L << wl;
-  long carve = (base + (cwin - 1)) & ~(cwin - 1);
-  /* grant records at base, 16 bytes each: {name_off, name_len, handle, flags}. Up to two records
-     (stdout, then stdin for a filter), so the names start at base+32 — clear of both records. */
-  int *rec = (int *)base;
-  rec[0] = (int)(base + 32); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
-  char *nm = (char *)(base + 32);
+  /* grant records, 16 bytes each: {name_off, name_len, handle, flags}. Up to two (stdout, then stdin
+     for a filter), their names in `nm`. */
+  static int rec[8];
+  static char nm[16];
+  rec[0] = (int)(long)nm; rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
   nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
   long gn = 1;
   /* A `< file` redirect or pipe stage points `in_fd` at real input: drain it and grant the child a
@@ -295,25 +308,16 @@ static int spawn_cmd(long mod, int argc, char **argv) {
       inlen += r;
     long sin = __px_exec_stdin(__px(), (long)filter_in, inlen);
     if (sin >= 0) {
-      rec[4] = (int)(base + 38); rec[5] = 5; rec[6] = (int)sin; rec[7] = 0;
+      rec[4] = (int)(long)(nm + 6); rec[5] = 5; rec[6] = (int)sin; rec[7] = 0;
       nm[6]='s'; nm[7]='t'; nm[8]='d'; nm[9]='i'; nm[10]='n';
       gn = 2;
     }
   }
-  /* the command's args buffer at carve + guard + 128 (module_args_base, #1059): {argc, envc=0} then packed argv */
-  char *ab = (char *)(carve + POWERBOX_NULL_GUARD + 128);
-  int *hdr = (int *)ab;
-  hdr[0] = argc; hdr[1] = 0;
-  char *p = ab + 8;
-  for (int i = 0; i < argc; i++) {
-    char *s = argv[i]; long L = slen(s);
-    for (long k = 0; k < L; k++) *p++ = s[k];
-    *p++ = 0;
-  }
-  long child = __spawn(__inst(), mod, base, gn, 0, carve, wl, 0);
+  long child = spawn_child(mod, rec, gn, argc, argv);
+  if (child < 0) { puts_(argv[0]); puts_(": cannot execute\n"); return 126; }   /* refused, loudly */
   return (int)__join(__inst(), child);
 }
-#endif /* TEMEN_SHELL_OP13 */
+#endif /* TEMEN_SHELL_SPAWN */
 
 #ifdef TEMEN_SHELL_POSIX
 /* Set by `sh -c` when the whole command line is ONE simple command: then the shell *becomes* it
@@ -545,7 +549,7 @@ static int exec_line(char *line) {
        an external child (STAGE1.md §5); otherwise the classic `<cmd>: not found`. In the sequential
        build (the browser playground) there is no spawn path, so an unknown command is always
        `not found`. */
-#if defined(TEMEN_SHELL_OP13)
+#if defined(TEMEN_SHELL_SPAWN)
     long mod = __px_exec_lookup(__px(), (long)cmd, slen(cmd));
     if (mod < 0) { puts_(cmd); puts_(": not found\n"); st = 127; }
     else st = spawn_cmd(mod, argc, argv);
@@ -603,7 +607,7 @@ done:
 /* A command with its own redirects but default stdin/stdout. */
 static int run_line(char *line) { return run_line_io(line, 0, 1); }
 
-#ifdef TEMEN_SHELL_OP13
+#ifdef TEMEN_SHELL_SPAWN
 /* ---- Ring pipelines (STAGE1.md item 6): concurrent children over SharedRegion rings ---- */
 
 /* Is stage text `st` (a stage AFTER the first) a pure ring filter — runnable by the `__stage`
@@ -632,46 +636,30 @@ static int ring_filter_ok(char *st) {
   return 0;
 }
 
-/* The pool layout for a ring pipeline: 256 KiB-aligned stage carves (one per child — concurrent,
-   so they must be distinct; the `__stage` runner declares memory 18), then the parent's ring-0 map
-   slot (256 KiB-aligned ⇒ granule-aligned), then the spawn grant-record scratch — kept OUTSIDE
-   every carve, because records are (re)written while earlier children are already running in
-   theirs. */
-static long stage_carve0(void) { return ((long)pool + (TEMEN_STAGE_WIN - 1)) & ~(TEMEN_STAGE_WIN - 1); }
-static long stage_mapslot(void) { return stage_carve0() + 3 * TEMEN_STAGE_WIN; }
-static long stage_records(void) { return stage_carve0() + 3 * TEMEN_STAGE_WIN + 65536; }
+/* The parent's ring-0 map slot: one region granule (≤ 64 KiB), granule-aligned inside this buffer. */
+static char ring_slot[131072];
 
-/* Spawn one ring stage: the `__stage` runner in its own 128 KiB carve, granted the shell's stdout,
-   its input ring `rin`, and (for a non-final stage) its output ring `rout`; argv = the stage's
-   tokens (argv[0] picks the filter). Returns the op-13 child handle. */
-static long spawn_stage(long mod, char *stage, long carve, int rin, int rout) {
+/* Spawn one ring stage: the `__stage` runner, granted the shell's stdout, its input ring `rin`, and
+   (for a non-final stage) its output ring `rout`; argv = the stage's tokens (argv[0] picks the
+   filter). The records live in `rec`/`nm` only until the spawn copies them into the child's
+   powerbox, so every stage reuses them. Returns the child handle, or -errno. */
+static long spawn_stage(long mod, char *stage, int rin, int rout) {
   static char cp[LINE_MAX]; scpy(cp, stage);
   char *av[MAXARGS]; int ac = tokenize(cp, av);   /* a ring filter: `ring_filter_ok` admitted it */
-  long base = stage_records();
-  int *rec = (int *)base;
-  char *nm = (char *)(base + 64);
+  static int rec[12];
+  static char nm[16];
   long out = __px_exec_stdout(__px());
-  rec[0] = (int)(base + 64); rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
+  rec[0] = (int)(long)nm; rec[1] = 6; rec[2] = (int)out; rec[3] = 0;
   nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
-  rec[4] = (int)(base + 70); rec[5] = 3; rec[6] = rin; rec[7] = 0;
+  rec[4] = (int)(long)(nm + 6); rec[5] = 3; rec[6] = rin; rec[7] = 0;
   nm[6]='r'; nm[7]='i'; nm[8]='n';
   long gn = 2;
   if (rout >= 0) {
-    rec[8] = (int)(base + 73); rec[9] = 4; rec[10] = rout; rec[11] = 0;
+    rec[8] = (int)(long)(nm + 9); rec[9] = 4; rec[10] = rout; rec[11] = 0;
     nm[9]='r'; nm[10]='o'; nm[11]='u'; nm[12]='t';
     gn = 3;
   }
-  /* the runner's args buffer at carve + guard + 128 (module_args_base, #1059): {argc, envc=0} + packed argv */
-  char *ab = (char *)(carve + POWERBOX_NULL_GUARD + 128);
-  int *hdr = (int *)ab;
-  hdr[0] = ac; hdr[1] = 0;
-  char *p = ab + 8;
-  for (int i = 0; i < ac; i++) {
-    char *sv = av[i]; long L = slen(sv);
-    for (long k = 0; k < L; k++) *p++ = sv[k];
-    *p++ = 0;
-  }
-  return __spawn(__inst(), mod, base, gn, 0, carve, TEMEN_STAGE_LOG2, 0);
+  return spawn_child(mod, rec, gn, ac, av);
 }
 
 static int run_line_io(char *line, long def_in, long def_out);
@@ -682,19 +670,25 @@ static int run_line_io(char *line, long def_in, long def_out);
    stage's, as in bash. The children run concurrently on both backends (interp fibers / JIT OS
    threads), parking on the ring futexes — real streaming with backpressure, not temp files. */
 static int run_ring_pipeline(char **stages, int ns, long mod) {
-  long c0 = stage_carve0();
-  long mapoff = stage_mapslot();
   int nr = ns - 1;
   int rh[3];
   for (int r = 0; r < nr; r++) rh[r] = (int)__as_region(__as(), 65536);
   long g = __rg_granule(rh[0]);
-  if (g <= 64 || __rg_map(rh[0], mapoff, 0, g, 3) != 0) return 125;   /* loudly, never silently */
+  if (g <= 64 || g > 65536) return 125;   /* loudly, never silently */
+  long mapoff = ((long)ring_slot + (g - 1)) & ~(g - 1);
+  if (__rg_map(rh[0], mapoff, 0, g, 3) != 0) return 125;
   rcap = g - 64;
   long child[3];
   for (int s = 1; s < ns; s++) {
     int rin = rh[s - 1];
     int rout = s < ns - 1 ? rh[s] : -1;
-    child[s - 1] = spawn_stage(mod, stages[s], c0 + (long)(s - 1) * TEMEN_STAGE_WIN, rin, rout);
+    child[s - 1] = spawn_stage(mod, stages[s], rin, rout);
+    if (child[s - 1] < 0) {
+      /* a refused stage (an exhausted budget): nothing reads the ring, so fail loudly, not hang */
+      for (int k = 0; k < s - 1; k++) __join(__inst(), child[k]);
+      __rg_unmap(rh[0], mapoff, g);
+      return 125;
+    }
   }
   ring_out = mapoff;
   ring_out_closed = 0;
@@ -706,7 +700,7 @@ static int run_ring_pipeline(char **stages, int ns, long mod) {
   __rg_unmap(rh[0], mapoff, g);
   return st;
 }
-#endif /* TEMEN_SHELL_OP13 */
+#endif /* TEMEN_SHELL_SPAWN */
 
 /* Run a pipeline `A | B | C`. When every stage after the first is a pure filter and the `__stage`
    runner is on PATH, the stages run **concurrently** — stage 0 in the shell, the rest as spawned
@@ -724,7 +718,7 @@ static int run_pipeline(char *seg) {
     else i++;
   }
   if (ns == 1) return run_line(stages[0]);
-#ifdef TEMEN_SHELL_OP13
+#ifdef TEMEN_SHELL_SPAWN
   if (ns <= 4) {
     int ok = 1;
     for (int s = 1; s < ns; s++) if (!ring_filter_ok(stages[s])) { ok = 0; break; }

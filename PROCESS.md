@@ -573,10 +573,14 @@ already call for.
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 
-> **Retiring (the pager's data path):** today the pager writes the page through its own window into
-> the child's carve. With carves deleted (INVARIANTS #13, 2026-09-29) the pager instead supplies the
-> page's bytes and the runtime copies them into the child's window at supply; the
-> fault → suspend → supply → retry-on-resume shape below is unchanged. Tracked in #1289.
+> **The pager's data path is a byte transfer (#1862, 2026-09-29):** the pager is called with the
+> fault address in the **child's** coordinates, fills a buffer in its own window, and replies with the
+> address of the faulting byte's source there; at the settle — on the pager's vCPU, before the reply
+> wakes the child — the runtime copies the page around that address into the child's window and maps
+> it. A source the pager's window cannot supply is `-EFAULT`, a fatal fault for the child. The pager
+> never addresses the child's memory, so it serves a child in a window it cannot see — the carve
+> dependence ("pager ⇒ nested") is gone. The fault → suspend → supply → retry-on-resume shape below
+> is unchanged.
 
 Two different things surface as "SIGSEGV" and the design splits them:
 

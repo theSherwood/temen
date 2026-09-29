@@ -19,6 +19,8 @@ static int __h_px = -1;
 static int __px(void) { if (__h_px < 0) __h_px = __capof(13); return __h_px; }   /* HOST_FN = 13 */
 static int __h_inst = -1;
 static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
+static int __h_budget = -1;
+static int __budget(void) { if (__h_budget < 0) __h_budget = __capof(14); return __h_budget; } /* Budget = 14 */
 
 long __px_write(int cap, long fd, long buf, long len);
 long __px_read(int cap, long fd, long buf, long len);
@@ -36,13 +38,14 @@ long __px_closedir(int cap, long dir);
 long __px_argc(int cap);
 long __px_argv(int cap, long i, long buf, long cap2);
 /* Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle. The spawn
-   itself is the shell's own `Instantiator` call.cap — `__spawn` (op 13) / `__join` (op 1) — dispatched
-   on the reflection-discovered `Instantiator` handle (`__inst()`), like every import here. */
+   itself is the shell's own `Instantiator` call.cap — `__spawn_rec` (op 17, a v1 detached record) /
+   `__join` (op 1) — dispatched on the reflection-discovered `Instantiator` handle (`__inst()`), like
+   every import here; each child's window is paid from the reflection-discovered `Budget`. */
 long __px_exec_lookup(int cap, long name, long len);
 long __px_exec_win(int cap, long module);
 long __px_exec_stdout(int cap);
 long __px_exec_stdin(int cap, long buf, long len);
-long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
+long __spawn_rec(int inst, long rec);
 long __join(int inst, long child);
 /* Ring pipelines (STAGE1.md item 6): mint a shareable region (`AddressSpace` op 5) and alias it into
    this window (`SharedRegion` ops 0/1/3), dispatched on the reflection-discovered handles below. */

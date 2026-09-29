@@ -75,10 +75,11 @@ int main(int argc, char **argv){
 /// The guest-side spawn helper (#1509), concatenated ahead of each C program that spawns.
 const SPAWN_C: &str = include_str!("../../temen-run/demos/posix_libc/spawn.c");
 
-/// The shell: `main(argc, argv)` — exec `argv[1]` as an external command, passing it `argv[1..]`.
-/// `pool` (a big writable global) both forces a window large enough for the command's carve and holds
-/// the spawn record + the aligned carve. Names link via imports (see [`link_shim`]); handles come
-/// from the guest's own cap.self reflection (`vm_cap_of`).
+/// The shell: `main(argc, argv)` — exec `argv[1]` as an external command, passing it `argv[1..]` as
+/// the spawn's args payload (the §3e buffer the command's `main(argc, argv)` reads). The command runs
+/// in a window of its own (the v1 detached record, #1863), so nothing is written into its memory.
+/// Names link via imports (see [`link_shim`]); handles come from the guest's own cap.self reflection
+/// (`vm_cap_of`).
 ///
 /// chibicc widens every scalar to an i64 slot, so the helper's `call.cap 6 17`/`6 1` are declared
 /// `(i64…) -> (i64)` even though the Instantiator contract's canonical child handle is i32. Both
@@ -90,18 +91,15 @@ long exec_stdout(int h);
 long exec_lookup(int h, char *name, long len);
 long stream_write(int h, void *buf, long n);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
-/* 384 KiB: room for the spawn record low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
-static char pool[393216];
+static long scratch[32];   /* the spawn record + one grant record */
+static long argsbuf[64];   /* the command's §3e args: {argc, envc} then packed argv[1..] */
 int main(int argc, char **argv){
   int hf = vm_cap_of(13);   /* HOST_PROC = 13: the embedder's exec host fn */
   long out = exec_stdout(hf);
   if (argc < 2) return 1;
   long mod = exec_lookup(hf, argv[1], slen(argv[1]));
   if (mod < 0){ stream_write(out, "not found\n", 10); return 127; }
-  long carve = ((long)pool + 131071) & ~131071;
-  /* the command's args buffer at carve + guard + 128 (#1059: chibicc reads argv one 16 KiB NULL
-     guard up, module_args_base): {argc-1, envc=0} then packed argv[1..] */
-  char *ab = (char *)(carve + 16384 + 128);
+  char *ab = (char *)argsbuf;
   int *hdr = (int *)ab;
   hdr[0] = argc - 1;
   hdr[1] = 0;
@@ -110,7 +108,7 @@ int main(int argc, char **argv){
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = (int)out;
-  long child = vm_spawn(mod, 0, carve, 17, 0, g, 1, pool);
+  long child = vm_spawn(mod, 0, 17, 0, g, 1, ab, p - ab, scratch);
   return (int)vm_join(child);
 }
 "#;
@@ -136,20 +134,17 @@ int main(int argc, char **argv){
 const TWO_CHILDREN: &str = r#"
 long exec_stdout(int h);
 long exec_lookup(int h, char *name, long len);
-/* 640 KiB: the spawn record low, then two 128 KiB-aligned 128 KiB carves. */
-static char pool[655360];
+static long scratch[32];
 int main(int argc, char **argv){
   int hf = vm_cap_of(13);
   long out = exec_stdout(hf);
   long mod = exec_lookup(hf, "echo", 4);
-  long ca = ((long)pool + 131071) & ~131071;
-  long cb = ca + 131072;
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = (int)out;
-  long a = vm_spawn(mod, 0, ca, 17, 0, g, 1, pool);
+  long a = vm_spawn(mod, 0, 17, 0, g, 1, 0, 0, scratch);
   long ra = vm_join(a);
-  long b = vm_spawn(mod, 0, cb, 17, 0, g, 0, pool);
+  long b = vm_spawn(mod, 0, 17, 0, g, 0, 0, 0, scratch);
   long rb = vm_join(b);
   return (int)(ra * 10 + rb);
 }
@@ -217,6 +212,8 @@ fn run(
     let _sink = host.shared_stdout(); // route the stdout Stream + re-granted child streams to one sink
     let out_h = host.grant_stream(StreamRole::Out);
     let _inst_h = host.grant_instantiator(0, win as u64);
+    // The `Budget` each child's detached window spends (`vm_spawn` finds it by reflection).
+    let _budget_h = host.grant_budget(0, 1 << 20, 0);
     let echo_h = host.grant_module(cmd);
     let _exec_h = host.grant_host_proc(exec_host(out_h, echo_h), temen_interp::CapState::Stateless);
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
