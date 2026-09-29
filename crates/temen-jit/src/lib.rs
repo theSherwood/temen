@@ -6113,8 +6113,9 @@ pub(crate) enum ChildRun {
     /// own for `thread.spawn`/`join`.
     Task,
     /// As a **durable** task (a durable parent's detached child, or a thawed one): a fiber runtime
-    /// of its own; `thread.spawn` stays refused — its vCPUs would run outside the freeze that
-    /// captures the child.
+    /// of its own, and a domain of its own, whose window's freeze word ends its waits (#1937);
+    /// `thread.spawn` stays refused — its vCPUs would run outside the freeze that captures the
+    /// child.
     DurableTask,
 }
 
@@ -6152,7 +6153,7 @@ fn compile_child_windowed(
     // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     shadow: temen_ir::durable_abi::ShadowArena,
     // How the child runs (see [`ChildRun`]): only a task has a fiber runtime of its own, and only a
-    // non-durable one a thread domain.
+    // non-durable one spawns threads.
     run: ChildRun,
 ) -> Result<CompiledModule, JitError> {
     let in_task = run != ChildRun::Inline;
