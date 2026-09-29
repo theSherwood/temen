@@ -132,6 +132,11 @@ block 0 (v0: i64) {
 /// supplies 123 — the record twin of `paging_offer.rs`'s single-fault vertical (exit 1123). The child
 /// faults at 16 KiB: its carve reserves the NULL guard below that like any window (#1206), and a guard
 /// fault is fatal, never the recoverable kind a pager services.
+/// The pager (func 2) follows the #1862 contract: it gets the child's fault address **in the child's
+/// own coordinates**, fills its own buffer (here `addr + 16384`, clear of the carve at 64 KiB), and
+/// replies with that address. It stores `123 + (addr >> 16)`: the child's fault at 16 KiB reads
+/// `123`, where a parent-window address (64 KiB higher) would make it `124`. The runtime copies the page around it into the child. It never writes
+/// the child's memory, so the same pager serves a child it cannot address.
 fn record_pager_program() -> String {
     record_pager_program_at(16384)
 }
@@ -188,10 +193,15 @@ block 0 (v0: i64) {{
 
 func 2 (i64) -> (i64) {{
 block 0 (vaddr: i64) {{
-  vb = i32.const 123
-  i32.store8 vaddr vb
-  vzero = i64.const 0
-  return vzero
+  voff = i64.const 16384
+  vsrc = i64.add vaddr voff
+  vsh = i64.const 16
+  vhi = i64.shr_u vaddr vsh
+  vhi32 = i32.wrap_i64 vhi
+  vbase = i32.const 123
+  vb = i32.add vbase vhi32
+  i32.store8 vsrc vb
+  return vsrc
   }}
 }}
 ",
@@ -1416,5 +1426,22 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
             matches!(r, Ok(Outcome::Exited(1123))),
             "{b:?}: the pager serves the fault: {r:?}"
         );
+    }
+}
+
+/// #1862: a pager reply names a source the pager's window can't supply — here 1 MiB past a buffer
+/// it did fill, beyond its 128 KiB window. The
+/// fault is unserviceable, so the child dies as a pagerless fault would (detect-and-kill), and the
+/// parent's `join` raises it: the run traps instead of the child reading unsupplied bytes.
+#[test]
+fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
+    let src = record_pager_program().replace(
+        "  return vsrc\n",
+        "  vpast = i64.const 1048576\n  vbad = i64.add vsrc vpast\n  return vbad\n",
+    );
+    assert!(src.contains("return vbad"), "the rewrite must apply");
+    for b in BACKENDS {
+        let e = run_bounded(b, &src).expect_err("an unsuppliable page is fatal");
+        assert!(e.contains("MemoryFault"), "{b:?}: {e}");
     }
 }

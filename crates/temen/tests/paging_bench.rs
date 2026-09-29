@@ -146,10 +146,11 @@ block 2 (vaf: i64) {{
 
 func 2 (i64) -> (i64) {{
 block 0 (vaddr: i64) {{
+  vcarve = i64.const {off}
+  vsrc = i64.add vaddr vcarve
   vb = i32.const {byte}
-  i32.store8 vaddr vb
-  vzero = i64.const 0
-  return vzero
+  i32.store8 vsrc vb
+  return vsrc
   }}
 }}
 ",

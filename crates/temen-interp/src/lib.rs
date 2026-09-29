@@ -5423,6 +5423,53 @@ struct PagerRef {
     export: u32,
 }
 
+/// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
+/// (child-relative) the reply supplies. The pager never addresses the child's memory; the runtime
+/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see.
+struct PageSink {
+    child: Mem,
+    /// The page's child-relative base.
+    page: u64,
+    /// The page's length: one host page, or less when the window is smaller than a page.
+    len: u64,
+    /// The fault address's offset in its page, so the reply (the source of the *faulting byte*)
+    /// locates the start of its page in the pager's window.
+    off: u64,
+}
+
+/// §2.2 / #1862 — settle a `page(addr)` request: copy the page the pager's reply `value` names
+/// out of the **pager's own window** (`pager_mem`, the serving vCPU's) into the faulting child's,
+/// then mark it mapped. `value` is the pager-window address of the faulting byte's source; the
+/// page around it is `[value - off, value - off + len)`. Runs on the pager's vCPU at the settle,
+/// before the reply is delivered, so the pager cannot reuse its buffer before the copy. Returns
+/// the value to deliver: unchanged, or `EFAULT` when the pager's window cannot supply that range
+/// (the child's fault is then fatal, as a pagerless one is). A ticket with no sink (not a page
+/// request) passes through.
+fn supply_page_at_settle(
+    sched: &SchedRef,
+    pager: &Arc<Mutex<Host>>,
+    ticket: u64,
+    value: i64,
+    pager_mem: Option<&Mem>,
+) -> i64 {
+    let Some(sink) = sched.take_page_sink(pager, ticket) else {
+        return value;
+    };
+    if value < 0 {
+        return value;
+    }
+    let bytes = (value as u64)
+        .checked_sub(sink.off)
+        .and_then(|src| pager_mem?.read_bytes_impl(src, sink.len));
+    match bytes {
+        Some(b) => {
+            sink.child.supply_page(sink.page, &b);
+            value
+        }
+        None => EFAULT,
+    }
+}
+
 /// Internal `?`-friendly driver result; [`VCpu::run`] folds an `Err` into `Step::Done(Err)`.
 enum Inner {
     Done(Vec<Value>),
@@ -5844,6 +5891,11 @@ struct Sched {
     /// that itself dies (its reply never comes). Bounded by in-flight-calls-across-a-death, not by
     /// call volume.
     orphan_tickets: BTreeSet<(usize, u64)>,
+    /// §2.2 / #1862 — the page each in-flight `page(addr)` request supplies, keyed like
+    /// [`Sched::ticket_waiters`] by `(pager domain id, ticket)`. Filed by the faulting child in
+    /// the same scheduler critical section as its enqueue, so the pager can never settle the
+    /// request before its sink exists; taken at the settle ([`supply_page_at_settle`]).
+    page_sinks: BTreeMap<(usize, u64), PageSink>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -6373,6 +6425,8 @@ impl Scheduler {
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
         let callee_id = callee.lock_unpoisoned().domain_id() as usize;
+        // #1862 — a page request settled without a copy (an error reply) drops its sink here.
+        s.page_sinks.remove(&(callee_id, ticket));
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
@@ -8908,12 +8962,28 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                     return;
                 };
+                // #1862: the pager gets the fault address in the child's own coordinates, and its
+                // reply is copied into the child through the sink filed here. Enqueue and sink are
+                // one scheduler critical section (lock order sched → host), so the pager cannot
+                // settle the request before its sink exists.
                 let (ticket, pager_id) = {
+                    let m = v.mem.as_ref().expect("a demand child has a window");
+                    let rel = addr - m.window.base();
+                    let page = rel / m.page * m.page;
+                    let sink = PageSink {
+                        child: m.fork_for_thread(),
+                        page,
+                        len: m.page.min(m.window.reserved() - page),
+                        off: rel - page,
+                    };
+                    let mut s = sched.lock();
                     let mut cg = pb.cell.lock_unpoisoned();
-                    (
-                        cg.svc_enqueue(pb.export, 0, vec![addr as i64]),
-                        cg.domain_id(),
-                    )
+                    let id = cg.domain_id();
+                    let t = cg.svc_enqueue(pb.export, 0, vec![rel as i64]);
+                    if let Some(t) = t {
+                        s.page_sinks.insert((id as usize, t), sink);
+                    }
+                    (t, id)
                 };
                 let Some(t) = ticket else {
                     // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
@@ -8934,11 +9004,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 // the negative reply and traps; its Done arm tears down as usual).
                                 v.page_fault = Some(addr);
                                 v.pending = Some(Pending::CapResult(r));
-                            } else if let Some(m) = v.mem.as_ref() {
-                                m.supply_page(addr);
                             }
                             // Fast lane: continue this vCPU here and now — the rewound access
-                            // re-executes on this worker with the page in place.
+                            // re-executes on this worker with the page in place (the settle, run
+                            // inline above, supplied it).
                             continue;
                         }
                         // Handler parked mid-service (4d.2): fall through to the ticket park — it
@@ -9164,6 +9233,17 @@ enum SchedRef {
 }
 
 impl SchedRef {
+    /// §2.2 / #1862 — take the page sink filed for `pager`'s dispatch `ticket`, if that dispatch is
+    /// a page request. The explorer runs no demand children, so it never has one.
+    fn take_page_sink(&self, pager: &Arc<Mutex<Host>>, ticket: u64) -> Option<PageSink> {
+        match self {
+            SchedRef::Real(s) => {
+                let id = pager.lock_unpoisoned().domain_id() as usize;
+                s.lock().page_sinks.remove(&(id, ticket))
+            }
+            SchedRef::Det(_) => None,
+        }
+    }
     fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         match self {
             SchedRef::Real(s) => s.spawn(make),
@@ -12439,18 +12519,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             v.frames[top].vals.push(Reg::from_i32(status));
         }
         Some(Pending::CapResult(status)) => {
-            if let Some(addr) = v.page_fault.take() {
+            if v.page_fault.take().is_some() {
                 // §2.2: this was a page-fault park, not a guest call.cap — the faulting op was
-                // rewound, so nothing is pushed. A non-negative reply means the pager wrote the
-                // page's bytes: supply it and let the rewound access re-execute over them. A
-                // negative reply (pager error, or CAP_REVOKED from a dead pager — D37
-                // death-is-revocation) is an unserviceable fault: detect-and-kill, exactly as a
-                // pagerless fault would have been.
+                // rewound, so nothing is pushed. A non-negative reply means the page was supplied
+                // at the pager's settle (#1862): the rewound access re-executes over it — and, were
+                // it somehow not, faults again and asks again rather than reading unsupplied bytes.
+                // A negative reply (pager error, an unsuppliable source, or CAP_REVOKED from a dead
+                // pager — D37 death-is-revocation) is an unserviceable fault: detect-and-kill,
+                // exactly as a pagerless fault would have been.
                 if status < 0 {
                     return Err(Trap::MemoryFault);
-                }
-                if let Some(m) = v.mem.as_ref() {
-                    m.supply_page(addr);
                 }
             } else {
                 // §3.6 revocation-unparks: the handle this fiber's capability call was parked
@@ -14866,6 +14944,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // handler's return must **not** clobber the injected value — the
                                 // dispatch still counts as served.
                                 if !run.replied {
+                                    // #1862: a page request's bytes move now, from this serving
+                                    // vCPU's window, before the reply can wake the child.
+                                    let value = supply_page_at_settle(
+                                        sched,
+                                        host,
+                                        run.ticket,
+                                        value,
+                                        mem.as_ref(),
+                                    );
                                     sched.cap_reply_or_stash(run.ticket, value, host);
                                 }
                                 *serve_count += 1;
@@ -30221,12 +30308,18 @@ impl Mem {
         }
     }
 
-    /// Supply the page containing the confined `abs_addr` (§14 lazy paging): mark it read-write
-    /// **without zeroing**, so the bytes the parent placed in the shared backing survive — the
-    /// faulting access then re-executes and reads them. Used by `resume` after a fault-driven yield.
-    fn supply_page(&self, abs_addr: u64) {
-        let page = abs_addr.wrapping_sub(self.window.base()) / self.page;
-        self.space_write().prot.insert(page, PageProt::Rw);
+    /// Supply a demand-paged page (§2.2, #1862): write the pager's `bytes` at the window-relative
+    /// page base `page`, then mark the page read-write — in that order, so no vCPU of the child sees
+    /// the page mapped before its bytes are in place. The write goes straight to the backing: the
+    /// page is `Unmapped` until this call maps it.
+    fn supply_page(&self, page: u64, bytes: &[u8]) {
+        let base = self.window.base() + page;
+        for (k, b) in bytes.iter().enumerate() {
+            self.set_byte(base + k as u64, *b);
+        }
+        self.space_write()
+            .prot
+            .insert(page / self.page, PageProt::Rw);
     }
 
     /// #801 `exec` image hygiene — the image-replace reuses the **caller's** window, whose

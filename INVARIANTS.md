@@ -275,8 +275,8 @@ frontier's own repair, never parked. Until it is gone:
 - **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
   `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
   spawn-time args payload; results ride the join and the region.
-- **What still leans on the carve moves first:** the §2.2 pager (the parent writes the page through
-  its own window — becomes a byte transfer at supply, retiring "pager ⇒ nested"); the durable subtree
+- **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
+  its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
   freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
   `FreezeScope`'s carve-named form folds into the detached one); and every producer still emitting a
   carve spawn. The carve-specific escape oracle and fuzz targets retire with the path they test, once
