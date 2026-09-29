@@ -1522,13 +1522,7 @@ fn admit_confined_child(
     // bounded them to its declared window). `readonly` is not enforced for a nested child —
     // intra-domain self-corruption is a §1 non-goal — as on the tree-walker.
     if let (Some((_, data, _)), Some(m)) = (&granted, pm) {
-        for d in data.iter() {
-            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-                for (k, &b) in d.bytes.iter().enumerate() {
-                    m.set_byte(base + d.offset + k as u64, b);
-                }
-            }
-        }
+        m.write_segments(base, data, child_size);
     }
     let module = granted.as_ref().map(|(_, _, m)| m);
     let Some((mut child_host, cinst, cas)) =
@@ -9298,18 +9292,11 @@ fn exec_image_build(
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
     {
-        let base = m.window.base();
         // #1059: preserve the command's guard-shifted args region across the image-replace (legacy
         // `[128, 16384)` for an unmarked command); mirrors the tree-walker exec path.
         let null_guard = temen_ir::module_null_guard();
         m.commit_fresh_image(img.image_len.min(img.child_size), null_guard);
-        for d in img.data.iter() {
-            if d.offset.saturating_add(d.bytes.len() as u64) <= img.child_size {
-                for (k, &b) in d.bytes.iter().enumerate() {
-                    m.set_byte(base + d.offset + k as u64, b);
-                }
-            }
-        }
+        m.write_segments(m.window.base(), &img.data, img.child_size);
         // #1768 — a personality exec's staged argv lands only now, at the commit.
         if personality {
             if let Some(blob) = img.host.exec_commit_args() {
