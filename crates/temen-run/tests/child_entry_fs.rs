@@ -1,15 +1,15 @@
 //! **#1011 slice 3c — a §14 child-entry phase reads and writes files through a re-granted shared memfs.**
 //!
-//! The nim compiler driver spawns each phase (`nifler → nimsem → hexer → …`) as an op-13 child that
+//! The nim compiler driver spawns each phase (`nifler → nimsem → hexer → …`) as a §14 child that
 //! *reads* its input file and *writes* its output — `nifler p <in> <out>` parses `<in>.nim` into
 //! `<out>.nif`, and the next phase reads that `.nif`. Every prior child-entry test re-granted only a
 //! `stdout` **Stream** (`child_entry_io*`), or proved a child *resolves* a granted cap over shared
-//! state without going through op-13 (`confined_child_grant`). These two tests compose the pieces on
+//! state without a spawn (`confined_child_grant`). These two tests compose the pieces on
 //! the real filesystem seam:
 //!
 //!   1. the parent holds a **forkable** `mem_fs_shared_factory` host proc (the re-grantable shape —
 //!      `can_regrant` requires `fork.is_some()`), whose store its own `MemFsHandle` observes;
-//!   2. it **op-13-spawns** a child-entry module with a one-entry grant list `{"fs" → that handle}`,
+//!   2. it **spawns** a child-entry module with a one-entry grant list `{"fs" → that handle}`,
 //!      so the spawn `regrant_into_child`s the memfs (re-minting the handler over the *same* store)
 //!      and `register_cap_name("fs", …)` in the child powerbox;
 //!   3. the child resolves `"fs"` by name and does file I/O through it — [`child_entry_writes_a_file…`]
@@ -21,7 +21,7 @@
 //! into a memfs its parent (the Rust-on-Temen driver guest) seeded and then reads. Proven here with
 //! hand-written text-IR children so it needs no toolchain and pins the plumbing, not the phase. Window
 //! confinement (invariant 2) is untouched: the children's `open`/`read`/`write` name *window-relative*
-//! buffers, masked to their carve; the shared authority is the granted cap (§3), not any carve address.
+//! buffers, masked to their own window; the shared authority is the granted cap (§3), not any window address.
 //! The memfs cap is relative-only (it refuses absolute paths, `EACCES`), so the guests name `in.bin` /
 //! `out.bin` — the same keys the parent seeds and reads back.
 
@@ -32,13 +32,14 @@ use temen_ir::Module;
 use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
 
-// The parent: `main(inst, module, fs)` lays a one-entry grant record `{name_off:18432, name_len:2}
+// The resumable-engine test's carve parent (its hand-written drive loop serves the carve
+// `VcpuEvent::Instantiate`; it moves to the detached event with the wasm-JIT lowering, #1865):
+// `main(inst, module, fs)` lays a one-entry grant record `{name_off:18432, name_len:2}
 // → fs` at window offset 17408, op-13 (`call.cap INSTANTIATOR(=6) 13`) spawns the child module into a
 // 64 KiB carve at `[65536, 131072)` (its declared `memory 16`, off = 1<<16), then op-1 joins it. The
 // grant name `"fs"` is a data segment at 18432; the record's second word carries the `fs` handle. The
 // grant record and cap-name buffer live in the parent window above the #1094 NULL guard (16384) — the
-// parent is guarded, so they sit at 17408/18432 (was 1024/2048). Both children below share this parent
-// — only their own file I/O differs.
+// parent is guarded, so they sit at 17408/18432 (was 1024/2048).
 const PARENT: &str = r#"
 memory 17
 data 18432 "fs"
@@ -64,18 +65,15 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-// Op-13-spawn `child` under [`PARENT`], re-granting a forkable memfs (seeded with `seed`) as `"fs"`.
-// Returns the child's joined status and the shared `MemFsHandle` (seed it before / read it after).
+// Spawn `child` through the [`temen_run::conductor`], re-granting a forkable memfs (seeded with `seed`)
+// as `"fs"`. Returns the child's joined status and the shared `MemFsHandle` (seed it before / read it
+// after).
 fn spawn_child_over_memfs(
     child: &Module,
     seed: Vec<(String, Vec<u8>)>,
 ) -> (Vec<Value>, MemFsHandle) {
     temen_verify::verify_module(child).expect("child verifies");
-    // The grant record's `name_off:2048 | name_len:2<<32` and the carve geometry in PARENT assume the
-    // child declares a 64 KiB window; assert it so a change to a module can't silently mis-carve.
-    assert_eq!(child.memory.expect("child window").size_log2, 16);
-    let parent = parse_module(PARENT).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("parent verifies");
+    let parent = temen_run::conductor(&["fs"], &[]);
 
     // A cross-domain shared memfs: every `HostProc` the factory yields (the parent's grant and the
     // child's re-mint) closes over one store, which this `MemFsHandle` also observes — so a file the
@@ -96,14 +94,18 @@ fn spawn_child_over_memfs(
         })
     };
     let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
-    let modh = host.grant_module(child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, child);
 
     let mut fuel = 200_000_000u64;
     let r = run_with_host(
         &parent,
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(fs_h)],
+        &[
+            Value::I32(inst),
+            Value::I32(modh),
+            Value::I32(budget),
+            Value::I32(fs_h),
+        ],
         &mut fuel,
         &mut host,
     )
@@ -123,7 +125,7 @@ fn read_back(handle: &MemFsHandle, key: &str) -> Vec<u8> {
 // A child-entry guest (its `Instantiator` starter arrives as `v0`, unused): resolve `"fs"` by name,
 // `open("out.bin", O_WRITE|O_CREATE|O_TRUNC = 2|16|8 = 26)`, `write` its 9-byte `"hello.nif"` data
 // segment, `close`, and return the bytes written. Fs ops are `call.cap HOST_PROC(=13) <op>` — op 0
-// open, 2 write, 4 close (fs.rs op protocol). The child carve is 64 KiB (>= the 16384 guard), so it is
+// open, 2 write, 4 close (fs.rs op protocol). The child window is 64 KiB (>= the 16384 guard), so it is
 // itself guarded — its scratch sits above the #1094 NULL guard (16384..).
 const WRITER: &str = r#"
 memory 16

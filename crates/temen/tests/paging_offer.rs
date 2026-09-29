@@ -17,9 +17,10 @@ use temen_text::parse_module;
 
 /// One pager cycle: parent reifies its pager export, spawns a demand child over a carve of
 /// `strides` 64 KiB strides, serves exactly `strides` faults from `svc.wait`, joins, and exits
-/// with `child_sum + serves * 1000`. The handler stores `123` at the fault address (parent-window
-/// coordinates — the same coordinates the bespoke `resume` hands the pager, pinned by
-/// `demand_coroutine_reports_fault_address`).
+/// with `child_sum + serves * 1000`. The handler gets the fault address in the child's coordinates
+/// and stores `123` at that byte's place in its own window — inside the carve, `carve_off + addr` —
+/// replying with that address, whose page the runtime copies into the child (#1862; the copy is
+/// onto the same backing while carves exist).
 fn pager_program(mem_log2: u8, carve_off: u64, carve_log2: u64, strides: u64) -> String {
     format!(
         "\
@@ -105,10 +106,11 @@ block 2 (vaf: i64) {{
 
 func 2 (i64) -> (i64) {{
 block 0 (vaddr: i64) {{
+  vcarve = i64.const {carve_off}
+  vsrc = i64.add vaddr vcarve
   vb = i32.const 123
-  i32.store8 vaddr vb
-  vzero = i64.const 0
-  return vzero
+  i32.store8 vsrc vb
+  return vsrc
   }}
 }}
 "

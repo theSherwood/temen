@@ -1,5 +1,5 @@
 //! #1025 Gap-2 (guest-serves-exec-via-grandchild), increment 3 — **a serve handler produces a real
-//! `.p.nif` by op-13-spawning the real nifler phase over a shared memfs.** Increments 1 & 2
+//! `.p.nif` by spawning the real nifler phase over a shared memfs.** Increments 1 & 2
 //! (`temen-interp/tests/svc_handler_spawns_grandchild.rs`) proved the mechanism with a *toy*
 //! grandchild: a serve handler can nest a §14 spawn+join, driven either by a host-enqueue or by a real
 //! caller-parking cap call. This increment swaps the toy for the **real committed `nifler_ce`** asset —
@@ -7,14 +7,13 @@
 //! instantiating nifler as its own confined §14 grandchild, whose emitted `.p.nif` is byte-identical to
 //! native nifler.
 //!
-//! Topology: the host-enqueue form (increment 1) — the servicer is the root, so the ~32 MiB window it
-//! needs to hold nifler's 16 MiB carve is a flat top-level allocation rather than a nested sub-window
-//! (the caller-parking layer is orthogonal, proven separately with the toy grandchild). The host
-//! enqueues one "svc" dispatch; the servicer's `main` stashes the five caps it was granted
-//! (`inst`/`nifler`/`fs`/`stdout`/`exit`) and `svc.poll`s; **its handler lays the three op-13 grant
-//! records `{fs, stdout, exit}`, op-13-spawns nifler into a 16 MiB carve with `nifler p /in.nim
-//! /out.nif` seeded at `carve + module_args_base`, and joins it** — the `op13_parent_src` spawn body
-//! (nimc.rs) relocated into a serve dispatch. nifler reads `/in.nim` and writes `/out.nif` into the
+//! Topology: the host-enqueue form (increment 1) — the servicer is the root (the caller-parking layer
+//! is orthogonal, proven separately with the toy grandchild). The host enqueues one "svc" dispatch;
+//! the servicer's `main` stashes the six caps it was granted (`inst`/`nifler`/`fs`/`stdout`/`exit`/
+//! `budget`) and `svc.poll`s; **its handler lays the three grant records `{fs, stdout, exit}` and an
+//! op-17 v1 spawn record — nifler in its own window, paid from `budget`, argv `nifler p /in.nim
+//! /out.nif` as the args payload — spawns nifler, and joins it**: the `temen_run::conductor` spawn,
+//! relocated into a serve dispatch. nifler reads `/in.nim` and writes `/out.nif` into the
 //! shared memfs, which the host reads back and diffs against the committed fixture.
 //!
 //! Serve + instantiate trips the §9 `svc_park_veto`, so this runs on the tree-walk oracle — the same
@@ -53,20 +52,11 @@ fn inflate(gz: &[u8]) -> Option<Vec<u8>> {
     out.status.success().then_some(out.stdout)
 }
 
-/// Build the serve-module text. `main` (func 0, params `inst,nifler,fs,stdout,exit`) stashes the five
-/// cap handles as i32 at 17520.. and `svc.poll`s. The handler (func 1) reloads them, lays the three
-/// 16-byte op-13 grant records `{fs@18432, stdout@18448, exit@18464}` at 17408/17424/17440, and
-/// op-13-spawns nifler (entry 0) into `[carve_off, carve_off+2^child_sl)` with argv seeded at
-/// `carve_off + args_base` (a data segment), then joins it. Mirrors `nimc::op13_parent_src`'s record /
-/// argv layout, but the spawn lives in a serve dispatch rather than the parent's own `main`.
-fn servicer_src() -> String {
-    let child_sl: u64 = 24; // nifler's 16 MiB carve (matches rust_driver_nifler)
-    let carve_off: u64 = 1 << child_sl;
-    let parent_sl: u64 = child_sl + 1; // 32 MiB window; the carve is its upper half
-    let args_base: u64 = 16512; // POWERBOX_NULL_GUARD(16384) + POWERBOX_ARGS_BASE(128)
-    let argv_off = carve_off + args_base;
-
-    // argv blob: {argc=4, envc=0} + "nifler\0p\0/in.nim\0/out.nif\0" (the `nifler p <in> <out>` form).
+/// The servicer: `main(inst, nifler, fs, stdout, exit, budget)` stashes its caps and `svc.poll`s; the
+/// "svc" `go` handler spawns nifler through an op-17 v1 record (grant records at 17408, spawn record at
+/// 17600, names at 18432, the argv payload a data segment at 20480) and joins it.
+fn servicer_src(nifler_log2: u8) -> String {
+    // argv payload: {argc=4, envc=0} + "nifler\0p\0/in.nim\0/out.nif\0" (the `nifler p <in> <out>` form).
     let mut blob = Vec::new();
     blob.extend_from_slice(&4u32.to_le_bytes());
     blob.extend_from_slice(&0u32.to_le_bytes());
@@ -74,23 +64,24 @@ fn servicer_src() -> String {
         blob.extend_from_slice(s.as_bytes());
         blob.push(0);
     }
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let args_len = blob.len();
+    let args_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
 
     // A 16-byte grant record's first word: name_off | (name_len << 32).
     let w0 = |name_off: u64, name_len: u64| name_off | (name_len << 32);
 
     format!(
-        r#"memory {parent_sl}
+        r#"memory 17
 data 18432 "fs"
 data 18448 "stdout"
 data 18464 "exit"
-data {argv_off} "{argv_esc}"
+data 20480 "{args_esc}"
 type 0 func (i64) -> (i64)
 type 1 interface {{ go: 0 }}
 export 0 interface "svc" 1 {{ go: 1 }}
 
-func (i32, i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
+func (i32, i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {{
   s0 = i64.const 17520
   i32.store s0 v0
   s1 = i64.const 17524
@@ -101,6 +92,8 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   i32.store s3 v3
   s4 = i64.const 17536
   i32.store s4 v4
+  s5 = i64.const 17540
+  i32.store s5 v5
   vz = i32.const 0
   vn = call.cap 4294967295 9 () -> (i64) vz ()
   return vn
@@ -119,6 +112,8 @@ block 0 (vx: i64) {{
   vout = i32.load s3
   s4 = i64.const 17536
   vexit = i32.load s4
+  s5 = i64.const 17540
+  vbud = i32.load s5
   xf = i64.const {rf}
   of = i64.const 17408
   i64.store of xf
@@ -137,14 +132,24 @@ block 0 (vx: i64) {{
   he = i64.extend_i32_u vexit
   ohe = i64.const 17448
   i64.store ohe he
-  vmh = i64.extend_i32_u vmod
-  vgptr = i64.const 17408
-  vgn = i64.const 3
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  r = i64.const 17600
+  ver = i64.const 1
+  i64.store r ver
+  slp = i64.const {slp}
+  i64.store r slp offset=16
+  i32.store r vmod offset=24
+  i32.store r vbud offset=28
+  gp = i64.const 17408
+  i64.store r gp offset=40
+  gn = i64.const 3
+  i64.store r gn offset=48
+  ap = i64.const 20480
+  i64.store r ap offset=56
+  al = i64.const {args_len}
+  i64.store r al offset=64
+  none = i32.const -1
+  i32.store r none offset=72
+  vh = call.cap 6 17 (i64) -> (i32) vinst (r)
   vr = call.cap 6 1 (i32) -> (i64) vinst (vh)
   return vr
   }}
@@ -153,11 +158,13 @@ block 0 (vx: i64) {{
         rf = w0(18432, 2),
         rs = w0(18448, 6),
         re = w0(18464, 4),
+        // size_log2 | pager u32::MAX (none)
+        slp = (nifler_log2 as u64 | (0xFFFF_FFFFu64 << 32)) as i64,
     )
 }
 
 #[test]
-fn a_serve_handler_spawns_real_nifler_via_op13_over_a_shared_memfs() {
+fn a_serve_handler_spawns_real_nifler_over_a_shared_memfs() {
     let Some(nifler_bytes) = inflate(NIFLER_CE_GZ) else {
         eprintln!("note: skipping (gzip unavailable)");
         return;
@@ -166,7 +173,8 @@ fn a_serve_handler_spawns_real_nifler_via_op13_over_a_shared_memfs() {
     temen_verify::verify_module(&nifler).expect("nifler verifies");
 
     let servicer = Arc::new({
-        let m = temen_text::parse_module(&servicer_src()).expect("parse servicer");
+        let log2 = nifler.memory.as_ref().expect("nifler window").size_log2;
+        let m = temen_text::parse_module(&servicer_src(log2)).expect("parse servicer");
         temen_verify::verify_module(&m).expect("servicer verifies");
         m
     });
@@ -186,8 +194,7 @@ fn a_serve_handler_spawns_real_nifler_via_op13_over_a_shared_memfs() {
 
     let mut host = Host::new();
     host.set_self_module(&servicer);
-    let inst = host.grant_instantiator(0, 1u64 << 25); // the servicer's 32 MiB window
-    let modh = host.grant_module(&nifler);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &nifler);
     let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
@@ -213,6 +220,7 @@ fn a_serve_handler_spawns_real_nifler_via_op13_over_a_shared_memfs() {
             Value::I32(fs_h),
             Value::I32(stdout_h),
             Value::I32(exit_h),
+            Value::I32(budget),
         ],
         &mut fuel,
         &mut host,
@@ -227,7 +235,7 @@ fn a_serve_handler_spawns_real_nifler_via_op13_over_a_shared_memfs() {
     let status = host.svc_result(ticket).expect("dispatch served");
     assert!(
         status == 0 || status == 5,
-        "the handler op-13-spawned nifler and joined its status ({status}); 0/5 are nifler's ok codes"
+        "the handler spawned nifler and joined its status ({status}); 0/5 are nifler's ok codes"
     );
 
     // The `.nif` nifler wrote, read back out of the shared store — byte-identical to native nifler.
@@ -236,10 +244,10 @@ fn a_serve_handler_spawns_real_nifler_via_op13_over_a_shared_memfs() {
         .into_iter()
         .find(|(k, _)| k == "out.nif")
         .map(|(_, v)| v)
-        .expect("nifler (as the serve handler's op-13 grandchild) wrote no `out.nif`");
+        .expect("nifler (as the serve handler's grandchild) wrote no `out.nif`");
     assert_eq!(
         emitted,
         EXPECT_NIF.as_bytes(),
-        "a serve handler's op-13 nifler grandchild emitted byte-identical NIF to native nifler"
+        "a serve handler's nifler grandchild emitted byte-identical NIF to native nifler"
     );
 }

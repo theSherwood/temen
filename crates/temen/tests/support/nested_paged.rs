@@ -190,7 +190,7 @@ fn run_nested_paged(m0: &temen_ir::Module, tail: &[i64]) -> (Outcome, Vec<u8>, u
         let vcpu = unsafe { &*(cx.data().vcpu as *const bytecode::Vcpu<'_>) };
         let info = vcpu.mem_map_info().expect("window");
         let (pg, mg) = (cx.data().pagestate.unwrap(), cx.data().mapped.unwrap());
-        let (table, cover) = build_pagestate_table(&info);
+        let (table, cover) = build_pagestate_table(&info, vcpu.win_flat_len());
         memory.write(&mut ctx, table_base, &table).unwrap();
         pg.set(&mut ctx, Val::I32(table_base as i32)).unwrap();
         mg.set(&mut ctx, Val::I64(cover as i64)).unwrap();

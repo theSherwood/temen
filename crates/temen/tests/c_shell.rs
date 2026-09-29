@@ -176,19 +176,19 @@ fn run_shell_ex(
     let cmd_mods: Vec<(&str, temen_ir::Module)> = cmds
         .iter()
         .map(|&(name, csrc)| {
-            // Phase 3: keep the manifest — the op-13 spawn binds the child's slots. (The `__stage`
+            // Phase 3: keep the manifest — the spawn binds the child's slots. (The `__stage`
             // ring runner needs no special linking: its region ops are chibicc `__vm_region_*`
             // builtins, inline `call.cap`s dispatched on the runtime-minted region handles.)
             let m = parse_module_raw(&c_to_ir_child(csrc)).expect("parse cmd");
             verify_module(&m).expect("verify cmd");
-            // The shell spawns `__stage` children with `size_log2 = 18` (a carve must equal the
-            // child's declared memory); the runner pins itself there with a pad, and this assert
-            // makes any drift loud instead of a probeable-but-silent spawn `-EINVAL`.
+            // The `__stage` runner lays its ring maps out for a `1 << TEMEN_STAGE_LOG2` window (18
+            // natively) and pins its declared memory there with a pad; this assert makes any drift
+            // between the two loud instead of a ring mapped past the window.
             if name == "__stage" {
                 assert_eq!(
                     m.memory.map(|mm| mm.size_log2),
                     Some(18),
-                    "__stage runner must declare memory 18 (the spawn's carve size)"
+                    "__stage runner must declare memory 18 (its ring layout's window)"
                 );
             }
             (name, m)
@@ -211,6 +211,9 @@ fn run_shell_ex(
         let (in_h, in_fifo) = host.grant_input_pipe();
         let inst_h = host.grant_instantiator(0, win as u64);
         let _as_h = host.grant_address_space(0, win as u64);
+        // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+        // returned when the child ends: room for the widest pipeline's three concurrent stages.
+        let _budget_h = host.grant_budget(0, 4 << 20, 0);
         let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
             .iter()
             .map(|(n, m)| {
@@ -222,7 +225,7 @@ fn run_shell_ex(
             })
             .collect();
         // The shell never `malloc`s, so the personality heap (top 64 KiB) is never touched — it just
-        // stays clear of the command carve (inside `pool`, low) and the shell's stack.
+        // stays clear of the shell's globals and stack.
         let (px_h, posix) =
             temen_posix::grant(host, (win - (64 << 10)) as u64, win as u64, stdin.to_vec());
         posix.set_stdout_sink(sink);
@@ -258,8 +261,7 @@ fn run_shell_ex(
     verify_module(&m).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     let init = vec![0u8; win];
 
-    // Interpreter: the shell loops to EOF and returns 0 (or `exit`s, a `Trap::Exit`). The reserved
-    // window backs the command carve op 13 spawns into.
+    // Interpreter: the shell loops to EOF and returns 0 (or `exit`s, a `Trap::Exit`).
     let mut fuel = 200_000_000u64;
     // How the interp arm ended, kept for the differential message below: a dropped-output flake reads
     // very differently depending on whether the shell returned normally or `exit`ed early, and the
@@ -273,7 +275,7 @@ fn run_shell_ex(
             &ir[..ir.len().min(400)]
         ),
     };
-    // JIT — given the module resolver + named-grant hooks op 13 needs.
+    // JIT — given the module resolver + named-grant hooks op 17 needs.
     let (jout, _) = compile_and_run_capture_reserved_with_host_ex(
         &m,
         0,
@@ -292,7 +294,7 @@ fn run_shell_ex(
     );
 
     // Bytecode cooperative engine — the browser's wasm-safe entry (`posix_shell_exec` runs this exact
-    // path in the playground). External-command spawns (op 13) and concurrent ring pipelines
+    // path in the playground). External-command spawns (op 17 v1) and concurrent ring pipelines
     // (op 11 + `SharedRegion` + futex) run single-thread/clockless here; its output must match interp,
     // making the differential interp==JIT==bytecode across the whole shell surface.
     let bout = shell_bytecode_stdout(&m, &cmd_mods, win, stdin, env, files, args);
@@ -316,9 +318,9 @@ fn run_shell_ex(
 /// Run the already-built shell module on the **bytecode cooperative engine** — the browser's wasm-safe
 /// entry ([`bytecode::compile_and_run_with_host`], the same one `posix_shell_exec` drives in the
 /// playground). Unlike [`run_shell_ex`]'s interp/JIT arms (OS threads + a wall clock), this is
-/// single-thread and clockless: external-command spawns (op 13) and concurrent ring pipelines
+/// single-thread and clockless: external-command spawns (op 17 v1) and concurrent ring pipelines
 /// (op 11 + `SharedRegion` + futex) run cooperatively — the browser-parity path slices 1–2 unblocked,
-/// plus the op-13 child-manifest binding this slice added (a chibicc command's `write` resolves).
+/// plus the child-manifest binding this slice added (a chibicc command's `write` resolves).
 /// Regions use the default software backing (`VecBacking`) — no OS shared memory, exactly as the
 /// browser gets (memfd shm is native-only). Returns the personality's captured stdout.
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +341,9 @@ fn shell_bytecode_stdout(
     let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst_h = host.grant_instantiator(0, win as u64);
     let _as_h = host.grant_address_space(0, win as u64);
+    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+    // returned when the child ends: room for the widest pipeline's three concurrent stages.
+    let _budget_h = host.grant_budget(0, 4 << 20, 0);
     let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
         .iter()
         .map(|(n, cm)| {
@@ -418,7 +423,7 @@ fn stage_runner_src() -> String {
 }
 
 /// A demo **external command** (`primes N` → the primes ≤ N) — a `--child-entry` program the shell
-/// `exec`s as an op-13 child, granted only its stdout. The playground registers it on PATH; the
+/// `exec`s as a detached child, granted only its stdout. The playground registers it on PATH; the
 /// browser fixture is built from this same source.
 const PRIMES_MAIN: &str = include_str!("../../temen-run/demos/shell/primes_main.c");
 
@@ -446,7 +451,7 @@ int main(int argc, char **argv){ write(1, "ok\n", 3); return 0; }
 
 /// STAGE1.md §5 — the real Stage-0 shell **spawns an external command**. A command name that is not a
 /// builtin is looked up in the personality's PATH registry and, if found, run as a separate compiled-C
-/// child via `Instantiator` op 13 + `join`: its `argv` is delivered, its stdout interleaves with the
+/// child via `Instantiator` op 17 (v1) + `join`: its `argv` is delivered, its stdout interleaves with the
 /// shell's own output in the one shared sink, and its status threads into `$?`. An unregistered name is
 /// still `<cmd>: not found` (status 127). Differential interp==JIT.
 #[test]
@@ -502,7 +507,7 @@ fn stage0_shell_runs_external_primes() {
 /// A **filter** external command that reads stdin (`upper < file`): the shell drains the `< file`
 /// redirect, hands the bytes to `exec_stdin` (a read-only pipe granted as the child's `"stdin"`), and
 /// `upper`'s `read(0, …)` uppercases them to its stdout. A separate compiled-C program consuming input
-/// — the op-13 spawn granting **two** streams (stdin + stdout). Differential interp==JIT==bytecode.
+/// — the spawn granting **two** streams (stdin + stdout). Differential interp==JIT==bytecode.
 #[test]
 fn stage0_shell_filter_reads_stdin() {
     let (iout, jout) = run_shell_ex(
@@ -1141,22 +1146,20 @@ fn stage0_shell_hash_comments() {
 #[test]
 #[ignore = "writes browser/tests/fixtures/{shell,stage_runner}.temen; run explicitly to regenerate"]
 fn gen_browser_shell_fixture() {
-    // The **full** shell — external-command spawn (op 13) and concurrent ring pipelines (op 11 +
-    // `SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` call.cap calls now
-    // compile on the browser's bytecode cooperative engine (the slices that lowered ops 13/11 + region
-    // + futex, plus op-13 child-manifest binding); the differential above proves the module runs there
+    // The **full** shell — external-command spawn (op 17 v1, detached) and concurrent ring pipelines
+    // (`SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` call.cap calls
+    // compile on the browser's bytecode cooperative engine (op 17 v1 routes to its detached arm, region
+    // + futex, child-manifest binding); the differential above proves the module runs there
     // byte-identically to the tree-walk/JIT oracle. `posix_shell_exec` grants the `__stage` runner
     // below so `cat f | sort | uniq`-style pipelines take the ring path in the playground.
     let src = format!("{SHIM}\n{RING}\n{SHELL_MAIN}");
     // `--data-page 65536`: the playground runs on a 64 KiB wasm host page, so the read-only string
     // data must share no host page with a writable global (else the shell's own write to a global
     // faults — D40 host-page RO/RW protection is enforced under wasm). Native chibicc defaults to
-    // 16 KiB, which is why the differential above never hit it. `-D TEMEN_STAGE_LOG2=19`: under the
-    // 64 KiB page the `__stage` runner's data sections round up so its window is 19 (512 KiB), not the
-    // native 18 — the shell must carve its ring stages to match. (External-command carves are sized
-    // per-command at run time via `exec_win`, so no `-D` is needed for them.) Verified end to end
-    // against a real Chromium run by `browser-shell-test.mjs`.
-    let ir = c_to_ir_with(&src, &["--data-page", "65536", "-D", "TEMEN_STAGE_LOG2=19"]);
+    // 16 KiB, which is why the differential above never hit it. Every spawn's window is sized at run
+    // time from the command's declared memory (`exec_win`), so the shell needs no size `-D`. Verified
+    // end to end against a real Chromium run by `browser-shell-test.mjs`.
+    let ir = c_to_ir_with(&src, &["--data-page", "65536"]);
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = temen_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
     verify_module(&m).expect("verify shell");
@@ -1172,9 +1175,8 @@ fn gen_browser_shell_fixture() {
     // builtins (no import manifest to link, so `c_to_ir_child`'s encode is self-contained). The browser
     // grants it under the name `__stage`, exactly as the differential's `run_shell_ex` does.
     // The `__stage` runner, also 64 KiB-page with `-D TEMEN_STAGE_LOG2=19` so its ring maps sit at the
-    // right half-window offset (256 KiB) for the 512 KiB window the 64 KiB page rounds it up to. Its
-    // declared memory (19) must equal the shell's ring carve (also 19 here) — a §14 child's carve
-    // equals its declared memory, the invariant the differential's `run_shell_ex` checks at 18.
+    // right half-window offset (256 KiB) for the 512 KiB window the 64 KiB page rounds it up to — the
+    // same layout-vs-window check the differential's `run_shell_ex` makes at 18.
     let runner_ir = c_to_ir_child_with(
         &stage_runner_src(),
         &["--data-page", "65536", "-D", "TEMEN_STAGE_LOG2=19"],
@@ -1184,8 +1186,8 @@ fn gen_browser_shell_fixture() {
     assert_eq!(
         rraw.memory.map(|mm| mm.size_log2),
         Some(19),
-        "the 64 KiB-page __stage runner must declare memory 19 (the shell's ring-carve size); \
-         drift breaks the spawn"
+        "the 64 KiB-page __stage runner must declare memory 19 (its ring layout's window); \
+         drift maps its rings past the window"
     );
     let rbytes = temen_encode::encode_module(&rraw);
     let rout = dir.join("stage_runner.temen");
@@ -1193,8 +1195,8 @@ fn gen_browser_shell_fixture() {
     eprintln!("wrote {} ({} bytes)", rout.display(), rbytes.len());
 
     // The demo external commands, 64 KiB-page. Each declares whatever window chibicc lands it at
-    // (`primes` 19, `upper` 18); the shell carves each spawn to that size via `exec_win`, so — unlike
-    // the ring runner — they need no fixed-size pin. `primes` is a generator (argv → stdout); `upper`
+    // (`primes` 19, `upper` 18); the shell sizes each spawn's window to that via `exec_win`, so —
+    // unlike the ring runner — they need no fixed-size pin. `primes` is a generator (argv → stdout); `upper`
     // is a **filter** — it reads stdin (a `< file` redirect the shell drains into its granted stdin
     // pipe), uppercases, and writes stdout.
     for (name, source) in [("primes", PRIMES_MAIN), ("upper", UPPER_MAIN)] {

@@ -317,6 +317,48 @@ where it sits, not what kind it is:
   either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
   case that needs per-operation semantics.
 
+**One rule per park site (#1898).** The oracle's scheduler parks a vCPU in one of thirteen waiter
+collections, each a `ParkSite` with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
+freeze; its op is abandoned and the thaw re-issues it), **phase** (it stays parked and another
+vCPU's unwind wakes it), or **decline** (no rule yet: the census refuses the freeze up front,
+`DeclineCause::Parked(site)`, rather than start one that would stall). Every list that walks the
+parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a new
+collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
+`waitpid`, a job-control stop, and a stream read. Phase: `thread.join`, a lane. Decline: a fork-twin
+`wait(-1)` (#1688), a reply or completion in flight (#1901), and an offer admission, which a durable
+caller never reaches (#1681).
+
+**How the rule stays enforced (proposed 2026-09-29, for owner sign-off; #1898–#1904).** The rule
+above was first applied one park at a time, by hand, and that is where the gaps came from. Four rules
+make it hold by construction:
+
+1. **One rule per park site, on every engine.** The table above, for the oracle (#1898). The JIT and
+   the bytecode engine apply the same rules (#1904, INVARIANTS #15).
+2. **Every park inside the cut is a re-issue.** A park whose op took no effect is abandoned and
+   re-issued, as the table's re-issue sites already are. A park waiting on an op that *has* taken
+   effect is split in two: the request commits and its ticket rides the artifact as cut data, and the
+   wait on that ticket is an ordinary re-issuable park (a reply, a completion: #1901). An op that has
+   partly taken effect completes short where its semantics allow (a pipe write larger than
+   `PIPE_BUF` may return a short count) and records its progress otherwise.
+3. **A boundary capability declares its freeze behaviour when it is granted.** An effect that has
+   left the VM cannot be made exactly-once by the VM alone. So a capability that can have an
+   operation in flight across the boundary declares one of: *re-issue* (idempotent, or no effect
+   while parked), *resume by request id* (the provider keeps results by id; the thaw re-binds the
+   edge and collects them), *drain* (a bounded wait for completion), or *none*. First-party
+   providers implement one of the first three. Granting a *none* capability marks the domain
+   non-freezable at grant time, so the embedder learns it when it chooses the capability, not when
+   a freeze fails (#1902).
+4. **Freeze liveness.** A freeze completes in bounded time when every vCPU is running instrumented
+   code (the back-edge polls bound the distance to the next poll), parked at a *re-issue* or *phase*
+   site, or inside a host call whose capability declared a freeze behaviour. Anything else is
+   declined by the census when the trigger fires (#1671), never discovered mid-unwind and never a
+   stall. The park × engine matrix pins it: every site on every engine either freezes and thaws to
+   the uninterrupted answer or declines cleanly (#1903).
+
+So the only permanent declines are a *none* capability the embedder chose to grant and the
+authority gaps #1703 lists as by design; the transform's coverage gaps (#1695) are a finite
+engineering list on another axis.
+
 So a freeze fails only while one of these rules is unimplemented. Each `DeclineCause` (#1671) and
 each `NonDurableKind` (§12.5) is a gap against this rule, tracked in #1703, not a permanent carve-out.
 The exceptions are the by-design ones #1703 lists, such as an un-attested `Module` grant: those
@@ -1470,6 +1512,18 @@ operands are therefore spilled); clear, it reloads the result as before. This ge
 interpreter oracle abandons today; the JIT and bytecode engines never set the word, so their
 host calls keep reloading. Pinned by `temen-durable/tests/quiesce_parks.rs::
 a_pipe_parked_root_is_abandoned_and_its_read_reissued_on_thaw`.
+
+**A freeze sees through a job-control stop (#1672).** A stopped vCPU runs no ops, so it never
+reaches a freeze point. But a stop lands asynchronously, and landing at the next freeze point
+instead of between two ops is indistinguishable to the guest, provided nothing leaves the domain
+meanwhile. So under a landing freeze a stopped vCPU runs on (the freeze re-admits one parked
+stopped), and every host call it reaches is abandoned, as above, rather than performed: the ops
+on the way touch only the domain's own window, whose vCPUs are all stopped. It unwinds at the
+call's poll. A serve op is left to run, since its thaw re-issues it anyway. The stop itself is the
+personality's state, so restoring a thawed domain stopped waits on that state riding the artifact.
+Only the interpreter oracle parks between ops; the JIT and bytecode engines take a stop inside the
+personality's syscall path. Pinned by `quiesce_parks.rs::a_stopped_domain_reaches_its_freeze_point_
+without_leaving_the_domain` and `::a_vcpu_stopped_before_the_freeze_is_brought_through_it`.
 
 **State word** (`NORMAL | UNWINDING | REWINDING`): per-vCPU, in-window (§2); every
 poll/prologue reads it. Freeze sets all to `UNWINDING` and drives each fiber to drain

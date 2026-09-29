@@ -2324,13 +2324,21 @@ admitted set is exactly `[0, H)`) which the driver writes to that global before 
 (native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike — and the §22
 `Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
 writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
-sparse grow, a non-RW mapping — **declines** emitted execution for that call and interprets it
-instead (tier-up falls through at the dispatch; an invoke uses the interpreted delivery), so
-emitted code never runs over a state it would mis-admit; the map-containing function itself is
+sparse grow, a non-RW mapping, pages committed past a fixed backing — **declines** emitted execution
+for that call and interprets it instead (tier-up falls through at the dispatch; an invoke uses the
+interpreted delivery), so emitted code never runs over a state it would mis-admit. A bounce *inside*
+an emitted call that leaves such a state gets `"mapped"` = 0, which admits nothing (#1919): the
+call's next access faults rather than run over it, and the driver declines the run to the
+interpreter — which is why a cooperative run whose module can change its page state is emitted
+paged, carrying that state exactly instead; the map-containing function itself is
 never emitted either (a remapping `call.cap` is not in-subset). `tierup_grow_window.rs` and
 `jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
 unsynced divergences pinned as negative tests. The **page-state** axis is carried by the paged entry.
-The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
+What keeps an emitted access inside its window is the bounds check itself, not the `& MASK` clamp:
+the clamp is to the 2^40 reservation, and on the browser's wasm32 the module's memory is the
+embedder's whole linear memory. So the check is exactly `temen_mask::Window::checked` for **any**
+value a host writes to `"mapped"` (`mapped < offset + width` traps; nothing wraps), and a host never
+writes more than the window's backing holds — a wrong but backed live size is then a trap-parity
 divergence, never an escape. The escalation past emit-nothing — a per-access **software page-check** in emitted code — has
 **landed** as the paged entry (#750, `compile_module_tierup_paged`), which the browser's cooperative
 tier-up selects whenever the module carries a `readonly` data segment or reaches `unmap`/`protect`
@@ -2350,8 +2358,9 @@ limits, fail-closed: `SharedRegion` aliasing still gates the whole module (a `Ba
 live outside the window), bulk-memory spans walk every page they touch (#1081, the `paged_walk`
 fuzz target), and the page check is never
 elided (an in-window proof says nothing about dynamic page state). Every **unflagged** entry emits
-byte-identical code — the fail-closed default pays zero TCB — and the check runs strictly inside
-the always-emitted `& MASK` clamp, so a wrong table is a trap-parity divergence, never an escape.
+byte-identical code — the fail-closed default pays zero TCB — and the page check runs after the
+bounds check, strictly inside `[0, mapped)`, so a wrong table is a trap-parity divergence, never an
+escape.
 `page_check.rs` is the differential + boundary proof (unmapped load, Ro load/store split, page-edge
 straddle, unsynced-table divergence pin). The cost is ~1.5–3×+ on the random-access tail, paid only
 by the modules the flip selects.
@@ -2376,6 +2385,26 @@ still falls to the interpreter. `map` (grow) is admitted on the nested paged pat
 refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned by `browser/tests/inst_codegen_paged.rs`. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
+
+**Process trees: leaf processes (#1896).** A cooperative run that drives a process tree (the
+browser's nimony build, `temen_nim_open`) keeps the tree itself on the interpreter — fork, exec,
+wait, pipes — and runs each **leaf process** whole on emitted wasm. An image a process `execve`s is
+offered to the host's emitter (`TierUpConfig::leaf`) when it cannot **park**, i.e. block until
+another process or thread acts (`image_may_park`, the engine's one predicate): the personality
+answers for its own ops (`SignalSource::import_parks` — file, directory, environment and identity
+ops never park, `read`/`write` only when the process holds a pipe, a socket or a terminal), a stream
+cap call parks only on a pipe end or a blocking stdin, the address-space ops never park, and a §12
+concurrency op, a rebindable import, or any other import or cap call may. The leaf runs over a flat
+copy of the caller's window, materialized exactly as the in-place exec would be, and tiers up at its
+entry (`CoopEvent::TierUp` naming its program); its delivery ends the process as a return from the
+entry would. An image that can change its page state — an address-space `map`/`unmap`/`protect`,
+inline or through an import, which the image alone does not show — is emitted page-checked
+(`compile_jit_page_checked`), because a whole run cannot decline when a hole or a protection takes
+its window past one bound. **Scheduling:** a leaf runs as one slice — nothing else in the tree runs
+until it ends, a schedule the interpreter could also have chosen for a leaf that terminates. A leaf
+that instead busy-waits on another process's effect through ops that do not park (polling for a
+file, say) never sees it and spins where the interpreter would complete: tracked debt on #1896,
+converging with resumable emitted frames, which are also what a leaf holding a pipe needs.
 
 ---
 

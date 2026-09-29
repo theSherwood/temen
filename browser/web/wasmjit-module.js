@@ -355,7 +355,7 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 // over the cdylib's shared memory, and deliver the results (or the trap) back to the parked vCPU;
 // `env.call_interp` is the live-state bounce. Proven observably identical to `onramp_exec` by
 // tests/coop_tierup_driver.rs (wasmi playing this file's role).
-async function driveCoopTierupRun(ex, memory, cacheKey) {
+export async function driveCoopTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
   // #816 env-routed tier-up: `win` is PER EVENT — the pending task's window base (root backing for
@@ -425,19 +425,35 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     },
   } });
 
-  const coopKey = cacheKey === undefined ? undefined : `${cacheKey}#coop`;
-  let module = cacheGet(coopKey);
-  if (module === undefined) {
-    const wptr = Number(ex.temen_coop_wasm_ptr());
-    const wlen = ex.temen_coop_wasm_len();
-    module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
-    cachePut(coopKey, module);
-    jitCacheStats.compiles++;
-  } else {
-    jitCacheStats.hits++;
+  // The run's own emit (program 0). A nimony build (`temen_nim_open`) emits none of its own: its
+  // programs are the leaf images its processes exec (#1896), each instantiated at its first TIERUP.
+  let emitted = {};
+  if (ex.temen_coop_wasm_len() > 0) {
+    const coopKey = cacheKey === undefined ? undefined : `${cacheKey}#coop`;
+    let module = cacheGet(coopKey);
+    if (module === undefined) {
+      const wptr = Number(ex.temen_coop_wasm_ptr());
+      const wlen = ex.temen_coop_wasm_len();
+      module = await WebAssembly.compile(u8().slice(wptr, wptr + wlen));
+      cachePut(coopKey, module);
+      jitCacheStats.compiles++;
+    } else {
+      jitCacheStats.hits++;
+    }
+    emitted = (await WebAssembly.instantiate(module, unitImports())).exports;
   }
-  const instance = await WebAssembly.instantiate(module, unitImports());
-  const emitted = instance.exports;
+  const programs = new Map([[0, emitted]]);
+  const programFor = async (m) => {
+    let p = programs.get(m);
+    if (p === undefined) {
+      const ptr = Number(ex.temen_coop_leaf_wasm_ptr(m));
+      const bytes = u8().slice(ptr, ptr + ex.temen_coop_leaf_wasm_len(m));
+      p = (await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports())).exports;
+      registerGlobals(p);
+      programs.set(m, p);
+    }
+    return p;
+  };
   const envCell = Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
   // #1627: a collecting guest's emitted frames push their live words to a spill stack named by the
   // env cell's cursor pair; every event is an outermost entry, so each one re-arms it at the base.
@@ -647,6 +663,8 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       // running the region (the per-event "mapped"/fuel fan-out covers every instance it may reach).
       await syncTable();
       const func = ex.temen_coop_func();
+      // Before the per-event fan-out below, so a program instantiated now gets this event's sync.
+      const program = await programFor(ex.temen_coop_module());
       const argvPtr = Number(ex.temen_coop_argv_ptr());
       const n = ex.temen_coop_argv_len();
       const args = [];
@@ -664,7 +682,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       }
       armEnv();
       try {
-        const ret = emitted['f' + func](eventWin(), envCell, ...args);
+        const ret = program['f' + func](eventWin(), envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
         const rlen = Math.max(1, rets.length) * 8;
         const rptr = Number(ex.temen_alloc(rlen));

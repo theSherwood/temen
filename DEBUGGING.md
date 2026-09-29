@@ -525,7 +525,7 @@ different things depending on which pair you compare:
   they checked a nested holder's carve against the *root's* NULL guard. Both are gone. The debug
   scheduler admits every confined child through `admit_confined_child`, the function the cooperative
   executor and the OS-thread parallel driver call, and `dbg_start_child` only schedules it (as for op 15).
-  `confined_spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
+  `spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
 
   **§14 coroutine step-into on the multi-vCPU engine (slice 16).** Coroutine step-into (14b/14c) now
   reaches the scheduled engine: `coro_step_into` is on by default for every debug-engine `VTask`, and the

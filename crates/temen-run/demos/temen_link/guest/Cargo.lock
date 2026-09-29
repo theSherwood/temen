@@ -26,7 +26,6 @@ dependencies = [
 name = "temen-link-guest"
 version = "0.0.0"
 dependencies = [
- "temen-encode",
  "temen-leng",
  "temen-posix-abi",
 ]

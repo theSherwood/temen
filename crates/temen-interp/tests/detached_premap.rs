@@ -115,9 +115,9 @@ fn run_interp(parent_src: &str) -> Result<Vec<Value>, Trap> {
     )
 }
 
-/// The resumable bytecode engine, driven through its detached-spawn protocol: the host mints the
-/// child's window, seeds the segments + payload, and builds the child over the stashed powerbox —
-/// which carries the pre-map, applied by the child constructor. Records how many spawns surfaced.
+/// The resumable bytecode engine, driven through its detached-spawn protocol: the host mints a
+/// backing for the child's window and starts the admitted child over it, which seeds the segments
+/// and the payload and aliases in the pre-map its powerbox carries. Records how many spawns surfaced.
 fn drive(
     prog: &bytecode::VcpuProgram,
     mut vcpu: bytecode::Vcpu<'_>,
@@ -128,28 +128,14 @@ fn drive(
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::InstantiateDetached {
-                module,
-                entry,
-                size_log2,
-                fuel,
-                args,
-                data,
-            } => {
+            bytecode::VcpuEvent::InstantiateDetached { size_log2, .. } => {
                 *spawns += 1;
                 let back = Arc::new(Region::new(1u64 << size_log2, 4096));
-                for seg in data.iter() {
-                    back.write_from(seg.offset, &seg.bytes);
-                }
-                back.write_from(temen_ir::module_args_base(), &args);
-                let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
-                let host = vcpu
-                    .take_granted_host()
-                    .expect("a pre-mapped spawn always stashes the child powerbox");
-                let child = bytecode::Vcpu::new_confined_child_grow_over_host(
-                    prog, module, entry, back, size_log2, reserved, fuel, host,
-                )
-                .expect("detached child builds");
+                let child = vcpu
+                    .take_child()
+                    .expect("an InstantiateDetached carries its admitted child")
+                    .start(prog, back, None)
+                    .expect("detached child builds");
                 let r = drive(prog, child, spawns);
                 let handle = children.len() as i32;
                 children.push(r);

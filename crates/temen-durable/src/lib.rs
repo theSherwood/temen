@@ -1249,14 +1249,14 @@ fn transform_func(
                     // `UNWINDING` must never reload as the served count) — before the
                     // generic `Leaf` arm.
                     Inst::CapCall {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: sop @ (SVC_POLL_OP | SVC_WAIT_OP),
+                        type_id,
+                        op,
                         sig,
                         handle,
                         args,
-                    } => SuspendKind::SvcServe {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: *sop,
+                    } if temen_ir::durable_abi::is_serve_op(*type_id, *op) => SuspendKind::SvcServe {
+                        type_id: *type_id,
+                        op: *op,
                         sig: *sig,
                         handle: *handle,
                         args: args.clone(),

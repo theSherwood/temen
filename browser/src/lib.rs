@@ -31,7 +31,7 @@ use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimc;
 mod nimony;
-pub use nimony::{nim_build, NimBuild};
+pub use nimony::{library_pack, nim_build, NimBuild};
 pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
@@ -215,11 +215,10 @@ pub extern "C" fn run_threads() -> i64 {
 /// runs every multi-domain guest on), over primitives already exercised on wasm32 — the wasm-JIT
 /// tier-up is orthogonal (a per-Worker compute accelerator; cap/serve/fork ops leaf-fold to the
 /// interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
-/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager runs in the
-/// module's 72-KiB window, so its scratch (the queue/spawn-arg structs and the "svc"/"o" name data
-/// segments) sits above the #1094 unconditional NULL guard (`[0, 16 KiB)` faults on any guest
-/// access). The spawned domains run in 4-KiB carves — below the guard's minimum window, so the guard
-/// no-ops there (#1094) and the domain's own name cells + reply slot keep their low `[0, 24)` offsets.
+/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager spawns both
+/// domains through op-17 v1 records (#1864): each is this module in a **detached 2^18 window of its
+/// own** paid from the `Budget` arg, so each starts with the module's data segments — the guest reads
+/// its "svc"/"o" names there, and every scratch cell sits above the #1094 NULL guard.
 const FORK_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
@@ -227,29 +226,25 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 131072
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
+; manager (inst, stdout, budget): spawn the server (func 1), offer its "svc" to the guest (func 4)
+; with our stdout as "o", and return the guest's status
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  ; the op-17 v1 record for the server at 17600: version 1 | entry 1, size_log2 18 | no pager,
+  ; module -1 (self) | budget, no grants, no args, region -1 (none); the rest is zero
   q1a0 = i64.const 17600
+  q1v0 = i64.const 4294967297
   i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
   q1a2 = i64.const 17616
+  q1v2 = i64.const -4294967278
   i64.store q1a2 q1v2
   q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
+  vself = i32.const -1
+  i32.store q1a3 vself
+  q1a3b = i64.const 17628
+  i32.store q1a3b vbud
+  q1a9 = i64.const 17672
+  i32.store q1a9 vself
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -269,27 +264,24 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  q2v0 = i64.const 17179869184
-  q2v1 = i64.const 135168
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2v5 = i64.const 16640
-  q2v6 = i64.const 2
-  q2a0 = i64.const 17664
+  ; the guest's record at 17696: version 1 | entry 4, the two grants above, otherwise as the server's
+  q2a0 = i64.const 17696
+  q2v0 = i64.const 17179869185
   i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
+  q2a2 = i64.const 17712
+  i64.store q2a2 q1v2
+  q2a3 = i64.const 17720
+  i32.store q2a3 vself
+  q2a3b = i64.const 17724
+  i32.store q2a3b vbud
+  q2a5 = i64.const 17736
+  q2v5 = i64.const 16640
   i64.store q2a5 q2v5
-  q2a6 = i64.const 17712
+  q2a6 = i64.const 17744
+  q2v6 = i64.const 2
   i64.store q2a6 q2v6
+  q2a9 = i64.const 17768
+  i32.store q2a9 vself
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
@@ -323,16 +315,10 @@ block 0 (vpid: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
@@ -357,7 +343,7 @@ block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
   br_if visechild 1(vhsvc, vho) 4(vr, vho)
   }
 block 4 (vr: i64, vho: i32) {
-  vp16 = i64.const 16
+  vp16 = i64.const 16704
   i64.store vp16 vr
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
@@ -380,11 +366,12 @@ pub extern "C" fn run_fork() -> i64 {
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let budget = host.grant_budget(0, 2 << 18, 0); // the server's and the guest's windows
     let mut fuel = 40_000_000u64;
     let r = match bytecode::compile_and_run_with_host(
         &m,
         0,
-        &[Value::I32(inst), Value::I32(out_h)],
+        &[Value::I32(inst), Value::I32(out_h), Value::I32(budget)],
         &mut fuel,
         &mut host,
     ) {
@@ -1573,7 +1560,7 @@ pub extern "C" fn temen_par_inst_paged() -> i32 {
 /// value for `"mapped"`).
 fn inst_sync_pagestate(v: &mut ParVcpu) {
     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-    let (table, cover) = bytecode::build_pagestate_table(&info);
+    let (table, cover) = bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
     v.pagestate = table;
     v.b = cover as i64;
 }
@@ -2521,7 +2508,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     // `temen_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
                     // memory IS the `"pagestate"` global's value: one shared memory, zero copies).
                     let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                    let (table, cover) = bytecode::build_pagestate_table(&info);
+                    let (table, cover) =
+                        bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
                     v.pagestate = table;
                     v.b = cover as i64;
                 } else {
@@ -2646,7 +2634,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 if let Some(h) = mapped {
                     if par_jit_paged() {
                         let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        let (table, cover) =
+                            bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
                         v.pagestate = table;
                         v.b = cover as i64;
                     } else {
@@ -2762,9 +2751,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             bytecode::VcpuEvent::CapPending { .. } => return PAR_TRAP,
             // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
             // mints and seeds from this blob, then posts to a new Worker (see
-            // [`PAR_INSTANTIATE_DETACHED`]). The by-name grant list has no path across Workers on this
-            // driver (as the op-13 arm above: a par child runs on its starter caps), so a spawn that
-            // stashed re-granted caps fails closed instead of silently running the child without them.
+            // [`PAR_INSTANTIATE_DETACHED`]). As in the confined arm above, the child is rebuilt there
+            // from integers with only its starter caps, so a spawn whose admitted powerbox carries
+            // re-granted caps or a pre-mapped region fails closed instead of silently running the
+            // child without them.
             bytecode::VcpuEvent::InstantiateDetached {
                 module,
                 entry,
@@ -2773,7 +2763,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 args,
                 data,
             } => {
-                if v.inner.take_granted_host().is_some() {
+                let admitted = v.inner.take_child();
+                if admitted.is_some_and(|c| c.granted()) {
                     return PAR_TRAP;
                 }
                 let mut seed = Vec::new();
@@ -3737,7 +3728,7 @@ fn grant_onramp_caps(
         // non-durable, so granting it everywhere would make every reactor that saves a warm
         // snapshot unfreezable.
         if temen_ir::spawns_detached(m) {
-            host.grant_detached_spawn_caps(win);
+            host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
         }
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
@@ -4389,6 +4380,9 @@ pub fn posix_shell_exec_with(
     let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst = host.grant_instantiator(0, win);
     let _as = host.grant_address_space(0, win);
+    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+    // returned when the child ends: room for the widest pipeline's three concurrent stages.
+    let _budget_h = host.grant_budget(0, 4 << 20, 0);
     let cmd_handles: Vec<(&str, i32, u8)> = cmds
         .iter()
         .map(|(n, cm)| {
@@ -7562,7 +7556,7 @@ impl JitOnrampRun {
         let paged = temen_wasm_jit::module_uses_unmap_protect(&module);
         let (pagestate, mapped) = if paged {
             let page = temen_interp::host_page_size();
-            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()))
+            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()), back.len())
         } else {
             (Vec::new(), declared_extent)
         };
@@ -7770,10 +7764,11 @@ impl JitOnrampRun {
                 Some(info) => {
                     if self.paged {
                         // #1201: the paged contract — the table from the live map, `"mapped"` = its
-                        // coverage (never the reserved domain), so the emitted bound check traps
-                        // everything above the table where the interpreter faults and the page states
-                        // refine within it.
-                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        // coverage (never the reserved domain, nor past the backing), so the emitted
+                        // bound check traps everything above the table where the interpreter faults
+                        // and the page states refine within it.
+                        let (table, cover) =
+                            bytecode::build_pagestate_table(&info, self.back.len());
                         self.pagestate = table;
                         self.mapped = cover;
                     } else {
@@ -9102,6 +9097,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     let tierup = bytecode::TierUpConfig {
         eligible: std::sync::Arc::clone(&wc.eligible),
         page_checked: wc.paged,
+        leaf: None,
     };
     // The resumable twin of the warm interp path's `run_over_grown`: the image bytes already
     // restored (no data seed), the captured page map re-established (`seed_pages`) so the grown heap
@@ -9129,7 +9125,9 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             run,
-            back: s.back.clone(),
+            back: Some(s.back.clone()),
+            nim: None,
+            module: 0,
             warm: true,
             emitted_wasm: std::sync::Arc::clone(&wc.wasm),
             func: 0,
@@ -9204,12 +9202,26 @@ pub extern "C" fn temen_run_onramp_posix(
     out.value
 }
 
+/// A **registry blob** of `entries` ([`blob_entries`] reads one): the framing a host uses to hand
+/// the cdylib a whole set in one buffer, and that a prebuilt set (the nim library, #958) ships in.
+pub fn registry_blob(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let len = |n: usize| (n as u32).to_le_bytes();
+    let mut out = len(entries.len()).to_vec();
+    for (name, bytes) in entries {
+        out.extend(len(name.len()));
+        out.extend(name.as_bytes());
+        out.extend(len(bytes.len()));
+        out.extend(*bytes);
+    }
+    out
+}
+
 /// The entries of a **registry blob** a host builds: all integers little-endian, a `u32` entry
 /// count, then per entry a `u32` name length + that many UTF-8 name bytes + a `u32` length + that
 /// many bytes. One buffer carries a whole set (a shell's commands, a tree's files) through one pair
 /// of arguments. Defensive: reading stops at the first entry that is truncated or not UTF-8, rather
 /// than trapping.
-fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
+pub fn blob_entries(bytes: &[u8]) -> Vec<(&str, &[u8])> {
     let rd_u32 = |at: usize| -> Option<usize> {
         bytes
             .get(at..at + 4)
@@ -12987,12 +12999,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // AddressSpace]` for the two-param shape, `child_entry_ok`) — #1201: a page-op child's
                 // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`. The
                 // emitted entry is `f{entry}` (0 for the phase drivers here).
-                let (host, args) = child.into_powerbox();
-                let handle = |i: usize| match args.get(i) {
-                    Some(Value::I64(h)) => *h as u64,
-                    _ => 0,
-                };
-                let (cinst, cas) = (handle(0), handle(1));
+                let (host, cinst, cas) = child.into_powerbox();
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
@@ -13028,38 +13035,19 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             // #1286 — a DETACHED child (op 15): its window is a fresh `WebAssembly.Memory` the page mints
             // (`foreign_mint`), reached only through `Region::Foreign`; the emitted `_start` runs bound to
             // that memory (`driveDetachedRun`). No carve, no alias — the driver cannot address a byte of
-            // it. Same powerbox shape as the op-13 arm (starter caps over the declared window, the child
-            // manifest bound), plus the spawn-time args payload seeded at `module_args_base()`.
+            // it. The engine admitted the child through the one admission every driver uses: its
+            // powerbox carries the starter caps over the reservation (a root's shape — growth is bounded
+            // by the minted memory's `maximum`), the marshaled caps, the child module as its own
+            // (§3.5 / #1296), its attestation and its import manifest bound. The spawn-time args
+            // payload is seeded at `module_args_base()`; this servicer holds the decoded child already.
             #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
             bytecode::VcpuEvent::InstantiateDetached {
-                module,
-                entry,
-                size_log2,
-                fuel,
-                args,
-                data: _, // this servicer holds the decoded child (`d.child.data`) already
+                size_log2, args, ..
             } => {
-                // A grant-less spawn (`grants_n == 0`) stashes no powerbox: the child gets a fresh one.
-                let mut host = d.root.take_granted_host().unwrap_or_default();
-                host.set_self_module(&d.child); // #1296: as the nested arm — the child's own module
-                let child_size = 1u64 << size_log2;
-                host.set_attestation(temen_interp::Attestation {
-                    tier: 1,
-                    window_exposed: false,
-                    freeze_exposed: false,
-                });
-                // Starter caps span the reservation (a root's shape; the tree-walker's op-15 arm grants
-                // the same): a detached child has no carve, and bounding `AddressSpace` to the declared
-                // window would refuse the `vm_map` growth it exists for. Growth is bounded by the minted
-                // memory's `maximum`.
-                let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
-                let (cinst, cas) = host.grant_starter_caps(reservation);
-                if host
-                    .bind_child_manifest(&d.child.imports, &d.child.types)
-                    .is_err()
-                {
+                let Some(child) = d.root.take_child() else {
                     return OP13JIT_TRAP;
-                }
+                };
+                let child_size = 1u64 << size_log2;
                 let init_mem = args_init_mem_raw(&args);
                 // On a key change (a different phase child — nifler_ce → nimsem_ce → hexer_ce across the
                 // whole card, #1025 3e), drop the stale emit BEFORE emitting the new child, so the old
@@ -13090,30 +13078,14 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     Some(e) => e,
                     None => {
                         // #1151 decline → the interpreter twin over a private sparse backing (the
-                        // child never enters the emitted tier, so it needs no JS-owned memory): seed
-                        // the segments + payload, run it to completion, bank the result.
+                        // child never enters the emitted tier, so it needs no JS-owned memory), which
+                        // the engine seeds; run it to completion, bank the result.
                         let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
                         let back = std::sync::Arc::new(temen_interp::Region::paged(
                             1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                             temen_interp::host_page_size(),
                         ));
-                        for seg in &d.child.data {
-                            back.write_from(seg.offset, &seg.bytes);
-                        }
-                        back.write_from(0, &init_mem);
-                        let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
-                            prog,
-                            module,
-                            entry,
-                            back,
-                            size_log2,
-                            temen_ir::DEFAULT_RESERVED_LOG2,
-                            fuel,
-                            host,
-                        ) {
-                            Ok(c) => drive_detached_leaf(c),
-                            Err(t) => Err(t),
-                        };
+                        let r = child.start(prog, back, None).and_then(drive_detached_leaf);
                         let handle = d.children.len() as i32;
                         d.children.push(Some(r));
                         d.root.deliver_handle(handle);
@@ -13126,7 +13098,8 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 ) else {
                     return OP13JIT_TRAP;
                 };
-                let _ = entry;
+                // The child's entry gets the starter handles the interpreter passes.
+                let (mut host, cinst, cas) = child.into_powerbox();
                 // #1527: an op-15 pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
                 // cannot alias, but a detached child runs to completion before its parent resumes
                 // (the handle is delivered only after `driveDetachedRun`; `join` reads the banked
@@ -13144,8 +13117,8 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         host: Box::new(host),
                         init_mem,
                         readback: None,
-                        entry_sp: cinst as u64,
-                        entry_as: cas as u64,
+                        entry_sp: cinst,
+                        entry_as: cas,
                     },
                     Some(emit),
                 ) {
@@ -15312,7 +15285,15 @@ struct CoopTierupRun {
     /// reallocates, so the base moves. That is what [`temen_coop_win_ptr`] /
     /// [`temen_coop_tierup_win_ptr`] are for, and why the JS driver re-reads them after every
     /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global).
-    back: std::sync::Arc<temen_interp::Region>,
+    ///
+    /// `None` for a nimony build ([`nimony::temen_nim_open`]): its root window is the engine's own,
+    /// and each process it tiers up runs over a window of that process's.
+    back: Option<std::sync::Arc<temen_interp::Region>>,
+    /// #1896 — a nimony build's session: its personality and the leaf images it emitted. `None` for
+    /// every other run.
+    nim: Option<nimony::NimSession>,
+    /// The program the pending TIERUP runs: `0`, this run's own emit, or a nim session's leaf image.
+    module: u32,
     /// #816 item 4: a warm-coop run — at DONE/TRAP the warm session's heap high-water advances (so
     /// the next restore zeroes what this eval dirtied), and [`temen_warm_close`] must drop this run
     /// before freeing the window it borrows.
@@ -15362,6 +15343,47 @@ struct CoopTierupRun {
 }
 
 impl CoopTierupRun {
+    /// #1896 — a nimony build's session over `run`: nothing of its own emitted, so every field but
+    /// the run and the nim session starts empty.
+    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession) -> Self {
+        CoopTierupRun {
+            run,
+            back: None,
+            nim: Some(nim),
+            module: 0,
+            warm: false,
+            emitted_wasm: std::sync::Arc::from([]),
+            func: 0,
+            mapped: 0,
+            argv: Vec::new(),
+            jit_code: 0,
+            jit_wasm: None,
+            jit_param_types: Vec::new(),
+            jit_result_types: Vec::new(),
+            sigs: Vec::new(),
+            shim_wasm: Vec::new(),
+            jit_wasm_by_handle: None,
+            pending_bounce_trap: None,
+            value: 0,
+            frame: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            paged: false,
+            pagestate: Vec::new(),
+            pagestate_version: u64::MAX,
+            pagestate_env: i64::MIN,
+            pagestate_cover: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// Whether the pending event's program carries the page check (#1009): this run's own emit's
+    /// mode, or a leaf image's own (#1896).
+    fn event_paged(&self) -> bool {
+        match (&self.nim, self.module) {
+            (Some(nim), m) if m != 0 => nim.leaf(m).is_some_and(|(_, paged)| paged),
+            _ => self.paged,
+        }
+    }
+
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
     /// — the [`TierupRun::sync_pagestate`] twin over the cooperative run — then stage its coverage
     /// for `"mapped"`. #816: the engine routes `mem_map_info`/`mem_map_version` to the pending
@@ -15372,7 +15394,8 @@ impl CoopTierupRun {
         let ver = self.run.mem_map_version();
         if ver != self.pagestate_version || env != self.pagestate_env {
             let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-            let (table, cover) = bytecode::build_pagestate_table(&info);
+            let backed = self.run.pending_win().map_or(0, |(_, len)| len);
+            let (table, cover) = bytecode::build_pagestate_table(&info, backed);
             self.pagestate = table;
             self.pagestate_cover = cover;
             self.pagestate_version = ver;
@@ -15479,11 +15502,16 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // non-one-bound-representable, so the per-call #717 `scalar_extent` sync would decline EVERY
     // tier-up. Paged mode replaces the decline with a per-access page check that traps
     // `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does (fail-closed). A guest that
-    // reaches `unmap`/`protect` itself needs the same treatment even with no rodata — non-paged the
-    // emitter module-gates it to emit-nothing (decline), paged it tiers up (the `sync_pagestate`
-    // per-event/-bounce refresh carries the runtime remaps).
+    // can change its own page state needs the same treatment even with no rodata: an `unmap` or
+    // `protect`, and a `map` too, which can leave a hole below the page it commits. A region cannot
+    // decline mid-flight, and past a bounce that leaves the window more than one bound the scalar
+    // tier could only deny every access (`"mapped"` = 0: the run traps and the whole of it declines
+    // to the interpreter); paged, it stays emitted and the `sync_pagestate` per-event/-bounce
+    // refresh carries the remaps exactly — the §14 codegen entry's rule
+    // (`module_uses_addr_space_page_ops`), one rule for both (#1919).
     let paged = all_shimmable
-        && (m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_unmap_protect(&m));
+        && (m.data.iter().any(|d| d.readonly)
+            || temen_wasm_jit::module_uses_addr_space_page_ops(&m));
     // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
     // The local-table fallback has no spill path, so it keeps #1546's veto.
     let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);
@@ -15639,6 +15667,7 @@ pub extern "C" fn temen_coop_open(
         // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
         // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
         page_checked: paged,
+        leaf: None,
     };
     // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
     // (#1312). It used to be clamped to `win_log2`, which made a `vm_map` past the declared window
@@ -15670,7 +15699,9 @@ pub extern "C" fn temen_coop_open(
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             run,
-            back,
+            back: Some(back),
+            nim: None,
+            module: 0,
             warm: false,
             emitted_wasm: wasm.into(),
             func: 0,
@@ -15714,10 +15745,16 @@ pub extern "C" fn temen_coop_run() -> i32 {
         return COOP_RUN_TRAP;
     };
     let (status, value, exit_code, ev) = match s.run.run() {
-        bytecode::CoopEvent::TierUp { func, argv, mapped } => {
+        bytecode::CoopEvent::TierUp {
+            module,
+            func,
+            argv,
+            mapped,
+        } => {
+            s.module = module;
             s.func = func;
             s.argv = argv.into_vec();
-            if s.paged {
+            if s.event_paged() {
                 s.sync_pagestate();
             } else {
                 s.mapped = mapped;
@@ -15799,9 +15836,18 @@ pub extern "C" fn temen_coop_run() -> i32 {
                 .max(grown);
         }
     }
-    let host = s.run.host_mut();
-    let stdout = std::mem::take(&mut host.stdout);
-    let stderr = std::mem::take(&mut host.stderr);
+    // #1896: a nimony build's output is its personality's, and its memfs outlives the run for
+    // `temen_nim_file` to read.
+    let (stdout, stderr) = match s.nim.take() {
+        Some(nim) => nimony::finish(nim),
+        None => {
+            let host = s.run.host_mut();
+            (
+                std::mem::take(&mut host.stdout),
+                std::mem::take(&mut host.stderr),
+            )
+        }
+    };
     let fb = s.frame.lock().unwrap().take();
     let (fb_rgba, fb_w, fb_h) = match fb {
         Some(f) => (f.rgba, f.width, f.height),
@@ -15819,6 +15865,30 @@ pub extern "C" fn temen_coop_run() -> i32 {
         LAST_STATUS = status;
     }
     ev
+}
+
+/// #1896: the program the pending TIERUP's `func` is in — `0`, this run's own emit
+/// ([`temen_coop_wasm_ptr`]), or a leaf image a nimony build emitted ([`temen_coop_leaf_wasm_ptr`]).
+#[no_mangle]
+pub extern "C" fn temen_coop_module() -> u32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
+}
+
+/// #1896: the emitted wasm of leaf image `module` of a nimony build (`null` when there is none). The
+/// bytes live as long as the session.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.nim.as_ref()?.leaf(module))
+        .map_or(core::ptr::null(), |(wasm, _)| wasm.as_ptr())
+}
+
+/// #1896: the byte length of [`temen_coop_leaf_wasm_ptr`]'s wasm.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_wasm_len(module: u32) -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.nim.as_ref()?.leaf(module))
+        .map_or(0, |(wasm, _)| wasm.len())
 }
 
 /// The pending TIERUP's function index.
@@ -15839,7 +15909,7 @@ pub extern "C" fn temen_coop_mapped() -> i64 {
 /// `"mapped"` write). `0` on an unpaged run.
 #[no_mangle]
 pub extern "C" fn temen_coop_paged() -> i32 {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.paged as i32)
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.event_paged() as i32)
 }
 
 /// #1009 paged: the pending TIERUP's page-state table base (its bytes live in this module's linear
@@ -15897,18 +15967,18 @@ pub extern "C" fn temen_coop_wasm_len() -> usize {
 /// freed memory (the emitted tier gets the fresh base through the `"win"` global).
 #[no_mangle]
 pub extern "C" fn temen_coop_win_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
-        s.back
-            .raw_base()
-            .map_or(core::ptr::null(), |p| p as *const u8)
-    })
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.back.as_ref()?.raw_base())
+        .map_or(core::ptr::null(), |p| p as *const u8)
 }
 
 /// The run window's byte length — the initial `1 << win_log2`, plus whatever the guest has
 /// `vm_map`-grown since (#1312). Like the base, re-read it rather than caching it.
 #[no_mangle]
 pub extern "C" fn temen_coop_win_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.back.len() as usize)
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.back.as_ref())
+        .map_or(0, |b| b.len() as usize)
 }
 
 /// #816 env-routed tier-up: the **pending event's** window base — the emitted `f{i}`s' `win` arg
@@ -16065,7 +16135,7 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8, spill_l
             // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
             // page-state table (version-guarded) so the post-bounce emitted access admits the growth
             // (the paged twin of the #717 scalar fan-out).
-            if s.paged {
+            if s.event_paged() {
                 s.sync_pagestate();
             }
             0

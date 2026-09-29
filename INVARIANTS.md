@@ -67,6 +67,12 @@ let it spend that again — the conservation break the earlier "harmless for a p
 note missed). The thaw may **attenuate** a carried budget through an embedder hook
 (`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never raise it; no hook
 ⇒ verbatim. Minting authority therefore survives a freeze exactly as it was left.
+*Refund on child end (2026-09-29, #1864, owner decision):* `Budget.mem` accounts **live** windows, not
+lifetime mints — when a detached child ends (joined or reaped), its window's bytes return to the
+budget that paid for them, so a parent can spawn, join and spawn again within one window's worth. A
+child frozen with its parent stays charged (the artifact carries the deduction). Conservation holds:
+the bytes return to the same budget they left. The bytecode tier still returns them at admission, like
+its lanes — a tracked gap (#1600), not a second rule.
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,
@@ -272,11 +278,18 @@ frontier's own repair, never parked. Until it is gone:
   read it after the join. Parent and child using the carve concurrently — stores, futex rendezvous —
   is not a supported channel; #1814 is the tracked divergence (invariant 9's "tracked debt with a
   convergence plan", the plan being this deletion).
+- **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
+  detached, with the spawn-time args payload and the pre-mapped region as fields, `module = -1` the
+  spawner's own program. Op 15's positional form and the v0 carve record retire with the carve path
+  (#1867); the version word is that migration's scaffolding. The window is always the child module's
+  declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
+  module it did not build need not know its size — any other value must equal it. A query for the
+  size is #1908; growth past it is charged to no budget yet (#1909).
 - **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
   `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
   spawn-time args payload; results ride the join and the region.
-- **What still leans on the carve moves first:** the §2.2 pager (the parent writes the page through
-  its own window — becomes a byte transfer at supply, retiring "pager ⇒ nested"); the durable subtree
+- **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
+  its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
   freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
   `FreezeScope`'s carve-named form folds into the detached one); and every producer still emitting a
   carve spawn. The carve-specific escape oracle and fuzz targets retire with the path they test, once

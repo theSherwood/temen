@@ -69,6 +69,9 @@ pub(crate) struct DurableCell {
     pub(crate) entry: u32,
     pub(crate) mapped_log2: u8,
     pub(crate) reserved_log2: u8,
+    /// #1854 — how far the child grew its window, asked of its own powerbox (`(hook, child ctx)`),
+    /// so its image reaches its grown pages; `None` when no hook is installed.
+    pub(crate) high_water: Option<(crate::HighWater, usize)>,
 }
 
 impl DurableCell {
@@ -77,6 +80,7 @@ impl DurableCell {
         entry: u32,
         mapped_log2: u8,
         reserved_log2: u8,
+        high_water: Option<(crate::HighWater, usize)>,
     ) -> DurableCell {
         DurableCell {
             base: Mutex::new(0),
@@ -85,6 +89,7 @@ impl DurableCell {
             entry,
             mapped_log2,
             reserved_log2,
+            high_water,
         }
     }
 }
@@ -300,14 +305,19 @@ unsafe fn file_carve_task(
 
 /// D66 — a granted child's teardown: release its powerbox and, for a detached child, return its
 /// lane to the parent through the `lane_give` hook (`-1` for a carve child: a no-op, it holds none).
+/// `window` is the `(budget, bytes)` a detached spawn spent on the child's window: they go back to
+/// that budget here, when the window goes (owner, 2026-09-29 — `Budget.mem` accounts live windows).
+/// `None` for a carve child and for a thaw's re-launch, which spent nothing in this life.
 unsafe fn granted_teardown(
     rt: &Nursery,
     release: crate::GrantChildReleaser,
     gc_ctx: *mut core::ffi::c_void,
     lane: i64,
+    window: Option<(i32, u64)>,
 ) -> crate::child_exec::Teardown {
     let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
     let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
+    let mem_give = rt.grant_budget_mem_give.load(Ordering::Acquire);
     Box::new(move || {
         let (ctx, parent_ctx) = (ctx, parent_ctx);
         // SAFETY: the powerbox is freed exactly once, here, by the task that owned it.
@@ -317,6 +327,12 @@ unsafe fn granted_teardown(
             // the parent host it was registered with.
             let give: crate::LaneGiver = unsafe { core::mem::transmute(lane_give) };
             unsafe { give(parent_ctx.0, lane) };
+        }
+        if let (Some((budget, bytes)), true) = (window, mem_give != 0) {
+            // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`, over the
+            // parent host it was registered with.
+            let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(mem_give) };
+            unsafe { give(parent_ctx.0, budget, bytes) };
         }
     })
 }
@@ -347,7 +363,7 @@ unsafe fn file_granted_carve_task(
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, -1);
+    let teardown = granted_teardown(rt, release, gc.ctx, -1, None);
     match file_carve_task(
         rt,
         code,
@@ -502,6 +518,8 @@ pub(crate) struct Nursery {
     grant_premap_admit: std::sync::atomic::AtomicUsize,
     grant_premap_stage: std::sync::atomic::AtomicUsize,
     grant_premap_apply: std::sync::atomic::AtomicUsize,
+    /// #1854 — the installed child [`crate::HighWater`] (0 = none).
+    grant_high_water: std::sync::atomic::AtomicUsize,
     /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
     grant_budget_take: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
@@ -598,6 +616,7 @@ impl Nursery {
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
+            grant_high_water: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
@@ -658,6 +677,10 @@ impl Nursery {
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
+        self.grant_high_water.store(
+            hooks.map_or(0, |h| h.high_water as usize),
+            Ordering::Release,
+        );
         self.grant_register_serve.store(rs, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
@@ -672,6 +695,18 @@ impl Nursery {
     /// so it must be given the shape its own family was built for.
     fn grant_ctx(&self) -> *mut core::ffi::c_void {
         self.grant_parent_ctx.load(Ordering::Acquire) as *mut core::ffi::c_void
+    }
+
+    /// #1854 — the installed child [`crate::HighWater`] over child powerbox `ctx`, for its freeze cell.
+    fn child_high_water(&self, ctx: *mut core::ffi::c_void) -> Option<(crate::HighWater, usize)> {
+        match self.grant_high_water.load(Ordering::Acquire) {
+            0 => None,
+            // SAFETY: a nonzero value is a `HighWater` stored by `set_grant_hooks`.
+            f => Some((
+                unsafe { core::mem::transmute::<usize, crate::HighWater>(f) },
+                ctx as usize,
+            )),
+        }
     }
 
     /// D66 — the lane chain a **plain** carve child (op 0/5) is gated on: its parent's lane alone.
@@ -943,7 +978,7 @@ impl Nursery {
         let n_results = funcs.get(entry as usize).map_or(1, |f| f.results.len());
         let code = std::sync::Arc::new(code);
         register_serve(self, gc.ctx, &code);
-        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap);
+        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, None);
         let thaw_off = shadow.thaw_state_off(0) as usize;
         let filed = file_task(
             self,
@@ -973,7 +1008,13 @@ impl Nursery {
             gc.retained_ctx as usize,
             teardown,
             Some(slot),
-            Some(DurableCell::new(shadow, entry, mapped_log2, reserved_log2)),
+            Some(DurableCell::new(
+                shadow,
+                entry,
+                mapped_log2,
+                reserved_log2,
+                self.child_high_water(gc.retained_ctx),
+            )),
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -1040,6 +1081,25 @@ impl Nursery {
             let (funcs, types) = self.self_program(self_prog);
             return Some((funcs, types, None, &[], self.shadow));
         }
+        self.resolve_granted(module, trap_out)
+    }
+
+    /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) — including
+    /// `SELF_MODULE` (`-1`), which the host resolves to the running module *with* its data segments
+    /// and declared memory. A detached child needs those (its window is fresh), where a carve child
+    /// of `-1` runs over the parent's bytes and takes only [`Self::self_program`] (#1863).
+    #[allow(clippy::type_complexity)]
+    unsafe fn resolve_granted(
+        &self,
+        module: i64,
+        trap_out: *mut i64,
+    ) -> Option<(
+        &[Func],
+        &[TypeEntry],
+        Option<i32>,
+        &[Data],
+        temen_ir::durable_abi::ShadowArena,
+    )> {
         let Some(resolver) = self.resolve_module else {
             *trap_out = TrapKind::CapFault as i64;
             return None;
@@ -1591,15 +1651,30 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     // #826: `mem_size` is the reserved span, so a record in a `map`-grown tail page is read where
     // the interpreter's live page map reads it; a record on a still-uncommitted page faults the
     // copy below through the SIGSEGV guard (`MemoryFault`), exactly like a guest load.
-    if rp.checked_add(56).is_none_or(|e| e > mem_size) {
-        *trap_out = TrapKind::MemoryFault as i64;
-        return 0;
-    }
     let base = (mem_base + rp) as *const u8;
-    // Copy the 56 bytes out of the guest window once, then share the layout decode with the two
-    // interpreter tiers (#911). `parse` returns `None` on a nonzero version word — fail closed.
-    let mut buf = [0u8; 56];
-    core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), 56);
+    let read = |len: usize, trap_out: *mut i64| -> Option<Vec<u8>> {
+        if rp.checked_add(len as u64).is_none_or(|e| e > mem_size) {
+            *trap_out = TrapKind::MemoryFault as i64;
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), len);
+        Some(buf)
+    };
+    // Copy the record out of the guest window, then share the layout decode with the two
+    // interpreter tiers (#911): the version word says its length (v0 carve, v1 detached); an
+    // unknown version or a nonzero reserved field fails closed.
+    let Some(head) = read(56, trap_out) else {
+        return 0;
+    };
+    let head: &[u8; 56] = head.as_slice().try_into().expect("56 bytes");
+    let Some(len) = SpawnRec::len_for(head) else {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    };
+    let Some(buf) = read(len, trap_out) else {
+        return 0;
+    };
     let sr = match SpawnRec::parse(&buf) {
         Some(s) => s,
         None => {
@@ -1607,6 +1682,33 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
             return 0;
         }
     };
+    if sr.detached {
+        // #1863: a v1 record is op 15 as data — the op-15 thunk spawns it. No pager on this tier
+        // (the v0 rule below).
+        if sr.pager != u32::MAX {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+        return instantiate_detached(
+            rt,
+            self_prog,
+            mem_base,
+            mem_size,
+            handle,
+            sr.budget as i64,
+            sr.modh as i64,
+            sr.grants_ptr as i64,
+            sr.grants_n as i64,
+            sr.entry as i64,
+            sr.size_log2,
+            sr.quota,
+            sr.args.0 as i64,
+            sr.args.1 as i64,
+            sr.region as i64,
+            sr.child_off as i64,
+            trap_out,
+        );
+    }
     let entry = sr.entry as i64;
     let off = sr.off as i64;
     let size_log2 = sr.size_log2;
@@ -1959,7 +2061,7 @@ unsafe fn spawn_detached_child(
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap);
+    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some((budget, child_size)));
     let premap_ctx = SendRaw(gc.ctx);
     let filed = file_task(
         rt,
@@ -2006,7 +2108,15 @@ unsafe fn spawn_detached_child(
         gc.retained_ctx as usize,
         teardown,
         None,
-        durable.map(|a| DurableCell::new(a, entry, mapped_log2, reserved_log2)),
+        durable.map(|a| {
+            DurableCell::new(
+                a,
+                entry,
+                mapped_log2,
+                reserved_log2,
+                rt.child_high_water(gc.retained_ctx),
+            )
+        }),
     );
     match filed {
         Filed::Slot(slot) => slot,
@@ -2015,17 +2125,10 @@ unsafe fn spawn_detached_child(
             0
         }
         // The child never ran (a refused pre-map alias or task stack) — the one refusal on this
-        // path that happens *after* `budget_mem_take` committed, so un-spend the window bytes
-        // (#1587) and answer `-EINVAL` like every other admission failure (INVARIANTS #5).
-        Filed::Refused => {
-            let give_addr = rt.grant_budget_mem_give.load(Ordering::Acquire);
-            if give_addr != 0 {
-                // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`.
-                let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(give_addr) };
-                unsafe { give(rt.grant_ctx(), budget, child_size) };
-            }
-            EINVAL as i32
-        }
+        // path that happens *after* `budget_mem_take` committed. Its teardown already ran, and that
+        // un-spent the window bytes (#1587), so answer `-EINVAL` like every other admission failure
+        // (INVARIANTS #5).
+        Filed::Refused => EINVAL as i32,
     }
 }
 
@@ -2080,7 +2183,7 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_detached(
     rt: *const Nursery,
-    self_prog: i64,
+    _self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -2125,11 +2228,12 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         return 0;
     }
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, self_prog, trap_out)
+        rt.resolve_granted(module, trap_out)
     else {
         return 0;
     };
     let entry = entry as u64;
+    let size_log2 = temen_ir::detached_size_log2(size_log2, mod_mem.map(|m| m as u8));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {

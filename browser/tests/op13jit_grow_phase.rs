@@ -10,9 +10,9 @@
 //! This pins the *scale* the pre-size blocked: a child declaring 1 MiB grows to the full 256 MiB carve
 //! in four `vm_map`s and touches the deepest page of every grown chunk. The wasmi driver plays
 //! `driveJitRun` (`env.call_interp` → `run_cross_tier`, re-pointing `"mapped"` after each bounce); the
-//! oracle is `new_confined_child_grow_over_host` over the same carve — the exact constructor the op-13
-//! step's interpreter fallback uses. Value parity, four bounces, and a `"mapped"` high-water at the whole
-//! carve are the non-vacuity proof.
+//! oracle is `new_confined_child_grow` over the same carve — the committed-declared, carve-growing
+//! window the op-13 step's interpreter fallback starts its child over. Value parity, four bounces, and a
+//! `"mapped"` high-water at the whole carve are the non-vacuity proof.
 
 use std::sync::Arc;
 
@@ -82,7 +82,7 @@ fn build() -> temen_ir::Module {
 }
 
 /// The interpreter oracle: the child as a **growable** confined child over the carve — declared `DECL`
-/// committed, `vm_map`-growing into `1 << CARVE` — via the constructor the op-13 step's fallback uses.
+/// committed, `vm_map`-growing into `1 << CARVE` — the window the op-13 step's fallback starts it over.
 fn oracle(m: &temen_ir::Module) -> i64 {
     let prog = bytecode::VcpuProgram::compile(m).expect("compile");
     let carve = 1usize << CARVE;
@@ -93,7 +93,7 @@ fn oracle(m: &temen_ir::Module) -> i64 {
     // SAFETY: `base` is `carve` valid bytes, exclusively this child's window, freed only after the vCPU.
     let back = Arc::new(unsafe { Region::shared(base, carve as u64) });
     let out = {
-        let mut vcpu = bytecode::Vcpu::new_confined_child_grow_over_host(
+        let mut vcpu = bytecode::Vcpu::new_confined_child_grow(
             &prog,
             0,
             0,
@@ -101,7 +101,6 @@ fn oracle(m: &temen_ir::Module) -> i64 {
             DECL,
             CARVE,
             u64::MAX,
-            Host::new(),
         )
         .expect("growable confined child builds");
         match vcpu.run() {

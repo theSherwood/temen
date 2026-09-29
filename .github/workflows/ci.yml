@@ -1059,6 +1059,12 @@ jobs:
           # differential plays the driver's role; this is the shipped `driveCoopTierupRun`, the only
           # place the post-bounce `"win"` fan-out over a relocating backing is exercised).
           node browser-coop-grow-test.mjs
+          # #1896: a process tree's leaf processes run whole on the emitted tier through the REAL JS
+          # driver (`temen_nim_open` + `driveCoopTierupRun`): a leaf child tiers up at its entry, as a
+          # program of its own; one that protects a page tiers up page-checked; one holding a pipe
+          # runs interpreted — and each tree ends as it does interpreted. The native pin is
+          # `temen-posix/tests/leaf_tierup.rs`.
+          node browser-nim-leaf-test.mjs
           # #1233: the Forth kernel on the cooperative tier through the REAL JS driver — its outer
           # interpreter tiers up and defines/dispatches §22 words from the emitted frame (a mid-bounce
           # install + the by-slot unit fetch), byte-identical to the interpreter; thread words pin the

@@ -427,6 +427,14 @@ pub mod durable_abi {
     pub const SVC_POLL_OP: u32 = 9;
     pub const SVC_WAIT_OP: u32 = 10;
 
+    /// Whether a host call `(type_id, op)` is a **serve op** (`svc.poll` / `svc.wait`): the one host
+    /// call the durable transform re-issues unconditionally on thaw (§13.4 slice 4b) rather than
+    /// modelling as a leaf whose result reloads. The one definition the transform, the import
+    /// binding and a landing freeze's abandon all ask.
+    pub const fn is_serve_op(type_id: u32, op: u32) -> bool {
+        type_id == crate::CAP_SELF_TYPE_ID && matches!(op, SVC_POLL_OP | SVC_WAIT_OP)
+    }
+
     /// End of the **always-live** durable control words: the state word, shadow-SP and arm
     /// countdowns occupy `[guard, guard+32)` and are polled at every safepoint, so their offsets
     /// are fixed ABI; `[guard+32, guard+64)` is the powerbox heap words and empty argv/envp, which a
@@ -537,27 +545,48 @@ pub mod durable_abi {
     }
 }
 
-/// The **op-17 spawn config record** (CONSOLIDATION.md §3/§3c/§3d): the fixed 56-byte little-endian
-/// layout that every `instantiate_rec` driver decodes — the tree-walker's op-17 arm, the bytecode
-/// tier's `Op::InstantiateRec`, and the Cranelift `instantiate_rec` thunk. One record subsumes every
-/// §14 spawn shape as data (module / entry / carve / pager / budget / quota / named-grant list).
-/// Hoisted here (temen-ir is the common dependency of all three) so the byte layout has **one**
-/// definition instead of three hand-decoded copies (#911). Only the *field extraction* is shared:
-/// each tier keeps its own pager / budget / grant handling and error order — they diverge by design
-/// (see the call sites), so this decodes the fields and validates nothing beyond the version word.
+/// The **op-17 spawn config record** (CONSOLIDATION.md §3/§3c/§3d): the little-endian layout every
+/// `instantiate_rec` driver decodes — the tree-walker's op-17 arm, the bytecode tier's
+/// `Op::InstantiateRec`, and the Cranelift `instantiate_rec` thunk. One record subsumes every §14
+/// spawn shape as data. Hoisted here (temen-ir is the common dependency of all three) so the byte
+/// layout has **one** definition instead of three hand-decoded copies (#911). Only the *field
+/// extraction* is shared: each tier keeps its own pager / budget / grant handling and error order.
+///
+/// **Two versions while the carve placement retires** (INVARIANTS #13 ruling 2026-09-29; #1863) —
+/// the version word is that migration's scaffolding, removed with the carve path (#1867):
+///
+/// | off | field | v0 (legacy carve, 56 B) | v1 (detached, [`SPAWN_REC_LEN`] = 88 B) |
+/// |---|---|---|---|
+/// | 0 | `u32` version | 0 | 1 |
+/// | 4 | `u32` entry | entry | entry |
+/// | 8 | `u64` off | carve offset | reserved, must be 0 |
+/// | 16 | `u32` size_log2 | carve size | the child's own window |
+/// | 20 | `u32` pager | impl export / `u32::MAX` | same |
+/// | 24 | `i32` module | handle / `-1` self | same |
+/// | 28 | `i32` budget | `Budget` handle / 0 (funds the child; excludes `quota`) | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
+/// | 32 | `i64` quota | raw fuel | raw fuel |
+/// | 40, 48 | `u64` grants ptr, count | named-grant list | same |
+/// | 56, 64 | `u64` args ptr, len | — | spawn-time args payload (len 0 = none) |
+/// | 72 | `i32` region | — | pre-mapped `SharedRegion` (−1 = none) |
+/// | 76 | `u32` | — | reserved, must be 0 |
+/// | 80 | `u64` child_off | — | where the region maps in the child |
+///
+/// A v1 record is op 15 (`instantiate_detached`) as data: every tier routes it to its op-15 path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
+    /// `true` for a v1 (detached) record.
+    pub detached: bool,
     /// Child entry function index (record offset 4).
     pub entry: u32,
-    /// Carve window offset within the parent's address space (offset 8).
+    /// v0: carve window offset within the parent's address space (offset 8). v1: always 0.
     pub off: u64,
-    /// Carve size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
+    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
     pub size_log2: i64,
     /// Pager impl-export index, or `u32::MAX` for none (offset 20).
     pub pager: u32,
     /// `Module` handle, or `-1` for self (offset 24).
     pub modh: i32,
-    /// `Budget` handle, or `0` for none — mutually exclusive with a nonzero `quota` (offset 28).
+    /// `Budget` handle, or `0` for none (offset 28) — see the table for its per-version meaning.
     pub budget: i32,
     /// Raw fuel quota (offset 32).
     pub quota: i64,
@@ -565,19 +594,46 @@ pub struct SpawnRec {
     pub grants_ptr: u64,
     /// Named-grant list count (offset 48).
     pub grants_n: u64,
+    /// v1: the spawn-time args payload `(ptr, len)` (offsets 56, 64); `(0, 0)` in v0.
+    pub args: (u64, u64),
+    /// v1: the pre-mapped region handle (offset 72), `-1` for none (always `-1` in v0).
+    pub region: i32,
+    /// v1: the region's offset in the child's window (offset 80).
+    pub child_off: u64,
 }
 
+/// The byte length of a v1 (detached) [`SpawnRec`]; a v0 record is its first 56 bytes.
+pub const SPAWN_REC_LEN: usize = 88;
+
 impl SpawnRec {
-    /// Decode the 56-byte record. `None` when the `version` word (offset 0) is nonzero — every
-    /// driver fails that closed. Pure layout decode: no handle/window/geometry validation, all of
-    /// which stays tier-local.
-    pub fn parse(rec: &[u8; 56]) -> Option<SpawnRec> {
+    /// The version word of a record whose first 56 bytes are `head` — how many bytes a driver must
+    /// read: 56 for version 0, [`SPAWN_REC_LEN`] for version 1. `None` for any other version (fail
+    /// closed).
+    pub fn len_for(head: &[u8; 56]) -> Option<usize> {
+        match u32::from_le_bytes([head[0], head[1], head[2], head[3]]) {
+            0 => Some(56),
+            1 => Some(SPAWN_REC_LEN),
+            _ => None,
+        }
+    }
+
+    /// Decode a record of exactly [`Self::len_for`] bytes. `None` on an unknown version, a length
+    /// that disagrees with it, or a v1 record whose reserved fields (`off`, offset 76) are nonzero
+    /// — every driver fails that closed. Pure layout decode: no handle/window/geometry validation,
+    /// all of which stays tier-local.
+    pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
+        let head: &[u8; 56] = rec.get(..56)?.try_into().ok()?;
+        if Self::len_for(head)? != rec.len() {
+            return None;
+        }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        if u32_at(0) != 0 {
-            return None; // version — fail closed
+        let detached = rec.len() == SPAWN_REC_LEN;
+        if detached && (u64_at(8) != 0 || u32_at(76) != 0) {
+            return None;
         }
         Some(SpawnRec {
+            detached,
             entry: u32_at(4),
             off: u64_at(8),
             size_log2: u32_at(16) as i64,
@@ -587,6 +643,13 @@ impl SpawnRec {
             quota: u64_at(32) as i64,
             grants_ptr: u64_at(40),
             grants_n: u64_at(48),
+            args: if detached {
+                (u64_at(56), u64_at(64))
+            } else {
+                (0, 0)
+            },
+            region: if detached { u32_at(72) as i32 } else { -1 },
+            child_off: if detached { u64_at(80) } else { 0 },
         })
     }
 }
@@ -3538,18 +3601,30 @@ impl Func {
         })
     }
 
-    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`).
+    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`)
+    /// or `instantiate_rec` (`call.cap 6 17` — the one spawn form, placed detached, #1863).
     /// See [`Module::spawns_detached`].
     pub fn spawns_detached(&self) -> bool {
+        self.issues_instantiator(&[15, 17])
+    }
+
+    /// Whether this function issues op 15, whose module operand must be a `Module` handle. See
+    /// [`spawns_by_module_handle`].
+    pub fn spawns_by_module_handle(&self) -> bool {
+        self.issues_instantiator(&[15])
+    }
+
+    /// Whether this function issues a static `Instantiator` op among `ops`.
+    fn issues_instantiator(&self, ops: &[u32]) -> bool {
         self.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
                     Inst::CapCall {
                         type_id: cap_id::INSTANTIATOR,
-                        op: 15,
+                        op,
                         ..
-                    }
+                    } if ops.contains(op)
                 )
             })
         })
@@ -3713,6 +3788,25 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// a powerbox a warm snapshot can freeze.
 pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
+}
+
+/// The window a detached spawn asks for, `log2`: `0` means "the module's declared window" (owner,
+/// 2026-09-29) — a spawner holding a module it did not build cannot know that size. Any other value
+/// is passed through, and every tier still refuses it unless it equals the declared memory (§14
+/// transparency). The one reading every tier's detached admission applies.
+pub fn detached_size_log2(requested: i64, declared: Option<u8>) -> i64 {
+    match (requested, declared) {
+        (0, Some(d)) => d as i64,
+        _ => requested,
+    }
+}
+
+/// Whether `module` issues op 15 (`instantiate_detached`), whose module operand must be a `Module`
+/// handle — the one spawn a by-name `"module"` grant serves. The op-17 record names the spawner's own
+/// program as `-1`, so an op-17-only guest is granted its `"budget"` alone, and keeps a powerbox a
+/// warm snapshot can freeze (a `Module` grant is non-durable).
+pub fn spawns_by_module_handle(module: &Module) -> bool {
+    module.funcs.iter().any(Func::spawns_by_module_handle)
 }
 
 /// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle),

@@ -571,10 +571,35 @@ struct MemFile {
     mtime: i64,
 }
 
+/// What a registered command runs.
+#[derive(Clone)]
+enum Command {
+    /// A granted command `Module`: its handle and its declared window.
+    Module { handle: i32, win_log2: u8 },
+    /// A command the embedder implements natively ([`Posix::register_host_command`]).
+    Host(HostCommand),
+}
+
+/// A command the embedder implements natively ([`Posix::register_host_command`]). A process that
+/// execs it runs it to completion over the files that process sees, then exits with the status it
+/// returns, as `exit` would. It gets the arguments the `execve` passed, `argv[0]` first. It runs
+/// inside that `execve`, holding the personality's state, so no other process's op is served until
+/// it returns.
+pub type HostCommand = Arc<dyn Fn(&[String], &mut dyn CommandFiles) -> i32 + Send + Sync>;
+
+/// The files a [`HostCommand`] reaches: the memfs, a relative path resolved against the working
+/// directory of the process that ran it.
+pub trait CommandFiles {
+    fn read(&mut self, path: &str) -> Option<Vec<u8>>;
+    fn write(&mut self, path: &str, bytes: &[u8]) -> bool;
+}
+
 /// What an `execve` path resolves to ([`Ctx::resolve_exec_path`]).
 enum ExecTarget {
     /// A registered command: the granted `Module` handle the registry names it by.
     Command(i32),
+    /// A command the embedder implements natively.
+    Host(HostCommand),
     /// #763 — a program the process built: the bytes of a memfs file holding a runnable module's
     /// encoding, which the engine promotes through the process's `ModuleLoader`
     /// ([`temen_interp::ExecCmd::Staged`]).
@@ -1006,11 +1031,12 @@ struct World {
     /// A pinned clock value (`Some(nanos)`) for determinism: when set, `clock(_)` returns it verbatim
     /// so a differential run is reproducible. `None` reads the real host clock.
     clock_fixed: Option<i64>,
-    /// The **PATH registry** (STAGE1.md §5): command name → `(granted Module handle, declared window
-    /// size_log2)`. `exec_lookup` returns the handle; `exec_win` the size_log2 (so the shell carves each
+    /// The **PATH registry** (STAGE1.md §5): command name → what it runs ([`Command`]).
+    /// `exec_lookup` returns a module's handle; `exec_win` its size_log2 (so the shell carves each
     /// spawn to the command's own window). The embedder seeds it with [`Posix::register_command`] after
-    /// granting each command `Module`. A plain `Vec` (a shell's PATH is short); first match wins.
-    commands: Vec<(String, i32, u8)>,
+    /// granting each command `Module`, or [`Posix::register_host_command`]. A plain `Vec` (a shell's
+    /// PATH is short); first match wins.
+    commands: Vec<(String, Command)>,
     /// #801 — paths registered as **executables** ([`Posix::register_executable`]): the exec-bit
     /// set `stat` consults (mode `0o755` vs a plain file's `0o644`) and the `exec_resolve` gate
     /// (a memfs file outside this set is `-EACCES`).
@@ -1073,6 +1099,25 @@ struct World {
 }
 
 impl World {
+    /// Register `name` in the PATH registry. A later registration of the same name shadows the
+    /// earlier (last wins), matching a `PATH` re-export.
+    fn register(&mut self, name: &str, command: Command) {
+        self.commands.retain(|(n, _)| n != name);
+        self.commands.push((name.to_string(), command));
+    }
+
+    /// Register `path` as a filesystem executable running `command` ([`Posix::register_executable`]):
+    /// the registry entry, a marker file at the path so `stat`/`glob`/`open` see a real file, and
+    /// the exec bit. The path is [`rooted`], as a file seed's is.
+    fn register_executable(&mut self, path: &str, command: Command) {
+        let path = rooted(path);
+        self.register(&path, command);
+        self.executables.insert(path.clone());
+        if !self.files.contains_key(&path) {
+            self.file_put(path, b"\x7fTEMEN".to_vec());
+        }
+    }
+
     /// Replace `path`'s contents, stamping it with the next tick of the write clock. Creating a
     /// file and truncating one are both writes, so both come here.
     fn file_put(&mut self, path: String, bytes: Vec<u8>) {
@@ -1337,6 +1382,25 @@ struct Ctx<'a> {
     wake_after: Vec<Arc<dyn Fn() + Send + Sync>>,
 }
 
+/// The files a [`HostCommand`] sees: the memfs, as the process that ran it does.
+struct ProcessFiles<'c, 'a>(&'c mut Ctx<'a>);
+
+impl CommandFiles for ProcessFiles<'_, '_> {
+    fn read(&mut self, path: &str) -> Option<Vec<u8>> {
+        let file = self.0.resolve(path);
+        self.0.w.files.get(&file).map(|f| f.bytes.clone())
+    }
+
+    fn write(&mut self, path: &str, bytes: &[u8]) -> bool {
+        let file = self.0.resolve(path);
+        if self.0.is_dir(&file) {
+            return false;
+        }
+        self.0.w.file_put(file, bytes.to_vec());
+        true
+    }
+}
+
 /// A handle to a granted POSIX personality's state — read the captured output after a run, stage
 /// the memfs/env, raise embedder signals. Cheap to clone (shares the `Arc`s). #863: holds the
 /// shared [`World`] plus the **root process's** [`Proc`] — the proc-side setters (`set_env`,
@@ -1427,6 +1491,17 @@ impl Posix {
         let mut names: Vec<String> = st.files.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Every memfs path, in the order its contents were last written: the order of the `st_mtim`
+    /// stamps the write clock gives them. A build tool's freshness check compares those stamps, so
+    /// an embedder that saves a build's outputs and seeds them into a later memfs, after the sources
+    /// they were made from and in this order, seeds outputs the tool finds up to date.
+    pub fn file_names_by_write(&self) -> Vec<String> {
+        let st = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut files: Vec<(i64, &String)> = st.files.iter().map(|(k, f)| (f.mtime, k)).collect();
+        files.sort();
+        files.into_iter().map(|(_, k)| k.clone()).collect()
     }
 
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
@@ -1671,10 +1746,14 @@ impl Posix {
     /// shell's `exec_lookup(name)` returns it (or `-1` when absent). A later registration of the same
     /// name shadows the earlier (last wins), matching a `PATH` re-export.
     pub fn register_command(&self, name: &str, module_handle: i32, win_log2: u8) {
-        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
-        st.commands.retain(|(n, _, _)| n != name);
-        st.commands
-            .push((name.to_string(), module_handle, win_log2));
+        let command = Command::Module {
+            handle: module_handle,
+            win_log2,
+        };
+        self.world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(name, command);
     }
 
     /// #801 — register a **filesystem executable**: `path → module_handle` in the same registry
@@ -1686,13 +1765,27 @@ impl Posix {
     /// [`rooted`], as a file seed's is: an executable is a file, and an `execve` finds it where
     /// every file op finds a file.
     pub fn register_executable(&self, path: &str, module_handle: i32, win_log2: u8) {
-        let path = rooted(path);
-        self.register_command(&path, module_handle, win_log2);
-        let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
-        st.executables.insert(path.clone());
-        if !st.files.contains_key(&path) {
-            st.file_put(path, b"\x7fTEMEN".to_vec());
-        }
+        let command = Command::Module {
+            handle: module_handle,
+            win_log2,
+        };
+        self.world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_executable(path, command);
+    }
+
+    /// Register a filesystem executable the embedder implements natively ([`HostCommand`]), with the
+    /// presentation [`Self::register_executable`] gives a module: a file at `path` with the exec
+    /// bit. A process that execs `path` runs `command` instead of replacing its image. It suits a
+    /// command whose implementation the embedder already carries, so that running it as a guest
+    /// would only interpret code the host could run: the self-hosted nim toolchain's `temen-link`
+    /// is `temen_leng::link_command` either way (#958).
+    pub fn register_host_command(&self, path: &str, command: HostCommand) {
+        self.world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_executable(path, Command::Host(command));
     }
 
     /// Set the `Stream` handle the shell re-grants to a spawned child as its `"stdout"` — what
@@ -1980,8 +2073,49 @@ pub fn bind_with_fork(
 /// proc-only lock, never the world — see [`World`]'s lock order) and returns the next deliverable
 /// handler, keeping POSIX signal *policy* (dispositions, mask, pending) inside this personality
 /// while the interp only performs the *mechanism* (the safepoint redirect, invariant 4). #863: one
-/// door per process — a fork twin's door locks the twin's `Proc`, so its signals are its own.
-struct SignalDoor(Arc<Mutex<Proc>>);
+/// door per process — a fork twin's door locks the twin's `Proc`, so its signals are its own. It holds
+/// the shared [`World`] too, which only [`SignalSource::import_parks`] reads — at an exec, where no
+/// personality lock is held, taking the world before the process as every op does (#1896).
+struct SignalDoor(Arc<Mutex<Proc>>, Arc<Mutex<World>>);
+
+/// #1896 — the ops that never park a process, whatever it holds: the file, directory, environment
+/// and identity ops. [`SignalDoor::import_parks`] answers `read`/`write` by what the process holds,
+/// and every op not here — a `fork`, a `wait`, a pipe, a signal, job control, a terminal — may park.
+const NEVER_PARKS: &[u32] = &[
+    OP_MALLOC,
+    OP_FREE,
+    OP_EXIT,
+    OP_OPEN,
+    OP_CLOSE,
+    OP_LSEEK,
+    OP_UNLINK,
+    OP_GETCWD,
+    OP_CHDIR,
+    OP_GETENV,
+    OP_SETENV,
+    OP_STAT,
+    OP_OPENDIR,
+    OP_READDIR,
+    OP_CLOSEDIR,
+    OP_ARGC,
+    OP_ARGV,
+    OP_DUP2,
+    OP_DUP,
+    OP_FCNTL,
+    OP_CLOCK,
+    OP_GETENV_R,
+    OP_UNSETENV,
+    OP_ENVIRON,
+    OP_MKDIR,
+    OP_RENAME,
+    OP_RMDIR,
+    OP_GETPID,
+    OP_GETPGID,
+    OP_ISATTY,
+    OP_GETPPID,
+    OP_FSTAT,
+    OP_STATP,
+];
 
 impl SignalSource for SignalDoor {
     fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
@@ -2093,6 +2227,29 @@ impl SignalSource for SignalDoor {
             .clone()
     }
 
+    /// #1896 — whether this personality's op `import` can park the process. The ops in
+    /// [`NEVER_PARKS`] never do; a `read` or `write` does when the process holds something it could
+    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. `None` for an
+    /// import that is not this personality's.
+    fn import_parks(&self, import: &str) -> Option<bool> {
+        let op = resolve_import(import)?.op;
+        if op != OP_READ && op != OP_WRITE {
+            return Some(!NEVER_PARKS.contains(&op));
+        }
+        let terminal = self
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .is_some();
+        let p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Some(p.fds.iter().flatten().any(|f| match f {
+            FdEntry::File(_) => false,
+            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => terminal,
+            _ => true,
+        }))
+    }
+
     /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
     /// interrupt want the blocking call restarted?
     fn syscall_restart(&self) -> bool {
@@ -2199,7 +2356,10 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
         .unwrap_or_else(|e| e.into_inner())
         .sig_armed
         .clone();
-    host.set_signal_source(Arc::new(SignalDoor(Arc::clone(&root))), armed);
+    host.set_signal_source(
+        Arc::new(SignalDoor(Arc::clone(&root), Arc::clone(&world))),
+        armed,
+    );
     // FORK.md PR 5 / #863 — grant **forkable**: the factory clones the per-process side by POSIX's
     // rules ([`Proc::fork`]) and shares the [`World`], so a `fork()` twin gets its own fd table /
     // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
@@ -2376,7 +2536,10 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         });
         ForkedProc {
             handler: handler(Arc::clone(&world), Arc::clone(&child)),
-            signal: Some((Arc::new(SignalDoor(Arc::clone(&child))), armed)),
+            signal: Some((
+                Arc::new(SignalDoor(Arc::clone(&child), Arc::clone(&world))),
+                armed,
+            )),
             refork: Some(fork_factory(Arc::clone(&world), Arc::clone(&child))),
             exit: Some(exit),
             exec_remap: Some(exec_remap_hook(child)),
@@ -2452,7 +2615,13 @@ pub fn cap_signal_source(
         .unwrap_or_else(|e| e.into_inner())
         .sig_armed
         .clone();
-    (Arc::new(SignalDoor(Arc::clone(&posix.root))), armed)
+    (
+        Arc::new(SignalDoor(
+            Arc::clone(&posix.root),
+            Arc::clone(&posix.world),
+        )),
+        armed,
+    )
 }
 
 /// The #972 **exec-remap hook** over an existing personality's root process (see
@@ -5010,13 +5179,11 @@ impl Ctx<'_> {
         let Ok(name) = std::str::from_utf8(&bytes) else {
             return Ok(vec![-1]);
         };
-        let h = self
-            .w
-            .commands
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, h, _)| *h as i64)
-            .unwrap_or(-1);
+        // A host command has no module to spawn: to this route it is not there.
+        let h = match self.w.commands.iter().find(|(n, _)| n == name) {
+            Some((_, Command::Module { handle, .. })) => *handle as i64,
+            _ => -1,
+        };
         Ok(vec![h])
     }
 
@@ -5042,7 +5209,8 @@ impl Ctx<'_> {
             // A built program has no handle to report: a guest that drives `__vm_exec_module`
             // itself promotes it through its own `ModuleLoader` (`from_bytes`). No exec follows
             // this answer, so the re-base the resolve stashed goes too.
-            Ok((ExecTarget::Image(_), _)) => {
+            // Nor has a host command, which only an `execve` runs.
+            Ok((ExecTarget::Image(_) | ExecTarget::Host(_), _)) => {
                 self.p.pending_exec_heap = None;
                 EACCES
             }
@@ -5064,13 +5232,17 @@ impl Ctx<'_> {
     /// resolved against the cwd.
     fn resolve_exec_path(&mut self, path: &str) -> Result<(ExecTarget, u8), i64> {
         let file = self.resolve(path);
-        let found = if let Some((_, h, wl)) = self
+        let registered = self
             .w
             .commands
             .iter()
-            .find(|(n, _, _)| *n == file && self.w.executables.contains(&file))
-        {
-            (ExecTarget::Command(*h), *wl)
+            .find(|(n, _)| *n == file && self.w.executables.contains(&file));
+        let found = if let Some((_, command)) = registered {
+            match command {
+                Command::Module { handle, win_log2 } => (ExecTarget::Command(*handle), *win_log2),
+                // No image, so no heap to re-base.
+                Command::Host(run) => return Ok((ExecTarget::Host(Arc::clone(run)), 0)),
+            }
         } else if let Some(f) = self.w.files.get(&file) {
             let wl = temen_encode::module_window_log2(&f.bytes).ok_or(EACCES)?;
             (ExecTarget::Image(f.bytes.as_slice().into()), wl)
@@ -5134,6 +5306,19 @@ impl Ctx<'_> {
             Ok(v) => v,
             Err(e) => return Ok(vec![e]),
         };
+        // A host command runs here, to completion, and the process exits with its status: what an
+        // image-replace with the command would come to, with no image to replace.
+        if let ExecTarget::Host(run) = target {
+            let Some(argv) = read_guest_cstr_vec(mem, argv_ptr) else {
+                return Ok(vec![EFAULT]);
+            };
+            let argv: Vec<String> = argv
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            let status = run(&argv, &mut ProcessFiles(self));
+            return Err(Trap::Exit(status));
+        }
         // The §14 window ceiling, checked and refused rather than truncated: the image-replace
         // reuses THIS window, so a command declaring more memory than the caller has cannot run
         // here. `window_size` is the documented bound `exec_module` admits against; the core
@@ -5190,6 +5375,7 @@ impl Ctx<'_> {
                 self.p.pending_exec_image = Some(bytes);
                 temen_interp::ExecCmd::Staged
             }
+            ExecTarget::Host(_) => unreachable!("a host command ran above"),
         };
         req(temen_interp::ParkEvent::ExecSelf { cmd });
         Ok(vec![ENOSYS])
@@ -5204,8 +5390,13 @@ impl Ctx<'_> {
             .w
             .commands
             .iter()
-            .find(|(_, h, _)| *h == handle)
-            .map(|(_, _, w)| *w as i64)
+            .find_map(|(_, c)| match c {
+                Command::Module {
+                    handle: h,
+                    win_log2,
+                } if *h == handle => Some(*win_log2 as i64),
+                _ => None,
+            })
             .unwrap_or(-1);
         Ok(vec![wl])
     }
@@ -7971,6 +8162,23 @@ block 0 (vph: i32) {\n\
         assert!(
             mtime!("/src.nim") > out,
             "an edited source outruns the artifact built from the old one"
+        );
+    }
+
+    /// The memfs lists its files in the order their contents were last written, which is the order
+    /// their `st_mtim` stamps compare in, not the order of their names.
+    #[test]
+    fn files_list_in_the_order_they_were_last_written() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/b.nim", b"1");
+        posix.write_file("/a.p.nif", b"2");
+        posix.write_file("/c.s.nif", b"3");
+        posix.write_file("/b.nim", b"4");
+        assert_eq!(
+            posix.file_names_by_write(),
+            ["/a.p.nif", "/c.s.nif", "/b.nim"],
+            "a rewrite moves a file to the end"
         );
     }
 

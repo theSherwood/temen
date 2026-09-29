@@ -1,9 +1,9 @@
-//! **#1025 slice 3c — the memfs-I/O link phase, run as a confined op-13 §14 child.** The connective
+//! **#1025 slice 3c — the memfs-I/O link phase, run as a confined §14 child.** The connective
 //! phase that lets the driver guest fan out `… → hexer → link` through one shared store: unlike
 //! `nim_link_guest` (a top-level powerbox over stdin/stdout — its input can't be a host-seeded stream
 //! when a driver produces it at runtime), this is built `--child-entry` and hands off through the
-//! **memfs**. A driver op-13-spawns it with `{fs}` re-granted and argv `link <in.x.nif> <out.temen>
-//! <stem>` seeded in its carve; it reads the hexer Leng `.x.nif`, links it with
+//! **memfs**. A driver spawns it ([`temen_run::conductor`]) with `{fs}` re-granted and argv `link
+//! <in.x.nif> <out.temen> <stem>` as the args payload; it reads the hexer Leng `.x.nif`, links it with
 //! `temen_leng::link_nim_powerbox`, and writes the `temen_encode`d linked module to `<out.temen>` in the
 //! same store — exactly the shape hexer/nifler use.
 //!
@@ -13,8 +13,8 @@
 //! asset stop matching native fails the PR. The `.x.nif` input is the same system-module Leng the chain
 //! (`rust_driver_chain.rs`) and `nimlink_asset.rs` use (`sysvq0asl.x.nif.gz`).
 //!
-//! Heavy: the linker's no-free bump heap (the on-ramp `malloc` grows it via `vm_map` inside the carve)
-//! needs ~512 MiB, so the child runs in a 512 MiB carve inside a ~1 GiB window. Gated Linux + gzip.
+//! Heavy: the linker's no-free bump heap (the on-ramp `malloc` grows it via `vm_map` into the child
+//! window's reserved tail) needs ~512 MiB. Gated Linux + gzip.
 
 #![cfg(target_os = "linux")]
 
@@ -45,59 +45,6 @@ fn inflate(gz: &[u8]) -> Option<Vec<u8>> {
     let out = c.wait_with_output().ok()?;
     w.join().ok()?;
     out.status.success().then_some(out.stdout)
-}
-
-/// A single-cap (`{fs}`) op-13 parent (the #1094-safe layout: grant record at `guard+1024`, name at
-/// `guard+2048`, argv at `carve + module_args_base`), spawning `child` into `[carve_off, carve_off +
-/// 2^child_sl)` with argv `["link", in, out, stem]` and joining it. Mirrors `nifler_child_asset.rs`.
-fn parent_src(child_sl: u32, carve_off: u64) -> String {
-    let parent_sl = child_sl + 1;
-    let guard = temen_ir::POWERBOX_NULL_GUARD;
-    let rec_off = guard + 1024;
-    let name_off = guard + 2048;
-    let argv_off = carve_off + temen_ir::module_args_base();
-
-    let in_path = format!("nimcache/{STEM}.x.nif");
-    let out_path = format!("nimcache/{STEM}.temen");
-    let argv = ["link", &in_path, &out_path, STEM];
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
-    blob.extend_from_slice(&0u32.to_le_bytes()); // envc
-    for s in argv {
-        blob.extend_from_slice(s.as_bytes());
-        blob.push(0);
-    }
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-
-    // grant record {name_off:u32, name_len:u32, handle:i32, pad} at rec_off; the fs handle is arg v2.
-    let w0 = name_off | (2u64 << 32);
-    format!(
-        r#"memory {parent_sl}
-data {name_off} "fs"
-data {argv_off} "{argv_esc}"
-func (i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32) {{
-  x0 = i64.const {w0}
-  o0 = i64.const {rec_off}
-  i64.store o0 x0
-  hf = i64.extend_i32_u v2
-  ohf = i64.const {hoff}
-  i64.store ohf hf
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const {rec_off}
-  vgn = i64.const 1
-  ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-        hoff = rec_off + 8,
-    )
 }
 
 #[test]
@@ -151,12 +98,11 @@ fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
     let child = temen_encode::decode_module(&temen).expect("decode nim-link-fs.temen");
     temen_verify::verify_module(&child).expect("verify nim-link-fs.temen");
 
-    // Carve the child ~512 MiB (its no-free bump heap), a window at least its declared size.
-    let decl = child.memory.as_ref().expect("child window").size_log2 as u32;
-    let child_sl = temen_run::nim_phase_carve_log2(decl);
-    let carve_off = 1u64 << child_sl;
-    let parent = temen_text::parse_module(&parent_src(child_sl, carve_off)).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("verify parent");
+    let (in_path, out_path) = (
+        format!("nimcache/{STEM}.x.nif"),
+        format!("nimcache/{STEM}.temen"),
+    );
+    let parent = temen_run::conductor(&["fs"], &["link", &in_path, &out_path, STEM]);
 
     // Shared memfs seeded with the hexer `.x.nif` at `nimcache/<stem>.x.nif` (the key the driver hands
     // off through); the linker writes `nimcache/<stem>.temen` back into the same store.
@@ -176,14 +122,18 @@ fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
         })
     };
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
-    let inst = host.grant_instantiator(0, 1u64 << (child_sl + 1));
-    let modh = host.grant_module(&child);
+    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
     let mut fuel = 3_000_000_000_000u64;
     let r = run_with_host(
         &parent,
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(fs_h)],
+        &[
+            Value::I32(inst),
+            Value::I32(modh),
+            Value::I32(budget),
+            Value::I32(fs_h),
+        ],
         &mut fuel,
         &mut host,
     )
