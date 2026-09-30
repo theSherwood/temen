@@ -59,10 +59,14 @@ refunds every level. So no subtree ever holds more than any ancestor's ceiling, 
 descendant holds is charged to a grant from above (the invariant). Ceilings may **overcommit**: a
 parent may grant ceilings summing to more than its own, and the first to charge wins, bounded by the
 parent, so a ceiling is a cap, not a guarantee. A budget reaches a child only through its spawn, never
-a peer. This replaced Genode-style quota transfer, where a parent's remaining dropped by exactly what
+a peer: the budget named in the spawn pays for the child's window **and becomes the child's
+`"budget"`** (#1944 slice 2), so the child's own window counts inside its ceiling and the child's spawns
+charge it and every ancestor. A parent that names its own budget without splitting it first shares its
+whole ceiling with the child. This replaced Genode-style quota transfer, where a parent's remaining dropped by exactly what
 the child's rose and a shortfall cascaded up the ancestry as a transactional request. *Caveat closed
 (2026-09-16, #1502; nodes 2026-09-30, #1944):* `Budget` is **durable** — the artifact carries every
-node the handles reach, with its ceilings, its charges and its parent, so what a domain charged before
+node the handles of the whole cut reach (the root's and each detached descendant's, numbered once), with
+its ceilings, its charges and its parent, so what a domain charged before
 a freeze stays charged after it and a thawed subtree is still capped by every ancestor (a fresh
 re-grant would have let it spend that again). The thaw may **lower** a node's ceilings through an
 embedder hook (`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never

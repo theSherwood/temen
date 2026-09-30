@@ -413,13 +413,13 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                  and is declined",
             )],
 
-        // Declines on nesting (it names a node of the run's budget tree by index — a child is granted a
-        // node of its own by `split`, never the handle) but **durable** since #1502: the artifact
-        // carries every node the handles reach, with its ceilings, charges and parent (#1944), and the
-        // thaw may only lower a ceiling. This closed the caveat INVARIANTS #3's R2 ruling had recorded
+        // Declines on nesting as a re-grant (a grant list cannot carry one): a child's own `"budget"` is
+        // the node its spawn charged for its window (#1944 slice 2). **Durable** since #1502: the
+        // artifact carries every node the cut's handles reach, with its ceilings, charges and parent
+        // (#1944), and the thaw may only lower a ceiling. This closed the caveat INVARIANTS #3's R2 ruling had recorded
         // against itself ("minting authority does not survive a freeze").
         Capability::Budget => [
-            declines("index-carrying: the child is granted a node of its own by split, not the handle"),
+            declines("not re-grantable by name: a child's own budget is the node its spawn charged (#1944)"),
             F,
             B,
             U,

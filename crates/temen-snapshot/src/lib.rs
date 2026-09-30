@@ -366,9 +366,13 @@ pub enum FreezeError {
     /// #1680 — a pipe has an end outside the cut (held by a domain the freeze does not carry, such
     /// as a fork twin or a detached child). The cut's boundary is not yet carried (#1680 slice 2).
     PipeCrossesCut,
-    /// #1944 — a nested child's table holds a `Budget`. Its node lives in the child's own budget
-    /// tree, which the artifact does not carry: only the nodes the root's handles reach ride.
+    /// #1944 — a nested (carve) child's table holds a `Budget`. No spawn gives a carve child one, so
+    /// nothing carries it; carves retire with #1867.
     NestedBudget { slot: u32 },
+    /// #1944 slice 2 — a captured detached child holds budget nodes of a tree other than the root's.
+    /// A child's `"budget"` is its spawner's node, so the cut is one tree and its numbers name nodes
+    /// across every artifact; a child outside it could not be numbered.
+    DetachedBudgetTree { parent_task: usize, slot: usize },
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -566,10 +570,13 @@ pub fn freeze_with_prots(
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
-    freeze_at(module, window, prots, reserved_log2, host, 0)
+    let cut = number_cut_budgets(host)?;
+    freeze_at(module, window, prots, reserved_log2, host, 0, &cut)
 }
 
-/// [`freeze_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder asked for).
+/// [`freeze_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder asked for). `cut`
+/// numbers the budget nodes of the whole cut ([`number_cut_budgets`]); only the depth-0 artifact
+/// carries them.
 fn freeze_at(
     module: &Module,
     window: &[u8],
@@ -577,6 +584,7 @@ fn freeze_at(
     reserved_log2: u8,
     host: &Host,
     depth: usize,
+    cut: &CutBudgets,
 ) -> Result<Vec<u8>, FreezeError> {
     if let Some(p) = host.unreached_detached().first() {
         return Err(FreezeError::DetachedUnreached {
@@ -649,7 +657,7 @@ fn freeze_at(
         &mut handles,
         &mut child_state,
     )?;
-    let budgets = number_budgets(&host.capture_durable_budgets(), &mut handles, &child_state)?;
+    number_budgets(cut, &mut handles, &child_state)?;
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
             .memory
@@ -880,7 +888,7 @@ fn freeze_at(
         if depth >= MAX_DETACHED_DEPTH {
             return Err(FreezeError::DetachedTooDeep);
         }
-        let body = write_detached(detached_live, depth)?;
+        let body = write_detached(detached_live, depth, cut)?;
         section(&mut out, TAG_DETACHED, |b| b.extend_from_slice(&body));
     }
 
@@ -895,24 +903,69 @@ fn freeze_at(
         });
     }
 
-    // Section 10 — the budget nodes (#1944, v37), by artifact number. Elided when none rides.
-    if !budgets.is_empty() {
-        section(&mut out, TAG_BUDGETS, |b| write_budgets(b, &budgets));
+    // Section 10 — the budget nodes of the whole cut (#1944, v37), by number, in the depth-0 artifact
+    // only: a detached child's handles name the numbers it carries. Elided when none rides.
+    if depth == 0 && !cut.nodes.is_empty() {
+        section(&mut out, TAG_BUDGETS, |b| write_budgets(b, &cut.nodes));
     }
 
     Ok(out)
 }
 
-/// #1944 — number the budget nodes the root's handles reach (as captured: every named node with its
-/// ancestors, ascending live id) and rewrite each `Budget` binding's live id to its number. Numbers
-/// follow ascending live id, so a parent always numbers below its children, and a thawed tree
-/// re-freezes to the same numbers, because the restore mints its nodes in number order (§12.6).
-/// Returns the nodes by number, with `key` and `parent` renumbered too.
+/// #1944 — the budget nodes a freeze carries: every node the cut's domains name — the root's handles
+/// and each captured detached descendant's, all of one tree (a child's `"budget"` is its spawner's
+/// node, #1944 slice 2) — with its ancestors, numbered by ascending live id (`numbers`: live id →
+/// number). A parent always numbers below its children, and a thawed tree re-freezes to the same
+/// numbers, because the restore mints its nodes in number order (§12.6).
+struct CutBudgets {
+    nodes: Vec<DurableBudget>,
+    numbers: std::collections::BTreeMap<u32, u32>,
+}
+
+/// Collect and number [`CutBudgets`] from the root `host` and its captured detached descendants.
+fn number_cut_budgets(host: &Host) -> Result<CutBudgets, FreezeError> {
+    fn held(root: &Host, h: &Host, out: &mut Vec<u32>) -> Result<(), FreezeError> {
+        for c in h.captured_detached() {
+            let ch = c.host.lock().unwrap_or_else(|e| e.into_inner());
+            let mine = ch.budget_nodes_held();
+            if !mine.is_empty() && !root.shares_budget_tree(&ch) {
+                return Err(FreezeError::DetachedBudgetTree {
+                    parent_task: c.parent_task,
+                    slot: c.slot,
+                });
+            }
+            out.extend(mine);
+            held(root, &ch, out)?;
+        }
+        Ok(())
+    }
+    let mut all = host.budget_nodes_held();
+    held(host, host, &mut all)?;
+    let live = host.capture_budget_chains(&all);
+    let numbers: std::collections::BTreeMap<u32, u32> = live
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.key, i as u32))
+        .collect();
+    let nodes = live
+        .iter()
+        .enumerate()
+        .map(|(i, n)| DurableBudget {
+            key: i as u32,
+            parent: n.parent.map(|p| numbers[&p]),
+            ..*n
+        })
+        .collect();
+    Ok(CutBudgets { nodes, numbers })
+}
+
+/// Rewrite each of this artifact's `Budget` bindings from its live node id to its number in the cut.
+/// A nested (carve) child's table holds no `Budget`: the freeze refuses one.
 fn number_budgets(
-    live: &[DurableBudget],
+    cut: &CutBudgets,
     root: &mut [DurableHandle],
     children: &[FrozenChildState],
-) -> Result<Vec<DurableBudget>, FreezeError> {
+) -> Result<(), FreezeError> {
     if let Some(h) = children
         .iter()
         .flat_map(|c| c.handles.iter())
@@ -920,21 +973,12 @@ fn number_budgets(
     {
         return Err(FreezeError::NestedBudget { slot: h.slot });
     }
-    let number = |key: u32| live.iter().position(|n| n.key == key).map(|i| i as u32);
     for h in root.iter_mut() {
         if let DurableBinding::Budget { node } = &mut h.binding {
-            *node = number(*node).expect("the capture reaches every handle's node");
+            *node = cut.numbers[node]; // the cut reaches every handle's node
         }
     }
-    Ok(live
-        .iter()
-        .enumerate()
-        .map(|(i, n)| DurableBudget {
-            key: i as u32,
-            parent: n.parent.and_then(number),
-            ..*n
-        })
-        .collect())
+    Ok(())
 }
 
 /// A budget vector's five fields, in `read`'s order.
@@ -1082,7 +1126,11 @@ fn read_join_outcome(r: &mut Reader<'_>) -> Result<Option<Result<i64, Trap>>, Re
 /// was granted — then the child's own artifact, length-prefixed. The child is a root of its own window,
 /// so its artifact is exactly this format, frozen from its own powerbox (with its own detached children
 /// in *its* Section 8).
-fn write_detached(children: &[CapturedDetached], depth: usize) -> Result<Vec<u8>, FreezeError> {
+fn write_detached(
+    children: &[CapturedDetached],
+    depth: usize,
+    cut: &CutBudgets,
+) -> Result<Vec<u8>, FreezeError> {
     let mut order: Vec<&CapturedDetached> = children.iter().collect();
     order.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     let mut b = Vec::new();
@@ -1098,6 +1146,7 @@ fn write_detached(children: &[CapturedDetached], depth: usize) -> Result<Vec<u8>
                 c.reserved_log2,
                 &h,
                 depth + 1,
+                cut,
             )?
         };
         let l = &c.launch;
@@ -1250,7 +1299,7 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    restore_layout_at(artifact, module, host, 0)
+    restore_layout_at(artifact, module, host, 0, &mut ThawBudgets::default())
 }
 
 /// [`restore_layout`] at detached-nesting `depth`.
@@ -1259,8 +1308,9 @@ fn restore_layout_at(
     module: &Module,
     host: &mut Host,
     depth: usize,
+    cut: &mut ThawBudgets,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    let (bytes, prots, reserved_log2) = restore_at(artifact, module, host, depth)?;
+    let (bytes, prots, reserved_log2) = restore_at(artifact, module, host, depth, cut)?;
     let mapped = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let prots: Vec<CapturedProt> = prots
         .iter()
@@ -1285,7 +1335,16 @@ pub fn restore_with_prots(
     module: &Module,
     host: &mut Host,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
-    restore_at(artifact, module, host, 0)
+    restore_at(artifact, module, host, 0, &mut ThawBudgets::default())
+}
+
+/// #1944 — the cut's budget nodes as the depth-0 restore rebuilt them: each number's new live id, and
+/// whether any artifact of the cut named it (canonical: a freeze carries only the nodes some domain's
+/// handles reach, which is checked once every detached child is restored).
+#[derive(Default)]
+struct ThawBudgets {
+    ids: Vec<u32>,
+    reached: Vec<bool>,
 }
 
 /// [`restore_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
@@ -1294,6 +1353,7 @@ fn restore_at(
     module: &Module,
     host: &mut Host,
     depth: usize,
+    cut: &mut ThawBudgets,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
     // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
     // each fail-closed at the header before any section is read.
@@ -1464,17 +1524,11 @@ fn restore_at(
     if pipes.iter().any(|p| p.writers + p.readers == 0) {
         return Err(RestoreError::Malformed);
     }
-    // ---- Budget nodes (#1944, v37): every root handle's node must be carried, a nested child
-    // holds none (the freeze refuses one), and every carried node must be a named node or an
-    // ancestor of one (canonical: a freeze carries only the nodes the handles reach). ----
+    // ---- Budget nodes (#1944, v37): the depth-0 artifact carries the whole cut's; a detached
+    // child's names them by number, and a nested (carve) child holds none (the freeze refuses one).
     let mut budgets = decode_budgets(budgets_body)?;
-    let mut reached = vec![false; budgets.len()];
-    for h in &handles {
-        if let DurableBinding::Budget { node } = h.binding {
-            *reached
-                .get_mut(node as usize)
-                .ok_or(RestoreError::Malformed)? = true;
-        }
+    if depth > 0 && !budgets.is_empty() {
+        return Err(RestoreError::Malformed);
     }
     if child_state
         .iter()
@@ -1483,14 +1537,14 @@ fn restore_at(
     {
         return Err(RestoreError::Malformed);
     }
-    for i in (0..budgets.len()).rev() {
-        if reached[i] {
-            if let Some(p) = budgets[i].parent {
-                reached[p as usize] = true;
-            }
-        }
-    }
-    if reached.iter().any(|r| !r) {
+    let named_budgets = handles
+        .iter()
+        .filter_map(|h| match h.binding {
+            DurableBinding::Budget { node } => Some(node as usize),
+            _ => None,
+        })
+        .max();
+    if named_budgets.is_some_and(|n| n >= budgets.len().max(cut.ids.len())) {
         return Err(RestoreError::Malformed);
     }
 
@@ -1540,14 +1594,18 @@ fn restore_at(
     // table is pinned — the budget twin of the named-cap registrar step above. Attenuate-only; a
     // refusal fails the restore here, with nothing granted. Then re-mint the nodes, parents first,
     // and rewrite each handle's node number to the id its node was minted.
-    host.attenuate_budgets_for_thaw(&mut budgets, &handles)
-        .map_err(RestoreError::BudgetRefused)?;
-    let budget_ids = host
-        .restore_durable_budgets(&budgets)
-        .ok_or(RestoreError::Malformed)?;
+    if depth == 0 {
+        host.attenuate_budgets_for_thaw(&mut budgets, &handles)
+            .map_err(RestoreError::BudgetRefused)?;
+        cut.ids = host
+            .restore_durable_budgets(&budgets)
+            .ok_or(RestoreError::Malformed)?;
+        cut.reached = vec![false; budgets.len()];
+    }
     for h in handles.iter_mut() {
         if let DurableBinding::Budget { node } = &mut h.binding {
-            *node = budget_ids[*node as usize];
+            cut.reached[*node as usize] = true;
+            *node = cut.ids[*node as usize];
         }
     }
     // The interpreter names a pipe by its live id: rewrite each carried end's artifact number to the
@@ -1641,8 +1699,20 @@ fn restore_at(
     // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
     // child failing fails this restore. ----
     if let Some(body) = detached_body {
-        let children = decode_detached(body, host, depth)?;
+        let children = decode_detached(body, host, depth, cut)?;
         host.set_thawed_detached(children);
+    }
+    // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
+    // (canonical), known only now that every detached child's handles are in.
+    if depth == 0 {
+        for i in (0..budgets.len()).rev() {
+            if let (true, Some(p)) = (cut.reached[i], budgets[i].parent) {
+                cut.reached[p as usize] = true;
+            }
+        }
+        if cut.reached.iter().any(|r| !r) {
+            return Err(RestoreError::Malformed);
+        }
     }
 
     Ok((window, prots, reserved_log2))
@@ -1655,6 +1725,7 @@ fn decode_detached(
     body: &[u8],
     host: &mut Host,
     depth: usize,
+    cut: &mut ThawBudgets,
 ) -> Result<Vec<ThawedDetached>, RestoreError> {
     if depth >= MAX_DETACHED_DEPTH {
         return Err(RestoreError::Malformed);
@@ -1705,7 +1776,7 @@ fn decode_detached(
             .durable_module_by_digest(&digest)
             .ok_or(RestoreError::ModuleUnresolved(digest))?;
         let mut child = host.detached_thaw_host();
-        let restored = restore_layout_at(art, &module, &mut child, depth + 1);
+        let restored = restore_layout_at(art, &module, &mut child, depth + 1, cut);
         host.reclaim_thaw_seams(&mut child);
         let (window, reserved_log2) = restored?;
         out.push(ThawedDetached {
