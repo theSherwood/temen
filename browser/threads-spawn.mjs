@@ -224,8 +224,6 @@ async function worker() {
       : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { parentPort.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
-  const handles = []; // local spawn handle (index) → child completion slot ptr
-
   for (;;) {
     const ev = ex.temen_par_run(v);
     if (ev === DONE) {
@@ -263,15 +261,13 @@ async function worker() {
         win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
-      const handle = handles.length;
-      handles.push(cslot);
-      ex.temen_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
       continue;
     }
     if (ev === JOIN) {
-      const handle = Number(ex.temen_par_ev_a(v));
-      const cslot = handles[handle];
-      if (cslot === undefined) { ex.temen_par_deliver_join(v, 0n, 1); continue; } // bad handle -> trap, never wait(0)
+      // The engine resolved the guest's handle (a bad one traps the vCPU) and hands back the slot this
+      // Worker delivered for that child, once.
+      const cslot = Number(ex.temen_par_ev_a(v));
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       const result = i64()[(cslot + 8) >> 3];
@@ -294,9 +290,7 @@ async function worker() {
         slog: cslog, win: win + carve, winSize: 1 << cslog,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
-      const handle = handles.length;
-      handles.push(cslot);
-      ex.temen_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
       continue;
     }
     if (ev === WAIT) {

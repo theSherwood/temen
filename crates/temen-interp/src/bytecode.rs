@@ -3660,8 +3660,8 @@ pub enum VcpuEvent {
         /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
         mapped: u64,
     },
-    /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_handle`] with the
-    /// handle the guest will `join` it by (the host assigns handles densely per spawner: 0, 1, …).
+    /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_child`] with the
+    /// host's token for it (the engine issues the handle the guest `join`s it by).
     /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
     /// when its code spawns) — build the child with [`Vcpu::new_child_in`] so `func` resolves there.
     /// `vcpu` is the child's dense vCPU id, assigned here in spawn order across the run (root = 0) —
@@ -3673,8 +3673,12 @@ pub enum VcpuEvent {
         module: u32,
         vcpu: u64,
     },
-    /// `thread.join`: obtain child `handle`'s result, then call [`Vcpu::deliver_join`].
-    Join { handle: i32 },
+    /// `thread.join` (or a §14 `join`) of a live child this vCPU spawned: obtain the result of the
+    /// child the host gave `child` as its token ([`Vcpu::deliver_child`]), then call
+    /// [`Vcpu::deliver_join`]. The engine resolved the guest's handle by the oracle's rule — a
+    /// negative, never-issued or already-joined handle traps `ThreadFault` in the vCPU — so a host
+    /// keeps no child table of its own, and each token comes back at most once.
+    Join { child: u64 },
     /// `memory.wait`: run the futex wait on `addr`, then call [`Vcpu::deliver_code`] with the wasm code
     /// (0 = woken, 1 = not-equal, 2 = timed-out).
     Wait {
@@ -3715,8 +3719,8 @@ pub enum VcpuEvent {
         mapped: Option<u64>,
     },
     /// §14 confined child (ops 0, 5, 13, 17; THREADS.md 4c-domain §14-D2): start the admitted child
-    /// over the carve, then call [`Vcpu::deliver_handle`] with the handle the guest will `join` it by —
-    /// exactly the [`VcpuEvent::Spawn`] protocol. All the authority-bearing work already happened in
+    /// over the carve, then call [`Vcpu::deliver_child`] with the host's token for it — exactly the
+    /// [`VcpuEvent::Spawn`] protocol. All the authority-bearing work already happened in
     /// this vCPU, in the one admission every driver uses ([`admit_confined_child`]): the carve and entry
     /// validated (`-EINVAL` never surfaces), a module child's program resolved, compiled and **pushed to
     /// the shared source** and its data segments materialized into the carve, the child's powerbox
@@ -3743,7 +3747,7 @@ pub enum VcpuEvent {
     /// reservation, as a root's do, so `vm_map` grows the window), its module compiled and pushed.
     /// The host takes the child ([`Vcpu::take_child`]), starts it over a backing it mints for the
     /// window ([`PendingChild::start`], which seeds the data segments, the payload and a pre-mapped
-    /// region), and [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`]
+    /// region), and delivers its token ([`Vcpu::deliver_child`]) — the [`VcpuEvent::Instantiate`]
     /// protocol minus the carve. A host that runs the child on an emitted tier takes its powerbox
     /// instead ([`PendingChild::into_powerbox`]), seeds the payload ([`PendingChild::payload`]) and,
     /// since its window cannot alias, copies a pre-mapped region ([`Host::take_premap`]) in before
@@ -3861,15 +3865,24 @@ pub struct Vcpu<'p> {
     /// The child the last [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced
     /// — admitted, and waiting for the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
-    /// Detached children's window leases (INVARIANTS #3: `Budget.mem` accounts live windows). The
-    /// driver runs the child, so this engine sees its end only as the parent's `join`: a lease is
-    /// filed against the handle the driver delivers ([`deliver_handle`](Self::deliver_handle)) and its
-    /// bytes go back to the budget when that handle's join is delivered. `pending_lease` is the
-    /// just-admitted spawn's `(budget, bytes)`, `leases` the live `(handle, budget, bytes)`,
-    /// `joining` the handle whose join is in flight.
+    /// The children this vCPU spawned — threads and §14 children — indexed by the handle the guest
+    /// joins them by, issued densely (0, 1, …) as the host delivers each one
+    /// ([`deliver_child`](Self::deliver_child)). A join resolves its handle by the oracle's rule
+    /// ([`super::take_child`]) and spends it, so every host answers a bad join alike (#1728, #1736).
+    children: Vec<Option<VcpuChild>>,
+    /// The just-admitted detached spawn's window lease `(budget, bytes)`, filed with its child.
     pending_lease: Option<(i32, u64)>,
-    leases: Vec<(i32, i32, u64)>,
-    joining: Option<i32>,
+    /// The lease of the child whose join is in flight, given back on
+    /// [`deliver_join`](Self::deliver_join).
+    joining: Option<(i32, u64)>,
+}
+
+/// A child in a [`Vcpu`]'s table: the host's token for it, and a detached child's window lease.
+/// `Budget.mem` accounts live windows (INVARIANTS #3), and the driver runs the child, so this engine
+/// sees its end only as the parent's join: that is when the lease's bytes go back to the budget.
+struct VcpuChild {
+    token: u64,
+    lease: Option<(i32, u64)>,
 }
 
 /// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
@@ -4197,8 +4210,8 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
+            children: Vec::new(),
             pending_lease: None,
-            leases: Vec::new(),
             joining: None,
         })
     }
@@ -4249,8 +4262,8 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
+            children: Vec::new(),
             pending_lease: None,
-            leases: Vec::new(),
             joining: None,
         })
     }
@@ -4547,9 +4560,14 @@ impl<'p> Vcpu<'p> {
                     };
                 }
                 Ok(VcpuStop::Join { handle, dst }) => {
-                    self.pending = Some(dst);
-                    self.joining = Some(handle);
-                    return VcpuEvent::Join { handle };
+                    match super::take_child(&mut self.children, handle) {
+                        Ok(child) => {
+                            self.pending = Some(dst);
+                            self.joining = child.lease;
+                            return VcpuEvent::Join { child: child.token };
+                        }
+                        Err(t) => return VcpuEvent::Trapped(t),
+                    }
                 }
                 Ok(VcpuStop::CapPending { id, dst }) => {
                     let comps = match self.shared_host {
@@ -4796,15 +4814,17 @@ impl<'p> Vcpu<'p> {
         })
     }
 
-    /// Deliver a `thread.spawn` handle (after `Spawn`).
-    pub fn deliver_handle(&mut self, handle: i32) {
-        if let Some((budget, bytes)) = self.pending_lease.take() {
-            if handle >= 0 {
-                self.leases.push((handle, budget, bytes));
-            } else {
-                self.budget_mem_give(budget, bytes); // the driver refused the spawn
-            }
-        }
+    /// Deliver the host's `token` for the child the last [`VcpuEvent::Spawn`],
+    /// [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced, once the host has
+    /// started it. The engine files it under the next handle — the spawn's result, which the guest
+    /// joins it by — and hands the token back on that join ([`VcpuEvent::Join`]). A token is whatever
+    /// finds the child again on the host's side: a completion slot, a thread id, an index.
+    pub fn deliver_child(&mut self, token: u64) {
+        let handle = self.children.len() as i32;
+        self.children.push(Some(VcpuChild {
+            token,
+            lease: self.pending_lease.take(),
+        }));
         self.deliver_code(handle);
     }
 
@@ -4833,11 +4853,8 @@ impl<'p> Vcpu<'p> {
     /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
     /// child trap propagates (the joiner traps on its next `run`).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
-        if let Some(handle) = self.joining.take() {
-            if let Some(i) = self.leases.iter().position(|l| l.0 == handle) {
-                let (_, budget, bytes) = self.leases.swap_remove(i);
-                self.budget_mem_give(budget, bytes);
-            }
+        if let Some((budget, bytes)) = self.joining.take() {
+            self.budget_mem_give(budget, bytes);
         }
         let dst = self.pending.take().expect("deliver with no pending event");
         match res {
@@ -11262,12 +11279,15 @@ fn step_vcpu(
                 })?;
                 let target = match claim {
                     Claim::Continue(vm) => vm,
-                    Claim::Block => {
+                    // The oracle's rule: a durable run whose freeze is unwinding takes the
+                    // advisory downgrade (the poll status), so the resumer reaches its trailing
+                    // poll instead of re-idling (#1904).
+                    Claim::Block if !(ctx.durable && is_unwinding(ctx.mem)) => {
                         // Rewind the resumer's cursor so the wake re-executes the resume.
                         vt.active.pc = resume_ip;
                         return Ok(VcpuStop::BlockOnFiber { fiber: k });
                     }
-                    Claim::Poll => {
+                    Claim::Block | Claim::Poll => {
                         vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
                         vt.active.set(dst + 1, Reg::from_i64(0));
                         continue;
@@ -11738,6 +11758,137 @@ enum TaskState {
     Done(Result<Vec<Value>, Trap>),
 }
 
+impl TaskState {
+    /// #1904 — the [`super::ParkSite`] this state parks at, so a freeze applies the one rule for it
+    /// ([`super::ParkSite::freeze_rule`], DURABILITY §4 "One rule per park site"). Exhaustive, so a
+    /// new state cannot be missed.
+    fn park_site(&self) -> Option<super::ParkSite> {
+        use super::ParkSite;
+        match self {
+            TaskState::Runnable | TaskState::Done(_) => None,
+            // A serve-handler `reap` is a `wait(pid)`, which the oracle files with `thread.join`.
+            TaskState::BlockedJoin { .. } | TaskState::BlockedReap { .. } => Some(ParkSite::Join),
+            TaskState::BlockedWait { .. } => Some(ParkSite::Futex),
+            // A `cont.resume.block` resumer idles beside the serve loop, as on the oracle.
+            TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => Some(ParkSite::Svc),
+            TaskState::BlockedTicket { .. } => Some(ParkSite::Reply),
+            TaskState::BlockedReapPersonality { .. } => Some(ParkSite::Reap),
+            TaskState::BlockedPipeRead { .. } => Some(ParkSite::PipeRead),
+            TaskState::BlockedPipeWrite { .. } => Some(ParkSite::PipeWrite),
+            TaskState::BlockedStdin => Some(ParkSite::StreamRead),
+        }
+    }
+}
+
+/// #1904 — the pump's freeze step with nothing runnable, the oracle's `freeze_step`. `true` when it
+/// acted, so the pump looks at its tasks again.
+///
+/// - **Freeze-on-quiesce** fires when every park is one a freeze can end (the oracle's
+///   `quiesced_parks_only`: a `svc.wait`, or an indefinite futex wait). The census runs first: a
+///   fork twin, or a vCPU parked where the freeze has no rule, declines it on the run's powerbox
+///   and spends the arm, and the run carries on as if it was never armed.
+/// - **A freeze in flight** (the window reads `UNWINDING`) brings every park through it by its
+///   site's rule ([`admit_parks`]): a re-issue site is re-admitted — its re-executed op observes the freeze and is
+///   abandoned, a futex wait takes `WAIT_FROZEN` (#1769) — and a phase site stays parked for the
+///   completion that wakes it. Nothing else could wake a parked task, so without this the freeze
+///   would hang on it.
+fn freeze_step(
+    tasks: &mut [TaskSlot],
+    fibers: &[FiberState],
+    forked_twins: &std::collections::BTreeSet<usize>,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+    freeze_on_quiesce: &mut bool,
+) -> bool {
+    use super::{DeclineCause, FreezeDeclined, FreezeRule};
+    if *freeze_on_quiesce && quiesced_parks_only(tasks, fibers) {
+        *freeze_on_quiesce = false;
+        let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
+            let site = t.state.park_site()?;
+            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti))
+        });
+        let declined = match (forked_twins.first(), parked_declined) {
+            (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
+            (None, Some((site, ti))) => Some((DeclineCause::Parked(site), ti)),
+            (None, None) => None,
+        };
+        if let Some((cause, task)) = declined {
+            host.freeze_declined = Some(FreezeDeclined {
+                cause,
+                task: task as u64,
+                slot: None,
+            });
+            return true;
+        }
+        if let Some(m) = mem.as_mut() {
+            m.durable_set_state(super::STATE_UNWINDING);
+        }
+        // Fired: even with nothing to re-admit, a stopped task now sees through its stop.
+        admit_parks(tasks);
+        return true;
+    }
+    host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
+}
+
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait. The oracle re-issues the
+/// wait and the thaw re-parks the call on its ticket (#1901); this engine has no re-park yet, so a
+/// re-admitted call would be issued twice, and it declines instead (#1904).
+fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
+    match site {
+        super::ParkSite::Reply => super::FreezeRule::Decline,
+        s => s.freeze_rule(),
+    }
+}
+
+/// A freeze in flight: re-admit every task parked at a [`super::FreezeRule::Reissue`] site (see
+/// [`freeze_step`]). `true` when it re-admitted one.
+fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
+    use super::FreezeRule;
+    let mut admitted = false;
+    for t in tasks.iter_mut() {
+        let Some(site) = t.state.park_site() else {
+            continue;
+        };
+        if freeze_rule_here(site) != FreezeRule::Reissue {
+            continue;
+        }
+        // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+        if let TaskState::BlockedWait { dst, .. } = t.state {
+            t.vt.active
+                .set(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
+        }
+        t.state = TaskState::Runnable;
+        admitted = true;
+    }
+    admitted
+}
+
+/// The oracle's `quiesced_parks_only`: something is parked that a freeze could re-admit — a
+/// `svc.wait` (or a resumer idling beside it) or a futex wait — and no futex wait has a deadline.
+fn quiesced_parks_only(tasks: &[TaskSlot], fibers: &[FiberState]) -> bool {
+    let mut any = false;
+    for t in tasks {
+        match t.state {
+            TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => any = true,
+            TaskState::BlockedWait { deadline: None, .. } => any = true,
+            TaskState::BlockedWait { .. } => return false,
+            _ => {}
+        }
+    }
+    for f in fibers {
+        match f {
+            FiberState::WaitParked {
+                deadline: None,
+                woken: None,
+                ..
+            } => any = true,
+            FiberState::WaitParked { woken: None, .. } => return false,
+            _ => {}
+        }
+    }
+    any
+}
+
 /// Drive a whole domain — the entry vCPU plus any `thread.spawn` children — to completion on a
 /// **cooperative single-threaded scheduler** sharing one `Mem`. The oracle's concurrent programs are
 /// interleaving-invariant (verified by the tree-walker via stress / seed-sweep / DPOR), so any
@@ -11925,6 +12076,10 @@ struct CoopSched {
     /// At zero the pump returns [`CoopStep::Paused`], every task's cursor persisted — the next pump
     /// resumes exactly where this one stopped, as after a #1157 preemption.
     slice_left: Option<u64>,
+    /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**, one-shot: a durable run armed to
+    /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
+    /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
+    freeze_on_quiesce: bool,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -12106,6 +12261,8 @@ impl CoopSched {
             invoke_fibers: Vec::new(),
             suspend_on_idle: false,
             slice_left: None,
+            freeze_on_quiesce: host.is_durable()
+                && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
         })
     }
 
@@ -12146,6 +12303,7 @@ impl CoopSched {
             invoke_fibers: _,
             suspend_on_idle,
             slice_left,
+            freeze_on_quiesce,
         } = self;
         // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
         // (rather than always lowest-index) is what lets the preemption quantum actually rotate: a
@@ -12435,15 +12593,19 @@ impl CoopSched {
             // run a stopped process; the coop pick must skip it too, or a background job whose read
             // returns `-ERESTART` on the SIGTTIN keeps re-issuing (its libc retries) and spins forever
             // instead of benching. It re-runs when SIGCONT clears the stop. Domain-scoped (invariant 12).
+            // #1904 — the oracle's see-through (#1672): under a landing freeze a stopped domain runs to
+            // its next freeze point, and `Op::CapCall` abandons each host call on the way.
+            let see_through = host.is_durable() && is_unwinding(mem);
             let domain_stopped = |i: usize| -> bool {
-                match tasks[i].env {
-                    Some(k) => extra_envs[k]
-                        .host
-                        .lock_unpoisoned()
-                        .signal_poll()
-                        .is_some_and(|(_, s)| s.stopped()),
-                    None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
-                }
+                !see_through
+                    && match tasks[i].env {
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .signal_poll()
+                            .is_some_and(|(_, s)| s.stopped()),
+                        None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
+                    }
             };
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
@@ -12451,6 +12613,11 @@ impl CoopSched {
                 .map(|k| (last_pick + k) % n)
                 .find(|&i| matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i))
             else {
+                // #1904 — bring the parks through a freeze before any timer fires or the run is
+                // called deadlocked.
+                if freeze_step(tasks, fibers, forked_twins, mem, host, freeze_on_quiesce) {
+                    continue;
+                }
                 // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
                 // pending work on the offload pool, never a deadlock and never a reason to jump the
                 // logical clock. Block on the store for the smallest outstanding id (submission
@@ -16291,6 +16458,27 @@ impl Vm {
     /// The cursor (`cur`/`base`/`pc`) lives in locals for the duration of the loop so the optimizer
     /// keeps it in registers; it is written back to `self` only when the loop exits (suspend), which
     /// is also what a future blocking-op / debug-stop seam will do before yielding.
+    /// Write a host op's result slots into the registers from `at`.
+    fn set_results(&mut self, at: usize, res: &[i64], results: &[ValType]) {
+        for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
+            self.regs[at + i] = Reg::from_value(slot_to_val(*ty, *s));
+        }
+    }
+
+    /// #1904 — under a landing freeze a durable domain never parks (the oracle's `decide`, #1672):
+    /// an op that would park took no effect, so it is **abandoned**. `true` when it is: the running
+    /// context's re-issue word is set, the op's placeholder results stand, and the call's trailing
+    /// poll unwinds; the thaw re-issues the call.
+    fn abandon_for_freeze(&self, mem: &mut Option<Mem>, host: &mut HostCell) -> bool {
+        let freezing = is_unwinding(mem) && host.with(|p| p.is_durable());
+        if freezing {
+            if let Some(m) = mem.as_mut() {
+                m.durable_set_reissue_at(self.durable_region_base);
+            }
+        }
+        freezing
+    }
+
     fn resume(
         &mut self,
         source: &ModuleSource,
@@ -17027,6 +17215,19 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
+                    // landing freeze only to reach its next freeze point, so nothing may leave it on the
+                    // way — a host call is abandoned rather than performed, for the thaw to re-issue.
+                    // (A serve op is `Op::SvcPoll`, which the freeze already makes inert.)
+                    if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
+                        && self.abandon_for_freeze(mem, host)
+                    {
+                        for i in 0..results.len() {
+                            self.regs[base + *dst as usize + i] = Reg::default();
+                        }
+                        pc += 1;
+                        continue;
+                    }
                     // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): the one mint
                     // ([`super::Host::mint_pipe`]). The generic dispatch below declines it (an engine
                     // serves it only where its reads and writes can park), so it is serviced here.
@@ -17205,6 +17406,11 @@ impl Vm {
                             pc += 1;
                             continue;
                         }
+                        if self.abandon_for_freeze(mem, host) {
+                            self.set_results(base + *dst as usize, &res, results);
+                            pc += 1;
+                            continue;
+                        }
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
@@ -17220,6 +17426,16 @@ impl Vm {
                     // it re-executes on wake after the driver parks the task. The cooperative driver owns
                     // both ([`Outcome::ForkSelf`]/[`Outcome::ReapWait`]); other drivers `ThreadFault`.
                     if let Some(ev) = parks.request {
+                        // A blocking `waitpid` would park: under a landing freeze it is abandoned.
+                        if matches!(
+                            ev,
+                            super::ParkEvent::TaskExit(_) | super::ParkEvent::TaskExitAny
+                        ) && self.abandon_for_freeze(mem, host)
+                        {
+                            self.set_results(base + *dst as usize, &res, results);
+                            pc += 1;
+                            continue;
+                        }
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
@@ -17292,6 +17508,9 @@ impl Vm {
                         if interrupted {
                             self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
                             pc += 1;
+                        } else if self.abandon_for_freeze(mem, host) {
+                            self.set_results(base + *dst as usize, &res, results);
+                            pc += 1;
                         } else if let Some(pipe) = pipe_read_park {
                             self.module = module;
                             self.cur = cur;
@@ -17308,10 +17527,7 @@ impl Vm {
                             });
                         }
                     } else {
-                        for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
-                            self.regs[base + *dst as usize + i] =
-                                Reg::from_value(slot_to_val(*ty, *s));
-                        }
+                        self.set_results(base + *dst as usize, &res, results);
                         pc += 1;
                         // #1198 — this syscall STOPPED its own domain (a background terminal read/write
                         // hit `tty_background_check` → SIGTTIN/SIGTTOU default-action stop; or a `^Z`
@@ -17344,6 +17560,16 @@ impl Vm {
                         let v = self.regs[base + *dst as usize].i64();
                         host.with(|p| p.svc_results.insert(t, v));
                         self.serve_count += 1;
+                    }
+                    // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
+                    // makes **no progress** — it delivers an inert sentinel so its trailing poll
+                    // spills with the queue untouched, and the transform's `SvcServe` re-issue arm
+                    // re-executes the drain on thaw (#1904).
+                    if is_unwinding(mem) && host.with(|p| p.is_durable()) {
+                        self.regs[base + *dst as usize] = Reg::from_i64(0);
+                        self.serve_count = 0;
+                        pc += 1;
+                        continue;
                     }
                     // Admit queued dispatches: un-servable ones settle inline with a probeable
                     // errno (the dispatch's fault, never the domain's — it keeps serving); the

@@ -385,8 +385,6 @@ self.onmessage = async (e) => {
         : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
-  const handles = []; // local spawn handle (index) → child completion slot ptr
-
   for (;;) {
     // I22 hang site. A host wasm trap escaping `temen_par_run` — `memory access out of bounds`, or
     // `unreachable` from a panic=abort engine panic — unwinds into this async `onmessage`, rejecting
@@ -462,21 +460,13 @@ self.onmessage = async (e) => {
         win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
-      const handle = handles.length;
-      handles.push(cslot);
-      ex.temen_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
       continue;
     }
     if (evc === JOIN) {
-      // The oracle's `resolve_thread` rule (#773, #1728): a negative handle traps; any other is masked
-      // to the table's power-of-two span; a spent or never-issued slot traps.
-      const a = Number(ex.temen_par_ev_a(v));
-      let span = 1;
-      while (span < handles.length) span <<= 1;
-      const h = a < 0 ? -1 : a & (span - 1);
-      const cslot = handles[h];
-      if (cslot === undefined) { ex.temen_par_deliver_join(v, 0n, 1); continue; } // bad handle → trap, never wait(0)
-      handles[h] = undefined; // the join spends the handle
+      // The engine resolved the guest's handle (a bad one traps the vCPU) and hands back the slot this
+      // Worker delivered for that child, once.
+      const cslot = Number(ex.temen_par_ev_a(v));
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       ex.temen_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);
@@ -498,9 +488,7 @@ self.onmessage = async (e) => {
         slog: cslog, win: win + carve, winSize: 1 << cslog,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
-      const handle = handles.length;
-      handles.push(cslot);
-      ex.temen_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
       continue;
     }
     if (evc === INSTANTIATE_DETACHED) {
@@ -527,9 +515,7 @@ self.onmessage = async (e) => {
         win: 0, winSize: 2 ** cslog, tierup: false,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
-      const handle = handles.length;
-      handles.push(cslot);
-      ex.temen_par_deliver_handle(v, handle);
+      ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
       continue;
     }
     if (evc === WAIT) {

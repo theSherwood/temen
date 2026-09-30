@@ -678,7 +678,7 @@ in session discussion; collected here so the next slice has a home to be picked 
 - [ ] **vCPU-bomb backstop → spawner `ThreadFault`.** The 256-cap live-vCPU counter refuses
   construction, which fails the *whole run* via the JS host — cruder than the native drivers, where
   the spawner gets a clean `ThreadFault` and can handle it. Surface the refusal as a fault delivered
-  to the spawning vCPU (via `deliver_handle`'s error path) instead of a dead child.
+  to the spawning vCPU (a refusal delivery beside `Vcpu::deliver_child`) instead of a dead child.
 - [ ] **ABI cleanup: result structs instead of `static mut` stashes.** Multi-value returns
   (`temen_run_pb` streams, `temen_run_capture` snapshots, `temen_parse` output, `temen_par_stdout`) all go
   through single-reader `static mut` slots with ptr/len accessor pairs. An `temen_alloc`-returned

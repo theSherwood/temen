@@ -241,6 +241,17 @@ impl ChildTask {
     fn threads_live(&self) -> bool {
         self.dom.as_ref().is_some_and(|d| d.live_threads() > 0)
     }
+
+    /// #1937 — whether a teardown that finds this task parked wakes it rather than poisoning it: a
+    /// durable child parked in a futex wait whose own freeze word a freeze has rung. That wait ends
+    /// on the word when re-checked, so the child unwinds and rides the artifact; a poisoned one would
+    /// end in a trap and leave no image. Any other park may never come back, so it is poisoned.
+    fn unwinds_when_woken(&self) -> bool {
+        self.done.durable.is_some()
+            && self.slot.took_futex_park()
+            // SAFETY: the task's window is live while the task is; its first page holds the word.
+            && unsafe { fiber_rt::window_is_unwinding(self.window.base() as u64) }
+    }
 }
 
 /// In/out cell for the `Entry`-shaped [`resume_shim`]: the fiber to resume, and what it did.
@@ -557,12 +568,15 @@ impl ChildExec {
                     let e = g.tasks.get_mut(&id).expect("running task is filed");
                     if shutdown {
                         // Teardown: a park now would wait for a wake that can never come. Poison the
-                        // task's cell so its wait returns and the trailing guard unwinds it.
+                        // task's cell so its wait returns and the trailing guard unwinds it — unless
+                        // it parked after a freeze rang it, when the re-check below ends its wait.
                         let t = task.as_ref().expect("held");
-                        t.vm.trap
-                            .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
-                        if let Some(d) = &t.dom {
-                            d.wake_own_parked(); // its vCPUs share the cell
+                        if !t.unwinds_when_woken() {
+                            t.vm.trap
+                                .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                            if let Some(d) = &t.dom {
+                                d.wake_own_parked(); // its vCPUs share the cell
+                            }
                         }
                         e.woken = true;
                     }
@@ -800,22 +814,22 @@ impl ChildExec {
     /// Run teardown (`Nursery::join_children`): poison every parked task so it unwinds, let the
     /// runnable ones finish, wait for quiescence, join the workers. One parked forever would have
     /// hung the join, and unwinds through its trailing guard instead — the interpreter's teardown
-    /// sweep.
+    /// sweep. A task that parks after this began is poisoned too (`worker_loop`).
     ///
     /// `end_domain` — the parent's domain is ending (not freezing): its **carve** children end with
     /// it, running or not yet started, as the oracle ends them. Their cell gets the completion
     /// sentinel, which their entry and back-edge polls observe (`emit_domain_poll`). A
     /// freeze skips this, so a child the freeze reaches still unwinds under its own freeze word.
-    /// For the same reason a freeze wakes a parked **durable** child without poisoning it: the
-    /// freeze rang its word (`Nursery::ring_detached`), so it unwinds under it and rides, where a
-    /// poisoned one would end in a trap and leave no image (#1937).
+    /// For the same reason a **durable** child waiting under a word the freeze rang
+    /// (`Nursery::ring_detached`) is only woken, here or when it parks later, and unwinds and rides,
+    /// where a poisoned one would end in a trap and leave no image (#1937,
+    /// [`ChildTask::unwinds_when_woken`]).
     pub(crate) fn shutdown_and_join(self: &Arc<Self>, end_domain: bool) {
         let workers = {
             let mut g = lock(&self.state);
             g.shutdown = true;
             for e in g.tasks.values_mut() {
-                let unwinds =
-                    !end_domain && e.task.as_ref().is_some_and(|t| t.done.durable.is_some());
+                let unwinds = e.task.as_ref().is_some_and(|t| t.unwinds_when_woken());
                 let poisoned = if e.parked && !unwinds {
                     if let Some(t) = &e.task {
                         t.vm.trap

@@ -164,7 +164,6 @@ fn drive<'s, 'e>(
     orch: &'e Orch,
     mut vcpu: bytecode::Vcpu<'e>,
 ) -> Result<Vec<Value>, Trap> {
-    let mut handles: Vec<u64> = Vec::new();
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
@@ -179,7 +178,7 @@ fn drive<'s, 'e>(
                 let child_win = WinPtr(unsafe { win.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve, alive for the scope.
                 let back = Arc::new(unsafe { Region::shared(child_win.0, 1u64 << size_log2) });
-                start(scope, prog, orch, &mut vcpu, &mut handles, child_win, back)?;
+                start(scope, prog, orch, &mut vcpu, child_win, back)?;
             }
             bytecode::VcpuEvent::InstantiateDetached { .. } => {
                 // A fresh reservation, as every driver's detached window has; the engine seeds it.
@@ -189,15 +188,12 @@ fn drive<'s, 'e>(
                     temen_interp::host_page_size(),
                 ));
                 let win = WinPtr(std::ptr::null_mut());
-                start(scope, prog, orch, &mut vcpu, &mut handles, win, back)?;
+                start(scope, prog, orch, &mut vcpu, win, back)?;
             }
-            bytecode::VcpuEvent::Join { handle } => {
-                let Some(&id) = usize::try_from(handle).ok().and_then(|h| handles.get(h)) else {
-                    return Err(Trap::ThreadFault);
-                };
+            bytecode::VcpuEvent::Join { child } => {
                 let mut g = orch.done.lock().unwrap();
                 let r = loop {
-                    if let Some(r) = g.remove(&id) {
+                    if let Some(r) = g.remove(&child) {
                         break r;
                     }
                     g = orch.cv.wait(g).unwrap();
@@ -220,13 +216,13 @@ fn drive<'s, 'e>(
 }
 
 /// Start the child the last event announced over `back` — its window, whose bytes start at `win`
-/// (null for a detached one) — on its own scoped thread, and give `vcpu` the handle it joins it by.
+/// (null for a detached one) — on its own scoped thread, and give `vcpu` its completion id as the
+/// token a join hands back.
 fn start<'s, 'e>(
     scope: &'s std::thread::Scope<'s, 'e>,
     prog: &'e bytecode::VcpuProgram,
     orch: &'e Orch,
     vcpu: &mut bytecode::Vcpu<'e>,
-    handles: &mut Vec<u64>,
     win: WinPtr,
     back: Arc<Region>,
 ) -> Result<(), Trap> {
@@ -244,8 +240,7 @@ fn start<'s, 'e>(
         orch.done.lock().unwrap().insert(id, r);
         orch.cv.notify_all();
     });
-    vcpu.deliver_handle(handles.len() as i32);
-    handles.push(id);
+    vcpu.deliver_child(id);
     Ok(())
 }
 
