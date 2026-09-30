@@ -656,3 +656,65 @@ fn a_dropped_history_still_undoes_exactly_within_its_reach() {
         "the budget should still leave a usable tail to undo into"
     );
 }
+
+/// Unbounded recursion as chibicc lowers c_interpret's `sum_down` (#1958): the data-stack pointer
+/// rides as the first argument, and every level adds a frame.
+const SUM_DOWN: &str = r#"
+func (i64, i32) -> (i32) {
+block 0 (vsp: i64, vn: i32) {
+  vone = i32.const 1
+  vm = i32.sub vn vone
+  vs = call 0(vsp, vm)
+  vr = i32.add vn vs
+  return vr
+  }
+}
+"#;
+
+fn sum_down() -> ScheduledDebugRun {
+    let m = temen_text::parse_module(SUM_DOWN).expect("parse");
+    let args = [temen_interp::Value::I64(4096), temen_interp::Value::I32(5)];
+    ScheduledDebugRun::new(&m, 0, &args).expect("in the bytecode debug subset")
+}
+
+/// **#1958 — a boundary waits out what it cloned.** A continuation clone costs as much as the call
+/// stack is deep, so on a fixed stride the journal's cost per op grew with depth. A recursion some
+/// 20 000 frames deep now records a handful of boundaries where the stride alone would record one
+/// every `state_stride` turns (235 here). A shallow run keeps exactly one per stride. An undo into
+/// the longer segments still lands where a fresh run ticked there does.
+#[test]
+fn a_deep_stack_spaces_its_boundaries_by_what_they_clone() {
+    let stride = temen_interp::journal::DEFAULT_STATE_STRIDE;
+    let end = 60_000;
+    let mut r = sum_down();
+    r.set_journal_armed(true);
+    let mut fuel = FUEL;
+    while r.op_turn() < end && r.tick(&mut fuel) {}
+    let recorded = r.journal_stats().recorded_states;
+    assert!(
+        recorded <= 30,
+        "{recorded} boundaries in {end} turns (a fixed stride records {})",
+        end / stride + 1
+    );
+    let fresh_at = |t: u64| {
+        let mut f = sum_down();
+        let mut fuel = FUEL;
+        while f.op_turn() < t && f.tick(&mut fuel) {}
+        (f.frame_pc(0), f.depth(), f.op_turn())
+    };
+    for t in [end - 1, 45_001, 12_345] {
+        assert!(r.undo_to(t), "undo_to({t})");
+        assert_eq!(
+            (r.frame_pc(0), r.depth(), r.op_turn()),
+            fresh_at(t),
+            "undo_to({t})"
+        );
+    }
+
+    let (shallow, end) = armed_run_of(1000);
+    assert_eq!(
+        shallow.journal_stats().recorded_states as u64,
+        (end - 1) / stride + 1,
+        "a shallow run's boundaries stay one per stride"
+    );
+}

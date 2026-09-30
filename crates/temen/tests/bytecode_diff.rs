@@ -418,3 +418,84 @@ fn bytecode_kernel_perf() {
         );
     }
 }
+
+/// #1958 — unbounded recursion traps `StackOverflow` on both interpreters, never exhausting the host.
+/// `sum_down` is c_interpret's lesson starter as chibicc lowers it: the data-stack pointer rides as
+/// the first argument and never moves (no in-memory locals), so no guard page is ever touched and
+/// only the engine's own frame bound can stop it. The mutual pair checks the bound counts frames
+/// across functions.
+#[test]
+fn unbounded_recursion_traps_stack_overflow_on_both_interpreters() {
+    let sum_down = r#"
+func (i64, i32) -> (i32) {
+block 0 (vsp: i64, vn: i32) {
+  vone = i32.const 1
+  vm = i32.sub vn vone
+  vs = call 0(vsp, vm)
+  vr = i32.add vn vs
+  return vr
+  }
+}
+"#;
+    let mutual = r#"
+func (i64, i32) -> (i32) {
+block 0 (vsp: i64, vn: i32) {
+  vr = call 1(vsp, vn)
+  return vr
+  }
+}
+func (i64, i32) -> (i32) {
+block 0 (vsp: i64, vn: i32) {
+  vr = call 0(vsp, vn)
+  return vr
+  }
+}
+"#;
+    for src in [sum_down, mutual] {
+        let m = temen_text::parse_module(src).expect("parse");
+        let args = [Value::I64(4096), Value::I32(5)];
+        let mut fuel = 10_000_000u64;
+        assert_eq!(run(&m, 0, &args, &mut fuel), Err(Trap::StackOverflow));
+        let mut fuel = 10_000_000u64;
+        assert_eq!(
+            bytecode::compile_and_run(&m, 0, &args, &mut fuel),
+            Some(Err(Trap::StackOverflow))
+        );
+    }
+}
+
+/// #1958 — the bytecode engine's bound is a production one, well past the tree-walker's oracle
+/// bound: a recursion 100 000 deep returns, and one 200 000 deep traps `StackOverflow`.
+#[test]
+fn bytecode_recursion_bound_sits_past_the_jit_depths() {
+    let src = r#"
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vz = i64.const 0
+  vdone = i64.eq vn vz
+  br_if vdone 1(vz) 2(vn)
+}
+block 1 (vr: i64) {
+  return vr
+}
+block 2 (vm: i64) {
+  vone = i64.const 1
+  vm1 = i64.sub vm vone
+  vs = call 0(vm1)
+  vt = i64.add vs vone
+  return vt
+  }
+}
+"#;
+    let m = temen_text::parse_module(src).expect("parse");
+    let mut fuel = 10_000_000u64;
+    assert_eq!(
+        bytecode::compile_and_run(&m, 0, &[Value::I64(100_000)], &mut fuel),
+        Some(Ok(vec![Value::I64(100_000)]))
+    );
+    let mut fuel = 10_000_000u64;
+    assert_eq!(
+        bytecode::compile_and_run(&m, 0, &[Value::I64(200_000)], &mut fuel),
+        Some(Err(Trap::StackOverflow))
+    );
+}
