@@ -1396,23 +1396,20 @@ pub fn compile_and_run_with_host_interruptible_fast(
 /// asynchronously), this is a deterministic **guest budget**: `fuel` counts exactly the function
 /// entries, taken back-edges and resumes executed — the unit the tree-walker and bytecode engines
 /// charge — so a run either completes or traps `OutOfFuel` at the same safepoint on all three
-/// backends. The caller owns the `u64` cell, seeds it with the budget, and reads the remainder back
-/// after the call.
+/// backends. The caller seeds `fuel` with the budget and reads the remainder back after the call: a
+/// fixed allowance, never refilled (#1944 slice 3).
 ///
 /// # Safety
-/// `fuel` must point at a live, writable `u64` that outlives the call (its address is baked into the compiled
-/// code); `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
+/// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
 pub fn compile_and_run_with_host_fuel(
     m: &IrModule,
     func: FuncIdx,
     args: &[i64],
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-    fuel: *mut u64,
+    fuel: &mut u64,
 ) -> Result<JitOutcome, JitError> {
-    // A fixed allowance: the caller's `u64` is the whole budget (#1944 slice 3).
-    // SAFETY: `fuel` is live and writable for the call (the contract above).
-    let mut cell = FuelCell::fixed(unsafe { *fuel });
+    let mut cell = FuelCell::fixed(*fuel);
     let r = run_inner(
         m,
         func,
@@ -1424,8 +1421,7 @@ pub fn compile_and_run_with_host_fuel(
             ..RunOpts::default()
         },
     );
-    // SAFETY: as above.
-    unsafe { *fuel = cell.left };
+    *fuel = cell.left;
     Ok(r?.0)
 }
 
@@ -1577,15 +1573,14 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
 }
 
 /// [`compile_and_run_capture_reserved_with_host`] with a **counted-fuel budget armed** (INTERP_PERF.md
-/// "Fuel unification"): the caller owns the `u64` cell, seeds it with the budget, and reads the
-/// remainder back after the call; the run traps [`TrapKind::OutOfFuel`] when the budget would
-/// underflow, at the same IR safepoints (function entries + taken back-edges + `cont.resume`) the
-/// interpreters charge.
+/// "Fuel unification"): the caller seeds `fuel` with the budget and reads the remainder back after the
+/// call (a fixed allowance, never refilled — #1944 slice 3); the run traps [`TrapKind::OutOfFuel`]
+/// when the budget would underflow, at the same IR safepoints (function entries + taken back-edges +
+/// `cont.resume`) the interpreters charge.
 /// This lets the differential fuzzer **assert** cross-engine `OutOfFuel` parity rather than exclude it.
 ///
 /// # Safety
-/// As [`compile_and_run_capture_reserved_with_host`]; `fuel` must be a valid, writable `u64` that
-/// outlives the call.
+/// As [`compile_and_run_capture_reserved_with_host`].
 #[allow(clippy::too_many_arguments)]
 pub fn compile_and_run_capture_reserved_with_host_fuel(
     m: &IrModule,
@@ -1595,11 +1590,9 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
     reserved_log2: u8,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-    fuel: *mut u64,
+    fuel: &mut u64,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-    // A fixed allowance: the caller's `u64` is the whole budget (#1944 slice 3).
-    // SAFETY: `fuel` is live and writable for the call (the contract above).
-    let mut cell = FuelCell::fixed(unsafe { *fuel });
+    let mut cell = FuelCell::fixed(*fuel);
     let r = run_inner(
         m,
         func,
@@ -1615,8 +1608,7 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
             ..RunOpts::default()
         },
     );
-    // SAFETY: as above.
-    unsafe { *fuel = cell.left };
+    *fuel = cell.left;
     r
 }
 

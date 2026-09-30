@@ -321,22 +321,17 @@ impl Tree {
                     }
                     Some(None) => {
                         drop(kept);
-                        compile(
-                            host, program, entry, jit, plan, interrupt, self.quota, self.fuel,
-                        )?
+                        compile(host, program, entry, jit, plan, interrupt, self)?
                     }
                     None => {
-                        let (cm, image) = compile(
-                            host, program, entry, jit, plan, interrupt, self.quota, self.fuel,
-                        )?;
+                        let (cm, image) =
+                            compile(host, program, entry, jit, plan, interrupt, self)?;
                         *kept = Some(image.clone());
                         (cm, image)
                     }
                 }
             }
-            _ => compile(
-                host, program, entry, jit, plan, interrupt, self.quota, self.fuel,
-            )?,
+            _ => compile(host, program, entry, jit, plan, interrupt, self)?,
         };
         Ok(Loaded {
             cm,
@@ -778,7 +773,7 @@ struct Loaded {
 
 /// Compile `program` at `entry` over `host` — instrumented to fork when `plan` says it can — and share
 /// its code as an [`Image`], unless the program can extend its code (`jit`) or the code is more than
-/// code ([`CompiledModule::share`]).
+/// code ([`CompiledModule::share`]). `tree` is the run's: its quota, and its fuel cell if armed.
 ///
 /// # Safety
 /// As [`compile_image`].
@@ -789,8 +784,7 @@ unsafe fn compile(
     jit: bool,
     plan: Option<ForkPlan>,
     interrupt: Option<*const AtomicU64>,
-    quota: temen_jit::Quota,
-    fuel: usize,
+    tree: &Tree,
 ) -> Result<(CompiledModule, Option<Arc<Image>>), temen_jit::JitError> {
     let sized;
     let m = match program {
@@ -814,8 +808,8 @@ unsafe fn compile(
     let (code, at) = instrumented
         .as_ref()
         .map_or((m, entry), |(im, at)| (im, *at));
-    let fuel = (fuel != 0).then_some(fuel as *mut temen_jit::FuelCell);
-    let cm = compile_image(host, code, at, interrupt, quota, jit, fuel)?;
+    let fuel = (tree.fuel != 0).then_some(tree.fuel as *mut temen_jit::FuelCell);
+    let cm = compile_image(host, code, at, interrupt, tree.quota, jit, fuel)?;
     let image = (!jit).then(|| cm.share()).flatten().map(|code| {
         Arc::new(Image {
             code,
