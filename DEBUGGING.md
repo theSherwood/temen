@@ -2437,13 +2437,17 @@ boundaries rather than inverted per-op"* — and the first implementation did it
 or before `t` and re-executes the remainder (bounded by the stride, using `tick`, which honours no
 breakpoint or watch checks because this is re-execution of turns that already happened). Window
 pre-images stay per-op, so the window is exact at every turn and only the continuation needs the short
-replay. At the chosen stride of 256:
+replay. The stride is the least spacing: a boundary also waits out as many turns as its continuation
+cloned slots (#1958). On a fixed stride a deep call stack made the journal's cost per op grow with
+depth (a recursion to about 50 000 frames ran six times slower per op than at the start). Spaced
+by size, each op pays a constant share, and an undo's replay grows with depth instead. At the chosen
+stride of 256:
 
 **What the intra-segment replay rests on, and why it is not a new bet.** Re-executing to reach `t`
 needs those turns to run the same way twice — but that is the assumption reverse debugging has always
 made, not one the journal introduces. `seek` replays too, from turn 0 or the nearest ladder rung
-(stride 1024); undo replays at most `state_stride` (256). Same premise, strictly less of it, and
-`dap_checkpoints.rs`'s warm≡cold oracle is the standing test of it. It is in fact the *weaker* form:
+(stride 1024); undo replays at most one segment (`state_stride`, 256, or longer on a deep stack).
+Same premise, and `dap_checkpoints.rs`'s warm≡cold oracle is the standing test of it. It is in fact the *weaker* form:
 `seek` re-derives state by rebuilding a run from scratch, while undo restores a cloned continuation in
 the same process, so anything that could differ between a rebuilt run and the original is never
 re-derived at all.

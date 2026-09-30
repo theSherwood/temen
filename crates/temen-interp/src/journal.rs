@@ -84,6 +84,9 @@ pub struct JournalStats {
     pub entries: usize,
     /// Per-op state entries (continuation + host cursor) currently held.
     pub states: usize,
+    /// State entries ever recorded, including those since aged out: how often the journal paid for
+    /// a continuation clone.
+    pub recorded_states: usize,
     /// Pre-image bytes currently held.
     pub bytes: usize,
     /// Entries ever appended, including those since coalesced away.
@@ -104,6 +107,8 @@ pub(crate) struct StateEntry {
     pub(crate) coord: u64,
     pub(crate) cont: ScheduledContinuation,
     pub(crate) cursor: HostCursor,
+    /// The first turn the next boundary may take ([`Journal::state_due`]).
+    pub(crate) next: u64,
 }
 
 /// **The retention policy** (#1558) — static, and deliberately a parameter struct rather than
@@ -138,6 +143,11 @@ pub struct JournalPolicy {
     /// So `undo_to(t)` restores the nearest boundary at or before `t` and re-executes the remainder,
     /// which is bounded by this stride. `cargo run --release -p temen-run --example journal_cost`
     /// reports the trade at several strides.
+    ///
+    /// The stride is the **least** spacing: boundaries stay on its multiples, but each also waits out
+    /// as many turns as its continuation cloned slots, so the clone costs each op a constant share
+    /// however deep the call stack (#1958; a fixed stride made the cost per op grow with depth). The
+    /// replay an undo does grows with depth instead, bounded by that same size.
     pub state_stride: u64,
 }
 
@@ -186,6 +196,7 @@ pub struct Journal {
     armed: bool,
     appended: usize,
     appended_bytes: usize,
+    recorded_states: usize,
     /// The earliest coordinate this journal can still restore faithfully.
     ///
     /// Not derivable from `entries`: they exist only for turns that *wrote*, so the oldest entry's
@@ -249,6 +260,7 @@ impl Journal {
             entries: self.entries.len(),
             bytes: self.held_bytes,
             states: self.states.len(),
+            recorded_states: self.recorded_states,
             appended: self.appended,
             appended_bytes: self.appended_bytes,
             rewalked_bytes: self.rewalked_bytes,
@@ -285,11 +297,13 @@ impl Journal {
     /// compact host cursor. A no-op while disarmed. The caller is responsible for only calling this
     /// when the state is invertible (`Host::journal_invertible` and the checkpointable subset); a turn
     /// with no state entry is one [`state_at`](Self::state_at) will decline, so undo fails closed.
+    /// `next` is the first turn the following boundary may take ([`state_due`](Self::state_due)).
     pub(crate) fn record_state(
         &mut self,
         coord: u64,
         cont: ScheduledContinuation,
         cursor: HostCursor,
+        next: u64,
     ) {
         if !self.armed {
             return;
@@ -304,7 +318,16 @@ impl Journal {
             coord,
             cont,
             cursor,
+            next,
         });
+        self.recorded_states += 1;
+    }
+
+    /// Whether `coord` has reached the spacing the latest boundary at or before it asked for (or has
+    /// none). Keyed on that boundary rather than on the newest, so a replay after an undo meets the
+    /// boundaries the first pass recorded, which `record_state` then keeps.
+    pub(crate) fn state_due(&self, coord: u64) -> bool {
+        self.state_at(coord).is_none_or(|s| coord >= s.next)
     }
 
     /// The nearest state entry **at or before** `coord`, or `None` when the journal holds none that
