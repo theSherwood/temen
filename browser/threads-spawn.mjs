@@ -41,7 +41,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, vcpu, rootDomain, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService, ticket } = workerData;
+    smod, vcpu, rootDomain, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, jitService } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -94,134 +94,9 @@ async function worker() {
     jitEnvCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes()));
   }
 
-  // §14 instantiate real codegen: a confined child whose granted-unit entry is eligible runs it on
-  // emitted wasm here and fills the completion slot the parent joins (no vCPU). With the nested emit
-  // a cap-using entry is ALSO eligible — its instantiate/join arrive as the env.instantiate/env.join
-  // imports, serviced through the same completion-slot protocol (see web/worker.js, the browser twin).
-  if (role === 'confined' && instCodegen && ex.temen_par_enable_inst_codegen() === 1
-      && ex.temen_par_inst_eligible(entry) === 1) {
-    const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
-    const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
-    // #1151 Slice 2c: the child vCPU is built anyway — never `temen_par_run`, it services every
-    // `env.call_interp` leaf over the carve with the child's OWN powerbox (`temen_par_inst_call_interp`
-    // → `bounce_call`), so a leaf may store / `map` / `unmap` / `protect` exactly as the interpreter
-    // path would run it. On a paged unit (the module reaches a page op) the emitted accesses consult a
-    // page-state table re-synced from this vCPU after each bounce. Its starter cap handles (the entry
-    // args) come from the argv stash — no longer inert zeros.
-    const cv = ex.temen_par_child_confined(prog, BigInt(ticket), win, slog);
-    if (cv === 0) {
-      Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2);
-      parentPort.postMessage({ kind: 'fail', why: 'confined child vcpu build failed (codegen path)' });
-      return;
-    }
-    const paged = ex.temen_par_inst_paged() === 1;
-    let uexports = null;
-    const syncPaged = () => {
-      uexports.mapped.value = ex.temen_par_ev_b(cv);
-      uexports.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(cv));
-    };
-    const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
-    const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
-    const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
-      env: {
-        memory,
-        trap: () => {},
-        call_interp: (f, a) => {
-          if (ex.temen_par_inst_call_interp(cv, f, a) !== 0) throw new Error('cross-tier trap');
-          if (paged) syncPaged();
-        },
-        // The engine admits the grandchild against this child's vCPU (see web/worker.js).
-        instantiate: (cwin, inst, centry, off, cslog, quota) => {
-          const t = ex.temen_par_inst_instantiate(cv, inst, centry, off, cslog, quota);
-          if (t === 0n) throw new Error('nested instantiate trapped');
-          if (t < 0n) return Number(t);
-          const gslog = Number(cslog), carve = Number(ex.temen_par_ev_c(cv));
-          const gslot = ex.temen_par_alloc(SLOT);
-          const gstackTop = ex.temen_par_alloc(STACK) + STACK;
-          const gtlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-          parentPort.postMessage({
-            kind: 'spawn', role: 'confined', ticket: t.toString(), smod, entry: Number(centry),
-            slog: gslog, win: cwin + carve, winSize: 2 ** gslog,
-            slot: gslot, stackTop: gstackTop, tlsBase: gtlsBase,
-          });
-          const h = childSlots.length;
-          childSlots.push(gslot);
-          return h;
-        },
-        join: (_inst, child) => {
-          const gslot = childSlots[child];
-          if (gslot === undefined) throw new Error('join of unknown child');
-          Atomics.wait(i32(), gslot >> 2, 0);
-          if (Atomics.load(i32(), gslot >> 2) === 2) throw new Error('nested child trapped');
-          return i64()[(gslot + 8) >> 3];
-        },
-        // §11 slice 3 — thread/futex ops from an EMITTED unit, serviced through the same spawn
-        // relay + completion-slot protocol as the interpreter's SPAWN/JOIN arms. The spawned vCPU
-        // runs the granted unit's own `func` (smod — this Worker knows its module), over THIS
-        // child's window (a thread shares its spawner's window = the carve).
-        thread_spawn: (func, sp, arg) => {
-          const tslot = ex.temen_par_alloc(SLOT);
-          const tstackTop = ex.temen_par_alloc(STACK) + STACK;
-          const ttlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-          parentPort.postMessage({
-            kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
-            rootDomain, // a thread joins its spawner's domain
-            win, winSize,
-            slot: tslot, stackTop: tstackTop, tlsBase: ttlsBase,
-          });
-          const h = threadSlots.length;
-          threadSlots.push(tslot);
-          return h;
-        },
-        thread_join: (h) => {
-          const tslot = threadSlots[h];
-          if (tslot === undefined) throw new Error('join of unknown thread');
-          Atomics.wait(i32(), tslot >> 2, 0);
-          if (Atomics.load(i32(), tslot >> 2) === 2) throw new Error('unit thread trapped');
-          return i64()[(tslot + 8) >> 3];
-        },
-        // Futex over the shared window (addr confined by the window mask, as the engine does).
-        mem_wait: (cwin, addr, expected, timeout, is64) => {
-          const a = cwin + (Number(addr) & (winSize - 1));
-          const ms = timeout <= 0n ? Infinity : Number(timeout) / 1e6;
-          const r = is64
-            ? Atomics.wait(i64(), a >> 3, expected, ms)
-            : Atomics.wait(i32(), a >> 2, Number(BigInt.asIntN(32, expected)), ms);
-          return r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2;
-        },
-        mem_notify: (cwin, addr, count) => {
-          const a = cwin + (Number(addr) & (winSize - 1));
-          return Atomics.notify(i32(), a >> 2, count >>> 0);
-        },
-      },
-    });
-    const envCell = Number(ex.temen_par_alloc(ex.temen_wasmjit_env_bytes()));
-    uinst.exports.fuel.value = 1n << 61n; // fuel now lives in the emitted `fuel` global
-    // The entry args: the child's starter cap handles, staged by `temen_par_child_confined`.
-    const nargs = Number(ex.temen_par_tierup_argv_len(cv)), aptr = Number(ex.temen_par_tierup_argv_ptr(cv));
-    const args = [];
-    for (let i = 0; i < nargs; i++) args.push(i64()[(aptr >> 3) + i]);
-    if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1);
-    try {
-      const ret = uinst.exports['f' + entry](win, envCell, ...args);
-      i64()[(slot + 8) >> 3] = BigInt(ret);
-      Atomics.store(i32(), slot >> 2, 1);
-      Atomics.notify(i32(), slot >> 2);
-    } catch {
-      Atomics.store(i32(), slot >> 2, 2);
-      Atomics.notify(i32(), slot >> 2);
-    }
-    ex.temen_par_free(cv);
-    return;
-  }
-
-  // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
-  // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
   const v = role === 'root'
     ? ex.temen_par_root(prog, win, winSize, func)
-    : role === 'confined'
-      ? ex.temen_par_child_confined(prog, BigInt(ticket), win, slog)
-      : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
+    : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { parentPort.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   for (;;) {
@@ -275,23 +150,9 @@ async function worker() {
       continue;
     }
     if (ev === INSTANTIATE) {
-      // §14 confined executor child: the engine admitted it and built everything authority-bearing;
-      // we relay its ticket to a new Worker (whose window IS the carve), joined via the same
-      // completion-slot protocol as SPAWN.
-      const t = ex.temen_par_ev_a(v); // the admitted child, opaque
-      const carve = Number(ex.temen_par_ev_b(v)), cslog = Number(ex.temen_par_ev_c(v));
-      const am = ex.temen_par_ev_d(v); // (module << 32) | entry
-      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
-      const cslot = ex.temen_par_alloc(SLOT);
-      const cstackTop = ex.temen_par_alloc(STACK) + STACK;
-      const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-      parentPort.postMessage({
-        kind: 'spawn', role: 'confined', ticket: t.toString(), smod: csmod, entry: centry,
-        slog: cslog, win: win + carve, winSize: 1 << cslog,
-        slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
-      });
-      ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
-      continue;
+      // A §14 carve spawn. Children are detached now (#1865), and this CLI does not mint their
+      // memories (the browser Worker does, `web/worker.js`): fail closed.
+      throw new Error('a carve spawn is not served; spawn detached (op 17 v1)');
     }
     if (ev === WAIT) {
       const addr = Number(ex.temen_par_ev_a(v)), expected = Number(BigInt.asIntN(32, ex.temen_par_ev_b(v)));
@@ -396,8 +257,7 @@ async function main() {
   const prog = (jitMode || jitCodegen) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
   if (prog === 0) { console.log('FAIL: temen_par_compile returned null (decode/unsupported)'); process.exit(1); }
 
-  // The one shared guest window every vCPU runs over (TEMEN_WIN sizes it — the §14 kernels declare a
-  // 1 MiB window so their 64 KiB carves stay wasm-page-aligned).
+  // The one shared guest window every vCPU runs over (TEMEN_WIN sizes it).
   const winSize = Number(process.env.TEMEN_WIN ?? 1 << 16);
   const win = ex.temen_par_alloc(winSize);
 
@@ -407,25 +267,6 @@ async function main() {
   if (process.env.TEMEN_IO === '1' && ex.temen_par_powerbox_io() !== 1) {
     console.log('FAIL: temen_par_powerbox_io returned 0'); process.exit(1);
   }
-  // §14 mode (TEMEN_INST=1): publish the run recipe — the root's `Instantiator` spans the window, plus
-  // the optional granted module (TEMEN_INST_UNIT) for `instantiate_module`. The root vCPU builds its own
-  // powerbox from it (temen_par_root); confined children build theirs in-engine.
-  // §14 real-codegen mode (TEMEN_INST_CODEGEN=1): same recipe as TEMEN_INST, but each confined child whose
-  // granted-unit entry is in-subset runs it on emitted wasm (the confined-child block in worker()).
-  const instCodegen = process.env.TEMEN_INST_CODEGEN === '1';
-  if (process.env.TEMEN_INST === '1' || instCodegen) {
-    let uptr = 0, ulen = 0;
-    if (process.env.TEMEN_INST_UNIT) {
-      const unit = readFileSync(process.env.TEMEN_INST_UNIT);
-      uptr = ex.temen_par_alloc(unit.length);
-      u8().set(unit, uptr);
-      ulen = unit.length;
-    }
-    if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen, 0n) !== 1) {
-      console.log('FAIL: temen_par_powerbox_inst returned 0'); process.exit(1);
-    }
-  }
-
   console.log(`module: ${WASM}  shared=${memory.buffer instanceof SharedArrayBuffer}`);
   console.log(`  prog@0x${prog.toString(16)}  window@0x${win.toString(16)} (${winSize >> 10}KiB)  TLS ${tlsSize}B`);
 
@@ -437,7 +278,7 @@ async function main() {
   // A shared i32 cell every Worker atomically bumps on each tier-up / JIT-codegen invoke — proves the
   // seam actually fired (a result match alone couldn't distinguish "ran emitted wasm" from "silently
   // interpreted"). Shared by the tier-up and §22-codegen paths (they never run in the same run).
-  const tierupCell = (tierup || jitCodegen || instCodegen) ? ex.temen_par_alloc(4) : 0;
+  const tierupCell = (tierup || jitCodegen) ? ex.temen_par_alloc(4) : 0;
 
   const workers = new Set();
   let started = 0;
@@ -446,14 +287,13 @@ async function main() {
   const startVcpu = (cfg) => {
     started++;
     const w = new Worker(new URL(import.meta.url), {
-      workerData: { module, memory, prog, win, winSize, tierup, tierupPaged, jitCodegen, instCodegen, jitService, gptr, glen: guest.length, tierupCell, ...cfg },
+      workerData: { module, memory, prog, win, winSize, tierup, tierupPaged, jitCodegen, jitService, gptr, glen: guest.length, tierupCell, ...cfg },
     });
     workers.add(w);
     w.on('message', (m) => {
       if (m.kind === 'spawn') {
-        // A vCPU asked to spawn a (plain or §14-confined) child: start its Worker with the message's
-        // cfg verbatim (slot/stack/TLS already allocated by the parent; a confined child's message
-        // carries its own win/winSize — the carve — overriding the run defaults).
+        // A vCPU asked to spawn a thread: start its Worker with the message's cfg verbatim
+        // (slot/stack/TLS already allocated by the parent).
         const { kind, ...cfg } = m;
         startVcpu({ role: 'child', ...cfg });
       } else if (m.kind === 'done') {
@@ -475,12 +315,12 @@ async function main() {
     console.log(`  vCPUs started: ${started} (1 root + ${started - 1} spawned), ${ms.toFixed(0)} ms`);
     if (err) console.log(`  error: ${err}`);
     else console.log(`  root returned ${value}  expect ${EXPECT}  ${ok ? '✓' : '✗'}`);
-    // Non-vacuity: with TEMEN_TIERUP / TEMEN_JIT_CODEGEN / TEMEN_INST_CODEGEN the workers must have actually
+    // Non-vacuity: with TEMEN_TIERUP / TEMEN_JIT_CODEGEN the workers must have actually
     // run emitted wasm.
-    if (tierup || jitCodegen || instCodegen) {
+    if (tierup || jitCodegen) {
       const ran = Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2);
       const ranOk = ran > 0;
-      const label = jitCodegen ? 'JIT-codegen invokes' : instCodegen ? 'inst-codegen children' : 'tier-ups';
+      const label = jitCodegen ? 'JIT-codegen invokes' : 'tier-ups';
       console.log(`  ${label} fired: ${ran}  ${ranOk ? '✓ (ran emitted wasm)' : '✗ (vacuous — never ran emitted wasm)'}`);
       ok = ok && ranOk;
     }

@@ -89,30 +89,6 @@ async function main() {
     set('jit', 'fail', `jit: error ${e}`);
   }
 
-  // --- 4) §14 confined executor children across real Web Workers (4c-domain §14-D2) ---------------
-  // Three sub-proofs, each a fresh run over a 1 MiB window with 64 KiB carves:
-  //   a. instantiate:  8 confined children (each its own Worker + attenuated powerbox) → 8 × 5 = 40;
-  //   b. nested:       each child instantiates a grandchild over its whole carve — VM-in-VM-in-VM
-  //                    across THREE Worker generations → 8 × 9 = 72;
-  //   c. module:       `instantiate_module` a granted module 8× (compile + push to the shared source
-  //                    + data segments materialized, all crossing Workers) → 8 × 75 = 600.
-  try {
-    const opt = { inst: true, winSize: 1 << 20 };
-    const t0 = performance.now();
-    const a = await runPath('/corpus/threads_inst.temenc', opt);
-    const b = await runPath('/corpus/threads_inst_nested.temenc', opt);
-    const c = await runPath('/corpus/threads_inst_mod.temenc',
-      { ...opt, unitPath: '/corpus/threads_inst_unit.temenc' });
-    const ms = (performance.now() - t0).toFixed(0);
-    const ok = a.value === 40n && b.value === 72n && c.value === 600n;
-    set('inst', ok ? 'pass' : 'fail',
-      `inst: confined children → ${a.value} (want 40) · nested ×${b.started} Workers → ${b.value} ` +
-      `(want 72) · module → ${c.value} (want 600) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
-    log(`inst → ${a.value}/${b.value}/${c.value} (nested spanned ${b.started} Workers) in ${ms}ms`);
-  } catch (e) {
-    set('inst', 'fail', `inst: error ${e}`);
-  }
-
   // --- 5) host I/O from worker vCPUs across real Web Workers (THREADS.md 4d) ----------------------
   // 8 worker vCPUs each `call.cap`-write "tick\n" to the run's ONE shared powerbox (a Mutex<Host> in
   // shared memory — dispatch is in-Rust under the lock, no JS in the loop) and bump a shared counter.

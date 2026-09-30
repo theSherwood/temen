@@ -3314,14 +3314,15 @@ pub fn compile_and_run_capture_over_parallel_with_host(
 // across `std::thread`s as the differential proof.
 
 /// A compiled module, shareable **read-only** across vCPUs / threads / Workers (its [`Domain`] is
-/// `Sync`). Built once per run; each [`Vcpu`] borrows it. Also carries the memory declaration + data
-/// segments so each vCPU can build its window over the shared backing.
+/// `Sync`). Built once per run; each [`Vcpu`] borrows it. Also carries the memory declaration + the
+/// module itself (its data segments) so each vCPU can build its window over the shared backing.
 pub struct VcpuProgram {
     dom: Domain,
     mem_size_log2: Option<u8>,
     /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
     shadow: Option<super::ShadowArena>,
-    data: Vec<temen_ir::Data>,
+    /// The module compiled — see [`module`](VcpuProgram::module).
+    module: std::sync::Arc<Module>,
     /// #964: the module's NULL-guard extent (`0` = unmarked/legacy), captured at compile so every
     /// window this program is run over seeds the same guard the module's layout was built for.
     null_guard: u64,
@@ -3354,11 +3355,17 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             shadow: m.memory.as_ref().and_then(|mc| mc.shadow),
-            data: m.data.clone(),
+            module: std::sync::Arc::new(m.clone()),
             null_guard: temen_ir::module_null_guard(),
             fibers: SharedFibers::new(),
             next_vcpu: std::sync::atomic::AtomicU64::new(1),
         })
+    }
+
+    /// The module this program was compiled from: the running module a host registers
+    /// ([`Host::set_self_module`]), so a spawn record's `module = -1` names it.
+    pub fn module(&self) -> &std::sync::Arc<Module> {
+        &self.module
     }
 
     /// Reserve the next dense vCPU id (a `thread.spawn` child's), in spawn order across the run.
@@ -3951,6 +3958,12 @@ impl PendingChild {
         (self.module, self.entry)
     }
 
+    /// The module the child's program is (its powerbox's running module) — how a host that emitted
+    /// one module tells whether the child runs it.
+    pub fn self_module(&self) -> Option<&std::sync::Arc<Module>> {
+        self.host.self_module.as_ref()
+    }
+
     /// Start the child as a vCPU over `back`. For a confined child, `back` covers exactly its carve —
     /// `[win + carve, +2^size_log2)` of the parent's window, which per DESIGN.md §14 simply *is* the
     /// child's window (anything the parent wrote there, a module child's data segments, is already in
@@ -4047,7 +4060,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4072,7 +4085,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4097,7 +4110,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation(reserved_log2, sl, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4122,7 +4135,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4834,37 +4847,6 @@ impl<'p> Vcpu<'p> {
         let carve =
             self.mem.as_ref().map_or(0, |m| m.window.base()) + spawn.ibase + spawn.off as u64;
         Ok(Some((child, carve)))
-    }
-
-    /// A §14 `instantiate` (op 0) that this vCPU's code issued on an **emitted** tier — the emitted
-    /// parent's spawn bounce (the browser's `env.instantiate`) — admitted as the interpreted op is:
-    /// the `Instantiator` handle `inst` resolved in this vCPU's powerbox, then
-    /// [`admit_confined_child`] against its window and fuel. The child runs this vCPU's module.
-    /// `Ok(Some((child, carve)))`: the admitted child and where its carve starts in this vCPU's
-    /// window; `Ok(None)`: refused (`-EINVAL`); `Err`: a trap (a forged handle).
-    pub fn admit_instantiate(
-        &mut self,
-        inst: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
-    ) -> Result<Option<(PendingChild, u64)>, Trap> {
-        let (ibase, isize) = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().resolve_instantiator(inst)?,
-            None => self.host.resolve_instantiator(inst)?,
-        };
-        self.admit_confined(ConfinedSpawn {
-            ibase,
-            isize,
-            module: None,
-            entry,
-            off,
-            size_log2,
-            quota,
-            grants: None,
-            budget: 0,
-        })
     }
 
     /// Deliver the host's `token` for the child the last [`VcpuEvent::Spawn`],
