@@ -1941,8 +1941,8 @@ debt):** the bytecode parallel + browser-`Vcpu` drivers (I45 — fiber delivery 
 cross-thread futex is its own slice), the debug drivers (sanctioned whole-vCPU tiering;
 checkpointing excludes cap-parked fibers like futex-parked ones), the §22 invoke leaves
 (seam-free atomic), confined `instantiate` children on the cooperative driver (their
-completions live on their own host), durable runs everywhere (`freeze_drive` fails closed on
-any unwoken cap park — pinned), and zero/multi-result punts (the degenerate wait). Residue: the
+completions live on their own host), durable runs everywhere (a punted completion has no freeze
+rule yet, #1902), and zero/multi-result punts (the degenerate wait). Residue: the
 animated-offer punt is exercised only by construction (`wire_offer_proc` seals the provider
 `Host`; pin it when a public wiring can grant a provider an offloadable cap). I48 (a blocking
 `cont.resume`) stays deferred — this arc built the wake machinery it would idle on, the
