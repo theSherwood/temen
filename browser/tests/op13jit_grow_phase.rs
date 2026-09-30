@@ -3,7 +3,7 @@
 //! phase child with a fixed `alloc_zeroed` carve pre-sized 8× its declared window (`(decl + 3).max(24)`,
 //! doubled into its buddy parent) — for a ~256 MiB phase, a 4 GiB block inside the browser's 1 GiB
 //! memory, so the big nim phases could not tier up. Now the child is granted the policy carve
-//! (`nimc::PHASE_WINDOW_LOG2`'s buddy half, 256 MiB) and **commits only its declared window**: `"mapped"`
+//! (a 256 MiB buddy half) and **commits only its declared window**: `"mapped"`
 //! starts at `1 << DECL` and each `vm_map` bounce (an outlined `env.call_interp` leaf) grows it into the
 //! carve — the #1243 growable-child model, whose confinement `nested_grow_window` fuzzes.
 //!

@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**371 exports** in 38 families — 315 referenced from JS, 56 referenced by nothing, 9 behind a `cfg`.
+**349 exports** in 37 families — 294 referenced from JS, 55 referenced by nothing, 9 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,7 +11,6 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
-| `compile` | 2 | 1 | 0 |
 | `coop` | 46 | 40 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
@@ -25,15 +24,15 @@
 | `link` | 10 | 6 | 0 |
 | `mem` | 3 | 0 | 0 |
 | `module` | 3 | 0 | 0 |
-| `nim` | 12 | 12 | 0 |
-| `onramp` | 67 | 56 | 0 |
-| `op13jit` | 18 | 17 | 0 |
+| `nim` | 4 | 4 | 0 |
+| `onramp` | 66 | 55 | 0 |
+| `op13jit` | 10 | 9 | 0 |
 | `par` | 70 | 70 | 1 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
 | `release` | 4 | 0 | 0 |
-| `run` | 24 | 23 | 0 |
+| `run` | 21 | 20 | 0 |
 | `run0` | 1 | 1 | 0 |
 | `selfhost` | 2 | 2 | 0 |
 | `set` | 1 | 1 | 0 |
@@ -97,11 +96,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_callprof_len` — `cfg(feature = "callprof")`
 - `temen_callprof_ptr` — `cfg(feature = "callprof")`
 - `temen_callprof_reset` — `cfg(feature = "callprof")`
-
-### `compile`
-
-- `temen_compile_nim_fs`
-- `temen_compile_nim_link_fs` — *unreferenced*
 
 ### `coop`
 
@@ -238,16 +232,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_nim_file`
 - `temen_nim_file_ptr`
-- `temen_nim_libc_put`
 - `temen_nim_module_suffix`
 - `temen_nim_open`
-- `temen_nim_parse_imports`
-- `temen_nim_parse_includes`
-- `temen_nim_precrawl_put`
-- `temen_nim_precrawl_reset`
-- `temen_nim_stdlib_files`
-- `temen_nim_stdlib_open`
-- `temen_nim_stdlib_read`
 
 ### `onramp`
 
@@ -277,7 +263,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_jit_run_open_fs`
 - `temen_onramp_jit_run_pagestate_len`
 - `temen_onramp_jit_run_pagestate_ptr`
-- `temen_onramp_jit_run_readfile`
 - `temen_onramp_jit_run_report`
 - `temen_onramp_jit_run_slot`
 - `temen_onramp_jit_run_slot_count`
@@ -325,18 +310,10 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_op13jit_close`
 - `temen_op13jit_counter`
 - `temen_op13jit_deliver`
-- `temen_op13jit_exec_log`
-- `temen_op13jit_nimsem_open`
-- `temen_op13jit_nimsem_open_inline`
 - `temen_op13jit_open`
 - `temen_op13jit_open_child`
 - `temen_op13jit_open_detached`
 - `temen_op13jit_open_named` — *unreferenced*
-- `temen_op13jit_phase_diag`
-- `temen_op13jit_phase_open`
-- `temen_op13jit_phase_open_argv`
-- `temen_op13jit_phase_output`
-- `temen_op13jit_phase_read`
 - `temen_op13jit_result`
 - `temen_op13jit_step`
 
@@ -449,10 +426,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_run_dynlink`
 - `temen_run_jit`
 - `temen_run_nested`
-- `temen_run_nifler_crawl_diag`
-- `temen_run_nifler_crawl_fs`
 - `temen_run_nifler_fs`
-- `temen_run_nifler_jit_crawl_open`
 - `temen_run_nifler_jit_open`
 - `temen_run_onramp`
 - `temen_run_onramp_fs`

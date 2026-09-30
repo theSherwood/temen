@@ -289,8 +289,8 @@ impl Plan {
 }
 
 /// Run `plan` to completion on the resumable interpreter (the native / single-threaded driver,
-/// [`crate::nimc::drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which
-/// already holds `caps`), and return what the root returns — the last node's result.
+/// [`drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which already holds
+/// `caps`), and return what the root returns — the last node's result.
 pub fn run(
     plan: &Plan,
     modules: &[&Module],
@@ -323,9 +323,113 @@ pub fn run(
         &[],
         host,
     )
-    .and_then(|root| crate::nimc::drive_op13(&prog, base, root, None));
+    .and_then(|root| drive_op13(&prog, base, root));
     drop(back);
     // SAFETY: same layout; the root vCPU and its region views are dropped above.
     unsafe { std::alloc::dealloc(base, layout) };
     out
+}
+
+/// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`), for a root (see
+/// [`run`]) or a child a driver runs on the interpreter. The engine admits every spawn, its powerbox
+/// built; this loop only starts the child. On a **detached** spawn (op 15, #1288) it mints the fresh
+/// window's backing, a root-sized lazily-reserved `Region::new` (an `mmap` natively; the sparse
+/// `Paged` fallback on wasm32), which the engine seeds (committed window = the declared size, starter
+/// caps over the reservation, so `vm_map` grows it). On a nested `Instantiate` (op 13 — a carve) it
+/// starts the child over the sub-window at `base + carve`, committing the declared window the same
+/// way. `Join` delivers the child's result. Single-threaded here, so the window base travels as a raw
+/// ptr.
+pub(crate) fn drive_op13<'p>(
+    prog: &'p bytecode::VcpuProgram,
+    base: *mut u8,
+    mut vcpu: bytecode::Vcpu<'p>,
+) -> Result<Vec<Value>, Trap> {
+    let mut children: Vec<Option<Result<Vec<Value>, Trap>>> = Vec::new();
+    loop {
+        match vcpu.run() {
+            bytecode::VcpuEvent::Done(v) => return Ok(v),
+            bytecode::VcpuEvent::Trapped(t) => return Err(t),
+            bytecode::VcpuEvent::InstantiateDetached { .. } => {
+                // The fresh window's backing, a lazy reservation; the engine seeds it.
+                let back = std::sync::Arc::new(Region::new(
+                    1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                    temen_interp::host_page_size(),
+                ));
+                // A detached child's window is its own, not a sub-window of this one: a carve under
+                // it has no addressable base here, and declines below.
+                let r = vcpu
+                    .take_child()
+                    .ok_or(Trap::Malformed)
+                    .and_then(|c| c.start(prog, back, None))
+                    .and_then(|c| drive_op13(prog, core::ptr::null_mut(), c));
+                let token = children.len() as u64;
+                children.push(Some(r));
+                vcpu.deliver_child(token);
+            }
+            bytecode::VcpuEvent::Instantiate {
+                carve, size_log2, ..
+            } => {
+                if base.is_null() {
+                    // A nested carve needs an addressable parent window — the driver's decline
+                    // (see `crate::declined_child`), not a trap for the parent.
+                    return crate::declined_child();
+                }
+                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
+                // child); the child region aliases that sub-window — the §14 shared data plane.
+                let child_base = unsafe { base.add(carve as usize) };
+                let back =
+                    std::sync::Arc::new(unsafe { Region::shared(child_base, 1u64 << size_log2) });
+                // An `Instantiate` always carries its admitted child; `Malformed` rather than a panic
+                // if it somehow did not.
+                let r = vcpu
+                    .take_child()
+                    .ok_or(Trap::Malformed)
+                    .and_then(|c| c.start(prog, back, Some(size_log2)))
+                    .and_then(|c| drive_op13(prog, child_base, c));
+                let token = children.len() as u64;
+                children.push(Some(r));
+                vcpu.deliver_child(token);
+            }
+            // The engine resolved the guest's handle (a bad one traps in the vCPU) and hands each
+            // child's token back once.
+            bytecode::VcpuEvent::Join { child } => {
+                let banked = children[child as usize]
+                    .take()
+                    .expect("the engine hands a child's token back once");
+                vcpu.deliver_join(banked);
+            }
+            // #1296 — a child holding a re-granted `Jit`: `install` fills a slot of the child's OWN
+            // dispatch table (its `own_dom`); `invoke` runs the unit interpreted over the child's own
+            // window — this inline (interpreter) path has no emitted-unit servicer (that is the staged
+            // `JIT_RUN` path's bounce), correct and slower. The unit resolves on the child's host.
+            bytecode::VcpuEvent::JitInstall { handle, code } => {
+                let (funcs, types) = match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
+                {
+                    Ok((f, t, _wasm, _id)) => (Ok(f), t),
+                    Err(t) => (Err(t), std::sync::Arc::from(Vec::new())),
+                };
+                let _ = vcpu.deliver_jit_install(funcs, types);
+            }
+            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
+                let authorized = vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());
+                let _ = vcpu.deliver_jit_uninstall(authorized);
+            }
+            bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
+                match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code) {
+                    Ok((funcs, types, _wasm, _id)) => vcpu.deliver_jit_invoke(Ok(funcs), types),
+                    Err(t) => vcpu.deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                }
+            }
+            // The children this loop drives are single-threaded and non-interactive: no threads, no
+            // tier-up (this is the interpreter path), no cap or stdin park. The driver's decline — a
+            // value at the parent's join, never a parent-killing trap (see `crate::declined_child`).
+            // Named rather than `_` (see `VcpuEvent`).
+            bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Spawn { .. }
+            | bytecode::VcpuEvent::Wait { .. }
+            | bytecode::VcpuEvent::Notify { .. }
+            | bytecode::VcpuEvent::CapPending { .. }
+            | bytecode::VcpuEvent::StdinPark => return crate::declined_child(),
+        }
+    }
 }

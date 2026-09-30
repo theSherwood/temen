@@ -220,13 +220,13 @@ fn jit_parse(nifler: &temen_ir::Module, src: &str) -> Vec<u8> {
 /// interpreter (measured, on the rebuilt asset). The same split already ignores the Lua and SQLite
 /// cases in `jit_module.rs`.
 ///
-/// The coverage is not dropped, it moves: `browser-nifler-crawl-jit-test.mjs` runs the same
-/// differential — emitted-wasm nifler vs `temen_run_nifler_crawl_fs`, both products byte-compared —
-/// in real Chromium, and is now wired into the `real-browser` CI job.
+/// The coverage is not dropped, it moves: `browser-nifler-jit-test.mjs` runs the same differential —
+/// the card's emitted-wasm nifler vs `temen_run_nifler_fs`, the `.p.nif` byte-compared — in real
+/// Chromium, in the `real-browser` CI job.
 ///
 /// Un-ignore if wasmi's budget ever grows past this program; nothing else here needs changing.
 #[test]
-#[ignore = "wasmi can't translate nifler's grown _start (register budget); V8 does — see browser-nifler-crawl-jit-test.mjs"]
+#[ignore = "wasmi can't translate nifler's grown _start (register budget); V8 does — see browser-nifler-jit-test.mjs"]
 fn nifler_jit_emits_identical_pnif() {
     let Some(nifler) = nifler_temen() else {
         eprintln!("SKIP: browser/web/assets/nifler.temen.gz absent or gzip unavailable");

@@ -1272,22 +1272,17 @@ jobs:
         if: steps.pages_site.outputs.ok == 'true'
         with: { path: _site }
 
-  # The nim / op-13 card battery, split out of `browser-real`. Three of its scenarios alone cost
-  # 258 s + 164 s + 177 s, and the family as a whole is ~11.6 min of that job's ~16-21 min — one
-  # sequential `run:` block that was the whole PR run's critical path.
-  #
-  # The seam is an **asset** one, not an arbitrary slice. Every script here needs only the *committed*
-  # `web/assets` (`nifler_ce` / `nimsem_ce` / `hexer_ce` / `nim_stdlib.img` / `pg_libc`, each ungzipped
-  # into its own `*_test.*` scratch file by the test itself) plus the threads wasm module. So this job
-  # *drops* the LLVM install and the Postgres / bash / chibicc / self-host staging rather than
-  # duplicating them — sharding here removes work instead of copying it.
+  # The nim card battery and the op-13 loop, split out of `browser-real`, whose critical path they used
+  # to be. Every script here needs only the *committed* `web/assets` (`nimony.blob`, `nifler`) plus the
+  # threads wasm module. So this job *drops* the LLVM install and the Postgres / bash / chibicc /
+  # self-host staging rather than duplicating them — sharding here removes work instead of copying it.
   #
   # `browser-real` keeps the site assembly and the `site_ok` deploy output. This job has no site
   # responsibility, which is what lets it be a matrix at all: matrix job `outputs` are last-writer-wins,
   # so a sharded job cannot carry the deploy gate.
   #
-  # `shard` splits the family by measured cost, ~6 min a side. As the battery grows, add a row here
-  # rather than lengthening one of the existing two.
+  # `shard` splits the family by cost. As the battery grows, add a row here rather than lengthening one
+  # of the existing two.
   browser-real-nim:
     name: real-browser nim/op-13 cards (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -1325,93 +1320,50 @@ jobs:
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
-      - name: shard a — op-13 loop · nifler · hexer · nimsem · crawl
+      - name: shard a — op-13 loop · nifler
         if: matrix.shard == 'a'
         working-directory: browser
         run: |
           # #1025 Path 1: the JS-orchestrated §14 op-13 loop — a resumable driver marshals an `fs` grant to
           # a confined child, and JS runs that child's `_start` on emitted wasm over its carve. The child's
           # `call.cap` leaf resolves the marshaled `fs` on the reactor cross-tier bounce and returns 41; the
-          # driver joins it. The browser realization of nimc.rs::drive_op13 with the child tiered up. No
+          # driver joins it. The browser realization of `plan::drive_op13` with the child tiered up. No
           # assets (parses in-page); reuses the threads module built above.
           node browser-op13jit-e2e-test.mjs
-          # #1025 Path 1 (real nifler): the same op-13 loop scaled to a REAL phase child — a driver marshals
-          # {fs,stdout,exit} to nifler_ce (child-entry) and JS runs its `_start` on emitted wasm over the
-          # carve; it reads the source from the marshaled memfs and writes `.p.nif`, byte-identical to the
-          # interpreter oracle (top-level nifler on the tree-walker). nimc.rs phase-1 nifler crawl, nested +
-          # JIT'd. Uses the committed nifler_ce.temen.gz + web/assets/nifler.temen.gz; reuses the threads module.
-          node browser-op13jit-nifler-test.mjs
-          # #1364: the emitted-wasm nifler crawl step vs the interpreter, both products byte-compared.
+          # The nifler card on the wasm-JIT vs the interpreter, the `.p.nif` both write byte-compared.
           # This is the V8 home of a differential that used to live in `tests/nifler_jit.rs` on wasmi —
           # the rebuilt nifler asset carries enough front-end growth that one function now exceeds
           # wasmi's per-function register budget, so wasmi refuses the module outright while V8 runs it
           # fine (the same split already ignores Lua/SQLite in `jit_module.rs`). The Rust test is
           # `#[ignore]`d pointing here; without this line the coverage would simply be gone.
-          node browser-nifler-crawl-jit-test.mjs
-          # #1025 3a.3 (real hexer): the phase-agnostic op-13 tier-up (`temen_op13jit_phase_open_argv`) on the
-          # second front-end phase — a driver marshals {fs,stdout,exit} to hexer_ce (child-entry), seeds the
-          # committed semchecked system module (`.s.nif` + `.s.idx.nif`), and JS runs hexer_ce's `_start` on
-          # emitted wasm over its 256 MiB carve; the Leng `.x.nif` it writes is byte-identical to the committed
-          # expected (hexer is deterministic — the `rust_driver_hexer.rs` oracle). Reuses the threads module.
-          node browser-op13jit-hexer-test.mjs
-          # #1025 3a.3 (real nimsem — the heaviest phase, 4-cap): the same op-13 tier-up on nimsem_ce via
-          # `temen_op13jit_nimsem_open`, which adds an `exec` cap (`make_exec` over the shared memfs, running
-          # the top-level nifler on the interpreter) so the tiered-up nimsem shells out to nifler grandchildren
-          # (host-side) for the stdlib it imports, while its own sema runs on emitted wasm over a 256 MiB carve.
-          # Seeds the syslib closure + the parsed system module; the `.s.nif` it writes is byte-identical to the
-          # committed expected (`rust_driver_nimsem.rs`'s oracle). SELF-SKIPS under the 1 GiB threads-module
-          # ceiling — nimsem's 512 MiB window + 5.7 MB compile peaks ~1.3 GiB, so the byte-exact leg gates only
-          # once the host asks for 2 GiB (`web/engine-mem.js` `ENGINE_MAX_PAGES`; the `nim_phase_tierup_eligible.rs` headless
-          # gate already covers the WasmDriven-emit question at zero memory cost). Reuses the threads module.
-          node browser-op13jit-nimsem-test.mjs
-          # #1025 Path 1 (whole card): drive the WHOLE nim card through the op-13 loop — the compile's phase-1
-          # nifler crawl runs each module as a nested op-13 emitted child (nifler_ce, {fs,stdout,exit}
-          # marshaled, emit cached across modules), then nimsem/hexer/link/run finish. The card's output is
-          # byte-identical whether phase-1 ran on the interpreter or as nested op-13 emitted children. Uses
-          # the committed nim assets + nifler_ce.temen.gz; reuses the threads module.
-          node browser-nim-op13-crawl-e2e-test.mjs
-      - name: shard b — whole card · tier-up · worker reuse · prewarm gate · libc
+          node browser-nifler-jit-test.mjs
+      - name: shard b — nim card · worker reuse · prewarm gate
         if: matrix.shard == 'b'
         working-directory: browser
         run: |
-          # #1025 3e (whole card, all phases tiered): the step past crawl-only — nifler AND nimsem AND hexer
-          # each run as §14 op-13 detached emitted children via `jitNimWholeCardOp13` (crawl → toposort →
-          # nimsem → hexer, one growing memfs, every `.p/.s/.x` pre-seeded), so the final compile only
-          # links+runs. The card's stdout is byte-identical whether the phases ran on the interpreter or as
-          # op-13 emitted children — the whole-card realization of `nimc::compile_nim` on the wasm-JIT tier.
-          # Uses the committed nim assets + nifler_ce/nimsem_ce/hexer_ce; reuses the threads module.
-          node browser-nim-wholecard-op13-test.mjs
-          # #1025 3e (SHIPPED card wiring): drive the playground's own `snapshotClient.nimCompile` — the exact
-          # path the nim card uses — with the committed web/assets guests (now incl. the child-entry `_ce`).
-          # The snapshot WORKER runs `jitNimWholeCardOp13` (whole card tiered) then link+run and reports what
-          # it pre-seeded; asserts the compile finished (status 0) and the worker actually tiered up
-          # (tier.semmed/hexed > 0 — not a silent interpreter fallback), proving the asset plumbing +
-          # foreign-memory-in-a-Worker end-to-end. Reuses the threads module + committed assets.
+          # #958 (the shipped card): drive the playground's own `snapshotClient.nimCompile` — the exact path
+          # the nim card uses — with the committed toolchain (`web/assets/nimony.blob.gz`). The nim worker
+          # runs nimony's own driver (`nimony t -r --isMain prog.nim`) in one POSIX process tree. Asserts
+          # the program prints what native nimony's build prints, that the leaf processes (nifler2, hexer,
+          # the program) ran on emitted wasm rather than falling back to the interpreter, and that a
+          # program that does not compile reports nimony's diagnostic and runs nothing.
           node browser-nim-card-tierup-test.mjs
           # #1386 (warm-path regression): `runNimc` calls `snapshotClient.cancelNim()` before every compile;
-          # it used to terminate the nim worker unconditionally, throwing away the warmed guest-emit cache so
-          # every Run recompiled the ~5 s nimsem/hexer guests from cold (the deployed ~13–16 s). cancelNim now
-          # no-ops on an IDLE worker. Drives compile → cancelNim → compile ×3 (the real runNimc flow) and
-          # asserts the nim worker is spawned exactly ONCE (was 3×) with correct output each time —
-          # deterministic (spawn count, not timing), so CI-robust. Reuses committed assets; SKIPs if absent.
+          # it used to terminate the nim worker unconditionally, so every Run paid again for what an idle
+          # worker keeps (the inflated toolchain, an engine V8 has already optimized). cancelNim now
+          # no-ops on an IDLE worker. Drives cancelNim → compile three times (the real runNimc flow) and
+          # asserts the nim worker is spawned exactly ONCE with correct output each time — deterministic
+          # (spawn count, not timing), so CI-robust. Reuses committed assets; SKIPs if absent.
           node browser-nim-worker-reuse-test.mjs
           # #1386 (eager-prewarm automation guard): play.js warms the nim toolchain EAGERLY on load
-          # (requestIdleCallback) so the first Run is the fast ~3 s warm path — but that eager trigger is
-          # SKIPPED under automation (navigator.webdriver), because a browser test that drives its own
-          # compile right after load would collide with the background prewarm on the shared nim worker,
-          # run two full compiles at once, and thrash memory into the 30-min job timeout. This asserts, fast
-          # (no compile), that under Playwright the eager trigger does NOT auto-fire on load. SKIPs if the
+          # (requestIdleCallback) so the first Run is the warm path — but that eager trigger is SKIPPED
+          # under automation (navigator.webdriver), because a browser test that drives its own compile
+          # right after load would collide with the background prewarm on the shared nim worker, run two
+          # full compiles at once, and thrash memory into the 30-min job timeout. This asserts, fast (no
+          # compile), that under Playwright the eager trigger does NOT auto-fire on load. SKIPs if the
           # threads wasm is absent. (The scroll-into-view trigger — real users' fallback — is covered by
           # browser-nim-prewarm-test.)
           node browser-nim-eager-prewarm-gate-test.mjs
-          # #1422 (nim runtime providers): a nim program that formats a float could compile but not RUN —
-          # `formatBiggestFloat` calls C `snprintf`, which had no implementation, so the linked module
-          # carried unbound manifest imports and refused to start. The nim->powerbox link now binds those
-          # leaves against the prebuilt guest-C libc the chibicc card already uses (assets/pg_libc.temeno),
-          # seeded through temen_nim_libc_put. This drives that production FFI path and diffs the output
-          # against the native-nimony oracle. SKIPs if the threads wasm or the libc asset is absent.
-          node browser-nim-libc-test.mjs
-
 
   # Publish the artifact browser-real uploaded. A seconds-long job that rides browser-real's already-won
   # slot — no separate heavy build to starve (ISSUES.md I75). Only on a main push where the site
