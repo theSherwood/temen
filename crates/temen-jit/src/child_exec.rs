@@ -288,6 +288,14 @@ struct Entry {
     /// #1469 — the task's own domain, reachable while a worker holds the task: a poisoned task's
     /// parked vCPUs must be woken to observe it.
     dom: Option<Arc<Domain>>,
+    /// #1937 — a durable child's pardon from the teardown poison: under a freeze, its first park
+    /// after the teardown began is re-offered instead, whether it was parked then, running toward
+    /// the park, or not yet started. The freeze rang the child's own word
+    /// (`Nursery::ring_detached`), which ends its wait, so it unwinds and rides the artifact,
+    /// where a poisoned child ends in a trap and leaves no image. One park only: a wait that does
+    /// not end on the word (a host completion wait) is poisoned at its next. Set at spawn for a
+    /// durable child; a teardown that ends the domain revokes it.
+    pardon: bool,
 }
 
 struct ExecState {
@@ -299,7 +307,7 @@ struct ExecState {
     workers: Vec<std::thread::JoinHandle<()>>,
     idle_workers: usize,
     /// Run teardown began: a park now poisons the task (it unwinds through its trailing guard),
-    /// and workers exit once no task remains.
+    /// bar a durable child's pardoned one (`Entry::pardon`), and workers exit once no task remains.
     shutdown: bool,
 }
 
@@ -393,6 +401,7 @@ impl ChildExec {
                 woken: false,
                 stop,
                 dom,
+                pardon: durable,
             },
         );
         g.runnable.push_back(id);
@@ -557,12 +566,15 @@ impl ChildExec {
                     let e = g.tasks.get_mut(&id).expect("running task is filed");
                     if shutdown {
                         // Teardown: a park now would wait for a wake that can never come. Poison the
-                        // task's cell so its wait returns and the trailing guard unwinds it.
-                        let t = task.as_ref().expect("held");
-                        t.vm.trap
-                            .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
-                        if let Some(d) = &t.dom {
-                            d.wake_own_parked(); // its vCPUs share the cell
+                        // task's cell so its wait returns and the trailing guard unwinds it; a
+                        // pardoned durable child's park is re-offered instead (`Entry::pardon`).
+                        if !std::mem::take(&mut e.pardon) {
+                            let t = task.as_ref().expect("held");
+                            t.vm.trap
+                                .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                            if let Some(d) = &t.dom {
+                                d.wake_own_parked(); // its vCPUs share the cell
+                            }
                         }
                         e.woken = true;
                     }
@@ -806,17 +818,15 @@ impl ChildExec {
     /// it, running or not yet started, as the oracle ends them. Their cell gets the completion
     /// sentinel, which their entry and back-edge polls observe (`emit_domain_poll`). A
     /// freeze skips this, so a child the freeze reaches still unwinds under its own freeze word.
-    /// For the same reason a freeze wakes a parked **durable** child without poisoning it: the
-    /// freeze rang its word (`Nursery::ring_detached`), so it unwinds under it and rides, where a
-    /// poisoned one would end in a trap and leave no image (#1937).
+    /// For the same reason a freeze spares a **durable** child's next park (`Entry::pardon`), here
+    /// or in the worker that files it (#1937); an ending domain revokes the pardon.
     pub(crate) fn shutdown_and_join(self: &Arc<Self>, end_domain: bool) {
         let workers = {
             let mut g = lock(&self.state);
             g.shutdown = true;
             for e in g.tasks.values_mut() {
-                let unwinds =
-                    !end_domain && e.task.as_ref().is_some_and(|t| t.done.durable.is_some());
-                let poisoned = if e.parked && !unwinds {
+                e.pardon &= !end_domain;
+                let poisoned = if e.parked && !std::mem::take(&mut e.pardon) {
                     if let Some(t) = &e.task {
                         t.vm.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);

@@ -591,6 +591,112 @@ fn a_detached_childs_wait_ends_on_its_own_freeze_word_not_its_parents() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A detached child that counts to `n` in a callee, then waits `ms` on a futex nothing notifies,
+/// then returns 7. The callee cannot suspend, so the transform gives its loop no poll: the child
+/// first reads its freeze word inside the wait, after the wait has parked once.
+fn counting_then_waiting_child(n: u64, ms: u64) -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vc = call 1 (v0)
+  va = i64.const 66000
+  ve = i32.const 0
+  vto = i64.const {}
+  vw = i32.atomic.wait va ve vto
+  vn = i64.const {n}
+  vd = i64.sub vc vn
+  vs = i64.const 7
+  vr = i64.add vd vs
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vz = i64.const 0
+  br 1(vz)
+}}
+block 1 (vi: i64) {{
+  vn = i64.const {n}
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi) 3(vi)
+}}
+block 2 (vj: i64) {{
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk)
+}}
+block 3 (vf: i64) {{
+  return vf
+  }}
+}}
+",
+        ms * 1_000_000
+    )
+}
+
+/// **#1937 — a durable child that first parks after a freeze's teardown began still rides.** The
+/// embedder requests the freeze before the root runs, so the root unwinds right after it spawns the
+/// child (or in its wait, if the request is late), and the run's teardown rings the child and shuts
+/// the executor down while the child is still counting. Only then does the child's wait park.
+/// Before, the executor poisoned every park filed after the teardown began: the child ended in a
+/// trap and left no image, so the freeze carried no child. Now its first such park is re-offered,
+/// the wait ends on the child's rung word, and it unwinds and rides; every thaw answers `7`.
+#[test]
+fn a_durable_child_that_first_parks_after_the_freezes_teardown_rides() {
+    use temen_jit::FreezeController;
+    let parent =
+        verified(transform_module_assume_confined(&parse(WAITING_PARENT)).expect("transform"));
+    let child = child_module(&counting_then_waiting_child(1 << 28, 1000));
+    let (mut fhost, args) = powerbox(&child);
+    let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    let fc = FreezeController::new();
+    // No delay: the request lands as soon as the run publishes its window.
+    let ctl = {
+        let fc = fc.clone();
+        std::thread::spawn(move || fc.request_freeze())
+    };
+    let r = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &args,
+        &MemLayout::image(win),
+        PARENT_LOG2,
+        0,
+        &mut fhost,
+        Some(fc),
+    );
+    ctl.join().expect("controller");
+    let fsnap = match r {
+        Ok((JitOutcome::Returned(v), snap)) => {
+            assert_eq!(
+                (v[0], fhost.captured_detached().len()),
+                (0, 1),
+                "the freeze must carry the child, which parked only after the teardown began"
+            );
+            snap.bytes().to_vec()
+        }
+        Ok((other, _)) => panic!("unexpected outcome {other:?}"),
+        Err(JitError::Unsupported(_)) => return,
+        Err(e) => panic!("JIT run failed: {e:?}"),
+    };
+    let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
+    let mut wrong = Vec::new();
+    for thaws in [Engine::Interp, Engine::Jit] {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.grant_durable_module(&child);
+        let mut twin = temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
+        begin_thaw(&mut twin, ARENA, 0);
+        if let Some((o, _)) = run(thaws, &parent, &args, &twin, &mut thost) {
+            if o != Out::Ret(7) {
+                wrong.push(format!("thawed on {thaws:?}: {o:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A detached child that counts to `n` and returns 7. Nothing in it can suspend, so the transform
 /// gives its loop no poll: a freeze that rings it mid-count cannot cut it.
 fn counting_child(n: u64) -> String {
