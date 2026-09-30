@@ -469,16 +469,16 @@ the real image-replace the multicall demo above stood in for. Mechanism: the eva
 fallible (resolve the command, regrant the inherited caps named in the grant list into a fresh
 powerbox, bind the command's imports, register its self module) — where a refusal is a clean `-EINVAL`
 that leaves the caller running (POSIX `execve` **returns only on failure**) — then hands `dispatch` an
-`Inner::Exec`/`Step::Exec`. `dispatch` materializes the command's data segments into the caller's window
-and swaps the vCPU to a fresh one (`VCpu::new`) running the command at its entry, then loops back to run
-it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
+`Inner::Exec`/`Step::Exec`. `dispatch` builds the command's image in a fresh window of the caller's
+geometry (`Mem::exec_window`: the NULL guard armed, the args region carried over, the data segments
+written; nothing else of the caller's window, which is released) and swaps the vCPU to a fresh one
+(`VCpu::new`) running the command at its entry, then loops back to run it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
 `temen-interp/tests/execve.rs`: a guest execs a separate command module that writes `"EXEC"` and exits
 `42`; the guest's post-`exec` `return 99` **never runs** (the image was truly replaced), and a bogus
 command handle returns `-EINVAL` with the caller still running. Interp only, like every fork test.
 
-*Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command reuses
-the caller's window (its declared memory must **fit** it — see below) and BSS is not zeroed (a well-formed
-command inits its own state from its data segments); non-durable domains only (durable freeze/thaw
+*Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command runs in
+a window of the caller's geometry (its declared memory must **fit** it — see below); non-durable domains only (durable freeze/thaw
 image-swap is the deferred capstone); and only from a clean root computation (no serve handler / active
 fibers).
 

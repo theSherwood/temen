@@ -9193,10 +9193,11 @@ struct ExecBuilt {
     host: Host,
     table: SharedSlots,
     vt: VTask,
-    /// #1896 — a leaf image the host emitted: the window it runs over (a flat copy of the caller's,
-    /// where emitted code can address it) and how it tiers up at its entry. `None`: the image runs
-    /// in the caller's window, interpreted.
-    leaf: Option<(Mem, LeafStart)>,
+    /// The window the image runs in, which replaces the caller's ([`Mem::exec_window`]).
+    mem: Mem,
+    /// #1896 — how a leaf image the host emitted tiers up at its entry (its window is flat, where
+    /// emitted code can address it). `None`: the image runs interpreted.
+    leaf: Option<LeafStart>,
 }
 
 /// How a leaf image tiers up at its entry ([`CoopStep::TierUp`]).
@@ -9308,10 +9309,10 @@ fn image_pages(host: &Host, m: &Module) -> bool {
 
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
 /// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
-/// window, reused in place). Resolves + compiles the command, admits it (entry sig, command window
-/// `<=` the caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] —
-/// the same personality carry the tree-walker uses), materializes the command image into `cur_mem`
-/// (or, for a leaf image the host emitted, into a flat copy of it: [`ExecBuilt::leaf`]), and pushes
+/// window). Resolves + compiles the command, admits it (entry sig, command window `<=` the
+/// caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] — the same
+/// personality carry the tree-walker uses), materializes the command image into a fresh window of
+/// the caller's geometry ([`Mem::exec_window`]; flat for a leaf image the host emitted), and pushes
 /// the compiled command as a new domain unit. Returns the rebuilt process ([`ExecBuilt`]) for the
 /// caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
 /// caller then writes a probeable `-EINVAL` and lets the task run on — POSIX: execve returns only
@@ -9358,46 +9359,38 @@ fn exec_image_build(
         m.window.reserved(),
     )?;
     let child_args: Vec<Value> = img.entry_args.iter().map(|&h| Value::I64(h)).collect();
-    // #1896 — a leaf image the host emitted runs over a flat copy of the caller's window, where
-    // emitted code can address it, materialized exactly as it would be in place. Chosen only after
-    // the commit, and only where the image runs: without such a window it runs in place, interpreted.
-    let leaf = leaf
-        .and_then(|emit| {
-            let parks = match image_parks(&img.host, &img.module) {
-                Parks::Never => false,
-                Parks::InStreams => true,
-                Parks::Otherwise => return None,
-            };
-            let paged = image_pages(&img.host, &img.module);
-            let offer = LeafOffer {
-                module: cm,
-                image: &img.module,
-                entry: entry as u32,
-                paged,
-                parks,
-            };
-            emit(&offer).then_some((paged, parks))
-        })
-        .and_then(|(paged, parks)| {
-            let flat = |_| super::Region::growable(m.window.mapped(), m.page);
-            Some((m.fork_private_over(flat)?, paged, parks))
-        });
-    let m = leaf.as_ref().map_or(m, |(win, ..)| win);
-    // Materialize the command image into the caller's window in place: zero the fresh image extent (the
-    // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
-    {
-        // #1059: preserve the command's guard-shifted args region across the image-replace (legacy
-        // `[128, 16384)` for an unmarked command); mirrors the tree-walker exec path.
-        let null_guard = temen_ir::module_null_guard();
-        m.commit_fresh_image(img.image_len.min(img.child_size), null_guard);
-        m.write_segments(m.window.base(), &img.data, img.child_size);
-        // #1768 — a personality exec's staged argv lands only now, at the commit.
-        if personality {
-            if let Some(blob) = img.host.exec_commit_args() {
-                m.write_exec_args(&blob);
-            }
-        }
-    }
+    // #1896 — a leaf image the host emitted runs in a flat window, where emitted code can address
+    // it. Chosen only after the commit, and only where the image runs: without a flat backing it
+    // runs interpreted.
+    let leaf = leaf.and_then(|emit| {
+        let parks = match image_parks(&img.host, &img.module) {
+            Parks::Never => false,
+            Parks::InStreams => true,
+            Parks::Otherwise => return None,
+        };
+        let paged = image_pages(&img.host, &img.module);
+        let offer = LeafOffer {
+            module: cm,
+            image: &img.module,
+            entry: entry as u32,
+            paged,
+            parks,
+        };
+        emit(&offer).then_some((paged, parks))
+    });
+    let flat = leaf.and_then(|l| Some((super::Region::growable(m.window.mapped(), m.page)?, l)));
+    let (back, leaf) = match flat {
+        Some((back, l)) => (back, Some(l)),
+        None => (m.twin_backing(m.window.reserved()), None),
+    };
+    // #1768 — a personality exec's staged argv lands only now, at the commit.
+    let args = personality.then(|| img.host.exec_commit_args()).flatten();
+    let win = m.exec_window(
+        back,
+        &img.data,
+        temen_ir::module_null_guard(),
+        args.as_deref(),
+    );
     // `exec_image` released the old image's own pipe ends (the fork-inherited ones the exec did not
     // carry). Empty for a command that inherited no CorePipe ends (the rung-1/2a case); non-empty
     // ends need the pipe-EOF wake the cooperative engine does not yet drive — a later rung.
@@ -9408,21 +9401,19 @@ fn exec_image_build(
     let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     new_vt.active.module = cm;
     new_vt.active.home = cm;
-    let leaf = leaf.map(|(win, paged, parks)| {
-        let start = LeafStart {
-            module: cm as u32,
-            entry: entry as u32,
-            argv: img.entry_args.iter().copied().collect(),
-            results: cunit.result_types[entry as usize].clone().into(),
-            paged,
-            parks,
-        };
-        (win, start)
+    let leaf = leaf.map(|(paged, parks)| LeafStart {
+        module: cm as u32,
+        entry: entry as u32,
+        argv: img.entry_args.iter().copied().collect(),
+        results: cunit.result_types[entry as usize].clone().into(),
+        paged,
+        parks,
     });
     Ok(ExecBuilt {
         host: child_host,
         table: child_table,
         vt: new_vt,
+        mem: win,
         leaf,
     })
 }
@@ -13476,8 +13467,8 @@ impl CoopSched {
                     // The build (resolve + compile + admit + powerbox + personality carry + image
                     // materialize) runs against the exec'ing task's own window + powerbox, then the
                     // rebuilt activation is installed where its `env` points.
-                    // The rebuilt activation lands where the task's `env` points; a leaf image
-                    // brings its own window, which replaces the caller's (#1896).
+                    // The rebuilt activation lands where the task's `env` points, with the window the
+                    // image was built in, which replaces the caller's.
                     let start = match tasks[ti].env {
                         None => {
                             // Root: build against the driver window/host, then migrate the task into a
@@ -13499,15 +13490,11 @@ impl CoopSched {
                                 Err(e) => refuse!(e),
                                 Ok(built) => {
                                     tasks[ti].vt = built.vt;
-                                    // The driver window moves into the env, or is released for
-                                    // the leaf image's own.
-                                    let (win, start) = match (built.leaf, mem.take()) {
-                                        (Some((win, start)), _) => (Some(win), Some(start)),
-                                        (None, win) => (win, None),
-                                    };
+                                    // The driver window is released for the image's own.
+                                    drop(mem.take());
                                     let eidx = extra_envs.len();
                                     extra_envs.push(ChildEnv {
-                                        mem: win,
+                                        mem: Some(built.mem),
                                         host: std::sync::Arc::new(std::sync::Mutex::new(
                                             built.host,
                                         )),
@@ -13516,14 +13503,14 @@ impl CoopSched {
                                         fibers: FiberTables::default(),
                                     });
                                     tasks[ti].env = Some(eidx);
-                                    start
+                                    built.leaf
                                 }
                             }
                         }
                         Some(k) => {
-                            // Fork twin: build against its confined env (its window is reused in place,
-                            // its powerbox carries the personality), then overwrite the env's host +
-                            // table — the window + fuel + task id are kept.
+                            // Fork twin: build against its confined env (its powerbox carries the
+                            // personality), then overwrite the env's window, host and table — the fuel
+                            // and task id are kept.
                             let host_arc = std::sync::Arc::clone(&extra_envs[k].host);
                             let built = {
                                 let mut g = host_arc.lock_unpoisoned();
@@ -13547,10 +13534,8 @@ impl CoopSched {
                                     extra_envs[k].host =
                                         std::sync::Arc::new(std::sync::Mutex::new(built.host));
                                     extra_envs[k].table = built.table;
-                                    built.leaf.map(|(win, start)| {
-                                        extra_envs[k].mem = Some(win);
-                                        start
-                                    })
+                                    extra_envs[k].mem = Some(built.mem);
+                                    built.leaf
                                 }
                             }
                         }
@@ -15910,16 +15895,17 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         host: child_host,
                         table: child_table,
                         vt: new_vt,
+                        mem: win,
                         leaf: _,
                     }) => {
                         // Replace the powerbox INSIDE this vCPU's cell, not the `Arc` itself: a
                         // fork twin's exit-hook holder kept a clone of the cell at spawn, so the
                         // post-exec exit must find the CARRIED hooks (`exec_carry`) behind the
                         // same cell — the parallel analogue of the cooperative arm overwriting
-                        // `extra_envs[k].host`. The window is already the command's image
-                        // (materialized in place by the build); the command's natural table
-                        // replaces this vCPU's dispatch table.
+                        // `extra_envs[k].host`. The image's window and the command's natural table
+                        // replace this vCPU's.
                         *host.lock_unpoisoned() = child_host;
+                        mem = Some(win);
                         tbl = Some(std::sync::Arc::new(child_table));
                         vt = new_vt;
                     }

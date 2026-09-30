@@ -2396,8 +2396,9 @@ directory, environment and identity ops never park, `read`/`write` only when the
 of the personality's pipes, a socket or a terminal; on a core pipe end they redirect to its stream
 call), a stream read parks on a core pipe end or a blocking stdin and a stream write on a core pipe
 end, the address-space ops never park, and a §12 concurrency op, a rebindable import, or any other
-import or cap call, a dynamic one included, may. The leaf runs over a flat copy of the caller's
-window, materialized exactly as the in-place exec would be, and tiers up at its entry
+import or cap call, a dynamic one included, may. The leaf's window is flat and growable, built as
+every exec builds its image (`Mem::exec_window`: a fresh window of the caller's geometry), and it
+tiers up at its entry
 (`CoopEvent::TierUp` naming its program); its delivery ends the process as a return from the entry
 would. An image that can change its page state — an address-space `map`/`unmap`/`protect`, inline
 or through an import, which the image alone does not show — is emitted page-checked
