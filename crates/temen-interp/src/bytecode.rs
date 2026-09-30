@@ -11881,7 +11881,7 @@ fn freeze_step(
         *freeze_on_quiesce = false;
         let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
             let site = t.state.park_site()?;
-            (site.freeze_rule() == FreezeRule::Decline).then_some((site, ti))
+            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti))
         });
         let declined = match (forked_twins.first(), parked_declined) {
             (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
@@ -11906,6 +11906,16 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait. The oracle re-issues the
+/// wait and the thaw re-parks the call on its ticket (#1901); this engine has no re-park yet, so a
+/// re-admitted call would be issued twice, and it declines instead (#1904).
+fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
+    match site {
+        super::ParkSite::Reply => super::FreezeRule::Decline,
+        s => s.freeze_rule(),
+    }
+}
+
 /// A freeze in flight: re-admit every task parked at a [`super::FreezeRule::Reissue`] site (see
 /// [`freeze_step`]). `true` when it re-admitted one.
 fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
@@ -11915,7 +11925,7 @@ fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
         let Some(site) = t.state.park_site() else {
             continue;
         };
-        if site.freeze_rule() != FreezeRule::Reissue {
+        if freeze_rule_here(site) != FreezeRule::Reissue {
             continue;
         }
         // The freeze ended this wait, not its event: the thaw re-issues it (#1769).

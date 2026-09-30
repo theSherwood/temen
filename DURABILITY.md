@@ -317,16 +317,28 @@ where it sits, not what kind it is:
   either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
   case that needs per-operation semantics.
 
-**One rule per park site (#1898).** The oracle's scheduler parks a vCPU in one of thirteen waiter
-collections, each a `ParkSite` with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
+**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites (its
+waiter collections, with a reply and a page fault told apart in the one they share), each a `ParkSite`
+with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
 freeze; its op is abandoned and the thaw re-issues it), **phase** (it stays parked and another
 vCPU's unwind wakes it), or **decline** (no rule yet: the census refuses the freeze up front,
 `DeclineCause::Parked(site)`, rather than start one that would stall). Every list that walks the
 parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a new
 collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
-`waitpid`, a job-control stop, and a stream read. Phase: `thread.join`, a lane. Decline: a fork-twin
-`wait(-1)` (#1688), a reply or completion in flight (#1901), and an offer admission, which a durable
+`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane.
+Decline: a fork-twin `wait(-1)` (#1688), a demand-paged child's page fault (#1940), a punted
+completion, which is a host call outside the cut (#1902), and an offer admission, which a durable
 caller never reaches (#1681).
+
+**A reply wait is a re-issue of the wait, not the call (#1901).** A caller parked on a live callee's
+reply has already issued its dispatch: it is queued on the callee, in the callee's handler, or
+answered. Every one of those rides the cut on the callee (its serve section), so a freeze abandons the
+caller's *wait*: it records the ticket for the caller's shadow context on the caller's powerbox (the
+serve section's reply waits, codec v35), and the caller unwinds with its re-issue word set. On thaw the
+re-issued call finds the record and waits on that ticket instead of enqueueing the call again, and the
+callee, rewound, serves or has served it. A caller in a nested carve declines instead, since the carve's
+powerbox rides without the record, and the carve is retiring. A thaw re-links a `LiveImpl` to a
+re-launched detached child as it does to a re-created nested one.
 
 **How the rule stays enforced (proposed 2026-09-29, for owner sign-off; #1898–#1904).** The rule
 above was first applied one park at a time, by hand, and that is where the gaps came from. Four rules
@@ -337,7 +349,7 @@ make it hold by construction:
 2. **Every park inside the cut is a re-issue.** A park whose op took no effect is abandoned and
    re-issued, as the table's re-issue sites already are. A park waiting on an op that *has* taken
    effect is split in two: the request commits and its ticket rides the artifact as cut data, and the
-   wait on that ticket is an ordinary re-issuable park (a reply, a completion: #1901). An op that has
+   wait on that ticket is an ordinary re-issuable park (a reply: #1901). An op that has
    partly taken effect completes short where its semantics allow (a pipe write larger than
    `PIPE_BUF` may return a short count) and records its progress otherwise.
 3. **A boundary capability declares its freeze behaviour when it is granted.** An effect that has

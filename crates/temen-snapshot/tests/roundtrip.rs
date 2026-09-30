@@ -1109,6 +1109,28 @@ fn serve_state_round_trips_through_the_codec() {
     );
 }
 
+/// #1901 (v35) — a domain's **reply waits** ride the serve section, even when its own serve trio is
+/// empty (a caller that serves nothing): restored exactly, and the canonical re-freeze is
+/// byte-identical.
+#[test]
+fn reply_waits_round_trip_through_the_codec() {
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let mut host = Host::new();
+    host.set_reply_waits(vec![(0, 4), (3, 0)]);
+    let artifact = freeze(&inst, &win, &host).expect("freeze with reply waits");
+
+    let mut rhost = Host::new();
+    let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
+    assert_eq!(rhost.reply_waits(), vec![(0, 4), (3, 0)]);
+    assert_eq!(rhost.svc_state(), (Vec::new(), Vec::new(), 0));
+    let refrozen = freeze(&inst, &rwin, &rhost).expect("re-freeze");
+    assert_eq!(
+        refrozen, artifact,
+        "canonical re-serialize is byte-identical"
+    );
+}
+
 /// The serve section is **elided** when the trio is empty (a never-served domain), so the
 /// artifact's TLV walk carries no `TAG_SERVE` (4) — and restoring such an artifact leaves the
 /// host's serve state at its empty default.

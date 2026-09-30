@@ -224,12 +224,12 @@ fn a_vcpu_parked_at_a_decline_site_declines() {
     };
     rs.lock()
         .ticket_waiters
-        .insert((1, 2), Waiter::VCpu(parked_vcpu(&f, 5)));
+        .insert((1, 2), Waiter::VCpu(page_faulted(&f, 5)));
     assert_eq!(
         f.census(&f.root_seat()),
-        Some(DeclineCause::Parked(ParkSite::Reply))
+        Some(DeclineCause::Parked(ParkSite::PageFault))
     );
-    let v = rs.lock().take(ParkSite::Reply, false);
+    let v = rs.lock().take(ParkSite::PageFault, false);
     assert_eq!(v.len(), 1);
 
     rs.lock()
@@ -238,6 +238,56 @@ fn a_vcpu_parked_at_a_decline_site_declines() {
         .or_default()
         .push(Waiter::VCpu(parked_vcpu(&f, 6)));
     assert_eq!(f.census(&f.root_seat()), None, "a stream read re-issues");
+}
+
+/// A vCPU parked on its pager's page (#1940), which shares `ticket_waiters` with a reply wait.
+fn page_faulted(f: &Fixture, id: TaskId) -> Box<VCpu> {
+    let mut v = parked_vcpu(f, id);
+    v.page_fault = Some(0);
+    v
+}
+
+/// #1901 — a caller parked on a live callee's reply does not decline: a freeze re-admits it to
+/// abandon its wait, and records the ticket for its context on its powerbox, so the thaw's re-issued
+/// call waits on it instead of enqueueing the call again.
+#[test]
+fn a_freeze_re_admits_a_reply_wait_and_records_its_ticket() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    let mut v = parked_vcpu(&f, 5);
+    v.reply_ticket = Some(2);
+    v.durable_sp_ctx = 3;
+    rs.lock().ticket_waiters.insert((1, 2), Waiter::VCpu(v));
+    assert_eq!(f.census(&f.root_seat()), None, "a reply wait re-issues");
+
+    let mut s = rs.lock();
+    admit_parks_for_freeze(&mut s);
+    assert!(s.ticket_waiters.is_empty());
+    let v = s.runnable.pop_front().expect("re-admitted");
+    assert_eq!(v.dstate, STATE_UNWINDING);
+    assert!(matches!(v.pending, Some(Pending::Abandoned)));
+    drop(s);
+    assert_eq!(f.root.lock_unpoisoned().reply_waits(), vec![(3, 2)]);
+}
+
+/// #1901 — except in a nested carve, whose powerbox rides without the record: its thaw would issue
+/// the call twice.
+#[test]
+fn a_reply_wait_in_a_nested_carve_declines() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    let mut v = parked_vcpu(&f, 5);
+    v.reply_ticket = Some(2);
+    v.freeze_sink = Some(Arc::clone(&f.root));
+    rs.lock().ticket_waiters.insert((1, 2), Waiter::VCpu(v));
+    assert_eq!(
+        f.census(&f.root_seat()),
+        Some(DeclineCause::Parked(ParkSite::Reply))
+    );
 }
 
 /// A vCPU parked in an indefinite `atomic.wait`: the park that lets freeze-on-quiesce fire.
@@ -250,7 +300,7 @@ fn park_on_futex(s: &mut Sched, f: &Fixture, id: TaskId) {
         .push((0, Waiter::VCpu(v)));
 }
 
-/// #1918 — freeze-on-quiesce asks the census before it fires. With a reply park beside the futex
+/// #1918 — freeze-on-quiesce asks the census before it fires. With a page-fault park beside the futex
 /// park, it declines: the decline lands on the run root's powerbox, the arm is spent, and nothing is
 /// re-admitted or phased, so the run carries on as if it was never armed.
 #[test]
@@ -263,7 +313,7 @@ fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
         let mut s = rs.lock();
         park_on_futex(&mut s, &f, 4);
         s.ticket_waiters
-            .insert((1, 2), Waiter::VCpu(parked_vcpu(&f, 5)));
+            .insert((1, 2), Waiter::VCpu(page_faulted(&f, 5)));
         s.freeze_on_quiesce = Some(Arc::clone(&f.root));
     }
     let (s, acted) = freeze_step(rs, rs.lock());
@@ -280,7 +330,7 @@ fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
     assert_eq!(
         f.root.lock_unpoisoned().take_freeze_declined(),
         Some(FreezeDeclined {
-            cause: DeclineCause::Parked(ParkSite::Reply),
+            cause: DeclineCause::Parked(ParkSite::PageFault),
             task: 5,
             slot: None
         })
