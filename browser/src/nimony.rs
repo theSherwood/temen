@@ -260,6 +260,82 @@ fn leaf_emitter(leaves: Leaves, suspends: bool) -> LeafEmitter {
     })
 }
 
+// ---- nimony's module-stem hash (gear2/modnames.nim + lib/tinyhashes.nim), reproduced exactly -------
+
+fn uhash(s: &str) -> u32 {
+    let mut h: u32 = 0;
+    for c in s.bytes() {
+        h = h.wrapping_add(c as u32);
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+    }
+    h = h.wrapping_add(h << 3);
+    h ^= h >> 11;
+    h = h.wrapping_add(h << 15);
+    h
+}
+
+fn base36(mut id: u32) -> String {
+    const B36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut r = String::new();
+    while id > 0 {
+        r.push(B36[(id % 36) as usize] as char);
+        id /= 36;
+    }
+    r
+}
+
+fn relative_path(path: &str, base: &str) -> String {
+    let p: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let b: Vec<&str> = base
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut i = 0;
+    while i < p.len() && i < b.len() && p[i] == b[i] {
+        i += 1;
+    }
+    let mut out: Vec<&str> = vec![".."; b.len() - i];
+    out.extend_from_slice(&p[i..]);
+    out.join("/")
+}
+
+/// `gear2/modnames.moduleSuffix` — `name[0..3]` + base36(`uhash`) of the shortest of the file's path
+/// relative to the cwd (`/`) and to each search path (`/lib`).
+fn module_suffix(file: &str) -> String {
+    let mut rel = relative_path(file, "/");
+    let c = relative_path(file, "/lib");
+    if c.len() < rel.len() {
+        rel = c;
+    }
+    let name = rel.rsplit('/').next().unwrap_or(&rel);
+    let name = name.strip_suffix(".nim").unwrap_or(name);
+    let mut stem: String = name.chars().take(3).collect();
+    stem.push_str(&base36(uhash(&rel)));
+    stem
+}
+
+/// nimony's module-stem hash for `[path)`, a path relative to the build's directory ([`module_suffix`]),
+/// onto the stdout slot; returns its length. The card finds the module a build of `prog.nim` linked by
+/// it: `nimcache/<stem>.temen/prog.temen`.
+///
+/// # Safety
+/// `(path_ptr, path_len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_module_suffix(path_ptr: *const u8, path_len: usize) -> usize {
+    let path = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(path_ptr, path_len) })
+        .into_owned();
+    let bytes = module_suffix(&path).into_bytes();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(crate::OUT), bytes) };
+    len
+}
+
 /// The memfs of the most recent nimony build, which [`temen_nim_file`] reads.
 static mut LAST_BUILD: Option<temen_posix::Posix> = None;
 /// The file the most recent [`temen_nim_file`] read ([`temen_nim_file_ptr`]).

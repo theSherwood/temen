@@ -328,7 +328,10 @@ collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe re
 `waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane.
 Decline: a fork-twin `wait(-1)` (#1688), a demand-paged child's page fault (#1940), a punted
 completion, which is a host call outside the cut (#1902), and an offer admission, which a durable
-caller never reaches (#1681).
+caller never reaches (#1681). A fiber parked at a site follows the same rule: the freeze drive of
+whichever vCPU finishes first gives an unwoken fiber park the placeholder and re-issue word its
+site calls for, and a resumer that then claims the flattened fiber sees it still parked (#1677). A
+serve handler, parked or caught mid-run, rides the same way, with its reply linkage (#1676).
 
 **A reply wait is a re-issue of the wait, not the call (#1901).** A caller parked on a live callee's
 reply has already issued its dispatch: it is queued on the callee, in the callee's handler, or
@@ -2753,6 +2756,8 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    arm branches on. The park kind is probed at freeze time from which scheduler map holds
    the fiber's waiter (`wait_waiters` vs `cap_waiters`/`ticket_waiters`) — a probe, not a
    record; the snapshot still carries nothing new.
+   **Superseded (#1677):** the marker option landed as the re-issue word (#1672), and an unwoken
+   fiber park now follows its `ParkSite` rule like a vCPU's (§4, "One rule per park site").
    **BUILT 2026-07-24** (the corrected scope): `freeze_drive` classifies every `ParkedOn`
    fiber up front — serve-handler parks (`handler_parks`) and unwoken non-futex parks fail
    the freeze closed (`FiberFault`) — then flattens the rest through the same
@@ -2784,6 +2789,16 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    completion cell — a silent-corruption hole this step closes; pinned in
    `temen-durable/tests/serve.rs`). The `serve_run` reply-linkage record stays step 4, where
    mid-handler freezes become capturable instead of refused.
+   **BUILT (#1676):** a handler the freeze catches mid-run unwinds as a fiber does and reports
+   `FIBER_FROZEN` (#1835), never `(FIBER_RETURNED, 0)`, so the serve epilogue keeps it the way it
+   keeps a parked handler (`handler_parks`) instead of refusing. Each vCPU's freeze drive hands
+   its handlers' reply linkage — `fiber slot → ticket` — to the powerbox (`Host::frozen_handlers`,
+   the serve section's third part, codec v36); the handler fibers ride as fibers, a parked one's
+   park abandoned by its site rule (#1677). On thaw the serve loop adopts the records, claims each
+   thawed handler (a fresh claim of its seeded fiber, whose placeholder entry frame only rewinds),
+   and the handler finishes and replies to its ticket. The census no longer declines a parked
+   handler (`ServeHandlerParked` is gone). Pinned in `temen-durable/tests/serve.rs`: a mid-run
+   handler and a futex-parked handler each freeze and thaw to their real replies.
 4. **Subtree thaw wiring** — restore hosts, re-link `LiveImplEntry` callees by `DomainId`,
    re-park callers (race-check against restored cells), mark `svc.wait` consumers runnable.
    **Slice 4a BUILT 2026-07-24 (per-fiber thaw re-arm):** `shadow_switch` now forces an
@@ -2801,7 +2816,8 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    progress, and the transform classifies `call.cap CAP_SELF svc.poll/svc.wait` as a new
    **re-issue** `SuspendKind::SvcServe` (spill `out − nres`; the sentinel is never captured —
    a `Leaf` reload would have masqueraded it as the served count). The thaw arm flips
-   `NORMAL` (the mid-handler gate guarantees the serve point is the deepest frozen frame),
+   `NORMAL` (the serve frame's own context: a handler frozen mid-run is a fiber context of its
+   own, re-armed `REWINDING` when the serve loop switches into it, #1676),
    reloads handle + args, and re-executes: the drain runs against the *restored* queue — an
    empty one re-parks `svc.wait` exactly as an uninterrupted run would ("thaw marks them
    runnable" via re-execution, no waiter capture). Pinned in `temen-durable/tests/serve.rs`
@@ -2983,7 +2999,9 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    cap-parked callers" step parallel to 4c-bis's `svc_waiters` drain — at which point the
    caller's rewound frame re-issues the `call.cap` on thaw under the decided policy (a), the
    same O10 the guard above already fixes as the boundary semantics. Recorded as the entry so
-   the invariant-9 divergence is enumerated rather than silently normalized.
+   the invariant-9 divergence is enumerated rather than silently normalized. **Superseded
+   (#1901, #1677):** a `CapReply` park, vCPU or fiber, now re-issues its *wait* and the thaw
+   re-parks the call on its ticket (§4).
 
 Fail-closed stays the default at every step: anything the current step can't capture keeps
 refusing the freeze, exactly as `has_blocked_parks` does today.

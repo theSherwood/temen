@@ -113,7 +113,8 @@ mod os_thread_rt;
 // only; the loom futex model has no regions (`futex_key_of` is `Anon`-only there).
 #[cfg(not(loom))]
 pub use os_thread_rt::{
-    region_canon_forget_window, region_canon_lookup, region_canon_new_owner, region_canon_record,
+    park_host_call, region_canon_forget_window, region_canon_lookup, region_canon_new_owner,
+    region_canon_record, wake_host_parks, HostPark,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —

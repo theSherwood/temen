@@ -89,10 +89,11 @@ fn jit_row(site: ParkSite) -> Row {
     match site {
         ParkSite::Futex => Row::Case(futex),
         ParkSite::Join => Row::Case(join),
-        ParkSite::PipeRead | ParkSite::PipeWrite | ParkSite::StreamRead => Row::Pending {
-            issue: 1826,
-            why: "the JIT serves no host-call park outside a process tree: the op's placeholder \
-                  answer stands: an empty read reads as EOF, a full write writes nothing",
+        ParkSite::PipeRead => Row::Case(pipe_read),
+        ParkSite::PipeWrite => Row::Case(pipe_write),
+        ParkSite::StreamRead => Row::Pending {
+            issue: 1904,
+            why: "the row's trigger is freeze-on-quiesce, which the JIT does not implement",
         },
         ParkSite::Stopped => Row::Pending {
             issue: 1826,
@@ -817,6 +818,62 @@ block 0 (vx: i64) {
 /// call waits on that ticket and `C` serves the queued dispatch once: `served·1000 + reply`, `1042`.
 /// Issued twice, `C` would serve two.
 fn reply(site: ParkSite, engine: Engine) {
+    reply_from(site, engine, T_CALLS);
+}
+
+/// `T` of [`reply`]: it makes the call itself.
+const T_CALLS: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vcap: i64) {
+  vh = i32.wrap_i64 vcap
+  vx = i64.const 41
+  vr = call.cap 268435456 0 (i64) -> (i64) vh (vx)
+  return vr
+  }
+}
+"#;
+
+/// `T` of [`reply`] with its call in a fiber (#1677): it drives the fiber with `cont.resume.block`,
+/// so it idles while the fiber waits on the reply. Its first resume comes before any poll, as the
+/// call does in [`T_CALLS`]. Under the freeze `T` unwinds past the parked fiber, and the freeze drive
+/// abandons the fiber's wait and records the fiber's ticket.
+const T_CALLS_IN_A_FIBER: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vcap: i64) {
+  vf = ref.func 5
+  vfsp = i64.const 8192
+  vk = cont.new vf vfsp
+  vs, vv = cont.resume.block vk vcap
+  br 1(vk, vcap, vs, vv)
+}
+block 1 (vk1: i64, vc: i64, vs1: i32, vv1: i64) {
+  vone = i32.const 1
+  vdone = i32.eq vs1 vone
+  br_if vdone 3(vv1) 2(vk1, vc)
+}
+block 2 (vk2: i64, vc2: i64) {
+  vs2, vv2 = cont.resume.block vk2 vc2
+  br 1(vk2, vc2, vs2, vv2)
+}
+block 3 (vr: i64) {
+  return vr
+  }
+}
+"#;
+
+/// The fiber [`T_CALLS_IN_A_FIBER`] drives, func 5: the call.
+const CALLING_FIBER: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vcap: i64) {
+  vh = i32.wrap_i64 vcap
+  vx = i64.const 41
+  vr = call.cap 268435456 0 (i64) -> (i64) vh (vx)
+  return vr
+  }
+}
+"#;
+
+fn reply_from(site: ParkSite, engine: Engine, t: &str) {
     let src = r#"
 memory 17
 type 0 func (i64) -> (i64)
@@ -856,14 +913,8 @@ block 2 (vi3: i32, vc2: i32, vt2: i32) {
   return vres
   }
 }
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, vcap: i64) {
-  vh = i32.wrap_i64 vcap
-  vx = i64.const 41
-  vr = call.cap 268435456 0 (i64) -> (i64) vh (vx)
-  return vr
-  }
-}
+"#;
+    let server = r#"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i32.const 0
@@ -879,7 +930,7 @@ block 0 (vx: i64) {
   }
 }
 "#;
-    let src = format!("{src}{FIBER}");
+    let src = format!("{src}{t}{server}{FIBER}{CALLING_FIBER}");
     let inst = instrumented(&src);
     let powerbox = || {
         let mut h = durable_host(&inst);
@@ -910,7 +961,7 @@ block 0 (vx: i64) {
     assert_eq!(
         h.reply_waits().len(),
         1,
-        "{site:?}: T's wait was abandoned, and its ticket rides"
+        "{site:?}: the caller's wait was abandoned, and its ticket rides"
     );
 
     let art = temen_snapshot::freeze(&inst, &snap, &h).expect("serialize");
@@ -925,4 +976,82 @@ block 0 (vx: i64) {
         "{site:?}: the thaw waits on the same ticket, and C serves it once"
     );
     assert!(th.reply_waits().is_empty(), "{site:?}: the wait was taken");
+}
+
+/// #1677 — a **fiber** parked at a re-issue site freezes as a vCPU parked there does: the freeze
+/// drive abandons its park and the thaw re-issues it. The oracle's rows; a fiber parks on a futex
+/// (the `stopped` row's fiber), a stream read, or a live call's reply.
+#[test]
+fn a_fiber_parked_at_a_reissue_site_freezes_like_a_vcpu() {
+    stream_read_in_a_fiber(ParkSite::StreamRead, Engine::Interp);
+    reply_from(ParkSite::Reply, Engine::Interp, T_CALLS_IN_A_FIBER);
+}
+
+/// A stream read in a fiber — the root drives a fiber with `cont.resume.block` that reads one byte
+/// from a blocking stdin with nothing waiting, while its sibling loops. The input arrives only after
+/// the freeze: `1000·1 + 'x' + 7`.
+fn stream_read_in_a_fiber(site: ParkSite, engine: Engine) {
+    let src = format!(
+        r#"
+memory 17
+func (i32) -> (i64) {{
+block 0 (vin: i32) {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vf = ref.func 3
+  vfsp = i64.const 8192
+  vk = cont.new vf vfsp
+  vin64 = i64.extend_i32_u vin
+  br 1(vt, vk, vin64)
+}}
+block 1 (vt1: i32, vk1: i64, va: i64) {{
+  vs, vn = cont.resume.block vk1 va
+  vone = i32.const 1
+  vdone = i32.eq vs vone
+  br_if vdone 2(vt1, vn) 1(vt1, vk1, va)
+}}
+block 2 (vt2: i32, vn2: i64) {{
+  vj = thread.join vt2
+  vk = i64.const 1000
+  vnk = i64.mul vn2 vk
+  vbuf = i64.const 66100
+  vb = i32.load8_u vbuf
+  vb64 = i64.extend_i32_u vb
+  vs = i64.add vnk vb64
+  vres = i64.add vs vj
+  return vres
+  }}
+}}
+func (i64, i64) -> (i64) {{
+{SIBLING_LOOP}
+block 2 (va2: i64) {{
+  vr = i64.const 7
+  return vr
+  }}
+}}
+{FIBER}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, va: i64) {{
+  vin = i32.wrap_i64 va
+  vbuf = i64.const 66100
+  vlen = i64.const 1
+  vn = call.cap 0 0 (i64, i64) -> (i64) vin (vbuf, vlen)
+  return vn
+  }}
+}}"#
+    );
+    freeze_parked_then_thaw(
+        engine,
+        site,
+        &src,
+        |h| {
+            let vin = h.grant_stream(StreamRole::In);
+            h.set_stdin_blocking(true);
+            vec![Value::I32(vin)]
+        },
+        Uninterrupted::WaitsOnTheOutside,
+        arm_in_sibling,
+        |h| h.push_stdin(b"x"),
+        Ok(1000 + i64::from(b'x') + 7),
+    );
 }

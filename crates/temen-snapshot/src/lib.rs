@@ -240,12 +240,16 @@ use temen_ir::Module;
 /// abandoned. The thaw's re-issued call waits on that ticket instead of enqueueing the call again. The
 /// section is present iff the trio or the waits are non-empty; with no reply wait it ends in a zero
 /// count.
-/// v36 (#1944): budgets are a tree of ceilings. `B_BUDGET` carries its node's **key** (its index in
+/// v36 (#1676): after the reply waits, Section 4 carries the domain's **frozen handlers** —
+/// `(fiber slot, ticket)` in ascending slot order, for each serve handler a freeze caught parked or
+/// mid-run. The handler rides as a fiber; this is its reply linkage, which the thaw's serve loop
+/// adopts. The section is present iff any of the three parts is non-empty.
+/// v37 (#1944): budgets are a tree of ceilings. `B_BUDGET` carries its node's **key** (its index in
 /// the run's tree), and Section 10 (`TAG_BUDGETS`) carries every node the domain's handles name, with
 /// each ancestor: `(key, parent, ceilings, live charge)` in ascending key order. A key names one node
 /// across every artifact of a freeze, so a thaw rebuilds a node its domains shared once. Elided when
 /// no `Budget` rides.
-const FORMAT_VERSION: u16 = 36;
+const FORMAT_VERSION: u16 = 37;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -278,7 +282,7 @@ const TAG_DETACHED: u64 = 8;
 /// Section 9 (v32, #1680): the pipes inside the cut, by artifact number — each one's buffered bytes.
 /// Emitted only when a pipe end rides.
 const TAG_PIPES: u64 = 9;
-/// Section 10 (v36, #1944): the budget nodes the handle table's `B_BUDGET`s name, with their
+/// Section 10 (v37, #1944): the budget nodes the handle table's `B_BUDGET`s name, with their
 /// ancestors. Emitted only when a `Budget` rides.
 const TAG_BUDGETS: u64 = 10;
 /// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
@@ -816,19 +820,19 @@ fn freeze_at(
     // domain's artifact keeps the pre-serve section layout.
     // v35 (#1901): the domain's reply waits trail the trio — a caller's side of the same protocol.
     let (svc_queue, svc_results, svc_next_ticket) = host.svc_state();
+    // v36 (#1676): then the handlers a freeze caught, which reply to the other side.
     let reply_waits = host.reply_waits();
+    let frozen_handlers = host.frozen_handlers();
     if !svc_queue.is_empty()
         || !svc_results.is_empty()
         || svc_next_ticket != 0
         || !reply_waits.is_empty()
+        || !frozen_handlers.is_empty()
     {
         section(&mut out, TAG_SERVE, |b| {
             write_serve_trio(b, &svc_queue, &svc_results, svc_next_ticket);
-            write_uleb(b, reply_waits.len() as u64);
-            for &(ctx, ticket) in &reply_waits {
-                write_uleb(b, ctx as u64);
-                write_uleb(b, ticket);
-            }
+            write_ticket_map(b, &reply_waits);
+            write_ticket_map(b, &frozen_handlers);
         });
     }
 
@@ -887,7 +891,7 @@ fn freeze_at(
             }
         });
     }
-    // Section 10 — the budget nodes the handles name, with their ancestors (#1944, v36). Elided when
+    // Section 10 — the budget nodes the handles name, with their ancestors (#1944, v37). Elided when
     // no `Budget` rides.
     let budgets = host.capture_durable_budgets();
     if !budgets.is_empty() {
@@ -1065,7 +1069,7 @@ fn decode_named(body: Option<&[u8]>) -> Result<Vec<Option<DurableNamedCap>>, Res
     Ok(out)
 }
 
-/// Encode Section 10 ([`TAG_BUDGETS`], v36): the node count, then each node in ascending key order as
+/// Encode Section 10 ([`TAG_BUDGETS`], v37): the node count, then each node in ascending key order as
 /// `key`, `parent` (`0` none | `1 + key`), the five ceilings (`-1` = unbounded, as a two's-complement
 /// `u64` uleb) and the live `mem` charge.
 fn write_budgets(b: &mut Vec<u8>, budgets: &[DurableBudget]) {
@@ -1081,7 +1085,7 @@ fn write_budgets(b: &mut Vec<u8>, budgets: &[DurableBudget]) {
     }
 }
 
-/// Decode Section 10 ([`TAG_BUDGETS`], v36). Absent ⇒ no `Budget` rides; present but empty, keys out
+/// Decode Section 10 ([`TAG_BUDGETS`], v37). Absent ⇒ no `Budget` rides; present but empty, keys out
 /// of ascending order, a parent that is not an earlier carried node, or a ceiling below `-1` is not
 /// what a freeze writes, so it is malformed.
 fn decode_budgets(body: Option<&[u8]>) -> Result<Vec<DurableBudget>, RestoreError> {
@@ -1514,23 +1518,22 @@ fn restore_at(
     if let Some(body) = serve_body {
         let mut sr = Reader::new(body);
         let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
-        let n = sr.uleb()?;
-        let mut waits: Vec<(u32, u64)> = Vec::new();
-        for _ in 0..n {
-            let ctx = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            if waits.last().is_some_and(|&(p, _)| ctx <= p) {
-                return Err(RestoreError::Malformed); // non-canonical: contexts must ascend
-            }
-            waits.push((ctx, sr.uleb()?));
-        }
+        let waits = read_ticket_map(&mut sr)?;
+        let handlers = read_ticket_map(&mut sr)?;
         if !sr.at_end() {
             return Err(RestoreError::Malformed);
         }
-        if queue.is_empty() && results.is_empty() && next_ticket == 0 && waits.is_empty() {
+        if queue.is_empty()
+            && results.is_empty()
+            && next_ticket == 0
+            && waits.is_empty()
+            && handlers.is_empty()
+        {
             return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
         }
         host.set_svc_state(queue, results, next_ticket);
         host.set_reply_waits(waits);
+        host.set_frozen_handlers(handlers);
     }
 
     // ---- Attestation (#1289 R1, O14, v20): decode Section 6 and re-stamp the host, so the domain's
@@ -2034,6 +2037,31 @@ fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
     }
     let next_ticket = r.uleb()?;
     Ok((queue, results, next_ticket))
+}
+
+/// The serve section's `(key, ticket)` maps (v35, v36): a count, then each pair in ascending key
+/// order — a caller's shadow context and the reply it waits on, or a handler's fiber slot and the
+/// ticket it replies to.
+fn write_ticket_map(b: &mut Vec<u8>, map: &[(u32, u64)]) {
+    write_uleb(b, map.len() as u64);
+    for &(key, ticket) in map {
+        write_uleb(b, key as u64);
+        write_uleb(b, ticket);
+    }
+}
+
+/// The inverse of [`write_ticket_map`], rejecting a key that does not ascend (non-canonical).
+fn read_ticket_map(r: &mut Reader) -> Result<Vec<(u32, u64)>, RestoreError> {
+    let n = r.uleb()?;
+    let mut map: Vec<(u32, u64)> = Vec::new();
+    for _ in 0..n {
+        let key = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        if map.last().is_some_and(|&(p, _)| key <= p) {
+            return Err(RestoreError::Malformed);
+        }
+        map.push((key, r.uleb()?));
+    }
+    Ok(map)
 }
 
 /// Encode a handle table (§12.5): a length prefix then each record's `slot`/`generation`/`type_id`

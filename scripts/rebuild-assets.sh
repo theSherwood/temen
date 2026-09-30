@@ -19,7 +19,7 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nifler nim_hello nim_phases
+#   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nifler nim_hello
 #           nim_driver_guest nim_card nim_link lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
@@ -212,32 +212,6 @@ if want nim_hello; then
   fi
 fi
 
-# --- 6b) nimsem.temen.gz + hexer.temen.gz (the nimc "compile a whole Nim program" card's phase guests;
-# nifler is step 5). build_e2e_chain.sh builds all three phase guests with identical browser flags
-# (--binary --host-page 65536 --stub-externs); we gzip nimsem + hexer into web/assets (nim_stdlib.img.gz
-# is an fs image, not a wire-coupled module, so it never goes stale). --------------------------------
-if want nim_phases; then
-  echo "=== [nim_phases] crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh → gzip nimsem+hexer ==="
-  E2E_OUT="${TEMEN_E2E_CACHE:-/tmp/temen_e2e_chain}/temen"
-  # build_e2e_chain.sh reuses any phase guest its cache already holds, which is stale after exactly
-  # the changes this script exists for (a wire bump decodes it as `BadVersion`). A rebuild rebuilds.
-  rm -f "$E2E_OUT"/nifler.temen "$E2E_OUT"/nimsem.temen "$E2E_OUT"/hexer.temen
-  if bash crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh; then
-    ok=1
-    for p in nimsem hexer; do
-      if [ -f "$E2E_OUT/$p.temen" ] && validate "$E2E_OUT/$p.temen"; then
-        gzip -9 -n -c "$E2E_OUT/$p.temen" > "browser/web/assets/$p.temen.gz"
-      else
-        ok=0
-      fi
-    done
-    [ "$ok" = 1 ] && note "nim_phases ✓ (nimsem.temen.gz + hexer.temen.gz)" \
-                  || note "nim_phases ✗ (a phase guest missing/failed re-validate)"
-  else
-    note "nim_phases SKIP/✗ (nimony toolchain — nim + nimony/bin/{nimony,hexer} + clang/llvm-nm?)"
-  fi
-fi
-
 # --- 6c) nimsem driver-guest fixtures (crates/temen-llvm/tests/rust_driver_nimsem.rs): the step-9 guest
 # op-13-spawns child-entry nimsem over the system import closure. build_frontend.sh (TEMEN_NIMSEM_EMIT_
 # ASSET=1) rebuilds nimsem_ce.temen.gz + syslib.tar.gz + sysvq0asl.{p,s}.nif together. Toolchain-gated. -
@@ -250,36 +224,6 @@ if want nim_driver_guest; then
     note "nim_driver_guest ✓ (nimsem_ce.temen.gz + syslib.tar.gz + sysvq0asl.{p,s}.nif)"
   else
     note "nim_driver_guest SKIP/✗ (nimony toolchain — see build_frontend.sh; then refresh the expected via the test)"
-  fi
-  # The nimc card's whole-card tier-up (#1025 3e) op-13-spawns the CHILD-ENTRY phase guests; the
-  # playground fetches them from web/assets, so mirror the committed `_ce` fixtures there (they're the
-  # same wire-coupled modules the browser op-13 tests use — nifler_ce from the nifler demo, nimsem_ce +
-  # hexer_ce from the frontend fixtures). A plain copy (the fixtures are the toolchain-built source of
-  # truth), re-validated after; a stale copy only degrades the card to the interpreter, never crashes.
-  ceok=1
-  for pair in "crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz:nifler_ce" \
-              "$FX/nimsem_ce.temen.gz:nimsem_ce" "$FX/hexer_ce.temen.gz:hexer_ce"; do
-    srcgz="${pair%%:*}"; base="${pair##*:}"
-    if [ -f "$srcgz" ] && gunzip -c "$srcgz" > "/tmp/rebuild_$base.temen" 2>/dev/null \
-       && validate "/tmp/rebuild_$base.temen"; then
-      cp "$srcgz" "browser/web/assets/$base.temen.gz"
-    else
-      ceok=0
-    fi
-  done
-  [ "$ceok" = 1 ] && note "nim_card_ce ✓ (nifler_ce + nimsem_ce + hexer_ce → web/assets)" \
-                  || note "nim_card_ce ✗ (a child-entry fixture missing/failed re-validate)"
-
-  # The pre-compiled stdlib pack (#1375): system.nim's sema is ~30 s and user-independent, so the card
-  # ships the stdlib's `.p/.s/.s.idx/.x.nif` prebuilt and each Run skips re-checking it (~42 s → ~3 s
-  # compile). WIRE-COUPLED to nimsem_ce/hexer_ce + the stdlib image (rebuilt just above), so regenerate
-  # here. Needs the threads wasm + playwright (the guests run on the browser engine); build-prestdlib.mjs
-  # is fail-soft (SKIPs without them), so this only refreshes the pack when the harness is present.
-  if [ -f browser/target/wasm32-unknown-unknown/release/temen_browser.wasm ]; then
-    ( cd browser && node build-prestdlib.mjs ) && note "nim_prestdlib ✓ (nim_prestdlib.pack.gz)" \
-      || note "nim_prestdlib SKIP/✗ (needs threads wasm + playwright — see build-prestdlib.mjs)"
-  else
-    note "nim_prestdlib SKIP (threads wasm absent; build the browser engine first)"
   fi
 fi
 
@@ -393,9 +337,9 @@ for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo
 # A SKIP here is easy to read as "not applicable" when it actually means "this asset is now STALE and
 # nothing regenerated it" — which is silent until CI fails on a byte-comparison gate. That happened
-# twice on the v0.6.2 bump: `nim_link`/`nim_link_fs` (the in-guest linker IS temen-leng, so it goes
-# stale whenever the linker changes, wire format or not) and `nim_prestdlib` (wire-coupled to the
-# `_ce` guests). Call the skipped steps out again, separately, with what unblocks each.
+# on the v0.6.2 bump with `nim_link`/`nim_link_fs` (the in-guest linker IS temen-leng, so it goes
+# stale whenever the linker changes, wire format or not). Call the skipped steps out again,
+# separately, with what unblocks each.
 SKIPPED=()
 for r in "${RESULTS[@]}"; do case "$r" in *SKIP*|*✗*) SKIPPED+=("$r");; esac; done
 if [ "${#SKIPPED[@]}" -gt 0 ]; then
@@ -403,13 +347,10 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   for r in "${SKIPPED[@]}"; do echo "    $r"; done
   echo
   echo "    These are not advisory. An asset that embeds compiled code (the nim-link guests embed"
-  echo "    temen-leng; the prestdlib pack embeds the _ce guests' output) goes stale on any change to"
-  echo "    what it embeds, and the gate that catches it is a byte-comparison in CI, not here."
-  echo "    The browser-engine steps need:  cd browser && cargo run --bin gencorpus && \\"
-  echo "      RUSTFLAGS=\"-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals -Clink-arg=--shared-memory\" \\"
-  echo "      cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown"
-  echo "    (see .github/workflows/ci.yml for the full flag set); the LLVM steps need the LLVM whose"
-  echo "    major matches rustc's on PATH (scripts/ci/install-llvm.sh). CI puts it there via"
+  echo "    temen-leng) goes stale on any change to what it embeds, and the gate that catches it is a"
+  echo "    byte-comparison in CI, not here."
+  echo "    The LLVM steps need the LLVM whose major matches rustc's on PATH"
+  echo "    (scripts/ci/install-llvm.sh). CI puts it there via"
   echo "    GITHUB_PATH; locally nothing does, so if the distro\'s unversioned llvm-link is older"
   echo "    than rustc\'s LLVM (\`rustc -vV | grep LLVM\`) prefix the run with"
   echo "      PATH=/usr/lib/llvm-\$(grep -oP \'LLVM_MAJOR=\\K[0-9]+\' scripts/ci/install-llvm.sh)/bin:\$PATH"

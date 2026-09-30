@@ -789,14 +789,11 @@ fn a_woken_event_parked_fiber_freezes_without_a_placeholder() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.4 step 2, the gate: an **unwoken capability park** cannot freeze — a `Leaf` (call.cap)
-// point spills its results *including* the call's, so a placeholder would be reloaded on thaw
-// as if it were the call's real result (reload-not-reissue). The park's kind is probed by which
-// scheduler map holds the waiter; a cap park is not in `wait_waiters`. Since #1671 the freeze
-// census sees this at the trigger and **declines** — the run goes on as if unarmed and the
-// embedder reads `FiberParkedOnCall` — where it used to unwind and then refuse with `FiberFault`
-// (the unwind-time refusal stays as the backstop). Re-issuing the park instead is #1676. The
-// fiber parks in a blocking stdin read (the racing-fibers shape from `fiber_parks.rs`, handle
+// §13.4 step 2 / #1677: an **unwoken capability park** freezes by its site's rule, as a vCPU's does.
+// A `Leaf` (call.cap) point spills its results *including* the call's, so the freeze drive gives the
+// park a placeholder and sets the fiber's re-issue word: its thaw re-issues the read rather than
+// reload the placeholder as its result. (Until #1677 the census declined it, `FiberParkedOnCall`.)
+// The fiber parks in a blocking stdin read (the racing-fibers shape from `fiber_parks.rs`, handle
 // passed through memory — the transform has no conversions).
 // ---------------------------------------------------------------------------
 
@@ -827,9 +824,9 @@ block 0 (va: i64, vb: i64) {
 "#;
 
 #[test]
-fn an_unwoken_cap_parked_fiber_declines_the_freeze() {
-    use temen_durable::{arm_freeze_after, read_state, STATE_NORMAL};
-    use temen_interp::{DeclineCause, StreamRole};
+fn an_unwoken_cap_parked_fiber_freezes_and_its_thaw_reissues_the_read() {
+    use temen_durable::{arm_freeze_after, begin_thaw, read_state, STATE_UNWINDING};
+    use temen_interp::StreamRole;
 
     let mut m = temen_text::parse_module(SRC_CAP_PARKED_FIBER).expect("parse");
     m.memory = Some(Memory {
@@ -839,35 +836,34 @@ fn an_unwoken_cap_parked_fiber_declines_the_freeze() {
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
 
-    let run = |arm: bool| {
-        let mut h = Host::new();
-        h.set_durable(true);
-        let handle = h.grant_stream(StreamRole::In);
-        h.set_stdin_blocking(true);
-        let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        if arm {
-            arm_freeze_after(&mut win, 2);
-        }
-        let mut fuel = 1_000_000u64;
-        let (r, snap) = run_capture_reserved_with_host(
-            &inst,
-            0,
-            &[Value::I32(handle)],
-            &mut fuel,
-            &win,
-            SIZE_LOG2,
-            &mut h,
-        );
-        (r, read_state(&snap), h.take_freeze_declined())
-    };
-    let (base, _, _) = run(false);
-    let (r, state, declined) = run(true);
-    assert_eq!(r, base, "declined: the run goes on exactly as unarmed");
-    assert_eq!(state, STATE_NORMAL, "nothing unwound");
+    let mut h = Host::new();
+    h.set_durable(true);
+    let handle = h.grant_stream(StreamRole::In);
+    h.set_stdin_blocking(true);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, 2);
+    let mut fuel = 1_000_000u64;
+    let args = [Value::I32(handle)];
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
+    assert_eq!(h.take_freeze_declined(), None, "not declined");
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(h.frozen_fibers().len(), 1, "the parked fiber rides");
+
+    // The input arrives after the freeze; the thaw re-issues the fiber's read, which takes it.
+    h.push_stdin(b"abcd");
+    let fibers = h.frozen_fibers().to_vec();
+    h.set_frozen_fibers(fibers);
+    let mut twin = snap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut fuel = 1_000_000u64;
+    let (r, _) =
+        run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &twin, SIZE_LOG2, &mut h);
     assert_eq!(
-        declined.map(|d| (d.cause, d.slot)),
-        Some((DeclineCause::FiberParkedOnCall, Some(0))),
-        "a cap-parked fiber can't ride (its placeholder would masquerade as a result), so the cut declines"
+        r,
+        Ok(vec![Value::I64(4)]),
+        "the re-issued read returned its 4 bytes"
     );
 }
 

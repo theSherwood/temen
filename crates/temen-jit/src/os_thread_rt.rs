@@ -196,15 +196,114 @@ impl Done {
     }
 }
 
-/// #1685 — mark the running context's `thread.join` (or `Instantiator.join`, #1904) for re-issue on
-/// thaw: the freeze ended it, or it took the placeholder of a child that unwound. Its unwind spills the
-/// word into the join's frame.
+/// #1685 — mark the call the running context is in for re-issue on thaw: a `thread.join` or an
+/// `Instantiator.join` (#1904) the freeze ended, or that took the placeholder of a child that unwound;
+/// a host call a landing freeze abandoned (#1826). Its unwind spills the word into the call's frame.
 ///
 /// # Safety
 /// `mem_base` is a durable run's committed window base.
-pub(crate) unsafe fn mark_join_reissue(mem_base: u64) {
+pub(crate) unsafe fn mark_reissue(mem_base: u64) {
     let word = crate::durable_shadow::get() + temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
     *((mem_base + word) as *mut i32) = 1;
+}
+
+/// #1826 — how a host call's park ([`park_host_call`]) ended.
+#[cfg(not(loom))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPark {
+    /// The event came (or had already come): run the op again (invariant 7, the rewound park).
+    Woken,
+    /// A landing freeze ended it: the call is marked for re-issue, and its placeholder answer stands
+    /// for the trailing poll to unwind past (#1672).
+    Frozen,
+    /// No live vCPU could ever end it: the oracle's deadlock verdict, `ThreadFault`.
+    Deadlock,
+    /// The run was killed or its domain torn down: return, and the trailing guards unwind.
+    Ended,
+}
+
+/// #1826 — park the calling vCPU's host call on `key` until `still_parked` turns false, through the
+/// run's futex hub ([`futex_wait`]), so it has the futex wait's every exit: a kill, the domain's
+/// teardown, a freeze (`WAIT_FROZEN`), and deadlock detection (no live vCPU left to end it). A
+/// [`wake_host_parks`] on `key` re-checks it. `still_parked` must not take the `Host` (a waker holds
+/// it while it takes the futex lock): it reads state the host shares, such as a pipe's FIFO.
+///
+/// A durable run's deferred children run first ([`Domain::drive_deferred_before_park`]): one of
+/// them may be what ends the park. The caller holds no lock the run's other vCPUs need.
+///
+/// # Safety
+/// `trap_out` is a live JIT call's trap cell (its `VmCtx`); `unwind_base` is a durable run's
+/// committed window base, or `0`.
+#[cfg(not(loom))]
+pub unsafe fn park_host_call(
+    trap_out: *mut i64,
+    unwind_base: u64,
+    key: u64,
+    still_parked: impl Fn() -> bool,
+) -> HostPark {
+    let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
+    let frozen = || unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
+    if vm.sched.is_null() {
+        // No thread domain: the caller is the run's only vCPU, and nothing else could end it.
+        return if frozen() {
+            mark_reissue(unwind_base);
+            HostPark::Frozen
+        } else if still_parked() {
+            HostPark::Deadlock
+        } else {
+            HostPark::Woken
+        };
+    }
+    let dom = current_domain(vm.sched as *const Domain);
+    dom.drive_deferred_before_park(dom.current_task());
+    let lane = dom.lane_chain();
+    dom.lane_give_back(&lane);
+    let hub = dom.hub();
+    let status = futex_wait(
+        &hub.futex,
+        &hub.futex_cv,
+        FutexKey::Host(key),
+        still_parked,
+        None,
+        dom.env().epoch_addr,
+        unwind_base,
+        &hub.parked,
+        || lock(&hub.threads).live > hub.parked.load(Ordering::Acquire),
+        || load_trap(trap_out) != 0,
+    );
+    let ended = || epoch_fired(dom.env().epoch_addr) || load_trap(trap_out) != 0;
+    if !dom.lane_acquire(&lane, ended) || ended() {
+        return HostPark::Ended;
+    }
+    match status {
+        temen_ir::durable_abi::WAIT_FROZEN => {
+            mark_reissue(unwind_base);
+            HostPark::Frozen
+        }
+        #[cfg(not(loom))]
+        WAIT_DEADLOCK => HostPark::Deadlock,
+        _ => HostPark::Woken,
+    }
+}
+
+/// #1826 — wake every host call parked on `key` ([`park_host_call`]): each re-checks its predicate.
+///
+/// # Safety
+/// As [`park_host_call`].
+#[cfg(not(loom))]
+pub unsafe fn wake_host_parks(trap_out: *mut i64, key: u64) {
+    let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
+    if vm.sched.is_null() {
+        return;
+    }
+    let hub = current_domain(vm.sched as *const Domain).hub();
+    futex_notify(
+        &hub.futex,
+        &hub.futex_cv,
+        FutexKey::Host(key),
+        u32::MAX,
+        &hub.parked,
+    );
 }
 
 /// The per-run thread table + futex — the "scheduler address" baked into the `thread.*` thunks. It
@@ -410,6 +509,9 @@ pub(crate) enum FutexKey {
     Anon(u64),
     /// A `Backed` region byte: keyed on `(backing identity, canonical byte offset in the region)`.
     Region(u64, u64),
+    /// #1826 — a host call parked on something the host owns (a pipe, by its global id): see
+    /// [`park_host_call`].
+    Host(u64),
 }
 
 /// Per-absolute-page `(backing identity, region byte offset of the page start)` recorded by every §13
@@ -2136,7 +2238,7 @@ pub(crate) unsafe extern "C" fn thread_join(
                 }
                 if done.unwound.load(Ordering::Relaxed) {
                     // SAFETY: a child unwinds only on a durable run, whose window is committed.
-                    unsafe { mark_join_reissue(dom.env().mem_base) };
+                    unsafe { mark_reissue(dom.env().mem_base) };
                 }
                 return result;
             }
@@ -2145,7 +2247,7 @@ pub(crate) unsafe extern "C" fn thread_join(
             }
             // SAFETY: on a durable run `mem_base` is the committed window base, offset 0 RW for the run.
             if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
-                unsafe { mark_join_reissue(unwind_base) };
+                unsafe { mark_reissue(unwind_base) };
                 return 0; // freeze in progress — return so the join's trailing safepoint unwinds
             }
             // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a

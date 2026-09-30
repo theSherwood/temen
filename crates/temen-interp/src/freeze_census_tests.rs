@@ -38,7 +38,6 @@ impl Fixture {
             nested_children: &[],
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
-            handler_parked: false,
             window_safe: true,
             host: &self.root,
             registry: &self.registry,
@@ -87,16 +86,6 @@ fn a_root_holding_a_non_durable_handle_is_left_to_the_codec() {
         .lock_unpoisoned()
         .grant_blocking(Duration::ZERO, None);
     assert_eq!(f.census(&f.root_seat()), None);
-}
-
-#[test]
-fn a_parked_serve_handler_declines() {
-    let f = Fixture::new();
-    let seat = Seat {
-        handler_parked: true,
-        ..f.root_seat()
-    };
-    assert_eq!(f.census(&seat), Some(DeclineCause::ServeHandlerParked));
 }
 
 #[test]
