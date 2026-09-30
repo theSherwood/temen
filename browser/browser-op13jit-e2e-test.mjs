@@ -1,6 +1,6 @@
 // Real-browser (V8) end-to-end for the **JS-orchestrated §14 op-13 loop** (#1025 Path 1): a resumable
-// driver marshals an `fs` grant to a confined child, and JS runs the child's `_start` on the **emitted
-// wasm** tier (`driveJitRun`) over its carve. The child's `call.cap` leaf resolves the *marshaled* `fs`
+// driver re-grants its `fs` to a detached child (op 17 v1), and JS runs the child's `_start` on the
+// **emitted wasm** tier (`driveDetachedRun`) in the child's own `WebAssembly.Memory`. The child's `call.cap` leaf resolves the *marshaled* `fs`
 // on the reactor cross-tier bounce and returns `40 + fs()` = 41; the shared counter ticks once. This is
 // the browser realization of `nimc.rs::drive_op13` with the child tiered up — the nested phase on JIT.
 import { startServer } from './serve.mjs';
@@ -28,7 +28,9 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 const res = await page.evaluate(async () => {
   const par = await import('./par.js');
-  const { driveJitRun } = await import('./wasmjit-module.js');
+  const { driveDetachedRun } = await import('./wasmjit-module.js');
+  const { foreignMemory } = await import('./foreign-mem.js');
+  const drive = (key) => driveDetachedRun(ex, memory, foreignMemory(ex.temen_op13jit_child_mem_id()), key);
   const eng = await par.loadEngine();
   const ex = eng.ex, memory = eng.memory;
 
@@ -38,12 +40,12 @@ const res = await page.evaluate(async () => {
     if (steps++ > 8) { ex.temen_op13jit_close(); return { err: 'loop did not terminate' }; }
     const s = ex.temen_op13jit_step();
     if (s === 0) break;             // OP13JIT_DONE
-    if (s === 1) {                  // OP13JIT_CHILD — run the staged child on emitted wasm
+    if (s === 2) {                  // OP13JIT_CHILD_DETACHED — run the staged child on emitted wasm
       try {
-        await driveJitRun(ex, memory, 'op13jit-child');
+        await drive('op13jit-child');
       } catch (e) {
         ex.temen_op13jit_close();
-        return { err: `driveJitRun threw: ${String(e && e.message || e)}` };
+        return { err: `driveDetachedRun threw: ${String(e && e.message || e)}` };
       }
       ex.temen_op13jit_deliver();
       drove++;
@@ -58,7 +60,7 @@ const res = await page.evaluate(async () => {
 
   // #1201 — the same loop over a PAGE-OP child (`op13_paged_child`: its leaf `protect`s the "K" page
   // read-only, `f0` reads K back → 116): the single-shot emit is paged, the child is staged for
-  // `driveJitRun` (not run on the interpreter inline), and the driver re-syncs `"pagestate"`/`"mapped"`
+  // `driveDetachedRun` (not run on the interpreter inline), and the driver re-syncs `"pagestate"`/`"mapped"`
   // after the bounce — so the page-op child runs on the EMITTED tier like any other.
   const bytes = new Uint8Array(await (await fetch('/corpus/op13_paged_child.temenc')).arrayBuffer());
   const ptr = ex.temen_alloc(bytes.length);
@@ -71,13 +73,13 @@ const res = await page.evaluate(async () => {
     if (pSteps++ > 8) { ex.temen_op13jit_close(); return { result, counter, drove, err: 'paged loop did not terminate' }; }
     const s = ex.temen_op13jit_step();
     if (s === 0) break;
-    if (s === 1) {
+    if (s === 2) {
       paged = ex.temen_onramp_jit_run_pagestate_len() > 0;
       try {
-        await driveJitRun(ex, memory, 'op13jit-paged-child');
+        await drive('op13jit-paged-child');
       } catch (e) {
         ex.temen_op13jit_close();
-        return { result, counter, drove, err: `paged driveJitRun threw: ${String(e && e.message || e)}` };
+        return { result, counter, drove, err: `paged driveDetachedRun threw: ${String(e && e.message || e)}` };
       }
       ex.temen_op13jit_deliver();
       pDrove++;

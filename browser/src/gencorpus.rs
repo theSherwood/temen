@@ -13,7 +13,7 @@ use std::io::Write;
 
 use temen_browser::{
     capture_exec, durable_run, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec,
-    reflect_exec, region_exec,
+    reflect_exec, region_exec, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use temen_durable::{
     init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
@@ -466,42 +466,46 @@ block 3 () {
 }
 "#;
 
-// ---- §14 nested child guests (confined sub-window domains) -------------------------------------
-// All lifted verbatim from `crates/temen/tests/bytecode_instantiate.rs` (known parseable + engine-
-// supported, checked bit-identical to the tree-walker there). Func 0 receives an `Instantiator`
-// (iface 6) over `[0, 128 KiB)`; `instantiate` is `call.cap 6 0`, `join` is `call.cap 6 1`.
+// ---- §14 nested child guests (detached child domains) -------------------------------------------
+// Func 0 receives an `Instantiator` (iface 6) and resolves the 1 MiB `"budget"` by name
+// (`instantiate_exec`); it spawns func 1 of its own module detached — an op-17 v1 record at 17408,
+// module `-1` — in a fresh window of the module's declared size, paid from the budget; `join` is
+// `call.cap 6 1`.
 
-// Parent instantiates a child in a 4 KiB window at 64 KiB, the child writes 123 at its own offset 7
-// (→ shared backing 64 KiB + 7) and returns 42; the parent joins, reads the marker back, returns
-// 42*1000 + 123 = 42123 — confined child execution over the shared data plane.
-const CHILD_SHARED: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  v7 = i64.const 65543
-  v8 = i32.load8_u v7
-  v9 = i64.extend_i32_u v8
-  v10 = i64.const 1000
-  v11 = i64.mul v6 v10
-  v12 = i64.add v11 v9
-  return v12
-  }
+/// A nested-corpus guest (`memory {mem}`): func 0 spawns func 1 (`child`, a whole `func`) through a
+/// v1 record asking for window `2^size_log2` (`0`: the declared one). With `join` it joins the child
+/// into `vj`; either way `tail` ends the block (the spawn's handle is `vh`).
+fn nested_guest(mem: u8, size_log2: i64, join: bool, tail: &str, child: &str) -> String {
+    let rec = temen_ir::SpawnRec {
+        size_log2,
+        ..temen_ir::SpawnRec::v1(1)
+    };
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, None, "vbud");
+    let join = if join {
+        "  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n"
+    } else {
+        ""
+    };
+    format!(
+        "memory {mem}\ndata 16384 \"budget\"\n{seg}func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
+         vbp = i64.const 16384\n  vbl = i64.const 6\n  vbud = self.resolve vbp vbl\n{stores}  \
+         vrp = i64.const 17408\n  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n{join}{tail}  }}\n}}\n{child}"
+    )
 }
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 7
-  v2 = i32.const 123
-  i32.store8 v1 v2
-  v3 = i64.const 42
-  return v3
-  }
+
+/// Isolation: the child writes 123 at 65543 of its **own** window and returns 42; the parent joins
+/// and reads the same offset of its own window — untouched, 0 — returning `42 * 1000 + 0 = 42000`.
+fn child_isolated() -> String {
+    nested_guest(
+        17,
+        0,
+        true,
+        "  v7 = i64.const 65543\n  v8 = i32.load8_u v7\n  v9 = i64.extend_i32_u v8\n  \
+         v10 = i64.const 1000\n  v11 = i64.mul vj v10\n  v12 = i64.add v11 v9\n  return v12\n",
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 65543\n  v2 = i32.const 123\n  \
+         i32.store8 v1 v2\n  v3 = i64.const 42\n  return v3\n  }\n}\n",
+    )
 }
-"#;
 
 // Depth-2 VM-in-VM: the child, handed an `Instantiator` over *its* window, instantiates a grandchild
 // — confinement composes. The grandchild returns 77, propagated up through two joins.
@@ -544,72 +548,42 @@ block 0 (v0: i64) {
 "#;
 
 // A two-arg child receives its starter caps `(Instantiator, AddressSpace)` and uses the AddressSpace
-// (iface 5, op 1 = unmap) to decommit the first 16 KiB of its **own** 64 KiB window — a confined
+// (iface 5, op 1 = unmap) to decommit 16 KiB at 64 KiB of its **own** 256 KiB window — a confined
 // page op — returning 0. Proves the §14 memory-management capability is attenuated to the child.
-const CHILD_ADDRSPACE: &str = r#"memory 18
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 16
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  return v6
-  }
+fn child_addrspace() -> String {
+    nested_guest(
+        18,
+        0,
+        true,
+        "  return vj\n",
+        "func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i32.wrap_i64 v1\n  \
+         v3 = i64.const 65536\n  v4 = i64.const 16384\n  v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n  \
+         return v5\n  }\n}\n",
+    )
 }
-func (i64, i64) -> (i64) {
-block 0 (v0: i64, v1: i64) {
-  v2 = i32.wrap_i64 v1
-  v3 = i64.const 0
-  v4 = i64.const 16384
-  v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)
-  return v5
-  }
-}
-"#;
 
-// Confinement boundary: a 4 KiB child at offset 128 KiB doesn't fit the 128 KiB holder, so
-// `instantiate` returns -EINVAL (-22); the parent returns it without joining.
-const CHILD_BADCARVE: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 131072
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = i64.extend_i32_s v5
-  return v6
-  }
+// Admission boundary: a record asking for a 4 KiB window when the module declares 128 KiB is refused
+// probeably — the spawn returns -EINVAL (-22), charging nothing; the parent returns it without joining.
+fn child_refused() -> String {
+    nested_guest(
+        17,
+        12,
+        false,
+        "  v6 = i64.extend_i32_s vh\n  return v6\n",
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 0\n  return v1\n  }\n}\n",
+    )
 }
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 0
-  return v1
-  }
-}
-"#;
 
 // A child trap (`unreachable`) must propagate through `join` as the parent's trap (STATUS_TRAP).
-const CHILD_TRAP: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 0
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  return v6
-  }
+fn child_trap() -> String {
+    nested_guest(
+        17,
+        0,
+        true,
+        "  return vj\n",
+        "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  unreachable\n  }\n}\n",
+    )
 }
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  unreachable
-  }
-}
-"#;
 
 // ---- §12 fibers (cooperative continuation switching) -------------------------------------------
 // Lifted verbatim from `crates/temen/tests/bytecode_fibers.rs`. No powerbox needed (cont.* doesn't
@@ -2172,22 +2146,36 @@ fn main() {
             if i + 1 == gcroots.len() { "\n" } else { ",\n" },
         ));
     }
-    // Nested-child corpus — each runs func 0 with an Instantiator over [0, 128 KiB); the (status,
-    // value) is the ground truth (confined child execution, depth, attenuation, boundary, traps).
+    // Nested-child corpus — each runs func 0 with an Instantiator and a budget (`instantiate_exec`);
+    // the (status, value) is the ground truth (detached child execution, isolation, depth, attenuation,
+    // admission, traps), checked here against what each guest is written to produce so a regression
+    // cannot quietly become the truth.
+    let (isolated, addrspace, refused, trap) = (
+        child_isolated(),
+        child_addrspace(),
+        child_refused(),
+        child_trap(),
+    );
     let nested = [
-        ("child_shared", CHILD_SHARED),
-        ("child_depth2", CHILD_DEPTH2),
-        ("child_addrspace", CHILD_ADDRSPACE),
-        ("child_badcarve", CHILD_BADCARVE),
-        ("child_trap", CHILD_TRAP),
-        // §14 coroutines reuse the Instantiator grant, so they run on the same `temen_run_nested` path.
-        ("coro_roundtrip", CORO),
-        ("coro_forged", CORO_FORGED),
+        ("child_isolated", isolated.as_str(), (STATUS_OK, 42000)),
+        ("child_depth2", CHILD_DEPTH2, (STATUS_OK, 77)),
+        ("child_addrspace", addrspace.as_str(), (STATUS_OK, 0)),
+        (
+            "child_refused",
+            refused.as_str(),
+            (STATUS_OK, temen_ir::errno::EINVAL),
+        ),
+        ("child_trap", trap.as_str(), (STATUS_TRAP, 0)),
+        // §14 coroutines reuse the Instantiator grant, so they run on the same `temen_run_nested` path
+        // — which declines them: the bytecode engine does not compile a coroutine op.
+        ("coro_roundtrip", CORO, (STATUS_UNSUPPORTED, 0)),
+        ("coro_forged", CORO_FORGED, (STATUS_UNSUPPORTED, 0)),
     ];
     json.push_str("],\n\"nested\":[\n");
-    for (i, (name, src)) in nested.iter().enumerate() {
+    for (i, (name, src, want)) in nested.iter().enumerate() {
         let (m, file) = emit(name, src);
         let (status, value) = instantiate_exec(&m);
+        assert_eq!((status, value), *want, "nested corpus guest {name}");
         json.push_str(&format!(
             "  {{\"name\":\"{name}\",\"file\":\"{file}\",\"status\":{status},\"value\":\"{value}\"}}{}",
             if i + 1 == nested.len() { "\n" } else { ",\n" },

@@ -8,46 +8,31 @@
 //! - the interpreter loop a declined child runs on (`nimc::drive_op13`) indexed its table with the
 //!   guest's handle, so an out-of-range handle panicked the host.
 //!
+//! The driver spawns detached (op 17 v1); the carve spawn this loop also served retired (#1289).
+//!
 //! Both now resolve through `temen_interp::take_child`. The loop reports a trap as `OP13JIT_TRAP`
 //! without its kind; `take_child`'s own unit test pins the kind.
 
 use std::sync::Mutex;
 
 use temen_browser::{
-    temen_op13jit_close, temen_op13jit_open_named, temen_op13jit_result, temen_op13jit_step,
+    temen_op13jit_close, temen_op13jit_open_detached, temen_op13jit_result, temen_op13jit_step,
     OP13JIT_DONE, OP13JIT_TRAP,
 };
+
+#[path = "support/op13jit_driver.rs"]
+mod op13jit_driver;
 
 // The op-13 loop state is process-global (`OP13_JIT`): serialize the tests.
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// The driver (`memory 16`, entry `(inst, module, fs)`): op 13 spawns the child into the 32-KiB carve
-/// at 32768 with no grants, joins it into `vr`, then runs `tail`, which must leave the result in `vo`.
+/// The driver spawns the child with no grants and joins it into `vr`, then runs `tail`, which must
+/// leave the result in `vo`.
 fn driver(tail: &str) -> Vec<u8> {
-    let src = format!(
-        r#"memory 16
-func (i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32) {{
-  vmh = i64.extend_i32_u v1
-  vg = i64.const 0
-  ventry = i64.const 0
-  voff = i64.const 32768
-  vsl = i64.const 15
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vg, vg, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-{tail}
-  return vo
-  }}
-}}
-"#
-    );
-    let m = temen_text::parse_module(&src).expect("parse driver");
-    temen_verify::verify_module(&m).expect("verify driver");
-    temen_encode::encode_module(&m)
+    op13jit_driver::driver(&[], tail)
 }
 
-/// The child (`memory 15`, the carve): runs `body`, then returns 42. An unreachable §13
+/// The child (`memory 15`, its own window): runs `body`, then returns 42. An unreachable §13
 /// `SharedRegion` op declines the emit, so the child runs on the interpreter loop inline.
 fn child(body: &str) -> Vec<u8> {
     let src = format!(
@@ -78,7 +63,7 @@ block 0 () {{
 fn run(driver: &[u8], child: &[u8]) -> (i32, i64) {
     // SAFETY: live byte slices for the duration of the call.
     let st = unsafe {
-        temen_op13jit_open_named(driver.as_ptr(), driver.len(), child.as_ptr(), child.len())
+        temen_op13jit_open_detached(driver.as_ptr(), driver.len(), child.as_ptr(), child.len())
     };
     assert_eq!(st, 0, "the op-13 loop opens");
     let out = (temen_op13jit_step(), temen_op13jit_result());

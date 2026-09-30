@@ -1193,7 +1193,7 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
   };
   const pushBytes = (bytes) => { const p = Number(ex.temen_alloc(bytes.length)); u8().set(bytes, p); return p; };
 
-  // Run one `nifler --deps parse <file> <out>` step as an op-13 nested emitted child. Returns
+  // Run one `nifler --deps parse <file> <out>` step as a detached emitted child on the op-13 loop. Returns
   // `{pnif, deps}` (the two products) or `null` if the driver/child trapped.
   const op13Step = async (file, out, src) => {
     const cp = pushBytes(niflerCeBytes);
@@ -1208,12 +1208,6 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
       if (steps++ > 8) { ex.temen_op13jit_close(); return null; }
       const s = ex.temen_op13jit_step();
       if (s === 0) break;             // DONE
-      if (s === 1) {                  // CHILD — run nifler_ce emitted
-        try { await driveJitRun(ex, memory, cacheKey); }
-        catch { ex.temen_op13jit_close(); return null; }
-        ex.temen_op13jit_deliver();
-        continue;
-      }
       if (s === 2) {                  // CHILD_DETACHED (#1286) — run it in its own Memory
         try { await driveDetachedRun(ex, memory, foreignMemory(ex.temen_op13jit_child_mem_id()), cacheKey); }
         catch { ex.temen_op13jit_close(); return null; }
@@ -1318,10 +1312,6 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       if (steps++ > 8) { lastTrap = 'loop>8'; ex.temen_op13jit_close(); return null; }
       const s = ex.temen_op13jit_step();
       if (s === 0) return Number(ex.temen_op13jit_result());   // DONE
-      if (s === 1) {                                           // CHILD (nested carve)
-        try { await driveJitRun(ex, memory, phaseKey); } catch (e) { lastTrap = `driveJitRun: ${String(e && e.message || e)}`; ex.temen_op13jit_close(); return null; }
-        ex.temen_op13jit_deliver(); continue;
-      }
       if (s === 2) {                                           // CHILD_DETACHED (own Memory)
         try { await driveDetachedRun(ex, memory, foreignMemory(ex.temen_op13jit_child_mem_id()), phaseKey); }
         catch (e) { lastTrap = `driveDetachedRun: ${String(e && e.message || e)}`; ex.temen_op13jit_close(); return null; }
