@@ -83,6 +83,20 @@ block 0 (v0: i64) {\n\
   }\n\
 }\n";
 
+/// A 64 KiB command that reports what is at 96 KiB, past its own image, plus 7: `7` in a fresh
+/// window, where nothing of the caller's carries over.
+const FRESH_COMMAND: &str = "memory 16\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  v1 = i64.const 98304\n\
+  v2 = i32.load8_u v1\n\
+  v3 = i64.extend_i32_u v2\n\
+  v4 = i64.const 7\n\
+  v5 = i64.add v3 v4\n\
+  return v5\n\
+  }\n\
+}\n";
+
 /// How the guest spells a personality call. The two forms produce byte-identical modules apart from
 /// the spelling — `vdummy` is emitted in both so even the value numbering matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +150,9 @@ enum Body {
     /// #1768 — `execve("/bin/c", ["x", "x", "x"], NULL)` into [`ARGC_COMMAND`]: the image-replace must
     /// deliver the argv the op staged, so the command returns `3`.
     ExecDeliversArgv,
+    /// Leave `90` at 96 KiB, then `execve("/bin/c", NULL, NULL)` into [`FRESH_COMMAND`]: the new
+    /// image's window is fresh, so the command returns `7`, not `97`.
+    ExecStartsFresh,
     /// `fork()`; the child `execve`s and falls back to `exit(9)`; the parent `wait4`s and exits
     /// with the reaped `WEXITSTATUS`. Nim's `execShellCmd` is exactly this shape.
     ForkExecReap,
@@ -555,6 +572,18 @@ fn guest(form: Form, body: Body) -> String {
              }}\n\
              export 0 func \"_start\" 0\n"
         ),
+        // `98304` is past the 64 KiB command's image and clear of this module's data and shadow.
+        Body::ExecStartsFresh => format!(
+            "{head}func () -> () {{\n\
+             block 0 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vmark = i64.const 98304\n\
+             \x20 v90 = i32.const 90\n\
+             \x20 i32.store8 vmark v90\n\
+             {exec}  }}\n\
+             }}\n\
+             export 0 func \"_start\" 0\n"
+        ),
         Body::ForkExecReap => format!(
             "{head}func () -> () {{\n\
              block 0 () {{\n\
@@ -596,6 +625,7 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
     let command = parse_module(match body {
         Body::ExecRefusedUntouched => UNSTARTABLE,
         Body::ExecDeliversArgv => ARGC_COMMAND,
+        Body::ExecStartsFresh => FRESH_COMMAND,
         _ => COMMAND,
     })
     .expect("parse command");
@@ -728,15 +758,26 @@ fn an_execve_the_engine_refuses_leaves_the_caller_untouched_on_every_route() {
     );
 }
 
-/// #1768 — the new image reads the argv its `execve` passed. On the JIT this is a different road
-/// from the interpreters' (the image runs in a fresh window seeded from the commit, not the caller's
-/// window reused in place), so it is a row of its own.
+/// #1768 — the new image reads the argv its `execve` passed, which the commit writes into its fresh
+/// window: the args region of `Mem::exec_window` on the interpreters, the fresh run's seed on the JIT.
 #[test]
 fn an_execd_image_reads_the_argv_it_was_given_on_every_route() {
     assert_parity(
         Body::ExecDeliversArgv,
         Cmd::Registered,
         Outcome::Returned(vec![Value::I64(3)]),
+    );
+}
+
+/// An exec replaces the address space: the new image starts in a fresh window of the caller's
+/// geometry, so the bytes the caller left past the image stay behind. The JIT always started the
+/// image afresh; the interpreters built it in the caller's window until `Mem::exec_window`.
+#[test]
+fn an_execd_image_starts_in_a_fresh_window_on_every_route() {
+    assert_parity(
+        Body::ExecStartsFresh,
+        Cmd::Registered,
+        Outcome::Returned(vec![Value::I64(7)]),
     );
 }
 
