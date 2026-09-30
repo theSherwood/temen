@@ -6962,11 +6962,15 @@ pub struct ScheduledDebugRun {
     /// record time and re-applied by the DAP backend on rebuilds — so a `seek` replays them at the
     /// identical turns. Empty (the default) is zero-cost.
     forced: Vec<(u64, usize)>,
-    /// Recorded **step spans** (#1942): `(from, to, task)` — the turns `[from, to)` a step drove and
-    /// the thread it drove. A step runs its own thread while the others stay frozen, which the policy
-    /// pick would not reproduce, so a replay prefers the span's thread over those turns. Sorted and
-    /// disjoint; the DAP backend re-installs the list on every rebuild, like `forced`.
-    step_spans: Vec<(u64, u64, usize)>,
+    /// Recorded **step spans** (#1942): the turns each step drove, its thread, and whether it kept
+    /// the other threads frozen. The policy pick would not reproduce a step's schedule, so a replay
+    /// picks by the span over those turns. Sorted and disjoint; the DAP backend re-installs the list
+    /// on every rebuild, like `forced`.
+    step_spans: Vec<StepSpan>,
+    /// Whether the next step keeps the other threads frozen ([`set_single_thread`]).
+    ///
+    /// [`set_single_thread`]: Self::set_single_thread
+    single_thread: bool,
     /// Set when `drive` stopped *before* an op that hits a watchpoint (the access hasn't applied yet);
     /// taken by the backend to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -7856,44 +7860,76 @@ fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
     None
 }
 
-/// The thread a recorded step span prefers at `turn`, if one covers it (#1942).
-fn span_at(spans: &[(u64, u64, usize)], turn: u64) -> Option<usize> {
-    let i = spans.partition_point(|&(from, _, _)| from <= turn);
-    let &(_, to, task) = spans.get(i.checked_sub(1)?)?;
-    (turn < to).then_some(task)
+/// One recorded step (#1942): the turns `[from, to)` it drove, the thread it stepped, and whether it
+/// kept the other threads frozen (DAP `singleThread`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepSpan {
+    pub from: u64,
+    pub to: u64,
+    pub task: usize,
+    pub single_thread: bool,
+}
+
+/// The step a recorded span says was running at `turn`, as `(thread, single_thread)`, if one covers
+/// it (#1942).
+fn span_at(spans: &[StepSpan], turn: u64) -> Option<(usize, bool)> {
+    let i = spans.partition_point(|s| s.from <= turn);
+    let s = spans.get(i.checked_sub(1)?)?;
+    (turn < s.to).then_some((s.task, s.single_thread))
 }
 
 /// Drop the step spans at or past `turn`, clipping one that straddles it — the future a new step
 /// from `turn` rewrites (#1942).
-fn truncate_spans(spans: &mut Vec<(u64, u64, usize)>, turn: u64) {
-    spans.retain(|&(from, _, _)| from < turn);
+fn truncate_spans(spans: &mut Vec<StepSpan>, turn: u64) {
+    spans.retain(|s| s.from < turn);
     if let Some(last) = spans.last_mut() {
-        last.1 = last.1.min(turn);
+        last.to = last.to.min(turn);
     }
 }
 
-/// Record a step's span, merged into the previous one when it continues it on the same thread (a
-/// run of steps on one thread — every step of a single-threaded program — stays one span).
-fn push_span(spans: &mut Vec<(u64, u64, usize)>, span: (u64, u64, usize)) {
-    let (from, to, task) = span;
-    if from >= to {
+/// Record a step's span, merged into the previous one when it continues it on the same thread in
+/// the same mode (a run of steps on one thread — every step of a single-threaded program — stays one
+/// span).
+fn push_span(spans: &mut Vec<StepSpan>, span: StepSpan) {
+    if span.from >= span.to {
         return;
     }
     match spans.last_mut() {
-        Some(last) if last.1 == from && last.2 == task => last.1 = to,
+        Some(last)
+            if last.to == span.from
+                && last.task == span.task
+                && last.single_thread == span.single_thread =>
+        {
+            last.to = span.to
+        }
         _ => spans.push(span),
     }
 }
 
-/// The pick among the **runnable** tasks, without side effects: a forced switch recorded for `turn`
-/// wins, then `pref` (the stepping thread live, or a recorded step span's on replay — #1942), then a
-/// `seed`ed pick chosen uniformly via [`splitmix64`]`(seed ^ turn)`, else the lowest-index runnable
-/// (the original default). Each candidate only while it is runnable; `None` when nothing is.
+/// The pick among the **runnable** tasks, without side effects. Each candidate only while it is
+/// runnable; `None` when nothing is.
+///
+/// 1. A forced switch recorded for `turn` wins.
+/// 2. Then `pref`, the step in progress: `(thread, single_thread)` live, or a recorded step span's
+///    on replay (#1942).
+///    - A **single-thread** step (DAP `singleThread`) runs only its thread, the others frozen.
+///    - Any other step shares the turns: the runnable threads take one each, in order. The stepped
+///      thread still decides when the step ends, but the others keep running meanwhile, as the DAP
+///      spec has them do, so a step over a spin-wait on another thread's flag ends. When a step
+///      kept to its thread, it never did.
+///    - A blocked stepping thread falls through to the policy (a step over a `join` can't
+///      deadlock).
+/// 3. Then the policy: a `seed`ed pick chosen uniformly via [`splitmix64`]`(seed ^ turn)`, else the
+///    runnable threads in turn, one [`COOP_QUANTUM`] each — the release engine's preemption quantum,
+///    so a run through a spin-wait ends on both engines. Within the first quantum that is the
+///    lowest-index runnable thread, as it always was.
+///
+/// Every rule is a function of the arguments alone, so a replay picks exactly as the live run did.
 fn dbg_preview_pick(
     tasks: &[DbgTask],
     seed: Option<u64>,
     forced: &[(u64, usize)],
-    pref: Option<usize>,
+    pref: Option<(usize, bool)>,
     turn: u64,
 ) -> Option<usize> {
     let runnable =
@@ -7901,13 +7937,17 @@ fn dbg_preview_pick(
     if let Some(f) = forced_at(forced, turn).filter(|&f| runnable(f)) {
         return Some(f);
     }
-    if let Some(p) = pref.filter(|&p| runnable(p)) {
-        return Some(p);
-    }
     let set: Vec<usize> = (0..tasks.len()).filter(|&i| runnable(i)).collect();
+    if let Some((p, single_thread)) = pref.filter(|&(p, _)| runnable(p)) {
+        return Some(if single_thread {
+            p
+        } else {
+            set[(turn % set.len() as u64) as usize]
+        });
+    }
     match seed {
         _ if set.is_empty() => None,
-        None => Some(set[0]),
+        None => Some(set[((turn / COOP_QUANTUM) % set.len() as u64) as usize]),
         Some(s) => Some(set[(splitmix64(s ^ turn) % set.len() as u64) as usize]),
     }
 }
@@ -7923,7 +7963,7 @@ fn dbg_pick_runnable(
     clock: &mut u64,
     seed: Option<u64>,
     forced: &[(u64, usize)],
-    pref: Option<usize>,
+    pref: Option<(usize, bool)>,
     turn: u64,
 ) -> Option<usize> {
     loop {
@@ -8019,6 +8059,7 @@ impl ScheduledDebugRun {
             sched_seed: None,
             forced: Vec::new(),
             step_spans: Vec::new(),
+            single_thread: false,
             last_watch: None,
             // Entry-stopped: the first `step` steps off the entry op (not to completion), and the
             // `stopped`/`focus` reads resolve the root task without an explicit `locate`.
@@ -8313,10 +8354,10 @@ impl ScheduledDebugRun {
     }
 
     /// The unified scheduler pump. `step` selects the mode:
-    /// - `None` — a plain resume (`continue`/`reverseContinue`): run the **lowest-index** runnable
-    ///   thread one op per turn, stopping on any thread's breakpoint or watchpoint.
-    /// - `Some((st, max))` — step thread `st`: run **`st`** by preference (falling back to the lowest
-    ///   runnable only while `st` is blocked, so a step *over* a `join` can't deadlock), stopping the
+    /// - `None` — a plain resume (`continue`/`reverseContinue`): run the policy's pick one op per turn
+    ///   ([`dbg_preview_pick`]), stopping on any thread's breakpoint or watchpoint.
+    /// - `Some((st, max))` — step thread `st` (sharing the turns with the others, or alone when
+    ///   [`single_thread`](Self::set_single_thread); see [`dbg_preview_pick`]), stopping the
     ///   moment `st` reaches a call depth `<= max` at an instruction (`max = None` ⇒ any depth = one
     ///   instruction = step-*in*). Another thread's breakpoint/watchpoint still interrupts a step.
     ///
@@ -8346,6 +8387,7 @@ impl ScheduledDebugRun {
             sched_seed,
             forced,
             step_spans,
+            single_thread,
             scheduled_writes,
             write_cursor,
             last_watch,
@@ -8378,7 +8420,7 @@ impl ScheduledDebugRun {
             // for this turn (explicit user intent) > the stepping thread — this step's, or on a
             // resume past a recorded step, that step's span (#1942) > the policy pick.
             let pref = step
-                .map(|(st, _)| st)
+                .map(|(st, _)| (st, *single_thread))
                 .or_else(|| span_at(step_spans, *turn));
             let ti = if let Some(p) = dbg_pinned_coro(tasks) {
                 p
@@ -8573,9 +8615,10 @@ impl ScheduledDebugRun {
     }
 
     /// Step [the stepping thread](Self::step_thread) until its call depth is `<= max_depth` (`None` ⇒
-    /// any = one instruction), keeping other threads frozen unless the stepped thread blocks. The
+    /// any = one instruction). The
     /// shared driver for the stepping verbs (step off the current op first, then seek the next
-    /// qualifying stop).
+    /// qualifying stop). The other threads share the turns meanwhile unless
+    /// [`set_single_thread`](Self::set_single_thread) froze them.
     ///
     /// The step is recorded as a span (#1942) so a replay runs the same thread over the same turns.
     /// A step taken from an earlier turn (after a step back) rewrites the future, so the spans at or
@@ -8588,17 +8631,30 @@ impl ScheduledDebugRun {
         let from = self.turn;
         truncate_spans(&mut self.step_spans, from);
         let stop = self.drive(fuel, Some((st, max_depth)), None);
-        push_span(&mut self.step_spans, (from, self.turn, st));
+        let span = StepSpan {
+            from,
+            to: self.turn,
+            task: st,
+            single_thread: self.single_thread,
+        };
+        push_span(&mut self.step_spans, span);
         stop
     }
 
+    /// Whether the steps that follow keep the other threads frozen (DAP `singleThread`) — the step
+    /// moves only its own thread. Off by default: the other runnable threads share the turns while
+    /// a step runs (see [`dbg_preview_pick`]).
+    pub fn set_single_thread(&mut self, on: bool) {
+        self.single_thread = on;
+    }
+
     /// Replace the recorded **step spans** (#1942) — the DAP backend re-installs them on every rebuild.
-    pub fn set_step_spans(&mut self, spans: Vec<(u64, u64, usize)>) {
+    pub fn set_step_spans(&mut self, spans: Vec<StepSpan>) {
         self.step_spans = spans;
     }
 
     /// The recorded step spans, for the backend to carry across rebuilds.
-    pub fn step_spans(&self) -> &[(u64, u64, usize)] {
+    pub fn step_spans(&self) -> &[StepSpan] {
         &self.step_spans
     }
 

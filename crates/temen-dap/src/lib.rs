@@ -200,6 +200,7 @@ impl DapServer {
             "provideStdin" => self.on_provide_stdin(args),
             "provideCap" => self.on_provide_cap(args),
             "memModelStats" => self.on_mem_model_stats(),
+            "fsImage" => self.on_fs_image(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
             "globals" => self.on_globals(),
@@ -1354,6 +1355,17 @@ impl DapServer {
         (true, map, vec![])
     }
 
+    /// The custom `fsImage` request: the program's `vm_fs` files, as base64 of a Temen fs-image blob —
+    /// the format the `fsImage` launch argument seeds from. It rewinds with the program, so a step back
+    /// past a file's creation removes it. Fails cleanly with no session.
+    fn on_fs_image(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(s) = self.session.as_ref() else {
+            return (false, Json::Null, vec![]);
+        };
+        let image = base64_encode(&s.inspector.fs_image());
+        (true, Json::obj(vec![("image", Json::s(image))]), vec![])
+    }
+
     /// The custom `memModelStats` request (slice 4): the armed memory model's counters + line-state
     /// grids, as JSON. Fails cleanly when the session has no model.
     fn on_mem_model_stats(&mut self) -> (bool, Json, Vec<Event>) {
@@ -1416,18 +1428,24 @@ impl DapServer {
         // line changes) so the editor advances a line at a time, not an op at a time; `stepOut`
         // already lands in the caller. Without debug info, all three stay op-level (IR debugging).
         //
-        // The step drives the thread `threadId` names (#1942) — the others stay frozen — and reads
-        // that thread's lines. Without one, the thread that stopped (a `stackTrace` of another thread
-        // must not redirect it).
+        // The step drives the thread `threadId` names (#1942) and reads that thread's lines. Without
+        // one, the thread that stopped (a `stackTrace` of another thread must not redirect it). The
+        // other threads keep running meanwhile, as the DAP spec has them do, unless `singleThread`
+        // freezes them — a split view stepping one thread at a time.
         let thread = args
             .and_then(|a| a.get("threadId"))
             .and_then(|v| v.as_i64())
             .map(|t| t.max(1) as u64 - 1);
+        let single_thread = args
+            .and_then(|a| a.get("singleThread"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let has_debug = match self.session.as_mut() {
             Some(s) => {
                 if let Some(t) = thread.or_else(|| s.inspector.stopped_task()) {
                     s.inspector.select_task(t);
                 }
+                s.inspector.set_single_thread(single_thread);
                 s.debug.is_some()
             }
             None => return (false, Json::Null, vec![]),
@@ -1474,13 +1492,16 @@ impl DapServer {
         last
     }
 
-    /// The `(file, line)` of the focused thread's innermost frame, if it maps to source.
+    /// The `(file, line)` of the focused thread's innermost frame, if it maps to source. Line 0 is
+    /// not a line: the compiler gives it to ops that belong to none (the code around a call), so a
+    /// line step passes them like any unmapped op instead of stopping there.
     fn current_source_line(&self) -> Option<(String, u32)> {
         let s = self.session.as_ref()?;
         s.inspector
             .backtrace()
             .first()
             .and_then(|f| f.source.as_ref().map(|src| (src.file.clone(), src.line)))
+            .filter(|&(_, line)| line != 0)
     }
 
     fn on_step_back(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {

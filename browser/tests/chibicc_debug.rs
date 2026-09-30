@@ -1291,7 +1291,7 @@ fn thread_top(s: &mut DapServer, seq: i64, tid: i64) -> Option<(i64, String)> {
 }
 
 /// **Split-view stepping on a chosen thread, and a Step Back that undoes the last step.** A step
-/// names its thread (`threadId`) and moves only that thread; a `stepBack` then undoes the most recent
+/// names its thread (`threadId`) and, with `singleThread`, moves only that thread; a `stepBack` then undoes the most recent
 /// step, whichever thread took it, and leaves the other thread where it was. Stepping again after a
 /// step back rewrites the future, and the rewritten future is what later replays see.
 ///
@@ -1312,9 +1312,11 @@ fn a_step_moves_the_thread_it_names_and_step_back_undoes_the_last_step() {
     let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
     assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
     let mut seq = 10;
+    // Split view steps one thread at a time: `singleThread` keeps the other frozen.
     let mut go = |s: &mut DapServer, cmd: &str, tid: i64| {
         seq += 1;
-        s.handle(&req(seq, cmd, Json::obj(vec![("threadId", Json::i(tid))])))
+        let args = vec![("threadId", Json::i(tid)), ("singleThread", Json::Bool(true))];
+        s.handle(&req(seq, cmd, Json::obj(args)))
     };
     let at = |s: &mut DapServer, tid: i64| thread_top(s, 900 + tid, tid);
     let val = |s: &mut DapServer, name: &str| eval_in_frame(s, 950, name);
@@ -1395,4 +1397,89 @@ fn a_step_moves_the_thread_it_names_and_step_back_undoes_the_last_step() {
         .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("exited"))
         .and_then(|m| m.get("body")?.get("exitCode")?.as_i64());
     assert_eq!(code, Some(33), "a + b");
+}
+
+/// `main` spins on a flag only the worker sets.
+const SPIN_WAIT_SRC: &str = r#"#include <pthread.h>
+int ready = 0;
+void* worker(void* arg) {
+  ready = 1;
+  return 0;
+}
+int main(void) {
+  pthread_t t;
+  pthread_create(&t, 0, worker, 0);
+  while (ready == 0) {}
+  int after = 1;
+  pthread_join(t, 0);
+  return after;
+}
+"#;
+
+/// **A step over a spin-wait lands, and so does a run.** A step kept to its thread and the default
+/// schedule ran the lowest-index thread, so while `main` spun on `ready` the worker that sets it never
+/// ran: the step never ended, and neither did `continue`. A step without `singleThread` now shares the
+/// turns with the other runnable threads, as the DAP spec has it, and a run rotates between runnable
+/// threads each quantum, as the release engine's preemption does.
+#[test]
+fn a_step_over_a_spin_wait_lands_and_so_does_a_run() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, SPIN_WAIT_SRC);
+
+    // Step over each line from the spawn on, as a learner does: the steps reach the line after the
+    // loop.
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 10, true);
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
+    let mut lines = vec![];
+    for seq in 10..30 {
+        let top = thread_top(&mut s, 100 + seq, 1);
+        lines.push(top.as_ref().map_or(-1, |t| t.0));
+        if top == Some((12, "main".into())) {
+            break;
+        }
+        s.handle(&req(seq, "next", Json::obj(vec![("threadId", Json::i(1))])));
+    }
+    assert_eq!(lines.last(), Some(&12), "the steps got past the spin loop: {lines:?}");
+
+    // A plain run of the same program ends.
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 1, true);
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let out = s.handle(&req(5, "continue", Json::obj(vec![])));
+    assert!(
+        out.iter()
+            .any(|m| m.get("event").and_then(|e| e.as_str()) == Some("terminated")),
+        "the run ended"
+    );
+}
+
+/// **Code a macro expanded to sits on the macro's invocation line.** `atomic_fetch_add` is a macro in
+/// <stdatomic.h>, and its expansion used to carry that header's line, so a step onto it stopped "in"
+/// the header and a thread running it showed no line of the program. It is `main`'s line 5 now, as a C
+/// debugger shows it and as `__LINE__` reads it.
+#[test]
+fn a_macro_expansion_steps_as_the_line_that_invoked_it() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let src = "#include <stdatomic.h>\natomic_int n;\nint main(void) {\n  int a = 1;\n  atomic_fetch_add(&n, 1);\n  a = 2;\n  return a;\n}\n";
+    let ir = compile_g(&chibicc, src);
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 4, true);
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
+    s.handle(&req(5, "next", Json::obj(vec![])));
+    assert_eq!(
+        top_frame(&mut s, 6).map(|(l, _, p)| (l, p)),
+        Some((5, "/in.c".into())),
+        "the step lands on the invocation, in the program"
+    );
 }

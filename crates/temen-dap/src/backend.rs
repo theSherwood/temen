@@ -20,7 +20,8 @@
 //! tree-walker oracle) and `dap_over_bytecode_*` (server level).
 
 use temen_interp::bytecode::{
-    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledWrite, ValueWatchTarget,
+    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledWrite, StepSpan,
+    ValueWatchTarget,
 };
 use temen_interp::moment::Ladder;
 use temen_interp::MemEvent;
@@ -241,6 +242,9 @@ pub trait Debuggee {
     // --- threads / time coordinate ---------------------------------------------------------------
     fn threads(&self) -> Vec<u64>;
     fn select_task(&mut self, id: u64) -> bool;
+    /// Whether the steps that follow move only their thread (DAP `singleThread`), the others frozen.
+    /// Default: nothing to set (a backend with one thread).
+    fn set_single_thread(&mut self, _on: bool) {}
     fn stopped_task(&self) -> Option<u64>;
     fn turn(&self) -> u64;
     fn clock(&self) -> u64;
@@ -352,6 +356,12 @@ pub trait Debuggee {
     /// program that imports the `"stderr"` stream. Rewinds with the program the same way.
     fn stderr(&self) -> &[u8] {
         &[]
+    }
+    /// The program's `vm_fs` files, as a [`temen_fs::encode_image`] blob (the launch's `fsImage`
+    /// format). An empty image when the session grants no `vm_fs`. Like the streams it rewinds with
+    /// the program: a step back past a file's creation removes it.
+    fn fs_image(&self) -> Vec<u8> {
+        temen_fs::encode_image(&[], &[])
     }
 }
 
@@ -504,10 +514,10 @@ pub struct BytecodeBackend {
     /// Slice 7: the recorded forced switches, concrete `(turn, task)` — re-applied on every
     /// rebuild for the same reason.
     forced: Vec<(u64, usize)>,
-    /// #1942: the recorded **step spans** — the turns each step drove and its thread — carried from
-    /// the live run and re-applied on every rebuild, so a replay runs the steps' threads, not the
-    /// policy's.
-    spans: Vec<(u64, u64, usize)>,
+    /// #1942: the recorded **step spans** — the turns each step drove, its thread and whether it
+    /// ran alone — carried from the live run and re-applied on every rebuild, so a replay schedules
+    /// the steps as they ran, not as the policy would.
+    spans: Vec<StepSpan>,
     /// Slice 8: recorded **debugger state writes** ([`ScheduledWrite`]), keyed by the clock/turn
     /// they were made at. The engine re-applies each whenever execution passes its clock — on the
     /// live resume *and* on every seek replay / rev-trace probe (the list is re-installed on each
@@ -788,19 +798,11 @@ impl BytecodeBackend {
             &self.tape,
         );
         // A rebuilt run carries the journal too, so a `seek` backward leaves a session that can then
-        // `step_back` by undo rather than by another rebuild.
+        // `step_back` by undo rather than by another rebuild. Its capabilities start as the launch
+        // granted them (a `vm_fs` store holds the seed): the replay re-runs each one that keeps its
+        // own state, so the store follows the program to wherever the seek lands.
         run.map(|mut r| {
             r.set_journal_armed(self.journaling);
-            // #1491 — and its capabilities' declared state (a `vm_fs` store's files and open table).
-            // The rebuild replays the tape, which never enters a handler, so the handler has to hold
-            // the state at the tape's end — the state the live run already holds, since a replay
-            // leaves it untouched and a live advance extends the tape with it. Seeded fresh instead,
-            // a guest seeking back and then running past the tape reads a store that forgot its
-            // own writes.
-            if self.powerbox {
-                let carried = self.run.host().capture_cap_states();
-                r.host_mut().restore_cap_states(&carried);
-            }
             r
         })
     }
@@ -1248,6 +1250,9 @@ impl Debuggee for BytecodeBackend {
     fn select_task(&mut self, id: u64) -> bool {
         self.run.select_task(id)
     }
+    fn set_single_thread(&mut self, on: bool) {
+        self.run.set_single_thread(on);
+    }
     fn stopped_task(&self) -> Option<u64> {
         self.run.stopped_task()
     }
@@ -1498,5 +1503,8 @@ impl Debuggee for BytecodeBackend {
     }
     fn stderr(&self) -> &[u8] {
         &self.run.host().stderr
+    }
+    fn fs_image(&self) -> Vec<u8> {
+        temen_fs::vm_fs_image(self.run.host())
     }
 }

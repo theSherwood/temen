@@ -7623,6 +7623,9 @@ struct ReleaseSession {
 }
 static mut RELEASE: Option<ReleaseSession> = None;
 static mut RELEASE_VALUE: i64 = 0;
+/// The release run's `vm_fs` files as an fs-image blob ([`temen_release_fs_image`]): the open run's
+/// as of the last call, or those the last run ended with.
+static mut RELEASE_FS: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// `temen_release_run`: the run finished — its status, exit code, trap and value are in the read-back
 /// slots, as after [`temen_run_onramp`].
@@ -7660,6 +7663,8 @@ pub extern "C" fn temen_release_open(
     host.stdin = stdin.to_vec();
     grant_onramp_caps(&mut host, &m, None);
     let init = onramp_env_init(&run_env());
+    // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(RELEASE_FS), Vec::new()) };
     match bytecode::CoopRun::new_seeded(&m, 0, &[], u64::MAX, host, &init) {
         Some(Ok(run)) => {
             // SAFETY: single-threaded access to the session statics (one Worker owns this driver).
@@ -7702,6 +7707,8 @@ pub extern "C" fn temen_release_run(budget: u64) -> i32 {
         // Idle suspension and tier-up surfacing are never enabled on this session.
         _ => (STATUS_UNSUPPORTED, 0, 0, None),
     };
+    // The session closes below, and its files with it — keep them for the Files panel.
+    let fs = temen_fs::vm_fs_image(s.run.host_mut());
     // SAFETY: as above.
     unsafe {
         LAST_STATUS = status;
@@ -7714,9 +7721,34 @@ pub extern "C" fn temen_release_run(budget: u64) -> i32 {
             }
             _ => -1,
         };
+        stash(&mut *core::ptr::addr_of_mut!(RELEASE_FS), fs);
     }
     temen_release_close();
     RELEASE_DONE
+}
+
+/// The release run's `vm_fs` files as a Temen fs-image blob ([`temen_fs::encode_image`], the DAP
+/// `fsImage` format): the open run's now, or, once it has ended, the files it ended with. Returns the
+/// length; the bytes are at [`temen_release_fs_ptr`] until the next call or the next open. Empty
+/// (`0`) before any run has been opened.
+#[no_mangle]
+pub extern "C" fn temen_release_fs_image() -> usize {
+    // SAFETY: single-threaded access to the session statics and the read-back slot.
+    unsafe {
+        if let Some(s) = (*core::ptr::addr_of_mut!(RELEASE)).as_mut() {
+            stash(
+                &mut *core::ptr::addr_of_mut!(RELEASE_FS),
+                temen_fs::vm_fs_image(s.run.host_mut()),
+            );
+        }
+        (*core::ptr::addr_of!(RELEASE_FS)).1
+    }
+}
+/// Pointer to the blob the last [`temen_release_fs_image`] returned the length of.
+#[no_mangle]
+pub extern "C" fn temen_release_fs_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(RELEASE_FS)).0 }
 }
 
 /// The finished release run's entry result (a C `main`'s return value under `STATUS_OK`).
