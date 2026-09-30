@@ -208,7 +208,12 @@ static int n_dbg_loc, cap_dbg_loc;
 
 // Record the source location of the *next* instruction in the current block, from `tok`. Skips a
 // duplicate at the same (func,block,inst) so a statement emitting no new instruction adds no row.
+// Code a macro expanded to is placed at the macro's invocation, as a C debugger shows it (and as
+// `__LINE__` reads it): `atomic_fetch_add(&n, 1)` in `main` is a line of `main`, not of
+// <stdatomic.h>, where its tokens were written.
 static void dbg_loc(Token *tok) {
+  while (tok && tok->origin)
+    tok = tok->origin;
   if (!opt_g || !tok || !tok->file || cur_block < 0)
     return;
   if (n_dbg_loc && dbg_loc_buf[n_dbg_loc - 1].func == cur_func_idx &&

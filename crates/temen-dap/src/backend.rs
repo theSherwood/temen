@@ -20,7 +20,8 @@
 //! tree-walker oracle) and `dap_over_bytecode_*` (server level).
 
 use temen_interp::bytecode::{
-    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledWrite, ValueWatchTarget,
+    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledWrite, StepSpan,
+    ValueWatchTarget,
 };
 use temen_interp::moment::Ladder;
 use temen_interp::MemEvent;
@@ -241,6 +242,9 @@ pub trait Debuggee {
     // --- threads / time coordinate ---------------------------------------------------------------
     fn threads(&self) -> Vec<u64>;
     fn select_task(&mut self, id: u64) -> bool;
+    /// Whether the steps that follow move only their thread (DAP `singleThread`), the others frozen.
+    /// Default: nothing to set (a backend with one thread).
+    fn set_single_thread(&mut self, _on: bool) {}
     fn stopped_task(&self) -> Option<u64>;
     fn turn(&self) -> u64;
     fn clock(&self) -> u64;
@@ -510,10 +514,10 @@ pub struct BytecodeBackend {
     /// Slice 7: the recorded forced switches, concrete `(turn, task)` — re-applied on every
     /// rebuild for the same reason.
     forced: Vec<(u64, usize)>,
-    /// #1942: the recorded **step spans** — the turns each step drove and its thread — carried from
-    /// the live run and re-applied on every rebuild, so a replay runs the steps' threads, not the
-    /// policy's.
-    spans: Vec<(u64, u64, usize)>,
+    /// #1942: the recorded **step spans** — the turns each step drove, its thread and whether it
+    /// ran alone — carried from the live run and re-applied on every rebuild, so a replay schedules
+    /// the steps as they ran, not as the policy would.
+    spans: Vec<StepSpan>,
     /// Slice 8: recorded **debugger state writes** ([`ScheduledWrite`]), keyed by the clock/turn
     /// they were made at. The engine re-applies each whenever execution passes its clock — on the
     /// live resume *and* on every seek replay / rev-trace probe (the list is re-installed on each
@@ -1245,6 +1249,9 @@ impl Debuggee for BytecodeBackend {
     }
     fn select_task(&mut self, id: u64) -> bool {
         self.run.select_task(id)
+    }
+    fn set_single_thread(&mut self, on: bool) {
+        self.run.set_single_thread(on);
     }
     fn stopped_task(&self) -> Option<u64> {
         self.run.stopped_task()
