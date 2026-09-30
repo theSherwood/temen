@@ -1,10 +1,10 @@
 // Real-browser gate for the nim-card **pre-warm** (#1375): scrolling the nim card into view must fire a
-// background compile that warms the worker's guest-emit cache (`__nimPrewarmDone`) WITHOUT the user
-// clicking Run — so the user's first real Run is the fast (~3 s) tiered path, not the ~13 s first-emit one.
-// (The trigger is scroll-into-view, not load: the prewarm allocates the compiler's large foreign memories,
-// so it fires only on the "about to use it" signal, not for every visitor.) Asserts the pre-warm triggers
-// and completes, then that a real compile through the shipped client path is still correct — and, with the
-// idle-worker reuse fix (#1386), fast. Logs timing (not asserted — CI machines vary).
+// background compile (`__nimPrewarmDone`) WITHOUT the user clicking Run, so the user's first real Run
+// does not pay the toolchain's download and inflate, nor the engine's first, unoptimized pass over a
+// build. (The trigger is scroll-into-view, not load: the prewarm is a whole build, so it fires only on
+// the "about to use it" signal, not for every visitor.) Asserts the pre-warm triggers and completes,
+// then that a real compile through the shipped client path is still correct. Logs timing (not asserted
+// — CI machines vary).
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -16,13 +16,8 @@ async function loadChromium() {
   }
   throw new Error('playwright not found');
 }
-for (const a of ['nifler', 'nimsem', 'hexer', 'nifler_ce', 'nimsem_ce', 'hexer_ce']) {
-  if (!existsSync(`${ROOT}/web/assets/${a}.temen.gz`)) { console.log(`SKIP: web/assets/${a}.temen.gz absent`); process.exit(0); }
-}
-if (!existsSync(`${ROOT}/web/assets/nim_stdlib.img.gz`) ||
-    !existsSync(`${ROOT}/web/assets/nim_prestdlib.pack.gz`) ||
-    !existsSync(`${ROOT}/target/wasm32-unknown-unknown/release/temen_browser.wasm`)) {
-  console.log('SKIP: stdlib image / prestdlib pack / threads wasm absent'); process.exit(0);
+if (!existsSync(`${ROOT}/target/wasm32-unknown-unknown/release/temen_browser.wasm`)) {
+  console.log('SKIP: threads wasm absent'); process.exit(0);
 }
 const chromium = await loadChromium();
 const { server, port } = await startServer(ROOT);
@@ -51,17 +46,10 @@ const prewarmed = await page.waitForFunction(() => globalThis.__nimPrewarmDone =
 const res = await page.evaluate(async () => {
   const gunzip = async (u) => new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
   const fetchGz = async (p) => gunzip(new Uint8Array(await (await fetch(p)).arrayBuffer()));
-  const getAssets = async () => {
-    const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe] = await Promise.all([
-      fetchGz('./assets/nifler.temen.gz'), fetchGz('./assets/nimsem.temen.gz'), fetchGz('./assets/hexer.temen.gz'),
-      fetchGz('./assets/nim_stdlib.img.gz'),
-      fetchGz('./assets/nifler_ce.temen.gz'), fetchGz('./assets/nimsem_ce.temen.gz'), fetchGz('./assets/hexer_ce.temen.gz')]);
-    const preStdlib = await fetchGz('./assets/nim_prestdlib.pack.gz').catch(() => null);
-    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
-  };
+  const getAssets = async () => ({ bundle: await fetchGz('./assets/nimony.blob.gz') });
   const src = 'import std/syncio\n\nwrite(stdout, "hello, Nim\\n")\n';
   const t = performance.now();
-  const r = await globalThis.__snapshotClient.nimCompile(getAssets, src, 'prog.nim', () => {});
+  const r = await globalThis.__snapshotClient.nimCompile(getAssets, src);
   const ms = Math.round(performance.now() - t);
   const td = new TextDecoder();
   const out = typeof r.stdout === 'string' ? r.stdout : (r.stdout && r.stdout.length ? td.decode(r.stdout) : '');
