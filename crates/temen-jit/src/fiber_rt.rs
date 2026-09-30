@@ -532,6 +532,15 @@ impl FiberSlot {
         self.park_self_resolving.load(Ordering::Relaxed)
     }
 
+    /// #1937 — whether that event park is a futex wait (it holds a [`Self::park_cell`]): the one park
+    /// whose re-check also ends on the waiter's freeze word. Read while the fiber is still suspended.
+    pub(crate) fn took_futex_park(&self) -> bool {
+        self.park_cell
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// D66 — the single-owner claim for a platform slot's resume (generation 0, never recycled).
     pub(crate) fn claim_for_worker(&self, worker: u64) -> bool {
         if !self.own.claim() {
