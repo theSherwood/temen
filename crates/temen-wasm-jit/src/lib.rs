@@ -6639,7 +6639,7 @@ fn emit_block_body(
                     uleb(code, INSTANTIATE_IMPORT_IDX as u64);
                 } else if *op == 17 {
                     // §3c.3 env.instantiate_rec(win, inst, record_ptr) -> i32 child handle — the
-                    // config-record spawn; the servicer reads + validates the 56-byte record from
+                    // config-record spawn; the servicer reads + validates the record (`SpawnRec`) from
                     // linear memory at win + record_ptr (window-relative, like every §14 pointer).
                     code.push(OP_LOCAL_GET);
                     uleb(code, 0); // win

@@ -4,13 +4,16 @@
 //! present only when the module actually uses op 17 — so every existing nested-mode module
 //! keeps its exact import set and no driver changes until it loads an op-17 module.
 //!
-//! The proof mirrors `nested_vm.rs`: the emitted parent builds the 56-byte record in its window
+//! The proof mirrors `nested_vm.rs`: the emitted parent builds a v1 (detached) record in its window
 //! with ordinary stores, bounces, and the servicer reads the record back out of linear memory
-//! (the full marshalling round-trip), validates it exactly as the other tiers do, runs the child
-//! on the interpreter (the oracle), and `env.join` returns its result. The conditional-import
+//! (the full marshalling round-trip), decodes it with the one shared [`temen_ir::SpawnRec::parse`],
+//! runs the child detached — the interpreter oracle, in a window of its own — and `env.join`
+//! returns its result. The conditional-import
 //! property is asserted from both sides: the op-17 module refuses to instantiate without the
 //! import defined, and the op-0 module from `nested_vm.rs`'s shape instantiates with a linker
 //! that never defines it.
+
+mod support;
 
 use temen_interp::{run, Value};
 use temen_wasm_jit::compile_module_nested;
@@ -19,45 +22,34 @@ use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store
 const WIN_BASE: i32 = 0x1_0000;
 const ENV_PTR: i32 = 1024;
 
-/// Parent (func 0, `(i64 inst) -> (i64)`): build the record at window offset 18432 (above the #1094
-/// NULL guard) — version 0, entry 1, off 0, size_log2 10, pager `u32::MAX`, module -1, budget 0, quota
-/// 0, no grants —
+/// Where the parent builds its record: above the #1094 NULL guard.
+const REC_AT: u64 = 18432;
+
+/// Parent (func 0, `(i64 inst) -> (i64)`): build a v1 record for func 1 at [`REC_AT`] — the module's
+/// declared window, no pager, its own module, no budget, no fuel cap, no grants —
 /// `instantiate_rec`, `join`, return. Child (func 1): pure compute, returns 9.
-const REC_PARENT: &str = r#"memory 16
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+fn rec_parent() -> String {
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(1));
+    format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   vinst = i32.wrap_i64 v0
-  va0 = i64.const 18432
-  vf0 = i64.const 4294967296
-  i64.store va0 vf0
-  va1 = i64.const 18440
-  vz = i64.const 0
-  i64.store va1 vz
-  va2 = i64.const 18448
-  vf16 = i64.const -4294967286
-  i64.store va2 vf16
-  va3 = i64.const 18456
-  vf24 = i64.const 4294967295
-  i64.store va3 vf24
-  va4 = i64.const 18464
-  i64.store va4 vz
-  va5 = i64.const 18472
-  i64.store va5 vz
-  va6 = i64.const 18480
-  i64.store va6 vz
-  vrp = i64.const 18432
+{stores}  vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return vr
-  }
-}
-func () -> (i64) {
-block 0 () {
+  }}
+}}
+func () -> (i64) {{
+block 0 () {{
   vr = i64.const 9
   return vr
-  }
+  }}
+}}
+"#
+    )
 }
-"#;
 
 fn parse(src: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(src).expect("parse");
@@ -157,11 +149,12 @@ fn base_linker(engine: &Engine, memory: Memory) -> Linker<HostState> {
     linker
 }
 
-/// The record round-trip: emitted stores → linear memory → `env.instantiate_rec` reads + validates
-/// the record host-side → interpreter child → `env.join`. Result must equal the child oracle.
+/// The record round-trip: emitted stores → linear memory → `env.instantiate_rec` reads + decodes
+/// the record host-side → detached interpreter child → `env.join`. Result must equal the child
+/// oracle.
 #[test]
 fn record_spawn_bounces_and_matches_interp() {
-    let m = parse(REC_PARENT);
+    let m = parse(&rec_parent());
     let want = oracle_child(&m, 1);
     assert_eq!(want, 9, "child oracle");
 
@@ -190,19 +183,19 @@ fn record_spawn_bounces_and_matches_interp() {
                   _inst: i32,
                   record_ptr: i64|
                   -> i32 {
-                // Read the 56-byte record back out of linear memory — the marshalling proof —
-                // and validate it exactly as the tree-walker / Cranelift thunk do.
-                let mut rec = [0u8; 56];
+                // Read the record back out of linear memory — the marshalling proof — and decode
+                // it as every tier does.
+                let mut rec = [0u8; temen_ir::SPAWN_REC_LEN];
                 memory
                     .read(&caller, (win as u64 + record_ptr as u64) as usize, &mut rec)
                     .expect("record in-window");
-                let u32_at =
-                    |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
-                assert_eq!(u32_at(0), 0, "version");
-                assert_eq!(u32_at(20), u32::MAX, "no pager");
-                assert_eq!(u32_at(24) as i32, -1, "self module");
-                assert_eq!(u32_at(28), 0, "no budget");
-                let entry = u32_at(4);
+                let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
+                assert_eq!(
+                    rec,
+                    temen_ir::SpawnRec::v1(1),
+                    "the record the parent built, detached"
+                );
+                let entry = rec.entry;
                 caller.data_mut().saw_rec_bounce = true;
                 let m = caller.data().module.clone();
                 let r = oracle_child(&m, entry);
@@ -238,7 +231,7 @@ fn instantiate_rec_import_is_conditional() {
     let engine = Engine::default();
 
     // Side 1: the op-17 module NEEDS the import.
-    let m = parse(REC_PARENT);
+    let m = parse(&rec_parent());
     let wasm = compile_module_nested(&m, false).expect("emits");
     let module = WModule::new(&engine, &wasm).expect("validates");
     let mut store: Store<HostState> = Store::new(
