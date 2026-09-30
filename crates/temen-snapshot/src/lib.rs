@@ -239,7 +239,11 @@ use temen_ir::Module;
 /// abandoned. The thaw's re-issued call waits on that ticket instead of enqueueing the call again. The
 /// section is present iff the trio or the waits are non-empty; with no reply wait it ends in a zero
 /// count.
-const FORMAT_VERSION: u16 = 35;
+/// v36 (#1676): after the reply waits, Section 4 carries the domain's **frozen handlers** —
+/// `(fiber slot, ticket)` in ascending slot order, for each serve handler a freeze caught parked or
+/// mid-run. The handler rides as a fiber; this is its reply linkage, which the thaw's serve loop
+/// adopts. The section is present iff any of the three parts is non-empty.
+const FORMAT_VERSION: u16 = 36;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -808,19 +812,19 @@ fn freeze_at(
     // domain's artifact keeps the pre-serve section layout.
     // v35 (#1901): the domain's reply waits trail the trio — a caller's side of the same protocol.
     let (svc_queue, svc_results, svc_next_ticket) = host.svc_state();
+    // v36 (#1676): then the handlers a freeze caught, which reply to the other side.
     let reply_waits = host.reply_waits();
+    let frozen_handlers = host.frozen_handlers();
     if !svc_queue.is_empty()
         || !svc_results.is_empty()
         || svc_next_ticket != 0
         || !reply_waits.is_empty()
+        || !frozen_handlers.is_empty()
     {
         section(&mut out, TAG_SERVE, |b| {
             write_serve_trio(b, &svc_queue, &svc_results, svc_next_ticket);
-            write_uleb(b, reply_waits.len() as u64);
-            for &(ctx, ticket) in &reply_waits {
-                write_uleb(b, ctx as u64);
-                write_uleb(b, ticket);
-            }
+            write_ticket_map(b, &reply_waits);
+            write_ticket_map(b, &frozen_handlers);
         });
     }
 
@@ -1425,23 +1429,22 @@ fn restore_at(
     if let Some(body) = serve_body {
         let mut sr = Reader::new(body);
         let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
-        let n = sr.uleb()?;
-        let mut waits: Vec<(u32, u64)> = Vec::new();
-        for _ in 0..n {
-            let ctx = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            if waits.last().is_some_and(|&(p, _)| ctx <= p) {
-                return Err(RestoreError::Malformed); // non-canonical: contexts must ascend
-            }
-            waits.push((ctx, sr.uleb()?));
-        }
+        let waits = read_ticket_map(&mut sr)?;
+        let handlers = read_ticket_map(&mut sr)?;
         if !sr.at_end() {
             return Err(RestoreError::Malformed);
         }
-        if queue.is_empty() && results.is_empty() && next_ticket == 0 && waits.is_empty() {
+        if queue.is_empty()
+            && results.is_empty()
+            && next_ticket == 0
+            && waits.is_empty()
+            && handlers.is_empty()
+        {
             return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
         }
         host.set_svc_state(queue, results, next_ticket);
         host.set_reply_waits(waits);
+        host.set_frozen_handlers(handlers);
     }
 
     // ---- Attestation (#1289 R1, O14, v20): decode Section 6 and re-stamp the host, so the domain's
@@ -1945,6 +1948,31 @@ fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
     }
     let next_ticket = r.uleb()?;
     Ok((queue, results, next_ticket))
+}
+
+/// The serve section's `(key, ticket)` maps (v35, v36): a count, then each pair in ascending key
+/// order — a caller's shadow context and the reply it waits on, or a handler's fiber slot and the
+/// ticket it replies to.
+fn write_ticket_map(b: &mut Vec<u8>, map: &[(u32, u64)]) {
+    write_uleb(b, map.len() as u64);
+    for &(key, ticket) in map {
+        write_uleb(b, key as u64);
+        write_uleb(b, ticket);
+    }
+}
+
+/// The inverse of [`write_ticket_map`], rejecting a key that does not ascend (non-canonical).
+fn read_ticket_map(r: &mut Reader) -> Result<Vec<(u32, u64)>, RestoreError> {
+    let n = r.uleb()?;
+    let mut map: Vec<(u32, u64)> = Vec::new();
+    for _ in 0..n {
+        let key = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        if map.last().is_some_and(|&(p, _)| key <= p) {
+            return Err(RestoreError::Malformed);
+        }
+        map.push((key, r.uleb()?));
+    }
+    Ok(map)
 }
 
 /// Encode a handle table (§12.5): a length prefix then each record's `slot`/`generation`/`type_id`

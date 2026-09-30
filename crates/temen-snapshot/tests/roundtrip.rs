@@ -1109,20 +1109,22 @@ fn serve_state_round_trips_through_the_codec() {
     );
 }
 
-/// #1901 (v35) — a domain's **reply waits** ride the serve section, even when its own serve trio is
-/// empty (a caller that serves nothing): restored exactly, and the canonical re-freeze is
+/// #1901 (v35), #1676 (v36) — a domain's **reply waits** and **frozen handlers** ride the serve
+/// section, even when its own serve trio is empty: restored exactly, and the canonical re-freeze is
 /// byte-identical.
 #[test]
-fn reply_waits_round_trip_through_the_codec() {
+fn reply_waits_and_frozen_handlers_round_trip_through_the_codec() {
     let inst = instrument(SRC);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut host = Host::new();
     host.set_reply_waits(vec![(0, 4), (3, 0)]);
+    host.set_frozen_handlers(vec![(1, 9)]);
     let artifact = freeze(&inst, &win, &host).expect("freeze with reply waits");
 
     let mut rhost = Host::new();
     let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
     assert_eq!(rhost.reply_waits(), vec![(0, 4), (3, 0)]);
+    assert_eq!(rhost.frozen_handlers(), vec![(1, 9)]);
     assert_eq!(rhost.svc_state(), (Vec::new(), Vec::new(), 0));
     let refrozen = freeze(&inst, &rwin, &rhost).expect("re-freeze");
     assert_eq!(
