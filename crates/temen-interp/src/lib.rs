@@ -5545,6 +5545,12 @@ enum Waiter {
         /// backstop. Read solely for a `wait_waiters` entry, by [`futex_parks_unsatisfiable`];
         /// [`Waiter::fiber`] builds the other waiter kinds, which are not futex parks at all.
         wait_indefinite: bool,
+        /// #1952 — `Some(host)` when the parked op was **rewound** (a pipe read or write,
+        /// [`Waiter::rewound_fiber`]): a wake re-admits the fiber with nothing delivered, so the op
+        /// re-executes, and an interrupt flags `host` (the fiber's domain powerbox) so the re-run
+        /// completes `-EINTR` — the vCPU pipe park's discipline. `None` for a park whose wake
+        /// delivers the op's result.
+        rewound: Option<Arc<Mutex<Host>>>,
     },
 }
 
@@ -5558,6 +5564,24 @@ impl Waiter {
             slot,
             svc,
             wait_indefinite: false,
+            rewound: None,
+        }
+    }
+
+    /// #1952 — a fiber parked in a **rewound** op (a pipe read or write) of the domain whose
+    /// powerbox is `host`: see [`Waiter::Fiber::rewound`].
+    fn rewound_fiber(
+        reg: Arc<FiberRegistry>,
+        slot: usize,
+        svc: usize,
+        host: Arc<Mutex<Host>>,
+    ) -> Waiter {
+        Waiter::Fiber {
+            reg,
+            slot,
+            svc,
+            wait_indefinite: false,
+            rewound: Some(host),
         }
     }
 }
@@ -6038,8 +6062,9 @@ fn wake_pipe_batch_locked(s: &mut Sched, woken: Vec<Waiter>) -> u32 {
     for w in woken {
         match w {
             Waiter::VCpu(v) => s.runnable.push_back(v),
+            // #1952 — a fiber's pipe park was rewound: its op re-executes.
             Waiter::Fiber { reg, slot, svc, .. } => {
-                reg.wake_blocked(slot, Reg::from_i64(0));
+                reg.wake_rewound(slot);
                 svc_wake_locked(s, svc);
             }
         }
@@ -6536,8 +6561,24 @@ impl Scheduler {
                     v.host.lock_unpoisoned().set_sig_interrupt();
                     s.runnable.push_back(v);
                 }
-                Waiter::Fiber { reg, slot, svc, .. } => {
-                    reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                // #1952 — the vCPU discipline: flag the fiber's powerbox, and its rewound op
+                // re-executes and completes `-EINTR`.
+                Waiter::Fiber {
+                    reg,
+                    slot,
+                    svc,
+                    rewound,
+                    ..
+                } => {
+                    match rewound {
+                        Some(host) => {
+                            host.lock_unpoisoned().set_sig_interrupt();
+                            reg.wake_rewound(slot);
+                        }
+                        None => {
+                            reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                        }
+                    }
                     svc_wake_locked(&mut s, svc);
                 }
             }
@@ -7711,6 +7752,18 @@ fn teardown_run(s: &mut Sched) {
             .cloned()
             .unwrap_or(Trap::ThreadFault);
         reap(s, v, reason);
+    }
+}
+
+/// #1952 — the park-vs-wake recheck for a pipe read or write of domain-local pipe `pipe` (the vCPU
+/// park's and a fiber's): whether the op should re-run at once — the pipe is ready ([`PipeProbe`]),
+/// has vanished (the re-run fails closed), or a signal already interrupts it — and the pipe's
+/// global id, the waiters' key. Called with the scheduler lock held.
+fn pipe_park_check(host: &Arc<Mutex<Host>>, pipe: u32, write: bool) -> (bool, u32) {
+    let mut hg = host.lock_unpoisoned();
+    match hg.pipe_probe(pipe, write) {
+        Some(p) => (p.ready() || interrupt_before_park(&mut hg), p.gid()),
+        None => (true, u32::MAX),
     }
 }
 
@@ -9117,18 +9170,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
                 // so a wake from another image of the pipe (fork twin, exec carry) finds them.
-                let (ready, gid) = {
-                    let mut hg = v.host.lock_unpoisoned();
-                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
-                        Some((fifo, writers, _, gid, _, _)) => (
-                            !fifo.lock_unpoisoned().is_empty()
-                                || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
-                            *gid,
-                        ),
-                        None => (true, u32::MAX), // vanished — re-run to fail closed
-                    };
-                    (ready || interrupt_before_park(&mut hg), gid)
-                };
+                let (ready, gid) = pipe_park_check(&v.host, pipe, false);
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -9149,18 +9191,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 // Same global-id keying as the read park above.
-                let (ready, gid) = {
-                    let mut hg = v.host.lock_unpoisoned();
-                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
-                        Some((fifo, _, readers, gid, _, _)) => (
-                            fifo.lock_unpoisoned().len() < PIPE_CAP
-                                || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
-                            *gid,
-                        ),
-                        None => (true, u32::MAX), // vanished — re-run to fail closed
-                    };
-                    (ready || interrupt_before_park(&mut hg), gid)
-                };
+                let (ready, gid) = pipe_park_check(&v.host, pipe, true);
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -11208,14 +11239,24 @@ impl FiberRegistry {
     /// make it claimable. `false` if the slot is not a blocked park (already woken, freed —
     /// the wake is then a no-op, matching every other idempotent wake path).
     fn wake_blocked(&self, slot: usize, result: Reg) -> bool {
+        self.wake_parked(slot, Some(result))
+    }
+
+    /// #1952 — the event fired for a fiber parked in a **rewound** op: make it claimable with
+    /// nothing delivered, so the op re-executes. `false` as [`Self::wake_blocked`].
+    fn wake_rewound(&self, slot: usize) -> bool {
+        self.wake_parked(slot, None)
+    }
+
+    fn wake_parked(&self, slot: usize, result: Option<Reg>) -> bool {
         let mut t = self.lock();
         match &mut t.fibers[slot] {
             RegFiber::ParkedOn {
                 frames,
                 woken: woken @ false,
             } => {
-                if let Some(f) = frames.last_mut() {
-                    f.vals.push(result);
+                if let (Some(f), Some(r)) = (frames.last_mut(), result) {
+                    f.vals.push(r);
                 }
                 *woken = true;
                 true
@@ -12640,13 +12681,15 @@ fn decide(
     durable: bool,
     clean_root: bool,
 ) -> Decision {
-    // A fiber or the deterministic explorer cannot be parked or handed to the fork engine; it
-    // keeps whatever the op answered.
-    let parkable = cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_));
+    // The deterministic explorer cannot park; it keeps whatever the op answered. A pipe park parks
+    // the calling fiber, fiber 0 or not (#1952); only fiber 0 can be handed to the fork engine,
+    // have its image replaced, or be benched.
+    let real = matches!(sched, SchedRef::Real(_));
+    let parkable = cur == ROOT_FIBER && real;
     // #1672 — under a landing freeze a durable domain never parks: the park is abandoned instead.
     let freezing = durable && mem.is_some_and(|m| m.durable_state() == STATE_UNWINDING);
     let park = |d: Decision| if freezing { Decision::Abandon } else { d };
-    if parkable {
+    if real {
         if let Some(pipe) = t.read_park {
             return if t.sig_intr {
                 Decision::Eintr
@@ -13859,6 +13902,50 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[rtop].vals.push(Reg::from_i32(FIBER_PARKED));
                     frames[rtop].vals.push(Reg::from_i64(0));
                     continue 'frames;
+                }};
+            }
+            // #1952 — a pipe read or write that must wait parks the **calling fiber**, with its op
+            // rewound so the wake re-executes it. Fiber 0 parks its vCPU (`Blocked::PipeRead` /
+            // `PipeWrite`); any other fiber parks alone, in the pipe's waiters, and its resumer runs
+            // on. The registration re-checks the pipe under the scheduler lock, as the vCPU park
+            // does: a write, close or signal that landed since the op found no waiter to wake.
+            macro_rules! pipe_park {
+                ($top:expr, $pipe:expr, $write:expr) => {{
+                    let (pipe, write): (u32, bool) = ($pipe, $write);
+                    frames[$top].inst -= 1; // rewind: the op re-executes on wake
+                    if *cur == ROOT_FIBER {
+                        return Ok(Inner::Park(if write {
+                            Blocked::PipeWrite { pipe }
+                        } else {
+                            Blocked::PipeRead { pipe }
+                        }));
+                    }
+                    let SchedRef::Real(sr) = sched else {
+                        unreachable!("`decide` parks only on the real scheduler")
+                    };
+                    let regc = Arc::clone(registry);
+                    let hostc = Arc::clone(host);
+                    let svck = hostc.lock_unpoisoned().domain_id() as usize;
+                    fiber_park!(|slot: usize| {
+                        let mut sg = sr.lock();
+                        let (ready, gid) = pipe_park_check(&hostc, pipe, write);
+                        if ready {
+                            drop(sg);
+                            regc.wake_rewound(slot);
+                        } else {
+                            let waiters = if write {
+                                &mut sg.pipe_write_waiters
+                            } else {
+                                &mut sg.pipe_waiters
+                            };
+                            waiters.entry(gid).or_default().push(Waiter::rewound_fiber(
+                                Arc::clone(&regc),
+                                slot,
+                                svck,
+                                Arc::clone(&hostc),
+                            ));
+                        }
+                    });
                 }};
             }
             macro_rules! jit_install_body {
@@ -16047,14 +16134,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -16257,14 +16338,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -16425,14 +16500,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -16515,14 +16584,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -17191,6 +17254,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // #1639 — the guest asked for a wait with no end, so the
                                         // deadline just pushed is only the `MAX_WAIT` backstop.
                                         wait_indefinite: to_ns < 0,
+                                        rewound: None,
                                     },
                                 ));
                                 // Compare-under-lock: a value that already changed wakes the
