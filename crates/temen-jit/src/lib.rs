@@ -868,6 +868,27 @@ pub type GrantNamedChildBuilder = unsafe extern "C" fn(
     trap_out: *mut i64,
 ) -> i32;
 
+/// The host callback for **`instantiate_detached`** (Instantiator op 15): [`GrantNamedChildBuilder`]'s
+/// by-name grants plus what the admission ([`BudgetMemTaker`]) just did: `budget`, the handle it
+/// charged for the child's window, which becomes the child's `"budget"`, and `lane`, the lane it
+/// reserved, which the child is stamped with. The thunk passes both from one spawn to the next hook,
+/// so a second vCPU's spawn between the two cannot hand this child its budget or lane (#1972).
+///
+/// # Safety
+/// As [`GrantNamedChildBuilder`].
+pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    grants_ptr: u64,
+    grants_n: u64,
+    child_size: u64,
+    budget: i32,
+    lane: i64,
+    out: *mut GrantChild,
+    trap_out: *mut i64,
+) -> i32;
+
 /// Free a child `Host` built by a [`GrantChildBuilder`] or [`GrantNamedChildBuilder`] — called once,
 /// after the granted child has run and its outcome is stashed for `join`. Deliberately paired with the
 /// builder (rather than, say, leaking the host for the run's lifetime like a `Module` grant) because a
@@ -913,15 +934,20 @@ pub struct BudgetTaken {
     pub spawn: i64,
 }
 
-/// PROCESS.md §5 / #1287 — the `Budget` admission for a detached spawn: deduct `bytes` (the
-/// child's declared window) from the budget behind `budget` on the parent `Host`. Returns nonzero when
-/// admitted; `0` for a forged/wrong-type handle or an exhausted quota — the spawn refuses probeably
-/// (`-EINVAL`), charging nothing, exactly the interpreter's `budget_mem_take`.
+/// PROCESS.md §5 / #1287, D66 — the admission for a detached spawn, the interpreter's
+/// `Host::admit_detached_spawn`: reserve the lane of the budget behind `budget` against the parent's
+/// Σ and charge `bytes` (the child's declared window) to that budget, or neither. Returns the lane it
+/// reserved (`-1` = unbounded), which the build then stamps on the child
+/// ([`GrantDetachedChildBuilder`]), or [`ADMIT_REFUSED`] for a forged/wrong-type handle or no room:
+/// the spawn refuses probeably (`-EINVAL`), charging nothing.
 ///
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`).
 pub type BudgetMemTaker =
-    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i32;
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i64;
+
+/// A [`BudgetMemTaker`]'s refusal. Never a lane: a lane is `-1` (unbounded) or non-negative.
+pub const ADMIT_REFUSED: i64 = i64::MIN;
 
 /// D66 — return a detached child's **lane** to its parent's `granted_lanes` once the child is reaped
 /// (the JIT twin of the interpreter's `credit_child_lane`). Called by the child-domain executor at
@@ -983,9 +1009,10 @@ pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
     pub build_named: GrantNamedChildBuilder,
     /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list as
-    /// `build_named`, but the child attests `window_exposed = false` and its starter caps span
-    /// `child_size` = the window **reservation** (a root's shape — no carve bounds it).
-    pub build_detached: GrantNamedChildBuilder,
+    /// `build_named`, but the child attests `window_exposed = false`, its starter caps span
+    /// `child_size` = the window **reservation** (a root's shape — no carve bounds it), and the
+    /// budget that paid for its window is its own (see [`GrantDetachedChildBuilder`]).
+    pub build_detached: GrantDetachedChildBuilder,
     /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
     pub budget_mem_take: BudgetMemTaker,
     /// #1587 — its undo for a spawn that fails after the take (see [`BudgetMemGiver`]).
