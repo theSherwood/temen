@@ -12393,13 +12393,17 @@ fn handle_mem(
 /// there all along, and the JIT cannot tell `call.sym` from `call.import` at all (both reach its
 /// thunk as the import dispatch).
 pub struct ParkTransients {
-    /// A pipe whose parked readers should be woken (a write, or a writer-to-zero close).
+    /// A pipe, by its **global id** (the wake key), whose parked readers should be woken (a write,
+    /// or a writer-to-zero close).
     pub wake_readers: Option<u32>,
-    /// A pipe whose parked writers should be woken (a drained-full read, or a reader-to-zero close).
+    /// A pipe, by its global id, whose parked writers should be woken (a drained-full read, or a
+    /// reader-to-zero close).
     pub wake_writers: Option<u32>,
-    /// A blocking pipe read that found an empty FIFO with writers open.
+    /// A blocking pipe read, by the pipe's **domain-local index**, that found an empty FIFO with
+    /// writers open.
     pub read_park: Option<u32>,
-    /// A blocking pipe write that found a full FIFO with readers open (backpressure).
+    /// A blocking pipe write, by the pipe's domain-local index, that found a full FIFO with readers
+    /// open (backpressure).
     pub write_park: Option<u32>,
     /// The #799 caller request: `fork`, `execve`, or a blocking `waitpid`'s bench.
     pub request: Option<ParkEvent>,
@@ -19080,6 +19084,39 @@ type PipeBacking = (
     bool, // #1926 — one-shot EOF: the terminal's input, whose read of an EOF restores the writer
 );
 
+/// #1826 — one end of a pipe, as a parked op sees it: whether the op can proceed, readable from the
+/// pipe's shared state alone, so a waiter can re-check it without the `Host` (a JIT park waits with
+/// the `Host` released, for a sibling's write to get in). The one readiness rule: the `Host`'s own
+/// checks ([`Host::pipe_read_ready`], [`Host::pipe_write_ready`]) read it too.
+#[derive(Clone)]
+pub struct PipeProbe {
+    fifo: Arc<Mutex<VecDeque<u8>>>,
+    /// The open ends of the other kind: the writers for a read end, the readers for a write end.
+    others: Arc<std::sync::atomic::AtomicUsize>,
+    gid: u32,
+    write: bool,
+}
+
+impl PipeProbe {
+    /// Whether the op on this end can proceed: a read finds bytes, or EOF (no writer left); a write
+    /// finds room, or `EPIPE` (no reader left).
+    pub fn ready(&self) -> bool {
+        let others_gone = self.others.load(std::sync::atomic::Ordering::SeqCst) == 0;
+        let fifo = self.fifo.lock_unpoisoned();
+        others_gone
+            || if self.write {
+                fifo.len() < PIPE_CAP
+            } else {
+                !fifo.is_empty()
+            }
+    }
+
+    /// The pipe's global id, its park/wake key across domains.
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+}
+
 /// FORK.md §8.6 — mint the **global pipe id** a new FIFO carries (`PipeBacking.3`). The park/wake
 /// key must survive a pipe end crossing domains: fork clones the local `pipes` vec so indices
 /// align by construction, but exec's `install_pipe_end` renumbers from 0 in the fresh image — a
@@ -23005,7 +23042,7 @@ impl Host {
 
     /// Take the transient "the last stdin read parked" flag (the `CapCall` arm uses it to yield
     /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
-    pub(crate) fn take_stdin_parked(&mut self) -> bool {
+    pub fn take_stdin_parked(&mut self) -> bool {
         core::mem::take(&mut self.stdin_parked)
     }
 
@@ -23056,13 +23093,19 @@ impl Host {
     /// (EOF). A vanished pipe reads ready (the re-run fails closed). `pipe` is the domain-local index
     /// the read park flag reports. Byte-identical to the tree-walker's `Step::Park(PipeRead)` re-check.
     pub(crate) fn pipe_read_ready(&self, pipe: u32) -> bool {
-        match self.pipes.get(pipe as usize) {
-            Some((fifo, writers, _, _, _, _)) => {
-                !fifo.lock_unpoisoned().is_empty()
-                    || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
-            }
-            None => true,
-        }
+        self.pipe_probe(pipe, false).is_none_or(|p| p.ready())
+    }
+
+    /// #1826 — end `write` of domain-local pipe `pipe`, as a [`PipeProbe`]: its readiness, readable
+    /// without this `Host`. `None` for no such pipe.
+    pub fn pipe_probe(&self, pipe: u32, write: bool) -> Option<PipeProbe> {
+        let (fifo, writers, readers, gid, _, _) = self.pipes.get(pipe as usize)?;
+        Some(PipeProbe {
+            fifo: Arc::clone(fifo),
+            others: Arc::clone(if write { readers } else { writers }),
+            gid: *gid,
+            write,
+        })
     }
 
     /// #1146 (deeper) — blocking-stdin readiness for the bytecode scheduler drivers: a task parked in a
@@ -23077,13 +23120,7 @@ impl Host {
     /// when the FIFO has room under `PIPE_CAP`, OR every reader closed (the re-run writes / `-EPIPE`s).
     /// The write twin of [`Self::pipe_read_ready`].
     pub(crate) fn pipe_write_ready(&self, pipe: u32) -> bool {
-        match self.pipes.get(pipe as usize) {
-            Some((fifo, _, readers, _, _, _)) => {
-                fifo.lock_unpoisoned().len() < PIPE_CAP
-                    || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
-            }
-            None => true,
-        }
+        self.pipe_probe(pipe, true).is_none_or(|p| p.ready())
     }
 
     /// #796 L1 — set the transient "a signal interrupted a blocking syscall" flag, so the next re-run of
