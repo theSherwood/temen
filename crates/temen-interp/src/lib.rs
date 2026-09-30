@@ -15069,6 +15069,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // reservation (and, on wasm, the minted memory's `maximum`).
                                 let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
                                 let (cinst, cas) = ch.grant_starter_caps(reservation);
+                                // #1944 — the budget that paid for the window is the child's own.
+                                host.lock_unpoisoned().give_child_budget(budget, &mut ch);
                                 for (name, gh) in &glist {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
@@ -21842,6 +21844,11 @@ pub struct Host {
     /// on the one object both hooks hold. The interpreter's arm sets the child's cap directly and
     /// never reads it (its `take` and `build` are one arm), so it is inert there.
     pending_child_lane: Option<i64>,
+    /// #1944 — the node [`Host::admit_detached_spawn`] just charged for a child's window, waiting for
+    /// the JIT's builder ([`Host::spawn_detached_child`]) to give the child as its `"budget"`: the
+    /// budget twin of `pending_child_lane`. The interpreter's arms name the handle directly
+    /// ([`Host::give_child_budget`]) and never read it.
+    pending_child_budget: Option<u32>,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -22597,6 +22604,7 @@ impl Host {
             granted_lanes: 0,
             parent_domain: None,
             pending_child_lane: None,
+            pending_child_budget: None,
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -23782,6 +23790,9 @@ impl Host {
         self.lend_jit_admission(&mut child);
         child.named_cap_registrar = self.named_cap_registrar.take();
         child.budget_thaw_hook = self.budget_thaw_hook.take();
+        // #1944: the child's budget nodes are this domain's tree's — the restore rebuilt the cut's
+        // nodes here once, and the child's handles name them.
+        child.budgets = Arc::clone(&self.budgets);
         child
     }
 
@@ -24841,11 +24852,31 @@ impl Host {
     /// [`DurableBinding::Budget`], keyed by live id. Ascending key, so each parent precedes its
     /// children (a node is always minted after the node it is split from).
     pub fn capture_durable_budgets(&self) -> Vec<DurableBudget> {
-        self.budgets
-            .capture(self.table.iter().filter_map(|s| match s.entry {
+        self.capture_budget_chains(&self.budget_nodes_held())
+    }
+
+    /// #1944 slice 2 — the budget nodes this domain's handles name, by live id.
+    pub fn budget_nodes_held(&self) -> Vec<u32> {
+        self.table
+            .iter()
+            .filter_map(|s| match s.entry {
                 Some(Binding::Budget(node)) => Some(node),
                 _ => None,
-            }))
+            })
+            .collect()
+    }
+
+    /// #1944 slice 2 — [`Self::capture_durable_budgets`] over any set of this tree's nodes: what a
+    /// freeze carries for a whole cut, whose detached children hold nodes of this same tree
+    /// ([`Self::shares_budget_tree`]).
+    pub fn capture_budget_chains(&self, held: &[u32]) -> Vec<DurableBudget> {
+        self.budgets.capture(held.iter().copied())
+    }
+
+    /// #1944 slice 2 — whether `other`'s budget nodes live in this domain's tree: a detached child's
+    /// does, from the spawn that gave it its `"budget"`.
+    pub fn shares_budget_tree(&self, other: &Host) -> bool {
+        Arc::ptr_eq(&self.budgets, &other.budgets)
     }
 
     /// #1944 — rebuild carried budget nodes in this domain's tree before
@@ -25349,7 +25380,34 @@ impl Host {
             return None;
         }
         self.pending_child_lane = Some(lane);
+        self.pending_child_budget = self.budget_node(budget);
         Some(lane)
+    }
+
+    /// The node a live `Budget` handle names.
+    fn budget_node(&self, handle: i32) -> Option<u32> {
+        match self.resolve(handle, cap_id::BUDGET) {
+            Ok(Binding::Budget(node)) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// #1944 slice 2 — give `child` the node behind `budget`, the one its admission charged
+    /// ([`Host::admit_detached_spawn`]), as its `"budget"`: the budget that pays for a child's window
+    /// is the child's own. The child's host joins this domain's tree, so its window counts inside that
+    /// node's ceiling and its own spawns charge the node and every ancestor. The name resolves to it
+    /// ahead of any re-grant the spawner also called `"budget"`.
+    pub fn give_child_budget(&self, budget: i32, child: &mut Host) {
+        if let Some(node) = self.budget_node(budget) {
+            self.lend_budget_node(node, child);
+        }
+    }
+
+    fn lend_budget_node(&self, node: u32, child: &mut Host) {
+        child.budgets = Arc::clone(&self.budgets);
+        if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
+            child.cap_names.insert(0, ("budget".to_string(), h));
+        }
     }
 
     /// #1587, #1944 — return `bytes` of `mem` to the node behind `handle` and every ancestor: the
@@ -28221,9 +28279,13 @@ impl Host {
         // D66 — the lane the admission that preceded this build reserved (the JIT path's two-hook
         // sequence); `None` ⇒ unbounded, which is also what an un-admitted build gets.
         let lane = self.pending_child_lane.take().unwrap_or(-1);
+        let budget = self.pending_child_budget.take();
         let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
         ch.set_durable(durable);
         ch.set_lane_cap(lane);
+        if let Some(node) = budget {
+            self.lend_budget_node(node, &mut ch); // #1944 — the paying budget is the child's
+        }
         Some((ch, cinst, cas))
     }
 

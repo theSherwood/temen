@@ -238,3 +238,81 @@ fn a_child_whose_restore_fails_refuses_the_parents() {
         .expect("a registrar serving `vm_fs` restores the tree");
     assert_eq!(rhost.take_thawed_detached().len(), 1);
 }
+
+/// #1944 slice 2: a detached child's `"budget"` is its spawner's node, so parent and child share a
+/// tree. The parent's artifact numbers the whole cut's nodes — its own and those only the child names
+/// (here a node the child split) — and carries them once; the thaw rebuilds them once, so a charge
+/// the thawed child makes reaches the thawed parent's node, and a re-freeze is byte-identical.
+#[test]
+fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
+    use temen_interp::cap_id;
+    let read = |h: &mut Host, b: i32| h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None);
+    let (p, c) = (parent(), child());
+    let (window, mut chost) = frozen_root(&c);
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.grant_durable_module(&c);
+    let root = host.grant_budget(-1, 1 << 20, -1);
+    let paid = host
+        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, 1 << 18, -1], None)
+        .unwrap()[0] as i32;
+    assert!(
+        host.budget_mem_take(paid, 1 << 17),
+        "the child's window, charged"
+    );
+    host.give_child_budget(paid, &mut chost);
+    let cb = chost
+        .resolve_cap_name("budget")
+        .expect("the child's budget");
+    let mine = chost
+        .cap_dispatch_slots(cap_id::BUDGET, 0, cb, &[-1, 1 << 16, -1], None)
+        .unwrap()[0] as i32;
+    assert!(mine >= 0, "the child splits a node of its own");
+    host.set_captured_detached(vec![CapturedDetached {
+        parent_task: 0,
+        slot: 1,
+        window,
+        reserved_log2: 17,
+        host: Arc::new(Mutex::new(chost)),
+        module: Arc::new(c.clone()),
+        launch: launch(&c),
+    }]);
+    let mut win = init_durable_window(1 << 17, ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+    let art = freeze(&p, &win, &host).expect("freeze the tree");
+
+    let mut rhost = Host::new();
+    rhost.set_durable(true);
+    rhost.grant_durable_module(&c);
+    restore_with_prots(&art, &p, &mut rhost).expect("restore");
+    let mut thawed = rhost.take_thawed_detached();
+    let t = &mut thawed[0];
+    assert_eq!(
+        read(&mut rhost, paid),
+        Ok(vec![1 << 17]),
+        "the window's charge stayed"
+    );
+    assert_eq!(
+        read(&mut t.host, cb),
+        Ok(vec![1 << 17]),
+        "the child's budget is that node"
+    );
+    assert!(
+        t.host.budget_mem_take(mine, 1 << 16),
+        "the child charges its own node"
+    );
+    assert_eq!(
+        read(&mut rhost, paid),
+        Ok(vec![1 << 16]),
+        "and the charge reaches the parent's node"
+    );
+    assert_eq!(
+        read(&mut rhost, root),
+        Ok(vec![(1 << 20) - (1 << 17) - (1 << 16)])
+    );
+    t.host.budget_mem_give(mine, 1 << 16);
+
+    // §12.6 canonicality: the restored tree re-freezes to the same bytes.
+    rhost.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
+    assert_eq!(freeze(&p, &win, &rhost).expect("re-freeze"), art);
+}

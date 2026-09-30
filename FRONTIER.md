@@ -64,7 +64,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *debugger* 🔶 — instantiate/join/instantiate_module(_named)/instantiate_rec/instantiate_detached run on the debug scheduler through the executor's admission (#1855); the coroutine spawns fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**
-- *nesting* ⛔ — index-carrying: the child is granted a node of its own by split, not the handle
+- *nesting* ⛔ — not re-grantable by name: a child's own budget is the node its spawn charged (#1944)
 
 **`Module`**
 - *durability* 🔶 — durable iff the grant is attested freezable (#1361): the artifact carries the §4 content digest and the restoring host re-grants the module. An un-attested grant is still NonDurableKind::Module

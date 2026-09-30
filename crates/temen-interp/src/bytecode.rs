@@ -1751,6 +1751,8 @@ fn admit_detached_child(
     child_host.set_attestation(host.detached_child_attestation());
     let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
+    // #1944 — the budget that paid for the window is the child's own.
+    host.give_child_budget(s.budget, &mut child_host);
     for (name, gh) in &glist {
         if let Some(cg) = host.regrant_into_child(*gh, &mut child_host) {
             child_host.register_cap_name(name, cg);

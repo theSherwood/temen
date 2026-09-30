@@ -472,10 +472,17 @@ block 3 () {
 // module `-1` — in a fresh window of the module's declared size, paid from the budget; `join` is
 // `call.cap 6 1`.
 
-/// A nested-corpus guest (`memory {mem}`): func 0 spawns func 1 (`child`, a whole `func`) through a
+/// A nested-corpus guest (`memory {mem}`): func 0 spawns func 1 (`child`, whole `func`s) through a
 /// v1 record asking for window `2^size_log2` (`0`: the declared one). With `join` it joins the child
-/// into `vj`; either way `tail` ends the block (the spawn's handle is `vh`).
-fn nested_guest(mem: u8, size_log2: i64, join: bool, tail: &str, child: &str) -> String {
+/// into `vj`; either way `tail` ends the block (the spawn's handle is `vh`). `data` adds segments.
+fn nested_guest(
+    mem: u8,
+    size_log2: i64,
+    join: bool,
+    data: &str,
+    tail: &str,
+    child: &str,
+) -> String {
     let rec = temen_ir::SpawnRec {
         size_log2,
         ..temen_ir::SpawnRec::v1(1)
@@ -487,7 +494,7 @@ fn nested_guest(mem: u8, size_log2: i64, join: bool, tail: &str, child: &str) ->
         ""
     };
     format!(
-        "memory {mem}\ndata 16384 \"budget\"\n{seg}func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
+        "memory {mem}\ndata 16384 \"budget\"\n{seg}{data}func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
          vbp = i64.const 16384\n  vbl = i64.const 6\n  vbud = self.resolve vbp vbl\n{stores}  \
          vrp = i64.const 17408\n  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n{join}{tail}  }}\n}}\n{child}"
     )
@@ -500,6 +507,7 @@ fn child_isolated() -> String {
         17,
         0,
         true,
+        "",
         "  v7 = i64.const 65543\n  v8 = i32.load8_u v7\n  v9 = i64.extend_i32_u v8\n  \
          v10 = i64.const 1000\n  v11 = i64.mul vj v10\n  v12 = i64.add v11 v9\n  return v12\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 65543\n  v2 = i32.const 123\n  \
@@ -507,45 +515,27 @@ fn child_isolated() -> String {
     )
 }
 
-// Depth-2 VM-in-VM: the child, handed an `Instantiator` over *its* window, instantiates a grandchild
-// — confinement composes. The grandchild returns 77, propagated up through two joins.
-const CHILD_DEPTH2: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  return v6
-  }
+// Depth-2 VM-in-VM: the child spawns a grandchild of its own, detached, from its own `"budget"` — the
+// node that paid for its window (#1944) — so confinement composes. The grandchild returns 77,
+// propagated up through two joins.
+fn child_depth2() -> String {
+    let (seg, stores) =
+        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::v1(2), None, "vb");
+    nested_guest(
+        17,
+        0,
+        true,
+        &seg,
+        "  return vj\n",
+        &format!(
+            "func (i64) -> (i64) {{\nblock 0 (va: i64) {{\n  vi = i32.wrap_i64 va\n  \
+             vbp = i64.const 16384\n  vbl = i64.const 6\n  vb = self.resolve vbp vbl\n{stores}  \
+             vrp = i64.const 17504\n  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)\n  \
+             vj = call.cap 6 1 (i32) -> (i64) vi (vh)\n  return vj\n  }}\n}}\n\
+             func (i64) -> (i64) {{\nblock 0 (va: i64) {{\n  v = i64.const 77\n  return v\n  }}\n}}\n"
+        ),
+    )
 }
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i32.wrap_i64 v0
-  v2 = i64.const 0
-  v3 = i32.const 171
-  i32.store8 v2 v3
-  v4 = i64.const 2
-  v5 = i64.const 2048
-  v6 = i64.const 10
-  v7 = i64.const 0
-  v8 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v4, v5, v6, v7)
-  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
-  return v9
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 0
-  v2 = i32.const 200
-  i32.store8 v1 v2
-  v3 = i64.const 77
-  return v3
-  }
-}
-"#;
 
 // A two-arg child receives its starter caps `(Instantiator, AddressSpace)` and uses the AddressSpace
 // (iface 5, op 1 = unmap) to decommit 16 KiB at 64 KiB of its **own** 256 KiB window — a confined
@@ -555,6 +545,7 @@ fn child_addrspace() -> String {
         18,
         0,
         true,
+        "",
         "  return vj\n",
         "func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i32.wrap_i64 v1\n  \
          v3 = i64.const 65536\n  v4 = i64.const 16384\n  v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n  \
@@ -569,6 +560,7 @@ fn child_refused() -> String {
         17,
         12,
         false,
+        "",
         "  v6 = i64.extend_i32_s vh\n  return v6\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 0\n  return v1\n  }\n}\n",
     )
@@ -580,6 +572,7 @@ fn child_trap() -> String {
         17,
         0,
         true,
+        "",
         "  return vj\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  unreachable\n  }\n}\n",
     )
@@ -2150,15 +2143,16 @@ fn main() {
     // the (status, value) is the ground truth (detached child execution, isolation, depth, attenuation,
     // admission, traps), checked here against what each guest is written to produce so a regression
     // cannot quietly become the truth.
-    let (isolated, addrspace, refused, trap) = (
+    let (isolated, depth2, addrspace, refused, trap) = (
         child_isolated(),
+        child_depth2(),
         child_addrspace(),
         child_refused(),
         child_trap(),
     );
     let nested = [
         ("child_isolated", isolated.as_str(), (STATUS_OK, 42000)),
-        ("child_depth2", CHILD_DEPTH2, (STATUS_OK, 77)),
+        ("child_depth2", depth2.as_str(), (STATUS_OK, 77)),
         ("child_addrspace", addrspace.as_str(), (STATUS_OK, 0)),
         (
             "child_refused",
