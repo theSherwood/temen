@@ -62,7 +62,6 @@ impl Fixture {
                         entry: 0,
                         digest: module_digest(&m),
                         module: m,
-                        max_vcpus: 1,
                         same_module: false,
                     },
                 ),

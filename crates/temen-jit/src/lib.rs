@@ -938,7 +938,8 @@ pub struct BudgetTaken {
 
 /// PROCESS.md §5 / #1287, D66 — the admission for a detached spawn, the interpreter's
 /// `Host::admit_detached_spawn`: reserve the lane of the budget behind `budget` against the parent's
-/// Σ and charge `bytes` (the child's declared window) to that budget, or neither. Returns the lane it
+/// Σ and charge `bytes` (the child's declared window) and the child's first vCPU to that budget, or
+/// none of them. Returns the lane it
 /// reserved (`-1` = unbounded), which the build then stamps on the child
 /// ([`GrantDetachedChildBuilder`]), or [`ADMIT_REFUSED`] for a forged/wrong-type handle or no room:
 /// the spawn refuses probeably (`-EINVAL`), charging nothing.
@@ -956,9 +957,10 @@ pub const ADMIT_REFUSED: i64 = i64::MIN;
 /// task finish with the lane the child was stamped with (`-1` = unbounded, a no-op).
 pub type LaneGiver = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, lane: i64);
 
-/// #1587 — the undo of a [`BudgetMemTaker`] whose spawn then failed *after* the take: return `bytes`
-/// to `budget` on the parent. The OS-thread spawn is the one refusal on the detached path that
-/// happens after the commit, so without this a guest that trips it leaks its allowance per attempt.
+/// #1587, #1877 — settle what a [`BudgetMemTaker`] admitted: the window's `bytes` and the child's
+/// first vCPU go back to `budget` on the parent, at the child's end or when its spawn fails *after*
+/// the take. The OS-thread spawn is the one refusal on the detached path that happens after the
+/// commit, so without this a guest that trips it leaks its allowance per attempt.
 pub type BudgetMemGiver =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64);
 

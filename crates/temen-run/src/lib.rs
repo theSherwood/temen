@@ -1999,14 +1999,9 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
         // SAFETY: the harvest hands over the nursery's retained ref — one counted `Arc` to the
         // child's `Mutex<Host>`, built by `finish_child_build` — now ours.
         let child = unsafe { std::sync::Arc::from_raw(h.powerbox as *const Mutex<Host>) };
-        let (module, lane, channel, names) = {
+        let (module, lane, names) = {
             let c = child.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                c.self_module(),
-                c.lane_cap(),
-                c.channel_cap(),
-                c.cap_names().to_vec(),
-            )
+            (c.self_module(), c.lane_cap(), c.cap_names().to_vec())
         };
         let Some(module) = module else {
             continue;
@@ -2018,7 +2013,6 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
             entry: h.entry,
             digest: temen_interp::module_digest(&module),
             module: std::sync::Arc::clone(&module),
-            max_vcpus: usize::MAX,
             same_module,
         };
         // A finished child's `join` outcome — its value, or its trap (#1674); `None` for a trap cell
@@ -2047,10 +2041,7 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
                         task: 0,
                         entry: h.entry,
                         digest: spawn.digest,
-                        fuel: u64::MAX,
                         lane,
-                        channel,
-                        max_vcpus: u64::MAX,
                         same_module,
                         names,
                     },
@@ -2884,7 +2875,7 @@ unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
 
 /// #1944 slice 3 — a budget node's fuel as the JIT meters it: a [`temen_jit::FuelCell`] draws from
 /// it and hands back what it did not burn.
-struct HostFuel(temen_interp::FuelSrc);
+struct HostFuel(temen_interp::NodeRef);
 
 impl temen_jit::FuelSource for HostFuel {
     fn draw(&self) -> Option<u64> {
@@ -2894,7 +2885,7 @@ impl temen_jit::FuelSource for HostFuel {
         self.0.give_back(unspent)
     }
     fn room(&self) -> i64 {
-        self.0.room()
+        self.0.fuel_room()
     }
 }
 
@@ -2904,7 +2895,7 @@ unsafe fn child_fuel_source(ctx: *mut c_void) -> Option<Arc<dyn temen_jit::FuelS
     let src = (*(ctx as *const Mutex<Host>))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .fuel_source();
+        .own_node();
     Some(Arc::new(HostFuel(src)))
 }
 
@@ -3687,14 +3678,15 @@ pub unsafe extern "C" fn lane_give(ctx: *mut c_void, lane: i64) {
     parent.give_lane(lane);
 }
 
-/// #1587 — the undo of [`budget_mem_take`] for a spawn that failed after the take
-/// ([`temen_jit::BudgetMemGiver`]): return `bytes` to `budget` on the parent `Host`.
+/// #1587, #1877 — the settling of what [`budget_mem_take`] admitted ([`temen_jit::BudgetMemGiver`]):
+/// at the child's end, or for a spawn that failed after the take, its window's `bytes` and its first
+/// vCPU go back to `budget` on the parent `Host` ([`Host::release_detached`]).
 ///
 /// # Safety
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
 pub unsafe extern "C" fn budget_mem_give(ctx: *mut c_void, budget: i32, bytes: u64) {
     let parent = &mut *(ctx as *mut Host);
-    parent.budget_mem_give(budget, bytes);
+    parent.release_detached(budget, bytes);
 }
 
 /// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window
@@ -5950,7 +5942,7 @@ pub fn grant_conductor(host: &mut Host, child: &temen_ir::Module) -> (i32, i32, 
     let log2 = child.memory.as_ref().map_or(0, |m| m.size_log2);
     let inst = host.grant_instantiator(0, 1u64 << CONDUCTOR_LOG2);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(-1, 1i64 << log2, 0);
+    let budget = host.grant_budget(-1, 1i64 << log2, -1);
     (inst, modh, budget)
 }
 
@@ -6916,13 +6908,14 @@ impl HostCap {
     /// (`Instantiator.instantiate_detached`, op 15) whose fresh platform windows no ancestor below
     /// the platform can read (the child attests `window_exposed = false` — the distrust-spawner trust
     /// anchor). Embedder-granted like `exec`/`fs`; each mint charges the child's window size to
-    /// `mem`. Its fuel is unbounded on its own level, so the run's fuel limit above it is what caps
-    /// the children it funds (#1944 slice 3); its spawn is `0`.
+    /// `mem`. Its fuel and spawn are unbounded on its own level (#1944 slice 3): the run's fuel limit
+    /// above it caps the children it funds, and each child it funds is one `spawn` of it while it
+    /// lives.
     pub fn detached_budget(mem: u64) -> HostCap {
         HostCap {
             type_id: cap_id::BUDGET,
             op: 0,
-            grant: Arc::new(move |h, _| h.grant_budget(-1, mem as i64, 0)),
+            grant: Arc::new(move |h, _| h.grant_budget(-1, mem as i64, -1)),
             unbound: false,
             offer: None,
             iface: None,

@@ -98,10 +98,7 @@ fn launch(child: &Module) -> DetachedLaunch {
         task: 3,
         entry: 0,
         digest: module_digest(child),
-        fuel: 12_345,
         lane: 2,
-        channel: -1,
-        max_vcpus: 4,
         same_module: false,
         names: vec![("fs".to_string(), 0x0103)],
     }

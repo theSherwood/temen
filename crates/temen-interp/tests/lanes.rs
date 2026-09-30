@@ -197,7 +197,7 @@ fn a_parents_granted_lanes_may_not_exceed_its_cap_and_a_reaped_child_returns_its
     host.set_lane_cap(2);
     let inst = host.grant_instantiator(0, 1 << 16);
     let modh = host.grant_module(&child);
-    let budget = host.grant_budget(-1, 3 << 12, 0);
+    let budget = host.grant_budget(-1, 3 << 12, -1);
     let args = vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)];
     let mut fuel = u64::MAX;
     let r = run_with_host(&parent, 0, &args, &mut fuel, &mut host);
@@ -216,7 +216,7 @@ fn a_parents_granted_lanes_may_not_exceed_its_cap_and_a_reaped_child_returns_its
 fn split_bounds_a_childs_lane_by_the_holders_cap_and_never_draws_the_cap_down() {
     let mut host = Host::new();
     host.set_lane_cap(2);
-    let b = host.grant_budget(-1, 1 << 20, 0);
+    let b = host.grant_budget(-1, 1 << 20, -1);
     let split = |host: &mut Host, lane: i64| -> i64 {
         host.cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, 4096, 0, -1, lane], None)
             .expect("split dispatches")[0]
@@ -255,7 +255,7 @@ fn split_bounds_a_childs_lane_by_the_holders_cap_and_never_draws_the_cap_down() 
 #[test]
 fn budget_mem_give_is_the_exact_undo_of_a_take() {
     let mut host = Host::new();
-    let b = host.grant_budget(-1, 8192, 0);
+    let b = host.grant_budget(-1, 8192, -1);
     let read_mem = |host: &mut Host| -> i64 {
         host.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)
             .unwrap()[0]
@@ -264,7 +264,7 @@ fn budget_mem_give_is_the_exact_undo_of_a_take() {
     assert_eq!(read_mem(&mut host), 4096);
     host.budget_mem_give(b, 4096);
     assert_eq!(read_mem(&mut host), 8192);
-    let u = host.grant_budget(-1, -1, 0);
+    let u = host.grant_budget(-1, -1, -1);
     host.budget_mem_give(u, 4096);
     assert_eq!(
         host.cap_dispatch_slots(cap_id::BUDGET, 1, u, &[1], None)

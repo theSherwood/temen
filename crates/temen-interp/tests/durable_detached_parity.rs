@@ -101,7 +101,7 @@ fn powerbox_with(
     } else {
         host.grant_module(child)
     };
-    let budget = host.grant_budget(-1, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)]
 }
 
@@ -367,7 +367,7 @@ fn probe(durable: bool) -> i64 {
     host.set_durable(durable);
     let inst = host.grant_instantiator(0, 1 << 16);
     let ch = host.grant_module(&child);
-    let budget = host.grant_budget(-1, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     let lh = host.grant_module(&leaf); // un-instrumented on purpose: the thing §4 refuses
     let mut fuel = u64::MAX;
     let r = temen_interp::run_with_host(

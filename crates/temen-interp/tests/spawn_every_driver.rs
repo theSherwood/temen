@@ -483,7 +483,7 @@ fn op15_setup(child: &Module, mem: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ 
         let mut h = Host::new();
         let i = h.grant_instantiator(0, 1 << 17);
         let c = h.grant_module(child);
-        let b = h.grant_budget(-1, mem, 0);
+        let b = h.grant_budget(-1, mem, -1);
         let o = h.grant_stream(StreamRole::Out);
         let args = vec![Value::I32(i), Value::I32(c), Value::I32(b), Value::I32(o)];
         (h, args)
@@ -678,7 +678,7 @@ fn op15_tree_setup(
             unreachable!("op15_setup hands the budget third")
         };
         let node = h
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, node_mem, 0], None)
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, node_mem, -1], None)
             .expect("split")[0] as i32;
         assert!(h.budget_mem_take(root, root_used), "the root's own use");
         if !pay_root {
@@ -757,7 +757,7 @@ fn op15_fuel_setup(child: &Module, fuel: i64) -> impl Fn() -> (Host, Vec<Value>)
             unreachable!("op15_setup hands the budget third")
         };
         let node = h
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[fuel, -1, 0], None)
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[fuel, -1, -1], None)
             .expect("split")[0];
         args[2] = Value::I32(node as i32);
         (h, args)
@@ -886,7 +886,7 @@ fn joins_agree(what: &str, joins: &str, want: &Ran) {
     let setup = |h: &mut Host| {
         let i = h.grant_instantiator(0, 1 << 17);
         let c = h.grant_module(&child);
-        let b = h.grant_budget(-1, 1 << 20, 0);
+        let b = h.grant_budget(-1, 1 << 20, -1);
         vec![Value::I32(i), Value::I32(c), Value::I32(b)]
     };
     let setup = || {
@@ -953,11 +953,12 @@ fn rec_segment(at: u64, rec: &SpawnRec) -> String {
 }
 
 /// Three generations of one `memory 16` module, each window 64 KiB. The root resolves its `"budget"`,
-/// splits a node with a `mem` ceiling of `child_ceiling`, and spawns func 1 detached, paid from it.
+/// splits a node with a `mem` ceiling of `mem` and a `spawn` ceiling of `spawn` (`-1` = unbounded),
+/// and spawns func 1 detached, paid from it.
 /// Func 1 resolves its own `"budget"` — the node that paid for it — and spawns func 2 from it: a
 /// refused spawn returns its `-errno`, an admitted one `join + 20`. Func 2 returns 3. The root returns
 /// what its child did plus 100.
-fn three_generations(child_ceiling: i64) -> String {
+fn three_generations(mem: i64, spawn: i64) -> String {
     format!(
         "memory 16
 data 16384 \"budget\"
@@ -967,8 +968,9 @@ block 0 (vinst: i32) {{
   nl = i64.const 6
   vroot = self.resolve np nl
   all = i64.const -1
-  cap = i64.const {child_ceiling}
-  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, all)
+  cap = i64.const {mem}
+  sp = i64.const {spawn}
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, sp)
   bf = i64.const 17436
   i32.store bf vsub
   rp = i64.const 17408
@@ -1022,7 +1024,7 @@ fn generations_setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
         let mut h = Host::new();
         h.set_self_module(&std::sync::Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 16);
-        let b = h.grant_budget(-1, 1 << 20, 0);
+        let b = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", b);
         (h, vec![Value::I32(i)])
     }
@@ -1060,7 +1062,7 @@ block 0 (va: i64) {{
 
 #[test]
 fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
-    let m = module(&three_generations(1 << 17));
+    let m = module(&three_generations(1 << 17, -1));
     agree_on_every_driver(
         "a child whose 128 KiB ceiling holds its window and its child's",
         &m,
@@ -1071,11 +1073,162 @@ fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
 
 #[test]
 fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
-    let m = module(&three_generations(1 << 16));
+    let m = module(&three_generations(1 << 16, -1));
     agree_on_every_driver(
         "a child whose 64 KiB ceiling its own window fills",
         &m,
         &generations_setup(&m),
         &ok(-22 + 100),
     );
+}
+
+// ---- #1944 slice 3: a detached child is one `spawn` of the budget that pays for it while it lives ----
+
+/// An op-15 spawn of `module` into `dst` (a text-IR operand), funded by `vb`, whose payload word is
+/// `word` at `at`. Expects `vinst`, `vb`, `vm`, `gz`, `sl` and `al` in scope.
+fn spawn_into(dst: &str, at: u64, word: i64) -> String {
+    format!(
+        "  pa{dst} = i64.const {at}\n  pw{dst} = i64.const {word}\n  i64.store pa{dst} pw{dst}\n\
+         \x20 {dst} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gz, gz, gz, sl, gz, pa{dst}, al)\n"
+    )
+}
+
+/// An op-15 parent `(i32 inst, i32 module, i32 budget) -> i64` that spawns child A, joins it, then spawns
+/// child C and joins it, returning `join(A) + join(C)`: each child returns its payload word, A's 100
+/// and C's 102. A refused C traps its join (a negative handle).
+fn spawn_after_join() -> String {
+    format!(
+        "memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32) {{
+  vm = i64.extend_i32_s vmod
+  vb = i64.extend_i32_s vbud
+  gz = i64.const 0
+  sl = i64.const 15
+  al = i64.const 8
+{a}{ja}{c}{jc}  vr = i64.add ja jc
+  return vr
+  }}
+}}
+",
+        a = spawn_into("vha", 20480, 100),
+        ja = join("ja", "vha"),
+        c = spawn_into("vhc", 20496, 102),
+        jc = join("jc", "vhc"),
+    )
+}
+
+/// The powerbox a [`spawn_after_join`] parent runs over: its `Instantiator`, `child` as a `Module`,
+/// and a `Budget` of 1 MiB whose `spawn` ceiling is `spawn`.
+fn spawn_setup(child: &Module, spawn: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    move || {
+        let mut h = Host::new();
+        let i = h.grant_instantiator(0, 1 << 17);
+        let c = h.grant_module(child);
+        let b = h.grant_budget(-1, 1 << 20, spawn);
+        (h, vec![Value::I32(i), Value::I32(c), Value::I32(b)])
+    }
+}
+
+/// On every driver, a detached child hands its `spawn` back when it ends: a one-child budget funds C
+/// once A is joined. (That a live child holds its charge is
+/// [`a_childs_spawn_ceiling_counts_itself_and_its_children`]'s: a child is live while it spawns.)
+#[test]
+fn a_joined_detached_child_hands_its_spawn_back() {
+    let m = module(&spawn_after_join());
+    let child = module(CHILD_RETURNS_PAYLOAD);
+    agree_on_every_driver(
+        "op 15, a one-child budget spawning twice in turn",
+        &m,
+        &spawn_setup(&child, 1),
+        &ok(100 + 102),
+    );
+}
+
+/// On every driver, a budget whose `spawn` ceiling is 0 funds no child, and its refusal charges
+/// nothing: the budget's `mem` room is whole after it.
+#[test]
+fn a_spawn_0_budget_funds_no_child() {
+    let m = module(&op15_then(false, 0, ROOM_AFTER_REFUSAL));
+    let child = module(CHILD_READS);
+    let setup = || {
+        let (mut h, mut args) = op15_setup(&child, 1 << 20)();
+        args[2] = Value::I32(h.grant_budget(-1, 1 << 20, 0));
+        (h, args)
+    };
+    agree_on_every_driver("op 15, a spawn-0 budget", &m, &setup, &ok(1 << 20));
+}
+
+/// On every driver, a child's `spawn` ceiling counts its own first vCPU and its children: a child
+/// whose ceiling is one live vCPU fills it itself and is refused a grandchild, and one whose ceiling
+/// is two is not.
+#[test]
+fn a_childs_spawn_ceiling_counts_itself_and_its_children() {
+    let m = module(&three_generations(1 << 17, 1));
+    agree_on_every_driver(
+        "a child whose one-vCPU ceiling it fills",
+        &m,
+        &generations_setup(&m),
+        &ok(-22 + 100),
+    );
+    let m = module(&three_generations(1 << 17, 2));
+    agree_on_every_driver(
+        "a child whose two-vCPU ceiling holds its child",
+        &m,
+        &generations_setup(&m),
+        &ok(3 + 20 + 100),
+    );
+}
+
+// ---- #1944 slice 3: a detached child's pipes are charged to the budget that pays for it ----
+
+/// A pipe's worst-case FIFO, the `channel` memory each mint charges (`temen_interp`'s `PIPE_CAP`).
+const PIPE_CAP: i64 = 64 * 1024;
+
+/// A detached child that mints pipes (the `pipe()` self-op, 16) until one is refused, and returns how
+/// many it minted.
+const CHILD_MINTS_PIPES: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vn0 = i64.const 0
+  br 1(vn0)
+}
+block 1 (vn: i64) {
+  vz = i32.const 0
+  vfds = i64.const 20480
+  vr = call.cap 4294967295 16 (i64) -> (i32) vz (vfds)
+  vrz = i32.const 0
+  vfail = i32.lt_s vr vrz
+  br_if vfail 2(vn) 3(vn)
+}
+block 2 (vnf: i64) {
+  return vnf
+}
+block 3 (vnok: i64) {
+  vone = i64.const 1
+  vn2 = i64.add vnok vone
+  br 1(vn2)
+  }
+}
+";
+
+/// On every driver, a detached child's pipes are charged to the budget that paid for it: a child
+/// whose budget holds one pipe's channel memory mints exactly one.
+#[test]
+fn a_detached_childs_pipes_are_capped_by_its_budget() {
+    let m = module(&op15(false));
+    let child = module(CHILD_MINTS_PIPES);
+    let base = op15_setup(&child, 1 << 20);
+    let setup = || {
+        let (mut h, mut args) = base();
+        let Value::I32(root) = args[2] else {
+            unreachable!("op15_setup hands the budget third")
+        };
+        let node = h
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, -1, -1, PIPE_CAP], None)
+            .expect("split")[0];
+        args[2] = Value::I32(node as i32);
+        (h, args)
+    };
+    agree_on_every_driver("op 15, a one-pipe channel ceiling", &m, &setup, &ok(1));
 }
