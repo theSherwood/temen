@@ -21,7 +21,9 @@ the tracker. (The old `ISSUES.md` registry is **retired**; see [The split](#the-
 One GitHub Project, two axes:
 
 - **Columns = the native `Status` field** — Backlog / Active / Blocked /
-  In-Review / Done. Managed by dragging cards.
+  In-Review / Done. Managed by dragging cards. A session can't set it, so a
+  session marks the work it takes with a comment instead
+  ([Claiming work](#claiming-work)).
 - **Swimlanes = group by Parent issue.** Every issue is a sub-issue of exactly
   one **epic**, and the epic *is* the workstream. So the parent link is the
   workstream classification — there is no separate "Workstream" field to keep in
@@ -93,6 +95,33 @@ The taxonomy is reproducible and idempotent: **`scripts/setup-labels.sh`**.
 5. Put the root-cause detail in the issue body. If it must live beside the code
    (reviewed in the fixing PR), add it to the relevant **design doc** and link it
    — don't split status across two places.
+
+## Claiming work
+
+Parallel sessions can't see each other. Two of them fixed the same flake in
+separate PRs (#1935, #1939), and two built #1944 in parallel (#1957, #1961). So
+a session claims an issue before it starts work on it:
+
+1. **Look first.** Read the issue's comments, and search open PRs for its number
+   (`repo:theSherwood/temen is:pr is:open <N>`). An unreleased claim or an open
+   PR for the same scope means someone holds it.
+2. **Claim.** Comment on the issue:
+
+   ```
+   **Active:** <scope: the issue, or which slice> · <session link> · branch `<branch>`
+   ```
+
+   Then read the comments again. If another claim for the same scope came first,
+   it wins: say so under yours and stop.
+3. **Held by someone else?** Don't start, even if the user asked you to. Tell the
+   user who holds it (the claim's session link, or the PR) and let them decide.
+4. **Hand-off.** Your PR says `Part of #N` or `Fixes #N`, which links it from the
+   issue. The claim holds until that PR merges or closes. If you stop before
+   opening one, comment `**Released:**` with what's done and on which branch.
+5. **Stale claims.** A claim with no open PR and no push to its branch for 24
+   hours is stale. Say so on the issue, then claim it.
+
+An issue worked in slices takes one claim per slice. Name the slice.
 
 ## The split
 

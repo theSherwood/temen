@@ -20,6 +20,13 @@ issue is the status source of truth. (`ISSUES.md` is **retired**; its history is
 git.) Flaky CI → a `kind:flaky-ci` issue. Full workflow, epic list, and label taxonomy:
 **`ISSUE_TRACKING.md`** (labels are reproducible via `scripts/setup-labels.sh`).
 
+**Claim an issue before you start work on it.** Parallel sessions can't see each other,
+and two of them have built the same PR. First read the issue's comments and search open
+PRs for its number. If nobody holds it, comment
+`**Active:** <scope> · <session link> · branch <branch>` on the issue. If somebody does,
+don't start: tell the user who holds it, even when they asked you for that work. Steps,
+hand-off and stale claims: **`ISSUE_TRACKING.md` § Claiming work**.
+
 ## Prime directive: keep it simple
 
 This is a sandbox VM whose entire value is a **small, trustworthy core**. Every
