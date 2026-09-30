@@ -6969,7 +6969,7 @@ enum RunInput {
     /// A **detached child** run (#1285, DETACHED_JIT.md §3): the on-ramp powerbox (as `Stdin`) plus
     /// `argv` seeded at `module_args_base()` — the spawn-time args payload a detached child needs because
     /// the op-13 convention (a parent data segment landing inside the child's carve) has no analogue
-    /// across memories. The window is the child's own foreign memory (`open_foreign_run`). Constructed
+    /// across memories. The window is the child's own foreign memory (`open_detached_run`). Constructed
     /// only by the wasm32 threads-build FFI (`temen_detached_jit_run_open`); dead on native.
     #[allow(dead_code)]
     Detached {
@@ -7122,25 +7122,23 @@ impl JitOnrampRun {
         )
     }
 
-    /// Open a single-shot JIT run over a **detached child's own memory** (#1285, DETACHED_JIT.md §3.1):
-    /// the page-registered foreign memory `mem_id` (`web/foreign-mem.js`), addressed through
-    /// `Region::Foreign`. The child's window starts one host header page into that memory (`win` =
-    /// [`DETACHED_HEADER_BYTES`]; the header holds the emitted tier's `env` cell and `pagestate`, unreachable
-    /// by the guest since every span is checked against `"mapped"` before `win` is added). The memory is
-    /// grown here to the module's declared window and later by each `vm_map` bounce
-    /// ([`run_cross_tier`](Self::run_cross_tier)). No `Shared` alias, no carve: the parent cannot address a
-    /// byte of it.
-    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-    pub(crate) fn open_foreign_run(
+    /// Open a single-shot JIT run over a **detached child's own window** (#1285, DETACHED_JIT.md §3.1):
+    /// `back`, from [`mint_detached_backing`] — in the browser the page-registered foreign memory
+    /// (`web/foreign-mem.js`), addressed through `Region::Foreign`. The child's window starts one host
+    /// header page into that memory (`win` = [`DETACHED_HEADER_BYTES`]; the header holds the emitted
+    /// tier's `env` cell and `pagestate`, unreachable by the guest since every span is checked against
+    /// `"mapped"` before `win` is added). The backing is grown here to the module's declared window and
+    /// later by each `vm_map` bounce ([`run_cross_tier`](Self::run_cross_tier)). No `Shared` alias, no
+    /// carve: the parent cannot address a byte of it.
+    pub(crate) fn open_detached_run(
         m: &temen_ir::Module,
-        mem_id: u32,
+        back: std::sync::Arc<temen_interp::Region>,
         shared_memory: bool,
         input: RunInput,
         cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
         let size_log2 = m.memory.map(|mc| mc.size_log2).ok_or(STATUS_UNSUPPORTED)?;
         let declared = 1u64 << size_log2;
-        let back = std::sync::Arc::new(foreign_region(mem_id, 0));
         if !back.grow_to(declared) {
             return Err(STATUS_UNSUPPORTED);
         }
@@ -7929,13 +7927,17 @@ pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
 }
 
 /// Run `m`'s function 0 with an `Instantiator` (iface 6) granted over `[0, 128 KiB)` — the §14
-/// **nested-child** seam: function 0 may `instantiate`/`join` confined child domains over power-of-two
-/// sub-windows of that range (a child runs on the cooperative executor, confined by masking to its
-/// slice, joinable through the shared thread machinery). Returns `(status, i64-widened value)`.
-/// Shared by the wasm [`temen_run_nested`] export and the native `gencorpus` ground truth.
+/// **nested-child** seam: function 0 may spawn detached children of its own module (an op-17 v1 record,
+/// module `-1`) paid from the 1 MiB `"budget"` it resolves by name, each in a fresh window of its own on
+/// the cooperative executor, and `join` them; §14 coroutines use the same `Instantiator`. Returns
+/// `(status, i64-widened value)`. Shared by the wasm [`temen_run_nested`] export and the native
+/// `gencorpus` ground truth.
 pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
+    host.set_self_module(&std::sync::Arc::new(m.clone()));
     let inst = host.grant_instantiator(0, 128 << 10);
+    let budget = host.grant_budget(0, 1 << 20, 0);
+    host.register_cap_name("budget", budget);
     let mut fuel = 5_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &[Value::I32(inst)], &mut fuel, &mut host) {
         None => (STATUS_UNSUPPORTED, 0),
@@ -11976,18 +11978,18 @@ pub extern "C" fn temen_onramp_jit_run_close() {
 }
 
 // ==== #1025 Path 1: the JS-orchestrated §14 op-13 loop — a nested child on the EMITTED tier ==========
-// The browser realization of `nimc.rs::drive_op13`, but the confined child runs on **emitted wasm** over
-// its carve instead of the interpreter. The resumable driver vCPU runs Rust-side; at an op-13
-// `instantiate` the engine has already admitted the child and **marshaled** the parent's grant list into
-// its powerbox (`take_child`) — this loop hands that powerbox + the child module + the carve to a
-// [`JitOnrampRun`] (`open_shared_run_over_host`, stashed in `JIT_RUN`), so JS drives the child's emitted
-// `_start` via `driveJitRun` (its `call.cap` leaves resolving over the marshaled host on the reactor
-// cross-tier bounce). The child's returned value is delivered back to the driver's `join`. Single-Worker
-// and sequential (nim's phases run in order) — no cross-Worker transport, no new emitted-code surface.
+// The browser realization of `nimc.rs::drive_op13`, but the detached child runs on **emitted wasm** over
+// its own window instead of the interpreter. The resumable driver vCPU runs Rust-side; at a detached
+// spawn the engine has already admitted the child and **marshaled** the parent's grant list into its
+// powerbox (`take_child`) — this loop mints the child's window ([`mint_detached_backing`]) and hands it,
+// the powerbox and the child module to a [`JitOnrampRun`] (`open_detached_run`, stashed in `JIT_RUN`), so
+// JS drives the child's emitted `_start` via `driveDetachedRun` (its `call.cap` leaves resolving over the
+// marshaled host on the reactor cross-tier bounce). The child's returned value is delivered back to the
+// driver's `join`. Single-Worker and sequential (nim's phases run in order) — no cross-Worker transport,
+// no new emitted-code surface. The carve child this loop also ran retired with #1289.
 
 /// Step codes [`temen_op13jit_step`] returns to the JS loop.
 pub const OP13JIT_DONE: i32 = 0; // the driver returned — its result is in `temen_op13jit_result`
-pub const OP13JIT_CHILD: i32 = 1; // an op-13 child is staged in `JIT_RUN` — JS drives it, then `_deliver`
 pub const OP13JIT_CHILD_DETACHED: i32 = 2; // #1286: a DETACHED child is staged — JS `driveDetachedRun`s it over `temen_op13jit_child_mem_id()`'s Memory, then `_deliver`
 pub const OP13JIT_TRAP: i32 = -1; // the driver (or a child spawn) trapped
 
@@ -12015,13 +12017,14 @@ struct Op13JitDriver {
     /// #1286: the foreign-memory id of the **detached** child currently staged (`OP13JIT_CHILD_DETACHED`),
     /// `-1` otherwise — JS looks the child's `WebAssembly.Memory` up by it to drive the run.
     child_mem_id: i32,
-    /// #1527: the staged detached child's op-15 **pre-mapped region** on the emitted tier —
-    /// `(backing, child window offset, child window size)`. The region's bytes were copied into the
-    /// child's memory at the offset before it started; [`temen_op13jit_deliver`] copies the span back
-    /// into the region before it banks the result (see [`Host::take_premap`]). `None` for an
-    /// un-mapped child and for the interpreter twin (whose `Mem` aliases the region in software).
-    #[allow(dead_code)] // read only by the wasm32 threads build (the foreign-memory seam)
-    premap_copyback: Option<(temen_interp::RegionBacking, u64, u64)>,
+    /// The staged child's window backing ([`mint_detached_backing`]), held until its result is delivered.
+    child_back: Option<std::sync::Arc<temen_interp::Region>>,
+    /// #1527: the staged detached child's **pre-mapped region** on the emitted tier — `(backing, child
+    /// window offset)`. The region's bytes were copied into the child's window at the offset before it
+    /// started; [`temen_op13jit_deliver`] copies the span back into the region before it banks the
+    /// result (see [`Host::take_premap`]). `None` for an un-mapped child and for the interpreter twin
+    /// (whose `Mem` aliases the region in software).
+    premap_copyback: Option<(temen_interp::RegionBacking, u64)>,
 }
 static mut OP13_JIT: Option<Op13JitDriver> = None;
 
@@ -12053,39 +12056,46 @@ static mut OP13_CHILD_MODULE: Option<(u64, std::sync::Arc<temen_ir::Module>)> = 
 static NIFLER_PHASE: std::sync::Mutex<Option<(u64, std::sync::Arc<nimc::Phase>)>> =
     std::sync::Mutex::new(None);
 
-/// A minimal op-13 driver that grants one cap (`"fs"`) to a confined child in a **buddy-half** carve
-/// (`voff == 1<<vsl == 32768`, the upper half of the `memory 16` window) and returns the child's join
-/// result. `v0`=Instantiator, `v1`=Module, `v2`=the `fs` handle it writes into the single grant record
-/// (at 17408, name `"fs"` at 18432 — both above the parent NULL guard, below the carve).
-const OP13_MINI_DRIVER: &str = r#"memory 16
+/// A minimal op-13 driver (`memory 16`, entry `(Instantiator, Module, Budget)`): it resolves its
+/// `"fs"` by name, writes one grant record re-granting it as `"fs"` (at 17536, the name at 18432 — both
+/// above the NULL guard), spawns the child module detached through an op-17 v1 record at 17408 (its
+/// declared window, paid from the budget) and returns the child's join result.
+fn op13_mini_driver() -> String {
+    let rec = temen_ir::SpawnRec {
+        grants_ptr: 17536,
+        grants_n: 1,
+        ..temen_ir::SpawnRec::v1(0)
+    };
+    let (seg, stores) = plan::spawn_rec_ir(17408, &rec, Some("v1"), "v2");
+    format!(
+        r#"memory 16
 data 18432 "fs"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  w = i64.const 8589953024
-  o = i64.const 17408
-  i64.store o w
-  hf = i64.extend_i32_u v2
-  ohf = i64.const 17416
-  i64.store ohf hf
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 1
-  ventry = i64.const 0
-  voff = i64.const 32768
-  vsl = i64.const 15
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }
+{seg}func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vfp = i64.const 18432
+  vfl = i64.const 2
+  vfs = self.resolve vfp vfl
+  vg = i64.const 17536
+  vgw = i64.const 8589953024
+  i64.store vg vgw
+  vgh = i64.const 17544
+  i32.store vgh vfs
+{stores}  vr = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vr)
+  vres = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vres
+  }}
+}}
+"#
+    )
 }
-"#;
 
-/// The confined child the mini-driver spawns — a §14 **child-entry** module (`f0: [I64]->[I64]`, the
+/// The detached child the mini-driver spawns — a §14 **child-entry** module (`f0: [I64]->[I64]`, the
 /// `child_entry_ok` shape; its `sp` param is unused here). `f0` (emitted) = `40 + f1()`; `f1` (a
-/// cross-tier `call.cap` leaf) resolves the marshaled `"fs"` and calls it. A correct nested emitted run
-/// returns 41.
-const OP13_MINI_CHILD: &str = r#"memory 12
+/// cross-tier `call.cap` leaf) resolves the re-granted `"fs"` (its name a data segment above the NULL
+/// guard of its own window) and calls it. A correct nested emitted run returns 41.
+const OP13_MINI_CHILD: &str = r#"memory 15
+data 16384 "fs"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v40 = i64.const 40
@@ -12096,13 +12106,10 @@ block 0 (v0: i64) {
 }
 func () -> (i64) {
 block 0 () {
-  vname = i64.const 29542
-  vzero = i64.const 0
-  i64.store vzero vname
-  vp0 = i64.const 0
+  vp = i64.const 16384
   vl2 = i64.const 2
-  vh = self.resolve vp0 vl2
-  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
+  vh = self.resolve vp vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vp)
   return vr
   }
 }
@@ -12113,7 +12120,7 @@ block 0 () {
 static mut OP13_JIT_COUNTER: Option<std::sync::Arc<std::sync::Mutex<i64>>> = None;
 
 /// **Open the JS-orchestrated op-13 loop** over the built-in mini driver + child (#1025 Path 1). Grants
-/// the driver a forkable `"fs"` counter + the child `Module` + an `Instantiator`, allocates the driver
+/// the driver a forkable `"fs"` counter + the child `Module` + a `Budget`, allocates the driver
 /// window in linear memory, and stands up the resumable root vCPU. Returns `0`, or a negative status on a
 /// build error. Drive it with [`temen_op13jit_step`].
 #[no_mangle]
@@ -12125,8 +12132,7 @@ pub extern "C" fn temen_op13jit_open() -> i32 {
 }
 
 /// [`temen_op13jit_open`] over a **caller-provided** encoded child module (the same mini driver +
-/// marshaled `"fs"` counter; the child is spawned into the driver's 32-KiB buddy-half carve, so it
-/// declares `memory 15` or less). The seam the page-op / decline gates use: a child the single-shot
+/// re-granted `"fs"` counter; the child runs detached in its own declared window). The seam the page-op / decline gates use: a child the single-shot
 /// emit declines (#1151) runs on the interpreter inside [`temen_op13jit_step`] instead of trapping it.
 ///
 /// # Safety
@@ -12142,16 +12148,16 @@ pub unsafe extern "C" fn temen_op13jit_open_child(ptr: *const u8, len: usize) ->
 }
 
 fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
-    let Ok(driver) = temen_text::parse_module(OP13_MINI_DRIVER) else {
+    let Ok(driver) = temen_text::parse_module(&op13_mini_driver()) else {
         return -STATUS_DECODE_ERR;
     };
-    op13jit_open_driver(driver, child, false)
+    op13jit_open_driver(driver, child)
 }
 
-/// [`temen_op13jit_open`] over a **caller-provided driver AND child** for the detached spawn (#1286): the
-/// driver's entry is `(Instantiator, Module, WindowMinter) -> i64` — the third handle a 1 GiB-quota
-/// `WindowMinter` instead of the mini driver's `"fs"` (still granted + registered by name). A driver that
-/// issues op 15 stages the child as [`OP13JIT_CHILD_DETACHED`].
+/// [`temen_op13jit_open`] over a **caller-provided driver AND child** (#1286): the driver's entry is
+/// `(Instantiator, Module, Budget[, AddressSpace]) -> i64`, the budget holding the default per-child
+/// memory ceiling; `"fs"` and `"jit"` are granted by name. A driver's detached spawn stages the child
+/// as [`OP13JIT_CHILD_DETACHED`].
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled (or any readable byte range
@@ -12171,41 +12177,17 @@ pub unsafe extern "C" fn temen_op13jit_open_detached(
     ) else {
         return -STATUS_DECODE_ERR;
     };
-    op13jit_open_driver(driver, child, true)
+    op13jit_open_driver(driver, child)
 }
 
-/// The op-13 loop's common open: verify, compile the driver, grant the powerbox (`Instantiator` over the
-/// driver's `memory 16` window, the child `Module`, the forkable `"fs"` counter, and — `minter` — a
-/// `WindowMinter`), allocate the window, stand up the resumable root with `(inst, modh, fs | minter)`.
 /// The op-13 driver's `Jit` table reservation (`2^4` slots): what a child re-granted the driver's `jit`
 /// installs into (its own table, sized from this at spawn).
 const OP13_JIT_TABLE_LOG2: u8 = 4;
 
-/// [`temen_op13jit_open_child`] over a **caller-provided driver too** (both encoded): a nested (op-13,
-/// carve) loop whose driver program is the test's own — e.g. one that re-grants the driver's `"jit"`
-/// into the child by name (#1296). The detached twin is [`temen_op13jit_open_detached`].
-///
-/// # Safety
-/// `[driver_ptr, driver_len)` and `[child_ptr, child_len)` are live byte slices for the call.
-#[no_mangle]
-pub unsafe extern "C" fn temen_op13jit_open_named(
-    driver_ptr: *const u8,
-    driver_len: usize,
-    child_ptr: *const u8,
-    child_len: usize,
-) -> i32 {
-    let driver = std::slice::from_raw_parts(driver_ptr, driver_len);
-    let child = std::slice::from_raw_parts(child_ptr, child_len);
-    let (Ok(driver), Ok(child)) = (
-        temen_encode::decode_module(driver),
-        temen_encode::decode_module(child),
-    ) else {
-        return -STATUS_DECODE_ERR;
-    };
-    op13jit_open_driver(driver, child, false)
-}
-
-fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter: bool) -> i32 {
+/// The op-13 loop's common open: verify, compile the driver, grant the powerbox (`Instantiator` over the
+/// driver's window, the child `Module`, the forkable `"fs"` counter and `"jit"` by name, a `Budget`),
+/// allocate the window, stand up the resumable root with `(inst, modh, budget[, as])`.
+fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32 {
     temen_op13jit_close();
     if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err()
     {
@@ -12253,17 +12235,13 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     let jit_h =
         host.grant_jit_with_table(driver.memory.map(|mc| mc.size_log2), OP13_JIT_TABLE_LOG2);
     host.register_cap_name("jit", jit_h);
-    // #1286: the detached driver's third entry arg is a `WindowMinter` (byte quota = the default
-    // per-child memory ceiling) rather than the `"fs"` handle.
-    let third = if minter {
-        host.grant_budget(0, (DETACHED_DEFAULT_MAX_BYTES) as i64, 0)
-    } else {
-        fs_h
-    };
+    // #1286: the driver's third entry arg is the `Budget` its children's windows are paid from (the
+    // default per-child memory ceiling).
+    let budget = host.grant_budget(0, DETACHED_DEFAULT_MAX_BYTES as i64, 0);
     // #1527: a driver whose entry takes a fourth arg gets an `AddressSpace` over its window — so a
     // detached driver can mint a region (`create_region`), map it for itself and pre-map it into
     // the child (the op-15 11-arg form). The three-arg drivers are unchanged.
-    let mut args = vec![Value::I32(inst), Value::I32(modh), Value::I32(third)];
+    let mut args = vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)];
     if driver.funcs.first().is_some_and(|f| f.params.len() == 4) {
         args.push(Value::I32(host.grant_address_space(0, win)));
     }
@@ -12312,6 +12290,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
             readback: None,
             child_key: 0,
             child_mem_id: -1,
+            child_back: None,
             premap_copyback: None,
         });
     }
@@ -12790,6 +12769,7 @@ unsafe fn op13_phase_open_impl(
             readback: Some(readback),
             child_key,
             child_mem_id: -1,
+            child_back: None,
             premap_copyback: None,
         });
     }
@@ -12884,10 +12864,11 @@ pub unsafe extern "C" fn temen_op13jit_phase_read(key_ptr: *const u8, key_len: u
     len
 }
 
-/// **Step the op-13 driver** to its next event. Returns [`OP13JIT_DONE`] (result ready), [`OP13JIT_CHILD`]
-/// (a child is staged in `JIT_RUN` — JS must `driveJitRun` it then call [`temen_op13jit_deliver`]), or
-/// [`OP13JIT_TRAP`]. The driver's own `join` (reading a child result it already got a handle for) is
-/// serviced inline; only an op-13 `instantiate` yields to JS.
+/// **Step the op-13 driver** to its next event. Returns [`OP13JIT_DONE`] (result ready),
+/// [`OP13JIT_CHILD_DETACHED`] (a child is staged in `JIT_RUN` — JS must `driveDetachedRun` it over
+/// [`temen_op13jit_child_mem_id`]'s memory, then call [`temen_op13jit_deliver`]), or [`OP13JIT_TRAP`]. The
+/// driver's own `join` (reading a child result it already got a handle for) is serviced inline; only a
+/// spawn yields to JS.
 #[no_mangle]
 pub extern "C" fn temen_op13jit_step() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the driver.
@@ -12905,120 +12886,14 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 return OP13JIT_DONE;
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
-            bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
-            } => {
-                // The engine admitted the child through the one admission every driver uses: its
-                // powerbox carries the marshaled caps, the starter `Instantiator`/`AddressSpace` over the
-                // carve, the child module as its own (§3.5 / #1296) and its import manifest bound.
-                let Some(child) = d.root.take_child() else {
-                    return OP13JIT_TRAP;
-                };
-                let child_size = 1u64 << size_log2;
-                // SAFETY: the engine validated the carve within the driver's window; the child window
-                // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
-                let carve_ptr = unsafe { d.mem_base.add(carve as usize) };
-                // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once);
-                // on a miss, emit now — BEFORE the powerbox is committed to a run — so a decline still has
-                // the powerbox to run the child on the interpreter with.
-                // On a key change (a different phase child — nifler_ce → nimsem_ce → hexer_ce across the
-                // whole card, #1025 3e), drop the stale emit BEFORE emitting the new child, so the old
-                // child's hundreds-of-MB `SharedProgram` + wasm doesn't co-reside with the new emit and
-                // blow the engine's linear-memory budget. Within a crawl (same child) the key matches, so
-                // the cache is kept and nifler_ce still emits once.
-                unsafe {
-                    if (*core::ptr::addr_of!(OP13_CHILD_EMIT))
-                        .as_ref()
-                        .is_some_and(|c| c.key != d.child_key)
-                    {
-                        *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = None;
-                    }
-                }
-                let cached = if d.child_key != 0 {
-                    unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
-                        .filter(|c| c.key == d.child_key)
-                        .map(|c| c.emit.clone())
-                } else {
-                    None
-                };
-                let had_cache = cached.is_some();
-                let emit = match cached {
-                    Some(c) => c,
-                    None => match JitOnrampRun::emit_for_run(&d.child, true) {
-                        Ok(e) => e,
-                        Err(_) => {
-                            // #1151: the emit declined (a child that `unmap`s/`protect`s its pages, an
-                            // out-of-subset entry, a suspending reachable set). Run the admitted child on
-                            // the interpreter over the same carve and powerbox instead of trapping the
-                            // driver, exactly as the native `drive_op13` does, and bank the result for the
-                            // driver's `join` like an emitted child's. Fail-closed, byte-identical.
-                            // SAFETY: `prog` outlives the driver (freed in `close`, after the root and this
-                            // child are dropped); the carve region aliases the driver's live window.
-                            let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
-                            let back = std::sync::Arc::new(unsafe {
-                                temen_interp::Region::shared(carve_ptr, child_size)
-                            });
-                            // #1253: the interpreter twin of the emitted phase child — `mapped` starts
-                            // at the child's declared window over the carve-sized backing, exactly as
-                            // the emit's `"mapped"` does, so the decline runs byte-identical.
-                            let decl = d.child.memory.as_ref().map_or(size_log2, |m| m.size_log2);
-                            let r = child
-                                .start(prog, back, Some(decl))
-                                .and_then(|c| nimc::drive_op13(prog, carve_ptr, c, None));
-                            let token = d.children.len() as u64;
-                            d.children.push(Some(r));
-                            d.root.deliver_child(token);
-                            continue; // the driver's `join` on this handle is serviced inline below
-                        }
-                    },
-                };
-                // The child runs EMITTED over the same powerbox it would on the interpreter, and its
-                // entry gets the same starter handles the interpreter passes (`[Instantiator,
-                // AddressSpace]` for the two-param shape, `child_entry_ok`) — #1201: a page-op child's
-                // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`. The
-                // emitted entry is `f{entry}` (0 for the phase drivers here).
-                let (host, cinst, cas) = child.into_powerbox();
-                let run = unsafe {
-                    JitOnrampRun::open_shared_run_over_host(
-                        &d.child,
-                        carve_ptr,
-                        child_size,
-                        size_log2,
-                        true,
-                        host,
-                        Vec::new(),
-                        None,
-                        cinst,
-                        cas,
-                        Some(emit),
-                    )
-                };
-                match run {
-                    Ok(r) => {
-                        // On a cache miss, stash this run's emit for the next `phase_open` (same child).
-                        if !had_cache && d.child_key != 0 {
-                            unsafe {
-                                *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = Some(Op13ChildEmit {
-                                    key: d.child_key,
-                                    emit: r.cached_emit(),
-                                });
-                            }
-                        }
-                        unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
-                        return OP13JIT_CHILD;
-                    }
-                    Err(_) => return OP13JIT_TRAP,
-                }
-            }
-            // #1286 — a DETACHED child (op 15): its window is a fresh `WebAssembly.Memory` the page mints
-            // (`foreign_mint`), reached only through `Region::Foreign`; the emitted `_start` runs bound to
-            // that memory (`driveDetachedRun`). No carve, no alias — the driver cannot address a byte of
-            // it. The engine admitted the child through the one admission every driver uses: its
+            // #1286 — a DETACHED child (op 17 v1 / op 15): its window is its own backing
+            // ([`mint_detached_backing`] — in the browser a fresh `WebAssembly.Memory`, reached only
+            // through `Region::Foreign`), and the emitted `_start` runs bound to it (`driveDetachedRun`).
+            // No carve, no alias — the driver cannot address a byte of it. The engine admitted the child through the one admission every driver uses: its
             // powerbox carries the starter caps over the reservation (a root's shape — growth is bounded
             // by the minted memory's `maximum`), the marshaled caps, the child module as its own
             // (§3.5 / #1296), its attestation and its import manifest bound. The spawn-time args
             // payload is seeded at `module_args_base()`; this servicer holds the decoded child already.
-            #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
             bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
                 let Some(child) = d.root.take_child() else {
                     return OP13JIT_TRAP;
@@ -13055,25 +12930,25 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     None => {
                         // #1151 decline → the interpreter twin over a private sparse backing (the
                         // child never enters the emitted tier, so it needs no JS-owned memory), which
-                        // the engine seeds; run it to completion, bank the result.
+                        // the engine seeds; run it to completion on the native driver's loop, bank the result.
                         let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
                         let back = std::sync::Arc::new(temen_interp::Region::paged(
                             1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                             temen_interp::host_page_size(),
                         ));
-                        let r = child.start(prog, back, None).and_then(drive_detached_leaf);
+                        let r = child
+                            .start(prog, back, None)
+                            .and_then(|c| nimc::drive_op13(prog, c));
                         let token = d.children.len() as u64;
                         d.children.push(Some(r));
                         d.root.deliver_child(token);
                         continue;
                     }
                 };
-                let Some(mem_id) = foreign_mem::mint(
-                    DETACHED_HEADER_BYTES + child_size,
-                    DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
-                ) else {
+                let Some((back, mem_id)) = mint_detached_backing(child_size) else {
                     return OP13JIT_TRAP;
                 };
+                let back = std::sync::Arc::new(back);
                 // The child's entry gets the starter handles the interpreter passes.
                 let (mut host, cinst, cas) = child.into_powerbox();
                 // #1527: an op-15 pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
@@ -13085,9 +12960,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // `temen_op13jit_deliver` copies the span back. The interpreter twin above keeps the
                 // software alias, so the two tiers agree byte-for-byte (INVARIANTS #14).
                 let premap = host.take_premap();
-                match JitOnrampRun::open_foreign_run(
+                match JitOnrampRun::open_detached_run(
                     &d.child,
-                    mem_id,
+                    std::sync::Arc::clone(&back),
                     true,
                     RunInput::PreGranted {
                         host: Box::new(host),
@@ -13102,8 +12977,8 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         if let Some((backing, off)) = premap {
                             let bytes: Vec<u8> =
                                 (0..backing.size()).map(|i| backing.read_byte(i)).collect();
-                            foreign_region(mem_id, child_size).write_from(off, &bytes);
-                            d.premap_copyback = Some((backing, off, child_size));
+                            back.write_from(off, &bytes);
+                            d.premap_copyback = Some((backing, off));
                         }
                         if !had_cache && d.child_key != 0 {
                             unsafe {
@@ -13114,19 +12989,13 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             }
                         }
                         unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
-                        d.child_mem_id = mem_id as i32;
+                        d.child_mem_id = mem_id;
+                        d.child_back = Some(back);
                         return OP13JIT_CHILD_DETACHED;
                     }
                     Err(_) => return OP13JIT_TRAP,
                 }
             }
-            // Without `atomics` the page cannot mint a shareable detached window (`foreign_mint` /
-            // `driveDetachedRun` need a `SharedArrayBuffer`-backed `WebAssembly.Memory`), so a
-            // detached spawn fails closed here. Named rather than `_` (see `VcpuEvent`): the wildcard
-            // gave this same answer invisibly in every non-atomics build, which is how a cfg-gated arm
-            // above could come to exist with nobody having decided what the other build does.
-            #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
-            bytecode::VcpuEvent::InstantiateDetached { .. } => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Join { child } => {
                 let banked = d.children[child as usize]
                     .take()
@@ -13134,10 +13003,12 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 d.root.deliver_join(banked);
                 // continue: the driver's own join is serviced without yielding to JS
             }
-            // The op-13 driver is a 64 KiB root that only spawns phases and joins them: no threads,
-            // no tier-up of its own, no §22 units, no cap or stdin park. Named rather than `_` (see
-            // `VcpuEvent`) so a new event fails to build here instead of trapping the crawl.
-            bytecode::VcpuEvent::TierUp { .. }
+            // The op-13 driver is a 64 KiB root that only spawns detached phases and joins them: no
+            // carve child (#1289), no threads, no tier-up of its own, no §22 units, no cap or stdin
+            // park. Named rather than `_` (see `VcpuEvent`) so a new event fails to build here instead
+            // of trapping the crawl.
+            bytecode::VcpuEvent::Instantiate { .. }
+            | bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
@@ -13167,29 +13038,35 @@ pub(crate) fn declined_child() -> Result<Vec<Value>, Trap> {
     Ok(vec![Value::I64(temen_ir::errno::EINVAL)])
 }
 
-/// Run a declined **detached** child to completion on the interpreter (#1286): a leaf — it may `join`
-/// nothing and spawn nothing (a detached child that itself spawns is out of this fallback's scope and
-/// declines: the parent's `join` sees [`declined_child`]), so only `Done`/`Trapped` are serviced.
-#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-fn drive_detached_leaf(mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap> {
-    match vcpu.run() {
-        bytecode::VcpuEvent::Done(v) => Ok(v),
-        bytecode::VcpuEvent::Trapped(t) => Err(t),
-        // A leaf: anything that would need the host again is out of this fallback's scope and is
-        // the driver's decline — a value at the parent's join (see `declined_child`). Named rather
-        // than `_` (see `VcpuEvent`).
-        bytecode::VcpuEvent::TierUp { .. }
-        | bytecode::VcpuEvent::Spawn { .. }
-        | bytecode::VcpuEvent::Join { .. }
-        | bytecode::VcpuEvent::Wait { .. }
-        | bytecode::VcpuEvent::Notify { .. }
-        | bytecode::VcpuEvent::JitInstall { .. }
-        | bytecode::VcpuEvent::JitUninstall { .. }
-        | bytecode::VcpuEvent::JitInvoke { .. }
-        | bytecode::VcpuEvent::Instantiate { .. }
-        | bytecode::VcpuEvent::InstantiateDetached { .. }
-        | bytecode::VcpuEvent::CapPending { .. }
-        | bytecode::VcpuEvent::StdinPark => declined_child(),
+/// A detached child's window backing on this build (#1286), and the foreign-memory id JS drives it
+/// by: the threads build mints a fresh `WebAssembly.Memory` on the page (`Region::Foreign`, growable to
+/// the detached ceiling); a native build (the tests) backs it in-process (id `-1`), so the op-13 loop's
+/// one detached arm runs there too. The plain wasm build has no Memory to mint (`None`): its detached
+/// spawn fails closed.
+fn mint_detached_backing(child_size: u64) -> Option<(temen_interp::Region, i32)> {
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    {
+        let id = foreign_mem::mint(
+            DETACHED_HEADER_BYTES + child_size,
+            DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
+        )?;
+        Some((foreign_region(id, 0), id as i32))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = child_size;
+        Some((
+            temen_interp::Region::paged(
+                1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_interp::host_page_size(),
+            ),
+            -1,
+        ))
+    }
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    {
+        let _ = child_size;
+        None
     }
 }
 
@@ -13206,7 +13083,7 @@ pub extern "C" fn temen_op13jit_child_mem_id() -> i32 {
 
 /// **Deliver the emitted child's result** to the driver after JS drove `JIT_RUN` (#1025 Path 1). Reads the
 /// child's returned value from the finished run, banks it under the child handle, delivers that handle to
-/// the driver's `instantiate`, and closes `JIT_RUN`. Call after a [`OP13JIT_CHILD`] step + `driveJitRun`;
+/// the driver's spawn, and closes `JIT_RUN`. Call after a [`OP13JIT_CHILD_DETACHED`] step + `driveDetachedRun`;
 /// then resume with [`temen_op13jit_step`] (which services the driver's `join` on this handle).
 #[no_mangle]
 pub extern "C" fn temen_op13jit_deliver() -> i32 {
@@ -13217,10 +13094,10 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
         return OP13JIT_TRAP;
     };
     // #1527: copy the pre-mapped span back into the region before the parent can read it.
-    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-    if let Some((backing, off, child_size)) = d.premap_copyback.take() {
+    let back = d.child_back.take();
+    if let (Some((backing, off)), Some(back)) = (d.premap_copyback.take(), back) {
         let mut bytes = vec![0u8; backing.size() as usize];
-        foreign_region(d.child_mem_id as u32, child_size).read_into(off, &mut bytes);
+        back.read_into(off, &mut bytes);
         for (i, b) in bytes.iter().enumerate() {
             backing.write_byte(i as u64, *b);
         }
@@ -14655,8 +14532,8 @@ pub extern "C" fn temen_run_reflect(mod_ptr: *const u8, mod_len: usize, arg: i64
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **nested-child** powerbox
-/// (an `Instantiator` over `[0, 128 KiB)`; see [`instantiate_exec`]): function 0 may `instantiate`
-/// confined child guests over sub-windows and `join` them. Returns the guest's `i64` result; sets
+/// (an `Instantiator` and a `"budget"`; see [`instantiate_exec`]): function 0 may spawn detached child
+/// guests and `join` them. Returns the guest's `i64` result; sets
 /// [`LAST_STATUS`].
 #[no_mangle]
 pub extern "C" fn temen_run_nested(mod_ptr: *const u8, mod_len: usize) -> i64 {
@@ -14768,50 +14645,6 @@ block 3 () {
     }
     // Word 0 of the captured image should be 1000 + 7 = 1007.
     i64::from_le_bytes(out.snapshot[..8].try_into().unwrap())
-}
-
-/// Self-contained nested-child probe (so usable via `wasmtime --invoke run_instantiate`): a parent
-/// `instantiate`s a confined child in a 4 KiB sub-window at 64 KiB, the child writes a marker into
-/// the shared backing and returns 42, the parent joins and reads the marker back — returning
-/// `42 * 1000 + 123 = 42123` iff confined child execution + the shared data plane work on this
-/// target. Returns `-1` on any mismatch.
-#[no_mangle]
-pub extern "C" fn run_instantiate() -> i64 {
-    const SHARED: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 12
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  v7 = i64.const 65543
-  v8 = i32.load8_u v7
-  v9 = i64.extend_i32_u v8
-  v10 = i64.const 1000
-  v11 = i64.mul v6 v10
-  v12 = i64.add v11 v9
-  return v12
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 7
-  v2 = i32.const 123
-  i32.store8 v1 v2
-  v3 = i64.const 42
-  return v3
-  }
-}
-"#;
-    let Ok(m) = temen_text::parse_module(SHARED) else {
-        return -1;
-    };
-    match instantiate_exec(&m) {
-        (STATUS_OK, v) => v,
-        _ => -1,
-    }
 }
 
 /// Self-contained SIMD probe (`wasmtime --invoke run_simd`): splat 21 into an `i64x2`, add lanewise,
@@ -16630,10 +16463,10 @@ block 0 () {
             assert!(guard < 8, "loop did not terminate");
             match temen_op13jit_step() {
                 OP13JIT_DONE => break,
-                OP13JIT_CHILD => {
-                    // Stand in for `driveJitRun`: run the staged child's `f0` on the interpreter oracle over
-                    // its marshaled host + carve (the child-entry takes an `sp` param it ignores), and record
-                    // the value where `_deliver` reads it.
+                OP13JIT_CHILD_DETACHED => {
+                    // Stand in for `driveDetachedRun`: run the staged child's `f0` on the interpreter oracle
+                    // over its marshaled host + own window (the child-entry takes an `sp` param it ignores),
+                    // and record the value where `_deliver` reads it.
                     // SAFETY: single-threaded test; the staged run lives in `JIT_RUN`.
                     let v = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).as_mut() }
                         .expect("child staged")
@@ -16658,7 +16491,7 @@ block 0 () {
         assert_eq!(
             temen_op13jit_counter(),
             1,
-            "the marshaled fs ran exactly once inside the confined child"
+            "the marshaled fs ran exactly once inside the detached child"
         );
         temen_op13jit_close();
         assert_eq!(temen_op13jit_counter(), 0, "close cleared the loop state");
@@ -16902,7 +16735,8 @@ pub extern "C" fn temen_detached_jit_run_open(
         stdin,
         argv: argv_from_payload(args_ptr, args_len),
     };
-    match JitOnrampRun::open_foreign_run(&m, mem_id, true, input, None) {
+    let back = std::sync::Arc::new(foreign_region(mem_id, 0));
+    match JitOnrampRun::open_detached_run(&m, back, true, input, None) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by the export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };

@@ -2,8 +2,8 @@
 //! detached §14 child in its own window, and the capabilities each is granted **by name** — plus the
 //! one generator that turns that plan into the root's Temen IR.
 //!
-//! The root is ordinary guest code. Every spawn and grant it makes goes through op 15 and a grant
-//! record, so it is verified and confined like any other guest, and the generator that writes it is
+//! The root is ordinary guest code. Every spawn and grant it makes goes through an op-17 spawn record
+//! and a grant record, so it is verified and confined like any other guest, and the generator that writes it is
 //! not trusted: a wrong plan produces a root the verifier or the spawn refuses, never authority the
 //! host did not grant. What the root may hand out is exactly what [`Plan::root_args`] granted it.
 //!
@@ -25,8 +25,10 @@ const REC_BASE: u64 = GUARD + 1024;
 /// One 16-byte name slot per root capability, shared by every record that grants it, then two per
 /// pipe (the names its ends are granted under).
 const NAME_BASE: u64 = GUARD + 2048;
+/// One op-17 spawn record per node ([`temen_ir::SPAWN_REC_LEN`] bytes each).
+const SPAWN_BASE: u64 = GUARD + 4096;
 /// The nodes' argv payloads, back to back.
-const ARGV_BASE: u64 = GUARD + 4096;
+const ARGV_BASE: u64 = GUARD + 8192;
 const SLOT: u64 = 16;
 
 /// A run: the root's own capabilities, and the nodes it spawns and joins.
@@ -59,8 +61,8 @@ pub struct Pipe {
     pub to_name: String,
 }
 
-/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 15) in a
-/// fresh window minted from the root's budget.
+/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 17 v1) in
+/// a fresh window paid from the root's budget.
 pub struct Node {
     /// The node's window, `1 << window_log2` bytes.
     pub window_log2: u8,
@@ -106,8 +108,11 @@ impl Plan {
             .iter()
             .chain(self.pipes.iter().flat_map(|p| [&p.from_name, &p.to_name]))
             .collect();
-        if NAME_BASE + names.len() as u64 * SLOT > ARGV_BASE {
+        if NAME_BASE + names.len() as u64 * SLOT > SPAWN_BASE {
             return Err(format!("{} capability names do not fit", names.len()));
+        }
+        if SPAWN_BASE + n as u64 * temen_ir::SPAWN_REC_LEN as u64 > ARGV_BASE {
+            return Err(format!("{n} nodes' spawn records do not fit"));
         }
         if PIPE_BASE + self.pipes.len() as u64 * 8 > REC_BASE {
             return Err(format!("{} pipes do not fit", self.pipes.len()));
@@ -214,7 +219,7 @@ impl Plan {
         if REC_BASE + r * SLOT > NAME_BASE {
             return Err(format!("{r} grant records do not fit"));
         }
-        // Spawn every node (op 15: its own window, minted from the budget), then join every node.
+        // Spawn every node (op 17 v1: its own window, paid from the budget), then join every node.
         let sfx = |k: usize| {
             if k == 0 {
                 String::new()
@@ -225,19 +230,23 @@ impl Plan {
         let mut body = String::new();
         for (k, node) in self.nodes.iter().enumerate() {
             let s = sfx(k);
-            body.push_str(&format!("  vmh{s} = i64.extend_i32_u v{}\n", 1 + k));
-            if k == 0 {
-                body.push_str(&format!("  vmin = i64.extend_i32_u v{}\n", 1 + n));
-            }
-            let (ap, al) = argv_at[k];
+            let at = SPAWN_BASE + k as u64 * temen_ir::SPAWN_REC_LEN as u64;
+            let rec = temen_ir::SpawnRec {
+                size_log2: node.window_log2 as i64,
+                grants_ptr: first_rec[k],
+                grants_n: rec_n[k] as u64,
+                args: (argv_at[k].0, argv_at[k].1 as u64),
+                ..temen_ir::SpawnRec::v1(0)
+            };
+            let (seg, stores) = spawn_rec_ir(
+                at,
+                &rec,
+                Some(&format!("v{}", 1 + k)),
+                &format!("v{}", 1 + n),
+            );
+            data.push_str(&seg);
             body.push_str(&format!(
-                "  vgptr{s} = i64.const {gptr}\n  vgn{s} = i64.const {gn}\n  ventry{s} = i64.const 0\n  \
-                 vlog{s} = i64.const {log}\n  vq{s} = i64.const 0\n  vap{s} = i64.const {ap}\n  \
-                 val{s} = i64.const {al}\n  vh{s} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) \
-                 -> (i32) v0 (vmin, vmh{s}, vgptr{s}, vgn{s}, ventry{s}, vlog{s}, vq{s}, vap{s}, val{s})\n",
-                gptr = first_rec[k],
-                gn = rec_n[k],
-                log = node.window_log2,
+                "{stores}  vrp{s} = i64.const {at}\n  vh{s} = call.cap 6 17 (i64) -> (i32) v0 (vrp{s})\n"
             ));
         }
         // Every node holds its own ends now; drop the root's, so a reader sees EOF when its writer exits.
@@ -288,6 +297,31 @@ impl Plan {
     }
 }
 
+/// An op-17 spawn record `rec` at window offset `at` of a guest being generated: the data segment that
+/// holds its bytes, and the stores that fill its `module` field (unless `modh` is `None`: the record's
+/// own, e.g. `-1` for the spawner's module) and its `budget` field from `i32` values (handles are only
+/// known at run time).
+pub fn spawn_rec_ir(
+    at: u64,
+    rec: &temen_ir::SpawnRec,
+    modh: Option<&str>,
+    budget: &str,
+) -> (String, String) {
+    let esc: String = rec.encode().iter().map(|b| format!("\\x{b:02x}")).collect();
+    let mut stores = String::new();
+    if let Some(modh) = modh {
+        stores.push_str(&format!(
+            "  rm{at} = i64.const {m}\n  i32.store rm{at} {modh}\n",
+            m = at + 24
+        ));
+    }
+    stores.push_str(&format!(
+        "  rb{at} = i64.const {b}\n  i32.store rb{at} {budget}\n",
+        b = at + 28
+    ));
+    (format!("data {at} \"{esc}\"\n"), stores)
+}
+
 /// Run `plan` to completion on the resumable interpreter (the native / single-threaded driver,
 /// [`crate::nimc::drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which
 /// already holds `caps`), and return what the root returns — the last node's result.
@@ -323,7 +357,7 @@ pub fn run(
         &[],
         host,
     )
-    .and_then(|root| crate::nimc::drive_op13(&prog, base, root, None));
+    .and_then(|root| crate::nimc::drive_op13(&prog, root));
     drop(back);
     // SAFETY: same layout; the root vCPU and its region views are dropped above.
     unsafe { std::alloc::dealloc(base, layout) };

@@ -11,10 +11,7 @@ fn root() -> &'static Path {
 /// Quoted `temen_*` strings in the JS that name something other than an export — each with the reason.
 /// Exact, not a prefix list: an entry that stops being quoted anywhere, or starts being exported,
 /// fails `the_allowlist_is_exactly_what_it_says`, so this cannot silently widen.
-const QUOTED_NON_EXPORTS: &[(&str, &str)] = &[(
-    "temen_fs",
-    "the memfs data-image kind (`temen-fs`), not a symbol",
-)];
+const QUOTED_NON_EXPORTS: &[(&str, &str)] = &[];
 
 #[test]
 fn every_temen_name_the_js_touches_is_an_export() {

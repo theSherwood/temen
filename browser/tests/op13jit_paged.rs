@@ -2,7 +2,7 @@
 //! Path 1). The loop runs each separate-module child on the single-shot JIT tier (`JitOnrampRun`).
 //! #1199 made a child the emit *declines* run on the interpreter inside the step instead of trapping
 //! the driver; #1201 makes a page-op child not decline at all: it emits **paged**, is staged in
-//! `JIT_RUN` for the JS driver (`OP13JIT_CHILD`), and its `env.call_interp` bounces rebuild the
+//! `JIT_RUN` for the JS driver (`OP13JIT_CHILD_DETACHED`), and its `env.call_interp` bounces rebuild the
 //! page-state table the emitted accesses consult. The emitted execution itself is pinned on wasmi by
 //! `jit_paged_onramp.rs` (the same run type over a wasmi memory); here the loop's own seam is pinned:
 //! the child is staged emitted and paged, with its **real** starter `AddressSpace` handle as the second
@@ -11,7 +11,7 @@
 //!
 //! The child: `f0(sp, as)` = `40 + f1(as) + K`; `f1` resolves the marshaled `"fs"` (the counter → 1),
 //! then `protect`s the page holding "K" = 75 read-only. The built-in emittable child still yields
-//! `OP13JIT_CHILD`; a child the emit genuinely declines (a `SharedRegion` op anywhere in the module
+//! `OP13JIT_CHILD_DETACHED`; a child the emit genuinely declines (a `SharedRegion` op anywhere in the module
 //! gates the paged emit off) runs on the interpreter inline — the #1199 fallback, still there.
 
 use std::sync::Mutex;
@@ -21,14 +21,14 @@ use temen_browser::{
     temen_onramp_jit_run_pagestate_len, temen_onramp_jit_run_pagestate_ptr,
     temen_onramp_jit_run_slot, temen_onramp_jit_run_slot_count, temen_op13jit_close,
     temen_op13jit_counter, temen_op13jit_open, temen_op13jit_open_child, temen_op13jit_result,
-    temen_op13jit_step, OP13JIT_CHILD, OP13JIT_DONE,
+    temen_op13jit_step, OP13JIT_CHILD_DETACHED, OP13JIT_DONE,
 };
 use temen_interp::host_page_size;
 
 // The op-13 loop state is process-global (`OP13_JIT`, `JIT_RUN`): serialize the tests.
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// The page-op child (`memory 15` — the mini driver's 32-KiB buddy-half carve). "K" sits at 16 KiB —
+/// The page-op child (`memory 15`, its own 32-KiB window). "K" sits at 16 KiB —
 /// just above the NULL guard the single-shot bounce seeds, page-aligned on a 4 KiB or 16 KiB host —
 /// on the page `f1` protects (after storing the `fs` name on it). `region_op` appends an
 /// **unreachable** function with a §13 `SharedRegion` `map` (iface 4 op 0): the paged emit gates on
@@ -94,13 +94,13 @@ fn page_op_child_is_staged_emitted_and_paged_with_its_real_handles() {
     open(&child(false));
     assert_eq!(
         temen_op13jit_step(),
-        OP13JIT_CHILD,
+        OP13JIT_CHILD_DETACHED,
         "the page-op child emits (paged) and is staged for the JS driver"
     );
     // The staged run is paged: a table over the child's declared window, `"mapped"` = its coverage.
     let page = host_page_size();
     let len = temen_onramp_jit_run_pagestate_len();
-    assert_eq!(len as u64 * page, 1 << 15, "table over the 32-KiB carve");
+    assert_eq!(len as u64 * page, 1 << 15, "table over the 32-KiB window");
     assert_eq!(temen_onramp_jit_run_mapped(), len as u64 * page);
     // The entry slots: `[Instantiator, AddressSpace]` — the real handles the interpreter passes.
     assert_eq!(temen_onramp_jit_run_slot_count(), 2);
@@ -116,7 +116,7 @@ fn page_op_child_is_staged_emitted_and_paged_with_its_real_handles() {
     assert_eq!(
         temen_onramp_jit_run_call_interp(1, scratch.as_mut_ptr()),
         0,
-        "the leaf runs over the marshaled host + carve"
+        "the leaf runs over the marshaled host + window"
     );
     let ret = i64::from_le_bytes(scratch[..8].try_into().unwrap());
     assert_eq!(ret, 1, "fs() = 1, protect = 0");
@@ -146,7 +146,7 @@ fn page_op_child_is_staged_emitted_and_paged_with_its_real_handles() {
 fn declined_child_runs_on_the_interpreter_inline() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     open(&child(true));
-    // No `OP13JIT_CHILD` yield: the declined child ran on the interpreter inside the step, and the
+    // No `OP13JIT_CHILD_DETACHED` yield: the declined child ran on the interpreter inside the step, and the
     // driver's join was serviced inline — the loop completes in one step (the #1199 fallback).
     assert_eq!(
         temen_op13jit_step(),
@@ -172,7 +172,7 @@ fn emittable_child_still_yields_to_the_emitted_tier() {
     assert_eq!(temen_op13jit_open(), 0);
     assert_eq!(
         temen_op13jit_step(),
-        OP13JIT_CHILD,
+        OP13JIT_CHILD_DETACHED,
         "the built-in child emits and is staged for the JS driver"
     );
     assert_eq!(

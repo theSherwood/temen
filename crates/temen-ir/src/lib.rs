@@ -652,6 +652,50 @@ impl SpawnRec {
             child_off: if detached { u64_at(80) } else { 0 },
         })
     }
+
+    /// A v1 (detached) record for `entry` with every other field at its "none" value: the module's
+    /// declared window (`size_log2` 0), no pager, the spawner's own module, no budget, no fuel cap,
+    /// no grants, no args, no region. Producers set the fields they use.
+    pub fn v1(entry: u32) -> SpawnRec {
+        SpawnRec {
+            detached: true,
+            entry,
+            off: 0,
+            size_log2: 0,
+            pager: u32::MAX,
+            modh: -1,
+            budget: 0,
+            quota: 0,
+            grants_ptr: 0,
+            grants_n: 0,
+            args: (0, 0),
+            region: -1,
+            child_off: 0,
+        }
+    }
+
+    /// The record's bytes, the inverse of [`Self::parse`]: 56 for v0, [`SPAWN_REC_LEN`] for v1.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(SPAWN_REC_LEN);
+        b.extend_from_slice(&(self.detached as u32).to_le_bytes());
+        b.extend_from_slice(&self.entry.to_le_bytes());
+        b.extend_from_slice(&self.off.to_le_bytes());
+        b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
+        b.extend_from_slice(&self.pager.to_le_bytes());
+        b.extend_from_slice(&self.modh.to_le_bytes());
+        b.extend_from_slice(&self.budget.to_le_bytes());
+        b.extend_from_slice(&self.quota.to_le_bytes());
+        b.extend_from_slice(&self.grants_ptr.to_le_bytes());
+        b.extend_from_slice(&self.grants_n.to_le_bytes());
+        if self.detached {
+            b.extend_from_slice(&self.args.0.to_le_bytes());
+            b.extend_from_slice(&self.args.1.to_le_bytes());
+            b.extend_from_slice(&self.region.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&self.child_off.to_le_bytes());
+        }
+        b
+    }
 }
 
 /// SSA value types. `i8`/`i16` are memory access *widths*, not value types (§3a).
@@ -7199,5 +7243,33 @@ mod effects_tests {
                 "pure ⇒ removable for {inst:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_rec_tests {
+    use super::*;
+
+    #[test]
+    fn encode_is_the_inverse_of_parse() {
+        let mut v1 = SpawnRec::v1(3);
+        v1.modh = 5;
+        v1.budget = 9;
+        v1.quota = 1 << 40;
+        v1.grants_ptr = 17536;
+        v1.grants_n = 2;
+        v1.args = (18432, 24);
+        v1.region = 7;
+        v1.child_off = 65536;
+        let b = v1.encode();
+        assert_eq!(b.len(), SPAWN_REC_LEN);
+        assert_eq!(SpawnRec::parse(&b), Some(v1));
+        let v0 = SpawnRec {
+            detached: false,
+            off: 65536,
+            size_log2: 12,
+            ..SpawnRec::v1(1)
+        };
+        assert_eq!(SpawnRec::parse(&v0.encode()), Some(v0));
     }
 }

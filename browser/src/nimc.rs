@@ -381,30 +381,25 @@ fn run_phase(
     (host.stdout, code)
 }
 
-// ---- run a phase as a confined §14 op-13 child on the resumable (tier-up-capable) engine (#1025) ---
-// A phase run this way executes as a **separate-module confined child** over a sub-window carve instead
-// of inline in the driver's own powerbox: the same resumable bytecode engine `run_phase` uses, but on
+// ---- run a phase as a detached §14 child on the resumable (tier-up-capable) engine (#1025) ---------
+// A phase run this way executes as a **separate-module detached child** in its own window instead of
+// inline in the driver's own powerbox: the same resumable bytecode engine `run_phase` uses, but on
 // the tier-up-capable path (the admitted child, `PendingChild::start`) a JIT'd phase rides — matching
 // the native op-13 conductor (`temen-run/examples/nim_chain_op13.rs`). `child` is a **child-entry**
 // phase module (func 0 = `[I64]->[I64]`, built `--child-entry`); `{fs, stdout, exit}` are re-granted
-// into it (`vm_map` auto-binds to the child's AddressSpace), argv is seeded into its carve, and its
-// joined status returns.
+// into it (`vm_map` auto-binds to the child's AddressSpace), argv rides the spawn-time args payload, and
+// its joined status returns.
 
 /// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`). The engine admits
-/// every spawn, its powerbox built; this loop only starts the child. On a **detached** spawn (op 15,
-/// #1288 — how the phases are spawned) it mints the fresh window's backing, a root-sized
-/// lazily-reserved `Region::new` (an `mmap` natively; the sparse `Paged` fallback on wasm32), which the
-/// engine seeds (committed window = the declared size, starter caps over the reservation, so `vm_map`
-/// grows it). On a nested `Instantiate` (op 13 — a grandchild carve) it starts the child over the
-/// sub-window at `base + carve`, committing the declared window the same way. `Join` delivers the
-/// child's result. Single-threaded here, so the window base travels as a raw ptr. `child` is the module
-/// the *root* driver spawns (its declared size starts a nested carve); `None` for a grandchild. A
-/// detached spawn needs no module in hand, so it works at any depth.
+/// every spawn, its powerbox built; this loop only starts the child. On a **detached** spawn (#1288 —
+/// how the phases are spawned) it mints the fresh window's backing, a root-sized lazily-reserved
+/// `Region::new` (an `mmap` natively; the sparse `Paged` fallback on wasm32), which the engine seeds
+/// (committed window = the declared size, starter caps over the reservation, so `vm_map` grows it),
+/// and drives the child to completion — at any depth. `Join` delivers the child's result. A carve
+/// child (retired, #1289) is the driver's decline.
 pub(crate) fn drive_op13<'p>(
     prog: &'p bytecode::VcpuProgram,
-    base: *mut u8,
     mut vcpu: bytecode::Vcpu<'p>,
-    child: Option<&Module>,
 ) -> Result<Vec<Value>, Trap> {
     let mut children: Vec<Option<Result<Vec<Value>, Trap>>> = Vec::new();
     loop {
@@ -417,40 +412,11 @@ pub(crate) fn drive_op13<'p>(
                     1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                     temen_interp::host_page_size(),
                 ));
-                // A detached phase spawns no nested grandchildren through this loop (nimsem's nifler
-                // runs via the `exec` cap as its own detached root), so it needs no window base.
                 let r = vcpu
                     .take_child()
                     .ok_or(Trap::Malformed)
                     .and_then(|c| c.start(prog, back, None))
-                    .and_then(|c| drive_op13(prog, core::ptr::null_mut(), c, None));
-                let token = children.len() as u64;
-                children.push(Some(r));
-                vcpu.deliver_child(token);
-            }
-            bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
-            } => {
-                if base.is_null() {
-                    // A nested carve needs an addressable parent window — the driver's decline
-                    // (see `crate::declined_child`), not a trap for the parent.
-                    return crate::declined_child();
-                }
-                let declared = child
-                    .and_then(|m| m.memory.as_ref().map(|mc| mc.size_log2))
-                    .unwrap_or(size_log2);
-                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
-                // child); the child region aliases that sub-window — the §14 shared data plane.
-                let child_base = unsafe { base.add(carve as usize) };
-                let back =
-                    std::sync::Arc::new(unsafe { Region::shared(child_base, 1u64 << size_log2) });
-                // An `Instantiate` always carries its admitted child; `Malformed` rather than a panic
-                // if it somehow did not.
-                let r = vcpu
-                    .take_child()
-                    .ok_or(Trap::Malformed)
-                    .and_then(|c| c.start(prog, back, Some(declared)))
-                    .and_then(|c| drive_op13(prog, child_base, c, None));
+                    .and_then(|c| drive_op13(prog, c));
                 let token = children.len() as u64;
                 children.push(Some(r));
                 vcpu.deliver_child(token);
@@ -490,6 +456,7 @@ pub(crate) fn drive_op13<'p>(
             // join, never a parent-killing trap (see `crate::declined_child`). Named rather than `_`
             // (see `VcpuEvent`).
             bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Instantiate { .. }
             | bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
