@@ -62,8 +62,10 @@ type LimitedEntry =
 /// written back into its carve at finish. `None` for a detached child (its window is its own).
 pub(crate) type CopyBack = Box<dyn FnOnce(&[u8]) + Send>;
 
-/// A task's one-shot teardown: release the child powerbox, return its lane.
-pub(crate) type Teardown = Box<dyn FnOnce() + Send>;
+/// A task's one-shot teardown: release the child powerbox, return its lane and its window's bytes.
+/// Its argument says whether a freeze captured the child (#1971): a child that unwound for a freeze
+/// is carried by the artifact, not ended, so its window stays charged, as on the interpreter.
+pub(crate) type Teardown = Box<dyn FnOnce(bool) + Send>;
 
 /// A raw pointer that crosses to a worker under the executor's ownership discipline (documented at
 /// each construction site).
@@ -725,7 +727,7 @@ impl ChildExec {
             // `settle` published the outcome and dropped the live count; free what remains.
             task.window.restore_rw();
             if let Some(t) = task.teardown.take() {
-                t();
+                t(false); // a durable child hosts no vCPUs, so a retiring one was never captured
             }
             return;
         }
@@ -735,6 +737,7 @@ impl ChildExec {
         // #1361 step 4 — a durable child that unwound for a freeze leaves its window image for the
         // harvest (the parent's artifact carries it). Retire the base under the cell's lock first, so
         // no doorbell store can land on a window about to be freed.
+        let mut captured = false;
         if let Some(d) = task.done.durable.as_ref() {
             *d.base.lock().unwrap_or_else(|e| e.into_inner()) = 0;
             // It unwound iff it spilled past its frame base under the freeze, the rule a thread
@@ -763,13 +766,14 @@ impl ChildExec {
                     task.window.rw_mut().to_vec()
                 };
                 *d.image.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+                captured = true;
             }
         }
         if let Some(c) = task.copy_back.take() {
             c(task.window.rw_mut());
         }
         if let Some(t) = task.teardown.take() {
-            t();
+            t(captured);
         }
         {
             let mut st = task.done.state.lock().unwrap_or_else(|e| e.into_inner());

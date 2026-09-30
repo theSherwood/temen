@@ -3081,6 +3081,13 @@ fn relaunch_detached(
     } = grants
         .lock_unpoisoned()
         .prepare_detached_relaunch(&launch, host)?;
+    // #1971 — the lease op 15 filed at the spawn, filed again: the child's window goes back to the
+    // budget that paid for it when the child ends, on the spawner's handle, as an unfrozen child's does.
+    let lease = spawner
+        .host
+        .lock_unpoisoned()
+        .relaunch_lease(&host, memory_log2)
+        .map(|(budget, bytes)| (Arc::clone(&spawner.host), budget, bytes));
     // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
     // `begin_thaw`, on the child's own window.
@@ -3130,6 +3137,7 @@ fn relaunch_detached(
     child.durable = true;
     child.kill = Some(Arc::clone(&kflag));
     child.freeze_bell = Some(Arc::clone(&bell));
+    child.window_lease = lease;
     child.lane_chain = std::iter::once((dom, launch.lane))
         .chain(spawner.lane_chain.iter().copied())
         .collect();
@@ -15290,15 +15298,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         ch.register_cap_name(name, cg);
                                     }
                                 }
+                                // #1975 — every exit from here that spawns nothing hands back what
+                                // the admission took, so the spawn charges nothing.
+                                let undo = || {
+                                    host.lock_unpoisoned().undo_detached_spawn(
+                                        budget,
+                                        child_size,
+                                        child_lane_val,
+                                    )
+                                };
                                 // The pre-mapped region: staged into the child powerbox (a re-grant,
                                 // as the list above) and aliased onto its window through the child's
                                 // own `map` path, before it starts. Admitted above, so a miss here is
                                 // an engine fault, never a guest-reachable refusal.
                                 if let Some((r, o)) = premap {
                                     let staged = host.lock_unpoisoned().stage_premap(r, o, &mut ch);
-                                    (staged && ch.apply_premap(&mut fm) >= 0)
-                                        .then_some(())
-                                        .ok_or(Trap::Malformed)?;
+                                    if !(staged && ch.apply_premap(&mut fm) >= 0) {
+                                        undo();
+                                        return Err(Trap::Malformed);
+                                    }
                                 }
                                 // A child of the running module itself binds leniently (#1234
                                 // — its manifest is the parent's whole import surface).
@@ -15309,6 +15327,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     ch.bind_child_manifest(&cm.imports, &cm.types)
                                 };
                                 if bound.is_err() {
+                                    undo();
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
                                     ch.set_self_module_opt(Some(Arc::clone(&cm.module)));
@@ -15452,7 +15471,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 .vals
                                                 .push(Reg::from_i32((threads.len() - 1) as i32));
                                         }
-                                        None => return Err(Trap::ThreadFault),
+                                        None => {
+                                            undo();
+                                            return Err(Trap::ThreadFault);
+                                        }
                                     }
                                 }
                             }
@@ -25649,6 +25671,29 @@ impl Host {
             return None;
         }
         Some(lane)
+    }
+
+    /// #1975 — the undo of [`Host::admit_detached_spawn`], for a spawn that goes no further after its
+    /// admission: the window's bytes go back to the budget and the lane to this domain's Σ, so a spawn
+    /// refused after its admission charges nothing, as one refused before it does.
+    pub fn undo_detached_spawn(&mut self, budget: i32, child_size: u64, lane: i64) {
+        self.budget_mem_give(budget, child_size);
+        self.give_lane(lane);
+    }
+
+    /// #1971 — the lease a thaw's relaunch of `child`, a detached child this domain spawned, files for
+    /// its window: this domain's handle on the budget that paid for it (the node `child` holds as its
+    /// `"budget"`), and the window's size, `1 << window_log2`. The same lease op 15 filed at the spawn,
+    /// so the thawed child's end hands its window back as an unfrozen child's does. `None` when `child`
+    /// holds no budget or this domain no handle on it.
+    pub fn relaunch_lease(&self, child: &Host, window_log2: u8) -> Option<(i32, u64)> {
+        let node = child.budget_node(child.resolve_cap_name("budget")?)?;
+        let slot = self
+            .table
+            .iter()
+            .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))?;
+        let handle = slot as u32 | ((self.table[slot].generation & GEN_MASK) << CAP_LOG2);
+        Some((handle as i32, 1u64 << window_log2))
     }
 
     /// The node a live `Budget` handle names.

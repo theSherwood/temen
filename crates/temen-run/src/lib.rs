@@ -1951,6 +1951,8 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             // As the interpreter's re-launch: a lane the thawing parent's cap no longer fits is not
             // re-drawn; the child keeps its own cap either way.
         }
+        // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
+        let window_lease = host.relaunch_lease(&r.host, r.memory_log2);
         let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
         let mut trap = 0i64;
         // SAFETY: `gc`/`trap` are live out-cells for the call.
@@ -1975,6 +1977,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             prots: window.dense_prots().into_iter().map(window_prot).collect(),
             // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
             child: unsafe { gc.assume_init() },
+            window: window_lease,
         });
     }
     Ok(out)

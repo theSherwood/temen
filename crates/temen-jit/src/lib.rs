@@ -1915,6 +1915,10 @@ pub struct DetachedSeed {
     pub prots: Vec<WindowProt>,
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
+    /// #1971 — the lease its window was charged under, as the spawn filed it: the parent's handle on
+    /// the budget that paid, and the bytes it paid. Handed back when the thawed child ends. `None`
+    /// when the parent holds no handle on that budget.
+    pub window: Option<(i32, u64)>,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
