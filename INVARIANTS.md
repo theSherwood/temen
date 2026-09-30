@@ -74,8 +74,9 @@ raise them; no hook ⇒ verbatim. *Refund on child end (2026-09-29, #1864, owner
 `Budget.mem` accounts **live** windows, not lifetime mints — when a detached child ends (joined or
 reaped), its window's bytes return to every level charged for it, so a parent can spawn, join and
 spawn again within one window's worth. A child frozen with its parent stays charged (the artifact
-carries the charge). The bytecode drivers still return a child's *lane* at admission — a tracked gap
-(#1600), not a second rule.
+carries the charge), and its relaunch after the thaw hands the window back when it ends (#1971). A
+spawn refused after its admission charges nothing (#1975). The bytecode drivers still return a child's
+*lane* at admission — a tracked gap (#1600), not a second rule.
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

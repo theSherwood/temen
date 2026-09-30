@@ -894,6 +894,34 @@ impl ModuleSource {
 }
 
 #[cfg(test)]
+mod frame_bound_tests {
+    use super::*;
+
+    fn vm() -> Vm {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        let c = compile_module(&m.funcs, &m.types, None).expect("compile");
+        Vm::new(&c, 0, &[]).expect("vm")
+    }
+
+    /// #1958 — a call that would nest past [`MAX_FRAMES`], or grow the register file past
+    /// [`MAX_REG_SLOTS`], traps `StackOverflow` before it allocates anything.
+    #[test]
+    fn a_call_past_either_bound_traps_before_it_allocates() {
+        let mut v = vm();
+        let regs = v.regs.len();
+        assert_eq!(v.open_frame(MAX_REG_SLOTS + 1), Err(Trap::StackOverflow));
+        assert_eq!(v.regs.len(), regs, "nothing allocated");
+        assert_eq!(v.open_frame(regs + 1), Ok(()), "under both bounds");
+        v.stack.resize(MAX_FRAMES - 1, (0, 0, 0, 0, 0));
+        assert_eq!(v.open_frame(regs + 1), Ok(()), "the last frame opens");
+        v.stack.push((0, 0, 0, 0, 0));
+        assert_eq!(v.open_frame(regs + 2), Err(Trap::StackOverflow));
+        assert_eq!(v.regs.len(), regs + 1, "nothing allocated");
+    }
+}
+
+#[cfg(test)]
 mod module_source_tests {
     use super::*;
 
@@ -1689,7 +1717,8 @@ impl FreshWindow {
 /// **probeable refusal** — the driver lands `-EINVAL` and nothing was charged; `Err` is a trap (a
 /// forged handle, an unreadable payload). The checks — entry shape, the window = the module's
 /// declared memory, the payload fitting the args area, `premap_admit`, durability — run before the
-/// `Budget.mem` take, so a refusal charges nothing.
+/// `Budget.mem` take, so a refusal charges nothing; one after it (the child's imports not binding)
+/// hands the take back (`Host::undo_detached_spawn`, #1975).
 ///
 /// `freezes_detached`: whether a freeze of this run captures a detached child. A durable domain
 /// spawns detached only an attested-freezable module, and only while it holds freeze authority over
@@ -1750,26 +1779,13 @@ fn admit_detached_child(
     };
     let durable = host.is_durable();
     let durable_ok = !durable || (freezes_detached && cdurable);
-    if !ok_entry
-        || child_size == 0
-        || !mod_ok
-        || !payload_ok
-        || !premap_ok
-        || !durable_ok
-        || match host.admit_detached_spawn(s.budget, child_size) {
-            // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do
-            // not yet return a lane at their reap, so the lane is given straight back (#1600). The
-            // window's bytes stay spent while the child lives: the driver returns them at its end
-            // (`AdmittedChild::lease`).
-            Some(lane) => {
-                host.give_lane(lane);
-                false
-            }
-            None => true,
-        }
-    {
+    if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || !durable_ok {
         return Ok(None);
     }
+    let Some(lane) = host.admit_detached_spawn(s.budget, child_size) else {
+        return Ok(None);
+    };
+    // #1975 — every exit from here that builds no child hands back what the admission took.
     let mut child_host = Host::new();
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
@@ -1786,6 +1802,7 @@ fn admit_detached_child(
     // The pre-mapped region rides the child's powerbox; the window build aliases it in.
     if let Some((r, o)) = s.premap {
         if !host.stage_premap(r, o, &mut child_host) {
+            host.undo_detached_spawn(s.budget, child_size, lane);
             return Err(Trap::Malformed);
         }
     }
@@ -1798,8 +1815,13 @@ fn admit_detached_child(
         child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
     };
     if bound.is_err() {
+        host.undo_detached_spawn(s.budget, child_size, lane);
         return Ok(None);
     }
+    // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet
+    // return a lane at their reap, so the lane is given straight back (#1600). The window's bytes stay
+    // spent while the child lives: the driver returns them at its end (`AdmittedChild::lease`).
+    host.give_lane(lane);
     let args = child_entry_args(arity, cinst, cas);
     let fuel = if s.quota <= 0 {
         parent_fuel
@@ -6061,7 +6083,7 @@ fn journal_state(
     // (`JournalPolicy::state_stride` carries the measurements). Turn 0 is always a boundary so a run
     // can always be undone to its start.
     let stride = policy.state_stride.max(1);
-    if !turn.is_multiple_of(stride) {
+    if !turn.is_multiple_of(stride) || !journal.state_due(turn) {
         return;
     }
     let invertible = host.journal_invertible()
@@ -6107,7 +6129,25 @@ fn journal_state(
             .collect(),
         extra_units: source.extra_units(),
     };
-    journal.record_state(turn, cont, host.journal_cursor());
+    // #1958 — the next boundary waits out as many turns as this one cloned slots, so the clone's cost
+    // per op stays constant at any call depth (`JournalPolicy::state_stride`).
+    let slots: u64 = cont
+        .tasks
+        .iter()
+        .map(|t| t.active.clone_slots())
+        .sum::<u64>()
+        + cont
+            .fibers
+            .iter()
+            .map(|f| match f {
+                FiberState::Parked { vm, .. }
+                | FiberState::WaitParked { vm, .. }
+                | FiberState::CapParked { vm, .. }
+                | FiberState::HostParked { vm, .. } => vm.clone_slots(),
+                _ => 0,
+            })
+            .sum::<u64>();
+    journal.record_state(turn, cont, host.journal_cursor(), turn + stride.max(slots));
 }
 
 /// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
@@ -17011,7 +17051,37 @@ struct Vm {
     sig_handler_stack: Vec<usize>,
 }
 
+/// #1958 — the deepest one `Vm`'s calls may nest (its return stack), past which a call traps
+/// `StackOverflow`: the engine's own ceiling, as wasm traps on stack exhaustion. Above the depth the
+/// JIT tiers reach with small frames before their stacks overflow, so a program they run, this runs.
+/// (The tree-walker's `MAX_CALL_DEPTH` is an oracle bound, not a production one.)
+const MAX_FRAMES: usize = 1 << 17;
+
+/// #1958 — the register file's ceiling in slots (16 bytes each: 256 MiB live, at most twice that
+/// allocated as the `Vec` grows), past which a call traps `StackOverflow`. A backstop for fat frames:
+/// the depth bound alone lets a many-slot function's recursion exhaust the host first. Only a chain
+/// averaging over 128 slots a frame meets it before [`MAX_FRAMES`].
+const MAX_REG_SLOTS: usize = 1 << 24;
+
 impl Vm {
+    /// Open a callee window ending at slot `need` for a call that pushes a return entry: the one place
+    /// a call grows the register file, bounded by [`MAX_FRAMES`] and [`MAX_REG_SLOTS`] (#1958).
+    fn open_frame(&mut self, need: usize) -> Result<(), Trap> {
+        if self.stack.len() >= MAX_FRAMES || need > MAX_REG_SLOTS {
+            return Err(Trap::StackOverflow);
+        }
+        if self.regs.len() < need {
+            self.regs.resize(need, Reg::default());
+        }
+        Ok(())
+    }
+
+    /// The slots a clone of this `Vm` copies, its registers and return entries: what the journal
+    /// spaces its continuation boundaries by (#1958).
+    fn clone_slots(&self) -> u64 {
+        (self.regs.len() + self.stack.len()) as u64
+    }
+
     /// Open the entry activation: a zero-based window sized to the entry function, seeded with the
     /// call arguments. Total — an out-of-range entry or arg overflow is a clean `Malformed` trap.
     /// Every entry (root, fiber, thread, coroutine) starts in module 0.
@@ -17240,9 +17310,7 @@ impl Vm {
                                     // before any cross-module reassignment below.
                                     let nb = base + c.progs[cur].nslots as usize;
                                     let need = nb + tm.progs[tfunc].nslots as usize;
-                                    if self.regs.len() < need {
-                                        self.regs.resize(need, Reg::default());
-                                    }
+                                    self.open_frame(need)?;
                                     self.regs[nb] = Reg::from_i64(sp as i64);
                                     self.regs[nb + 1] = Reg::from_i32(signum);
                                     // Return linkage resumes at the SAME `pc` so the interrupted op
@@ -17656,9 +17724,7 @@ impl Vm {
                     // A direct call stays in the current module.
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + c.progs[callee].nslots as usize;
-                    if self.regs.len() < need {
-                        self.regs.resize(need, Reg::default());
-                    }
+                    self.open_frame(need)?;
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
                     }
@@ -17692,9 +17758,7 @@ impl Vm {
                     }
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + tm.progs[tfunc].nslots as usize;
-                    if self.regs.len() < need {
-                        self.regs.resize(need, Reg::default());
-                    }
+                    self.open_frame(need)?;
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
                     }
@@ -18225,9 +18289,7 @@ impl Vm {
                         }
                         let nb = base + c.progs[cur].nslots as usize;
                         let need = nb + c.progs[fidx].nslots as usize;
-                        if self.regs.len() < need {
-                            self.regs.resize(need, Reg::default());
-                        }
+                        self.open_frame(need)?;
                         for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
                             self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
                         }

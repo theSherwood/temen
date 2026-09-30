@@ -212,7 +212,7 @@ unsafe fn file_task(
     if futex_sched != 0
         && !unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).try_child_start() }
     {
-        teardown();
+        teardown(false);
         return Filed::AtCeiling;
     }
     let done = std::sync::Arc::new(ChildDone {
@@ -238,7 +238,7 @@ unsafe fn file_task(
     let task = match task {
         Ok(t) => t,
         Err(teardown) => {
-            teardown();
+            teardown(false);
             if futex_sched != 0 {
                 unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
             }
@@ -343,23 +343,57 @@ unsafe fn granted_teardown(
     let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
     let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
     let mem_give = rt.grant_budget_mem_give.load(Ordering::Acquire);
-    Box::new(move || {
+    Box::new(move |captured| {
         let (ctx, parent_ctx) = (ctx, parent_ctx);
-        // SAFETY: the powerbox is freed exactly once, here, by the task that owned it.
-        unsafe { release(ctx.0) };
-        if lane_give != 0 && lane >= 0 {
-            // SAFETY: a nonzero address is the embedder's registered `LaneGiver`; `parent_ctx` is
-            // the parent host it was registered with.
-            let give: crate::LaneGiver = unsafe { core::mem::transmute(lane_give) };
-            unsafe { give(parent_ctx.0, lane) };
-        }
-        if let (Some((budget, bytes)), true) = (window, mem_give != 0) {
-            // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`, over the
-            // parent host it was registered with.
-            let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(mem_give) };
-            unsafe { give(parent_ctx.0, budget, bytes) };
+        // #1971 — a child a freeze captured keeps its window charged: the artifact carries the
+        // charge, and the thaw's relaunch files the lease again.
+        let window = if captured { None } else { window };
+        // SAFETY: the powerbox is freed exactly once, here, by the task that owned it; the givers
+        // were loaded from `rt`, registered with the parent host `parent_ctx` names.
+        unsafe {
+            release(ctx.0);
+            give_back(parent_ctx.0, lane_give, mem_give, lane, window);
         }
     })
+}
+
+/// Hand a detached child's lane and window bytes back to its parent: at the child's end
+/// ([`granted_teardown`]), or when its spawn goes no further after the admission took them
+/// ([`undo_admission`]).
+///
+/// # Safety
+/// `lane_give` / `mem_give` are 0 or the embedder's registered [`crate::LaneGiver`] /
+/// [`crate::BudgetMemGiver`], and `parent_ctx` is the parent host they were registered with.
+unsafe fn give_back(
+    parent_ctx: *mut core::ffi::c_void,
+    lane_give: usize,
+    mem_give: usize,
+    lane: i64,
+    window: Option<(i32, u64)>,
+) {
+    if lane_give != 0 && lane >= 0 {
+        let give: crate::LaneGiver = core::mem::transmute(lane_give);
+        give(parent_ctx, lane);
+    }
+    if let (Some((budget, bytes)), true) = (window, mem_give != 0) {
+        let give: crate::BudgetMemGiver = core::mem::transmute(mem_give);
+        give(parent_ctx, budget, bytes);
+    }
+}
+
+/// #1975 — the undo of a detached spawn's admission (`budget_mem_take`), for a spawn that files no
+/// child after it: its window's bytes and its lane go back, so it charges nothing.
+///
+/// # Safety
+/// `rt` is the live nursery whose `grant_ctx` the admission charged.
+unsafe fn undo_admission(rt: &Nursery, budget: i32, bytes: u64, lane: i64) {
+    give_back(
+        rt.grant_ctx(),
+        rt.grant_lane_give.load(Ordering::Acquire),
+        rt.grant_budget_mem_give.load(Ordering::Acquire),
+        lane,
+        Some((budget, bytes)),
+    );
 }
 
 /// D66 — the lane chain a granted child's task is gated on: its parent's lane over its own.
@@ -954,6 +988,7 @@ impl Nursery {
             image,
             prots,
             child: gc,
+            window,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr == 0 {
@@ -992,7 +1027,7 @@ impl Nursery {
         let n_results = funcs.get(entry as usize).map_or(1, |f| f.results.len());
         let code = std::sync::Arc::new(code);
         register_serve(self, gc.ctx, &code);
-        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, None);
+        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window);
         let thaw_off = shadow.thaw_state_off(0) as usize;
         let filed = file_task(
             self,
@@ -1442,7 +1477,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         n_results,
         rt.parent_lane_chain(),
         0,
-        Box::new(|| ()), // an empty powerbox: nothing to release
+        Box::new(|_| ()), // an empty powerbox: nothing to release
     ) {
         Filed::Slot(slot) => slot,
         // #1586 — at the §15 live-vCPU ceiling (`ThreadFault` is what the interpreter raises when
@@ -2348,14 +2383,18 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         trap_out,
     ) == 0
     {
+        undo_admission(rt, budget as i32, child_size, lane);
         return 0;
     }
+    // #1975 — every exit from here that files no child hands back what the admission took, as the
+    // one above does.
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
         if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
+            undo_admission(rt, budget as i32, child_size, lane);
             return EINVAL as i32;
         }
     }
@@ -2367,6 +2406,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         if stage(rt.grant_ctx(), gc.ctx, r, o) == 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
+            undo_admission(rt, budget as i32, child_size, lane);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -2400,6 +2440,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         Err(_) => {
             release(gc.ctx);
             release(gc.retained_ctx);
+            undo_admission(rt, budget as i32, child_size, lane);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
