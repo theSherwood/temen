@@ -1704,13 +1704,14 @@ fn a_cap_free_domain_elides_the_named_section() {
 // #1502 — a `Budget` rides the artifact. Before this, a durable domain that held a `Budget` (which
 // INVARIANTS #3 R2 makes every domain that can mint a detached child) could not be frozen without
 // draining it, and the thaw's fresh re-grant forgot what had been spent — the conservation break.
-// Now the artifact carries the *remaining* quotas, and the thaw may only narrow them.
+// Now the artifact carries the budget's node — its ceilings and its live charge (#1944) — and the
+// thaw may only narrow the ceilings.
 // ---------------------------------------------------------------------------------------------
 
 use temen_interp::{cap_id, BudgetState};
 
-/// A host holding a partly-spent budget, frozen **without** draining. `mem` remaining before the
-/// freeze; the handle the guest holds.
+/// A host holding a partly-spent budget, frozen **without** draining. The handle the guest holds;
+/// the `mem` room left before the freeze (the 1 MiB ceiling minus a 4 KiB charge).
 fn budget_host() -> (Host, i32, i64) {
     let mut host = Host::new();
     host.grant_clock();
@@ -1748,11 +1749,11 @@ fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
 }
 
 /// The hook may **attenuate**: a re-hosted domain under a tighter ceiling gets less than it carried,
-/// and an unbounded field may become bounded.
+/// and an unbounded field may become bounded. It sees the node's ceilings; the carried charge stays.
 #[test]
 fn the_thaw_hook_may_attenuate_a_carried_budget() {
     let inst = instrument(SRC);
-    let (host, h, remaining) = budget_host();
+    let (host, h, _) = budget_host();
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
@@ -1767,8 +1768,8 @@ fn the_thaw_hook_may_attenuate_a_carried_budget() {
     restore(&artifact, &inst, &mut thost).expect("an attenuating hook is honoured");
     assert_eq!(
         read_mem(&mut thost, h),
-        remaining / 2,
-        "mem attenuated to half"
+        (1 << 19) - 4096,
+        "the mem ceiling halved, the carried charge still spent"
     );
     assert_eq!(
         thost.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
@@ -1783,7 +1784,7 @@ fn the_thaw_hook_may_attenuate_a_carried_budget() {
 #[test]
 fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
     let inst = instrument(SRC);
-    let (host, _h, remaining) = budget_host();
+    let (host, _h, _) = budget_host();
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
@@ -1809,8 +1810,9 @@ fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
         match restore(&artifact, &inst, &mut thost) {
             Err(RestoreError::BudgetRefused(e)) => {
                 assert_eq!(
-                    e.carried.mem, remaining,
-                    "{what}: the refusal names the carried state"
+                    e.carried.mem,
+                    1 << 20,
+                    "{what}: the refusal names the carried ceilings"
                 );
             }
             other => panic!("{what}: expected BudgetRefused, got {other:?}"),

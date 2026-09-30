@@ -45,34 +45,41 @@ no ambient names. The one sanctioned residue: a domain offering its *own* export
 own grant graph. *Violated by:* any path where a domain reaches a capability its ancestors
 never granted. (Owner decision 2026-07-23; IMPORTS.md §3.3/§3.6, PROCESS.md §4.)
 
-**Ruling — window-minting authority is the memory budget, and it tops up down the graph
-(2026-09-08, #1289 R2):** minting or growing an independent (detached) window is not a separate
-authority — it **spends `Budget.mem`** (PROCESS.md §5), which attenuates down the grant graph like
-every other authority, so a domain can never hold more VA than its ancestors granted. The standalone
-`WindowMinter` capability retires once every mint site takes a budget. Because authority moves only
-down, a domain that needs *more* memory than its budget holds cannot pull it: it **requests** from its
-parent (a message *up* — a served endpoint / fault upcall, the data plane), and the parent **grants**
-by **transferring** bytes from its own `Budget.mem` *down* into the child's (the control plane) — the
-parent's remaining drops by exactly what the child's rises (conservation). If the parent lacks the
-slack, it requests from *its* parent first, so a deep child's top-up **cascades recursively up the
-ancestry** to the first ancestor with slack (or the platform's root budget), each hop updating two
-budgets. The cascade is **transactional**: if no ancestor can cover the shortfall, nothing transfers
-anywhere and the request fails closed (`-ENOMEM`), exactly as an over-asking `split` deducts nothing.
-This is Genode's quota-transfer applied to VA — `split` pushes budget down eagerly at spawn,
-`transfer` pushes it down lazily on demand — so every byte a descendant holds stays traceable to a
-grant from above (the invariant), and nothing becomes ambient-under-`Instantiator`. *Caveat closed (2026-09-16, #1502):* `Budget` is
-**durable** — the artifact carries a budget's *remaining* quotas verbatim and the thaw re-mints them,
-so what a domain already minted before a freeze stays deducted after it (a fresh re-grant would have
-let it spend that again — the conservation break the earlier "harmless for a platform-driven freeze"
-note missed). The thaw may **attenuate** a carried budget through an embedder hook
-(`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never raise it; no hook
-⇒ verbatim. Minting authority therefore survives a freeze exactly as it was left.
-*Refund on child end (2026-09-29, #1864, owner decision):* `Budget.mem` accounts **live** windows, not
-lifetime mints — when a detached child ends (joined or reaped), its window's bytes return to the
-budget that paid for them, so a parent can spawn, join and spawn again within one window's worth. A
-child frozen with its parent stays charged (the artifact carries the deduction). Conservation holds:
-the bytes return to the same budget they left. The bytecode tier still returns them at admission, like
-its lanes — a tracked gap (#1600), not a second rule.
+**Ruling — window-minting authority is the memory budget (2026-09-08, #1289 R2):** minting an
+independent (detached) window is not a separate authority — it **spends `Budget.mem`** (PROCESS.md
+§5), which attenuates down the grant graph like every other authority, so a domain can never hold more
+VA than its ancestors granted. The standalone `WindowMinter` capability retired. *(R2's second half —
+the Genode-style `transfer` top-up, "the parent's remaining drops by exactly what the child's rises",
+cascading up the ancestry — is superseded by the tree-of-ceilings ruling below.)*
+
+**Ruling — a budget is a tree of ceilings (2026-09-30, #1944, owner decision):** a `Budget` is a node
+whose ceilings cap its **whole subtree**; they are not drawn from its parent (the cgroups `memory.max`
+model, and the model D66 lanes already use). A holds 2 MB and grants B 1 MB: B's subtree can never use
+more than 1 MB, and A can use 2 MB minus what B's subtree uses at that moment; B can grant C 500 KB and
+still use its own 1 MB. The rules:
+- **A use charges every level.** Minting a window charges the paying node **and every ancestor**; it
+  succeeds only if every bounded level has room, all-or-nothing, under one lock per tree. Ending the
+  use refunds the same chain.
+- **Grants only go parent to child.** A budget reaches a child only through its spawn: the budget named
+  in the spawn record pays for the child's window **and becomes the child's `"budget"`**, so the child's
+  own window counts inside its ceiling. A parent that names its own budget without splitting it first
+  shares its whole ceiling with the child. A grant list still cannot carry a `Budget`.
+- **Ceilings are clamped, and may overcommit.** `split` clamps a child's ceilings to the holder's and
+  deducts nothing, so children's ceilings may sum past the parent's (the first to allocate wins,
+  bounded by the parent). A ceiling is a cap, not a guarantee. `transfer` retired: there is nothing to
+  move later.
+- **Conservation** is now: every live byte is charged to its budget and to every ancestor, so no
+  subtree ever holds more than any ancestor's ceiling. `read` reports the least room along the chain.
+- **Durability** (#1502 carried over): a freeze carries each held node's key, ceilings, live charge
+  and parent link, for the node and its ancestors; the thaw rebuilds each key once for every domain of
+  the frozen tree, so a node the domains shared is shared again, and what was already minted stays
+  charged. The thaw may **attenuate** a node's ceilings through an embedder hook
+  (`Host::set_budget_thaw_hook`), never raise them; no hook ⇒ verbatim.
+- **Refund on child end** (2026-09-29, #1864, carried over): `Budget.mem` accounts **live** windows —
+  when a detached child ends (joined or reaped) its window's bytes return to the chain that paid for
+  them, so a parent can spawn, join and spawn again within one window's worth. A child frozen with its
+  parent stays charged (the artifact carries the charge). The bytecode tier still returns a child's
+  lane at admission — a tracked gap (#1600), not a second rule.
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,
@@ -85,8 +92,9 @@ cap enforced at grant time, and a running task counts against its own lane and e
 The model is a **ceiling**, not a transfer: the parent's own tasks may fill any lane it holds,
 including a child's — so 6 / 2 / 2 is *A up to 6, B ≤ 2 contended with A, C ≤ 2 contended with A, B
 and C never contending with each other*. This was chosen over the `split`-style hard partition the
-other three budget dimensions use, accepting that a parent can absorb a child's lane in exchange for
-not stranding idle capacity; revisit if a workload needs the guarantee. *Violated by:* a §14 spawn
+other budget dimensions then used (they have since followed it: the tree-of-ceilings ruling above),
+accepting that a parent can absorb a child's lane in exchange for not stranding idle capacity; revisit
+if a workload needs the guarantee. *Violated by:* a §14 spawn
 path that takes a worker without a lane, or a grant that exceeds the grantor's cap. (DESIGN.md §23
 "Child-domain scheduling".)
 

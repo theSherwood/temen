@@ -315,8 +315,8 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 v1 records) —
   each in a fresh window of its own paid from the budget, running on the cooperative executor and
   joinable through the §12 thread machinery. 5-case differential (all matching native): isolation — a
-  child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`, still a carve until
-  #1944 lets a detached child pay for a grandchild), a two-arg child managing its own pages via an
+  child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`: the child pays for
+  the grandchild from its own budget, #1944), a two-arg child managing its own pages via an
   attenuated `AddressSpace` (`0`), a window that disagrees with the module's refused at admission
   (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). So a guest can spin up isolated
   sub-guests inside the wasm sandbox.

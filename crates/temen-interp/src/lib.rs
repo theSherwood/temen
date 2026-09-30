@@ -14999,6 +14999,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // reservation (and, on wasm, the minted memory's `maximum`).
                                 let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
                                 let (cinst, cas) = ch.grant_starter_caps(reservation);
+                                // #1944 — the budget that paid for the window is the child's own.
+                                host.lock_unpoisoned().give_child_budget(budget, &mut ch);
                                 for (name, gh) in &glist {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
@@ -19459,23 +19461,20 @@ enum Binding {
     /// the impl computes over its arguments alone. Exporter-domain state is the designed
     /// follow-up.
     Offer(u32),
-    /// A §15 / PROCESS.md §5 `Budget` handle, carrying the index of its [`BudgetState`] in
-    /// [`Host::budgets`]. Authority over a passable, **splittable** resource-quota vector (fuel / mem /
-    /// spawn): `split` attenuates a sub-budget out of the remaining, `read` reports it. Out-of-line (an
-    /// index, not the state) so `Binding` stays `Copy`, like [`Binding::SharedRegion`].
+    /// A §15 / PROCESS.md §5 `Budget` handle, carrying the index of its node in [`Host::budgets`].
+    /// Authority over a node of a run's [`BudgetTree`] (fuel / mem / spawn / channel / lane ceilings):
+    /// `split` mints a child node, `read` reports the room along the chain. Out-of-line (an index, not
+    /// the node) so `Binding` stays `Copy`, like [`Binding::SharedRegion`].
     Budget(u32),
 }
 
-/// §15 / PROCESS.md §5 — a `Budget`'s **remaining** resource-quota vector. Three meterable resources
-/// today (fuel / mem / spawn, the anti-bomb dials §15 already tracks); the vector is kept deliberately
-/// short (O8). A field is a non-negative remaining amount. `split` moves quota from a parent entry into
-/// a fresh child entry (never raising a total — attenuation, D19); `read` reports a field. Charging a
-/// domain's live consumption against its budget is the follow-up (the `create(module, window, budget)`
-/// accounting) — this type is the passable, splittable object the accounting will draw down.
+/// §15 / PROCESS.md §5 — a `Budget`'s resource-quota vector: a node's **ceilings** in its tree
+/// ([`BudgetTree`]), and what `read` reports as the room left along its chain. The vector is kept
+/// deliberately short (O8). A field is a non-negative amount or `-1` (unbounded).
 ///
-/// **Public since #1502**: this is also what a `Budget` handle carries across a freeze
-/// ([`DurableBinding::Budget`]) and what the thaw hook ([`Host::set_budget_thaw_hook`]) sees and
-/// returns — one type for the live table, the artifact, and the hook, never a second form.
+/// **Public since #1502**: this is also what a carried budget node holds across a freeze
+/// ([`DurableBudget`]) and what the thaw hook ([`Host::set_budget_thaw_hook`]) sees and returns — one
+/// type for the live tree, the artifact, and the hook, never a second form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetState {
     pub fuel: i64,
@@ -19491,6 +19490,136 @@ pub struct BudgetState {
     /// Σ-of-granted-lanes ≤ its cap is enforced at spawn ([`Host::admit_detached_spawn`]), and a
     /// reaped child returns its lane. Stamped onto the child's [`Host::lane_cap`] at spawn.
     pub lane: i64,
+}
+
+/// #1944 — one run's budgets: a **tree of ceilings** behind one lock (INVARIANTS #3, ruling
+/// 2026-09-30). A node's ceilings cap its whole subtree; they are not drawn from its parent, so a
+/// parent keeps its own ceiling after a `split` and may grant children ceilings that sum past it
+/// (overcommit — the first to allocate wins). A charge (a detached window minted) lands on the paying
+/// node **and every ancestor**, all-or-nothing, and its refund returns to the same chain. The tree is
+/// shared by every domain a budget reached (a `Budget` handle names a node, and the node that pays for
+/// a child becomes the child's own `"budget"`), so parent and child charge under the same lock. Nodes
+/// only ever append: a node's index is its identity for the run and across a freeze
+/// ([`DurableBudget::key`]).
+#[derive(Debug, Default)]
+pub struct BudgetTree(Mutex<Vec<BudgetNode>>);
+
+#[derive(Clone, Copy, Debug)]
+struct BudgetNode {
+    ceil: BudgetState,
+    /// Live `mem` charged to this node's subtree: every window minted from it or a descendant and not
+    /// yet ended. The one charged dimension today; the others are ceilings only.
+    used: u64,
+    parent: Option<u32>,
+}
+
+impl BudgetTree {
+    fn mint(&self, ceil: BudgetState, used: u64, parent: Option<u32>) -> u32 {
+        let mut nodes = self.0.lock_unpoisoned();
+        nodes.push(BudgetNode { ceil, used, parent });
+        (nodes.len() - 1) as u32
+    }
+
+    /// The node and its ancestors, nearest first.
+    fn chain(nodes: &[BudgetNode], node: u32) -> impl Iterator<Item = &BudgetNode> {
+        std::iter::successors(nodes.get(node as usize), |n| {
+            n.parent.and_then(|p| nodes.get(p as usize))
+        })
+    }
+
+    /// What `read` reports: per field, the least room along the chain (`ceil - used` for `mem`, the
+    /// ceiling for the rest), `-1` if no node on it is bounded.
+    fn room(&self, node: u32) -> BudgetState {
+        let nodes = self.0.lock_unpoisoned();
+        let least = |f: &dyn Fn(&BudgetNode) -> i64| {
+            Self::chain(&nodes, node)
+                .map(f)
+                .filter(|&v| v >= 0)
+                .min()
+                .unwrap_or(-1)
+        };
+        BudgetState {
+            fuel: least(&|n| n.ceil.fuel),
+            mem: least(&|n| {
+                if n.ceil.mem < 0 {
+                    -1
+                } else {
+                    (n.ceil.mem as u64).saturating_sub(n.used) as i64
+                }
+            }),
+            spawn: least(&|n| n.ceil.spawn),
+            channel: least(&|n| n.ceil.channel),
+            lane: least(&|n| n.ceil.lane),
+        }
+    }
+
+    /// Charge `bytes` of `mem` to `node` and every ancestor, or to none if any bounded one lacks room.
+    fn charge(&self, node: u32, bytes: u64) -> bool {
+        let mut nodes = self.0.lock_unpoisoned();
+        let fits = |n: &BudgetNode| {
+            n.ceil.mem < 0
+                || n.used
+                    .checked_add(bytes)
+                    .is_some_and(|u| u <= n.ceil.mem as u64)
+        };
+        if nodes.get(node as usize).is_none() || !Self::chain(&nodes, node).all(fits) {
+            return false;
+        }
+        let mut at = Some(node);
+        while let Some(i) = at {
+            let n = &mut nodes[i as usize];
+            n.used += bytes;
+            at = n.parent;
+        }
+        true
+    }
+
+    /// Return `bytes` a [`charge`](Self::charge) put on `node`'s chain.
+    fn refund(&self, node: u32, bytes: u64) {
+        let mut nodes = self.0.lock_unpoisoned();
+        let mut at = nodes.get(node as usize).map(|_| node);
+        while let Some(i) = at {
+            let n = &mut nodes[i as usize];
+            n.used = n.used.saturating_sub(bytes);
+            at = n.parent;
+        }
+    }
+
+    fn set_ceil(&self, node: u32, ceil: BudgetState) {
+        if let Some(n) = self.0.lock_unpoisoned().get_mut(node as usize) {
+            n.ceil = ceil;
+        }
+    }
+
+    fn ceil(&self, node: u32) -> Option<BudgetState> {
+        self.0.lock_unpoisoned().get(node as usize).map(|n| n.ceil)
+    }
+}
+
+/// A `Budget` handle's target: a node of a run's [`BudgetTree`].
+#[derive(Clone, Debug)]
+struct BudgetRef {
+    tree: Arc<BudgetTree>,
+    node: u32,
+}
+
+/// #1944 — a carried budget node's parent link, or a carried `Budget` handle, names a key the artifact
+/// does not carry ([`Host::restore_durable_budgets`]): a malformed artifact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BudgetRestoreError {
+    pub key: u32,
+}
+
+/// #1944 — a budget node a freeze carried: its tree index (`key`, the identity every carried handle
+/// and every other domain of the frozen tree names it by), ceilings, live charge, and parent. A domain's
+/// artifact carries the chains of the nodes it holds; a thaw rebuilds each key once
+/// ([`Host::restore_durable_budgets`]), so domains that shared a node share it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableBudget {
+    pub key: u32,
+    pub ceil: BudgetState,
+    pub used: u64,
+    pub parent: Option<u32>,
 }
 
 /// §6 (PROCESS.md) — a domain's platform-vouched **attestation**, reported by `self.attest`. The
@@ -19631,13 +19760,12 @@ pub enum DurableBinding {
     Named {
         idx: u32,
     },
-    /// #1502 — a `Budget` handle's **remaining** quotas at freeze. Value-typed (four `i64`s, no
-    /// parent link: the top-up cascade is guest-driven, INVARIANTS #3 R2), so it rides the artifact
-    /// like `AddressSpace` and is re-minted into `Host::budgets` on thaw. Carrying the *remaining*
-    /// rather than re-granting fresh is what keeps #3's conservation across the boundary: a thawed
-    /// parent cannot re-spend what it already minted. The thaw may **attenuate** it, never raise it
+    /// #1502, #1944 — a `Budget` handle, as its node's key in the run's tree. The node, its live charge
+    /// and its ancestors ride beside the table ([`DurableBudget`]), so a thawed domain cannot re-spend
+    /// what it already minted (INVARIANTS #3's conservation across the boundary), and domains that
+    /// shared a node share it again. The thaw may **attenuate** a node's ceilings, never raise them
     /// ([`Host::set_budget_thaw_hook`]).
-    Budget(BudgetState),
+    Budget(u32),
 }
 
 /// #1455 — one named host capability captured for restore, parallel to the `host_procs` table (see
@@ -19796,7 +19924,9 @@ pub enum NonDurableKind {
     ModuleLoader,
     Blocking,
     HostProc,
-    // Budget: retired (#1502) — durable, value-typed, carried as `DurableBinding::Budget`.
+    /// #1944 — a `Budget` node of a tree other than the domain's own ([`Host::budget_tree`]). No live
+    /// path mints one; a key only names a node within one tree, so it could not be carried.
+    Budget,
     Pipe,
     /// A wired interface offer (IMPORTS.md §3.2) — carries an out-of-line reference to the
     /// offering domain's functions, so it must be re-wired after restore, not snapshotted.
@@ -20517,7 +20647,7 @@ pub struct ModuleRestoreError {
     pub digest: [u8; 32],
 }
 
-/// #1502 — the thaw-side **budget hook**: given a carried `Budget`'s remaining quotas, what the
+/// #1502 — the thaw-side **budget hook**: given a carried budget node's ceilings, what the
 /// restoring embedder wants the thawed domain to hold instead. Returning the input re-grants it
 /// verbatim; returning less **attenuates** it (a re-hosted domain under a tighter ceiling); returning
 /// `None` refuses the restore. Returning *more* on any bounded field, or lifting a bounded field to
@@ -20527,11 +20657,12 @@ pub struct ModuleRestoreError {
 pub type BudgetThawHook = Box<dyn FnMut(BudgetState) -> Option<BudgetState> + Send>;
 
 /// Why a thaw could not re-grant a carried `Budget` (#1502): the hook declined (`offered: None`) or
-/// offered more than was carried. Names the slot and both states, so an embedder can tell "I refused
+/// offered more than was carried. Names the node and both states, so an embedder can tell "I refused
 /// on purpose" from "my hook has a sign error".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BudgetThawRefused {
-    pub slot: u32,
+    /// The carried node's key ([`DurableBudget::key`]).
+    pub node: u32,
     pub carried: BudgetState,
     pub offered: Option<BudgetState>,
 }
@@ -21461,10 +21592,21 @@ pub struct Host {
     /// child would get by `map`ping the handle itself. `None` for every root and every child spawned
     /// without one.
     premap: Option<(u32, u64)>,
-    /// §15 / PROCESS.md §5 `Budget` states, indexed by the id a [`Binding::Budget`] carries. Each is a
-    /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
-    /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
-    budgets: Vec<BudgetState>,
+    /// §15 / PROCESS.md §5 `Budget` nodes, indexed by the id a [`Binding::Budget`] carries
+    /// (append-only, like `regions` — a split budget's index stays valid for the run).
+    budgets: Vec<BudgetRef>,
+    /// #1944 — the tree this domain's embedder-granted budgets root in ([`Host::grant_budget`]). A
+    /// detached child shares its spawner's: the node that paid for it is its `"budget"`.
+    budget_tree: Arc<BudgetTree>,
+    /// #1944 — the node [`Host::admit_detached_spawn`] just charged for a child's window, waiting for
+    /// the JIT's builder that follows ([`Host::spawn_detached_child`]) to grant it to the child as its
+    /// `"budget"` — the budget twin of `pending_child_lane`. The interpreter's arms name the handle
+    /// directly ([`Host::give_child_budget`]) and never read it.
+    pending_child_budget: Option<BudgetRef>,
+    /// #1944 — the budget nodes a thaw rebuilt, by carried key ([`Host::restore_durable_budgets`]). A
+    /// thawed detached child's restore host borrows them ([`Host::detached_thaw_host`]) and hands back
+    /// what it added, so every domain of the thawed tree names one node per key.
+    thaw_budgets: BTreeMap<u32, BudgetRef>,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -22245,6 +22387,9 @@ impl Host {
             region_hook: None,
             premap: None,
             budgets: Vec::new(),
+            budget_tree: Arc::default(),
+            pending_child_budget: None,
+            thaw_budgets: BTreeMap::new(),
             pipes: Vec::new(),
             channel_used: Arc::new(std::sync::atomic::AtomicI64::new(0)), // #989
             channel_cap: -1, // #989 — unbounded by default
@@ -22538,8 +22683,10 @@ impl Host {
         // them with the twin's exit status at completion (Live → Zombie in each process table).
         twin.exit_hooks = twin_exit;
         twin.exec_remap_hooks = twin_exec_remap;
-        // The twin gets its own copy of the value-typed quota vectors.
+        // #1944: the twin holds the same budget nodes (a copy of the domain holds no more authority
+        // than the domain did — its windows charge the same chains).
         twin.budgets = self.budgets.clone();
+        twin.budget_tree = Arc::clone(&self.budget_tree);
         twin.quota = self.quota;
         // Structural intern / import binding tables ride along (same program surface).
         twin.iface_intern = self.iface_intern.clone();
@@ -23435,6 +23582,10 @@ impl Host {
         self.lend_jit_admission(&mut child);
         child.named_cap_registrar = self.named_cap_registrar.take();
         child.budget_thaw_hook = self.budget_thaw_hook.take();
+        // #1944: the tree's nodes rebuilt so far, so a node the child shares with this domain (the
+        // budget that paid for it, at least) is the same node again.
+        child.thaw_budgets = self.thaw_budgets.clone();
+        child.budget_tree = Arc::clone(&self.budget_tree);
         child
     }
 
@@ -23442,6 +23593,8 @@ impl Host {
     pub fn reclaim_thaw_seams(&mut self, child: &mut Host) {
         self.named_cap_registrar = child.named_cap_registrar.take();
         self.budget_thaw_hook = child.budget_thaw_hook.take();
+        // #1944: the nodes the child's restore added, so a sibling restored next shares them.
+        self.thaw_budgets.extend(child.thaw_budgets.clone());
     }
 
     /// #1361 step 4 — prepare a thawed detached child's re-launch, the one preparation both engines use:
@@ -24306,10 +24459,16 @@ impl Host {
                         None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
                     }
                 }
-                // #1502: a Budget's whole state is its remaining-quota vector — value-typed, so it
-                // rides verbatim. The index is valid by construction (`budgets` only grows, and every
-                // `Binding::Budget` is minted from a push), so this is a lookup, not a check.
-                Binding::Budget(i) => DurableBinding::Budget(self.budgets[i as usize]),
+                // #1502, #1944: a Budget rides as its node's key in the run's tree; the node and its
+                // ancestors ride beside the table (`capture_durable_budgets`). A node of any tree but
+                // this domain's own is one no live path mints, and has no key a thaw could share.
+                Binding::Budget(i) => {
+                    let b = &self.budgets[i as usize];
+                    if !Arc::ptr_eq(&b.tree, &self.budget_tree) {
+                        return Err(self.non_durable(slot, NonDurableKind::Budget));
+                    }
+                    DurableBinding::Budget(b.node)
+                }
                 // #1680: a pipe the domain tree minted rides by its global id (the codec checks that
                 // every end is inside the cut). An embedder-fed pipe (no channel charge) is fed from
                 // outside the tree: the cut's boundary, not yet carried.
@@ -24364,8 +24523,8 @@ impl Host {
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
                 | Binding::JitCode { .. }
-                // #1502: a Budget is durable (value-typed remaining quotas) — a drain keeps it, the
-                // complement of `capture` above.
+                // #1502: a Budget is durable (a node key, its chain beside the table) — a drain keeps
+                // it, the complement of `capture` above.
                 | Binding::Budget(_) => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 // #1361: the complement of `capture` above — an attested-freezable grant is
@@ -24482,18 +24641,94 @@ impl Host {
                     }
                     Binding::HostProc(idx)
                 }
-                // #1502: re-mint the carried remaining quotas as a fresh `budgets` entry and bind the
-                // captured slot to it — the guest's handle value resolves to exactly what it had left
-                // at freeze. Any attenuation the embedder asked for has already been applied to the
-                // carried state by `attenuate_budgets_for_thaw`, which the snapshot restore runs first.
-                DurableBinding::Budget(state) => {
+                // #1502, #1944: bind the captured slot to the node the restore rebuilt for its key
+                // (`restore_durable_budgets`, run first — with any attenuation the embedder asked
+                // for already applied), so the guest's handle names what it named at freeze.
+                DurableBinding::Budget(key) => {
+                    let Some(b) = self.thaw_budgets.get(&key).cloned() else {
+                        continue; // the restore checked every key; a slot with none stays closed
+                    };
                     let idx = self.budgets.len() as u32;
-                    self.budgets.push(state);
+                    self.budgets.push(b);
                     Binding::Budget(idx)
                 }
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// #1944 — the budget nodes this domain's `Budget` handles name, with every ancestor, in key order:
+    /// what its artifact carries beside the handle table ([`DurableBinding::Budget`]). A node reached
+    /// from several handles, or from several domains' artifacts, is one key.
+    pub fn capture_durable_budgets(&self) -> Vec<DurableBudget> {
+        let nodes = self.budget_tree.0.lock_unpoisoned();
+        let mut keys = BTreeSet::new();
+        for s in &self.table {
+            if let Some(Binding::Budget(i)) = s.entry {
+                let mut at = Some(self.budgets[i as usize].node);
+                while let Some(k) = at.filter(|k| keys.insert(*k)) {
+                    at = nodes.get(k as usize).and_then(|n| n.parent);
+                }
+            }
+        }
+        keys.into_iter()
+            .filter_map(|key| {
+                let n = nodes.get(key as usize)?;
+                Some(DurableBudget {
+                    key,
+                    ceil: n.ceil,
+                    used: n.used,
+                    parent: n.parent,
+                })
+            })
+            .collect()
+    }
+
+    /// #1944 — rebuild the carried budget nodes (after [`Self::attenuate_budgets_for_thaw`]) that no
+    /// domain restored earlier rebuilt, each under its carried parent, and check that every carried
+    /// `Budget` handle names one. A carried charge stays: a child frozen with its parent keeps its
+    /// window's bytes spent (INVARIANTS #3). `Err` names a key a node's parent link or a handle points
+    /// at that nothing carries — a malformed artifact.
+    pub fn restore_durable_budgets(
+        &mut self,
+        budgets: &[DurableBudget],
+        handles: &[DurableHandle],
+    ) -> Result<(), BudgetRestoreError> {
+        if let Some(b) = self.thaw_budgets.values().next() {
+            self.budget_tree = Arc::clone(&b.tree);
+        }
+        let mut sorted = budgets.to_vec();
+        sorted.sort_by_key(|n| n.key);
+        for n in sorted {
+            if self.thaw_budgets.contains_key(&n.key) {
+                continue;
+            }
+            let parent = match n.parent {
+                None => None,
+                Some(key) => Some(
+                    self.thaw_budgets
+                        .get(&key)
+                        .ok_or(BudgetRestoreError { key })?
+                        .node,
+                ),
+            };
+            let node = self.budget_tree.mint(n.ceil, n.used, parent);
+            self.thaw_budgets.insert(
+                n.key,
+                BudgetRef {
+                    tree: Arc::clone(&self.budget_tree),
+                    node,
+                },
+            );
+        }
+        for h in handles {
+            if let DurableBinding::Budget(key) = h.binding {
+                if !self.thaw_budgets.contains_key(&key) {
+                    return Err(BudgetRestoreError { key });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// #1680 — the tree-minted pipes this domain's live ends name, with those its nested children
@@ -24709,15 +24944,16 @@ impl Host {
     }
 
     /// #1502 — the budget half of the authority seam, run by the snapshot restore **before** the
-    /// handle table is pinned (as `restore_durable_named` is for named capabilities): every
-    /// `DurableBinding::Budget` in `handles` is offered to the hook, and rewritten in place to what it
-    /// returns. Fail-closed and attenuate-only: the hook may return the carried state or less on
-    /// every field (a bounded field may shrink, an unbounded one may become bounded); a refusal
-    /// (`None`), a raise, or lifting a bounded field to unbounded refuses the whole restore, naming
-    /// the slot. No hook ⇒ every budget is re-granted verbatim, so conservation is the default.
+    /// handle table is pinned (as `restore_durable_named` is for named capabilities): every carried
+    /// budget node this host has not already rebuilt is offered to the hook, and its ceilings rewritten
+    /// in place to what it returns. Fail-closed and attenuate-only: the hook may return the carried
+    /// ceilings or less on every field (a bounded field may shrink, an unbounded one may become
+    /// bounded); a refusal (`None`), a raise, or lifting a bounded field to unbounded refuses the whole
+    /// restore, naming the node. No hook ⇒ every node is rebuilt verbatim, so conservation is the
+    /// default.
     pub fn attenuate_budgets_for_thaw(
         &mut self,
-        handles: &mut [DurableHandle],
+        budgets: &mut [DurableBudget],
     ) -> Result<(), BudgetThawRefused> {
         let Some(mut hook) = self.budget_thaw_hook.take() else {
             return Ok(());
@@ -24732,10 +24968,11 @@ impl Host {
             }
         }
         let mut refused = None;
-        for h in handles.iter_mut() {
-            let DurableBinding::Budget(carried) = h.binding else {
-                continue;
-            };
+        for n in budgets.iter_mut() {
+            if self.thaw_budgets.contains_key(&n.key) {
+                continue; // rebuilt by a domain restored earlier, which already offered it
+            }
+            let carried = n.ceil;
             let offered = hook(carried);
             let ok = offered.is_some_and(|o| {
                 attenuates(carried.fuel, o.fuel)
@@ -24745,10 +24982,10 @@ impl Host {
                     && attenuates(carried.lane, o.lane)
             });
             match (ok, offered) {
-                (true, Some(o)) => h.binding = DurableBinding::Budget(o),
+                (true, Some(o)) => n.ceil = o,
                 _ => {
                     refused.get_or_insert(BudgetThawRefused {
-                        slot: h.slot,
+                        node: n.key,
                         carried,
                         offered,
                     });
@@ -24950,22 +25187,36 @@ impl Host {
             return None;
         }
         self.pending_child_lane = Some(lane);
+        self.pending_child_budget = self.budget_ref(budget).cloned();
         Some(lane)
     }
 
-    /// #1587 — return `bytes` to the `mem` field of the `Budget` behind `handle`: the undo of a
-    /// [`Host::budget_mem_take`] whose spawn then failed *after* the take (the JIT's OS-thread spawn is
-    /// the one refusal on that path that happens after the commit). Inert on an unbounded budget and on
-    /// a forged handle; never raises a bounded field past what a take drew, because it is only ever
-    /// called once per failed take.
+    /// #1944 — grant `child` the budget node behind `budget`, the one its admission charged
+    /// ([`Host::admit_detached_spawn`]), as its `"budget"`: the budget that pays for a child's window is
+    /// the child's own, so the child's spawns charge inside its ceiling and its parent's. The name
+    /// resolves to it ahead of any re-grant the spawner also called `"budget"`.
+    pub fn give_child_budget(&self, budget: i32, child: &mut Host) {
+        if let Some(b) = self.budget_ref(budget) {
+            child.take_budget_node(b.clone());
+        }
+    }
+
+    /// Hold `b` as this (child) domain's `"budget"`, rooting its own budgets in `b`'s tree.
+    fn take_budget_node(&mut self, b: BudgetRef) {
+        self.budget_tree = Arc::clone(&b.tree);
+        let id = self.budgets.len() as u32;
+        self.budgets.push(b);
+        if let Some(h) = self.try_grant(cap_id::BUDGET, Binding::Budget(id)) {
+            self.cap_names.insert(0, ("budget".to_string(), h));
+        }
+    }
+
+    /// Return `bytes` a [`Host::budget_mem_take`] charged to the `Budget` node behind `handle` and its
+    /// ancestors: when the child whose window they paid for ends (joined or reaped), or when its spawn
+    /// failed after the take (#1587). Inert on a forged handle. Called once per take.
     pub fn budget_mem_give(&mut self, handle: i32, bytes: u64) {
-        let Ok(Binding::Budget(idx)) = self.resolve(handle, cap_id::BUDGET) else {
-            return;
-        };
-        if let Some(b) = self.budgets.get_mut(idx as usize) {
-            if b.mem >= 0 {
-                b.mem = b.mem.saturating_add(bytes as i64);
-            }
+        if let Some(b) = self.budget_ref(handle) {
+            b.tree.refund(b.node, bytes);
         }
     }
 
@@ -26416,24 +26667,21 @@ impl Host {
         self.grant_module_inner(m, true)
     }
 
-    /// Deduct `bytes` from the `mem` field of the `Budget` behind `handle` — the detached-spawn
-    /// admission (#1289 R2: minting a detached window is not a separate authority, it **spends
-    /// `Budget.mem`**; the standalone `WindowMinter` retired). `false` (nothing deducted) for a
-    /// forged / wrong-type handle or an insufficient bounded quota: the spawn refuses probeably,
-    /// never a trap. An **unbounded** (`-1`) mem field admits any size and stays unbounded (an
-    /// embedder that does not meter detached VA passes an unbounded-`mem` budget).
+    /// Charge `bytes` of `mem` to the `Budget` node behind `handle` and every ancestor — the
+    /// detached-spawn admission (#1289 R2: minting a detached window is not a separate authority, it
+    /// **spends `Budget.mem`**; #1944: on every level of the tree). `false` (nothing charged) for a
+    /// forged / wrong-type handle or a bounded node on the chain without room: the spawn refuses
+    /// probeably, never a trap. **Unbounded** (`-1`) nodes admit any size.
     pub fn budget_mem_take(&mut self, handle: i32, bytes: u64) -> bool {
-        let idx = match self.resolve(handle, cap_id::BUDGET) {
-            Ok(Binding::Budget(i)) => i as usize,
-            _ => return false,
-        };
-        match self.budgets.get_mut(idx) {
-            Some(b) if b.mem < 0 => true, // unbounded: admit, undrained
-            Some(b) if b.mem as u64 >= bytes => {
-                b.mem -= bytes as i64;
-                true
-            }
-            _ => false,
+        self.budget_ref(handle)
+            .is_some_and(|b| b.tree.charge(b.node, bytes))
+    }
+
+    /// The node a live `Budget` handle names.
+    fn budget_ref(&self, handle: i32) -> Option<&BudgetRef> {
+        match self.resolve(handle, cap_id::BUDGET) {
+            Ok(Binding::Budget(i)) => self.budgets.get(i as usize),
+            _ => None,
         }
     }
 
@@ -26700,39 +26948,29 @@ impl Host {
         self.region_hook.is_some()
     }
 
-    /// Grant a §15 / PROCESS.md §5 `Budget` — a splittable resource-quota vector `(fuel, mem, spawn)` —
-    /// returning its handle. The embedder mints the **root** budget with the total resources it lends a
-    /// domain; the guest `split`s sub-budgets out of it (attenuation) and `read`s remaining. A field of
-    /// `-1` means "unbounded" (the anti-bomb ceilings still cap actual consumption; `read` reports it as
-    /// `-1`). Charging live consumption against a budget is the follow-up — this is the passable object.
     /// §3b — read a Budget handle's state without consuming it (the op-17 spawn's `fits`-time
     /// mem-quota gate). `None` for a dangling/mistyped handle (the spawn fails closed).
     pub(crate) fn peek_budget(&self, h: i32) -> Option<BudgetState> {
-        match self.resolve(h, cap_id::BUDGET).ok()? {
-            Binding::Budget(i) => self.budgets.get(i as usize).copied(),
-            _ => None,
-        }
+        self.budget_ref(h).map(|b| b.tree.room(b.node))
     }
 
     /// §3b — **consume** a Budget at spawn commit: the state is drained to zero (the handle stays
     /// granted; `read` reports 0s), so one budget funds exactly one child — split first to fund
     /// several. Returns the taken state; `None` for a dangling/mistyped handle.
     pub(crate) fn take_budget(&mut self, h: i32) -> Option<BudgetState> {
-        match self.resolve(h, cap_id::BUDGET).ok()? {
-            Binding::Budget(i) => {
-                let s = self.budgets.get_mut(i as usize)?;
-                let t = *s;
-                *s = BudgetState {
-                    fuel: 0,
-                    mem: 0,
-                    spawn: 0,
-                    channel: 0,
-                    lane: 0,
-                };
-                Some(t)
-            }
-            _ => None,
-        }
+        let b = self.budget_ref(h)?;
+        let t = b.tree.room(b.node);
+        b.tree.set_ceil(
+            b.node,
+            BudgetState {
+                fuel: 0,
+                mem: 0,
+                spawn: 0,
+                channel: 0,
+                lane: 0,
+            },
+        );
+        Some(t)
     }
 
     /// §3c.2 — the one Budget read/consume a record spawn performs, exposed for the JIT tier's
@@ -26758,6 +26996,10 @@ impl Host {
         Some(Ok((b.fuel, b.spawn)))
     }
 
+    /// Grant a §15 / PROCESS.md §5 `Budget` — a root node of this domain's [`BudgetTree`] with ceilings
+    /// `(fuel, mem, spawn)` — returning its handle. The embedder mints the **root** budget with the
+    /// resources it lends a domain; the guest `split`s child nodes under it and `read`s the room left.
+    /// A field of `-1` means "unbounded" (`read` reports it as `-1`).
     pub fn grant_budget(&mut self, fuel: i64, mem: i64, spawn: i64) -> i32 {
         // #989 — the 3-arg form defaults `channel` unbounded (`-1`), so every existing caller is
         // unchanged; use `grant_budget_channel` to bound a child's channel memory.
@@ -26766,13 +27008,18 @@ impl Host {
 
     /// #989 — [`grant_budget`] with an explicit `channel` (host-served channel-memory) dimension.
     pub fn grant_budget_channel(&mut self, fuel: i64, mem: i64, spawn: i64, channel: i64) -> i32 {
-        let id = self.budgets.len() as u32;
-        self.budgets.push(BudgetState {
+        let ceil = BudgetState {
             fuel,
             mem,
             spawn,
             channel,
             lane: -1, // D66: unbounded unless a `split` narrows it
+        };
+        let node = self.budget_tree.mint(ceil, 0, None);
+        let id = self.budgets.len() as u32;
+        self.budgets.push(BudgetRef {
+            tree: Arc::clone(&self.budget_tree),
+            node,
         });
         self.grant(cap_id::BUDGET, Binding::Budget(id))
     }
@@ -27825,9 +28072,13 @@ impl Host {
         // D66 — the lane the admission that preceded this build reserved (the JIT path's two-hook
         // sequence); `None` ⇒ unbounded, which is also what an un-admitted build gets.
         let lane = self.pending_child_lane.take().unwrap_or(-1);
+        let budget = self.pending_child_budget.take();
         let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
         ch.set_durable(durable);
         ch.set_lane_cap(lane);
+        if let Some(b) = budget {
+            ch.take_budget_node(b); // #1944 — the paying budget is the child's
+        }
         Some((ch, cinst, cas))
     }
 
@@ -29132,90 +29383,52 @@ impl Host {
                 }])
             }
             Binding::Budget(idx) => {
-                // §15 / PROCESS.md §5: a passable, splittable resource-quota vector.
-                let idx = idx as usize;
-                let Some(&BudgetState {
-                    fuel,
-                    mem,
-                    spawn,
-                    channel,
-                    lane,
-                }) = self.budgets.get(idx)
-                else {
+                // §15 / PROCESS.md §5, #1944: a node of the run's budget tree — ceilings on a subtree.
+                let Some(b) = self.budgets.get(idx as usize).cloned() else {
+                    return Ok(vec![EINVAL]);
+                };
+                let Some(ceil) = b.tree.ceil(b.node) else {
                     return Ok(vec![EINVAL]);
                 };
                 match op {
                     0 => {
-                        // split(fuel, mem, spawn) -> sub_handle | -errno. For each field, `-1` = "all
-                        // remaining"; a non-negative amount must be `<=` the holder's remaining
-                        // (attenuation — a child can never exceed the parent, D19). An **unbounded**
-                        // (`-1`) parent field grants any child amount and stays unbounded. Over-asking
-                        // any bounded field is `-EINVAL` — the whole split fails closed, nothing deducted.
-                        // Returns `(child_amount, parent_remaining_after)`.
-                        let split_field = |arg: i64, rem: i64| -> Option<(i64, i64)> {
+                        // split(fuel, mem, spawn, channel, lane) -> sub_handle | -errno. Mints a child
+                        // node whose ceilings are clamped to this one's, deducting nothing (INVARIANTS
+                        // #3, 2026-09-30): the child's subtree is capped by both, and this holder keeps
+                        // its whole ceiling. Per field, `-1` = inherit this node's ceiling; an unbounded
+                        // (`-1`) holder field bounds nothing.
+                        let clamp = |arg: i64, cap: i64| -> i64 {
                             if arg < 0 {
-                                // "all remaining": bounded parent → child takes it all (parent 0);
-                                // unbounded parent → child unbounded, parent stays unbounded.
-                                Some(if rem < 0 { (-1, -1) } else { (rem, 0) })
-                            } else if rem < 0 {
-                                (arg, -1).into() // unbounded parent, bounded request
-                            } else if arg <= rem {
-                                (arg, rem - arg).into()
+                                cap
+                            } else if cap < 0 {
+                                arg
                             } else {
-                                None // over-attenuation of a bounded field
+                                arg.min(cap)
                             }
                         };
-                        // D66 — the lane is a **ceiling** (INVARIANTS #3, 2026-09-21): the child's
-                        // lane is bounded by the holder's own cap, and the holder keeps its cap (no
-                        // draw-down). Omitted ⇒ inherit the holder's cap. Σ-of-lanes ≤ cap is checked
-                        // at *spawn*, where the lane is actually taken up, not here.
+                        // D66 — the lane is a ceiling bounded by the holder's own cap (INVARIANTS #3,
+                        // 2026-09-21), refused past it; Σ-of-lanes ≤ cap is checked at *spawn*, where
+                        // the lane is actually taken up, not here. Omitted ⇒ inherit the holder's cap.
                         let my_cap = self.lane_cap;
-                        let split_lane = |arg: i64| -> Option<i64> {
-                            if arg < 0 {
-                                Some(my_cap)
-                            } else if my_cap < 0 || arg <= my_cap {
-                                Some(arg)
-                            } else {
-                                None // a lane wider than the holder's own cap
-                            }
+                        let lane = match *args.get(4).unwrap_or(&-1) {
+                            a if a < 0 => my_cap,
+                            a if my_cap < 0 || a <= my_cap => a,
+                            _ => return Ok(vec![EINVAL]), // a lane wider than the holder's own cap
                         };
-                        let _ = lane; // the sub-budget's lane derives from the cap, not the field
-                        let (
-                            Some((cf, pf)),
-                            Some((cm, pm)),
-                            Some((cs, ps)),
-                            Some((cc, pc)),
-                            Some(cl),
-                        ) = (
-                            split_field(*args.first().unwrap_or(&0), fuel),
-                            split_field(*args.get(1).unwrap_or(&0), mem),
-                            split_field(*args.get(2).unwrap_or(&0), spawn),
-                            split_field(*args.get(3).unwrap_or(&-1), channel), // #989 — omitted ⇒ inherit (unbounded)
-                            split_lane(*args.get(4).unwrap_or(&-1)), // D66 — omitted ⇒ inherit the cap
-                        )
-                        else {
-                            return Ok(vec![EINVAL]);
+                        let child = BudgetState {
+                            fuel: clamp(*args.first().unwrap_or(&0), ceil.fuel),
+                            mem: clamp(*args.get(1).unwrap_or(&0), ceil.mem),
+                            spawn: clamp(*args.get(2).unwrap_or(&0), ceil.spawn),
+                            channel: clamp(*args.get(3).unwrap_or(&-1), ceil.channel), // #989 — omitted ⇒ inherit
+                            lane,
                         };
-                        // Mint the child budget first; draw down the parent only once the grant
-                        // succeeds, so a full handle table (-EMFILE) leaves the parent's quota intact.
-                        let child = self.budgets.len() as u32;
-                        self.budgets.push(BudgetState {
-                            fuel: cf,
-                            mem: cm,
-                            spawn: cs,
-                            channel: cc,
-                            lane: cl,
-                        });
+                        let node = b.tree.mint(child, 0, Some(b.node));
+                        let id = self.budgets.len() as u32;
+                        self.budgets.push(BudgetRef { tree: b.tree, node });
                         Ok(vec![
-                            match self.try_grant(cap_id::BUDGET, Binding::Budget(child)) {
-                                Some(h) => {
-                                    let b = &mut self.budgets[idx];
-                                    b.fuel = pf;
-                                    b.mem = pm;
-                                    b.spawn = ps;
-                                    b.channel = pc;
-                                    h as i64
-                                }
+                            match self.try_grant(cap_id::BUDGET, Binding::Budget(id)) {
+                                Some(h) => h as i64,
+                                // A full handle table: the node stays, unreachable (nodes only append).
                                 None => {
                                     self.budgets.pop();
                                     EMFILE
@@ -29223,78 +29436,22 @@ impl Host {
                             },
                         ])
                     }
-                    // read(field) -> remaining | -EINVAL: `0` fuel, `1` mem, `2` spawn (the §15
-                    // monitoring readout), `3` channel, `4` lane. Window-independent — one field per call.
-                    1 => Ok(vec![match *args.first().unwrap_or(&-1) {
-                        0 => fuel,
-                        1 => mem,
-                        2 => spawn,
-                        3 => channel, // #989
-                        4 => lane,    // D66
-                        _ => EINVAL,
-                    }]),
-                    2 => {
-                        // transfer(dst, fuel, mem, spawn) -> 0 | -errno (#1289 R2, the top-up
-                        // primitive — `split`'s lazy inverse). Move quota **from this budget (the
-                        // holder) into an existing budget `dst` the caller also holds** — a parent
-                        // tops up a child's create-budget from its own. Conservation: the holder falls
-                        // by exactly what `dst` rises. Attenuation: a bounded holder field can only move
-                        // what it has; `-1` in a field = "all remaining". Transactional: over-asking any
-                        // bounded field is `-EINVAL` and **nothing moves** (like an over-asking `split`).
-                        let dst_h = *args.first().unwrap_or(&-1) as i32;
-                        let Ok(Binding::Budget(dst)) = self.resolve(dst_h, cap_id::BUDGET) else {
-                            return Ok(vec![EINVAL]);
-                        };
-                        let dst = dst as usize;
-                        if dst == idx || dst >= self.budgets.len() {
-                            // A self-transfer would clobber its own credit; a stale index is closed.
-                            return Ok(vec![EINVAL]);
-                        }
-                        // Per field, from the holder's remaining: `(moved, holder_after)`. `-1` = move
-                        // all (bounded holder → moves it all, holder 0; unbounded holder → dst becomes
-                        // unbounded, holder stays unbounded). An unbounded holder hands out any bounded
-                        // amount and stays unbounded. Over-asking a bounded field ⇒ `None` (fail closed).
-                        let move_field = |arg: i64, rem: i64| -> Option<(i64, i64)> {
-                            if arg < 0 {
-                                Some(if rem < 0 { (-1, -1) } else { (rem, 0) })
-                            } else if rem < 0 {
-                                Some((arg, -1))
-                            } else if arg <= rem {
-                                Some((arg, rem - arg))
-                            } else {
-                                None
-                            }
-                        };
-                        let (Some((mf, hf)), Some((mm, hm)), Some((ms, hs))) = (
-                            move_field(*args.get(1).unwrap_or(&0), fuel),
-                            move_field(*args.get(2).unwrap_or(&0), mem),
-                            move_field(*args.get(3).unwrap_or(&0), spawn),
-                        ) else {
-                            return Ok(vec![EINVAL]);
-                        };
-                        // Credit `dst` (a `-1` move, or an already-unbounded field, stays unbounded),
-                        // then debit the holder. Both writes are disjoint cells (`dst != idx`).
-                        let credit = |cur: i64, moved: i64| -> i64 {
-                            if moved < 0 || cur < 0 {
-                                -1
-                            } else {
-                                cur + moved
-                            }
-                        };
-                        let d = self.budgets[dst];
-                        self.budgets[dst] = BudgetState {
-                            fuel: credit(d.fuel, mf),
-                            mem: credit(d.mem, mm),
-                            spawn: credit(d.spawn, ms),
-                            channel: d.channel, // #989 — transfer (op 2) moves only fuel/mem/spawn; channel passes through
-                            lane: d.lane,       // D66 — a lane is a ceiling, never moved
-                        };
-                        let h = &mut self.budgets[idx];
-                        h.fuel = hf;
-                        h.mem = hm;
-                        h.spawn = hs;
-                        Ok(vec![0])
+                    // read(field) -> room | -EINVAL: `0` fuel, `1` mem, `2` spawn (the §15 monitoring
+                    // readout), `3` channel, `4` lane — the least room along the node's chain (for
+                    // `mem`, ceiling minus live charge), `-1` if nothing on it is bounded.
+                    1 => {
+                        let room = b.tree.room(b.node);
+                        Ok(vec![match *args.first().unwrap_or(&-1) {
+                            0 => room.fuel,
+                            1 => room.mem,
+                            2 => room.spawn,
+                            3 => room.channel, // #989
+                            4 => room.lane,    // D66
+                            _ => EINVAL,
+                        }])
                     }
+                    // Op 2 (`transfer`, #1289 R2's lazy top-up) retired with the tree (#1944): a
+                    // ceiling is granted up front and overcommit is allowed, so nothing moves later.
                     _ => Ok(vec![EINVAL]),
                 }
             }

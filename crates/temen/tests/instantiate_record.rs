@@ -1676,3 +1676,107 @@ fn a_joined_detached_childs_window_returns_to_its_budget() {
         );
     }
 }
+
+/// #1944 — three generations of one `memory 17` module: the root splits its budget into
+/// a node with a `mem` ceiling of `child_ceiling` and spawns func 1 detached, paid from it; func 1
+/// spawns func 2 from its own `"budget"` — the node that paid for it — and returns `join + 20`, or the
+/// refusal's `-errno`. Func 2 returns 3. The root exits with its child's result plus 100.
+fn three_generations(child_ceiling: i64) -> String {
+    let rec = |at: u64, entry: u32| -> String {
+        let esc: String = temen_ir::SpawnRec::v1(entry)
+            .encode()
+            .iter()
+            .map(|b| format!("\\x{b:02x}"))
+            .collect();
+        format!("data {at} \"{esc}\"\n")
+    };
+    format!(
+        "memory 17
+data 16384 \"vm\"
+data 16400 \"budget\"
+{r1}{r2}import 0 \"exit\" (i32) -> ()
+
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 2
+  vh = self.resolve vp vl
+  np = i64.const 16400
+  nl = i64.const 6
+  vroot = self.resolve np nl
+  all = i64.const -1
+  cap = i64.const {child_ceiling}
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, all)
+  bf = i64.const 17436
+  i32.store bf vsub
+  rp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (rp)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  k = i64.const 100
+  vr = i64.add vj k
+  vc = i32.wrap_i64 vr
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+func 1 (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vinst = i32.wrap_i64 va
+  np = i64.const 16400
+  nl = i64.const 6
+  vb = self.resolve np nl
+  bf = i64.const 17532
+  i32.store bf vb
+  rp = i64.const 17504
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vz = i32.const 0
+  vneg = i32.lt_s vch vz
+  br_if vneg 1(vch) 2(vinst, vch)
+  }}
+block 1 (ve: i32) {{
+  vr = i64.extend_i32_s ve
+  return vr
+  }}
+block 2 (vi: i32, vc: i32) {{
+  vj = call.cap 6 1 (i32) -> (i64) vi (vc)
+  k = i64.const 20
+  vr = i64.add vj k
+  return vr
+  }}
+}}
+func 2 (i64) -> (i64) {{
+block 0 (va: i64) {{
+  v = i64.const 3
+  return v
+  }}
+}}
+",
+        r1 = rec(17408, 1),
+        r2 = rec(17504, 2),
+    )
+}
+
+/// The tiers a §14 child can spawn on. The JIT compiles every non-durable child with a null
+/// `InstEnv`, so a child's spawn traps there (#1956).
+const NESTING_BACKENDS: [Backend; 2] = [Backend::TreeWalk, Backend::Bytecode];
+
+/// #1944: a detached child spawns and joins a detached grandchild paid from its own budget — the one
+/// that paid for its window.
+#[test]
+fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
+    let src = three_generations(1 << 18);
+    for b in NESTING_BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 123, "{b:?}");
+    }
+}
+
+/// #1944 (the owner's A/B/C example): a child's ceiling caps its whole subtree even while its parent
+/// has room. The child's 128 KiB ceiling holds its own window, so its child's spawn is refused
+/// (`-22 + 100`), under a root budget of 1 MiB.
+#[test]
+fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
+    let src = three_generations(1 << 17);
+    for b in NESTING_BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 78, "{b:?}");
+    }
+}

@@ -58,9 +58,10 @@
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     Attestation, BudgetState, BudgetThawRefused, CapturedDetached, CapturedProt, DetachedLaunch,
-    DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap, DurablePipe,
-    FreezeScope, FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host,
-    MemLayout, NonDurableHandle, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, Trap,
+    DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap,
+    DurablePipe, FreezeScope, FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested,
+    FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena, StreamRole, SvcDispatch,
+    ThawedDetached, Trap,
 };
 use temen_ir::Module;
 
@@ -239,7 +240,12 @@ use temen_ir::Module;
 /// abandoned. The thaw's re-issued call waits on that ticket instead of enqueueing the call again. The
 /// section is present iff the trio or the waits are non-empty; with no reply wait it ends in a zero
 /// count.
-const FORMAT_VERSION: u16 = 35;
+/// v36 (#1944): budgets are a tree of ceilings. `B_BUDGET` carries its node's **key** (its index in
+/// the run's tree), and Section 10 (`TAG_BUDGETS`) carries every node the domain's handles name, with
+/// each ancestor: `(key, parent, ceilings, live charge)` in ascending key order. A key names one node
+/// across every artifact of a freeze, so a thaw rebuilds a node its domains shared once. Elided when
+/// no `Budget` rides.
+const FORMAT_VERSION: u16 = 36;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -272,6 +278,9 @@ const TAG_DETACHED: u64 = 8;
 /// Section 9 (v32, #1680): the pipes inside the cut, by artifact number — each one's buffered bytes.
 /// Emitted only when a pipe end rides.
 const TAG_PIPES: u64 = 9;
+/// Section 10 (v36, #1944): the budget nodes the handle table's `B_BUDGET`s name, with their
+/// ancestors. Emitted only when a `Budget` rides.
+const TAG_BUDGETS: u64 = 10;
 /// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
 /// untrusted artifact must not choose the depth; freeze refuses past the same bound, so it never emits
 /// an artifact restore would reject.
@@ -293,8 +302,7 @@ const B_JIT_CODE: u8 = 9;
 /// A named embedder host capability (#1455). Index-only payload — the name and the provider's
 /// captured state ride [`TAG_NAMED`], exactly as a §22 domain's units ride [`TAG_JIT`].
 const B_NAMED: u8 = 10;
-/// #1502 — a `Budget`'s remaining quotas, four `i64`s (`-1` = unbounded) each written as its
-/// two's-complement `u64` uleb.
+/// #1502, #1944 — a `Budget` handle: its node's key in Section 10.
 const B_BUDGET: u8 = 11;
 /// `FreezeAuthority` (#1440): the `(base, size)` sub-range an ancestor may snapshot. A durable
 /// binding because the authority has to survive a round trip — a thawed parent must hold over its
@@ -879,6 +887,12 @@ fn freeze_at(
             }
         });
     }
+    // Section 10 — the budget nodes the handles name, with their ancestors (#1944, v36). Elided when
+    // no `Budget` rides.
+    let budgets = host.capture_durable_budgets();
+    if !budgets.is_empty() {
+        section(&mut out, TAG_BUDGETS, |b| write_budgets(b, &budgets));
+    }
 
     Ok(out)
 }
@@ -1051,6 +1065,75 @@ fn decode_named(body: Option<&[u8]>) -> Result<Vec<Option<DurableNamedCap>>, Res
     Ok(out)
 }
 
+/// Encode Section 10 ([`TAG_BUDGETS`], v36): the node count, then each node in ascending key order as
+/// `key`, `parent` (`0` none | `1 + key`), the five ceilings (`-1` = unbounded, as a two's-complement
+/// `u64` uleb) and the live `mem` charge.
+fn write_budgets(b: &mut Vec<u8>, budgets: &[DurableBudget]) {
+    write_uleb(b, budgets.len() as u64);
+    for n in budgets {
+        write_uleb(b, n.key as u64);
+        write_uleb(b, n.parent.map_or(0, |p| 1 + p as u64));
+        let c = n.ceil;
+        for f in [c.fuel, c.mem, c.spawn, c.channel, c.lane] {
+            write_uleb(b, f as u64);
+        }
+        write_uleb(b, n.used);
+    }
+}
+
+/// Decode Section 10 ([`TAG_BUDGETS`], v36). Absent ⇒ no `Budget` rides; present but empty, keys out
+/// of ascending order, a parent that is not an earlier carried node, or a ceiling below `-1` is not
+/// what a freeze writes, so it is malformed.
+fn decode_budgets(body: Option<&[u8]>) -> Result<Vec<DurableBudget>, RestoreError> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed);
+    }
+    let mut out: Vec<DurableBudget> = Vec::with_capacity(n.min(1024));
+    let key = |v: u64| u32::try_from(v).map_err(|_| RestoreError::Malformed);
+    for _ in 0..n {
+        let k = key(r.uleb()?)?;
+        let parent = match r.uleb()? {
+            0 => None,
+            p => Some(key(p - 1)?),
+        };
+        let mut field = || -> Result<i64, RestoreError> {
+            let v = r.uleb()? as i64;
+            if v < -1 {
+                return Err(RestoreError::Malformed);
+            }
+            Ok(v)
+        };
+        let ceil = BudgetState {
+            fuel: field()?,
+            mem: field()?,
+            spawn: field()?,
+            channel: field()?,
+            lane: field()?,
+        };
+        let used = r.uleb()?;
+        let ascending = out.last().is_none_or(|l| l.key < k);
+        let parent_ok = parent.is_none_or(|p| out.iter().any(|l| l.key == p));
+        if !ascending || !parent_ok {
+            return Err(RestoreError::Malformed);
+        }
+        out.push(DurableBudget {
+            key: k,
+            ceil,
+            used,
+            parent,
+        });
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(out)
+}
+
 /// Decode Section 9 ([`TAG_PIPES`], v32): each pipe's bytes, keyed by artifact number. Absent ⇒ no
 /// pipe rides; present but empty is non-canonical.
 fn decode_pipes(body: Option<&[u8]>) -> Result<Vec<DurablePipe>, RestoreError> {
@@ -1196,6 +1279,7 @@ fn restore_at(
     let mut named_body = None;
     let mut detached_body = None;
     let mut pipes_body = None;
+    let mut budgets_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -1211,6 +1295,7 @@ fn restore_at(
             TAG_NAMED => named_body = Some(body),
             TAG_DETACHED => detached_body = Some(body),
             TAG_PIPES => pipes_body = Some(body),
+            TAG_BUDGETS => budgets_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -1382,11 +1467,15 @@ fn restore_at(
     // v17: restore the call.dyn table reservation so the thaw run's dispatch table has the
     // padding the re-applied installs land in (a fresh host defaults to 0).
     host.set_jit_table_log2(jit_table_log2);
-    // #1502: offer every carried `Budget` to the embedder's hook before the table is pinned — the
-    // budget twin of the named-cap registrar step above. Attenuate-only; a refusal fails the restore
-    // here, with nothing granted.
-    host.attenuate_budgets_for_thaw(&mut handles)
+    // #1502, #1944: offer every carried budget node to the embedder's hook before the table is pinned
+    // — the budget twin of the named-cap registrar step above. Attenuate-only; a refusal fails the
+    // restore here, with nothing granted. Then rebuild the nodes, each handle's key checked against
+    // them.
+    let mut budgets = decode_budgets(budgets_body)?;
+    host.attenuate_budgets_for_thaw(&mut budgets)
         .map_err(RestoreError::BudgetRefused)?;
+    host.restore_durable_budgets(&budgets, &handles)
+        .map_err(|_| RestoreError::Malformed)?;
     // The interpreter names a pipe by its live id: rewrite each carried end's artifact number to the
     // id its rebuilt pipe was minted.
     let ids = host
@@ -2018,11 +2107,9 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, domain as u64);
             write_uleb(b, unit as u64);
         }
-        DurableBinding::Budget(q) => {
+        DurableBinding::Budget(key) => {
             b.push(B_BUDGET);
-            for f in [q.fuel, q.mem, q.spawn, q.channel, q.lane] {
-                write_uleb(b, f as u64);
-            }
+            write_uleb(b, key as u64);
         }
     }
 }
@@ -2082,22 +2169,7 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             unit: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         B_BUDGET => {
-            // A field is `-1` (unbounded) or a non-negative remaining; anything else is not a state
-            // `Host` ever produces, so it is a malformed artifact, not a quota to trust.
-            let mut field = || -> Result<i64, RestoreError> {
-                let v = r.uleb()? as i64;
-                if v < -1 {
-                    return Err(RestoreError::Malformed);
-                }
-                Ok(v)
-            };
-            DurableBinding::Budget(BudgetState {
-                fuel: field()?,
-                mem: field()?,
-                spawn: field()?,
-                channel: field()?,
-                lane: field()?,
-            })
+            DurableBinding::Budget(u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?)
         }
         _ => return Err(RestoreError::Malformed),
     })

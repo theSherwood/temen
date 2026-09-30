@@ -4218,8 +4218,8 @@ block 2 (p2: i64, n2: i64) {
 ; its window — the spawn's args payload landed at the powerbox args base (0x4080), `{len: i64}` then
 ; the text — so the child just hands the buffer to `prompt` (74), which runs the prelude on its first
 ; call exactly as `_start` does. Signature is the §14 child-entry shape; the arg is the child's own
-; `Instantiator`, which this kernel deliberately ignores: a sandbox does not nest a sandbox (it holds
-; no `budget`, so `sandbox` refuses).
+; `Instantiator`, which this kernel ignores. Its `budget` is the one that paid for its window (#1944),
+; which that window fills, so a `sandbox` inside it is refused.
 func (i64) -> (i64) {
 block 0 (x: i64) {
   lp = i64.const 16512
@@ -4242,8 +4242,9 @@ block 0 (x: i64) {
 ; dictionary from scratch. The program travels as the spawn's args payload, `{len, text}`.
 ;
 ; It is born with only what we hand it, by name, in the spawn record's grant list: `stdout` and
-; `jit`. No stdin, no `budget` — so `sandbox` inside a sandbox says "no sandbox capability". It also
-; holds its own starter `Instantiator` (its entry arg), unused. `jit` is there because a Forth that
+; `jit` — no stdin — plus, as every detached child, the budget that paid for its window as its own
+; `budget` (#1944). Ours is one window, which the child's fills, so `sandbox` inside a sandbox is
+; refused (`-EINVAL`). It also holds its own starter `Instantiator` (its entry arg), unused. `jit` is there because a Forth that
 ; cannot define a word is not a Forth; the child's `vm_jit_*` imports bind to that grant
 ; (`Host::bind_child_manifest`, through the record's `-1 = self` module selector).
 ;

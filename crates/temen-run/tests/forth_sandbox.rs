@@ -72,16 +72,13 @@ fn a_sandboxed_definition_does_not_escape() {
     );
 }
 
-/// A sandbox cannot nest one: the child's own `Instantiator` arrives as its entry argument and is
-/// never registered under a name, and it holds no `budget`, so the inner `sandbox` finds nothing and
-/// says so.
+/// A sandbox cannot nest one here: the child's `budget` is the node that paid for its window (#1944)
+/// — the host's one-window budget, which the child's own window fills — so the inner spawn is refused
+/// and the inner `sandbox` returns its `-EINVAL`.
 #[test]
 fn a_sandbox_cannot_sandbox() {
     let (out, _) = run(Backend::Bytecode, "s\" 0 0 sandbox . cr\" sandbox drop\n");
-    assert!(
-        out.contains("no sandbox capability"),
-        "inner sandbox must be refused: {out:?}"
-    );
+    assert_eq!(out, "-22 \n", "inner sandbox must be refused");
 }
 
 /// The issue's first gate: the child redefines a word the parent already has, prints with *its*

@@ -453,57 +453,110 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// #1502 — a `Budget` is durable. Its whole state is four `i64`s of *remaining* quota, so it rides a
-// capture verbatim and a restore re-mints it. Carrying the remaining rather than re-granting fresh is
-// what keeps INVARIANTS #3's conservation across a freeze: what the domain already spent stays spent.
+// #1502, #1944 — a `Budget` is durable. A handle captures as its node's key; the node, its live
+// charge and its ancestors ride beside the table, so a restore rebuilds the chain and what the domain
+// already spent stays spent (INVARIANTS #3's conservation across a freeze).
 // ---------------------------------------------------------------------------------------------
 
-use temen_interp::BudgetState;
+use temen_interp::{BudgetState, DurableBudget};
 
-/// A budget that has been partly spent captures as its **remaining** quotas, restores into a fresh
-/// table at the same slot, and the guest-held handle then reads the same remaining — not the
-/// original grant.
+/// A partly spent budget and a node split under it capture as keys plus both nodes (ceilings, charge,
+/// parent link); a restore into a fresh host rebuilds the chain, so the guest's handles read the room
+/// they had and a charge through the child still lands on the parent.
 #[test]
-fn a_budget_round_trips_through_capture_restore_with_its_remaining_intact() {
+fn a_budget_chain_round_trips_through_capture_restore_with_its_charges_intact() {
     let mut a = Host::new();
     a.grant_clock();
-    let h = a.grant_budget_channel(7, 1 << 20, 3, -1); // `-1` channel: the unbounded encoding
-    assert!(a.budget_mem_take(h, 4096), "spend some of the mem quota");
-    let remaining = BudgetState {
+    let root = a.grant_budget_channel(7, 1 << 20, 3, -1); // `-1` channel: the unbounded encoding
+    assert!(
+        a.budget_mem_take(root, 4096),
+        "spend some of the mem ceiling"
+    );
+    let child = a
+        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, 1 << 16, -1], None)
+        .unwrap()[0] as i32;
+    assert!(child >= 0, "split");
+    let ceil = BudgetState {
         fuel: 7,
-        mem: (1 << 20) - 4096,
+        mem: 1 << 20,
         spawn: 3,
         channel: -1,
         lane: -1,
     };
 
-    let captured = a
-        .capture_durable_handles()
-        .expect("a Budget is durable: the capture must not refuse it");
-    assert!(
-        captured
-            .iter()
-            .any(|c| c.binding == DurableBinding::Budget(remaining)),
-        "the capture carries the remaining quotas, not the original grant: {captured:?}"
+    let handles = a.capture_durable_handles().expect("a Budget is durable");
+    let budgets = a.capture_durable_budgets();
+    assert_eq!(
+        budgets,
+        vec![
+            DurableBudget {
+                key: 0,
+                ceil,
+                used: 4096,
+                parent: None
+            },
+            DurableBudget {
+                key: 1,
+                ceil: BudgetState {
+                    mem: 1 << 16,
+                    ..ceil
+                },
+                used: 0,
+                parent: Some(0),
+            },
+        ],
+        "the capture carries both nodes: ceilings, the live charge and the link"
     );
+    assert!(handles
+        .iter()
+        .any(|c| c.binding == DurableBinding::Budget(1)));
 
     let mut b = Host::new();
-    b.restore_durable_handles(&captured);
+    b.restore_durable_budgets(&budgets, &handles)
+        .expect("every key is carried");
+    b.restore_durable_handles(&handles);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
-        captured,
-        "restore reinstates the exact captured set, Budget included"
-    );
-    // The guest's handle value resolves to the re-minted entry, and `read(mem)` is the remaining.
-    assert_eq!(
-        b.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[1], None),
-        Ok(vec![remaining.mem]),
-        "read(mem) after restore is what was left at capture"
+        handles,
+        "the exact captured set"
     );
     assert_eq!(
-        b.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
+        b.capture_durable_budgets(),
+        budgets,
+        "the exact captured nodes"
+    );
+    let read = |h: &mut Host, handle| h.cap_dispatch_slots(cap_id::BUDGET, 1, handle, &[1], None);
+    assert_eq!(
+        read(&mut b, root),
+        Ok(vec![(1 << 20) - 4096]),
+        "the charge stayed spent"
+    );
+    assert!(
+        b.budget_mem_take(child, 1 << 16),
+        "the child's whole ceiling"
+    );
+    assert_eq!(
+        read(&mut b, root),
+        Ok(vec![(1 << 20) - 4096 - (1 << 16)]),
+        "charged to the parent"
+    );
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::BUDGET, 1, root, &[3], None),
         Ok(vec![-1]),
-        "an unbounded field survives the two's-complement uleb"
+        "an unbounded field survives"
+    );
+}
+
+/// A carried handle naming a key the artifact does not carry is malformed, and the restore says so
+/// before any slot is pinned.
+#[test]
+fn a_handle_naming_an_uncarried_budget_node_refuses_the_restore() {
+    let mut a = Host::new();
+    a.grant_budget(1, 2, 3);
+    let handles = a.capture_durable_handles().unwrap();
+    assert_eq!(
+        Host::new().restore_durable_budgets(&[], &handles),
+        Err(temen_interp::BudgetRestoreError { key: 0 })
     );
 }
 
@@ -521,5 +574,64 @@ fn a_drain_keeps_a_budget() {
         a.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[2], None),
         Ok(vec![3]),
         "the budget is untouched by the drain"
+    );
+}
+
+/// #1944: a parent and the detached child its budget paid for share a node; each domain's artifact
+/// carries the chain it holds, and the thaw rebuilds the shared node once — the child restored through
+/// the parent's `detached_thaw_host` — so a charge the thawed child makes lands on the thawed parent.
+#[test]
+fn a_node_two_domains_share_is_one_node_after_a_thaw() {
+    let mut parent = Host::new();
+    let root = parent.grant_budget(-1, 1 << 20, -1);
+    let paid = parent
+        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, 1 << 18, -1], None)
+        .unwrap()[0] as i32;
+    assert!(parent.admit_detached_spawn(paid, 1 << 16).is_some());
+    let mut child = Host::new();
+    parent.give_child_budget(paid, &mut child);
+    let cb = child.resolve_cap_name("budget").unwrap();
+
+    let (ph, pb) = (
+        parent.capture_durable_handles().unwrap(),
+        parent.capture_durable_budgets(),
+    );
+    let (ch, cbs) = (
+        child.capture_durable_handles().unwrap(),
+        child.capture_durable_budgets(),
+    );
+    assert_eq!(
+        cbs.len(),
+        2,
+        "the child's artifact carries its node and the root above it"
+    );
+
+    let mut tparent = Host::new();
+    tparent.restore_durable_budgets(&pb, &ph).unwrap();
+    tparent.restore_durable_handles(&ph);
+    let mut tchild = tparent.detached_thaw_host();
+    tchild.restore_durable_budgets(&cbs, &ch).unwrap();
+    tchild.restore_durable_handles(&ch);
+    tparent.reclaim_thaw_seams(&mut tchild);
+
+    let read = |h: &mut Host, b| {
+        h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)
+            .unwrap()[0]
+    };
+    assert_eq!(
+        read(&mut tparent, paid),
+        (1 << 18) - (1 << 16),
+        "the window's charge stayed"
+    );
+    assert!(tchild.budget_mem_take(cb, 1 << 16));
+    assert_eq!(
+        read(&mut tparent, paid),
+        (1 << 18) - (1 << 17),
+        "the child charged the parent's node"
+    );
+    assert_eq!(
+        read(&mut tparent, root),
+        (1 << 20) - (1 << 17),
+        "and the root above it"
     );
 }

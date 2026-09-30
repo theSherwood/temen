@@ -748,3 +748,114 @@ fn a_handle_masks_onto_the_table() {
         &ok(101),
     );
 }
+
+// ---- #1944: a detached child pays for its own detached child ------------------------------------
+
+/// A data segment holding a v1 spawn record of this module's function `entry` (its declared window;
+/// the budget field filled at run time), at `at`.
+fn rec_segment(at: u64, entry: u32) -> String {
+    let esc: String = temen_ir::SpawnRec::v1(entry)
+        .encode()
+        .iter()
+        .map(|b| format!("\\x{b:02x}"))
+        .collect();
+    format!("data {at} \"{esc}\"\n")
+}
+
+/// Three generations of one `memory 16` module, each window 64 KiB. The root resolves its `"budget"`,
+/// splits a node with a `mem` ceiling of `child_ceiling`, and spawns func 1 detached, paid from it.
+/// Func 1 resolves its own `"budget"` — the node that paid for it — and spawns func 2 from it: a
+/// refused spawn returns its `-errno`, an admitted one `join + 20`. Func 2 returns 3. The root returns
+/// what its child did plus 100.
+fn three_generations(child_ceiling: i64) -> String {
+    format!(
+        "memory 16
+data 16384 \"budget\"
+{r1}{r2}func (i32) -> (i64) {{
+block 0 (vinst: i32) {{
+  np = i64.const 16384
+  nl = i64.const 6
+  vroot = self.resolve np nl
+  all = i64.const -1
+  cap = i64.const {child_ceiling}
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, all)
+  bf = i64.const 17436
+  i32.store bf vsub
+  rp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  k = i64.const 100
+  vr = i64.add vj k
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vinst = i32.wrap_i64 va
+  np = i64.const 16384
+  nl = i64.const 6
+  vb = self.resolve np nl
+  bf = i64.const 17532
+  i32.store bf vb
+  rp = i64.const 17504
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vz = i32.const 0
+  vneg = i32.lt_s vch vz
+  br_if vneg 1(vch) 2(vinst, vch)
+  }}
+block 1 (ve: i32) {{
+  vr = i64.extend_i32_s ve
+  return vr
+  }}
+block 2 (vi: i32, vh: i32) {{
+  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  k = i64.const 20
+  vr = i64.add vj k
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  v = i64.const 3
+  return v
+  }}
+}}
+",
+        r1 = rec_segment(17408, 1),
+        r2 = rec_segment(17504, 2),
+    )
+}
+
+/// The root's powerbox: its `Instantiator`, its running module, and a 1 MiB `"budget"`.
+fn generations_setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    move || {
+        let mut h = Host::new();
+        h.set_self_module(&std::sync::Arc::new(m.clone()));
+        let i = h.grant_instantiator(0, 1 << 16);
+        let b = h.grant_budget(0, 1 << 20, 0);
+        h.register_cap_name("budget", b);
+        (h, vec![Value::I32(i)])
+    }
+}
+
+#[test]
+fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
+    let m = module(&three_generations(1 << 17));
+    agree_on_every_driver(
+        "a child whose 128 KiB ceiling holds its window and its child's",
+        &m,
+        &generations_setup(&m),
+        &ok(3 + 20 + 100),
+    );
+}
+
+#[test]
+fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
+    let m = module(&three_generations(1 << 16));
+    agree_on_every_driver(
+        "a child whose 64 KiB ceiling its own window fills",
+        &m,
+        &generations_setup(&m),
+        &ok(-22 + 100),
+    );
+}

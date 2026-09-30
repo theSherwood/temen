@@ -413,13 +413,12 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                  and is declined",
             )],
 
-        // Declines on nesting (its index into `Host::budgets` is meaningless in another table — a child
-        // is granted a *sub*-budget by `split`/`transfer`, never the handle) but **durable** since
-        // #1502: the artifact carries the remaining quotas verbatim (`DurableBinding::Budget`) and the
-        // thaw may only attenuate them. This closed the caveat INVARIANTS #3's R2 ruling had recorded
-        // against itself ("minting authority does not survive a freeze").
+        // Declines on nesting as a re-grant (a grant list cannot carry one): a child's own `"budget"` is
+        // the node that paid for its window (#1944), reached through the spawn record. **Durable** since
+        // #1502: the artifact carries each held node's key, ceilings, charge and parent
+        // (`DurableBinding::Budget`), and the thaw may only attenuate the ceilings.
         Capability::Budget => [
-            declines("index-carrying: the child is granted a sub-budget by split/transfer, not the handle"),
+            declines("not re-grantable by name: a child's own budget is the node that paid for its window (#1944)"),
             F,
             B,
             U,
