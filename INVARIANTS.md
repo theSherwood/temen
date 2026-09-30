@@ -85,7 +85,13 @@ one on op 15 or a v1 record traps `CapFault`). The run's own node carries the em
 (`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
 budgets below it, since what is left of it differs by engine (their default limits differ, and each
 draws on its own schedule). The carve ops (0/5/13, v0 records) keep a fixed
-allowance until #1867 deletes them.
+allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
+ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
+vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
+with the window when the child ends; a domain's other vCPUs (its threads, fork twins and spawned
+processes) are not charged yet, a tracked gap (#2001). A pipe's worst-case FIFO is charged to the
+`channel` of the node of the domain that minted it, and every ancestor, until its last end closes. An
+exec keeps its domain's node, so a child cannot exec its way out of its budget.
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

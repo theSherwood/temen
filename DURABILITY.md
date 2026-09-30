@@ -590,8 +590,9 @@ the tree is flattened into the root's `unreached_detached()`, which `freeze` ref
 **Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
 own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
 spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
-entry and module digest, and the bounds its spawner granted it (fuel left, lane, channel, vCPU
-ceiling, import names). A thaw may narrow those bounds, never widen them. Restore rebuilds each child
+entry and module digest, its lane and its import names. Its fuel, `spawn` and `channel` bounds are its
+budget node's (Section 10, #1944 slice 3; the launch record carried them itself until v38). A thaw
+may narrow those bounds, never widen them. Restore rebuilds each child
 into a fresh powerbox holding the restoring host's thaw seams (`Host::detached_thaw_host`: its durable
 module grants and JIT admission copied, its registrar and budget hook lent), so one restoring host
 decides what the whole tree gets back; a child whose module it no longer grants is
