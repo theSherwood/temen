@@ -419,13 +419,14 @@ fn bytecode_kernel_perf() {
     }
 }
 
-/// #1958 — unbounded recursion traps `StackOverflow` on both interpreters, never exhausting the host.
+/// #1958, #1983 — unbounded recursion traps `StackOverflow` on every engine, never exhausting the
+/// host or aborting it.
 /// `sum_down` is c_interpret's lesson starter as chibicc lowers it: the data-stack pointer rides as
 /// the first argument and never moves (no in-memory locals), so no guard page is ever touched and
 /// only the engine's own frame bound can stop it. The mutual pair checks the bound counts frames
 /// across functions.
 #[test]
-fn unbounded_recursion_traps_stack_overflow_on_both_interpreters() {
+fn unbounded_recursion_traps_stack_overflow_on_every_engine() {
     let sum_down = r#"
 func (i64, i32) -> (i32) {
 block 0 (vsp: i64, vn: i32) {
@@ -460,6 +461,10 @@ block 0 (vsp: i64, vn: i32) {
         assert_eq!(
             bytecode::compile_and_run(&m, 0, &args, &mut fuel),
             Some(Err(Trap::StackOverflow))
+        );
+        assert_eq!(
+            temen_jit::compile_and_run(&m, 0, &[4096, 5]).expect("jit"),
+            temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::StackOverflow)
         );
     }
 }

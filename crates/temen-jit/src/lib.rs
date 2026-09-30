@@ -6669,8 +6669,8 @@ fn sig_from(
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
     sig.params.push(AbiParam::new(I64)); // trap_out (host-owned trap cell)
-                                         // §2b path B: a 4th context param — the running stack's low bound (`usable_low`), or 0 for the
-                                         // root/thread-top (which keeps its OS-guarded stack). Threaded through every call (constant within
+                                         // §2b path B: a 4th context param — the running stack's limit: a fiber's `usable_low`, or the
+                                         // root/thread-top's thread limit (`stack_check::thread_limit`, #1983). Threaded through every call (constant within
                                          // a stack's call tree; set anew at each fiber/root entry), so the prologue check reads a per-vCPU
                                          // limit from a register with no cell and no TLS. Always present (the software stack-overflow guard
                                          // is in the always-on escape-TCB path; see `emit_stack_check`).
@@ -7433,12 +7433,19 @@ fn build_trampoline(
     // (8-byte `encode_slot` slots) straight into the buffer Rust reads, so no register read-back.
     let sret = uses_sret(&entry.results);
     let mut call_args = vec![mem_base, fn_table_base, trap_out];
-    // §2b path B: the root runs on the OS thread stack (OS-guarded), so its stack-limit is 0 ⇒ the
-    // prologue check is inert for the root computation; fibers get a real limit at their own entry.
+    // §2b path B: the root runs on the calling thread's own stack, so it takes that stack's limit from
+    // the host (#1983, `stack_check::thread_limit`); fibers get a real limit at their own entry.
     let limit = if with_limit {
         b.block_params(blk)[5]
     } else {
-        b.ins().iconst(I64, 0) // stack_limit = 0 (root)
+        let mut sig = module.make_signature(); // host C ABI
+        sig.returns.push(AbiParam::new(I64));
+        let sig = b.import_signature(sig);
+        let f = b
+            .ins()
+            .iconst(I64, stack_check::thread_limit as *const () as i64);
+        let call = b.ins().call_indirect(sig, f, &[]);
+        b.inst_results(call)[0]
     };
     call_args.push(limit);
     if sret {
@@ -9516,6 +9523,82 @@ pub(crate) mod stack_check {
     /// check's own scratch. A single frame larger than the whole stack is a residual backstop concern
     /// (STACK_GUARD.md §2b) — Cranelift 0.132 doesn't expose the final frame size to enforce it.
     pub(crate) const RED_ZONE: u64 = 1 << 14; // 16 KiB
+
+    /// #1983 — the stack limit for guest code entered on the calling thread's **own** stack: the root
+    /// (the entry trampoline) and a spawned vCPU's top. The thread stack's low bound plus a quarter of
+    /// its size, which stays free for the host code a guest call runs, so unbounded recursion traps
+    /// `StackOverflow` instead of reaching the OS guard page, where the process aborts. `0` (the check
+    /// inert, as a fiber-less stack had it before) when the bounds are unknown or the caller is on
+    /// some other stack, such as a host re-entry from inside a guest fiber. The bounds are looked up
+    /// once per thread.
+    pub(crate) extern "C" fn thread_limit() -> u64 {
+        thread_local! {
+            static BOUNDS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+        }
+        let (low, high) = BOUNDS.with(|b| {
+            b.get().unwrap_or_else(|| {
+                let v = stack_bounds();
+                b.set(Some(v));
+                v
+            })
+        });
+        let here = 0u8;
+        let sp = &here as *const u8 as u64;
+        if low == 0 || sp <= low || sp > high {
+            return 0;
+        }
+        low + (high - low) / 4
+    }
+
+    /// The calling thread's stack as `(low, high)`, or `(0, 0)` where the platform can't say.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stack_bounds() -> (u64, u64) {
+        // SAFETY: `attr` is initialised by `pthread_getattr_np` before it is read, and destroyed once.
+        unsafe {
+            let mut attr = std::mem::zeroed::<libc::pthread_attr_t>();
+            if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+                return (0, 0);
+            }
+            let (mut addr, mut size) = (std::ptr::null_mut(), 0usize);
+            let ok = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
+            libc::pthread_attr_destroy(&mut attr);
+            if !ok {
+                return (0, 0);
+            }
+            (addr as u64, addr as u64 + size as u64)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stack_bounds() -> (u64, u64) {
+        // SAFETY: both calls only read the calling thread's own descriptor.
+        unsafe {
+            let this = libc::pthread_self();
+            let high = libc::pthread_get_stackaddr_np(this) as u64;
+            let size = libc::pthread_get_stacksize_np(this) as u64;
+            (high - size, high)
+        }
+    }
+
+    #[cfg(windows)]
+    fn stack_bounds() -> (u64, u64) {
+        let (mut low, mut high) = (0usize, 0usize);
+        // SAFETY: writes the calling thread's stack bounds into the two locals.
+        unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high)
+        };
+        (low as u64, high as u64)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
+    fn stack_bounds() -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// The per-prologue software stack-limit check — overflow protection for the arena/software-guard
@@ -9526,14 +9609,15 @@ pub(crate) mod stack_check {
 /// native stack past the fiber's low bound. The check sits in the entry block, *after* the machine
 /// prologue's `sub rsp`, so `get_stack_pointer` already reflects this frame and it is validated
 /// directly (soundness relies on Cranelift not page-probing during `sub rsp` — `enable_probestack` is
-/// off; see the ISA flags). `limit == 0` (the root / spawned-vCPU top, on OS-guarded stacks) ⇒
+/// off; see the ISA flags). The root and a spawned vCPU's top take their thread's limit
+/// ([`stack_check::thread_limit`], #1983). `limit == 0` (an entry off its thread's stack) ⇒
 /// `SP - RED_ZONE` is a huge address, never unsigned-`< 0`, so the check is inert there. The limit is a
 /// constant within a stack's call tree, so the callee re-checks before its own frame.
 fn emit_stack_check(b: &mut FunctionBuilder, lower: &Lower) {
     let cont = b.create_block();
     let trap_blk = b.create_block();
     // §2b path B: the running stack's low bound, from our own ABI param (per-vCPU by construction — no
-    // cell, no TLS). 0 for the root/thread-top ⇒ `SP - RED_ZONE < 0` is never true ⇒ inert (OS guard).
+    // cell, no TLS). 0 ⇒ `SP - RED_ZONE < 0` is never true ⇒ inert (the OS guard only).
     let limit = b.use_var(lower.limit_var);
     let sp = b.ins().get_stack_pointer(I64);
     let guard = b.ins().iadd_imm(sp, -(stack_check::RED_ZONE as i64)); // SP - RED_ZONE
