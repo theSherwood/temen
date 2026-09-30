@@ -102,7 +102,7 @@ fn host(child: &temen_ir::Module, minter_quota: u64) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(-1, (minter_quota) as i64, 0);
+    let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
     (host, [inst, modh, budget])
 }
 
@@ -223,7 +223,7 @@ block 2 () {
 fn fuel_host(child: &temen_ir::Module, fuel: i64) -> (Host, [i32; 3]) {
     let (mut host, mut h) = host(child, 1 << 20);
     h[2] = host
-        .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[fuel, -1, 0], None)
+        .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[fuel, -1, -1], None)
         .expect("split")[0] as i32;
     (host, h)
 }
@@ -254,6 +254,63 @@ fn a_detached_childs_budget_bounds_its_fuel_under_an_unmetered_jit_root() {
             "the JIT, ceiling {fuel}"
         );
     }
+}
+
+/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
+/// 2^16, no payload), join it, then spawn and join it again, returning the two results' sum. A refused
+/// second spawn traps its join (a negative handle).
+const SPAWN_JOIN_SPAWN: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 16
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vh2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
+  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vr = i64.add vj vj2
+  return vr
+  }
+}
+"#;
+
+/// [`host`] whose `Budget` funds `spawn` live children (1 MiB of window).
+fn spawn_host(child: &temen_ir::Module, spawn: i64) -> (Host, [i32; 3]) {
+    let (mut host, mut h) = host(child, 1 << 20);
+    h[2] = host.grant_budget(-1, 1 << 20, spawn);
+    (host, h)
+}
+
+/// #1944 slice 3 — a detached child is one `spawn` of the budget that pays for it while it lives, on
+/// the JIT as on the interpreter: a spawn-0 budget funds no child, and a one-child budget funds a
+/// second once the first is joined (the JIT hands the child back through its lease hook).
+#[test]
+fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
+    let c = module(CHILD_LOOPS);
+    let refused = module(&parent(false));
+    assert_eq!(
+        interp_result(&refused, spawn_host(&c, 0)),
+        Ok(vec![Value::I64(-22)]),
+        "interpreter, a spawn-0 budget"
+    );
+    assert_eq!(
+        jit_outcome(&refused, spawn_host(&c, 0)),
+        JitOutcome::Returned(vec![-22]),
+        "the JIT, a spawn-0 budget"
+    );
+    let twice = module(SPAWN_JOIN_SPAWN);
+    assert_eq!(
+        interp_result(&twice, spawn_host(&c, 1)),
+        Ok(vec![Value::I64(14)]),
+        "interpreter, a one-child budget in turn"
+    );
+    assert_eq!(
+        jit_outcome(&twice, spawn_host(&c, 1)),
+        JitOutcome::Returned(vec![14]),
+        "the JIT, a one-child budget in turn"
+    );
 }
 
 /// A detached child (`memory 16`) importing `exit`, which no grant binds.
@@ -614,7 +671,7 @@ fn premap_host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(-1, 1i64 << 17, 0);
+    let budget = host.grant_budget(-1, 1i64 << 17, -1);
     (host, [inst, aspace, modh, budget])
 }
 

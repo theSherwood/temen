@@ -365,7 +365,7 @@ pub extern "C" fn run_fork() -> i64 {
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
-    let budget = host.grant_budget(-1, 2 << 18, 0); // the server's and the guest's windows
+    let budget = host.grant_budget(-1, 2 << 18, -1); // the server's and the guest's windows
     let mut fuel = 40_000_000u64;
     let r = match bytecode::compile_and_run_with_host(
         &m,
@@ -2132,7 +2132,7 @@ pub extern "C" fn temen_par_root(
             args.push(Value::I32(host.grant_budget(
                 -1,
                 (cfg.minter_quota) as i64,
-                0,
+                -1,
             )));
         }
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
@@ -4351,7 +4351,7 @@ pub fn posix_shell_exec_with(
     let _as = host.grant_address_space(0, win);
     // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.
-    let _budget_h = host.grant_budget(-1, 4 << 20, 0);
+    let _budget_h = host.grant_budget(-1, 4 << 20, -1);
     let cmd_handles: Vec<(&str, i32, u8)> = cmds
         .iter()
         .map(|(n, cm)| {
@@ -7343,7 +7343,7 @@ pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
     host.set_self_module(&std::sync::Arc::new(m.clone()));
     let inst = host.grant_instantiator(0, 128 << 10);
-    let budget = host.grant_budget(-1, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
     let mut fuel = 5_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &[Value::I32(inst)], &mut fuel, &mut host) {
@@ -11641,7 +11641,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
     host.register_cap_name("jit", jit_h);
     // #1286: the driver's third entry arg is the `Budget` its children's windows are paid from (the
     // default per-child memory ceiling).
-    let budget = host.grant_budget(-1, DETACHED_DEFAULT_MAX_BYTES as i64, 0);
+    let budget = host.grant_budget(-1, DETACHED_DEFAULT_MAX_BYTES as i64, -1);
     // #1527: a driver whose entry takes a fourth arg gets an `AddressSpace` over its window — so a
     // detached driver can mint a region (`create_region`), map it for itself and pre-map it into
     // the child (the op-15 11-arg form). The three-arg drivers are unchanged.

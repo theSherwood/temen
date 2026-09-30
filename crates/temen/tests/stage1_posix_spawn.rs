@@ -182,9 +182,9 @@ fn run(
     let out_h = host.grant_stream(StreamRole::Out);
     let _inst_h = host.grant_instantiator(0, win as u64);
     let echo_h = host.grant_module(cmd);
-    let _budget_h = host.grant_budget(-1, 1 << 20, 0); // the command's window is paid from this
-                                                       // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack (a lean shell
-                                                       // never `malloc`s, so this region stays untouched).
+    let _budget_h = host.grant_budget(-1, 1 << 20, -1); // the command's window is paid from this
+                                                        // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack (a lean shell
+                                                        // never `malloc`s, so this region stays untouched).
     let (_px_h, posix) =
         temen_posix::grant(&mut host, (win - (64 << 10)) as u64, win as u64, Vec::new());
     posix.set_stdout_sink(sink); // …and the shell's own fd-1 writes land in the same sink.

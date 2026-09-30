@@ -149,7 +149,7 @@ fn rust_driver_guest_runs_real_nifler() {
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&nifler);
     // nifler's window, paid from this and returned when it ends.
-    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, -1);
     let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);

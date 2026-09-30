@@ -3093,13 +3093,12 @@ fn relaunch_detached(
         &funcs,
         child_host.lock_unpoisoned().jit_table_log2(),
     ));
-    let child_quota = Quota {
-        max_vcpus: (launch.max_vcpus as usize).min(quota.max_vcpus),
-        max_fibers: quota.max_fibers,
-    };
+    // A detached child's quota is its spawner's, as at the spawn; its fuel, vCPUs and channel memory
+    // are its budget chain's, which the restore carried (#1944 slice 3).
+    let child_quota = quota;
     // #1944 slice 3 — the child draws from the budget that paid for it, which its restored node chain
     // still charges; what it had drawn and not burned went back at the freeze.
-    let child_fuel = Fuel::drawn(child_host.lock_unpoisoned().fuel_source());
+    let child_fuel = Fuel::drawn(child_host.lock_unpoisoned().own_node());
     let kflag = Arc::new(AtomicBool::new(false));
     let bell = Arc::new(AtomicBool::new(false));
     let mut child = Box::new(VCpu::new(
@@ -3149,7 +3148,6 @@ fn relaunch_detached(
                 entry: launch.entry,
                 module: Arc::clone(&module),
                 digest: launch.digest,
-                max_vcpus: child_quota.max_vcpus,
                 same_module: launch.same_module,
             },
         ),
@@ -3416,9 +3414,9 @@ fn drive_over_cell(
                     unreached.push(p);
                     continue;
                 };
-                let (lane, channel, names) = {
+                let (lane, names) = {
                     let h = p.host.lock_unpoisoned();
-                    (h.lane_cap(), h.channel_cap(), h.cap_names.clone())
+                    (h.lane_cap(), h.cap_names.clone())
                 };
                 owners.push(Arc::clone(&p.host));
                 captured.push(CapturedDetached {
@@ -3431,13 +3429,7 @@ fn drive_over_cell(
                         task: p.child_task,
                         entry: p.spawn.entry,
                         digest: p.spawn.digest,
-                        // #1944 slice 3: unread — the child's draws are charged to its budget
-                        // chain, and what it did not burn went back as it unwound. The field
-                        // retires with the record's channel and vCPU bounds (slice 3's PR 2).
-                        fuel: u64::MAX,
                         lane,
-                        channel,
-                        max_vcpus: p.spawn.max_vcpus as u64,
                         same_module: p.spawn.same_module,
                         names,
                     },
@@ -7716,7 +7708,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
     // back to the budget that paid for them (lock order sched → host).
     if let Some((cell, budget, bytes)) = v.window_lease.take() {
-        cell.lock_unpoisoned().budget_mem_give(budget, bytes);
+        cell.lock_unpoisoned().release_detached(budget, bytes);
     }
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
@@ -8962,7 +8954,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // here). Never during a freeze unwind: the child is captured, not ended.
                 if !froze {
                     if let Some((cell, budget, bytes)) = v.window_lease.take() {
-                        cell.lock_unpoisoned().budget_mem_give(budget, bytes);
+                        cell.lock_unpoisoned().release_detached(budget, bytes);
                     }
                 }
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
@@ -10933,8 +10925,6 @@ pub struct DetachedSpawn {
     pub module: Arc<Module>,
     /// The grant's digest ([`module_digest`] of `module`).
     pub digest: [u8; 32],
-    /// The child's vCPU ceiling (its funding budget's `spawn`, clamped to ours).
-    pub max_vcpus: usize,
     /// The spawner's own module (`is_self_module`), whose imports bind leniently (#1234).
     pub same_module: bool,
 }
@@ -10952,14 +10942,8 @@ pub struct DetachedLaunch {
     pub entry: u32,
     /// The §4 content digest of the module grant it runs.
     pub digest: [u8; 32],
-    /// The child's remaining fuel at the cut.
-    pub fuel: u64,
     /// The child's D66 lane cap (`-1` = unbounded).
     pub lane: i64,
-    /// The child's §3b channel-memory cap (`-1` = unbounded).
-    pub channel: i64,
-    /// The child's vCPU ceiling.
-    pub max_vcpus: u64,
     /// Whether the child runs its spawner's own module (its imports then bind leniently, #1234).
     pub same_module: bool,
     /// The names the spawner registered the child's grants under, `(name, handle)` — what its imports
@@ -15351,8 +15335,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // paid for its window, its own node: every level above charges
                                     // for what it burns.
                                     let child_fuel =
-                                        Fuel::drawn(child_host.lock_unpoisoned().fuel_source());
-                                    let spawn_quota_max = spawn_quota.max_vcpus; // #1361 step 4
+                                        Fuel::drawn(child_host.lock_unpoisoned().own_node());
                                     let cfuncs = Arc::clone(&cm.funcs);
                                     let ctypes = Arc::clone(&cm.types); // child module type section (#922)
                                     let csched = sched.clone();
@@ -15429,7 +15412,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                         entry: entry as u32,
                                                         module: Arc::clone(&cm.module),
                                                         digest: cm.digest,
-                                                        max_vcpus: spawn_quota_max,
                                                         same_module,
                                                     },
                                                 ),
@@ -19411,16 +19393,16 @@ pub type RegionBacking = Arc<dyn SharedBacking>;
 /// filling the FIFO forever. Paired with the FIFO bound ([`PIPE_CAP`]) this makes the pipe a true
 /// bounded buffer: a `write` that would overflow **parks** the writer (backpressure) until the reader
 /// drains room or every reader closes (→ `-EPIPE`).
-/// #989 — the **channel-memory charge** riding a host-served pipe backing: a clone of the *minting*
-/// domain's [`Host::channel_used`] counter plus a fire-once refund guard. The charge is on the
-/// `Arc`-shared backing (not a per-`Host` side table) so a §14 child that closes the last end
-/// refunds the domain that *minted* it — the credit follows the backing across the re-grant, not the
-/// closing `Host`. `PIPE_CAP` (the worst-case full FIFO) is charged at mint and refunded once, when
-/// the backing's last handle (both counts → 0) closes. `None` = an embedder-owned, uncharged backing
-/// (a terminal/stdin feed).
+/// #989 — the **channel-memory charge** riding a host-served pipe backing: the *minting* domain's
+/// own budget node, charged `PIPE_CAP` of `channel` up its chain (#1944 slice 3), plus a fire-once
+/// refund guard. The charge is on the `Arc`-shared backing (not a per-`Host` side table) so a §14
+/// child that closes the last end refunds the domain that *minted* it — the credit follows the
+/// backing across the re-grant, not the closing `Host`. `PIPE_CAP` (the worst-case full FIFO) is
+/// charged at mint and refunded once, when the backing's last handle (both counts → 0) closes.
+/// `None` = an embedder-owned, uncharged backing (a terminal/stdin feed).
 struct ChannelCharge {
-    /// The minting domain's `channel_used` running total (bytes).
-    used: Arc<std::sync::atomic::AtomicI64>,
+    /// The node the mint charged: the minting domain's own.
+    node: NodeRef,
     /// Set exactly once at last-close so the refund can never double-fire (fork shares the backing).
     refunded: std::sync::atomic::AtomicBool,
 }
@@ -19831,6 +19813,14 @@ const BUDGET_DIMS: usize = 5;
 const BUDGET_FUEL: usize = 0;
 /// The `mem` dimension's index: what a detached window charges.
 const BUDGET_MEM: usize = 1;
+/// The `spawn` dimension's index: one per live vCPU of the subtree (#1944 slice 3, the cgroups
+/// `pids.max` model). A detached child's first vCPU is charged with its window at the admission and
+/// handed back with it ([`Host::admit_detached_spawn`]); a domain's other vCPUs are not charged yet
+/// (#2001).
+const BUDGET_SPAWN: usize = 2;
+/// The `channel` dimension's index: a host-served pipe's worst-case FIFO, [`PIPE_CAP`], charged to
+/// the node of the domain that minted it until its last end closes (#989, #1944 slice 3).
+const BUDGET_CHANNEL: usize = 3;
 /// The `lane` dimension's index: a ceiling on a child's lane, never charged by the tree (D66).
 const BUDGET_LANE: usize = 4;
 
@@ -19941,13 +19931,23 @@ impl BudgetTree {
     /// Charge `amount` of dimension `d` to `n` and every ancestor, or to none of them: `false` when
     /// any bounded level lacks the room.
     fn charge(&self, n: u32, d: usize, amount: u64) -> bool {
+        self.add(n, d, amount, true)
+    }
+
+    /// [`Self::charge`] past any ceiling: a use that exists already, accounted again — what a thaw
+    /// rebuilds (a pipe, a re-created vCPU), or an embedder's own mint. It still charges every level.
+    fn force_charge(&self, n: u32, d: usize, amount: u64) {
+        self.add(n, d, amount, false);
+    }
+
+    fn add(&self, n: u32, d: usize, amount: u64, check: bool) -> bool {
         let mut nodes = self.0.lock_unpoisoned();
         if (n as usize) >= nodes.len() {
             return false;
         }
         let a = i64::try_from(amount).unwrap_or(i64::MAX);
         let room = Self::left(&nodes, n, d);
-        if room >= 0 && a > room {
+        if check && room >= 0 && a > room {
             return false;
         }
         let chain: Vec<u32> = Self::chain(&nodes, n).collect();
@@ -19956,6 +19956,21 @@ impl BudgetTree {
             *u = u.saturating_add(a);
         }
         true
+    }
+
+    /// What `n`'s subtree has charged of dimension `d`.
+    fn used(&self, n: u32, d: usize) -> i64 {
+        self.0
+            .lock_unpoisoned()
+            .get(n as usize)
+            .map_or(0, |node| node.used[d])
+    }
+
+    /// Set `n`'s own ceiling on dimension `d` (`-1` = unbounded); its ancestors' still bound it.
+    fn set_ceiling(&self, n: u32, d: usize, ceiling: i64) {
+        if let Some(node) = self.0.lock_unpoisoned().get_mut(n as usize) {
+            node.ceiling[d] = ceiling;
+        }
     }
 
     /// The undo of a [`Self::charge`]: return `amount` of dimension `d` to `n` and every ancestor.
@@ -20075,6 +20090,11 @@ impl BudgetTree {
     /// ascending key, so each parent precedes its children. `root`, the capturing domain's own node,
     /// stays behind (#1944 slice 3): it is the activation's, and a thaw hangs what was under it under
     /// its own ([`Host::restore_durable_budgets`]), so its children carry `parent: None`.
+    ///
+    /// A node's `channel` use is carried as `0`: the thaw re-charges every pipe it rebuilds, to the
+    /// thawing root ([`Host::restore_durable_pipes`]), so carrying it too would count it twice. Its
+    /// `spawn` use is carried as is, like its `mem`: the detached children it counts stay charged
+    /// through a freeze, and the thaw files their leases again ([`Host::relaunch_lease`]).
     fn capture(&self, held: impl IntoIterator<Item = u32>, root: u32) -> Vec<DurableBudget> {
         let nodes = self.0.lock_unpoisoned();
         let mut keys = BTreeSet::new();
@@ -20086,26 +20106,29 @@ impl BudgetTree {
         keys.into_iter()
             .map(|k| {
                 let node = &nodes[k as usize];
+                let mut used = node.used;
+                used[BUDGET_CHANNEL] = 0;
                 DurableBudget {
                     key: k,
                     parent: node.parent.filter(|&p| p != root),
                     ceiling: BudgetState::from_dims(node.ceiling),
-                    used: BudgetState::from_dims(node.used),
+                    used: BudgetState::from_dims(used),
                 }
             })
             .collect()
     }
 }
 
-/// #1944 slice 3 — the budget node a consumer draws its fuel from: a domain's own node
-/// ([`Host::fuel_source`]), in its run's tree.
+/// #1944 slice 3 — a node of a run's budget tree, as a domain holds its own ([`Host::own_node`]):
+/// its vCPUs draw their fuel from it, and each pipe the domain mints is charged to it. Every charge
+/// reaches every ancestor too.
 #[derive(Clone)]
-pub struct FuelSrc {
+pub struct NodeRef {
     tree: Arc<BudgetTree>,
     node: u32,
 }
 
-impl FuelSrc {
+impl NodeRef {
     /// A draw of up to [`FUEL_CHUNK`] from the chain, charged to every level: `None` when every level
     /// is unbounded (nothing to meter), `Some(0)` when the chain is spent.
     pub fn draw(&self) -> Option<u64> {
@@ -20120,7 +20143,7 @@ impl FuelSrc {
     }
 
     /// The fuel room left along the whole chain, `-1` when every level is unbounded.
-    pub fn room(&self) -> i64 {
+    pub fn fuel_room(&self) -> i64 {
         let nodes = self.tree.0.lock_unpoisoned();
         if (self.node as usize) < nodes.len() {
             BudgetTree::left(&nodes, self.node, BUDGET_FUEL)
@@ -20138,12 +20161,12 @@ impl FuelSrc {
 /// unwinds for a freeze, returns what it drew and did not burn.
 pub(crate) struct Fuel {
     left: u64,
-    src: Option<FuelSrc>,
+    src: Option<NodeRef>,
 }
 
 impl Fuel {
     /// Fuel drawn from `src`, none yet: the first safepoint draws.
-    pub(crate) fn drawn(src: FuelSrc) -> Fuel {
+    pub(crate) fn drawn(src: NodeRef) -> Fuel {
         Fuel {
             left: 0,
             src: Some(src),
@@ -20190,7 +20213,7 @@ impl Fuel {
     pub(crate) fn can_burn(&self) -> u64 {
         match &self.src {
             None => self.left,
-            Some(s) => match s.room() {
+            Some(s) => match s.fuel_room() {
                 r if r < 0 => u64::MAX,
                 r => self.left.saturating_add(r as u64),
             },
@@ -22312,16 +22335,6 @@ pub struct Host {
     /// `Host` clones the `Arc`, so both domains see the same queue — the cross-domain `cmd1 | cmd2`
     /// wiring). Append-only vector (a pipe's index stays valid for the run), like `regions`/`budgets`.
     pipes: Vec<PipeBacking>,
-    /// #989 — this domain's running total of **host-served channel backing bytes** (pipe FIFOs),
-    /// charged `PIPE_CAP` per guest-minted pipe and refunded at last-close. Shared (`Arc`) so a pipe
-    /// backing can hold a clone and refund the minter across a §14 re-grant. Fork gives the twin a
-    /// fresh counter (its inherited backings still refund the parent, via their own clone).
-    channel_used: Arc<std::sync::atomic::AtomicI64>,
-    /// #989 — this domain's ceiling on `channel_used` (bytes); `-1` = unbounded (the root/embedder
-    /// default, so every existing host is unchanged). A §14 spawn stamps it from the funding
-    /// `Budget`'s `channel` field, so a parent's `Budget` split bounds a child's channel memory the
-    /// same way it bounds fuel/mem/spawn.
-    channel_cap: i64,
     /// D66 — this domain's **lane cap**: how many tasks of its subtree may be *running at once*
     /// (INVARIANTS #3 ruling 2026-09-21). `-1` = unbounded (the default — every existing run). A §14
     /// spawn stamps the child's from the funding budget's `lane`; the embedder sets the root's
@@ -23089,9 +23102,7 @@ impl Host {
             budgets: Arc::default(),
             own_budget: BudgetTree::RUN_NODE,
             pipes: Vec::new(),
-            channel_used: Arc::new(std::sync::atomic::AtomicI64::new(0)), // #989
-            channel_cap: -1, // #989 — unbounded by default
-            lane_cap: -1,    // D66 — unbounded by default
+            lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
             parent_domain: None,
             attestation: Attestation::default(),
@@ -23282,8 +23293,6 @@ impl Host {
         // (POSIX fork inherits rlimits); the inherited pipe backings still carry the PARENT's counter
         // (cloned in the `twin.pipes = self.pipes.clone()` below), so their last-close refunds the
         // parent, not the twin — no double-charge on fork.
-        twin.channel_used = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        twin.channel_cap = self.channel_cap;
         // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
         twin.regions = self.regions.clone();
         twin.pipes = self.pipes.clone();
@@ -24097,7 +24106,10 @@ impl Host {
                     .compare_exchange(false, true, SeqCst, SeqCst)
                     .is_ok()
             {
-                charge.used.fetch_sub(PIPE_CAP as i64, SeqCst);
+                charge
+                    .node
+                    .tree
+                    .refund(charge.node.node, BUDGET_CHANNEL, PIPE_CAP as u64);
             }
         }
     }
@@ -24302,7 +24314,7 @@ impl Host {
 
     /// #1361 step 4 — prepare a thawed detached child's re-launch, the one preparation both engines use:
     /// resolve its program by digest among this (spawner's) powerbox's durable grants, and re-apply to
-    /// its restored powerbox what the spawner decided — durability, lane and channel caps, its program
+    /// its restored powerbox what the spawner decided — durability, its lane cap, its program
     /// as self module, its grant names, and its import bindings (leniently for a same-module child,
     /// #1234). `None` if the grant is gone, it declares no memory, or its imports no longer bind.
     pub fn prepare_detached_relaunch(
@@ -24314,7 +24326,6 @@ impl Host {
         let memory_log2 = g.memory_log2?;
         host.set_durable(true);
         host.set_lane_cap(launch.lane);
-        host.set_channel_cap(launch.channel);
         host.set_self_module_opt(Some(Arc::clone(&g.module)));
         for (name, h) in &launch.names {
             host.register_cap_name(name, *h);
@@ -25831,16 +25842,13 @@ impl Host {
         self.grant(cap_id::STREAM, Binding::Stream { role, sink: None })
     }
 
-    /// #989 — this domain's host-served channel-memory cap (`-1` = unbounded).
-    pub fn channel_cap(&self) -> i64 {
-        self.channel_cap
-    }
-
-    /// #989 — set this domain's channel-memory ceiling (bytes); `-1` = unbounded. A §14 spawn calls
-    /// this on the child `Host` with the funding `Budget`'s `channel` field, so a parent's `Budget`
-    /// split bounds a child's host-served pipe memory. Embedders leave it `-1` (unchanged behaviour).
+    /// #989 — set this domain's own node's channel-memory ceiling (bytes); `-1` = unbounded. The carve
+    /// spawn paths call it on a carve child's `Host`, whose node heads a tree of its own, with the
+    /// funding record's `Budget.channel` (until #1867 deletes the carve). A detached child needs none:
+    /// its own node is the budget that paid for it, whose chain bounds its pipes (#1944 slice 3).
     pub fn set_channel_cap(&mut self, cap: i64) {
-        self.channel_cap = cap;
+        self.budgets
+            .set_ceiling(self.own_budget, BUDGET_CHANNEL, cap);
     }
 
     /// D66 — set this domain's lane cap (see [`Host::lane_cap`]); `-1` = unbounded. The embedder sets
@@ -25887,10 +25895,13 @@ impl Host {
     }
 
     /// D66 / #1289 R2 — **the one detached-spawn admission** every engine calls (INVARIANTS #15): the
-    /// funding budget's lane is reserved against this domain's Σ ([`Host::try_grant_lane`]) and its
-    /// `mem` is spent for the window ([`Host::budget_mem_take`]), as one step — if the second refuses
-    /// the first is undone, so a refused spawn charges nothing on either axis. `Some(lane)` = admitted
-    /// (the lane to stamp on the child and to return at its reap); `None` = refused, probeably.
+    /// funding budget's lane is reserved against this domain's Σ ([`Host::try_grant_lane`]), its `mem`
+    /// is spent for the window ([`Host::budget_mem_take`]), and its `spawn` for the child's first vCPU
+    /// (#1944 slice 3: the budget that pays for a child's window pays for its vCPUs, so a spawn-0
+    /// budget funds no child), as one step — if a later charge refuses the earlier ones are undone, so
+    /// a refused spawn charges nothing. `Some(lane)` = admitted (the lane to stamp on the child and to
+    /// return at its reap); `None` = refused, probeably. The window's lease hands the `mem` and the
+    /// vCPU back when the child ends ([`Host::release_detached`]).
     pub fn admit_detached_spawn(&mut self, budget: i32, child_size: u64) -> Option<i64> {
         // #1361 step 4 — R1's endpoint (#1440): a **durable** domain spawns detached only over children
         // a freeze of it may capture, i.e. while it holds freeze authority over its detached progeny.
@@ -25906,15 +25917,31 @@ impl Host {
             self.give_lane(lane);
             return None;
         }
+        if !self.budget_charge(budget, BUDGET_SPAWN, 1) {
+            self.budget_mem_give(budget, child_size);
+            self.give_lane(lane);
+            return None;
+        }
         Some(lane)
     }
 
     /// #1975 — the undo of [`Host::admit_detached_spawn`], for a spawn that goes no further after its
-    /// admission: the window's bytes go back to the budget and the lane to this domain's Σ, so a spawn
-    /// refused after its admission charges nothing, as one refused before it does.
+    /// admission: the window's bytes and the first vCPU go back to the budget and the lane to this
+    /// domain's Σ, so a spawn refused after its admission charges nothing, as one refused before it does.
     pub fn undo_detached_spawn(&mut self, budget: i32, child_size: u64, lane: i64) {
-        self.budget_mem_give(budget, child_size);
+        self.release_detached(budget, child_size);
         self.give_lane(lane);
+    }
+
+    /// #1877, #1944 slice 3 — a detached child's window lease, settled: the child ended (joined or
+    /// reaped), or its spawn failed after the admission, so its window's `bytes` of `mem` and its first
+    /// vCPU go back to the budget that paid for them, at every level. Never on a freeze: a frozen
+    /// child stays charged, and the thaw's relaunch files the lease again ([`Host::relaunch_lease`]).
+    pub fn release_detached(&mut self, budget: i32, bytes: u64) {
+        self.budget_mem_give(budget, bytes);
+        if let Some(node) = self.budget_node(budget) {
+            self.budgets.refund(node, BUDGET_SPAWN, 1);
+        }
     }
 
     /// #1971 — the lease a thaw's relaunch of `child`, a detached child this domain spawned, files for
@@ -25959,14 +25986,14 @@ impl Host {
     /// becomes `fuel` (unbounded when `fuel` does not fit a ceiling — `u64::MAX` by convention),
     /// whatever earlier activations burned, so a reactor call or a thaw starts with the limit its
     /// embedder passes. Returns the node its vCPUs draw from.
-    pub fn begin_activation(&mut self, fuel: u64) -> FuelSrc {
+    pub fn begin_activation(&mut self, fuel: u64) -> NodeRef {
         self.budgets.set_fuel_room(self.own_budget, fuel);
-        self.fuel_source()
+        self.own_node()
     }
 
     /// #1944 slice 3 — the node this domain's vCPUs draw their fuel from: its own.
-    pub fn fuel_source(&self) -> FuelSrc {
-        FuelSrc {
+    pub fn own_node(&self) -> NodeRef {
+        NodeRef {
             tree: Arc::clone(&self.budgets),
             node: self.own_budget,
         }
@@ -25975,7 +26002,7 @@ impl Host {
     /// #1944 slice 3 — the fuel room left on this domain's own chain: what an activation reads back
     /// once its vCPUs have handed back what they did not burn. `u64::MAX` when unbounded.
     pub fn fuel_left(&self) -> u64 {
-        match self.fuel_source().room() {
+        match self.own_node().fuel_room() {
             r if r < 0 => u64::MAX,
             r => r as u64,
         }
@@ -25991,33 +26018,35 @@ impl Host {
         }
     }
 
-    /// #989 — the domain's live channel-memory total (bytes), for the §15 monitoring readout and tests.
+    /// #989 — the live channel memory (bytes) charged to this domain's own node: its pipes, those of
+    /// every domain sharing the node (a fork twin), and its subtree's. For the §15 readout and tests.
     pub fn channel_used(&self) -> i64 {
-        self.channel_used.load(std::sync::atomic::Ordering::SeqCst)
+        self.budgets.used(self.own_budget, BUDGET_CHANNEL)
     }
 
-    /// #989 — charge one `PIPE_CAP` unconditionally (trusted embedder mint), returning the charge to
-    /// stash in the backing so its last-close refunds this domain.
+    /// #989 — charge one `PIPE_CAP` to this domain's own node whatever its ceilings (a trusted
+    /// embedder mint, or a pipe a thaw rebuilds), returning the charge to stash in the backing so its
+    /// last-close refunds the same node.
     fn charge_channel(&self) -> Option<Arc<ChannelCharge>> {
-        use std::sync::atomic::Ordering::SeqCst;
-        self.channel_used.fetch_add(PIPE_CAP as i64, SeqCst);
-        Some(Arc::new(ChannelCharge {
-            used: Arc::clone(&self.channel_used),
-            refunded: std::sync::atomic::AtomicBool::new(false),
-        }))
+        self.budgets
+            .force_charge(self.own_budget, BUDGET_CHANNEL, PIPE_CAP as u64);
+        Some(self.channel_charge())
     }
 
-    /// #989 — charge one `PIPE_CAP` **iff** it fits under `channel_cap` (the guest-reachable mint):
-    /// `None` when a bounded cap would be exceeded (the caller fails the mint closed, nothing charged),
-    /// else the charge to stash in the backing. An unbounded cap (`-1`) always succeeds.
+    /// #989, #1944 slice 3 — charge one `PIPE_CAP` to this domain's own node and every ancestor **iff**
+    /// each has the room (the guest-reachable mint): `None` when a bounded ceiling would be exceeded
+    /// (the caller fails the mint closed, nothing charged), else the charge to stash in the backing.
     fn try_charge_channel(&self) -> Option<Arc<ChannelCharge>> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if self.channel_cap >= 0
-            && self.channel_used.load(SeqCst) + PIPE_CAP as i64 > self.channel_cap
-        {
-            return None;
-        }
-        Some(self.charge_channel().expect("charge_channel is infallible"))
+        self.budgets
+            .charge(self.own_budget, BUDGET_CHANNEL, PIPE_CAP as u64)
+            .then(|| self.channel_charge())
+    }
+
+    fn channel_charge(&self) -> Arc<ChannelCharge> {
+        Arc::new(ChannelCharge {
+            node: self.own_node(),
+            refunded: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
@@ -27448,7 +27477,7 @@ impl Host {
             self.register_cap_name("module", module);
         }
         if self.resolve_cap_name("budget").is_none() {
-            let budget = self.grant_budget(-1, win as i64, 0);
+            let budget = self.grant_budget(-1, win as i64, -1);
             self.register_cap_name("budget", budget);
         }
     }
@@ -27470,10 +27499,14 @@ impl Host {
     /// refuses probeably, never a trap. A chain unbounded at every level admits any size (an embedder
     /// that does not meter detached VA passes an unbounded-`mem` budget).
     pub fn budget_mem_take(&mut self, handle: i32, bytes: u64) -> bool {
-        match self.resolve(handle, cap_id::BUDGET) {
-            Ok(Binding::Budget(node)) => self.budgets.charge(node, BUDGET_MEM, bytes),
-            _ => false,
-        }
+        self.budget_charge(handle, BUDGET_MEM, bytes)
+    }
+
+    /// Charge `amount` of dimension `d` to the node behind `handle` and every ancestor: `false`, with
+    /// nothing charged, for a forged handle or when a bounded level lacks the room.
+    fn budget_charge(&self, handle: i32, d: usize, amount: u64) -> bool {
+        self.budget_node(handle)
+            .is_some_and(|node| self.budgets.charge(node, d, amount))
     }
 
     fn grant_module_inner(&mut self, m: &Module, durable: bool) -> i32 {
@@ -29327,6 +29360,11 @@ impl Host {
         let (mut host, ci, ca) = self
             .spawn_named_child(grants, window_reserved)
             .ok_or(EINVAL)?;
+        // #1944 slice 3 — an exec replaces the image, not the domain: the new image's use is charged
+        // to the node the old one's was, as a process keeps its cgroup across `execve`, so a child
+        // cannot exec its way out of the budget that caps it.
+        host.budgets = Arc::clone(&self.budgets);
+        host.own_budget = self.own_budget;
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
@@ -35546,10 +35584,11 @@ block 0 (v0: i64) {
 
 #[cfg(test)]
 mod channel_budget_tests {
-    //! #989 — host-served **channel-memory** accounting: a guest-minted pipe charges `PIPE_CAP`
-    //! against the domain's `channel_used`, is refused past `channel_cap`, and is refunded when the
-    //! backing's last handle closes. The charge rides the `Arc`-shared backing, so a fork twin shares
-    //! it without a double-charge and the refund always credits the minter exactly once.
+    //! #989, #1944 slice 3 — host-served **channel-memory** accounting: a guest-minted pipe charges
+    //! `PIPE_CAP` of `channel` to the minting domain's own budget node and every ancestor, is refused
+    //! past any level's ceiling, and is refunded when the backing's last handle closes. The charge
+    //! rides the `Arc`-shared backing, so a fork twin (which shares its parent's node) shares it
+    //! without a double-charge and the refund credits the minter's node exactly once.
     use super::*;
 
     #[test]
@@ -35603,11 +35642,11 @@ mod channel_budget_tests {
         assert!(parent.try_grant_pipe().is_some()); // pipe 0, charged to the parent
         assert_eq!(parent.channel_used(), PIPE_CAP as i64);
 
-        // Fork: the twin shares the backing (counts bumped to 2/2) with a FRESH counter of its own.
+        // Fork: the twin shares the backing (counts bumped to 2/2) and its parent's node.
         let twin = parent.fork_powerbox(42).expect("fork");
         assert_eq!(
             twin.channel_used(),
-            0,
+            PIPE_CAP as i64,
             "fork does not re-charge the shared backing"
         );
 
@@ -35626,7 +35665,43 @@ mod channel_budget_tests {
             0,
             "the minter is refunded exactly once"
         );
-        assert_eq!(twin.channel_used(), 0, "the twin was never charged");
+        assert_eq!(twin.channel_used(), 0, "the twin shares the refunded node");
+    }
+
+    /// #1944 slice 3 — a detached child's pipes are charged to the budget that paid for it, and to
+    /// every ancestor: a child whose budget holds one pipe of channel memory mints one, and a second
+    /// is refused, though the spawner's own node has room.
+    #[test]
+    fn a_childs_pipes_are_charged_to_its_budget_chain() {
+        let mut parent = Host::new();
+        let b = parent.grant_budget_channel(-1, -1, -1, 4 * PIPE_CAP as i64);
+        let node = parent
+            .cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, -1, -1, PIPE_CAP as i64], None)
+            .expect("split")[0] as i32;
+        let mut child = Host::new();
+        parent.give_child_budget(node, &mut child);
+        assert!(child.try_grant_pipe().is_some(), "one pipe fits the node");
+        assert!(child.try_grant_pipe().is_none(), "a second exceeds it");
+        let room = |h: &mut Host, b: i32| {
+            h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[3], None)
+                .expect("read")[0]
+        };
+        assert_eq!(room(&mut parent, node), 0);
+        assert_eq!(
+            room(&mut parent, b),
+            3 * PIPE_CAP as i64,
+            "the parent's budget is charged for its child's pipe"
+        );
+        assert!(
+            parent.try_grant_pipe().is_some(),
+            "the spawner's own node has room"
+        );
+        assert!(child.drop_pipe_writer(0) && child.drop_pipe_reader(0));
+        assert_eq!(
+            room(&mut parent, b),
+            4 * PIPE_CAP as i64,
+            "the last close refunds every level"
+        );
     }
 
     /// #1826 — the one mint ([`Host::mint_pipe`]) writes the ends at `fds` in POSIX order, read end

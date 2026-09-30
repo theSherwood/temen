@@ -209,7 +209,7 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
         .expect("split")[0] as i32;
     let mut child = Host::new();
     h.give_child_budget(node, &mut child);
-    let src = child.fuel_source();
+    let src = child.own_node();
     assert_eq!(src.draw(), Some(50), "half the chain's room");
     assert_eq!(fuel_room(&mut h, node), 50);
     assert_eq!(fuel_room(&mut h, root), 950, "charged to every level");
@@ -218,13 +218,13 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
     assert_eq!(fuel_room(&mut h, root), 970, "refunded to every level");
 
     // A vCPU that ends hands back the rest of its draw: it drew 35 of the 70 and burned one.
-    let mut fuel = Fuel::drawn(child.fuel_source());
+    let mut fuel = Fuel::drawn(child.own_node());
     fuel.burn().expect("room left");
     drop(fuel);
     assert_eq!(fuel_room(&mut h, node), 69);
 
     // A lone vCPU burns the chain to its last unit, then traps.
-    let mut fuel = Fuel::drawn(child.fuel_source());
+    let mut fuel = Fuel::drawn(child.own_node());
     for _ in 0..69 {
         fuel.burn().expect("room left");
     }
@@ -243,7 +243,7 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
 #[test]
 fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() {
     let mut h = Host::new();
-    assert_eq!(h.fuel_source().draw(), None, "no activation yet: unbounded");
+    assert_eq!(h.own_node().draw(), None, "no activation yet: unbounded");
     let mut fuel = Fuel::drawn(h.begin_activation(10));
     for _ in 0..4 {
         fuel.burn().expect("room left");
@@ -263,7 +263,7 @@ fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() 
     assert_eq!(src.draw(), Some(5));
     let _ = h.begin_activation(u64::MAX);
     assert_eq!(h.fuel_left(), u64::MAX, "u64::MAX: unbounded");
-    let mut fuel = Fuel::drawn(h.fuel_source());
+    let mut fuel = Fuel::drawn(h.own_node());
     fuel.burn().expect("unmetered");
     assert_eq!(
         fuel.remaining(),
@@ -292,7 +292,7 @@ fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
 
     let mut child = Host::new();
     h.give_child_budget(sub, &mut child);
-    let mut fuel = Fuel::drawn(child.fuel_source());
+    let mut fuel = Fuel::drawn(child.own_node());
     for _ in 0..5 {
         fuel.burn().expect("the activation's room");
     }

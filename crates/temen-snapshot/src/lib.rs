@@ -248,7 +248,10 @@ use temen_ir::Module;
 /// artifact number, and Section 10 (`TAG_BUDGETS`) carries every node the handles reach, parents
 /// first: its parent, its five ceilings and what its subtree had charged. Elided when no budget
 /// rides.
-const FORMAT_VERSION: u16 = 37;
+/// v38 (#1944 slice 3): a detached child's launch record drops its fuel, channel cap and vCPU
+/// ceiling. Its budget chain (Section 10) carries all three: what it burned, its channel ceiling, and
+/// its `spawn` ceiling with the one vCPU its window's lease holds.
+const FORMAT_VERSION: u16 = 38;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -1155,10 +1158,7 @@ fn write_detached(
         write_uleb(&mut b, l.task);
         write_uleb(&mut b, l.entry as u64);
         b.extend_from_slice(&l.digest);
-        write_uleb(&mut b, l.fuel);
         write_uleb(&mut b, l.lane as u64);
-        write_uleb(&mut b, l.channel as u64);
-        write_uleb(&mut b, l.max_vcpus);
         b.push(l.same_module as u8);
         write_uleb(&mut b, l.names.len() as u64);
         for (name, h) in &l.names {
@@ -1751,10 +1751,7 @@ fn decode_detached(
             .take(32)?
             .try_into()
             .expect("take(32) yields exactly 32 bytes");
-        let fuel = r.uleb()?;
         let lane = r.uleb()? as i64;
-        let channel = r.uleb()? as i64;
-        let max_vcpus = r.uleb()?;
         let same_module = match r.u8()? {
             0 => false,
             1 => true,
@@ -1789,10 +1786,7 @@ fn decode_detached(
                 task,
                 entry,
                 digest,
-                fuel,
                 lane,
-                channel,
-                max_vcpus,
                 same_module,
                 names,
             },

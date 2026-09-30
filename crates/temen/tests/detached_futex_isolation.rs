@@ -123,7 +123,7 @@ fn run(driver: Driver, root_src: &str) -> Result<Vec<Value>, Trap> {
     let inst = host.grant_instantiator(0, WIN as u64);
     let waiter = host.grant_module(&parse(WAITER));
     let notifier = host.grant_module(&parse(NOTIFIER));
-    let budget = host.grant_budget(-1, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     let args = [inst, waiter, notifier, budget].map(Value::I32);
     let mut fuel = 50_000_000u64;
     match driver {

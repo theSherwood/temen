@@ -361,7 +361,7 @@ unsafe fn granted_teardown(
     })
 }
 
-/// Hand a detached child's lane and window bytes back to its parent: at the child's end
+/// Hand a detached child's lane, window bytes and first vCPU back to its parent: at the child's end
 /// ([`granted_teardown`]), or when its spawn goes no further after the admission took them
 /// ([`undo_admission`]).
 ///

@@ -1832,7 +1832,7 @@ fn admit_detached_child(
     host.give_lane(lane);
     let args = child_entry_args(arity, cinst, cas);
     // #1944 slice 3 — the child draws its fuel from the budget that paid for its window, its own node.
-    let fuel = Fuel::drawn(child_host.fuel_source());
+    let fuel = Fuel::drawn(child_host.own_node());
     let child = AdmittedChild {
         mem: None,
         host: child_host,
@@ -4916,10 +4916,11 @@ impl<'p> Vcpu<'p> {
         Ok(child.token)
     }
 
-    /// The child a join resolved has ended: its window's bytes go back to the budget that paid.
+    /// The child a join resolved has ended: its window's bytes and its first vCPU go back to the budget
+    /// that paid.
     pub fn end_join(&mut self) {
         if let Some((budget, bytes)) = self.joining.take() {
-            self.budget_mem_give(budget, bytes);
+            self.release_detached(budget, bytes);
         }
     }
 
@@ -4959,11 +4960,11 @@ impl<'p> Vcpu<'p> {
         Ok(Some((child, size_log2)))
     }
 
-    /// Give `bytes` back to `budget` in this vCPU's powerbox.
-    fn budget_mem_give(&mut self, budget: i32, bytes: u64) {
+    /// Settle a detached child's window lease in this vCPU's powerbox ([`Host::release_detached`]).
+    fn release_detached(&mut self, budget: i32, bytes: u64) {
         match self.shared_host {
-            Some(m) => m.lock_unpoisoned().budget_mem_give(budget, bytes),
-            None => self.host.budget_mem_give(budget, bytes),
+            Some(m) => m.lock_unpoisoned().release_detached(budget, bytes),
+            None => self.host.release_detached(budget, bytes),
         }
     }
 
@@ -6898,8 +6899,8 @@ fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [
         if matches!(t.state, DbgTaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
                 match env {
-                    None => host.budget_mem_give(budget, bytes),
-                    Some(k) => envs[k].host.budget_mem_give(budget, bytes),
+                    None => host.release_detached(budget, bytes),
+                    Some(k) => envs[k].host.release_detached(budget, bytes),
                 }
             }
         }
@@ -12383,7 +12384,7 @@ fn refund_ended_windows(tasks: &mut [TaskSlot], host: &mut Host, envs: &[ChildEn
     for t in tasks.iter_mut() {
         if matches!(t.state, TaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
-                task_host(host, envs, env).with(|h| h.budget_mem_give(budget, bytes));
+                task_host(host, envs, env).with(|h| h.release_detached(budget, bytes));
             }
         }
     }
@@ -17218,7 +17219,7 @@ fn par_start_child<'scope, 'env>(
         // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
         // the result is published, so a joiner sees the refund.
         if let Some((parent, budget, bytes)) = lease {
-            parent.lock_unpoisoned().budget_mem_give(budget, bytes);
+            parent.lock_unpoisoned().release_detached(budget, bytes);
         }
         reg.publish(id, r);
     });

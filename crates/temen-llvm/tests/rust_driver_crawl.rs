@@ -310,7 +310,7 @@ fn rust_driver_guest_reads_a_phase_output_from_the_memfs() {
     host.register_cap_name("inst", inst);
     host.register_cap_name("nifler", modh);
     // nifler's window (one child live at a time), paid from this and returned when it ends.
-    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, -1);
     host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
@@ -403,7 +403,7 @@ fn run_driver_guest(
     host.register_cap_name("inst", inst);
     host.register_cap_name("nifler", modh);
     // nifler's window (one child live at a time), paid from this and returned when it ends.
-    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, -1);
     host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
