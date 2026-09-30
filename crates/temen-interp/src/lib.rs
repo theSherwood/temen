@@ -5368,13 +5368,13 @@ enum Step {
 /// FORK.md §8.6 — the ready payload of an `exec_module` (`execve`) image-replace. Everything fallible
 /// (module resolve, grant regrant, import bind) is done in the eval loop — where a refusal is a clean
 /// `-EINVAL` that leaves the caller running — so `dispatch`'s rebuild is **infallible**: it only
-/// reloads the command's data into the caller's window and swaps the vCPU to a fresh one running the
-/// command, keeping the `TaskId`/fuel. `host` is the command's ready powerbox (inherited caps
+/// builds the command's image in a fresh window of the caller's geometry and swaps the vCPU to a fresh
+/// one running the command, keeping the `TaskId`/fuel. `host` is the command's ready powerbox (inherited caps
 /// regranted by name, its own imports bound, its module registered as the self module).
 /// #801 exec ABI — the powerbox **args region** `[base, end)`: the caller packs `{argc:i32,
 /// envc:i32}` at its base and NUL-packed argv/envp strings after, immediately before
-/// `exec_module`; the image-replace freshens everything else in the declared image but keeps
-/// this range (see `commit_fresh_image`). Mirrors the guest-side constants in
+/// `exec_module`; the image-replace's fresh window carries this range over (see `exec_window`).
+/// Mirrors the guest-side constants in
 /// `crates/temen-run/demos/posix_libc/exec.c`.
 const EXEC_ARGS_BASE: u64 = 128;
 const EXEC_ARGS_END: u64 = 16384;
@@ -5396,10 +5396,9 @@ pub struct ExecImage {
     pub entry: u64,
     /// The entry's arguments: the starter handles its shape takes (none for a powerbox `_start`).
     pub entry_args: Vec<i64>,
-    /// The window the command runs in: the caller's backed prefix (the image-replace reuses it).
+    /// The backed prefix of the window the command runs in: the caller's (the image-replace keeps
+    /// the caller's window geometry).
     pub child_size: u64,
-    /// `1 << memory_log2` of the command: the extent an in-place replace freshens.
-    pub image_len: u64,
     pub(crate) funcs: Arc<[Func]>,
     pub(crate) types: Arc<[temen_ir::TypeEntry]>,
     pub(crate) data: Arc<[Data]>,
@@ -5413,19 +5412,17 @@ struct ExecReq {
     types: Arc<[temen_ir::TypeEntry]>,
     data: Arc<[Data]>,
     entry: u64,
-    child_size: u64,
-    /// `1 << memory_log2` of the command module: the extent `dispatch` freshens (commits + zeroes)
-    /// in the reused window before materializing `data` — the command's C `.bss` contract.
-    image_len: u64,
     host: Host,
     /// Entry args in the fresh powerbox: the granted `Instantiator`, then `AddressSpace` iff the
     /// command's entry takes two params (§14 child-entry ABI).
     entry_args: Vec<Value>,
     /// The command module's NULL-guard extent (#1059/#1094): `POWERBOX_NULL_GUARD` for every command
-    /// (unconditional; `0` only for a sub-window smaller than the guard). The preserved exec args region
-    /// rides it (`commit_fresh_image`), so a command's `_start` finds argv where it reads it
-    /// (`module_args_base` = `guard + 128`).
+    /// (unconditional; `0` only for a sub-window smaller than the guard). The exec args region rides
+    /// it (`exec_window`), so a command's `_start` finds argv where it reads it (`module_args_base` =
+    /// `guard + 128`).
     null_guard: u64,
+    /// A personality exec's committed argv (#1768), written into the args region of the new window.
+    args: Option<Vec<u8>>,
 }
 
 /// CONSOLIDATION.md §2.2: a demand process child's pager binding — the provider (parent) host
@@ -5545,6 +5542,12 @@ enum Waiter {
         /// backstop. Read solely for a `wait_waiters` entry, by [`futex_parks_unsatisfiable`];
         /// [`Waiter::fiber`] builds the other waiter kinds, which are not futex parks at all.
         wait_indefinite: bool,
+        /// #1952 — `Some(host)` when the parked op was **rewound** (a pipe read or write,
+        /// [`Waiter::rewound_fiber`]): a wake re-admits the fiber with nothing delivered, so the op
+        /// re-executes, and an interrupt flags `host` (the fiber's domain powerbox) so the re-run
+        /// completes `-EINTR` — the vCPU pipe park's discipline. `None` for a park whose wake
+        /// delivers the op's result.
+        rewound: Option<Arc<Mutex<Host>>>,
     },
 }
 
@@ -5558,6 +5561,24 @@ impl Waiter {
             slot,
             svc,
             wait_indefinite: false,
+            rewound: None,
+        }
+    }
+
+    /// #1952 — a fiber parked in a **rewound** op (a pipe read or write) of the domain whose
+    /// powerbox is `host`: see [`Waiter::Fiber::rewound`].
+    fn rewound_fiber(
+        reg: Arc<FiberRegistry>,
+        slot: usize,
+        svc: usize,
+        host: Arc<Mutex<Host>>,
+    ) -> Waiter {
+        Waiter::Fiber {
+            reg,
+            slot,
+            svc,
+            wait_indefinite: false,
+            rewound: Some(host),
         }
     }
 }
@@ -6038,8 +6059,9 @@ fn wake_pipe_batch_locked(s: &mut Sched, woken: Vec<Waiter>) -> u32 {
     for w in woken {
         match w {
             Waiter::VCpu(v) => s.runnable.push_back(v),
+            // #1952 — a fiber's pipe park was rewound: its op re-executes.
             Waiter::Fiber { reg, slot, svc, .. } => {
-                reg.wake_blocked(slot, Reg::from_i64(0));
+                reg.wake_rewound(slot);
                 svc_wake_locked(s, svc);
             }
         }
@@ -6536,8 +6558,24 @@ impl Scheduler {
                     v.host.lock_unpoisoned().set_sig_interrupt();
                     s.runnable.push_back(v);
                 }
-                Waiter::Fiber { reg, slot, svc, .. } => {
-                    reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                // #1952 — the vCPU discipline: flag the fiber's powerbox, and its rewound op
+                // re-executes and completes `-EINTR`.
+                Waiter::Fiber {
+                    reg,
+                    slot,
+                    svc,
+                    rewound,
+                    ..
+                } => {
+                    match rewound {
+                        Some(host) => {
+                            host.lock_unpoisoned().set_sig_interrupt();
+                            reg.wake_rewound(slot);
+                        }
+                        None => {
+                            reg.wake_blocked(slot, Reg::from_i64(EINTR));
+                        }
+                    }
                     svc_wake_locked(&mut s, svc);
                 }
             }
@@ -7711,6 +7749,18 @@ fn teardown_run(s: &mut Sched) {
             .cloned()
             .unwrap_or(Trap::ThreadFault);
         reap(s, v, reason);
+    }
+}
+
+/// #1952 — the park-vs-wake recheck for a pipe read or write of domain-local pipe `pipe` (the vCPU
+/// park's and a fiber's): whether the op should re-run at once — the pipe is ready ([`PipeProbe`]),
+/// has vanished (the re-run fails closed), or a signal already interrupts it — and the pipe's
+/// global id, the waiters' key. Called with the scheduler lock held.
+fn pipe_park_check(host: &Arc<Mutex<Host>>, pipe: u32, write: bool) -> (bool, u32) {
+    let mut hg = host.lock_unpoisoned();
+    match hg.pipe_probe(pipe, write) {
+        Some(p) => (p.ready() || interrupt_before_park(&mut hg), p.gid()),
+        None => (true, u32::MAX),
     }
 }
 
@@ -9117,18 +9167,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
                 // so a wake from another image of the pipe (fork twin, exec carry) finds them.
-                let (ready, gid) = {
-                    let mut hg = v.host.lock_unpoisoned();
-                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
-                        Some((fifo, writers, _, gid, _, _)) => (
-                            !fifo.lock_unpoisoned().is_empty()
-                                || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
-                            *gid,
-                        ),
-                        None => (true, u32::MAX), // vanished — re-run to fail closed
-                    };
-                    (ready || interrupt_before_park(&mut hg), gid)
-                };
+                let (ready, gid) = pipe_park_check(&v.host, pipe, false);
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -9149,18 +9188,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 // Same global-id keying as the read park above.
-                let (ready, gid) = {
-                    let mut hg = v.host.lock_unpoisoned();
-                    let (ready, gid) = match hg.pipes.get(pipe as usize) {
-                        Some((fifo, _, readers, gid, _, _)) => (
-                            fifo.lock_unpoisoned().len() < PIPE_CAP
-                                || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
-                            *gid,
-                        ),
-                        None => (true, u32::MAX), // vanished — re-run to fail closed
-                    };
-                    (ready || interrupt_before_park(&mut hg), gid)
-                };
+                let (ready, gid) = pipe_park_check(&v.host, pipe, true);
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -9415,11 +9443,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     types,
                     data,
                     entry,
-                    child_size,
-                    image_len,
                     host,
                     entry_args,
                     null_guard,
+                    args,
                 } = *req;
                 // The replaced image gets its own function table: `execve` replaces the whole image,
                 // and the caller's table is sized for the CALLER's functions — an image with more of
@@ -9428,17 +9455,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let dt = Arc::new(DomainTable::new(&funcs, 0));
                 let (fuel, depth, id, sched_ref, quota) =
                     (v.fuel, v.depth, v.id, v.sched.clone(), v.quota);
-                // Materialize the command's data segments into the caller's window — the command runs
-                // where the shell did (image-replace). First freshen the command's declared image
-                // extent: commit its pages read-write and zero them (`commit_fresh_image`) — C's
-                // `.bss` is a no-segment zero guarantee, the caller's committed extent may be
-                // smaller than the command declares, and stale caller bytes must not leak into the
-                // fresh image. Then the segments write over the zeroed ground.
-                let mem = v.mem.take();
-                if let Some(m) = mem.as_ref() {
-                    m.commit_fresh_image(image_len.min(child_size), null_guard);
-                    m.write_segments(m.window.base(), &data, child_size);
-                }
+                // The command's image, in a fresh window of the caller's geometry (`exec_window`): an
+                // exec replaces the address space, and the caller's window is released.
+                let mem = v.mem.take().map(|m| {
+                    let back = m.twin_backing(m.window.reserved());
+                    m.exec_window(back, &data, null_guard, args.as_deref())
+                });
                 *v = VCpu::new(
                     funcs,
                     types,
@@ -11208,14 +11230,24 @@ impl FiberRegistry {
     /// make it claimable. `false` if the slot is not a blocked park (already woken, freed —
     /// the wake is then a no-op, matching every other idempotent wake path).
     fn wake_blocked(&self, slot: usize, result: Reg) -> bool {
+        self.wake_parked(slot, Some(result))
+    }
+
+    /// #1952 — the event fired for a fiber parked in a **rewound** op: make it claimable with
+    /// nothing delivered, so the op re-executes. `false` as [`Self::wake_blocked`].
+    fn wake_rewound(&self, slot: usize) -> bool {
+        self.wake_parked(slot, None)
+    }
+
+    fn wake_parked(&self, slot: usize, result: Option<Reg>) -> bool {
         let mut t = self.lock();
         match &mut t.fibers[slot] {
             RegFiber::ParkedOn {
                 frames,
                 woken: woken @ false,
             } => {
-                if let Some(f) = frames.last_mut() {
-                    f.vals.push(result);
+                if let (Some(f), Some(r)) = (frames.last_mut(), result) {
+                    f.vals.push(r);
                 }
                 *woken = true;
                 true
@@ -12640,13 +12672,15 @@ fn decide(
     durable: bool,
     clean_root: bool,
 ) -> Decision {
-    // A fiber or the deterministic explorer cannot be parked or handed to the fork engine; it
-    // keeps whatever the op answered.
-    let parkable = cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_));
+    // The deterministic explorer cannot park; it keeps whatever the op answered. A pipe park parks
+    // the calling fiber, fiber 0 or not (#1952); only fiber 0 can be handed to the fork engine,
+    // have its image replaced, or be benched.
+    let real = matches!(sched, SchedRef::Real(_));
+    let parkable = cur == ROOT_FIBER && real;
     // #1672 — under a landing freeze a durable domain never parks: the park is abandoned instead.
     let freezing = durable && mem.is_some_and(|m| m.durable_state() == STATE_UNWINDING);
     let park = |d: Decision| if freezing { Decision::Abandon } else { d };
-    if parkable {
+    if real {
         if let Some(pipe) = t.read_park {
             return if t.sig_intr {
                 Decision::Eintr
@@ -12687,10 +12721,8 @@ fn decide(
         // nowhere else (#1768): a refused exec returns to an untouched caller.
         ParkEvent::ExecSelf { cmd } => {
             match build_exec_req(host, mem, sched, cmd, 0, 0, 0, 0, durable, clean_root) {
-                Ok(req) => {
-                    if let (Some(blob), Some(m)) = (req.host.exec_commit_args(), mem) {
-                        m.write_exec_args(&blob);
-                    }
+                Ok(mut req) => {
+                    req.args = req.host.exec_commit_args();
                     Decision::Exec(req)
                 }
                 Err(e) => Decision::ExecRefused(e),
@@ -12779,10 +12811,9 @@ fn build_exec_req(
         types: img.types,
         data: img.data,
         entry,
-        child_size: img.child_size,
-        image_len: img.image_len,
         host: img.host,
         entry_args: img.entry_args.into_iter().map(Value::I64).collect(),
+        args: None,
     }))
 }
 
@@ -13859,6 +13890,50 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[rtop].vals.push(Reg::from_i32(FIBER_PARKED));
                     frames[rtop].vals.push(Reg::from_i64(0));
                     continue 'frames;
+                }};
+            }
+            // #1952 — a pipe read or write that must wait parks the **calling fiber**, with its op
+            // rewound so the wake re-executes it. Fiber 0 parks its vCPU (`Blocked::PipeRead` /
+            // `PipeWrite`); any other fiber parks alone, in the pipe's waiters, and its resumer runs
+            // on. The registration re-checks the pipe under the scheduler lock, as the vCPU park
+            // does: a write, close or signal that landed since the op found no waiter to wake.
+            macro_rules! pipe_park {
+                ($top:expr, $pipe:expr, $write:expr) => {{
+                    let (pipe, write): (u32, bool) = ($pipe, $write);
+                    frames[$top].inst -= 1; // rewind: the op re-executes on wake
+                    if *cur == ROOT_FIBER {
+                        return Ok(Inner::Park(if write {
+                            Blocked::PipeWrite { pipe }
+                        } else {
+                            Blocked::PipeRead { pipe }
+                        }));
+                    }
+                    let SchedRef::Real(sr) = sched else {
+                        unreachable!("`decide` parks only on the real scheduler")
+                    };
+                    let regc = Arc::clone(registry);
+                    let hostc = Arc::clone(host);
+                    let svck = hostc.lock_unpoisoned().domain_id() as usize;
+                    fiber_park!(|slot: usize| {
+                        let mut sg = sr.lock();
+                        let (ready, gid) = pipe_park_check(&hostc, pipe, write);
+                        if ready {
+                            drop(sg);
+                            regc.wake_rewound(slot);
+                        } else {
+                            let waiters = if write {
+                                &mut sg.pipe_write_waiters
+                            } else {
+                                &mut sg.pipe_waiters
+                            };
+                            waiters.entry(gid).or_default().push(Waiter::rewound_fiber(
+                                Arc::clone(&regc),
+                                slot,
+                                svck,
+                                Arc::clone(&hostc),
+                            ));
+                        }
+                    });
                 }};
             }
             macro_rules! jit_install_body {
@@ -16049,14 +16124,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -16259,14 +16328,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -16427,14 +16490,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -16517,14 +16574,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
                         }
-                        Decision::PipeRead(pipe) => {
-                            frames[top].inst -= 1; // rewind: the read re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeRead { pipe }));
-                        }
-                        Decision::PipeWrite(pipe) => {
-                            frames[top].inst -= 1; // rewind: the write re-executes on wake
-                            return Ok(Inner::Park(Blocked::PipeWrite { pipe }));
-                        }
+                        Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
+                        Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
@@ -17193,6 +17244,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // #1639 — the guest asked for a wait with no end, so the
                                         // deadline just pushed is only the `MAX_WAIT` backstop.
                                         wait_indefinite: to_ns < 0,
+                                        rewound: None,
                                     },
                                 ));
                                 // Compare-under-lock: a value that already changed wakes the
@@ -21895,9 +21947,12 @@ pub struct Host {
     /// `self.covers`, and `export.handle` resolve through one host-side entry on all three
     /// backends. `None` until registered (the ops then fail closed, probeable).
     self_module: Option<Arc<Module>>,
-    /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, kept in step
-    /// with it by [`Host::set_self_module_opt`], its one writer.
-    self_grant: Option<ModuleGrant>,
+    /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, built at the
+    /// first resolve and reset by [`Host::set_self_module_opt`], its one writer. Lazily, because
+    /// every fork, spawn and exec sets the self module, and a grant copies the module's code and
+    /// hashes its encoding: tens of milliseconds for a compiler, where only a spawn of the running
+    /// program (`module = -1`) ever reads it.
+    self_grant: std::sync::OnceLock<ModuleGrant>,
     /// The domain's one shared service state for offers it reifies (`export.handle` — all of a
     /// domain's reified offers share it), created lazily on first reification.
     self_instance: Option<Arc<Mutex<ProviderState>>>,
@@ -22615,7 +22670,7 @@ impl Host {
             import_remaps: Vec::new(),
             import_reqs: Vec::new(),
             self_module: None,
-            self_grant: None,
+            self_grant: std::sync::OnceLock::new(),
             self_instance: None,
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
@@ -26077,7 +26132,7 @@ impl Host {
     /// [`SELF_MODULE`] resolves to ([`Host::resolve_module`]) is always the current module's (#1863:
     /// a spawn record's `module = -1` means "my own program", on every tier).
     pub(crate) fn set_self_module_opt(&mut self, m: Option<Arc<Module>>) {
-        self.self_grant = m.as_ref().map(|m| ModuleGrant::of(Arc::clone(m), false));
+        self.self_grant = std::sync::OnceLock::new();
         self.self_module = m;
     }
 
@@ -26980,7 +27035,10 @@ impl Host {
         // #1863: `-1` names the running module — a spawn of "my own program" needs no grant, as
         // the op-17 record always allowed. With no module registered it faults like a forgery.
         if handle == SELF_MODULE {
-            return self.self_grant.as_ref().ok_or(Trap::CapFault);
+            let m = self.self_module.as_ref().ok_or(Trap::CapFault)?;
+            return Ok(self
+                .self_grant
+                .get_or_init(|| ModuleGrant::of(Arc::clone(m), false)));
         }
         match self.resolve(handle, cap_id::MODULE)? {
             Binding::Module(id) => self.modules.get(id as usize).ok_or(Trap::CapFault),
@@ -28729,7 +28787,6 @@ impl Host {
             entry_args: bytecode::child_entry_handles(arity, starters[0], starters[1]).collect(),
             entry,
             child_size,
-            image_len: 1u64 << memory_log2,
             digest: g.digest,
             module: Arc::clone(&g.module),
             funcs: Arc::clone(&g.funcs),
@@ -30770,14 +30827,6 @@ impl Mem {
     /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
     /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
     fn fork_private(&self) -> Option<Mem> {
-        self.fork_private_over(|reserved| Some(self.twin_backing(reserved)))
-    }
-
-    /// [`fork_private`](Mem::fork_private) over the backing `backing(reserved)` chooses — a
-    /// **growable flat** one for an exec'd image that runs on the emitted tier (#1896), which is grown
-    /// to hold the copied tail pages. `None` where `fork_private` refuses, or when the backing cannot
-    /// be had or grown.
-    fn fork_private_over(&self, backing: impl FnOnce(u64) -> Option<Region>) -> Option<Mem> {
         // §13 region aliasing and externally-`Backed` pages cannot be duplicated blindly — fail
         // closed, as ever. Plain page protections (an `Ro` stack-guard page, an `Unmapped` hole,
         // an explicitly re-`Rw`'d page) *within the snapshotted prefix* are per-domain view
@@ -30822,7 +30871,7 @@ impl Mem {
         let mut twin = Mem::with_reservation_over(
             reserved.trailing_zeros() as u8,
             mapped.trailing_zeros() as u8,
-            Arc::new(backing(reserved)?),
+            Arc::new(self.twin_backing(reserved)),
             Some(self.shadow),
         );
         twin.seed(&self.window_snapshot());
@@ -31180,52 +31229,52 @@ impl Mem {
             .insert(page / self.page, PageProt::Rw);
     }
 
-    /// #801 `exec` image hygiene — the image-replace reuses the **caller's** window, whose
-    /// committed extent and leftover bytes are the caller's, not the command's. The command's
-    /// declared image `[0, len)` must arrive fresh: every page committed read-write (the caller
-    /// may have mapped a smaller prefix, demand-paged, or RO-protected pages the command's
-    /// statics land on) and every byte zeroed — C's `.bss` is a *no-segment zero guarantee*, and
-    /// stale caller bytes must not leak into the new image. The exec admissibility gate already
-    /// bounded the command's declared memory by this window, so `len` never exceeds `reserved()`.
-    /// Data segments materialize after this (Step::Exec), exactly like a fresh instantiation — and,
-    /// like one, the image starts behind this window's NULL guard (#1094: every instantiation seeds
-    /// it, [`seed_null_guard`](Mem::seed_null_guard)): committing the image read-write must not
-    /// open `[0, guard)`, or a null dereference in an exec'd program reads zeros where the same
-    /// program loaded fresh faults — and where its emitted twin, whose guard compare is baked, faults
-    /// too (#1896).
+    /// FORK.md §8.6 — the window an `execve` replaces this one with. An exec replaces the address
+    /// space: the new image gets this window's geometry (its reservation, its backed prefix and its
+    /// shadow arena) over `back`, a fresh backing, and nothing else of this window. The caller's bytes
+    /// past the image, the pages it `vm_map`ped in the reserved tail and its page protections stay
+    /// behind, as they do on the Cranelift JIT, whose exec starts the image in a fresh instance. Nor
+    /// is the caller's window zeroed or copied, which for a compiler's forked child was most of what
+    /// an exec cost.
     ///
-    /// One carve-out: the **args region** `[null_guard + EXEC_ARGS_BASE, null_guard + EXEC_ARGS_END)`
-    /// is *preserved*, not zeroed — the caller packed `{argc, envc}` + NUL-packed argv/envp strings
-    /// there right before `exec_module`, and the command's child-entry runtime reads them from the same
-    /// window (the #801 exec ABI: "argv arrives through the preserved args region"). Under the #1059
-    /// NULL guard the whole region rides one guard up (a guard-marked command reads argv at
-    /// `module_args_base = guard + EXEC_ARGS_BASE`), so the preserved window shifts with it; `null_guard`
-    /// is `0` for a legacy command, leaving the classic `[EXEC_ARGS_BASE, EXEC_ARGS_END)` carve-out.
-    fn commit_fresh_image(&self, len: u64, null_guard: u64) {
-        let pages = len.div_ceil(self.page).max(1);
-        {
-            let mut space = self.space_write();
-            for p in 0..pages {
-                if p * self.page < self.window.mapped() {
-                    space.prot.remove(&p); // read-write is the mapped prefix's default
-                } else {
-                    space.prot.insert(p, PageProt::Rw); // explicit commit in the reserved tail
-                }
-            }
-            for p in 0..self.null_guard / self.page {
-                space.prot.insert(p, PageProt::Unmapped); // the guard `seed_null_guard` armed
-            }
-        }
-        let base = self.window.base();
+    /// The image arrives as a fresh instantiation's does: behind the NULL guard (#1094: a null
+    /// dereference in an exec'd program faults where the same program loaded fresh faults, and where
+    /// its emitted twin, whose guard compare is baked, faults too, #1896), with its data segments
+    /// written. One region carries over, the **args region** `[null_guard + EXEC_ARGS_BASE,
+    /// null_guard + EXEC_ARGS_END)`: the caller packs `{argc, envc}` and its NUL-packed argv/envp there
+    /// right before `exec_module`, and the command's child-entry runtime reads them there (the #801
+    /// exec ABI). A personality exec's committed argv (`args`, #1768) is written last, over it.
+    fn exec_window(
+        &self,
+        back: Region,
+        data: &[temen_ir::Data],
+        null_guard: u64,
+        args: Option<&[u8]>,
+    ) -> Mem {
+        let (reserved, mapped) = (self.window.reserved(), self.window.mapped());
+        let mut m = Mem::with_reservation_over(
+            reserved.trailing_zeros() as u8,
+            mapped.trailing_zeros() as u8,
+            Arc::new(back),
+            Some(self.shadow),
+        );
+        m.seed_null_guard(null_guard);
         let args_base = null_guard + EXEC_ARGS_BASE;
-        let args_end = null_guard + EXEC_ARGS_END;
-        self.zero_run(base, len.min(args_base));
-        let tail = args_end.min(len);
-        self.zero_run(base + tail, len - tail);
+        let args_len = (null_guard + EXEC_ARGS_END)
+            .min(mapped)
+            .saturating_sub(args_base);
+        if let Ok(carried) = self.read_window(args_base, args_len as usize) {
+            m.write_run(args_base, &carried);
+        }
+        m.write_segments(0, data, mapped);
+        if let Some(blob) = args {
+            m.write_exec_args(blob);
+        }
+        m
     }
 
     /// #1768 — write a committed personality exec's args blob at `module_args_base`, the region
-    /// [`Self::commit_fresh_image`] preserves, so the new image's `_start` reads its own argv there.
+    /// [`Self::exec_window`] carries over, so the new image's `_start` reads its own argv there.
     /// Only ever called once the exec is committed; the personality bounded the blob to the region.
     fn write_exec_args(&self, blob: &[u8]) {
         self.write_run(self.window.base() + temen_ir::module_args_base(), blob);
@@ -32057,17 +32106,6 @@ impl Mem {
         }
         for (k, &b) in bytes.iter().enumerate() {
             self.set_byte(off + k as u64, b);
-        }
-    }
-
-    /// Zero `len` bytes at the backing-absolute `off`, as [`Self::write_run`] writes.
-    fn zero_run(&self, off: u64, len: u64) {
-        if !self.has_regions.load(Ordering::Relaxed) {
-            self.back.zero(off, len);
-            return;
-        }
-        for k in 0..len {
-            self.set_byte(off + k, 0);
         }
     }
 
@@ -33729,22 +33767,6 @@ mod mem_fork_tests {
         assert_eq!(twin.byte((1 << 16) + page - 1), 0xA5, "to its last byte");
         twin.set_byte(1 << 16, 0x01);
         assert_eq!(m.byte(1 << 16), 0x5A, "private copy, not aliased");
-    }
-
-    /// #1896 — a copy over a **growable** flat backing (what an exec'd leaf image runs over) grows it
-    /// to hold the tail pages the window `vm_map`-committed past its mapped prefix.
-    #[test]
-    fn fork_private_over_a_growable_backing_grows_it_for_tail_pages() {
-        let mut m = Mem::with_reservation(18, 16, None); // 64 KiB mapped, 256 KiB reserved
-        let page = m.page;
-        let tail = (1 << 16) + 2 * page;
-        assert_eq!(m.map(tail, page, PROT_READ | PROT_WRITE), 0);
-        m.set_byte(tail + page - 1, 0xA5);
-        let copy = m
-            .fork_private_over(|_| Region::growable(1 << 16, page))
-            .expect("a growable backing grows to the tail page");
-        assert!(copy.flat_win_base().is_some(), "the copy is flat");
-        assert_eq!(copy.byte(tail + page - 1), 0xA5, "the tail page came over");
     }
 
     /// #816 item 3 — the flat twin-backing seam, pinned on the non-unix arm (a forced `Paged`

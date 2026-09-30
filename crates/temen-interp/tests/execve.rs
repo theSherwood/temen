@@ -275,3 +275,82 @@ fn a_failed_exec_module_on_the_bytecode_engine_leaves_the_caller_running() {
         "a refused exec ran no command, so nothing was written"
     );
 }
+
+/// A 64 KiB caller that leaves `90` at 48 KiB and `65` in the args region (the #801 exec ABI: a
+/// caller packs argv there for the command), then execs the command with no grants.
+const FRESH_GUEST: &str = r#"
+memory 16
+func (i32, i64) -> (i64) {
+block 0 (vinst: i32, vcmd: i64) {
+  vs = i64.const 49152
+  v90 = i32.const 90
+  i32.store8 vs v90
+  va = i64.const 16520
+  v65 = i32.const 65
+  i32.store8 va v65
+  vz = i32.const 0
+  vgp = i64.const 0
+  vgn = i64.const 0
+  ventry = i64.const 0
+  vsl = i64.const 16
+  vr = call.cap 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) vz (vcmd, vgp, vgn, ventry, vsl)
+  v99 = i64.const 99
+  return v99
+  }
+}
+"#;
+
+/// A 32 KiB command: returns what is at 48 KiB, past its own image, times 1000, plus the byte in
+/// the args region.
+const FRESH_CMD: &str = r#"
+memory 15
+func (i64) -> (i64) {
+block 0 (vinst: i64) {
+  vs = i64.const 49152
+  vsb = i32.load8_u vs
+  vs64 = i64.extend_i32_u vsb
+  vk = i64.const 1000
+  vhi = i64.mul vs64 vk
+  va = i64.const 16520
+  vab = i32.load8_u va
+  va64 = i64.extend_i32_u vab
+  vr = i64.add vhi va64
+  return vr
+  }
+}
+"#;
+
+/// An exec replaces the address space: the command starts in a fresh window of the caller's
+/// geometry, so the caller's bytes past the command's image are gone (the command reads `0` where
+/// the caller left `90`), while the args region carries over (`65`). The tree-walker and the
+/// bytecode engine agree, as the Cranelift JIT, whose exec starts the image in a fresh instance,
+/// always has.
+#[test]
+fn exec_module_starts_the_command_in_a_fresh_window() {
+    type Run = fn(&temen_ir::Module, &[Value], &mut u64, &mut Host) -> Vec<Value>;
+    let engines: [(&str, Run); 2] = [
+        ("tree-walker", |m, a, f, h| {
+            run_with_host(m, 0, a, f, h).expect("run")
+        }),
+        ("bytecode", |m, a, f, h| {
+            temen_interp::bytecode::compile_and_run_with_host(m, 0, a, f, h)
+                .expect("the bytecode engine compiles it")
+                .expect("run")
+        }),
+    ];
+    for (engine, run) in engines {
+        let guest = module(FRESH_GUEST);
+        let cmd = module(FRESH_CMD);
+        let mut host = Host::new();
+        host.set_self_module(&guest);
+        let inst = host.grant_instantiator(0, 1u64 << 16);
+        let cmd_h = host.grant_module(&cmd);
+        let mut fuel = 40_000_000u64;
+        let args = [Value::I32(inst), Value::I64(cmd_h as i64)];
+        assert_eq!(
+            run(&guest, &args, &mut fuel, &mut host),
+            vec![Value::I64(65)],
+            "{engine}: the command reads zero past its image, and the args region the caller packed"
+        );
+    }
+}
