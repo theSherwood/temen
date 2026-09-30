@@ -10,10 +10,10 @@
 //! - **`Pending`** names the issue that builds the row.
 //! - **`Unreachable`** says why the engine never parks there during a durable run.
 //!
-//! The oracle and the JIT each have a runner ([`run`]). The bytecode rows wait on #1904, which gives
-//! that engine the same park rules; enabling it is adding its runner and flipping its rows. Every
-//! engine keeps the fiber-safepoint countdown ([`arm_freeze_after`]), so the rows that fire the
-//! freeze in a sibling use it and run unchanged on each.
+//! Each engine has a runner ([`run`]). Every engine keeps the fiber-safepoint countdown
+//! ([`arm_freeze_after`]), so the rows that fire the freeze in a sibling use it and run unchanged on
+//! each; the oracle and the bytecode engine also keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]),
+//! which the one-vCPU rows use.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,10 +53,7 @@ fn row(site: ParkSite, engine: Engine) -> Row {
     match engine {
         Engine::Interp => interp_row(site),
         Engine::Jit => jit_row(site),
-        Engine::Bytecode => Row::Pending {
-            issue: 1904,
-            why: "the same park rules on this engine, and its runner here",
-        },
+        Engine::Bytecode => bytecode_row(site),
     }
 }
 
@@ -118,6 +115,43 @@ fn jit_row(site: ParkSite) -> Row {
             issue: 1901,
             why: "a call in flight inside the cut (the JIT's `live_impl_call` reply and its \
                   punted-call completion); built with its re-park",
+        },
+        ParkSite::Admit => ADMIT_UNREACHABLE,
+    }
+}
+
+/// The bytecode engine's rows, run through its durable entry
+/// (`bytecode::compile_and_run_capture_reserved_with_host`). That entry runs one vCPU: it refuses
+/// `thread.*`, so the rows whose freeze fires in a sibling cannot run on it.
+fn bytecode_row(site: ParkSite) -> Row {
+    const NO_THREADS: &str =
+        "the durable bytecode entry refuses `thread.*`, and this row's park waits \
+                              on a sibling vCPU";
+    match site {
+        ParkSite::Svc => Row::Case(svc),
+        ParkSite::StreamRead => Row::Case(stream_read),
+        ParkSite::Join => Row::Unreachable { why: NO_THREADS },
+        ParkSite::Futex | ParkSite::PipeRead | ParkSite::PipeWrite => Row::Pending {
+            issue: 1904,
+            why: "one vCPU's park here waits on the outside: needs a row whose release feeds it \
+                  (a futex word, a pipe) from outside the run",
+        },
+        ParkSite::Stopped => Row::Pending {
+            issue: 1904,
+            why: "the bytecode engine wires no stop door (`set_stop_apply`); its bench reads only \
+                  a personality's `stopped()`",
+        },
+        ParkSite::Reap | ParkSite::ReapAny => Row::Pending {
+            issue: 1904,
+            why: "a `waitpid` waits on a fork twin, and the bytecode census has no fork-twin decline \
+                  outside freeze-on-quiesce",
+        },
+        ParkSite::Lane => Row::Unreachable {
+            why: "the cooperative pump runs one task at a time and has no lanes",
+        },
+        ParkSite::Reply | ParkSite::Completion => Row::Pending {
+            issue: 1901,
+            why: "a call in flight inside the cut; built with its re-park",
         },
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
@@ -217,7 +251,21 @@ fn run(
                     Err(e) => panic!("the JIT refused the module: {e:?}"),
                 }
             }
-            Engine::Bytecode => unreachable!("no bytecode runner yet"),
+            Engine::Bytecode => {
+                let mut fuel = 10_000_000u64;
+                let (r, snap) = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                    &inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h,
+                )
+                .expect("the bytecode engine runs the module");
+                let r = match r {
+                    Ok(v) => match v[..] {
+                        [Value::I64(n)] => Ok(n),
+                        ref other => panic!("unexpected result {other:?}"),
+                    },
+                    Err(t) => Err(format!("{t:?}")),
+                };
+                (r, snap)
+            }
         };
         let _ = tx.send((r, snap, h));
     });
@@ -514,51 +562,55 @@ block 2 (va2: i64) {{
     );
 }
 
-/// A stream read — the root reads one byte from a blocking stdin with nothing waiting, while its
-/// sibling loops. The input arrives only after the freeze: `1000·1 + 'x' + 7`.
+/// A stream read — the root parks a fiber on a futex nothing will notify, then reads one byte from a
+/// blocking stdin with nothing waiting. (One vCPU, so the row runs on an engine whose durable entry
+/// refuses `thread.*`.) Freeze-on-quiesce fires with both parked; the input arrives only after the
+/// freeze: `1000·1 + 'x'`.
 fn stream_read(site: ParkSite, engine: Engine) {
-    let src = format!(
-        r#"
+    let src = r#"
 memory 17
-func (i32) -> (i64) {{
-block 0 (vin: i32) {{
+func (i32) -> (i64) {
+block 0 (vin: i32) {
+  vf = ref.func 1
+  vsp = i64.const 4096
+  vfk = cont.new vf vsp
   vz = i64.const 0
-  vt = thread.spawn 1 vz vz
+  vs, vx = cont.resume vfk vz
   vbuf = i64.const 66100
   vlen = i64.const 1
   vn = call.cap 0 0 (i64, i64) -> (i64) vin (vbuf, vlen)
-  vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vb = i32.load8_u vbuf
   vb64 = i64.extend_i32_u vb
-  vs = i64.add vnk vb64
-  vres = i64.add vs vj
+  vres = i64.add vnk vb64
   return vres
-  }}
-}}
-func (i64, i64) -> (i64) {{
-{SIBLING_LOOP}
-block 2 (va2: i64) {{
-  vr = i64.const 7
-  return vr
-  }}
-}}
-{FIBER}"#
-    );
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
     freeze_parked_then_thaw(
         engine,
         site,
-        &src,
+        src,
         |h| {
             let vin = h.grant_stream(StreamRole::In);
             h.set_stdin_blocking(true);
             vec![Value::I32(vin)]
         },
         Uninterrupted::WaitsOnTheOutside,
-        arm_in_sibling,
+        arm_freeze_on_quiesce,
         |h| h.push_stdin(b"x"),
-        1000 + i64::from(b'x') + 7,
+        1000 + i64::from(b'x'),
     );
 }
 

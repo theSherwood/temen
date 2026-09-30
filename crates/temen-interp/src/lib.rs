@@ -31425,8 +31425,13 @@ impl Mem {
     /// #1672: set context `ctx`'s re-issue word ([`REISSUE_IN_REGION_OFF`]), marking the host call
     /// it is in as abandoned under a landing freeze.
     fn durable_set_reissue(&mut self, ctx: usize) {
-        let off = self.shadow.region_base(ctx) + REISSUE_IN_REGION_OFF;
-        let _ = self.write_bytes_impl(off, &1i32.to_le_bytes());
+        self.durable_set_reissue_at(self.shadow.region_base(ctx));
+    }
+
+    /// [`Self::durable_set_reissue`] for the context whose region starts at `region` (the bytecode
+    /// engine tracks its running context by region base).
+    fn durable_set_reissue_at(&mut self, region: u64) {
+        let _ = self.write_bytes_impl(region + REISSUE_IN_REGION_OFF, &1i32.to_le_bytes());
     }
 
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
