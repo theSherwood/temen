@@ -4484,6 +4484,28 @@ impl<'p> Vcpu<'p> {
                 Ok(VcpuStop::ChildOffer { dst, .. }) => {
                     self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                 }
+                // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and its
+                // resumer runs on (this driver cannot idle a blocking resume: the `FIBER_PARKED`
+                // poll). A vanished pipe's op just re-runs, and fails closed.
+                Ok(
+                    stop @ (VcpuStop::PipeRead { .. }
+                    | VcpuStop::PipeWrite { .. }
+                    | VcpuStop::StdinPark),
+                ) if self.vt.active_id != ROOT_FIBER => {
+                    let parked = ctx.host.with(|h| {
+                        HostWait::of(&stop, h).map(|on| {
+                            let ready = on.ready(h);
+                            (on, ready)
+                        })
+                    });
+                    if let Some((on, ready)) = parked {
+                        let vt = &mut self.vt;
+                        let mem = &mut *ctx.mem;
+                        fibers.with(|f, sp, _| {
+                            park_fiber_on_host(vt, f, sp, mem, durable, false, on, ready)
+                        });
+                    }
+                }
                 // §3.6 (I36 slice 2): live calls / svc.wait need the cooperative scheduler's waker
                 // topology (`drive`); on this single-vCPU driver nothing could ever wake them —
                 // fail closed rather than hang. They need a hand-wired live cap to arrive here.
@@ -4517,6 +4539,7 @@ impl<'p> Vcpu<'p> {
                             FiberState::Parked { .. }
                                 | FiberState::WaitParked { .. }
                                 | FiberState::CapParked { .. }
+                                | FiberState::HostParked { .. }
                         )
                     });
                     if froze && parked {
@@ -5969,7 +5992,9 @@ fn journal_state(
         && !fibers.iter().any(|f| {
             matches!(
                 f,
-                FiberState::WaitParked { .. } | FiberState::CapParked { .. }
+                FiberState::WaitParked { .. }
+                    | FiberState::CapParked { .. }
+                    | FiberState::HostParked { .. }
             )
         });
     if !invertible {
@@ -8854,7 +8879,9 @@ impl ScheduledDebugRun {
                 .any(|f| {
                     matches!(
                         f,
-                        FiberState::WaitParked { .. } | FiberState::CapParked { .. }
+                        FiberState::WaitParked { .. }
+                            | FiberState::CapParked { .. }
+                            | FiberState::HostParked { .. }
                     )
                 })
             && self.extra_envs.iter().all(|e| {
@@ -9816,6 +9843,11 @@ enum FiberState {
         /// `Some(result)` once the drain claimed the completion; `None` while still in flight.
         woken: Option<i64>,
     },
+    /// #1952 — **event-parked on a host op that must wait**: a pipe read or write, or a blocking
+    /// stdin read, parked the FIBER, not its vCPU (the oracle's rewound fiber park). The op was
+    /// rewound, so the fiber re-executes it when resumed. A `cont.resume` claims it once the op can
+    /// proceed ([`HostWait::ready`]) and reports `FIBER_PARKED` without switching until then.
+    HostParked { vm: Vm, on: HostWait },
     /// Currently on the resume chain (active or an ancestor) — not independently resumable.
     /// `blocking_ip` (I48): `Some(ip)` if this fiber's current resume used `cont.resume.block`, so a
     /// park inside it idles the resumer (rewinding the resumer's cursor to `ip`) instead of returning
@@ -9942,6 +9974,36 @@ fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
 /// `NORMAL` is consumed by the resumer that runs on.
 fn is_unwinding(mem: &Option<Mem>) -> bool {
     mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
+}
+
+/// #1952 — what a [`FiberState::HostParked`] fiber waits on.
+#[derive(Clone)]
+enum HostWait {
+    /// A pipe end, read without the `Host` ([`super::PipeProbe`]).
+    Pipe(super::PipeProbe),
+    /// Its domain's blocking stdin.
+    Stdin,
+}
+
+impl HostWait {
+    /// What a host-park `stop` waits on, over the parker's powerbox: `None` for any other stop, or a
+    /// pipe that has vanished (its re-run fails closed).
+    fn of(stop: &VcpuStop, host: &Host) -> Option<HostWait> {
+        match *stop {
+            VcpuStop::PipeRead { pipe } => host.pipe_probe(pipe, false).map(HostWait::Pipe),
+            VcpuStop::PipeWrite { pipe } => host.pipe_probe(pipe, true).map(HostWait::Pipe),
+            VcpuStop::StdinPark => Some(HostWait::Stdin),
+            _ => None,
+        }
+    }
+
+    /// Whether the parked op can proceed, over the parked fiber's domain powerbox.
+    fn ready(&self, host: &Host) -> bool {
+        match self {
+            HostWait::Pipe(p) => p.ready(),
+            HostWait::Stdin => host.stdin_ready(),
+        }
+    }
 }
 
 /// F2 (FIBER_PARK.md) — the ordered completion drain over the fiber registry: claim ready punt
@@ -10157,10 +10219,13 @@ fn freeze_drive(
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
     // fails the whole freeze closed.
-    if fibers
-        .iter()
-        .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
-    {
+    // A host park (#1952) likewise has no re-issue arm yet (#1677).
+    if fibers.iter().any(|f| {
+        matches!(
+            f,
+            FiberState::CapParked { woken: None, .. } | FiberState::HostParked { .. }
+        )
+    }) {
         return Err(Trap::FiberFault);
     }
     let mut frozen = Vec::new();
@@ -10403,7 +10468,8 @@ fn gc_scan_beneath(
             for fib in fibers {
                 if let FiberState::Parked { vm, .. }
                 | FiberState::WaitParked { vm, .. }
-                | FiberState::CapParked { vm, .. } = fib
+                | FiberState::CapParked { vm, .. }
+                | FiberState::HostParked { vm, .. } = fib
                 {
                     scan_vm_roots(vm, source, &mut consider);
                 }
@@ -11224,6 +11290,14 @@ fn step_vcpu(
                 // inside it idles this task (rewinding to `resume_ip`) instead of the FIBER_PARKED
                 // poll. `None` for a plain `cont.resume`.
                 let blocking_ip = blocking.then_some(resume_ip);
+                // #1952 — a poll of a host-parked fiber asks whether its op can proceed now, over
+                // this task's powerbox (read here: the claim below runs under the registry).
+                let host_ready = fibers
+                    .with(|f, _, _| match f.get(k) {
+                        Some(FiberState::HostParked { on, .. }) => Some(on.clone()),
+                        _ => None,
+                    })
+                    .is_some_and(|on| ctx.host.with(|h| on.ready(h)));
                 // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the ordered drain
                 // first (so a busy resume-poll loop observes its completion without waiting
                 // for driver idle — the WaitParked `real_deadline` shape, completion form).
@@ -11329,6 +11403,23 @@ fn step_vcpu(
                     // deliberately NOT delivered — the oracle's `LiveWoken`); still in
                     // flight, the resumer gets `(FIBER_PARKED, 0)` without a switch (I48: a
                     // blocking resume idles until the ordered completion drain wakes it).
+                    // #1952 — a host-parked fiber: once its op can proceed, the resume continues it,
+                    // and its rewound op re-executes (nothing is delivered); until then the resumer
+                    // gets `(FIBER_PARKED, 0)` without a switch, or idles under a blocking resume.
+                    Some(slot @ FiberState::HostParked { .. }) => {
+                        if !host_ready {
+                            return Ok(if blocking && cooperative {
+                                Claim::Block
+                            } else {
+                                Claim::Poll
+                            });
+                        }
+                        let FiberState::HostParked { vm, .. } = std::mem::replace(slot, running())
+                        else {
+                            unreachable!()
+                        };
+                        Ok(Claim::Continue(vm))
+                    }
                     Some(slot @ FiberState::CapParked { .. }) => {
                         let FiberState::CapParked { woken, .. } = slot else {
                             unreachable!()
@@ -11832,6 +11923,112 @@ enum TaskState {
     },
     /// Finished — its result (or trap) is retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
+}
+
+/// Park `vt`'s running fiber (never fiber 0) as `park(vm)` — §3.6 slice 5a, the one route every
+/// fiber park takes: unwind one chain link to the fiber's resumer and set its `Vm` aside in `fibers`.
+/// The resumer gets `(FIBER_PARKED, 0)`. Under a blocking resume (I48) on a driver that `can_idle`,
+/// the resumer instead re-executes its resume: at once when `woken(fibers)` says the park's event
+/// already fired (the park-time recheck), else after idling on the fiber — the returned slot, which
+/// the caller parks its task on (`BlockedOnFiber`).
+#[allow(clippy::too_many_arguments)]
+fn park_running_fiber(
+    vt: &mut VTask,
+    fibers: &mut [FiberState],
+    fiber_sp: &mut [u64],
+    mem: &mut Option<Mem>,
+    durable: bool,
+    can_idle: bool,
+    park: impl FnOnce(Vm) -> FiberState,
+    woken: impl FnOnce(&mut [FiberState]) -> bool,
+) -> Option<usize> {
+    let k = vt.active_id;
+    // I48: the blocking-resume marker, set at the claim, before the park overwrites `Running`.
+    let blocking_ip = match fibers.get(k) {
+        Some(FiberState::Running { blocking_ip, .. }) => *blocking_ip,
+        _ => None,
+    };
+    let (rid, resumer, rdst) = vt.chain.pop().expect("a running fiber has a resumer");
+    shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
+    fibers[k] = park(std::mem::replace(&mut vt.active, resumer));
+    vt.active_id = rid;
+    let woken = woken(fibers);
+    if let (Some(ip), true) = (blocking_ip, can_idle) {
+        vt.active.pc = ip;
+        return (!woken).then_some(k);
+    }
+    vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
+    vt.active.set(rdst + 1, Reg::from_i64(0));
+    None
+}
+
+/// #1952 — park `vt`'s running fiber on a host op that must wait ([`FiberState::HostParked`]):
+/// [`park_running_fiber`], with `ready` the park-time recheck.
+#[allow(clippy::too_many_arguments)]
+fn park_fiber_on_host(
+    vt: &mut VTask,
+    fibers: &mut [FiberState],
+    fiber_sp: &mut [u64],
+    mem: &mut Option<Mem>,
+    durable: bool,
+    can_idle: bool,
+    on: HostWait,
+    ready: bool,
+) -> Option<usize> {
+    park_running_fiber(
+        vt,
+        fibers,
+        fiber_sp,
+        mem,
+        durable,
+        can_idle,
+        |vm| FiberState::HostParked { vm, on },
+        |_| ready,
+    )
+}
+
+/// #1952 — task `ti`'s running fiber (never fiber 0) parks on the host op `stop` must wait for
+/// ([`FiberState::HostParked`]), in its task's domain: the root's registry and window, or its
+/// confined `instantiate` env's. Nothing parks for a vanished pipe: its op re-runs, and fails closed.
+#[allow(clippy::too_many_arguments)]
+fn host_park_fiber(
+    tasks: &mut [TaskSlot],
+    ti: usize,
+    fibers: &mut Vec<FiberState>,
+    fiber_sp: &mut Vec<u64>,
+    mem: &mut Option<Mem>,
+    extra_envs: &mut [ChildEnv],
+    host: &mut Host,
+    stop: &VcpuStop,
+) {
+    let durable = host.is_durable();
+    let Some((on, ready)) = task_host(host, extra_envs, tasks[ti].env).with(|h| {
+        HostWait::of(stop, h).map(|on| {
+            let ready = on.ready(h);
+            (on, ready)
+        })
+    }) else {
+        return;
+    };
+    let (fibers, fiber_sp, mem) = match tasks[ti].env {
+        None => (fibers, fiber_sp, mem),
+        Some(e) => {
+            let e = &mut extra_envs[e];
+            (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
+        }
+    };
+    if let Some(k) = park_fiber_on_host(
+        &mut tasks[ti].vt,
+        fibers,
+        fiber_sp,
+        mem,
+        durable,
+        true,
+        on,
+        ready,
+    ) {
+        tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+    }
 }
 
 impl TaskState {
@@ -12655,11 +12852,17 @@ impl CoopSched {
                         None => &*fibers,
                         Some(k) => &extra_envs[k].fibers.fibers,
                     };
-                    if matches!(
-                        reg.get(fiber),
-                        Some(FiberState::WaitParked { woken: Some(_), .. })
-                            | Some(FiberState::CapParked { woken: Some(_), .. })
-                    ) {
+                    let woken = match reg.get(fiber) {
+                        Some(
+                            FiberState::WaitParked { woken: Some(_), .. }
+                            | FiberState::CapParked { woken: Some(_), .. },
+                        ) => true,
+                        Some(FiberState::HostParked { on, .. }) => {
+                            task_host(host, extra_envs, t.env).with(|h| on.ready(h))
+                        }
+                        _ => false,
+                    };
+                    if woken {
                         t.state = TaskState::Runnable;
                     }
                 }
@@ -13092,6 +13295,16 @@ impl CoopSched {
                 // the settle scan re-admits it on `stdin_ready` and the all-parked signal sweep
                 // interrupts it (the re-run completes `-EINTR`), exactly like a pipe park. Invariant 14:
                 // the tree-walker's stdin park, carried to the cooperative driver.
+                // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and its
+                // resumer runs on (or idles on it, under a blocking resume). Fiber 0's park is its
+                // task's (the arms below). A vanished pipe's op just re-runs, and fails closed.
+                Ok(
+                    stop @ (VcpuStop::PipeRead { .. }
+                    | VcpuStop::PipeWrite { .. }
+                    | VcpuStop::StdinPark),
+                ) if tasks[ti].vt.active_id != ROOT_FIBER => {
+                    host_park_fiber(tasks, ti, fibers, fiber_sp, mem, extra_envs, host, &stop);
+                }
                 Ok(VcpuStop::StdinPark) => {
                     tasks[ti].state = TaskState::BlockedStdin;
                 }
@@ -13154,42 +13367,31 @@ impl CoopSched {
                     if tasks[ti].vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
                         let comps = host.completions();
                         let k = tasks[ti].vt.active_id;
-                        // I48: read the blocking-resume marker off the parking fiber's `Running` state
-                        // before it is overwritten with `CapParked`.
-                        let blocking_ip = match fibers.get(k) {
-                            Some(FiberState::Running { blocking_ip, .. }) => *blocking_ip,
-                            _ => None,
-                        };
-                        let vt = &mut tasks[ti].vt;
-                        let (rid, resumer, rdst) =
-                            vt.chain.pop().expect("a running fiber has a resumer");
-                        shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
-                        let fvm = std::mem::replace(&mut vt.active, resumer);
-                        fibers[k] = FiberState::CapParked {
-                            vm: fvm,
-                            dst,
-                            id,
-                            woken: None,
-                        };
-                        drain_cap_parked(fibers, &comps);
-                        vt.active_id = rid;
-                        // I48: a blocking resume idles the resumer on this cap-parked fiber. Rewind so
-                        // the wake re-executes the resume; if the drain already claimed the completion,
-                        // keep the task Runnable to re-resume at once, else park it until the drain
-                        // (at idle or a later poll) wakes the fiber.
-                        if let Some(ip) = blocking_ip {
-                            vt.active.pc = ip;
-                            let woken_now = matches!(
-                                fibers.get(k),
-                                Some(FiberState::CapParked { woken: Some(_), .. })
-                            );
-                            if !woken_now {
-                                tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
-                            }
-                            continue;
+                        // The drain right after the park is the register-then-recheck: a completion
+                        // that raced the park wakes the fiber at once.
+                        if let Some(k) = park_running_fiber(
+                            &mut tasks[ti].vt,
+                            fibers,
+                            fiber_sp,
+                            mem,
+                            durable,
+                            true,
+                            |vm| FiberState::CapParked {
+                                vm,
+                                dst,
+                                id,
+                                woken: None,
+                            },
+                            |fibers| {
+                                drain_cap_parked(fibers, &comps);
+                                matches!(
+                                    fibers.get(k),
+                                    Some(FiberState::CapParked { woken: Some(_), .. })
+                                )
+                            },
+                        ) {
+                            tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
                         }
-                        vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
-                        vt.active.set(rdst + 1, Reg::from_i64(0));
                     } else {
                         let comps = match tasks[ti].env {
                             None => host.completions(),
@@ -13960,7 +14162,6 @@ impl CoopSched {
                     // `WAIT_NOT_EQUAL` — after the one transient `FIBER_PARKED`, like the oracle).
                     if tasks[ti].vt.active_id != ROOT_FIBER {
                         let durable = host.is_durable();
-                        let k = tasks[ti].vt.active_id;
                         // The fiber lives in its task's domain: the root's registry and window, or its
                         // confined `instantiate` env's.
                         let (fibers, fiber_sp, mem) = match tasks[ti].env {
@@ -13970,29 +14171,16 @@ impl CoopSched {
                                 (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
                             }
                         };
-                        // I48: read the blocking-resume marker off the parking fiber's `Running` state
-                        // (set at the claim) before it is overwritten with `WaitParked` below.
-                        let blocking_ip = match fibers.get(k) {
-                            Some(FiberState::Running { blocking_ip, .. }) => *blocking_ip,
-                            _ => None,
-                        };
-                        let vt = &mut tasks[ti].vt;
-                        let (rid, resumer, rdst) =
-                            vt.chain.pop().expect("a running fiber has a resumer");
-                        shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
-                        let fvm = std::mem::replace(&mut vt.active, resumer);
-                        let cur = mem
+                        let (cur, key) = mem
                             .as_ref()
-                            .map(|m| m.atomic_value(base, width))
-                            .unwrap_or(0);
+                            .map_or((0, super::FutexKey::Anon(0, base)), |m| {
+                                (m.atomic_value(base, width), m.futex_key(base))
+                            });
                         let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
-                        fibers[k] = FiberState::WaitParked {
-                            vm: fvm,
+                        let park = |vm| FiberState::WaitParked {
+                            vm,
                             wait_dst: dst,
-                            key: mem
-                                .as_ref()
-                                .map(|m| m.futex_key(base))
-                                .unwrap_or(super::FutexKey::Anon(0, base)),
+                            key,
                             // #1638: an infinite wait arms neither clock. It ends by `notify`,
                             // by the park-time recheck, or not at all — and "not at all" is the
                             // driver's deadlock exit, not a fabricated `WAIT_TIMED_OUT`.
@@ -14000,21 +14188,18 @@ impl CoopSched {
                             real_deadline: timeout.map(sched_wall_deadline),
                             woken,
                         };
-                        vt.active_id = rid;
-                        // I48: a blocking resume idles the resumer on this fiber instead of the
-                        // FIBER_PARKED poll. Rewind so the wake re-executes the resume; if the
-                        // value-recheck already woke the fiber, keep the task Runnable to re-resume at
-                        // once (the oracle's recheck-re-admit — no transient poll), else park it until
-                        // the fiber's event/idle-timer wakes it.
-                        if let Some(ip) = blocking_ip {
-                            vt.active.pc = ip;
-                            if woken.is_none() {
-                                tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
-                            }
-                            continue;
+                        if let Some(k) = park_running_fiber(
+                            &mut tasks[ti].vt,
+                            fibers,
+                            fiber_sp,
+                            mem,
+                            durable,
+                            true,
+                            park,
+                            |_| woken.is_some(),
+                        ) {
+                            tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
                         }
-                        vt.active.set(rdst, Reg::from_i32(super::FIBER_PARKED));
-                        vt.active.set(rdst + 1, Reg::from_i64(0));
                         continue;
                     }
                     // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
@@ -15632,6 +15817,27 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // could not arrive.
             Ok(VcpuStop::ChildOffer { dst, .. }) => {
                 vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            }
+            // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and this
+            // vCPU's resumer runs on (the driver cannot idle a blocking resume: the `FIBER_PARKED`
+            // poll). A vanished pipe's op just re-runs, and fails closed.
+            Ok(
+                stop @ (VcpuStop::PipeRead { .. }
+                | VcpuStop::PipeWrite { .. }
+                | VcpuStop::StdinPark),
+            ) if vt.active_id != ROOT_FIBER => {
+                let parked = {
+                    let g = host.lock_unpoisoned();
+                    HostWait::of(&stop, &g).map(|on| {
+                        let ready = on.ready(&g);
+                        (on, ready)
+                    })
+                };
+                if let Some((on, ready)) = parked {
+                    FiberCell::Shared(&domain.fibers).with(|f, sp, _| {
+                        park_fiber_on_host(&mut vt, f, sp, &mut mem, false, false, on, ready)
+                    });
+                }
             }
             Ok(VcpuStop::LiveCall { .. })
             | Ok(VcpuStop::SvcWait)

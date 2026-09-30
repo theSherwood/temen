@@ -222,10 +222,10 @@ pub enum HostPark {
     Ended,
 }
 
-/// #1826 — park the calling vCPU's host call on `key` until `still_parked` turns false, through the
-/// run's futex hub ([`futex_wait`]), so it has the futex wait's every exit: a kill, the domain's
-/// teardown, a freeze (`WAIT_FROZEN`), and deadlock detection (no live vCPU left to end it). A
-/// [`wake_host_parks`] on `key` re-checks it. `still_parked` must not take the `Host` (a waker holds
+/// #1826 — park the calling fiber's host call until `still_parked` turns false. Fiber 0 parks its
+/// vCPU on `key` through the run's futex hub ([`futex_wait`]), so it has the futex wait's every exit:
+/// a kill, the domain's teardown, a freeze (`WAIT_FROZEN`), and deadlock detection (no live vCPU left
+/// to end it); a [`wake_host_parks`] on `key` re-checks it. Any other fiber parks alone (#1952). `still_parked` must not take the `Host` (a waker holds
 /// it while it takes the futex lock): it reads state the host shares, such as a pipe's FIFO.
 ///
 /// A durable run's deferred children run first ([`Domain::drive_deferred_before_park`]): one of
@@ -243,6 +243,25 @@ pub unsafe fn park_host_call(
 ) -> HostPark {
     let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
     let frozen = || unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
+    // #1952 — a fiber's park takes the fiber alone: it yields `FIBER_PARKED` to its resumer, which
+    // runs on, and re-checks each time a `cont.resume` polls it. It parks before the first re-check,
+    // for the one transient `FIBER_PARKED` the oracle's register-then-recheck gives.
+    if let Some(slot) = fiber_rt::current_fiber_slot() {
+        let ended = || epoch_fired(vm.epoch as usize) || load_trap(trap_out) != 0;
+        loop {
+            if frozen() {
+                mark_reissue(unwind_base);
+                return HostPark::Frozen;
+            }
+            fiber_rt::fiber_event_park(&slot, false, None);
+            if ended() {
+                return HostPark::Ended;
+            }
+            if !frozen() && !still_parked() {
+                return HostPark::Woken;
+            }
+        }
+    }
     if vm.sched.is_null() {
         // No thread domain: the caller is the run's only vCPU, and nothing else could end it.
         return if frozen() {

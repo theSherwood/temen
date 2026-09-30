@@ -205,12 +205,15 @@ pub unsafe extern "C" fn cap_thunk(
     // completion cell (`fiber_cap_wait`) — the §3.6 slice-5a contract, completion form, the
     // futex thunk's exact shape. Gated on the oracle's predicate: a live fiber, exactly one
     // result slot (the wake delivers one scalar — invariant 8), and a non-durable run (the
-    // freeze driver has no cap-park re-derivation). Root context keeps the sync face below:
-    // a single-threaded guest's punts run inline — semantically identical and cheaper than a
-    // pool round-trip nobody could overlap with (DESIGN.md §12), and the "sync ops never pay"
-    // pin stays intact (nothing here is touched unless a fiber is live).
-    if n_results == 1 && temen_jit::fiber_active() && !(*(ctx as *mut Host)).is_durable() {
-        let mut pending_id = None;
+    // freeze driver has no cap-park re-derivation). Root context keeps the sync face
+    // (`pending = None`): a single-threaded guest's punts run inline — semantically identical and
+    // cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12), and the "sync ops
+    // never pay" pin stays intact (nothing here is touched unless a fiber is live). Either face, a
+    // would-block op parks the calling fiber and runs again (#1826, #1952).
+    let pending_face =
+        n_results == 1 && temen_jit::fiber_active() && !(*(ctx as *mut Host)).is_durable();
+    loop {
+        let (mut pending_id, mut park) = (None, None);
         cap_thunk_impl(
             ctx,
             mem_base,
@@ -224,8 +227,8 @@ pub unsafe extern "C" fn cap_thunk(
             results,
             n_results,
             trap_out,
-            Some(&mut pending_id),
-            &mut None, // a fiber keeps the op's answer; it never parks the thread
+            pending_face.then_some(&mut pending_id),
+            &mut park,
         );
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
@@ -233,30 +236,8 @@ pub unsafe extern "C" fn cap_thunk(
             if *trap_out == 0 {
                 *results = r;
             }
+            return;
         }
-        return;
-    }
-    // Sync face (`pending = None`): a single-threaded guest's punts run inline — semantically
-    // identical and cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12). A
-    // would-block op parks and runs again (#1826).
-    loop {
-        let mut park = None;
-        cap_thunk_impl(
-            ctx,
-            mem_base,
-            mem_size,
-            mem_reserved,
-            type_id,
-            op,
-            handle,
-            args,
-            n_args,
-            results,
-            n_results,
-            trap_out,
-            None,
-            &mut park,
-        );
         match park {
             Some(p) if p.park(trap_out) => continue,
             _ => return,
@@ -624,9 +605,8 @@ unsafe fn cap_thunk_impl(
 
 /// #1826 — the park decision for a JIT run outside a process tree, over the transients an op left:
 /// the interpreters' `decide` for its pipe and stdin parks. A pipe wake re-checks the parks on that
-/// pipe ([`temen_jit::wake_host_parks`]). A would-block op returns what to park on — only in the root
-/// context: a fiber keeps the op's answer, as on the oracle. A deliverable signal interrupts it
-/// instead: `-EINTR`.
+/// pipe ([`temen_jit::wake_host_parks`]). A would-block op returns what the calling fiber parks on
+/// (#1952: any fiber, as on the oracle). A deliverable signal interrupts it instead: `-EINTR`.
 ///
 /// # Safety
 /// `results`/`trap_out` as [`cap_thunk`]'s.
@@ -650,7 +630,7 @@ unsafe fn host_park(
         .read_park
         .map(|p| (p, false))
         .or(parks.write_park.map(|p| (p, true)));
-    if (pipe_park.is_none() && !stdin_park) || temen_jit::fiber_active() {
+    if pipe_park.is_none() && !stdin_park {
         return None;
     }
     if parks.sig_intr {
