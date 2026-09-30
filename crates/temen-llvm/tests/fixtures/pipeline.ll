@@ -1,215 +1,227 @@
-; ModuleID = '/tmp/claude-0/-home-user-vm/8192c67a-39d3-5f8d-8db5-366ce6cb9abb/scratchpad/pipeline.bc'
+; ModuleID = 'pipeline.bc'
 source_filename = "pipeline.c"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-pc-linux-gnu"
 
-@.str = private unnamed_addr constant [4 x i8] c"gen\00", align 1
-@.str.1 = private unnamed_addr constant [3 x i8] c"up\00", align 1
+@.str = private unnamed_addr constant [9 x i8] c"/bin/gen\00", align 1
+@.str.1 = private unnamed_addr constant [8 x i8] c"/bin/up\00", align 1
 @__px_handle = internal unnamed_addr global i32 -1, align 4
 @.str.3 = private unnamed_addr constant [6 x i8] c"posix\00", align 1
 @str = private unnamed_addr constant [12 x i8] c"pipeline ok\00", align 1
 
 ; Function Attrs: nounwind uwtable
 define dso_local noundef i32 @main() local_unnamed_addr #0 {
-  %1 = alloca [2 x i32], align 4
-  %2 = alloca i32, align 4
-  call void @llvm.lifetime.start.p0(i64 8, ptr nonnull %1) #4
-  %3 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %4 = icmp slt i32 %3, 0
-  br i1 %4, label %5, label %7
+  %1 = alloca [5 x i64], align 16
+  %2 = alloca [5 x i64], align 16
+  %3 = alloca [2 x i32], align 4
+  %4 = alloca i32, align 4
+  call void @llvm.lifetime.start.p0(i64 8, ptr nonnull %3) #5
+  %5 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %6 = icmp slt i32 %5, 0
+  br i1 %6, label %7, label %9
 
-5:                                                ; preds = %0
-  %6 = tail call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %6, ptr @__px_handle, align 4, !tbaa !5
-  br label %7
+7:                                                ; preds = %0
+  %8 = tail call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %8, ptr @__px_handle, align 4, !tbaa !5
+  br label %9
 
-7:                                                ; preds = %0, %5
-  %8 = phi i32 [ %6, %5 ], [ %3, %0 ]
-  %9 = ptrtoint ptr %1 to i64
-  %10 = call i64 @__vm_host_call(i32 noundef %8, i32 noundef 23, i64 noundef %9, i64 noundef 0, i64 noundef 0, i64 noundef 0) #4
-  %11 = and i64 %10, 4294967295
-  %12 = icmp eq i64 %11, 0
-  br i1 %12, label %13, label %116
+9:                                                ; preds = %0, %7
+  %10 = phi i32 [ %8, %7 ], [ %5, %0 ]
+  %11 = ptrtoint ptr %3 to i64
+  %12 = call i64 @__vm_host_call(i32 noundef %10, i32 noundef 23, i64 noundef %11, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  %13 = and i64 %12, 4294967295
+  %14 = icmp eq i64 %13, 0
+  br i1 %14, label %15, label %120
 
-13:                                               ; preds = %7
-  %14 = load i32, ptr %1, align 4, !tbaa !5
-  %15 = getelementptr inbounds [2 x i32], ptr %1, i64 0, i64 1
-  %16 = load i32, ptr %15, align 4, !tbaa !5
-  %17 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %18 = icmp slt i32 %17, 0
-  br i1 %18, label %19, label %21
+15:                                               ; preds = %9
+  %16 = load i32, ptr %3, align 4, !tbaa !5
+  %17 = getelementptr inbounds [2 x i32], ptr %3, i64 0, i64 1
+  %18 = load i32, ptr %17, align 4, !tbaa !5
+  %19 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %20 = icmp slt i32 %19, 0
+  br i1 %20, label %21, label %23
 
-19:                                               ; preds = %13
-  %20 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %20, ptr @__px_handle, align 4, !tbaa !5
-  br label %21
+21:                                               ; preds = %15
+  %22 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %22, ptr @__px_handle, align 4, !tbaa !5
+  br label %23
 
-21:                                               ; preds = %13, %19
-  %22 = phi i32 [ %20, %19 ], [ %17, %13 ]
-  %23 = call i64 @__vm_host_call(i32 noundef %22, i32 noundef 25, i64 noundef 1, i64 noundef 0, i64 noundef 0, i64 noundef 0) #4
-  %24 = and i64 %23, 2147483648
-  %25 = icmp eq i64 %24, 0
-  br i1 %25, label %26, label %116
+23:                                               ; preds = %15, %21
+  %24 = phi i32 [ %22, %21 ], [ %19, %15 ]
+  %25 = call i64 @__vm_host_call(i32 noundef %24, i32 noundef 25, i64 noundef 1, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  %26 = and i64 %25, 2147483648
+  %27 = icmp eq i64 %26, 0
+  br i1 %27, label %28, label %120
 
-26:                                               ; preds = %21
-  %27 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %28 = icmp slt i32 %27, 0
-  br i1 %28, label %29, label %31
+28:                                               ; preds = %23
+  %29 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %30 = icmp slt i32 %29, 0
+  br i1 %30, label %31, label %33
 
-29:                                               ; preds = %26
-  %30 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %30, ptr @__px_handle, align 4, !tbaa !5
-  br label %31
+31:                                               ; preds = %28
+  %32 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %32, ptr @__px_handle, align 4, !tbaa !5
+  br label %33
 
-31:                                               ; preds = %26, %29
-  %32 = phi i32 [ %30, %29 ], [ %27, %26 ]
-  %33 = sext i32 %16 to i64
-  %34 = call i64 @__vm_host_call(i32 noundef %32, i32 noundef 24, i64 noundef %33, i64 noundef 1, i64 noundef 0, i64 noundef 0) #4
-  %35 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %36 = icmp slt i32 %35, 0
-  br i1 %36, label %37, label %39
+33:                                               ; preds = %28, %31
+  %34 = phi i32 [ %32, %31 ], [ %29, %28 ]
+  %35 = sext i32 %18 to i64
+  %36 = call i64 @__vm_host_call(i32 noundef %34, i32 noundef 24, i64 noundef %35, i64 noundef 1, i64 noundef 0, i64 noundef 0) #5
+  %37 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %38 = icmp slt i32 %37, 0
+  br i1 %38, label %39, label %41
 
-37:                                               ; preds = %31
-  %38 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %38, ptr @__px_handle, align 4, !tbaa !5
-  br label %39
+39:                                               ; preds = %33
+  %40 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %40, ptr @__px_handle, align 4, !tbaa !5
+  br label %41
 
-39:                                               ; preds = %31, %37
-  %40 = phi i32 [ %38, %37 ], [ %35, %31 ]
-  %41 = call i64 @__vm_host_call(i32 noundef %40, i32 noundef 6, i64 noundef %33, i64 noundef 0, i64 noundef 0, i64 noundef 0) #4
-  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %2) #4
-  store i32 0, ptr %2, align 4, !tbaa !5
-  %42 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %43 = icmp slt i32 %42, 0
-  br i1 %43, label %44, label %46
+41:                                               ; preds = %33, %39
+  %42 = phi i32 [ %40, %39 ], [ %37, %33 ]
+  %43 = call i64 @__vm_host_call(i32 noundef %42, i32 noundef 6, i64 noundef %35, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %4) #5
+  store i32 0, ptr %4, align 4, !tbaa !5
+  call void @llvm.lifetime.start.p0(i64 40, ptr nonnull %2) #5
+  call void @llvm.memset.p0.i64(ptr noundef nonnull align 16 dereferenceable(40) %2, i8 0, i64 40, i1 false)
+  store i64 ptrtoint (ptr @.str to i64), ptr %2, align 16, !tbaa !9
+  %44 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %45 = icmp slt i32 %44, 0
+  br i1 %45, label %46, label %48
 
-44:                                               ; preds = %39
-  %45 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %45, ptr @__px_handle, align 4, !tbaa !5
-  br label %46
+46:                                               ; preds = %41
+  %47 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %47, ptr @__px_handle, align 4, !tbaa !5
+  br label %48
 
-46:                                               ; preds = %39, %44
-  %47 = phi i32 [ %45, %44 ], [ %42, %39 ]
-  %48 = call i64 @__vm_host_call(i32 noundef %47, i32 noundef 27, i64 noundef ptrtoint (ptr @.str to i64), i64 noundef 3, i64 noundef 0, i64 noundef 0) #4
-  %49 = icmp slt i64 %48, 0
-  br i1 %49, label %114, label %50
+48:                                               ; preds = %41, %46
+  %49 = phi i32 [ %47, %46 ], [ %44, %41 ]
+  %50 = ptrtoint ptr %2 to i64
+  %51 = call i64 @__vm_host_call(i32 noundef %49, i32 noundef 62, i64 noundef %50, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  call void @llvm.lifetime.end.p0(i64 40, ptr nonnull %2) #5
+  %52 = icmp slt i64 %51, 0
+  br i1 %52, label %118, label %53
 
-50:                                               ; preds = %46
-  %51 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %52 = icmp slt i32 %51, 0
-  br i1 %52, label %53, label %55
+53:                                               ; preds = %48
+  %54 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %55 = icmp slt i32 %54, 0
+  br i1 %55, label %56, label %58
 
-53:                                               ; preds = %50
-  %54 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %54, ptr @__px_handle, align 4, !tbaa !5
-  br label %55
+56:                                               ; preds = %53
+  %57 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %57, ptr @__px_handle, align 4, !tbaa !5
+  br label %58
 
-55:                                               ; preds = %50, %53
-  %56 = phi i32 [ %54, %53 ], [ %51, %50 ]
-  %57 = ptrtoint ptr %2 to i64
-  %58 = call i64 @__vm_host_call(i32 noundef %56, i32 noundef 28, i64 noundef %48, i64 noundef %57, i64 noundef 0, i64 noundef 0) #4
-  %59 = trunc i64 %58 to i32
-  %60 = trunc i64 %48 to i32
-  %61 = icmp eq i32 %59, %60
-  br i1 %61, label %62, label %114
+58:                                               ; preds = %53, %56
+  %59 = phi i32 [ %57, %56 ], [ %54, %53 ]
+  %60 = ptrtoint ptr %4 to i64
+  %61 = call i64 @__vm_host_call(i32 noundef %59, i32 noundef 28, i64 noundef %51, i64 noundef %60, i64 noundef 0, i64 noundef 0) #5
+  %62 = trunc i64 %61 to i32
+  %63 = trunc i64 %51 to i32
+  %64 = icmp eq i32 %62, %63
+  br i1 %64, label %65, label %118
 
-62:                                               ; preds = %55
-  %63 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %64 = icmp slt i32 %63, 0
-  br i1 %64, label %65, label %67
+65:                                               ; preds = %58
+  %66 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %67 = icmp slt i32 %66, 0
+  br i1 %67, label %68, label %70
 
-65:                                               ; preds = %62
-  %66 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %66, ptr @__px_handle, align 4, !tbaa !5
-  br label %67
+68:                                               ; preds = %65
+  %69 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %69, ptr @__px_handle, align 4, !tbaa !5
+  br label %70
 
-67:                                               ; preds = %62, %65
-  %68 = phi i32 [ %66, %65 ], [ %63, %62 ]
-  %69 = and i64 %23, 2147483647
-  %70 = call i64 @__vm_host_call(i32 noundef %68, i32 noundef 24, i64 noundef %69, i64 noundef 1, i64 noundef 0, i64 noundef 0) #4
-  %71 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %72 = icmp slt i32 %71, 0
-  br i1 %72, label %73, label %75
+70:                                               ; preds = %65, %68
+  %71 = phi i32 [ %69, %68 ], [ %66, %65 ]
+  %72 = and i64 %25, 2147483647
+  %73 = call i64 @__vm_host_call(i32 noundef %71, i32 noundef 24, i64 noundef %72, i64 noundef 1, i64 noundef 0, i64 noundef 0) #5
+  %74 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %75 = icmp slt i32 %74, 0
+  br i1 %75, label %76, label %78
 
-73:                                               ; preds = %67
-  %74 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %74, ptr @__px_handle, align 4, !tbaa !5
-  br label %75
+76:                                               ; preds = %70
+  %77 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %77, ptr @__px_handle, align 4, !tbaa !5
+  br label %78
 
-75:                                               ; preds = %67, %73
-  %76 = phi i32 [ %74, %73 ], [ %71, %67 ]
-  %77 = call i64 @__vm_host_call(i32 noundef %76, i32 noundef 6, i64 noundef %69, i64 noundef 0, i64 noundef 0, i64 noundef 0) #4
-  %78 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %79 = icmp slt i32 %78, 0
-  br i1 %79, label %80, label %82
+78:                                               ; preds = %70, %76
+  %79 = phi i32 [ %77, %76 ], [ %74, %70 ]
+  %80 = call i64 @__vm_host_call(i32 noundef %79, i32 noundef 6, i64 noundef %72, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  %81 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %82 = icmp slt i32 %81, 0
+  br i1 %82, label %83, label %85
 
-80:                                               ; preds = %75
-  %81 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %81, ptr @__px_handle, align 4, !tbaa !5
-  br label %82
+83:                                               ; preds = %78
+  %84 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %84, ptr @__px_handle, align 4, !tbaa !5
+  br label %85
 
-82:                                               ; preds = %75, %80
-  %83 = phi i32 [ %81, %80 ], [ %78, %75 ]
-  %84 = sext i32 %14 to i64
-  %85 = call i64 @__vm_host_call(i32 noundef %83, i32 noundef 24, i64 noundef %84, i64 noundef 0, i64 noundef 0, i64 noundef 0) #4
-  %86 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %87 = icmp slt i32 %86, 0
-  br i1 %87, label %88, label %90
+85:                                               ; preds = %78, %83
+  %86 = phi i32 [ %84, %83 ], [ %81, %78 ]
+  %87 = sext i32 %16 to i64
+  %88 = call i64 @__vm_host_call(i32 noundef %86, i32 noundef 24, i64 noundef %87, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  %89 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %90 = icmp slt i32 %89, 0
+  br i1 %90, label %91, label %93
 
-88:                                               ; preds = %82
-  %89 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %89, ptr @__px_handle, align 4, !tbaa !5
-  br label %90
+91:                                               ; preds = %85
+  %92 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %92, ptr @__px_handle, align 4, !tbaa !5
+  br label %93
 
-90:                                               ; preds = %82, %88
-  %91 = phi i32 [ %89, %88 ], [ %86, %82 ]
-  %92 = call i64 @__vm_host_call(i32 noundef %91, i32 noundef 6, i64 noundef %84, i64 noundef 0, i64 noundef 0, i64 noundef 0) #4
-  %93 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %94 = icmp slt i32 %93, 0
-  br i1 %94, label %95, label %97
+93:                                               ; preds = %85, %91
+  %94 = phi i32 [ %92, %91 ], [ %89, %85 ]
+  %95 = call i64 @__vm_host_call(i32 noundef %94, i32 noundef 6, i64 noundef %87, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  call void @llvm.lifetime.start.p0(i64 40, ptr nonnull %1) #5
+  call void @llvm.memset.p0.i64(ptr noundef nonnull align 16 dereferenceable(40) %1, i8 0, i64 40, i1 false)
+  store i64 ptrtoint (ptr @.str.1 to i64), ptr %1, align 16, !tbaa !9
+  %96 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %97 = icmp slt i32 %96, 0
+  br i1 %97, label %98, label %100
 
-95:                                               ; preds = %90
-  %96 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %96, ptr @__px_handle, align 4, !tbaa !5
-  br label %97
+98:                                               ; preds = %93
+  %99 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %99, ptr @__px_handle, align 4, !tbaa !5
+  br label %100
 
-97:                                               ; preds = %90, %95
-  %98 = phi i32 [ %96, %95 ], [ %93, %90 ]
-  %99 = call i64 @__vm_host_call(i32 noundef %98, i32 noundef 27, i64 noundef ptrtoint (ptr @.str.1 to i64), i64 noundef 2, i64 noundef 0, i64 noundef 0) #4
-  %100 = icmp slt i64 %99, 0
-  br i1 %100, label %114, label %101
+100:                                              ; preds = %93, %98
+  %101 = phi i32 [ %99, %98 ], [ %96, %93 ]
+  %102 = ptrtoint ptr %1 to i64
+  %103 = call i64 @__vm_host_call(i32 noundef %101, i32 noundef 62, i64 noundef %102, i64 noundef 0, i64 noundef 0, i64 noundef 0) #5
+  call void @llvm.lifetime.end.p0(i64 40, ptr nonnull %1) #5
+  %104 = icmp slt i64 %103, 0
+  br i1 %104, label %118, label %105
 
-101:                                              ; preds = %97
-  %102 = load i32, ptr @__px_handle, align 4, !tbaa !5
-  %103 = icmp slt i32 %102, 0
-  br i1 %103, label %104, label %106
+105:                                              ; preds = %100
+  %106 = load i32, ptr @__px_handle, align 4, !tbaa !5
+  %107 = icmp slt i32 %106, 0
+  br i1 %107, label %108, label %110
 
-104:                                              ; preds = %101
-  %105 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #4
-  store i32 %105, ptr @__px_handle, align 4, !tbaa !5
-  br label %106
+108:                                              ; preds = %105
+  %109 = call i32 @__vm_cap_resolve(ptr noundef nonnull @.str.3, i64 noundef 5) #5
+  store i32 %109, ptr @__px_handle, align 4, !tbaa !5
+  br label %110
 
-106:                                              ; preds = %101, %104
-  %107 = phi i32 [ %105, %104 ], [ %102, %101 ]
-  %108 = call i64 @__vm_host_call(i32 noundef %107, i32 noundef 28, i64 noundef %99, i64 noundef %57, i64 noundef 0, i64 noundef 0) #4
-  %109 = trunc i64 %108 to i32
-  %110 = trunc i64 %99 to i32
-  %111 = icmp eq i32 %109, %110
-  br i1 %111, label %112, label %114
+110:                                              ; preds = %105, %108
+  %111 = phi i32 [ %109, %108 ], [ %106, %105 ]
+  %112 = call i64 @__vm_host_call(i32 noundef %111, i32 noundef 28, i64 noundef %103, i64 noundef %60, i64 noundef 0, i64 noundef 0) #5
+  %113 = trunc i64 %112 to i32
+  %114 = trunc i64 %103 to i32
+  %115 = icmp eq i32 %113, %114
+  br i1 %115, label %116, label %118
 
-112:                                              ; preds = %106
-  %113 = call i32 @puts(ptr nonnull dereferenceable(1) @str)
-  br label %114
+116:                                              ; preds = %110
+  %117 = call i32 @puts(ptr nonnull dereferenceable(1) @str)
+  br label %118
 
-114:                                              ; preds = %112, %97, %106, %55, %46
-  %115 = phi i32 [ 3, %46 ], [ 4, %55 ], [ 0, %112 ], [ 5, %97 ], [ 6, %106 ]
-  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %2) #4
-  br label %116
+118:                                              ; preds = %116, %100, %110, %58, %48
+  %119 = phi i32 [ 3, %48 ], [ 4, %58 ], [ 0, %116 ], [ 5, %100 ], [ 6, %110 ]
+  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %4) #5
+  br label %120
 
-116:                                              ; preds = %114, %21, %7
-  %117 = phi i32 [ 1, %7 ], [ %115, %114 ], [ 2, %21 ]
-  call void @llvm.lifetime.end.p0(i64 8, ptr nonnull %1) #4
-  ret i32 %117
+120:                                              ; preds = %118, %23, %9
+  %121 = phi i32 [ 1, %9 ], [ %119, %118 ], [ 2, %23 ]
+  call void @llvm.lifetime.end.p0(i64 8, ptr nonnull %3) #5
+  ret i32 %121
 }
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
@@ -222,14 +234,18 @@ declare i64 @__vm_host_call(i32 noundef, i32 noundef, i64 noundef, i64 noundef, 
 
 declare i32 @__vm_cap_resolve(ptr noundef, i64 noundef) local_unnamed_addr #2
 
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #3
+
 ; Function Attrs: nofree nounwind
-declare noundef i32 @puts(ptr nocapture noundef readonly) local_unnamed_addr #3
+declare noundef i32 @puts(ptr nocapture noundef readonly) local_unnamed_addr #4
 
 attributes #0 = { nounwind uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
 attributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }
 attributes #2 = { "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
-attributes #3 = { nofree nounwind }
-attributes #4 = { nounwind }
+attributes #3 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #4 = { nofree nounwind }
+attributes #5 = { nounwind }
 
 !llvm.module.flags = !{!0, !1, !2, !3}
 !llvm.ident = !{!4}
@@ -243,3 +259,5 @@ attributes #4 = { nounwind }
 !6 = !{!"int", !7, i64 0}
 !7 = !{!"omnipotent char", !8, i64 0}
 !8 = !{!"Simple C/C++ TBAA"}
+!9 = !{!10, !10, i64 0}
+!10 = !{!"long", !7, i64 0}

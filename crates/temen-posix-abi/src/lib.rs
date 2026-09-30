@@ -5,7 +5,8 @@
 
 use temen_ir::{FuncType, ValType::I64};
 
-/// `(bare name, i64 argument count)`, one per op. **Order is the op number.**
+/// `(bare name, i64 argument count)`, one per op. **Order is the op number.** A retired op keeps its
+/// number, so no later op moves: its row is [`RETIRED`].
 pub const OPS: &[(&str, usize)] = &[
     ("write", 3),        // 0
     ("read", 3),         // 1
@@ -34,7 +35,7 @@ pub const OPS: &[(&str, usize)] = &[
     ("dup2", 2),         // 24
     ("dup", 1),          // 25
     ("fcntl", 3),        // 26
-    ("spawn", 4),        // 27
+    RETIRED,             // 27: the delegate `spawn`, replaced by `pspawn` (62, #1969)
     ("waitpid", 3),      // 28
     ("wait", 1),         // 29
     ("signal", 2),       // 30
@@ -50,7 +51,7 @@ pub const OPS: &[(&str, usize)] = &[
     ("sigprocmask", 3),  // 40
     ("sigaction", 3),    // 41
     ("sigaltstack", 2),  // 42
-    ("spawn2", 1),       // 43
+    RETIRED,             // 43: the delegate `spawn2`, likewise
     ("getpid", 0),       // 44
     ("setpgid", 2),      // 45
     ("getpgid", 1),      // 46
@@ -72,8 +73,13 @@ pub const OPS: &[(&str, usize)] = &[
     ("pspawn", 1),       // 62
 ];
 
+/// The row of a retired op in [`OPS`]: it has no name, so nothing imports it, and the personality
+/// serves nothing at its number.
+pub const RETIRED: (&str, usize) = ("", 0);
+
 /// The vocabulary as `(import names, signatures)`, op-ordered: `__px_<name>` taking its `i64`
-/// arguments and returning one `i64` — except `exit`, `(i64) -> ()`.
+/// arguments and returning one `i64` — except `exit`, `(i64) -> ()`. A retired op's import name is
+/// empty, which no import has.
 pub fn vtable() -> (Vec<String>, Vec<FuncType>) {
     OPS.iter()
         .map(|&(name, nargs)| {
@@ -88,7 +94,12 @@ pub fn vtable() -> (Vec<String>, Vec<FuncType>) {
                     results: vec![I64],
                 }
             };
-            (format!("__px_{name}"), sig)
+            let import = if name.is_empty() {
+                String::new()
+            } else {
+                format!("__px_{name}")
+            };
+            (import, sig)
         })
         .unzip()
 }

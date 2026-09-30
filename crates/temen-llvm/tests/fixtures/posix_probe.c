@@ -2,16 +2,16 @@
  * resolve the embedder-granted personality by name (`__vm_cap_resolve("posix")`, §7 self.resolve)
  * and drive the process/fd ABI through `__vm_host_call` (§7 host-defined capability) — the same idiom
  * `fs_probe.c` uses for the `fs` cap. Exercises the ops added for a real shell: `pipe`/`dup2` (the fd
- * surface), `posix_spawn`/`waitpid` (the fork-free process model, with fd inheritance), and `write`.
+ * surface), `posix_spawn`/`waitpid` (a child process, with fd inheritance), and `write`.
  * Exit 0 iff every step behaved; any failure returns its step number.
  *
  * The committed `posix_probe.ll` is this file compiled with `clang -O2 -emit-llvm -S` (regenerate the
  * same way after editing).
  *
- * The embedder wires `Posix::set_spawn` to an uppercasing delegate that exits 42; `spawn("up")` inherits
- * this guest's fd 0 (preloaded stdin) as the child's input and routes the child's stdout to fd 1 (the
- * personality's captured stdout), so `posix.stdout()` observes the child's `"HELLO"` followed by this
- * guest's own `"ok"` marker — the Rust test asserts both that and `WEXITSTATUS == 42`. */
+ * The embedder registers `/bin/up`, which uppercases its stdin and exits 42. Spawned with no file
+ * actions, it inherits this guest's fd 0 (preloaded stdin) as its input and fd 1 (the personality's
+ * captured stdout) as its output, so `posix.stdout()` observes the child's `"HELLO"` — the Rust test
+ * asserts that, and this guest checks `WEXITSTATUS == 42`. */
 
 extern int __vm_cap_resolve(const char *name, long len);
 extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
@@ -22,7 +22,7 @@ extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
  * therefore lands on the *powerbox* stdout (the run's `stdout`), distinct from the personality's. */
 extern int printf(const char *, ...);
 
-enum { WRITE = 0, READ = 1, PIPE = 23, DUP2 = 24, SPAWN = 27, WAITPID = 28 };
+enum { WRITE = 0, READ = 1, PIPE = 23, DUP2 = 24, WAITPID = 28, PSPAWN = 62 };
 
 static int px;
 static long hc(int op, long a, long b, long c, long d) { return __vm_host_call(px, op, a, b, c, d); }
@@ -43,10 +43,11 @@ int main(void) {
   if (hc(READ, r, (long)buf, 8, 0) != 4) return 5;
   if (buf[0] != 'p' || buf[1] != 'i' || buf[2] != 'n' || buf[3] != 'g') return 6;
 
-  /* 3. posix_spawn a child (the delegate uppercases the inherited stdin, exits 42); waitpid its status.
-   *    fd 0 (preloaded "hello") is the child's stdin; the child's stdout follows fd 1 to the captured
-   *    stdout the test reads back. */
-  long pid = hc(SPAWN, (long)"up", 2, 0, 0);
+  /* 3. posix_spawn a child (it uppercases the inherited stdin, exits 42); waitpid its status. fd 0
+   *    (preloaded "hello") is the child's stdin; the child's stdout follows fd 1 to the captured stdout
+   *    the test reads back. The request is `{path, argv, envp, actions, nactions}`. */
+  long req[5] = {(long)"/bin/up", 0, 0, 0, 0};
+  long pid = hc(PSPAWN, (long)req, 0, 0, 0);
   if (pid < 0) return 7;
   int st = 0;
   if (hc(WAITPID, pid, (long)&st, 0, 0) != pid) return 8;

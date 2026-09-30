@@ -249,9 +249,9 @@ The remaining slices turn that into a *compiled-C* program with *real libc*:
   Proven by `fork_import.rs` (a separate-module guest whose `fork` **import** forks-returns-twice).
 - **Slice 3 — libc into a nested child** (blocker D / the real gap). A §14 child spawned by
   `instantiate_named`/op 13 gets an *attenuated* powerbox (instantiator + address space + regranted
-  streams/pipes) — **not** posix libc. Existing compiled-C children get libc only because they run as a
-  *separate top-level run* via the `set_spawn` delegate (`c_posix_spawn.rs`), which cannot be the
-  *parked* caller a fork needs. So a nested fork-guest needs libc in its powerbox: extend
+  streams/pipes) — **not** posix libc. Compiled-C children then got libc only by running as a
+  *separate top-level run* through the `set_spawn` delegate (since retired, #1969), which could not be
+  the *parked* caller a fork needs. So a nested fork-guest needs libc in its powerbox: extend
   `regrant_into_child` to carry a **forkable `HostProc`** (re-grant the libc handle, sharing `Inner`), or
   give the child a fresh forkable libc at spawn. This is the load-bearing new interp/posix plumbing.
 - **Slice 4 — the compiled-C entry ABI over op 13. DONE.** No adaptation was needed: chibicc's
@@ -297,7 +297,7 @@ compiled-C `fork()` parks and returns twice like the hand-written form. All thre
 users (`c_shell_exec`, dynlink) stay green.
 
 Key refs: `c_fork.rs` (compiled-C fork), `fork_import.rs` (named-import fork binding), `fork_manager.rs` (the real-libc capstone), `SRC_FORK_PID` (`clone_caller.rs:276`), `SIBLING_AS_SERVICE` (`svc_serve_loop.rs:477`),
-`bind_with_fork` (`temen-posix/src/lib.rs`), `bind_shim` + harness (`crates/temen/tests/c_posix_spawn.rs`),
+`bind_with_fork` (`temen-posix/src/lib.rs`), `bind_shim` + harness (`crates/temen/tests/c_posix.rs`),
 op 13 compiled-C exec (`c_shell_exec.rs`), `regrant_into_child` (temen-interp).
 
 ### 8.2 Increment 2 — the derived mechanism (two findings that settle it)

@@ -398,7 +398,7 @@ signals ladder). In dependency order:
    `__vm_host_call` still needs a standard-libc call — e.g. `printf` — to trip temen-llvm's
    `needs_powerbox_entry` and get the synthesized `_start`; a real shell links libc, so it always does.)*
    **[Slice 4b done 2026-07-29 — the libc shim + a pipeline.]** `posix_shim.h` gives the on-ramp real-C
-   `write`/`read`/`pipe`/`dup`/`dup2`/`waitpid` + a fork-free `sh_spawn` over the `"posix"` cap — the
+   `write`/`read`/`pipe`/`dup`/`dup2`/`waitpid` + `sh_spawn` over the `"posix"` cap — the
    World-B analogue of `demos/shell/shim.c`, the layer a shell links. `pipeline.c` runs a real `gen | up`
    pipeline through it (wire stdout→pipe, run stage 1, restore stdout, wire pipe→stdin, run stage 2 —
    the classic redirect save/restore), landing "HELLO" on the personality's stdout, cross-backend.
@@ -429,7 +429,9 @@ signals ladder). In dependency order:
    shell's fd 1 while its exit status returns through `waitpid`. (The delegate is the test embedder —
    promoting a reusable builder into `temen-run` waits on `temen-run` gaining an `temen-posix` dep, deferred
    until a second consumer needs it.) **Remaining:** `fork`/`vfork`/`execve` (return-twice /
-   image-replace) on the durable-clone capstone.
+   image-replace) on the durable-clone capstone. **[Retired 2026-09-30, #1969.]** The delegate spawn
+   (ops 27/43, `Posix::set_spawn`) gave way to `pspawn` (op 62): a child is a real process, run by the
+   engine as a fork twin is, so `sh_spawn` and every test above spawn through it.
 5. **Signals** — L0 doorbell (a word bash polls at command boundaries; exact for `trap`, ships
    cheaply) → L1 interruptible parks → L2 safepoint handlers (Ctrl-C a running loop; parked, S13).
    **[Slice 3 done 2026-07-29 — the L0 doorbell.]** `signal`/`kill`/`sigcheck` landed as personality

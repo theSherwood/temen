@@ -3636,6 +3636,53 @@ int main(void) {{\n\
     }
 }
 
+/// A `pspawn` child with no file actions inherits its parent's descriptors: its stdout is the
+/// parent's, so its bytes follow the ones the parent wrote before the spawn, and its exit status
+/// reaches the parent's `waitpid`. (The compiled-C `spawn`/`waitpid` test this replaced ran its child
+/// through an embedder delegate instead, #1969.)
+#[test]
+fn c_pspawn_child_inherits_its_parents_stdout_on_every_driver() {
+    const CMD: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+int main(void) {
+  __px_write(0, 1, (long)"HELLO", 5);
+  return 42;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}\n\
+long __px_pspawn(int cap, long req);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static long req[5];\n\
+static int status;\n\
+int main(void) {{\n\
+  __px_write(0, 1, (long)\">>\", 2);\n\
+  req[0] = (long)\"/bin/up\";\n\
+  long pid = __px_pspawn(0, (long)req);\n\
+  if (pid <= 0) return 100 - pid;\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 3;\n\
+  return (status >> 8) & 0xff;\n\
+}}\n"
+    );
+    let stage = |host: &mut Host, posix: &Posix| stage_executable(host, posix, "/bin/up", CMD);
+    for (driver, e) in [
+        ("tree-walker", run_interp_setup(&src, stage)),
+        ("cooperative", run_bytecode_setup(&src, stage)),
+        ("parallel", run_bytecode_parallel_setup(&src, stage)),
+    ] {
+        assert_eq!(
+            e.result,
+            vec![Value::I32(42)],
+            "{driver}: the child's status"
+        );
+        assert_eq!(
+            e.stdout, b">>HELLO",
+            "{driver}: the parent's bytes, then the child's"
+        );
+    }
+}
+
 /// The `demos/shell` sources, compiled here as a **command** rather than a root program — the
 /// three files `c_shell.rs` already builds, reached the other way.
 const SH_SHIM: &str = include_str!("../../temen-run/demos/shell/shim.c");
