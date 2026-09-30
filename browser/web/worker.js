@@ -13,7 +13,7 @@ const STACK = 1 << 20; // per-Worker stack
 const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // Event codes — must match browser/src/lib.rs PAR_*.
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8,
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, TIERUP = 7, JIT_INVOKE = 8,
   INSTANTIATE_DETACHED = 9;
 
 // §22 codegen arg/result marshalling by scalar type code (0=i32, 1=i64, 2=f32, 3=f64): the engine
@@ -473,8 +473,8 @@ self.onmessage = async (e) => {
       return;
     }
     if (evc === SPAWN) {
-      // ev_a packs (spawning frame's module << 32) | func, as the INSTANTIATE event does — the
-      // child resolves `func` in that module (an installed §22 unit spawns its own functions).
+      // ev_a packs (spawning frame's module << 32) | func — the child resolves `func` in that module
+      // (an installed §22 unit spawns its own functions).
       const cam = ex.temen_par_ev_a(v);
       const csmod = Number(cam >> 32n), cfunc = Number(BigInt.asUintN(32, cam));
       const csp = ex.temen_par_ev_b(v), carg = ex.temen_par_ev_c(v);
@@ -502,10 +502,6 @@ self.onmessage = async (e) => {
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       ex.temen_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);
       continue;
-    }
-    if (evc === INSTANTIATE) {
-      // A §14 carve spawn: the par driver's children are detached (#1865), so it fails closed.
-      throw new Error('a carve spawn is not served on the par driver; spawn detached (op 17 v1)');
     }
     if (evc === INSTANTIATE_DETACHED) {
       // §5 detached child (#1286 slice 3b): the engine admitted it (the Instantiator resolved, the

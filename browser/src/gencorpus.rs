@@ -1030,9 +1030,8 @@ block 0 (v0: i64) {
 }
 "#;
 
-// #1151 — the **page-op** granted module (the real-Chromium twin of `browser/tests/inst_codegen_paged.rs`):
-// with the detached root ([`inst_detached_root`], #1865), the unit's entry (emitted, **paged**) calls a
-// helper that `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an
+// #1151 — the **page-op** granted module: with the detached root ([`inst_detached_root`], #1865),
+// the unit's entry (emitted, **paged**) calls a helper that `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an
 // out-of-subset leaf the Worker bounces whole onto the child's own vCPU over its own window, re-syncing
 // the page-state table into the child's header after — then reads K on the `Ro` page and stores + loads
 // a marker at `target`, returning

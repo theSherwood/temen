@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**352 exports** in 37 families — 298 referenced from JS, 54 referenced by nothing, 10 behind a `cfg`.
+**353 exports** in 37 families — 298 referenced from JS, 55 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -27,11 +27,11 @@
 | `nim` | 4 | 4 | 0 |
 | `onramp` | 66 | 55 | 0 |
 | `op13jit` | 9 | 9 | 0 |
-| `par` | 75 | 74 | 2 |
+| `par` | 74 | 74 | 2 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
-| `release` | 4 | 0 | 0 |
+| `release` | 6 | 0 | 0 |
 | `run` | 21 | 20 | 0 |
 | `run0` | 1 | 1 | 0 |
 | `selfhost` | 2 | 2 | 0 |
@@ -319,7 +319,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_par_alloc`
 - `temen_par_child`
-- `temen_par_child_confined` — *unreferenced*
 - `temen_par_child_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_par_compile`
 - `temen_par_compile_jit`
@@ -415,6 +414,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `release`
 
 - `temen_release_close` — *unreferenced*
+- `temen_release_fs_image` — *unreferenced*
+- `temen_release_fs_ptr` — *unreferenced*
 - `temen_release_open` — *unreferenced*
 - `temen_release_run` — *unreferenced*
 - `temen_release_value` — *unreferenced*
