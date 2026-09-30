@@ -169,7 +169,7 @@ fn host(a: &temen_ir::Module, b: &temen_ir::Module, lane_cap: i64) -> (Host, [i3
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let ma = host.grant_module(a);
     let mb = host.grant_module(b);
-    let budget = host.grant_budget(0, 2i64 << 17, 0);
+    let budget = host.grant_budget(-1, 2i64 << 17, 0);
     (host, [inst, aspace, ma, mb, budget])
 }
 

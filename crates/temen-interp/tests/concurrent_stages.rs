@@ -400,7 +400,7 @@ fn two_detached_stages_pipe_through_a_shared_region_ring() {
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let ha = host.grant_address_space(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (2 << 17) as i64, 0); // exactly two 2^17 windows
+    let hw = host.grant_budget(-1, (2 << 17) as i64, 0); // exactly two 2^17 windows
     let mut fuel = 50_000_000u64;
     let r = run_with_host(
         &a,

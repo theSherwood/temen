@@ -12,9 +12,10 @@
 use core::ffi::c_void;
 use core::ptr::null_mut;
 use std::sync::Mutex;
-use temen_interp::{cap_id, run_with_host, Host, MemLayout, Value};
+use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_ex, GrantChild, GrantChildHooks, JitOutcome,
+    TrapKind,
 };
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
@@ -101,12 +102,19 @@ fn host(child: &temen_ir::Module, minter_quota: u64) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(0, (minter_quota) as i64, 0);
+    let budget = host.grant_budget(-1, (minter_quota) as i64, 0);
     (host, [inst, modh, budget])
 }
 
 fn run_jit(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i64 {
-    let (mut host, h) = host(child, quota);
+    match jit_outcome(parent, host(child, quota)) {
+        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
+        ref o => panic!("jit ended abnormally: {o:?}"),
+    }
+}
+
+/// Run `parent` on the JIT over `(host, handles)`, with no fuel armed for the root.
+fn jit_outcome(parent: &temen_ir::Module, (mut host, h): (Host, [i32; 3])) -> JitOutcome {
     let args = [h[0] as i64, h[1] as i64, h[2] as i64];
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         parent,
@@ -120,27 +128,32 @@ fn run_jit(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i
         Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit run");
-    match jo {
-        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
-        ref o => panic!("jit ended abnormally: {o:?}"),
-    }
+    jo
 }
 
 fn run_interp(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i64 {
-    let (mut host, h) = host(child, quota);
+    match interp_result(parent, host(child, quota))
+        .expect("interp run")
+        .first()
+    {
+        Some(Value::I64(x)) => *x,
+        other => panic!("unexpected interp result {other:?}"),
+    }
+}
+
+/// Run `parent` on the tree-walker over `(host, handles)`.
+fn interp_result(
+    parent: &temen_ir::Module,
+    (mut host, h): (Host, [i32; 3]),
+) -> Result<Vec<Value>, Trap> {
     let mut fuel = 50_000_000u64;
-    let r = run_with_host(
+    run_with_host(
         parent,
         0,
         &[Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])],
         &mut fuel,
         &mut host,
     )
-    .expect("interp run");
-    match r.first() {
-        Some(Value::I64(x)) => *x,
-        other => panic!("unexpected interp result {other:?}"),
-    }
 }
 
 #[test]
@@ -185,6 +198,62 @@ fn a_detached_child_on_the_jit_holds_the_budget_that_paid_for_it() {
     let want = (1 << 20) - (1 << 16);
     assert_eq!(run_interp(&p, &c, 1 << 20), want, "interpreter oracle");
     assert_eq!(run_jit(&p, &c, 1 << 20), want, "the JIT");
+}
+
+/// A detached child (`memory 16`) that takes 1000 loop back-edges (one fuel each), then returns 7.
+const CHILD_LOOPS: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vn = i32.const 1000
+  br 1(vn)
+}
+block 1 (vi: i32) {
+  one = i32.const 1
+  vj = i32.sub vi one
+  br_if vj 1(vj) 2()
+}
+block 2 () {
+  v = i64.const 7
+  return v
+  }
+}
+"#;
+
+/// [`host`] whose `Budget` is a node split from the granted one with a `fuel` ceiling.
+fn fuel_host(child: &temen_ir::Module, fuel: i64) -> (Host, [i32; 3]) {
+    let (mut host, mut h) = host(child, 1 << 20);
+    h[2] = host
+        .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[fuel, -1, 0], None)
+        .expect("split")[0] as i32;
+    (host, h)
+}
+
+/// #1944 slice 3, #1705 — a detached child burns the fuel of the budget that paid for it, on the JIT
+/// as on the interpreter, though the JIT's root runs with no fuel armed at all: a ceiling the child
+/// loops past ends it (the join hands its trap to the parent), and one with room lets it finish.
+#[test]
+fn a_detached_childs_budget_bounds_its_fuel_under_an_unmetered_jit_root() {
+    let p = module(&parent(true));
+    let c = module(CHILD_LOOPS);
+    for (fuel, want_interp, want_jit) in [
+        (2000, Ok(vec![Value::I64(7)]), JitOutcome::Returned(vec![7])),
+        (
+            500,
+            Err(Trap::OutOfFuel),
+            JitOutcome::Trapped(TrapKind::OutOfFuel),
+        ),
+    ] {
+        assert_eq!(
+            interp_result(&p, fuel_host(&c, fuel)),
+            want_interp,
+            "interpreter, ceiling {fuel}"
+        );
+        assert_eq!(
+            jit_outcome(&p, fuel_host(&c, fuel)),
+            want_jit,
+            "the JIT, ceiling {fuel}"
+        );
+    }
 }
 
 /// A detached child (`memory 16`) importing `exit`, which no grant binds.
@@ -545,7 +614,7 @@ fn premap_host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(0, 1i64 << 17, 0);
+    let budget = host.grant_budget(-1, 1i64 << 17, 0);
     (host, [inst, aspace, modh, budget])
 }
 

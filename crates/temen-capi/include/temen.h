@@ -118,7 +118,7 @@ TemenInstance *temen_instance_with_mem_hooks(TemenInstance *i, TemenMemHook hook
 
 /* ---- Run config ---- (a NULL pointer means all defaults; *_set flags select a field). */
 typedef struct {
-  uint64_t fuel;       /* per-op budget for the interpreters (if fuel_set); ignored by the JIT */
+  uint64_t fuel;       /* the run's fuel limit on every backend (if fuel_set) */
   int32_t fuel_set;
   uint64_t deadline_ms; /* JIT detect-and-kill deadline (if deadline_set); ignored by interps */
   int32_t deadline_set;

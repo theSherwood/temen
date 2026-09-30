@@ -936,7 +936,7 @@ block 0 (vx: i64) {
         let mut h = durable_host(&inst);
         let i = h.grant_instantiator(0, WINDOW as u64);
         let m = h.grant_durable_module(&inst);
-        let b = h.grant_budget(0, 1 << 20, 0);
+        let b = h.grant_budget(-1, 1 << 20, 0);
         h.grant_freeze_authority(FreezeScope::DetachedProgeny);
         (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
     };

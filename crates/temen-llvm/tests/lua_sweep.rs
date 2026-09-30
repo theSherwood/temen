@@ -32,7 +32,7 @@ fn run(backend: Backend) -> temen_run::Run {
     let config = RunConfig {
         limits: Limits {
             // The heavy files (gc stress, deep calls) exceed the default fuel on the interpreters.
-            fuel: Some(u64::MAX / 4),
+            fuel: Some(u64::MAX), // no limit on any backend
             deadline: None,
             max_fibers: 0,
             max_vcpus: 0,

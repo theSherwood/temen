@@ -28,7 +28,7 @@ fn run(backend: Backend) -> temen_run::Run {
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
         limits: Limits {
-            fuel: Some(u64::MAX / 4),
+            fuel: Some(u64::MAX), // no limit on any backend
             deadline: None,
             max_fibers: 0,
             max_vcpus: 0,

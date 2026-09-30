@@ -78,7 +78,7 @@ fn jit_fuel(src: &str, args: &[i64], budget: u64) -> (JitOutcome, u64) {
         args,
         temen_run::cap_thunk,
         core::ptr::null_mut(),
-        &mut cell as *mut u64,
+        &mut cell,
     )
     .expect("jit compiles");
     (outcome, cell)

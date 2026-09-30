@@ -91,7 +91,7 @@ fn host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(0, 1i64 << 17, 0); // exactly one 2^17 window
+    let budget = host.grant_budget(-1, 1i64 << 17, 0); // exactly one 2^17 window
     (host, [inst, aspace, modh, budget])
 }
 
