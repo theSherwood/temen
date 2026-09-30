@@ -6967,6 +6967,10 @@ pub struct ScheduledDebugRun {
     /// picks by the span over those turns. Sorted and disjoint; the DAP backend re-installs the list
     /// on every rebuild, like `forced`.
     step_spans: Vec<StepSpan>,
+    /// The scheduler-event sink (#1987), if one is installed ([`set_sched_sink`]).
+    ///
+    /// [`set_sched_sink`]: Self::set_sched_sink
+    sched_sink: Option<SchedSinkFn>,
     /// Whether the next step keeps the other threads frozen ([`set_single_thread`]).
     ///
     /// [`set_single_thread`]: Self::set_single_thread
@@ -7037,6 +7041,35 @@ pub enum SchedTraceEvent {
     /// `task` left its innermost function at `turn` (#1981): a return, or the task finishing. One per
     /// frame left, so a `longjmp` that drops three frames records three.
     Return { turn: u64, task: usize },
+    /// `task`'s `thread.join` of `child` completed at `turn` without parking — `child` had already
+    /// finished (#1987). A join that parked completes with `WakeJoin` instead.
+    Join {
+        turn: u64,
+        task: usize,
+        child: usize,
+    },
+}
+
+/// The **scheduler-event sink** (#1987): every [`SchedTraceEvent`] as the engine produces it, live and
+/// in order with the access sink — what a model that needs thread lifecycle (a race detector's spawn
+/// and join edges) consumes, without arming the trace tape.
+pub type SchedSinkFn = Box<dyn FnMut(&SchedTraceEvent) + Send>;
+
+/// Hand scheduler events to whoever is listening: the trace tape when armed, the scheduler-event
+/// sink when installed.
+fn record_sched(
+    trace: &mut Option<Vec<SchedTraceEvent>>,
+    sink: &mut Option<SchedSinkFn>,
+    events: Vec<SchedTraceEvent>,
+) {
+    if let Some(sink) = sink.as_mut() {
+        for e in &events {
+            sink(e);
+        }
+    }
+    if let Some(trace) = trace.as_mut() {
+        trace.extend(events);
+    }
 }
 
 /// How many call frames `task` has open: its active activation plus the suspended callers, or none
@@ -7080,11 +7113,22 @@ fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
 fn trace_diff(
     before: &[(u8, u64)],
     actor_depth: usize,
+    actor_threads: &[Option<usize>],
     tasks: &[DbgTask],
     turn: u64,
     actor: usize,
     out: &mut Vec<SchedTraceEvent>,
 ) {
+    // #1987: a join handle the op consumed without parking — the child had already finished.
+    for (slot, child) in actor_threads.iter().enumerate() {
+        if let (Some(child), Some(None)) = (child, tasks[actor].threads.get(slot)) {
+            out.push(SchedTraceEvent::Join {
+                turn,
+                task: actor,
+                child: *child,
+            });
+        }
+    }
     // #1981: the frames the actor entered or left, so an embedder can build exact per-thread call
     // spans from the tape instead of sampling stacks at stops (a short thread can live and die
     // between two stops).
@@ -8123,6 +8167,7 @@ impl ScheduledDebugRun {
             sched_seed: None,
             forced: Vec::new(),
             step_spans: Vec::new(),
+            sched_sink: None,
             single_thread: false,
             last_watch: None,
             // Entry-stopped: the first `step` steps off the entry op (not to completion), and the
@@ -8306,6 +8351,12 @@ impl ScheduledDebugRun {
         self.access_sink = Some(sink);
     }
 
+    /// Install the **scheduler-event sink** ([`SchedSinkFn`], #1987): each scheduler event, live, in
+    /// order with the access sink's memory events — replays included, like the access sink.
+    pub fn set_sched_sink(&mut self, sink: SchedSinkFn) {
+        self.sched_sink = Some(sink);
+    }
+
     /// Install the session's **scheduled debugger writes** ([`ScheduledWrite`], slice 8): each is
     /// applied when execution passes its turn — on the live resume and on every replay — so time
     /// travel stays truthful. The cursor lands past entries at turns already passed.
@@ -8464,6 +8515,7 @@ impl ScheduledDebugRun {
             journal_policy,
             access_sink,
             sched_trace,
+            sched_sink,
             sched_seed,
             forced,
             step_spans,
@@ -8495,7 +8547,8 @@ impl ScheduledDebugRun {
             // it is runnable (so a step stays on it and a step-over runs its own call), else the
             // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
             // stuck; unblocks a stepped `join`/`wait`).
-            let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
+            let pre_pick =
+                (sched_trace.is_some() || sched_sink.is_some()).then(|| trace_tags(tasks));
             // Precedence: the coroutine pin (an atomicity constraint) > a forced switch recorded
             // for this turn (explicit user intent) > the stepping thread — this step's, or on a
             // resume past a recorded step, that step's span (#1942) > the policy pick.
@@ -8543,8 +8596,10 @@ impl ScheduledDebugRun {
                 }
             };
             // Slice 6: the only transition a pick causes is a timed-out wait waking.
-            if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
-                trace_pick_diff(before, tasks, *turn, trace);
+            if let Some(before) = pre_pick.as_ref() {
+                let mut events = Vec::new();
+                trace_pick_diff(before, tasks, *turn, &mut events);
+                record_sched(sched_trace, sched_sink, events);
             }
             // Pre-op stop checks (breakpoint / watchpoint), skipped for a thread that just reported (it
             // must make progress off its current op first, so a loop-body stop re-fires each iteration).
@@ -8661,13 +8716,20 @@ impl ScheduledDebugRun {
             journal.apply_policy(*turn, journal_policy);
             // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
             let trace_turn = *turn;
-            let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
+            let tracing = sched_trace.is_some() || sched_sink.is_some();
+            let pre_adv = tracing.then(|| trace_tags(tasks));
             let pre_depth = trace_depth(&tasks[ti]);
-            if let Some(trace) = sched_trace.as_mut() {
-                trace.push(SchedTraceEvent::Turn {
+            let pre_threads = if tracing {
+                tasks[ti].threads.clone()
+            } else {
+                Vec::new()
+            };
+            if tracing {
+                let event = SchedTraceEvent::Turn {
                     turn: trace_turn,
                     task: ti,
-                });
+                };
+                record_sched(sched_trace, sched_sink, vec![event]);
             }
             if let Serviced::Declined = service_advance(
                 tasks, ti, extra_envs, fibers, source, table, fuel, mem, host, *clock, turn,
@@ -8676,8 +8738,18 @@ impl ScheduledDebugRun {
                 return SchedStop::Declined;
             }
             // Slice 6: derive the park/wake/spawn edges this advance caused (see `trace_diff`).
-            if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
-                trace_diff(before, pre_depth, tasks, trace_turn, ti, trace);
+            if let Some(before) = pre_adv.as_ref() {
+                let mut events = Vec::new();
+                trace_diff(
+                    before,
+                    pre_depth,
+                    &pre_threads,
+                    tasks,
+                    trace_turn,
+                    ti,
+                    &mut events,
+                );
+                record_sched(sched_trace, sched_sink, events);
             }
         }
     }
@@ -8795,6 +8867,7 @@ impl ScheduledDebugRun {
             journal_policy,
             access_sink,
             sched_trace,
+            sched_sink,
             sched_seed,
             forced,
             step_spans,
@@ -8807,15 +8880,17 @@ impl ScheduledDebugRun {
                                                    // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
                                                    // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
                                                    // A `CapParked` task is not runnable, so a parked run refuses to tick — as the single engine's.
-        let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
+        let pre_pick = (sched_trace.is_some() || sched_sink.is_some()).then(|| trace_tags(tasks));
         let Some(ti) = dbg_pinned_coro(tasks).or_else(|| {
             let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
             dbg_pick_runnable(tasks, clock, *sched_seed, forced, pref, *turn)
         }) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
-        if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
-            trace_pick_diff(before, tasks, *turn, trace);
+        if let Some(before) = pre_pick.as_ref() {
+            let mut events = Vec::new();
+            trace_pick_diff(before, tasks, *turn, &mut events);
+            record_sched(sched_trace, sched_sink, events);
         }
         apply_due_writes(
             scheduled_writes,
@@ -8857,13 +8932,20 @@ impl ScheduledDebugRun {
         );
         journal.apply_policy(*turn, journal_policy);
         let trace_turn = *turn;
-        let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
+        let tracing = sched_trace.is_some() || sched_sink.is_some();
+        let pre_adv = tracing.then(|| trace_tags(tasks));
         let pre_depth = trace_depth(&tasks[ti]);
-        if let Some(trace) = sched_trace.as_mut() {
-            trace.push(SchedTraceEvent::Turn {
+        let pre_threads = if tracing {
+            tasks[ti].threads.clone()
+        } else {
+            Vec::new()
+        };
+        if tracing {
+            let event = SchedTraceEvent::Turn {
                 turn: trace_turn,
                 task: ti,
-            });
+            };
+            record_sched(sched_trace, sched_sink, vec![event]);
         }
         if let Serviced::Declined = service_advance(
             tasks, ti, extra_envs, fibers, source, table, fuel, mem, host, *clock, turn,
@@ -8875,8 +8957,18 @@ impl ScheduledDebugRun {
         }
         // Slice 6: the park/wake/spawn edges this replayed op caused (identical to `drive`'s,
         // so a `tick`-replay refills the tape deterministically).
-        if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
-            trace_diff(before, pre_depth, tasks, trace_turn, ti, trace);
+        if let Some(before) = pre_adv.as_ref() {
+            let mut events = Vec::new();
+            trace_diff(
+                before,
+                pre_depth,
+                &pre_threads,
+                tasks,
+                trace_turn,
+                ti,
+                &mut events,
+            );
+            record_sched(sched_trace, sched_sink, events);
         }
         !matches!(tasks[0].state, DbgTaskState::Done(_))
     }

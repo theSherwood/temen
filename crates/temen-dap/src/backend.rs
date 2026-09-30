@@ -350,6 +350,11 @@ pub trait Debuggee {
     fn set_access_sink(&mut self, _sink: SharedSink) -> bool {
         false
     }
+    /// Install a scheduler-event consumer (#1987). `false` when this backend has no scheduler (the
+    /// tree-walker), so a race model fails its launch cleanly. Default: unsupported.
+    fn set_sched_sink(&mut self, _sink: SharedSchedSink) -> bool {
+        false
+    }
 
     // --- powerbox output -------------------------------------------------------------------------
     /// The guest's captured stdout at the current stop, if this session runs under a powerbox (else
@@ -578,12 +583,29 @@ pub struct BytecodeBackend {
     /// it observes the replay too and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
     /// The rev-trace probes stay silent (they build raw runs, no sink). `None` = no consumer.
     access_sink: Option<SharedSink>,
+    /// The session's scheduler-event consumer (#1987), re-installed on every rebuild like
+    /// `access_sink`. `None` = no consumer.
+    sched_sink: Option<SharedSchedSink>,
 }
 
 /// A shared, re-installable access-sink consumer: `(clock-or-turn, task, event)`. `Arc<Mutex<…>>`
 /// so the backend can hand a fresh boxed wrapper to every rebuilt run while one consumer (a
 /// host-side model) accumulates.
 pub type SharedSink = std::sync::Arc<std::sync::Mutex<dyn FnMut(u64, usize, MemEvent) + Send>>;
+
+/// A shared, re-installable scheduler-event consumer (#1987) — [`SharedSink`]'s twin for the engine's
+/// scheduler-event sink.
+pub type SharedSchedSink =
+    std::sync::Arc<std::sync::Mutex<dyn FnMut(&bytecode::SchedTraceEvent) + Send>>;
+
+/// Wrap the shared scheduler-event consumer as the engine's boxed sink.
+fn wrap_sched_sink(sink: &SharedSchedSink) -> bytecode::SchedSinkFn {
+    let s = std::sync::Arc::clone(sink);
+    Box::new(move |ev| {
+        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+        (*g)(ev)
+    })
+}
 
 /// Wrap the shared consumer as the engine's boxed sink ([`AccessSinkFn`]).
 fn wrap_sink(sink: &SharedSink) -> AccessSinkFn {
@@ -700,6 +722,7 @@ impl BytecodeBackend {
             undo_steps: 0,
             replay_steps: 0,
             access_sink: None,
+            sched_sink: None,
             sched_trace: false,
             seed,
             forced: Vec::new(),
@@ -715,6 +738,13 @@ impl BytecodeBackend {
     pub fn set_access_sink(&mut self, sink: SharedSink) {
         self.run.set_access_sink(wrap_sink(&sink));
         self.access_sink = Some(sink);
+    }
+
+    /// Install the session's scheduler-event consumer (#1987) — the thread lifecycle a race model
+    /// needs beside the accesses.
+    pub fn set_sched_sink(&mut self, sink: SharedSchedSink) {
+        self.run.set_sched_sink(wrap_sched_sink(&sink));
+        self.sched_sink = Some(sink);
     }
 
     /// Arm or disarm the **undo journal** for this session (#1556). On by default; turning it off
@@ -1137,6 +1167,9 @@ impl Debuggee for BytecodeBackend {
         if let Some(sink) = &self.access_sink {
             run.set_access_sink(wrap_sink(sink));
         }
+        if let Some(sink) = &self.sched_sink {
+            run.set_sched_sink(wrap_sched_sink(sink));
+        }
         // Re-arm the trace tape: the replay refills it deterministically from the restore point.
         if self.sched_trace {
             run.set_sched_trace(true);
@@ -1443,6 +1476,12 @@ impl Debuggee for BytecodeBackend {
                         ("turn", Json::i(*turn as i64)),
                         ("task", Json::i(*task as i64)),
                     ]),
+                    E::Join { turn, task, child } => Json::obj(vec![
+                        ("kind", Json::s("join")),
+                        ("turn", Json::i(*turn as i64)),
+                        ("task", Json::i(*task as i64)),
+                        ("child", Json::i(*child as i64)),
+                    ]),
                 })
                 .collect(),
         ))
@@ -1507,6 +1546,10 @@ impl Debuggee for BytecodeBackend {
     /// The engine-level sink installer.
     fn set_access_sink(&mut self, sink: SharedSink) -> bool {
         BytecodeBackend::set_access_sink(self, sink);
+        true
+    }
+    fn set_sched_sink(&mut self, sink: SharedSchedSink) -> bool {
+        BytecodeBackend::set_sched_sink(self, sink);
         true
     }
     /// W4 blocking stdin: append the provided bytes to the parked run's stdin — the next resume

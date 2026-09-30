@@ -1604,3 +1604,84 @@ fn a_deadlock_names_its_cycle() {
     assert_eq!(held_by_2, 2, "thread 1 waits on m2, held by the worker (id 1)");
     assert_eq!(held_by_1, 1, "thread 2 waits on m1, held by main (id 0)");
 }
+
+/// Both threads bump `counter`; with `LOCK` defined, under a mutex.
+const RACE_SRC: &str = r#"#include <pthread.h>
+int counter = 0;
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+void *worker(void *arg) {
+#ifdef LOCK
+  pthread_mutex_lock(&m);
+#endif
+  counter++;
+#ifdef LOCK
+  pthread_mutex_unlock(&m);
+#endif
+  return 0;
+}
+int main(void) {
+  pthread_t t;
+  pthread_create(&t, 0, worker, 0);
+#ifdef LOCK
+  pthread_mutex_lock(&m);
+#endif
+  counter++;
+#ifdef LOCK
+  pthread_mutex_unlock(&m);
+#endif
+  pthread_join(t, 0);
+  return counter;
+}
+"#;
+
+/// The `races` request's list after running `src` to the end under `raceDetect`.
+fn races_of(chibicc: &temen_ir::Module, src: &str) -> Vec<Json> {
+    let ir = compile_g(chibicc, src);
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = vec![
+        ("programText", Json::s(&ir)),
+        ("function", Json::i(0)),
+        ("args", Json::Arr(vec![])),
+        ("engine", Json::s("bytecode")),
+        ("powerbox", Json::s("onramp")),
+        ("raceDetect", Json::Bool(true)),
+    ];
+    let out = s.handle(&req(2, "launch", Json::obj(launch)));
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    s.handle(&req(4, "continue", Json::obj(vec![])));
+    let out = s.handle(&req(5, "races", Json::obj(vec![])));
+    response(&out)
+        .get("body")
+        .and_then(|b| b.get("races"))
+        .and_then(|r| r.as_array())
+        .map(<[Json]>::to_vec)
+        .expect("a races list")
+}
+
+/// **The race detector (#1987).** Two threads bumping a counter with nothing between them race: the
+/// run reports a race on one word between thread 1 and thread 2, at least one side a write. Under a
+/// mutex the same increments are ordered by the lock word (its CAS acquires, its unlock's store
+/// releases) and nothing is reported; nor are the spawn's and the join's own orderings.
+#[test]
+fn the_race_detector_finds_an_unprotected_counter_and_not_a_locked_one() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let racy = races_of(&chibicc, RACE_SRC);
+    let thread = |r: &Json, side: &str| r.get(side).and_then(|s| s.get("thread")).and_then(|t| t.as_i64());
+    let write = |r: &Json, side: &str| r.get(side).and_then(|s| s.get("write")) == Some(&Json::Bool(true));
+    assert!(
+        racy.iter().any(|r| {
+            let mut pair = [thread(r, "first"), thread(r, "second")];
+            pair.sort();
+            pair == [Some(1), Some(2)] && (write(r, "first") || write(r, "second"))
+        }),
+        "a race between the two threads: {racy:?}"
+    );
+    let locked = races_of(&chibicc, &format!("#define LOCK\n{RACE_SRC}"));
+    assert!(locked.is_empty(), "no race under the mutex: {locked:?}");
+}
