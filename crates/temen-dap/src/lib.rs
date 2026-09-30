@@ -191,9 +191,9 @@ impl DapServer {
             "scopes" => self.on_scopes(args),
             "variables" => self.on_variables(args),
             "continue" => self.on_continue(args),
-            "next" => self.on_step(StepKind::Over),
-            "stepIn" => self.on_step(StepKind::In),
-            "stepOut" => self.on_step(StepKind::Out),
+            "next" => self.on_step(StepKind::Over, args),
+            "stepIn" => self.on_step(StepKind::In, args),
+            "stepOut" => self.on_step(StepKind::Out, args),
             "stepBack" => self.on_step_back(args),
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
@@ -1410,13 +1410,26 @@ impl DapServer {
         self.session.as_ref().is_none_or(|s| s.condition_holds(pc))
     }
 
-    fn on_step(&mut self, kind: StepKind) -> (bool, Json, Vec<Event>) {
+    fn on_step(&mut self, kind: StepKind, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
         // `stepIn` descends into calls (single op); `next` runs over them; `stepOut` runs to return.
         // With debug info, `next`/`stepIn` step a whole *source line* (op-stepping until the frame's
         // line changes) so the editor advances a line at a time, not an op at a time; `stepOut`
         // already lands in the caller. Without debug info, all three stay op-level (IR debugging).
-        let has_debug = match self.session.as_ref() {
-            Some(s) => s.debug.is_some(),
+        //
+        // The step drives the thread `threadId` names (#1942) — the others stay frozen — and reads
+        // that thread's lines. Without one, the thread that stopped (a `stackTrace` of another thread
+        // must not redirect it).
+        let thread = args
+            .and_then(|a| a.get("threadId"))
+            .and_then(|v| v.as_i64())
+            .map(|t| t.max(1) as u64 - 1);
+        let has_debug = match self.session.as_mut() {
+            Some(s) => {
+                if let Some(t) = thread.or_else(|| s.inspector.stopped_task()) {
+                    s.inspector.select_task(t);
+                }
+                s.debug.is_some()
+            }
             None => return (false, Json::Null, vec![]),
         };
         let stop = match kind {
@@ -1501,6 +1514,8 @@ impl DapServer {
     /// rewinds within the frame, not into a callee), so a line that called a function is one step.
     fn step_back_source_line(&mut self) -> Stop {
         const CAP: usize = 1_000_000;
+        // The line to leave is the one the walked thread — the thread that ran last (#1942) — is on.
+        self.session.as_mut().unwrap().inspector.focus_last_ran();
         let (start, from) = (self.current_source_line(), self.position());
         let mut last = Stop::Blocked;
         let mut target = None;
