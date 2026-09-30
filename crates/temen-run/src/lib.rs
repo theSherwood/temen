@@ -225,6 +225,7 @@ pub unsafe extern "C" fn cap_thunk(
             n_results,
             trap_out,
             Some(&mut pending_id),
+            &mut None, // a fiber keeps the op's answer; it never parks the thread
         );
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
@@ -236,22 +237,66 @@ pub unsafe extern "C" fn cap_thunk(
         return;
     }
     // Sync face (`pending = None`): a single-threaded guest's punts run inline — semantically
-    // identical and cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12).
-    cap_thunk_impl(
-        ctx,
-        mem_base,
-        mem_size,
-        mem_reserved,
-        type_id,
-        op,
-        handle,
-        args,
-        n_args,
-        results,
-        n_results,
-        trap_out,
-        None,
-    );
+    // identical and cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12). A
+    // would-block op parks and runs again (#1826).
+    loop {
+        let mut park = None;
+        cap_thunk_impl(
+            ctx,
+            mem_base,
+            mem_size,
+            mem_reserved,
+            type_id,
+            op,
+            handle,
+            args,
+            n_args,
+            results,
+            n_results,
+            trap_out,
+            None,
+            &mut park,
+        );
+        match park {
+            Some(p) if p.park(trap_out) => continue,
+            _ => return,
+        }
+    }
+}
+
+/// #1826 — a would-block op on a JIT run outside a process tree (a pipe read of an empty FIFO with
+/// writers open, a pipe write to a full one with readers open, a blocking stdin read with no input):
+/// what its caller parks on, with every lock the run's other vCPUs need released, before running the
+/// op again ([`temen_jit::park_host_call`]). The op's placeholder results are already written.
+struct HostParkReq {
+    /// The pipe end the op is waiting on, or `None` for stdin, which nothing can feed during a JIT run
+    /// (the embedder's `push_stdin` needs the `Host` the run holds).
+    probe: Option<temen_interp::PipeProbe>,
+    /// A durable run's window base, or `0`.
+    unwind_base: u64,
+}
+
+impl HostParkReq {
+    /// The stdin park's key: past every pipe's global id (a `u32`).
+    const STDIN: u64 = u64::MAX;
+
+    /// Park; `true` when the op must run again. A freeze leaves the placeholder answer for the trailing
+    /// poll to unwind past, and a park no live vCPU could end is the oracle's deadlock, `ThreadFault`.
+    ///
+    /// # Safety
+    /// `trap_out` is the live call's trap cell; the caller holds no lock the run's other vCPUs need.
+    unsafe fn park(&self, trap_out: *mut i64) -> bool {
+        let key = self.probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
+        let still_parked = || self.probe.as_ref().is_none_or(|p| !p.ready());
+        match temen_jit::park_host_call(trap_out, self.unwind_base, key, still_parked) {
+            temen_jit::HostPark::Woken => true,
+            temen_jit::HostPark::Frozen | temen_jit::HostPark::Ended => false,
+            temen_jit::HostPark::Deadlock => {
+                *trap_out = TrapKind::ThreadFault as i64;
+                false
+            }
+        }
+    }
 }
 
 /// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
@@ -389,6 +434,7 @@ unsafe fn cap_thunk_impl(
     n_results: u64,
     trap_out: *mut i64,
     pending: Option<&mut Option<u64>>,
+    park: &mut Option<HostParkReq>,
 ) {
     let host = &mut *(ctx as *mut Host);
     // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
@@ -544,21 +590,26 @@ unsafe fn cap_thunk_impl(
                 // Every transient the op left is drained, acted on or not: one left set would land
                 // on a later call.
                 let parks = host.take_park_transients();
+                let stdin_park = host.take_stdin_parked();
+                if !serves {
+                    *park = host_park(
+                        host, &parks, stdin_park, mem_base, results, n_results, trap_out,
+                    );
+                    return;
+                }
                 // A woken park runs its op again (invariant 7: the rewound park).
                 let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
-                if serves
-                    && jit_proc::serve_request(
-                        host,
-                        parks,
-                        dispatch,
-                        view,
-                        (mem_size, mem_reserved),
-                        results,
-                        n_results,
-                        trap_out,
-                        bell,
-                    )
-                {
+                if jit_proc::serve_request(
+                    host,
+                    parks,
+                    dispatch,
+                    view,
+                    (mem_size, mem_reserved),
+                    results,
+                    n_results,
+                    trap_out,
+                    bell,
+                ) {
                     continue;
                 }
             }
@@ -569,6 +620,57 @@ unsafe fn cap_thunk_impl(
         }
         return;
     }
+}
+
+/// #1826 — the park decision for a JIT run outside a process tree, over the transients an op left:
+/// the interpreters' `decide` for its pipe and stdin parks. A pipe wake re-checks the parks on that
+/// pipe ([`temen_jit::wake_host_parks`]). A would-block op returns what to park on — only in the root
+/// context: a fiber keeps the op's answer, as on the oracle. A deliverable signal interrupts it
+/// instead: `-EINTR`.
+///
+/// # Safety
+/// `results`/`trap_out` as [`cap_thunk`]'s.
+unsafe fn host_park(
+    host: &Host,
+    parks: &temen_interp::ParkTransients,
+    stdin_park: bool,
+    mem_base: *mut u8,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) -> Option<HostParkReq> {
+    // A wake names the pipe by its global id, the park key.
+    for gid in [parks.wake_readers, parks.wake_writers]
+        .into_iter()
+        .flatten()
+    {
+        temen_jit::wake_host_parks(trap_out, gid as u64);
+    }
+    let pipe_park = parks
+        .read_park
+        .map(|p| (p, false))
+        .or(parks.write_park.map(|p| (p, true)));
+    if (pipe_park.is_none() && !stdin_park) || temen_jit::fiber_active() {
+        return None;
+    }
+    if parks.sig_intr {
+        if n_results != 0 {
+            *results = temen_ir::errno::EINTR;
+        }
+        return None;
+    }
+    let probe = match pipe_park {
+        Some((pipe, write)) => Some(host.pipe_probe(pipe, write)?),
+        None => None,
+    };
+    Some(HostParkReq {
+        probe,
+        unwind_base: if host.is_durable() {
+            mem_base as u64
+        } else {
+            0
+        },
+    })
 }
 
 /// The `(type_id, op, handle)` a thunk's `call.import` dispatch reaches — `packed` is the dispatch's
@@ -661,65 +763,80 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // thunk over the locked `Host`'s pointer (compile/install/uninstall/release mutate the unit
     // registry + the live module; the generic ops mutate `Host` state). The guard is released on
     // return.
-    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-    // CALLS.md 5c.1b — a **locked-domain caller** (itself a granted child) does not take the
-    // parked transport yet: the delegate below holds this domain's own guard, so blocking on a
-    // sibling's reply while a sibling blocks on ours would deadlock (A holds A waiting B; B
-    // blocked on A's lock). Refuse probeably (`-EINVAL`, the pre-5c.1 answer) — the child-caller
-    // tier is a recorded 5c residue; the root caller (unlocked thunk) covers the transport.
-    if guard.live_impl_of(handle, type_id).is_some() {
-        if n_results != 0 {
-            *results = EINVAL;
+    // A parked op runs again from the top: its dispatch re-takes the lock (#1826).
+    loop {
+        let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+        // CALLS.md 5c.1b — a **locked-domain caller** (itself a granted child) does not take the
+        // parked transport yet: the delegate below holds this domain's own guard, so blocking on a
+        // sibling's reply while a sibling blocks on ours would deadlock (A holds A waiting B; B
+        // blocked on A's lock). Refuse probeably (`-EINVAL`, the pre-5c.1 answer) — the child-caller
+        // tier is a recorded 5c residue; the root caller (unlocked thunk) covers the transport.
+        if guard.live_impl_of(handle, type_id).is_some() {
+            if n_results != 0 {
+                *results = EINVAL;
+            }
+            *trap_out = 0;
+            return;
         }
-        *trap_out = 0;
+        let host_ptr = &mut *guard as *mut Host as *mut c_void;
+        let mut pending_id = None;
+        let mut park = None;
+        cap_thunk_impl(
+            host_ptr,
+            mem_base,
+            mem_size,
+            mem_reserved,
+            type_id,
+            op,
+            handle,
+            args,
+            n_args,
+            results,
+            n_results,
+            trap_out,
+            Some(&mut pending_id),
+            &mut park,
+        );
+        // #1826 — a would-block op parks with the domain lock released, so a sibling's write gets in,
+        // then runs again.
+        if let Some(p) = park {
+            drop(guard);
+            if p.park(trap_out) {
+                continue;
+            }
+            return;
+        }
+        // §12 parking-on-blocking: a punted offloadable dispatch — release the domain lock **before**
+        // waiting, so sibling vCPU threads' call.cap calls proceed while the offload pool does the work
+        // (the §5b serialization fix on the JIT threaded tier). The impl wrote no results on the punt;
+        // the completion's scalar is the call's single result slot (invariant 8 — a wider declared
+        // signature fails closed).
+        if let Some(id) = pending_id {
+            let comps = guard.completions();
+            let durable = guard.is_durable();
+            drop(guard);
+            if n_results > 1 {
+                *trap_out = TrapKind::CapFault as i64;
+                return;
+            }
+            // F3 (FIBER_PARK.md) — a punt inside a FIBER on the threaded tier parks the fiber
+            // (lock already released above), so the spawned vCPU keeps polling its other fibers;
+            // the root keeps the blocking wait (a JIT vCPU is a real thread — blocking it at root
+            // is the landed P3 contract).
+            let r = if n_results == 1 && temen_jit::fiber_active() && !durable {
+                fiber_cap_wait(&comps, id, trap_out)
+            } else {
+                comps.wait(id)
+            };
+            if *trap_out != 0 {
+                return;
+            }
+            if n_results == 1 {
+                *results = r;
+            }
+            *trap_out = 0;
+        }
         return;
-    }
-    let host_ptr = &mut *guard as *mut Host as *mut c_void;
-    let mut pending_id = None;
-    cap_thunk_impl(
-        host_ptr,
-        mem_base,
-        mem_size,
-        mem_reserved,
-        type_id,
-        op,
-        handle,
-        args,
-        n_args,
-        results,
-        n_results,
-        trap_out,
-        Some(&mut pending_id),
-    );
-    // §12 parking-on-blocking: a punted offloadable dispatch — release the domain lock **before**
-    // waiting, so sibling vCPU threads' call.cap calls proceed while the offload pool does the work
-    // (the §5b serialization fix on the JIT threaded tier). The impl wrote no results on the punt;
-    // the completion's scalar is the call's single result slot (invariant 8 — a wider declared
-    // signature fails closed).
-    if let Some(id) = pending_id {
-        let comps = guard.completions();
-        let durable = guard.is_durable();
-        drop(guard);
-        if n_results > 1 {
-            *trap_out = TrapKind::CapFault as i64;
-            return;
-        }
-        // F3 (FIBER_PARK.md) — a punt inside a FIBER on the threaded tier parks the fiber
-        // (lock already released above), so the spawned vCPU keeps polling its other fibers;
-        // the root keeps the blocking wait (a JIT vCPU is a real thread — blocking it at root
-        // is the landed P3 contract).
-        let r = if n_results == 1 && temen_jit::fiber_active() && !durable {
-            fiber_cap_wait(&comps, id, trap_out)
-        } else {
-            comps.wait(id)
-        };
-        if *trap_out != 0 {
-            return;
-        }
-        if n_results == 1 {
-            *results = r;
-        }
-        *trap_out = 0;
     }
 }
 

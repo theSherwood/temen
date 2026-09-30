@@ -2580,7 +2580,7 @@ pub(crate) unsafe extern "C" fn join(
         // the artifact), and the join is re-issued on thaw against the re-launched child.
         if done.durable.as_ref().is_some_and(DurableCell::unwound) {
             rt.children.lock().unwrap_or_else(|e| e.into_inner())[slot].joined = false;
-            crate::os_thread_rt::mark_join_reissue(mem_base);
+            crate::os_thread_rt::mark_reissue(mem_base);
             return 0;
         }
         if trap != 0 {

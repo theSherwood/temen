@@ -89,10 +89,11 @@ fn jit_row(site: ParkSite) -> Row {
     match site {
         ParkSite::Futex => Row::Case(futex),
         ParkSite::Join => Row::Case(join),
-        ParkSite::PipeRead | ParkSite::PipeWrite | ParkSite::StreamRead => Row::Pending {
-            issue: 1826,
-            why: "the JIT serves no host-call park outside a process tree: the op's placeholder \
-                  answer stands: an empty read reads as EOF, a full write writes nothing",
+        ParkSite::PipeRead => Row::Case(pipe_read),
+        ParkSite::PipeWrite => Row::Case(pipe_write),
+        ParkSite::StreamRead => Row::Pending {
+            issue: 1904,
+            why: "the row's trigger is freeze-on-quiesce, which the JIT does not implement",
         },
         ParkSite::Stopped => Row::Pending {
             issue: 1826,
