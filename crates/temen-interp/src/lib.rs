@@ -9035,7 +9035,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (ready, gid) = {
                     let mut hg = v.host.lock_unpoisoned();
                     let (ready, gid) = match hg.pipes.get(pipe as usize) {
-                        Some((fifo, writers, _, gid, _)) => (
+                        Some((fifo, writers, _, gid, _, _)) => (
                             !fifo.lock_unpoisoned().is_empty()
                                 || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
@@ -9067,7 +9067,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (ready, gid) = {
                     let mut hg = v.host.lock_unpoisoned();
                     let (ready, gid) = match hg.pipes.get(pipe as usize) {
-                        Some((fifo, _, readers, gid, _)) => (
+                        Some((fifo, _, readers, gid, _, _)) => (
                             fifo.lock_unpoisoned().len() < PIPE_CAP
                                 || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
@@ -19078,6 +19078,7 @@ type PipeBacking = (
     Arc<std::sync::atomic::AtomicUsize>, // open read-end handles (EPIPE contract)
     u32,                        // global pipe id — THE park/wake key (`Sched::pipe_waiters`)
     Option<Arc<ChannelCharge>>, // #989 — channel-memory charge (minter's counter + refund guard)
+    bool, // #1926 — one-shot EOF: the terminal's input, whose read of an EOF restores the writer
 );
 
 /// FORK.md §8.6 — mint the **global pipe id** a new FIFO carries (`PipeBacking.3`). The park/wake
@@ -22369,7 +22370,7 @@ impl Host {
         // forking a stage and that stage installing its own ends.
         for s in &twin.table {
             if let Some(Binding::PipeEnd { pipe, write }) = s.entry {
-                if let Some((_, writers, readers, _, _)) = twin.pipes.get(pipe as usize) {
+                if let Some((_, writers, readers, _, _, _)) = twin.pipes.get(pipe as usize) {
                     let counter = if write { writers } else { readers };
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -23057,7 +23058,7 @@ impl Host {
     /// the read park flag reports. Byte-identical to the tree-walker's `Step::Park(PipeRead)` re-check.
     pub(crate) fn pipe_read_ready(&self, pipe: u32) -> bool {
         match self.pipes.get(pipe as usize) {
-            Some((fifo, writers, _, _, _)) => {
+            Some((fifo, writers, _, _, _, _)) => {
                 !fifo.lock_unpoisoned().is_empty()
                     || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
             }
@@ -23078,7 +23079,7 @@ impl Host {
     /// The write twin of [`Self::pipe_read_ready`].
     pub(crate) fn pipe_write_ready(&self, pipe: u32) -> bool {
         match self.pipes.get(pipe as usize) {
-            Some((fifo, _, readers, _, _)) => {
+            Some((fifo, _, readers, _, _, _)) => {
                 fifo.lock_unpoisoned().len() < PIPE_CAP
                     || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
             }
@@ -23136,7 +23137,7 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
             // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
-            Some((_, writers, _, _, _)) if writers.load(SeqCst) > 0 => {
+            Some((_, writers, _, _, _, _)) if writers.load(SeqCst) > 0 => {
                 let zeroed = writers.fetch_sub(1, SeqCst) == 1;
                 if zeroed {
                     self.refund_if_dead(pipe); // #989 — last writer gone; refund iff readers already 0
@@ -23153,7 +23154,7 @@ impl Host {
     /// backings) idempotent. `&self`: the counter and guard are atomics, so no `&mut` is needed.
     fn refund_if_dead(&self, pipe: u32) {
         use std::sync::atomic::Ordering::SeqCst;
-        if let Some((_, writers, readers, _, Some(charge))) = self.pipes.get(pipe as usize) {
+        if let Some((_, writers, readers, _, Some(charge), _)) = self.pipes.get(pipe as usize) {
             if writers.load(SeqCst) == 0
                 && readers.load(SeqCst) == 0
                 && charge
@@ -23172,7 +23173,7 @@ impl Host {
     fn drop_pipe_reader(&self, pipe: u32) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
-            Some((_, _, readers, _, _)) if readers.load(SeqCst) > 0 => {
+            Some((_, _, readers, _, _, _)) if readers.load(SeqCst) > 0 => {
                 let zeroed = readers.fetch_sub(1, SeqCst) == 1;
                 if zeroed {
                     self.refund_if_dead(pipe); // #989 — last reader gone; refund iff writers already 0
@@ -24421,7 +24422,7 @@ impl Host {
         let mut all = self.frozen_pipes.clone();
         all.extend(self.durable_pipe_backings());
         all.into_iter()
-            .map(|(key, (fifo, writers, readers, _, _))| DurablePipe {
+            .map(|(key, (fifo, writers, readers, _, _, _))| DurablePipe {
                 key,
                 bytes: fifo.lock_unpoisoned().iter().copied().collect(),
                 writers: writers.load(SeqCst),
@@ -24470,6 +24471,7 @@ impl Host {
                 count(p.readers),
                 gid,
                 self.charge_channel(),
+                false,
             );
             self.thaw_pipes.insert(gid, b);
             ids.push(gid);
@@ -24935,6 +24937,7 @@ impl Host {
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             next_pipe_gid(),
             charge,
+            false,
         ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
@@ -24962,6 +24965,7 @@ impl Host {
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             next_pipe_gid(),
             Some(charge),
+            false,
         ));
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
@@ -25006,9 +25010,10 @@ impl Host {
     /// #797 — [`Self::grant_input_pipe`]'s **terminal** variant: the writer count starts at **1**
     /// (held by the feeding personality), so an empty read **parks** ([`Blocked::PipeRead`])
     /// instead of the filter form's drain-then-EOF — a prompt blocks until a keystroke. Returns
-    /// the read handle, the backing the personality feeds, the **writer-count** `Arc` (dropping
-    /// it to 0 — the `^D` close — turns parked readers into true EOF via the wake), and the pipe
-    /// id for [`SignalSource::set_pipe_wake`].
+    /// the read handle, the backing the personality feeds, the **writer-count** `Arc`, and the pipe
+    /// id for [`SignalSource::set_pipe_wake`]. Dropping the count to 0 is the `^D`: the next read of
+    /// the empty pipe, parked or not yet issued, returns EOF and restores the count to 1 (#1926), so
+    /// one `^D` ends one read.
     #[allow(clippy::type_complexity)]
     pub fn grant_terminal_input(
         &mut self,
@@ -25028,6 +25033,7 @@ impl Host {
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             gid,
             None, // #989 — embedder-owned terminal input, not guest-minted channel memory
+            true, // #1926 — a `^D` ends one read, not every read after it
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing, writers, gid)
@@ -25045,6 +25051,7 @@ impl Host {
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             next_pipe_gid(),
             None, // #989 — embedder-owned filter input, not guest-minted channel memory
+            false,
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
@@ -29587,7 +29594,7 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(vec![v]);
         // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
-        let Some((fifo_arc, writers_arc, readers_arc, gid, _)) =
+        let Some((fifo_arc, writers_arc, readers_arc, gid, _, one_shot_eof)) =
             self.pipes.get(pipe as usize).cloned()
         else {
             return ret(EINVAL);
@@ -29608,6 +29615,13 @@ impl Host {
                         drop(fifo);
                         self.pipe_read_parked = Some(pipe);
                         return ret(0); // placeholder; the eval loop parks and re-issues on wake
+                    }
+                    // #1926 — a terminal's `^D` is one EOF. This read takes it and gives the writer
+                    // back, under the FIFO lock, so the next read blocks for new input. The `^D`
+                    // may have come before any read was waiting; the read that returns it is still
+                    // the one that consumes it.
+                    if len > 0 && one_shot_eof {
+                        writers_arc.store(1, SeqCst);
                     }
                     return ret(0); // EOF (all writers closed) or a zero-length read
                 }

@@ -6676,8 +6676,8 @@ fn c_terminal_ctrl_d_eof_is_one_shot_not_a_permanent_close() {
     assert_eq!(
         e.result,
         vec![Value::I32(42)],
-        "tree-walker: the empty-line ^D EOF'd only the pending read; the second read re-armed the \
-         terminal writer and blocked for the later `x` instead of inheriting the EOF"
+        "tree-walker: the empty-line ^D EOF'd only the pending read, which gave the writer back, so \
+         the second read blocked for the later `x` instead of inheriting the EOF"
     );
     let b = run_bytecode_terminal_setup(TERM_ONESHOT_EOF_SRC, feeds(), |_, _| {});
     assert_eq!(
@@ -6685,6 +6685,29 @@ fn c_terminal_ctrl_d_eof_is_one_shot_not_a_permanent_close() {
         vec![Value::I32(42)],
         "coop bytecode (the browser tier): same one-shot ^D EOF — the shell's prompt read no longer \
          inherits a foreground job's ^D"
+    );
+}
+
+// #1926 — a `^D` typed before any read is waiting still ends exactly one read. The feed lands before
+// the guest runs, so no read is parked when the writer drops; the first read must still return that
+// EOF, and the second must block for the later `x`. Before the fix, the first read restored the
+// writer before reading, so the EOF was lost and it took the `x` instead (100). An interactive bash
+// lost its closing `^D` that way when the key beat its prompt read, and waited forever.
+#[test]
+fn c_terminal_ctrl_d_before_the_read_still_ends_it() {
+    let feeds = || vec![(600u64, b"x\n".to_vec())];
+    let ctrl_d_first = |_: &mut Host, px: &Posix| px.feed_terminal(b"\x04");
+    let e = run_interp_terminal_setup(TERM_ONESHOT_EOF_SRC, feeds(), ctrl_d_first);
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: the ^D typed before the read EOF'd it, and the next read blocked for `x`"
+    );
+    let b = run_bytecode_terminal_setup(TERM_ONESHOT_EOF_SRC, feeds(), ctrl_d_first);
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode: the ^D typed before the read EOF'd it, and the next read blocked for `x`"
     );
 }
 
