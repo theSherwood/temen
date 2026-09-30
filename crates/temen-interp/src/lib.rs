@@ -20196,7 +20196,7 @@ impl NodeRef {
     }
 
     /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the
-    /// freeze, or a run's root, which its embedder starts.
+    /// freeze.
     pub fn force_vcpu(&self) {
         self.tree.force_charge(self.node, BUDGET_SPAWN, 1);
     }
@@ -20230,8 +20230,8 @@ impl LiveVcpu {
         LiveVcpu(Some(node))
     }
 
-    /// A vCPU charged elsewhere (a detached child's first), or one the carve path leaves uncharged
-    /// until #1867 deletes it.
+    /// A vCPU that holds no charge: a run's root, a detached child's first (its window's lease holds
+    /// it), or a carve child's, which the carve path leaves uncharged until #1867 deletes it.
     pub(crate) fn none() -> LiveVcpu {
         LiveVcpu(None)
     }

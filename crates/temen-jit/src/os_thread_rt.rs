@@ -187,8 +187,9 @@ impl Done {
         let mut st = lock(&self.state);
         cell_unpark(&self.joiner_parked, &hub.parked);
         lock(&dom.threads).live -= 1;
-        dom.vcpu_ended(); // #2001: its `spawn` goes back with its live slot
-                          // A §14 child's vCPU also held a slot of the run-wide count (see `thread_spawn`).
+        // #2001 — its `spawn` goes back with its live slot.
+        dom.vcpu_ended();
+        // A §14 child's vCPU also held a slot of the run-wide count (see `thread_spawn`).
         if !std::ptr::eq(hub, dom) {
             lock(&hub.threads).live -= 1;
         }
