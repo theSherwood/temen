@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use temen_durable::{
     arm_freeze_after, arm_freeze_on_quiesce, begin_thaw, init_durable_window,
-    transform_module_assume_confined,
+    transform_module_assume_confined, ARM_QUIESCE_OFF,
 };
 use temen_interp::{
     run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
@@ -131,10 +131,11 @@ fn bytecode_row(site: ParkSite) -> Row {
         ParkSite::Svc => Row::Case(svc),
         ParkSite::StreamRead => Row::Case(stream_read),
         ParkSite::Join => Row::Unreachable { why: NO_THREADS },
-        ParkSite::Futex | ParkSite::PipeRead | ParkSite::PipeWrite => Row::Pending {
+        ParkSite::Futex => Row::Case(futex_alone),
+        ParkSite::PipeRead | ParkSite::PipeWrite => Row::Pending {
             issue: 1904,
-            why: "one vCPU's park here waits on the outside: needs a row whose release feeds it \
-                  (a futex word, a pipe) from outside the run",
+            why: "one vCPU's pipe park waits on the outside, and a pipe fed from outside the domain \
+                  crosses the cut (#1680)",
         },
         ParkSite::Stopped => Row::Case(stopped),
         ParkSite::Reap | ParkSite::ReapAny => Row::Pending {
@@ -291,7 +292,7 @@ fn freeze_parked_then_thaw(
     uninterrupted: Uninterrupted,
     arm: fn(&mut [u8]),
     release: impl FnOnce(&mut Host),
-    want: i64,
+    want: Answer,
 ) -> Host {
     assert_ne!(site.freeze_rule(), FreezeRule::Decline, "{site:?}");
     let inst = instrumented(src);
@@ -305,7 +306,7 @@ fn freeze_parked_then_thaw(
             &init_durable_window(WINDOW, TEST_ARENA),
             h,
         );
-        assert_eq!(res, Ok(want), "{site:?}: the uninterrupted answer");
+        assert_eq!(res, want, "{site:?}: the uninterrupted answer");
     }
     let mut h = durable_host(&inst);
     let args = host(&mut h);
@@ -319,11 +320,13 @@ fn freeze_parked_then_thaw(
     let fibers = h.frozen_fibers().to_vec();
     h.set_frozen_fibers(fibers);
     let mut win2 = snap;
+    // The arm rides the window: a quiesce-frozen run that goes idle again would freeze again. The
+    // thaw runs disarmed, to give the uninterrupted answer.
+    win2[ARM_QUIESCE_OFF as usize] = 0;
     begin_thaw(&mut win2, TEST_ARENA, 0);
     let (res2, _, h) = run(engine, &inst, &args, &win2, h);
     assert_eq!(
-        res2,
-        Ok(want),
+        res2, want,
         "{site:?}: the thaw gives the uninterrupted answer"
     );
     h
@@ -412,7 +415,37 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1007,
+        Ok(1007),
+    );
+}
+
+/// `atomic.wait` on one vCPU — the root waits, indefinitely, on a word nothing can store to: the
+/// uninterrupted run is a deadlock (`ThreadFault`). Freeze-on-quiesce fires on the wait; the thaw
+/// re-issues it (#1769), so it deadlocks exactly as the uninterrupted run, never reloading the freeze's
+/// `WAIT_FROZEN` as the wait's answer.
+fn futex_alone(site: ParkSite, engine: Engine) {
+    let src = r#"
+memory 17
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
+    freeze_parked_then_thaw(
+        engine,
+        site,
+        src,
+        |_| vec![],
+        Uninterrupted::Runs,
+        arm_freeze_on_quiesce,
+        |_| {},
+        Err("ThreadFault".into()),
     );
 }
 
@@ -448,7 +481,7 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1007,
+        Ok(1007),
     );
 }
 
@@ -502,7 +535,7 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1000 + i64::from(b'x') + 7,
+        Ok(1000 + i64::from(b'x') + 7),
     );
 }
 
@@ -554,7 +587,7 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1007,
+        Ok(1007),
     );
 }
 
@@ -606,7 +639,7 @@ block 0 (vsp: i64, varg: i64) {
         Uninterrupted::WaitsOnTheOutside,
         arm_freeze_on_quiesce,
         |h| h.push_stdin(b"x"),
-        1000 + i64::from(b'x'),
+        Ok(1000 + i64::from(b'x')),
     );
 }
 
@@ -707,7 +740,7 @@ block 0 (vsp: i64, varg: i64) {
             );
             stopper.set(false);
         },
-        1001,
+        Ok(1001),
     );
     assert_eq!(h.stdout, b"x", "{site:?}: the thaw re-issued the write");
 }
@@ -756,7 +789,7 @@ block 0 (vx: i64) {
             let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
             *ticket.lock().unwrap() = Some(t);
         },
-        1041,
+        Ok(1041),
     );
     let t = ticket.lock().unwrap().expect("enqueued");
     assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
