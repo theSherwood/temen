@@ -77,6 +77,29 @@ static long __pthread_entry(long rec) {
   return (long)r->fn(r->arg);
 }
 
+// Thread ids for owner-tracking mutexes: 0 is the main thread, and `pthread_create` numbers the rest
+// in the order it makes them. A thread finds its own id from where its data stack lives — each
+// spawned thread's is a `__PTHREAD_STACK` block this table records — so no thread-local storage is
+// involved: a `_Thread_local` read compiles to `vcpu.tls`, which would keep every mutex operation off
+// the browser's wasm-JIT tier. Past `__PTHREAD_MAX_IDS` threads, the later ones read as id 0.
+#define __PTHREAD_MAX_IDS 256
+static char *__pthread_stacks[__PTHREAD_MAX_IDS];
+static int __pthread_next_id = 1;
+
+static int __pthread_self_id(void) {
+  char here;
+  int n = __vm_atomic_load32(&__pthread_next_id);
+  // A handful of entries: no use vectorizing. clang 22 early-exit-vectorizes it into `<2 x ptr>`
+  // compares, which the LLVM on-ramp doesn't translate yet (#1993).
+#pragma clang loop vectorize(disable)
+  for (int i = 1; i < n && i < __PTHREAD_MAX_IDS; i++) {
+    char *base = __pthread_stacks[i];
+    if (base && &here >= base && &here < base + __PTHREAD_STACK)
+      return i;
+  }
+  return 0;
+}
+
 static int pthread_create(pthread_t *t, const pthread_attr_t *attr,
                           void *(*start_routine)(void *), void *arg) {
   (void)attr;
@@ -92,6 +115,10 @@ static int pthread_create(pthread_t *t, const pthread_attr_t *attr,
   void *stack = malloc(__PTHREAD_STACK);
   if (!stack)
     return 11;
+  // Recorded before the thread starts, so its first lock already knows its id.
+  int id = __vm_atomic_add32(&__pthread_next_id, 1);
+  if (id < __PTHREAD_MAX_IDS)
+    __pthread_stacks[id] = (char *)stack;
   int h = __vm_thread_spawn(__pthread_entry, stack, (long)r);
   if (h < 0)
     return 11;
@@ -107,9 +134,11 @@ static int pthread_join(pthread_t t, void **retval) {
 }
 
 // ---- mutexes -------------------------------------------------------------------------------
-// `__state`: 0 = unlocked, 1 = locked. Futex-backed — a contended locker parks on the state word
-// and is woken by `unlock`'s notify; `__vm_wait32` re-checks the word atomically, so the classic
-// unlock-between-cas-and-wait race cannot lose a wakeup.
+// `__state`: 0 = unlocked, else the holder's thread id + 1 (`__pthread_self_id`), so the word itself
+// names who holds it — what a debugger reads to explain a deadlock's cycle. Futex-backed — a
+// contended locker parks on the state word, waiting on the value it saw, and is woken by `unlock`'s
+// notify; `__vm_wait32` re-checks the word atomically, so the classic unlock-between-cas-and-wait race
+// cannot lose a wakeup.
 typedef struct {
   int __state;
 } pthread_mutex_t;
@@ -125,12 +154,14 @@ static int pthread_mutex_destroy(pthread_mutex_t *m) {
   return 0;
 }
 static int pthread_mutex_lock(pthread_mutex_t *m) {
-  while (__vm_atomic_cas32(&m->__state, 0, 1) != 0)
-    __vm_wait32(&m->__state, 1, -1L); // park while locked (forever)
+  int me = __pthread_self_id() + 1;
+  int held;
+  while ((held = __vm_atomic_cas32(&m->__state, 0, me)) != 0)
+    __vm_wait32(&m->__state, held, -1L); // park while it stays locked (forever)
   return 0;
 }
 static int pthread_mutex_trylock(pthread_mutex_t *m) {
-  return __vm_atomic_cas32(&m->__state, 0, 1) == 0 ? 0 : 16; // EBUSY
+  return __vm_atomic_cas32(&m->__state, 0, __pthread_self_id() + 1) == 0 ? 0 : 16; // EBUSY
 }
 static int pthread_mutex_unlock(pthread_mutex_t *m) {
   __vm_atomic_store32(&m->__state, 0);

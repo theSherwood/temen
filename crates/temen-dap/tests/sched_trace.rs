@@ -91,7 +91,7 @@ fn traced_run(src: &str) -> (BytecodeBackend, String) {
             Stop::Blocked => panic!("unexpected block"),
         }
     }
-    let tape = b.sched_trace_json().expect("a tape").to_string();
+    let tape = b.sched_trace_json(0).expect("a tape").to_string();
     (b, tape)
 }
 
@@ -210,7 +210,7 @@ fn trace_tape_is_bit_identical_across_replay() {
             Stop::Blocked => panic!("unexpected block"),
         }
     }
-    let replayed = a.sched_trace_json().expect("a tape").to_string();
+    let replayed = a.sched_trace_json(0).expect("a tape").to_string();
     assert_eq!(
         tape_a, replayed,
         "seek(0) + rerun refills the identical tape"
@@ -357,4 +357,17 @@ block 0 () {
     ));
     let out = s.handle(&req(3, "schedTrace", Json::obj(vec![])));
     assert_eq!(response(&out).get("success"), Some(&Json::Bool(false)));
+}
+
+/// `schedTrace`'s `from` (#1981): the events from that index on, so a client draining the tape as a
+/// run goes reads each event once. Any split point gives the tape's head plus exactly that tail.
+#[test]
+fn the_tape_reads_from_an_index() {
+    let (b, whole) = traced_run(FUTEX_HANDOFF);
+    let whole = kinds_of(&whole);
+    assert!(whole.len() > 4, "a tape with some events");
+    for k in [0, 1, whole.len() / 2, whole.len(), whole.len() + 5] {
+        let tail = kinds_of(&b.sched_trace_json(k).expect("a tape").to_string());
+        assert_eq!(tail, whole[k.min(whole.len())..].to_vec(), "from {k}");
+    }
 }

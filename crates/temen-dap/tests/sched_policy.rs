@@ -49,7 +49,7 @@ fn backend(seed: Option<u64>) -> BytecodeBackend {
 fn run_traced(b: &mut BytecodeBackend) -> String {
     assert!(Debuggee::set_sched_trace(b, true), "trace armed");
     drive_to_end(b);
-    b.sched_trace_json().expect("a tape").to_string()
+    b.sched_trace_json(0).expect("a tape").to_string()
 }
 
 fn drive_to_end(b: &mut BytecodeBackend) {
@@ -89,7 +89,7 @@ fn seeded_schedule_survives_seek() {
     let tape = run_traced(&mut b);
     let _ = Debuggee::seek(&mut b, 0);
     drive_to_end(&mut b);
-    let replayed = b.sched_trace_json().expect("a tape").to_string();
+    let replayed = b.sched_trace_json(0).expect("a tape").to_string();
     assert_eq!(
         tape, replayed,
         "seek(0) + rerun replays the seeded schedule"
@@ -132,7 +132,7 @@ fn forced_switch_lands_and_survives_seek() {
                     && e.get("task").and_then(|v| v.as_i64()) == Some(chosen as i64)
             })
     };
-    let tape = b.sched_trace_json().expect("a tape").to_string();
+    let tape = b.sched_trace_json(0).expect("a tape").to_string();
     assert!(
         has_forced_turn(&tape),
         "the forced task ran turn {turn}: {tape}"
@@ -140,7 +140,7 @@ fn forced_switch_lands_and_survives_seek() {
     // Rewind and re-drive: the override replays at the identical turn.
     let _ = Debuggee::seek(&mut b, 0);
     drive_to_end(&mut b);
-    let replayed = b.sched_trace_json().expect("a tape").to_string();
+    let replayed = b.sched_trace_json(0).expect("a tape").to_string();
     assert_eq!(tape, replayed, "the forced switch survives seek");
 }
 

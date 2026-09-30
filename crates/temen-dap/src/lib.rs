@@ -22,6 +22,7 @@ mod backend;
 mod expr;
 mod json;
 pub mod models;
+pub mod races;
 pub use backend::{BytecodeBackend, Debuggee, SharedSink};
 pub use json::{parse, Json};
 
@@ -47,6 +48,9 @@ struct Session {
     /// sink when the `launch` arg `memModel` armed one; read back by `memModelStats`. `None` = no
     /// model, no sink, no cost.
     mem_model: Option<Arc<Mutex<models::MemModel>>>,
+    /// The session's race model (#1987), fed by the access sink and the scheduler-event sink when
+    /// the `launch` arg `raceDetect` armed one; read back by `races`. `None` = no model.
+    race_model: Option<Arc<Mutex<races::RaceModel>>>,
     debug: Option<DebugInfo>,
     /// `(file, line) → first IR pc on that line` — the reverse of `Inspector::source_loc`, for
     /// binding source-line breakpoints. A terminator is a pc like any other (#1713), so a line whose
@@ -201,8 +205,10 @@ impl DapServer {
             "provideCap" => self.on_provide_cap(args),
             "memModelStats" => self.on_mem_model_stats(),
             "fsImage" => self.on_fs_image(),
+            "blockedThreads" => self.on_blocked_threads(),
+            "races" => self.on_races(),
             "memoryMap" => self.on_memory_map(),
-            "schedTrace" => self.on_sched_trace(),
+            "schedTrace" => self.on_sched_trace(args),
             "globals" => self.on_globals(),
             "forceSwitch" => self.on_force_switch(args),
             "setVariable" => self.on_set_variable(args),
@@ -456,21 +462,48 @@ impl DapServer {
                         .map(|v| (v.max(1)) as u64)
                         .unwrap_or(d.page_size),
                 };
-                let model = Arc::new(Mutex::new(models::MemModel::new(cfg)));
-                let feed = Arc::clone(&model);
-                let sink: SharedSink = Arc::new(Mutex::new(
-                    move |clock: u64, task: usize, ev: temen_interp::MemEvent| {
-                        feed.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .observe(clock, task, ev)
-                    },
-                ));
-                if !inspector.set_access_sink(sink) {
-                    return (false, Json::Null, vec![]); // fail-closed: no sink on this engine
-                }
-                Some(model)
+                Some(Arc::new(Mutex::new(models::MemModel::new(cfg))))
             }
         };
+        // `raceDetect: true` (#1987): arm a happens-before race model over the same access sink,
+        // plus the engine's scheduler-event sink for the spawn/join/wake edges. Fail-closed on an
+        // engine without a scheduler (the tree-walker).
+        let race_model = (args.get("raceDetect").and_then(|v| v.as_bool()) == Some(true))
+            .then(|| Arc::new(Mutex::new(races::RaceModel::new())));
+        if let Some(model) = &race_model {
+            let feed = Arc::clone(model);
+            let sink: backend::SharedSchedSink = Arc::new(Mutex::new(
+                move |ev: &temen_interp::bytecode::SchedTraceEvent| {
+                    feed.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .observe_sched(ev)
+                },
+            ));
+            if !inspector.set_sched_sink(sink) {
+                return (false, Json::Null, vec![]);
+            }
+        }
+        // One access sink feeds every model armed (the engine has one).
+        if mem_model.is_some() || race_model.is_some() {
+            let (mem, race) = (mem_model.clone(), race_model.clone());
+            let sink: SharedSink = Arc::new(Mutex::new(
+                move |clock: u64, task: usize, ev: temen_interp::MemEvent| {
+                    if let Some(m) = &mem {
+                        m.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe(clock, task, ev);
+                    }
+                    if let Some(r) = &race {
+                        r.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .observe(clock, task, ev);
+                    }
+                },
+            ));
+            if !inspector.set_access_sink(sink) {
+                return (false, Json::Null, vec![]); // fail-closed: no sink on this engine
+            }
+        }
         // `schedTrace: true` (slice 6): arm the scheduler trace tape — any bytecode session
         // (a spawn-free guest is a one-task schedule that traces its own turns); fail-closed on
         // the tree-walker, which has no schedule to trace (`set_sched_trace` returns false there).
@@ -482,6 +515,7 @@ impl DapServer {
         self.session = Some(Session {
             inspector,
             mem_model,
+            race_model,
             debug,
             line_index,
             breakpoints: Vec::new(),
@@ -1334,11 +1368,17 @@ impl DapServer {
 
     /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —
     /// turns, parks, wakes with waker→wakee identities, spawns. Fails cleanly when unarmed.
-    fn on_sched_trace(&mut self) -> (bool, Json, Vec<Event>) {
+    fn on_sched_trace(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // `from` (a Temen extension): only the events from that index on, so a client draining the
+        // tape as a run goes reads each event once instead of the whole tape every time (#1981).
+        let from = args
+            .and_then(|a| a.get("from"))
+            .and_then(|f| f.as_i64())
+            .map_or(0, |f| f.max(0) as usize);
         let Some(tape) = self
             .session
             .as_ref()
-            .and_then(|s| s.inspector.sched_trace_json())
+            .and_then(|s| s.inspector.sched_trace_json(from))
         else {
             return (false, Json::Null, vec![]);
         };
@@ -1353,6 +1393,74 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         };
         (true, map, vec![])
+    }
+
+    /// The custom `races` request (#1987): the data races the session's race model has found, as
+    /// `{ races: [{ addr, first, second }] }` — the 4-byte word, and for each side `{ thread, turn,
+    /// write }` (a DAP thread id, the turn of the access, whether it wrote). Fails cleanly when the
+    /// session armed no model (`raceDetect`).
+    fn on_races(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(model) = self.session.as_ref().and_then(|s| s.race_model.as_ref()) else {
+            return (false, Json::Null, vec![]);
+        };
+        let side = |r: &races::RaceSide| {
+            Json::obj(vec![
+                ("thread", Json::i(r.task as i64 + 1)),
+                ("turn", Json::i(r.turn as i64)),
+                ("write", Json::Bool(r.write)),
+            ])
+        };
+        let list = model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .races()
+            .iter()
+            .map(|r| {
+                Json::obj(vec![
+                    ("addr", Json::i(r.addr as i64)),
+                    ("first", side(&r.first)),
+                    ("second", side(&r.second)),
+                ])
+            })
+            .collect();
+        (true, Json::obj(vec![("races", Json::Arr(list))]), vec![])
+    }
+
+    /// The custom `blockedThreads` request (#1986): what each blocked thread waits on —
+    /// `{ id, futex, value }` for a `memory.wait` (the word's address and its current 32-bit value,
+    /// from which an embedder that knows the guest's sync objects reads their owner) or `{ id, joins }`
+    /// for a `thread.join`. Thread ids are DAP thread ids. After a `deadlock` stop, this is the cycle.
+    fn on_blocked_threads(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(s) = self.session.as_ref() else {
+            return (false, Json::Null, vec![]);
+        };
+        let threads = s
+            .inspector
+            .blocked_on()
+            .into_iter()
+            .map(|(t, on)| {
+                let id = ("id", Json::i(t as i64 + 1));
+                match on {
+                    temen_interp::bytecode::BlockedOn::Futex(addr) => {
+                        let value = s
+                            .inspector
+                            .read_window(addr, 4)
+                            .ok()
+                            .and_then(|b| b.try_into().ok())
+                            .map_or(Json::Null, |b| Json::i(i64::from(u32::from_le_bytes(b))));
+                        Json::obj(vec![id, ("futex", Json::i(addr as i64)), ("value", value)])
+                    }
+                    temen_interp::bytecode::BlockedOn::Join(child) => {
+                        Json::obj(vec![id, ("joins", Json::i(child as i64 + 1))])
+                    }
+                }
+            })
+            .collect();
+        (
+            true,
+            Json::obj(vec![("threads", Json::Arr(threads))]),
+            vec![],
+        )
     }
 
     /// The custom `fsImage` request: the program's `vm_fs` files, as base64 of a Temen fs-image blob —
@@ -1815,7 +1923,10 @@ impl DapServer {
                 events.push(("exited", Json::obj(body)));
                 events.push(("terminated", Json::obj(vec![])));
             }
-            Stop::Blocked => events.push(stopped_event("pause", tid)),
+            // No thread can run (#1986): its own reason, not a `pause` — a client running in
+            // budgeted slices would otherwise take it for a spent budget and resume forever.
+            // `blockedThreads` says what each thread waits on.
+            Stop::Blocked => events.push(stopped_event("deadlock", tid)),
         }
         events
     }
