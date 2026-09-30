@@ -172,7 +172,7 @@ fn granted_host(win: u64) -> (Host, Arc<Mutex<i64>>) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, win);
     let loader = temen_run::grant_module_loader(&mut host);
-    let budget = host.grant_budget(0, 1 << 17, 0); // the child's window
+    let budget = host.grant_budget(-1, 1 << 17, 0); // the child's window
     let fsh = grant_fs(&mut host, &counter);
     host.register_cap_name("inst", inst);
     host.register_cap_name("loader", loader);

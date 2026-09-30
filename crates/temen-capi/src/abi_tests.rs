@@ -177,7 +177,7 @@ block 2 () {
 #[test]
 fn run_config_threads_fuel_and_memory() {
     unsafe {
-        // fuel=1 out-of-fuels the tree-walker at a loop back-edge (LOOP_HELLO); the JIT ignores it.
+        // fuel=1 out-of-fuels every backend at a loop back-edge (LOOP_HELLO), the JIT included.
         let cfg = TemenRunConfig {
             fuel: 1,
             fuel_set: 1,
@@ -200,17 +200,16 @@ fn run_config_threads_fuel_and_memory() {
             temen_instantiate_with_imports(m, imports)
         };
 
-        let inst = mk();
-        let trapped = temen_instance_run(inst, TEMEN_BACKEND_TREEWALK, &cfg);
-        assert!(trapped.is_null(), "fuel=1 must out-of-fuel the tree-walker");
-        assert!(!temen_last_error().is_null(), "an error message was set");
-        temen_instance_free(inst);
-
-        let inst = mk();
-        let ok = temen_instance_run(inst, TEMEN_BACKEND_JIT, &cfg);
-        assert!(!ok.is_null(), "the JIT ignores per-op fuel");
-        temen_run_free(ok);
-        temen_instance_free(inst);
+        for backend in [TEMEN_BACKEND_TREEWALK, TEMEN_BACKEND_JIT] {
+            let inst = mk();
+            let trapped = temen_instance_run(inst, backend, &cfg);
+            assert!(
+                trapped.is_null(),
+                "fuel=1 must out-of-fuel backend {backend}"
+            );
+            assert!(!temen_last_error().is_null(), "an error message was set");
+            temen_instance_free(inst);
+        }
     }
 }
 

@@ -584,7 +584,8 @@ pub unsafe extern "C" fn temen_instance_with_mem_hooks(
 /// field is applied (else the default is used); `max_fibers`/`max_vcpus` of `0` also mean "default".
 #[repr(C)]
 pub struct TemenRunConfig {
-    /// Per-op fuel for the interpreters (applied iff `fuel_set`). Ignored by the JIT.
+    /// The run's fuel limit on every backend (applied iff `fuel_set`): the root budget's fuel ceiling
+    /// (#1944 slice 3).
     pub fuel: u64,
     pub fuel_set: i32,
     /// JIT detect-and-kill deadline in milliseconds (applied iff `deadline_set`). Ignored by interps.

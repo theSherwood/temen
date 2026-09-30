@@ -2882,6 +2882,32 @@ unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
         .cap_high_water(base)
 }
 
+/// #1944 slice 3 — a budget node's fuel as the JIT meters it: a [`temen_jit::FuelCell`] draws from
+/// it and hands back what it did not burn.
+struct HostFuel(temen_interp::FuelSrc);
+
+impl temen_jit::FuelSource for HostFuel {
+    fn draw(&self) -> Option<u64> {
+        self.0.draw()
+    }
+    fn give_back(&self, unspent: u64) {
+        self.0.give_back(unspent)
+    }
+    fn room(&self) -> i64 {
+        self.0.room()
+    }
+}
+
+/// #1944 slice 3 — a detached child's [`temen_jit::ChildFuelSource`] over its powerbox (always the
+/// shared form): the node it draws from is its own, the budget that paid for its window.
+unsafe fn child_fuel_source(ctx: *mut c_void) -> Option<Arc<dyn temen_jit::FuelSource>> {
+    let src = (*(ctx as *const Mutex<Host>))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fuel_source();
+    Some(Arc::new(HostFuel(src)))
+}
+
 /// #1834 — the page map a run seeded with `init` builds its window under: the host's view of it,
 /// just seeded from `init` ([`Host::reset_cap_pages`]), read back as [`jit_layout`] reads a capture,
 /// so a thaw re-applies exactly what the freeze recorded. Empty for an `init` that deviates nowhere:
@@ -2984,6 +3010,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         },
         premap_apply,
         high_water: high_water_locked,
+        fuel_source: child_fuel_source,
         release: grant_child_release,
         bind_imports: if locked {
             child_bind_imports_locked
@@ -4955,6 +4982,7 @@ unsafe fn powerbox_compile_run(
     quota: temen_jit::Quota,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
+    fuel: Option<*mut temen_jit::FuelCell>,
 ) -> Result<JitRun, temen_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     // #1234: one value carries the shape and the pointer — the compile below and the hooks further
@@ -4969,7 +4997,7 @@ unsafe fn powerbox_compile_run(
         None,
         Some(module_resolver_locked), // §14 module children resolve their `Module` grant
         interrupt_ptr,
-        None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
+        fuel, // the root budget's cell when `Limits.fuel` bounds the run ([`jit_run`])
         None, // no D45 fast path: the fast fns deref a raw `*mut Host`, not a `Mutex<Host>`
         quota,
         CLI_JIT_TABLE_LOG2,
@@ -5922,7 +5950,7 @@ pub fn grant_conductor(host: &mut Host, child: &temen_ir::Module) -> (i32, i32, 
     let log2 = child.memory.as_ref().map_or(0, |m| m.size_log2);
     let inst = host.grant_instantiator(0, 1u64 << CONDUCTOR_LOG2);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(0, 1i64 << log2, 0);
+    let budget = host.grant_budget(-1, 1i64 << log2, 0);
     (inst, modh, budget)
 }
 
@@ -6192,9 +6220,9 @@ fn outcome_from_jit(results: &[ValType], jit: JitOutcome) -> Result<Outcome, Str
     }
 }
 
-/// The default per-op fuel budget for the interpreters when [`Limits::fuel`] is `None` — generous, but
-/// finite so a non-terminating guest under the tree-walker can't hang the host (a runaway guest is
-/// better bounded by a `deadline` on the JIT, which has no cheap per-op counter).
+/// The interpreters' fuel limit when [`Limits::fuel`] is `None` — generous, but finite so a
+/// non-terminating guest under the tree-walker can't hang the host. The JIT's default is no limit: a
+/// runaway guest is better bounded there by a `deadline`, which costs its code no fuel checks.
 const DEFAULT_FUEL: u64 = 1 << 34;
 
 /// Which execution backend a run targets. All three honour the same [`RunConfig`] where they support
@@ -6217,7 +6245,10 @@ pub enum Backend {
 /// all three.
 #[derive(Clone, Debug)]
 pub struct Limits {
-    /// Per-op budget for `TreeWalk`/`Bytecode` (`None` ⇒ [`DEFAULT_FUEL`]); ignored by the JIT.
+    /// The run's fuel limit: the root budget's fuel ceiling, which every vCPU of the run (a child's
+    /// included) draws from, on every backend (#1944 slice 3). `None` is each backend's default:
+    /// [`DEFAULT_FUEL`] on `TreeWalk`/`Bytecode`, no limit on the JIT (whose code then carries no fuel
+    /// checks). A limit past `i64::MAX` is no limit.
     pub fuel: Option<u64>,
     /// Wall-clock deadline for the JIT's detect-and-kill watchdog (§5); ignored by the interpreters.
     pub deadline: Option<std::time::Duration>,
@@ -6355,6 +6386,15 @@ fn jit_run(
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
     let quota = limits.quota();
+    // #1944 slice 3 — `Limits.fuel` is the root budget's fuel ceiling on the JIT too (#1705): a
+    // bounded one arms the root, whose cell draws from the host's own node. `None` (the JIT's default)
+    // or an unbounded limit leaves the run un-metered: its deadline stops a runaway.
+    let mut root_fuel = limits
+        .fuel
+        .and_then(|n| temen_jit::FuelCell::metering(Arc::new(HostFuel(host.begin_activation(n)))));
+    let fuel = root_fuel
+        .as_deref_mut()
+        .map(|c| c as *mut temen_jit::FuelCell);
     // §12 threads and fibers run on the serialized arm. Waiting and notifying alone make no second
     // caller: a guest that only sleeps on a futex (nim's `nanosleep`) is single-threaded, and runs
     // as a process, which can fork.
@@ -6375,6 +6415,7 @@ fn jit_run(
                     quota,
                     init_mem,
                     snapshot_cap,
+                    fuel,
                 )
             };
             *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -6390,6 +6431,7 @@ fn jit_run(
                     quota,
                     init_mem,
                     snapshot_cap,
+                    fuel,
                 )
             }
         } else {
@@ -6401,12 +6443,13 @@ fn jit_run(
             let ip = interrupt.map(std::sync::Arc::as_ptr);
             let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
             let r = unsafe {
-                jit_proc::compile_image(host, m, func, ip, quota, jit)
+                jit_proc::compile_image(host, m, func, ip, quota, jit, fuel)
                     .and_then(|cm| jit_proc::run_image(host, cm, ip, None, start))
             };
             (r, results)
         }
     });
+    drop(root_fuel); // what the root drew and did not burn goes back to its node
     let run = run.map_err(|e| format!("JIT compile failed: {e:?}"))?;
     if let JitOutcome::Trapped(kind) = run.outcome {
         let who = match run.trap_fiber {
@@ -6872,13 +6915,14 @@ impl HostCap {
     /// `WindowMinter` retired). The authority to spawn **detached** children
     /// (`Instantiator.instantiate_detached`, op 15) whose fresh platform windows no ancestor below
     /// the platform can read (the child attests `window_exposed = false` — the distrust-spawner trust
-    /// anchor). Embedder-granted like `exec`/`fs`; each mint deducts the child's window size from
-    /// `mem` (fuel/spawn are `0` — this cap is a pure VA authority).
+    /// anchor). Embedder-granted like `exec`/`fs`; each mint charges the child's window size to
+    /// `mem`. Its fuel is unbounded on its own level, so the run's fuel limit above it is what caps
+    /// the children it funds (#1944 slice 3); its spawn is `0`.
     pub fn detached_budget(mem: u64) -> HostCap {
         HostCap {
             type_id: cap_id::BUDGET,
             op: 0,
-            grant: Arc::new(move |h, _| h.grant_budget(0, mem as i64, 0)),
+            grant: Arc::new(move |h, _| h.grant_budget(-1, mem as i64, 0)),
             unbound: false,
             offer: None,
             iface: None,

@@ -43,7 +43,7 @@ pub struct VmCtx {
     /// The §5 kill-path interrupt cell a compile with epoch checks polls (null when not armed).
     pub epoch: *const AtomicU64,
     /// The counted-fuel cell a compile with fuel checks charges (null when not armed).
-    pub fuel: *mut u64,
+    pub fuel: *mut crate::FuelCell,
     /// #932 — the host `armed` flag a compile with signal checks polls (null when not armed).
     pub sig_armed: *const AtomicBool,
     /// #932 — the signal-delivery ctx handed to the take/return thunks (null when not armed).
@@ -64,7 +64,7 @@ pub struct VmCtx {
 pub struct InstanceAddrs {
     pub cap_ctx: *mut c_void,
     pub epoch: *const AtomicU64,
-    pub fuel: *mut u64,
+    pub fuel: *mut crate::FuelCell,
     pub sig_armed: *const AtomicBool,
     pub sig_ctx: *mut c_void,
     pub embedder: *mut c_void,

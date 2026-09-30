@@ -74,10 +74,13 @@ Grounded in the current code, so the plan builds on reality:
 
 ### The genuine asymmetry to design around
 
-**Fuel is not uniform and can't cheaply be.** The tree-walker/bytecode decrement a `&mut u64` per
-op; the JIT polls an interrupt `AtomicU64` cell at back-edges (the deadline-watchdog path). So the
-uniform "bound this run" knob must be **interrupt/deadline-based** (binds all three), with per-op
-`fuel` as an interp-only refinement. Model it honestly:
+**Fuel was not uniform.** The tree-walker/bytecode decrement a `&mut u64` per op; the JIT polls an
+interrupt `AtomicU64` cell at back-edges (the deadline-watchdog path). So the uniform "bound this run"
+knob was made **interrupt/deadline-based** (binds all three), with per-op `fuel` as an interp-only
+refinement. (Since #1944 slice 3 `fuel` binds the JIT too: it is the root budget's fuel ceiling, and a
+JIT compile given one charges the same safepoints the interpreters do, refilling from the budget
+chain. The deadline stays the JIT's default runaway bound, since it costs code no checks.) The
+original model:
 
 ```
 Limits {
@@ -170,9 +173,9 @@ unify into one (in `temen-ir` or `temen-interp`) consumed by both backends.
       `temen_jit::Quota` internally, so the two structurally-identical backend `Quota` types stay an
       impl detail the embedder never touches. (Deduping them into one shared type would churn both
       escape-TCB-adjacent crates for no consumer-visible gain — left as optional cleanup.)
-- [x] `Limits` + `RunConfig` (fuel = interpreters' per-op budget, ignored by the JIT; deadline = the
-      JIT's §5 watchdog, ignored by the interpreters; `memory_size_log2` overrides the window). The
-      asymmetry is modeled honestly and documented per-knob rather than papered over.
+- [x] `Limits` + `RunConfig` (fuel = the root budget's fuel ceiling on every backend since #1944
+      slice 3, its default per backend — 2^34 on the interpreters, none on the JIT; deadline = the
+      JIT's §5 watchdog, ignored by the interpreters; `memory_size_log2` overrides the window).
 - [x] `Backend` selector + `Instance::run(backend, &config)` single-backend facade; `Instance::run_diff`
       for the tree-walk == JIT oracle; `call`/`call_with_stdin` are now `run_diff` with a default/stdin
       config. Acceptance: `crates/temen/tests/powerbox_run.rs` (every backend under one config; fuel

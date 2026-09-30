@@ -255,7 +255,7 @@ fn split_bounds_a_childs_lane_by_the_holders_cap_and_never_draws_the_cap_down() 
 #[test]
 fn budget_mem_give_is_the_exact_undo_of_a_take() {
     let mut host = Host::new();
-    let b = host.grant_budget(0, 8192, 0);
+    let b = host.grant_budget(-1, 8192, 0);
     let read_mem = |host: &mut Host| -> i64 {
         host.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)
             .unwrap()[0]
@@ -264,7 +264,7 @@ fn budget_mem_give_is_the_exact_undo_of_a_take() {
     assert_eq!(read_mem(&mut host), 4096);
     host.budget_mem_give(b, 4096);
     assert_eq!(read_mem(&mut host), 8192);
-    let u = host.grant_budget(0, -1, 0);
+    let u = host.grant_budget(-1, -1, 0);
     host.budget_mem_give(u, 4096);
     assert_eq!(
         host.cap_dispatch_slots(cap_id::BUDGET, 1, u, &[1], None)

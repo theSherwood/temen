@@ -107,7 +107,6 @@ fn a_detached_child_that_completed_with_a_trap_does_not_decline() {
             Outcome {
                 result: Err(Trap::Unreachable),
                 mem: None,
-                fuel: 0,
                 trap_bt: Vec::new(),
                 trap_fiber: None,
                 trap_fault: None,
@@ -194,7 +193,7 @@ fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
         &[],
         None,
         Arc::clone(&f.root),
-        0,
+        Fuel::fixed(0),
         0,
         id,
         f.sched.clone(),

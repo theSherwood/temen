@@ -180,6 +180,10 @@ pub(crate) struct Tree {
     /// Whether the run armed a deadline (then every image polls the cell, the root's included).
     deadline: bool,
     quota: temen_jit::Quota,
+    /// #1944 slice 3 — the root budget's fuel cell when `Limits.fuel` bounds the run (`0`: un-metered).
+    /// Every image of the tree charges it: a process shares its forker's budget node, as a fork twin
+    /// does on the interpreters.
+    fuel: usize,
     /// The commands the tree compiled (#1825), by what their code depends on.
     code: Mutex<HashMap<CodeKey, Arc<CodeSlot>>>,
 }
@@ -196,7 +200,11 @@ struct TreeState {
 }
 
 impl Tree {
-    fn new(interrupt: Option<&Arc<AtomicU64>>, quota: temen_jit::Quota) -> Arc<Tree> {
+    fn new(
+        interrupt: Option<&Arc<AtomicU64>>,
+        quota: temen_jit::Quota,
+        fuel: Option<*mut temen_jit::FuelCell>,
+    ) -> Arc<Tree> {
         Arc::new(Tree {
             state: Mutex::new(TreeState {
                 next_pid: 2,
@@ -212,6 +220,7 @@ impl Tree {
                 .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             deadline: interrupt.is_some(),
             quota,
+            fuel: fuel.map_or(0, |c| c as usize),
             code: Mutex::new(HashMap::new()),
         })
     }
@@ -312,17 +321,22 @@ impl Tree {
                     }
                     Some(None) => {
                         drop(kept);
-                        compile(host, program, entry, jit, plan, interrupt, self.quota)?
+                        compile(
+                            host, program, entry, jit, plan, interrupt, self.quota, self.fuel,
+                        )?
                     }
                     None => {
-                        let (cm, image) =
-                            compile(host, program, entry, jit, plan, interrupt, self.quota)?;
+                        let (cm, image) = compile(
+                            host, program, entry, jit, plan, interrupt, self.quota, self.fuel,
+                        )?;
                         *kept = Some(image.clone());
                         (cm, image)
                     }
                 }
             }
-            _ => compile(host, program, entry, jit, plan, interrupt, self.quota)?,
+            _ => compile(
+                host, program, entry, jit, plan, interrupt, self.quota, self.fuel,
+            )?,
         };
         Ok(Loaded {
             cm,
@@ -776,6 +790,7 @@ unsafe fn compile(
     plan: Option<ForkPlan>,
     interrupt: Option<*const AtomicU64>,
     quota: temen_jit::Quota,
+    fuel: usize,
 ) -> Result<(CompiledModule, Option<Arc<Image>>), temen_jit::JitError> {
     let sized;
     let m = match program {
@@ -799,7 +814,8 @@ unsafe fn compile(
     let (code, at) = instrumented
         .as_ref()
         .map_or((m, entry), |(im, at)| (im, *at));
-    let cm = compile_image(host, code, at, interrupt, quota, jit)?;
+    let fuel = (fuel != 0).then_some(fuel as *mut temen_jit::FuelCell);
+    let cm = compile_image(host, code, at, interrupt, quota, jit, fuel)?;
     let image = (!jit).then(|| cm.share()).flatten().map(|code| {
         Arc::new(Image {
             code,
@@ -841,6 +857,7 @@ pub(crate) unsafe fn compile_image(
     interrupt: Option<*const AtomicU64>,
     quota: temen_jit::Quota,
     jit: bool,
+    fuel: Option<*mut temen_jit::FuelCell>,
 ) -> Result<CompiledModule, temen_jit::JitError> {
     let cc = CapCtx::Raw(&mut *host);
     let mut cm = CompiledModule::compile(
@@ -852,7 +869,7 @@ pub(crate) unsafe fn compile_image(
         None,
         Some(module_resolver), // §14 module children resolve their `Module` grant
         interrupt,
-        None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
+        fuel, // the root budget's cell when `Limits.fuel` bounds the run (`jit_run`)
         Some(fast_cap_resolver),
         quota,
         CLI_JIT_TABLE_LOG2,
@@ -1162,8 +1179,9 @@ pub(crate) unsafe fn run_root(
     quota: temen_jit::Quota,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
+    fuel: Option<*mut temen_jit::FuelCell>,
 ) -> (Result<JitRun, temen_jit::JitError>, Vec<ValType>) {
-    let tree = Tree::new(interrupt, quota);
+    let tree = Tree::new(interrupt, quota, fuel);
     let start = Start::Fresh {
         program: Program::Embedder(m),
         entry: func,

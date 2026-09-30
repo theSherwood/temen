@@ -67,8 +67,8 @@ use cranelift_codegen::ir::types::{
 };
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
-    InstBuilder, JumpTableData, MemFlags, SigRef, SourceLoc, StackSlotData, StackSlotKind, Type,
-    UserFuncName, Value, ValueLabel,
+    InstBuilder, JumpTableData, MemFlags, SigRef, Signature, SourceLoc, StackSlotData,
+    StackSlotKind, Type, UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::LabelValueLoc;
@@ -186,6 +186,8 @@ mod vcpu_tls;
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
 mod vmctx;
 pub use vmctx::{InstanceAddrs, VmCtx};
+mod fuel;
+pub use fuel::{FuelCell, FuelSource};
 
 // §12.8 4A.5 durable-runtime-internal per-OS-thread shadow-region base (`durable.shadow_base`): the
 // base of the region the running durable context spills into, so concurrent vCPUs each have their own
@@ -1004,6 +1006,12 @@ pub type PremapApply = unsafe extern "C" fn(
     reserved: u64,
 ) -> i32;
 
+/// #1944 slice 3 — the budget chain a detached child's vCPUs draw their fuel from: its own node (the
+/// budget that paid for its window), read off child powerbox `child_ctx` (always the shared form).
+/// `None` when the child holds none. A plain Rust fn: it hands back a Rust trait object.
+pub type ChildFuelSource =
+    unsafe fn(child_ctx: *mut core::ffi::c_void) -> Option<std::sync::Arc<dyn FuelSource>>;
+
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
@@ -1028,6 +1036,9 @@ pub struct GrantChildHooks {
     /// detached child grew its window, so a freeze's capture of it reaches its grown pages, as the
     /// root's does.
     pub high_water: HighWater,
+    /// #1944 slice 3 — the budget chain a **detached** child's vCPUs draw their fuel from (see
+    /// [`ChildFuelSource`]).
+    pub fuel_source: ChildFuelSource,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
@@ -1399,18 +1410,23 @@ pub fn compile_and_run_with_host_fuel(
     cap_ctx: *mut core::ffi::c_void,
     fuel: *mut u64,
 ) -> Result<JitOutcome, JitError> {
-    Ok(run_inner(
+    // A fixed allowance: the caller's `u64` is the whole budget (#1944 slice 3).
+    // SAFETY: `fuel` is live and writable for the call (the contract above).
+    let mut cell = FuelCell::fixed(unsafe { *fuel });
+    let r = run_inner(
         m,
         func,
         args,
         cap_thunk,
         cap_ctx,
         RunOpts {
-            fuel: Some(fuel),
+            fuel: Some(&mut *cell),
             ..RunOpts::default()
         },
-    )?
-    .0)
+    );
+    // SAFETY: as above.
+    unsafe { *fuel = cell.left };
+    Ok(r?.0)
 }
 
 /// Like [`compile_and_run`], but seed the guest window with `init_mem` (its low bytes) and
@@ -1581,7 +1597,10 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
     cap_ctx: *mut core::ffi::c_void,
     fuel: *mut u64,
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-    run_inner(
+    // A fixed allowance: the caller's `u64` is the whole budget (#1944 slice 3).
+    // SAFETY: `fuel` is live and writable for the call (the contract above).
+    let mut cell = FuelCell::fixed(unsafe { *fuel });
+    let r = run_inner(
         m,
         func,
         args,
@@ -1592,10 +1611,13 @@ pub fn compile_and_run_capture_reserved_with_host_fuel(
             reserved_log2,
             snapshot_cap: Some(SNAP_CAP),
             // counted-fuel budget armed — traps OutOfFuel at the shared safepoints
-            fuel: Some(fuel),
+            fuel: Some(&mut *cell),
             ..RunOpts::default()
         },
-    )
+    );
+    // SAFETY: as above.
+    unsafe { *fuel = cell.left };
+    r
 }
 
 /// [`compile_and_run_capture_reserved_with_host`] that first **re-establishes** a captured
@@ -2159,7 +2181,7 @@ struct RunOpts<'a> {
     /// §5 async kill-path cell, host-written and polled at safepoints.
     interrupt: Option<*const AtomicU64>,
     /// Safepoint-anchored counted-fuel budget cell (a deterministic guest budget).
-    fuel: Option<*mut u64>,
+    fuel: Option<*mut FuelCell>,
     /// §9/D45 devirtualized fast cap resolver.
     fast_resolver: Option<FastCapResolver>,
     /// §15 spawn quota.
@@ -3124,7 +3146,7 @@ impl CompiledModule {
         sub: Option<SubWindow>,
         resolve_module: Option<ModuleResolver>,
         interrupt: Option<*const AtomicU64>,
-        fuel: Option<*mut u64>,
+        fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
         quota: Quota,
         table_reserve_log2: u8,
@@ -3162,7 +3184,7 @@ impl CompiledModule {
         sub: Option<SubWindow>,
         resolve_module: Option<ModuleResolver>,
         interrupt: Option<*const AtomicU64>,
-        fuel: Option<*mut u64>,
+        fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
         quota: Quota,
         table_reserve_log2: u8,
@@ -3207,7 +3229,7 @@ impl CompiledModule {
         let mut instance = InstanceAddrs {
             cap_ctx,
             epoch: epoch_addr as *const AtomicU64,
-            fuel: fuel_addr as *mut u64,
+            fuel: fuel_addr as *mut FuelCell,
             sig_armed: signal.as_ref().map_or(core::ptr::null(), |s| s.armed),
             sig_ctx: signal.as_ref().map_or(core::ptr::null_mut(), |s| s.ctx),
             ..InstanceAddrs::NONE
@@ -6496,7 +6518,7 @@ fn compile_child_windowed(
         instance: InstanceAddrs {
             cap_ctx,
             epoch: epoch_addr as *const AtomicU64,
-            fuel: fuel_addr as *mut u64,
+            fuel: fuel_addr as *mut FuelCell,
             // Its `thread.*` and futex sites run on the parent's domain (null when it has none).
             sched: futex_sched as *const core::ffi::c_void,
             ..InstanceAddrs::NONE
@@ -7666,8 +7688,23 @@ fn lower_block(
             if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
                 if !sig.results.is_empty() {
                     let v = if lower.fuel {
+                        // #1944 slice 3 — what the domain can still burn: the cell's `left` plus its
+                        // budget chain's room, asked of the cell (word 2).
                         let addr = vmctx_load(b, lower, vmctx::FUEL);
-                        b.ins().load(I64, MemFlags::trusted(), addr, 0)
+                        let rsig = {
+                            let mut s = Signature::new(lower.frontend_config.default_call_conv);
+                            s.params.push(AbiParam::new(I64)); // the cell
+                            s.returns.push(AbiParam::new(I64)); // the remaining fuel
+                            b.import_signature(s)
+                        };
+                        let remaining = b.ins().load(
+                            I64,
+                            MemFlags::trusted(),
+                            addr,
+                            crate::fuel::REMAINING_OFF,
+                        );
+                        let call = b.ins().call_indirect(rsig, remaining, &[addr]);
+                        b.inst_results(call)[0]
                     } else {
                         b.ins().iconst(I64, i64::MAX)
                     };
@@ -9483,23 +9520,45 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
         return; // no fuel armed for this compile — emit nothing
     }
     let cont = b.create_block();
+    let refill_blk = b.create_block();
     let trap_blk = b.create_block();
+    b.append_block_param(cont, I64);
     let addr = vmctx_load(b, lower, vmctx::FUEL);
     // Plain load (not `readonly`) — the store below writes the same address, so the load is not
     // loop-invariant and is re-evaluated each iteration. `trusted()` = aligned + notrap (a host-owned
-    // aligned cell that never faults), no atomic ordering (single guest thread owns this budget).
+    // aligned cell that never faults), no atomic ordering (the cell's `left`, word 0 of a `FuelCell`).
     let fuel = b.ins().load(I64, MemFlags::trusted(), addr, 0);
-    // Exhausted? (`fuel == 0` ⇒ the next charge would underflow) → trap before charging.
-    b.ins().brif(fuel, cont, &[], trap_blk, &[]);
+    // Spent? (`fuel == 0` ⇒ the next charge would underflow) → refill before charging.
+    b.ins()
+        .brif(fuel, cont, &[BlockArg::from(fuel)], refill_blk, &[]);
+    // #1944 slice 3 — the cell's refill (word 1) draws the next chunk from the budget chain; `0` is a
+    // spent chain (or a spent fixed allowance), which traps as a spent counter always did.
+    b.switch_to_block(refill_blk);
+    b.set_cold_block(refill_blk);
+    let sig = {
+        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+        s.params.push(AbiParam::new(I64)); // the cell
+        s.returns.push(AbiParam::new(I64)); // the refilled `left`, or 0
+        b.import_signature(s)
+    };
+    let refill = b
+        .ins()
+        .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
+    let call = b.ins().call_indirect(sig, refill, &[addr]);
+    let drawn = b.inst_results(call)[0];
+    b.ins()
+        .brif(drawn, cont, &[BlockArg::from(drawn)], trap_blk, &[]);
     b.switch_to_block(trap_blk);
+    b.set_cold_block(trap_blk);
     emit_trap(b, lower, TrapKind::OutOfFuel);
     b.switch_to_block(cont);
     // Charge one: store `fuel - 1` back. The store⇒load dependency (same `addr`) is what keeps the
     // load above from being hoisted out of a loop.
+    let fuel = b.block_params(cont)[0];
     let one = b.ins().iconst(I64, 1);
     let charged = b.ins().isub(fuel, one);
     b.ins().store(MemFlags::trusted(), charged, addr, 0);
-    // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
+    // `cont`/`refill_blk`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
 }
 
 /// The software stack-overflow guard's tunables. See `crates/temen-jit/STACK_GUARD.md`. Under §2b

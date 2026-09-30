@@ -14,7 +14,7 @@ mod drivers;
 
 use drivers::{agree_on_every_driver, Ran};
 use temen_interp::{cap_id, Attestation, Host, StreamRole, Trap, Value};
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 
 fn module(src: &str) -> Module {
@@ -429,7 +429,7 @@ const PAYLOAD: i64 = 1000;
 /// 32 KiB window, funded by `budget`, handed `PAYLOAD` as its 8-byte args payload and, iff `grant`,
 /// `stdout` by name.
 fn op15(grant: bool) -> String {
-    op15_then(grant, JOIN_OR_ERRNO)
+    op15_then(grant, 0, JOIN_OR_ERRNO)
 }
 
 /// #1975 — the tail of a parent that reports what a refused spawn left in its budget: the `mem` room,
@@ -451,8 +451,9 @@ block 2 () {
 }
 ";
 
-/// [`op15`] ending in `tail` instead of [`JOIN_OR_ERRNO`].
-fn op15_then(grant: bool, tail: &str) -> String {
+/// [`op15`] passing the fuel `quota` operand `quota` and ending in `tail` instead of
+/// [`JOIN_OR_ERRNO`].
+fn op15_then(grant: bool, quota: i64, tail: &str) -> String {
     format!(
         "memory 17
 func (i32, i32, i32, i32) -> (i64) {{
@@ -466,7 +467,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
   gn = i64.const {n}
   en = i64.const 0
   sl = i64.const 15
-  q = i64.const 0
+  q = i64.const {quota}
   al = i64.const 8
   vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gp, gn, en, sl, q, pa, al)
 {tail}",
@@ -482,7 +483,7 @@ fn op15_setup(child: &Module, mem: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ 
         let mut h = Host::new();
         let i = h.grant_instantiator(0, 1 << 17);
         let c = h.grant_module(child);
-        let b = h.grant_budget(0, mem, 0);
+        let b = h.grant_budget(-1, mem, 0);
         let o = h.grant_stream(StreamRole::Out);
         let args = vec![Value::I32(i), Value::I32(c), Value::I32(b), Value::I32(o)];
         (h, args)
@@ -607,7 +608,7 @@ fn a_detached_child_whose_import_is_unbound_is_refused() {
     agree_on_every_driver("op 15, an unbound import", &m, &setup, &ok(-22));
     // #1975 — and it charged nothing: the import is bound after the admission, whose take the refusal
     // hands back, so the budget still has all its room.
-    let m = module(&op15_then(false, ROOM_AFTER_REFUSAL));
+    let m = module(&op15_then(false, 0, ROOM_AFTER_REFUSAL));
     agree_on_every_driver(
         "op 15, an unbound import charges nothing",
         &m,
@@ -677,7 +678,7 @@ fn op15_tree_setup(
             unreachable!("op15_setup hands the budget third")
         };
         let node = h
-            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[0, node_mem, 0], None)
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, node_mem, 0], None)
             .expect("split")[0] as i32;
         assert!(h.budget_mem_take(root, root_used), "the root's own use");
         if !pay_root {
@@ -719,6 +720,112 @@ fn a_detached_window_is_charged_to_every_level_of_the_chain() {
         &m,
         &op15_tree_setup(&child, 1 << 15, 1 << 15, 0, true),
         &ran,
+    );
+}
+
+// ---- #1944 slice 3: a detached child burns the fuel of the budget that paid for it ----
+
+/// A detached child that takes its payload word's worth of loop back-edges (one fuel each), then
+/// returns 7.
+const CHILD_LOOPS: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 16512
+  vp = i64.load va
+  vn = i32.wrap_i64 vp
+  br 1(vn)
+}
+block 1 (vi: i32) {
+  one = i32.const 1
+  vj = i32.sub vi one
+  br_if vj 1(vj) 2()
+}
+block 2 () {
+  v = i64.const 7
+  return v
+  }
+}
+";
+
+/// [`op15_setup`] paying with a node split from the root with a `fuel` ceiling (`-1` = unbounded on
+/// its own, so only the run's fuel caps it).
+fn op15_fuel_setup(child: &Module, fuel: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    let base = op15_setup(child, 1 << 20);
+    move || {
+        let (mut h, mut args) = base();
+        let Value::I32(root) = args[2] else {
+            unreachable!("op15_setup hands the budget third")
+        };
+        let node = h
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[fuel, -1, 0], None)
+            .expect("split")[0];
+        args[2] = Value::I32(node as i32);
+        (h, args)
+    }
+}
+
+fn trapped(t: Trap) -> Ran {
+    Ran {
+        result: Err(t),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+/// #1944 slice 3 — on every driver, a detached child burns the fuel of the budget that paid for it:
+/// a node's fuel ceiling ends a child that loops past it, though its parent has fuel to spare (the
+/// join hands the child's trap to the parent), and a node with room lets it finish.
+#[test]
+fn a_detached_childs_fuel_is_capped_by_its_budget() {
+    let m = module(&op15(false));
+    let child = module(CHILD_LOOPS);
+    agree_on_every_driver(
+        "op 15, a fuel ceiling with room",
+        &m,
+        &op15_fuel_setup(&child, 2 * PAYLOAD),
+        &ok(7),
+    );
+    agree_on_every_driver(
+        "op 15, a node unbounded on its own",
+        &m,
+        &op15_fuel_setup(&child, -1),
+        &ok(7),
+    );
+    agree_on_every_driver(
+        "op 15, a fuel ceiling the child loops past",
+        &m,
+        &op15_fuel_setup(&child, PAYLOAD / 2),
+        &trapped(Trap::OutOfFuel),
+    );
+}
+
+/// #1944 slice 3 — the per-spawn fuel `quota` is retired (the budget is the one fuel limit): a
+/// nonzero one traps `CapFault` on every driver, as op 15's operand and as a v1 record's field.
+#[test]
+fn a_detached_spawn_with_a_fuel_quota_traps() {
+    let child = module(CHILD_LOOPS);
+    let m = module(&op15_then(false, 5, JOIN_OR_ERRNO));
+    agree_on_every_driver(
+        "op 15, a nonzero quota",
+        &m,
+        &op15_setup(&child, 1 << 20),
+        &trapped(Trap::CapFault),
+    );
+    let mut rec = SpawnRec::v1(1);
+    rec.quota = 5;
+    let m = module(&record_spawn(&rec));
+    agree_on_every_driver(
+        "op 17, a v1 record with a nonzero quota",
+        &m,
+        &generations_setup(&m),
+        &trapped(Trap::CapFault),
+    );
+    let m = module(&record_spawn(&SpawnRec::v1(1)));
+    agree_on_every_driver(
+        "op 17, a v1 record with no quota",
+        &m,
+        &generations_setup(&m),
+        &ok(3),
     );
 }
 
@@ -779,7 +886,7 @@ fn joins_agree(what: &str, joins: &str, want: &Ran) {
     let setup = |h: &mut Host| {
         let i = h.grant_instantiator(0, 1 << 17);
         let c = h.grant_module(&child);
-        let b = h.grant_budget(0, 1 << 20, 0);
+        let b = h.grant_budget(-1, 1 << 20, 0);
         vec![Value::I32(i), Value::I32(c), Value::I32(b)]
     };
     let setup = || {
@@ -788,14 +895,6 @@ fn joins_agree(what: &str, joins: &str, want: &Ran) {
         (h, args)
     };
     agree_on_every_driver(what, &m, &setup, want);
-}
-
-fn thread_fault() -> Ran {
-    Ran {
-        result: Err(Trap::ThreadFault),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    }
 }
 
 #[test]
@@ -812,7 +911,7 @@ fn each_child_joins_once_by_its_handle() {
 #[test]
 fn a_second_join_of_a_child_traps() {
     let joins = format!("{}{}", join("vr0", "vh0"), join("vr", "vh0"));
-    joins_agree("a re-join", &joins, &thread_fault());
+    joins_agree("a re-join", &joins, &trapped(Trap::ThreadFault));
 }
 
 #[test]
@@ -820,7 +919,7 @@ fn a_negative_handle_traps() {
     joins_agree(
         "join(-1)",
         &format!("  vn = i32.const -1\n{}", join("vr", "vn")),
-        &thread_fault(),
+        &trapped(Trap::ThreadFault),
     );
 }
 
@@ -830,7 +929,7 @@ fn a_handle_past_the_table_traps() {
     joins_agree(
         "join(3)",
         &format!("  vn = i32.const 3\n{}", join("vr", "vn")),
-        &thread_fault(),
+        &trapped(Trap::ThreadFault),
     );
 }
 
@@ -848,12 +947,8 @@ fn a_handle_masks_onto_the_table() {
 
 /// A data segment holding a v1 spawn record of this module's function `entry` (its declared window;
 /// the budget field filled at run time), at `at`.
-fn rec_segment(at: u64, entry: u32) -> String {
-    let esc: String = temen_ir::SpawnRec::v1(entry)
-        .encode()
-        .iter()
-        .map(|b| format!("\\x{b:02x}"))
-        .collect();
+fn rec_segment(at: u64, rec: &SpawnRec) -> String {
+    let esc: String = rec.encode().iter().map(|b| format!("\\x{b:02x}")).collect();
     format!("data {at} \"{esc}\"\n")
 }
 
@@ -916,8 +1011,8 @@ block 0 (va: i64) {{
   }}
 }}
 ",
-        r1 = rec_segment(17408, 1),
-        r2 = rec_segment(17504, 2),
+        r1 = rec_segment(17408, &SpawnRec::v1(1)),
+        r2 = rec_segment(17504, &SpawnRec::v1(2)),
     )
 }
 
@@ -927,10 +1022,40 @@ fn generations_setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
         let mut h = Host::new();
         h.set_self_module(&std::sync::Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 16);
-        let b = h.grant_budget(0, 1 << 20, 0);
+        let b = h.grant_budget(-1, 1 << 20, 0);
         h.register_cap_name("budget", b);
         (h, vec![Value::I32(i)])
     }
+}
+
+/// A `memory 16` root that spawns its func 1 by the v1 record `rec`, paid from its `"budget"`, and
+/// returns the join. Func 1 returns 3.
+fn record_spawn(rec: &SpawnRec) -> String {
+    format!(
+        "memory 16
+data 16384 \"budget\"
+{r}func (i32) -> (i64) {{
+block 0 (vinst: i32) {{
+  np = i64.const 16384
+  nl = i64.const 6
+  vb = self.resolve np nl
+  bf = i64.const 17436
+  i32.store bf vb
+  rp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  return vj
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  v = i64.const 3
+  return v
+  }}
+}}
+",
+        r = rec_segment(17408, rec),
+    )
 }
 
 #[test]

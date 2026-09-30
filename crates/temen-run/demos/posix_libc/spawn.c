@@ -69,15 +69,16 @@ static inline int vm_budget_of_(void) {
   return vm_budget_;
 }
 
-/* vm_spawn(module, entry, size_log2, quota, grants, n, args, args_len, scratch) -> child | -errno.
+/* vm_spawn(module, entry, size_log2, grants, n, args, args_len, scratch) -> child | -errno.
  * `module`: a granted `Module` handle, or -1 for this program. The child runs in a window of its
  * own — its module's declared memory, spent from this domain's `Budget`. `size_log2` 0 asks for
  * exactly that; any other value must equal it (else the spawn refuses, -EINVAL).
  * `args`/`args_len`: the spawn-time args payload, copied to the child's args buffer before it starts
  * (the §3e `{argc, envc}` + packed strings a `main(argc, argv)` reads); `args_len` 0 = none.
- * `quota`: raw fuel (0 = the parent's). The child starts immediately; `vm_join` collects it. */
-static inline long vm_spawn(long module, long entry, long size_log2, long quota, vm_grant *grants,
-                            long n, void *args, long args_len, void *scratch) {
+ * The child's fuel comes from the same `Budget` (the record's per-spawn `quota` is retired, #1944).
+ * The child starts immediately; `vm_join` collects it. */
+static inline long vm_spawn(long module, long entry, long size_log2, vm_grant *grants, long n,
+                            void *args, long args_len, void *scratch) {
   int *w = (int *)scratch;
   long *q = (long *)scratch;
   w[0] = 1;                /* version: the detached record */
@@ -87,7 +88,7 @@ static inline long vm_spawn(long module, long entry, long size_log2, long quota,
   w[5] = -1;               /* @20 pager: u32::MAX = none */
   w[6] = (int)module;      /* @24 */
   w[7] = vm_budget_of_();  /* @28 the Budget the window spends */
-  q[4] = quota;            /* @32 */
+  q[4] = 0;                /* @32 quota: retired, must be 0 */
   int *g = (int *)((char *)scratch + 88);
   for (long i = 0; i < n; i = i + 1) {
     g[i * 4 + 0] = (int)(long)grants[i].name;

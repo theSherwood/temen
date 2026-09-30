@@ -1681,7 +1681,7 @@ fn a_durable_freeze_is_never_killed_by_a_detached_child() {
     host.set_durable(true);
     let ih = host.grant_instantiator(0, WINDOW as u64);
     let mh = host.grant_module(&child_mod);
-    let bh = host.grant_budget(0, (1u64 << 17) as i64, 0); // one detached window
+    let bh = host.grant_budget(-1, (1u64 << 17) as i64, 0); // one detached window
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING); // freeze from the start
     let mut fuel = 50_000_000u64;
