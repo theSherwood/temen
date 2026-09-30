@@ -55,7 +55,7 @@ try {
   page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
-  const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
+  const WORK_IDS = ['powerbox', 'threads', 'jit', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
 
   // I22 mitigation: the index page exercises the rare shared-memory codegen-stash race (a worker vCPU
@@ -66,7 +66,7 @@ try {
   // visible (per AGENTS.md "log flakiness early"); a real regression fails all 3 attempts and stays red.
   const INDEX_ATTEMPTS = 3;
   let pageOk = false;
-  let isolated, powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads;
+  let isolated, powerbox, threads, jit, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads;
   for (let attempt = 1; attempt <= INDEX_ATTEMPTS; attempt++) {
     if (attempt > 1) {
       console.log(`  [I22 retry] index-page attempt ${attempt}/${INDEX_ATTEMPTS} — reloading (a prior attempt hit the rare codegen-race trap; it clears on reload)`);
@@ -95,7 +95,6 @@ try {
     powerbox = await read('powerbox');
     threads = await read('threads');
     jit = await read('jit');
-    inst = await read('inst');
     capio = await read('capio');
     wasmjit = await read('wasmjit');
     tierup = await read('tierup');
@@ -108,7 +107,7 @@ try {
     instthreads = await read('instthreads');
 
     pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
-      threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
+      threads.status === 'pass' && jit.status === 'pass' &&
       capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
       jitcodegen.status === 'pass' && instcodegen.status === 'pass' &&
       instnested.status === 'pass' && instpaged.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
@@ -118,7 +117,7 @@ try {
       break;
     }
     if (attempt < INDEX_ATTEMPTS) {
-      const bad = WORK_IDS.filter((id, i) => [powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads][i].status !== 'pass');
+      const bad = WORK_IDS.filter((id, i) => [powerbox, threads, jit, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads][i].status !== 'pass');
       console.log(`  [I22 retry] attempt ${attempt}: index page not green (failing: ${bad.join(', ') || 'isolated'}) — retrying`);
     }
   }
@@ -127,7 +126,6 @@ try {
   console.log(`  ${powerbox.text}`);
   console.log(`  ${threads.text}`);
   console.log(`  ${jit.text}`);
-  console.log(`  ${inst.text}`);
   console.log(`  ${capio.text}`);
   console.log(`  ${wasmjit.text}`);
   console.log(`  ${tierup.text}`);
@@ -374,14 +372,14 @@ try {
   const ok = pageOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: Temen runs in a real browser — powerbox + genuine multi-Worker ` +
-    `parallelism (incl. §22 guest-JIT on a shared Domain, §14 confined executor children on their ` +
+    `parallelism (incl. §22 guest-JIT on a shared Domain, §14 detached children on their ` +
     `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
     `WebAssembly.Memory under cross-origin isolation — plus the playground (Temen text parsed ` +
     `in-browser via temen_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
     `(Temen IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
     `per-Worker JIT tier-up (a threaded guest's compute leaves run on emitted wasm on their own ` +
     `Workers), §22 guest-JIT real codegen (a guest's Jit.invoke runs the submitted unit on ` +
-    `emitted wasm per-Worker), and §14 instantiate_module real codegen (a confined child runs its ` +
+    `emitted wasm per-Worker), and §14 instantiate real codegen (a detached child runs its ` +
     `granted unit on emitted wasm — the unit compiles on push), all byte-identical to the interpreter`);
 } catch (e) {
   failed = true;

@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**349 exports** in 37 families — 294 referenced from JS, 55 referenced by nothing, 9 behind a `cfg`.
+**354 exports** in 37 families — 298 referenced from JS, 56 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -27,7 +27,7 @@
 | `nim` | 4 | 4 | 0 |
 | `onramp` | 66 | 55 | 0 |
 | `op13jit` | 9 | 9 | 0 |
-| `par` | 70 | 70 | 1 |
+| `par` | 75 | 74 | 2 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
@@ -319,7 +319,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_par_alloc`
 - `temen_par_child`
-- `temen_par_child_confined`
+- `temen_par_child_confined` — *unreferenced*
 - `temen_par_child_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_par_compile`
 - `temen_par_compile_jit`
@@ -341,7 +341,10 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_free`
 - `temen_par_inst_call_interp`
 - `temen_par_inst_eligible`
-- `temen_par_inst_instantiate`
+- `temen_par_inst_end_join`
+- `temen_par_inst_file_child`
+- `temen_par_inst_instantiate_rec`
+- `temen_par_inst_join`
 - `temen_par_inst_paged`
 - `temen_par_inst_pagestate_sync`
 - `temen_par_inst_unit_wasm_len`
@@ -383,10 +386,12 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_stderr_ptr`
 - `temen_par_stdout_len`
 - `temen_par_stdout_ptr`
+- `temen_par_thread_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_par_tierup_argv_len`
 - `temen_par_tierup_argv_ptr`
 - `temen_par_tierup_pagestate_len`
 - `temen_par_tierup_pagestate_ptr`
+- `temen_par_win_len`
 
 ### `parse`
 

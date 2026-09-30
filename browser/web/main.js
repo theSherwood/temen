@@ -89,30 +89,6 @@ async function main() {
     set('jit', 'fail', `jit: error ${e}`);
   }
 
-  // --- 4) §14 confined executor children across real Web Workers (4c-domain §14-D2) ---------------
-  // Three sub-proofs, each a fresh run over a 1 MiB window with 64 KiB carves:
-  //   a. instantiate:  8 confined children (each its own Worker + attenuated powerbox) → 8 × 5 = 40;
-  //   b. nested:       each child instantiates a grandchild over its whole carve — VM-in-VM-in-VM
-  //                    across THREE Worker generations → 8 × 9 = 72;
-  //   c. module:       `instantiate_module` a granted module 8× (compile + push to the shared source
-  //                    + data segments materialized, all crossing Workers) → 8 × 75 = 600.
-  try {
-    const opt = { inst: true, winSize: 1 << 20 };
-    const t0 = performance.now();
-    const a = await runPath('/corpus/threads_inst.temenc', opt);
-    const b = await runPath('/corpus/threads_inst_nested.temenc', opt);
-    const c = await runPath('/corpus/threads_inst_mod.temenc',
-      { ...opt, unitPath: '/corpus/threads_inst_unit.temenc' });
-    const ms = (performance.now() - t0).toFixed(0);
-    const ok = a.value === 40n && b.value === 72n && c.value === 600n;
-    set('inst', ok ? 'pass' : 'fail',
-      `inst: confined children → ${a.value} (want 40) · nested ×${b.started} Workers → ${b.value} ` +
-      `(want 72) · module → ${c.value} (want 600) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
-    log(`inst → ${a.value}/${b.value}/${c.value} (nested spanned ${b.started} Workers) in ${ms}ms`);
-  } catch (e) {
-    set('inst', 'fail', `inst: error ${e}`);
-  }
-
   // --- 5) host I/O from worker vCPUs across real Web Workers (THREADS.md 4d) ----------------------
   // 8 worker vCPUs each `call.cap`-write "tick\n" to the run's ONE shared powerbox (a Mutex<Host> in
   // shared memory — dispatch is in-Rust under the lock, no JS in the loop) and bump a shared counter.
@@ -375,84 +351,84 @@ block 0 (v0: i64) {
     set('jitcodegen', 'fail', `jitcodegen: error ${e}`);
   }
 
-  // --- 9) §14 instantiate_module **real codegen** across real Web Workers (BROWSER.md slice 5) ------
-  // The root `instantiate_module`s a granted unit 8× as confined children (each its own Worker + carve).
-  // With codegen, a child whose unit entry is fully in-subset runs it on EMITTED WASM (the unit
-  // "compiles on push") instead of a confined vCPU — reading the "K"=75 the parent materialized into its
-  // carve → 8 × 75 = 600. Run it BOTH ways: interp (`inst`) and codegen (`instCodegen`); both 600, and
-  // codegen must actually run children on wasm. Cap-using unit entries (nested instantiate) stay interp.
+  // --- 9) §14 detached children **on emitted wasm** across real Web Workers (#1865) -----------------
+  // The root spawns a granted unit 8× as DETACHED children (op-17 v1 records paid from its budget), each
+  // on its own Worker in its own `WebAssembly.Memory`. With codegen, a child whose unit entry is in the
+  // emitter subset runs it on EMITTED WASM bound to that memory — reading the "K"=75 its window was
+  // seeded with → 8 × 75 = 600. Run it BOTH ways: interp (`inst`) and codegen (`instCodegen`); both 600,
+  // and codegen must actually run children on wasm. The growth case: the unit `vm_map`s past its
+  // declared 64 KiB in a helper the emitted entry bounces to its own vCPU, then stores+loads 4242 above
+  // it — so it passes on the emitted tier only if the Worker re-reads the child's `"mapped"` after the
+  // bounce.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_unit.temenc');
-    const opt = { unit, winSize: 1 << 20 };
+    const opt = { unit, winSize: 1 << 20, minter: 8 * 65536 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
     const codegen = await run(guest, { ...opt, instCodegen: true });
-    // #1123 slice 3 — per-event window routing: a carve (128 KiB, `slog 17`) LARGER than the granted
-    // unit's declared memory (`memory 16` = 64 KiB). The unit stores+loads 4242 at byte 100000, above its
-    // declared window but inside the carve — so it succeeds ONLY if the child's live `mapped` is routed to
-    // the carve (else the access faults at `1<<declared`). Must hold on BOTH tiers (interp == codegen),
-    // exercising the browser routing directly rather than by non-regression.
-    const hiGuest = await fetchBytes('/corpus/threads_inst_mod_high.temenc');
-    const hiUnit = await fetchBytes('/corpus/threads_inst_unit_high.temenc');
-    const hiOpt = { unit: hiUnit, winSize: 1 << 20 };
-    const hiInterp = await run(hiGuest, { ...hiOpt, inst: true });
-    const hiCodegen = await run(hiGuest, { ...hiOpt, instCodegen: true });
+    const growGuest = await fetchBytes('/corpus/threads_inst_detached_one.temenc');
+    const growUnit = await fetchBytes('/corpus/threads_inst_unit_grow.temenc');
+    const growOpt = { unit: growUnit, winSize: 1 << 20, minter: 65536 };
+    const growInterp = await run(growGuest, { ...growOpt, inst: true });
+    const growCodegen = await run(growGuest, { ...growOpt, instCodegen: true });
     const ms = (performance.now() - t0).toFixed(0);
-    const hiOk = hiInterp.value === 4242n && hiCodegen.value === 4242n && hiCodegen.tierups > 0;
-    const ok = interp.value === 600n && codegen.value === 600n && codegen.tierups > 0 && hiOk;
+    const growOk = growInterp.value === 4242n && growCodegen.value === 4242n && growCodegen.tierups > 0;
+    const ok = interp.value === 600n && codegen.value === 600n && codegen.tierups > 0 && growOk;
     set('instcodegen', ok ? 'pass' : 'fail',
       `instcodegen: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
-      `(want 600, ${codegen.tierups} children ran on emitted wasm) · carve>declared → interp ${hiInterp.value} / ` +
-      `codegen ${hiCodegen.value} (want 4242) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
-    log(`instcodegen → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted children; carve>declared → ${hiInterp.value}/${hiCodegen.value} across ${codegen.started} Workers in ${ms}ms`);
+      `(want 600, ${codegen.tierups} detached children ran on emitted wasm) · vm_map growth → interp ` +
+      `${growInterp.value} / codegen ${growCodegen.value} (want 4242) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`instcodegen → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted detached children; growth → ${growInterp.value}/${growCodegen.value} across ${codegen.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instcodegen', 'fail', `instcodegen: error ${e}`);
   }
 
-  // --- 10) §14 **VM-in-VM real codegen** (nested instantiate on emitted wasm) -----------------------
-  // Same root, but the granted unit's entry USES its Instantiator: it reads its "K"=75, spawns a pure
-  // grandchild (→ 9) into a narrowed 1 KiB sub-carve of its own window, joins it, returns 84 →
-  // 8 × 84 = 672. With codegen the cap-using entry itself runs on EMITTED WASM (`compile_module_nested`
-  // — the browser's last §14 gap): its instantiate/join arrive as `env.instantiate`/`env.join` imports,
-  // serviced by the Worker through the same completion-slot protocol, the grandchildren spawning on
-  // their own Workers (17 total). Both tiers must agree, and codegen must actually emit (tierups —
-  // children AND their emitted grandchildren bump it).
+  // --- 10) §14 **VM-in-VM real codegen** (a detached child's spawn on emitted wasm, #1865) -----------
+  // Same detached root, but the granted unit's entry SPAWNS: it reads its "K"=75, spawns a pure
+  // grandchild (→ 9) of its own module DETACHED — an op-17 v1 record paid from its own `budget`, the node
+  // that paid for its window (#1944) — joins it, returns 84 → 8 × 84 = 672. With codegen the spawning
+  // entry itself runs on EMITTED WASM: its spawn and join arrive as `env.instantiate_rec`/`env.join`,
+  // admitted and resolved by the child's own vCPU, each grandchild on its own Worker in its own
+  // `Memory` (17 Workers). Both tiers must agree, and codegen must actually emit.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
-    const unit = await fetchBytes('/corpus/threads_inst_nested_unit.temenc');
-    const opt = { unit, winSize: 1 << 20 };
+    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
+    const unit = await fetchBytes('/corpus/threads_inst_nested_detached_unit.temenc');
+    const opt = { unit, winSize: 1 << 20, minter: 16 * 65536 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
     const codegen = await run(guest, { ...opt, instCodegen: true });
     const ms = (performance.now() - t0).toFixed(0);
-    const ok = interp.value === 672n && codegen.value === 672n && codegen.tierups > 0;
+    // Non-vacuity: all 16 ran emitted — the 8 spawning children too, not just their pure grandchildren.
+    const ok = interp.value === 672n && codegen.value === 672n && codegen.tierups === 16;
     set('instnested', ok ? 'pass' : 'fail',
       `instnested: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
-      `(want 672, ${codegen.tierups} emitted incl. VM-in-VM parents) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `(want 672, ${codegen.tierups}/16 emitted incl. the spawning children) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instnested → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instnested', 'fail', `instnested: error ${e}`);
   }
 
-  // --- 10b) §14 **page-op child real codegen** (#1151) ----------------------------------------------
-  // Same root; the granted unit manages its own pages: its entry (emitted, PAGED) calls a helper that
-  // `unmap`s one carve page and `protect`s another read-only — an out-of-subset leaf the Worker bounces
-  // onto the child's own vCPU over its carve (`temen_par_inst_call_interp`), re-syncing the page-state
-  // table after — then reads "K"=75 on the Ro page and stores+loads a marker on an Rw page → 7509;
+  // --- 10b) §14 **page-op child real codegen** (#1151; detached, #1865) ------------------------------
+  // Same detached root; the granted unit manages its own pages: its entry (emitted, PAGED) calls a helper
+  // that `unmap`s one page of its window and `protect`s another read-only — an out-of-subset leaf the
+  // Worker bounces onto the child's own vCPU (`temen_par_inst_call_interp`), re-syncing the page-state
+  // table into the child's header after — then reads "K"=75 on the Ro page and stores+loads a marker on
+  // an Rw page → 7509;
   // 8 × 7509 = 60072 on both tiers, codegen actually emitting. The trap twin stores on the UNMAPPED
   // page: the child faults on both tiers (the root's join propagates it → the run rejects), so the
   // emitted access provably honors the page state, not just the window bound.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_paged_unit.temenc');
     const trapUnit = await fetchBytes('/corpus/threads_inst_paged_trap_unit.temenc');
+    const opt = { winSize: 1 << 20, minter: 8 * 65536 };
     const t0 = performance.now();
-    const interp = await run(guest, { unit, winSize: 1 << 20, inst: true });
-    const codegen = await run(guest, { unit, winSize: 1 << 20, instCodegen: true });
+    const interp = await run(guest, { ...opt, unit, inst: true });
+    const codegen = await run(guest, { ...opt, unit, instCodegen: true });
     const outcome = (p) => p.then(() => 'done', () => 'trap');
-    const trapInterp = await outcome(run(guest, { unit: trapUnit, winSize: 1 << 20, inst: true }));
-    const trapCodegen = await outcome(run(guest, { unit: trapUnit, winSize: 1 << 20, instCodegen: true }));
+    const trapInterp = await outcome(run(guest, { ...opt, unit: trapUnit, inst: true }));
+    const trapCodegen = await outcome(run(guest, { ...opt, unit: trapUnit, instCodegen: true }));
     const ms = (performance.now() - t0).toFixed(0);
     const ok = interp.value === 60072n && codegen.value === 60072n && codegen.tierups > 0 &&
       trapInterp === 'trap' && trapCodegen === 'trap';
@@ -513,16 +489,16 @@ block 0 (v0: i64) {
     set('jitb2', 'fail', `jitb2: error ${e}`);
   }
 
-  // --- 13) §11 **threads inside a granted unit** (CONSOLIDATION.md §11 slice 3) -------------------
+  // --- 13) §11 **threads inside a granted unit** (CONSOLIDATION.md §11 slice 3; detached, #1865) ------
   // The granted unit's entry thread.spawns its OWN f1 (→7), joins it, and does a mismatching
-  // i32.atomic.wait (→1) → 71; 8 confined children → 568. Interp: module-aware spawn through the
-  // relay (each unit thread a real Worker over the child's carve). Codegen: the entry runs on
+  // i32.atomic.wait (→1) → 71; 8 detached children → 568. Interp: module-aware spawn through the
+  // relay (each unit thread a real Worker over the child's own Memory). Codegen: the entry runs on
   // EMITTED WASM, its thread/futex ops arriving as env.thread_spawn/join + env.mem_wait imports —
   // serviced through the same completion-slot protocol. Both tiers must agree.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_threads_unit.temenc');
-    const opt = { unit, winSize: 1 << 20 };
+    const opt = { unit, winSize: 1 << 20, minter: 8 * 65536 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
     const codegen = await run(guest, { ...opt, instCodegen: true });
