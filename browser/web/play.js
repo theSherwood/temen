@@ -7,7 +7,9 @@
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
-import { runJitModule, runWarmJit, runWarmCoop, runJitCompiler, runJitSelfhost, runJitNifler } from './wasmjit-module.js';
+import {
+  runJitModule, runWarmJit, runWarmCoop, runJitCompiler, runJitSelfhost, runJitNifler, nimToolchain, nimCompileRun,
+} from './wasmjit-module.js';
 import { SnapshotClient } from './snapshot-client.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
@@ -1408,50 +1410,36 @@ for x in xs:
     editable: true,
     lang: 'nim',
     mode: 'io',
-    // The three phase guests (gzipped `.temen`) + the nimony stdlib image, plus the child-entry (`_ce`)
-    // variants that let the whole card tier up: `jitNimWholeCardOp13` op-13-spawns each phase as an
-    // emitted child (#1025 3e — ~3.3× faster than the tree-walker, byte-identical). The top-level guests
-    // stay for the interpreter fallback (a phase the orchestrator can't tier runs on the tree-walker).
-    urls: {
-      nifler: './assets/nifler.temen.gz',
-      nimsem: './assets/nimsem.temen.gz',
-      hexer: './assets/hexer.temen.gz',
-      stdlib: './assets/nim_stdlib.img.gz',
-      niflerCe: './assets/nifler_ce.temen.gz',
-      nimsemCe: './assets/nimsem_ce.temen.gz',
-      hexerCe: './assets/hexer_ce.temen.gz',
-      preStdlib: './assets/nim_prestdlib.pack.gz',
-      // #1422: the prebuilt guest libc the nim->powerbox link binds `snprintf`/`strtod`/libm against,
-      // so a program that formats or parses a float (or calls `sin`) can actually run. Not gzipped —
-      // it is the same `.temeno` unit the chibicc card links against (`PG_LIBC_URL`).
-      libc: './assets/pg_libc.temeno',
-    },
-    desc: "**Compile a whole Nim program in your browser** (NIM.md §3c/§3e; #958) — the capstone of the " +
-      "nimony-on-Temen slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
-      "nimony toolchain client-side**: the page plays nifmake itself — computes each module's cache stem " +
-      "exactly as nimony does, crawls your program's `import` graph with `nifler`, then runs `nimsem` " +
-      "(sema — itself spawning `nifler` as a sandboxed `exec` child over a shared in-memory `fs`) and " +
-      "`hexer` (lower) over the whole closure, links the result through the nim→powerbox bridge with " +
-      "`temen-leng`, and **runs `_start` under the powerbox**. Every phase is a verified Temen guest; the " +
-      "stdlib is mounted from a committed `temen_fs` image. Edit the Nim on the left and click Run — the " +
-      "output below is your program's **real stdout**, produced by a Nim program the Temen compiled and " +
-      "ran end-to-end, no server. The default below shows a `proc`, a `string` parameter, and string " +
-      "concatenation (`&`) all compiling through; the language conformance suite (#956) runs **15/15** " +
-      "features end-to-end on the Temen — generics, exceptions, methods, closures, `seq`/`string`/`Table`, " +
-      "floats, iterators, variant/`ref` objects, ARC destructors. (`echo` isn't an identifier nimony " +
-      "resolves yet — a front-end gap; use `write(stdout, …)` for output. The four assets total ~6.5 MB " +
-      "gzipped and inflate in-browser.)",
-    src: `# Edit this Nim, then Run. The whole nimony toolchain compiles it in your
-# browser — nifler (parse) -> nimsem (sema) -> hexer (lower) -> temen-leng
-# (translate + link) — and the result runs on the Temen. The text below is
-# your program's real stdout.
-import std/syncio
+    // nimony's own toolchain, each tool built by nimony with no C compiler (`scripts/nim-toolchain.sh`),
+    // with nimony's library and that library prebuilt: one gzipped registry blob (`nimbuild --bundle`).
+    url: './assets/nimony.blob.gz',
+    desc: "**Compile a whole Nim program in your browser, with nimony's own driver** (#958, #763). Click " +
+      "Run and `nimony t -r --isMain prog.nim` builds your program the way it does on a host, then runs " +
+      "it: nimony plans the build and nifmake runs every step through `/bin/sh` — `nifler2` parses each " +
+      "module, `nimsem` checks it (and builds and runs a program of its own for anything evaluated at " +
+      "compile time), `hexer` lowers it, and `temen-link` links the whole program into one Temen module. " +
+      "Every tool is a verified Temen module that **nimony built from its own source, " +
+      "with no C compiler**; they fork, exec and wait on each other in one sandboxed process tree over " +
+      "an in-memory filesystem. The tree runs on the interpreter, while the processes that only compute " +
+      "(the parser, the lowering, your program) run on emitted wasm — suspended by JSPI where one waits " +
+      "on a pipe. Most of the standard library comes prebuilt (`strutils`, `sequtils`, `tables`, `sets`, " +
+      "`math`, `options`, …), so a build compiles only your own modules. The output below is your " +
+      "program's real stdout. (The toolchain ships as one ~5 MB gzipped asset and inflates in-browser.)",
+    src: `# Edit this Nim, then Run. nimony's own toolchain compiles it in your browser —
+# nifler2 (parse) -> nimsem (check) -> hexer (lower) -> temen-link — and the
+# result runs on the Temen. The text below is your program's real stdout.
+import std/[syncio, strutils]
 
 proc greet(name: string): string =
-  "hello, " & name & "\\n"
+  "hello, " & name
 
-write(stdout, greet("Nim"))
-write(stdout, greet("the Temen"))
+var words = 0
+for word in "the quick brown fox jumps over the lazy dog".split(' '):
+  inc words
+
+echo greet("Nim")
+echo "words: ", words
+echo toUpperAscii("temen")
 `,
   },
   'temen-leng: translate real nimony Leng → Temen IR (self-host)': {
@@ -3198,14 +3186,13 @@ async function runNifler(c) {
   runEnd(rec, { ok: true, status, result: `${nif.length} B .p.nif` });
 }
 
-// Compile a **whole Nim program** in the browser — the nimony toolchain capstone (NIM.md §3c/§3e;
-// #958). Fetch the three phase guests (`nifler`/`nimsem`/`hexer`, gzipped) + the stdlib image
-// (gzipped), inflate them, then hand the editor's Nim as `<main>.nim` to `temen_compile_nim_fs`: the
-// cdylib plays nifmake (computes stems, crawls the `import` graph with nifler), runs nimsem + hexer
-// over the closure (nimsem spawning nifler through a wasm-native `exec` cap over the shared memfs),
-// links through the nim→powerbox bridge, and runs `_start` under the powerbox. The program's real
-// **stdout** comes back on the module stdout slot; a compile/link/run failure lands on stderr. All
-// phases run on the bytecode engine (the ~hundreds-of-func Nim guests fold to the tree-walker); no JIT.
+// Compile a **whole Nim program** in the browser with nimony's own driver, and run it (#958, #763). The
+// card's one asset is nimony's toolchain (`nimony.blob.gz`, `nimToolchain`); `nimCompileRun` runs
+// `nimony t -r --isMain prog.nim` over it, one POSIX process tree: the tree on the interpreter, each
+// leaf process (nifler2, hexer, the program) on emitted wasm, and temen-link natively. It runs on the
+// nim worker, so a build (or a program that never returns) stalls only that worker; a page without one
+// runs it on the main thread.
+let nimMainToolchain = null; // the main thread's `nimToolchain`, when there is no nim worker
 async function runNimc(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching toolchain…');
@@ -3213,136 +3200,58 @@ async function runNimc(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
   const rec = runStart(c, { tier: 'interpreter' });
-  // Lazily fetch + inflate the four assets (each ships **gzipped**: phase `.temen` are ~3–17 MB raw, the
-  // stdlib image ~2.4 MB; DecompressionStream inflates in-browser, no library). In the worker path this
-  // runs **once** — the worker caches the guests — so re-Runs ship only the source, not ~28 MB again.
+  // Fetched and inflated once: the worker keeps the toolchain, so later Runs ship only the source.
   const getAssets = async () => {
-    // #1375: the pre-compiled stdlib pack is optional — fetch best-effort so an older deploy without it
-    // still works (the worker just falls back to the full from-scratch tier-up).
-    const preStdlib = ex.urls.preStdlib
-      ? await fetchTimed(rec, c, ex.urls.preStdlib).then(gunzip).catch(() => null)
-      : null;
-    const [gn, gs, gh, gl, gnc, gsc, ghc] = await Promise.all([
-      fetchTimed(rec, c, ex.urls.nifler),
-      fetchTimed(rec, c, ex.urls.nimsem),
-      fetchTimed(rec, c, ex.urls.hexer),
-      fetchTimed(rec, c, ex.urls.stdlib),
-      fetchTimed(rec, c, ex.urls.niflerCe),
-      fetchTimed(rec, c, ex.urls.nimsemCe),
-      fetchTimed(rec, c, ex.urls.hexerCe),
-    ]);
-    // The guest libc rides along uncompressed; a tree without the asset just gets `null` and the link
-    // leaves those leaves unbound (same behaviour as before #1422).
-    const libc = ex.urls.libc
-      ? await fetchTimed(rec, c, ex.urls.libc).catch(() => null)
-      : null;
-    const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe] =
-      await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl), gunzip(gnc), gunzip(gsc), gunzip(ghc)]);
-    logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B · +child-entry (${niflerCe.length + nimsemCe.length + hexerCe.length}B for the tiered whole card)${preStdlib ? ` · +pre-compiled stdlib (${preStdlib.length}B, skips ~30 s system.nim sema)` : ''}`);
-    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib, libc };
+    const gz = await fetchTimed(rec, c, ex.url);
+    const bundle = await gunzip(gz);
+    logTo(c, `nimony.blob.gz: ${gz.length}B → ${bundle.length}B toolchain (inflated)`);
+    return { bundle };
   };
-  const main = 'prog.nim';
   const source = c.editor.getValue();
-  setState(c, 'running', 'compiling Nim (nifler → nimsem → hexer → link → run)…');
+  nimPrewarmed = true; // a Run warms the toolchain itself: a pre-warm not yet started would only queue
+  setState(c, 'running', 'compiling Nim with nimony (nifler2 → nimsem → hexer → temen-link), then running it…');
   const t0 = performance.now();
-  let status, out, err, tierInfo = null;
+  let r;
   try {
     if (snapshotClient) {
-      // Off the main thread (issue #1005): the whole toolchain runs on the snapshot worker's own engine,
-      // so the ~1–3 min compile — or a runaway compiled guest that never returns — stalls only that
-      // worker, never the page. A fresh Run first `cancelNim`s any still-running one (terminates the
-      // stuck worker), so the card is never wedged by a previous hang.
+      // A fresh Run first cancels a still-running one (terminating its worker), so a program that
+      // never returns cannot wedge the card.
       snapshotClient.cancelNim();
-      // Live-stream the compiled program's stdout as its `_start` runs (#1143) — after the phases finish,
-      // a chatty program prints progressively instead of all at once. The final banner+stdout overwrites.
-      const ndec = new TextDecoder();
-      const r = await snapshotClient.nimCompile(getAssets, source, main,
-        (chunk) => { c.el.stdout.textContent += ndec.decode(chunk, { stream: true }); });
+      r = await snapshotClient.nimCompile(getAssets, source);
       if (!r.ok) throw new Error(r.error || 'nim worker unavailable');
-      ({ status } = r);
-      out = r.stdout;
-      err = r.stderr;
-      // What actually tiered up (the worker's real telemetry — not the hardcoded label below). `tier` is
-      // the whole-card orchestrator's result (`jitNimWholeCardOp13`: per-module crawl/nimsem/hexer on the
-      // wasm-JIT + per-phase ms); `runTier` is which tier ran the compiled program (#1357). A `tier.error`
-      // (or absent `tier`) means the orchestrator declined and the tree-walker did the compile.
-      tierInfo = { ...(r.tier || {}), runTier: r.runTier };
     } else {
-      // Fallback: no worker (e.g. the page lacks cross-origin isolation) — run on the main thread. This
-      // freezes the tab for the duration, but keeps the card working where a worker can't be spawned.
-      const { nifler, nimsem, hexer, stdlib, libc } = await getAssets();
-      // #1422: seed the guest libc on THIS engine too (the main-thread fallback runs a different
-      // instance from the worker's), so `snprintf`/`strtod`/libm bind here as well.
-      if (libc && libc.length) {
-        const lp = Number(eng.ex.temen_alloc(libc.length));
-        new Uint8Array(eng.memory.buffer).set(libc, lp);
-        eng.ex.temen_nim_libc_put(lp, libc.length);
-        eng.ex.temen_dealloc(lp, libc.length);
-      }
-      const srcBytes = new TextEncoder().encode(source);
-      const mainBytes = new TextEncoder().encode(main);
-      // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
-      // fresh view and fill them.
-      const np = eng.ex.temen_alloc(nifler.length);
-      const smp = eng.ex.temen_alloc(nimsem.length);
-      const hp = eng.ex.temen_alloc(hexer.length);
-      const ip = eng.ex.temen_alloc(stdlib.length);
-      const sp = eng.ex.temen_alloc(srcBytes.length);
-      const mp = eng.ex.temen_alloc(mainBytes.length);
-      const view = new Uint8Array(eng.memory.buffer);
-      view.set(nifler, np);
-      view.set(nimsem, smp);
-      view.set(hexer, hp);
-      view.set(stdlib, ip);
-      view.set(srcBytes, sp);
-      view.set(mainBytes, mp);
-      eng.ex.temen_compile_nim_fs(
-        np, nifler.length, smp, nimsem.length, hp, hexer.length,
-        ip, stdlib.length, sp, srcBytes.length, mp, mainBytes.length);
-      status = eng.ex.temen_status();
-      eng.ex.temen_dealloc(np, nifler.length);
-      eng.ex.temen_dealloc(smp, nimsem.length);
-      eng.ex.temen_dealloc(hp, hexer.length);
-      eng.ex.temen_dealloc(ip, stdlib.length);
-      eng.ex.temen_dealloc(sp, srcBytes.length);
-      eng.ex.temen_dealloc(mp, mainBytes.length);
-      out = readModuleStdout();
-      err = readModuleStderr();
+      nimMainToolchain ??= nimToolchain((await getAssets()).bundle);
+      r = await nimCompileRun(eng.ex, eng.memory, nimMainToolchain, source);
     }
   } catch (e) {
-    setState(c, 'error', `${e.message} — run \`bash ../crates/temen-run/demos/nim_e2e_chain/build_e2e_chain.sh\` to build the phase guests + stdlib image`);
+    setState(c, 'error', `${e.message} — run \`ONLY=nim_card bash scripts/rebuild-assets.sh\` to build the toolchain`);
     logTo(c, `compile failed: ${e.message}`);
     runNote(rec, { fetchError: e.message });
     runEnd(rec, { ok: false });
     return;
   }
-  // Report the tier the compiler ACTUALLY ran on (the worker's telemetry), not a hardcoded guess: the
-  // whole card tiers up when the orchestrator seeded every phase (`crawled`/`semmed`/`hexed` > 0, no
-  // `error`); otherwise the tree-walker did the compile. `runTier` (#1357) is the compiled program's tier.
-  const ti = tierInfo || {};
-  const tiered = !ti.error && ti.semmed > 0 && ti.hexed > 0;
-  const tm = ti.timings || {};
-  const compileTier = tiered ? 'wasm-jit (op-13)' : 'interpreter';
-  const ms = runStage(rec, `compile+run:${compileTier}`, performance.now() - t0).toFixed(0);
-  runTier(rec, tiered ? 'wasm-jit' : 'interpreter');
-  if (tierInfo) {
-    const fmt = (n) => (n === undefined ? '?' : `${Math.round(n)}ms`);
-    logTo(c, `tier: compile=${compileTier}${tiered ? ` (crawl ${fmt(tm.crawlMs)} · nimsem ${fmt(tm.nimsemMs)} · hexer ${fmt(tm.hexerMs)})` : ''} · run=${ti.runTier || 'interpreter'}${ti.error ? ` · orchestrator fell back: ${ti.error}` : ''}`);
-  }
-  logTo(c, `compile+run → status ${status}, ${out.length}B stdout in ${ms}ms`);
-  // 0 = OK, 5 = clean Exit. Any other status: a phase/link/run failure — show the diagnostic (stderr).
-  if (status !== 0 && status !== 5) {
-    c.el.stdout.textContent = err || out;
-    setState(c, 'error', `compile failed: status ${status}${err ? ` — ${err.trim().split('\n')[0]}` : ''}`);
-    runEnd(rec, { ok: false, status });
+  const ms = runStage(rec, 'compile+run', performance.now() - t0).toFixed(0);
+  runTier(rec, r.leaves > 0 ? 'wasm-jit' : 'interpreter');
+  runNote(rec, { leaves: r.leaves, resumes: r.resumes });
+  logTo(c, `compile+run → status ${r.status}, exit ${r.exit}, ${r.stdout.length}B stdout in ${ms}ms; ` +
+    `${r.leaves} processes ran on emitted wasm (${r.resumes} parked calls resumed)`);
+  if (!r.built) {
+    // Nothing was linked: what the build printed is nimony's diagnostics.
+    const diag = `${r.stdout}${r.stderr}`;
+    c.el.stdout.textContent = diag;
+    setState(c, 'error', `compile failed${diag ? ` — ${diag.trim().split('\n')[0]}` : ''}`);
+    runEnd(rec, { ok: false, status: r.status });
     return;
   }
   const bar = '─'.repeat(10);
-  c.el.stdout.textContent =
-    `${bar} your Nim, compiled by the Temen (nifler → nimsem → hexer → temen-leng) and run — stdout ${bar}\n${out}`;
-  c.el.result.textContent = `${out.length} B stdout`;
-  setState(c, 'done', `compiled + ran your Nim · ${compileTier} · ${out.length} B stdout · ${ms}ms`);
-  runEnd(rec, { ok: true, status, result: `${out.length} B stdout` });
+  c.el.stdout.textContent = `${bar} your Nim, compiled by nimony on the Temen and run — stdout ${bar}\n${r.stdout}` +
+    (r.stderr ? `${bar} stderr ${bar}\n${r.stderr}` : '');
+  c.el.result.textContent = `${r.stdout.length} B stdout`;
+  const ok = r.exit === 0;
+  setState(c, ok ? 'done' : 'error', ok
+    ? `compiled + ran your Nim · ${r.stdout.length} B stdout · ${ms}ms`
+    : `compiled your Nim; the program exited ${r.exit}`);
+  runEnd(rec, { ok, status: r.status, result: `${r.stdout.length} B stdout` });
 }
 
 // Boot PostgreSQL `--single` single-shot on the main engine (the `temen_run_pg` entry): fetch the
@@ -5589,33 +5498,21 @@ function setupTheme() {
   mq.addEventListener('change', () => { if (sel.value === 'auto') apply('auto'); }); // follow the OS live
 }
 
-// #1375: pre-warm the nim card's toolchain off the main thread. Its first compile otherwise pays a
-// ~5 s one-time guest emit (`nimsem_ce`/`hexer_ce` → wasm, cached per worker) on top of the ~3 s tiered
-// compile. A background compile of a trivial program warms the worker's emit cache + uploaded assets, so
-// the user's first real Run is the fast ~3 s path. Best-effort and at most once: a real Run started
+// #1375: pre-warm the nim card off the main thread: fetch and inflate its toolchain, hand it to the nim
+// worker, and compile and run a trivial program there, so the user's first Run pays neither the download
+// nor the engine's first, unoptimized pass over a build. Best-effort and at most once: a real Run started
 // mid-pre-warm just `cancelNim`s it (no worse than a cold first Run); a completed one makes the Run fast.
 let nimPrewarmed = false;
 async function nimPrewarm(c) {
   const ex = c.ex;
-  if (nimPrewarmed || !snapshotClient || !ex.urls) return;
+  if (nimPrewarmed || !snapshotClient || !ex.url) return;
   nimPrewarmed = true;
   try {
-    const fetchGz = async (u) => (u ? gunzip(await fetchModule(u)) : null);
-    // Reuse `fetchModule`'s cache so the user's real Run re-downloads nothing; the worker caches the
-    // inflated assets after this, so the real Run re-uploads nothing either.
-    const getAssets = async () => {
-      const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib] = await Promise.all([
-        fetchGz(ex.urls.nifler), fetchGz(ex.urls.nimsem), fetchGz(ex.urls.hexer), fetchGz(ex.urls.stdlib),
-        fetchGz(ex.urls.niflerCe), fetchGz(ex.urls.nimsemCe), fetchGz(ex.urls.hexerCe),
-        ex.urls.preStdlib ? fetchGz(ex.urls.preStdlib).catch(() => null) : Promise.resolve(null),
-      ]);
-      const libc = ex.urls.libc
-        ? await fetch(ex.urls.libc).then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)).catch(() => null)
-        : null;
-      return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib, libc };
-    };
+    // Reuse `fetchModule`'s cache so the user's real Run re-downloads nothing; the worker keeps the
+    // inflated toolchain after this, so the real Run re-uploads nothing either.
+    const getAssets = async () => ({ bundle: await gunzip(await fetchModule(ex.url)) });
     setState(c, 'warming', 'warming up the Nim toolchain…');
-    await snapshotClient.nimCompile(getAssets, 'import std/syncio\n\nwrite(stdout, "")\n', 'prewarm.nim', () => {});
+    await snapshotClient.nimCompile(getAssets, 'echo ""\n');
     setState(c, 'ready', 'toolchain warm — compile is fast');
     globalThis.__nimPrewarmDone = true; // test/telemetry hook (harmless)
   } catch (e) { globalThis.__nimPrewarmErr = String(e && e.message || e); /* best-effort; a real Run warms it anyway */ }

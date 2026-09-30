@@ -3,22 +3,29 @@
 //! end — over the self-hosted lane's toolchain and a program tree, and reports how long the build
 //! took, the process's peak resident memory, and what the run held at its end. A measurement, not a
 //! gate: the engine's cost before the wasm factor, from the code the browser runs. It also writes
-//! the library pack the browser seeds ([`temen_browser::library_pack`]).
+//! the library pack the browser seeds ([`temen_browser::library_pack`]), and the toolchain the
+//! playground's nim card ships.
 //!
 //! ```text
 //! nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] [--pack <pack>]
-//!          [--expect <module.temen>] [--leaves]
+//!          [--bundle <toolchain>] [--expect <module.temen>] [--leaves]
 //! ```
 //!
-//! `<toolchain-dir>` holds what `scripts/ci/nim-selfhost-lane.sh` builds: `nimony.temen`,
-//! `nifmake.temen`, `nimsem.temen`, `nifler2.temen`, `hexer.temen`, the shell's `sh.ir`, and the
-//! guest libc as `libc.temeno`. `<tree>` holds `lib/` and `<prog.nim>`; it is seeded at `--at` (by
-//! default its host path, where the lane builds), without its `bin/` or `nimcache/`.
+//! `<toolchain-dir>` holds what `scripts/nim-toolchain.sh` builds: `nimony.temen`, `nifmake.temen`,
+//! `nimsem.temen`, `nifler2.temen`, `hexer.temen`, the shell's `sh.ir`, and the guest libc as
+//! `libc.temeno`. `<tree>` holds `lib/` and `<prog.nim>`; it is seeded at `--at` (by default its
+//! host path, where the lane builds), without its `bin/` or `nimcache/`.
 //!
 //! - `--lib <pack>` seeds a library pack after the tree, so the build compiles only the program's
 //!   own modules. The pack must come from a build at the same `--at`.
 //! - `--pack <pack>` writes the library pack of this build: build a program that imports the
 //!   library, and the pack holds everything it compiled of the library.
+//! - `--bundle <toolchain>` writes the toolchain the nim card ships (`web/assets/nimony.blob.gz`,
+//!   gzipped): a registry blob ([`temen_browser::registry_blob`]) of three entries. `cwd` is `--at`,
+//!   where a build that uses it runs: the pack names it. `commands` is what this build ran with, as
+//!   `temen_nim_open` takes it, the driver (nimony) first. `files` is what this build seeded before
+//!   its program, without the program: the tree's library, then this build's library pack, then the
+//!   guest libc.
 //! - `--expect <module.temen>` is the module the build must link.
 //! - `--leaves` tiers up each leaf process at its entry and serves it by bouncing the entry, the
 //!   native stand-in for running it emitted (#1896).
@@ -77,29 +84,34 @@ fn main() {
         args.drain(i..=i + 1);
         Some(value)
     };
-    let (at, lib, pack, expect) = (
+    let (at, lib, pack, bundle, expect) = (
         flag("--at"),
         flag("--lib"),
         flag("--pack"),
+        flag("--bundle"),
         flag("--expect"),
     );
     let [tools, tree, prog] = &args[..] else {
         panic!(
             "usage: nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] \
-             [--pack <pack>] [--expect <module.temen>] [--leaves]"
+             [--pack <pack>] [--bundle <toolchain>] [--expect <module.temen>] [--leaves]"
         );
     };
     let tools = Path::new(tools);
     let tree = std::fs::canonicalize(tree).unwrap_or_else(|e| panic!("{tree}: {e}"));
     let dir = at.unwrap_or_else(|| tree.to_string_lossy().into_owned());
 
-    let decode = |name: &str| {
-        let m = temen_encode::decode_module(&read(&tools.join(format!("{name}.temen"))))
-            .unwrap_or_else(|e| panic!("decode {name}: {e:?}"));
+    let encoded: Vec<Vec<u8>> = TOOLS
+        .iter()
+        .map(|t| read(&tools.join(format!("{t}.temen"))))
+        .collect();
+    let decode = |(name, bytes): (&&str, &Vec<u8>)| {
+        let m =
+            temen_encode::decode_module(bytes).unwrap_or_else(|e| panic!("decode {name}: {e:?}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
         m
     };
-    let modules: Vec<temen_ir::Module> = TOOLS.iter().map(|t| decode(t)).collect();
+    let modules: Vec<temen_ir::Module> = TOOLS.iter().zip(&encoded).map(decode).collect();
     let sh = String::from_utf8(read(&tools.join("sh.ir"))).expect("sh.ir is text");
     let sh = temen_text::parse_module(&sh).expect("parse sh.ir");
     temen_verify::verify_module(&sh).expect("verify sh.ir");
@@ -118,7 +130,7 @@ fn main() {
     // The tree, without its `bin/` (the toolchain, which the guest has as commands) or its
     // `nimcache/` (what a build writes); then the library pack, newer than the sources it was built
     // from; then the guest libc where `temen-link` looks for it.
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut tree_files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut top: Vec<_> = std::fs::read_dir(&tree)
         .unwrap_or_else(|e| panic!("{}: {e}", tree.display()))
         .flatten()
@@ -128,8 +140,8 @@ fn main() {
         let name = e.file_name().to_string_lossy().into_owned();
         match (name.as_str(), e.path().is_dir()) {
             ("bin" | "nimcache", _) => {}
-            (_, true) => collect(&e.path(), &format!("{dir}/{name}/"), &mut files),
-            (_, false) => files.push((format!("{dir}/{name}"), read(&e.path()))),
+            (_, true) => collect(&e.path(), &format!("{dir}/{name}/"), &mut tree_files),
+            (_, false) => tree_files.push((format!("{dir}/{name}"), read(&e.path()))),
         }
     }
     let lib = lib.map(|p| read(Path::new(&p)));
@@ -137,11 +149,12 @@ fn main() {
         .as_deref()
         .map_or(Vec::new(), temen_browser::blob_entries);
     let libc = read(&tools.join("libc.temeno"));
-    let files: Vec<(&str, &[u8])> = files
+    let libc = ("/lib/temen/libc.temeno", libc.as_slice());
+    let files: Vec<(&str, &[u8])> = tree_files
         .iter()
         .map(|(p, b)| (p.as_str(), b.as_slice()))
         .chain(lib.iter().copied())
-        .chain([("/lib/temen/libc.temeno", libc.as_slice())])
+        .chain([libc])
         .collect();
 
     let argv: [&[u8]; 4] = [b"bin/nimony", b"t", b"--isMain", prog.as_bytes()];
@@ -188,17 +201,51 @@ fn main() {
         );
         eprintln!("✅ it is {e}, byte for byte");
     }
+    if pack.is_none() && bundle.is_none() {
+        return;
+    }
+    let library = temen_browser::library_pack(&b.posix, &dir);
+    let library: Vec<(&str, &[u8])> = library
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
     if let Some(p) = pack {
-        let library = temen_browser::library_pack(&b.posix, &dir);
-        let entries: Vec<(&str, &[u8])> = library
-            .iter()
-            .map(|(n, b)| (n.as_str(), b.as_slice()))
-            .collect();
-        let blob = temen_browser::registry_blob(&entries);
+        let blob = temen_browser::registry_blob(&library);
         std::fs::write(&p, &blob).unwrap_or_else(|e| panic!("{p}: {e}"));
         eprintln!(
             "wrote the library pack {p}: {} files, {} bytes",
-            entries.len(),
+            library.len(),
+            blob.len()
+        );
+    }
+    if let Some(p) = bundle {
+        let sh = temen_encode::encode_module(&sh);
+        let named: Vec<String> = paths.iter().map(|p| p.join("\n")).collect();
+        let commands: Vec<(&str, &[u8])> = named
+            .iter()
+            .map(String::as_str)
+            .zip(encoded.iter().map(Vec::as_slice))
+            .chain([("/bin/sh", sh.as_slice())])
+            .collect();
+        let program = format!("{dir}/{prog}");
+        let seeded: Vec<(&str, &[u8])> = tree_files
+            .iter()
+            .filter(|(p, _)| *p != program)
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .chain(library.iter().copied())
+            .chain([libc])
+            .collect();
+        let blob = temen_browser::registry_blob(&[
+            ("cwd", dir.as_bytes()),
+            ("commands", &temen_browser::registry_blob(&commands)),
+            ("files", &temen_browser::registry_blob(&seeded)),
+        ]);
+        std::fs::write(&p, &blob).unwrap_or_else(|e| panic!("{p}: {e}"));
+        eprintln!(
+            "wrote the toolchain {p}: {} commands, {} files ({} from the library pack), {} bytes",
+            commands.len(),
+            seeded.len(),
+            library.len(),
             blob.len()
         );
     }

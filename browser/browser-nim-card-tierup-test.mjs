@@ -1,12 +1,9 @@
-// Real-browser (V8) end-to-end for the **shipped nim card, tiered on the snapshot worker** (#1025 3e
-// wiring): drives the playground's own `snapshotClient.nimCompile` — the exact path play.js's nim card
-// uses — with the committed `web/assets` guests (now including the child-entry `_ce` variants). The
-// worker runs `jitNimWholeCardOp13` (nifler+nimsem+hexer as op-13 detached emitted children) then the
-// final link+run, and reports what it pre-seeded. Asserts the program's stdout is correct AND that the
-// worker actually tiered up (`tier.semmed`/`hexed` > 0 — not a silent interpreter fallback), proving the
-// asset plumbing (card urls → play.js → snapshot-client → worker) and foreign-memory-in-a-Worker both
-// work end-to-end. Heavier than the direct orchestrator gate (a full worker compile), so it's the
-// shipped-path regression guard on top of `browser-nim-wholecard-op13-test`.
+// Real-browser (V8) end-to-end for the **shipped nim card** (#958): drives the playground's own
+// `snapshotClient.nimCompile` — the exact path play.js's nim card takes — with the committed toolchain
+// (`web/assets/nimony.blob.gz`). The nim worker runs `nimony t --isMain prog.nim` and then the program it
+// built, in one POSIX process tree (`nimCompileRun`). Asserts the program prints what native nimony's
+// build of it prints, that the toolchain's leaf processes ran on emitted wasm rather than falling back to
+// the interpreter, and that a program that does not compile reports nimony's diagnostic and runs nothing.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -18,16 +15,8 @@ async function loadChromium() {
   }
   throw new Error('playwright not found');
 }
-for (const a of ['nifler', 'nimsem', 'hexer', 'nifler_ce', 'nimsem_ce', 'hexer_ce']) {
-  if (!existsSync(`${ROOT}/web/assets/${a}.temen.gz`)) { console.log(`SKIP: web/assets/${a}.temen.gz absent`); process.exit(0); }
-}
-if (!existsSync(`${ROOT}/web/assets/nim_stdlib.img.gz`) ||
-    !existsSync(`${ROOT}/target/wasm32-unknown-unknown/release/temen_browser.wasm`)) {
-  console.log('SKIP: stdlib image or threads wasm absent'); process.exit(0);
-}
-// #1375: this test asserts the pre-compiled stdlib pack is active (crawled === 1) — skip if it's absent.
-if (!existsSync(`${ROOT}/web/assets/nim_prestdlib.pack.gz`)) {
-  console.log('SKIP: web/assets/nim_prestdlib.pack.gz absent'); process.exit(0);
+if (!existsSync(`${ROOT}/target/wasm32-unknown-unknown/release/temen_browser.wasm`)) {
+  console.log('SKIP: threads wasm absent'); process.exit(0);
 }
 
 const chromium = await loadChromium();
@@ -44,74 +33,41 @@ await page.waitForFunction(() => !!globalThis.__snapshotClient, null, { timeout:
   .catch(() => {});
 
 const res = await page.evaluate(async () => {
-  const gunzip = async (u) => new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
-  const fetchGz = async (p) => gunzip(new Uint8Array(await (await fetch(p)).arrayBuffer()));
-  // The card's exact asset set (play.js `getAssets`): the three phase guests + stdlib + the child-entry
-  // `_ce` variants that let the whole card tier up.
-  const getAssets = async () => {
-    const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe] = await Promise.all([
-      fetchGz('./assets/nifler.temen.gz'), fetchGz('./assets/nimsem.temen.gz'), fetchGz('./assets/hexer.temen.gz'),
-      fetchGz('./assets/nim_stdlib.img.gz'),
-      fetchGz('./assets/nifler_ce.temen.gz'), fetchGz('./assets/nimsem_ce.temen.gz'), fetchGz('./assets/hexer_ce.temen.gz')]);
-    // #1375: the pre-compiled stdlib pack (optional) — skips re-semchecking system.nim (~30 s).
-    const preStdlib = await fetchGz('./assets/nim_prestdlib.pack.gz').catch(() => null);
-    // #1422: the prebuilt guest libc the nim->powerbox link binds `snprintf`/`strtod`/libm against.
-    // Ships uncompressed, and the link leaves those leaves unbound without it — so a program that
-    // formats a float (this one does, via `$sqrt`) compiles but cannot run. `play.js` fetches it the
-    // same way; it was missing here only because the old test program never touched a float.
-    const libc = await fetch('./assets/pg_libc.temeno')
-      .then(async (r) => new Uint8Array(await r.arrayBuffer())).catch(() => null);
-    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib, libc };
-  };
-  // #1375: imports several packed stdlib modules **and uses them**. `crawled === 1` below then proves
-  // every one of them came from the pack rather than being re-crawled, and the output proves they
-  // actually work from their prebuilt artifacts — a pack that seeds a broken or mismatched module
-  // would compile but produce the wrong bytes. Before the pack was broadened these three imports cost
-  // ~21-31 s per Run; packed, the whole Run is ~3-5 s.
-  // Everything here stays inside nimony's subset: `[]` on a seq, `parseInt` and friends are `.raises`
-  // and would need a try/except, so the module uses are the non-raising ones.
-  const source = 'import std/syncio\nimport std/strutils\nimport std/tables\nimport std/math\n\n'
+  const client = globalThis.__snapshotClient;
+  if (!client) return { err: 'snapshotClient not exposed (page lacks cross-origin isolation?)' };
+  const gunzip = async (u) => new Uint8Array(await new Response(new Blob([u]).stream()
+    .pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+  // The card's asset, as play.js's `runNimc` fetches it.
+  const getAssets = async () => ({ bundle: await gunzip(new Uint8Array(await (await fetch('./assets/nimony.blob.gz')).arrayBuffer())) });
+  // Uses three modules of the prebuilt library, and a float, which `formatFloat` prints through the
+  // guest libc's `snprintf`.
+  const source = 'import std/[syncio, strutils, tables, math]\n\n'
     + 'proc greet(name: string): string =\n  "hello, " & name & "\\n"\n\n'
     + 'var t = initTable[string, int]()\nt["k"] = 7\n'
     + 'write(stdout, greet("Nim"))\nwrite(stdout, greet("the Temen"))\n'
     + 'write(stdout, toUpperAscii("ab") & "|" & formatFloat(sqrt(4.0), ffDecimal, 1) & "|" & $t.len & "\\n")\n';
-
-  const client = globalThis.__snapshotClient;
-  if (!client) return { err: 'snapshotClient not exposed (page lacks cross-origin isolation?)' };
-  // When the worker streams (chunkSink active), the program's stdout arrives via the callback, not the
-  // final reply — capture it best-effort. The load-bearing signal for the WIRING is the tier telemetry:
-  // `tier.semmed/hexed` prove the worker ran `jitNimWholeCardOp13` (not a silent interpreter fallback).
-  const td = new TextDecoder();
-  let streamed = '';
-  const r = await client.nimCompile(getAssets, source, 'prog.nim', (b) => { try { streamed += td.decode(b, { stream: true }); } catch {} });
-  const replyStdout = typeof r.stdout === 'string' ? r.stdout
-    : (r.stdout && r.stdout.length ? td.decode(r.stdout instanceof Uint8Array ? r.stdout : new Uint8Array(r.stdout)) : '');
-  // `stderr` carries the compile diagnostic when `status != 0`; without it a failure here is a bare
-  // status number and the next person has to re-instrument the test to learn anything.
-  const replyStderr = typeof r.stderr === 'string' ? r.stderr
-    : (r.stderr && r.stderr.length ? td.decode(r.stderr instanceof Uint8Array ? r.stderr : new Uint8Array(r.stderr)) : '');
-  return { ok: r.ok, status: r.status, replyStdout, replyStderr, streamedStdout: streamed, tier: r.tier, runTier: r.runTier, error: r.error };
+  const t0 = performance.now();
+  const ran = await client.nimCompile(getAssets, source);
+  const secs = (performance.now() - t0) / 1000;
+  const failed = await client.nimCompile(getAssets, 'let x: int = "nope"\necho x\n');
+  return { ran, failed, secs };
 });
 
 await browser.close(); server.close();
-console.log('RESULT', JSON.stringify({ ...res, stdout: res.stdout }, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
-const t = res.tier || {};
-const tieredUp = !t.error && t.semmed > 0 && t.hexed > 0;
-// The reply's stdout must be populated (not just the live stream) — that's what play.js renders on the
-// page; a blank reply.stdout is the "no output on screen" bug (#1352 follow-up).
-// The greeting plus one result from each packed module: `AB` from strutils, `2.0` from math, `1` from
-// tables — byte-identical to what native nimony prints for the same program.
-const outOk = (res.replyStdout || '').includes('hello, Nim') && (res.replyStdout || '').includes('AB|2.0|1');
-const runEmitted = res.runTier === 'wasm-jit'; // #1357: the compiled program ran on the wasm-JIT tier
-// #1375: the pre-compiled stdlib pack must be active — the crawl skips every stdlib module, so only the
-// user's own `main` is crawled (crawled === 1). A regression (pack not used, key mismatch, or a module
-// dropped from the pack) crawls that module's whole closure instead.
-const preStdlibActive = t.crawled === 1;
-const ok = res.ok && res.status === 0 && tieredUp && outOk && runEmitted && preStdlibActive;
-console.log(`  nim-card-tierup: status ${res.status} · tier crawled=${t.crawled} semmed=${t.semmed} hexed=${t.hexed} · runTier=${res.runTier} · preStdlib=${preStdlibActive}${t.error ? ` · tier ERR ${t.error}` : ''}`);
-console.log(`  reply.stdout:    ${JSON.stringify((res.replyStdout || '').slice(0, 80))}`);
-if (!ok && res.replyStderr) console.log(`  reply.stderr:    ${JSON.stringify(res.replyStderr.slice(0, 400))}`);
-console.log(`  streamed stdout: ${JSON.stringify((res.streamedStdout || '').slice(0, 80))}`);
-console.log(ok ? 'PASS — the shipped nim card compiled on the worker with the whole card tiered up' : 'FAIL');
+if (res.err) { console.log(`FAIL: ${res.err}`); process.exit(1); }
+const { ran, failed } = res;
+// What native nimony's build of the program prints.
+const want = 'hello, Nim\nhello, the Temen\nAB|2.0|1\n';
+if (!ran.ok || !failed.ok) console.log(`  errors: ${ran.error} / ${failed.error}`);
+console.log(`  ran:    ok ${ran.ok} · status ${ran.status} exit ${ran.exit} · built ${ran.built} · ` +
+  `${ran.leaves} leaf processes emitted, ${ran.resumes} parked calls resumed · ${res.secs.toFixed(1)} s`);
+console.log(`          stdout ${JSON.stringify(ran.stdout)}${ran.stderr ? ` · stderr ${JSON.stringify(ran.stderr.slice(0, 400))}` : ''}`);
+console.log(`  failed: ok ${failed.ok} · exit ${failed.exit} · built ${failed.built} · stdout ${JSON.stringify((failed.stdout || '').slice(0, 200))}`);
+const ok = ran.ok && ran.built && ran.exit === 0 && ran.stdout === want
+  // The program and each of the toolchain's parsing and lowering runs are leaf processes.
+  && ran.leaves >= 3
+  && failed.ok && !failed.built && failed.exit !== 0
+  && /prog\.nim\(1, \d+\) Error: type mismatch/.test(failed.stdout);
+console.log(ok ? 'PASS — the shipped nim card compiled and ran on nimony\'s own driver, leaves on emitted wasm' : 'FAIL');
 process.exit(ok ? 0 : 1);
