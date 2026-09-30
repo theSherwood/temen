@@ -7,7 +7,7 @@
 // no-ops (MVP: no reclamation, like `free`). File-backed mappings (a real `fd`) are **not** supported
 // in the sandbox powerbox — they return `MAP_FAILED`. No authority beyond the Memory capability, all
 // guest C.
-#include <stdlib.h> // size_t, malloc, __pg_pagesize (the map-growing page allocator)
+#include <stdlib.h> // size_t, malloc, __vm_page_size (the map-growing page allocator)
 
 #define PROT_NONE 0x0
 #define PROT_READ 0x1
@@ -31,7 +31,12 @@ static inline void *mmap(void *addr, size_t len, int prot, int flags, int fd, lo
   (void)prot;
   (void)offset;
   if (fd != -1 || !(flags & MAP_ANONYMOUS) || len == 0) return MAP_FAILED;
-  long pg = __pg_pagesize();
+  // The page size from the Memory capability, as `malloc` reads it. Not `__pg_pagesize`: that is a
+  // helper inside the libc bodies, which a program compiled against the prebuilt libc unit
+  // (declarations only) doesn't see — so every `mmap` program failed that compile and took the
+  // slow whole-program retry.
+  long pg = __vm_page_size();
+  if (pg <= 0) pg = 4096;
   // Over-allocate by a page so the payload can be rounded up to a page boundary.
   char *raw = (char *)malloc(len + (size_t)pg);
   if (!raw) return MAP_FAILED;

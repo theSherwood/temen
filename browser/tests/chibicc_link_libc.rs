@@ -641,3 +641,53 @@ fn a_thread_local_is_per_thread_in_a_linked_playground_program() {
         "T1 sees 0\nT2 sees 0\nmain sees 0\n"
     );
 }
+
+/// **An `mmap` program compiles against the prebuilt libc's declarations.** `<sys/mman.h>` called
+/// `__pg_pagesize`, a helper that lives only in the libc bodies, so a program unit compiled
+/// declarations-only failed on it ("implicit declaration"), and c_interpret fell back to compiling the
+/// whole libc into the lesson, which now overruns a lesson's compile budget. The header reads the page
+/// size from the Memory capability itself. The mapping is page-aligned, zero-filled and writable.
+#[test]
+fn an_mmap_program_links_against_the_prebuilt_libc() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        false,
+    );
+    let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
+    let src = r#"#include <stdio.h>
+#include <sys/mman.h>
+int main(void) {
+  char *p = mmap(0, 10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) { printf("failed\n"); return 1; }
+  printf("aligned=%d zero=%d\n", ((long)p & 4095) == 0, p[9999] == 0);
+  p[9999] = 7;
+  printf("wrote=%d unmap=%d\n", p[9999], munmap(p, 10000));
+  return 0;
+}
+"#;
+    let prog_ir = emit_object_flags(
+        &chibicc,
+        "in.c",
+        &[("in.c", src)],
+        false,
+        temen_browser::PG_DECLS_ONLY_ARGV,
+    );
+    let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
+    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    assert!(
+        out.status == STATUS_OK || out.status == STATUS_EXIT,
+        "link+run status {} — stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "aligned=1 zero=1\nwrote=7 unmap=0\n"
+    );
+}
