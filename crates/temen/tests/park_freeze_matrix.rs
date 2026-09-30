@@ -67,8 +67,9 @@ fn interp_row(site: ParkSite) -> Row {
         ParkSite::Stopped => Row::Case(stopped),
         ParkSite::Svc => Row::Case(svc),
         ParkSite::Reap => Row::Unreachable {
-            why: "a blocking `waitpid` waits on a fork twin, which declines the freeze first (#1688); \
-                  `posix_spawn` runs its child through a host delegate and never parks",
+            why: "a blocking `waitpid` waits on a fork twin or a `pspawn`ed process, which declines \
+                  the freeze first (#1688); the delegate `spawn` runs its child through the embedder \
+                  and never parks",
         },
         ParkSite::Lane => Row::Unreachable {
             why: "a run that can freeze is serialized onto one worker, and a task gives its lane back \

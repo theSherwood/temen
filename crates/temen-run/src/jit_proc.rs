@@ -39,7 +39,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use temen_interp::{GuestMem, Host, ParkEvent, ParkTransients, Trap, TwinTrap, Value};
+use temen_interp::{
+    ExecCmd, GuestMem, Host, ParkEvent, ParkTransients, SpawnPlan, Trap, TwinTrap, Value,
+};
 use temen_ir::durable_abi::{ShadowArena, STATE_OFF, STATE_UNWINDING};
 use temen_ir::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
 use temen_ir::{cap_id, FuncIdx, Inst, Module, ValType};
@@ -358,12 +360,15 @@ impl Tree {
         };
         let hooks = twin_host.exit_hooks();
         let tree = Arc::clone(self);
-        let image = Arc::clone(image);
-        let args = point.args().to_vec();
+        let start = Start::Twin {
+            image: Arc::clone(image),
+            window,
+            args: point.args().to_vec(),
+        };
         let spawned = std::thread::Builder::new()
             .name(format!("temen-jit-pid{pid}"))
             .stack_size(PROC_STACK)
-            .spawn(move || tree.run_twin(pid, twin_host, image, window, args));
+            .spawn(move || tree.run_proc(pid, twin_host, start));
         match spawned {
             Ok(t) => {
                 st.live += 1;
@@ -394,22 +399,86 @@ impl Tree {
         pid as i64
     }
 
-    /// A twin's thread: run its process to the end, then retire it — the exit hooks its
+    /// **Spawn** a process for the caller over `host` (a personality `posix_spawn`, the JIT's arm of
+    /// the oracle's `spawn_vcpu`): mint its pid as [`Self::fork`] mints a twin's, commit the spawn's
+    /// staged state to a duplicate of the caller's powerbox ([`Host::spawn_powerbox`]), build its
+    /// image there as an exec builds one ([`Host::exec_image`]), and start it on its own thread, from
+    /// its entry, in a fresh window of the caller's geometry. Nothing of the caller is copied, so
+    /// nothing unwinds: the caller's call completes with the pid, or `-EAGAIN` when no process could
+    /// be minted. A process whose image cannot be built exits as it is born
+    /// ([`Host::spawn_failed`]).
+    fn spawn(
+        self: &Arc<Self>,
+        host: &mut Host,
+        cmd: ExecCmd,
+        plan: SpawnPlan,
+        (mapped, reserved): (u64, u64),
+    ) -> i64 {
+        let mut st = self.lock();
+        if st.live >= self.quota.max_vcpus || self.torn_down.load(Ordering::SeqCst) {
+            return EAGAIN;
+        }
+        let pid = st.next_pid;
+        // #1648 — from here a factory may register a process under this pid: burn it.
+        st.next_pid = pid + 1;
+        let Some(mut twin) = host.spawn_powerbox(pid, plan) else {
+            return EAGAIN;
+        };
+        let built = twin
+            .exec_module(cmd)
+            .and_then(|m| twin.exec_image(&m, &[], 0, 0, mapped, reserved));
+        let img = match built {
+            Ok(img) => img,
+            Err(_) => {
+                twin.spawn_failed(temen_interp::SPAWN_EXEC_FAILED);
+                drop(st);
+                self.ring();
+                return pid as i64;
+            }
+        };
+        let (start, child) = image_start(img);
+        let child = Arc::new(Mutex::new(Some(child)));
+        let (tree, cell) = (Arc::clone(self), Arc::clone(&child));
+        let spawned = std::thread::Builder::new()
+            .name(format!("temen-jit-pid{pid}"))
+            .stack_size(PROC_STACK)
+            .spawn(move || {
+                let host = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(host) = host {
+                    tree.run_proc(pid, host, start);
+                }
+            });
+        match spawned {
+            Ok(t) => {
+                st.live += 1;
+                st.threads.push(t);
+            }
+            // As a fork twin the OS gives no thread: it dies at birth, as a crash, retired through
+            // its exit hooks with its pipe ends released.
+            Err(_) => {
+                let host = child.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(mut host) = host {
+                    host.spawn_failed(temen_interp::reap_status(&Err(Trap::ThreadFault)));
+                }
+                st.traps.push(TwinTrap {
+                    task: pid,
+                    trap: Trap::ThreadFault,
+                    backtrace: Vec::new(),
+                    fault: None,
+                });
+            }
+        }
+        drop(st);
+        // The pipes the caller's duplicate left with no writers or no readers: their waiters see it.
+        self.ring();
+        pid as i64
+    }
+
+    /// A process's thread: run it to the end from `start` (a fork twin re-entering its parent's
+    /// image, or a spawned process starting a new one), then retire it — the exit hooks its
     /// personalities rode in on first (so a parent's re-run `waitpid` finds it a zombie), then the
     /// ring that wakes that parent.
-    fn run_twin(
-        self: Arc<Self>,
-        pid: u64,
-        mut host: Host,
-        image: Arc<Image>,
-        window: TwinWindow,
-        args: Vec<i64>,
-    ) {
-        let start = Start::Twin {
-            image,
-            window,
-            args,
-        };
+    fn run_proc(self: Arc<Self>, pid: u64, mut host: Host, start: Start<'static>) {
         // SAFETY: this thread owns `host` for the whole process.
         let (r, results, final_host) = unsafe { run_process(&self, pid, &mut host, start, None) };
         let result = interp_result(&r, &results);
@@ -645,26 +714,33 @@ unsafe fn run_process(
             retire(tree, cur);
             return (Err(temen_jit::JitError::Malformed), results, image_host);
         };
-        // The commit: the personality hands over the argv it staged, and the new image finds it in
-        // its args region.
-        let init = img.host.exec_commit_args().map(|blob| {
-            let mut buf = vec![0u8; temen_ir::module_args_base() as usize];
-            buf.extend_from_slice(&blob);
-            buf
-        });
         cur.disarm_caller_requests();
-        start = Start::Fresh {
-            program: Program::Command {
-                grant: img.module,
-                digest: img.digest,
-                size_log2: img.child_size.trailing_zeros() as u8,
-            },
-            entry: img.entry as FuncIdx,
-            args: img.entry_args,
-            init_mem: init,
-        };
-        image_host = Some(img.host);
+        let (next, next_host) = image_start(img);
+        start = next;
+        image_host = Some(next_host);
     }
+}
+
+/// Where an image an exec or a spawn built ([`Host::exec_image`]) starts, and the powerbox it runs
+/// over: fresh, at its command's entry, in a window of the caller's backed prefix, with the argv the
+/// commit hands over (the personality's staged argv) in its args region.
+fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
+    let init = img.host.exec_commit_args().map(|blob| {
+        let mut buf = vec![0u8; temen_ir::module_args_base() as usize];
+        buf.extend_from_slice(&blob);
+        buf
+    });
+    let start = Start::Fresh {
+        program: Program::Command {
+            grant: img.module,
+            digest: img.digest,
+            size_log2: img.child_size.trailing_zeros() as u8,
+        },
+        entry: img.entry as FuncIdx,
+        args: img.entry_args,
+        init_mem: init,
+    };
+    (start, img.host)
 }
 
 /// A process is done with its last image: disarm its powerbox, and release the pipe ends it holds
@@ -955,6 +1031,14 @@ pub(crate) unsafe fn serve_request(
                     && window.is_some_and(|w| begin_fork_unwind(w, plan.arena))
             }) {
                 answer(ENOSYS);
+            }
+            false
+        }
+        // As on the interpreters: a fiber, or a source that staged nothing, keeps the op's
+        // placeholder. Nothing of the caller is copied, so nothing unwinds.
+        Some(ParkEvent::SpawnSelf { cmd }) => {
+            if let Some(plan) = parks.spawn.filter(|_| !temen_jit::fiber_active()) {
+                answer(proc.tree.spawn(host, cmd, plan, (mapped, reserved)));
             }
             false
         }
