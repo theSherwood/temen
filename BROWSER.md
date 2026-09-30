@@ -996,7 +996,8 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    and the **Chromium** `#instcodegen` page item (interp vs codegen both → 600 across real Web
    Workers, 8 children on wasm). Correctness rests on the emitter's existing load-op differential
    (`differential.rs`) plus this end-to-end orchestration differential — §14's established proof mode
-   (ground truths asserted in the JS host).
+   (ground truths asserted in the JS host). *Superseded (#1865):* the child is **detached** now — the
+   emit binds its own `WebAssembly.Memory` — and the Node twin's `TEMEN_INST_CODEGEN` mode is gone.
    **[landed — the runtime-compile→emit mechanism, native differential]** The dynamic loop's core is
    in the TCB-side seam, not the JS host: `Host` now carries an injected wasm emitter
    (`set_jit_wasm_emitter`, a bare `fn` like the `JitValidator`), so a closed-blob `Jit.compile` — the
@@ -1114,7 +1115,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    `instpaged` work item (#1151, `threads_inst_paged_unit`: the entry's helper `unmap`s one carve page
    and `protect`s the "K" page read-only, the entry reads K and stores on an `Rw` page → 7509; root
    sums 8 × 7509 = 60072, interp ≡ codegen with every child emitted **paged**; the trap twin storing on
-   the unmapped page faults on both tiers). The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
+   the unmapped page faults on both tiers). *Superseded (#1865):* these items run **detached**
+   children now — the spawn is an op-17 v1 record, serviced from emitted code as `env.instantiate_rec`
+   (`temen_par_inst_instantiate_rec`, admitted by the child's own vCPU) — and
+   `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
    #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a
    page-op child **paged** (`compile_jit_paged` → `compile_module_reactor_paged`; `JitOnrampRun`
    rebuilds the page-state table after each bounce and `driveJitRun` re-points `"pagestate"`/`"mapped"`,

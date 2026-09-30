@@ -322,12 +322,29 @@ block 0 (vsp: i64, vp: i64) {
   },
   inst: {
     mode: 'inst',
-    desc: '§14 sandboxing: the root instantiates 8 confined children — each on its OWN Web Worker, ' +
-      'confined to a 64 KiB carve of the 1 MiB window with an attenuated powerbox — joins them and ' +
-      'sums 8 × 5 = 40.',
-    src: `memory 20
-func (i32) -> (i64) {
-block 0 (v0: i32) {
+    desc: '§14 sandboxing: the root spawns 8 **detached** children of its own func 1 — each on its OWN ' +
+      'Web Worker, in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the ' +
+      'root was granted — joins them and sums 8 × 5 = 40. One op-17 v1 spawn record serves all eight.',
+    src: `memory 16
+; the root: (instantiator, budget) -> sum
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vbud: i32) {
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; 1, size_log2 0 (the declared window) | pager none, module -1 (self) | budget, region -1 (none).
+  ; Everything else — offset, quota, grants, args, child_off — stays zero.
+  vr0 = i64.const 17408
+  vf0 = i64.const 4294967297            ; version 1, entry 1
+  i64.store vr0 vf0
+  vr2 = i64.const 17424
+  vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
+  i64.store vr2 vf2
+  vr3 = i64.const 17432
+  vself = i32.const -1
+  i32.store vr3 vself                   ; module -1 (self)
+  vr3b = i64.const 17436
+  i32.store vr3b vbud                   ; budget
+  vr9 = i64.const 17480
+  i32.store vr9 vself                   ; region -1 (none)
   vi0 = i64.const 0
   br 1(vi0, v0)
 }
@@ -337,19 +354,14 @@ block 1 (vi: i64, vinst: i32) {
   br_if vlt 2(vi, vinst) 3(vinst)
 }
 block 2 (vi2: i64, vinst2: i32) {
-  vone = i64.const 1
-  viplus = i64.add vi2 vone
-  v64k = i64.const 65536
-  voff = i64.mul viplus v64k
-  ventry = i64.const 1
-  vslog = i64.const 16
-  vquota = i64.const 0
-  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst2 (vrp)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
+  vone = i64.const 1
   vinext = i64.add vi2 vone
   br 1(vinext, vinst2)
 }
@@ -379,6 +391,7 @@ block 6 (vs3: i64) {
   return vs3
   }
 }
+; a child: its own window, its own Worker
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 5
@@ -4896,6 +4909,8 @@ async function runText(c) {
   const opts = {
     jit: mode === 'jit',
     inst: mode === 'inst',
+    // The §14 recipe's budget: the root's detached children are paid from it (1 MiB).
+    minter: mode === 'inst' ? 1 << 20 : 0,
     io: mode === 'io',
     // Slice 2 (WASM_AOT.md): the compute-only recipe defaults to the wasm-JIT tier-up path — the
     // interpreter drives, hot in-subset functions run on emitted wasm over the same live window
@@ -5067,7 +5082,7 @@ const POWERBOX_MODES = [
   ['plain', 'none (compute only)'],
   ['io', 'host I/O (stdout)'],
   ['jit', 'guest JIT (§22)'],
-  ['inst', 'instantiator (§14)'],
+  ['inst', 'instantiator + budget (§14)'],
   ['onramp', 'on-ramp host (named powerbox, one thread)'],
 ];
 

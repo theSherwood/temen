@@ -1011,154 +1011,13 @@ block 0 (vsp: i64, vp: i64) {
 }
 "#;
 
-// ---- §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) ----------------------------
-// Browser-sized: carves are 64 KiB (`slog 16` — the wasm page granularity) inside a 1 MiB window
-// (`memory 20`), children at `64 KiB × (i+1)`; handles at `mem[16400 + i*4]` (above the #1094 NULL guard). Ground truths (40 / 72 /
-// 600) are asserted in the JS host, like the threads kernel's 4000.
+// ---- §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2; detached, #1865) ------------
+// Browser-sized: each child is a fresh 64 KiB window (`memory 16` — the wasm page granularity) in its
+// own `WebAssembly.Memory`; the root's handles sit at `mem[16400 + i*4]` (above the #1094 NULL
+// guard). Ground truths are asserted in the JS host, like the threads kernel's 4000.
 
-// Root `(instantiator) -> sum`: instantiate 8 same-module children (func 1), join, sum. 8 × 5 = 40.
-const THREADS_INST: &str = r#"memory 20
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  vi0 = i64.const 0
-  br 1(vi0, v0)
-}
-block 1 (vi: i64, vinst: i32) {
-  vn = i64.const 8
-  vlt = i64.lt_u vi vn
-  br_if vlt 2(vi, vinst) 3(vinst)
-}
-block 2 (vi2: i64, vinst2: i32) {
-  vone = i64.const 1
-  viplus = i64.add vi2 vone
-  v64k = i64.const 65536
-  voff = i64.mul viplus v64k
-  ventry = i64.const 1
-  vslog = i64.const 16
-  vquota = i64.const 0
-  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
-  v4 = i64.const 4
-  vholo = i64.mul vi2 v4
-  v16 = i64.const 16400
-  vhoff = i64.add v16 vholo
-  i32.store vhoff vh
-  vinext = i64.add vi2 vone
-  br 1(vinext, vinst2)
-}
-block 3 (vinst3: i32) {
-  vj0 = i64.const 0
-  vs0 = i64.const 0
-  br 4(vj0, vs0, vinst3)
-}
-block 4 (vj: i64, vs: i64, vinst4: i32) {
-  vn2 = i64.const 8
-  vlt2 = i64.lt_u vj vn2
-  br_if vlt2 5(vj, vs, vinst4) 6(vs)
-}
-block 5 (vj2: i64, vs2: i64, vinst5: i32) {
-  v4b = i64.const 4
-  vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16400
-  vjoff = i64.add v16b vjlo
-  vhh = i32.load vjoff
-  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
-  vsn = i64.add vs2 vr
-  v1b = i64.const 1
-  vjn = i64.add vj2 v1b
-  br 4(vjn, vsn, vinst5)
-}
-block 6 (vs3: i64) {
-  return vs3
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 5
-  return v1
-  }
-}
-"#;
-
-// Same fan-out, but each child (handed its own Instantiator) instantiates a grandchild (func 2) in
-// the upper half of its 64 KiB window (slog 15 at off 32768 — above the child's own NULL guard, which
-// a 64 KiB carve reserves like a root does, #1206; a carve at 0 is refused there exactly as at the
-// root), joins it, and returns its value — VM-in-VM-in-VM across three Worker generations. 8 × 9 = 72.
-const THREADS_INST_NESTED: &str = r#"memory 20
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  vi0 = i64.const 0
-  br 1(vi0, v0)
-}
-block 1 (vi: i64, vinst: i32) {
-  vn = i64.const 8
-  vlt = i64.lt_u vi vn
-  br_if vlt 2(vi, vinst) 3(vinst)
-}
-block 2 (vi2: i64, vinst2: i32) {
-  vone = i64.const 1
-  viplus = i64.add vi2 vone
-  v64k = i64.const 65536
-  voff = i64.mul viplus v64k
-  ventry = i64.const 1
-  vslog = i64.const 16
-  vquota = i64.const 0
-  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst2 (ventry, voff, vslog, vquota)
-  v4 = i64.const 4
-  vholo = i64.mul vi2 v4
-  v16 = i64.const 16400
-  vhoff = i64.add v16 vholo
-  i32.store vhoff vh
-  vinext = i64.add vi2 vone
-  br 1(vinext, vinst2)
-}
-block 3 (vinst3: i32) {
-  vj0 = i64.const 0
-  vs0 = i64.const 0
-  br 4(vj0, vs0, vinst3)
-}
-block 4 (vj: i64, vs: i64, vinst4: i32) {
-  vn2 = i64.const 8
-  vlt2 = i64.lt_u vj vn2
-  br_if vlt2 5(vj, vs, vinst4) 6(vs)
-}
-block 5 (vj2: i64, vs2: i64, vinst5: i32) {
-  v4b = i64.const 4
-  vjlo = i64.mul vj2 v4b
-  v16b = i64.const 16400
-  vjoff = i64.add v16b vjlo
-  vhh = i32.load vjoff
-  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
-  vsn = i64.add vs2 vr
-  v1b = i64.const 1
-  vjn = i64.add vj2 v1b
-  br 4(vjn, vsn, vinst5)
-}
-block 6 (vs3: i64) {
-  return vs3
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  vinst = i32.wrap_i64 v0
-  ventry = i64.const 2
-  voff = i64.const 32768
-  vslog = i64.const 15
-  vquota = i64.const 0
-  vgh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vgr = call.cap 6 1 (i32) -> (i64) vinst (vgh)
-  return vgr
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 9
-  return v1
-  }
-}
-"#;
-
-// The granted "plugin" module for op 5: a 64 KiB window (== the carve, §14 transparency) with a data
-// segment `"K"` (75) at offset 0; its entry reads that own data byte and returns it.
+// The granted "plugin" module: a 64 KiB window with a data segment `"K"` (75) just above the NULL
+// guard; its entry reads that own data byte and returns it.
 const THREADS_INST_UNIT: &str = r#"memory 16
 data 16384 "K"
 func (i64) -> (i64) {
@@ -1171,44 +1030,12 @@ block 0 (v0: i64) {
 }
 "#;
 
-// The **§14 VM-in-VM** granted module: like [`THREADS_INST_UNIT`] but the entry *uses* its
-// `Instantiator` — it reads its own data byte ("K" = 75), `instantiate`s func 1 (a pure grandchild →
-// 9) into a **narrowed** 1 KiB sub-carve of its own window, `join`s it, and returns 75 + 9 = 84. With
-// the same [`THREADS_INST_MOD`] root: 8 × 84 = 672. On the codegen tier the entry emits via
-// `compile_module_nested` — its `call.cap 6 0/1` become `env.instantiate`/`env.join` serviced by the
-// Worker through the confined-child completion-slot protocol (grandchildren spawn on their own
-// Workers), differential against the interpreter's driver servicing the same ops.
-const THREADS_INST_NESTED_UNIT: &str = r#"memory 16
-data 16384 "K"
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  vinst = i32.wrap_i64 v0
-  vz = i64.const 16384
-  vk32 = i32.load8_u vz
-  vk = i64.extend_i32_u vk32
-  ventry = i64.const 1
-  voff = i64.const 32768
-  vslog = i64.const 10
-  vquota = i64.const 0
-  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vg = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  vr = i64.add vk vg
-  return vr
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 9
-  return v1
-  }
-}
-"#;
-
 // #1151 — the **page-op** granted module (the real-Chromium twin of `browser/tests/inst_codegen_paged.rs`):
-// with the same [`THREADS_INST_MOD`] root, the unit's entry (emitted, **paged**) calls a helper that
-// `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an out-of-subset
-// leaf the Worker bounces whole onto the child's own vCPU over its carve, re-syncing the page-state
-// table after — then reads K on the `Ro` page and stores + loads a marker at `target`, returning
+// with the detached root ([`inst_detached_root`], #1865), the unit's entry (emitted, **paged**) calls a
+// helper that `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an
+// out-of-subset leaf the Worker bounces whole onto the child's own vCPU over its own window, re-syncing
+// the page-state table into the child's header after — then reads K on the `Ro` page and stores + loads
+// a marker at `target`, returning
 // `75 × 100 + 9 = 7509`; the root sums 8 × 7509 = 60072. Offsets are 16 KiB multiples so they are
 // page-aligned on a 4 KiB (wasm) or 16 KiB host page. `target` on an `Rw` page (16 KiB + 8) passes; on
 // the unmapped page P (`threads_inst_paged_trap_unit`) the child faults on BOTH tiers.
@@ -1418,9 +1245,9 @@ block 6 () {
 
 // §11 slice 3: the granted unit's entry uses the THREAD + FUTEX primitives — spawn its own f1
 // (→ 7), join, and a mismatching i32.atomic.wait (mem[16448] = 0 ≠ 99 → 1) → 71; with the same
-// [`THREADS_INST_MOD`] root: 8 × 71 = 568. On the codegen tier the entry runs on emitted wasm, its
+// [`inst_detached_root`]: 8 × 71 = 568. On the codegen tier the entry runs on emitted wasm, its
 // ops bounced through env.thread_spawn/env.thread_join/env.mem_wait — each spawned thread a real
-// Worker over the child's own carve (worker.js services them via the spawn relay + completion slot).
+// Worker over the child's own memory (worker.js services them via the spawn relay + completion slot).
 const THREADS_INST_THREADS_UNIT: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -1447,48 +1274,52 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-// Root `(instantiator, module) -> sum`: `instantiate_module` the granted module 8 times, join, sum —
-// compile + push-to-shared-source + data materialization crossing Workers. 8 × 75 = 600.
-const THREADS_INST_MOD: &str = r#"memory 20
-func (i32, i32) -> (i64) {
-block 0 (vinst0: i32, vmod0: i32) {
-  vmod64 = i64.extend_i32_s vmod0
-  vi0 = i64.const 0
-  br 1(vi0, vinst0, vmod64)
-}
-block 1 (vi: i64, vinst: i32, vmod: i64) {
-  vn = i64.const 8
+// #1865 — a root `(instantiator, module, budget) -> sum`
+// that spawns the granted module `n` times through one op-17 v1 record (module and budget filled in
+// at run time), each child in a fresh window of its own on its own Worker and `Memory`, paid from the
+// budget, then joins them and sums. With [`THREADS_INST_UNIT`]: 8 × 75 = 600.
+fn inst_detached_root(n: u64) -> String {
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(
+        17408,
+        &temen_ir::SpawnRec::v1(0),
+        Some("vmod0"),
+        "vbud0",
+    );
+    format!(
+        r#"memory 20
+{seg}func (i32, i32, i32) -> (i64) {{
+block 0 (vinst0: i32, vmod0: i32, vbud0: i32) {{
+{stores}  vi0 = i64.const 0
+  br 1(vi0, vinst0)
+}}
+block 1 (vi: i64, vinst: i32) {{
+  vn = i64.const {n}
   vlt = i64.lt_u vi vn
-  br_if vlt 2(vi, vinst, vmod) 3(vinst)
-}
-block 2 (vi2: i64, vinst2: i32, vmod2: i64) {
-  vone = i64.const 1
-  viplus = i64.add vi2 vone
-  v64k = i64.const 65536
-  voff = i64.mul viplus v64k
-  ventry = i64.const 0
-  vslog = i64.const 16
-  vquota = i64.const 0
-  vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst2 (vmod2, ventry, voff, vslog, vquota)
+  br_if vlt 2(vi, vinst) 3(vinst)
+}}
+block 2 (vi2: i64, vinst2: i32) {{
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst2 (vrp)
   v4 = i64.const 4
   vholo = i64.mul vi2 v4
   v16 = i64.const 16400
   vhoff = i64.add v16 vholo
   i32.store vhoff vh
+  vone = i64.const 1
   vinext = i64.add vi2 vone
-  br 1(vinext, vinst2, vmod2)
-}
-block 3 (vinst3: i32) {
+  br 1(vinext, vinst2)
+}}
+block 3 (vinst3: i32) {{
   vj0 = i64.const 0
   vs0 = i64.const 0
   br 4(vj0, vs0, vinst3)
-}
-block 4 (vj: i64, vs: i64, vinst4: i32) {
-  vn2 = i64.const 8
+}}
+block 4 (vj: i64, vs: i64, vinst4: i32) {{
+  vn2 = i64.const {n}
   vlt2 = i64.lt_u vj vn2
   br_if vlt2 5(vj, vs, vinst4) 6(vs)
-}
-block 5 (vj2: i64, vs2: i64, vinst5: i32) {
+}}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {{
   v4b = i64.const 4
   vjlo = i64.mul vj2 v4b
   v16b = i64.const 16400
@@ -1499,47 +1330,85 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
   br 4(vjn, vsn, vinst5)
-}
-block 6 (vs3: i64) {
+}}
+block 6 (vs3: i64) {{
   return vs3
-  }
+  }}
+}}
+"#
+    )
 }
-"#;
 
-// #1123 slice 3 — a **carve LARGER than the granted unit's declared memory** (the malloc/nim-phase
-// shape: the child grows its heap above `1<<declared`). The root `instantiate_module`s the unit once
-// into a **128 KiB** carve (`slog 17`) at a 128 KiB-aligned offset, while the unit declares only
-// `memory 16` (64 KiB). The unit then stores+loads a sentinel at byte 100000 — inside `[64 KiB, 128 KiB)`,
-// above its declared window but inside the carve — and returns it (4242). This only succeeds when the
-// child's live `"mapped"` is routed to the carve (128 KiB); with `mapped == 1<<declared` (64 KiB) the
-// access faults. Asserted in the JS host (main.js) on BOTH the interp and emitted-codegen tiers, so it
-// exercises the browser per-event window routing directly, not just non-regression.
-const THREADS_INST_MOD_HIGH: &str = r#"memory 20
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vmod0: i32) {
-  vmod = i64.extend_i32_s vmod0
-  ventry = i64.const 0
-  voff = i64.const 131072
-  vslog = i64.const 17
-  vquota = i64.const 0
-  vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod, ventry, voff, vslog, vquota)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vh)
+// #1865 — the §14 VM-in-VM granted module: the child reads its own "K" (75), spawns
+// func 1 of its own module (a pure grandchild → 9) detached through an op-17 v1 record, paid from its
+// own `"budget"` — the node that paid for its window (#1944) — joins it and returns 75 + 9 = 84. With
+// [`inst_detached_root`]: 8 × 84 = 672. On the codegen tier the spawn and join arrive as the Worker's
+// `env.instantiate_rec`/`env.join`, admitted and resolved by the child's own vCPU; the `"budget"`
+// lookup (`self.resolve`, outside the emitter subset) is func 2, a bounce, so the entry emits.
+fn inst_nested_detached_unit() -> String {
+    let (seg, stores) =
+        temen_browser::plan::spawn_rec_ir(17408, &temen_ir::SpawnRec::v1(1), None, "vb");
+    format!(
+        r#"memory 16
+data 16384 "K"
+data 16392 "budget"
+{seg}func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vinst = i32.wrap_i64 va
+  vq = i64.const 16384
+  vk8 = i32.load8_u vq
+  vk = i64.extend_i32_u vk8
+  vb = call 2 ()
+{stores}  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vr = i64.add vk vj
   return vr
-  }
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  v9 = i64.const 9
+  return v9
+  }}
+}}
+func () -> (i32) {{
+block 0 () {{
+  vbp = i64.const 16392
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  return vb
+  }}
+}}
+"#
+    )
 }
-"#;
 
-// The granted unit for [`THREADS_INST_MOD_HIGH`]: declares `memory 16` (64 KiB) but is run over a larger
-// carve; it stores+loads `4242` at byte 100000 (in `[64 KiB, carve)`) and returns it — proving the child
-// reaches above its declared memory only because `"mapped"` is routed to the carve.
-const THREADS_INST_UNIT_HIGH: &str = r#"memory 16
+// #1865 — a detached child that grows its own window: its entry calls func 1, which `vm_map`s
+// `[64 KiB, 128 KiB)` past its declared 64 KiB, then stores+loads `4242` at byte 100000 and returns
+// it. On the emitted tier func 1 is a bounce to the child's own vCPU, so the store after it passes
+// only if the Worker re-reads the child's `"mapped"` after the bounce. (It replaces the carve case
+// of a window larger than the declared one, which has no detached meaning: a detached window is the
+// module's own, grown by `vm_map`.)
+const THREADS_INST_UNIT_GROW: &str = r#"memory 16
+import 0 "vm_map" (i64, i64, i32) -> (i64)
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  vg = call 1 ()
   vaddr = i64.const 100000
   vsent = i64.const 4242
   i64.store vaddr vsent
   vgot = i64.load vaddr
   return vgot
+  }
+}
+func () -> (i64) {
+block 0 () {
+  voff = i64.const 65536
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vg = call.import 0 (voff, vlen, vprot)
+  return vg
   }
 }
 "#;
@@ -2288,13 +2157,14 @@ fn main() {
     emit("threads_jit_install", THREADS_JIT_INSTALL);
     // §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) — the confined-executor-child
     // kernels + the granted module for op 5. Ground truths (40 / 72 / 600) asserted in the JS host.
-    emit("threads_inst", THREADS_INST);
-    emit("threads_inst_nested", THREADS_INST_NESTED);
-    emit("threads_inst_mod", THREADS_INST_MOD);
+    emit("threads_inst_detached", &inst_detached_root(8));
+    emit("threads_inst_detached_one", &inst_detached_root(1));
+    emit("threads_inst_unit_grow", THREADS_INST_UNIT_GROW);
+    emit(
+        "threads_inst_nested_detached_unit",
+        &inst_nested_detached_unit(),
+    );
     emit("threads_inst_unit", THREADS_INST_UNIT);
-    emit("threads_inst_mod_high", THREADS_INST_MOD_HIGH);
-    emit("threads_inst_unit_high", THREADS_INST_UNIT_HIGH);
-    emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
     // #1151 — the page-op unit (→ 8 × 7509 = 60072) and its trap twin (store on the unmapped page).
     emit("threads_inst_paged_unit", &inst_paged_unit(16384 + 8));
     emit("threads_inst_paged_trap_unit", &inst_paged_unit(32768 + 8));

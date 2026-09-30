@@ -1375,6 +1375,15 @@ struct ConfinedSpawn {
     budget: i32,
 }
 
+/// Read the op-17 spawn record at window offset `rp`: its version word says how long it is (v0 carve,
+/// v1 detached). A bad version or reserved field is a `CapFault` (fail closed).
+fn read_spawn_rec(m: &Mem, rp: u64) -> Result<SpawnRec, Trap> {
+    let head = m.read_window(rp, 56)?;
+    let head: &[u8; 56] = head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
+    let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
+    SpawnRec::parse(&m.read_window(rp, len)?).ok_or(Trap::CapFault)
+}
+
 /// A §5 detached spawn (op 15, #1286) as its lowering resolved it: a separate module in a fresh
 /// window of its own, never a carve of the spawner's.
 #[derive(Clone, Copy)]
@@ -1397,6 +1406,22 @@ struct DetachedSpawn {
     /// A `SharedRegion` of the spawner's, `(region, child_off)`, aliased into the child's window
     /// before it starts.
     premap: Option<(i32, u64)>,
+}
+
+impl DetachedSpawn {
+    /// A v1 (detached) op-17 record's spawn: op 15 as data (#1863).
+    fn of(sr: &SpawnRec) -> DetachedSpawn {
+        DetachedSpawn {
+            budget: sr.budget,
+            module: sr.modh,
+            entry: sr.entry as i64,
+            size_log2: sr.size_log2,
+            quota: sr.quota,
+            grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
+            args: (sr.args.1 > 0).then_some(sr.args),
+            premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
+        }
+    }
 }
 
 /// What an admitted child runs.
@@ -3289,14 +3314,15 @@ pub fn compile_and_run_capture_over_parallel_with_host(
 // across `std::thread`s as the differential proof.
 
 /// A compiled module, shareable **read-only** across vCPUs / threads / Workers (its [`Domain`] is
-/// `Sync`). Built once per run; each [`Vcpu`] borrows it. Also carries the memory declaration + data
-/// segments so each vCPU can build its window over the shared backing.
+/// `Sync`). Built once per run; each [`Vcpu`] borrows it. Also carries the memory declaration + the
+/// module itself (its data segments) so each vCPU can build its window over the shared backing.
 pub struct VcpuProgram {
     dom: Domain,
     mem_size_log2: Option<u8>,
     /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
     shadow: Option<super::ShadowArena>,
-    data: Vec<temen_ir::Data>,
+    /// The module compiled — see [`module`](VcpuProgram::module).
+    module: std::sync::Arc<Module>,
     /// #964: the module's NULL-guard extent (`0` = unmarked/legacy), captured at compile so every
     /// window this program is run over seeds the same guard the module's layout was built for.
     null_guard: u64,
@@ -3329,11 +3355,17 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             shadow: m.memory.as_ref().and_then(|mc| mc.shadow),
-            data: m.data.clone(),
+            module: std::sync::Arc::new(m.clone()),
             null_guard: temen_ir::module_null_guard(),
             fibers: SharedFibers::new(),
             next_vcpu: std::sync::atomic::AtomicU64::new(1),
         })
+    }
+
+    /// The module this program was compiled from: the running module a host registers
+    /// ([`Host::set_self_module`]), so a spawn record's `module = -1` names it.
+    pub fn module(&self) -> &std::sync::Arc<Module> {
+        &self.module
     }
 
     /// Reserve the next dense vCPU id (a `thread.spawn` child's), in spawn order across the run.
@@ -3920,6 +3952,18 @@ enum ChildWindow {
 }
 
 impl PendingChild {
+    /// The module the child runs, as its spawner's program source numbers it, and its entry — what
+    /// a host that runs the child on an emitted tier checks its emit against.
+    pub fn module_entry(&self) -> (u32, u32) {
+        (self.module, self.entry)
+    }
+
+    /// The module the child's program is (its powerbox's running module) — how a host that emitted
+    /// one module tells whether the child runs it.
+    pub fn self_module(&self) -> Option<&std::sync::Arc<Module>> {
+        self.host.self_module.as_ref()
+    }
+
     /// Start the child as a vCPU over `back`. For a confined child, `back` covers exactly its carve —
     /// `[win + carve, +2^size_log2)` of the parent's window, which per DESIGN.md §14 simply *is* the
     /// child's window (anything the parent wrote there, a module child's data segments, is already in
@@ -4016,7 +4060,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4041,7 +4085,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4066,7 +4110,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation(reserved_log2, sl, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4091,7 +4135,7 @@ impl<'p> Vcpu<'p> {
         let mem = prog.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, prog.shadow);
             mm.seed(init_mem);
-            mm.init_data(&prog.data);
+            mm.init_data(&prog.module.data);
             mm.seed_null_guard(prog.null_guard); // #964
             mm
         });
@@ -4585,16 +4629,13 @@ impl<'p> Vcpu<'p> {
                         vcpu: self.prog.take_vcpu_id(),
                     };
                 }
-                Ok(VcpuStop::Join { handle, dst }) => {
-                    match super::take_child(&mut self.children, handle) {
-                        Ok(child) => {
-                            self.pending = Some(dst);
-                            self.joining = child.lease;
-                            return VcpuEvent::Join { child: child.token };
-                        }
-                        Err(t) => return VcpuEvent::Trapped(t),
+                Ok(VcpuStop::Join { handle, dst }) => match self.join_child(handle) {
+                    Ok(child) => {
+                        self.pending = Some(dst);
+                        return VcpuEvent::Join { child };
                     }
-                }
+                    Err(t) => return VcpuEvent::Trapped(t),
+                },
                 Ok(VcpuStop::CapPending { id, dst }) => {
                     let comps = match self.shared_host {
                         Some(m) => m.lock_unpoisoned().completions(),
@@ -4809,49 +4850,84 @@ impl<'p> Vcpu<'p> {
         Ok(Some((child, carve)))
     }
 
-    /// A §14 `instantiate` (op 0) that this vCPU's code issued on an **emitted** tier — the emitted
-    /// parent's spawn bounce (the browser's `env.instantiate`) — admitted as the interpreted op is:
-    /// the `Instantiator` handle `inst` resolved in this vCPU's powerbox, then
-    /// [`admit_confined_child`] against its window and fuel. The child runs this vCPU's module.
-    /// `Ok(Some((child, carve)))`: the admitted child and where its carve starts in this vCPU's
-    /// window; `Ok(None)`: refused (`-EINVAL`); `Err`: a trap (a forged handle).
-    pub fn admit_instantiate(
-        &mut self,
-        inst: i32,
-        entry: i64,
-        off: i64,
-        size_log2: i64,
-        quota: i64,
-    ) -> Result<Option<(PendingChild, u64)>, Trap> {
-        let (ibase, isize) = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().resolve_instantiator(inst)?,
-            None => self.host.resolve_instantiator(inst)?,
-        };
-        self.admit_confined(ConfinedSpawn {
-            ibase,
-            isize,
-            module: None,
-            entry,
-            off,
-            size_log2,
-            quota,
-            grants: None,
-            budget: 0,
-        })
-    }
-
     /// Deliver the host's `token` for the child the last [`VcpuEvent::Spawn`],
     /// [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced, once the host has
     /// started it. The engine files it under the next handle — the spawn's result, which the guest
     /// joins it by — and hands the token back on that join ([`VcpuEvent::Join`]). A token is whatever
     /// finds the child again on the host's side: a completion slot, a thread id, an index.
     pub fn deliver_child(&mut self, token: u64) {
+        let handle = self.file_child(token);
+        self.deliver_code(handle);
+    }
+
+    /// File the host's `token` for a child this vCPU admitted under the next handle, with the
+    /// admission's window lease, and return the handle. What [`deliver_child`](Self::deliver_child)
+    /// does for an interpreted spawn, and what a host calls itself for a spawn its emitted code
+    /// issued ([`admit_record`](Self::admit_record)), whose handle goes back to that code.
+    pub fn file_child(&mut self, token: u64) -> i32 {
         let handle = self.children.len() as i32;
         self.children.push(Some(VcpuChild {
             token,
             lease: self.pending_lease.take(),
         }));
-        self.deliver_code(handle);
+        handle
+    }
+
+    /// A `join` this vCPU's **emitted** code issued (the browser's `env.join` bounce): resolve
+    /// `handle` by the oracle's child-table rule, as the interpreted join does, and return the host's
+    /// token for the child, once. The host waits on the child, then calls
+    /// [`end_join`](Self::end_join). `Err` is the trap the interpreted join raises.
+    pub fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
+        let child = super::take_child(&mut self.children, handle)?;
+        self.joining = child.lease;
+        Ok(child.token)
+    }
+
+    /// The child a join resolved has ended: its window's bytes go back to the budget that paid.
+    pub fn end_join(&mut self) {
+        if let Some((budget, bytes)) = self.joining.take() {
+            self.budget_mem_give(budget, bytes);
+        }
+    }
+
+    /// An op-17 record this vCPU's **emitted** code spawned (the browser's `env.instantiate_rec`
+    /// bounce, #1865), admitted as the interpreted op is: the `Instantiator` resolved in this vCPU's
+    /// powerbox, the record read from its window, and a v1 record through [`admit_detached_child`],
+    /// the one detached admission. A v0 (carve) record traps, as the interpreted op does on every
+    /// host that runs this vCPU over a window of its own. `Ok(Some((child, size_log2)))`: admitted —
+    /// the host starts it, then [`file_child`](Self::file_child)s its token; `Ok(None)`: refused
+    /// (`-EINVAL`); `Err`: a trap.
+    pub fn admit_record(
+        &mut self,
+        inst: i32,
+        rec: u64,
+    ) -> Result<Option<(PendingChild, u8)>, Trap> {
+        match self.shared_host {
+            Some(m) => m.lock_unpoisoned().resolve_instantiator(inst)?,
+            None => self.host.resolve_instantiator(inst)?,
+        };
+        let sr = read_spawn_rec(self.mem.as_ref().ok_or(Trap::Malformed)?, rec)?;
+        if !sr.detached || sr.pager != u32::MAX {
+            return Err(Trap::CapFault);
+        }
+        let spawn = DetachedSpawn::of(&sr);
+        let admitted = match self.shared_host {
+            Some(m) => admit_detached_child(
+                &mut m.lock_unpoisoned(),
+                self.mem.as_ref(),
+                self.fuel,
+                spawn,
+                true,
+            ),
+            None => admit_detached_child(&mut self.host, self.mem.as_ref(), self.fuel, spawn, true),
+        }?;
+        let Some((child, window)) = admitted else {
+            return Ok(None);
+        };
+        let (size_log2, lease) = (window.size_log2, child.lease);
+        let child = self.pending_child(child, spawn.entry as u32, ChildWindow::Fresh(window))?;
+        self.pending_lease = lease;
+        Ok(Some((child, size_log2)))
     }
 
     /// Give `bytes` back to `budget` in this vCPU's powerbox.
@@ -4879,9 +4955,7 @@ impl<'p> Vcpu<'p> {
     /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
     /// child trap propagates (the joiner traps on its next `run`).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
-        if let Some((budget, bytes)) = self.joining.take() {
-            self.budget_mem_give(budget, bytes);
-        }
+        self.end_join();
         let dst = self.pending.take().expect("deliver with no pending event");
         match res {
             Ok(vals) => {
@@ -18512,15 +18586,8 @@ impl Vm {
                     let ih = r!(*handle).i32();
                     let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
-                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                    let head = m.read_window(rp, 56)?;
-                    let head: &[u8; 56] =
-                        head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
-                    // The version word says how long the record is (v0 carve, v1 detached).
-                    let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
-                    let raw = m.read_window(rp, len)?;
                     // Shared layout decode (#911); pager/budget handling stays tier-local.
-                    let sr = SpawnRec::parse(&raw).ok_or(Trap::CapFault)?; // version / reserved — fail closed
+                    let sr = read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
                     if sr.detached {
                         // #1863: a v1 record is op 15 as data — the same outcome op 15 produces,
                         // served by every driver's detached arm. No pager on this tier (see above).
@@ -18532,16 +18599,7 @@ impl Vm {
                         self.cur = cur;
                         self.base = base;
                         self.pc = pc + 1;
-                        let spawn = DetachedSpawn {
-                            budget: sr.budget,
-                            module: sr.modh,
-                            entry: sr.entry as i64,
-                            size_log2: sr.size_log2,
-                            quota: sr.quota,
-                            grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
-                            args: (sr.args.1 > 0).then_some(sr.args),
-                            premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
-                        };
+                        let spawn = DetachedSpawn::of(&sr);
                         return Ok(Outcome::InstantiateDetached { spawn, dst });
                     }
                     let entry = sr.entry as i64;

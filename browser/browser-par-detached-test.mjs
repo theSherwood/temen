@@ -12,6 +12,15 @@
 // The root returns Σ(word_i + 1) + h4 = (1001 + 2001 + 3001) - 22. Non-vacuity: `started === 4` — the
 // root and three child Workers were all created (the children are spawned before any join, so all
 // three run at once, each over its own memory).
+//
+// #1865: the same run again with `instCodegen` — each child's entry runs on EMITTED wasm bound to its
+// own Memory. Its `vm_map` sits in a helper the emitted entry bounces to the child's own vCPU, so the
+// emitted store on the grown page passes only if the Worker re-read the child's `"mapped"` after the
+// bounce. Non-vacuity: `tierups === 3`, one per child that ran emitted.
+//
+// Two more #1865 pins. A root's child of its OWN module (a record's `module = -1`) stays on the
+// interpreter under `instCodegen` even when the granted unit emits a function at the same entry: only a
+// child whose program is the unit runs the unit's emit. And a carve spawn (op 0) fails closed.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -72,7 +81,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 `;
 // The child: the payload word at module_args_base() (16384 + 128), a vm_map of [64 KiB, 80 KiB) past
-// the declared window, the word stored + reloaded on the grown page, returned + 1.
+// the declared window (in func 1, which the emitted entry bounces to), the word stored + reloaded on
+// the grown page, returned + 1.
 const CHILD_SRC = `memory 16
 import 0 "vm_map" (i64, i64, i32) -> (i64)
 
@@ -80,10 +90,7 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vab = i64.const 16512
   va = i64.load vab
-  voff = i64.const 65536
-  vlen = i64.const 16384
-  vprot = i32.const 3
-  vg = call.import 0 (voff, vlen, vprot)
+  vg = call 1 ()
   vp = i64.const 65600
   i64.store vp va
   vld = i64.load vp
@@ -92,12 +99,86 @@ block 0 (v0: i64) {
   return vs
   }
 }
+func () -> (i64) {
+block 0 () {
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vg = call.import 0 (voff, vlen, vprot)
+  return vg
+  }
+}
 `;
 const CHILD_LOG2 = 16, MINTER_QUOTA = 3 * (1 << CHILD_LOG2);
+// #1865: the root spawns its OWN func 1 (→ 7) through an op-17 v1 record (`module = -1`) and joins
+// it, with a granted unit whose func 1 (→ 9) is emitted. Only a child that runs the granted unit may
+// run its emit, so with `instCodegen` this child stays interpreted: 7, no emitted children.
+const SELF_ROOT_SRC = `memory 16
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vm: i32, vbud: i32) {
+  vr0 = i64.const 17408
+  vf0 = i64.const 4294967297
+  i64.store vr0 vf0
+  vr2 = i64.const 17424
+  vf2 = i64.const -4294967296
+  i64.store vr2 vf2
+  vr3 = i64.const 17432
+  vself = i32.const -1
+  i32.store vr3 vself
+  vr3b = i64.const 17436
+  i32.store vr3b vbud
+  vr9 = i64.const 17480
+  i32.store vr9 vself
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+`;
+const NINE_UNIT_SRC = `memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 1
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v9 = i64.const 9
+  return v9
+  }
+}
+`;
+// A §14 carve spawn (op 0) on the par driver fails closed: its children are detached (#1865).
+const CARVE_ROOT_SRC = `memory 20
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ve = i64.const 1
+  voff = i64.const 65536
+  vslog = i64.const 16
+  vq = i64.const 0
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vslog, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v5 = i64.const 5
+  return v5
+  }
+}
+`;
 
-const res = await page.evaluate(async ({ rootSrc, childSrc, minter }) => {
+const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc }) => {
   const { loadEngine, makeRunner } = await import('./par.js');
-  const once = async (eng) => {
+  const once = async (eng, codegen = false, src = { root: rootSrc, child: childSrc, minter }) => {
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
   const parse = (src) => {
@@ -110,11 +191,13 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter }) => {
     if (ok !== 1) throw new Error('parse: ' + new TextDecoder().decode(out));
     return out;
   };
-  const root = parse(rootSrc), child = parse(childSrc);
+  const root = parse(src.root), child = src.child ? parse(src.child) : null;
   const run = makeRunner(eng);
   try {
-    const { value, started } = await run(root, { inst: true, unit: child, minter });
-    return { value: value.toString(), started };
+    const { value, started, tierups } = await run(root, codegen
+      ? { instCodegen: true, unit: child, minter: src.minter, winSize: src.winSize }
+      : { inst: true, unit: child, minter: src.minter, winSize: src.winSize });
+    return { value: value.toString(), started, tierups };
   } catch (e) {
     return { err: String(e && e.message ? e.message : e) };
   }
@@ -127,8 +210,11 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter }) => {
   const fresh = await loadEngine(eng);
   const usedBytes = eng.memory.buffer.byteLength, freshBytes = fresh.memory.buffer.byteLength;
   const second = await once(fresh);
-  return { ...first, second, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
-}, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA });
+  const emitted = await once(await loadEngine(fresh), true);
+  const self = await once(await loadEngine(fresh), true, { root: selfRootSrc, child: nineUnitSrc, minter: 1 << 16 });
+  const carve = await once(await loadEngine(fresh), false, { root: carveRootSrc, child: null, minter: 0, winSize: 1 << 20 });
+  return { ...first, second, emitted, self, carve, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
+}, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC });
 
 await browser.close();
 await new Promise((r) => server.close(r));
@@ -136,8 +222,18 @@ console.log('RESULT', JSON.stringify(res));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
 const EXPECT = String(1001 + 2001 + 3001 - 22);
 const again = res.second && !res.second.err && res.second.value === EXPECT && res.second.started === 4;
-const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory;
+const em = res.emitted;
+const emittedOk = em && !em.err && em.value === EXPECT && em.started === 4 && em.tierups === 3;
+const sf = res.self, cv = res.carve;
+const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 0;
+const carveOk = cv && /carve spawn is not served/.test(cv.err ?? '');
+// The carve run's Worker reports its refusal as a failure; that one is expected.
+const unexpected = errors.filter((e) => !/carve spawn is not served/.test(e));
+const ok = unexpected.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk;
 console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4${res.err ? ` · ERR ${res.err}` : ''}`);
 console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
+console.log(`  on emitted wasm: value ${em?.value}/${EXPECT} workers ${em?.started}/4 emitted children ${em?.tierups}/3${em?.err ? ` · ERR ${em.err}` : ''}`);
+console.log(`  own-module child under instCodegen: value ${sf?.value}/7 emitted ${sf?.tierups}/0${sf?.err ? ` · ERR ${sf.err}` : ''}`);
+console.log(`  carve spawn: ${carveOk ? 'fails closed' : `NOT refused (${cv?.err ?? cv?.value})`}`);
 console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth' : 'FAIL');
 process.exit(ok ? 0 : 1);
