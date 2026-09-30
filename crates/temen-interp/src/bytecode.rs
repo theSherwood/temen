@@ -1717,7 +1717,8 @@ impl FreshWindow {
 /// **probeable refusal** — the driver lands `-EINVAL` and nothing was charged; `Err` is a trap (a
 /// forged handle, an unreadable payload). The checks — entry shape, the window = the module's
 /// declared memory, the payload fitting the args area, `premap_admit`, durability — run before the
-/// `Budget.mem` take, so a refusal charges nothing.
+/// `Budget.mem` take, so a refusal charges nothing; one after it (the child's imports not binding)
+/// hands the take back (`Host::undo_detached_spawn`, #1975).
 ///
 /// `freezes_detached`: whether a freeze of this run captures a detached child. A durable domain
 /// spawns detached only an attested-freezable module, and only while it holds freeze authority over
@@ -1778,26 +1779,13 @@ fn admit_detached_child(
     };
     let durable = host.is_durable();
     let durable_ok = !durable || (freezes_detached && cdurable);
-    if !ok_entry
-        || child_size == 0
-        || !mod_ok
-        || !payload_ok
-        || !premap_ok
-        || !durable_ok
-        || match host.admit_detached_spawn(s.budget, child_size) {
-            // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do
-            // not yet return a lane at their reap, so the lane is given straight back (#1600). The
-            // window's bytes stay spent while the child lives: the driver returns them at its end
-            // (`AdmittedChild::lease`).
-            Some(lane) => {
-                host.give_lane(lane);
-                false
-            }
-            None => true,
-        }
-    {
+    if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || !durable_ok {
         return Ok(None);
     }
+    let Some(lane) = host.admit_detached_spawn(s.budget, child_size) else {
+        return Ok(None);
+    };
+    // #1975 — every exit from here that builds no child hands back what the admission took.
     let mut child_host = Host::new();
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
@@ -1814,6 +1802,7 @@ fn admit_detached_child(
     // The pre-mapped region rides the child's powerbox; the window build aliases it in.
     if let Some((r, o)) = s.premap {
         if !host.stage_premap(r, o, &mut child_host) {
+            host.undo_detached_spawn(s.budget, child_size, lane);
             return Err(Trap::Malformed);
         }
     }
@@ -1826,8 +1815,13 @@ fn admit_detached_child(
         child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
     };
     if bound.is_err() {
+        host.undo_detached_spawn(s.budget, child_size, lane);
         return Ok(None);
     }
+    // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet
+    // return a lane at their reap, so the lane is given straight back (#1600). The window's bytes stay
+    // spent while the child lives: the driver returns them at its end (`AdmittedChild::lease`).
+    host.give_lane(lane);
     let args = child_entry_args(arity, cinst, cas);
     let fuel = if s.quota <= 0 {
         parent_fuel

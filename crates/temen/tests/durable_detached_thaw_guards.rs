@@ -111,7 +111,12 @@ fn verified(m: temen_ir::Module) -> temen_ir::Module {
 }
 
 fn parent() -> temen_ir::Module {
-    verified(transform_module(&parse(PARENT)).expect("transform"))
+    parent_of(PARENT)
+}
+
+/// A parent from its source, instrumented as [`PARENT`] is.
+fn parent_of(src: &str) -> temen_ir::Module {
+    verified(transform_module(&parse(src)).expect("transform"))
 }
 
 /// The child touches memory, so it takes the confined transform: its data sits above the arena, and
@@ -187,41 +192,49 @@ fn run(
     }
 }
 
-/// Fresh: child `src` on `engine` with no freeze.
-fn fresh(engine: Engine, src: &str) -> Option<Out> {
+/// Fresh: `parent` over child `src` on `engine` with no freeze.
+fn fresh(engine: Engine, parent: &temen_ir::Module, src: &str) -> Option<Out> {
     let child = child_module(src);
     let (mut host, args) = powerbox(&child);
     let win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    run(engine, &parent(), &args, &win, &mut host).map(|(o, _)| o)
+    run(engine, parent, &args, &win, &mut host).map(|(o, _)| o)
 }
 
-/// Freeze from the start on `froze` (the child is cut in its loop, before the probe), carry the tree
-/// through the codec, and thaw it on `thaws`.
-fn thawed(froze: Engine, thaws: Engine, src: &str) -> Option<Out> {
-    let parent = parent();
-    let child = child_module(src);
+/// Freeze `parent` over `child` from the start on `engine`, so the child is cut in its loop before
+/// the probe: the frozen powerbox (the child captured live), the args, and the window image.
+fn frozen(
+    engine: Engine,
+    parent: &temen_ir::Module,
+    child: &temen_ir::Module,
+) -> Option<(Host, Vec<i64>, Vec<u8>)> {
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     write_state(&mut win, STATE_UNWINDING);
     // The JIT runs the child on its own thread, so on a loaded runner it can finish its loop (and
     // run the probe) before the freeze reaches it; that run is not the case under test — retry it
     // (#1760).
     let mut attempts = 0;
-    let (fhost, args, fsnap) = loop {
-        let (mut fhost, args) = powerbox(&child);
-        let (_, fsnap) = run(froze, &parent, &args, &win, &mut fhost)?;
+    loop {
+        let (mut fhost, args) = powerbox(child);
+        let (_, fsnap) = run(engine, parent, &args, &win, &mut fhost)?;
         if fhost.captured_detached().len() == 1 {
-            break (fhost, args, fsnap);
+            return Some((fhost, args, fsnap));
         }
         attempts += 1;
-        assert!(attempts < 50, "{froze:?} never froze the child live");
-    };
-    let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
+        assert!(attempts < 50, "{engine:?} never froze the child live");
+    }
+}
+
+/// Freeze `parent` on `froze` ([`frozen`]), carry the tree through the codec, and thaw it on `thaws`.
+fn thawed(froze: Engine, thaws: Engine, parent: &temen_ir::Module, src: &str) -> Option<Out> {
+    let child = child_module(src);
+    let (fhost, args, fsnap) = frozen(froze, parent, &child)?;
+    let art = temen_snapshot::freeze(parent, &fsnap, &fhost).expect("serialize");
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.grant_durable_module(&child);
-    let mut twin = temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
+    let mut twin = temen_snapshot::restore(&art, parent, &mut thost).expect("restore");
     begin_thaw(&mut twin, ARENA, 0);
-    run(thaws, &parent, &args, &twin, &mut thost).map(|(o, _)| o)
+    run(thaws, parent, &args, &twin, &mut thost).map(|(o, _)| o)
 }
 
 /// Every fresh and thawed run of `probe` answers `want`; reports every cell that does not.
@@ -231,17 +244,22 @@ fn check(probe: &str, want: Out) {
 
 /// [`check`] over a whole child source.
 fn check_child(src: &str, want: Out) {
+    check_with(&parent(), src, want);
+}
+
+/// [`check_child`] under `parent`.
+fn check_with(parent: &temen_ir::Module, src: &str, want: Out) {
     use Engine::*;
     let mut wrong = Vec::new();
     for e in [Interp, Jit] {
-        match fresh(e, src) {
+        match fresh(e, parent, src) {
             Some(o) if o != want => wrong.push(format!("fresh on {e:?}: {o:?}")),
             _ => {}
         }
     }
     for froze in [Interp, Jit] {
         for thaws in [Interp, Jit] {
-            match thawed(froze, thaws, src) {
+            match thawed(froze, thaws, parent, src) {
                 Some(o) if o != want => {
                     wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: {o:?}"))
                 }
@@ -268,6 +286,50 @@ fn a_thawed_detached_child_cannot_unmap_its_null_guard() {
 #[test]
 fn a_thawed_detached_childs_null_load_faults() {
     check(NULL_LOAD, Out::Trap("MemoryFault".into()));
+}
+
+/// [`PARENT`], returning instead the room left in its budget (`v2`) once it has joined the child.
+const PARENT_ROOM: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 17
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vf = i64.const 1
+  vroom = call.cap 14 1 (i64) -> (i64) v2 (vf)
+  return vroom
+  }
+}
+";
+
+/// #1971 — a freeze keeps a captured child's window charged, on either engine: the child is carried,
+/// not ended, so at the cut its budget still has the 128 KiB window out. The JIT's teardown used to
+/// hand the window back when the freeze ended the child's task, so its artifacts carried no charge for
+/// a child that runs on after the thaw.
+#[test]
+fn a_freeze_keeps_a_captured_childs_window_charged() {
+    let parent = parent_of(PARENT_ROOM);
+    let child = child_module(&child(RO_LOAD));
+    for engine in [Engine::Interp, Engine::Jit] {
+        let Some((mut host, args, _)) = frozen(engine, &parent, &child) else {
+            continue;
+        };
+        let room = host
+            .cap_dispatch_slots(temen_interp::cap_id::BUDGET, 1, args[2] as i32, &[1], None)
+            .expect("read")[0];
+        assert_eq!(room, (1 << 20) - (1 << 17), "frozen on {engine:?}");
+    }
+}
+
+/// #1971 — a child that was live at the freeze hands its window back to the budget that paid for it
+/// when it ends after the thaw, as an unfrozen child does: once the parent has joined it, the budget
+/// has all its room again. The relaunch used to file no lease, so the window stayed charged.
+#[test]
+fn a_thawed_detached_childs_end_hands_its_window_back() {
+    check_with(&parent_of(PARENT_ROOM), &child(RO_LOAD), Out::Ret(1 << 20));
 }
 
 /// A store to the readonly segment faults after a thaw as before it.

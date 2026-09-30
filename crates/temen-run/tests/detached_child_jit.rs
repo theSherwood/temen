@@ -187,6 +187,91 @@ fn a_detached_child_on_the_jit_holds_the_budget_that_paid_for_it() {
     assert_eq!(run_jit(&p, &c, 1 << 20), want, "the JIT");
 }
 
+/// A detached child (`memory 16`) importing `exit`, which no grant binds.
+const CHILD_IMPORTS_EXIT: &str = r#"memory 16
+import 0 "exit" (i32) -> ()
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vr = i64.const 42
+  return vr
+  }
+}
+"#;
+
+/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
+/// 2^16, grants `(gp, gn)`), and if the spawn is refused return the room left in `v2`, else `-1`.
+fn parent_room_after_refusal(gp: u64, gn: u64) -> String {
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  vgp = i64.const {gp}
+  vgn = i64.const {gn}
+  vlog = i64.const 16
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, vz, vlog, vz, vz, vz)
+  vz32 = i32.const 0
+  vneg = i32.lt_s vh vz32
+  br_if vneg 1(v2) 2()
+}}
+block 1 (vb: i32) {{
+  vf = i64.const 1
+  vr = call.cap 14 1 (i64) -> (i64) vb (vf)
+  return vr
+}}
+block 2 () {{
+  vm = i64.const -1
+  return vm
+  }}
+}}
+"#
+    )
+}
+
+/// #1975 — a spawn refused after its admission charges nothing. The child's imports are bound after
+/// the budget's take, and an unbound one refuses the spawn `-EINVAL`: the refusal hands the take
+/// back, so the budget keeps all its room, on the JIT as on the interpreter.
+#[test]
+fn a_detached_spawn_refused_for_an_unbound_import_charges_nothing() {
+    let p = module(&parent_room_after_refusal(0, 0));
+    let c = module(CHILD_IMPORTS_EXIT);
+    assert_eq!(run_interp(&p, &c, 1 << 20), 1 << 20, "interpreter oracle");
+    assert_eq!(run_jit(&p, &c, 1 << 20), 1 << 20, "the JIT");
+}
+
+/// #1975 — on the JIT the builder reads the grant records after the budget's take, so a record out
+/// of the window traps there: the trap hands the take back too. (The interpreter reads them before
+/// its admission and traps the same way, having charged nothing.)
+#[test]
+fn a_detached_spawn_trapping_on_its_grant_records_charges_nothing() {
+    let p = module(&parent_room_after_refusal(1 << 40, 1));
+    let c = module(CHILD);
+    let (mut host, h) = host(&c, 1 << 20);
+    let args = [h[0] as i64, h[1] as i64, h[2] as i64];
+    let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
+        &p,
+        0,
+        &args,
+        &[],
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        temen_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+        Some(temen_run::module_resolver),
+        Some(grant_hooks(&mut host as *mut Host)),
+    )
+    .expect("jit run");
+    assert!(
+        matches!(jo, JitOutcome::Trapped(_)),
+        "the record out of the window traps: {jo:?}"
+    );
+    let room = host
+        .cap_dispatch_slots(cap_id::BUDGET, 1, h[2], &[1], None)
+        .expect("read")[0];
+    assert_eq!(room, 1 << 20, "the trap handed the window back");
+}
+
 /// #1972 — the JIT's op-15 thunk admits a child (`budget_mem_take`) and builds it
 /// (`build_detached`) in two hook calls, and a concurrent run's hooks each take the parent's lock on
 /// their own. So two vCPUs of one domain can admit, admit, build, build. Each build must still give

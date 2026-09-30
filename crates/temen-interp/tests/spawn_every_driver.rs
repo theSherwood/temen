@@ -429,6 +429,30 @@ const PAYLOAD: i64 = 1000;
 /// 32 KiB window, funded by `budget`, handed `PAYLOAD` as its 8-byte args payload and, iff `grant`,
 /// `stdout` by name.
 fn op15(grant: bool) -> String {
+    op15_then(grant, JOIN_OR_ERRNO)
+}
+
+/// #1975 — the tail of a parent that reports what a refused spawn left in its budget: the `mem` room,
+/// or `-1` if the spawn was admitted after all.
+const ROOM_AFTER_REFUSAL: &str = "\
+  vz = i32.const 0
+  vneg = i32.lt_s vch vz
+  br_if vneg 1(vbud) 2()
+}
+block 1 (vb1: i32) {
+  vf = i64.const 1
+  vroom = call.cap 14 1 (i64) -> (i64) vb1 (vf)
+  return vroom
+}
+block 2 () {
+  vm = i64.const -1
+  return vm
+  }
+}
+";
+
+/// [`op15`] ending in `tail` instead of [`JOIN_OR_ERRNO`].
+fn op15_then(grant: bool, tail: &str) -> String {
     format!(
         "memory 17
 func (i32, i32, i32, i32) -> (i64) {{
@@ -445,7 +469,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
   q = i64.const 0
   al = i64.const 8
   vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gp, gn, en, sl, q, pa, al)
-{JOIN_OR_ERRNO}",
+{tail}",
         g = store_grant("g", 16384, 16484, "stdout", "vout"),
         n = u8::from(grant),
     )
@@ -581,6 +605,15 @@ fn a_detached_child_whose_import_is_unbound_is_refused() {
     let child = module(DETACHED_IMPORTS_EXIT);
     let setup = op15_setup(&child, 1 << 20);
     agree_on_every_driver("op 15, an unbound import", &m, &setup, &ok(-22));
+    // #1975 — and it charged nothing: the import is bound after the admission, whose take the refusal
+    // hands back, so the budget still has all its room.
+    let m = module(&op15_then(false, ROOM_AFTER_REFUSAL));
+    agree_on_every_driver(
+        "op 15, an unbound import charges nothing",
+        &m,
+        &setup,
+        &ok(1 << 20),
+    );
 }
 
 #[test]
