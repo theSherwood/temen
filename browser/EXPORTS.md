@@ -348,8 +348,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_child_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_par_compile`
 - `temen_par_compile_jit`
+- `temen_par_deliver_child`
 - `temen_par_deliver_code`
-- `temen_par_deliver_handle`
 - `temen_par_deliver_jit_invoke`
 - `temen_par_deliver_jit_invoke_trap`
 - `temen_par_deliver_join`

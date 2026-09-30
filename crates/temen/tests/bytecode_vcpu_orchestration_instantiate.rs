@@ -317,7 +317,6 @@ fn drive<'s, 'e>(
     orch: &'e Orch,
     mut vcpu: bytecode::Vcpu<'e>,
 ) -> Result<Vec<Value>, Trap> {
-    let mut handles: Vec<u64> = Vec::new(); // local handle (index) → global id
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(vals) => return Ok(vals),
@@ -341,13 +340,10 @@ fn drive<'s, 'e>(
                     let r = drive(scope, prog, child_win, orch, child);
                     orch.publish(id, r);
                 });
-                let handle = handles.len() as i32;
-                handles.push(id);
-                vcpu.deliver_handle(handle);
+                vcpu.deliver_child(id);
             }
-            bytecode::VcpuEvent::Join { handle } => {
-                let id = handles[handle as usize];
-                vcpu.deliver_join(orch.join(id));
+            bytecode::VcpuEvent::Join { child } => {
+                vcpu.deliver_join(orch.join(child));
             }
             _ => panic!("unexpected event in the instantiate orchestration kernels"),
         }

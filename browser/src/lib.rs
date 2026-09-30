@@ -712,6 +712,9 @@ pub extern "C" fn temen_par_alloc(len: usize) -> *mut u8 {
 pub const PAR_DONE: i32 = 0;
 pub const PAR_TRAP: i32 = 1;
 pub const PAR_SPAWN: i32 = 2;
+/// `thread.join` (or a §14 `join`) of a live child: `temen_par_ev_a` = the token the host gave for it
+/// ([`temen_par_deliver_child`] — the JS hosts give its completion slot). The engine resolved the
+/// guest's handle, so a bad one never reaches the host: the vCPU traps instead.
 pub const PAR_JOIN: i32 = 3;
 pub const PAR_WAIT: i32 = 4;
 pub const PAR_NOTIFY: i32 = 5;
@@ -2562,8 +2565,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 v.d = vcpu as i64;
                 return PAR_SPAWN;
             }
-            bytecode::VcpuEvent::Join { handle } => {
-                v.a = handle as i64;
+            bytecode::VcpuEvent::Join { child } => {
+                v.a = child as i64;
                 return PAR_JOIN;
             }
             bytecode::VcpuEvent::Wait {
@@ -2792,11 +2795,13 @@ par_ev_getter!(temen_par_ev_b, b);
 par_ev_getter!(temen_par_ev_c, c);
 par_ev_getter!(temen_par_ev_d, d);
 
-/// Deliver a `thread.spawn` handle (after `PAR_SPAWN`).
+/// Deliver the host's token for the child a `PAR_SPAWN`, `PAR_INSTANTIATE` or
+/// `PAR_INSTANTIATE_DETACHED` announced, once its Worker is started: the engine issues the guest's
+/// handle, and a join of it hands the token back ([`PAR_JOIN`]).
 #[no_mangle]
-pub extern "C" fn temen_par_deliver_handle(v: *mut ParVcpu, handle: i32) {
+pub extern "C" fn temen_par_deliver_child(v: *mut ParVcpu, token: i64) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_handle(handle) };
+    unsafe { (*v).inner.deliver_child(token as u64) };
 }
 
 /// Deliver a `memory.wait` code / `memory.notify` count (after `PAR_WAIT` / `PAR_NOTIFY`).
@@ -11995,7 +12000,8 @@ struct Op13JitDriver {
     child: std::sync::Arc<temen_ir::Module>,
     mem_base: *mut u8,
     layout: Layout,
-    /// Joined child results, indexed by the handle `instantiate` returns (the `join` takes them).
+    /// Finished children's results, indexed by the token this driver gave each one
+    /// ([`bytecode::Vcpu::deliver_child`]); the engine's join hands the token back once.
     children: Vec<Option<Result<Vec<Value>, Trap>>>,
     /// The driver's final return value (set on `Done`).
     result: i64,
@@ -12959,9 +12965,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             let r = child
                                 .start(prog, back, Some(decl))
                                 .and_then(|c| nimc::drive_op13(prog, carve_ptr, c, None));
-                            let handle = d.children.len() as i32;
+                            let token = d.children.len() as u64;
                             d.children.push(Some(r));
-                            d.root.deliver_handle(handle);
+                            d.root.deliver_child(token);
                             continue; // the driver's `join` on this handle is serviced inline below
                         }
                     },
@@ -13056,9 +13062,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             temen_interp::host_page_size(),
                         ));
                         let r = child.start(prog, back, None).and_then(drive_detached_leaf);
-                        let handle = d.children.len() as i32;
+                        let token = d.children.len() as u64;
                         d.children.push(Some(r));
-                        d.root.deliver_handle(handle);
+                        d.root.deliver_child(token);
                         continue;
                     }
                 };
@@ -13121,8 +13127,10 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             // above could come to exist with nobody having decided what the other build does.
             #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
             bytecode::VcpuEvent::InstantiateDetached { .. } => return OP13JIT_TRAP,
-            bytecode::VcpuEvent::Join { handle } => {
-                let banked = temen_interp::take_child(&mut d.children, handle).and_then(|r| r);
+            bytecode::VcpuEvent::Join { child } => {
+                let banked = d.children[child as usize]
+                    .take()
+                    .expect("the engine hands a child's token back once");
                 d.root.deliver_join(banked);
                 // continue: the driver's own join is serviced without yielding to JS
             }
@@ -13217,9 +13225,9 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
             backing.write_byte(i as u64, *b);
         }
     }
-    let handle = d.children.len() as i32;
+    let token = d.children.len() as u64;
     d.children.push(Some(Ok(vec![Value::I64(value)])));
-    d.root.deliver_handle(handle);
+    d.root.deliver_child(token);
     STATUS_OK
 }
 

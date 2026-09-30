@@ -8,6 +8,7 @@
     all(windows, target_arch = "x86_64")
 ))]
 
+use std::time::Duration;
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
     write_state, STATE_UNWINDING,
@@ -449,22 +450,39 @@ fn a_detached_child_its_parent_is_joining_rides_the_freeze() {
 /// the freeze captured no child. Every thaw answers the uninterrupted `7`.
 #[test]
 fn a_controller_freeze_reaches_the_detached_child_a_jit_parent_is_joining() {
-    use temen_jit::FreezeController;
-    let parent = parent();
-    let child = child_module(&waiting_child(1000));
-    let (mut fhost, args) = powerbox(&child);
+    // Well inside the child's second-long wait, so the root is parked in its join.
+    controller_freeze(
+        &parent(),
+        &child_module(&waiting_child(1000)),
+        Duration::from_millis(100),
+        1,
+        "the freeze must cut the join and carry the child",
+    );
+}
+
+/// The embedder's [`temen_jit::FreezeController`] requests a freeze `after` the JIT run of `parent`
+/// starts, over a powerbox granting `child`. The frozen run returns `0` carrying `carried` detached
+/// children (`why` says why), and every engine's thaw of its artifact answers the uninterrupted `7`.
+fn controller_freeze(
+    parent: &temen_ir::Module,
+    child: &temen_ir::Module,
+    after: Duration,
+    carried: usize,
+    why: &str,
+) {
+    let (mut fhost, args) = powerbox(child);
     let win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    let fc = FreezeController::new();
+    let fc = temen_jit::FreezeController::new();
     let ctl = {
         let fc = fc.clone();
         std::thread::spawn(move || {
-            // Well inside the child's second-long wait, so the root is parked in its join.
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(after);
             fc.request_freeze();
         })
     };
+    let started = std::time::Instant::now();
     let r = temen_run::jit_cap_run(
-        &parent,
+        parent,
         0,
         &args,
         &MemLayout::image(win),
@@ -473,13 +491,14 @@ fn a_controller_freeze_reaches_the_detached_child_a_jit_parent_is_joining() {
         &mut fhost,
         Some(fc),
     );
+    eprintln!("freeze run: {:?}", started.elapsed());
     ctl.join().expect("controller");
     let fsnap = match r {
         Ok((JitOutcome::Returned(v), snap)) => {
             assert_eq!(
                 (v[0], fhost.captured_detached().len()),
-                (0, 1),
-                "the freeze must cut the join and carry the child"
+                (0, carried),
+                "{why}"
             );
             snap.bytes().to_vec()
         }
@@ -487,15 +506,15 @@ fn a_controller_freeze_reaches_the_detached_child_a_jit_parent_is_joining() {
         Err(JitError::Unsupported(_)) => return,
         Err(e) => panic!("JIT run failed: {e:?}"),
     };
-    let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
+    let art = temen_snapshot::freeze(parent, &fsnap, &fhost).expect("serialize");
     let mut wrong = Vec::new();
     for thaws in [Engine::Interp, Engine::Jit] {
         let mut thost = Host::new();
         thost.set_durable(true);
-        thost.grant_durable_module(&child);
-        let mut twin = temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
+        thost.grant_durable_module(child);
+        let mut twin = temen_snapshot::restore(&art, parent, &mut thost).expect("restore");
         begin_thaw(&mut twin, ARENA, 0);
-        if let Some((o, _)) = run(thaws, &parent, &args, &twin, &mut thost) {
+        if let Some((o, _)) = run(thaws, parent, &args, &twin, &mut thost) {
             if o != Out::Ret(7) {
                 wrong.push(format!("thawed on {thaws:?}: {o:?}"));
             }
@@ -524,6 +543,12 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 ";
 
+/// [`WAITING_PARENT`], instrumented. Its wait touches memory, so it takes the confined transform, as
+/// a child does.
+fn waiting_parent() -> temen_ir::Module {
+    verified(transform_module_assume_confined(&parse(WAITING_PARENT)).expect("transform"))
+}
+
 /// **#1937 — a detached child's wait ends on its own freeze word, not its parent's.** The embedder
 /// requests a freeze while the root waits on its own futex, not joining the child, so nothing rings
 /// the child until the root has unwound; meanwhile the executor re-polls the child's wait every
@@ -533,62 +558,75 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 /// every thaw answers the uninterrupted `7`.
 #[test]
 fn a_detached_childs_wait_ends_on_its_own_freeze_word_not_its_parents() {
-    use temen_jit::FreezeController;
-    // Its wait touches memory, so it takes the confined transform, as a child does.
-    let parent =
-        verified(transform_module_assume_confined(&parse(WAITING_PARENT)).expect("transform"));
-    let child = child_module(&waiting_child(1000));
-    let (mut fhost, args) = powerbox(&child);
-    let win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    let fc = FreezeController::new();
-    let ctl = {
-        let fc = fc.clone();
-        std::thread::spawn(move || {
-            // Inside the root's 200 ms wait, and long before the child's one-second wait ends. (Were
-            // it to land after, the root would be joining, and the join's ring carries the child.)
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            fc.request_freeze();
-        })
-    };
-    let r = temen_run::jit_cap_run(
-        &parent,
-        0,
-        &args,
-        &MemLayout::image(win),
-        PARENT_LOG2,
-        0,
-        &mut fhost,
-        Some(fc),
+    // Inside the root's 200 ms wait, and long before the child's one-second wait ends. (Were it to
+    // land after, the root would be joining, and the join's ring carries the child.)
+    controller_freeze(
+        &waiting_parent(),
+        &child_module(&waiting_child(1000)),
+        Duration::from_millis(100),
+        1,
+        "the freeze must carry the child, still waiting when the root unwound",
     );
-    ctl.join().expect("controller");
-    let fsnap = match r {
-        Ok((JitOutcome::Returned(v), snap)) => {
-            assert_eq!(
-                (v[0], fhost.captured_detached().len()),
-                (0, 1),
-                "the freeze must carry the child, still waiting when the root unwound"
-            );
-            snap.bytes().to_vec()
-        }
-        Ok((other, _)) => panic!("unexpected outcome {other:?}"),
-        Err(JitError::Unsupported(_)) => return,
-        Err(e) => panic!("JIT run failed: {e:?}"),
-    };
-    let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
-    let mut wrong = Vec::new();
-    for thaws in [Engine::Interp, Engine::Jit] {
-        let mut thost = Host::new();
-        thost.set_durable(true);
-        thost.grant_durable_module(&child);
-        let mut twin = temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
-        begin_thaw(&mut twin, ARENA, 0);
-        if let Some((o, _)) = run(thaws, &parent, &args, &twin, &mut thost) {
-            if o != Out::Ret(7) {
-                wrong.push(format!("thawed on {thaws:?}: {o:?}"));
-            }
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A detached child that counts to `n` in a function that cannot suspend, so nothing polls while it
+/// counts, then waits a second on a futex nothing notifies, and returns 7.
+fn counting_then_waiting_child(n: u64) -> String {
+    format!(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vn = i64.const {n}
+  vc = call 1 (vn)
+  va = i64.const 66000
+  ve = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va ve vto
+  vd = i64.sub vc vn
+  vs = i64.const 7
+  vr = i64.add vd vs
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vz = i64.const 0
+  br 1(vz, v0)
+}}
+block 1 (vi: i64, vn: i64) {{
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi, vn) 3(vi)
+}}
+block 2 (vj: i64, vm: i64) {{
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk, vm)
+}}
+block 3 (vf: i64) {{
+  return vf
+  }}
+}}
+"
+    )
+}
+
+/// **#1937 — a detached child that parks after the freeze's teardown began still rides.** The freeze
+/// is requested as the run starts, so the root unwinds at its first safepoint while the child is
+/// still counting with nothing to poll. Only then does the child reach its wait, its word rung, and
+/// park. Before, the teardown poisoned any task that parked after it began, so the child ended in a
+/// trap with no image and the freeze carried none: CI's `(0, 0)` whenever a slow runner let the
+/// freeze reach the child before its first park. Now that wait ends on the rung word, and the child
+/// unwinds and rides.
+#[test]
+fn a_detached_child_that_parks_after_the_freeze_began_rides() {
+    // About half a second on the JIT, far longer than the root takes to unwind.
+    controller_freeze(
+        &waiting_parent(),
+        &child_module(&counting_then_waiting_child(1 << 29)),
+        Duration::ZERO,
+        1,
+        "the freeze must carry the child, which parked after the teardown began",
+    );
 }
 
 /// A detached child that counts to `n` and returns 7. Nothing in it can suspend, so the transform
@@ -632,59 +670,12 @@ block 3 (vf: i64) {{
 /// returns its 7, the freeze carries no child, and every thaw answers 7.
 #[test]
 fn a_durable_child_that_returns_under_a_freeze_is_joined_not_carried() {
-    use temen_jit::FreezeController;
-    let parent = parent();
-    let child = child_module(&counting_child(1 << 31));
-    let (mut fhost, args) = powerbox(&child);
-    let win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    let fc = FreezeController::new();
-    let ctl = {
-        let fc = fc.clone();
-        std::thread::spawn(move || {
-            // Well inside the child's count, so the root is parked in its join.
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            fc.request_freeze();
-        })
-    };
-    let started = std::time::Instant::now();
-    let r = temen_run::jit_cap_run(
-        &parent,
+    // Well inside the child's count, so the root is parked in its join.
+    controller_freeze(
+        &parent(),
+        &child_module(&counting_child(1 << 31)),
+        Duration::from_millis(100),
         0,
-        &args,
-        &MemLayout::image(win),
-        PARENT_LOG2,
-        0,
-        &mut fhost,
-        Some(fc),
+        "the child returned: the join takes its result, and no image of it rides",
     );
-    eprintln!("freeze run: {:?}", started.elapsed());
-    ctl.join().expect("controller");
-    let fsnap = match r {
-        Ok((JitOutcome::Returned(v), snap)) => {
-            assert_eq!(
-                (v[0], fhost.captured_detached().len()),
-                (0, 0),
-                "the child returned: the join takes its result, and no image of it rides"
-            );
-            snap.bytes().to_vec()
-        }
-        Ok((other, _)) => panic!("unexpected outcome {other:?}"),
-        Err(JitError::Unsupported(_)) => return,
-        Err(e) => panic!("JIT run failed: {e:?}"),
-    };
-    let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
-    let mut wrong = Vec::new();
-    for thaws in [Engine::Interp, Engine::Jit] {
-        let mut thost = Host::new();
-        thost.set_durable(true);
-        thost.grant_durable_module(&child);
-        let mut twin = temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
-        begin_thaw(&mut twin, ARENA, 0);
-        if let Some((o, _)) = run(thaws, &parent, &args, &twin, &mut thost) {
-            if o != Out::Ret(7) {
-                wrong.push(format!("thawed on {thaws:?}: {o:?}"));
-            }
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

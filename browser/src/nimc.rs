@@ -424,9 +424,9 @@ pub(crate) fn drive_op13<'p>(
                     .ok_or(Trap::Malformed)
                     .and_then(|c| c.start(prog, back, None))
                     .and_then(|c| drive_op13(prog, core::ptr::null_mut(), c, None));
-                let handle = children.len() as i32;
+                let token = children.len() as u64;
                 children.push(Some(r));
-                vcpu.deliver_handle(handle);
+                vcpu.deliver_child(token);
             }
             bytecode::VcpuEvent::Instantiate {
                 carve, size_log2, ..
@@ -451,15 +451,17 @@ pub(crate) fn drive_op13<'p>(
                     .ok_or(Trap::Malformed)
                     .and_then(|c| c.start(prog, back, Some(declared)))
                     .and_then(|c| drive_op13(prog, child_base, c, None));
-                let handle = children.len() as i32;
+                let token = children.len() as u64;
                 children.push(Some(r));
-                vcpu.deliver_handle(handle);
+                vcpu.deliver_child(token);
             }
-            // A handle this driver never delivered (a refused spawn's `-errno`, or a forged value), or
-            // one already joined, traps by the oracle's child-table rule — never an out-of-bounds host
-            // panic, and the same answer the op13jit driver gives.
-            bytecode::VcpuEvent::Join { handle } => {
-                vcpu.deliver_join(temen_interp::take_child(&mut children, handle).and_then(|r| r));
+            // The engine resolved the guest's handle (a bad one traps in the vCPU) and hands each
+            // child's token back once.
+            bytecode::VcpuEvent::Join { child } => {
+                let banked = children[child as usize]
+                    .take()
+                    .expect("the engine hands a child's token back once");
+                vcpu.deliver_join(banked);
             }
             // #1296 — a child holding a re-granted `Jit`: `install` fills a slot of the child's OWN
             // dispatch table (its `own_dom`); `invoke` runs the unit interpreted over the child's own

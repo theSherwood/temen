@@ -3660,8 +3660,8 @@ pub enum VcpuEvent {
         /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
         mapped: u64,
     },
-    /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_handle`] with the
-    /// handle the guest will `join` it by (the host assigns handles densely per spawner: 0, 1, …).
+    /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_child`] with the
+    /// host's token for it (the engine issues the handle the guest `join`s it by).
     /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
     /// when its code spawns) — build the child with [`Vcpu::new_child_in`] so `func` resolves there.
     /// `vcpu` is the child's dense vCPU id, assigned here in spawn order across the run (root = 0) —
@@ -3673,8 +3673,12 @@ pub enum VcpuEvent {
         module: u32,
         vcpu: u64,
     },
-    /// `thread.join`: obtain child `handle`'s result, then call [`Vcpu::deliver_join`].
-    Join { handle: i32 },
+    /// `thread.join` (or a §14 `join`) of a live child this vCPU spawned: obtain the result of the
+    /// child the host gave `child` as its token ([`Vcpu::deliver_child`]), then call
+    /// [`Vcpu::deliver_join`]. The engine resolved the guest's handle by the oracle's rule — a
+    /// negative, never-issued or already-joined handle traps `ThreadFault` in the vCPU — so a host
+    /// keeps no child table of its own, and each token comes back at most once.
+    Join { child: u64 },
     /// `memory.wait`: run the futex wait on `addr`, then call [`Vcpu::deliver_code`] with the wasm code
     /// (0 = woken, 1 = not-equal, 2 = timed-out).
     Wait {
@@ -3715,8 +3719,8 @@ pub enum VcpuEvent {
         mapped: Option<u64>,
     },
     /// §14 confined child (ops 0, 5, 13, 17; THREADS.md 4c-domain §14-D2): start the admitted child
-    /// over the carve, then call [`Vcpu::deliver_handle`] with the handle the guest will `join` it by —
-    /// exactly the [`VcpuEvent::Spawn`] protocol. All the authority-bearing work already happened in
+    /// over the carve, then call [`Vcpu::deliver_child`] with the host's token for it — exactly the
+    /// [`VcpuEvent::Spawn`] protocol. All the authority-bearing work already happened in
     /// this vCPU, in the one admission every driver uses ([`admit_confined_child`]): the carve and entry
     /// validated (`-EINVAL` never surfaces), a module child's program resolved, compiled and **pushed to
     /// the shared source** and its data segments materialized into the carve, the child's powerbox
@@ -3743,7 +3747,7 @@ pub enum VcpuEvent {
     /// reservation, as a root's do, so `vm_map` grows the window), its module compiled and pushed.
     /// The host takes the child ([`Vcpu::take_child`]), starts it over a backing it mints for the
     /// window ([`PendingChild::start`], which seeds the data segments, the payload and a pre-mapped
-    /// region), and [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`]
+    /// region), and delivers its token ([`Vcpu::deliver_child`]) — the [`VcpuEvent::Instantiate`]
     /// protocol minus the carve. A host that runs the child on an emitted tier takes its powerbox
     /// instead ([`PendingChild::into_powerbox`]), seeds the payload ([`PendingChild::payload`]) and,
     /// since its window cannot alias, copies a pre-mapped region ([`Host::take_premap`]) in before
@@ -3861,15 +3865,24 @@ pub struct Vcpu<'p> {
     /// The child the last [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced
     /// — admitted, and waiting for the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
-    /// Detached children's window leases (INVARIANTS #3: `Budget.mem` accounts live windows). The
-    /// driver runs the child, so this engine sees its end only as the parent's `join`: a lease is
-    /// filed against the handle the driver delivers ([`deliver_handle`](Self::deliver_handle)) and its
-    /// bytes go back to the budget when that handle's join is delivered. `pending_lease` is the
-    /// just-admitted spawn's `(budget, bytes)`, `leases` the live `(handle, budget, bytes)`,
-    /// `joining` the handle whose join is in flight.
+    /// The children this vCPU spawned — threads and §14 children — indexed by the handle the guest
+    /// joins them by, issued densely (0, 1, …) as the host delivers each one
+    /// ([`deliver_child`](Self::deliver_child)). A join resolves its handle by the oracle's rule
+    /// ([`super::take_child`]) and spends it, so every host answers a bad join alike (#1728, #1736).
+    children: Vec<Option<VcpuChild>>,
+    /// The just-admitted detached spawn's window lease `(budget, bytes)`, filed with its child.
     pending_lease: Option<(i32, u64)>,
-    leases: Vec<(i32, i32, u64)>,
-    joining: Option<i32>,
+    /// The lease of the child whose join is in flight, given back on
+    /// [`deliver_join`](Self::deliver_join).
+    joining: Option<(i32, u64)>,
+}
+
+/// A child in a [`Vcpu`]'s table: the host's token for it, and a detached child's window lease.
+/// `Budget.mem` accounts live windows (INVARIANTS #3), and the driver runs the child, so this engine
+/// sees its end only as the parent's join: that is when the lease's bytes go back to the budget.
+struct VcpuChild {
+    token: u64,
+    lease: Option<(i32, u64)>,
 }
 
 /// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
@@ -4197,8 +4210,8 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
+            children: Vec::new(),
             pending_lease: None,
-            leases: Vec::new(),
             joining: None,
         })
     }
@@ -4249,8 +4262,8 @@ impl<'p> Vcpu<'p> {
             jit_page_checked: false,
             pending_tierup: None,
             pending_child: None,
+            children: Vec::new(),
             pending_lease: None,
-            leases: Vec::new(),
             joining: None,
         })
     }
@@ -4547,9 +4560,14 @@ impl<'p> Vcpu<'p> {
                     };
                 }
                 Ok(VcpuStop::Join { handle, dst }) => {
-                    self.pending = Some(dst);
-                    self.joining = Some(handle);
-                    return VcpuEvent::Join { handle };
+                    match super::take_child(&mut self.children, handle) {
+                        Ok(child) => {
+                            self.pending = Some(dst);
+                            self.joining = child.lease;
+                            return VcpuEvent::Join { child: child.token };
+                        }
+                        Err(t) => return VcpuEvent::Trapped(t),
+                    }
                 }
                 Ok(VcpuStop::CapPending { id, dst }) => {
                     let comps = match self.shared_host {
@@ -4796,15 +4814,17 @@ impl<'p> Vcpu<'p> {
         })
     }
 
-    /// Deliver a `thread.spawn` handle (after `Spawn`).
-    pub fn deliver_handle(&mut self, handle: i32) {
-        if let Some((budget, bytes)) = self.pending_lease.take() {
-            if handle >= 0 {
-                self.leases.push((handle, budget, bytes));
-            } else {
-                self.budget_mem_give(budget, bytes); // the driver refused the spawn
-            }
-        }
+    /// Deliver the host's `token` for the child the last [`VcpuEvent::Spawn`],
+    /// [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced, once the host has
+    /// started it. The engine files it under the next handle — the spawn's result, which the guest
+    /// joins it by — and hands the token back on that join ([`VcpuEvent::Join`]). A token is whatever
+    /// finds the child again on the host's side: a completion slot, a thread id, an index.
+    pub fn deliver_child(&mut self, token: u64) {
+        let handle = self.children.len() as i32;
+        self.children.push(Some(VcpuChild {
+            token,
+            lease: self.pending_lease.take(),
+        }));
         self.deliver_code(handle);
     }
 
@@ -4833,11 +4853,8 @@ impl<'p> Vcpu<'p> {
     /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
     /// child trap propagates (the joiner traps on its next `run`).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
-        if let Some(handle) = self.joining.take() {
-            if let Some(i) = self.leases.iter().position(|l| l.0 == handle) {
-                let (_, budget, bytes) = self.leases.swap_remove(i);
-                self.budget_mem_give(budget, bytes);
-            }
+        if let Some((budget, bytes)) = self.joining.take() {
+            self.budget_mem_give(budget, bytes);
         }
         let dst = self.pending.take().expect("deliver with no pending event");
         match res {

@@ -282,7 +282,9 @@ property, so in practice:
         materialized into the carve), then surfaces one mechanical event —
         `VcpuEvent::Instantiate { module, entry, carve, size_log2 }` — serviced exactly like
         `Spawn`: take the admitted child (`Vcpu::take_child`), start it on a Worker/thread over the
-        carve region (`PendingChild::start`) and wire its completion slot into `join`. Per DESIGN.md §14
+        carve region (`PendingChild::start`) and deliver its completion slot as the child's token
+        (`Vcpu::deliver_child`), which the engine hands back when the guest `join`s it — the engine
+        issues and checks the handle, so a host keeps no child table (#1736). Per DESIGN.md §14
         ("a sub-window is indistinguishable from a top-level window") the carve region — a fresh
         `Region::shared` at `parent_win + carve` — simply *is* the child's window: **no new `temen-mem`
         machinery** (the earlier estimate was wrong). The attenuated powerbox (`Instantiator` +

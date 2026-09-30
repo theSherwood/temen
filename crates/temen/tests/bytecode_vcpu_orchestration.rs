@@ -236,7 +236,6 @@ fn drive<'s, 'e>(
     host: &'e Host,
     mut vcpu: bytecode::Vcpu<'e>,
 ) -> Result<Vec<Value>, Trap> {
-    let mut handles: Vec<u64> = Vec::new(); // local spawn handle (index) → global id
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(vals) => return Ok(vals),
@@ -263,13 +262,10 @@ fn drive<'s, 'e>(
                     let r = drive(scope, prog, cback, host, child);
                     host.publish(id, r);
                 });
-                let handle = handles.len() as i32;
-                handles.push(id);
-                vcpu.deliver_handle(handle);
+                vcpu.deliver_child(id);
             }
-            bytecode::VcpuEvent::Join { handle } => {
-                let id = handles[handle as usize];
-                vcpu.deliver_join(host.join(id));
+            bytecode::VcpuEvent::Join { child } => {
+                vcpu.deliver_join(host.join(child));
             }
             bytecode::VcpuEvent::Wait {
                 addr,
