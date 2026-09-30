@@ -20,7 +20,7 @@
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
 #   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nifler nim_hello nim_phases
-#           nim_driver_guest nim_link lua_snapshot
+#           nim_driver_guest nim_card nim_link lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -281,6 +281,37 @@ if want nim_driver_guest; then
   else
     note "nim_prestdlib SKIP (threads wasm absent; build the browser engine first)"
   fi
+fi
+
+# --- 6c') nimony.blob.gz (the nim card's toolchain, #958): nimony's own tools, each built by nimony with
+# no C compiler (scripts/nim-toolchain.sh — the self-hosted lane's), with nimony's library and that
+# library prebuilt. `nimbuild --bundle` builds the program below with them at `/nim`, where the card
+# builds, and writes what it ran with plus the library pack the build left. Nothing in the blob is
+# wire-coupled but the tools, and all of it is rebuilt together, so the pack always matches them. -----
+if want nim_card; then
+  echo "=== [nim_card] scripts/nim-toolchain.sh + nimbuild --bundle → web/assets/nimony.blob.gz ==="
+  T="$(mktemp -d)"
+  mkdir -p "$T/card"
+  # The library a playground program reaches for, compiled once so a build compiles only its own
+  # modules; the `const` makes compile-time evaluation build its helper too.
+  cat >"$T/card/prelude.nim" <<'NIM'
+import std/[syncio, strutils, sequtils, tables, sets, hashes, algorithm, math, options, deques,
+  parseutils, bitops, intsets]
+
+proc prelude(s: string): int = s.len
+const atCompileTime = prelude("prebuilt")
+echo "prelude ", atCompileTime
+NIM
+  if [ -n "${NIMONY_BIN:-}" ] && [ -n "${NIM_BIN:-}" ] && bash scripts/nim-toolchain.sh "$T" \
+     && ln -s "$T/nimony/lib" "$T/card/lib" \
+     && ( cd browser && cargo build --release -q --bin nimbuild ) \
+     && browser/target/release/nimbuild "$T" "$T/card" prelude.nim --at /nim --leaves --bundle "$T/nimony.blob" \
+     && gzip -9 -n -c "$T/nimony.blob" > browser/web/assets/nimony.blob.gz; then
+    note "nim_card ✓ (nimony.blob.gz — gated by browser/tests/nimony.rs)"
+  else
+    note "nim_card SKIP/✗ (nimony toolchain — NIMONY_BIN/NIM_BIN; see scripts/nim-toolchain.sh)"
+  fi
+  rm -rf "$T"
 fi
 
 # --- 6d) the in-guest linkers (nim-link.temen.gz + nim-link-fs.temen.gz): `temen_leng::link_nim_powerbox`

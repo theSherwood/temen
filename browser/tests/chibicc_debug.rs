@@ -1247,3 +1247,152 @@ fn without_block_stdin_exhausted_reads_stay_eof() {
         "EOF reads (0 bytes) let the guest run to completion unchanged"
     );
 }
+
+// Two threads that each write their own global, for the split-view stepping test below. Line 13 is
+// `main`'s first statement after the spawn; `count_a`'s body is lines 5–7.
+const TWO_THREADS_SRC: &str = r#"#include <pthread.h>
+int a = 0;
+int b = 0;
+void* count_a(void* arg) {
+  a = 1;
+  a = 2;
+  a = 3;
+  return 0;
+}
+int main(void) {
+  pthread_t t;
+  pthread_create(&t, 0, count_a, 0);
+  b = 10;
+  b = 20;
+  b = 30;
+  pthread_join(t, 0);
+  return a + b;
+}
+"#;
+
+/// The `(line, bare function name)` of DAP thread `tid`'s top frame.
+fn thread_top(s: &mut DapServer, seq: i64, tid: i64) -> Option<(i64, String)> {
+    let out = s.handle(&req(
+        seq,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid))]),
+    ));
+    let f = response(&out)
+        .get("body")?
+        .get("stackFrames")?
+        .as_array()?
+        .first()?
+        .clone();
+    let name = f.get("name")?.as_str()?;
+    Some((
+        f.get("line")?.as_i64()?,
+        name.split_once(' ').map_or(name, |(_, n)| n).to_string(),
+    ))
+}
+
+/// **Split-view stepping on a chosen thread, and a Step Back that undoes the last step.** A step
+/// names its thread (`threadId`) and moves only that thread; a `stepBack` then undoes the most recent
+/// step, whichever thread took it, and leaves the other thread where it was. Stepping again after a
+/// step back rewrites the future, and the rewritten future is what later replays see.
+///
+/// Before the fix a step ignored `threadId` (it always drove the thread that last stopped), and a
+/// step back replayed the default schedule instead of the one the steps took, landing somewhere else
+/// entirely.
+#[test]
+fn a_step_moves_the_thread_it_names_and_step_back_undoes_the_last_step() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, TWO_THREADS_SRC);
+
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 13, true);
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
+    let mut seq = 10;
+    let mut go = |s: &mut DapServer, cmd: &str, tid: i64| {
+        seq += 1;
+        s.handle(&req(seq, cmd, Json::obj(vec![("threadId", Json::i(tid))])))
+    };
+    let at = |s: &mut DapServer, tid: i64| thread_top(s, 900 + tid, tid);
+    let val = |s: &mut DapServer, name: &str| eval_in_frame(s, 950, name);
+
+    // Thread 2 starts in the spawn trampoline; step it into `count_a`. Thread 1 stays put.
+    for _ in 0..20 {
+        if at(&mut s, 2).is_some_and(|(_, f)| f == "count_a") {
+            break;
+        }
+        go(&mut s, "stepIn", 2);
+    }
+    assert_eq!(
+        at(&mut s, 2),
+        Some((5, "count_a".into())),
+        "thread 2 reached count_a"
+    );
+    assert_eq!(
+        at(&mut s, 1),
+        Some((13, "main".into())),
+        "thread 1 did not move"
+    );
+    assert_eq!(val(&mut s, "b").as_deref(), Some("0"));
+
+    go(&mut s, "next", 2);
+    go(&mut s, "next", 2);
+    assert_eq!(at(&mut s, 2), Some((7, "count_a".into())));
+    assert_eq!(val(&mut s, "a").as_deref(), Some("2"));
+    go(&mut s, "next", 1);
+    assert_eq!(at(&mut s, 1), Some((14, "main".into())));
+    assert_eq!(val(&mut s, "b").as_deref(), Some("10"));
+    assert_eq!(
+        at(&mut s, 2),
+        Some((7, "count_a".into())),
+        "thread 2 did not move"
+    );
+
+    // Step Back undoes thread 1's step, then thread 2's, each leaving the other thread alone.
+    go(&mut s, "stepBack", 1);
+    assert_eq!(
+        at(&mut s, 1),
+        Some((13, "main".into())),
+        "thread 1's step undone"
+    );
+    assert_eq!(val(&mut s, "b").as_deref(), Some("0"));
+    assert_eq!(
+        at(&mut s, 2),
+        Some((7, "count_a".into())),
+        "thread 2 untouched"
+    );
+    assert_eq!(val(&mut s, "a").as_deref(), Some("2"));
+    go(&mut s, "stepBack", 1);
+    assert_eq!(
+        at(&mut s, 2),
+        Some((6, "count_a".into())),
+        "thread 2's step undone"
+    );
+    assert_eq!(val(&mut s, "a").as_deref(), Some("1"));
+    assert_eq!(
+        at(&mut s, 1),
+        Some((13, "main".into())),
+        "thread 1 untouched"
+    );
+
+    // A new step from here rewrites the future; stepping back over it replays the new one.
+    go(&mut s, "next", 1);
+    assert_eq!(at(&mut s, 1), Some((14, "main".into())));
+    assert_eq!(val(&mut s, "b").as_deref(), Some("10"));
+    assert_eq!(at(&mut s, 2), Some((6, "count_a".into())));
+    go(&mut s, "stepBack", 1);
+    assert_eq!(at(&mut s, 1), Some((13, "main".into())));
+    assert_eq!(at(&mut s, 2), Some((6, "count_a".into())));
+    assert_eq!(val(&mut s, "a").as_deref(), Some("1"));
+
+    // And the program still runs to its answer.
+    let out = go(&mut s, "continue", 1);
+    let code = out
+        .iter()
+        .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("exited"))
+        .and_then(|m| m.get("body")?.get("exitCode")?.as_i64());
+    assert_eq!(code, Some(33), "a + b");
+}

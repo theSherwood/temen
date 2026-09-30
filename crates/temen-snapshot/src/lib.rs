@@ -234,7 +234,12 @@ use temen_ir::Module;
 /// v34 (#1835): a `cont.resume`'s shadow frame also carries the resume's `(status, value)`, which
 /// only the instrumented code reads: a thaw reloads them when the fiber returned, whose slot is free,
 /// instead of re-issuing the resume.
-const FORMAT_VERSION: u16 = 34;
+/// v35 (#1901): Section 4 (serve state) carries, after the serve trio, the domain's **reply waits** —
+/// `(shadow context, ticket)` in ascending context order, for each live call whose wait a freeze
+/// abandoned. The thaw's re-issued call waits on that ticket instead of enqueueing the call again. The
+/// section is present iff the trio or the waits are non-empty; with no reply wait it ends in a zero
+/// count.
+const FORMAT_VERSION: u16 = 35;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -801,10 +806,21 @@ fn freeze_at(
     // order), and ticket counter. Plain data (§13.2 "serialize as-is"); tickets are
     // cut-internal under §13.1. Elided when the trio is empty/zero, so a never-served
     // domain's artifact keeps the pre-serve section layout.
+    // v35 (#1901): the domain's reply waits trail the trio — a caller's side of the same protocol.
     let (svc_queue, svc_results, svc_next_ticket) = host.svc_state();
-    if !svc_queue.is_empty() || !svc_results.is_empty() || svc_next_ticket != 0 {
+    let reply_waits = host.reply_waits();
+    if !svc_queue.is_empty()
+        || !svc_results.is_empty()
+        || svc_next_ticket != 0
+        || !reply_waits.is_empty()
+    {
         section(&mut out, TAG_SERVE, |b| {
-            write_serve_trio(b, &svc_queue, &svc_results, svc_next_ticket)
+            write_serve_trio(b, &svc_queue, &svc_results, svc_next_ticket);
+            write_uleb(b, reply_waits.len() as u64);
+            for &(ctx, ticket) in &reply_waits {
+                write_uleb(b, ctx as u64);
+                write_uleb(b, ticket);
+            }
         });
     }
 
@@ -1403,18 +1419,29 @@ fn restore_at(
         host.set_frozen_child_state(child_state);
     }
 
-    // ---- Serve state (§13.4 step 3, v13): decode the serve trio and restore it. The section is
-    // present iff the trio is non-empty (canonical); its absence restores the empty default. ----
+    // ---- Serve state (§13.4 step 3, v13): decode the serve trio and the reply waits (v35, #1901)
+    // and restore them. The section is present iff either is non-empty (canonical); its absence
+    // restores the empty default. ----
     if let Some(body) = serve_body {
         let mut sr = Reader::new(body);
         let (queue, results, next_ticket) = read_serve_trio(&mut sr)?;
+        let n = sr.uleb()?;
+        let mut waits: Vec<(u32, u64)> = Vec::new();
+        for _ in 0..n {
+            let ctx = u32::try_from(sr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+            if waits.last().is_some_and(|&(p, _)| ctx <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: contexts must ascend
+            }
+            waits.push((ctx, sr.uleb()?));
+        }
         if !sr.at_end() {
             return Err(RestoreError::Malformed);
         }
-        if queue.is_empty() && results.is_empty() && next_ticket == 0 {
-            return Err(RestoreError::Malformed); // non-canonical: an empty trio elides the section
+        if queue.is_empty() && results.is_empty() && next_ticket == 0 && waits.is_empty() {
+            return Err(RestoreError::Malformed); // non-canonical: an empty section is elided
         }
         host.set_svc_state(queue, results, next_ticket);
+        host.set_reply_waits(waits);
     }
 
     // ---- Attestation (#1289 R1, O14, v20): decode Section 6 and re-stamp the host, so the domain's

@@ -5,7 +5,7 @@
 //! evaluation's is, and `temen-link` is there without being given. The real driver is measured by
 //! `src/nimbuild.rs`.
 
-use temen_browser::{library_pack, nim_build, STATUS_EXIT};
+use temen_browser::{blob_entries, library_pack, nim_build, STATUS_EXIT};
 
 /// Returns 7: exec'd, the process exits 7.
 const SEVEN: &str = "memory 17\n\
@@ -237,4 +237,78 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
     assert!(pack
         .iter()
         .all(|(n, b)| posix.read_file(n).as_ref() == Some(b)));
+}
+
+/// The committed toolchain the nim card ships (`web/assets/nimony.blob.gz`, `nimbuild --bundle`), inflated
+/// by `gzip` as the page's `DecompressionStream` does. `None` when `gzip` is missing.
+fn committed_toolchain() -> Option<Vec<u8>> {
+    use std::io::Write;
+    let gz = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/assets/nimony.blob.gz"
+    ))
+    .expect("web/assets/nimony.blob.gz is committed");
+    let mut c = std::process::Command::new("gzip")
+        .arg("-dc")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdin = c.stdin.take()?;
+    let writer = std::thread::spawn(move || stdin.write_all(&gz));
+    let out = c.wait_with_output().ok()?;
+    writer.join().ok()?.ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// The asset gate for the nim card's toolchain. Its tools are encoded modules, so an IR, encoder or
+/// wire change invalidates them: each must still decode and verify. Rebuild it with
+/// `ONLY=nim_card bash scripts/rebuild-assets.sh`. The card runs the first, nimony, with the others
+/// where nimony and the shell's `PATH` find them, over the files a build at the toolchain's directory
+/// needs: nimony's library, the library pack (nimony's options memo with it, and newer than every
+/// source), and the guest libc.
+#[test]
+fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
+    let Some(blob) = committed_toolchain() else {
+        eprintln!("SKIP: gzip unavailable to inflate nimony.blob.gz");
+        return;
+    };
+    let top: std::collections::HashMap<&str, &[u8]> = blob_entries(&blob).into_iter().collect();
+    let cwd = std::str::from_utf8(top["cwd"]).expect("cwd is text");
+    let commands = blob_entries(top["commands"]);
+    let paths: Vec<&str> = commands.iter().map(|(paths, _)| *paths).collect();
+    let tool = |t: &str| format!("{cwd}/bin/{t}\n/bin/{t}");
+    assert_eq!(
+        paths,
+        ["nimony", "nifmake", "nimsem", "nifler2", "hexer"]
+            .map(tool)
+            .into_iter()
+            .chain(["/bin/sh".to_string()])
+            .collect::<Vec<_>>()
+    );
+    for (paths, bytes) in &commands {
+        let m = temen_encode::decode_module(bytes).unwrap_or_else(|e| {
+            panic!("decode {paths:?}: {e:?} — stale; ONLY=nim_card bash scripts/rebuild-assets.sh")
+        });
+        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {paths:?}: {e:?}"));
+    }
+    let files = blob_entries(top["files"]);
+    let at = |p: &str| files.iter().position(|(n, _)| *n == p);
+    let lib = format!("{cwd}/lib/");
+    let cache = format!("{cwd}/nimcache/");
+    let last_source = files.iter().rposition(|(n, _)| n.starts_with(&lib));
+    let first_cached = files.iter().position(|(n, _)| n.starts_with(&cache));
+    assert!(
+        at(&format!("{lib}std/system.nim")).is_some(),
+        "nimony's library"
+    );
+    assert!(
+        at(&format!("{cache}cachedconfigfile.txt")).is_some(),
+        "the options memo, without which a build re-runs every step"
+    );
+    assert!(
+        last_source < first_cached,
+        "the pack is seeded after the sources it was built from"
+    );
+    assert!(at("/lib/temen/libc.temeno").is_some(), "the guest libc");
 }

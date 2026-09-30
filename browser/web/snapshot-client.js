@@ -141,11 +141,12 @@ export class SnapshotClient {
     });
   }
 
-  // Compile a whole Nim program off the main thread. `getAssets()` resolves the four phase buffers
-  // `{ nifler, nimsem, hexer, stdlib }` (fetched + inflated by the caller); they're posted to the nim
-  // worker once and cached there, so subsequent Runs ship only `source`. Resolves `{ ok, status,
-  // stdout, stderr }`, or `{ ok:false, error }` (the caller then falls back to the main-thread path).
-  async nimCompile(getAssets, source, main = 'prog.nim', onChunk) {
+  // Compile a whole Nim program off the main thread, and run it. `getAssets()` resolves `{ bundle }`,
+  // nimony's toolchain (the card's `nimony.blob.gz`, inflated by the caller); it is posted to the nim
+  // worker once and kept there, so later Runs ship only `source`. Resolves `nimCompileRun`'s
+  // `{ ok, status, exit, stdout, stderr, built, leaves, resumes }`, or `{ ok:false, error }` (the
+  // caller then falls back to the main-thread path).
+  async nimCompile(getAssets, source) {
     const w = this._workerFor(SnapshotClient.NIMC_KEY);
     await w.ready;
     if (!w.nimAssets) {
@@ -165,7 +166,7 @@ export class SnapshotClient {
       w.nimAssets = null; // worker rejected the upload: let a later Run retry it
       return { ok: false, error: loaded.error || 'nim assets failed to load' };
     }
-    return this._request(w, 'nimCompile', { source, main }, onChunk);
+    return this._request(w, 'nimCompile', { source });
   }
 
   // Abort an in-flight nim compile so a stuck/runaway guest (which can't be interrupted cooperatively)
@@ -173,11 +174,9 @@ export class SnapshotClient {
   // fresh engine and re-sends assets. Pending requests on it never resolve — the caller drops them.
   //
   // Only fires when the worker is actually BUSY (a compile in flight). An IDLE worker is kept alive and
-  // reused: its engine holds the warmed guest-emit cache (`jitModuleCache`) that the pre-warm and each
-  // prior compile filled — terminating it there would throw that away and force every Run to re-emit the
-  // ~5 s nimsem/hexer guests from cold (the reason repeated Runs never got the warm ~3 s path, #1386).
-  // Reuse is safe: each compile resets the pre-crawl accumulator and keys its run module by content, and
-  // wasm memory plateaus at one compile's peak (each compile frees its own allocations).
+  // reused: it holds the inflated toolchain and an engine V8 has already optimized, and terminating it
+  // would make the next Run pay both again (#1386). Reuse is safe: each Run is a fresh session over the
+  // kept toolchain, and wasm memory plateaus at one Run's peak.
   cancelNim() {
     const w = this._workers.get(SnapshotClient.NIMC_KEY);
     if (!w) return;

@@ -9,8 +9,10 @@ flags, so every artifact up to there is byte-identical to `nimony c`'s), then ON
 node in place of lengc + cc + link: `temen-link -o:<prog.temen> <every module's .c.nif, main
 first>`, which writes one verified Temen module. It sits beside `backendWasm` (the same shape:
 ithaqua is its whole-program tool), shares its output-naming helper (`wholeProgramFile`), and gets
-its own backend directory (`<main>.temen/`). `nimony t -r` refuses: a Temen module runs under a
-Temen host. `temen-link` itself lives in this repo (`crates/temen-run/demos/temen_link`).
+its own backend directory (`<main>.temen/`). A Temen module runs under a Temen host, so `nimony t -r`
+runs it only where nimony itself runs on one: it execs it there, as a native nimony execs its
+executable, and refuses anywhere else. `temen-link` itself lives in this repo
+(`crates/temen-run/demos/temen_link`).
 
 A program built for Temen sees `defined(temen)`: its target CPU/OS are the C backend's, but it runs
 under a Temen host. The define changes no artifact of code that does not test it (the `.p/.s/.x/.c.nif`
@@ -177,14 +179,18 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      let exeOutDir = exeOutPath.parentDir
      if exeOutDir.len > 0:
        onRaiseQuit createDir(path(exeOutDir))
-@@ -2251,5 +2293,9 @@
+@@ -2251,5 +2293,13 @@
          let shim = compilerDir() / "tests" / "ithaqua" / "run_wasm.js"
          exec "node " & quoteShell(shim) & " " &
               quoteShell(c.config.wasmFile(c.rootNode.files[0], backend)) & executableArgs
 +      elif c.config.backend == backendTemen:
-+        # A Temen module runs under a Temen host (`temen-run`), not natively.
-+        quit "nimony t -r: run " & c.config.temenFile(c.rootNode.files[0], backend) &
-+             " under a Temen host"
++        # A Temen module runs under a Temen host (`temen-run`), not natively. A
++        # nimony that runs on one runs it as a native nimony runs its executable.
++        when defined(temen):
++          exec c.config.temenFile(c.rootNode.files[0], backend) & executableArgs
++        else:
++          quit "nimony t -r: run " & c.config.temenFile(c.rootNode.files[0], backend) &
++               " under a Temen host"
        else:
          exec c.config.exeFile(c.rootNode.files[0], backend) & executableArgs
 --- a/src/nimony/nifconfig.nim

@@ -22,8 +22,8 @@ use temen_durable::{
     transform_module_assume_confined, ARM_QUIESCE_OFF,
 };
 use temen_interp::{
-    run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
-    Value,
+    run_capture_reserved_with_host, CapState, FreezeRule, FreezeScope, Host, ParkSite,
+    SignalSource, StreamRole, Value,
 };
 use temen_ir::{Memory, Module};
 use temen_jit::JitOutcome;
@@ -74,10 +74,9 @@ fn interp_row(site: ParkSite) -> Row {
             why: "a run that can freeze is serialized onto one worker, and a task gives its lane back \
                   when it parks, so no lane is ever full",
         },
-        ParkSite::Reply | ParkSite::Completion => Row::Pending {
-            issue: 1901,
-            why: "a call in flight inside the cut; built with its re-park",
-        },
+        ParkSite::Reply => Row::Case(reply),
+        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::ReapAny => Row::Unreachable {
             why: "`wait(-1)` needs a live fork twin, which declines the freeze first (#1688)",
         },
@@ -111,14 +110,27 @@ fn jit_row(site: ParkSite) -> Row {
             issue: 1904,
             why: "a lane cap comes only from a granted §14 child; needs a granted-child runner",
         },
-        ParkSite::Reply | ParkSite::Completion => Row::Pending {
-            issue: 1901,
-            why: "a call in flight inside the cut (the JIT's `live_impl_call` reply and its \
-                  punted-call completion); built with its re-park",
+        ParkSite::Reply => Row::Pending {
+            issue: 1904,
+            why:
+                "the JIT's `live_impl_call` reply park: its re-park on thaw, and the re-link of a \
+                  `LiveImpl` onto a re-launched detached child",
         },
+        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
 }
+
+const PAGE_FAULT_PENDING: Row = Row::Pending {
+    issue: 1940,
+    why: "a faulting access is no call to re-issue, and cannot unwind until its page arrives",
+};
+
+const COMPLETION_PENDING: Row = Row::Pending {
+    issue: 1902,
+    why: "a punted host call is in flight outside the cut; its capability declares what a freeze does",
+};
 
 /// The bytecode engine's rows, run through its durable entry
 /// (`bytecode::compile_and_run_capture_reserved_with_host`). That entry runs one vCPU: it refuses
@@ -146,10 +158,12 @@ fn bytecode_row(site: ParkSite) -> Row {
         ParkSite::Lane => Row::Unreachable {
             why: "the cooperative pump runs one task at a time and has no lanes",
         },
-        ParkSite::Reply | ParkSite::Completion => Row::Pending {
-            issue: 1901,
-            why: "a call in flight inside the cut; built with its re-park",
+        ParkSite::Reply => Row::Pending {
+            issue: 1904,
+            why: "a live call's reply park: its re-park on thaw (#1901)",
         },
+        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
 }
@@ -793,4 +807,122 @@ block 0 (vx: i64) {
     );
     let t = ticket.lock().unwrap().expect("enqueued");
     assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
+}
+
+/// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one dispatch
+/// (op 15, then `child_offer`), while the root resumes a fiber, where the countdown fires. The root
+/// unwinds and rings `C`, which unwinds in its `svc.wait` without serving; `T` then enqueues its call
+/// and parks on the reply, and the freeze re-admits it: its wait is abandoned, its dispatch stays
+/// queued on `C`, and the ticket rides the root's powerbox. Through the codec, the thaw's re-issued
+/// call waits on that ticket and `C` serves the queued dispatch once: `served·1000 + reply`, `1042`.
+/// Issued twice, `C` would serve two.
+fn reply(site: ParkSite, engine: Engine) {
+    let src = r#"
+memory 17
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 3 }
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 2
+  vlog = i64.const 17
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, ve, vlog, vz)
+  vex = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vex)
+  vcap64 = i64.extend_i32_u vcap
+  vt = thread.spawn 1 vz vcap64
+  vf = ref.func 4
+  vfsp = i64.const 4096
+  vk = cont.new vf vfsp
+  br 1(v0, vc, vt, vk, vz)
+}
+block 1 (vi0: i32, vc1: i32, vt1: i32, vk1: i64, vi: i64) {
+  vs, vx = cont.resume vk1 vi
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 20
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(vi0, vc1, vt1, vk1, vi2) 2(vi0, vc1, vt1)
+}
+block 2 (vi3: i32, vc2: i32, vt2: i32) {
+  vr = thread.join vt2
+  vn = call.cap 6 1 (i32) -> (i64) vi3 (vc2)
+  vth = i64.const 1000
+  vm = i64.mul vn vth
+  vres = i64.add vm vr
+  return vres
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vcap: i64) {
+  vh = i32.wrap_i64 vcap
+  vx = i64.const 41
+  vr = call.cap 268435456 0 (i64) -> (i64) vh (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }
+}
+"#;
+    let src = format!("{src}{FIBER}");
+    let inst = instrumented(&src);
+    let powerbox = || {
+        let mut h = durable_host(&inst);
+        let i = h.grant_instantiator(0, WINDOW as u64);
+        let m = h.grant_durable_module(&inst);
+        let b = h.grant_budget(0, 1 << 20, 0);
+        h.grant_freeze_authority(FreezeScope::DetachedProgeny);
+        (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
+    };
+
+    let (h, args) = powerbox();
+    let (res, _, _) = run(
+        engine,
+        &inst,
+        &args,
+        &init_durable_window(WINDOW, TEST_ARENA),
+        h,
+    );
+    assert_eq!(res, Ok(1042), "{site:?}: the uninterrupted answer");
+
+    let (h, args) = powerbox();
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_in_sibling(&mut win);
+    let (res, snap, mut h) = run(engine, &inst, &args, &win, h);
+    assert_eq!(res, Ok(0), "{site:?}: the root unwinds for the freeze");
+    assert_eq!(h.take_freeze_declined(), None, "{site:?}: not declined");
+    assert_eq!(h.captured_detached().len(), 1, "{site:?}: C rides the cut");
+    assert_eq!(
+        h.reply_waits().len(),
+        1,
+        "{site:?}: T's wait was abandoned, and its ticket rides"
+    );
+
+    let art = temen_snapshot::freeze(&inst, &snap, &h).expect("serialize");
+    let mut th = durable_host(&inst);
+    th.grant_durable_module(&inst);
+    let mut twin = temen_snapshot::restore(&art, &inst, &mut th).expect("restore");
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (res, _, th) = run(engine, &inst, &args, &twin, th);
+    assert_eq!(
+        res,
+        Ok(1042),
+        "{site:?}: the thaw waits on the same ticket, and C serves it once"
+    );
+    assert!(th.reply_waits().is_empty(), "{site:?}: the wait was taken");
 }

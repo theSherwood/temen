@@ -274,20 +274,18 @@ try {
     ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim parsed on the Temen, wasm-JIT)')
     : fail(`nifler run: state=${nifler.state} msg=${nifler.msg} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
 
-  // The whole-program nim compiler card (NIM.md §3c/§3e; #958) — the toolchain capstone: it inflates
-  // the three committed phase guests (`nifler`/`nimsem`/`hexer` `.temen.gz`) + the stdlib image
-  // (`nim_stdlib.img.gz`, all committed → always present) and compiles the editor's whole Nim program
-  // **client-side** — the page plays nifmake (stems, `import` crawl), runs nimsem (spawning nifler via
-  // an `exec` cap) + hexer over the closure, links through the nim→powerbox bridge, and runs `_start`.
-  // Assert the editor holds an I/O Nim program and the run prints the program's real stdout. This is the
-  // heaviest card (four assets, multi-phase compile on the tree-walker), so a generous timeout.
+  // The whole-program nim compiler card (#958, #763): nimony's own driver, `nimony t -r --isMain
+  // prog.nim`, over the committed toolchain (`nimony.blob.gz`: every tool built by nimony with no C
+  // compiler, nimony's library and that library prebuilt) builds the editor's program **client-side**
+  // and runs it, in one POSIX process tree. Assert the editor holds the default program and the run
+  // prints its real stdout. A whole build per Run, so a generous timeout.
   const nimcCard = 'nim: compile & run a whole Nim program → Temen (the full toolchain, in your browser)';
   const nimcSrc = await page.evaluate(
     (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
     card(nimcCard),
   );
-  nimcSrc.includes('import std/syncio') && nimcSrc.includes('proc greet') &&
-    nimcSrc.includes('write(stdout')
+  nimcSrc.includes('import std/[syncio, strutils]') && nimcSrc.includes('proc greet') &&
+    nimcSrc.includes('echo greet')
     ? ok('nim compiler card → editor holds a whole Nim program')
     : fail(`nim compiler editor: ${nimcSrc.slice(0, 80)}`);
   await runCard(page, nimcCard, 180_000);
@@ -297,9 +295,8 @@ try {
     stdout: document.querySelector(`${sel} .stdout`).textContent,
   }), card(nimcCard));
   nimc.state === 'done' && nimc.result.endsWith('B stdout') &&
-    nimc.stdout.includes('hello, Nim') &&
-    nimc.stdout.includes('hello, the Temen')
-    ? ok('whole-program nim compiler card: the full toolchain compiled + ran a Nim program in-browser')
+    nimc.stdout.includes('hello, Nim\nwords: 9\nTEMEN\n')
+    ? ok('whole-program nim compiler card: nimony built + ran a Nim program in-browser')
     : fail(`nimc run: state=${nimc.state} result=${nimc.result} stdout=${nimc.stdout.slice(0, 120)}`);
 
   // #1005: the compile runs on the snapshot worker's own engine, not the main thread. Confirm the nim

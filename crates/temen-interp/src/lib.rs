@@ -2861,23 +2861,6 @@ fn seed_domain(
                 ff,
             );
         }
-        // §13.4 slice 4d: re-link every holder's restored `LiveImpl` handles to their
-        // re-created callees now that the subtree exists — the holder's rewound call then
-        // dispatches to the live callee exactly as before the freeze. Each holder (the root and
-        // every re-created child) resolves its callee by the `(holder task, join slot)` edge, so
-        // a nested holder (a child holding a cap onto a grandchild) re-links against its *own*
-        // children, not just the root against its direct children.
-        let holders = std::iter::once((id, Arc::clone(host_shared))).chain(holder_hosts);
-        for (htask, hhost) in holders {
-            let pending = hhost.lock_unpoisoned().take_pending_live_impls();
-            for (idx, cslot, export) in pending {
-                if let Some(chost) = child_hosts_by_edge.get(&(htask, cslot)) {
-                    hhost
-                        .lock_unpoisoned()
-                        .relink_live_impl(idx, Arc::clone(chost), export);
-                }
-            }
-        }
         // #1361 step 2 — deliver each completed-but-unjoined **detached** child: post its result
         // into the scheduler and map it to the recording parent's join slot, so the parent's
         // re-executed `thread.join` reloads it (reload-not-reissue). Mirrors the completed-nested
@@ -2932,9 +2915,29 @@ fn seed_domain(
                 },
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
+            let edge = (spawner.id, td.slot);
             if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td, fuel, quota)
             {
+                // A detached child is a callee like a nested one (#1901).
+                child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
                 s.runnable.push_back(child);
+            }
+        }
+        // §13.4 slice 4d: re-link every holder's restored `LiveImpl` handles to their
+        // re-created callees now that the subtree exists, nested and detached — the holder's rewound call then
+        // dispatches to the live callee exactly as before the freeze. Each holder (the root and
+        // every re-created child) resolves its callee by the `(holder task, join slot)` edge, so
+        // a nested holder (a child holding a cap onto a grandchild) re-links against its *own*
+        // children, not just the root against its direct children.
+        let holders = std::iter::once((id, Arc::clone(host_shared))).chain(holder_hosts);
+        for (htask, hhost) in holders {
+            let pending = hhost.lock_unpoisoned().take_pending_live_impls();
+            for (idx, cslot, export) in pending {
+                if let Some(chost) = child_hosts_by_edge.get(&(htask, cslot)) {
+                    hhost
+                        .lock_unpoisoned()
+                        .relink_live_impl(idx, Arc::clone(chost), export);
+                }
             }
         }
         // Enqueue every re-created child, spawned and nested, parents first (ascending cid).
@@ -5693,7 +5696,8 @@ where
     victims
 }
 
-/// #1898 — where the oracle's scheduler parks a vCPU: one site per waiter collection of [`Sched`].
+/// #1898 — where the oracle's scheduler parks a vCPU: one site per kind of park, which is one waiter
+/// collection of [`Sched`] but for `ticket_waiters`, shared by a reply and a page fault.
 /// Every rule a freeze applies to a park reads [`ParkSite::freeze_rule`], and every list that walks
 /// the parked vCPUs is a loop over [`ParkSite::ALL`] through [`Sched::parked`] / [`Sched::take`] —
 /// whose matches are exhaustive, so a new collection cannot be missed by one list (DURABILITY §4,
@@ -5722,6 +5726,8 @@ pub enum ParkSite {
     ReapAny,
     /// A caller awaiting a served reply (`ticket_waiters`).
     Reply,
+    /// A demand-paged vCPU awaiting its pager's page (`ticket_waiters`, marked by `page_fault`).
+    PageFault,
     /// A caller awaiting a punted completion (`completion_waiters`).
     Completion,
     /// A caller awaiting a busy offer instance (`admit_waiters`).
@@ -5742,7 +5748,7 @@ pub enum FreezeRule {
 }
 
 impl ParkSite {
-    pub const ALL: [ParkSite; 13] = [
+    pub const ALL: [ParkSite; 14] = [
         ParkSite::Svc,
         ParkSite::Futex,
         ParkSite::PipeRead,
@@ -5754,6 +5760,7 @@ impl ParkSite {
         ParkSite::Lane,
         ParkSite::ReapAny,
         ParkSite::Reply,
+        ParkSite::PageFault,
         ParkSite::Completion,
         ParkSite::Admit,
     ];
@@ -5762,19 +5769,22 @@ impl ParkSite {
         match self {
             // The re-executed op observes `UNWINDING`: a serve op and a wait unwind at their suspend
             // points, and a pipe, reap or stream call is abandoned (#1672, #1899). A stopped vCPU sees
-            // through its stop to its next freeze point, abandoning any host call on the way.
+            // through its stop to its next freeze point, abandoning any host call on the way. A reply
+            // wait is abandoned too, but not its call: the dispatch rides the cut on its callee, and
+            // the thaw's re-issued call waits on the same ticket (#1901).
             ParkSite::Svc
             | ParkSite::Futex
             | ParkSite::PipeRead
             | ParkSite::PipeWrite
             | ParkSite::Reap
             | ParkSite::Stopped
-            | ParkSite::StreamRead => FreezeRule::Reissue,
+            | ParkSite::StreamRead
+            | ParkSite::Reply => FreezeRule::Reissue,
             ParkSite::Join | ParkSite::Lane => FreezeRule::Phase,
-            // A `wait(-1)` needs a live fork twin (#1688); a reply or completion is in flight across
-            // the boundary (#1901); a durable caller never animates an offer, so never waits to enter
-            // one (#1681).
-            ParkSite::ReapAny | ParkSite::Reply | ParkSite::Completion | ParkSite::Admit => {
+            // A `wait(-1)` needs a live fork twin (#1688). A faulting access is no call, and it cannot
+            // unwind until its page arrives (#1940). A completion is a host operation outside the cut
+            // (#1902). A durable caller never animates an offer, so never waits to enter one (#1681).
+            ParkSite::ReapAny | ParkSite::PageFault | ParkSite::Completion | ParkSite::Admit => {
                 FreezeRule::Decline
             }
         }
@@ -5798,7 +5808,8 @@ impl Sched {
             ParkSite::Join => vcpus(self.join_waiters.values()),
             ParkSite::Lane => vcpus(&self.lane_waiters),
             ParkSite::ReapAny => vcpus(&self.reap_any_waiters),
-            ParkSite::Reply => vcpus(self.ticket_waiters.values()),
+            ParkSite::Reply => vcpus(self.ticket_waiters.values().filter(|w| is_reply(*w))),
+            ParkSite::PageFault => vcpus(self.ticket_waiters.values().filter(|w| !is_reply(*w))),
             ParkSite::Completion => vcpus(self.completion_waiters.values()),
             ParkSite::Admit => vcpus(self.admit_waiters.values().flatten()),
         }
@@ -5822,7 +5833,10 @@ impl Sched {
             ParkSite::Join => vcpus(self.join_waiters.values_mut()),
             ParkSite::Lane => vcpus(&mut self.lane_waiters),
             ParkSite::ReapAny => vcpus(&mut self.reap_any_waiters),
-            ParkSite::Reply => vcpus(self.ticket_waiters.values_mut()),
+            ParkSite::Reply => vcpus(self.ticket_waiters.values_mut().filter(|w| is_reply(*w))),
+            ParkSite::PageFault => {
+                vcpus(self.ticket_waiters.values_mut().filter(|w| !is_reply(*w)))
+            }
             ParkSite::Completion => vcpus(self.completion_waiters.values_mut()),
             ParkSite::Admit => vcpus(self.admit_waiters.values_mut().flatten()),
         }
@@ -5847,11 +5861,25 @@ impl Sched {
             ParkSite::Join => drain_where(&mut self.join_waiters, pick(f)),
             ParkSite::Lane => drain_where(&mut self.lane_waiters, pick(f)),
             ParkSite::ReapAny => drain_where(&mut self.reap_any_waiters, pick(f)),
-            ParkSite::Reply => drain_where(&mut self.ticket_waiters, pick(f)),
+            ParkSite::Reply => {
+                let mut pick = pick(f);
+                drain_where(&mut self.ticket_waiters, |e| is_reply(e) && pick(e))
+            }
+            ParkSite::PageFault => {
+                drain_where(&mut self.ticket_waiters, |e: &((usize, u64), Waiter)| {
+                    !is_reply(e)
+                })
+            }
             ParkSite::Completion => drain_where(&mut self.completion_waiters, pick(f)),
             ParkSite::Admit => drain_queues(&mut self.admit_waiters, pick(f)),
         }
     }
+}
+
+/// Whether a `ticket_waiters` entry waits on a reply ([`ParkSite::Reply`]), not on a page
+/// ([`ParkSite::PageFault`]). A fiber never page-faults.
+fn is_reply<T: DomainMember>(e: &T) -> bool {
+    e.vcpu().is_none_or(|v| v.page_fault.is_none())
 }
 
 /// Why a vCPU is filed in [`Sched::svc_waiters`] (#1815). The map is shared by the `svc.wait`
@@ -7880,6 +7908,19 @@ fn admit_parks_for_freeze(s: &mut Sched) {
                         }
                         // A stream read is not rewound: its wake delivers the result (#1899).
                         ParkSite::StreamRead => v.pending = Some(Pending::Abandoned),
+                        // Nor is a live call. Its dispatch stays with the callee (queued, in its
+                        // handler, or answered), so the thaw's re-issued call must wait on the same
+                        // ticket rather than enqueue it again (#1901).
+                        ParkSite::Reply => {
+                            let t = v
+                                .reply_ticket
+                                .take()
+                                .expect("a reply park carries its ticket");
+                            v.host
+                                .lock_unpoisoned()
+                                .await_reply_after_thaw(v.durable_sp_ctx, t);
+                            v.pending = Some(Pending::Abandoned);
+                        }
                         _ => {}
                     }
                     s.runnable.push_back(v);
@@ -7983,6 +8024,16 @@ fn freeze_census(
                     return declined(DeclineCause::Parked(site), v.id, None);
                 }
             }
+        }
+        // #1901 — a reply wait's ticket rides its caller's powerbox, and a nested carve's powerbox
+        // carries only its serve trio and handles: its thaw would issue the call twice. The carve is
+        // retiring (INVARIANTS #13), so it gets no new record.
+        if let Some(v) = s
+            .parked(ParkSite::Reply)
+            .into_iter()
+            .find(|v| v.freeze_sink.is_some())
+        {
+            return declined(DeclineCause::Parked(ParkSite::Reply), v.id, None);
         }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in me.into_iter().chain(others.iter()) {
@@ -9107,6 +9158,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 sched.completion_drain(&comps);
             }
             Step::Park(Blocked::CapReply { ticket, callee }) => {
+                v.reply_ticket = Some(ticket);
                 park_cap_reply(sched, v, ticket, callee);
             }
             // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
@@ -11583,6 +11635,9 @@ struct VCpu {
     /// A fault address awaiting its pager reply: set when the fault parks awaiting the pager
     /// (the queued transport), consumed at resume — supply the page instead of pushing the reply.
     page_fault: Option<u64>,
+    /// The dispatch ticket of the live call this vCPU last parked on ([`Blocked::CapReply`]): a freeze
+    /// that re-admits it records the ticket for the thaw's re-issued call (#1901).
+    reply_ticket: Option<u64>,
     /// Call-depth base for the stack-overflow bound.
     depth: u32,
     /// This task's own id (where its outcome is published on completion).
@@ -11821,6 +11876,7 @@ impl VCpu {
             fault_pager: false,
             pager: None,
             page_fault: None,
+            reply_ticket: None,
             depth,
             id,
             parent_task: 0,
@@ -11900,6 +11956,7 @@ impl VCpu {
             fault_pager: false,
             pager: None,
             page_fault: None,
+            reply_ticket: None,
             depth: self.depth,
             id: new_id,
             parent_task: self.parent_task,
@@ -12001,6 +12058,7 @@ impl VCpu {
             fault_pager: false,
             pager: None,
             page_fault: None,
+            reply_ticket: None,
             depth,
             id: 0, // unused: driven inline, never via the executor
             parent_task: 0,
@@ -12570,6 +12628,25 @@ fn decide(
     }
 }
 
+/// Issue a live call to `callee`: enqueue its dispatch and name its ticket (`None` on a full queue),
+/// with the callee's domain id. A call whose wait a freeze abandoned is not issued again: its dispatch
+/// stayed with the callee, so this names the ticket it was waiting on (#1901).
+fn issue_live_call(
+    host: &Arc<Mutex<Host>>,
+    ctx: usize,
+    callee: &Arc<Mutex<Host>>,
+    export: u32,
+    op: u32,
+    args: Vec<i64>,
+) -> (Option<u64>, u64) {
+    let resumed = host.lock_unpoisoned().take_reply_wait(ctx);
+    let mut cg = callee.lock_unpoisoned();
+    (
+        resumed.or_else(|| cg.svc_enqueue(export, op, args)),
+        cg.domain_id(),
+    )
+}
+
 /// #1672 — mark the running context's host call abandoned ([`Decision::Abandon`]): its unwind
 /// spills the re-issue word into the call's frame, and the thaw re-issues the call.
 fn abandon_for_freeze(mem: &mut Option<Mem>, ctx: usize) {
@@ -12739,6 +12816,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         fault_pager,
         pager: _,
         page_fault: _,
+        reply_ticket: _,
         frames,
         root_parked,
         below,
@@ -15628,10 +15706,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.live_impl_of(h, *type_id)
                     };
                     if let Some((callee, export)) = live {
-                        let (ticket, callee_id) = {
-                            let mut cg = callee.lock_unpoisoned();
-                            (cg.svc_enqueue(export, *op, argv), cg.domain_id())
-                        };
+                        let (ticket, callee_id) =
+                            issue_live_call(host, *durable_sp_ctx, &callee, export, *op, argv);
                         match ticket {
                             Some(t) => {
                                 // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
@@ -15961,10 +16037,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((callee, export, base_op)) = live {
-                        let (ticket, callee_id) = {
-                            let mut cg = callee.lock_unpoisoned();
-                            (cg.svc_enqueue(export, base_op + *op, argv), cg.domain_id())
-                        };
+                        let (ticket, callee_id) = issue_live_call(
+                            host,
+                            *durable_sp_ctx,
+                            &callee,
+                            export,
+                            base_op + *op,
+                            argv,
+                        );
                         match ticket {
                             Some(t) => {
                                 // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
@@ -16134,10 +16214,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((callee, export, base_op)) = live {
-                        let (ticket, callee_id) = {
-                            let mut cg = callee.lock_unpoisoned();
-                            (cg.svc_enqueue(export, base_op, argv), cg.domain_id())
-                        };
+                        let (ticket, callee_id) =
+                            issue_live_call(host, *durable_sp_ctx, &callee, export, base_op, argv);
                         match ticket {
                             Some(t) => {
                                 // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
@@ -21485,6 +21563,10 @@ pub struct Host {
     /// enqueuer), per the pinned §3.6 design. Enqueued embedder-side this slice
     /// ([`Host::svc_enqueue`]); the cross-domain caller side is the §3.6 caller-parking slice.
     svc_queue: VecDeque<SvcDispatch>,
+    /// #1901 — the reply each live call a freeze abandoned was waiting on, by shadow context. The
+    /// dispatch stayed with its callee, so the context's re-issued call waits on this ticket instead
+    /// of enqueueing the call again. Cut data: it rides the serve section.
+    reply_waits: BTreeMap<u32, u64>,
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
     svc_next_ticket: u64,
@@ -22185,6 +22267,7 @@ impl Host {
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
+            reply_waits: BTreeMap::new(),
             svc_next_ticket: 0,
             handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -25595,6 +25678,29 @@ impl Host {
         self.svc_queue = queue.into();
         self.svc_results = results.into_iter().collect();
         self.svc_next_ticket = next;
+    }
+
+    /// #1901 — context `ctx`'s live call, abandoned by a freeze, waits on its callee's `ticket`.
+    fn await_reply_after_thaw(&mut self, ctx: usize, ticket: u64) {
+        self.reply_waits.insert(ctx as u32, ticket);
+    }
+
+    /// #1901 — the ticket context `ctx`'s re-issued live call waits on, when a freeze abandoned the
+    /// call's wait. Taken: the context's next call is a fresh one.
+    fn take_reply_wait(&mut self, ctx: usize) -> Option<u64> {
+        self.reply_waits.remove(&(ctx as u32))
+    }
+
+    /// #1901 — the abandoned reply waits for the snapshot codec, `(context, ticket)` in ascending
+    /// context order (the artifact's canonical order).
+    pub fn reply_waits(&self) -> Vec<(u32, u64)> {
+        self.reply_waits.iter().map(|(&c, &t)| (c, t)).collect()
+    }
+
+    /// #1901 — restore the abandoned reply waits from a snapshot (the inverse of
+    /// [`Host::reply_waits`]). Replaces whatever is present.
+    pub fn set_reply_waits(&mut self, waits: Vec<(u32, u64)>) {
+        self.reply_waits = waits.into_iter().collect();
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).

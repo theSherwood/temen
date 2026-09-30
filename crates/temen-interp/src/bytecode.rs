@@ -6934,6 +6934,11 @@ pub struct ScheduledDebugRun {
     /// record time and re-applied by the DAP backend on rebuilds — so a `seek` replays them at the
     /// identical turns. Empty (the default) is zero-cost.
     forced: Vec<(u64, usize)>,
+    /// Recorded **step spans** (#1942): `(from, to, task)` — the turns `[from, to)` a step drove and
+    /// the thread it drove. A step runs its own thread while the others stay frozen, which the policy
+    /// pick would not reproduce, so a replay prefers the span's thread over those turns. Sorted and
+    /// disjoint; the DAP backend re-installs the list on every rebuild, like `forced`.
+    step_spans: Vec<(u64, u64, usize)>,
     /// Set when `drive` stopped *before* an op that hits a watchpoint (the access hasn't applied yet);
     /// taken by the backend to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
@@ -7822,38 +7827,79 @@ fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
     None
 }
 
-/// Pick the next thread to run under the session's **schedule policy** (slice 7): a forced-switch
-/// entry for this `turn` wins (when its task is runnable), then a `seed`ed pick chooses uniformly
-/// among the runnable set via [`splitmix64`]`(seed ^ turn)`, else the lowest-index runnable — the
-/// original deterministic default. If none is runnable, advance the futex `clock` to the earliest
+/// The thread a recorded step span prefers at `turn`, if one covers it (#1942).
+fn span_at(spans: &[(u64, u64, usize)], turn: u64) -> Option<usize> {
+    let i = spans.partition_point(|&(from, _, _)| from <= turn);
+    let &(_, to, task) = spans.get(i.checked_sub(1)?)?;
+    (turn < to).then_some(task)
+}
+
+/// Drop the step spans at or past `turn`, clipping one that straddles it — the future a new step
+/// from `turn` rewrites (#1942).
+fn truncate_spans(spans: &mut Vec<(u64, u64, usize)>, turn: u64) {
+    spans.retain(|&(from, _, _)| from < turn);
+    if let Some(last) = spans.last_mut() {
+        last.1 = last.1.min(turn);
+    }
+}
+
+/// Record a step's span, merged into the previous one when it continues it on the same thread (a
+/// run of steps on one thread — every step of a single-threaded program — stays one span).
+fn push_span(spans: &mut Vec<(u64, u64, usize)>, span: (u64, u64, usize)) {
+    let (from, to, task) = span;
+    if from >= to {
+        return;
+    }
+    match spans.last_mut() {
+        Some(last) if last.1 == from && last.2 == task => last.1 = to,
+        _ => spans.push(span),
+    }
+}
+
+/// The pick among the **runnable** tasks, without side effects: a forced switch recorded for `turn`
+/// wins, then `pref` (the stepping thread live, or a recorded step span's on replay — #1942), then a
+/// `seed`ed pick chosen uniformly via [`splitmix64`]`(seed ^ turn)`, else the lowest-index runnable
+/// (the original default). Each candidate only while it is runnable; `None` when nothing is.
+fn dbg_preview_pick(
+    tasks: &[DbgTask],
+    seed: Option<u64>,
+    forced: &[(u64, usize)],
+    pref: Option<usize>,
+    turn: u64,
+) -> Option<usize> {
+    let runnable =
+        |i: usize| matches!(tasks.get(i).map(|t| &t.state), Some(DbgTaskState::Runnable));
+    if let Some(f) = forced_at(forced, turn).filter(|&f| runnable(f)) {
+        return Some(f);
+    }
+    if let Some(p) = pref.filter(|&p| runnable(p)) {
+        return Some(p);
+    }
+    let set: Vec<usize> = (0..tasks.len()).filter(|&i| runnable(i)).collect();
+    match seed {
+        _ if set.is_empty() => None,
+        None => Some(set[0]),
+        Some(s) => Some(set[(splitmix64(s ^ turn) % set.len() as u64) as usize]),
+    }
+}
+
+/// Pick the next thread to run under the session's **schedule policy** (slice 7) — the
+/// [`dbg_preview_pick`] order. If none is runnable, advance the futex `clock` to the earliest
 /// `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`), then retry. `None`
 /// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
-/// pure function of `(seed, forced, turn, task states)`, so replay reproduces it exactly.
+/// pure function of `(seed, forced, pref, turn, task states)`, so replay reproduces it exactly —
+/// which is why the live `drive` and the replaying `tick` both pick through here.
 fn dbg_pick_runnable(
     tasks: &mut [DbgTask],
     clock: &mut u64,
     seed: Option<u64>,
     forced: &[(u64, usize)],
+    pref: Option<usize>,
     turn: u64,
 ) -> Option<usize> {
     loop {
-        // A forced switch recorded for this turn wins while its task is runnable.
-        if let Some(f) = forced_at(forced, turn) {
-            if matches!(tasks.get(f).map(|t| &t.state), Some(DbgTaskState::Runnable)) {
-                return Some(f);
-            }
-        }
-        let runnable: Vec<usize> = tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| matches!(t.state, DbgTaskState::Runnable))
-            .map(|(i, _)| i)
-            .collect();
-        if !runnable.is_empty() {
-            return Some(match seed {
-                None => runnable[0], // the original lowest-index default
-                Some(s) => runnable[(splitmix64(s ^ turn) % runnable.len() as u64) as usize],
-            });
+        if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, turn) {
+            return Some(i);
         }
         // #1638 — only a waiter with a REAL deadline is a clock-advance candidate. `flatten`
         // drops the indefinite ones, so "nothing runnable and every remaining waiter is
@@ -7943,6 +7989,7 @@ impl ScheduledDebugRun {
             write_cursor: 0,
             sched_seed: None,
             forced: Vec::new(),
+            step_spans: Vec::new(),
             last_watch: None,
             // Entry-stopped: the first `step` steps off the entry op (not to completion), and the
             // `stopped`/`focus` reads resolve the root task without an explicit `locate`.
@@ -8269,6 +8316,7 @@ impl ScheduledDebugRun {
             sched_trace,
             sched_seed,
             forced,
+            step_spans,
             scheduled_writes,
             write_cursor,
             last_watch,
@@ -8298,57 +8346,49 @@ impl ScheduledDebugRun {
             // stuck; unblocks a stepped `join`/`wait`).
             let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
             // Precedence: the coroutine pin (an atomicity constraint) > a forced switch recorded
-            // for this turn (explicit user intent) > the stepping thread > the policy pick.
+            // for this turn (explicit user intent) > the stepping thread — this step's, or on a
+            // resume past a recorded step, that step's span (#1942) > the policy pick.
+            let pref = step
+                .map(|(st, _)| st)
+                .or_else(|| span_at(step_spans, *turn));
             let ti = if let Some(p) = dbg_pinned_coro(tasks) {
                 p
-            } else if let Some(f) = forced_at(forced, *turn).filter(|f| {
-                matches!(
-                    tasks.get(*f).map(|t| &t.state),
-                    Some(DbgTaskState::Runnable)
-                )
-            }) {
-                f
             } else {
-                match step {
-                    Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
-                    _ => match dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn) {
-                        Some(i) => i,
-                        // Nothing runnable and no timed waiter: a thread parked in a blocking-stdin
-                        // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
-                        // lowest-index one), else a true deadlock.
-                        None => {
-                            // #1366: a thread parked on a host-completed cap is a live `CapPark`
-                            // stop on that thread (lowest-index), resumable via `deliver_cap`.
-                            if let Some((p, id, at)) =
-                                tasks.iter().enumerate().find_map(|(i, t)| match t.state {
-                                    DbgTaskState::CapParked { id, at, .. } => Some((i, id, at)),
-                                    _ => None,
-                                })
-                            {
-                                // The stop location is the call itself, falling back to the live pc.
-                                let pc =
-                                    at.or_else(|| tasks[p].vt.debug_active().cur_ir_pc(source));
-                                if let Some(pc) = pc {
-                                    *stopped = Some(p);
-                                    *focus = p;
-                                    return SchedStop::CapPark { id, pc };
-                                }
+                match dbg_pick_runnable(tasks, clock, *sched_seed, forced, pref, *turn) {
+                    Some(i) => i,
+                    // Nothing runnable and no timed waiter: a thread parked in a blocking-stdin
+                    // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
+                    // lowest-index one), else a true deadlock.
+                    None => {
+                        // #1366: a thread parked on a host-completed cap is a live `CapPark`
+                        // stop on that thread (lowest-index), resumable via `deliver_cap`.
+                        if let Some((p, id, at)) =
+                            tasks.iter().enumerate().find_map(|(i, t)| match t.state {
+                                DbgTaskState::CapParked { id, at, .. } => Some((i, id, at)),
+                                _ => None,
+                            })
+                        {
+                            // The stop location is the call itself, falling back to the live pc.
+                            let pc = at.or_else(|| tasks[p].vt.debug_active().cur_ir_pc(source));
+                            if let Some(pc) = pc {
+                                *stopped = Some(p);
+                                *focus = p;
+                                return SchedStop::CapPark { id, pc };
                             }
-                            let parked = tasks
-                                .iter()
-                                .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
-                            let pc =
-                                parked.and_then(|p| tasks[p].vt.debug_active().cur_ir_pc(source));
-                            return match (parked, pc) {
-                                (Some(p), Some(pc)) => {
-                                    *stopped = Some(p);
-                                    *focus = p;
-                                    SchedStop::StdinPark { pc }
-                                }
-                                _ => SchedStop::Blocked,
-                            };
                         }
-                    },
+                        let parked = tasks
+                            .iter()
+                            .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
+                        let pc = parked.and_then(|p| tasks[p].vt.debug_active().cur_ir_pc(source));
+                        return match (parked, pc) {
+                            (Some(p), Some(pc)) => {
+                                *stopped = Some(p);
+                                *focus = p;
+                                SchedStop::StdinPark { pc }
+                            }
+                            _ => SchedStop::Blocked,
+                        };
+                    }
                 }
             };
             // Slice 6: the only transition a pick causes is a timed-out wait waking.
@@ -8490,18 +8530,50 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// Step the stopped thread until its call depth is `<= max_depth` (`None` ⇒ any = one instruction),
-    /// keeping other threads frozen unless the stepped thread blocks. The shared driver for the stepping
-    /// verbs (step off the current op first, then seek the next qualifying stop).
+    /// The thread a step drives (#1942): the focused one — the thread a client named with
+    /// [`select_task`](Self::select_task) — while it is live, else the stopped one. `None` before the
+    /// first stop.
+    fn step_thread(&self) -> Option<usize> {
+        let st = self.stopped?;
+        let live = |i: usize| {
+            self.tasks
+                .get(i)
+                .is_some_and(|t| !matches!(t.state, DbgTaskState::Done(_)))
+        };
+        Some(if live(self.focus) { self.focus } else { st })
+    }
+
+    /// Step [the stepping thread](Self::step_thread) until its call depth is `<= max_depth` (`None` ⇒
+    /// any = one instruction), keeping other threads frozen unless the stepped thread blocks. The
+    /// shared driver for the stepping verbs (step off the current op first, then seek the next
+    /// qualifying stop).
+    ///
+    /// The step is recorded as a span (#1942) so a replay runs the same thread over the same turns.
+    /// A step taken from an earlier turn (after a step back) rewrites the future, so the spans at or
+    /// past this turn go first.
     fn step_to(&mut self, max_depth: Option<usize>, fuel: &mut u64) -> SchedStop {
-        let Some(st) = self.stopped else {
+        let Some(st) = self.step_thread() else {
             return self.run_until_stop(fuel);
         };
         self.tasks[st].at_bp = true; // step *off* the current op first, then seek the next stop
-        self.drive(fuel, Some((st, max_depth)), None)
+        let from = self.turn;
+        truncate_spans(&mut self.step_spans, from);
+        let stop = self.drive(fuel, Some((st, max_depth)), None);
+        push_span(&mut self.step_spans, (from, self.turn, st));
+        stop
     }
 
-    /// **Step** one instruction — descends into a call. Drives the stopped thread; other threads
+    /// Replace the recorded **step spans** (#1942) — the DAP backend re-installs them on every rebuild.
+    pub fn set_step_spans(&mut self, spans: Vec<(u64, u64, usize)>) {
+        self.step_spans = spans;
+    }
+
+    /// The recorded step spans, for the backend to carry across rebuilds.
+    pub fn step_spans(&self) -> &[(u64, u64, usize)] {
+        &self.step_spans
+    }
+
+    /// **Step** one instruction — descends into a call. Drives the stepping thread; other threads
     /// stay frozen.
     pub fn step(&mut self, fuel: &mut u64) -> SchedStop {
         self.step_to(None, fuel)
@@ -8517,13 +8589,15 @@ impl ScheduledDebugRun {
     /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
     /// the stepped thread blocks), landing at the next op at the same call depth.
     pub fn step_over(&mut self, fuel: &mut u64) -> SchedStop {
-        let max = self.stopped.map(|s| self.step_depth(s));
+        let max = self.step_thread().map(|s| self.step_depth(s));
         self.step_to(max, fuel)
     }
 
     /// **Step out** — run until the stepped thread's current function returns (one call depth shallower).
     pub fn step_out(&mut self, fuel: &mut u64) -> SchedStop {
-        let max = self.stopped.map(|s| self.step_depth(s).saturating_sub(1));
+        let max = self
+            .step_thread()
+            .map(|s| self.step_depth(s).saturating_sub(1));
         self.step_to(max, fuel)
     }
 
@@ -8557,6 +8631,7 @@ impl ScheduledDebugRun {
             sched_trace,
             sched_seed,
             forced,
+            step_spans,
             scheduled_writes,
             write_cursor,
             ..
@@ -8567,9 +8642,10 @@ impl ScheduledDebugRun {
                                                    // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
                                                    // A `CapParked` task is not runnable, so a parked run refuses to tick — as the single engine's.
         let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
-        let Some(ti) = dbg_pinned_coro(tasks)
-            .or_else(|| dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn))
-        else {
+        let Some(ti) = dbg_pinned_coro(tasks).or_else(|| {
+            let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
+            dbg_pick_runnable(tasks, clock, *sched_seed, forced, pref, *turn)
+        }) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
         if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
@@ -8733,12 +8809,12 @@ impl ScheduledDebugRun {
     }
 
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
-    /// focused thread becomes the one about to run (lowest-index runnable), or none once the run finished.
+    /// focused thread becomes the one the schedule runs next, or none once the run finished.
     pub fn locate(&mut self) {
-        let next = self
-            .tasks
-            .iter()
-            .position(|t| matches!(t.state, DbgTaskState::Runnable));
+        // The thread the recorded schedule runs next (#1942) — after a step back, the thread whose
+        // step was undone — rather than the lowest-index runnable one.
+        let pref = span_at(&self.step_spans, self.turn);
+        let next = dbg_preview_pick(&self.tasks, self.sched_seed, &self.forced, pref, self.turn);
         self.stopped = next;
         self.focus = next.unwrap_or(0);
     }
@@ -11805,7 +11881,7 @@ fn freeze_step(
         *freeze_on_quiesce = false;
         let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
             let site = t.state.park_site()?;
-            (site.freeze_rule() == FreezeRule::Decline).then_some((site, ti))
+            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti))
         });
         let declined = match (forked_twins.first(), parked_declined) {
             (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
@@ -11830,6 +11906,16 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait. The oracle re-issues the
+/// wait and the thaw re-parks the call on its ticket (#1901); this engine has no re-park yet, so a
+/// re-admitted call would be issued twice, and it declines instead (#1904).
+fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
+    match site {
+        super::ParkSite::Reply => super::FreezeRule::Decline,
+        s => s.freeze_rule(),
+    }
+}
+
 /// A freeze in flight: re-admit every task parked at a [`super::FreezeRule::Reissue`] site (see
 /// [`freeze_step`]). `true` when it re-admitted one.
 fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
@@ -11839,7 +11925,7 @@ fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
         let Some(site) = t.state.park_site() else {
             continue;
         };
-        if site.freeze_rule() != FreezeRule::Reissue {
+        if freeze_rule_here(site) != FreezeRule::Reissue {
             continue;
         }
         // The freeze ended this wait, not its event: the thaw re-issues it (#1769).

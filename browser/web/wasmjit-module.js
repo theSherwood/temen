@@ -361,7 +361,11 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
   && typeof WebAssembly.promising === 'function';
 
-export async function driveCoopTierupRun(ex, memory, cacheKey) {
+export async function driveCoopTierupRun(ex, memory, cacheKey, counts = {}) {
+  // #1896: how many processes ran whole on the emitted tier, and how many parked calls in them
+  // resumed. A caller that wants to know passes the object to fill.
+  counts.leaves = 0;
+  counts.resumes = 0;
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
   // #816 env-routed tier-up: `win` is PER EVENT — the pending task's window base (root backing for
@@ -685,6 +689,7 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
       if (ev === 4 /* COOP_RUN_RESUME */) {
         // #1896: a leaf's parked call returned. Its results go to the call's scratch, the globals
         // fan out as after any bounce, and the leaf's frames run on.
+        counts.resumes++;
         const task = ex.temen_coop_task();
         const leaf = suspended.get(task);
         suspended.delete(task);
@@ -747,6 +752,7 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
       const func = ex.temen_coop_func();
       // Before the per-event fan-out below, so a program instantiated now gets this event's sync.
       const m = ex.temen_coop_module();
+      if (m !== 0) counts.leaves++;
       const program = await programFor(m);
       const argvPtr = Number(ex.temen_coop_argv_ptr());
       const n = ex.temen_coop_argv_len();
@@ -785,6 +791,97 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
     throw new Error('cooperative tier-up run trapped (declined to the interpreter)');
   }
   return status;
+}
+
+// A **registry blob** (the cdylib's `registry_blob`): all integers little-endian, a u32 entry count,
+// then per entry a u32 name length, the name (UTF-8), a u32 length and the bytes. Its entries, each
+// `[name, bytes]` with `bytes` a view into `blob`.
+export function blobEntries(blob) {
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const dec = new TextDecoder();
+  const out = [];
+  let o = 4;
+  for (let n = dv.getUint32(0, true); n > 0; n--) {
+    const nl = dv.getUint32(o, true);
+    const name = dec.decode(blob.subarray(o + 4, o + 4 + nl));
+    const bl = dv.getUint32(o + 4 + nl, true);
+    o += 8 + nl;
+    out.push([name, blob.subarray(o, o + bl)]);
+    o += bl;
+  }
+  return out;
+}
+
+// The registry blob of `entries`, each `[name, bytes]` ([`blobEntries`]'s inverse).
+export function registryBlob(entries) {
+  const enc = new TextEncoder();
+  const named = entries.map(([n, b]) => [enc.encode(n), b]);
+  const out = new Uint8Array(named.reduce((t, [n, b]) => t + 8 + n.length + b.length, 4));
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, named.length, true);
+  let o = 4;
+  for (const [n, b] of named) {
+    dv.setUint32(o, n.length, true);
+    out.set(n, o + 4);
+    dv.setUint32(o + 4 + n.length, b.length, true);
+    out.set(b, o + 8 + n.length);
+    o += 8 + n.length + b.length;
+  }
+  return out;
+}
+
+// #958 — nimony's toolchain as the nim card ships it (`web/assets/nimony.blob.gz`, written by
+// `nimbuild --bundle`): a registry blob of `cwd`, the directory a build with it runs in (its library
+// pack names it); `commands`, as `temen_nim_open` takes them, nimony first; and `files`, what a build
+// seeds before its program — nimony's library, the library pack, the guest libc.
+export function nimToolchain(bundle) {
+  const e = new Map(blobEntries(bundle));
+  return {
+    cwd: new TextDecoder().decode(e.get('cwd')),
+    commands: e.get('commands'),
+    nimony: blobEntries(e.get('commands'))[0][1],
+    files: blobEntries(e.get('files')),
+  };
+}
+
+// #958 — compile `source` as `prog.nim` with nimony's own driver and run what it builds:
+// `nimony t -r --isMain prog.nim`, one `temen_nim_open` session over `toolchain` ([`nimToolchain`])
+// that `driveCoopTierupRun` runs. The process tree (nimony, nifmake, nimsem, the shell) runs on the
+// interpreter, each leaf process (nifler2, hexer, the program itself) whole on the emitted tier
+// (#1896), and temen-link natively. nimony prints nothing when a build succeeds, so what the session
+// prints is the program's. When the build fails, nothing is linked and what it printed is nimony's
+// diagnostics. Resolves `{ status, exit, stdout, stderr, built, leaves, resumes }`: `built` is
+// whether the program was linked, and so ran.
+export async function nimCompileRun(ex, memory, toolchain, source) {
+  const enc = new TextEncoder();
+  const text = (p, n) => new TextDecoder().decode(new Uint8Array(memory.buffer, p, n).slice());
+  const held = [];
+  const put = (bytes) => {
+    const p = Number(ex.temen_alloc(bytes.length));
+    new Uint8Array(memory.buffer).set(bytes, p);
+    held.push([p, bytes.length]);
+    return [p, bytes.length];
+  };
+  const { cwd } = toolchain;
+  const files = registryBlob([...toolchain.files, [`${cwd}/prog.nim`, enc.encode(source)]]);
+  const argv = enc.encode(['bin/nimony', 't', '-r', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
+  const args = [put(toolchain.nimony), put(toolchain.commands), put(files), put(argv), put(enc.encode(cwd))];
+  const opened = ex.temen_nim_open(...args.flat(), suspendsLeaves ? 1 : 0);
+  // The session holds its own copies of what it was opened with.
+  for (const [p, n] of held.splice(0)) ex.temen_dealloc(p, n);
+  if (opened !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
+  const counts = {};
+  const status = await driveCoopTierupRun(ex, memory, undefined, counts);
+  const stdout = text(Number(ex.temen_stdout_ptr()), ex.temen_stdout_len());
+  const stderr = text(Number(ex.temen_stderr_ptr()), ex.temen_stderr_len());
+  const exit = ex.temen_exit_code();
+  // `nimcache/<stem>.temen/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
+  // slot (read it only after the call: the slot moves).
+  const stemLen = ex.temen_nim_module_suffix(...put(enc.encode('prog.nim')));
+  const stem = text(Number(ex.temen_stdout_ptr()), stemLen);
+  const built = Number(ex.temen_nim_file(...put(enc.encode(`${cwd}/nimcache/${stem}.temen/prog.temen`)))) >= 0;
+  for (const [p, n] of held.splice(0)) ex.temen_dealloc(p, n);
+  return { status, exit, stdout, stderr, built, ...counts };
 }
 
 // Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
