@@ -1305,7 +1305,12 @@ Two halves make it honest:
   server's per-`open` cursors are read back by the guest's next `read`, so a thaw that forgot them
   resumes a guest whose open file silently rewound. `Captured { capture, restore }` serializes it;
   `Stateless` claims there is nothing (`display` is pure output); `Uncaptured` holds state nothing
-  serializes yet (a POSIX personality's fd table), and refuses a freeze like an unnamed capability.
+  serializes yet (a fork twin's personality, #1688), and refuses a freeze like an unnamed capability.
+  The POSIX personality is `Captured` since #1894: its memfs, unread stdin, zombies, and its root
+  process's fd table (shared descriptions written once), allocator, cwd, environment, and signal and
+  stop state ride; the embedder's configuration (commands, sinks, delegates, the terminal) does not,
+  and a socket's fd comes back closed, an edge the thaw does not re-bind. A thaw's registrar rebuilds
+  it with `Posix::from_state`, returns `named_grant`, and the embedder `install`s its doors.
   *A required answer since #1699, not an opt-in:* when "stateless" was the default, a provider that
   forgot to declare froze with empty state and thawed reset, and a thawed capability came back from
   the registrar with no capture at all, so the next freeze lost its state even when the first had it.
@@ -1535,7 +1540,9 @@ meanwhile. So under a landing freeze a stopped vCPU runs on (the freeze re-admit
 stopped), and every host call it reaches is abandoned, as above, rather than performed: the ops
 on the way touch only the domain's own window, whose vCPUs are all stopped. It unwinds at the
 call's poll. A serve op is left to run, since its thaw re-issues it anyway. The stop itself is the
-personality's state, so restoring a thawed domain stopped waits on that state riding the artifact.
+personality's state, which rides the artifact (#1894): a thawed personality that was stopped
+publishes its stop to the engine the moment the run installs the stop mirror, so the domain parks at
+its first op until `SIGCONT`.
 Only the interpreter oracle parks between ops; the JIT and bytecode engines take a stop inside the
 personality's syscall path. Pinned by `quiesce_parks.rs::a_stopped_domain_reaches_its_freeze_point_
 without_leaving_the_domain` and `::a_vcpu_stopped_before_the_freeze_is_brought_through_it`.

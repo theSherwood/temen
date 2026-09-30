@@ -29,9 +29,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{
-    cap_id, CapState, ForkedProc, GuestMem, Host, HostProc, HostProcFork, SignalSource, Trap,
+    cap_id, CapState, ForkedProc, GuestMem, Host, HostProc, HostProcFork, NamedCapGrant,
+    SignalSource, Trap,
 };
 use temen_ir::ResolvedCap;
+
+mod state;
+pub use state::StateError;
 
 /// Op numbers on the shared `HOST_PROC` handle; [`resolve`] maps libc names to these.
 pub const OP_WRITE: u32 = 0;
@@ -1407,6 +1411,31 @@ pub struct Posix {
 }
 
 impl Posix {
+    /// #1894 — this personality's guest-visible state as the bytes a freeze carries: the memfs, the
+    /// root process's fd table, allocator, cwd, environment and signal state (see [`state`]).
+    pub fn capture_state(&self) -> Vec<u8> {
+        let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        let p = self.root.lock().unwrap_or_else(|e| e.into_inner());
+        state::capture(&w, &p)
+    }
+
+    /// #1894 — put [`Posix::capture_state`]'s bytes back, leaving the embedder's configuration and the
+    /// run's doors as they are. Nothing changes when the bytes are refused.
+    pub fn restore_state(&self, bytes: &[u8]) -> Result<(), StateError> {
+        let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self.root.lock().unwrap_or_else(|e| e.into_inner());
+        state::restore(&mut w, &mut p, bytes)
+    }
+
+    /// #1894 — a personality rebuilt from a freeze's captured state, for a thaw's registrar: grant it
+    /// with [`named_grant`], then [`install`] its doors on the thawed host. The embedder re-applies its
+    /// own configuration (commands, sinks, delegates) as it did for the frozen run.
+    pub fn from_state(bytes: &[u8]) -> Result<Posix, StateError> {
+        let posix = new_posix(0, 0, Vec::new());
+        posix.restore_state(bytes)?;
+        Ok(posix)
+    }
+
     /// The signal whose default action terminated this personality's root process, if one did
     /// (POSIX `WTERMSIG` for the root). A root killed that way ends its run as a trap — the engine's
     /// kill is signal-blind — so this is how an embedder tells "bash died of SIGINT, as bash does"
@@ -2181,8 +2210,15 @@ impl SignalSource for SignalDoor {
 
     /// #1259 — store the core's **inline** stop/continue mirror-apply closure (the reorder-critical
     /// `stop_depth` write, fired synchronously in program order; see [`SignalSource::set_stop_apply`]).
+    ///
+    /// #1894 — a process already stopped when its run installs the mirror (a thawed stopped job)
+    /// publishes its stop at once, so the engine parks it at its first op rather than run it.
     fn set_stop_apply(&self, apply: Arc<dyn Fn(bool) + Send + Sync>) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).stop_apply = Some(apply);
+        let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if p.stopped_sig.is_some() {
+            apply(true);
+        }
+        p.stop_apply = Some(apply);
     }
 
     /// #796 default actions — store the core's terminate closure for this process's domain.
@@ -2330,44 +2366,66 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
 }
 
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
-    let world = Arc::new(Mutex::new(new_world(stdin)));
-    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
-    let posix = Posix {
-        world: Arc::clone(&world),
-        root: Arc::clone(&root),
-    };
-    // #863 slice 2 — the root is pid 1 in the process table (so a child can `kill(1, sig)` its
-    // init-like parent; `kill` short-circuits to the self path when the root signals itself).
-    world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .procs
-        .insert(1, ProcEntry::Live(Arc::clone(&root)));
-    // #796 L2 — install the async-signal source + the shared `armed` flag (the *same* `Arc` the
-    // personality mutates), so the interp can redirect into a handler at a safepoint (PROCESS.md §9 L2).
-    let armed = root
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .sig_armed
-        .clone();
-    host.set_signal_source(
-        Arc::new(SignalDoor(Arc::clone(&root), Arc::clone(&world))),
-        armed,
-    );
+    let posix = new_posix(heap_base, heap_end, stdin);
     // FORK.md PR 5 / #863 — grant **forkable**: the factory clones the per-process side by POSIX's
     // rules ([`Proc::fork`]) and shares the [`World`], so a `fork()` twin gets its own fd table /
     // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
     // semantics. `Host::fork_powerbox` calls this factory to carry libc into the twin, instead of
     // failing closed on an opaque closure.
-    let root_for_remap = Arc::clone(&root);
-    // #1699 — the personality holds a process's fd table, cwd, env and signal state, which the
-    // guest observes and nothing serializes yet: `Uncaptured`, so a freeze refuses it rather than
-    // thaw a fresh process under the guest.
-    let handle = host.grant_host_proc_forkable(
-        handler(Arc::clone(&world), Arc::clone(&root)),
-        fork_factory(world, root),
-        CapState::Uncaptured,
-    );
+    let g = named_grant(&posix);
+    let handle = host.grant_host_proc_forkable(g.handler, g.fork.expect("forkable"), g.state);
+    install(host, &posix, handle);
+    (handle, posix)
+}
+
+/// A fresh personality: its world, and its root process as pid 1 of the process table (so a child
+/// can `kill(1, sig)` its init-like parent; `kill` short-circuits to the self path when the root
+/// signals itself, #863 slice 2).
+fn new_posix(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Posix {
+    let world = Arc::new(Mutex::new(new_world(stdin)));
+    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
+    world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .procs
+        .insert(1, ProcEntry::Live(Arc::clone(&root)));
+    Posix { world, root }
+}
+
+/// #1894 — the personality as a host capability: its handler, its fork factory and its state,
+/// which a freeze captures and an in-session rewind restores. [`grant`] grants it; a thaw's
+/// registrar returns it for a personality rebuilt with [`Posix::from_state`].
+pub fn named_grant(posix: &Posix) -> NamedCapGrant {
+    NamedCapGrant {
+        handler: handler(Arc::clone(&posix.world), Arc::clone(&posix.root)),
+        fork: Some(fork_factory(
+            Arc::clone(&posix.world),
+            Arc::clone(&posix.root),
+        )),
+        state: captured(posix),
+    }
+}
+
+/// #1894 — the personality's [`CapState`]: a capture and a restore over its root process and world.
+fn captured(posix: &Posix) -> CapState {
+    let (c, r) = (posix.clone(), posix.clone());
+    CapState::Captured {
+        capture: Box::new(move || c.capture_state()),
+        // An in-session rewind hands back bytes this personality wrote, so a refusal is not reachable.
+        restore: Box::new(move |bytes| {
+            let _ = r.restore_state(bytes);
+        }),
+    }
+}
+
+/// Wire the personality granted at `handle` into `host`: the async-signal door, the op vtable and the
+/// root process's exec-remap hook. [`grant`] does this; a thaw does it once its registrar has
+/// re-granted the personality.
+pub fn install(host: &mut Host, posix: &Posix, handle: i32) {
+    // #796 L2 — install the async-signal source + the shared `armed` flag (the *same* `Arc` the
+    // personality mutates), so the interp can redirect into a handler at a safepoint (PROCESS.md §9 L2).
+    let (source, armed) = cap_signal_source(posix);
+    host.set_signal_source(source, armed);
     // #801 — publish the op vtable on the grant: what lets an exec'd/spawned `__px_`-linked
     // image's manifest bind through the §3.5 coverage walk, signature-checked, with no external
     // resolver — the op knowledge travels with the grant.
@@ -2375,8 +2433,7 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     host.set_host_proc_vtable(handle, names, sigs);
     // #972 — the root process's exec-remap hook: an execve from the root re-points its adopted
     // pipe fds at the carried ends' new handles (fork twins get theirs from the factory).
-    host.push_exec_remap_hook(exec_remap_hook(root_for_remap));
-    (handle, posix)
+    host.push_exec_remap_hook(exec_remap_hook(Arc::clone(&posix.root)));
 }
 
 /// #863 — the self-replicating fork factory over one process: mints a `fork()` twin's handler +
@@ -2537,6 +2594,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
             refork: Some(fork_factory(Arc::clone(&world), Arc::clone(&child))),
             exit: Some(exit),
             exec_remap: Some(exec_remap_hook(child)),
+            // A twin's process does not ride yet: the capture carries the root's (#1688).
             state: CapState::Uncaptured,
         }
     })
@@ -2560,26 +2618,13 @@ pub fn cap(
     Posix,
     impl Fn() -> (HostProc, CapState) + Send + Sync + 'static,
 ) {
-    let world = Arc::new(Mutex::new(new_world(stdin)));
-    let root = Arc::new(Mutex::new(new_proc(heap_base, heap_end)));
-    let posix = Posix {
-        world: Arc::clone(&world),
-        root: Arc::clone(&root),
-    };
-    // #863 slice 2 — the root is pid 1 in the process table (so a child can `kill(1, sig)` its
-    // init-like parent; `kill` short-circuits to the self path when the root signals itself).
-    world
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .procs
-        .insert(1, ProcEntry::Live(Arc::clone(&root)));
+    let posix = new_posix(heap_base, heap_end, stdin);
     // Per-backend mint over the SAME world+proc: the interp and JIT hosts are two engines of one
     // process, so they share both sides (unlike a fork, which clones the proc side).
+    let p = posix.clone();
     let make = move || {
-        (
-            handler(Arc::clone(&world), Arc::clone(&root)),
-            CapState::Uncaptured,
-        )
+        let g = named_grant(&p);
+        (g.handler, g.state)
     };
     (posix, make)
 }

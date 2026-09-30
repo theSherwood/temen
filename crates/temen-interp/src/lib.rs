@@ -20789,8 +20789,8 @@ pub enum CapState {
         capture: HostProcStateCapture,
         restore: HostProcStateRestore,
     },
-    /// The provider holds state the guest can observe and does not serialize it — a POSIX
-    /// personality's fd table and cwd. Named or not, it is not durable: a freeze refuses it
+    /// The provider holds state the guest can observe and does not serialize it — a fork twin's
+    /// POSIX personality (#1688). Named or not, it is not durable: a freeze refuses it
     /// (`NonDurableKind::HostProc`) rather than thaw a fresh one in its place, and an in-session
     /// rewind can't invert it.
     Uncaptured,
