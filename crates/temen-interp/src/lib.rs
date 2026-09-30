@@ -5876,6 +5876,58 @@ impl Sched {
     }
 }
 
+impl Sched {
+    /// #1677 — the site fiber `slot` of `reg` is parked at, with the ticket a reply wait names (`0`
+    /// elsewhere). A fiber parks only in a call that lets it: a futex wait, a stream read, a live
+    /// call's reply, or a punted completion.
+    fn fiber_park(&self, reg: &Arc<FiberRegistry>, slot: usize) -> Option<(ParkSite, u64)> {
+        let is = |w: &Waiter| is_fiber(w, reg, slot);
+        if self.wait_waiters.values().flatten().any(|(_, w)| is(w)) {
+            Some((ParkSite::Futex, 0))
+        } else if self.cap_waiters.values().flatten().any(is) {
+            Some((ParkSite::StreamRead, 0))
+        } else if let Some((&(_, t), _)) = self.ticket_waiters.iter().find(|(_, w)| is(w)) {
+            Some((ParkSite::Reply, t))
+        } else if self.completion_waiters.values().any(is) {
+            Some((ParkSite::Completion, 0))
+        } else {
+            None
+        }
+    }
+
+    /// [`Sched::fiber_park`], taking the waiter entry out.
+    fn take_fiber_park(
+        &mut self,
+        reg: &Arc<FiberRegistry>,
+        slot: usize,
+    ) -> Option<(ParkSite, u64)> {
+        let park = self.fiber_park(reg, slot)?;
+        let keep = |w: &Waiter| !is_fiber(w, reg, slot);
+        match park.0 {
+            ParkSite::Futex => {
+                for q in self.wait_waiters.values_mut() {
+                    q.retain(|(_, w)| keep(w));
+                }
+                self.wait_waiters.retain(|_, q| !q.is_empty());
+            }
+            ParkSite::StreamRead => {
+                for q in self.cap_waiters.values_mut() {
+                    q.retain(keep);
+                }
+                self.cap_waiters.retain(|_, q| !q.is_empty());
+            }
+            ParkSite::Reply => self.ticket_waiters.retain(|_, w| keep(w)),
+            _ => self.completion_waiters.retain(|_, w| keep(w)),
+        }
+        Some(park)
+    }
+}
+
+/// Whether `w` is fiber `slot` of `reg`.
+fn is_fiber(w: &Waiter, reg: &Arc<FiberRegistry>, slot: usize) -> bool {
+    matches!(w, Waiter::Fiber { reg: r, slot: sl, .. } if Arc::ptr_eq(r, reg) && *sl == slot)
+}
+
 /// Whether a `ticket_waiters` entry waits on a reply ([`ParkSite::Reply`]), not on a page
 /// ([`ParkSite::PageFault`]). A fiber never page-faults.
 fn is_reply<T: DomainMember>(e: &T) -> bool {
@@ -6733,33 +6785,16 @@ impl Scheduler {
         }
     }
 
-    /// DURABILITY.md §13.4 step 2 — whether fiber `slot` of `reg` is parked in a **futex
-    /// wait** (its waiter entry sits in `wait_waiters`). The freeze driver's park-kind probe:
-    /// a futex park freezes (its `MemoryWait` thaw arm re-issues the wait), a cap park
-    /// (`cap_waiters`/`ticket_waiters`) does not (its `Leaf` spill would reload the freeze
-    /// placeholder as the call's result) — probe only, nothing is consumed.
-    fn fiber_wait_parked(&self, reg: &Arc<FiberRegistry>, slot: usize) -> bool {
-        let s = self.lock();
-        s.wait_waiters.values().any(|q| {
-            q.iter().any(|(_, w)| {
-                matches!(w, Waiter::Fiber { reg: r, slot: sl, .. }
-                    if Arc::ptr_eq(r, reg) && *sl == slot)
-            })
-        })
+    /// #1677 — where fiber `slot` of `reg` is parked ([`Sched::fiber_park`]). Probe only.
+    fn fiber_park(&self, reg: &Arc<FiberRegistry>, slot: usize) -> Option<(ParkSite, u64)> {
+        self.lock().fiber_park(reg, slot)
     }
 
-    /// DURABILITY.md §13.4 step 2 — consume fiber `slot`'s futex waiter entry (the freeze
-    /// takes ownership of the park; the thaw's re-issued wait re-derives it). A stale timer
-    /// for the purged waiter finds it absent and is skipped, as for a notified waiter.
-    fn purge_fiber_wait_park(&self, reg: &Arc<FiberRegistry>, slot: usize) {
-        let mut s = self.lock();
-        for q in s.wait_waiters.values_mut() {
-            q.retain(|(_, w)| {
-                !matches!(w, Waiter::Fiber { reg: r, slot: sl, .. }
-                    if Arc::ptr_eq(r, reg) && *sl == slot)
-            });
-        }
-        s.wait_waiters.retain(|_, q| !q.is_empty());
+    /// #1677 — take fiber `slot`'s waiter entry out of the scheduler: the freeze owns the park now,
+    /// and the thaw re-issues it. No wake can reach the fiber after this, so its `woken` flag is
+    /// final. A stale timer for a taken futex waiter finds it absent and is skipped.
+    fn take_fiber_park(&self, reg: &Arc<FiberRegistry>, slot: usize) -> Option<(ParkSite, u64)> {
+        self.lock().take_fiber_park(reg, slot)
     }
 
     /// §3.6 slice 3 — a caller's enqueue landed on domain `key`'s queue: wake its vCPUs parked
@@ -8089,9 +8124,13 @@ fn freeze_census(
         if *nested_child && reg.has_freeze_residue() {
             return declined(DeclineCause::NestedChildFibers, *task, None);
         }
+        // #1677 — an unwoken fiber park follows its site's rule, as a vCPU's does.
         for (slot, woken) in reg.blocked_parks() {
-            if !woken && !rs.fiber_wait_parked(reg, slot) {
-                return declined(DeclineCause::FiberParkedOnCall, *task, Some(slot));
+            match rs.fiber_park(reg, slot) {
+                _ if woken => {}
+                Some((site, _)) if site.freeze_rule() == FreezeRule::Reissue => {}
+                Some((site, _)) => return declined(DeclineCause::Parked(site), *task, Some(slot)),
+                None => return declined(DeclineCause::FiberParkedOnCall, *task, Some(slot)),
             }
         }
     }
@@ -9510,18 +9549,19 @@ impl SchedRef {
             SchedRef::Det(_) => 0,
         }
     }
-    /// §13.4 step 2 park-kind probe ([`Scheduler::fiber_wait_parked`]); the explorer hosts no
-    /// durable freezes, so its arm answers `false` (→ the freeze fails closed).
-    fn fiber_wait_parked(&self, reg: &Arc<FiberRegistry>, slot: usize) -> bool {
+    /// #1677 fiber park probe ([`Scheduler::fiber_park`]); the explorer hosts no durable freezes,
+    /// so its arm answers `None` (→ the freeze fails closed).
+    fn fiber_park(&self, reg: &Arc<FiberRegistry>, slot: usize) -> Option<(ParkSite, u64)> {
         match self {
-            SchedRef::Real(s) => s.fiber_wait_parked(reg, slot),
-            SchedRef::Det(_) => false,
+            SchedRef::Real(s) => s.fiber_park(reg, slot),
+            SchedRef::Det(_) => None,
         }
     }
-    /// §13.4 step 2 waiter consume ([`Scheduler::purge_fiber_wait_park`]); explorer: no-op.
-    fn purge_fiber_wait_park(&self, reg: &Arc<FiberRegistry>, slot: usize) {
-        if let SchedRef::Real(s) = self {
-            s.purge_fiber_wait_park(reg, slot);
+    /// #1677 fiber park take ([`Scheduler::take_fiber_park`]); explorer: `None`.
+    fn take_fiber_park(&self, reg: &Arc<FiberRegistry>, slot: usize) -> Option<(ParkSite, u64)> {
+        match self {
+            SchedRef::Real(s) => s.take_fiber_park(reg, slot),
+            SchedRef::Det(_) => None,
         }
     }
     /// Atomic reply-or-stash ([`Scheduler::cap_reply_or_stash`]); the explorer has no caller
@@ -11140,6 +11180,14 @@ impl FiberRegistry {
                 t.fibers[slot] = old;
                 Ok((slot, Claimed::StillParked))
             }
+            // #1677 — another vCPU's freeze drive already flattened it: the registry is the
+            // domain's, and whichever vCPU finishes first drives every parked fiber. Only a freeze
+            // leaves a slot `Frozen`, so this resumer is unwinding too: it is told the fiber is
+            // still parked, its trailing poll unwinds, and the thaw re-issues the resume.
+            RegFiber::Frozen => {
+                t.fibers[slot] = RegFiber::Frozen;
+                Ok((slot, Claimed::StillParked))
+            }
             old => {
                 t.fibers[slot] = old; // lost: already running (or done) — put it back untouched
                 Err(Trap::FiberFault)
@@ -12243,13 +12291,17 @@ impl VCpu {
             return Err(Trap::FiberFault);
         }
         // §13.4 step 2 classification (before anything is consumed): an event-parked fiber
-        // freezes when its thaw can re-derive the park — a WOKEN park's delivered result is
-        // already in its frames (the point's spill reloads it), and an unwoken FUTEX park
-        // re-issues at its `MemoryWait` thaw arm. An unwoken CAP park would spill the freeze
-        // placeholder into a `Leaf` frame (reloaded as the call's result — unsound), so it
-        // fails the whole freeze closed.
+        // freezes when its thaw can re-derive the park. A WOKEN park's delivered result is already
+        // in its frames (the point's spill reloads it). An unwoken park follows its site's rule, as
+        // a vCPU's does (#1677): only a re-issue site freezes, and the census declined the rest.
         for (slot, woken) in self.registry.blocked_parks() {
-            if !woken && !self.sched.fiber_wait_parked(&self.registry, slot) {
+            let reissues = |(site, _): (ParkSite, u64)| site.freeze_rule() == FreezeRule::Reissue;
+            if !woken
+                && !self
+                    .sched
+                    .fiber_park(&self.registry, slot)
+                    .is_some_and(reissues)
+            {
                 return Err(Trap::FiberFault);
             }
         }
@@ -12264,23 +12316,37 @@ impl VCpu {
             .unwrap_or_else(|| arena.frame_base(self.vcpu_ctx));
         while let Some((slot, frames)) = self.registry.take_parked_for_freeze() {
             // Placeholder resume value (inert; not spilled by `Yield`).
-            self.flatten_fiber_for_freeze(slot, frames, Some(Reg::from_i64(0)))?;
+            self.flatten_fiber_for_freeze(slot, frames, Some(Reg::from_i64(0)), false)?;
         }
-        // §13.4 step 2 — flatten the event-parked fibers (classified above): a woken park's
-        // frames already carry its delivered result (no placeholder — the point's spill reloads
-        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and the
-        // freeze's `WAIT_FROZEN` is delivered — the `MemoryWait` point spills it, and its thaw arm
-        // re-issues exactly such a wait, which re-checks the restored guest value (the O10
-        // re-issue rule turned inward; #1769).
-        while let Some((slot, frames, woken)) = self.registry.take_blocked_for_freeze() {
-            let placeholder = if woken {
-                None
-            } else {
-                self.sched.purge_fiber_wait_park(&self.registry, slot);
-                // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
-                Some(Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN))
+        // §13.4 step 2 — flatten the event-parked fibers (classified above). The waiter entry
+        // comes out of the scheduler first, so no wake lands after the fiber's `woken` is read.
+        // A woken park's frames already carry its delivered result (no placeholder: the point's
+        // spill reloads the real value at thaw). An unwoken one is abandoned as a vCPU's is
+        // (#1677): a futex wait takes `WAIT_FROZEN`, which its `MemoryWait` thaw arm re-issues
+        // against the restored value (#1769); a stream read or a reply wait takes a placeholder
+        // and its context's re-issue word, and the thaw re-issues the call, the reply's on the
+        // same ticket (#1901).
+        while let Some(&(slot, _)) = self.registry.blocked_parks().first() {
+            let park = self.sched.take_fiber_park(&self.registry, slot);
+            let Some((_, frames, woken)) = self.registry.take_blocked_for_freeze() else {
+                break;
             };
-            self.flatten_fiber_for_freeze(slot, frames, placeholder)?;
+            let (placeholder, reissue) = match park {
+                _ if woken => (None, false),
+                Some((ParkSite::Futex, _)) => (
+                    Some(Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN)),
+                    false,
+                ),
+                Some((ParkSite::StreamRead, _)) => (Some(Reg::from_i64(0)), true),
+                Some((ParkSite::Reply, ticket)) => {
+                    self.host
+                        .lock_unpoisoned()
+                        .await_reply_after_thaw(shadow_context_index(slot), ticket);
+                    (Some(Reg::from_i64(0)), true)
+                }
+                _ => return Err(Trap::FiberFault),
+            };
+            self.flatten_fiber_for_freeze(slot, frames, placeholder, reissue)?;
         }
         // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
         self.durable_sp_ctx = self.vcpu_ctx;
@@ -12296,12 +12362,14 @@ impl VCpu {
     /// continuation spills into *its own* shadow region, and record the [`FrozenFiber`]
     /// residue. `placeholder` is the inert resume/status value delivered when the park's
     /// point excludes it from the spill (`None` when the frames already carry a real
-    /// delivered result — a woken event-park).
+    /// delivered result — a woken event-park). `reissue` marks the fiber's host call abandoned,
+    /// so its thaw re-issues it (#1677).
     fn flatten_fiber_for_freeze(
         &mut self,
         slot: usize,
         mut frames: Vec<Frame>,
         placeholder: Option<Reg>,
+        reissue: bool,
     ) -> Result<(), Trap> {
         // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
         let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
@@ -12322,6 +12390,9 @@ impl VCpu {
         let arena = self.arena();
         if let Some(m) = self.mem.as_mut() {
             m.durable_set_sp(arena.region_base(fctx), arena.frame_base(fctx));
+        }
+        if reissue {
+            abandon_for_freeze(&mut self.mem, fctx);
         }
         self.frames = frames;
         self.cur = ROOT_FIBER;
@@ -19724,7 +19795,7 @@ pub enum DeclineCause {
     DetachedUnreachable,
     /// A serve handler is parked (#1677).
     ServeHandlerParked,
-    /// A fiber is parked on a capability call, a ticket or a pipe (#1676).
+    /// A fiber is parked where no scheduler waiter records it, so no rule applies (#1677).
     FiberParkedOnCall,
     /// A detached child's window has a §13 region mapped, so its image cannot be taken (#1679).
     SharedRegionWindow,
