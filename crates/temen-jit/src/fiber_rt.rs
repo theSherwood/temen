@@ -1150,7 +1150,14 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // globally-deepest frame's flip to `NORMAL` propagates back up through the switches — exactly as
         // the former single global state word did. Mirrors the interp's `shadow_switch` carry.
         let phase = *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *const i32);
-        *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *mut i32) = phase;
+        // DURABILITY.md §13.4 step 4 (per-fiber thaw re-arm), the interp's `shadow_switch`: a fiber
+        // whose restored region still holds a frame (seeded frozen residue not yet rewound) re-enters
+        // `REWINDING` whatever the carried phase, or a first resume after the root's rewind finished
+        // would start it fresh and orphan its spilled frame (#1973: a fiber parked on a pipe).
+        let rewinding =
+            slot.shadow_sp.load(Ordering::Relaxed) > rtm.table.shadow.frame_base(slot_idx + 1);
+        *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *mut i32) =
+            if rewinding { STATE_REWINDING } else { phase };
         rtm.cur_shadow = Some(Arc::clone(&slot));
         Some((resumer, resumer_region))
     } else {

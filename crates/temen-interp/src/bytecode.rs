@@ -10212,13 +10212,10 @@ fn freeze_drive(
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
     // fails the whole freeze closed.
-    // A host park (#1952) likewise has no re-issue arm yet (#1677).
-    if fibers.iter().any(|f| {
-        matches!(
-            f,
-            FiberState::CapParked { woken: None, .. } | FiberState::HostParked { .. }
-        )
-    }) {
+    if fibers
+        .iter()
+        .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
+    {
         return Err(Trap::FiberFault);
     }
     let mut frozen = Vec::new();
@@ -10261,6 +10258,9 @@ fn freeze_drive(
                 vm.set(dst, Reg::from_i64(r));
                 (vm, false)
             }
+            // A pipe or stdin park's op is rewound (#1952): the unwind re-runs it, and it abandons
+            // itself under the landing freeze (`abandon_for_freeze`), for the thaw to re-issue.
+            FiberState::HostParked { vm, .. } => (vm, false),
             other => {
                 // Not parked: nothing to flatten. A fresh, already-unwound (#1835) or finished slot
                 // still rides (#1684), so the thaw rebuilds the table slot for slot.

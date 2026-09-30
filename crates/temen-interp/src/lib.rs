@@ -5899,12 +5899,16 @@ impl Sched {
 
 impl Sched {
     /// #1677 — the site fiber `slot` of `reg` is parked at, with the ticket a reply wait names (`0`
-    /// elsewhere). A fiber parks only in a call that lets it: a futex wait, a stream read, a live
-    /// call's reply, or a punted completion.
+    /// elsewhere). A fiber parks only in a call that lets it: a futex wait, a pipe op (#1952), a
+    /// stream read, a live call's reply, or a punted completion.
     fn fiber_park(&self, reg: &Arc<FiberRegistry>, slot: usize) -> Option<(ParkSite, u64)> {
         let is = |w: &Waiter| is_fiber(w, reg, slot);
         if self.wait_waiters.values().flatten().any(|(_, w)| is(w)) {
             Some((ParkSite::Futex, 0))
+        } else if self.pipe_waiters.values().flatten().any(is) {
+            Some((ParkSite::PipeRead, 0))
+        } else if self.pipe_write_waiters.values().flatten().any(is) {
+            Some((ParkSite::PipeWrite, 0))
         } else if self.cap_waiters.values().flatten().any(is) {
             Some((ParkSite::StreamRead, 0))
         } else if let Some((&(_, t), _)) = self.ticket_waiters.iter().find(|(_, w)| is(w)) {
@@ -5931,17 +5935,22 @@ impl Sched {
                 }
                 self.wait_waiters.retain(|_, q| !q.is_empty());
             }
-            ParkSite::StreamRead => {
-                for q in self.cap_waiters.values_mut() {
-                    q.retain(keep);
-                }
-                self.cap_waiters.retain(|_, q| !q.is_empty());
-            }
+            ParkSite::PipeRead => retain_waiters(&mut self.pipe_waiters, keep),
+            ParkSite::PipeWrite => retain_waiters(&mut self.pipe_write_waiters, keep),
+            ParkSite::StreamRead => retain_waiters(&mut self.cap_waiters, keep),
             ParkSite::Reply => self.ticket_waiters.retain(|_, w| keep(w)),
             _ => self.completion_waiters.retain(|_, w| keep(w)),
         }
         Some(park)
     }
+}
+
+/// Keep the waiters of `m` that `keep` accepts, dropping the queues left empty.
+fn retain_waiters<K: Ord>(m: &mut BTreeMap<K, Vec<Waiter>>, keep: impl Fn(&Waiter) -> bool) {
+    for q in m.values_mut() {
+        q.retain(&keep);
+    }
+    m.retain(|_, q| !q.is_empty());
 }
 
 /// Whether `w` is fiber `slot` of `reg`.
@@ -12353,7 +12362,8 @@ impl VCpu {
         // (#1677): a futex wait takes `WAIT_FROZEN`, which its `MemoryWait` thaw arm re-issues
         // against the restored value (#1769); a stream read or a reply wait takes a placeholder
         // and its context's re-issue word, and the thaw re-issues the call, the reply's on the
-        // same ticket (#1901).
+        // same ticket (#1901). A pipe park's op is rewound (#1952): the unwind re-runs it, and
+        // `decide` abandons it under the landing freeze, as a re-admitted vCPU's (#1672).
         while let Some(&(slot, _)) = self.registry.blocked_parks().first() {
             let park = self.sched.take_fiber_park(&self.registry, slot);
             let Some((_, frames, woken)) = self.registry.take_blocked_for_freeze() else {
@@ -12365,6 +12375,7 @@ impl VCpu {
                     Some(Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN)),
                     false,
                 ),
+                Some((ParkSite::PipeRead | ParkSite::PipeWrite, _)) => (None, false),
                 Some((ParkSite::StreamRead, _)) => (Some(Reg::from_i64(0)), true),
                 Some((ParkSite::Reply, ticket)) => {
                     self.host
