@@ -212,6 +212,22 @@ struct MemMapping {
     file_off: u64,
 }
 
+impl MemMapping {
+    /// Copy the whole mapping from the guest window back into its file, growing the file if the
+    /// mapping reaches past its end. Nothing to copy without a window, or if the range can't be read.
+    fn write_back(&self, mem: Option<&dyn GuestMem>) {
+        let Some(bytes) = mem.and_then(|m| m.read_bytes(self.base, self.len)) else {
+            return;
+        };
+        let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let end = (self.file_off + self.len) as usize;
+        if end > d.len() {
+            d.resize(end, 0);
+        }
+        d[self.file_off as usize..end].copy_from_slice(&bytes);
+    }
+}
+
 #[derive(Default)]
 struct MemFsState {
     files: HashMap<String, Arc<Mutex<Vec<u8>>>>,
@@ -669,8 +685,21 @@ impl MemFsState {
                 let Some(slot) = self.open.get_mut(a(0) as usize) else {
                     return EBADF;
                 };
-                if slot.take().is_none() {
+                let Some(closed) = slot.take() else {
                     return EBADF;
+                };
+                // Copy the file's shared mappings back as its descriptor goes, so the file holds what
+                // the program wrote through them once it is done with the file — on a real system the
+                // writes are in the file by the time the process exits, mapping or not. The mappings
+                // stay live: a later `msync`/`munmap` copies back again.
+                if !self.crash_frozen() {
+                    for map in self
+                        .maps
+                        .iter()
+                        .filter(|m| Arc::ptr_eq(&m.data, &closed.data))
+                    {
+                        map.write_back(mem.as_deref());
+                    }
                 }
                 0
             }
@@ -807,16 +836,7 @@ impl MemFsState {
                 };
                 let map = self.maps.remove(idx);
                 if !self.crash_frozen() {
-                    if let Some(m) = mem.as_deref() {
-                        if let Some(bytes) = m.read_bytes(map.base, map.len) {
-                            let mut d = map.data.lock().unwrap_or_else(|e| e.into_inner());
-                            let end = (map.file_off + map.len) as usize;
-                            if end > d.len() {
-                                d.resize(end, 0);
-                            }
-                            d[map.file_off as usize..end].copy_from_slice(&bytes);
-                        }
-                    }
+                    map.write_back(mem.as_deref());
                 }
                 0
             }
@@ -1103,6 +1123,16 @@ pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 
     h
 }
 
+/// The files and directories in the `vm_fs` store `host` granted ([`grant_vm_fs`]), as an
+/// [`encode_image`] blob: what the program has written so far, in the format a launch seeds from. An
+/// empty image when `host` grants no `vm_fs`. It reads the store through the capability's own state,
+/// so it needs no handle to the store and survives the store being re-granted.
+pub fn vm_fs_image(host: &temen_interp::Host) -> Vec<u8> {
+    host.capture_named_cap_state("vm_fs")
+        .and_then(|state| MemFsHandle::from_state(&state).ok())
+        .map_or_else(|| encode_image(&[], &[]), |fs| fs.image())
+}
+
 /// #1697 — [`grant_vm_fs`]'s thaw half: a [`temen_interp::NamedCapRegistrar`] that serves `vm_fs`,
 /// rebuilding the store from the state the artifact carries, and refuses every other name. An
 /// embedder that grants `vm_fs` gives its registrar this too (first, or as its fallback), so what it
@@ -1351,6 +1381,32 @@ mod tests {
             a.capture_state(),
             "and ends in the same state"
         );
+    }
+
+    /// Closing a file's descriptor copies its shared mappings back: the file holds what the program
+    /// wrote through the mapping, with no `munmap` or `msync`. The mapping stays live, so a write after
+    /// the close still reaches the file at `munmap`.
+    #[test]
+    fn closing_a_file_copies_its_shared_mappings_back() {
+        let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
+            fs(op, args, Some(mem), None).expect("host fn")[0]
+        };
+        let store = MemFsHandle::seeded(&[("f".into(), b"AAAA".to_vec())], &[]);
+        let mut fs = store.handler();
+        // Path "f" at 0; the mapping at 16.
+        let mut mem = VecMem(vec![0u8; 32]);
+        mem.0[0] = b'f';
+        let fd = call(&mut fs, FS_OPEN, &[0, 1, O_READ | O_WRITE], &mut mem);
+        assert_eq!(call(&mut fs, FS_MMAP, &[fd, 0, 4, 16], &mut mem), 0);
+        assert_eq!(&mem.0[16..20], b"AAAA", "the file is copied in");
+        mem.0[16..20].copy_from_slice(b"WXYZ");
+        let file = |store: &MemFsHandle| store.seed().0[0].1.clone();
+        assert_eq!(file(&store), b"AAAA", "not copied back before the close");
+        assert_eq!(call(&mut fs, FS_CLOSE, &[fd], &mut mem), 0);
+        assert_eq!(file(&store), b"WXYZ", "copied back by the close");
+        mem.0[16] = b'!';
+        assert_eq!(call(&mut fs, FS_MUNMAP, &[16], &mut mem), 0);
+        assert_eq!(file(&store), b"!XYZ", "and again by the munmap");
     }
 
     /// A capture is all or nothing: bytes this version cannot fully read refuse the whole store.

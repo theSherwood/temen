@@ -1,11 +1,17 @@
 #ifndef __SYS_MMAN_H
 #define __SYS_MMAN_H
 
-// <sys/mman.h> for the playground — **anonymous** memory mapping over the granted Memory capability.
-// `mmap` with `MAP_ANONYMOUS` hands back page-aligned, zero-filled memory from the same map-growing
-// allocator `malloc` uses (`__vm_map` under the hood — see <stdlib.h>); `munmap`/`mprotect` are
-// no-ops (MVP: no reclamation, like `free`). File-backed mappings (a real `fd`) are **not** supported
-// in the sandbox powerbox — they return `MAP_FAILED`. No authority beyond the Memory capability, all
+// <sys/mman.h> for the playground: memory mapping over the granted Memory capability, and over the
+// `vm_fs` memfs for a file.
+//
+// - `MAP_ANONYMOUS` hands back page-aligned, zero-filled memory from the same map-growing allocator
+//   `malloc` uses (`__vm_map` under the hood; see <stdlib.h>).
+// - A file mapping gets the same fresh pages with the file's bytes copied in. `MAP_PRIVATE` stops
+//   there. `MAP_SHARED` registers the pages with the memfs (its `FS_MMAP`), which copies them back to
+//   the file on `msync`, on `munmap`, and when the file's descriptor is closed.
+//
+// There is no reclamation (like `free`), and `mprotect` is a no-op: the mapping is always readable and
+// writable within the confined window. No authority beyond the Memory and `vm_fs` capabilities; all
 // guest C.
 #include <stdlib.h> // size_t, malloc, __vm_page_size (the map-growing page allocator)
 
@@ -20,35 +26,69 @@
 #define MAP_ANONYMOUS 0x20
 #define MAP_ANON 0x20
 
+#define MS_ASYNC 1
+#define MS_INVALIDATE 2
+#define MS_SYNC 4
+
 #define MAP_FAILED ((void *)-1L)
 
-// `mmap(addr, len, prot, flags, fd, offset)` — anonymous only. Returns page-aligned memory (whole
-// pages, as `mmap` promises) or `MAP_FAILED`. `addr`/`prot`/`offset` are accepted and ignored (the
-// mapping is always readable+writable within the confined window); a file `fd` (>= 0) or a
-// non-anonymous mapping is refused. Fresh window pages are zero-filled, matching `MAP_ANONYMOUS`.
-static inline void *mmap(void *addr, size_t len, int prot, int flags, int fd, long offset) {
-  (void)addr;
-  (void)prot;
-  (void)offset;
-  if (fd != -1 || !(flags & MAP_ANONYMOUS) || len == 0) return MAP_FAILED;
-  // The page size from the Memory capability, as `malloc` reads it. Not `__pg_pagesize`: that is a
-  // helper inside the libc bodies, which a program compiled against the prebuilt libc unit
-  // (declarations only) doesn't see — so every `mmap` program failed that compile and took the
-  // slow whole-program retry.
+// The memfs seam and the ops this header uses (see <unistd.h> for the seam itself).
+extern long __vm_fs(long op, long a, long b, long c, long d);
+enum { __FS_MM_READ = 1, __FS_MM_SEEK = 3, __FS_MM_MMAP = 9, __FS_MM_MSYNC = 10, __FS_MM_MUNMAP = 11 };
+
+// `len` bytes of fresh, page-aligned memory: whole pages, as `mmap` promises. The page size comes
+// from the Memory capability, as `malloc` reads it. (Not `__pg_pagesize`: that is a helper inside the
+// libc bodies, which a program compiled against the prebuilt libc unit, declarations only, doesn't
+// see.)
+static inline char *__mmap_pages(size_t len) {
   long pg = __vm_page_size();
   if (pg <= 0) pg = 4096;
   // Over-allocate by a page so the payload can be rounded up to a page boundary.
   char *raw = (char *)malloc(len + (size_t)pg);
-  if (!raw) return MAP_FAILED;
-  long aligned = ((long)raw + pg - 1) & ~(pg - 1);
-  return (void *)aligned;
+  if (!raw) return 0;
+  return (char *)(((long)raw + pg - 1) & ~(pg - 1));
 }
 
-// No reclamation in the MVP allocator (like `free`), so `munmap`/`mprotect` succeed as no-ops.
-static inline int munmap(void *addr, size_t len) {
+// `mmap(addr, len, prot, flags, fd, offset)`. `addr` and `prot` are accepted and ignored. Returns the
+// mapping, or `MAP_FAILED` (a zero length, a bad descriptor, or no memory left).
+static inline void *mmap(void *addr, size_t len, int prot, int flags, int fd, long offset) {
   (void)addr;
+  (void)prot;
+  if (len == 0) return MAP_FAILED;
+  if (flags & MAP_ANONYMOUS) {
+    if (fd != -1) return MAP_FAILED;
+    char *p = __mmap_pages(len);
+    return p ? (void *)p : MAP_FAILED;
+  }
+  if (fd < 3 || offset < 0) return MAP_FAILED;
+  char *p = __mmap_pages(len);
+  if (!p) return MAP_FAILED;
+  if (flags & MAP_SHARED) {
+    // The memfs copies the file in and remembers the pages, to copy them back later.
+    return __vm_fs(__FS_MM_MMAP, fd, offset, (long)len, (long)p) < 0 ? MAP_FAILED : (void *)p;
+  }
+  // MAP_PRIVATE: a copy of the file's bytes, read at `offset` without moving the descriptor. Past
+  // the end of the file the pages stay zero, as they do for a real mapping.
+  long pos = __vm_fs(__FS_MM_SEEK, fd, 1 /* SEEK_CUR */, 0, 0);
+  if (pos < 0 || __vm_fs(__FS_MM_SEEK, fd, 0 /* SEEK_SET */, offset, 0) < 0) return MAP_FAILED;
+  long got = __vm_fs(__FS_MM_READ, fd, (long)p, (long)len, 0);
+  __vm_fs(__FS_MM_SEEK, fd, 0 /* SEEK_SET */, pos, 0);
+  return got < 0 ? MAP_FAILED : (void *)p;
+}
+
+// Copy a shared file mapping back to its file and forget it. Anonymous and private mappings have
+// nothing to copy back (the memfs doesn't know them), and their memory is never reclaimed, so
+// unmapping them succeeds as a no-op.
+static inline int munmap(void *addr, size_t len) {
   (void)len;
+  __vm_fs(__FS_MM_MUNMAP, (long)addr, 0, 0, 0);
   return 0;
+}
+// Copy `[addr, addr + len)` of a shared file mapping back to its file.
+static inline int msync(void *addr, size_t len, int flags) {
+  (void)flags;
+  long r = __vm_fs(__FS_MM_MSYNC, (long)addr, (long)len, 0, 0);
+  return r < 0 ? -1 : 0;
 }
 static inline int mprotect(void *addr, size_t len, int prot) {
   (void)addr;

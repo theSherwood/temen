@@ -200,6 +200,7 @@ impl DapServer {
             "provideStdin" => self.on_provide_stdin(args),
             "provideCap" => self.on_provide_cap(args),
             "memModelStats" => self.on_mem_model_stats(),
+            "fsImage" => self.on_fs_image(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
             "globals" => self.on_globals(),
@@ -1352,6 +1353,17 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         };
         (true, map, vec![])
+    }
+
+    /// The custom `fsImage` request: the program's `vm_fs` files, as base64 of a Temen fs-image blob —
+    /// the format the `fsImage` launch argument seeds from. It rewinds with the program, so a step back
+    /// past a file's creation removes it. Fails cleanly with no session.
+    fn on_fs_image(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(s) = self.session.as_ref() else {
+            return (false, Json::Null, vec![]);
+        };
+        let image = base64_encode(&s.inspector.fs_image());
+        (true, Json::obj(vec![("image", Json::s(image))]), vec![])
     }
 
     /// The custom `memModelStats` request (slice 4): the armed memory model's counters + line-state

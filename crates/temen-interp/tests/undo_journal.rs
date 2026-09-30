@@ -368,57 +368,27 @@ fn stateful_counter_host(
     (host, h, n)
 }
 
-/// **Declared state rides the tape (#1491).** A capability with opaque declared state is undoable
-/// while its crossings are recorded: the undo re-arms replay from the run's own tape, so re-execution
-/// re-serves the recorded answers without entering the handler, and the handler keeps the state of
-/// the tape's end — what a live continuation past it will call into.
+/// **Fail-closed on declared state, recorded or not.** A replay re-runs a capability with declared state
+/// so that state follows the program, and the journal holds no copy of it to rewind it to — so it
+/// records nothing for those turns and undo declines, leaving the checkpoint-plus-replay path to
+/// serve, which restores the state from the checkpoint. Refusing beats rewinding wrongly.
 #[test]
-fn a_stateful_capability_undoes_while_its_crossings_are_recorded() {
-    let m = cap_module();
-    let (host, h, count) = stateful_counter_host(true);
-    let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
-        .expect("in the debug subset");
-    r.set_journal_armed(true);
-    let mut fuel = FUEL;
-    while r.tick(&mut fuel) {}
-    let end = r.op_turn();
-    assert!(
-        r.can_undo_to(0),
-        "recorded crossings make the state invertible"
-    );
-    assert!(r.undo_to(0));
-    let mut fuel = FUEL;
-    while r.op_turn() < end && r.tick(&mut fuel) {}
-    assert_eq!(
-        r.result().cloned(),
-        Some(Ok(vec![temen_interp::Value::I64(1002)])),
-        "re-execution re-serves the taped 1 and 2"
-    );
-    assert_eq!(
-        *count.lock().unwrap(),
-        2,
-        "the handler was never re-entered: it still holds the state of the tape's end"
-    );
-}
-
-/// **Fail-closed on state nothing records.** Without a tape, re-execution after an undo would call the
-/// live handler, whose declared state has no inverse, so the journal records nothing for those turns
-/// and undo declines, leaving the checkpoint-plus-replay path to serve. Refusing beats rewinding wrongly.
-#[test]
-fn a_stateful_capability_nothing_records_declines_to_undo() {
-    let m = cap_module();
-    let (host, h, _) = stateful_counter_host(false);
-    let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
-        .expect("in the debug subset");
-    r.set_journal_armed(true);
-    let mut fuel = FUEL;
-    while r.tick(&mut fuel) {}
-    let end = r.op_turn();
-    assert!(
-        !r.can_undo_to(end / 2),
-        "an unrecorded stateful capability must decline to undo, not rewind it wrongly"
-    );
-    assert!(!r.undo_to(end / 2));
+fn a_stateful_capability_declines_to_undo() {
+    for recorded in [true, false] {
+        let m = cap_module();
+        let (host, h, _) = stateful_counter_host(recorded);
+        let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
+            .expect("in the debug subset");
+        r.set_journal_armed(true);
+        let mut fuel = FUEL;
+        while r.tick(&mut fuel) {}
+        let end = r.op_turn();
+        assert!(
+            !r.can_undo_to(end / 2),
+            "a stateful capability must decline to undo, not rewind it wrongly (recorded: {recorded})"
+        );
+        assert!(!r.undo_to(end / 2));
+    }
 }
 
 // ---- the static retention policy (#1558) ----------------------------------------------------------

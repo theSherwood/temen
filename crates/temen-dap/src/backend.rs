@@ -353,6 +353,12 @@ pub trait Debuggee {
     fn stderr(&self) -> &[u8] {
         &[]
     }
+    /// The program's `vm_fs` files, as a [`temen_fs::encode_image`] blob (the launch's `fsImage`
+    /// format). An empty image when the session grants no `vm_fs`. Like the streams it rewinds with
+    /// the program: a step back past a file's creation removes it.
+    fn fs_image(&self) -> Vec<u8> {
+        temen_fs::encode_image(&[], &[])
+    }
 }
 
 /// The tree-walker backend — the original, full-featured engine. Every method delegates to the
@@ -788,19 +794,11 @@ impl BytecodeBackend {
             &self.tape,
         );
         // A rebuilt run carries the journal too, so a `seek` backward leaves a session that can then
-        // `step_back` by undo rather than by another rebuild.
+        // `step_back` by undo rather than by another rebuild. Its capabilities start as the launch
+        // granted them (a `vm_fs` store holds the seed): the replay re-runs each one that keeps its
+        // own state, so the store follows the program to wherever the seek lands.
         run.map(|mut r| {
             r.set_journal_armed(self.journaling);
-            // #1491 — and its capabilities' declared state (a `vm_fs` store's files and open table).
-            // The rebuild replays the tape, which never enters a handler, so the handler has to hold
-            // the state at the tape's end — the state the live run already holds, since a replay
-            // leaves it untouched and a live advance extends the tape with it. Seeded fresh instead,
-            // a guest seeking back and then running past the tape reads a store that forgot its
-            // own writes.
-            if self.powerbox {
-                let carried = self.run.host().capture_cap_states();
-                r.host_mut().restore_cap_states(&carried);
-            }
             r
         })
     }
@@ -1498,5 +1496,8 @@ impl Debuggee for BytecodeBackend {
     }
     fn stderr(&self) -> &[u8] {
         &self.run.host().stderr
+    }
+    fn fs_image(&self) -> Vec<u8> {
+        temen_fs::vm_fs_image(self.run.host())
     }
 }

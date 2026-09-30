@@ -351,3 +351,59 @@ fn a_reverse_seek_keeps_the_files_the_guest_wrote() {
         "the read past the tape sees the 'A' written before the seek"
     );
 }
+
+/// The inverse of [`b64`], for the `fsImage` reply.
+fn unb64(s: &str) -> Vec<u8> {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digits: Vec<u32> = s
+        .bytes()
+        .filter(|&c| c != b'=')
+        .map(|c| A.iter().position(|&a| a == c).expect("base64 digit") as u32)
+        .collect();
+    let mut out = Vec::new();
+    for chunk in digits.chunks(4) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, d)| n | d << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    out
+}
+
+/// The `vm_fs` files at the current stop, read through the `fsImage` request.
+fn files(s: &mut DapServer, seq: i64) -> Vec<(String, Vec<u8>)> {
+    let out = s.handle(&req(seq, "fsImage", Json::obj(vec![])));
+    let image = response(&out)
+        .get("body")
+        .and_then(|b| b.get("image"))
+        .and_then(|i| i.as_str())
+        .map(unb64)
+        .expect("an fsImage reply");
+    temen_fs::decode_image(&image).expect("a decodable image").0
+}
+
+/// The `fsImage` request shows the files as of the current stop, and they rewind with the program:
+/// none at entry, `f` = "A" once the write has run, none again after a seek back to before the open,
+/// and `f` once more when the run passes the write again. A debugger's Files panel reads this.
+#[test]
+fn the_fs_image_request_shows_the_files_at_the_current_stop() {
+    let mut s = DapServer::new();
+    launch(&mut s, FILE_IO_SPREAD);
+    assert!(files(&mut s, 3).is_empty(), "nothing written at entry");
+    s.handle(&req(4, "seek", Json::obj(vec![("t", Json::i(3400))])));
+    let written = vec![("f".to_string(), b"A".to_vec())];
+    assert_eq!(files(&mut s, 5), written, "the written file");
+    s.handle(&req(6, "seek", Json::obj(vec![("t", Json::i(1500))])));
+    assert!(
+        files(&mut s, 7).is_empty(),
+        "a seek back before the open removes it"
+    );
+    s.handle(&req(8, "continue", Json::obj(vec![])));
+    assert_eq!(files(&mut s, 9), written, "the file again at the end");
+    s.handle(&req(10, "reverseContinue", Json::obj(vec![])));
+    assert!(
+        files(&mut s, 11).is_empty(),
+        "and gone again back at the entry"
+    );
+}

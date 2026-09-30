@@ -691,3 +691,73 @@ int main(void) {
         "aligned=1 zero=1\nwrote=7 unmap=0\n"
     );
 }
+
+/// **A file mapping.** `MAP_PRIVATE` copies the file in and never writes back; `MAP_SHARED` writes
+/// back when the descriptor closes (no `munmap` needed) and again at `munmap`. The file is read back
+/// through `read` each time, so what's checked is the file, not the mapping.
+#[test]
+fn a_file_mapping_reads_the_file_and_a_shared_one_writes_it_back() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        false,
+    );
+    let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
+    let src = r#"#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+static void show(const char *what) {
+  char b[5] = {0};
+  int fd = open("f", O_RDONLY);
+  read(fd, b, 4);
+  close(fd);
+  printf("%s %s\n", what, b);
+}
+int main(void) {
+  int fd = open("f", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  write(fd, "AAAA", 4);
+  close(fd);
+  fd = open("f", O_RDONLY);
+  char *q = mmap(0, 4, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  printf("private %c%c\n", q[0], q[3]);
+  q[0] = 'P';
+  munmap(q, 4);
+  close(fd);
+  show("after private:");
+  fd = open("f", O_RDWR);
+  char *p = mmap(0, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  p[0] = 'W'; p[1] = 'X'; p[2] = 'Y'; p[3] = 'Z';
+  close(fd);
+  show("after close:");
+  p[0] = '!';
+  munmap(p, 4);
+  show("after munmap:");
+  return 0;
+}
+"#;
+    let prog_ir = emit_object_flags(
+        &chibicc,
+        "in.c",
+        &[("in.c", src)],
+        false,
+        temen_browser::PG_DECLS_ONLY_ARGV,
+    );
+    let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
+    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    assert!(
+        out.status == STATUS_OK || out.status == STATUS_EXIT,
+        "link+run status {} — stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "private AA\nafter private: AAAA\nafter close: WXYZ\nafter munmap: !XYZ\n"
+    );
+}

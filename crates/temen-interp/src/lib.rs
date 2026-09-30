@@ -23846,6 +23846,32 @@ impl Host {
         &self.cap_names
     }
 
+    /// Whether `handle` names a live host capability whose provider captures its own state
+    /// ([`CapState::Captured`]) — one a replay re-runs so its state follows the program.
+    fn host_proc_captured(&self, handle: i32) -> bool {
+        matches!(
+            self.resolve(handle, cap_id::HOST_PROC),
+            Ok(Binding::HostProc(idx))
+                if matches!(
+                    self.host_procs.get(idx as usize).map(|e| &e.state),
+                    Some(CapState::Captured { .. })
+                )
+        )
+    }
+
+    /// The current state of the host capability registered under `name` — the bytes its provider's
+    /// [`CapState::Captured`] hands a checkpoint — or `None` when no live host capability carries
+    /// that name, or its provider captures no state. Lets an embedder show what a capability holds
+    /// (a debugger's view of the `vm_fs` files) without keeping its own handle to the provider,
+    /// which a rebuild would leave pointing at a stale store.
+    pub fn capture_named_cap_state(&self, name: &str) -> Option<Vec<u8>> {
+        let (_, h) = self.cap_names.iter().find(|(n, _)| n == name)?;
+        match self.resolve(*h, cap_id::HOST_PROC).ok()? {
+            Binding::HostProc(idx) => self.host_procs.get(idx as usize)?.state.capture(),
+            _ => None,
+        }
+    }
+
     /// The durable module grant with §4 content digest `digest`, if this host holds one — what a
     /// detached child's artifact is restored against (#1361 step 4).
     pub fn durable_module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<Module>> {
@@ -24021,15 +24047,13 @@ impl Host {
     /// fail-closed gate (#1557).
     ///
     /// False when the guest is using the §3.6 **serve** path (its queue drains rather than appends, so a
-    /// length cannot restore it) or holds a capability with **opaque declared state** that nothing
-    /// records (an embedder capture/restore blob has no inverse). A run that answers false still
+    /// length cannot restore it) or holds a capability with **declared state** (an embedder
+    /// capture/restore blob has no inverse a cursor could apply). A run that answers false still
     /// time-travels: the journal declines to undo across such a point and the checkpoint-plus-replay
-    /// path serves it.
+    /// path serves it, restoring the capability's state from the checkpoint.
     ///
-    /// Declared state is no obstacle while crossings are **recorded** (#1491): an undo re-arms replay
-    /// from the run's own tape, so re-execution re-serves every crossing up to the tape's end without
-    /// entering the handler, and the handler's live state is exactly the state a live continuation
-    /// past that end needs.
+    /// Recording the crossings doesn't lift this: a replay re-runs a capability with declared state so
+    /// its state follows the program, and an undo has no copy of that state to rewind it to.
     pub(crate) fn journal_invertible(&self) -> bool {
         let (queue, results, _) = self.svc_state();
         // A promoted stdin (#1720) keeps its cursor in the shared cell a child also advances, which a
@@ -24037,11 +24061,10 @@ impl Host {
         self.in_shared.is_none()
             && queue.is_empty()
             && results.is_empty()
-            && (self.cap_record.is_some()
-                || self
-                    .host_procs
-                    .iter()
-                    .all(|e| matches!(e.state, CapState::Stateless)))
+            && self
+                .host_procs
+                .iter()
+                .all(|e| matches!(e.state, CapState::Stateless))
     }
 
     /// Whether every **live** host capability can be reconstructed: it carries a registered name, and
@@ -24115,16 +24138,10 @@ impl Host {
         self.mem_mapped_bytes = s.mem_mapped_bytes;
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
-        // as a fresh powerbox minted them.
-        //
-        // #1491 — except under a replaying tape. There every crossing up to the tape's end is served
-        // from the tape and never enters the handler, so the handler must already hold the state at
-        // the tape's **end** — what a live continuation past it will read (the embedder that armed
-        // the tape seeds it; the DAP carries it from the run it rebuilds). Rewinding it to the
-        // checkpoint's would make the guest's own taped writes vanish the moment it runs live.
-        if self.cap_replay.is_none() {
-            self.restore_cap_states(&s.cap_states);
-        }
+        // as a fresh powerbox minted them. Under a replaying tape too: a replay re-runs such a
+        // capability (see `cap_dispatch_slots_impl`), so from here its state follows the replay
+        // forward, and a store rewound to the checkpoint shows the files the guest had written by then.
+        self.restore_cap_states(&s.cap_states);
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -28854,6 +28871,19 @@ impl Host {
                 None
             };
             if let Some(rec) = served {
+                // A capability whose state is its own (`CapState::Captured`, a `vm_fs` store) is
+                // re-run as well, so its state follows the replay: a store rewound with the program
+                // re-applies the writes the replay passes. Its answer is a function of that state
+                // and the guest's inputs, which the replay reproduces, so it matches the tape; the
+                // tape's answer is still the one served.
+                let mut mem = mem;
+                if self.host_proc_captured(handle) {
+                    let rerun: Option<&mut dyn GuestMem> = match &mut mem {
+                        Some(m) => Some(&mut **m),
+                        None => None,
+                    };
+                    let _ = self.cap_dispatch_slots_inner(type_id, op, handle, args, rerun, None);
+                }
                 // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
                 // return the recorded result slots — no live host needed.
                 if let Some(m) = mem {
