@@ -1,4 +1,4 @@
-//! #1296 slice 3 — a §14 **op-13 child holds a re-granted `Jit`** on the browser's JS-orchestrated
+//! #1296 slice 3 — a detached §14 **child holds a re-granted `Jit`** on the browser's JS-orchestrated
 //! op-13 loop (`temen_op13jit_*`), the tier the playground's children actually run on. The driver
 //! program re-grants its `"jit"` (the loop's parent host holds one, validator + wasm emitter armed)
 //! into the child by name beside `"fs"`; the child resolves it, `compile`s a unit, `invoke`s it over
@@ -6,7 +6,7 @@
 //!
 //! Two seams are pinned, in the order the servicer takes them:
 //! - **Emitted child, bounced Jit ops** (`child_jit_ops_persist_across_bounces`): the child is staged
-//!   emitted (`OP13JIT_CHILD`); its Jit-op leaf bounces through `temen_onramp_jit_run_call_interp`
+//!   emitted (`OP13JIT_CHILD_DETACHED`); its Jit-op leaf bounces through `temen_onramp_jit_run_call_interp`
 //!   (what the emitted `f0`'s `env.call_interp` does). Bounced twice, the second `install` lands in
 //!   the **next** slot — the run's dispatch table persists across bounces (a throwaway table would
 //!   hand out the same slot again, and the first unit would be unreachable).
@@ -17,9 +17,12 @@
 use std::sync::Mutex;
 
 use temen_browser::{
-    temen_onramp_jit_run_call_interp, temen_op13jit_close, temen_op13jit_open_named,
-    temen_op13jit_result, temen_op13jit_step, OP13JIT_CHILD, OP13JIT_DONE,
+    temen_onramp_jit_run_call_interp, temen_op13jit_close, temen_op13jit_open_detached,
+    temen_op13jit_result, temen_op13jit_step, OP13JIT_CHILD_DETACHED, OP13JIT_DONE,
 };
+
+#[path = "support/op13jit_driver.rs"]
+mod op13jit_driver;
 
 // The op-13 loop state is process-global (`OP13_JIT`, `JIT_RUN`): serialize the tests.
 static LOCK: Mutex<()> = Mutex::new(());
@@ -28,46 +31,9 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// name scratch at 16392).
 const BLOB_OFF: i64 = 20480;
 
-/// The driver (`memory 16`, entry `(inst, module, fs)`): two 16-byte grant records at 17408 —
-/// `"fs"` (its third entry arg) and `"jit"` (resolved by name on its own powerbox) — then op 13 into
-/// the 32-KiB buddy-half carve at 32768 with `grants_n = 2`, join, return the child's result.
+/// The driver re-grants `"fs"` and `"jit"` (both on its own powerbox by name) and spawns the child.
 fn driver() -> Vec<u8> {
-    let src = r#"memory 16
-data 18432 "fs"
-data 18448 "jit"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  w = i64.const 8589953024
-  o = i64.const 17408
-  i64.store o w
-  hf = i64.extend_i32_u v2
-  ohf = i64.const 17416
-  i64.store ohf hf
-  np = i64.const 18448
-  nl = i64.const 3
-  hj = self.resolve np nl
-  w1 = i64.const 12884920336
-  o1 = i64.const 17424
-  i64.store o1 w1
-  hj64 = i64.extend_i32_u hj
-  ohj = i64.const 17432
-  i64.store ohj hj64
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 2
-  ventry = i64.const 0
-  voff = i64.const 32768
-  vsl = i64.const 15
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }
-}
-"#;
-    let m = temen_text::parse_module(src).expect("parse driver");
-    temen_verify::verify_module(&m).expect("verify driver");
-    temen_encode::encode_module(&m)
+    op13jit_driver::driver(&["fs", "jit"], "")
 }
 
 /// The unit the child compiles: `(a, b) -> a + b`, declaring the CHILD's memory (`memory 15`) — the
@@ -79,7 +45,7 @@ fn unit_blob() -> Vec<u8> {
     temen_encode::encode_module(&m)
 }
 
-/// The child (`memory 15`, the carve): `f0(sp, as)` (emitted) = `f1()`; `f1` (a cross-tier leaf)
+/// The child (`memory 15`, its own window): `f0(sp, as)` (emitted) = `f1()`; `f1` (a cross-tier leaf)
 /// resolves `"jit"`, stages the blob, compiles it, invokes `(3, 4)`, installs it, and returns
 /// `invoke * 1000 + slot`. `region_op` appends an unreachable §13 `SharedRegion` op so the emit
 /// declines and the child runs on the interpreter inline.
@@ -140,7 +106,8 @@ block 0 () {{
 fn open(child: &[u8]) {
     let d = driver();
     // SAFETY: live byte slices for the duration of the call.
-    let st = unsafe { temen_op13jit_open_named(d.as_ptr(), d.len(), child.as_ptr(), child.len()) };
+    let st =
+        unsafe { temen_op13jit_open_detached(d.as_ptr(), d.len(), child.as_ptr(), child.len()) };
     assert_eq!(st, 0, "op-13 loop opens over the jit-granting driver");
 }
 
@@ -155,16 +122,16 @@ fn child_jit_ops_persist_across_bounces() {
     open(&child(false));
     assert_eq!(
         temen_op13jit_step(),
-        OP13JIT_CHILD,
+        OP13JIT_CHILD_DETACHED,
         "the child emits and is staged for the JS driver"
     );
     // Service the leaf's bounce the way the emitted `f0` would (`env.call_interp(1, [])`): the Jit
-    // ops run on the interpreter against the child's re-granted table over the child's carve.
+    // ops run on the interpreter against the child's re-granted table over the child's window.
     let mut scratch = [0u8; 16];
     assert_eq!(
         temen_onramp_jit_run_call_interp(1, scratch.as_mut_ptr()),
         0,
-        "the leaf compiles, invokes and installs over the marshaled host + carve"
+        "the leaf compiles, invokes and installs over the marshaled host + window"
     );
     let first = i64::from_le_bytes(scratch[..8].try_into().unwrap());
     // The unit answered 3 + 4; the install landed in a padding slot of the child's own table (past
@@ -190,7 +157,7 @@ fn child_jit_ops_persist_across_bounces() {
 }
 
 /// A child whose entry `thread.spawn`s: the wasm-JIT declines `thread.spawn` (OPS_PARITY.md), so the
-/// child runs inline on the interpreter, where the op-13 leaf driver does not service `Spawn` either.
+/// child runs inline on the interpreter, where the op-13 loop's driver does not service `Spawn` either.
 fn child_spawning() -> Vec<u8> {
     let src = r#"memory 15
 func (i64, i64) -> (i64) {

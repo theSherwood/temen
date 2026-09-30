@@ -2,8 +2,8 @@
 //! detached §14 child in its own window, and the capabilities each is granted **by name** — plus the
 //! one generator that turns that plan into the root's Temen IR.
 //!
-//! The root is ordinary guest code. Every spawn and grant it makes goes through op 15 and a grant
-//! record, so it is verified and confined like any other guest, and the generator that writes it is
+//! The root is ordinary guest code. Every spawn and grant it makes goes through an op-17 spawn record
+//! and a grant record, so it is verified and confined like any other guest, and the generator that writes it is
 //! not trusted: a wrong plan produces a root the verifier or the spawn refuses, never authority the
 //! host did not grant. What the root may hand out is exactly what [`Plan::root_args`] granted it.
 //!
@@ -25,8 +25,10 @@ const REC_BASE: u64 = GUARD + 1024;
 /// One 16-byte name slot per root capability, shared by every record that grants it, then two per
 /// pipe (the names its ends are granted under).
 const NAME_BASE: u64 = GUARD + 2048;
+/// One op-17 spawn record per node ([`temen_ir::SPAWN_REC_LEN`] bytes each).
+const SPAWN_BASE: u64 = GUARD + 4096;
 /// The nodes' argv payloads, back to back.
-const ARGV_BASE: u64 = GUARD + 4096;
+const ARGV_BASE: u64 = GUARD + 8192;
 const SLOT: u64 = 16;
 
 /// A run: the root's own capabilities, and the nodes it spawns and joins.
@@ -59,8 +61,8 @@ pub struct Pipe {
     pub to_name: String,
 }
 
-/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 15) in a
-/// fresh window minted from the root's budget.
+/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 17 v1) in
+/// a fresh window paid from the root's budget.
 pub struct Node {
     /// The node's window, `1 << window_log2` bytes.
     pub window_log2: u8,
@@ -106,8 +108,11 @@ impl Plan {
             .iter()
             .chain(self.pipes.iter().flat_map(|p| [&p.from_name, &p.to_name]))
             .collect();
-        if NAME_BASE + names.len() as u64 * SLOT > ARGV_BASE {
+        if NAME_BASE + names.len() as u64 * SLOT > SPAWN_BASE {
             return Err(format!("{} capability names do not fit", names.len()));
+        }
+        if SPAWN_BASE + n as u64 * temen_ir::SPAWN_REC_LEN as u64 > ARGV_BASE {
+            return Err(format!("{n} nodes' spawn records do not fit"));
         }
         if PIPE_BASE + self.pipes.len() as u64 * 8 > REC_BASE {
             return Err(format!("{} pipes do not fit", self.pipes.len()));
@@ -214,7 +219,7 @@ impl Plan {
         if REC_BASE + r * SLOT > NAME_BASE {
             return Err(format!("{r} grant records do not fit"));
         }
-        // Spawn every node (op 15: its own window, minted from the budget), then join every node.
+        // Spawn every node (op 17 v1: its own window, paid from the budget), then join every node.
         let sfx = |k: usize| {
             if k == 0 {
                 String::new()
@@ -225,19 +230,23 @@ impl Plan {
         let mut body = String::new();
         for (k, node) in self.nodes.iter().enumerate() {
             let s = sfx(k);
-            body.push_str(&format!("  vmh{s} = i64.extend_i32_u v{}\n", 1 + k));
-            if k == 0 {
-                body.push_str(&format!("  vmin = i64.extend_i32_u v{}\n", 1 + n));
-            }
-            let (ap, al) = argv_at[k];
+            let at = SPAWN_BASE + k as u64 * temen_ir::SPAWN_REC_LEN as u64;
+            let rec = temen_ir::SpawnRec {
+                size_log2: node.window_log2 as i64,
+                grants_ptr: first_rec[k],
+                grants_n: rec_n[k] as u64,
+                args: (argv_at[k].0, argv_at[k].1 as u64),
+                ..temen_ir::SpawnRec::v1(0)
+            };
+            let (seg, stores) = spawn_rec_ir(
+                at,
+                &rec,
+                Some(&format!("v{}", 1 + k)),
+                &format!("v{}", 1 + n),
+            );
+            data.push_str(&seg);
             body.push_str(&format!(
-                "  vgptr{s} = i64.const {gptr}\n  vgn{s} = i64.const {gn}\n  ventry{s} = i64.const 0\n  \
-                 vlog{s} = i64.const {log}\n  vq{s} = i64.const 0\n  vap{s} = i64.const {ap}\n  \
-                 val{s} = i64.const {al}\n  vh{s} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) \
-                 -> (i32) v0 (vmin, vmh{s}, vgptr{s}, vgn{s}, ventry{s}, vlog{s}, vq{s}, vap{s}, val{s})\n",
-                gptr = first_rec[k],
-                gn = rec_n[k],
-                log = node.window_log2,
+                "{stores}  vrp{s} = i64.const {at}\n  vh{s} = call.cap 6 17 (i64) -> (i32) v0 (vrp{s})\n"
             ));
         }
         // Every node holds its own ends now; drop the root's, so a reader sees EOF when its writer exits.
@@ -288,6 +297,31 @@ impl Plan {
     }
 }
 
+/// An op-17 spawn record `rec` at window offset `at` of a guest being generated: the data segment that
+/// holds its bytes, and the stores that fill its `module` field (unless `modh` is `None`: the record's
+/// own, e.g. `-1` for the spawner's module) and its `budget` field from `i32` values (handles are only
+/// known at run time).
+pub fn spawn_rec_ir(
+    at: u64,
+    rec: &temen_ir::SpawnRec,
+    modh: Option<&str>,
+    budget: &str,
+) -> (String, String) {
+    let esc: String = rec.encode().iter().map(|b| format!("\\x{b:02x}")).collect();
+    let mut stores = String::new();
+    if let Some(modh) = modh {
+        stores.push_str(&format!(
+            "  rm{at} = i64.const {m}\n  i32.store rm{at} {modh}\n",
+            m = at + 24
+        ));
+    }
+    stores.push_str(&format!(
+        "  rb{at} = i64.const {b}\n  i32.store rb{at} {budget}\n",
+        b = at + 28
+    ));
+    (format!("data {at} \"{esc}\"\n"), stores)
+}
+
 /// Run `plan` to completion on the resumable interpreter (the native / single-threaded driver,
 /// [`drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which already holds
 /// `caps`), and return what the root returns — the last node's result.
@@ -323,7 +357,7 @@ pub fn run(
         &[],
         host,
     )
-    .and_then(|root| drive_op13(&prog, base, root));
+    .and_then(|root| drive_op13(&prog, root));
     drop(back);
     // SAFETY: same layout; the root vCPU and its region views are dropped above.
     unsafe { std::alloc::dealloc(base, layout) };
@@ -332,16 +366,13 @@ pub fn run(
 
 /// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`), for a root (see
 /// [`run`]) or a child a driver runs on the interpreter. The engine admits every spawn, its powerbox
-/// built; this loop only starts the child. On a **detached** spawn (op 15, #1288) it mints the fresh
-/// window's backing, a root-sized lazily-reserved `Region::new` (an `mmap` natively; the sparse
-/// `Paged` fallback on wasm32), which the engine seeds (committed window = the declared size, starter
-/// caps over the reservation, so `vm_map` grows it). On a nested `Instantiate` (op 13 — a carve) it
-/// starts the child over the sub-window at `base + carve`, committing the declared window the same
-/// way. `Join` delivers the child's result. Single-threaded here, so the window base travels as a raw
-/// ptr.
+/// built; this loop only starts the child. On a **detached** spawn (#1288) it mints the fresh window's
+/// backing, a root-sized lazily-reserved `Region::new` (an `mmap` natively; the sparse `Paged`
+/// fallback on wasm32), which the engine seeds (committed window = the declared size, starter caps
+/// over the reservation, so `vm_map` grows it), and drives the child to completion — at any depth.
+/// `Join` delivers the child's result. A carve child (retired, #1289) is the driver's decline.
 pub(crate) fn drive_op13<'p>(
     prog: &'p bytecode::VcpuProgram,
-    base: *mut u8,
     mut vcpu: bytecode::Vcpu<'p>,
 ) -> Result<Vec<Value>, Trap> {
     let mut children: Vec<Option<Result<Vec<Value>, Trap>>> = Vec::new();
@@ -355,37 +386,11 @@ pub(crate) fn drive_op13<'p>(
                     1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                     temen_interp::host_page_size(),
                 ));
-                // A detached child's window is its own, not a sub-window of this one: a carve under
-                // it has no addressable base here, and declines below.
                 let r = vcpu
                     .take_child()
                     .ok_or(Trap::Malformed)
                     .and_then(|c| c.start(prog, back, None))
-                    .and_then(|c| drive_op13(prog, core::ptr::null_mut(), c));
-                let token = children.len() as u64;
-                children.push(Some(r));
-                vcpu.deliver_child(token);
-            }
-            bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
-            } => {
-                if base.is_null() {
-                    // A nested carve needs an addressable parent window — the driver's decline
-                    // (see `crate::declined_child`), not a trap for the parent.
-                    return crate::declined_child();
-                }
-                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
-                // child); the child region aliases that sub-window — the §14 shared data plane.
-                let child_base = unsafe { base.add(carve as usize) };
-                let back =
-                    std::sync::Arc::new(unsafe { Region::shared(child_base, 1u64 << size_log2) });
-                // An `Instantiate` always carries its admitted child; `Malformed` rather than a panic
-                // if it somehow did not.
-                let r = vcpu
-                    .take_child()
-                    .ok_or(Trap::Malformed)
-                    .and_then(|c| c.start(prog, back, Some(size_log2)))
-                    .and_then(|c| drive_op13(prog, child_base, c));
+                    .and_then(|c| drive_op13(prog, c));
                 let token = children.len() as u64;
                 children.push(Some(r));
                 vcpu.deliver_child(token);
@@ -425,6 +430,7 @@ pub(crate) fn drive_op13<'p>(
             // value at the parent's join, never a parent-killing trap (see `crate::declined_child`).
             // Named rather than `_` (see `VcpuEvent`).
             bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Instantiate { .. }
             | bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }

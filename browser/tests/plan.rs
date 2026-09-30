@@ -8,8 +8,9 @@ use temen_browser::plan::{run, Node, Pipe, Plan};
 use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Trap, Value};
 use temen_ir::Module;
 
-/// A one-node plan is the nim phase driver, byte for byte: the text `nimc`'s phases ran on before
-/// the plan existed (it replaced `detached_parent_src`, compared equal on every phase shape).
+/// A one-node plan is the nim phase driver, byte for byte: grant records for the node's caps, its argv
+/// payload, and one op-17 v1 spawn record (at 20480: version 1, entry 0, window 2^20, no pager, grants
+/// at 17408 × 2, args at 24576 × 12, no region) whose module and budget the root fills in.
 #[test]
 fn a_one_node_plan_is_the_phase_driver() {
     let src = Plan::single(20, &["a", "b"], &["fs", "stdout"])
@@ -20,7 +21,8 @@ fn a_one_node_plan_is_the_phase_driver() {
         r#"memory 16
 data 18432 "fs"
 data 18448 "stdout"
-data 20480 "\x02\x00\x00\x00\x00\x00\x00\x00\x61\x00\x62\x00"
+data 24576 "\x02\x00\x00\x00\x00\x00\x00\x00\x61\x00\x62\x00"
+data 20480 "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x60\x00\x00\x00\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   xr17408 = i64.const 8589953024
@@ -35,16 +37,12 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   h17424 = i64.extend_i32_u v4
   oh17424 = i64.const 17432
   i64.store oh17424 h17424
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vgptr = i64.const 17408
-  vgn = i64.const 2
-  ventry = i64.const 0
-  vlog = i64.const 20
-  vq = i64.const 0
-  vap = i64.const 20480
-  val = i64.const 12
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgptr, vgn, ventry, vlog, vq, vap, val)
+  rm20480 = i64.const 20504
+  i32.store rm20480 v1
+  rb20480 = i64.const 20508
+  i32.store rb20480 v2
+  vrp = i64.const 20480
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }

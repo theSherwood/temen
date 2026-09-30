@@ -92,8 +92,7 @@ reproduced (not argued):
    full encode/decode/execute roundtrip (`run_roundtrip() == 1442695040888963407`, exercising the
    production `temen-encode` decode path `temen_run` depends on), the host powerbox
    (`run_powerbox() == 17` — `Stream.write` + capture and `Exit.exit(42)`), the seed→transform→snapshot
-   capture (`run_capture() == 1007`), a confined nested child guest (`run_instantiate() == 42123` —
-   `Instantiator.instantiate`/`join` over a sub-window), **and** cooperative continuations
+   capture (`run_capture() == 1007`), **and** cooperative continuations
    (`run_fiber() == 107`, `run_coroutine() == 1001329`). So the full stack — compute, concurrency,
    codec, capabilities, memory capture, sub-guest isolation, *and* fibers/coroutines — runs on the
    real production target.
@@ -124,7 +123,6 @@ wasmtime run --invoke run_threads   -W memory64=y "$W"   # 4000 (8 vCPUs, cooper
 wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (encode→decode→run)
 wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + capture + exit(42))
 wasmtime run --invoke run_capture   -W memory64=y "$W"   # 1007 (seed window → transform → snapshot)
-wasmtime run --invoke run_instantiate -W memory64=y "$W" # 42123 (confined nested child + shared backing)
 wasmtime run --invoke run_fiber     -W memory64=y "$W"   # 107 (cont.new/resume cooperative fiber)
 wasmtime run --invoke run_coroutine -W memory64=y "$W"   # 1001329 (spawn_coroutine/resume/yield)
 wasmtime run --invoke run_tailcall  -W memory64=y "$W"   # 120 (return_call tail recursion, O(1) state)
@@ -313,14 +311,15 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   allocation read through `temen_snapshot_ptr`/`temen_snapshot_len`. Validated wasm32 (3-case snapshot
   differential, byte-for-byte) and wasm64 (`run_capture() == 1007`). Closes the last output channel —
   return value ✓, streams ✓, **memory image ✓**.
-- [x] **§14 nested child guests (`temen_run_nested`).** Function 0 gets an `Instantiator` (iface 6) over
-  `[0, 128 KiB)` and `instantiate`/`join`s **confined child domains** over power-of-two sub-windows —
-  each a fresh domain, masked to its slice, running on the cooperative executor and joinable through
-  the §12 thread machinery. 5-case differential (lifted from `bytecode_instantiate.rs`, all matching
-  native): shared-backing data plane (`42123`), depth-2 VM-in-VM (`77`), a two-arg child managing its
-  own pages via an attenuated `AddressSpace` (`0`), an out-of-range carve rejected at the boundary
-  (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). wasm64 `run_instantiate() ==
-  42123`. So a guest can spin up isolated sub-guests inside the wasm sandbox.
+- [x] **§14 nested child guests (`temen_run_nested`).** Function 0 gets an `Instantiator` (iface 6) and
+  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 v1 records) —
+  each in a fresh window of its own paid from the budget, running on the cooperative executor and
+  joinable through the §12 thread machinery. 5-case differential (all matching native): isolation — a
+  child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`, still a carve until
+  #1944 lets a detached child pay for a grandchild), a two-arg child managing its own pages via an
+  attenuated `AddressSpace` (`0`), a window that disagrees with the module's refused at admission
+  (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). So a guest can spin up isolated
+  sub-guests inside the wasm sandbox.
 - [x] **§12 fibers + §14 coroutines.** Cooperative continuation switching — the engine's signature.
   *Fibers* (`cont.new`/`cont.resume`/`suspend`, no powerbox → the plain `temen_run0` path): run-to-
   completion (`107`), suspend round-trip (`36`), multi-suspend loop (`19`), and forged-handle / root-

@@ -2,11 +2,11 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**349 exports** in 37 families — 294 referenced from JS, 55 referenced by nothing, 9 behind a `cfg`.
+**347 exports** in 37 families — 294 referenced from JS, 53 referenced by nothing, 9 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
-| `(corpus runners)` | 18 | 0 | 0 |
+| `(corpus runners)` | 17 | 0 | 0 |
 | `abi` | 1 | 1 | 0 |
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
@@ -26,7 +26,7 @@
 | `module` | 3 | 0 | 0 |
 | `nim` | 4 | 4 | 0 |
 | `onramp` | 66 | 55 | 0 |
-| `op13jit` | 10 | 9 | 0 |
+| `op13jit` | 9 | 9 | 0 |
 | `par` | 70 | 70 | 1 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
@@ -59,7 +59,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `run_fork` — *unreferenced*
 - `run_gcroots` — *unreferenced*
 - `run_guest` — *unreferenced*
-- `run_instantiate` — *unreferenced*
 - `run_jit` — *unreferenced*
 - `run_powerbox` — *unreferenced*
 - `run_reflect` — *unreferenced*
@@ -313,7 +312,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_op13jit_open`
 - `temen_op13jit_open_child`
 - `temen_op13jit_open_detached`
-- `temen_op13jit_open_named` — *unreferenced*
 - `temen_op13jit_result`
 - `temen_op13jit_step`
 
