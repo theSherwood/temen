@@ -306,9 +306,9 @@ property, so in practice:
         cached `Int32Array`/`BigInt64Array` views go stale when the shared `WebAssembly.Memory` grows
         mid-run (e.g. a module compile+push) — the hosts now refresh views before Atomics access.
         *Superseded (#1865):* the par driver's children are detached now — each in its own
-        `WebAssembly.Memory` (`PAR_INSTANTIATE_DETACHED`, `temen_par_child_detached`); the Workers no
-        longer serve `PAR_INSTANTIATE` (a carve spawn fails closed), the `#inst` item is gone (the
-        `instcodegen`/`instnested` items cover it), and `threads-spawn.mjs` dropped `TEMEN_INST`.
+        `WebAssembly.Memory` (`PAR_INSTANTIATE_DETACHED`, `temen_par_child_detached`). `PAR_INSTANTIATE`
+        and `temen_par_child_confined` are deleted (a carve spawn traps `CapFault`), the `#inst` item is
+        gone (the `instcodegen`/`instnested` items cover it), and `threads-spawn.mjs` dropped `TEMEN_INST`.
 - [x] **4d — host I/O (`call.cap`) from every vCPU, resumable + browser.** The last driver-capability
   cell: natively `drive_parallel` had the 4c-host shared `Mutex<Host>`, but a resumable/browser vCPU
   carried a deny-all host, so a worker vCPU's I/O `call.cap` was an inert `CapFault` — a parallel

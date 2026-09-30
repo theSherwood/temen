@@ -25,7 +25,7 @@ const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 // Event codes (must match browser/src/lib.rs PAR_*).
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8;
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, TIERUP = 7, JIT_INVOKE = 8;
 
 // §22 codegen arg/result marshalling by scalar type code (0=i32, 1=i64, 2=f32, 3=f64) — see worker.js.
 const _sdv = new DataView(new ArrayBuffer(8));
@@ -119,8 +119,8 @@ async function worker() {
       return;
     }
     if (ev === SPAWN) {
-      // ev_a packs (spawning frame's module << 32) | func, as the INSTANTIATE event does — the
-      // child resolves `func` in that module (an installed §22 unit spawns its own functions).
+      // ev_a packs (spawning frame's module << 32) | func — the child resolves `func` in that module
+      // (an installed §22 unit spawns its own functions).
       const cam = ex.temen_par_ev_a(v);
       const csmod = Number(cam >> 32n), cfunc = Number(BigInt.asUintN(32, cam));
       const csp = ex.temen_par_ev_b(v), carg = ex.temen_par_ev_c(v);
@@ -148,11 +148,6 @@ async function worker() {
       const result = i64()[(cslot + 8) >> 3];
       ex.temen_par_deliver_join(v, result, trapped ? 1 : 0);
       continue;
-    }
-    if (ev === INSTANTIATE) {
-      // A §14 carve spawn. Children are detached now (#1865), and this CLI does not mint their
-      // memories (the browser Worker does, `web/worker.js`): fail closed.
-      throw new Error('a carve spawn is not served; spawn detached (op 17 v1)');
     }
     if (ev === WAIT) {
       const addr = Number(ex.temen_par_ev_a(v)), expected = Number(BigInt.asIntN(32, ex.temen_par_ev_b(v)));

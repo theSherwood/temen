@@ -155,7 +155,8 @@ block 0 (v0: i64) {
   }
 }
 `;
-// A §14 carve spawn (op 0) on the par driver fails closed: its children are detached (#1865).
+// A §14 carve spawn (op 0) on the par driver fails closed, as a `CapFault` trap: its children are
+// detached (#1865).
 const CARVE_ROOT_SRC = `memory 20
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -226,10 +227,8 @@ const em = res.emitted;
 const emittedOk = em && !em.err && em.value === EXPECT && em.started === 4 && em.tierups === 3;
 const sf = res.self, cv = res.carve;
 const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 0;
-const carveOk = cv && /carve spawn is not served/.test(cv.err ?? '');
-// The carve run's Worker reports its refusal as a failure; that one is expected.
-const unexpected = errors.filter((e) => !/carve spawn is not served/.test(e));
-const ok = unexpected.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk;
+const carveOk = cv && cv.err === 'guest trap: CapFault';
+const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk;
 console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4${res.err ? ` · ERR ${res.err}` : ''}`);
 console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
 console.log(`  on emitted wasm: value ${em?.value}/${EXPECT} workers ${em?.started}/4 emitted children ${em?.tierups}/3${em?.err ? ` · ERR ${em.err}` : ''}`);

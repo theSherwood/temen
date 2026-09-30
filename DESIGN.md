@@ -2382,7 +2382,7 @@ the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mappe
 after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
 wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
 still falls to the interpreter. `map` (grow) is admitted on the nested paged path by the same
-refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned by `browser/tests/inst_codegen_paged.rs`. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned in real Chromium by `browser-test`'s `instpaged` item. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 
