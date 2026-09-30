@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{
-    cap_id, CapState, ForkedProc, GuestMem, Host, HostProc, HostProcFork, NamedCapGrant,
+    cap_id, CapState, ForkedProc, GuestMem, Host, HostProc, HostProcFork, NamedCapGrant, OpParks,
     SignalSource, Trap,
 };
 use temen_ir::ResolvedCap;
@@ -2194,8 +2194,9 @@ pub fn bind_with_fork(
 struct SignalDoor(Arc<Mutex<Proc>>, Arc<Mutex<World>>);
 
 /// #1896 — the ops that never park a process, whatever it holds: the file, directory, environment
-/// and identity ops. [`SignalDoor::import_parks`] answers `read`/`write` by what the process holds,
-/// and every op not here — a `fork`, a `wait`, a pipe, a signal, job control, a terminal — may park.
+/// and identity ops, and adopting a pipe's ends. [`SignalDoor::import_parks`] answers `read`/`write`
+/// by what the process holds, and `wait4` and `pspawn` park only on children. Every op not here — a
+/// `fork`, a signal, job control, a terminal — may park otherwise.
 const NEVER_PARKS: &[u32] = &[
     OP_MALLOC,
     OP_FREE,
@@ -2230,6 +2231,7 @@ const NEVER_PARKS: &[u32] = &[
     OP_GETPPID,
     OP_FSTAT,
     OP_STATP,
+    OP_PIPE_ADOPT,
 ];
 
 impl SignalSource for SignalDoor {
@@ -2386,15 +2388,22 @@ impl SignalSource for SignalDoor {
         Some(fds.chain(p.term_in.as_ref().map(|t| t.get())).collect())
     }
 
-    /// #1896 — whether this personality's op `import` can park the process. The ops in
-    /// [`NEVER_PARKS`] never do; a `read` or `write` does when the process holds something it could
-    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. A core pipe end
-    /// is not one: the op redirects to the core pipe's stream call, which parks in its place and
-    /// which the engine answers for. `None` for an import that is not this personality's.
-    fn import_parks(&self, import: &str) -> Option<bool> {
+    /// #1896 — how this personality's op `import` can park the process. The ops in [`NEVER_PARKS`]
+    /// never do, and `wait4` and `pspawn` park only on children. A `read` or `write` parks when the
+    /// process holds something it could block on — a pipe end, a socket, or stdio on a terminal; any
+    /// other op may park. A core pipe end is not one: the op redirects to the core pipe's stream call,
+    /// which parks in its place and which the engine answers for. `None` for an import that is not
+    /// this personality's.
+    fn import_parks(&self, import: &str) -> Option<OpParks> {
         let op = resolve_import(import)?.op;
+        if NEVER_PARKS.contains(&op) {
+            return Some(OpParks::Never);
+        }
+        if op == OP_WAIT4 || op == OP_PSPAWN {
+            return Some(OpParks::OnChildren);
+        }
         if op != OP_READ && op != OP_WRITE {
-            return Some(!NEVER_PARKS.contains(&op));
+            return Some(OpParks::Otherwise);
         }
         let terminal = self
             .1
@@ -2403,11 +2412,16 @@ impl SignalSource for SignalDoor {
             .terminal
             .is_some();
         let p = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        Some(p.fds.iter().flatten().any(|f| match f {
+        let blocks = p.fds.iter().flatten().any(|f| match f {
             FdEntry::File(_) | FdEntry::CorePipe(_) => false,
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => terminal,
             _ => true,
-        }))
+        });
+        Some(if blocks {
+            OpParks::Otherwise
+        } else {
+            OpParks::Never
+        })
     }
 
     /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed

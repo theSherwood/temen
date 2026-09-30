@@ -47,6 +47,51 @@ block 0 (vcap: i64) {\n\
   }\n\
 }\n";
 
+/// `/bin/leaf` that spawns `kid` (a [`LEAF`], or [`forking`] one: it writes `out.txt` and exits 5),
+/// waits for it, and ends with its status plus 20, returned from its entry. Its entry only calls,
+/// and the helper it calls makes the personality calls, as a real nim module does.
+fn spawn_leaf(kid: &str) -> String {
+    format!(
+        "memory 17\n\
+import 0 \"__px_pspawn\" (i64) -> (i64)\n\
+import 1 \"__px_wait4\" (i64, i64, i64, i64) -> (i64)\n\
+data 40000 \"{kid}\\x00\"\n\
+func (i64) -> (i64) {{\n\
+block 0 (vcap: i64) {{\n\
+  vs = call 1 ()\n\
+  return vs\n\
+  }}\n\
+}}\n\
+func () -> (i64) {{\n\
+block 0 () {{\n\
+  vreq = i64.const 41000\n\
+  vpath = i64.const 40000\n\
+  i64.store vreq vpath\n\
+  vpid = call.import 0 (vreq)\n\
+  vst = i64.const 41100\n\
+  vz = i64.const 0\n\
+  vw = call.import 1 (vpid, vst, vz, vz)\n\
+  vhi = i64.const 41101\n\
+  vsw = i32.load8_u vhi\n\
+  vs = i64.extend_i32_u vsw\n\
+  vtwenty = i64.const 20\n\
+  vr = i64.add vs vtwenty\n\
+  return vr\n\
+  }}\n\
+}}\n"
+    )
+}
+
+/// `leaf` importing `fork`, which it never calls: an image that can park that way, which the engine
+/// runs interpreted.
+fn forking(leaf: &str) -> String {
+    leaf.replacen(
+        "import 3 \"__px_exit\" (i64) -> ()\n",
+        "import 3 \"__px_exit\" (i64) -> ()\nimport 4 \"__px_fork\" (i64) -> (i64)\n",
+        1,
+    )
+}
+
 /// Forks; the child execs `/bin/leaf` (exiting 9 if it could not), and the parent exits with the
 /// child's exit status. With `pipe`, it first makes a pipe, which the child inherits.
 fn guest(pipe: bool) -> String {
@@ -134,6 +179,13 @@ fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
     host.set_import_bindings(binds);
     let command = host.grant_module(&module(command));
     posix.register_executable("/bin/leaf", command, 17);
+    for (path, kid) in [
+        ("/bin/kid", LEAF.to_string()),
+        ("/bin/forkkid", forking(LEAF)),
+    ] {
+        let kid = host.grant_module(&module(&kid));
+        posix.register_executable(path, kid, 17);
+    }
     posix.set_cwd("/w");
     let offered = Arc::new(Mutex::new(Vec::new()));
     let offers = Arc::clone(&offered);
@@ -240,6 +292,40 @@ fn a_leaf_that_can_map_pages_is_offered_paged() {
     assert_eq!(leaves.tierups.len(), 1);
 }
 
+/// Making a pipe does not park: the core's mint (self op 16) and adopting its ends into
+/// descriptors (`pipe_adopt`), which is how a nim program's `pipe` makes one. An image that makes one
+/// is offered, as one that does not.
+#[test]
+fn a_leaf_that_makes_a_pipe_is_offered() {
+    let pipes = LEAF
+        .replacen(
+            "import 3 \"__px_exit\" (i64) -> ()\n",
+            "import 3 \"__px_exit\" (i64) -> ()\n\
+             import 4 \"__px_pipe_adopt\" (i64, i64, i64) -> (i64)\n",
+            1,
+        )
+        .replacen(
+            "block 0 (vcap: i64) {\n",
+            "block 0 (vcap: i64) {\n\
+             \x20 vh0 = i32.const 0\n\
+             \x20 vhs = i64.const 42000\n\
+             \x20 vpm = call.cap 4294967295 16 (i64) -> (i64) vh0 (vhs)\n\
+             \x20 vrh32 = i32.load vhs\n\
+             \x20 vrh = i64.extend_i32_u vrh32\n\
+             \x20 vwh32 = i32.load vhs offset=4\n\
+             \x20 vwh = i64.extend_i32_u vwh32\n\
+             \x20 vfds = i64.const 42100\n\
+             \x20 vad = call.import 4 (vrh, vwh, vfds)\n",
+            1,
+        );
+    let (interpreted, _) = run_tree(&guest(false), &pipes, false);
+    assert_eq!(interpreted.root, Ok(5));
+    let (emitted, leaves) = run_tree(&guest(false), &pipes, true);
+    assert_eq!(emitted, interpreted);
+    assert_eq!(leaves.offered, [(false, false)], "offered, not parking");
+    assert_eq!(leaves.tierups.len(), 1);
+}
+
 /// A leaf that holds one of the personality's own pipe ends may park on it, as the personality
 /// answers, and an image that imports `fork` may park in it: both run interpreted, and end as they
 /// would anyway. (A core pipe end parks only in a stream call, where a host that suspends can serve
@@ -254,11 +340,7 @@ fn an_image_that_can_park_runs_interpreted() {
         "a child holding a pipe end is not offered"
     );
 
-    let forks = LEAF.replacen(
-        "import 3 \"__px_exit\" (i64) -> ()\n",
-        "import 3 \"__px_exit\" (i64) -> ()\nimport 4 \"__px_fork\" (i64) -> (i64)\n",
-        1,
-    );
+    let forks = forking(LEAF);
     let (interpreted, _) = run_tree(&guest(false), &forks, false);
     let (declined, leaves) = run_tree(&guest(false), &forks, true);
     assert_eq!(declined, interpreted);
@@ -505,5 +587,48 @@ fn a_leaf_that_exits_after_a_parked_call_ends_there() {
         (leaves.tierups.len(), leaves.resumes),
         (1, 0),
         "tiered up once, parked, and ended in the rest of the call: {leaves:?}"
+    );
+}
+
+/// A leaf may spawn and wait: both park only on its children, which the engine serves beneath the
+/// emitted frames. Its spawn is handed back to the pump, which starts the child (itself a leaf) and
+/// runs the call on; its wait parks as a pipe read does. The tree ends as it does interpreted.
+#[test]
+fn a_leaf_spawns_and_waits_and_ends_as_interpreted() {
+    let spawner = spawn_leaf("/bin/kid");
+    let (interpreted, _) = run_tree(&guest(false), &spawner, false);
+    assert_eq!(
+        interpreted,
+        Ending {
+            root: Ok(25),
+            wrote: Some(b"leaf".to_vec()),
+        },
+        "the spawned child wrote its file and exited 5; its parent exited 25, and the root with it"
+    );
+    let (emitted, leaves) = run_tree(&guest(false), &spawner, true);
+    assert_eq!(emitted, interpreted);
+    assert_eq!(
+        leaves.offered,
+        [(false, true), (false, false)],
+        "the spawner is offered parking, and the child it spawned is offered too"
+    );
+    assert_eq!(leaves.tierups.len(), 2, "both ran emitted: {leaves:?}");
+    assert_eq!(leaves.resumes, 1, "the spawner's call ran on: {leaves:?}");
+
+    // A child that runs interpreted has not ended when its parent waits: the wait parks.
+    let spawner = spawn_leaf("/bin/forkkid");
+    let (interpreted, _) = run_tree(&guest(false), &spawner, false);
+    assert_eq!(interpreted.root, Ok(25));
+    let (emitted, leaves) = run_tree(&guest(false), &spawner, true);
+    assert_eq!(emitted, interpreted);
+    assert_eq!(
+        leaves.offered,
+        [(false, true)],
+        "only the spawner is offered"
+    );
+    assert_eq!(leaves.tierups.len(), 1);
+    assert_eq!(
+        leaves.resumes, 1,
+        "the wait ran on once the child ended: {leaves:?}"
     );
 }

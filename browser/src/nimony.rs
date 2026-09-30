@@ -4,8 +4,9 @@
 //! temen-link — and nimsem's compile-time evaluation builds and runs programs of its own. The process
 //! tree runs on the browser's interpreter tier, over one POSIX personality and its memfs, as the
 //! self-hosted lane runs it natively (`scripts/ci/nim-selfhost-lane.sh`); a **leaf** process — one
-//! that cannot park, such as hexer and nifler2, or one that parks only on its pipes where the host can
-//! suspend its emitted frames — runs whole on the emitted tier (#1896).
+//! that cannot park, such as hexer and nifler2, or one that parks only on its pipes and its children
+//! where the host can suspend its emitted frames, such as nimsem — runs whole on the emitted tier
+//! (#1896).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -356,10 +357,10 @@ pub(crate) fn finish(nim: NimSession) -> (Vec<u8>, Vec<u8>) {
 /// ([`blob_entries`]) whose entry names list a module's paths, one per line; `[files)` the tree it
 /// builds in, a blob of `path → bytes`; `[argv)` its arguments, each NUL-terminated; `[cwd)` the
 /// directory it runs in. `suspend` is non-zero when the driver can suspend a leaf's emitted frames
-/// where a call parks (JSPI): a leaf process that parks only on its pipes then runs emitted too, and
-/// a parked call surfaces as [`crate::COOP_RUN_RESUME`] once it returns. Returns `0`, or a negative
-/// status. When the run is done the exit code, stdout and stderr read back as after any run, and
-/// [`temen_nim_file`] reads what the build wrote.
+/// where a call parks (JSPI): a leaf process that parks only on its pipes and its children then runs
+/// emitted too, and a parked call surfaces as [`crate::COOP_RUN_RESUME`] once it returns. Returns
+/// `0`, or a negative status. When the run is done the exit code, stdout and stderr read back as
+/// after any run, and [`temen_nim_file`] reads what the build wrote.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live [`crate::temen_alloc`]ation the host filled, or `(null, 0)`.
