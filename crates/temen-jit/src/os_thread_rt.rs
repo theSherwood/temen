@@ -1750,6 +1750,29 @@ impl Domain {
         (result, trap, faulted)
     }
 
+    /// The task of the vCPU running on this thread: a concurrent durable child's own (set by
+    /// `run_child`; concurrent children would race the shared `cur_task`), else `cur_task`.
+    fn current_task(&self) -> u64 {
+        CONCURRENT_SPAWN_TASK
+            .with(|c| c.get())
+            .unwrap_or_else(|| *lock(&self.cur_task))
+    }
+
+    /// #1655, #1904 — a durable vCPU about to park runs the deferred children first. A durable run
+    /// defers every spawn while its window is not `NORMAL`, and `ARMED` counts, so a child it is
+    /// waiting on may not have started, and only this vCPU can start it: without this an armed run
+    /// whose trigger has not fired parks for a notify, a result or a byte nothing will produce. It
+    /// is what the interpreter's single worker does when the vCPU ahead of the queue parks.
+    ///
+    /// # Safety
+    /// As [`Self::drive_frozen_spawns`] from a park: this vCPU's frame is below, and no lock the
+    /// children publish through is held.
+    pub(crate) unsafe fn drive_deferred_before_park(&self, cur: u64) {
+        if self.env().durable && !lock(&self.pending_spawns).is_empty() {
+            self.drive_frozen_spawns(cur, crate::durable_shadow::get());
+        }
+    }
+
     /// Run every child *deferred* on a durable run (slice 3.3), inline and in spawn order — the JIT's
     /// single-worker equivalent of the interpreter dispatching its enqueued children once the vCPU
     /// ahead of them yields. Two callers: `run_inner` once the root has unwound for a freeze, and
@@ -2014,9 +2037,7 @@ pub(crate) unsafe extern "C" fn thread_join(
     // §12.8 concurrent-thaw stage 2: on a concurrent durable child's OS thread, use *this* thread's task
     // (set by `run_child`) — concurrent children would race the shared `cur_task`. The root's own thread
     // has no `CONCURRENT_SPAWN_TASK`, so it falls back to `cur_task` (set to the root by the thaw driver).
-    let cur = CONCURRENT_SPAWN_TASK
-        .with(|c| c.get())
-        .unwrap_or_else(|| *lock(&dom.cur_task));
+    let cur = dom.current_task();
     let done = {
         let mut dc = lock(&dom.dchildren);
         if !dc.is_empty() {
@@ -2083,14 +2104,12 @@ pub(crate) unsafe extern "C" fn thread_join(
     } else {
         0
     };
-    // #1655 — a durable run defers every spawn while its window is not `NORMAL`, and `ARMED` counts:
-    // the child has not started, and only this vCPU can start it. So when the joined child has no
-    // result yet, run the deferred children inline now, in spawn order — what the interpreter's single
-    // worker does when the joiner parks. The wait below then takes what the child left: its real
-    // result if it finished, or — if it unwound for a freeze — the placeholder, marked for re-issue.
-    // SAFETY: a durable run's committed window; `done.state` is not held (the children publish there).
-    if unwind_base != 0 && lock(&done.state).is_none() && !lock(&dom.pending_spawns).is_empty() {
-        unsafe { dom.drive_frozen_spawns(cur, crate::durable_shadow::get()) };
+    // #1655 — the joined child may not have started: run the deferred children before parking. The
+    // wait below then takes what the child left: its real result if it finished, or — if it unwound
+    // for a freeze — the placeholder, marked for re-issue.
+    // SAFETY: `done.state` is not held (the children publish there).
+    if lock(&done.state).is_none() {
+        unsafe { dom.drive_deferred_before_park(cur) };
     }
     // D66 — a joiner holds no lane while it waits. Under a cap of 1 this is load-bearing: the child
     // being joined cannot run at all until the joiner steps aside. Released before the completion
@@ -2269,6 +2288,10 @@ pub(crate) unsafe extern "C" fn thread_wait(
             unwind_base,
             trap_out,
         );
+    }
+    // #1904 — a wait that would park runs the deferred children first: the notifier may be one.
+    if read_phys(phys, width) & mask == expected & mask {
+        dom.drive_deferred_before_park(dom.current_task());
     }
     // D66 — a parked vCPU holds no lane. This is what makes a bounded domain composable rather than
     // deadlock-prone: under a cap of 1, a vCPU that waits must let its peer run, or the notify it is
