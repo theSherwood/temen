@@ -61,8 +61,9 @@ vCPU and **separate per spawned vCPU/OS thread**. Widen that host cell from one 
   save/restore discipline `temen_set_current_fiber` already uses (`fiber_rt.rs:853/858`): set the
   resumed fiber's low bound before `call_tramp`, restore the previous value after (handles nested
   resumes automatically);
-- the **root** computation (on the OS thread stack, not an arena slot) keeps `stack_limit = 0`, and
-  `SP − RED_ZONE < 0` is never true → the check is inert there (same convention as `epoch_addr == 0`).
+- the **root** computation (on the OS thread stack, not an arena slot) takes its thread's limit, the
+  stack's low bound plus a quarter of its size (#1983). `stack_limit = 0` still means inert
+  (`SP − RED_ZONE < 0` is never true), which is what an entry off its thread's stack gets.
 
 This keeps the check per-thread-correct with no ABI param and no TLS access-model codegen.
 
@@ -128,7 +129,8 @@ original sketch:
 - The fiber's limit is sourced from **`temen_fiber::Yielder::stack_low()`** (temen-fiber now stores the
   control stack's `usable_low` in its `Control` and exposes it) — correct for both stack backends with
   no alignment coupling and no root-on-managed-stack change. The **root** and each **spawned vCPU top**
-  pass `limit = 0` (they run on OS-guarded thread stacks ⇒ check inert); only fibers get a real limit.
+  pass their OS thread stack's limit (#1983; before it they passed `0`, and deep recursion there
+  aborted the process on the OS guard page).
 
 Touch-points (all cfg-gated on `stack-check`, so the default ABI is byte-identical): `sig_from`, the
 entry block params + `pbase` + `sret` index, `Lower.limit_var`, `ctx_args`, `emit_stack_check`,

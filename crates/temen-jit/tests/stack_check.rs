@@ -126,3 +126,94 @@ fn shallow_fiber_runs_under_the_guard() {
         other => panic!("expected Returned([7]), got {other:?}"),
     }
 }
+
+// #1983 — recursion on a stack the JIT did not allocate: the root (the calling thread's own stack)
+// and a spawned vCPU's top (its OS thread's stack). Each takes its thread's limit, so unbounded
+// recursion traps `StackOverflow` rather than running into the OS guard page, where the process
+// aborts.
+const ROOT_RECURSE: &str = "\
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+";
+
+const SPAWNED_TOP_RECURSE: &str = "\
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = thread.join v1
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = call 2 (v0)
+  return v2
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 2 (v0)
+  return v1
+  }
+}
+";
+
+// Recursion to depth `n` on the root, returning `n`: well short of the limit, it must run.
+const ROOT_DEPTH: &str = "\
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vz = i64.const 0
+  vdone = i64.eq vn vz
+  br_if vdone 1(vz) 2(vn)
+}
+block 1 (vr: i64) {
+  return vr
+}
+block 2 (vm: i64) {
+  vone = i64.const 1
+  vm1 = i64.sub vm vone
+  vs = call 0(vm1)
+  vt = i64.add vs vone
+  return vt
+  }
+}
+";
+
+#[test]
+fn unbounded_root_recursion_traps_stack_overflow() {
+    let m = parse_module(ROOT_RECURSE).expect("parse");
+    match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Trapped(TrapKind::StackOverflow) => {}
+        other => panic!("expected StackOverflow on the root, got {other:?}"),
+    }
+}
+
+#[test]
+fn unbounded_spawned_vcpu_top_recursion_traps_stack_overflow() {
+    let m = parse_module(SPAWNED_TOP_RECURSE).expect("parse");
+    match compile_and_run(&m, 0, &[]).expect("jit compile/run") {
+        JitOutcome::Trapped(TrapKind::StackOverflow) => {}
+        other => panic!("expected StackOverflow on the spawned vCPU's top, got {other:?}"),
+    }
+}
+
+#[test]
+fn bounded_root_recursion_runs_under_the_limit() {
+    let m = parse_module(ROOT_DEPTH).expect("parse");
+    match compile_and_run(&m, 0, &[10_000]).expect("jit compile/run") {
+        JitOutcome::Returned(slots) => assert_eq!(slots, vec![10_000]),
+        other => panic!("expected Returned([10000]), got {other:?}"),
+    }
+}

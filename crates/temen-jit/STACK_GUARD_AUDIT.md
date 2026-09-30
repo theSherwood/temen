@@ -27,8 +27,11 @@ hardening / assurance items; two cheap ones are already fixed in this change.
 3. **Per-vCPU-correct by construction.** The limit is a *value* ABI param, constant within a stack's
    call tree, set anew at each fiber entry from `Yielder::stack_low()` (`fiber_rt.rs:680`). There is no
    shared cell and no TLS, so concurrent vCPUs cannot clobber each other's limit. The root and each
-   spawned-vCPU top pass `limit = 0` (they run on OS-guarded thread stacks ⇒ check inert). Pinned by
-   `stack_check.rs::spawned_vcpu_fiber_recursion_traps_stack_overflow`.
+   spawned-vCPU top pass their own thread's limit (#1983, `stack_check::thread_limit`: the thread
+   stack's low bound plus a quarter of its size, looked up once per thread on the host side, `0` when
+   the caller is off its thread's stack). Pinned by
+   `stack_check.rs::spawned_vcpu_fiber_recursion_traps_stack_overflow` and the root and vCPU-top
+   recursion tests beside it.
 
 4. **Frames are validated directly.** The check sits *after* the machine prologue's `sub rsp` (entry
    block), so `get_stack_pointer` reflects this frame; `SP - RED_ZONE < limit` traps if the frame
@@ -87,7 +90,9 @@ over-approximates (sound superset), the open decision in STACK_GUARD_FLIP.md #4,
 guest assumption of zeroed stacks if one exists. **Recommendation:** fold the zero-on-reclaim decision
 into #4; document the trust-boundary reasoning either way.
 
-### F5 — [note; out of scope for the fiber flip] Root / vCPU-top JIT recursion stays OS-guarded
+### F5 — [resolved by #1983] Root / vCPU-top JIT recursion stays OS-guarded
+**Resolved:** the root and spawned-vCPU tops now take their thread's stack limit, so their recursion
+traps `StackOverflow` too. On the OS guard page it aborted the process (#1983). The original note:
 Root and spawned-vCPU tops run with `limit = 0` (check inert) on their OS thread stacks by design, so
 their deep JIT recursion is bounded only by the OS guard page — which shares the `sigaltstack`
 double-fault DoS (STACK_GUARD_FLIP.md "sigaltstack finding"). The flip does not change this (it only

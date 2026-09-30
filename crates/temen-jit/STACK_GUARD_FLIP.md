@@ -111,9 +111,9 @@ Two independent follow-ups fell out:
 - **(a) — RESOLVED for fibers by PR2.** Making the software check always-on means a *fiber* overflow now
   traps `StackOverflow` through `trap_out` (no signal) ~`RED_ZONE` above the guard page, so it never
   reaches the page and never double-faults — the DoS is gone for fibers on the default guard-page
-  backend. (The root / spawned-vCPU tops still run `limit = 0` on OS stacks, so a `sigaltstack` would
-  only matter for a deeply-recursive *root* JIT computation — a much narrower, still-open case. A
-  dedicated `sigaltstack` install is therefore optional now, not a DoS fix.)
+  backend. (The root / spawned-vCPU tops then still ran `limit = 0` on OS stacks, leaving a
+  deeply-recursive *root* JIT computation to the OS guard page. #1983 gave them their thread's limit,
+  so they trap too, and a dedicated `sigaltstack` install is not needed for a DoS fix.)
 - **(b)** Correct the `TrapKind::StackOverflow` / `MemoryFault` docs re: stack-exhaustion faults.
 
 ## CI: point the guard-page-oracle fuzz lane at `guard-page-stacks` (apply on `main`)
