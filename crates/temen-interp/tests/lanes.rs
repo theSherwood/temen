@@ -149,7 +149,7 @@ func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   vf = i64.const -1
   vm = i64.const 4096
-  vs = i64.const 0
+  vs = i64.const -1
   vc = i64.const -1
   vl2 = i64.const 2
   vl1 = i64.const 1
