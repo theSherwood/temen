@@ -25,9 +25,11 @@
 # --expect`, no normalization, no tolerance), the module linked in-guest must be the host's link of
 # the same `.c.nif`s, and the program must print what the native binary prints.
 #
-# With NIM_LANE_SELF=1 the lane also builds nimsem itself in-guest (#763): the artifacts again match
-# native nimony's, and the nimsem nimony builds on Temen is byte for byte the nimsem that built it
-# (`--fixed-point`). The nightly run (and a manual dispatch) sets it; a PR run leaves it out.
+# With NIM_LANE_SELF=1 the lane also has nimony build each of its own tools in-guest (#763): the
+# driver, nifmake, nifler2, nimsem and hexer. Each must be byte for byte the tool that ran in the
+# build (`--fixed-point`), and nimsem's artifacts must also match native nimony's. nifler2 takes its
+# plugins, parsegen and regex, which nimsem builds for Temen and runs in-guest. The nightly run (and
+# a manual dispatch) sets it; a PR run leaves it out.
 #
 #   NIMONY_BIN=<nimony/bin> NIM_BIN=<dir holding nim> [NIM_LANE_SELF=1] bash scripts/ci/nim-selfhost-lane.sh
 #
@@ -90,10 +92,13 @@ fi
 echo "✅ the program built on Temen prints what the native build prints: $(cat "$W/temen.out")"
 
 if [ -z "${NIM_LANE_SELF:-}" ]; then
-  echo "[5/5] skipped: nimony building nimsem in-guest runs with NIM_LANE_SELF=1 (the nightly run)"
+  echo "[5/5] skipped: nimony building its tools in-guest runs with NIM_LANE_SELF=1 (the nightly run)"
   exit 0
 fi
-echo "[5/5] nimony builds nimsem on Temen, and it is the nimsem that built it"
-# Against the toolchain's native build of nimsem, in the tree's nimcache (`--expect`), and against
-# the nimsem.temen the toolchain linked from it (`--fixed-point`).
+echo "[5/5] nimony builds each of its tools on Temen, and each is the tool that built it"
+# Each against the .temen the toolchain linked (`--fixed-point`); nimsem also against the
+# toolchain's native build of it, in the tree's nimcache (`--expect`).
 lane --engine jit --expect --fixed-point "$N" src/nimony/nimsem.nim "$W/cache-nimsem"
+for p in nifler2/nifler2 hexer/hexer nimony/nimony nifmake/nifmake; do
+  lane --engine jit --fixed-point "$N" "src/$p.nim" "$W/cache-$(basename "$p")"
+done
