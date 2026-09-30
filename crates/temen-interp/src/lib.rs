@@ -21667,9 +21667,12 @@ pub struct Host {
     /// `self.covers`, and `export.handle` resolve through one host-side entry on all three
     /// backends. `None` until registered (the ops then fail closed, probeable).
     self_module: Option<Arc<Module>>,
-    /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, kept in step
-    /// with it by [`Host::set_self_module_opt`], its one writer.
-    self_grant: Option<ModuleGrant>,
+    /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, built at the
+    /// first resolve and reset by [`Host::set_self_module_opt`], its one writer. Lazily, because
+    /// every fork, spawn and exec sets the self module, and a grant copies the module's code and
+    /// hashes its encoding: tens of milliseconds for a compiler, where only a spawn of the running
+    /// program (`module = -1`) ever reads it.
+    self_grant: std::sync::OnceLock<ModuleGrant>,
     /// The domain's one shared service state for offers it reifies (`export.handle` — all of a
     /// domain's reified offers share it), created lazily on first reification.
     self_instance: Option<Arc<Mutex<ProviderState>>>,
@@ -22386,7 +22389,7 @@ impl Host {
             import_remaps: Vec::new(),
             import_reqs: Vec::new(),
             self_module: None,
-            self_grant: None,
+            self_grant: std::sync::OnceLock::new(),
             self_instance: None,
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
@@ -25751,7 +25754,7 @@ impl Host {
     /// [`SELF_MODULE`] resolves to ([`Host::resolve_module`]) is always the current module's (#1863:
     /// a spawn record's `module = -1` means "my own program", on every tier).
     pub(crate) fn set_self_module_opt(&mut self, m: Option<Arc<Module>>) {
-        self.self_grant = m.as_ref().map(|m| ModuleGrant::of(Arc::clone(m), false));
+        self.self_grant = std::sync::OnceLock::new();
         self.self_module = m;
     }
 
@@ -26662,7 +26665,10 @@ impl Host {
         // #1863: `-1` names the running module — a spawn of "my own program" needs no grant, as
         // the op-17 record always allowed. With no module registered it faults like a forgery.
         if handle == SELF_MODULE {
-            return self.self_grant.as_ref().ok_or(Trap::CapFault);
+            let m = self.self_module.as_ref().ok_or(Trap::CapFault)?;
+            return Ok(self
+                .self_grant
+                .get_or_init(|| ModuleGrant::of(Arc::clone(m), false)));
         }
         match self.resolve(handle, cap_id::MODULE)? {
             Binding::Module(id) => self.modules.get(id as usize).ok_or(Trap::CapFault),
