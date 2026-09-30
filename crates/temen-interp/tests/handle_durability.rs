@@ -453,58 +453,98 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// #1502 — a `Budget` is durable. Its whole state is four `i64`s of *remaining* quota, so it rides a
-// capture verbatim and a restore re-mints it. Carrying the remaining rather than re-granting fresh is
-// what keeps INVARIANTS #3's conservation across a freeze: what the domain already spent stays spent.
+// #1502, #1944 — a `Budget` is durable. A handle names its node in the run's budget tree, and the
+// nodes ride beside the handles with their ceilings, their charges and their parents, so a thawed
+// subtree is still capped by every ancestor and what it had charged stays charged.
 // ---------------------------------------------------------------------------------------------
 
-use temen_interp::BudgetState;
+use temen_interp::DurableBudget;
 
-/// A budget that has been partly spent captures as its **remaining** quotas, restores into a fresh
-/// table at the same slot, and the guest-held handle then reads the same remaining — not the
-/// original grant.
+/// `split(fuel, mem, spawn)` of `holder`: the child node's handle.
+fn split(host: &mut Host, holder: i32, ask: [i64; 3]) -> i32 {
+    host.cap_dispatch_slots(cap_id::BUDGET, 0, holder, &ask, None)
+        .expect("split")[0] as i32
+}
+
+/// `read(field)` of `h`: the room left along its chain.
+fn read(host: &mut Host, h: i32, field: i64) -> i64 {
+    host.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[field], None)
+        .expect("read")[0]
+}
+
+/// Restore `nodes` then `handles` into `host`, rewriting each handle's node key to its new id — what
+/// the snapshot codec does between its two steps.
+fn restore_budgets(host: &mut Host, nodes: &[DurableBudget], handles: &[DurableHandle]) {
+    let ids = host
+        .restore_durable_budgets(nodes)
+        .expect("parents come first");
+    let mut handles = handles.to_vec();
+    for h in &mut handles {
+        if let DurableBinding::Budget { node } = &mut h.binding {
+            let at = nodes.iter().position(|n| n.key == *node).expect("carried");
+            *node = ids[at];
+        }
+    }
+    host.restore_durable_handles(&handles);
+}
+
+/// A root with a child node `b` that has charged a window round-trips through capture/restore: each
+/// handle reads the same room, and `b` is still under the root, so the root's remaining room caps it.
 #[test]
-fn a_budget_round_trips_through_capture_restore_with_its_remaining_intact() {
+fn a_budget_node_round_trips_with_its_ceilings_charge_and_parent() {
     let mut a = Host::new();
     a.grant_clock();
-    let h = a.grant_budget_channel(7, 1 << 20, 3, -1); // `-1` channel: the unbounded encoding
-    assert!(a.budget_mem_take(h, 4096), "spend some of the mem quota");
-    let remaining = BudgetState {
-        fuel: 7,
-        mem: (1 << 20) - 4096,
-        spawn: 3,
-        channel: -1,
-        lane: -1,
-    };
+    let root = a.grant_budget_channel(7, 1 << 20, 3, -1); // `-1` channel: the unbounded encoding
+    let b = split(&mut a, root, [0, 1 << 19, 0]);
+    assert!(
+        a.budget_mem_take(b, 4096),
+        "b's window charges b and the root"
+    );
 
     let captured = a
         .capture_durable_handles()
         .expect("a Budget is durable: the capture must not refuse it");
+    let nodes = a.capture_durable_budgets();
+    assert_eq!(nodes.len(), 2, "the root and b ride: {nodes:?}");
+    assert_eq!(nodes[1].parent, Some(nodes[0].key), "b is under the root");
     assert!(
-        captured
-            .iter()
-            .any(|c| c.binding == DurableBinding::Budget(remaining)),
-        "the capture carries the remaining quotas, not the original grant: {captured:?}"
+        nodes.iter().all(|n| n.used.mem == 4096),
+        "b's window is charged to b and to the root: {nodes:?}"
     );
 
-    let mut b = Host::new();
-    b.restore_durable_handles(&captured);
+    let mut t = Host::new();
+    t.grant_clock();
+    restore_budgets(&mut t, &nodes, &captured);
+    assert_eq!(read(&mut t, root, 1), (1 << 20) - 4096, "the root's room");
+    assert_eq!(read(&mut t, b, 1), (1 << 19) - 4096, "b's room");
+    assert_eq!(read(&mut t, root, 3), -1, "an unbounded field survives");
     assert_eq!(
-        b.capture_durable_handles().unwrap(),
-        captured,
-        "restore reinstates the exact captured set, Budget included"
+        t.capture_durable_budgets()
+            .iter()
+            .map(|n| (n.parent.is_some(), n.ceiling, n.used))
+            .collect::<Vec<_>>(),
+        nodes
+            .iter()
+            .map(|n| (n.parent.is_some(), n.ceiling, n.used))
+            .collect::<Vec<_>>(),
+        "the restored tree carries what the capture carried"
     );
-    // The guest's handle value resolves to the re-minted entry, and `read(mem)` is the remaining.
-    assert_eq!(
-        b.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[1], None),
-        Ok(vec![remaining.mem]),
-        "read(mem) after restore is what was left at capture"
-    );
-    assert_eq!(
-        b.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
-        Ok(vec![-1]),
-        "an unbounded field survives the two's-complement uleb"
-    );
+    // b is still capped by its restored parent: once the root is full, b has no room.
+    assert!(t.budget_mem_take(root, (1 << 20) - 4096), "fill the root");
+    assert_eq!(read(&mut t, b, 1), 0, "b's room is its parent's");
+    assert!(!t.budget_mem_take(b, 1), "b cannot charge past its parent");
+}
+
+/// A node list whose parent comes after its child is refused: dropping the link would lift the child
+/// out from under its parent's ceiling.
+#[test]
+fn a_restore_refuses_a_child_before_its_parent() {
+    let mut a = Host::new();
+    let root = a.grant_budget(-1, 1 << 20, -1);
+    split(&mut a, root, [0, 4096, 0]);
+    let mut nodes = a.capture_durable_budgets();
+    nodes.reverse();
+    assert_eq!(Host::new().restore_durable_budgets(&nodes), None);
 }
 
 /// The complement: a drain keeps a `Budget`, exactly as it keeps every other durable binding — a

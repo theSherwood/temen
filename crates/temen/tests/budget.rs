@@ -1,13 +1,13 @@
-//! PROCESS.md §5 / §15 — `Budget` (iface 14): a passable, **splittable** resource-quota vector
-//! `(fuel, mem, spawn)`. §15's principle — "every meterable resource is already a capability with a
-//! quota" — promoted to an object a domain can `split` (attenuate a sub-budget), `read` (monitor),
-//! and `transfer` (top up an existing sub-budget down the graph — #1289 R2, `split`'s lazy inverse).
+//! PROCESS.md §5 / §15, #1944 — `Budget` (iface 14): a node of the run's budget tree, with a
+//! **ceiling** per dimension that caps its whole subtree. A domain can `split` a child node (its
+//! ceilings clamped to this node's, nothing deducted), `read` the room left along the chain (the
+//! least any level has left), and `transfer` to raise a child node's ceiling (clamped to this node's).
 //!
 //! `Budget` is an ordinary capability (it dispatches through the generic `call.cap` path, not the
 //! eval-loop-serviced `Instantiator`), so the interpreter and the JIT service it through the **same**
 //! `Host::cap_dispatch_slots` — these tests run each program on both backends and assert identical
-//! results (parity for free, like `Stream`/`Clock`). Charging a domain's live consumption against its
-//! budget (the `create(module, window, budget)` accounting) is the follow-up; this pins the object.
+//! results (parity for free, like `Stream`/`Clock`). What a charge does to the chain is pinned in
+//! `temen-interp`'s `budget_tree_tests`.
 
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
@@ -48,9 +48,10 @@ fn run_jit(src: &str, host: &mut Host, bh: i32) -> JitOutcome {
     .0
 }
 
-/// `split(300, 200, 3)` out of a `(1000, 500, 10)` budget, then read the parent's fuel remaining and
-/// the child's whole vector; encode all four as `((parent_fuel*1000 + child_fuel)*1000 +
-/// child_mem)*1000 + child_spawn` = `((700*1000 + 300)*1000 + 200)*1000 + 3` = `700300200003`.
+/// `split(300, 200, 3)` out of a `(1000, 500, 10)` budget, then read the parent's fuel room and the
+/// child's whole vector. The split deducts nothing, so the parent keeps its 1000. Encode all four as
+/// `((parent_fuel*1000 + child_fuel)*1000 + child_mem)*1000 + child_spawn` =
+/// `((1000*1000 + 300)*1000 + 200)*1000 + 3` = `1000300200003`.
 const SPLIT_AND_READ: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
@@ -76,22 +77,22 @@ block 0 (vb: i32) {\n\
   }\n\
 }\n";
 
-/// `split(2000, 0, 0)` out of a `(1000, …)` budget over-asks the bounded fuel field, so the whole
-/// split fails closed with `-EINVAL` (`-22`); nothing is deducted.
+/// `split(2000, 0, 0)` out of a `(1000, …)` budget asks for more fuel than the parent's ceiling: the
+/// child's ceiling is clamped to the parent's 1000. Returns the child's fuel room (`1000`).
 const OVER_SPLIT: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
   big = i64.const 2000\n\
   z = i64.const 0\n\
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vb (big, z, z)\n\
-  vr = i64.extend_i32_s vsub\n\
-  return vr\n\
+  vcf = call.cap 14 1 (i64) -> (i64) vsub (z)\n\
+  return vcf\n\
   }\n\
 }\n";
 
-/// `split(-1, -1, -1)` takes **all remaining** of every field; the parent is left at `(0, 0, 0)`.
-/// Encode `((child_fuel*1000 + parent_fuel)*1000 + parent_spawn)` = `((1000*1000 + 0)*1000 + 0)` =
-/// `1000000000`.
+/// `split(-1, -1, -1)` leaves the child unbounded on its own, so only its parent caps it: it reads the
+/// parent's room, and the parent keeps all of it. Encode `((child_fuel*1000 + parent_fuel)*1000 +
+/// parent_spawn)` = `((1000*1000 + 1000)*1000 + 10)` = `1001000010`.
 const SPLIT_ALL: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
@@ -129,47 +130,47 @@ fn split_and_read_matches_across_backends() {
     let (ir, jo) = both(SPLIT_AND_READ, (1000, 500, 10));
     assert_eq!(
         ir,
-        Ok(vec![Value::I64(700_300_200_003)]),
-        "interp: parent 700 fuel left; child holds (300, 200, 3)"
+        Ok(vec![Value::I64(1_000_300_200_003)]),
+        "interp: the parent keeps its 1000 fuel; the child holds (300, 200, 3)"
     );
     assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[700_300_200_003]),
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[1_000_300_200_003]),
         "jit: must match interp, got {jo:?}"
     );
 }
 
 #[test]
-fn over_split_is_einval_on_both() {
+fn an_over_asking_split_is_clamped_on_both() {
     let (ir, jo) = both(OVER_SPLIT, (1000, 500, 10));
     assert_eq!(
         ir,
-        Ok(vec![Value::I64(-22)]),
-        "interp: over-split -> -EINVAL"
+        Ok(vec![Value::I64(1000)]),
+        "interp: the child's fuel ceiling is clamped to the parent's"
     );
     assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[-22]),
-        "jit: over-split must be -EINVAL, got {jo:?}"
-    );
-}
-
-#[test]
-fn split_all_drains_parent_on_both() {
-    let (ir, jo) = both(SPLIT_ALL, (1000, 500, 10));
-    assert_eq!(
-        ir,
-        Ok(vec![Value::I64(1_000_000_000)]),
-        "interp: child took all 1000 fuel; parent left at 0"
-    );
-    assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[1_000_000_000]),
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[1000]),
         "jit: must match interp, got {jo:?}"
     );
 }
 
-/// #1289 R2 — `transfer` (op 2), the top-up primitive (`split`'s lazy inverse). From `(1000, 500,
-/// 10)`, `split` a child `(0, 200, 0)` (parent now mem 300), then `transfer(child, 0, 100, 0)` moves
-/// 100 mem from the holder DOWN into the child: parent mem 300→200, child mem 200→300 (conservation).
-/// Encode `parent_mem*1000 + child_mem` = `200*1000 + 300` = `200300`.
+#[test]
+fn split_all_shares_the_parent_ceiling_on_both() {
+    let (ir, jo) = both(SPLIT_ALL, (1000, 500, 10));
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(1_001_000_010)]),
+        "interp: the child reads the parent's 1000; the parent keeps 1000 fuel and 10 spawn"
+    );
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[1_001_000_010]),
+        "jit: must match interp, got {jo:?}"
+    );
+}
+
+/// #1289 R2, #1944 — `transfer` (op 2), the top-up. From `(1000, 500, 10)`, `split` a child `(0, 200,
+/// 0)`, then `transfer(child, 0, 100, 0)` raises the child's mem ceiling 200→300; the parent keeps its
+/// 500 (a ceiling is a cap, not a reservation). Encode `parent_mem*1000 + child_mem` =
+/// `500*1000 + 300` = `500300`.
 const TRANSFER_AND_READ: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
@@ -188,8 +189,8 @@ block 0 (vb: i32) {\n\
   }\n\
 }\n";
 
-/// `transfer` over-asks a bounded field (mem 1000 from a holder with 300) — fails closed `-EINVAL`
-/// and moves **nothing**; the parent's mem is still 300 (returned to prove the no-op).
+/// `transfer` asks to raise the child's mem by 1000, past the holder's 500 ceiling: the child's
+/// ceiling is clamped to 500. Returns the child's mem room (`500`).
 const OVER_TRANSFER: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
@@ -199,8 +200,8 @@ block 0 (vb: i32) {\n\
   m1000 = i64.const 1000\n\
   vt = call.cap 14 2 (i32, i64, i64, i64) -> (i32) vb (vsub, z, m1000, z)\n\
   fld1 = i64.const 1\n\
-  vpm = call.cap 14 1 (i64) -> (i64) vb (fld1)\n\
-  return vpm\n\
+  vcm = call.cap 14 1 (i64) -> (i64) vsub (fld1)\n\
+  return vcm\n\
   }\n\
 }\n";
 
@@ -220,29 +221,29 @@ block 0 (vb: i32) {\n\
 }\n";
 
 #[test]
-fn transfer_moves_quota_down_conserving_on_both() {
+fn transfer_raises_a_childs_ceiling_on_both() {
     let (ir, jo) = both(TRANSFER_AND_READ, (1000, 500, 10));
     assert_eq!(
         ir,
-        Ok(vec![Value::I64(200_300)]),
-        "interp: 100 mem moved holder->child; parent 200, child 300"
+        Ok(vec![Value::I64(500_300)]),
+        "interp: the child's mem ceiling raised to 300; the parent keeps 500"
     );
     assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[200_300]),
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[500_300]),
         "jit: must match interp, got {jo:?}"
     );
 }
 
 #[test]
-fn over_transfer_is_einval_and_moves_nothing_on_both() {
+fn an_over_asking_transfer_is_clamped_to_the_holders_ceiling_on_both() {
     let (ir, jo) = both(OVER_TRANSFER, (1000, 500, 10));
     assert_eq!(
         ir,
-        Ok(vec![Value::I64(300)]),
-        "interp: over-transfer failed closed; parent mem untouched at 300"
+        Ok(vec![Value::I64(500)]),
+        "interp: the child's mem ceiling clamped to the holder's 500"
     );
     assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[300]),
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[500]),
         "jit: must match interp, got {jo:?}"
     );
 }
@@ -264,8 +265,8 @@ fn transfer_from_an_unbounded_holder_on_both() {
 // ---- #989: the channel (4th) dimension ---------------------------------------------------------
 
 /// `split(300, 200, 3, 500)` out of a `(1000, 500, 10, channel=800)` budget, then read the parent's
-/// and child's `channel` (field 3). Encode `child_channel*1000 + parent_channel` = `500*1000 + 300`
-/// = `500300` (split_field(500, 800) → child 500, parent 300).
+/// and child's `channel` (field 3). Encode `child_channel*1000 + parent_channel` = `500*1000 + 800`
+/// = `500800` (the child's ceiling is 500; the parent keeps its 800).
 const SPLIT_CHANNEL: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
@@ -285,9 +286,9 @@ block 0 (vb: i32) {\n\
 }\n";
 
 /// A LEGACY 3-arg `split(300, 200, 3)` (no channel arg) of a `channel=800` budget: the omitted
-/// channel means "inherit / all remaining", so the child takes all 800 and the parent is left 0 —
-/// the backward-compatible default that keeps a §14 child's channel UNBOUNDED when the parent was
-/// unbounded. Encode `child_channel*1000 + parent_channel` = `800*1000 + 0` = `800000`.
+/// channel leaves the child unbounded on its own, so it reads its parent's 800, and the parent keeps
+/// 800 — the default that keeps a §14 child's channel UNBOUNDED when the parent was unbounded.
+/// Encode `child_channel*1000 + parent_channel` = `800*1000 + 800` = `800800`.
 const SPLIT_CHANNEL_LEGACY_3ARG: &str = "memory 17\n\
 func (i32) -> (i64) {\n\
 block 0 (vb: i32) {\n\
@@ -324,25 +325,25 @@ fn channel_split_and_read_matches_across_backends() {
     let (ir, jo) = both_channel(SPLIT_CHANNEL, (1000, 500, 10, 800));
     assert_eq!(
         ir,
-        Ok(vec![Value::I64(500_300)]),
-        "interp: channel split(500) → child 500, parent 300"
+        Ok(vec![Value::I64(500_800)]),
+        "interp: channel split(500) → child 500, parent keeps 800"
     );
     assert!(
-        matches!(&jo, JitOutcome::Returned(s) if s == &[500_300]),
+        matches!(&jo, JitOutcome::Returned(s) if s == &[500_800]),
         "jit ≡ interp on the channel dimension: {jo:?}"
     );
 }
 
 #[test]
-fn channel_omitted_arg_inherits_all_remaining() {
+fn channel_omitted_arg_inherits_the_parent_ceiling() {
     let (ir, jo) = both_channel(SPLIT_CHANNEL_LEGACY_3ARG, (1000, 500, 10, 800));
     assert_eq!(
         ir,
-        Ok(vec![Value::I64(800_000)]),
-        "interp: a 3-arg split takes all remaining channel (child 800, parent 0)"
+        Ok(vec![Value::I64(800_800)]),
+        "interp: a 3-arg split leaves the child capped only by the parent's 800"
     );
     assert!(
-        matches!(&jo, JitOutcome::Returned(s) if s == &[800_000]),
+        matches!(&jo, JitOutcome::Returned(s) if s == &[800_800]),
         "jit ≡ interp: {jo:?}"
     );
 }

@@ -13,7 +13,7 @@
 mod drivers;
 
 use drivers::{agree_on_every_driver, Ran};
-use temen_interp::{Attestation, Host, StreamRole, Trap, Value};
+use temen_interp::{cap_id, Attestation, Host, StreamRole, Trap, Value};
 use temen_ir::Module;
 use temen_text::parse_module;
 
@@ -625,6 +625,68 @@ fn a_detached_spawn_beyond_the_budget_is_refused() {
     let child = module(CHILD_READS);
     let setup = op15_setup(&child, (1 << 15) - 1);
     agree_on_every_driver("op 15, a budget one byte short", &m, &setup, &ok(-22));
+}
+
+/// [`op15_setup`] over a budget tree: a node split from the root with `node_mem` (`-1` = unbounded on
+/// its own), and the root already charged `root_used`. The guest pays with the node, or with the root
+/// when `pay_root`.
+fn op15_tree_setup(
+    child: &Module,
+    root_mem: i64,
+    node_mem: i64,
+    root_used: u64,
+    pay_root: bool,
+) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    let base = op15_setup(child, root_mem);
+    move || {
+        let (mut h, mut args) = base();
+        let Value::I32(root) = args[2] else {
+            unreachable!("op15_setup hands the budget third")
+        };
+        let node = h
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[0, node_mem, 0], None)
+            .expect("split")[0] as i32;
+        assert!(h.budget_mem_take(root, root_used), "the root's own use");
+        if !pay_root {
+            args[2] = Value::I32(node);
+        }
+        (h, args)
+    }
+}
+
+/// #1944 — on every driver, a detached window is charged to the node that pays and to every
+/// ancestor, and a `split` reserves nothing: the root's own use leaves a 32 KiB node no room for a
+/// 32 KiB window; a node's own ceiling refuses what its root could hold; and the root can still pay
+/// for the window its 32 KiB child node could have used.
+#[test]
+fn a_detached_window_is_charged_to_every_level_of_the_chain() {
+    let m = module(&op15(false));
+    let child = module(CHILD_READS);
+    let ran = ok(PAYLOAD.wrapping_add(i64::from_le_bytes(*b"ABCDEFGH")));
+    agree_on_every_driver(
+        "op 15, the root's use caps its node",
+        &m,
+        &op15_tree_setup(&child, 1 << 16, 1 << 15, 3 << 14, false),
+        &ok(-22),
+    );
+    agree_on_every_driver(
+        "op 15, room at every level",
+        &m,
+        &op15_tree_setup(&child, 1 << 16, 1 << 15, 1 << 14, false),
+        &ran,
+    );
+    agree_on_every_driver(
+        "op 15, the node one byte short",
+        &m,
+        &op15_tree_setup(&child, 1 << 20, (1 << 15) - 1, 0, false),
+        &ok(-22),
+    );
+    agree_on_every_driver(
+        "op 15, a split reserves nothing",
+        &m,
+        &op15_tree_setup(&child, 1 << 15, 1 << 15, 0, true),
+        &ran,
+    );
 }
 
 /// A detached child that returns its payload word.
