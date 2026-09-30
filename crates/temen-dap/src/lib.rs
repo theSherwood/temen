@@ -201,8 +201,9 @@ impl DapServer {
             "provideCap" => self.on_provide_cap(args),
             "memModelStats" => self.on_mem_model_stats(),
             "fsImage" => self.on_fs_image(),
+            "blockedThreads" => self.on_blocked_threads(),
             "memoryMap" => self.on_memory_map(),
-            "schedTrace" => self.on_sched_trace(),
+            "schedTrace" => self.on_sched_trace(args),
             "globals" => self.on_globals(),
             "forceSwitch" => self.on_force_switch(args),
             "setVariable" => self.on_set_variable(args),
@@ -1334,11 +1335,17 @@ impl DapServer {
 
     /// The custom `schedTrace` request (slice 6): the scheduler trace tape as a JSON array —
     /// turns, parks, wakes with waker→wakee identities, spawns. Fails cleanly when unarmed.
-    fn on_sched_trace(&mut self) -> (bool, Json, Vec<Event>) {
+    fn on_sched_trace(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        // `from` (a Temen extension): only the events from that index on, so a client draining the
+        // tape as a run goes reads each event once instead of the whole tape every time (#1981).
+        let from = args
+            .and_then(|a| a.get("from"))
+            .and_then(|f| f.as_i64())
+            .map_or(0, |f| f.max(0) as usize);
         let Some(tape) = self
             .session
             .as_ref()
-            .and_then(|s| s.inspector.sched_trace_json())
+            .and_then(|s| s.inspector.sched_trace_json(from))
         else {
             return (false, Json::Null, vec![]);
         };
@@ -1353,6 +1360,43 @@ impl DapServer {
             return (false, Json::Null, vec![]);
         };
         (true, map, vec![])
+    }
+
+    /// The custom `blockedThreads` request (#1986): what each blocked thread waits on —
+    /// `{ id, futex, value }` for a `memory.wait` (the word's address and its current 32-bit value,
+    /// from which an embedder that knows the guest's sync objects reads their owner) or `{ id, joins }`
+    /// for a `thread.join`. Thread ids are DAP thread ids. After a `deadlock` stop, this is the cycle.
+    fn on_blocked_threads(&mut self) -> (bool, Json, Vec<Event>) {
+        let Some(s) = self.session.as_ref() else {
+            return (false, Json::Null, vec![]);
+        };
+        let threads = s
+            .inspector
+            .blocked_on()
+            .into_iter()
+            .map(|(t, on)| {
+                let id = ("id", Json::i(t as i64 + 1));
+                match on {
+                    temen_interp::bytecode::BlockedOn::Futex(addr) => {
+                        let value = s
+                            .inspector
+                            .read_window(addr, 4)
+                            .ok()
+                            .and_then(|b| b.try_into().ok())
+                            .map_or(Json::Null, |b| Json::i(i64::from(u32::from_le_bytes(b))));
+                        Json::obj(vec![id, ("futex", Json::i(addr as i64)), ("value", value)])
+                    }
+                    temen_interp::bytecode::BlockedOn::Join(child) => {
+                        Json::obj(vec![id, ("joins", Json::i(child as i64 + 1))])
+                    }
+                }
+            })
+            .collect();
+        (
+            true,
+            Json::obj(vec![("threads", Json::Arr(threads))]),
+            vec![],
+        )
     }
 
     /// The custom `fsImage` request: the program's `vm_fs` files, as base64 of a Temen fs-image blob —
@@ -1815,7 +1859,10 @@ impl DapServer {
                 events.push(("exited", Json::obj(body)));
                 events.push(("terminated", Json::obj(vec![])));
             }
-            Stop::Blocked => events.push(stopped_event("pause", tid)),
+            // No thread can run (#1986): its own reason, not a `pause` — a client running in
+            // budgeted slices would otherwise take it for a spent budget and resume forever.
+            // `blockedThreads` says what each thread waits on.
+            Stop::Blocked => events.push(stopped_event("deadlock", tid)),
         }
         events
     }

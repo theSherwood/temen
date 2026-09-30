@@ -1483,3 +1483,124 @@ fn a_macro_expansion_steps_as_the_line_that_invoked_it() {
         "the step lands on the invocation, in the program"
     );
 }
+
+/// **The scheduler trace records calls and returns (#1981).** A worker thread that lives and dies
+/// inside one `continue` shows on the tape as a `call` into `worker` on its own task, followed by the
+/// matching `return` — what a flame chart builds that thread's span from, where stack samples taken
+/// at stops never see it. Each task's calls and returns pair up, never returning past its entry.
+#[test]
+fn the_scheduler_trace_records_calls_and_returns() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let src = "#include <pthread.h>\nint x;\nvoid *worker(void *a) { x = 1; return 0; }\nint main(void) {\n  pthread_t t;\n  pthread_create(&t, 0, worker, 0);\n  pthread_join(t, 0);\n  return x;\n}\n";
+    let ir = compile_g(&chibicc, src);
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let launch = vec![
+        ("programText", Json::s(&ir)),
+        ("function", Json::i(0)),
+        ("args", Json::Arr(vec![])),
+        ("engine", Json::s("bytecode")),
+        ("powerbox", Json::s("onramp")),
+        ("schedTrace", Json::Bool(true)),
+    ];
+    let out = s.handle(&req(2, "launch", Json::obj(launch)));
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    s.handle(&req(4, "continue", Json::obj(vec![])));
+    let out = s.handle(&req(5, "schedTrace", Json::obj(vec![])));
+    let tape = response(&out)
+        .get("body")
+        .and_then(|b| b.as_array())
+        .map(<[Json]>::to_vec)
+        .expect("a trace tape");
+    let field = |e: &Json, k: &str| e.get(k).cloned();
+    let kind = |e: &Json| e.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+    let task = |e: &Json| e.get("task").and_then(|t| t.as_i64()).unwrap_or(-1);
+    let call_worker = tape
+        .iter()
+        .position(|e| kind(e) == "call" && task(e) == 1 && field(e, "func") == Some(Json::s("worker")))
+        .expect("the worker's call into `worker` is on the tape");
+    assert!(
+        tape[call_worker..]
+            .iter()
+            .any(|e| kind(e) == "return" && task(e) == 1),
+        "and so is its return"
+    );
+    for t in 0..2 {
+        let mut depth = 0i64;
+        for e in tape.iter().filter(|e| task(e) == t) {
+            match kind(e).as_str() {
+                "call" => depth += 1,
+                "return" => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "task {t} returned past its entry");
+        }
+    }
+}
+
+/// Two threads that each hold one mutex and wait for the other's.
+const DEADLOCK_SRC: &str = r#"#include <pthread.h>
+pthread_mutex_t m1, m2;
+volatile int ready1 = 0, ready2 = 0;
+void *worker(void *arg) {
+  pthread_mutex_lock(&m2);
+  ready2 = 1;
+  while (!ready1) {}
+  pthread_mutex_lock(&m1);
+  return 0;
+}
+int main(void) {
+  pthread_t t;
+  pthread_create(&t, 0, worker, 0);
+  pthread_mutex_lock(&m1);
+  ready1 = 1;
+  while (!ready2) {}
+  pthread_mutex_lock(&m2);
+  return 0;
+}
+"#;
+
+/// **A deadlock names its cycle (#1986).** The run stops with reason `deadlock` (not `pause`, which a
+/// client running in budgeted slices would take for a spent budget and resume forever), and
+/// `blockedThreads` lists each thread's futex word with its value. A locked mutex holds its holder's
+/// thread id + 1 (`pthread.h`), so the two waits read as "thread 1 waits on m2, held by thread 2" and
+/// "thread 2 waits on m1, held by thread 1".
+#[test]
+fn a_deadlock_names_its_cycle() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, DEADLOCK_SRC);
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 1, true);
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let out = s.handle(&req(5, "continue", Json::obj(vec![])));
+    assert_eq!(stopped_reason(&out).as_deref(), Some("deadlock"));
+    let out = s.handle(&req(6, "blockedThreads", Json::obj(vec![])));
+    let threads = response(&out)
+        .get("body")
+        .and_then(|b| b.get("threads"))
+        .and_then(|t| t.as_array())
+        .map(<[Json]>::to_vec)
+        .expect("the blocked threads");
+    let wait = |id: i64| {
+        let t = threads
+            .iter()
+            .find(|t| t.get("id").and_then(|v| v.as_i64()) == Some(id))
+            .unwrap_or_else(|| panic!("thread {id} is blocked: {threads:?}"));
+        let n = |k: &str| t.get(k).and_then(|v| v.as_i64()).expect(k);
+        (n("futex"), n("value"))
+    };
+    let ((m2, held_by_2), (m1, held_by_1)) = (wait(1), wait(2));
+    assert_ne!(m1, m2, "each waits on a different mutex");
+    // Ids are pthread's (0 = main = DAP thread 1); the word holds id + 1.
+    assert_eq!(held_by_2, 2, "thread 1 waits on m2, held by the worker (id 1)");
+    assert_eq!(held_by_1, 1, "thread 2 waits on m1, held by main (id 0)");
+}

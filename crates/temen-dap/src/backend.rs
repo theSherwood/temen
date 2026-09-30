@@ -242,6 +242,11 @@ pub trait Debuggee {
     // --- threads / time coordinate ---------------------------------------------------------------
     fn threads(&self) -> Vec<u64>;
     fn select_task(&mut self, id: u64) -> bool;
+    /// What each blocked thread waits on (#1986), as `(thread, what)`. Default: nothing (a backend
+    /// with one thread).
+    fn blocked_on(&self) -> Vec<(u64, bytecode::BlockedOn)> {
+        Vec::new()
+    }
     /// Whether the steps that follow move only their thread (DAP `singleThread`), the others frozen.
     /// Default: nothing to set (a backend with one thread).
     fn set_single_thread(&mut self, _on: bool) {}
@@ -298,8 +303,9 @@ pub trait Debuggee {
     fn set_sched_trace(&mut self, _on: bool) -> bool {
         false
     }
-    /// The trace tape so far as a JSON array (`None` when unarmed/unsupported).
-    fn sched_trace_json(&self) -> Option<Json> {
+    /// The trace tape so far as a JSON array, from event index `from` on (`None` when
+    /// unarmed/unsupported).
+    fn sched_trace_json(&self, _from: usize) -> Option<Json> {
         None
     }
     // --- state writes (slice 8) ------------------------------------------------------------------
@@ -1253,6 +1259,13 @@ impl Debuggee for BytecodeBackend {
     fn set_single_thread(&mut self, on: bool) {
         self.run.set_single_thread(on);
     }
+    fn blocked_on(&self) -> Vec<(u64, bytecode::BlockedOn)> {
+        self.run
+            .blocked_on()
+            .into_iter()
+            .map(|(t, on)| (t as u64, on))
+            .collect()
+    }
     fn stopped_task(&self) -> Option<u64> {
         self.run.stopped_task()
     }
@@ -1358,11 +1371,13 @@ impl Debuggee for BytecodeBackend {
         self.sched_trace = on;
         true
     }
-    fn sched_trace_json(&self) -> Option<Json> {
+    fn sched_trace_json(&self, from: usize) -> Option<Json> {
         let tape = self.run.sched_trace()?;
         use bytecode::SchedTraceEvent as E;
         Some(Json::Arr(
-            tape.iter()
+            tape.get(from..)
+                .unwrap_or_default()
+                .iter()
                 .map(|e| match e {
                     E::Turn { turn, task } => Json::obj(vec![
                         ("kind", Json::s("turn")),
@@ -1402,6 +1417,30 @@ impl Debuggee for BytecodeBackend {
                         ("kind", Json::s("spawn")),
                         ("turn", Json::i(*turn as i64)),
                         ("parent", Json::i(*parent as i64)),
+                        ("task", Json::i(*task as i64)),
+                    ]),
+                    // #1981: `func` is the function's name where the program's debug info has one
+                    // (module 0), else its index as text.
+                    E::Call {
+                        turn,
+                        task,
+                        module,
+                        func,
+                    } => {
+                        let name = (*module == 0)
+                            .then(|| temen_interp::func_name(&self.module, *func as FuncIdx))
+                            .flatten()
+                            .map_or_else(|| format!("#{func}"), str::to_string);
+                        Json::obj(vec![
+                            ("kind", Json::s("call")),
+                            ("turn", Json::i(*turn as i64)),
+                            ("task", Json::i(*task as i64)),
+                            ("func", Json::s(name)),
+                        ])
+                    }
+                    E::Return { turn, task } => Json::obj(vec![
+                        ("kind", Json::s("return")),
+                        ("turn", Json::i(*turn as i64)),
                         ("task", Json::i(*task as i64)),
                     ]),
                 })
