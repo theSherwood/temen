@@ -739,6 +739,13 @@ request, in the op's own lock scope (`SignalSource::spawn_take`), then:
 The caller's call completes with the pid. Nothing unwinds, so the Cranelift JIT serves a spawn in
 place (no fork plan, no shadow arena), and a spawning program needs no fork instrumentation at all.
 
+**Threaded programs** (#1969). A program that spawns threads or runs fibers is a process on the
+Cranelift JIT too, its powerbox locked because its vCPUs call at once. A vCPU that parks — on a pipe,
+or in a blocking `wait4` — waits for the tree's bell with that lock released, so a sibling's call gets
+in; a fiber's pipe park parks the fiber alone, as outside a tree. Such a program spawns, pipes and
+reaps from any vCPU's root context, as on the interpreters. It does not fork (it is not bare, §9.5),
+and its `execve` answers `-ENOSYS`.
+
 **nimony.** A nim program built for Temen spawns. Its `osproc.startProcess` passes the fork path's
 own child steps to the spawn as file actions, and `os.execShellCmd` spawns `/bin/sh -c`
 (`patches/nimony/temen-spawn.patch`). temen-leng forwards the `pspawn` leaf to the op

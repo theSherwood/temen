@@ -48,9 +48,9 @@ use temen_ir::{cap_id, FuncIdx, Inst, Module, ValType};
 use temen_jit::{CompiledModule, ForkPoint, JitOutcome, SharedCode, TrapKind, TwinWindow, VmCtx};
 
 use crate::{
-    blocked_wait_interrupted, fast_cap_resolver, module_resolver, module_serves,
-    production_budget_taker, production_grant_hooks, CapCtx, JitRun, JitSigDelivery,
-    CLI_JIT_TABLE_LOG2,
+    blocked_wait_interrupted, fast_cap_resolver, module_resolver, module_resolver_locked,
+    module_serves, production_budget_taker, production_grant_hooks, CapCtx, HostParkReq, JitRun,
+    JitSigDelivery, CLI_JIT_TABLE_LOG2,
 };
 
 /// The root process's pid — the personality's process-table root, as on both interpreters.
@@ -253,13 +253,15 @@ impl Tree {
         })
     }
 
-    /// Block until the bell rings past `seen`, the tree is torn down, or the kill-path fires. Wakes
-    /// at a bounded cadence too, so a kill-path store (which rings nothing) is observed.
-    fn wait(&self, seen: u64) {
+    /// Block until the bell rings past `seen`, the tree is torn down, the kill-path fires, or `stop`
+    /// holds. Wakes at a bounded cadence too, so a kill-path store or a `stop` (which ring nothing)
+    /// is observed.
+    fn wait(&self, seen: u64, stop: impl Fn() -> bool) {
         let mut g = self.bell.0.lock().unwrap_or_else(|e| e.into_inner());
         while self.rings.load(Ordering::SeqCst) == seen
             && !self.torn_down.load(Ordering::SeqCst)
             && self.interrupt.load(Ordering::SeqCst) == 0
+            && !stop()
         {
             g = self
                 .bell
@@ -270,31 +272,36 @@ impl Tree {
         }
     }
 
-    /// The code process `pid` starts `program` at `entry` with, over `host` (#1825). An `execve` of a
-    /// command the tree already compiled under an equal [`CodeKey`] instantiates that compile. Anything
-    /// else is compiled here ([`compile`]): the embedder's program, which no other process starts; a
-    /// command that can extend its code, which is then its own; a command's first `execve`, whose
-    /// compile the tree keeps. A `process` image (not a serve handler) may fork.
+    /// The code process `pid` starts `program` at `entry` with, over the powerbox `cc` names (#1825).
+    /// An `execve` of a command the tree already compiled under an equal [`CodeKey`] instantiates that
+    /// compile. Anything else is compiled here ([`compile`]): the embedder's program, which no other
+    /// process starts; a command that can extend its code, which is then its own; a concurrent
+    /// command, whose code is never shared (it owns a runtime) and whose powerbox is locked; a
+    /// command's first `execve`, whose compile the tree keeps. A `process` image (not a serve handler)
+    /// may fork.
     ///
     /// # Safety
     /// As [`compile_image`].
     unsafe fn load(
         &self,
         pid: u64,
-        host: &mut Host,
+        cc: CapCtx,
         program: &Program<'_>,
         entry: FuncIdx,
         process: bool,
     ) -> Result<Loaded, temen_jit::JitError> {
         let m = program.module();
         let calls = host_calls(m);
-        let jit = drives_jit(&calls, host);
-        let plan = process.then(|| ForkPlan::of(m, &calls, host)).flatten();
+        let (jit, plan) = cc.with_host(|host| {
+            let plan = process.then(|| ForkPlan::of(m, &calls, host)).flatten();
+            (drives_jit(&calls, host), plan)
+        });
         let interrupt = self.interrupt_for(pid, plan.is_some());
         let (cm, image) = match program {
+            // Shared code is compiled for a raw powerbox.
             Program::Command {
                 digest, size_log2, ..
-            } if !jit => {
+            } if !jit && !cc.is_locked() => {
                 let key = CodeKey {
                     digest: *digest,
                     size_log2: *size_log2,
@@ -315,23 +322,19 @@ impl Tree {
                 );
                 let mut kept = slot.image.lock().unwrap_or_else(|e| e.into_inner());
                 match kept.clone() {
-                    Some(Some(image)) => {
-                        let cm = image.code.instance(CapCtx::Raw(&mut *host).ptr());
-                        (cm, Some(image))
-                    }
+                    Some(Some(image)) => (image.code.instance(cc.ptr()), Some(image)),
                     Some(None) => {
                         drop(kept);
-                        compile(host, program, entry, jit, plan, interrupt, self)?
+                        compile(cc, program, entry, jit, plan, interrupt, self)?
                     }
                     None => {
-                        let (cm, image) =
-                            compile(host, program, entry, jit, plan, interrupt, self)?;
+                        let (cm, image) = compile(cc, program, entry, jit, plan, interrupt, self)?;
                         *kept = Some(image.clone());
                         (cm, image)
                     }
                 }
             }
-            _ => compile(host, program, entry, jit, plan, interrupt, self)?,
+            _ => compile(cc, program, entry, jit, plan, interrupt, self)?,
         };
         Ok(Loaded {
             cm,
@@ -607,11 +610,12 @@ enum Start<'a> {
 }
 
 /// What a process image's `call.cap` thunk finds through its vmctx's `embedder` slot: the tree it
-/// belongs to, and the image it runs when its code is shared — whose fork plan the thunk reads a fork
-/// call against.
+/// belongs to, the image it runs when its code is shared — whose fork plan the thunk reads a fork
+/// call against — and whether its program spawns threads.
 pub(crate) struct ProcCtx {
     tree: Arc<Tree>,
     image: Option<Arc<Image>>,
+    threads: bool,
 }
 
 impl ProcCtx {
@@ -671,40 +675,46 @@ unsafe fn run_process(
                 if process {
                     cur.arm_caller_requests();
                 }
-                let r = tree
-                    .load(pid, cur, &program, entry, process)
-                    .and_then(|code| {
-                        let ctx = ProcCtx {
-                            tree: Arc::clone(tree),
-                            image: code.image,
-                        };
-                        let start = Entry::Fresh {
-                            args: &args,
-                            init_mem: init_mem.as_deref(),
-                            snapshot_cap,
-                        };
-                        run_image(cur, code.cm, code.interrupt, Some(&ctx), start)
-                    });
+                let threads = module.funcs.iter().any(temen_ir::Func::uses_threads);
+                let r = with_cap_ctx(cur, concurrent(module), |cc| {
+                    tree.load(pid, cc, &program, entry, process)
+                        .and_then(|code| {
+                            let ctx = ProcCtx {
+                                tree: Arc::clone(tree),
+                                image: code.image,
+                                threads,
+                            };
+                            let start = Entry::Fresh {
+                                args: &args,
+                                init_mem: init_mem.as_deref(),
+                                snapshot_cap,
+                            };
+                            run_image(cc, code.cm, code.interrupt, Some(&ctx), start)
+                        })
+                });
                 (r, results)
             }
+            // A twin's image forks, so its program is bare: single-threaded.
             Start::Twin {
                 image,
                 window,
                 args,
             } => {
                 cur.arm_caller_requests();
-                let cm = image.code.instance(CapCtx::Raw(&mut *cur).ptr());
+                let cc = CapCtx::Raw(&mut *cur);
+                let cm = image.code.instance(cc.ptr());
                 let results = image.results.clone();
                 let ctx = ProcCtx {
                     tree: Arc::clone(tree),
                     image: Some(image),
+                    threads: false,
                 };
                 let start = Entry::Twin {
                     window,
                     args: &args,
                 };
                 let interrupt = tree.interrupt_for(pid, true);
-                (run_image(cur, cm, interrupt, Some(&ctx), start), results)
+                (run_image(cc, cm, interrupt, Some(&ctx), start), results)
             }
         };
         let unwound = matches!(
@@ -771,14 +781,15 @@ struct Loaded {
     interrupt: Option<*const AtomicU64>,
 }
 
-/// Compile `program` at `entry` over `host` — instrumented to fork when `plan` says it can — and share
-/// its code as an [`Image`], unless the program can extend its code (`jit`) or the code is more than
-/// code ([`CompiledModule::share`]). `tree` is the run's: its quota, and its fuel cell if armed.
+/// Compile `program` at `entry` over the powerbox `cc` names — instrumented to fork when `plan` says
+/// it can — and share its code as an [`Image`], unless the program can extend its code (`jit`) or the
+/// code is more than code ([`CompiledModule::share`]: a concurrent program's is). `tree` is the run's:
+/// its quota, and its fuel cell if armed.
 ///
 /// # Safety
 /// As [`compile_image`].
 unsafe fn compile(
-    host: &mut Host,
+    cc: CapCtx,
     program: &Program<'_>,
     entry: FuncIdx,
     jit: bool,
@@ -809,7 +820,7 @@ unsafe fn compile(
         .as_ref()
         .map_or((m, entry), |(im, at)| (im, *at));
     let fuel = (tree.fuel != 0).then_some(tree.fuel as *mut temen_jit::FuelCell);
-    let cm = compile_image(host, code, at, interrupt, tree.quota, jit, fuel)?;
+    let cm = compile_image(cc, code, at, interrupt, tree.quota, jit, fuel)?;
     let image = (!jit).then(|| cm.share()).flatten().map(|code| {
         Arc::new(Image {
             code,
@@ -834,18 +845,49 @@ pub(crate) enum Entry<'a> {
     },
 }
 
-/// The one JIT compile of an image over `host`: the unlocked [`crate::cap_thunk`] + raw `*mut Host` +
-/// the D45 fast path, §14 module children resolving their `Module` grant, and the §5 kill-path
-/// `interrupt` polled when `Some`. An image that can drive the §22 `Jit` interface (`jit`, see
-/// [`drives_jit`]) over a fiber-hosting grant gets the fiber runtime a submitted unit's `cont.*`
-/// resolve against; no other image does — none could use it, and it is run state the code would then
-/// own (#1825).
+/// Whether `m`'s `call.cap`s can come from more than one vCPU at once: it spawns threads or runs
+/// fibers (§12). Waiting and notifying alone make no second caller: a program that only sleeps on a
+/// futex (nim's `nanosleep`) is single-threaded, and can fork.
+pub(crate) fn concurrent(m: &Module) -> bool {
+    m.funcs.iter().any(|f| f.uses_fibers_or_threads())
+}
+
+/// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a `concurrent`
+/// program's vCPUs make theirs at once, so its powerbox is locked for the span of `f` and handed
+/// back after; any other program's is the raw host.
 ///
 /// # Safety
-/// `host` is the live powerbox the code dispatches into (every instance of shared code passes its own,
-/// in the same unlocked shape); `interrupt` (when `Some`) outlives the code.
-pub(crate) unsafe fn compile_image(
+/// `host` is live, and touched by no one else during `f`.
+pub(crate) unsafe fn with_cap_ctx<R>(
     host: &mut Host,
+    concurrent: bool,
+    f: impl FnOnce(CapCtx) -> R,
+) -> R {
+    if !concurrent {
+        return f(CapCtx::Raw(host));
+    }
+    let locked = Mutex::new(std::mem::take(host));
+    let r = f(CapCtx::Locked(&locked));
+    *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
+    r
+}
+
+/// The one JIT compile of an image over the powerbox `cc` names, in its shape: the unlocked
+/// [`crate::cap_thunk`] over a raw `*mut Host` with the D45 fast path, or for a concurrent program
+/// [`crate::cap_thunk_locked`] over the `Mutex<Host>` that serializes its vCPUs' calls. §14 module
+/// children resolve their `Module` grant, and the §5 kill-path `interrupt` is polled when `Some`.
+///
+/// An image that can drive the §22 `Jit` interface (`jit`, see [`drives_jit`]) gets the runtime its
+/// grant hosts in a submitted unit: the fibers a unit's `cont.*` resolve against, and in the
+/// concurrent shape the thread scheduler an installed unit's `thread.*` resolve against (its vCPUs
+/// are concurrent callers). No other image does — none could use them, and they are run state the
+/// code would then own (#1825).
+///
+/// # Safety
+/// `cc`'s host is the live powerbox the code dispatches into (every instance of shared code passes
+/// its own, in the same unlocked shape); `interrupt` (when `Some`) outlives the code.
+pub(crate) unsafe fn compile_image(
+    cc: CapCtx,
     module: &Module,
     entry: FuncIdx,
     interrupt: Option<*const AtomicU64>,
@@ -853,7 +895,14 @@ pub(crate) unsafe fn compile_image(
     jit: bool,
     fuel: Option<*mut temen_jit::FuelCell>,
 ) -> Result<CompiledModule, temen_jit::JitError> {
-    let cc = CapCtx::Raw(&mut *host);
+    // The fast fns and the raw resolver deref a `*mut Host`, not a `Mutex<Host>`.
+    let (resolver, fast): (
+        temen_jit::ModuleResolver,
+        Option<temen_jit::FastCapResolver>,
+    ) = match cc {
+        CapCtx::Raw(_) => (module_resolver, Some(fast_cap_resolver)),
+        CapCtx::Locked(_) => (module_resolver_locked, None),
+    };
     let mut cm = CompiledModule::compile(
         module,
         entry,
@@ -861,44 +910,44 @@ pub(crate) unsafe fn compile_image(
         cc.ptr(),
         temen_ir::DEFAULT_RESERVED_LOG2,
         None,
-        Some(module_resolver), // §14 module children resolve their `Module` grant
+        Some(resolver),
         interrupt,
         fuel, // the root budget's cell when `Limits.fuel` bounds the run (`jit_run`)
-        Some(fast_cap_resolver),
+        fast,
         quota,
         CLI_JIT_TABLE_LOG2,
     )?;
-    // Fiber-hosting grant (`set_jit_hosts_fibers`, e.g. the powerbox): stand up the fiber runtime so a
-    // submitted unit's `cont.*` resolve even when this top-level module uses no fibers itself.
-    if jit && host.jit_hosts_fibers() {
+    let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
+    if jit && fibers {
         cm.enable_fiber_hosting(quota)?;
+    }
+    if jit && threads && cc.is_locked() {
+        cm.enable_thread_hosting(quota)?;
     }
     Ok(cm)
 }
 
-/// The single-threaded JIT run of an image's code `cm` over `host` (the unlocked [`crate::cap_thunk`]
-/// and a raw `*mut Host`): register the live module for the cap thunk's re-entries, arm the
-/// production §14 hooks and the §5 kill-path `interrupt` (the cell the code polls), and run it. As a `process` of a
-/// tree, the image also carries its [`ProcCtx`], rings the tree's bell from its personality's doors,
-/// and — when it can fork — the fork hook that duplicates it.
+/// The JIT run of an image's code `cm` over the powerbox `cc` names: register the live module for the
+/// cap thunk's re-entries, arm the production §14 hooks and the §5 kill-path `interrupt` (the cell the
+/// code polls), and run it. As a `process` of a tree, the image also carries its [`ProcCtx`], rings
+/// the tree's bell from its personality's doors, and — when it can fork — the fork hook that
+/// duplicates it.
 ///
 /// # Safety
-/// `host` is the live powerbox `cm` dispatches into, touched by no one else during the run;
-/// `interrupt` (when `Some`) is the cell `cm` polls, and outlives the call.
+/// `cc`'s host is the live powerbox `cm` dispatches into, touched by no one else during the run but
+/// through its lock; `interrupt` (when `Some`) is the cell `cm` polls, and outlives the call.
 pub(crate) unsafe fn run_image(
-    host: &mut Host,
+    cc: CapCtx,
     mut cm: CompiledModule,
     interrupt: Option<*const AtomicU64>,
     process: Option<&ProcCtx>,
     start: Entry<'_>,
 ) -> Result<JitRun, temen_jit::JitError> {
-    let raw_host: *mut Host = host;
-    let cc = CapCtx::Raw(raw_host);
-    let host = &mut *raw_host;
     if let Some(p) = process {
         cm.set_embedder_ctx(p as *const ProcCtx as *mut c_void);
-        host.set_wake_bell(p.tree.bell());
-        if let Some(image) = p.image.as_ref().filter(|i| i.fork.is_some()) {
+        // Only a bare program forks (`ForkPlan::of`), and a bare program is single-threaded.
+        let forks = p.image.as_ref().filter(|i| i.fork.is_some());
+        if let (CapCtx::Raw(raw_host), Some(image)) = (cc, forks) {
             let tree = Arc::clone(&p.tree);
             let image = Arc::clone(image);
             let host = SendPtr(raw_host);
@@ -909,16 +958,22 @@ pub(crate) unsafe fn run_image(
             })));
         }
     }
-    host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+    let cm_ptr = &mut cm as *mut CompiledModule as usize;
+    cc.with_host(|host| {
+        if let Some(p) = process {
+            host.set_wake_bell(p.tree.bell());
+        }
+        host.set_jit_native_ctx(cm_ptr);
+        // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
+        // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
+        host.set_serve_native_ctx(cm_ptr);
+        if let Some(ip) = interrupt {
+            host.set_epoch_cell(ip as usize);
+        }
+    });
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
     cm.set_budget_taker(Some(production_budget_taker(cc)));
-    if let Some(ip) = interrupt {
-        host.set_epoch_cell(ip as usize);
-    }
-    // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a serving
-    // module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
-    host.set_serve_native_ctx(&mut cm as *mut CompiledModule as usize);
     let r = match start {
         Entry::Fresh {
             args,
@@ -929,9 +984,11 @@ pub(crate) unsafe fn run_image(
     };
     // The run's native contexts and kill-path cell die with it: a later run over this host must not
     // find them.
-    host.set_jit_native_ctx(0);
-    host.set_serve_native_ctx(0);
-    host.set_epoch_cell(0);
+    cc.with_host(|host| {
+        host.set_jit_native_ctx(0);
+        host.set_serve_native_ctx(0);
+        host.set_epoch_cell(0);
+    });
     r.map(|(outcome, snapshot)| JitRun {
         outcome,
         backtrace: cm.last_trap_backtrace().to_vec(),
@@ -953,31 +1010,40 @@ impl SendPtr {
 
 /// #1768/#1826 — the JIT's arm of the park decision (the interpreters' `decide`), made by the
 /// `call.cap` thunk of a JIT process right after an op, over the transients the op left (`parks`,
-/// [`Host::take_park_transients`]). `dispatch` is the `(type_id, op)` the call handed the thunk
-/// ([`Inst::host_dispatch`]); `bell` is the tree's ring count read *before* the op ran
-/// ([`bell_of`]), so an event between the op's look and the wait below is not slept through.
-/// Returns `true` when the op must run again (a waiter was woken).
+/// [`Host::take_park_transients`], and `stdin_park`, [`Host::take_stdin_parked`]). `dispatch` is the
+/// `(type_id, op)` the call handed the thunk ([`Inst::host_dispatch`]); `bell` is the tree's ring
+/// count read *before* the op ran ([`bell_of`]), so an event between the op's look and the wait is
+/// not slept through. Returns the park the caller waits out, with every lock the process's other
+/// vCPUs need released, before it runs the op again ([`crate::HostParkReq::park`]).
 ///
 /// * a pipe **wake** (a write, or the last close of an end) rings the tree: a process blocked on
 ///   the other end may proceed.
 /// * a pipe **park** (a read of an empty pipe, or a write to a full one, with the other end open)
-///   waits for the bell and runs the op again ([`wait_to_rerun`]) — in the process's root context,
-///   as the interpreters park only a root fiber; in a fiber the op's own answer stands.
+///   in a vCPU's root context waits for the bell ([`tree_park`]): the other end may be another
+///   process's. A fiber parks alone and re-checks its pipe each time it is resumed, as outside a
+///   tree (#1952).
 /// * `execve` — admit and build the image through the one rule every engine shares
 ///   ([`Host::exec_image`]); admitted, park it and unwind the whole run
 ///   ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the
 ///   caller's native stack is simply discarded (FORK.md §9.4). Refused: `-EINVAL`, nothing changed.
+///   A program that spawns threads answers `-ENOSYS`, as it did before it ran as a process: its
+///   exec is not served on this tier.
 /// * `fork` — on the process's root computation, at one of its image's fork sites
 ///   ([`ForkPlan::is_site`]), start the unwind ([`begin_fork_unwind`]): the call's trailing poll
 ///   unwinds the caller into its shadow stack, and the run hands the frozen window to the fork hook.
 ///   In a fiber, `-EAGAIN`, as the oracle refuses a non-bare fork; anywhere else the JIT cannot unwind
 ///   to (an image with no fork plan, a host frame or a barrier below the call), `-ENOSYS` — fork
 ///   unavailable here.
-/// * a blocking `waitpid` — wait for the bell and run the op again ([`wait_to_rerun`]), which reaps
-///   a child that exited or waits on.
+/// * `posix_spawn` — start the process the op staged ([`Tree::spawn`]); the call completes with its
+///   pid.
+/// * a blocking `waitpid` — in a root context, wait for the bell ([`tree_park`]) and run the op
+///   again, which reaps a child that exited or waits on. In a fiber the op's `-ECHILD` stands, as on
+///   the interpreters.
+/// * anything else — a blocking stdin read — parks as it would outside a tree
+///   ([`crate::host_park`]).
 ///
-/// `window` is the call's view of the guest window — the one its op read and wrote through — and
-/// `(mapped, reserved)` its backed prefix and reservation.
+/// `window` is the call's view of the guest window — the one its op read and wrote through —
+/// `mem_base` its base, and `(mapped, reserved)` its backed prefix and reservation.
 ///
 /// # Safety
 /// The [`crate::cap_thunk`] contract for `results`/`trap_out`, over a host armed for caller
@@ -985,35 +1051,38 @@ impl SendPtr {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn serve_request(
     host: &mut Host,
-    parks: ParkTransients,
+    mut parks: ParkTransients,
+    stdin_park: bool,
     dispatch: (u32, u32),
     window: Option<&mut dyn GuestMem>,
+    mem_base: *mut u8,
     (mapped, reserved): (u64, u64),
     results: *mut i64,
     n_results: u64,
     trap_out: *mut i64,
     bell: u64,
-) -> bool {
+) -> Option<HostParkReq> {
     let answer = |v: i64| {
         if n_results != 0 {
             *results = v;
         }
     };
-    let Some(proc) = proc_of(trap_out) else {
-        return false;
-    };
+    let proc = proc_of(trap_out)?;
     if parks.wake_readers.is_some() || parks.wake_writers.is_some() {
         proc.tree.ring();
     }
-    if parks.read_park.is_some() || parks.write_park.is_some() {
-        return !temen_jit::fiber_active() && wait_to_rerun(host, proc, bell, trap_out, answer);
+    let root = !temen_jit::fiber_active();
+    if root && (parks.read_park.is_some() || parks.write_park.is_some()) {
+        return tree_park(host, bell, trap_out, answer);
     }
-    match parks.request {
+    match parks.request.take() {
         Some(ParkEvent::ExecSelf { cmd }) => {
             // The JIT's own gates — the interpreters' `durable` + clean-root checks: a durable
             // domain's subtree must stay snapshottable, and a fiber is not the process's image to
-            // replace.
-            let admitted = if host.is_durable() || temen_jit::fiber_active() {
+            // replace. A threaded program's exec is not served here (see above).
+            let admitted = if proc.threads {
+                Err(ENOSYS)
+            } else if host.is_durable() || !root {
                 Err(EINVAL)
             } else {
                 host.exec_module(cmd)
@@ -1030,10 +1099,10 @@ pub(crate) unsafe fn serve_request(
                 }
                 Err(e) => answer(e),
             }
-            false
+            None
         }
         Some(ParkEvent::ForkSelf) => {
-            if temen_jit::fiber_active() {
+            if !root {
                 answer(EAGAIN);
             } else if !proc.fork().is_some_and(|plan| {
                 plan.is_site(dispatch)
@@ -1043,46 +1112,61 @@ pub(crate) unsafe fn serve_request(
             }) {
                 answer(ENOSYS);
             }
-            false
+            None
         }
         // As on the interpreters: a fiber, or a source that staged nothing, keeps the op's
         // placeholder. Nothing of the caller is copied, so nothing unwinds.
         Some(ParkEvent::SpawnSelf { cmd }) => {
-            if let Some(plan) = parks.spawn.filter(|_| !temen_jit::fiber_active()) {
+            if let Some(plan) = parks.spawn.take().filter(|_| root) {
                 answer(proc.tree.spawn(host, cmd, plan, (mapped, reserved)));
             }
-            false
+            None
         }
-        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) => {
-            wait_to_rerun(host, proc, bell, trap_out, answer)
+        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) if root => {
+            tree_park(host, bell, trap_out, answer)
         }
-        None => false,
+        _ => crate::host_park(
+            host, &parks, stdin_park, mem_base, results, n_results, trap_out,
+        ),
     }
 }
 
-/// Wait out a park: wait for the tree's bell to ring past `bell` and return `true`, so the op runs
-/// again (invariant 7: the rewound park) and either proceeds or parks anew. Ends early with
-/// `-EINTR` if a deliverable signal is pending, as on the interpreters — in a run that delivers
-/// signals, where the handler then takes it. A run that delivers none (every process run today: the
-/// #932 delivery is armed only by the one-shot entry) would find the same signal still pending on
-/// every retry, so it waits on. A kill-path store (a deadline, the tree's teardown) ends the wait
-/// with the kill trap.
+/// The park that waits for the tree's bell to ring past `bell` ([`wait_for_bell`]) — or, when a
+/// deliverable signal is pending in a run that delivers signals, none: the op completes `-EINTR`,
+/// as on the interpreters, and the handler takes it. A run that delivers none (every process run
+/// today: the #932 delivery is armed only by the one-shot entry) would find the same signal still
+/// pending on every retry, so it waits on.
 ///
 /// # Safety
 /// As [`serve_request`].
-unsafe fn wait_to_rerun(
+unsafe fn tree_park(
     host: &Host,
-    proc: &ProcCtx,
     bell: u64,
     trap_out: *mut i64,
     answer: impl Fn(i64),
-) -> bool {
+) -> Option<HostParkReq> {
     if delivers_signals(trap_out) && host.wait_interrupted() {
         answer(EINTR);
-        return false;
+        return None;
     }
-    proc.tree.wait(bell);
-    if blocked_wait_interrupted(host.epoch_cell(), trap_out) {
+    Some(HostParkReq::Tree { bell })
+}
+
+/// Wait out a [`tree_park`]: wait for the tree's bell to ring past `bell` and return `true`, so the
+/// op runs again (invariant 7: the rewound park) and either proceeds or parks anew. A kill-path store
+/// (a deadline, the tree's teardown) ends the wait with the kill trap; a trap a sibling vCPU stored
+/// (its process ended) ends it with that trap. Takes no lock the process's other vCPUs need.
+///
+/// # Safety
+/// `trap_out` is the live call's trap cell, of a JIT process's thunk call.
+pub(crate) unsafe fn wait_for_bell(trap_out: *mut i64, bell: u64) -> bool {
+    let Some(proc) = proc_of(trap_out) else {
+        return false;
+    };
+    let trap = &*(trap_out as *const std::sync::atomic::AtomicI64);
+    proc.tree.wait(bell, || trap.load(Ordering::Relaxed) != 0);
+    let epoch = VmCtx::of_trap_out(trap_out).epoch as usize;
+    if blocked_wait_interrupted(epoch, trap_out) {
         if *trap_out == 0 {
             *trap_out = TrapKind::OutOfFuel as i64;
         }
