@@ -22081,17 +22081,6 @@ pub struct Host {
     /// D66 — the domain that spawned this one (its [`Host::domain_id`]), `None` for a root. Set by
     /// [`Host::spawn_child_powerbox`] on every §14 builder path, so a child's lane chain can be walked.
     parent_domain: Option<u64>,
-    /// D66 — the lane [`Host::admit_detached_spawn`] just reserved, waiting for the builder that
-    /// follows it to stamp on the child ([`Host::spawn_detached_child`] consumes it). The JIT's op-15
-    /// thunk admits and builds through two hooks with no channel between them; this is that channel,
-    /// on the one object both hooks hold. The interpreter's arm sets the child's cap directly and
-    /// never reads it (its `take` and `build` are one arm), so it is inert there.
-    pending_child_lane: Option<i64>,
-    /// #1944 — the node [`Host::admit_detached_spawn`] just charged for a child's window, waiting for
-    /// the JIT's builder ([`Host::spawn_detached_child`]) to give the child as its `"budget"`: the
-    /// budget twin of `pending_child_lane`. The interpreter's arms name the handle directly
-    /// ([`Host::give_child_budget`]) and never read it.
-    pending_child_budget: Option<u32>,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -22849,8 +22838,6 @@ impl Host {
             lane_cap: -1,    // D66 — unbounded by default
             granted_lanes: 0,
             parent_domain: None,
-            pending_child_lane: None,
-            pending_child_budget: None,
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -25633,8 +25620,6 @@ impl Host {
             self.give_lane(lane);
             return None;
         }
-        self.pending_child_lane = Some(lane);
-        self.pending_child_budget = self.budget_node(budget);
         Some(lane)
     }
 
@@ -25653,14 +25638,10 @@ impl Host {
     /// ahead of any re-grant the spawner also called `"budget"`.
     pub fn give_child_budget(&self, budget: i32, child: &mut Host) {
         if let Some(node) = self.budget_node(budget) {
-            self.lend_budget_node(node, child);
-        }
-    }
-
-    fn lend_budget_node(&self, node: u32, child: &mut Host) {
-        child.budgets = Arc::clone(&self.budgets);
-        if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
-            child.cap_names.insert(0, ("budget".to_string(), h));
+            child.budgets = Arc::clone(&self.budgets);
+            if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
+                child.cap_names.insert(0, ("budget".to_string(), h));
+            }
         }
     }
 
@@ -28520,11 +28501,14 @@ impl Host {
     /// read authority over its minted window) and its starter caps span `reservation` — the whole
     /// window reservation, a root's shape, so the child's `vm_map` grows it. The native JIT's op-15
     /// thunk builds the child powerbox through this (`temen_run::grant_detached_child_build`), so
-    /// both backends stamp the same attestation and caps.
+    /// both backends stamp the same attestation and caps. `budget` and `lane` are what the admission
+    /// before this build ([`Self::admit_detached_spawn`]) charged and reserved for the child.
     pub fn spawn_detached_child(
         &mut self,
         grants: &[(String, i32)],
         reservation: u64,
+        budget: i32,
+        lane: i64,
     ) -> Option<(Host, i32, i32)> {
         let attestation = self.detached_child_attestation();
         // §4 / #1501: the detached child inherits the spawner's durability, as the tree-walker's
@@ -28533,16 +28517,14 @@ impl Host {
         // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
         // this builder's to decide.
         let durable = self.durable;
-        // D66 — the lane the admission that preceded this build reserved (the JIT path's two-hook
-        // sequence); `None` ⇒ unbounded, which is also what an un-admitted build gets.
-        let lane = self.pending_child_lane.take().unwrap_or(-1);
-        let budget = self.pending_child_budget.take();
+        // D66, #1944 — the child is stamped with the lane its admission reserved and given the
+        // budget it charged, as the tree-walker's arm does. The JIT's thunk carries both from its
+        // admission hook to this build itself, so nothing waits on this host between the two for
+        // another vCPU's spawn to take (#1972).
         let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
         ch.set_durable(durable);
         ch.set_lane_cap(lane);
-        if let Some(node) = budget {
-            self.lend_budget_node(node, &mut ch); // #1944 — the paying budget is the child's
-        }
+        self.give_child_budget(budget, &mut ch);
         Some((ch, cinst, cas))
     }
 

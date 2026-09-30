@@ -10,8 +10,12 @@
 //! interpreter's op-15 arm; an exhausted budget refuses `-EINVAL` on both.
 
 use core::ffi::c_void;
-use temen_interp::{run_with_host, Host, MemLayout, Value};
-use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
+use core::ptr::null_mut;
+use std::sync::Mutex;
+use temen_interp::{cap_id, run_with_host, Host, MemLayout, Value};
+use temen_jit::{
+    compile_and_run_capture_reserved_with_host_ex, GrantChild, GrantChildHooks, JitOutcome,
+};
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
 /// the parent pointer it decodes are chosen together (this used to hand-roll both, and nothing
@@ -154,6 +158,136 @@ fn a_detached_child_on_the_jit_matches_the_interpreter() {
     assert!(
         temen_jit::child_compiles() > before,
         "the child was JIT-compiled (not served by the interpreter)"
+    );
+}
+
+/// A detached child that reads the room left in its own `"budget"`.
+const CHILD_READS_ITS_BUDGET: &str = r#"memory 16
+data 20000 "budget"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vp = i64.const 20000
+  vl = i64.const 6
+  vb = self.resolve vp vl
+  vf = i64.const 1
+  vr = call.cap 14 1 (i64) -> (i64) vb (vf)
+  return vr
+  }
+}
+"#;
+
+/// #1944 — the budget that pays for a detached child's window is the child's `"budget"`, on the JIT
+/// as on the interpreter: the child reads its room with its own window already charged.
+#[test]
+fn a_detached_child_on_the_jit_holds_the_budget_that_paid_for_it() {
+    let p = module(&parent(true));
+    let c = module(CHILD_READS_ITS_BUDGET);
+    let want = (1 << 20) - (1 << 16);
+    assert_eq!(run_interp(&p, &c, 1 << 20), want, "interpreter oracle");
+    assert_eq!(run_jit(&p, &c, 1 << 20), want, "the JIT");
+}
+
+/// #1972 — the JIT's op-15 thunk admits a child (`budget_mem_take`) and builds it
+/// (`build_detached`) in two hook calls, and a concurrent run's hooks each take the parent's lock on
+/// their own. So two vCPUs of one domain can admit, admit, build, build. Each build must still give
+/// its child the lane and the `"budget"` that child's own admission charged. While the admission left
+/// them on the parent for the next build to take, child A got B's and child B got neither.
+#[test]
+fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
+    const WINDOW: u64 = 1 << 16;
+    let mut host = Host::new();
+    let root = host.grant_budget(-1, -1, -1);
+    let (a, b) = {
+        let mut split = |mem: i64, lane: i64| {
+            host.cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, mem, -1, -1, lane], None)
+                .expect("split")[0] as i32
+        };
+        (split(1 << 20, 1), split(1 << 19, 2))
+    };
+    let cell = Mutex::new(host);
+    let hooks = temen_run::production_grant_hooks(temen_run::CapCtx::Locked(&cell));
+    let ctx = &cell as *const Mutex<Host> as *mut c_void;
+    let build = |budget: i32, lane: i64| -> GrantChild {
+        let mut gc = GrantChild {
+            ctx: null_mut(),
+            retained_ctx: null_mut(),
+            inst_handle: 0,
+            as_handle: 0,
+            grant_handle: 0,
+            jit_table_log2: 0,
+            domain: 0,
+            lane_cap: -1,
+            parent_domain: 0,
+            parent_lane_cap: -1,
+        };
+        let mut trap = 0i64;
+        let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
+        // SAFETY: `ctx` is the locked parent cell the hooks were made for; with no grant records,
+        // nothing is read from the (null) window.
+        let built = unsafe {
+            (hooks.build_detached)(
+                ctx,
+                null_mut(),
+                0,
+                0,
+                0,
+                reservation,
+                budget,
+                lane,
+                &mut gc,
+                &mut trap,
+            )
+        };
+        assert_eq!(built, 1, "the build trapped {trap}");
+        gc
+    };
+    // SAFETY: as above.
+    let lanes = unsafe {
+        [
+            (hooks.budget_mem_take)(ctx, a, WINDOW),
+            (hooks.budget_mem_take)(ctx, b, WINDOW),
+        ]
+    };
+    assert_eq!(
+        lanes,
+        [1, 2],
+        "both admitted, with their lanes, before either is built"
+    );
+    let (ca, cb) = (build(a, lanes[0]), build(b, lanes[1]));
+    let room = |gc: &GrantChild| -> i64 {
+        // SAFETY: `gc.ctx` is the child powerbox cell the build filled, not yet released.
+        let child = unsafe { &*(gc.ctx as *const Mutex<Host>) };
+        let mut h = child.lock().unwrap();
+        let budget = h
+            .resolve_cap_name("budget")
+            .expect("the child holds a budget");
+        h.cap_dispatch_slots(cap_id::BUDGET, 1, budget, &[1], None)
+            .expect("read")[0]
+    };
+    assert_eq!(
+        (ca.lane_cap, room(&ca)),
+        (1, (1 << 20) - WINDOW as i64),
+        "child A: its own lane and budget"
+    );
+    assert_eq!(
+        (cb.lane_cap, room(&cb)),
+        (2, (1 << 19) - WINDOW as i64),
+        "child B: its own lane and budget"
+    );
+    // Each child hands back the lane stamped on it when it is reaped, so the parent's Σ returns to 0.
+    // SAFETY: as above; each child's two refs are released once each.
+    unsafe {
+        (hooks.lane_give)(ctx, ca.lane_cap);
+        (hooks.lane_give)(ctx, cb.lane_cap);
+        for c in [&ca, &cb] {
+            (hooks.release)(c.ctx);
+            (hooks.release)(c.retained_ctx);
+        }
+    }
+    assert_eq!(
+        cell.lock().unwrap().granted_lanes(),
+        0,
+        "every lane came back"
     );
 }
 

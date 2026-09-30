@@ -2227,7 +2227,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
-    let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
+    let build: crate::GrantDetachedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
     let take: crate::BudgetMemTaker = core::mem::transmute(take_addr);
     let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
@@ -2316,8 +2316,10 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
             apply_addr,
         ));
     }
-    // Admission = the budget's quota take (the commit; every refusal above charged nothing).
-    if take(rt.grant_ctx(), budget as i32, child_size) == 0 {
+    // Admission = the lane reserved and the budget's window charge (the commit; every refusal above
+    // charged nothing).
+    let lane = take(rt.grant_ctx(), budget as i32, child_size);
+    if lane == crate::ADMIT_REFUSED {
         return EINVAL as i32;
     }
     let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
@@ -2339,7 +2341,9 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         mem_size,
         grants_ptr as u64,
         grants_n as u64,
-        reservation, // starter caps span the reservation — a root's shape
+        reservation,   // starter caps span the reservation — a root's shape
+        budget as i32, // the handle `take` just charged: the child's `"budget"`
+        lane,          // and the lane it reserved
         &mut gc,
         trap_out,
     ) == 0

@@ -2760,6 +2760,8 @@ locked_parent_hook!(
         grants_ptr: u64,
         grants_n: u64,
         child_size: u64,
+        budget: i32,
+        lane: i64,
         out: *mut temen_jit::GrantChild,
         trap_out: *mut i64,
     ) -> i32
@@ -2767,7 +2769,7 @@ locked_parent_hook!(
 locked_parent_hook!(
     budget_mem_take_locked,
     budget_mem_take,
-    (budget: i32, bytes: u64) -> i32
+    (budget: i32, bytes: u64) -> i64
 );
 locked_parent_hook!(
     budget_mem_give_locked,
@@ -3488,11 +3490,13 @@ pub unsafe extern "C" fn grant_named_child_build(
 
 /// PROCESS.md §5 / #1287 — the **detached** child's powerbox builder ([`temen_jit::GrantChildHooks::
 /// build_detached`]): the same by-name grant records as [`grant_named_child_build`], built through
-/// [`Host::spawn_detached_child`] — the child attests `window_exposed = false` and its starter caps span
-/// `child_size` = the window reservation (a root's shape; the JIT thunk passes it).
+/// [`Host::spawn_detached_child`] — the child attests `window_exposed = false`, its starter caps span
+/// `child_size` = the window reservation (a root's shape; the JIT thunk passes it), and it gets what
+/// [`budget_mem_take`] just admitted it with: `budget` as its `"budget"`, and `lane`.
 ///
 /// # Safety
 /// As [`grant_named_child_build`].
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn grant_detached_child_build(
     ctx: *mut c_void,
     mem_base: *mut u8,
@@ -3500,6 +3504,8 @@ pub unsafe extern "C" fn grant_detached_child_build(
     grants_ptr: u64,
     grants_n: u64,
     child_size: u64,
+    budget: i32,
+    lane: i64,
     out: *mut temen_jit::GrantChild,
     trap_out: *mut i64,
 ) -> i32 {
@@ -3508,7 +3514,7 @@ pub unsafe extern "C" fn grant_detached_child_build(
         return 0;
     };
     let parent = &mut *(ctx as *mut Host);
-    let built = parent.spawn_detached_child(&grants, child_size);
+    let built = parent.spawn_detached_child(&grants, child_size, budget, lane);
     finish_child_build(parent, built, out, trap_out)
 }
 
@@ -3624,20 +3630,22 @@ pub unsafe extern "C" fn premap_apply(
     }
 }
 
-/// PROCESS.md §5 / #1287 — the `Budget` admission for a detached spawn on the JIT
-/// ([`temen_jit::BudgetMemTaker`]): deduct `bytes` from the minter behind `minter` on the parent `Host`.
-/// `1` = admitted; `0` = forged/wrong-type handle or exhausted quota (nothing deducted) — the spawn
-/// refuses probeably, exactly the interpreter's `budget_mem_take`.
+/// PROCESS.md §5 / #1287 — the admission for a detached spawn on the JIT
+/// ([`temen_jit::BudgetMemTaker`]): the lane it reserved, or [`temen_jit::ADMIT_REFUSED`] for a
+/// forged/wrong-type handle or no room (nothing charged) — the spawn refuses probeably, as the
+/// interpreter's admission does.
 ///
 /// # Safety
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
-pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i32 {
+pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i64 {
     let parent = &mut *(ctx as *mut Host);
     // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
     // the funding budget's lane is reserved against the parent's Σ and its `mem` taken, or neither.
-    // The lane rides to the builder that follows (`Host::pending_child_lane`) and comes back through
-    // [`lane_give`] when the child-domain executor reaps the task.
-    i32::from(parent.admit_detached_spawn(budget, bytes).is_some())
+    // The thunk hands the lane to the builder that follows ([`grant_detached_child_build`]), and it
+    // comes back through [`lane_give`] when the child-domain executor reaps the task.
+    parent
+        .admit_detached_spawn(budget, bytes)
+        .unwrap_or(temen_jit::ADMIT_REFUSED)
 }
 
 /// D66 — a reaped detached child returns its lane to the parent ([`temen_jit::LaneGiver`]).
