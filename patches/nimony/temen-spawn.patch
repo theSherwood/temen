@@ -1,0 +1,200 @@
+On Temen, nimony's `osproc` and `os` start processes with a spawn instead of a fork.
+
+Why: every process nimony's tools start is a fork followed at once by an exec (`osproc.startProcess`,
+`os.execShellCmd`). On Temen a fork copies the caller's whole memory, and a program that can fork
+cannot run on Temen's emitted tier, which is what keeps nimsem off it. Temen's POSIX personality
+serves a spawn instead: `pspawn` (op 62, `crates/temen-posix`) starts a new process running a
+program, applies file actions to its copy of the caller's fd table, and copies nothing else.
+
+What: `std/posix` binds `pspawn` for a program built for Temen (`defined(temen)`, see
+temen-backend.patch).
+- `startProcess` passes the fork path's own child steps to the spawn as file actions: the stdio
+  `dup2`s and `close`s, then the `chdir`. It tries each PATH candidate, as the fork path's child does.
+- `execShellCmd` spawns `/bin/sh -c`.
+- A failed spawn has created nothing, so it is reported as a failed fork is: `startProcess` raises,
+  `execShellCmd` returns -1.
+- `poDaemon` has no action; Temen serves a nim program no `setpgid` in any case.
+A build that is not for Temen is unchanged.
+
+A native build of a program built for Temen still links. That build is `nimony c -d:temen`, which
+the self-hosted lane holds Temen's build to. `temen_spawn.c` is `.compile`d into it: a `pspawn` that
+refuses with -ENOSYS. A Temen build (`nimony t`) compiles no C, so it never sees that file.
+
+Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the vendored
+`nimony/` submodule is never modified. Against the submodule pin (v0.6.2, 851fe262). Temen-specific,
+like temen-backend.patch, which it goes with.
+diff --git a/lib/std/os.nim b/lib/std/os.nim
+index 0b609e3..70a8ac1 100644
+--- a/lib/std/os.nim
++++ b/lib/std/os.nim
+@@ -242,15 +242,21 @@ proc execShellCmd*(command: string): int {.tags: [ExecIOEffect].} =
+     argv[1] = dashc.toCString
+     argv[2] = cmd.toCString
+     argv[3] = nil.cstring
+-    let pid = fork()
+-    if pid == Pid(0):
+-      # child: exec the shell; only reached past here if exec failed.
+-      discard execve(sh.toCString, cast[CCharArray](argv),
+-                     cast[CCharArray](posix_environ))
+-      exitnow(127'i32)
++    when defined(temen):
++      # Temen spawns the shell rather than forking to exec it (`posix.pspawn`).
++      var req = SpawnRequest(path: sh.toCString, argv: cast[CCharArray](argv),
++                             envp: cast[CCharArray](posix_environ))
++      let pid = pspawn(addr req)
++    else:
++      let pid = fork()
++      if pid == Pid(0):
++        # child: exec the shell; only reached past here if exec failed.
++        discard execve(sh.toCString, cast[CCharArray](argv),
++                       cast[CCharArray](posix_environ))
++        exitnow(127'i32)
+     dealloc(cast[pointer](argv))
+     if pid.int < 0:
+-      result = -1   # fork failed, like `system()`
++      result = -1   # no process started, like `system()`
+     else:
+       var status: cint = 0'i32
+       if waitpid(pid, status, 0'i32).int < 0:
+diff --git a/lib/std/osproc.nim b/lib/std/osproc.nim
+index 81d224e..bd1b503 100644
+--- a/lib/std/osproc.nim
++++ b/lib/std/osproc.nim
+@@ -255,35 +255,65 @@ when not defined(windows):
+     let envpC = cast[CCharArray](sysEnv)
+     let nPaths = execPaths.len
+     var wd = workingDir
+-    var pid: Pid = fork()
+-    if pid == Pid(0):
+-      # --- child: only async-signal-safe calls from here to execve/_exit
+-      # (`toCString` borrows the string's existing buffer; no allocation) ---
++    var pid = Pid(-1)
++    when defined(temen):
++      # Temen spawns the child rather than forking it (`posix.pspawn`): the
++      # fork path's own steps below, applied by the host to the child's copy
++      # of this fd table, and nothing else of this process copied. It has no
++      # `poDaemon` step: Temen serves a nim program no `setpgid`.
++      var acts = default(array[10, SpawnAction])
++      var n = 0
++      template act(o, f, a: int; p: nil cstring = nil) =
++        acts[n] = SpawnAction(op: o, fd: f, arg: a, path: p)
++        inc n
+       if poParentStreams notin options:
+-        discard dup2(pStdin[readIdx], 0'i32)
+-        discard dup2(pStdout[writeIdx], 1'i32)
++        act SpawnDup2, pStdin[readIdx], 0
++        act SpawnDup2, pStdout[writeIdx], 1
+         if poStdErrToStdOut in options:
+-          discard dup2(pStdout[writeIdx], 2'i32)
++          act SpawnDup2, pStdout[writeIdx], 2
+         else:
+-          discard dup2(pStderr[writeIdx], 2'i32)
+-        discard close(pStdin[readIdx]); discard close(pStdin[writeIdx])
+-        discard close(pStdout[readIdx]); discard close(pStdout[writeIdx])
+-        discard close(pStderr[readIdx]); discard close(pStderr[writeIdx])
+-      if poDaemon in options:
+-        discard setpgid(Pid(0), Pid(0))
+-      if wd.len > 0 and chdir(wd.toCString) != 0'i32:
+-        exitnow(127'i32)
++          act SpawnDup2, pStderr[writeIdx], 2
++        for fd in [pStdin[readIdx], pStdin[writeIdx], pStdout[readIdx],
++                   pStdout[writeIdx], pStderr[readIdx], pStderr[writeIdx]]:
++          act SpawnClose, fd, 0
++      if wd.len > 0:
++        act SpawnChdir, 0, 0, wd.toCString
+       for k in 0 ..< nPaths:
+-        let cand: cstring = sysPaths[k]
+-        if cand != nil:
+-          discard execve(cand, argvC, envpC)  # returns only on failure
+-      exitnow(127'i32)   # reached only if every exec failed
++        var req = SpawnRequest(path: sysPaths[k], argv: argvC, envp: envpC,
++          actions: cast[ptr UncheckedArray[SpawnAction]](addr acts[0]), nactions: n)
++        pid = pspawn(addr req)
++        if pid >= Pid(0): break
++    else:
++      pid = fork()
++      if pid == Pid(0):
++        # --- child: only async-signal-safe calls from here to execve/_exit
++        # (`toCString` borrows the string's existing buffer; no allocation) ---
++        if poParentStreams notin options:
++          discard dup2(pStdin[readIdx], 0'i32)
++          discard dup2(pStdout[writeIdx], 1'i32)
++          if poStdErrToStdOut in options:
++            discard dup2(pStdout[writeIdx], 2'i32)
++          else:
++            discard dup2(pStderr[writeIdx], 2'i32)
++          discard close(pStdin[readIdx]); discard close(pStdin[writeIdx])
++          discard close(pStdout[readIdx]); discard close(pStdout[writeIdx])
++          discard close(pStderr[readIdx]); discard close(pStderr[writeIdx])
++        if poDaemon in options:
++          discard setpgid(Pid(0), Pid(0))
++        if wd.len > 0 and chdir(wd.toCString) != 0'i32:
++          exitnow(127'i32)
++        for k in 0 ..< nPaths:
++          let cand: cstring = sysPaths[k]
++          if cand != nil:
++            discard execve(cand, argvC, envpC)  # returns only on failure
++        exitnow(127'i32)   # reached only if every exec failed
+     # --- parent ---
+     deallocCStringArray(sysPaths, execPaths.len)
+     deallocCStringArray(sysArgs, argsRaw.len)
+     deallocCStringArray(sysEnv, countCStringArray(sysEnv))
+     if pid.int < 0:
+-      raiseOSError(osLastError())
++      when defined(temen): raiseOSError(OSErrorCode(-pid))  # -errno
++      else: raiseOSError(osLastError())
+ 
+     result = Process(options: options, exitFlag: false, id: pid,
+                      inHandle: 0'i32, outHandle: 0'i32, errHandle: 0'i32,
+diff --git a/lib/std/posix/posix.nim b/lib/std/posix/posix.nim
+index df8d94a..6aa9ccb 100644
+--- a/lib/std/posix/posix.nim
++++ b/lib/std/posix/posix.nim
+@@ -568,6 +568,32 @@ when defined(posix):
+   proc read*(fildes: cint; buf: pointer; nbyte: int): int {.importc: "read", sideEffect.}
+   proc write*(fildes: cint; buf: pointer; nbyte: int): int {.importc: "write", sideEffect.}
+ 
++  when defined(temen):
++    # Temen's spawn, the POSIX personality's `pspawn`: a new process running
++    # `path`, with `actions` applied in order to its copy of the caller's fd
++    # table and nothing else of the caller copied. It answers the child's pid,
++    # or -errno with nothing created. `osproc` and `os` start every process
++    # with it on Temen, where a fork copies the caller's whole memory and
++    # keeps the caller off the tier that runs emitted code.
++    type
++      SpawnAction* = object
++        op*, fd*, arg*: int
++        path*: nil cstring  ## `SpawnChdir`'s directory
++      SpawnRequest* = object
++        path*: nil cstring
++        argv*, envp*: CCharArray
++        actions*: nil ptr UncheckedArray[SpawnAction]
++        nactions*: int
++    const
++      SpawnClose* = 1  ## close(fd)
++      SpawnDup2* = 2   ## dup2(fd, arg)
++      SpawnChdir* = 3  ## chdir(path)
++    proc pspawn*(req: ptr SpawnRequest): Pid {.importc: "pspawn", sideEffect.}
++    # A Temen link ignores this. A native build of a Temen program (what the
++    # self-hosted lane checks Temen's build against) links it: a `pspawn`
++    # that refuses.
++    {.compile: "temen_spawn.c".}
++
+   # The environment block. The generated `main` captures its third parameter
+   # (`char** envp`) into the `nimEnviron` global on every backend (see hexer's
+   # genMainProc), so no libc `environ`/`_NSGetEnviron` binding is needed.
+diff --git a/lib/std/posix/temen_spawn.c b/lib/std/posix/temen_spawn.c
+new file mode 100644
+index 0000000..21df91b
+--- /dev/null
++++ b/lib/std/posix/temen_spawn.c
+@@ -0,0 +1,9 @@
++/* `posix.pspawn` for a native build of a program built for Temen (`-d:temen`).
++   Temen serves `pspawn` to the program itself; natively nothing does, so a
++   spawn is refused and nothing is created. */
++#include <errno.h>
++
++int pspawn(void *req) {
++  (void)req;
++  return -ENOSYS;
++}

@@ -1,6 +1,6 @@
 //! **nimony's own driver, in the browser** (#958). `nimony t` builds a program as it does on a host:
 //! it parses the program's dependency graph, writes a build plan and runs nifmake over it, which
-//! forks and execs every step through `/bin/sh` — nifler2 and nimsem per module, hexer, then
+//! spawns every step through `/bin/sh` — nifler2 and nimsem per module, hexer, then
 //! temen-link — and nimsem's compile-time evaluation builds and runs programs of its own. The process
 //! tree runs on the browser's interpreter tier, over one POSIX personality and its memfs, as the
 //! self-hosted lane runs it natively (`scripts/ci/nim-selfhost-lane.sh`); a **leaf** process — one
@@ -74,7 +74,7 @@ pub fn nim_open(
     for (path, bytes) in files {
         posix.write_file(path, bytes);
     }
-    // No function of the driver tiers up: it forks and waits, and a tiered-up function cannot park.
+    // No function of the driver tiers up: it spawns and waits, and a tiered-up function cannot park.
     let tierup = leaf.map(|leaf| TierUpConfig {
         eligible: Arc::from([]),
         page_checked: false,

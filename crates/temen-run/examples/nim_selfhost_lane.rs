@@ -18,10 +18,11 @@
 //!
 //! 1. **The whole build is nimony's own, in-guest.** `nimony t --isMain prog.nim` — the driver with
 //!    its Temen backend (`patches/nimony/temen-backend.patch`) — parses the dependency graph,
-//!    writes the build plan and runs **nifmake** over it. nifmake forks and execs every step in
-//!    dependency order through the POSIX `/bin/sh`: **nifler** and **nimsem** per module, **hexer**
-//!    (`.x.nif`) and its dead-code elimination (`.c.nif`), then **temen-link**
-//!    (`demos/temen_link`), which links the whole program into `nimcache/<main>.temen/<prog>.temen`.
+//!    writes the build plan and runs **nifmake** over it. nifmake spawns every step in dependency
+//!    order through the POSIX `/bin/sh` (`patches/nimony/temen-spawn.patch`): **nifler** and
+//!    **nimsem** per module, **hexer** (`.x.nif`) and its dead-code elimination (`.c.nif`), then
+//!    **temen-link** (`demos/temen_link`), which links the whole program into
+//!    `nimcache/<main>.temen/<prog>.temen`.
 //!    The host seeds the tree and reads the result; it orders nothing. The build runs in the tree,
 //!    at its host path, as `cd <tree> && nimony t prog.nim` would: nimony writes some paths
 //!    absolute, so a build elsewhere is a build of different bytes.
@@ -30,7 +31,7 @@
 //!
 //! **Engines** (`--engine E1,E2,…`): E1 runs the build — the driver and every process it spawns.
 //! Each later engine runs hexer over every module again, held to E1's bytes, and **every** engine
-//! runs the program. Any engine can be E1: the JIT serves `fork`, `execve` and `waitpid` too (#1768).
+//! runs the program. Any engine can be E1: the JIT serves `pspawn`, `execve` and `waitpid` too.
 //!
 //! `--expect` makes the run a **test**: native nimony has built the same program in the same
 //! tree, and every artifact of every phase must be native's, byte for byte, when native runs

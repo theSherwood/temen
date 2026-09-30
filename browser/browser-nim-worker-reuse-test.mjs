@@ -35,19 +35,29 @@ const res = await page.evaluate(async () => {
   const client = globalThis.__snapshotClient;
   const td = new TextDecoder();
   const src = 'import std/syncio\n\nwrite(stdout, "hello, Nim\\n")\n';
-  const run = async () => { const r = await client.nimCompile(getAssets, src); return typeof r.stdout === 'string' ? r.stdout : (r.stdout && r.stdout.length ? td.decode(r.stdout) : ''); };
+  const caches = [];
+  const run = async () => {
+    const r = await client.nimCompile(getAssets, src);
+    caches.push({ compiles: r.compiles, hits: r.hits });
+    return typeof r.stdout === 'string' ? r.stdout : (r.stdout && r.stdout.length ? td.decode(r.stdout) : '');
+  };
   // Mimic runNimc's real flow: cancelNim() before each compile.
   client.cancelNim(); const out1 = await run();
   client.cancelNim(); const out2 = await run();
   client.cancelNim(); const out3 = await run();
-  return { spawns: client.nimWorkerSpawns, out1, out2, out3 };
+  return { spawns: client.nimWorkerSpawns, out1, out2, out3, caches };
 });
 await browser.close(); server.close();
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
 const allOk = [res.out1, res.out2, res.out3].every((o) => (o || '').includes('hello, Nim'));
 // Reuse ⇒ the nim worker is spawned exactly once across three cancelNim+compile cycles (was 3 before).
 const reused = res.spawns === 1;
-const ok = allOk && reused;
-console.log(`  nim-worker-reuse: spawns=${res.spawns} (want 1) · outputs ok=${allOk}`);
+// A reused worker keeps its compiled leaf modules too: the later builds compile none of their own,
+// and take each from the cache instead.
+const [c1, , c3] = res.caches;
+const cached = c1.compiles > 0 && c3.compiles === c1.compiles && c3.hits > c1.hits;
+const ok = allOk && reused && cached;
+console.log(`  nim-worker-reuse: spawns=${res.spawns} (want 1) · outputs ok=${allOk} · ` +
+  `leaf compiles ${c1.compiles} → ${c3.compiles} (want unchanged), cache hits ${c1.hits} → ${c3.hits}`);
 console.log(ok ? 'PASS — idle nim worker reused across Runs (cancelNim no-ops when idle), output correct' : 'FAIL');
 process.exit(ok ? 0 : 1);
