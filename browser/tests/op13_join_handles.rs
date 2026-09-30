@@ -10,8 +10,9 @@
 //!
 //! The driver spawns detached (op 17 v1); the carve spawn this loop also served retired (#1289).
 //!
-//! Both now resolve through `temen_interp::take_child`. The loop reports a trap as `OP13JIT_TRAP`
-//! without its kind; `take_child`'s own unit test pins the kind.
+//! Both then resolved through `temen_interp::take_child`; now the engine does, for every `Vcpu`
+//! host (#1736): the loops keep no child table. The loop reports a trap as `OP13JIT_TRAP` without
+//! its kind; `spawn_every_driver.rs` pins the kind on every driver.
 
 use std::sync::Mutex;
 

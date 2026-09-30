@@ -17,7 +17,7 @@
 //! pins the parallel FFI's event plumbing, which no other native test reaches.
 
 use temen_browser::{
-    temen_par_child_confined, temen_par_compile, temen_par_deliver_handle, temen_par_deliver_join,
+    temen_par_child_confined, temen_par_compile, temen_par_deliver_child, temen_par_deliver_join,
     temen_par_deliver_tierup, temen_par_enable_jit, temen_par_enable_jit_paged, temen_par_ev_a,
     temen_par_ev_b, temen_par_ev_c, temen_par_ev_d, temen_par_free, temen_par_powerbox_inst,
     temen_par_root, temen_par_run, temen_par_tierup_argv_len, temen_par_tierup_argv_ptr,
@@ -221,7 +221,7 @@ fn par_confined_child_tiers_up_over_its_own_carve() {
                 };
                 temen_par_free(child);
                 child_value = Some(v);
-                temen_par_deliver_handle(root, 0);
+                temen_par_deliver_child(root, 0);
             }
             PAR_JOIN => {
                 assert_eq!(temen_par_ev_a(root), 0, "join of the one child");
@@ -435,7 +435,7 @@ fn par_confined_child_paged_reflects_its_own_unmap() {
                 };
                 temen_par_free(child);
                 child_value = Some(v);
-                temen_par_deliver_handle(root, 0);
+                temen_par_deliver_child(root, 0);
             }
             PAR_JOIN => {
                 assert_eq!(temen_par_ev_a(root), 0, "join of the one child");
@@ -1097,7 +1097,7 @@ block 0 (vinst: i32, vmod: i32) {{
                     );
                     child_value = Some(temen_par_ev_a(child));
                     temen_par_free(child);
-                    temen_par_deliver_handle(v, 0);
+                    temen_par_deliver_child(v, 0);
                 }
                 PAR_JOIN => {
                     temen_par_deliver_join(v, child_value.expect("child ran before join"), 0);

@@ -16,7 +16,7 @@
 use std::sync::Mutex;
 
 use temen_browser::{
-    temen_par_child_confined, temen_par_compile, temen_par_deliver_handle, temen_par_deliver_join,
+    temen_par_child_confined, temen_par_compile, temen_par_deliver_child, temen_par_deliver_join,
     temen_par_enable_inst_codegen, temen_par_ev_a, temen_par_ev_b, temen_par_ev_c, temen_par_free,
     temen_par_inst_call_interp, temen_par_inst_eligible, temen_par_inst_paged,
     temen_par_inst_pagestate_sync, temen_par_inst_unit_wasm_len, temen_par_inst_unit_wasm_ptr,
@@ -415,7 +415,7 @@ fn drive(root: &temen_ir::Module, unit: &temen_ir::Module) -> Outcome {
                 };
                 temen_par_free(child);
                 child_result = Some(r);
-                temen_par_deliver_handle(root_v, 0);
+                temen_par_deliver_child(root_v, 0);
             }
             PAR_JOIN => {
                 let r = child_result.expect("child ran before join");
