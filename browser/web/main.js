@@ -433,24 +433,26 @@ block 0 (v0: i64) {
     set('instnested', 'fail', `instnested: error ${e}`);
   }
 
-  // --- 10b) §14 **page-op child real codegen** (#1151) ----------------------------------------------
-  // Same root; the granted unit manages its own pages: its entry (emitted, PAGED) calls a helper that
-  // `unmap`s one carve page and `protect`s another read-only — an out-of-subset leaf the Worker bounces
-  // onto the child's own vCPU over its carve (`temen_par_inst_call_interp`), re-syncing the page-state
-  // table after — then reads "K"=75 on the Ro page and stores+loads a marker on an Rw page → 7509;
+  // --- 10b) §14 **page-op child real codegen** (#1151; detached, #1865) ------------------------------
+  // Same detached root; the granted unit manages its own pages: its entry (emitted, PAGED) calls a helper
+  // that `unmap`s one page of its window and `protect`s another read-only — an out-of-subset leaf the
+  // Worker bounces onto the child's own vCPU (`temen_par_inst_call_interp`), re-syncing the page-state
+  // table into the child's header after — then reads "K"=75 on the Ro page and stores+loads a marker on
+  // an Rw page → 7509;
   // 8 × 7509 = 60072 on both tiers, codegen actually emitting. The trap twin stores on the UNMAPPED
   // page: the child faults on both tiers (the root's join propagates it → the run rejects), so the
   // emitted access provably honors the page state, not just the window bound.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_paged_unit.temenc');
     const trapUnit = await fetchBytes('/corpus/threads_inst_paged_trap_unit.temenc');
+    const opt = { winSize: 1 << 20, minter: 8 * 65536 };
     const t0 = performance.now();
-    const interp = await run(guest, { unit, winSize: 1 << 20, inst: true });
-    const codegen = await run(guest, { unit, winSize: 1 << 20, instCodegen: true });
+    const interp = await run(guest, { ...opt, unit, inst: true });
+    const codegen = await run(guest, { ...opt, unit, instCodegen: true });
     const outcome = (p) => p.then(() => 'done', () => 'trap');
-    const trapInterp = await outcome(run(guest, { unit: trapUnit, winSize: 1 << 20, inst: true }));
-    const trapCodegen = await outcome(run(guest, { unit: trapUnit, winSize: 1 << 20, instCodegen: true }));
+    const trapInterp = await outcome(run(guest, { ...opt, unit: trapUnit, inst: true }));
+    const trapCodegen = await outcome(run(guest, { ...opt, unit: trapUnit, instCodegen: true }));
     const ms = (performance.now() - t0).toFixed(0);
     const ok = interp.value === 60072n && codegen.value === 60072n && codegen.tierups > 0 &&
       trapInterp === 'trap' && trapCodegen === 'trap';

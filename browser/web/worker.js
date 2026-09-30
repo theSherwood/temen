@@ -272,13 +272,12 @@ self.onmessage = async (e) => {
   // bounce mirrors the cell into engine-side scratch for `temen_par_inst_call_interp`, then back (as
   // `driveDetachedRun` does for the op-13 loop). Its `"mapped"` is its vCPU's committed extent, re-read
   // after each bounce: a bounced leaf's `vm_map` grows its memory. Only a child of the granted unit
-  // (module ≠ 0) runs it. Its op-17 spawns are detached grandchildren (`env.instantiate_rec`); a
-  // paged unit and threads are #1865 slices 3c–3d, so those keep the interpreter (or trap, as the
-  // interpreter's detached vCPU does for a carve spawn or a thread).
+  // (module ≠ 0) runs it. Its op-17 spawns are detached grandchildren (`env.instantiate_rec`); a paged
+  // unit's page-state table is copied into its header. Threads are #1865 slice 3d, so those trap, as
+  // the interpreter's detached vCPU does for a carve spawn or a thread.
   const detachedChild = role === 'detached';
   if ((role === 'confined' || (detachedChild && smod !== 0)) && instCodegen
-      && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible(entry) === 1
-      && !(detachedChild && ex.temen_par_inst_paged() === 1)) {
+      && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible(entry) === 1) {
     const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const umem = detachedChild ? childMem : memory; // the memory the child's window lives in
@@ -303,9 +302,20 @@ self.onmessage = async (e) => {
     }
     const paged = ex.temen_par_inst_paged() === 1;
     let uexports = null;
+    // A paged unit's page-state table and its coverage, rebuilt from the child's live map. The emitted
+    // code reads the table through ITS memory: for a detached child that is its own, so the table is
+    // copied into the header slot reserved for it (as `driveDetachedRun` does).
     const syncPaged = () => {
       uexports.mapped.value = ex.temen_par_ev_b(cv);
-      uexports.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(cv));
+      const p = Number(ex.temen_par_tierup_pagestate_ptr(cv));
+      if (!detachedChild) {
+        uexports.pagestate.value = p;
+        return;
+      }
+      const n = ex.temen_par_tierup_pagestate_len(cv), off = ex.temen_detached_pagestate_off();
+      if (off + n > fbase) throw new Error('pagestate table does not fit the detached header');
+      new Uint8Array(childMem.buffer).set(new Uint8Array(memory.buffer).subarray(p, p + n), off);
+      uexports.pagestate.value = off;
     };
     // The env cell: engine-side for a carve child; the bottom of the header page for a detached one,
     // whose bounces go through `scratch` (the engine reads a bounce's slots from its own memory).

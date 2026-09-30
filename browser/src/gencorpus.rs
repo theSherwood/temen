@@ -1205,10 +1205,11 @@ block 0 (v0: i64) {
 "#;
 
 // #1151 — the **page-op** granted module (the real-Chromium twin of `browser/tests/inst_codegen_paged.rs`):
-// with the same [`THREADS_INST_MOD`] root, the unit's entry (emitted, **paged**) calls a helper that
-// `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an out-of-subset
-// leaf the Worker bounces whole onto the child's own vCPU over its carve, re-syncing the page-state
-// table after — then reads K on the `Ro` page and stores + loads a marker at `target`, returning
+// with the detached root ([`inst_detached_root`], #1865), the unit's entry (emitted, **paged**) calls a
+// helper that `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an
+// out-of-subset leaf the Worker bounces whole onto the child's own vCPU over its own window, re-syncing
+// the page-state table into the child's header after — then reads K on the `Ro` page and stores + loads
+// a marker at `target`, returning
 // `75 × 100 + 9 = 7509`; the root sums 8 × 7509 = 60072. Offsets are 16 KiB multiples so they are
 // page-aligned on a 4 KiB (wasm) or 16 KiB host page. `target` on an `Rw` page (16 KiB + 8) passes; on
 // the unmapped page P (`threads_inst_paged_trap_unit`) the child faults on BOTH tiers.
