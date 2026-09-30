@@ -5,7 +5,7 @@
 //! Two driver loops keep their own child tables:
 //! - the op-13 JIT driver's root loop (`temen_op13jit_step`) answered a re-join with the banked result
 //!   again, and an out-of-range handle with `Malformed`;
-//! - the interpreter loop a declined child runs on (`nimc::drive_op13`) indexed its table with the
+//! - the interpreter loop a declined child runs on (`plan::drive_op13`) indexed its table with the
 //!   guest's handle, so an out-of-range handle panicked the host.
 //!
 //! The driver spawns detached (op 17 v1); the carve spawn this loop also served retired (#1289).

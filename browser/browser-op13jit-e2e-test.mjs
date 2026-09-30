@@ -2,7 +2,7 @@
 // driver re-grants its `fs` to a detached child (op 17 v1), and JS runs the child's `_start` on the
 // **emitted wasm** tier (`driveDetachedRun`) in the child's own `WebAssembly.Memory`. The child's `call.cap` leaf resolves the *marshaled* `fs`
 // on the reactor cross-tier bounce and returns `40 + fs()` = 41; the shared counter ticks once. This is
-// the browser realization of `nimc.rs::drive_op13` with the child tiered up — the nested phase on JIT.
+// the browser realization of `plan::drive_op13` with the child tiered up — the nested phase on JIT.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
