@@ -764,9 +764,10 @@ pub struct ParVcpu {
     b: i64,
     c: i64,
     d: i64,
-    /// Built by [`temen_par_child_detached`]: this vCPU's window is a `Region::Foreign` over its own
-    /// `WebAssembly.Memory`, which the Worker-side carve/thread protocols (a `[win + carve)` alias, a
-    /// `thread.spawn` sibling over `win`) cannot address — those events fail closed (`PAR_TRAP`).
+    /// Built by [`temen_par_child_detached`] or [`temen_par_thread_detached`]: this vCPU's window is a
+    /// `Region::Foreign` over a detached child's own `WebAssembly.Memory`, which a carve (a
+    /// `[win + carve)` alias of the engine memory) cannot address — a carve spawn fails closed
+    /// (`PAR_TRAP`). A thread it spawns runs over the same memory (#1865).
     detached: bool,
     /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
     /// Worker via [`temen_par_tierup_argv_ptr`]/[`temen_par_tierup_argv_len`] to call the emitted region.
@@ -2287,21 +2288,59 @@ pub extern "C" fn temen_par_child(
     arg: i64,
     vcpu: i64,
 ) -> *mut ParVcpu {
-    if !par_vcpu_admit() {
-        return core::ptr::null_mut();
-    }
-    // A thread shares its SPAWNER's window — which for a §14 confined spawner is its carve, not the
-    // root window — so the mask derives from the passed window size (a power of two by construction:
-    // the root window or a carve), not the guest module's declared memory. Equal for root-window
-    // spawns; the confinement fix for carve spawns (CONSOLIDATION.md §11 slice 3).
     if !win_size.is_power_of_two() {
-        par_vcpu_retire();
         return core::ptr::null_mut();
     }
-    let sl = win_size.trailing_zeros() as u8;
     // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
     let back =
         std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
+    par_thread(prog, back, win_size, module, func, sp, arg, vcpu, false)
+}
+
+/// #1865 — [`temen_par_child`] for a thread of a §5 **detached** child: its spawner's window is the
+/// child's own `WebAssembly.Memory`, registered in this Worker's foreign registry as `mem_id` (one
+/// header page in, as [`temen_par_child_detached`] registers it), `win_size` bytes of it. Its futex
+/// words are there too, where the spawner's are.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn temen_par_thread_detached(
+    prog: *mut bytecode::VcpuProgram,
+    mem_id: u32,
+    win_size: usize,
+    module: u32,
+    func: u32,
+    sp: i64,
+    arg: i64,
+    vcpu: i64,
+) -> *mut ParVcpu {
+    if !win_size.is_power_of_two() {
+        return core::ptr::null_mut();
+    }
+    let back = std::sync::Arc::new(foreign_region(mem_id, win_size as u64));
+    par_thread(prog, back, win_size, module, func, sp, arg, vcpu, true)
+}
+
+/// A `thread.spawn`ed vCPU over its spawner's window `back` (`win_size` bytes).
+#[allow(clippy::too_many_arguments)]
+fn par_thread(
+    prog: *mut bytecode::VcpuProgram,
+    back: std::sync::Arc<temen_interp::Region>,
+    win_size: usize,
+    module: u32,
+    func: u32,
+    sp: i64,
+    arg: i64,
+    vcpu: i64,
+    detached: bool,
+) -> *mut ParVcpu {
+    if !par_vcpu_admit() {
+        return core::ptr::null_mut();
+    }
+    // A thread shares its SPAWNER's window — a detached child's own memory, or the root window — so
+    // the mask derives from the passed window size (a power of two by construction), not the guest
+    // module's declared memory (CONSOLIDATION.md §11 slice 3).
+    let sl = win_size.trailing_zeros() as u8;
     let args = [Value::I64(sp), Value::I64(arg)];
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl)
@@ -2325,7 +2364,10 @@ pub extern "C" fn temen_par_child(
                 Some(io) => inner.with_shared_host(&io.host),
                 None => inner,
             };
-            par_box(with_tierup(inner))
+            let v = par_box(with_tierup(inner));
+            // SAFETY: freshly boxed, exclusively ours until returned to the Worker.
+            unsafe { (*v).detached = detached };
+            v
         }
         Err(_) => {
             par_vcpu_retire();
@@ -2620,11 +2662,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 module,
                 vcpu,
             } => {
-                // A detached vCPU's window is not in the shared engine memory the sibling Worker would
-                // alias at `win` (see [`ParVcpu::detached`]): fail closed rather than alias garbage.
-                if v.detached {
-                    return PAR_TRAP;
-                }
+                // A detached vCPU's sibling runs over the same child memory
+                // ([`temen_par_thread_detached`], #1865): the Worker posts it with the thread.
                 // Pack `(module << 32) | func` exactly as the INSTANTIATE event does: the spawning
                 // frame's module rides to the child Worker so the child resolves `func` there (an
                 // installed §22 unit spawning its own functions — CONSOLIDATION.md §11).

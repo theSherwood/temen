@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**352 exports** in 37 families — 299 referenced from JS, 53 referenced by nothing, 9 behind a `cfg`.
+**353 exports** in 37 families — 300 referenced from JS, 53 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -27,7 +27,7 @@
 | `nim` | 4 | 4 | 0 |
 | `onramp` | 66 | 55 | 0 |
 | `op13jit` | 9 | 9 | 0 |
-| `par` | 75 | 75 | 1 |
+| `par` | 76 | 76 | 2 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
@@ -387,6 +387,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_stderr_ptr`
 - `temen_par_stdout_len`
 - `temen_par_stdout_ptr`
+- `temen_par_thread_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_par_tierup_argv_len`
 - `temen_par_tierup_argv_ptr`
 - `temen_par_tierup_pagestate_len`

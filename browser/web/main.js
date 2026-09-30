@@ -513,16 +513,16 @@ block 0 (v0: i64) {
     set('jitb2', 'fail', `jitb2: error ${e}`);
   }
 
-  // --- 13) §11 **threads inside a granted unit** (CONSOLIDATION.md §11 slice 3) -------------------
+  // --- 13) §11 **threads inside a granted unit** (CONSOLIDATION.md §11 slice 3; detached, #1865) ------
   // The granted unit's entry thread.spawns its OWN f1 (→7), joins it, and does a mismatching
-  // i32.atomic.wait (→1) → 71; 8 confined children → 568. Interp: module-aware spawn through the
-  // relay (each unit thread a real Worker over the child's carve). Codegen: the entry runs on
+  // i32.atomic.wait (→1) → 71; 8 detached children → 568. Interp: module-aware spawn through the
+  // relay (each unit thread a real Worker over the child's own Memory). Codegen: the entry runs on
   // EMITTED WASM, its thread/futex ops arriving as env.thread_spawn/join + env.mem_wait imports —
   // serviced through the same completion-slot protocol. Both tiers must agree.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_mod.temenc');
+    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_threads_unit.temenc');
-    const opt = { unit, winSize: 1 << 20 };
+    const opt = { unit, winSize: 1 << 20, minter: 8 * 65536 };
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
     const codegen = await run(guest, { ...opt, instCodegen: true });

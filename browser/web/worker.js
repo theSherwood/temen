@@ -273,8 +273,8 @@ self.onmessage = async (e) => {
   // `driveDetachedRun` does for the op-13 loop). Its `"mapped"` is its vCPU's committed extent, re-read
   // after each bounce: a bounced leaf's `vm_map` grows its memory. Only a child of the granted unit
   // (module ≠ 0) runs it. Its op-17 spawns are detached grandchildren (`env.instantiate_rec`); a paged
-  // unit's page-state table is copied into its header. Threads are #1865 slice 3d, so those trap, as
-  // the interpreter's detached vCPU does for a carve spawn or a thread.
+  // unit's page-state table is copied into its header; a thread runs over the same child memory. A
+  // carve spawn traps, as the interpreter's detached vCPU does.
   const detachedChild = role === 'detached';
   if ((role === 'confined' || (detachedChild && smod !== 0)) && instCodegen
       && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible(entry) === 1) {
@@ -392,7 +392,6 @@ self.onmessage = async (e) => {
         // runs the granted unit's own `func` (smod — this Worker knows its module), over THIS
         // child's window (a thread shares its spawner's window = the carve).
         thread_spawn: (func, sp, arg) => {
-          if (detachedChild) throw new Error('thread.spawn from a detached child'); // #1865 slice 3d
           const tslot = ex.temen_par_alloc(SLOT);
           const tstackTop = ex.temen_par_alloc(STACK) + STACK;
           const ttlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
@@ -400,6 +399,7 @@ self.onmessage = async (e) => {
             kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
             rootDomain, // a thread joins its spawner's domain
             win, winSize,
+            ...(detachedChild ? { childMem, tierup: false } : {}), // #1865: over the child's memory
             slot: tslot, stackTop: tstackTop, tlsBase: ttlsBase,
           });
           const h = threadSlots.length;
@@ -472,7 +472,9 @@ self.onmessage = async (e) => {
       ? ex.temen_par_child_confined(prog, BigInt(ticket), win, slog)
       : role === 'detached'
         ? ex.temen_par_child_detached(prog, BigInt(ticket), registerForeign(childMem, fbase), slog)
-        : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
+        : childMem // a thread of a detached child: over the same child memory (#1865)
+          ? ex.temen_par_thread_detached(prog, registerForeign(childMem, fbase), winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0))
+          : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   for (;;) {
@@ -548,6 +550,8 @@ self.onmessage = async (e) => {
         vcpu: ex.temen_par_ev_d(v).toString(), // the child's dense vCPU id (seeds its `vcpu.tls`)
         rootDomain, // a thread joins its spawner's domain
         win, winSize,
+        // #1865: a detached vCPU's thread shares its window, which is in the child's own memory.
+        ...(childMem ? { childMem, tierup: false } : {}),
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
       ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
