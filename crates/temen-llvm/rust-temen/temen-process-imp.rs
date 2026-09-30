@@ -1,15 +1,22 @@
-//! temen process spawning: `std::process::Command` over the POSIX personality's **fork-free** spawn
-//! (temen-posix `OP_SPAWN`/`OP_WAITPID`). A spawn runs the named command *to completion* synchronously —
-//! there is no fork-returns-twice — so a `Process` is already-exited by the time `spawn` returns, and
-//! `wait`/`try_wait` just reap the recorded status (`OP_WAITPID`). The command is resolved by the
-//! embedder's spawn delegate (`Posix::set_spawn`); without one, spawning is `Unsupported`.
+//! temen process spawning: `std::process::Command` over the POSIX personality's `posix_spawn`
+//! (temen-posix `OP_PSPAWN`). A child is a real process running beside its parent: its program starts
+//! at its entry in a fresh window, over the parent's descriptors as the spawn's file actions leave them,
+//! and the parent reaps it with `OP_WAITPID`. The program is a path the embedder registered, or a
+//! program the process built (under a `ModuleLoader`); a name without a `/` is looked up along `PATH`,
+//! as `posix_spawnp` does.
 //!
-//! Stdio: the child inherits the caller's fd 0 (stdin) and fd 1 (stdout). To **capture** stdout
-//! (`Command::output`), we bracket the spawn with `dup(1)`/`dup2(pipe_w, 1)`/restore so the child's
-//! output lands in an in-personality pipe we drain afterwards (the FIFO is unbounded, so the whole
-//! output is buffered by the time the synchronous spawn returns). Because the model is synchronous,
-//! there is no live child to stream *into*: child stdin is whatever fd 0 already holds, so `StdioPipes`
-//! never yields a writable stdin, and stderr is not separately captured (the host routes only stdout).
+//! Stdio: a child stream becomes the file action that sets the child's descriptor up — a `dup2` from a
+//! fresh pipe's end, a `ChildPipe`, a file, or the parent's stdout/stderr — or none, for an inherited
+//! one. Pipes are core pipes, so a parent can stream into a live child's stdin and read its output to
+//! EOF. The memfs has no `/dev/null`: a null stdin is a pipe nobody writes (EOF at once), and a null
+//! stdout or stderr is closed in the child (its writes fail with `EBADF`).
+//!
+//! Where it differs from unix: the personality has no close-on-exec, so a child inherits every
+//! descriptor its parent holds but the ones its file actions close — a pipe end the parent holds for
+//! another live child keeps that pipe open until this child exits too. An exec carries a process's
+//! environment, so `Command::env` changes do not reach the child. And `output` reads the child's
+//! stdout to EOF before its stderr: a child that fills its stderr pipe (64 KiB) before it closes its
+//! stdout waits on its parent, which waits on it.
 #![deny(unsafe_op_in_unsafe_fn)]
 use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
@@ -25,14 +32,56 @@ use crate::{fmt, io};
 
 pub type ChildPipe = Pipe;
 
-/// Map a negative errno from a spawn/wait op to an `io::Error`: `-ENOSYS` (no spawn delegate wired) and
-/// `-ENOENT` (unknown command) get the kinds programs match; the rest fall back to the raw code.
+/// temen-posix's `pspawn` file actions: close `fd`; `dup2(fd, arg)`; change the working directory to
+/// `path`.
+const PSPAWN_CLOSE: u64 = 1;
+const PSPAWN_DUP2: u64 = 2;
+const PSPAWN_CHDIR: u64 = 3;
+
+const ENOENT: i64 = -2;
+const ENOSYS: i64 = -38;
+/// `waitpid`'s option: answer `0` for a child still running rather than wait for it.
+const WNOHANG: i64 = 1;
+const SIGKILL: i64 = 9;
+
+/// Map a negative errno from a spawn/wait op to an `io::Error`: `-ENOENT` (nothing at any path the
+/// program names) and `-ENOSYS` (no `posix_spawn` on this route) get the kinds programs match; the
+/// rest fall back to the raw code.
 fn err(code: i64) -> io::Error {
     match code {
-        -2 => io::const_error!(io::ErrorKind::NotFound, "spawn: no such command"),
-        -38 => io::const_error!(io::ErrorKind::Unsupported, "spawn: no posix spawn delegate is wired"),
+        ENOENT => io::const_error!(io::ErrorKind::NotFound, "spawn: no such program"),
+        ENOSYS => io::const_error!(io::ErrorKind::Unsupported, "spawn: posix_spawn is unavailable here"),
         _ => io::Error::from_raw_os_error((-code) as i32),
     }
+}
+
+/// `bytes` NUL-terminated, as the spawn's paths and argv strings are.
+fn cstr(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if bytes.contains(&0) {
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "nul byte found in provided data"));
+    }
+    let mut v = Vec::with_capacity(bytes.len() + 1);
+    v.extend_from_slice(bytes);
+    v.push(0);
+    Ok(v)
+}
+
+/// The paths a spawn of `program` tries, in order: `program` itself when it holds a `/`, else each
+/// `PATH` directory joined with it (`/bin:/usr/bin` without a `PATH`), as `posix_spawnp` looks it up.
+fn candidates(program: &[u8]) -> Vec<Vec<u8>> {
+    if program.contains(&b'/') {
+        return vec![program.to_vec()];
+    }
+    let path = crate::env::var_os("PATH");
+    let dirs = path.as_ref().map_or(&b"/bin:/usr/bin"[..], |p| p.as_encoded_bytes());
+    dirs.split(|&b| b == b':')
+        .map(|dir| {
+            let mut p = if dir.is_empty() { b".".to_vec() } else { dir.to_vec() };
+            p.push(b'/');
+            p.extend_from_slice(program);
+            p
+        })
+        .collect()
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -57,9 +106,7 @@ pub enum Stdio {
     MakePipe,
     ParentStdout,
     ParentStderr,
-    #[allow(dead_code)] // only reachable via `From<File>`
     InheritFile(File),
-    #[allow(dead_code)] // only reachable via `From<ChildPipe>`
     Fd(Pipe),
 }
 
@@ -126,138 +173,144 @@ impl Command {
         self.cwd.as_ref().map(|cs| Path::new(cs))
     }
 
-    /// Run the command to completion on the personality's spawn delegate, returning the (already-exited)
-    /// `Process` and whatever stdio pipes the disposition asked for. `_default` fills in an unset stdout
-    /// disposition (`MakePipe` for `output`, `Inherit` for `status`/`spawn`); `_needs_stdin` is unused —
-    /// the synchronous model has no live child to stream stdin into (see the module header).
+    /// Start the command as a new process, returning it and the parent's ends of whatever pipes its
+    /// stdio asked for. `default` fills in an unset stdout/stderr disposition (`MakePipe` for `output`,
+    /// `Inherit` for `status`/`spawn`), and an unset stdin too when `needs_stdin`; an unset stdin is
+    /// null otherwise, as on unix.
     pub fn spawn(
         &mut self,
         default: Stdio,
-        _needs_stdin: bool,
+        needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
         if !host::have_posix() {
             return Err(unsupported_err());
         }
+        let null = Stdio::Null;
+        let stdin = self.stdin.as_ref().unwrap_or(if needs_stdin { &default } else { &null });
+        let stdout = self.stdout.as_ref().unwrap_or(&default);
+        let stderr = self.stderr.as_ref().unwrap_or(&default);
 
-        // Resolve each child stream to the fd its output is routed to — a fresh pipe's write end
-        // (`MakePipe`/`Null`), an existing pipe (`Fd`), or `-1` to inherit the parent's fd 1 / fd 2
-        // (`Inherit`/`Parent*`). No `dup2(pipe,1)` bracket: the redirect rides the `spawn2` request
-        // struct below, so it is atomic and per-child — parallel-safe (#848) — and never touches fd 1 /
-        // fd 2, so a concurrent capture on another vCPU can't observe or clobber the redirect.
-        let out_stream = ChildStream::setup(self.stdout.as_ref().unwrap_or(&default))?;
-        let err_stream = ChildStream::setup(self.stderr.as_ref().unwrap_or(&default))?;
-
-        // argv: the args as a NUL-separated blob (`argv[0]` is the program, set by `Command::new`).
-        let mut argv: Vec<u8> = Vec::new();
-        for (i, a) in self.args.iter().enumerate() {
-            if i > 0 {
-                argv.push(0);
-            }
-            argv.extend_from_slice(a.as_encoded_bytes());
+        // The file actions, applied in order to the child's copy of this process's descriptors: each
+        // stream's `dup2` (or close), then the close of every end of this spawn's pipes, which the
+        // child holds as 0–2 now. (A process's 0–2 are always open — std gives no way to close them —
+        // so a pipe end is never one of them.)
+        let mut actions: Vec<[u64; 4]> = Vec::new();
+        let streams = [
+            ChildStream::setup(stdin, 0, &mut actions)?,
+            ChildStream::setup(stdout, 1, &mut actions)?,
+            ChildStream::setup(stderr, 2, &mut actions)?,
+        ];
+        for (ours, theirs) in streams.iter().filter_map(|s| s.pipe.as_ref()) {
+            actions.push([PSPAWN_CLOSE, ours.fd() as u64, 0, 0]);
+            actions.push([PSPAWN_CLOSE, theirs.fd() as u64, 0, 0]);
         }
-        let name = self.program.as_encoded_bytes();
+        let cwd = match &self.cwd {
+            Some(dir) => Some(cstr(dir.as_encoded_bytes())?),
+            None => None,
+        };
+        if let Some(dir) = &cwd {
+            actions.push([PSPAWN_CHDIR, 0, 0, dir.as_ptr() as u64]);
+        }
 
-        // The 44-byte `spawn2` request: command target (name + argv) then the three fd-actions. The
-        // child's stdin inherits fd 0 (`-1`); its stdout/stderr route to the resolved write fds.
-        let mut req = [0u8; 44];
-        req[0..8].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
-        req[8..16].copy_from_slice(&(name.len() as u64).to_le_bytes());
-        req[16..24].copy_from_slice(&(argv.as_ptr() as u64).to_le_bytes());
-        req[24..32].copy_from_slice(&(argv.len() as u64).to_le_bytes());
-        req[32..36].copy_from_slice(&(-1i32).to_le_bytes());
-        req[36..40].copy_from_slice(&(out_stream.write_fd as i32).to_le_bytes());
-        req[40..44].copy_from_slice(&(err_stream.write_fd as i32).to_le_bytes());
-        let pid = host::spawn2(req.as_ptr());
+        // argv: the args as NUL-terminated strings (`argv[0]` is the program, set by `Command::new`),
+        // then NULL. The environment is the one this process carries (see the module header).
+        let args = self
+            .args
+            .iter()
+            .map(|a| cstr(a.as_encoded_bytes()))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(crate::ptr::null());
 
-        // The write ends stayed alive across the spawn (their fds had to be valid for the routing); drop
-        // them now. The captured read ends survive (they share the FIFO), holding the child's output.
-        let captured_out = out_stream.captured;
-        let captured_err = err_stream.captured;
-        drop(out_stream.write_keep);
-        drop(err_stream.write_keep);
-        drop(out_stream.discard);
-        drop(err_stream.discard);
-
+        let mut pid = ENOENT;
+        for path in candidates(self.program.as_encoded_bytes()) {
+            let path = cstr(&path)?;
+            let req = [
+                path.as_ptr() as u64,
+                argv.as_ptr() as u64,
+                0,
+                actions.as_ptr() as u64,
+                actions.len() as u64,
+            ];
+            pid = host::pspawn(req.as_ptr());
+            if pid != ENOENT {
+                break;
+            }
+        }
+        // The child holds its own ends now: the parent keeps only the ones its streams hand back.
+        let [stdin, stdout, stderr] = streams.map(ChildStream::ours);
         if pid < 0 {
             return Err(err(pid));
         }
-        let pipes = StdioPipes { stdin: None, stdout: captured_out, stderr: captured_err };
-        Ok((Process { pid: pid as i32, status: None }, pipes))
+        Ok((Process { pid: pid as i32, status: None }, StdioPipes { stdin, stdout, stderr }))
     }
 }
 
-/// The resolved redirect for one child stream (stdout or stderr): the fd its output is routed to
-/// (`write_fd`, `-1` = inherit the parent's fd 1 / fd 2), the captured read end handed back for
-/// `output` to drain (`MakePipe`), the write end kept alive so `write_fd` stays valid through the
-/// spawn, and a discard read end (`Null`) dropped afterwards. No fd is `dup2`'d — the routing is
-/// carried by the `spawn2` request, so setup never mutates the shared fd table.
+/// How one child stream is set up: a fresh pipe when it needs one, `(the parent's end, the child's
+/// end)`, and whether the parent keeps its end (the stream `StdioPipes` hands back).
 struct ChildStream {
-    write_fd: i64,
-    captured: Option<Pipe>,
-    write_keep: Option<Pipe>,
-    discard: Option<Pipe>,
+    pipe: Option<(Pipe, Pipe)>,
+    keep: bool,
 }
 
 impl ChildStream {
-    /// Resolve `cfg` into a `ChildStream` without touching the shared fd table. `MakePipe`/`Null` mint a
-    /// pipe and route to its write end (keeping / discarding the read end); `Fd` routes to an existing
-    /// pipe; `InheritFile` is unsupported; the inherit/parent variants leave `write_fd = -1` so the
-    /// child writes to the parent's own fd 1 / fd 2.
-    fn setup(cfg: &Stdio) -> io::Result<ChildStream> {
+    /// Push the file action that makes the child's descriptor `fd` what `cfg` asks for, minting the
+    /// pipe it needs. An inherited stream needs no action.
+    fn setup(cfg: &Stdio, fd: u64, actions: &mut Vec<[u64; 4]>) -> io::Result<ChildStream> {
+        let mut dup2 = |from: i32| actions.push([PSPAWN_DUP2, from as u64, fd, 0]);
+        let mut pipe = None;
+        let mut keep = false;
         match cfg {
+            Stdio::Inherit => {}
+            Stdio::ParentStdout | Stdio::ParentStderr => {
+                let from = if matches!(cfg, Stdio::ParentStdout) { 1 } else { 2 };
+                if from != fd {
+                    dup2(from as i32);
+                }
+            }
+            Stdio::Fd(p) => dup2(p.fd()),
+            Stdio::InheritFile(f) => dup2(f.fd()),
+            // A null stdin reads EOF at once: a pipe whose write end nobody keeps.
+            Stdio::MakePipe | Stdio::Null if fd == 0 => {
+                let (read, write) = pipe::pipe()?;
+                dup2(read.fd());
+                keep = matches!(cfg, Stdio::MakePipe);
+                pipe = Some((write, read));
+            }
             Stdio::MakePipe => {
-                let (read_end, write_end) = pipe::pipe()?;
-                Ok(ChildStream {
-                    write_fd: write_end.fd() as i64,
-                    captured: Some(read_end),
-                    write_keep: Some(write_end),
-                    discard: None,
-                })
+                let (read, write) = pipe::pipe()?;
+                dup2(write.fd());
+                keep = true;
+                pipe = Some((read, write));
             }
-            Stdio::Null => {
-                let (read_end, write_end) = pipe::pipe()?;
-                Ok(ChildStream {
-                    write_fd: write_end.fd() as i64,
-                    captured: None,
-                    write_keep: Some(write_end),
-                    discard: Some(read_end),
-                })
-            }
-            Stdio::Fd(p) => Ok(ChildStream {
-                write_fd: p.fd() as i64,
-                captured: None,
-                write_keep: None,
-                discard: None,
-            }),
-            Stdio::InheritFile(_) => Err(io::const_error!(
-                io::ErrorKind::Unsupported,
-                "file-backed child stdio is not supported on temen"
-            )),
-            // Inherit / ParentStdout / ParentStderr: inherit the parent's stream (the child writes to
-            // whatever fd 1 / fd 2 currently is).
-            Stdio::Inherit | Stdio::ParentStdout | Stdio::ParentStderr => Ok(ChildStream {
-                write_fd: -1,
-                captured: None,
-                write_keep: None,
-                discard: None,
-            }),
+            Stdio::Null => actions.push([PSPAWN_CLOSE, fd, 0, 0]),
         }
+        Ok(ChildStream { pipe, keep })
+    }
+
+    /// The parent's end, once the child holds its own: kept if the stream hands it back, else closed.
+    fn ours(self) -> Option<Pipe> {
+        let (ours, _theirs) = self.pipe?;
+        self.keep.then_some(ours)
     }
 }
 
-/// `Command::output`: capture both the child's stdout and stderr (the host spawn now routes stderr to
-/// fd 2, which our `MakePipe` redirect turns into a capturable pipe). Mirrors the generic `output` in
-/// `sys::process` but for the synchronous spawn.
+/// `Command::output`: run the command with its stdout and stderr piped, read both to EOF (stdout
+/// first — see the module header), and reap it.
 pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
     drop(pipes.stdin.take());
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    if let Some(out) = pipes.stdout.take() {
-        out.read_to_end(&mut stdout)?;
-    }
-    if let Some(err) = pipes.stderr.take() {
-        err.read_to_end(&mut stderr)?;
+    match (pipes.stdout.take(), pipes.stderr.take()) {
+        (Some(out), Some(err)) => read_output(out, &mut stdout, err, &mut stderr)?,
+        (Some(out), None) => {
+            out.read_to_end(&mut stdout)?;
+        }
+        (None, Some(err)) => {
+            err.read_to_end(&mut stderr)?;
+        }
+        (None, None) => {}
     }
     let status = process.wait()?;
     Ok((status, stdout, stderr))
@@ -349,7 +402,7 @@ impl fmt::Debug for Command {
 
 pub struct Process {
     pid: i32,
-    /// Cached once reaped, so `wait`/`try_wait` are idempotent (`OP_WAITPID` consumes the child).
+    /// Its wait status once reaped: `OP_WAITPID` consumes the child, so `wait`/`try_wait` keep it.
     status: Option<i32>,
 }
 
@@ -359,27 +412,42 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        // The child already ran to completion (synchronous spawn); there is nothing to signal.
-        Ok(())
+        // A reaped child is gone, and nothing is signalled — unix answers the same.
+        if self.status.is_some() {
+            return Ok(());
+        }
+        let r = host::kill(self.pid as i64, SIGKILL);
+        if r < 0 { Err(err(r)) } else { Ok(()) }
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        if let Some(s) = self.status {
-            return Ok(ExitStatus(s));
+        match self.reap(0)? {
+            Some(status) => Ok(ExitStatus(status)),
+            None => Err(io::const_error!(io::ErrorKind::Other, "waitpid: the child was not reaped")),
         }
-        let mut sb = [0u8; 4];
-        let r = host::waitpid(self.pid as i64, sb.as_mut_ptr(), 0);
-        if r < 0 {
-            return Err(err(r));
-        }
-        let s = i32::from_le_bytes(sb);
-        self.status = Some(s);
-        Ok(ExitStatus(s))
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        // A spawned child has already run, so its status is always immediately available.
-        Ok(Some(self.wait()?))
+        Ok(self.reap(WNOHANG)?.map(ExitStatus))
+    }
+
+    /// Reap the child with `waitpid(pid, options)`: its wait status, or `None` when `options` holds
+    /// `WNOHANG` and it is still running.
+    fn reap(&mut self, options: i64) -> io::Result<Option<i32>> {
+        if let Some(s) = self.status {
+            return Ok(Some(s));
+        }
+        let mut sb = [0u8; 4];
+        let r = host::waitpid(self.pid as i64, sb.as_mut_ptr(), options);
+        if r < 0 {
+            return Err(err(r));
+        }
+        if r == 0 {
+            return Ok(None);
+        }
+        let s = i32::from_le_bytes(sb);
+        self.status = Some(s);
+        Ok(Some(s))
     }
 }
 
@@ -476,20 +544,19 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
     }
 }
 
+/// Read a child's stdout to EOF, then its stderr (see the module header).
 pub fn read_output(
     out: ChildPipe,
     stdout: &mut Vec<u8>,
     err: ChildPipe,
     stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // The FIFOs are already fully populated (synchronous spawn) and non-blocking, so a straight
-    // drain of each in turn cannot deadlock.
     out.read_to_end(stdout)?;
     err.read_to_end(stderr)?;
     Ok(())
 }
 
 pub fn getpid() -> u32 {
-    // Single-process personality: a fixed, stable pid (there is no `getpid` op).
-    1
+    // The personality's pid for this process; `1`, a run's root, without a posix grant.
+    if host::have_posix() { host::getpid() as u32 } else { 1 }
 }
