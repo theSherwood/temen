@@ -13,11 +13,11 @@
 //! What stays baked is what describes the **code**, not the instance: the window geometry (the
 //! confinement mask is an immediate on the hot path), the table mask, the thunk *functions* (process
 //! globals), and whether each check is emitted at all (a compile armed with no kill-path, fuel budget
-//! or signal source emits no check, so its code is byte-identical to before). A compile's per-instance
-//! runtimes (the thread
-//! `Domain`, the §14 `Nursery`, the `setjmp` table, a §22 unit's program) are still baked; a module
-//! that has none is **instance-independent** — the property a fork twin sharing its parent's code,
-//! and a compile cache, would rely on (#1825).
+//! or signal source emits no check, so its code is byte-identical to before). The §12 thread
+//! `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it. A compile's other
+//! per-instance runtimes (the §14 `Nursery`, the `setjmp` table, a §22 unit's program) are still
+//! baked; a module that has none is **instance-independent** — the property a fork twin sharing its
+//! parent's code, and a compile cache, rely on (#1825).
 //!
 //! **The trust argument is the entry.** Code that runs with the wrong vmctx dispatches its `call.cap`s
 //! into the wrong powerbox — authority confusion, not a crash. So every entry into compiled code takes
@@ -52,6 +52,9 @@ pub struct VmCtx {
     /// what a `call.cap` thunk — which is handed this context as its `trap_out` — needs beyond the
     /// powerbox (temen-run's process-tree membership, #1768). Null when the embedder keeps none.
     pub embedder: *mut c_void,
+    /// The §12 thread domain (`os_thread_rt::Domain`) the instance's `thread.*`, futex and blocking
+    /// `cont.resume` sites run on: its own, or for a §14 child its parent's. Null when it has none.
+    pub sched: *const c_void,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -65,10 +68,11 @@ pub struct InstanceAddrs {
     pub sig_armed: *const AtomicBool,
     pub sig_ctx: *mut c_void,
     pub embedder: *mut c_void,
+    pub sched: *const c_void,
 }
 
 impl InstanceAddrs {
-    /// No powerbox, no kill-path, no fuel, no signals, no embedder state.
+    /// No powerbox, no kill-path, no fuel, no signals, no embedder state, no thread domain.
     pub const NONE: InstanceAddrs = InstanceAddrs {
         cap_ctx: core::ptr::null_mut(),
         epoch: core::ptr::null(),
@@ -76,6 +80,7 @@ impl InstanceAddrs {
         sig_armed: core::ptr::null(),
         sig_ctx: core::ptr::null_mut(),
         embedder: core::ptr::null_mut(),
+        sched: core::ptr::null(),
     };
 }
 
@@ -90,6 +95,7 @@ impl VmCtx {
             sig_armed: a.sig_armed,
             sig_ctx: a.sig_ctx,
             embedder: a.embedder,
+            sched: a.sched,
         }
     }
 
@@ -122,6 +128,7 @@ pub(crate) const EPOCH: i32 = core::mem::offset_of!(VmCtx, epoch) as i32;
 pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
 pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32;
 pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
+pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
 
 // The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.
 const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);

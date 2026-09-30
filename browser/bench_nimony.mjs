@@ -100,7 +100,7 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 const maxPages = Number(process.env.NIM_MAX_PAGES || 0) || undefined;
 const res = await page.evaluate(async ({ maxPages }) => {
   const par = await import('./par.js');
-  const { driveCoopTierupRun } = await import('./wasmjit-module.js');
+  const { driveCoopTierupRun, suspendsLeaves } = await import('./wasmjit-module.js');
   const eng = await par.loadEngine(null, { maxPages });
   const { ex, memory } = eng;
   const fetchB = async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer());
@@ -134,6 +134,8 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const argv = enc.encode(['bin/nimony', 't', '--isMain', m.prog].map((a) => `${a}\0`).join(''));
   const driver = tools[0][1];
   const args = [put(driver), put(cmds), put(tree), put(argv), put(enc.encode(m.dir))].flat();
+  // #1896: a leaf process that parks on its pipes runs emitted too where JSPI suspends its frames.
+  args.push(suspendsLeaves ? 1 : 0);
   const before = memory.buffer.byteLength;
   const t0 = performance.now();
   if (ex.temen_nim_open(...args) !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);

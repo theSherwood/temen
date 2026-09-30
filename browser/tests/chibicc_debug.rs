@@ -465,6 +465,43 @@ fn top_frame(s: &mut DapServer, seq: i64) -> Option<(i64, String, String)> {
     ))
 }
 
+/// **A debugged program's stderr is its own stream.** The seeded libc writes fd 2 through the
+/// `"stderr"` capability, which the session grants when the program imports it, and the server
+/// reports it as `output` events of category `stderr` — separate from stdout, so a client can show
+/// diagnostics apart from (and not graded as) program output.
+#[test]
+fn stderr_is_reported_apart_from_stdout() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  printf(\"out\\n\");\n  fprintf(stderr, \"err\\n\");\n  return 0;\n}\n",
+    );
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, 2, true);
+    let mut msgs = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    msgs.extend(s.handle(&req(
+        5,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    )));
+    let last = |category: &str| {
+        msgs.iter()
+            .rev()
+            .filter(|m| m.get("event").and_then(|e| e.as_str()) == Some("output"))
+            .filter_map(|m| m.get("body"))
+            .find(|b| b.get("category").and_then(|c| c.as_str()) == Some(category))
+            .and_then(|b| b.get("output"))
+            .and_then(|o| o.as_str())
+            .map(str::to_string)
+    };
+    assert_eq!(last("stdout").as_deref(), Some("out\n"), "stdout: {msgs:?}");
+    assert_eq!(last("stderr").as_deref(), Some("err\n"), "stderr: {msgs:?}");
+}
+
 const LOOPS_SRC: &str = r#"int main(void) {
   int a = 0;
   for (int i = 0; i < 2; i++)

@@ -1165,6 +1165,8 @@ static int gen_builtin_page_size(Node *node) {
 // `__vm_stream_read(buf,len)` lower to `call.sym "stream_write"/"stream_read"` on the Stream cap (the
 // host binds each name to its `(type_id, op)` — Stream op1/op0 — at load). The on-ramp reaches the same
 // endpoints through the `__vm_stream_*` temen-llvm intrinsics; this is the emit-object equivalent.
+// `__vm_stream_write_err(buf,len)` is the same write on the **stderr** stream (`call.sym "stderr"`),
+// which a host grants iff the module imports it (`Host::grant_stderr_if_imported`).
 static int gen_builtin_stream_raw(Node *node, const char *name) {
   Node *a = node->args;
   if (!a || !a->next || a->next->next)
@@ -2162,6 +2164,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_stream_raw(node, "stream_write");
         if (!strcmp(fname, "__vm_stream_read"))
           return gen_builtin_stream_raw(node, "stream_read");
+        if (!strcmp(fname, "__vm_stream_write_err"))
+          return gen_builtin_stream_raw(node, "stderr");
         if (!strcmp(fname, "__vm_resolve"))
           return gen_builtin_resolve(node);
         if (!strcmp(fname, "__vm_exec_module"))

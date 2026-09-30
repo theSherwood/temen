@@ -4,12 +4,13 @@
 //! temen-link — and nimsem's compile-time evaluation builds and runs programs of its own. The process
 //! tree runs on the browser's interpreter tier, over one POSIX personality and its memfs, as the
 //! self-hosted lane runs it natively (`scripts/ci/nim-selfhost-lane.sh`); a **leaf** process — one
-//! that cannot park, such as hexer and nifler2 — runs whole on the emitted tier (#1896).
+//! that cannot park, such as hexer and nifler2, or one that parks only on its pipes where the host can
+//! suspend its emitted frames — runs whole on the emitted tier (#1896).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint, LeafEmitter, TierUpConfig};
+use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint, LeafEmitter, LeafOffer, TierUpConfig};
 use temen_interp::Trap;
 use temen_ir::Module;
 
@@ -29,6 +30,8 @@ pub struct NimBuild {
     pub posix: temen_posix::Posix,
     /// How many processes ran whole as leaves, tiered up at their entry (#1896).
     pub leaves: usize,
+    /// How many calls parked in a leaf and were resumed.
+    pub resumes: usize,
 }
 
 /// Open `driver` (nimony) with `argv`, in `cwd`, over a memfs holding `files`. `commands` are what
@@ -93,7 +96,8 @@ pub fn nim_open(
 
 /// Run nimony's driver to its end ([`nim_open`]). With `leaves`, each leaf process tiers up at its
 /// entry, and this serves it by bouncing the entry: the nested interpretation an emitted image's own
-/// ops bounce into, so the native stand-in for running it emitted.
+/// ops bounce into, so the native stand-in for running it emitted. When that bounce parks, its frames
+/// are what the stand-in holds, suspended, until the resume hands it the entry's results.
 pub fn nim_build(
     driver: &Module,
     commands: &[(&Module, Vec<&str>)],
@@ -103,11 +107,11 @@ pub fn nim_build(
     leaves: bool,
 ) -> Option<NimBuild> {
     let leaf: Option<LeafEmitter> = match leaves {
-        true => Some(Arc::new(|_, _: &Module, _, _| true)),
+        true => Some(Arc::new(|_: &LeafOffer| true)),
         false => None,
     };
     let (mut run, posix) = nim_open(driver, commands, files, argv, cwd, leaf)?;
-    let mut ran = 0;
+    let (mut ran, mut resumes) = (0, 0);
     let end = loop {
         match run.run() {
             CoopEvent::TierUp { func, argv, .. } => {
@@ -115,9 +119,14 @@ pub fn nim_build(
                 let mut io = argv.to_vec();
                 io.resize(io.len().max(1), 0);
                 match run.bounce(func, &mut io, None) {
-                    Ok(n) => run.deliver_tierup(&io[..n]),
+                    Ok(Some(n)) => run.deliver_tierup(&io[..n]),
+                    Ok(None) => {}
                     Err(t) => run.deliver_tierup_trap(t),
                 }
+            }
+            CoopEvent::Resume { results } => {
+                resumes += 1;
+                run.deliver_tierup(&results);
             }
             end => break end,
         }
@@ -136,6 +145,7 @@ pub fn nim_build(
         footprint: run.footprint(),
         posix,
         leaves: ran,
+        resumes,
     })
 }
 
@@ -221,26 +231,30 @@ impl NimSession {
 
 /// The session's leaf emitter: emit an image whole, wasm-driven from its entry — page-checked when
 /// the engine says its page state can change — once per program. An image that is not wasm-drivable
-/// (it could suspend a frame) runs interpreted.
-fn leaf_emitter(leaves: Leaves) -> LeafEmitter {
-    Arc::new(move |module, m: &Module, entry, paged| {
+/// (it could suspend a frame) runs interpreted, and so does one that can park when the host cannot
+/// suspend its frames (`suspends`).
+fn leaf_emitter(leaves: Leaves, suspends: bool) -> LeafEmitter {
+    Arc::new(move |o: &LeafOffer| {
+        if o.parks && !suspends {
+            return false;
+        }
         let Ok(mut leaves) = leaves.lock() else {
             return false;
         };
-        let leaf = leaves.entry(module as u32).or_insert_with(|| {
-            let shape = temen_wasm_jit::Shape::Batch { entry };
-            let a = match paged {
+        let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
+            let shape = temen_wasm_jit::Shape::Batch { entry: o.entry };
+            let a = match o.paged {
                 true => {
                     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
-                    temen_wasm_jit::compile_jit_page_checked(m, shape, true, page_log2)
+                    temen_wasm_jit::compile_jit_page_checked(o.image, shape, true, page_log2)
                 }
-                false => temen_wasm_jit::compile_jit(m, shape, true),
+                false => temen_wasm_jit::compile_jit(o.image, shape, true),
             }
             .ok()?;
             let temen_wasm_jit::DriveMode::WasmDriven { .. } = a.drive else {
                 return None;
             };
-            Some((a.wasm.into(), paged))
+            Some((a.wasm.into(), o.paged))
         });
         leaf.is_some()
     })
@@ -265,8 +279,11 @@ pub(crate) fn finish(nim: NimSession) -> (Vec<u8>, Vec<u8>) {
 /// on the emitted tier (#1896). `[driver)` is nimony's module; `[cmds)` the commands, a registry blob
 /// ([`blob_entries`]) whose entry names list a module's paths, one per line; `[files)` the tree it
 /// builds in, a blob of `path → bytes`; `[argv)` its arguments, each NUL-terminated; `[cwd)` the
-/// directory it runs in. Returns `0`, or a negative status. When the run is done the exit code,
-/// stdout and stderr read back as after any run, and [`temen_nim_file`] reads what the build wrote.
+/// directory it runs in. `suspend` is non-zero when the driver can suspend a leaf's emitted frames
+/// where a call parks (JSPI): a leaf process that parks only on its pipes then runs emitted too, and
+/// a parked call surfaces as [`crate::COOP_RUN_RESUME`] once it returns. Returns `0`, or a negative
+/// status. When the run is done the exit code, stdout and stderr read back as after any run, and
+/// [`temen_nim_file`] reads what the build wrote.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live [`crate::temen_alloc`]ation the host filled, or `(null, 0)`.
@@ -283,6 +300,7 @@ pub unsafe extern "C" fn temen_nim_open(
     argv_len: usize,
     cwd_ptr: *const u8,
     cwd_len: usize,
+    suspend: i32,
 ) -> i32 {
     crate::temen_coop_close();
     // SAFETY: the caller's contract.
@@ -314,7 +332,7 @@ pub unsafe extern "C" fn temen_nim_open(
         argv.pop();
         let cwd = core::str::from_utf8(cwd).map_err(|_| STATUS_DECODE_ERR)?;
         let leaves = Leaves::default();
-        let emit = leaf_emitter(Arc::clone(&leaves));
+        let emit = leaf_emitter(Arc::clone(&leaves), suspend != 0);
         let (run, posix) = nim_open(&driver, &commands, &files, &argv, cwd, Some(emit))
             .ok_or(STATUS_UNSUPPORTED)?;
         // SAFETY: single-threaded wasm; the session is read back only via the coop exports.

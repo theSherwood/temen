@@ -17,6 +17,7 @@ typedef int pid_t;
 // not defined in the translation unit (`codegen_ir.c`), so the definitions below shadow them — and a
 // dispatcher that reached stdout by calling `write` would recurse into itself.
 extern long __vm_stream_write(const void *buf, unsigned long n);
+extern long __vm_stream_write_err(const void *buf, unsigned long n); // the stderr stream
 extern long __vm_stream_read(void *buf, unsigned long n);
 
 // #1323 (c_interpret #16, file I/O): file access over the powerbox `fs` capability. `__vm_fs(op,…)`
@@ -45,7 +46,8 @@ enum { __FS_O_READ = 1, __FS_O_WRITE = 2, __FS_O_APPEND = 4, __FS_O_TRUNC = 8, _
 // noise next to the hundreds this header set already moved out.
 static inline int write(int fd, char *buf, long n) {
   if (fd > 2) return (int)__vm_fs(__FS_WRITE, fd, (long)buf, n, 0); // file fd → the memfs
-  return (int)__vm_stream_write(buf, (unsigned long)n);             // 0/1/2 → the ambient Stream
+  if (fd == 2) return (int)__vm_stream_write_err(buf, (unsigned long)n); // → the stderr Stream
+  return (int)__vm_stream_write(buf, (unsigned long)n);             // 0/1 → the ambient Stream
 }
 static inline int read(int fd, char *buf, long n) {
   if (fd > 2) return (int)__vm_fs(__FS_READ, fd, (long)buf, n, 0);

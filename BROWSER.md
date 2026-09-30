@@ -782,6 +782,10 @@ suspension boundaries.
   `thread.join`/`memory.wait`/spawn/instantiate return to the vCPU event loop (state spilled at the
   boundary), exactly v86's dispatch-loop shape. Note `call.cap` host I/O on the browser path is
   **synchronous in-Rust** (the 4d shared powerbox) — it does *not* force a fallback, just a call.
+  JSPI (`WebAssembly.Suspending`/`promising`, in Chromium) is the first stack switching the tier
+  uses: a leaf process of a process tree that parks on its pipes is suspended there and resumed
+  (#1896, DESIGN.md "Process trees: leaf processes"). Where it is missing, such a leaf runs
+  interpreted.
 - **CSP footnote**: runtime wasm compilation needs `wasm-unsafe-eval` (or a permissive default) on
   the embedding page. Our pages are fine; document for embedders.
 

@@ -930,12 +930,6 @@ struct Terminal {
     input_pipe: u32,
     /// The canonical-mode line under construction (flushed to the backing on `\n`/`VEOF`).
     canon_buf: Vec<u8>,
-    /// #797 — a **one-shot** `VEOF` (`^D`) latch. An empty-line `^D` drops `input_writers` to 0 so the
-    /// pending read returns 0 (EOF); this flags that it was deliberate, so the NEXT terminal read
-    /// re-arms `input_writers` to 1 (a terminal is never truly writer-closed — the embedder keeps
-    /// typing). Without the re-arm the writer stayed 0 and EVERY later read EOF'd, so you could not
-    /// `^D` a foreground `cat` and keep using the shell (the shell's own prompt read then EOF'd too).
-    eof_armed: bool,
 }
 
 /// #1496 — the `TERM` name an interactive embedder exports alongside [`TERMCAP_ENTRY`]. Not `dumb`:
@@ -1569,7 +1563,6 @@ impl Posix {
             input_writers: writers,
             input_pipe: pipe,
             canon_buf: Vec::new(),
-            eof_armed: false,
         });
         // #797 interactive rung 2 — the ROOT's own terminal token (`h` was minted in its
         // powerbox); forks clone it, execs re-point it (see [`Proc::term_in`]).
@@ -1580,8 +1573,9 @@ impl Posix {
     /// #797 — deliver keystrokes to the terminal: the **line discipline runs here**, at feed
     /// time, host-side. Raw mode (`!ICANON`) deposits bytes immediately; canonical mode buffers
     /// with `VERASE`/`VKILL` editing and flushes completed lines (newline, or a mid-line `VEOF`);
-    /// `VEOF` on an empty line drops the held writer count — parked readers wake to true EOF
-    /// (one-shot, the rung-1 decision). `ECHO` mirrors input to the stdout sink (`VERASE` echoes
+    /// `VEOF` on an empty line drops the held writer count, so the next read of the empty pipe
+    /// returns EOF, once (the rung-1 decision; the core restores the count when a read takes the
+    /// EOF, #1926). `ECHO` mirrors input to the stdout sink (`VERASE` echoes
     /// backspace-space-backspace). `ISIG` chars never enter the stream: they fire the #798 group
     /// machinery at the foreground pgid (`VINTR`→SIGINT, `VQUIT`→SIGQUIT, `VSUSP`→SIGTSTP) via
     /// [`Self::kill_pid`] per member, after every lock is released. A parked reader is woken
@@ -1669,12 +1663,11 @@ impl Posix {
                     .extend(deposit);
             }
             if eof {
-                // #797 — drop the writer so the pending read returns 0 (EOF), and latch it as a
-                // one-shot: the next terminal read re-arms the writer so later reads block again
-                // (the shell's prompt read must NOT inherit this EOF — see [`Ctx::read`]).
+                // #797 — drop the writer so the next read of the empty pipe returns 0 (EOF). It is
+                // one-shot: the read that returns it restores the writer (#1926), so after a `^D`
+                // ends a foreground `cat`, the shell's prompt read blocks again.
                 term.input_writers
                     .store(0, std::sync::atomic::Ordering::SeqCst);
-                term.eof_armed = true;
             }
             if !out.is_empty() {
                 match &w.stdout_sink {
@@ -2229,8 +2222,9 @@ impl SignalSource for SignalDoor {
 
     /// #1896 — whether this personality's op `import` can park the process. The ops in
     /// [`NEVER_PARKS`] never do; a `read` or `write` does when the process holds something it could
-    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. `None` for an
-    /// import that is not this personality's.
+    /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. A core pipe end
+    /// is not one: the op redirects to the core pipe's stream call, which parks in its place and
+    /// which the engine answers for. `None` for an import that is not this personality's.
     fn import_parks(&self, import: &str) -> Option<bool> {
         let op = resolve_import(import)?.op;
         if op != OP_READ && op != OP_WRITE {
@@ -2244,7 +2238,7 @@ impl SignalSource for SignalDoor {
             .is_some();
         let p = self.0.lock().unwrap_or_else(|e| e.into_inner());
         Some(p.fds.iter().flatten().any(|f| match f {
-            FdEntry::File(_) => false,
+            FdEntry::File(_) | FdEntry::CorePipe(_) => false,
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => terminal,
             _ => true,
         }))
@@ -3313,18 +3307,6 @@ impl Ctx<'_> {
             // line before parking (POSIX stops BEFORE the I/O; the `bg` probe caught the steal).
             if self.p.stopped_sig.is_some() {
                 return Ok(vec![ERESTART]);
-            }
-            // #797 — re-arm the one-shot `^D` EOF. A prior empty-line `VEOF` dropped the terminal's
-            // writer to 0 so the then-pending read returned 0 (EOF). This is the NEXT fresh terminal
-            // read (e.g. the shell's prompt read after a foreground `cat` exited on that EOF): restore
-            // the writer so it blocks for new input instead of inheriting the stale EOF. A terminal is
-            // never truly writer-closed — the embedder keeps typing — so a second EOF needs a second ^D.
-            if let Some(t) = self.w.terminal.as_mut() {
-                if t.eof_armed {
-                    t.input_writers
-                        .store(1, std::sync::atomic::Ordering::SeqCst);
-                    t.eof_armed = false;
-                }
             }
             // #797 interactive rung 2 — mint the tag from THIS process's own token (handle
             // values are per-powerbox; the world's is the root namespace's). A process without

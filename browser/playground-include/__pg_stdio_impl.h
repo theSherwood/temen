@@ -29,7 +29,7 @@ __PG_FN void __pg_fwrite_raw(FILE *f, const char *p, size_t n) {
     if (f->fd > 2)
       __vm_fs(__FS_WRITE, f->fd, (long)p, (long)n, 0); // file fd → the memfs
     else
-      write(f->fd, (char *)p, (long)n); // 0/1/2 → the ambient Stream
+      write(f->fd, (char *)p, (long)n); // 0/1 → stdout, 2 → the stderr stream
   }
 }
 
@@ -442,6 +442,7 @@ __PG_FN FILE *fopen(const char *path, const char *mode) {
   FILE *f = (FILE *)malloc(sizeof(FILE));
   if (!f) { __vm_fs(__FS_CLOSE, fd, 0, 0, 0); return 0; }
   f->fd = (int)fd; f->memp = 0; f->memlenp = 0; f->mem = 0; f->memcap = 0; f->memlen = 0;
+  f->unget = 0;
   return f;
 }
 
@@ -449,7 +450,7 @@ __PG_FN FILE *open_memstream(char **bufp, size_t *lenp) {
   FILE *f = (FILE *)malloc(sizeof(FILE));
   if (!f) return 0;
   f->fd = -1; f->memp = bufp; f->memlenp = lenp;
-  f->memcap = 128; f->memlen = 0;
+  f->memcap = 128; f->memlen = 0; f->unget = 0;
   f->mem = (char *)malloc(f->memcap);
   if (!f->mem) return 0;
   f->mem[0] = 0;
@@ -460,11 +461,17 @@ __PG_FN FILE *open_memstream(char **bufp, size_t *lenp) {
 
 __PG_FN size_t fread(void *ptr, size_t sz, size_t nm, FILE *stream) {
   if (!stream || stream->fd < 0) return 0;
-  long want = (long)(sz * nm);
-  long r = stream->fd > 2 ? __vm_fs(__FS_READ, stream->fd, (long)ptr, want, 0)  // file fd → memfs
-                          : read(stream->fd, (char *)ptr, want);                // 0/1/2 → Stream
-  if (r <= 0) return 0;
-  return sz ? (size_t)r / sz : 0;
+  long want = (long)(sz * nm), got = 0;
+  if (want > 0 && stream->unget) { // a byte `ungetc` pushed back comes first
+    *(char *)ptr = (char)(stream->unget - 1);
+    stream->unget = 0;
+    got = 1;
+  }
+  long r = want - got == 0 ? 0
+           : stream->fd > 2 ? __vm_fs(__FS_READ, stream->fd, (long)ptr + got, want - got, 0) // memfs
+                            : read(stream->fd, (char *)ptr + got, want - got);          // Stream
+  if (r > 0) got += r;
+  return sz ? (size_t)got / sz : 0;
 }
 
 // Reposition/report a file stream (no-op-ish on a memory stream). SEEK_SET/CUR/END == the cap's whence.
@@ -487,22 +494,248 @@ __PG_FN int fclose(FILE *stream) {
   return 0;
 }
 
-__PG_FN int getchar(void) {
+// One byte from `stream` (or the byte `ungetc` pushed back), EOF at the end. A memory stream is
+// write-only here, so it reads as empty.
+__PG_FN int fgetc(FILE *stream) {
+  if (!stream) stream = stdin;
+  if (stream->unget) {
+    int c = stream->unget - 1;
+    stream->unget = 0;
+    return c;
+  }
+  if (stream->fd < 0) return EOF;
   char c;
-  return read(0, &c, 1) == 1 ? (unsigned char)c : EOF;
+  long r = stream->fd > 2 ? __vm_fs(__FS_READ, stream->fd, (long)&c, 1, 0) : read(stream->fd, &c, 1);
+  return r == 1 ? (unsigned char)c : EOF;
+}
+__PG_FN int getc(FILE *stream) { return fgetc(stream); }
+__PG_FN int getchar(void) { return fgetc(stdin); }
+
+// Push one byte back onto `stream` for the next read (one byte of pushback, as C guarantees).
+__PG_FN int ungetc(int c, FILE *stream) {
+  if (c == EOF || !stream) return EOF;
+  stream->unget = (unsigned char)c + 1;
+  return (unsigned char)c;
 }
 
 __PG_FN char *fgets(char *s, int size, FILE *stream) {
-  int fd = stream ? stream->fd : 0, i = 0;
+  int i = 0;
   while (i < size - 1) {
-    char c;
-    long r = fd > 2 ? __vm_fs(__FS_READ, fd, (long)&c, 1, 0) : read(fd, &c, 1);
-    if (r != 1) { if (i == 0) return 0; break; }
-    s[i++] = c;
+    int c = fgetc(stream);
+    if (c == EOF) { if (i == 0) return 0; break; }
+    s[i++] = (char)c;
     if (c == '\n') break;
   }
   s[i] = 0;
   return s;
+}
+
+// ---- input conversion (the scanf family) --------------------------------------------------------
+// One scanner over a FILE or a string. It needs one byte of lookahead — a number ends at the first
+// byte that can't continue it, which the next conversion must still see — hence `ungetc`.
+struct __pg_scan {
+  FILE *f;       // reading a stream, or...
+  const char *s; // ...a string (`sscanf`), when `f` is null
+  int n;         // bytes consumed so far (`%n`)
+};
+static int __pg_sget(struct __pg_scan *sc) {
+  int c = sc->f ? fgetc(sc->f) : (*sc->s ? (unsigned char)*sc->s++ : EOF);
+  if (c != EOF) sc->n++;
+  return c;
+}
+static void __pg_sunget(struct __pg_scan *sc, int c) {
+  if (c == EOF) return;
+  sc->n--;
+  if (sc->f) ungetc(c, sc->f);
+  else sc->s--;
+}
+static int __pg_isspace(int c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+static int __pg_digit(int c, int base) {
+  int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10
+        : c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 99;
+  return d < base ? d : -1;
+}
+// Is `c` in the `%[...]` set that starts at `set` (just past the `[`, and past a leading `^`)?
+static int __pg_inset(const char *set, const char *end, int c) {
+  for (const char *p = set; p < end; p++) {
+    if (p + 2 < end && p[1] == '-' && p != set) {
+      if (c >= (unsigned char)p[0] && c <= (unsigned char)p[2]) return 1;
+      p += 2;
+    } else if (c == (unsigned char)*p) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int __pg_vscan(struct __pg_scan *sc, const char *fmt, va_list ap) {
+  int assigned = 0, failed_at_eof = 0, c;
+  for (; *fmt; fmt++) {
+    if (__pg_isspace((unsigned char)*fmt)) { // whitespace matches any run of it, including none
+      while (__pg_isspace(c = __pg_sget(sc))) {}
+      __pg_sunget(sc, c);
+      continue;
+    }
+    if (*fmt != '%' || fmt[1] == '%') { // a literal byte (`%%` is a literal `%`, after whitespace)
+      if (*fmt == '%') {
+        fmt++;
+        while (__pg_isspace(c = __pg_sget(sc))) {}
+      } else {
+        c = __pg_sget(sc);
+      }
+      if (c != (unsigned char)*fmt) {
+        failed_at_eof = c == EOF;
+        __pg_sunget(sc, c);
+        break;
+      }
+      continue;
+    }
+    fmt++;
+    int skip = 0, width = 0, len = 0; // len: -2 hh, -1 h, 0 none, 1 l/j/z/t, 2 ll, 3 L
+    if (*fmt == '*') { skip = 1; fmt++; }
+    while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+    if (*fmt == 'h') { len = -1; if (*++fmt == 'h') { len = -2; fmt++; } }
+    else if (*fmt == 'l') { len = 1; if (*++fmt == 'l') { len = 2; fmt++; } }
+    else if (*fmt == 'L') { len = 3; fmt++; }
+    else if (*fmt == 'j' || *fmt == 'z' || *fmt == 't') { len = 1; fmt++; }
+    char conv = *fmt;
+    if (!conv) break;
+    if (conv == 'n') {
+      if (!skip) *va_arg(ap, int *) = sc->n;
+      continue;
+    }
+    if (conv != 'c' && conv != '[') { // every other conversion skips leading whitespace
+      while (__pg_isspace(c = __pg_sget(sc))) {}
+      __pg_sunget(sc, c);
+    }
+    if (width == 0) width = conv == 'c' ? 1 : 1 << 30;
+
+    if (conv == 'c' || conv == 's' || conv == '[') {
+      const char *set = 0, *set_end = 0;
+      int negate = 0;
+      if (conv == '[') {
+        set = ++fmt;
+        if (*set == '^') { negate = 1; set = ++fmt; }
+        if (*fmt == ']') fmt++; // a leading `]` is a member
+        while (*fmt && *fmt != ']') fmt++;
+        set_end = fmt;
+        if (!*fmt) break;
+      }
+      char *out = skip ? 0 : va_arg(ap, char *);
+      int k = 0;
+      while (k < width) {
+        c = __pg_sget(sc);
+        int take = c != EOF && (conv == 'c' ? 1
+                   : conv == 's' ? !__pg_isspace(c)
+                   : __pg_inset(set, set_end, c) != negate);
+        if (!take) { __pg_sunget(sc, c); if (c == EOF) failed_at_eof = 1; break; }
+        if (out) out[k] = (char)c;
+        k++;
+      }
+      if (k == 0 || (conv == 'c' && k < width)) break;
+      if (out && conv != 'c') out[k] = 0;
+      if (!skip) assigned++;
+      continue;
+    }
+
+    if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'o' || conv == 'x' || conv == 'X' ||
+        conv == 'p') {
+      int base = conv == 'd' || conv == 'u' ? 10 : conv == 'i' ? 0 : conv == 'o' ? 8 : 16;
+      int k = 0, neg = 0, digits = 0;
+      unsigned long long v = 0;
+      c = __pg_sget(sc);
+      if ((c == '-' || c == '+') && k < width) { neg = c == '-'; k++; c = __pg_sget(sc); }
+      if ((base == 0 || base == 16) && c == '0' && k < width) {
+        k++; digits = 1; c = __pg_sget(sc); // a lone `0` is a digit; `0x` introduces hex
+        if ((c == 'x' || c == 'X') && k < width) { base = 16; k++; digits = 0; c = __pg_sget(sc); }
+        else if (base == 0) base = 8;
+      }
+      if (base == 0) base = 10;
+      while (k < width && __pg_digit(c, base) >= 0) {
+        v = v * base + __pg_digit(c, base);
+        digits++; k++;
+        c = __pg_sget(sc);
+      }
+      __pg_sunget(sc, c);
+      if (!digits) { failed_at_eof = c == EOF; break; }
+      if (neg) v = -v;
+      if (!skip) {
+        if (conv == 'p') *va_arg(ap, void **) = (void *)v;
+        else if (len == -2) *va_arg(ap, char *) = (char)v;
+        else if (len == -1) *va_arg(ap, short *) = (short)v;
+        else if (len == 0) *va_arg(ap, int *) = (int)v;
+        else if (len == 1) *va_arg(ap, long *) = (long)v;
+        else *va_arg(ap, long long *) = (long long)v;
+        assigned++;
+      }
+      continue;
+    }
+
+    if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G' ||
+        conv == 'a' || conv == 'A') {
+      // [sign] digits [. digits] [e [sign] digits] — the mantissa as an integer over a power of ten,
+      // so a short decimal like 3.14 converts exactly-rounded (314 / 100).
+      int k = 0, neg = 0, digits = 0, frac = 0, exp = 0, eneg = 0;
+      double m = 0;
+      c = __pg_sget(sc);
+      if ((c == '-' || c == '+') && k < width) { neg = c == '-'; k++; c = __pg_sget(sc); }
+      while (k < width && c >= '0' && c <= '9') { m = m * 10 + (c - '0'); digits++; k++; c = __pg_sget(sc); }
+      if (k < width && c == '.') {
+        k++; c = __pg_sget(sc);
+        while (k < width && c >= '0' && c <= '9') { m = m * 10 + (c - '0'); digits++; frac++; k++; c = __pg_sget(sc); }
+      }
+      if (digits && k < width && (c == 'e' || c == 'E')) {
+        k++; c = __pg_sget(sc);
+        if ((c == '-' || c == '+') && k < width) { eneg = c == '-'; k++; c = __pg_sget(sc); }
+        while (k < width && c >= '0' && c <= '9') { exp = exp * 10 + (c - '0'); k++; c = __pg_sget(sc); }
+      }
+      __pg_sunget(sc, c);
+      if (!digits) { failed_at_eof = c == EOF; break; }
+      exp = (eneg ? -exp : exp) - frac;
+      double p = 1;
+      for (int e = exp < 0 ? -exp : exp; e > 0; e--) p *= 10;
+      double v = exp < 0 ? m / p : m * p;
+      if (neg) v = -v;
+      if (!skip) {
+        if (len == 0) *va_arg(ap, float *) = (float)v;
+        else if (len == 3) *va_arg(ap, long double *) = v;
+        else *va_arg(ap, double *) = v;
+        assigned++;
+      }
+      continue;
+    }
+    break; // an unknown conversion ends the scan
+  }
+  // EOF only for an input failure before any conversion was assigned, as C specifies.
+  return assigned == 0 && failed_at_eof ? EOF : assigned;
+}
+
+__PG_FN int vfscanf(FILE *stream, const char *fmt, va_list ap) {
+  struct __pg_scan sc = {stream ? stream : stdin, 0, 0};
+  return __pg_vscan(&sc, fmt, ap);
+}
+__PG_FN int vscanf(const char *fmt, va_list ap) { return vfscanf(stdin, fmt, ap); }
+__PG_FN int vsscanf(const char *str, const char *fmt, va_list ap) {
+  struct __pg_scan sc = {0, str, 0};
+  return __pg_vscan(&sc, fmt, ap);
+}
+__PG_FN int fscanf(FILE *stream, const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  int r = vfscanf(stream, fmt, ap);
+  va_end(ap);
+  return r;
+}
+__PG_FN int scanf(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  int r = vfscanf(stdin, fmt, ap);
+  va_end(ap);
+  return r;
+}
+__PG_FN int sscanf(const char *str, const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  int r = vsscanf(str, fmt, ap);
+  va_end(ap);
+  return r;
 }
 
 #endif

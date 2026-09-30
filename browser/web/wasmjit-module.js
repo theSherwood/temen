@@ -355,6 +355,12 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 // over the cdylib's shared memory, and deliver the results (or the trap) back to the parked vCPU;
 // `env.call_interp` is the live-state bounce. Proven observably identical to `onramp_exec` by
 // tests/coop_tierup_driver.rs (wasmi playing this file's role).
+/// #1896 — whether this host can **suspend** a leaf's emitted frames where a call in it parks: JSPI
+/// (`WebAssembly.Suspending` / `WebAssembly.promising`). Pass it to `temen_nim_open`: without it the
+/// engine offers no leaf that can park, and such a process runs interpreted instead.
+export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
+  && typeof WebAssembly.promising === 'function';
+
 export async function driveCoopTierupRun(ex, memory, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
@@ -387,42 +393,68 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
   // 1-slot table) and emits in local-table mode, so the shared table is inert for it.
   const tsize = 1 << ex.temen_coop_table_log2();
   const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
-  const unitImports = () => ({ env: {
+  const bounce = (target, argsPtr) => {
+    // #1627: a spilling run hands the bounce the words its emitted frames pushed, `[base, cursor)`.
+    const spillLen = spillBase
+      ? (new DataView(memory.buffer).getUint32(envCell + spillOff, true) - spillBase) / 8
+      : 0;
+    return ex.temen_coop_call_interp(target, argsPtr, spillLen);
+  };
+  // What a bounce's return fans out to the live instances — and a parked call's (#1896).
+  const afterBounce = (rc) => {
+    // #1233: the bounce may have been a `Jit.install`/`uninstall` issued from the emitted frame
+    // itself (Forth's outer interpreter defining a word, then `call.dyn`ing it) — the slot mirror
+    // moved mid-event, and the frame's next `call_indirect` must find the new occupant, not a stale
+    // or empty slot. Rebuild synchronously, before the globals fan-out below primes any instance
+    // this creates (a word unit is tiny; one over the sync compile budget gets a bounce shim now and
+    // its emitted unit at the next event-boundary sync).
+    if (rc === 0 && ex.temen_coop_table_gen() !== syncedGen) syncTableSync();
+    // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
+    // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
+    if (ex.temen_coop_paged()) {
+      const cover = ex.temen_coop_mapped();
+      for (const g of mappedGlobals) g.value = cover;
+      const ps = Number(ex.temen_coop_pagestate_ptr());
+      for (const g of pagestateGlobals) g.value = ps;
+    } else {
+      const now = ex.temen_coop_mapped_now();
+      for (const g of mappedGlobals) g.value = now;
+    }
+    // #1312: the bounce ran interpreted guest code, which may have `vm_map`-grown the window. A
+    // grow reallocates the backing and can MOVE it, so publish the current base to every live
+    // instance — the emitted frame reloads its `win` from this global on return from the bounce.
+    // Read it fresh here (never cached): this is the one point in the run where it can change.
+    const base = Number(ex.temen_coop_tierup_win_ptr());
+    for (const g of winGlobals) g.value = base;
+  };
+  const callInterp = (target, argsPtr) => {
+    const rc = bounce(target, argsPtr);
+    afterBounce(rc);
+    if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
+  };
+  // #1896 — a leaf's `call_interp` under JSPI. A call that parks (`2`) suspends the leaf's frames on
+  // the promise returned here, and the driver runs on; `COOP_RUN_RESUME` resolves it once the call
+  // has returned, with its results in the call's scratch.
+  let parking = null; // the running leaf's parked call: its scratch, and what resumes its frames
+  let parked = () => {}; // tells `settle` the running leaf parked
+  const leafCallInterp = suspendsLeaves
+    ? new WebAssembly.Suspending((target, argsPtr) => {
+      const rc = bounce(target, argsPtr);
+      if (rc === 2) {
+        return new Promise((resolve) => {
+          parking = { argsPtr, resolve };
+          parked();
+        });
+      }
+      afterBounce(rc);
+      if (rc !== 0) throw new Error('bounce trap');
+    })
+    : callInterp;
+  const unitImports = (call_interp = callInterp) => ({ env: {
     memory,
     __indirect_function_table: table,
     trap: () => {},
-    call_interp: (target, argsPtr) => {
-      // #1627: a spilling run hands the bounce the words its emitted frames pushed, `[base, cursor)`.
-      const spillLen = spillBase
-        ? (new DataView(memory.buffer).getUint32(envCell + spillOff, true) - spillBase) / 8
-        : 0;
-      const rc = ex.temen_coop_call_interp(target, argsPtr, spillLen);
-      // #1233: the bounce may have been a `Jit.install`/`uninstall` issued from the emitted frame
-      // itself (Forth's outer interpreter defining a word, then `call.dyn`ing it) — the slot mirror
-      // moved mid-event, and the frame's next `call_indirect` must find the new occupant, not a stale
-      // or empty slot. Rebuild synchronously, before the globals fan-out below primes any instance
-      // this creates (a word unit is tiny; one over the sync compile budget gets a bounce shim now and
-      // its emitted unit at the next event-boundary sync).
-      if (rc === 0 && ex.temen_coop_table_gen() !== syncedGen) syncTableSync();
-      // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
-      // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
-      if (ex.temen_coop_paged()) {
-        const cover = ex.temen_coop_mapped();
-        for (const g of mappedGlobals) g.value = cover;
-        const ps = Number(ex.temen_coop_pagestate_ptr());
-        for (const g of pagestateGlobals) g.value = ps;
-      } else {
-        const now = ex.temen_coop_mapped_now();
-        for (const g of mappedGlobals) g.value = now;
-      }
-      // #1312: the bounce ran interpreted guest code, which may have `vm_map`-grown the window. A
-      // grow reallocates the backing and can MOVE it, so publish the current base to every live
-      // instance — the emitted frame reloads its `win` from this global on return from the bounce.
-      // Read it fresh here (never cached): this is the one point in the run where it can change.
-      const base = Number(ex.temen_coop_tierup_win_ptr());
-      for (const g of winGlobals) g.value = base;
-      if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
-    },
+    call_interp,
   } });
 
   // The run's own emit (program 0). A nimony build (`temen_nim_open`) emits none of its own: its
@@ -448,7 +480,8 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
     if (p === undefined) {
       const ptr = Number(ex.temen_coop_leaf_wasm_ptr(m));
       const bytes = u8().slice(ptr, ptr + ex.temen_coop_leaf_wasm_len(m));
-      p = (await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports())).exports;
+      p = (await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports(leafCallInterp)))
+        .exports;
       registerGlobals(p);
       programs.set(m, p);
     }
@@ -617,9 +650,58 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
     syncedGen = gen;
   };
 
+  const deliver = (ret) => {
+    const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+    const rlen = Math.max(1, rets.length) * 8;
+    const rptr = Number(ex.temen_alloc(rlen));
+    for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
+    ex.temen_coop_deliver(rptr, rets.length);
+    ex.temen_dealloc(rptr, rlen);
+  };
+  // #1896 — run a leaf's frames, its entry or its frames resuming, until the leaf ends or a call in
+  // it parks: deliver the end, or hold the frames (`suspended`, by task) until the call returns.
+  const suspended = new Map();
+  const settle = async (task, go) => {
+    const parks = new Promise((r) => { parked = r; });
+    const run = go();
+    const end = await Promise.race([
+      run.then((ret) => ({ ret }), () => ({ trapped: true })),
+      parks.then(() => ({ parks: true })),
+    ]);
+    parked = () => {};
+    if (end.parks) {
+      suspended.set(task, { run, ...parking });
+      parking = null;
+    } else if (end.trapped) {
+      ex.temen_coop_deliver_trap();
+    } else {
+      deliver(end.ret);
+    }
+  };
+
   try {
     for (;;) {
       const ev = ex.temen_coop_run();
+      if (ev === 4 /* COOP_RUN_RESUME */) {
+        // #1896: a leaf's parked call returned. Its results go to the call's scratch, the globals
+        // fan out as after any bounce, and the leaf's frames run on.
+        const task = ex.temen_coop_task();
+        const leaf = suspended.get(task);
+        suspended.delete(task);
+        const from = Number(ex.temen_coop_argv_ptr()) >> 3;
+        for (let i = 0; i < ex.temen_coop_argv_len(); i++) {
+          i64()[(leaf.argsPtr >> 3) + i] = i64()[from + i];
+        }
+        await syncTable();
+        afterBounce(0);
+        for (const g of fuelGlobals) g.value = 1n << 61n;
+        armEnv();
+        await settle(task, () => {
+          leaf.resolve();
+          return leaf.run;
+        });
+        continue;
+      }
       if (ev === 3 /* COOP_RUN_JIT_INVOKE */) {
         // A guest-compiled §22 unit with emitted wasm: sync the table (its `call_indirect` may reach
         // installed units / program `f{i}`s / bounce shims), instantiate once per code handle, then
@@ -664,7 +746,8 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
       await syncTable();
       const func = ex.temen_coop_func();
       // Before the per-event fan-out below, so a program instantiated now gets this event's sync.
-      const program = await programFor(ex.temen_coop_module());
+      const m = ex.temen_coop_module();
+      const program = await programFor(m);
       const argvPtr = Number(ex.temen_coop_argv_ptr());
       const n = ex.temen_coop_argv_len();
       const args = [];
@@ -681,14 +764,14 @@ export async function driveCoopTierupRun(ex, memory, cacheKey) {
         for (const g of pagestateGlobals) g.value = ps;
       }
       armEnv();
+      // #1896: a leaf program runs under JSPI where there is one, so that a call in it can park.
+      if (suspendsLeaves && m !== 0) {
+        const entry = WebAssembly.promising(program['f' + func]);
+        await settle(ex.temen_coop_task(), () => entry(eventWin(), envCell, ...args));
+        continue;
+      }
       try {
-        const ret = program['f' + func](eventWin(), envCell, ...args);
-        const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
-        const rlen = Math.max(1, rets.length) * 8;
-        const rptr = Number(ex.temen_alloc(rlen));
-        for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
-        ex.temen_coop_deliver(rptr, rets.length);
-        ex.temen_dealloc(rptr, rlen);
+        deliver(program['f' + func](eventWin(), envCell, ...args));
       } catch {
         ex.temen_coop_deliver_trap();
       }

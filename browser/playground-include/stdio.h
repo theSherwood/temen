@@ -33,6 +33,7 @@ typedef struct __pg_FILE {
   size_t *memlenp;              // open_memstream: where to publish the length
   char *mem;                    // the growable buffer (memory stream)
   size_t memcap, memlen;
+  int unget;                    // `ungetc`'s pushed-back byte + 1; 0 = none (so zeroed means empty)
 } FILE;
 // The three standard streams. Normally this translation unit's own definition; under
 // `__PG_LIBC_DECLS_ONLY` (a program unit linking against a prebuilt libc unit, #1392) it is a
@@ -120,7 +121,16 @@ long ftell(FILE *stream);
 void rewind(FILE *stream);
 int fclose(FILE *stream);
 int getchar(void);
+int fgetc(FILE *stream);
+int getc(FILE *stream);
+int ungetc(int c, FILE *stream);
 char *fgets(char *s, int size, FILE *stream);
+int vfscanf(FILE *stream, const char *fmt, va_list ap);
+int vscanf(const char *fmt, va_list ap);
+int vsscanf(const char *str, const char *fmt, va_list ap);
+int fscanf(FILE *stream, const char *fmt, ...);
+int scanf(const char *fmt, ...);
+int sscanf(const char *str, const char *fmt, ...);
 #endif /* __PG_LIBC_DECLS_ONLY */
 
 // ---- bodies -----------------------------------------------------------------------------

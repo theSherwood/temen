@@ -2389,22 +2389,34 @@ losing §5 self-corruption detection, but the guest still cannot escape.)
 **Process trees: leaf processes (#1896).** A cooperative run that drives a process tree (the
 browser's nimony build, `temen_nim_open`) keeps the tree itself on the interpreter — fork, exec,
 wait, pipes — and runs each **leaf process** whole on emitted wasm. An image a process `execve`s is
-offered to the host's emitter (`TierUpConfig::leaf`) when it cannot **park**, i.e. block until
-another process or thread acts (`image_may_park`, the engine's one predicate): the personality
-answers for its own ops (`SignalSource::import_parks` — file, directory, environment and identity
-ops never park, `read`/`write` only when the process holds a pipe, a socket or a terminal), a stream
-cap call parks only on a pipe end or a blocking stdin, the address-space ops never park, and a §12
-concurrency op, a rebindable import, or any other import or cap call may. The leaf runs over a flat
-copy of the caller's window, materialized exactly as the in-place exec would be, and tiers up at its
-entry (`CoopEvent::TierUp` naming its program); its delivery ends the process as a return from the
-entry would. An image that can change its page state — an address-space `map`/`unmap`/`protect`,
-inline or through an import, which the image alone does not show — is emitted page-checked
+offered to the host's emitter (`TierUpConfig::leaf`, a `LeafOffer`) unless it can **park**, i.e.
+block until another process or thread acts, other than in a stream call (`image_parks`, the engine's
+one predicate): the personality answers for its own ops (`SignalSource::import_parks` — file,
+directory, environment and identity ops never park, `read`/`write` only when the process holds one
+of the personality's pipes, a socket or a terminal; on a core pipe end they redirect to its stream
+call), a stream read parks on a core pipe end or a blocking stdin and a stream write on a core pipe
+end, the address-space ops never park, and a §12 concurrency op, a rebindable import, or any other
+import or cap call, a dynamic one included, may. The leaf runs over a flat copy of the caller's
+window, materialized exactly as the in-place exec would be, and tiers up at its entry
+(`CoopEvent::TierUp` naming its program); its delivery ends the process as a return from the entry
+would. An image that can change its page state — an address-space `map`/`unmap`/`protect`, inline
+or through an import, which the image alone does not show — is emitted page-checked
 (`compile_jit_page_checked`), because a whole run cannot decline when a hole or a protection takes
-its window past one bound. **Scheduling:** a leaf runs as one slice — nothing else in the tree runs
-until it ends, a schedule the interpreter could also have chosen for a leaf that terminates. A leaf
-that instead busy-waits on another process's effect through ops that do not park (polling for a
-file, say) never sees it and spins where the interpreter would complete: tracked debt on #1896,
-converging with resumable emitted frames, which are also what a leaf holding a pipe needs.
+its window past one bound. **Parking.** An image that can park in a stream call (`LeafOffer::parks`)
+is emitted only by a host that can **suspend** its emitted frames there — the browser's driver,
+with JSPI (`WebAssembly.Suspending` on the leaf's `env.call_interp`, `WebAssembly.promising` on its
+entry). A call that parks in a bounce out of it hands its task the rest of the call (the bounce's
+interpreted continuation, its op rewound), and the task parks as an interpreted one would
+(`CoopRun::bounce` answers `None`); the host holds the frames and runs on. Once the park clears the
+pump runs the rest of the call and surfaces `CoopEvent::Resume` with its results, and the host
+resumes the frames with them. A host without JSPI is not offered such an image, which runs
+interpreted. (A durable form — instrument the image at its stream calls and pause it by unwind and
+rewind, #1768's mechanism — was measured and set aside: nim reaches `write` from nearly every
+function, so hexer instrumented grew about 6×, 339K to 2.0M instructions, past what the tier
+emits.) **Scheduling:** a leaf runs as one slice between parks — nothing else in the tree runs
+meanwhile, a schedule the interpreter could also have chosen. A leaf that instead busy-waits on
+another process's effect through ops that do not park (polling for a file, say) never sees it and
+spins where the interpreter would complete: tracked debt on #1896.
 
 ---
 

@@ -346,7 +346,11 @@ impl ChildExec {
     pub(crate) fn spawn(self: &Arc<Self>, mut task: ChildTask) {
         // #1469 — a child compiled with thread ops gets its own domain over its window (the thread
         // thunks find it through `os_thread_rt::CURRENT_DOMAIN`, set for each residency below).
-        if task._code.thread.spawn_thunk != 0 {
+        // So does a durable child (#1937): a wait ends on a freeze of its domain's window, and a
+        // durable child's is its own, the word its safepoints read. Its parent's domain, whose
+        // futex it shares through the hub, names the parent's window.
+        let durable = task.done.durable.is_some();
+        if task._code.thread.spawn_thunk != 0 || durable {
             if let Some(hub) = self.domain() {
                 let d = Arc::new(Domain::new_child(hub, task.chain.clone()));
                 d.set_env(
@@ -358,7 +362,7 @@ impl ChildExec {
                     task._code.fiber_cfg,
                     Some(task.rt.table()),
                     task._code.instance.epoch as usize,
-                    false,
+                    durable,
                 );
                 task.dom = Some(d);
             }
@@ -719,10 +723,17 @@ impl ChildExec {
         // no doorbell store can land on a window about to be freed.
         if let Some(d) = task.done.durable.as_ref() {
             *d.base.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-            // SAFETY: the window is live (freed only by the `drop(task)` below) and its first page
-            // holds the freeze word at `STATE_OFF`.
-            let unwound =
-                trap == 0 && unsafe { fiber_rt::window_is_unwinding(task.window.base() as u64) };
+            // It unwound iff it spilled past its frame base under the freeze, the rule a thread
+            // vCPU's end follows (`os_thread_rt::run_child`). The word alone is not enough (#1937): a
+            // doorbell that lands after the child's last safepoint leaves one that returned normally
+            // with its word `UNWINDING`, and its image would ride with nothing to rewind.
+            // SAFETY: the window is live (freed only by the `drop(task)` below); its first page holds
+            // the freeze word at `STATE_OFF`, and context 0's region the child's shadow-SP word.
+            let base = task.window.base() as u64;
+            let unwound = trap == 0
+                && unsafe { fiber_rt::window_is_unwinding(base) }
+                && unsafe { fiber_rt::read_shadow_sp(base, d.shadow.region_base(0)) }
+                    > d.shadow.frame_base(0);
             if unwound {
                 // #1854 — up to the child's high-water, as the root's capture reaches its own, so a
                 // page it grew through the Memory capability rides the artifact.
@@ -795,12 +806,17 @@ impl ChildExec {
     /// it, running or not yet started, as the oracle ends them. Their cell gets the completion
     /// sentinel, which their entry and back-edge polls observe (`emit_domain_poll`). A
     /// freeze skips this, so a child the freeze reaches still unwinds under its own freeze word.
+    /// For the same reason a freeze wakes a parked **durable** child without poisoning it: the
+    /// freeze rang its word (`Nursery::ring_detached`), so it unwinds under it and rides, where a
+    /// poisoned one would end in a trap and leave no image (#1937).
     pub(crate) fn shutdown_and_join(self: &Arc<Self>, end_domain: bool) {
         let workers = {
             let mut g = lock(&self.state);
             g.shutdown = true;
             for e in g.tasks.values_mut() {
-                let poisoned = if e.parked {
+                let unwinds =
+                    !end_domain && e.task.as_ref().is_some_and(|t| t.done.durable.is_some());
+                let poisoned = if e.parked && !unwinds {
                     if let Some(t) = &e.task {
                         t.vm.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);

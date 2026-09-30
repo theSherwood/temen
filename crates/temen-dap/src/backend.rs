@@ -66,7 +66,8 @@ fn grant_io_powerbox(
     // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
     // performs (#912), so a debugged guest sees the same handles in the same order the Run path gives
     // it. This session's own capabilities (`vm_fs`, the declared host-completed ones) follow.
-    let granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
+    let mut granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
+    granted.stderr = host.grant_stderr_if_imported(&m.imports);
     // #1323 (c_interpret #16, file I/O): a debugged program that does file I/O reaches a private,
     // in-memory **read-write** scratch filesystem through the `vm_fs` seam (chibicc `__vm_fs` builtin
     // → `call.sym "vm_fs"`, a flat call with base op 0 and the fs op in arg0). Mirror the browser Run
@@ -188,6 +189,12 @@ fn build_run(
 pub trait Debuggee {
     // --- execution -------------------------------------------------------------------------------
     fn run_until_stop(&mut self) -> Stop;
+    /// Run until a stop, or until logical time [`turn`](Self::turn) reaches `until` — then a live
+    /// [`StopReason::Pause`] stop. A backend without budgeted runs just runs to the next stop.
+    fn run_until_turn(&mut self, until: u64) -> Stop {
+        let _ = until;
+        self.run_until_stop()
+    }
     fn step(&mut self) -> Stop;
     fn step_over(&mut self) -> Stop;
     fn step_out(&mut self) -> Stop;
@@ -335,6 +342,11 @@ pub trait Debuggee {
     /// empty). The server surfaces it as DAP `output` events; on a reverse `seek` it reflects exactly
     /// the output produced up to *here* (the run is rebuilt + replayed), so it rewinds with the program.
     fn stdout(&self) -> &[u8] {
+        &[]
+    }
+    /// The guest's captured stderr at the current stop — [`stdout`](Self::stdout)'s twin, for a
+    /// program that imports the `"stderr"` stream. Rewinds with the program the same way.
+    fn stderr(&self) -> &[u8] {
         &[]
     }
 }
@@ -966,6 +978,7 @@ impl BytecodeBackend {
                         StopReason::Watchpoint { addr, write }
                     }
                     SchedBreak::Step => StopReason::Step,
+                    SchedBreak::Pause => StopReason::Pause,
                 };
                 Stop::Break { reason, pc }
             }
@@ -991,6 +1004,9 @@ impl BytecodeBackend {
 impl Debuggee for BytecodeBackend {
     fn run_until_stop(&mut self) -> Stop {
         self.resume(ScheduledDebugRun::run_until_stop)
+    }
+    fn run_until_turn(&mut self, until: u64) -> Stop {
+        self.resume(|run, fuel| run.run_until_turn(fuel, until))
     }
     fn step(&mut self) -> Stop {
         self.resume(ScheduledDebugRun::step)
@@ -1416,5 +1432,8 @@ impl Debuggee for BytecodeBackend {
     /// output produced up to *here* — it rewinds with the program. Empty for a deny-all session.
     fn stdout(&self) -> &[u8] {
         &self.run.host().stdout
+    }
+    fn stderr(&self) -> &[u8] {
+        &self.run.host().stderr
     }
 }
