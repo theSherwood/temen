@@ -739,6 +739,11 @@ request, in the op's own lock scope (`SignalSource::spawn_take`), then:
 The caller's call completes with the pid. Nothing unwinds, so the Cranelift JIT serves a spawn in
 place (no fork plan, no shadow arena), and a spawning program needs no fork instrumentation at all.
 
+**nimony.** A nim program built for Temen spawns. Its `osproc.startProcess` passes the fork path's
+own child steps to the spawn as file actions, and `os.execShellCmd` spawns `/bin/sh -c`
+(`patches/nimony/temen-spawn.patch`). temen-leng forwards the `pspawn` leaf to the op
+(`POSIX_SERVED_LEAVES`). So nimony's driver, nifmake and nimsem never fork on Temen.
+
 **Pipe ends.** An exec carries only the pipe ends the process's descriptors still name
 (`SignalSource::exec_keeps`; the terminal input end too): the others go with the old powerbox. A
 `close` or `dup2` a file action applies has no guest code to release the core end, so without this

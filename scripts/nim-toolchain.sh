@@ -28,9 +28,10 @@ mkdir -p "$1"
 W="$(cd "$1" && pwd)"
 
 # The tree, from a COPY of the pinned sources (the submodule is never modified), patched: nifmake is a
-# classic-Nim-only program upstream, the driver learns the Temen backend, and a compiler built for
-# Temen builds the programs it runs itself (compile-time evaluation, plugins) for Temen. See each
-# patch's own preamble. Every build of a tool happens in this tree, and so does the lane's self-build:
+# classic-Nim-only program upstream, the driver learns the Temen backend, a compiler built for
+# Temen builds the programs it runs itself (compile-time evaluation, plugins) for Temen, and a
+# program built for Temen starts its processes with Temen's spawn, not a fork. See each patch's own
+# preamble. Every build of a tool happens in this tree, and so does the lane's self-build:
 # the guest's memfs holds it at the same path, so both record the same paths — nimony records a
 # source path relative to its cwd, but writes a compile-time evaluation program's imports and output
 # file absolute.

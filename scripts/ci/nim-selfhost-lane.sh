@@ -4,7 +4,7 @@
 #
 #   nimony      the driver: `nimony t --isMain prog.nim` parses the dependency graph, writes the
 #               build plan (its Temen backend), and runs nifmake over it
-#   nifmake     forks and execs every step of the plan, in dependency order, through /bin/sh
+#   nifmake     spawns every step of the plan, in dependency order, through /bin/sh
 #   nifler      every module parsed (nimsem also spawns it for each file a module includes)
 #   nimsem      system, each dependency, then the program (--isMain)
 #   hexer       every module lowered to Leng (.x.nif), then dead-code eliminated (.c.nif)
@@ -12,11 +12,12 @@
 #
 # All of it in-guest: the host seeds the sources and reads the linked module, which then runs.
 #
-# On the engines: the JIT runs the build — it serves fork, execve and waitpid (#1768), and a run
+# On the engines: the JIT runs the build — it serves pspawn, execve and waitpid, and a run
 # compiles each program once, for every process that runs it (#1825) — then the bytecode engine reruns
 # hexer, held to the JIT's bytes, and both run the program. The tree-walker — the oracle, 4x slower
-# here — is `--engine tree`, for a local run; nim_e2e's `nim_shells_out_through_the_posix_sh`
-# differentials the spawning mechanism across all three engines on every PR.
+# here — is `--engine tree`, for a local run. On every PR, the spawn is differentialled across all
+# three engines by `caller_request_parity.rs`, and the fork + exec a program not built for Temen
+# takes by nim_e2e's `nim_shells_out_through_the_posix_sh`.
 #
 # Checked against native nimony (`nimony c -d:temen`) building the same program with the same
 # phases — each built by nimony from the same source as its Temen build, so only the target differs:
@@ -32,8 +33,8 @@
 #
 # Needs LLVM (scripts/ci/install-llvm.sh; `LLVM_LINK`/`LLVM_OPT` override the tools) for temen-link,
 # which is built from source every run, like every other tool here. Release-mode minutes, so it is a
-# step of its own rather than a `cargo test`. The per-PR gate over the same mechanisms, at a size a
-# debug test run can afford, is nim_e2e's `nim_shells_out_through_the_posix_sh`.
+# step of its own rather than a `cargo test`. The per-PR gates over its mechanisms, at a size a
+# debug test run can afford, are the two named above.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"

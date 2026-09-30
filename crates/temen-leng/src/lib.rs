@@ -1207,6 +1207,11 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // `ANY` (#1499) — the row and the shim are both `() -> i32`, and `sysconf` is the standing
     // reminder of what an `ANY` row does when those drift apart.
     ("osProcessId", sig(&[], &[I32]), 1),
+    // `std/posix`'s `pspawn(req) -> pid | -errno`, Temen's spawn: a program built for Temen
+    // (`-d:temen`) starts every process with it (`osproc`, `os.execShellCmd`). The personality
+    // serves it ([`POSIX_SERVED_LEAVES`]). This powerbox has no process table, so here it fails
+    // closed on `pipe`'s stub (row 43), the same `(ptr) -> -1`. **Pinned** (#1499).
+    ("pspawn", sig(&[I64], &[I32]), 43),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
@@ -1874,8 +1879,11 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 ///   stdio to pipes this way whenever the caller reads its output (`execCmdEx`, and so nimony's
 ///   compile-time evaluation). On the stubs `pipe` failed and nothing could be started. The edge
 ///   ([`posix_edge_unit`]) makes `pipe` a core pipe, as C's is.
+/// - `pspawn` → the personality's spawn. A program built for Temen starts its processes with it
+///   instead of `fork` + `execve`, so a program that never forks can run on the emitted tier.
 const POSIX_SERVED_LEAVES: &[&str] = &[
     "getcwd", "cExitSys", "fstat", "execve", "fork", "wait4", "exitnow", "pipe", "dup2", "close",
+    "pspawn",
 ];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split

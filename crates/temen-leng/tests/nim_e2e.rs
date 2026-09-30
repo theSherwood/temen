@@ -2394,9 +2394,10 @@ fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
     m
 }
 
-/// **The self-hosted shell-out, gated on every PR** — every mechanism nimsem's own `execNifler` rides,
-/// at a size CI can afford. (The full lane — nimsem spawning nifler for `system`'s whole import graph
-/// and matching native nimony — is `scripts/ci/nim-selfhost-lane.sh`; release-mode minutes, not this.)
+/// **The shell-out by fork + exec, gated on every PR** — what a nim program not built for Temen does,
+/// at a size CI can afford. A program built for Temen (`-d:temen`: nimony's own tools in the lane,
+/// `scripts/ci/nim-selfhost-lane.sh`) spawns instead (`patches/nimony/temen-spawn.patch`), and
+/// `caller_request_parity.rs` gates the spawn on the three engines.
 ///
 /// The parent calls the real `std/os.execShellCmd`, which is fork + `execve("/bin/sh", ["-c", cmd])` +
 /// `waitpid`, inlined. `/bin/sh` is the chibicc-built POSIX shell; `-c` of one simple command execs
