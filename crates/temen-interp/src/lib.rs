@@ -19851,7 +19851,7 @@ const BUDGET_FUEL: usize = 0;
 const BUDGET_MEM: usize = 1;
 /// The `spawn` dimension's index: one per live vCPU of the subtree (#1944 slice 3, the cgroups
 /// `pids.max` model). A detached child's first vCPU is charged with its window at the admission and
-/// handed back with it ([`Host::admit_detached_spawn`]); a domain's other vCPUs are not charged yet
+/// handed back with it ([`Host::admit_detached_spawn`]); a domain's other vCPUs hold a [`LiveVcpu`]
 /// (#2001).
 const BUDGET_SPAWN: usize = 2;
 /// The `channel` dimension's index: a host-served pipe's worst-case FIFO, [`PIPE_CAP`], charged to

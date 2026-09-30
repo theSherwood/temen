@@ -88,8 +88,12 @@ draws on its own schedule). The carve ops (0/5/13, v0 records) keep a fixed
 allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
 ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
 vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
-with the window when the child ends; a domain's other vCPUs (its threads, fork twins and spawned
-processes) are not charged yet, a tracked gap (#2001). A pipe's worst-case FIFO is charged to the
+with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
+process) is one `spawn` of the domain's node from when it is made until it ends, refused past a ceiling
+as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posix_spawn` return
+`-EAGAIN`) (#2001). A thaw re-charges the threads it re-creates. On the resumable `Vcpu` engine a
+thread's charge goes back at its join, where that engine learns it ended. A run's root is its
+embedder's and is charged to nothing. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. An
 exec keeps its domain's node, so a child cannot exec its way out of its budget.
 
