@@ -3920,6 +3920,12 @@ enum ChildWindow {
 }
 
 impl PendingChild {
+    /// The module the child runs, as its spawner's program source numbers it, and its entry — what
+    /// a host that runs the child on an emitted tier checks its emit against.
+    pub fn module_entry(&self) -> (u32, u32) {
+        (self.module, self.entry)
+    }
+
     /// Start the child as a vCPU over `back`. For a confined child, `back` covers exactly its carve —
     /// `[win + carve, +2^size_log2)` of the parent's window, which per DESIGN.md §14 simply *is* the
     /// child's window (anything the parent wrote there, a module child's data segments, is already in

@@ -1506,40 +1506,96 @@ block 6 (vs3: i64) {
 }
 "#;
 
-// #1123 slice 3 — a **carve LARGER than the granted unit's declared memory** (the malloc/nim-phase
-// shape: the child grows its heap above `1<<declared`). The root `instantiate_module`s the unit once
-// into a **128 KiB** carve (`slog 17`) at a 128 KiB-aligned offset, while the unit declares only
-// `memory 16` (64 KiB). The unit then stores+loads a sentinel at byte 100000 — inside `[64 KiB, 128 KiB)`,
-// above its declared window but inside the carve — and returns it (4242). This only succeeds when the
-// child's live `"mapped"` is routed to the carve (128 KiB); with `mapped == 1<<declared` (64 KiB) the
-// access faults. Asserted in the JS host (main.js) on BOTH the interp and emitted-codegen tiers, so it
-// exercises the browser per-event window routing directly, not just non-regression.
-const THREADS_INST_MOD_HIGH: &str = r#"memory 20
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vmod0: i32) {
-  vmod = i64.extend_i32_s vmod0
-  ventry = i64.const 0
-  voff = i64.const 131072
-  vslog = i64.const 17
-  vquota = i64.const 0
-  vh = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vmod, ventry, voff, vslog, vquota)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vh)
-  return vr
-  }
+// #1865 — the detached twin of [`THREADS_INST_MOD`]: a root `(instantiator, module, budget) -> sum`
+// that spawns the granted module `n` times through one op-17 v1 record (module and budget filled in
+// at run time), each child in a fresh window of its own on its own Worker and `Memory`, paid from the
+// budget, then joins them and sums. With [`THREADS_INST_UNIT`]: 8 × 75 = 600.
+fn inst_detached_root(n: u64) -> String {
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(
+        17408,
+        &temen_ir::SpawnRec::v1(0),
+        Some("vmod0"),
+        "vbud0",
+    );
+    format!(
+        r#"memory 20
+{seg}func (i32, i32, i32) -> (i64) {{
+block 0 (vinst0: i32, vmod0: i32, vbud0: i32) {{
+{stores}  vi0 = i64.const 0
+  br 1(vi0, vinst0)
+}}
+block 1 (vi: i64, vinst: i32) {{
+  vn = i64.const {n}
+  vlt = i64.lt_u vi vn
+  br_if vlt 2(vi, vinst) 3(vinst)
+}}
+block 2 (vi2: i64, vinst2: i32) {{
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst2 (vrp)
+  v4 = i64.const 4
+  vholo = i64.mul vi2 v4
+  v16 = i64.const 16400
+  vhoff = i64.add v16 vholo
+  i32.store vhoff vh
+  vone = i64.const 1
+  vinext = i64.add vi2 vone
+  br 1(vinext, vinst2)
+}}
+block 3 (vinst3: i32) {{
+  vj0 = i64.const 0
+  vs0 = i64.const 0
+  br 4(vj0, vs0, vinst3)
+}}
+block 4 (vj: i64, vs: i64, vinst4: i32) {{
+  vn2 = i64.const {n}
+  vlt2 = i64.lt_u vj vn2
+  br_if vlt2 5(vj, vs, vinst4) 6(vs)
+}}
+block 5 (vj2: i64, vs2: i64, vinst5: i32) {{
+  v4b = i64.const 4
+  vjlo = i64.mul vj2 v4b
+  v16b = i64.const 16400
+  vjoff = i64.add v16b vjlo
+  vhh = i32.load vjoff
+  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
+  vsn = i64.add vs2 vr
+  v1b = i64.const 1
+  vjn = i64.add vj2 v1b
+  br 4(vjn, vsn, vinst5)
+}}
+block 6 (vs3: i64) {{
+  return vs3
+  }}
+}}
+"#
+    )
 }
-"#;
 
-// The granted unit for [`THREADS_INST_MOD_HIGH`]: declares `memory 16` (64 KiB) but is run over a larger
-// carve; it stores+loads `4242` at byte 100000 (in `[64 KiB, carve)`) and returns it — proving the child
-// reaches above its declared memory only because `"mapped"` is routed to the carve.
-const THREADS_INST_UNIT_HIGH: &str = r#"memory 16
+// #1865 — a detached child that grows its own window: its entry calls func 1, which `vm_map`s
+// `[64 KiB, 128 KiB)` past its declared 64 KiB, then stores+loads `4242` at byte 100000 and returns
+// it. On the emitted tier func 1 is a bounce to the child's own vCPU, so the store after it passes
+// only if the Worker re-reads the child's `"mapped"` after the bounce. (It replaces the carve case
+// of a window larger than the declared one, which has no detached meaning: a detached window is the
+// module's own, grown by `vm_map`.)
+const THREADS_INST_UNIT_GROW: &str = r#"memory 16
+import 0 "vm_map" (i64, i64, i32) -> (i64)
 func (i64) -> (i64) {
 block 0 (v0: i64) {
+  vg = call 1 ()
   vaddr = i64.const 100000
   vsent = i64.const 4242
   i64.store vaddr vsent
   vgot = i64.load vaddr
   return vgot
+  }
+}
+func () -> (i64) {
+block 0 () {
+  voff = i64.const 65536
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vg = call.import 0 (voff, vlen, vprot)
+  return vg
   }
 }
 "#;
@@ -2291,9 +2347,10 @@ fn main() {
     emit("threads_inst", THREADS_INST);
     emit("threads_inst_nested", THREADS_INST_NESTED);
     emit("threads_inst_mod", THREADS_INST_MOD);
+    emit("threads_inst_detached", &inst_detached_root(8));
+    emit("threads_inst_detached_one", &inst_detached_root(1));
+    emit("threads_inst_unit_grow", THREADS_INST_UNIT_GROW);
     emit("threads_inst_unit", THREADS_INST_UNIT);
-    emit("threads_inst_mod_high", THREADS_INST_MOD_HIGH);
-    emit("threads_inst_unit_high", THREADS_INST_UNIT_HIGH);
     emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
     // #1151 — the page-op unit (→ 8 × 7509 = 60072) and its trap twin (store on the unmapped page).
     emit("threads_inst_paged_unit", &inst_paged_unit(16384 + 8));

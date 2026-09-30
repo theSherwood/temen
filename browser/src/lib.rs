@@ -750,9 +750,10 @@ pub const PAR_JIT_INVOKE: i32 = 8;
 /// The Worker mints the child a fresh shared `Memory` (one host header page + the declared window,
 /// growable to `temen_detached_max_bytes()`) and posts it and the ticket to a new Worker, which starts
 /// the child over it through `Region::Foreign` ([`temen_par_child_detached`] — the engine seeds the
-/// window). Joined through the same completion-slot protocol as [`PAR_INSTANTIATE`]. Children run
-/// **concurrently**, each in its own Worker over its own memory — the reason this is a Worker event
-/// and not an in-Rust one.
+/// window). `_d` = `(module << 32) | entry`, which the Worker checks against the run's emitted unit
+/// before running the child on the wasm tier. Joined through the same completion-slot protocol as
+/// [`PAR_INSTANTIATE`]. Children run **concurrently**, each in its own Worker over its own memory —
+/// the reason this is a Worker event and not an in-Rust one.
 pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
 
 /// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to four
@@ -2375,9 +2376,19 @@ pub extern "C" fn temen_par_child_detached(
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
     match child.start(unsafe { prog_ref(prog) }, back, None) {
         Ok(inner) => {
+            // #1865: the child's starter cap handles (its entry args), staged for a Worker that runs
+            // the entry on the emitted tier, as `temen_par_child_confined` stages them.
+            let entry_args: Vec<i64> = inner
+                .entry_args()
+                .iter()
+                .map(|a| first_i64(std::slice::from_ref(a)))
+                .collect();
             let v = par_box(inner);
             // SAFETY: freshly boxed, exclusively ours until returned to the Worker.
-            unsafe { (*v).detached = true };
+            unsafe {
+                (*v).detached = true;
+                (*v).tierup_argv = entry_args;
+            }
             v
         }
         Err(_) => {
@@ -2385,6 +2396,15 @@ pub extern "C" fn temen_par_child_detached(
             core::ptr::null_mut()
         }
     }
+}
+
+/// #1865 — the bytes a child vCPU's window holds ([`bytecode::Vcpu::win_flat_len`]): the `"mapped"`
+/// bound a Worker gives a detached child's emitted unit, re-read after each bounce, since a bounced
+/// leaf's `vm_map` grows the child's memory.
+#[no_mangle]
+pub extern "C" fn temen_par_win_len(v: *mut ParVcpu) -> u64 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.win_flat_len() }
 }
 
 /// The ceiling a detached child's minted memory may grow to (bytes, header excluded) — the Worker
@@ -2771,8 +2791,10 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 let Some(child) = v.inner.take_child() else {
                     return PAR_TRAP;
                 };
+                let (module, entry) = child.module_entry();
                 v.a = ticket(child);
                 v.b = size_log2 as i64;
+                v.d = ((module as i64) << 32) | entry as i64;
                 return PAR_INSTANTIATE_DETACHED;
             }
         }
