@@ -110,7 +110,15 @@ pub fn run_on(driver: Driver, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)
                     .map(|v| v.with_shared_host(&shared));
                 match root {
                     Err(t) => Err(t),
-                    Ok(root) => std::thread::scope(|s| drive(s, &prog, WinPtr(base), &orch, root)),
+                    Ok(root) => {
+                        let win = Win {
+                            base: WinPtr(base),
+                            back: Arc::clone(&back),
+                            size_log2: size_log2(m),
+                            host: Some(&shared),
+                        };
+                        std::thread::scope(|s| drive(s, &prog, &win, &orch, root))
+                    }
                 }
             };
             drop(back);
@@ -122,10 +130,15 @@ pub fn run_on(driver: Driver, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)
     }
 }
 
+/// The `log2` of `m`'s declared window.
+fn size_log2(m: &Module) -> u8 {
+    m.memory.map_or(16, |mc| mc.size_log2)
+}
+
 /// A zeroed window of the module's declared size, shareable across vCPU threads. The `unsafe` of
 /// lending host memory stays here in the test embedder, as in every parallel harness.
 fn window(m: &Module) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
-    let size = 1usize << m.memory.map_or(16, |mc| mc.size_log2);
+    let size = 1usize << size_log2(m);
     let layout = std::alloc::Layout::from_size_align(size, 8).expect("layout");
     // SAFETY: a non-zero, 8-aligned layout; the caller frees it once the run has joined.
     let base = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -153,6 +166,16 @@ struct WinPtr(*mut u8);
 // SAFETY: it only ever names the one live window allocation, which outlives the scope, or is null.
 unsafe impl Send for WinPtr {}
 
+/// The window a vCPU runs over, which the threads it spawns share: its bytes (at `base`), its backing
+/// and size, and the powerbox its threads share (the root's; a child's own is not shareable here, so
+/// its threads get an empty one, as the browser's per-Worker threads of a detached child do).
+struct Win<'e> {
+    base: WinPtr,
+    back: Arc<Region>,
+    size_log2: u8,
+    host: Option<&'e Mutex<Host>>,
+}
+
 /// Drive one `Vcpu` to completion on this thread, starting each child on its own scoped thread — a
 /// confined one over its carve, a detached one over a fresh backing — as the browser's per-Worker
 /// driver does with Workers. An event this harness does not orchestrate fails the test rather than
@@ -160,7 +183,7 @@ unsafe impl Send for WinPtr {}
 fn drive<'s, 'e>(
     scope: &'s std::thread::Scope<'s, 'e>,
     prog: &'e bytecode::VcpuProgram,
-    win: WinPtr,
+    win: &Win<'e>,
     orch: &'e Orch,
     mut vcpu: bytecode::Vcpu<'e>,
 ) -> Result<Vec<Value>, Trap> {
@@ -171,24 +194,68 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::Instantiate {
                 carve, size_log2, ..
             } => {
-                if win.0.is_null() {
+                if win.base.0.is_null() {
                     unorchestrated("a confined spawn inside a detached child");
                 }
                 // SAFETY: the engine validated the carve inside this vCPU's window.
-                let child_win = WinPtr(unsafe { win.0.add(carve as usize) });
+                let base = WinPtr(unsafe { win.base.0.add(carve as usize) });
                 // SAFETY: `2^size_log2` valid bytes at the validated carve, alive for the scope.
-                let back = Arc::new(unsafe { Region::shared(child_win.0, 1u64 << size_log2) });
-                start(scope, prog, orch, &mut vcpu, child_win, back)?;
+                let back = Arc::new(unsafe { Region::shared(base.0, 1u64 << size_log2) });
+                let child_win = Win {
+                    base,
+                    back,
+                    size_log2,
+                    host: None,
+                };
+                let child = take_child(&mut vcpu, prog, &child_win)?;
+                start(scope, prog, orch, &mut vcpu, child, child_win);
             }
-            bytecode::VcpuEvent::InstantiateDetached { .. } => {
+            bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
                 // A fresh reservation, as every driver's detached window has; the engine seeds it.
                 // Not flat on every host (no `mmap` on Windows), so its bytes are not addressed here.
                 let back = Arc::new(Region::new(
                     1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                     temen_interp::host_page_size(),
                 ));
-                let win = WinPtr(std::ptr::null_mut());
-                start(scope, prog, orch, &mut vcpu, win, back)?;
+                let child_win = Win {
+                    base: WinPtr(std::ptr::null_mut()),
+                    back,
+                    size_log2,
+                    host: None,
+                };
+                let child = take_child(&mut vcpu, prog, &child_win)?;
+                start(scope, prog, orch, &mut vcpu, child, child_win);
+            }
+            bytecode::VcpuEvent::Spawn {
+                func,
+                sp,
+                arg,
+                module,
+                vcpu: id,
+            } => {
+                // A thread over its spawner's window, as the browser's per-Worker driver starts one.
+                let args = [Value::I64(sp), Value::I64(arg)];
+                let back = Arc::clone(&win.back);
+                let child = bytecode::Vcpu::new_child_sized(
+                    prog,
+                    module,
+                    func,
+                    &args,
+                    back,
+                    win.size_log2,
+                )?
+                .with_vcpu_id(id);
+                let child = match win.host {
+                    Some(h) => child.with_shared_host(h),
+                    None => child,
+                };
+                let thread_win = Win {
+                    base: win.base,
+                    back: Arc::clone(&win.back),
+                    size_log2: win.size_log2,
+                    host: win.host,
+                };
+                start(scope, prog, orch, &mut vcpu, child, thread_win);
             }
             bytecode::VcpuEvent::Join { child } => {
                 let mut g = orch.done.lock().unwrap();
@@ -203,7 +270,6 @@ fn drive<'s, 'e>(
             }
             // Named, not `_`: a new event fails to build here as in every driver (#1414).
             bytecode::VcpuEvent::TierUp { .. } => unorchestrated("TierUp"),
-            bytecode::VcpuEvent::Spawn { .. } => unorchestrated("Spawn"),
             bytecode::VcpuEvent::Wait { .. } => unorchestrated("Wait"),
             bytecode::VcpuEvent::Notify { .. } => unorchestrated("Notify"),
             bytecode::VcpuEvent::JitInstall { .. } => unorchestrated("JitInstall"),
@@ -215,33 +281,39 @@ fn drive<'s, 'e>(
     }
 }
 
-/// Start the child the last event announced over `back` — its window, whose bytes start at `win`
-/// (null for a detached one) — on its own scoped thread, and give `vcpu` its completion id as the
-/// token a join hands back.
+/// The child the last event announced, started over `win`.
+fn take_child<'e>(
+    vcpu: &mut bytecode::Vcpu<'e>,
+    prog: &'e bytecode::VcpuProgram,
+    win: &Win<'e>,
+) -> Result<bytecode::Vcpu<'e>, Trap> {
+    let Some(pending) = vcpu.take_child() else {
+        panic!("a spawn event carries its admitted child");
+    };
+    pending.start(prog, Arc::clone(&win.back), None)
+}
+
+/// Run `child` over `win` on its own scoped thread, and give `vcpu` its completion id as the token a
+/// join hands back.
 fn start<'s, 'e>(
     scope: &'s std::thread::Scope<'s, 'e>,
     prog: &'e bytecode::VcpuProgram,
     orch: &'e Orch,
     vcpu: &mut bytecode::Vcpu<'e>,
-    win: WinPtr,
-    back: Arc<Region>,
-) -> Result<(), Trap> {
+    child: bytecode::Vcpu<'e>,
+    win: Win<'e>,
+) {
     let id = {
         let mut n = orch.next.lock().unwrap();
         *n += 1;
         *n
     };
-    let Some(pending) = vcpu.take_child() else {
-        panic!("a spawn event carries its admitted child");
-    };
-    let child = pending.start(prog, back, None)?;
     scope.spawn(move || {
-        let r = drive(scope, prog, win, orch, child);
+        let r = drive(scope, prog, &win, orch, child);
         orch.done.lock().unwrap().insert(id, r);
         orch.cv.notify_all();
     });
     vcpu.deliver_child(id);
-    Ok(())
 }
 
 fn unorchestrated(event: &str) -> ! {

@@ -2,15 +2,15 @@
 //!
 //! Compiled code burns [`FuelCell::left`] one unit per safepoint (word 0, a plain load/decrement/store)
 //! and, when it is spent, calls the cell's refill (word 1) instead of trapping at once: the refill
-//! draws the next chunk from the budget chain the embedder accounts in ([`FuelSource`]), and only a
+//! draws the next chunk from the budget chain the embedder accounts in ([`BudgetNode`]), and only a
 //! spent chain traps `OutOfFuel`. A cell with no source is a fixed allowance, refilled never — a
 //! carve child's, or a harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
 
 use std::sync::{Arc, Mutex};
 
-/// Where a [`FuelCell`] draws its next chunk: the embedder's budget chain (temen-run's, over a
-/// `temen_interp` budget node).
-pub trait FuelSource: Send + Sync {
+/// A domain's node in the embedder's budget chain (temen-run's, over a `temen_interp` budget node):
+/// where a [`FuelCell`] draws its next chunk, and what a domain's vCPUs are charged to (#2001).
+pub trait BudgetNode: Send + Sync {
     /// Up to a chunk of fuel from the chain, charged to every level: `None` when every level is
     /// unbounded (nothing to meter), `Some(0)` when the chain is spent.
     fn draw(&self) -> Option<u64>;
@@ -18,6 +18,12 @@ pub trait FuelSource: Send + Sync {
     fn give_back(&self, unspent: u64);
     /// The fuel room left along the chain, `-1` when every level is unbounded.
     fn room(&self) -> i64;
+    /// Charge one live vCPU to every level, all or nothing: `false` when a level's `spawn` is full.
+    fn charge_vcpu(&self) -> bool;
+    /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the freeze.
+    fn force_vcpu(&self);
+    /// Hand back a vCPU's charge when it ends.
+    fn vcpu_ended(&self);
 }
 
 /// A domain's counted-fuel cell. `repr(C)`: compiled code reads `left` at word 0 and calls `refill`
@@ -31,7 +37,7 @@ pub struct FuelCell {
     remaining: unsafe extern "C" fn(*const FuelCell) -> i64,
     /// The chain the next draw comes from; `None` for a fixed allowance (or once the chain proved
     /// unbounded). Locked by a refill, so the vCPUs of a domain sharing the cell draw one at a time.
-    src: Mutex<Option<Arc<dyn FuelSource>>>,
+    src: Mutex<Option<Arc<dyn BudgetNode>>>,
 }
 
 impl FuelCell {
@@ -41,17 +47,17 @@ impl FuelCell {
     }
 
     /// A cell that draws from `src`, none drawn yet: the first safepoint draws.
-    pub fn drawing(src: Arc<dyn FuelSource>) -> Box<FuelCell> {
+    pub fn drawing(src: Arc<dyn BudgetNode>) -> Box<FuelCell> {
         Self::with(0, Some(src))
     }
 
     /// [`Self::drawing`] when `src`'s chain is bounded; `None` when every level is unbounded — code
     /// with nothing to meter compiles without fuel checks.
-    pub fn metering(src: Arc<dyn FuelSource>) -> Option<Box<FuelCell>> {
+    pub fn metering(src: Arc<dyn BudgetNode>) -> Option<Box<FuelCell>> {
         (src.room() >= 0).then(|| Self::drawing(src))
     }
 
-    fn with(left: u64, src: Option<Arc<dyn FuelSource>>) -> Box<FuelCell> {
+    fn with(left: u64, src: Option<Arc<dyn BudgetNode>>) -> Box<FuelCell> {
         Box::new(FuelCell {
             left,
             refill: fuel_refill,

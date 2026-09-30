@@ -204,6 +204,9 @@ unsafe fn file_task(
     slot: Option<usize>,
     // #1361 step 4 — a durable detached child's freeze cell (see [`DurableCell`]).
     durable: Option<DurableCell>,
+    // #2001 — a detached child's own budget node, which its threads are charged to; `None` for a
+    // carve child.
+    node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 ) -> Filed {
     let futex_sched = rt.futex_sched;
     // #1586 — reserve a §15 live-vCPU slot before filing, so a parent cannot hold more concurrency
@@ -233,6 +236,7 @@ unsafe fn file_task(
             std::sync::Arc::clone(&done),
             copy_back,
             teardown,
+            node,
         )
     };
     let task = match task {
@@ -323,6 +327,7 @@ unsafe fn file_carve_task(
         chain,
         retained_ctx,
         teardown,
+        None,
         None,
         None,
     )
@@ -581,9 +586,9 @@ pub(crate) struct Nursery {
     grant_premap_admit: std::sync::atomic::AtomicUsize,
     grant_premap_stage: std::sync::atomic::AtomicUsize,
     grant_premap_apply: std::sync::atomic::AtomicUsize,
-    /// #1944 slice 3 — the installed [`crate::ChildFuelSource`] (0 = none: detached children run
-    /// un-metered).
-    grant_fuel_source: std::sync::atomic::AtomicUsize,
+    /// #1944 slice 3 — the installed [`crate::ChildBudgetNode`] (0 = none: detached children run
+    /// un-metered, and their threads uncharged).
+    grant_budget_node: std::sync::atomic::AtomicUsize,
     /// #1854 — the installed child [`crate::HighWater`] (0 = none).
     grant_high_water: std::sync::atomic::AtomicUsize,
     /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
@@ -682,7 +687,7 @@ impl Nursery {
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
-            grant_fuel_source: std::sync::atomic::AtomicUsize::new(0),
+            grant_budget_node: std::sync::atomic::AtomicUsize::new(0),
             grant_high_water: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
@@ -748,8 +753,8 @@ impl Nursery {
             hooks.map_or(0, |h| h.high_water as usize),
             Ordering::Release,
         );
-        self.grant_fuel_source.store(
-            hooks.map_or(0, |h| h.fuel_source as usize),
+        self.grant_budget_node.store(
+            hooks.map_or(0, |h| h.budget_node as usize),
             Ordering::Release,
         );
         self.grant_register_serve.store(rs, Ordering::Release);
@@ -820,22 +825,30 @@ impl Nursery {
         addr
     }
 
-    /// #1944 slice 3 — a detached child's fuel cell: it draws from the budget chain child powerbox
-    /// `ctx` holds as its own ([`crate::ChildFuelSource`]), whether or not this run is metered, so a
-    /// child's budget caps it on an unmetered root too (#1705). `None` — compiled un-metered — when
-    /// the chain is unbounded at the spawn (every level `-1`) or no source is installed. The caller
-    /// bakes the cell's address into the child and hands the cell to the child's task, whose end
-    /// returns what it did not burn.
+    /// #1944 slice 3 — the budget node child powerbox `ctx` holds as its own
+    /// ([`crate::ChildBudgetNode`]), and the fuel cell its vCPUs draw from it. The node is `None` when
+    /// no hook is installed. The cell draws whether or not this run is metered, so a child's budget
+    /// caps it on an unmetered root too (#1705); it is `None`, compiled un-metered, when the chain is
+    /// unbounded at the spawn (every level `-1`). The caller bakes the cell's address into the child
+    /// and hands the cell to the child's task, whose end returns what it did not burn, and the node to
+    /// its domain, which charges its threads (#2001).
     ///
     /// # Safety
     /// `ctx` is a detached child's powerbox the installed hooks built.
-    unsafe fn detached_fuel(&self, ctx: *mut core::ffi::c_void) -> Option<Box<crate::FuelCell>> {
-        let addr = self.grant_fuel_source.load(Ordering::Acquire);
+    unsafe fn detached_node(
+        &self,
+        ctx: *mut core::ffi::c_void,
+    ) -> (
+        Option<std::sync::Arc<dyn crate::BudgetNode>>,
+        Option<Box<crate::FuelCell>>,
+    ) {
+        let addr = self.grant_budget_node.load(Ordering::Acquire);
         if addr == 0 {
-            return None;
+            return (None, None);
         }
-        let source: crate::ChildFuelSource = core::mem::transmute(addr);
-        crate::FuelCell::metering(source(ctx)?)
+        let node = core::mem::transmute::<usize, crate::ChildBudgetNode>(addr)(ctx);
+        let fuel = node.clone().and_then(crate::FuelCell::metering);
+        (node, fuel)
     }
 
     /// This nursery's §14 domain task id (`0` = root) — `instantiate` records it as a child's
@@ -1033,7 +1046,7 @@ impl Nursery {
         };
         // #1944 slice 3 — the thawed child draws from its budget node again, as at its spawn; what
         // it drew before the freeze and did not burn went back as the freeze unwound it.
-        let child_fuel = self.detached_fuel(gc.ctx);
+        let (node, child_fuel) = self.detached_node(gc.ctx);
         let Ok(code) = crate::compile_child_windowed(
             &funcs,
             &types,
@@ -1099,6 +1112,7 @@ impl Nursery {
                 reserved_log2,
                 self.child_high_water(gc.retained_ctx),
             )),
+            node,
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -2138,6 +2152,8 @@ unsafe fn spawn_detached_child(
     // #1944 slice 3 — the child's fuel cell, drawing from its own budget node (`None`: un-metered);
     // its task's teardown returns what it did not burn.
     fuel: Option<Box<crate::FuelCell>>,
+    // #2001 — that node, which the child's threads are charged to.
+    node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     // #1361 step 4 — `Some(arena)` for a durable parent's child: its window starts as a durable one
     // (context 0's shadow-SP word at its frame base) and carries a freeze cell recording `entry`.
     durable: Option<temen_ir::durable_abi::ShadowArena>,
@@ -2211,6 +2227,7 @@ unsafe fn spawn_detached_child(
                 rt.child_high_water(gc.retained_ctx),
             )
         }),
+        node,
     );
     match filed {
         Filed::Slot(slot) => slot,
@@ -2463,7 +2480,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         }
     }
     // #1944 slice 3 — the child draws from the budget that paid for its window, its own node.
-    let child_fuel = rt.detached_fuel(gc.ctx);
+    let (node, child_fuel) = rt.detached_node(gc.ctx);
     let child_fuel_addr = child_fuel
         .as_deref()
         .map_or(0, |c| c as *const crate::FuelCell as usize);
@@ -2534,6 +2551,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         budget as i32,
         child_size,
         child_fuel,
+        node,
         durable.then_some(child_shadow),
         entry as u32,
         // SAFETY: a durable run's window is live and its first page holds the freeze word.
