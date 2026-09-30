@@ -14,7 +14,10 @@
 // the tree ends the same way. A leaf that loads through a null pointer crashes the same way on both
 // tiers. A leaf that pings its parent over core pipes and parks on its reply — reading an empty pipe,
 // or first writing to a full one — ends with exit 14 and the reply written: where the host suspends
-// (Chromium), after one tier-up and one resume; where it cannot (Node), interpreted.
+// (Chromium), after one tier-up and one resume; where it cannot (Node), interpreted. A leaf that
+// spawns a leaf and waits for it ends with exit 25 and the kid's file: where the host suspends, both
+// tier up, the kid while the spawner's frames wait, and the spawner resumes once; where it cannot,
+// only the kid tiers up.
 //
 // Usage:  node browser-nim-leaf-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -68,6 +71,14 @@ const check = (host, r, suspends) => {
         + `(want ${tierups} and ${resumes})`);
     }
   }
+  // Where the host suspends, the spawner and its kid both run emitted, the kid while the spawner's
+  // frames wait, and the spawner's call runs on once: one resume. Where it cannot, only the kid does.
+  ended('spawns and waits', r.spawn, 25, 'leaf');
+  const [tierups, resumes] = suspends ? [2, 1] : [1, 0];
+  if (r.spawn.leafTierups.length !== tierups || r.spawn.resumes !== resumes) {
+    fail(`${host}: a leaf that spawns and waits: ${r.spawn.leafTierups.length} tier-ups and `
+      + `${r.spawn.resumes} resumes (want ${tierups} and ${resumes})`);
+  }
 };
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
@@ -111,5 +122,6 @@ if (chromium === null) {
 if (process.exitCode) process.exit(process.exitCode);
 console.log('ok — a leaf child ran on the emitted tier; the one that protects a page ran page-checked; '
   + 'the one holding a personality pipe interpreted, each ending with exit 5 and the file written; a '
-  + 'null load crashed the child on both tiers alike; and a leaf that parks on its core pipes ran '
-  + `interpreted under Node${chromium ? ', and emitted in Chromium, suspended and resumed' : ''}`);
+  + 'null load crashed the child on both tiers alike; and a leaf that parks on its core pipes, or '
+  + 'spawns a leaf and waits for it, ran interpreted under Node'
+  + `${chromium ? ', and emitted in Chromium, suspended and resumed' : ''}`);

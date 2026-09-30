@@ -240,6 +240,39 @@ block 0 (vr: i64) {
 }
 ${shim(4, 1)}`;
 
+// `/bin/leaf` that spawns `/bin/kid` (a plain `leafImage`, which writes `leaf` to `out.txt` and exits
+// 5), waits for it, and returns its status plus 20. Both calls park only on the leaf's children: where
+// the host suspends a leaf's frames, it runs emitted, and its spawn starts the kid, itself a leaf,
+// while its own frames wait.
+const spawnLeaf = () => `memory 17
+import 0 "__px_pspawn" (i64) -> (i64)
+import 1 "__px_wait4" (i64, i64, i64, i64) -> (i64)
+data 40000 "/bin/kid\\x00"
+func (i64) -> (i64) {
+block 0 (vcap: i64) {
+  vs = call 1 ()
+  return vs
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vreq = i64.const 41000
+  vpath = i64.const 40000
+  i64.store vreq vpath
+  vpid = call.import 0 (vreq)
+  vst = i64.const 41100
+  vz = i64.const 0
+  vw = call.import 1 (vpid, vst, vz, vz)
+  vhi = i64.const 41101
+  vsw = i32.load8_u vhi
+  vs = i64.extend_i32_u vsw
+  vtwenty = i64.const 20
+  vr = i64.add vs vtwenty
+  return vr
+  }
+}
+`;
+
 // Run every case with the engine `ex` over `memory`, `drive` its driver, `suspends` whether the host
 // suspends a leaf's frames. Each result is how the tree ended (`exit`, what it `wrote` to
 // `/w/out.txt`) and what the run asked of the host: the program of each leaf tier-up (each TIERUP
@@ -272,7 +305,7 @@ export async function runCases({ ex, memory, drive, suspends }) {
     }
     return out;
   };
-  const run = async (driverText, leafText) => {
+  const run = async (driverText, leafText, more = []) => {
     const leafTierups = [];
     let resumes = 0;
     let paged = false;
@@ -289,7 +322,7 @@ export async function runCases({ ex, memory, drive, suspends }) {
       }));
     const args = [
       put(parse(driverText)),
-      put(blob([['/w/bin/leaf\n/bin/leaf', parse(leafText)]])),
+      put(blob([['/w/bin/leaf\n/bin/leaf', leafText], ...more].map(([n, text]) => [n, parse(text)]))),
       put(blob([])),
       put(enc.encode('bin/driver\0')),
       put(enc.encode('/w')),
@@ -311,5 +344,6 @@ export async function runCases({ ex, memory, drive, suspends }) {
     nulPiped: await run(driver(true), leafImage('null')),
     parkRead: await run(pingPong(), pingLeaf(0)),
     parkWrite: await run(pingPong(), pingLeaf(4)),
+    spawn: await run(driver(false), spawnLeaf(), [['/w/bin/kid\n/bin/kid', leafImage('plain')]]),
   };
 }

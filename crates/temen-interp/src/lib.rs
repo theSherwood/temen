@@ -21950,13 +21950,27 @@ pub trait SignalSource: Send + Sync {
 
     /// #1896 — can this process **park** in the op it imports as `import`: block until another
     /// process acts (a `fork`, a `wait`, a read of an empty pipe)? An engine runs an image whose ops
-    /// cannot park whole on the emitted wasm tier, where a frame cannot be suspended, so `Some(false)`
-    /// must be sound: the source answers from what the op is and what the process holds that it could
-    /// block on (a pipe end, a terminal). `None` for an import that is not this source's, which the
-    /// engine answers for. Default `None`.
-    fn import_parks(&self, _import: &str) -> Option<bool> {
+    /// cannot park whole on the emitted wasm tier, where a frame cannot be suspended, so
+    /// [`OpParks::Never`] must be sound: the source answers from what the op is and what the process
+    /// holds that it could block on (a pipe end, a terminal). `None` for an import that is not this
+    /// source's, which the engine answers for. Default `None`.
+    fn import_parks(&self, _import: &str) -> Option<OpParks> {
         None
     }
+}
+
+/// #1896 — how a process can park in an op ([`SignalSource::import_parks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpParks {
+    /// It cannot.
+    Never,
+    /// Only on its children: it waits for one to change state ([`ParkEvent::TaskExit`]), or asks
+    /// for one to be started ([`ParkEvent::SpawnSelf`]). The engine serves both without the
+    /// caller's frames, so a leaf whose host suspends them may make these calls.
+    OnChildren,
+    /// Some other way: a fork or an exec, which need the caller's frames, a signal, a read of
+    /// something only another process can fill.
+    Otherwise,
 }
 
 /// One interned interface's identity key: its `(op names, op signatures)` pair (#1109 — names

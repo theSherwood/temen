@@ -9591,6 +9591,97 @@ struct ExecBuilt {
     leaf: Option<LeafStart>,
 }
 
+/// A personality `posix_spawn` (#1970) task `ti` asked for: mint a process as the fork arm mints a
+/// twin (its pid is its task index + 1, and its parent reaps it) and build its image as the exec arm
+/// builds one, in an env of its own: a fresh window of the caller's geometry, with nothing of the
+/// caller copied. Answers the caller's result, the pid or `-EAGAIN` when no process could be minted,
+/// and the step that starts the child when its image is a leaf. A process whose image cannot be
+/// built still takes its task, done before it ran, so the settle retires it as it retires any
+/// process and no later process is handed its pid.
+#[allow(clippy::too_many_arguments)] // the pump's own state, borrowed field by field
+fn spawn_task(
+    tasks: &mut Vec<TaskSlot>,
+    extra_envs: &mut Vec<ChildEnv>,
+    forked_twins: &mut std::collections::BTreeSet<usize>,
+    pending_tierup: &mut Option<(usize, TierUpDst, Box<[ValType]>)>,
+    leaf: Option<&LeafEmitter>,
+    dom: &Domain,
+    mem: &Option<Mem>,
+    host: &mut Host,
+    fuel: u64,
+    ti: usize,
+    cmd: super::ExecCmd,
+    plan: super::SpawnPlan,
+) -> (i64, Option<CoopStep>) {
+    let child_ti = tasks.len();
+    let pid = child_ti as u64 + 1;
+    let (twin, child_fuel) = match tasks[ti].env {
+        Some(k) => (
+            extra_envs[k]
+                .host
+                .lock_unpoisoned()
+                .spawn_powerbox(pid, plan),
+            extra_envs[k].fuel,
+        ),
+        None => (host.spawn_powerbox(pid, plan), fuel),
+    };
+    let Some(mut twin) = twin else {
+        return (super::EAGAIN, None);
+    };
+    let caller = match tasks[ti].env {
+        Some(k) => extra_envs[k].mem.as_ref(),
+        None => mem.as_ref(),
+    };
+    let built = exec_image_build(&mut twin, caller, dom, cmd, 0, 0, 0, 0, true, leaf);
+    let (child_mem, child_host, table, vt, state, start) = match built {
+        Ok(built) => {
+            // Its own park door and pump bell, as the fork arm wires a twin's.
+            built.host.wire_park_door();
+            if let Some(bell) = host.external_wake() {
+                if let Some((_, source)) = built.host.signal_poll() {
+                    wire_pump_bell(&source, &bell);
+                }
+            }
+            let state = TaskState::Runnable;
+            let (m, h) = (Some(built.mem), built.host);
+            (m, h, built.table, built.vt, state, built.leaf)
+        }
+        Err(_) => {
+            let mut vt = VTask {
+                active: tasks[ti].vt.active.clone(),
+                active_id: ROOT_FIBER,
+                chain: Vec::new(),
+                root_shadow_sp: 0,
+                active_invoke: None,
+            };
+            vt.release();
+            let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
+            let state = TaskState::Done(failed);
+            (None, twin, dom.table.fork(), vt, state, None)
+        }
+    };
+    let eidx = extra_envs.len();
+    extra_envs.push(ChildEnv {
+        mem: child_mem,
+        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+        table,
+        fuel: child_fuel,
+        fibers: FiberTables::default(),
+    });
+    tasks.push(TaskSlot {
+        vt,
+        threads: Vec::new(),
+        env: Some(eidx),
+        state,
+        suspended: None,
+        lease: None,
+    });
+    forked_twins.insert(child_ti);
+    let win = extra_envs[eidx].mem.as_ref();
+    let step = start.and_then(|start| leaf_step(start, child_ti, win, pending_tierup));
+    (pid as i64, step)
+}
+
 /// #1896 — a leaf image tiers up at its entry: the host runs it whole, emitted, and its delivery ends
 /// the process. The step that starts task `ti`'s, over its window `win` — or `None` over a window one
 /// bound cannot describe, where an image emitted without the page check runs interpreted instead,
@@ -9630,25 +9721,27 @@ struct LeafStart {
 
 /// #1896 — how a process running image `m` can **park**: block in an op until another process, or
 /// another of its own threads, acts. An emitted frame cannot wait by itself, so an image runs on the
-/// emitted tier ([`TierUpConfig::leaf`]) when it cannot park, or when it parks only in a **stream**
-/// call and its host can suspend the emitted frames there ([`LeafOffer::parks`]). A stream read
-/// parks on a pipe end or a blocking stdin, and a stream write on a pipe end. The process's signal
-/// source answers for the ops bound to it ([`super::SignalSource::import_parks`]); the address-space
-/// ops cannot park; a §12 concurrency op may (a join or a futex wait parks, and a thread or a fiber
-/// needs the interpreter to schedule it); an import `import.attach` may retarget may; any other
-/// import or capability call may, a dynamic one included. (A linked program has no `call.sym` left:
-/// linking rewrote each to one of these.)
+/// emitted tier ([`TierUpConfig::leaf`]) when it cannot park, or when it parks only where its host
+/// can suspend the emitted frames ([`LeafOffer::parks`]): in a **stream** call, or on its
+/// **children** ([`super::OpParks::OnChildren`]). A stream read parks on a pipe end or a blocking
+/// stdin, and a stream write on a pipe end. The process's signal source answers for the ops bound to
+/// it ([`super::SignalSource::import_parks`]); the address-space ops and the pipe mint cannot park; a
+/// §12 concurrency op may (a join or a futex wait parks, and a thread or a fiber needs the
+/// interpreter to schedule it); an import `import.attach` may retarget may; any other import or
+/// capability call may, a dynamic one included. (A linked program has no `call.sym` left: linking
+/// rewrote each to one of these.)
 fn image_parks(host: &Host, m: &Module) -> Parks {
+    use super::OpParks;
     use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
     let source = host.signal_poll().map(|(_, s)| s);
     let import_parks = |(import, b): (&temen_ir::Import, &super::BoundImport)| match b.type_id {
-        _ if b.rebindable => true,
-        ADDRESS_SPACE => false,
+        _ if b.rebindable => OpParks::Otherwise,
+        ADDRESS_SPACE => OpParks::Never,
         HOST_PROC => source
             .as_ref()
             .and_then(|s| s.import_parks(&import.name))
-            .unwrap_or(true),
-        _ => true,
+            .unwrap_or(OpParks::Otherwise),
+        _ => OpParks::Otherwise,
     };
     let holds_pipe = host
         .table
@@ -9663,6 +9756,11 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         } => op > 2,
         Inst::CapCall {
             type_id: ADDRESS_SPACE,
+            ..
+        }
+        | Inst::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op: super::CAP_SELF_PIPE,
             ..
         } => false,
         Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
@@ -9682,18 +9780,21 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
             .flat_map(|f| &f.blocks)
             .flat_map(|b| &b.insts)
     };
+    let parks: Vec<OpParks> = m
+        .imports
+        .iter()
+        .zip(&host.import_bindings)
+        .map(import_parks)
+        .collect();
     if m.imports.len() != host.import_bindings.len()
-        || m.imports
-            .iter()
-            .zip(&host.import_bindings)
-            .any(import_parks)
+        || parks.contains(&OpParks::Otherwise)
         || m.funcs.iter().any(temen_ir::Func::uses_concurrency)
         || insts().any(may_park)
     {
         return Parks::Otherwise;
     }
-    match insts().any(stream_parks) {
-        true => Parks::InStreams,
+    match parks.contains(&OpParks::OnChildren) || insts().any(stream_parks) {
+        true => Parks::Suspendably,
         false => Parks::Never,
     }
 }
@@ -9701,8 +9802,8 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
 /// How a process running an image can park ([`image_parks`]).
 enum Parks {
     Never,
-    /// Only in a stream call.
-    InStreams,
+    /// Only where its host can suspend its emitted frames: in a stream call, or on its children.
+    Suspendably,
     Otherwise,
 }
 
@@ -9779,7 +9880,7 @@ fn exec_image_build(
     let leaf = leaf.and_then(|emit| {
         let parks = match image_parks(&img.host, &img.module) {
             Parks::Never => false,
-            Parks::InStreams => true,
+            Parks::Suspendably => true,
             Parks::Otherwise => return None,
         };
         let paged = image_pages(&img.host, &img.module);
@@ -10983,9 +11084,9 @@ struct BounceRunCtx<'a> {
     /// own table, never the root's mirror).
     jit_mirror: Option<JitMirror<'a>>,
     /// #1896 — where a bounce out of a leaf whose host suspends its emitted frames
-    /// ([`LeafOffer::parks`]) leaves a call that parks: its continuation, and the state its task
-    /// parks in. `None` for any other bounce, in which a park faults.
-    park: Option<&'a mut Option<(Vm, TaskState)>>,
+    /// ([`LeafOffer::parks`]) leaves a call that stops: its continuation, and what it stopped for.
+    /// `None` for any other bounce, in which a park faults.
+    park: Option<&'a mut Option<(Vm, Handoff)>>,
 }
 
 /// A wasm-JIT driver's dispatch-table mirror — the `slot → (domain, unit)` array and its generation
@@ -11295,22 +11396,37 @@ fn drive_nested(
                 let total = gc_write(mem, buf, cap, roots)?;
                 active.set(dst, Reg::from_i64(total));
             }
-            // #1896 — a call parks in a bounce out of a leaf whose host suspends the emitted frames
-            // beneath this drive. The drive stops here and hands back its continuation, the op
-            // rewound to re-execute, with the state the task parks in; the pump runs the rest once
-            // the park clears. A park anywhere else faults, as ever: nothing beneath could wait.
-            park @ (Outcome::PipeRead { .. } | Outcome::PipeWrite { .. } | Outcome::StdinPark) => {
+            // #1896 — a call parks, or asks for a process, in a bounce out of a leaf whose host
+            // suspends the emitted frames beneath this drive. The drive stops here and hands back its
+            // continuation: a park with its op rewound to re-execute and the state the task parks in,
+            // which the pump runs on once the park clears; a spawn past its op, which the pump starts
+            // first ([`spawn_task`]). Anywhere else these fault, as ever: nothing beneath could wait.
+            stop @ (Outcome::PipeRead { .. }
+            | Outcome::PipeWrite { .. }
+            | Outcome::StdinPark
+            | Outcome::ReapWait { .. }
+            | Outcome::SpawnSelf { .. }) => {
                 let slot = run_meta
                     .as_mut()
                     .and_then(|c| c.park.as_deref_mut())
                     .filter(|_| chain.is_empty())
                     .ok_or(Trap::CapFault)?;
-                let state = match park {
-                    Outcome::PipeRead { pipe } => TaskState::BlockedPipeRead { pipe },
-                    Outcome::PipeWrite { pipe } => TaskState::BlockedPipeWrite { pipe },
-                    _ => TaskState::BlockedStdin,
+                let handoff = match stop {
+                    Outcome::PipeRead { pipe } => {
+                        Handoff::Park(TaskState::BlockedPipeRead { pipe })
+                    }
+                    Outcome::PipeWrite { pipe } => {
+                        Handoff::Park(TaskState::BlockedPipeWrite { pipe })
+                    }
+                    Outcome::ReapWait { child } => {
+                        Handoff::Park(TaskState::BlockedReapPersonality { child })
+                    }
+                    Outcome::SpawnSelf { cmd, plan, dst } => {
+                        Handoff::Spawn(Box::new(SpawnAsk { cmd, plan, dst }))
+                    }
+                    _ => Handoff::Park(TaskState::BlockedStdin),
                 };
-                *slot = Some((active, state));
+                *slot = Some((active, handoff));
                 return Ok(Vec::new());
             }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
@@ -12660,6 +12776,75 @@ struct Suspended {
     /// Where the leaf's results land, and their types ([`CoopSched::pending_tierup`]).
     dst: TierUpDst,
     results: Box<[ValType]>,
+    /// A process the call asked for ([`Handoff::Spawn`]), which the pump starts before the call runs
+    /// on.
+    spawn: Option<Box<SpawnAsk>>,
+}
+
+/// A personality spawn asked for in a leaf's bounce ([`Outcome::SpawnSelf`]): the request, and the
+/// register of the call's continuation the answer lands in.
+struct SpawnAsk {
+    cmd: super::ExecCmd,
+    plan: super::SpawnPlan,
+    dst: u32,
+}
+
+/// #1896 — what a leaf's call hands back when it stops in a bounce ([`BounceRunCtx::park`]).
+enum Handoff {
+    /// It parked: the state its task waits in.
+    Park(TaskState),
+    /// It asked for a process, which only the pump can start.
+    Spawn(Box<SpawnAsk>),
+}
+
+/// Leave task `ti`, whose leaf's call stopped in a bounce ([`Handoff`]): parked in the state the call
+/// waits in, or runnable with the spawn it asked for. Answers the spawn, for the call's
+/// [`Suspended`].
+fn hand_off(
+    tasks: &mut [TaskSlot],
+    forked_twins: &mut std::collections::BTreeSet<usize>,
+    hooked_twins: &std::collections::BTreeSet<usize>,
+    ti: usize,
+    handoff: Handoff,
+) -> Option<Box<SpawnAsk>> {
+    match handoff {
+        Handoff::Park(state) => {
+            park_task(tasks, forked_twins, hooked_twins, ti, state);
+            None
+        }
+        Handoff::Spawn(ask) => {
+            tasks[ti].state = TaskState::Runnable;
+            Some(ask)
+        }
+    }
+}
+
+/// Park task `ti` in `state`, whichever tier its call parked from.
+///
+/// #1080 pipeline rung — an ANY-child reap parker (`child: None`) that re-parks has just re-run its
+/// `waitpid(-1)` and found nothing reapable, so every already-hooked Done twin's exit has been
+/// CONSUMED (reaped by this parker, or owned by another parent who reaps straight from the
+/// personality table without an engine wake). Such twins must stop satisfying the any-child wake
+/// criterion, or the settle re-wakes this parker forever on the same stale Done twin — a livelock in
+/// which the woken parker (lowest task index, e.g. root bash) is picked every pump iteration and a
+/// Runnable later task (the pipeline's exec stage) is NEVER scheduled: the `echo | cat` wedge (root
+/// re-parked ~2M times while `cat`'s twin starved). A Done-but-NOT-yet-hooked twin is kept: its exit
+/// hooks (and so its reapable zombie) fire at the next settle, and this parker must wake for it.
+/// `Some(pid)` parks are prune-immune (their wake keys on `tasks[pid-1]` directly) and self-limiting
+/// (the woken re-run reaps + returns).
+fn park_task(
+    tasks: &mut [TaskSlot],
+    forked_twins: &mut std::collections::BTreeSet<usize>,
+    hooked_twins: &std::collections::BTreeSet<usize>,
+    ti: usize,
+    state: TaskState,
+) {
+    if let TaskState::BlockedReapPersonality { child: None } = state {
+        forked_twins.retain(|&j| {
+            !(hooked_twins.contains(&j) && matches!(tasks[j].state, TaskState::Done(_)))
+        });
+    }
+    tasks[ti].state = state;
 }
 
 /// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
@@ -13524,6 +13709,31 @@ impl CoopSched {
                 continue;
             };
             last_pick = ti;
+            // #1896 — a leaf's call that asked for a process in its bounce: start it, as the spawn
+            // arm starts one for an interpreted caller, before the call runs on (below).
+            if let Some(ask) = tasks[ti].suspended.as_mut().and_then(|s| s.spawn.take()) {
+                let SpawnAsk { cmd, plan, dst } = *ask;
+                let (r, step) = spawn_task(
+                    tasks,
+                    extra_envs,
+                    forked_twins,
+                    pending_tierup,
+                    leaf.as_ref(),
+                    dom,
+                    mem,
+                    host,
+                    *fuel,
+                    ti,
+                    cmd,
+                    plan,
+                );
+                if let Some(s) = tasks[ti].suspended.as_mut() {
+                    s.vm.set(dst, Reg::from_i64(r));
+                }
+                if let Some(step) = step {
+                    return Ok(step);
+                }
+            }
             // #1157 — arm the preemption quantum ONLY when ≥2 tasks are runnable (genuinely concurrent).
             // A single runnable task (the common case — bash, every non-threaded browser guest) keeps
             // `budget = u64::MAX` / run-to-completion, so the hot path takes zero extra pump round-trips
@@ -13602,7 +13812,9 @@ impl CoopSched {
             // it parks again, the task waits again. A trap ends the process, whose frames the host
             // never resumes.
             if let Some(s) = tasks[ti].suspended.take() {
-                let Suspended { vm, dst, results } = *s;
+                let Suspended {
+                    vm, dst, results, ..
+                } = *s;
                 let mut parked = None;
                 let meta = BounceRunCtx {
                     jit_mirror: None, // a leaf's env is its own
@@ -13622,9 +13834,14 @@ impl CoopSched {
                 charge_slice(slice_left, *ctx.fuel);
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
-                    (Ok(_), Some((vm, state))) => {
-                        tasks[ti].state = state;
-                        tasks[ti].suspended = Some(Box::new(Suspended { vm, dst, results }));
+                    (Ok(_), Some((vm, handoff))) => {
+                        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff);
+                        tasks[ti].suspended = Some(Box::new(Suspended {
+                            vm,
+                            dst,
+                            results,
+                            spawn,
+                        }));
                     }
                     (Ok(vals), None) => {
                         *pending_tierup = Some((ti, dst, results));
@@ -14162,15 +14379,8 @@ impl CoopSched {
                     }
                 }
                 Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
-                    // A personality `posix_spawn`: mint a process as the fork arm mints a twin (its
-                    // pid is its task index + 1, and its parent reaps it) and build its image as the
-                    // exec arm builds one, in an env of its own: a fresh window of the caller's
-                    // geometry, with nothing of the caller copied. The caller runs on with the pid,
-                    // or `-EAGAIN` when no process could be minted. A process whose image cannot be
-                    // built still takes its task, done before it ran, so the settle retires it as it
-                    // retires any process and no later process is handed its pid.
-                    // The tree-walker's gate: a request from a fiber keeps its placeholder, and a
-                    // serve handler is not a clean root.
+                    // A personality `posix_spawn` ([`spawn_task`]). The tree-walker's gate: a request
+                    // from a fiber keeps its placeholder, and a serve handler is not a clean root.
                     if tasks[ti].vt.active_id != ROOT_FIBER {
                         tasks[ti]
                             .vt
@@ -14182,88 +14392,23 @@ impl CoopSched {
                         tasks[ti].vt.active.set(dst, Reg::from_i64(super::EINVAL));
                         continue;
                     }
-                    let child_ti = tasks.len();
-                    let pid = child_ti as u64 + 1;
-                    let (twin, child_fuel) = match tasks[ti].env {
-                        Some(k) => (
-                            extra_envs[k]
-                                .host
-                                .lock_unpoisoned()
-                                .spawn_powerbox(pid, plan),
-                            extra_envs[k].fuel,
-                        ),
-                        None => (host.spawn_powerbox(pid, plan), *fuel),
-                    };
-                    let Some(mut twin) = twin else {
-                        tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
-                        continue;
-                    };
-                    let caller = match tasks[ti].env {
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                        None => mem.as_ref(),
-                    };
-                    let built = exec_image_build(
-                        &mut twin,
-                        caller,
-                        dom,
-                        cmd,
-                        0,
-                        0,
-                        0,
-                        0,
-                        true,
+                    let (r, step) = spawn_task(
+                        tasks,
+                        extra_envs,
+                        forked_twins,
+                        pending_tierup,
                         leaf.as_ref(),
+                        dom,
+                        mem,
+                        host,
+                        *fuel,
+                        ti,
+                        cmd,
+                        plan,
                     );
-                    let (child_mem, child_host, table, vt, state, start) = match built {
-                        Ok(built) => {
-                            // Its own park door and pump bell, as the fork arm wires a twin's.
-                            built.host.wire_park_door();
-                            if let Some(bell) = host.external_wake() {
-                                if let Some((_, source)) = built.host.signal_poll() {
-                                    wire_pump_bell(&source, &bell);
-                                }
-                            }
-                            let state = TaskState::Runnable;
-                            let (m, h) = (Some(built.mem), built.host);
-                            (m, h, built.table, built.vt, state, built.leaf)
-                        }
-                        Err(_) => {
-                            let mut vt = VTask {
-                                active: tasks[ti].vt.active.clone(),
-                                active_id: ROOT_FIBER,
-                                chain: Vec::new(),
-                                root_shadow_sp: 0,
-                                active_invoke: None,
-                            };
-                            vt.release();
-                            let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
-                            let state = TaskState::Done(failed);
-                            (None, twin, dom.table.fork(), vt, state, None)
-                        }
-                    };
-                    let eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
-                        mem: child_mem,
-                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
-                        table,
-                        fuel: child_fuel,
-                        fibers: FiberTables::default(),
-                    });
-                    tasks.push(TaskSlot {
-                        vt,
-                        threads: Vec::new(),
-                        env: Some(eidx),
-                        state,
-                        suspended: None,
-                        lease: None,
-                    });
-                    forked_twins.insert(child_ti);
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(pid as i64));
-                    if let Some(start) = start {
-                        let win = extra_envs[eidx].mem.as_ref();
-                        if let Some(step) = leaf_step(start, child_ti, win, pending_tierup) {
-                            return Ok(step);
-                        }
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(r));
+                    if let Some(step) = step {
+                        return Ok(step);
                     }
                 }
                 Ok(VcpuStop::ForkSelf { dst }) => {
@@ -14394,26 +14539,8 @@ impl CoopSched {
                     // #799 — personality blocking `waitpid()`: the op was rewound (it re-executes on
                     // wake). Park until the named child completes; the settle scan re-admits it after
                     // firing the twin's exit hooks, so the re-executed op finds the twin retired.
-                    //
-                    // #1080 pipeline rung — an ANY-child parker (`child: None`) that re-parks has just
-                    // re-run its `waitpid(-1)` and found nothing reapable, so every already-hooked Done
-                    // twin's exit has been CONSUMED (reaped by this parker, or owned by another parent
-                    // who reaps straight from the personality table without an engine wake). Such twins
-                    // must stop satisfying the any-child wake criterion, or the settle re-wakes this
-                    // parker forever on the same stale Done twin — a livelock in which the woken parker
-                    // (lowest task index, e.g. root bash) is picked every pump iteration and a Runnable
-                    // later task (the pipeline's exec stage) is NEVER scheduled: the `echo | cat` wedge
-                    // (root re-parked ~2M times while `cat`'s twin starved). A Done-but-NOT-yet-hooked
-                    // twin is kept: its exit hooks (and so its reapable zombie) fire at the next settle,
-                    // and this parker must wake for it. `Some(pid)` parks are prune-immune (their wake
-                    // keys on `tasks[pid-1]` directly) and self-limiting (the woken re-run reaps + returns).
-                    if child.is_none() {
-                        forked_twins.retain(|&j| {
-                            !(hooked_twins.contains(&j)
-                                && matches!(tasks[j].state, TaskState::Done(_)))
-                        });
-                    }
-                    tasks[ti].state = TaskState::BlockedReapPersonality { child };
+                    let state = TaskState::BlockedReapPersonality { child };
+                    park_task(tasks, forked_twins, hooked_twins, ti, state);
                 }
                 Ok(VcpuStop::PipeRead { pipe }) => {
                     // #1080 rung 4 — park this task on a blocking pipe read; the settle scan polls
@@ -15110,10 +15237,10 @@ pub struct LeafOffer<'a> {
     pub entry: u32,
     /// It can change its page state: emit it with the per-access page check (#750).
     pub paged: bool,
-    /// It can park, in a stream call (a read of an empty pipe, say). Emit it only if the host can
-    /// **suspend** its emitted frames there: the call's bounce ([`CoopRun::bounce`]) then answers
-    /// that it parked, and the host holds the frames until [`CoopEvent::Resume`] hands it the call's
-    /// results.
+    /// It can park, in a stream call (a read of an empty pipe, say) or on its children (a wait, a
+    /// spawn). Emit it only if the host can **suspend** its emitted frames there: the call's bounce
+    /// ([`CoopRun::bounce`]) then answers that it parked, and the host holds the frames until
+    /// [`CoopEvent::Resume`] hands it the call's results.
     pub parks: bool,
 }
 
@@ -15621,6 +15748,8 @@ impl CoopRun {
             slot_units,
             table_gen,
             pending_tierup,
+            forked_twins,
+            hooked_twins,
             ..
         } = sched;
         // #1896: a leaf whose host suspends its frames can park in a bounce.
@@ -15707,15 +15836,19 @@ impl CoopRun {
             }
         }?;
         drop(beneath);
-        let Some((vm, state)) = parked else {
+        let Some((vm, handoff)) = parked else {
             return Ok(Some(n));
         };
-        // #1896: the call parked. Its task waits with the rest of the call, and its host with the
+        // #1896: the call stopped. Its task waits with the rest of the call, and its host with the
         // emitted frames.
         let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
-        let t = &mut tasks[ti];
-        t.state = state;
-        t.suspended = Some(Box::new(Suspended { vm, dst, results }));
+        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff);
+        tasks[ti].suspended = Some(Box::new(Suspended {
+            vm,
+            dst,
+            results,
+            spawn,
+        }));
         Ok(None)
     }
 }
