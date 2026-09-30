@@ -328,6 +328,10 @@ pub trait Debuggee {
         None
     }
 
+    /// Focus the thread a step back walks — the one that ran most recently (#1942) — so a source-line
+    /// step back reads that thread's lines. Default: nothing (a backend with one thread).
+    fn focus_last_ran(&mut self) {}
+
     // --- access sink / models --------------------------------------------------------------------
     /// Install the session's access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3): every
     /// module-0 memory op reaches it, `seek` replays included. `false` when this backend has no
@@ -430,21 +434,22 @@ impl Debuggee for Inspector {
     }
 }
 
-/// A cached map of the run's **stoppable positions** — `(clock, depth)` for every op that sits at a
-/// real IR instruction — over `[0, high_water]`. The op timeline of a deterministic replay is fixed
-/// for the whole session (breakpoints never change *which* ops run, and cap-input `tape` records are
-/// append-only + positional, so an earlier op's behavior can't change as the run goes further
-/// forward), so this is built once by a single fresh-run scan and reused by every `step_back` target
-/// search — replacing the per-`step_back` probe scan that re-derived it. Rebuilt only when a forward
-/// step advances the current position past `high_water`.
+/// A cached map of the run's **stoppable positions** — `(clock, thread, depth)` for every op that
+/// sits at a real IR instruction — over `[0, high_water]`. The op timeline of a deterministic replay
+/// only grows as the run goes forward (breakpoints never change *which* ops run, and cap-input `tape`
+/// records are append-only + positional, so an earlier op's behavior can't change), so this is built
+/// once by a single fresh-run scan and reused by every `step_back` target search — replacing the
+/// per-`step_back` probe scan that re-derived it. Rebuilt when a forward step advances the current
+/// position past `high_water`; clipped when a step from an earlier turn rewrites the future (#1942).
 struct RevTrace {
     /// The furthest clock/turn the scan covered; the cache is valid for any position `<= high_water`.
     high_water: u64,
-    /// `(clock, depth, sourced)` of each stoppable op in `[0, high_water)`, ascending — a `step_back`
-    /// target is the last entry strictly before the current position at call depth `<=` the current
-    /// frame count. `sourced` is whether the op has a source location; it picks the target from a
-    /// finished run, which has no frame count to compare against (see `step_back`).
-    stoppable: Vec<(u64, usize, bool)>,
+    /// `(clock, thread, depth, sourced)` of each stoppable op in `[0, high_water)`, ascending: the
+    /// thread that runs the op, and that thread's call depth there. A `step_back` target is the last
+    /// entry strictly before the current position on the thread that ran last, at call depth `<=` its
+    /// current frame count. `sourced` is whether the op has a source location; it picks the target
+    /// from a finished thread, which has no frame count to compare against (see `step_back`).
+    stoppable: Vec<(u64, usize, usize, bool)>,
 }
 
 /// The **bytecode backend** — the resumable bytecode debug session ([`ScheduledDebugRun`]) plus the
@@ -499,6 +504,10 @@ pub struct BytecodeBackend {
     /// Slice 7: the recorded forced switches, concrete `(turn, task)` — re-applied on every
     /// rebuild for the same reason.
     forced: Vec<(u64, usize)>,
+    /// #1942: the recorded **step spans** — the turns each step drove and its thread — carried from
+    /// the live run and re-applied on every rebuild, so a replay runs the steps' threads, not the
+    /// policy's.
+    spans: Vec<(u64, u64, usize)>,
     /// Slice 8: recorded **debugger state writes** ([`ScheduledWrite`]), keyed by the clock/turn
     /// they were made at. The engine re-applies each whenever execution passes its clock — on the
     /// live resume *and* on every seek replay / rev-trace probe (the list is re-installed on each
@@ -678,6 +687,7 @@ impl BytecodeBackend {
             sched_trace: false,
             seed,
             forced: Vec::new(),
+            spans: Vec::new(),
             writes: Vec::new(),
         })
     }
@@ -840,6 +850,40 @@ impl BytecodeBackend {
         self.run.set_scheduled_writes(self.writes.clone());
     }
 
+    /// A forward step (#1942). The run records the step's span, having dropped the spans at or past
+    /// this turn — a step from an earlier turn (after a step back) rewrites the future. Everything
+    /// cached from the old future goes with them: the checkpoints past this turn and the reverse
+    /// trace past it. Then the new spans are kept for the next rebuild.
+    fn step_forward(
+        &mut self,
+        verb: impl FnOnce(&mut ScheduledDebugRun, &mut u64) -> SchedStop,
+    ) -> Stop {
+        let now = self.run.op_turn();
+        self.checkpoints.truncate_after(now);
+        if let Some(trace) = self.rev_trace.as_mut().filter(|t| t.high_water > now) {
+            trace.high_water = now;
+            trace.stoppable.retain(|&(c, ..)| c < now);
+        }
+        let stop = self.resume(verb);
+        self.spans = self.run.step_spans().to_vec();
+        stop
+    }
+
+    /// The thread that ran the last stoppable op before `now` — the one whose step a step back undoes
+    /// (#1942). `None` at the very start, or when the trace can't be built.
+    fn last_ran(&mut self, now: u64) -> Option<usize> {
+        if !self.ensure_rev_trace(now) {
+            return None;
+        }
+        let trace = self.rev_trace.as_ref()?;
+        trace
+            .stoppable
+            .iter()
+            .rev()
+            .find(|&&(c, ..)| c < now)
+            .map(|&(_, t, ..)| t)
+    }
+
     /// Absorb the live run's recorded cap-input tape if it now reaches further than the one held — so
     /// a later reverse `seek` replays the furthest-forward inputs. Cheap no-op for a pure-output
     /// (`write`-only) program (its tape stays empty) and for deny-all sessions.
@@ -887,16 +931,17 @@ impl BytecodeBackend {
         // The probe must replay the *same schedule* as the session (slice 7 policy; the seed rides
         // `fresh`) and the same debugger writes (slice 8), or its timeline diverges.
         probe.set_forced_switches(self.forced.clone());
+        probe.set_step_spans(self.spans.clone());
         probe.set_scheduled_writes(self.writes.clone());
         loop {
             let c = probe.op_turn();
             if c >= now {
                 break;
             }
-            probe.locate();
-            if let Some(pc) = probe.frame_pc(0) {
+            probe.locate(); // focuses the thread that runs op `c`
+            if let (Some(ti), Some(pc)) = (probe.stopped_task(), probe.frame_pc(0)) {
                 let sourced = temen_interp::source_loc(&self.module, pc).is_some();
-                stoppable.push((c, probe.depth(), sourced));
+                stoppable.push((c, ti as usize, probe.depth(), sourced));
             }
             if !probe.tick(&mut fuel) {
                 break;
@@ -1009,13 +1054,13 @@ impl Debuggee for BytecodeBackend {
         self.resume(|run, fuel| run.run_until_turn(fuel, until))
     }
     fn step(&mut self) -> Stop {
-        self.resume(ScheduledDebugRun::step)
+        self.step_forward(ScheduledDebugRun::step)
     }
     fn step_over(&mut self) -> Stop {
-        self.resume(ScheduledDebugRun::step_over)
+        self.step_forward(ScheduledDebugRun::step_over)
     }
     fn step_out(&mut self) -> Stop {
-        self.resume(ScheduledDebugRun::step_out)
+        self.step_forward(ScheduledDebugRun::step_out)
     }
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
     // plus a recorded cap tape, so seeking to an earlier turn = rebuild a fresh run and replay to that
@@ -1043,20 +1088,31 @@ impl Debuggee for BytecodeBackend {
         // back over the whole call to `main`. The forward step that ended the run went from the last
         // source line to termination (a step passes sourceless code by), so its reverse lands on the
         // last op that has a source location.
-        let (now, now_depth) = (self.run.op_turn(), self.run.depth());
+        //
+        // **In a threaded run it walks the thread that ran last** (#1942): the previous op of that
+        // thread, at its depth. A step runs one thread while the others stay frozen, so this undoes
+        // the most recent step, whichever thread took it, and leaves the other threads where they
+        // are. A thread that has finished is like a finished run: its last sourced op.
+        let now = self.run.op_turn();
         if !self.ensure_rev_trace(now) {
             return Stop::Blocked;
         }
-        let finished = self.run.result().is_some();
+        let Some(task) = self.last_ran(now) else {
+            return self.rewind_to(0); // nothing stoppable before now: the start
+        };
+        let live = self.run.select_task(task as u64) && self.run.result().is_none();
+        let now_depth = self.run.depth();
         let target = self
             .rev_trace
             .as_ref()
-            .expect("ensure_rev_trace populated the cache")
+            .expect("last_ran populated the cache")
             .stoppable
             .iter()
             .rev()
-            .find(|&&(c, d, sourced)| c < now && if finished { sourced } else { d <= now_depth })
-            .map_or(0, |&(c, _, _)| c);
+            .find(|&&(c, t, d, sourced)| {
+                c < now && t == task && if live { d <= now_depth } else { sourced }
+            })
+            .map_or(0, |&(c, ..)| c);
         self.rewind_to(target)
     }
 
@@ -1080,7 +1136,8 @@ impl Debuggee for BytecodeBackend {
         // Re-apply the schedule policy (slice 7) — semantic, so the replay must carry it (the seed
         // rides `fresh`; forced switches are applied here).
         run.set_forced_switches(self.forced.clone());
-        // And the recorded debugger writes (slice 8) — the replay re-applies them at their turns.
+        run.set_step_spans(self.spans.clone()); // #1942: and the steps' threads
+                                                // And the recorded debugger writes (slice 8) — the replay re-applies them at their turns.
         run.set_scheduled_writes(self.writes.clone());
         // Restart from the nearest checkpoint at or before `t` (ladder kept sorted by turn) instead
         // of turn 0, when still checkpointable — bounding the replay to the stride.
@@ -1380,6 +1437,12 @@ impl Debuggee for BytecodeBackend {
             self.sync_writes();
         }
         ok
+    }
+    fn focus_last_ran(&mut self) {
+        let now = self.run.op_turn();
+        if let Some(task) = self.last_ran(now) {
+            self.run.select_task(task as u64);
+        }
     }
     /// Slice 7: resolve + record a forced switch.
     fn force_switch(&mut self, target: Option<usize>) -> Option<usize> {

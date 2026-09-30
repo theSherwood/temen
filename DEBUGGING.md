@@ -1350,6 +1350,17 @@ the root), `threads` lists root + workers, the worker's `stackTrace`/`variables`
 with `delta = 1`, and `continue` stops in the *other* worker. So the headline multithread debugger —
 per-thread breakpoints, thread selection, deterministic interleavings — is now usable from an editor.
 
+**Stepping a chosen thread, and stepping back over it (#1942).** On the bytecode backend `next`/
+`stepIn`/`stepOut` drive the thread their `threadId` names (the others stay frozen), not whichever
+thread last stopped. Each step records the span of turns it drove and its thread, and every pick —
+live and in the `tick` replay behind `seek`, the reverse trace and checkpoint rebuilds — goes through
+one precedence (coroutine pin > forced switch > the stepping thread or a recorded span > policy), so
+time travel replays the schedule the steps actually took. A `stepBack` walks the thread that ran last,
+so it undoes the most recent step, whichever thread took it, and leaves the other threads where they
+are; a step taken after stepping back rewrites the recorded future (its spans, checkpoints and cached
+reverse trace past that turn). Test: `chibicc_debug.rs`
+`a_step_moves_the_thread_it_names_and_step_back_undoes_the_last_step`.
+
 **Built — slice 4 (`evaluate` + multithreaded reverse-continue).** `evaluate` resolves a watch /
 hover / REPL expression — slice 1 a bare source-variable name in the given frame, read through
 `read_var` (advertised via `supportsEvaluateForHovers`; an unknown name fails so the client shows
