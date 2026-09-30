@@ -10,10 +10,9 @@
 //! - **`Pending`** names the issue that builds the row.
 //! - **`Unreachable`** says why the engine never parks there during a durable run.
 //!
-//! Each engine has a runner ([`run`]). Every engine keeps the fiber-safepoint countdown
-//! ([`arm_freeze_after`]), so the rows that fire the freeze in a sibling use it and run unchanged on
-//! each; the oracle and the bytecode engine also keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]),
-//! which the one-vCPU rows use.
+//! Each engine has a runner ([`run`]). The oracle and the JIT keep the fiber-safepoint countdown
+//! ([`arm_freeze_after`]), which the rows that fire the freeze in a sibling use; the oracle and the
+//! bytecode engine keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]), which the one-vCPU rows use.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -350,8 +349,8 @@ fn freeze_parked_then_thaw(
 
 /// The sibling every shared-shape row spawns: it resumes a fiber (the fiber-safepoint countdown fires
 /// the freeze inside it, with the root already parked), then does the row's release with its argument,
-/// and returns 7. The fiber-safepoint countdown is the trigger every engine keeps, so the same row runs
-/// on each. The fiber is [`FIBER`], which each such module defines as its func 2.
+/// and returns 7. The fiber-safepoint countdown is the trigger the oracle and the JIT share, so the same
+/// row runs on both. The fiber is [`FIBER`], which each such module defines as its func 2.
 const SIBLING_LOOP: &str = r#"
 block 0 (vsp: i64, varg: i64) {
   vf = ref.func 2
@@ -980,12 +979,203 @@ block 0 (vx: i64) {
 }
 
 /// #1677 — a **fiber** parked at a re-issue site freezes as a vCPU parked there does: the freeze
-/// drive abandons its park and the thaw re-issues it. The oracle's rows; a fiber parks on a futex
-/// (the `stopped` row's fiber), a stream read, or a live call's reply.
+/// drive abandons its park and the thaw re-issues it. A fiber parks on a futex (the `stopped` row's
+/// fiber), a pipe op or a stream read (#1952, #1973, on every engine), or a live call's reply.
 #[test]
 fn a_fiber_parked_at_a_reissue_site_freezes_like_a_vcpu() {
+    for engine in [Engine::Interp, Engine::Jit] {
+        pipe_read_in_a_fiber(engine);
+        pipe_write_in_a_fiber(engine);
+        stdin_read_in_a_fiber(engine, Trigger::Countdown);
+    }
+    // The bytecode engine keeps no countdown, and under freeze-on-quiesce only input from outside the
+    // domain can end the park: stdin, but not a pipe the domain minted (a pipe fed from outside crosses
+    // the cut, #1680). Its pipe and stdin parks share one flatten arm (`HostParked`).
+    for engine in [Engine::Interp, Engine::Bytecode] {
+        stdin_read_in_a_fiber(engine, Trigger::Quiesce);
+    }
     stream_read_in_a_fiber(ParkSite::StreamRead, Engine::Interp);
     reply_from(ParkSite::Reply, Engine::Interp, T_CALLS_IN_A_FIBER);
+}
+
+/// What fires a [`host_park_in_a_fiber`] row's freeze. The oracle keeps both triggers; the JIT keeps
+/// only the countdown, and the bytecode engine only freeze-on-quiesce.
+#[derive(Clone, Copy, Debug)]
+enum Trigger {
+    /// [`arm_in_sibling`]'s countdown, over the safepoints of a ticker fiber the root polls.
+    Countdown,
+    /// [`arm_freeze_on_quiesce`], when the root blocks on the parked fiber.
+    Quiesce,
+}
+
+/// The one-vCPU shape of a fiber's host park, so the row runs on an engine whose durable entry refuses
+/// `thread.*`. The root starts fiber `op` (func 1) with its first argument, and `op` parks on the host
+/// op. The root then drives `op` to its return `n` and answers `1000·n + byte 66100`:
+///
+/// - [`Trigger::Countdown`]: it polls `op` twenty times beside the ticker [`FIBER`] (func 2), whose
+///   safepoints fire the freeze with `op` parked, then does `release` with its second argument, which
+///   ends the park from inside the domain. It never resumes `op` once it has returned, however early
+///   the thaw's re-issued op completes.
+/// - [`Trigger::Quiesce`]: it blocks on `op` at once (`cont.resume.block`), so the domain goes idle with
+///   `op` parked; only `outside` can release it, and `release` must be empty.
+///
+/// `outside` is what arrives from outside the domain after the freeze.
+#[allow(clippy::too_many_arguments)]
+fn host_park_in_a_fiber(
+    site: ParkSite,
+    engine: Engine,
+    trigger: Trigger,
+    op: &str,
+    release: &str,
+    host: impl Fn(&mut Host) -> Vec<Value>,
+    uninterrupted: Uninterrupted,
+    outside: impl FnOnce(&mut Host),
+    want: Answer,
+) {
+    let (polls, arm): (i64, fn(&mut [u8])) = match trigger {
+        Trigger::Countdown => (20, arm_in_sibling),
+        Trigger::Quiesce => (1, arm_freeze_on_quiesce),
+    };
+    let src = format!(
+        r#"
+memory 17
+func (i32, i32) -> (i64) {{
+block 0 (va: i32, vb: i32) {{
+  vf = ref.func 1
+  vfsp = i64.const 8192
+  vk = cont.new vf vfsp
+  vt = ref.func 2
+  vtsp = i64.const 4096
+  vtk = cont.new vt vtsp
+  va64 = i64.extend_i32_u va
+  vi0 = i64.const 0
+  br 1(vk, vtk, va64, vb, vi0)
+}}
+block 1 (vk1: i64, vtk1: i64, va1: i64, vb1: i32, vi: i64) {{
+  vs, vn = cont.resume vk1 va1
+  vdone = i32.const 1
+  vfin = i32.eq vs vdone
+  br_if vfin 5(vn) 2(vk1, vtk1, va1, vb1, vi)
+}}
+block 2 (vk2: i64, vtk2: i64, va2: i64, vb2: i32, vi2: i64) {{
+  vts, vtx = cont.resume vtk2 vi2
+  vone = i64.const 1
+  vi3 = i64.add vi2 vone
+  vlim = i64.const {polls}
+  vmore = i64.ne vi3 vlim
+  br_if vmore 1(vk2, vtk2, va2, vb2, vi3) 3(vk2, va2, vb2)
+}}
+block 3 (vk3: i64, va3: i64, vb3: i32) {{
+{release}
+  br 4(vk3, va3)
+}}
+block 4 (vk4: i64, va4: i64) {{
+  vs4, vn4 = cont.resume.block vk4 va4
+  vd4 = i32.const 1
+  vfin4 = i32.eq vs4 vd4
+  br_if vfin4 5(vn4) 4(vk4, va4)
+}}
+block 5 (vn5: i64) {{
+  vth = i64.const 1000
+  vnk = i64.mul vn5 vth
+  vbuf = i64.const 66100
+  vbyte = i32.load8_u vbuf
+  vb64 = i64.extend_i32_u vbyte
+  vres = i64.add vnk vb64
+  return vres
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+{op}
+  }}
+}}
+{FIBER}"#
+    );
+    freeze_parked_then_thaw(engine, site, &src, host, uninterrupted, arm, outside, want);
+}
+
+/// A pipe grant: the read end, then the write end.
+fn read_then_write(h: &mut Host) -> Vec<Value> {
+    let (w, r) = h.grant_pipe();
+    vec![Value::I32(r), Value::I32(w)]
+}
+
+/// A pipe grant: the write end, then the read end.
+fn write_then_read(h: &mut Host) -> Vec<Value> {
+    let (w, r) = h.grant_pipe();
+    vec![Value::I32(w), Value::I32(r)]
+}
+
+/// A pipe read in a fiber: it reads one byte from an empty pipe, and the root writes `x` after its
+/// polls: `1000·1 + 'x'`.
+fn pipe_read_in_a_fiber(engine: Engine) {
+    host_park_in_a_fiber(
+        ParkSite::PipeRead,
+        engine,
+        Trigger::Countdown,
+        r#"  vbuf = i64.const 66100
+  vlen = i64.const 1
+  vn = call.cap 0 0 (i64, i64) -> (i64) vh (vbuf, vlen)
+  return vn"#,
+        r#"  vwbuf = i64.const 66200
+  vx = i32.const 120
+  i32.store8 vwbuf vx
+  vwlen = i64.const 1
+  vw = call.cap 0 1 (i64, i64) -> (i64) vb3 (vwbuf, vwlen)"#,
+        read_then_write,
+        Uninterrupted::Runs,
+        |_| {},
+        Ok(1000 + i64::from(b'x')),
+    );
+}
+
+/// A pipe write in a fiber: it fills the pipe (its capacity is the guest's whole 64 KiB) and writes
+/// one more byte, which parks until the root drains the pipe after its polls: `1000·1 + 0`, the second
+/// write's count (the drained bytes are the zeroed buffer, so byte 66100 stays 0).
+fn pipe_write_in_a_fiber(engine: Engine) {
+    host_park_in_a_fiber(
+        ParkSite::PipeWrite,
+        engine,
+        Trigger::Countdown,
+        r#"  vbuf = i64.const 65536
+  vcap = i64.const 65536
+  vfill = call.cap 0 1 (i64, i64) -> (i64) vh (vbuf, vcap)
+  vone = i64.const 1
+  vn = call.cap 0 1 (i64, i64) -> (i64) vh (vbuf, vone)
+  return vn"#,
+        r#"  vrbuf = i64.const 65536
+  vrcap = i64.const 65536
+  vr = call.cap 0 0 (i64, i64) -> (i64) vb3 (vrbuf, vrcap)"#,
+        write_then_read,
+        Uninterrupted::Runs,
+        |_| {},
+        Ok(1000),
+    );
+}
+
+/// A stdin read in a fiber: it reads one byte from a blocking stdin with nothing waiting, which only
+/// input from outside the domain ends; it arrives after the freeze: `1000·1 + 'x'`.
+fn stdin_read_in_a_fiber(engine: Engine, trigger: Trigger) {
+    host_park_in_a_fiber(
+        ParkSite::StreamRead,
+        engine,
+        trigger,
+        r#"  vbuf = i64.const 66100
+  vlen = i64.const 1
+  vn = call.cap 0 0 (i64, i64) -> (i64) vh (vbuf, vlen)
+  return vn"#,
+        "",
+        |h| {
+            let vin = h.grant_stream(StreamRole::In);
+            h.set_stdin_blocking(true);
+            vec![Value::I32(vin), Value::I32(0)]
+        },
+        Uninterrupted::WaitsOnTheOutside,
+        |h| h.push_stdin(b"x"),
+        Ok(1000 + i64::from(b'x')),
+    );
 }
 
 /// A stream read in a fiber — the root drives a fiber with `cont.resume.block` that reads one byte

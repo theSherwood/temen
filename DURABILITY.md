@@ -2816,7 +2816,9 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
    claimed by **post-rewind NORMAL** execution now rewinds from its spilled frame instead of
    starting fresh and orphaning it. Pinned with a witness-cell discriminator (the rewind
    reloads the *spilled* pre-park read; a fresh start re-reads the mutated cell) plus the
-   cooperative-poll loop a thawed park's transient re-park requires (invariant 7).
+   cooperative-poll loop a thawed park's transient re-park requires (invariant 7). The JIT's
+   `fiber_resume` applies the same re-arm (#1973): without it, a fiber flattened while parked
+   on a pipe op restarted from its entry when first resumed after the root's rewind.
    **Slice 4b BUILT 2026-07-24 (serve-point freeze + re-issue thaw):** the serve arm delivers
    an inert sentinel on observing `UNWINDING` (no drain, no park — the queue survives
    untouched for the v13 serve section) so its trailing poll unwinds with zero forward
