@@ -11771,7 +11771,7 @@ impl TaskState {
 ///   fork twin, or a vCPU parked where the freeze has no rule, declines it on the run's powerbox
 ///   and spends the arm, and the run carries on as if it was never armed.
 /// - **A freeze in flight** (the window reads `UNWINDING`) brings every park through it by its
-///   site's rule: a re-issue site is re-admitted — its re-executed op observes the freeze and is
+///   site's rule ([`admit_parks`]): a re-issue site is re-admitted — its re-executed op observes the freeze and is
 ///   abandoned, a futex wait takes `WAIT_FROZEN` (#1769) — and a phase site stays parked for the
 ///   completion that wakes it. Nothing else could wake a parked task, so without this the freeze
 ///   would hang on it.
@@ -11806,10 +11806,17 @@ fn freeze_step(
         if let Some(m) = mem.as_mut() {
             m.durable_set_state(super::STATE_UNWINDING);
         }
+        // Fired: even with nothing to re-admit, a stopped task now sees through its stop.
+        admit_parks(tasks);
+        return true;
     }
-    if !(host.is_durable() && is_unwinding(mem)) {
-        return false;
-    }
+    host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
+}
+
+/// A freeze in flight: re-admit every task parked at a [`super::FreezeRule::Reissue`] site (see
+/// [`freeze_step`]). `true` when it re-admitted one.
+fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
+    use super::FreezeRule;
     let mut admitted = false;
     for t in tasks.iter_mut() {
         let Some(site) = t.state.park_site() else {
@@ -12559,15 +12566,19 @@ impl CoopSched {
             // run a stopped process; the coop pick must skip it too, or a background job whose read
             // returns `-ERESTART` on the SIGTTIN keeps re-issuing (its libc retries) and spins forever
             // instead of benching. It re-runs when SIGCONT clears the stop. Domain-scoped (invariant 12).
+            // #1904 — the oracle's see-through (#1672): under a landing freeze a stopped domain runs to
+            // its next freeze point, and `Op::CapCall` abandons each host call on the way.
+            let see_through = host.is_durable() && is_unwinding(mem);
             let domain_stopped = |i: usize| -> bool {
-                match tasks[i].env {
-                    Some(k) => extra_envs[k]
-                        .host
-                        .lock_unpoisoned()
-                        .signal_poll()
-                        .is_some_and(|(_, s)| s.stopped()),
-                    None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
-                }
+                !see_through
+                    && match tasks[i].env {
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .signal_poll()
+                            .is_some_and(|(_, s)| s.stopped()),
+                        None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
+                    }
             };
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
@@ -17176,6 +17187,19 @@ impl Vm {
                     let mut argv: Vec<i64> = Vec::with_capacity(args.len());
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
+                    }
+                    // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
+                    // landing freeze only to reach its next freeze point, so nothing may leave it on the
+                    // way — a host call is abandoned rather than performed, for the thaw to re-issue.
+                    // (A serve op is `Op::SvcPoll`, which the freeze already makes inert.)
+                    if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
+                        && self.abandon_for_freeze(mem, host)
+                    {
+                        for i in 0..results.len() {
+                            self.regs[base + *dst as usize + i] = Reg::default();
+                        }
+                        pc += 1;
+                        continue;
                     }
                     // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): the one mint
                     // ([`super::Host::mint_pipe`]). The generic dispatch below declines it (an engine

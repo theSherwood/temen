@@ -136,11 +136,7 @@ fn bytecode_row(site: ParkSite) -> Row {
             why: "one vCPU's park here waits on the outside: needs a row whose release feeds it \
                   (a futex word, a pipe) from outside the run",
         },
-        ParkSite::Stopped => Row::Pending {
-            issue: 1904,
-            why: "the bytecode engine wires no stop door (`set_stop_apply`); its bench reads only \
-                  a personality's `stopped()`",
-        },
+        ParkSite::Stopped => Row::Case(stopped),
         ParkSite::Reap | ParkSite::ReapAny => Row::Pending {
             issue: 1904,
             why: "a `waitpid` waits on a fork twin, and the bytecode census has no fork-twin decline \
@@ -614,18 +610,24 @@ block 0 (vsp: i64, varg: i64) {
     );
 }
 
-/// A job-control stop with no personality behind it; [`Stopper::stop`] and [`Stopper::cont`] drive it.
+/// A job-control stop with no personality behind it; [`Stopper::set`] drives it. The oracle applies it
+/// through the door it installs ([`SignalSource::set_stop_apply`]); the bytecode engine reads
+/// [`SignalSource::stopped`].
 #[derive(Default)]
 struct Stopper {
     apply: Mutex<Option<StopApply>>,
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 type StopApply = Arc<dyn Fn(bool) + Send + Sync>;
 
 impl Stopper {
     fn set(&self, stopped: bool) {
-        let apply = self.apply.lock().unwrap().clone();
-        apply.expect("installed by the run")(stopped);
+        self.stopped
+            .store(stopped, std::sync::atomic::Ordering::SeqCst);
+        if let Some(apply) = self.apply.lock().unwrap().clone() {
+            apply(stopped);
+        }
     }
 }
 
@@ -635,6 +637,9 @@ impl SignalSource for Stopper {
     }
     fn set_stop_apply(&self, apply: StopApply) {
         self.apply.lock().unwrap().get_or_insert(apply);
+    }
+    fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
