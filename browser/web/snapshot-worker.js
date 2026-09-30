@@ -257,7 +257,10 @@ self.onmessage = async (e) => {
       const run = nimTurn.then(() => nimCompileRun(ex, memory, nim, msg.source));
       nimTurn = run.catch(() => {});
       const r = await run;
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
+      // The compiled-module cache's counters, so a caller can see a later build reuse this worker's
+      // compiled leaf modules.
+      const cache = { compiles: jitCacheStats.compiles, hits: jitCacheStats.hits };
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r, ...cache });
       return;
     }
     if (msg.type === 'stats') {
