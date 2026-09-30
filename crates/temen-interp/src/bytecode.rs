@@ -11279,12 +11279,15 @@ fn step_vcpu(
                 })?;
                 let target = match claim {
                     Claim::Continue(vm) => vm,
-                    Claim::Block => {
+                    // The oracle's rule: a durable run whose freeze is unwinding takes the
+                    // advisory downgrade (the poll status), so the resumer reaches its trailing
+                    // poll instead of re-idling (#1904).
+                    Claim::Block if !(ctx.durable && is_unwinding(ctx.mem)) => {
                         // Rewind the resumer's cursor so the wake re-executes the resume.
                         vt.active.pc = resume_ip;
                         return Ok(VcpuStop::BlockOnFiber { fiber: k });
                     }
-                    Claim::Poll => {
+                    Claim::Block | Claim::Poll => {
                         vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
                         vt.active.set(dst + 1, Reg::from_i64(0));
                         continue;
@@ -11755,6 +11758,127 @@ enum TaskState {
     Done(Result<Vec<Value>, Trap>),
 }
 
+impl TaskState {
+    /// #1904 — the [`super::ParkSite`] this state parks at, so a freeze applies the one rule for it
+    /// ([`super::ParkSite::freeze_rule`], DURABILITY §4 "One rule per park site"). Exhaustive, so a
+    /// new state cannot be missed.
+    fn park_site(&self) -> Option<super::ParkSite> {
+        use super::ParkSite;
+        match self {
+            TaskState::Runnable | TaskState::Done(_) => None,
+            // A serve-handler `reap` is a `wait(pid)`, which the oracle files with `thread.join`.
+            TaskState::BlockedJoin { .. } | TaskState::BlockedReap { .. } => Some(ParkSite::Join),
+            TaskState::BlockedWait { .. } => Some(ParkSite::Futex),
+            // A `cont.resume.block` resumer idles beside the serve loop, as on the oracle.
+            TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => Some(ParkSite::Svc),
+            TaskState::BlockedTicket { .. } => Some(ParkSite::Reply),
+            TaskState::BlockedReapPersonality { .. } => Some(ParkSite::Reap),
+            TaskState::BlockedPipeRead { .. } => Some(ParkSite::PipeRead),
+            TaskState::BlockedPipeWrite { .. } => Some(ParkSite::PipeWrite),
+            TaskState::BlockedStdin => Some(ParkSite::StreamRead),
+        }
+    }
+}
+
+/// #1904 — the pump's freeze step with nothing runnable, the oracle's `freeze_step`. `true` when it
+/// acted, so the pump looks at its tasks again.
+///
+/// - **Freeze-on-quiesce** fires when every park is one a freeze can end (the oracle's
+///   `quiesced_parks_only`: a `svc.wait`, or an indefinite futex wait). The census runs first: a
+///   fork twin, or a vCPU parked where the freeze has no rule, declines it on the run's powerbox
+///   and spends the arm, and the run carries on as if it was never armed.
+/// - **A freeze in flight** (the window reads `UNWINDING`) brings every park through it by its
+///   site's rule ([`admit_parks`]): a re-issue site is re-admitted — its re-executed op observes the freeze and is
+///   abandoned, a futex wait takes `WAIT_FROZEN` (#1769) — and a phase site stays parked for the
+///   completion that wakes it. Nothing else could wake a parked task, so without this the freeze
+///   would hang on it.
+fn freeze_step(
+    tasks: &mut [TaskSlot],
+    fibers: &[FiberState],
+    forked_twins: &std::collections::BTreeSet<usize>,
+    mem: &mut Option<Mem>,
+    host: &mut Host,
+    freeze_on_quiesce: &mut bool,
+) -> bool {
+    use super::{DeclineCause, FreezeDeclined, FreezeRule};
+    if *freeze_on_quiesce && quiesced_parks_only(tasks, fibers) {
+        *freeze_on_quiesce = false;
+        let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
+            let site = t.state.park_site()?;
+            (site.freeze_rule() == FreezeRule::Decline).then_some((site, ti))
+        });
+        let declined = match (forked_twins.first(), parked_declined) {
+            (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
+            (None, Some((site, ti))) => Some((DeclineCause::Parked(site), ti)),
+            (None, None) => None,
+        };
+        if let Some((cause, task)) = declined {
+            host.freeze_declined = Some(FreezeDeclined {
+                cause,
+                task: task as u64,
+                slot: None,
+            });
+            return true;
+        }
+        if let Some(m) = mem.as_mut() {
+            m.durable_set_state(super::STATE_UNWINDING);
+        }
+        // Fired: even with nothing to re-admit, a stopped task now sees through its stop.
+        admit_parks(tasks);
+        return true;
+    }
+    host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
+}
+
+/// A freeze in flight: re-admit every task parked at a [`super::FreezeRule::Reissue`] site (see
+/// [`freeze_step`]). `true` when it re-admitted one.
+fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
+    use super::FreezeRule;
+    let mut admitted = false;
+    for t in tasks.iter_mut() {
+        let Some(site) = t.state.park_site() else {
+            continue;
+        };
+        if site.freeze_rule() != FreezeRule::Reissue {
+            continue;
+        }
+        // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+        if let TaskState::BlockedWait { dst, .. } = t.state {
+            t.vt.active
+                .set(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
+        }
+        t.state = TaskState::Runnable;
+        admitted = true;
+    }
+    admitted
+}
+
+/// The oracle's `quiesced_parks_only`: something is parked that a freeze could re-admit — a
+/// `svc.wait` (or a resumer idling beside it) or a futex wait — and no futex wait has a deadline.
+fn quiesced_parks_only(tasks: &[TaskSlot], fibers: &[FiberState]) -> bool {
+    let mut any = false;
+    for t in tasks {
+        match t.state {
+            TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => any = true,
+            TaskState::BlockedWait { deadline: None, .. } => any = true,
+            TaskState::BlockedWait { .. } => return false,
+            _ => {}
+        }
+    }
+    for f in fibers {
+        match f {
+            FiberState::WaitParked {
+                deadline: None,
+                woken: None,
+                ..
+            } => any = true,
+            FiberState::WaitParked { woken: None, .. } => return false,
+            _ => {}
+        }
+    }
+    any
+}
+
 /// Drive a whole domain — the entry vCPU plus any `thread.spawn` children — to completion on a
 /// **cooperative single-threaded scheduler** sharing one `Mem`. The oracle's concurrent programs are
 /// interleaving-invariant (verified by the tree-walker via stress / seed-sweep / DPOR), so any
@@ -11942,6 +12066,10 @@ struct CoopSched {
     /// At zero the pump returns [`CoopStep::Paused`], every task's cursor persisted — the next pump
     /// resumes exactly where this one stopped, as after a #1157 preemption.
     slice_left: Option<u64>,
+    /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**, one-shot: a durable run armed to
+    /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
+    /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
+    freeze_on_quiesce: bool,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -12123,6 +12251,8 @@ impl CoopSched {
             invoke_fibers: Vec::new(),
             suspend_on_idle: false,
             slice_left: None,
+            freeze_on_quiesce: host.is_durable()
+                && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
         })
     }
 
@@ -12163,6 +12293,7 @@ impl CoopSched {
             invoke_fibers: _,
             suspend_on_idle,
             slice_left,
+            freeze_on_quiesce,
         } = self;
         // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
         // (rather than always lowest-index) is what lets the preemption quantum actually rotate: a
@@ -12452,15 +12583,19 @@ impl CoopSched {
             // run a stopped process; the coop pick must skip it too, or a background job whose read
             // returns `-ERESTART` on the SIGTTIN keeps re-issuing (its libc retries) and spins forever
             // instead of benching. It re-runs when SIGCONT clears the stop. Domain-scoped (invariant 12).
+            // #1904 — the oracle's see-through (#1672): under a landing freeze a stopped domain runs to
+            // its next freeze point, and `Op::CapCall` abandons each host call on the way.
+            let see_through = host.is_durable() && is_unwinding(mem);
             let domain_stopped = |i: usize| -> bool {
-                match tasks[i].env {
-                    Some(k) => extra_envs[k]
-                        .host
-                        .lock_unpoisoned()
-                        .signal_poll()
-                        .is_some_and(|(_, s)| s.stopped()),
-                    None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
-                }
+                !see_through
+                    && match tasks[i].env {
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .signal_poll()
+                            .is_some_and(|(_, s)| s.stopped()),
+                        None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
+                    }
             };
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
@@ -12468,6 +12603,11 @@ impl CoopSched {
                 .map(|k| (last_pick + k) % n)
                 .find(|&i| matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i))
             else {
+                // #1904 — bring the parks through a freeze before any timer fires or the run is
+                // called deadlocked.
+                if freeze_step(tasks, fibers, forked_twins, mem, host, freeze_on_quiesce) {
+                    continue;
+                }
                 // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
                 // pending work on the offload pool, never a deadlock and never a reason to jump the
                 // logical clock. Block on the store for the smallest outstanding id (submission
@@ -16308,6 +16448,27 @@ impl Vm {
     /// The cursor (`cur`/`base`/`pc`) lives in locals for the duration of the loop so the optimizer
     /// keeps it in registers; it is written back to `self` only when the loop exits (suspend), which
     /// is also what a future blocking-op / debug-stop seam will do before yielding.
+    /// Write a host op's result slots into the registers from `at`.
+    fn set_results(&mut self, at: usize, res: &[i64], results: &[ValType]) {
+        for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
+            self.regs[at + i] = Reg::from_value(slot_to_val(*ty, *s));
+        }
+    }
+
+    /// #1904 — under a landing freeze a durable domain never parks (the oracle's `decide`, #1672):
+    /// an op that would park took no effect, so it is **abandoned**. `true` when it is: the running
+    /// context's re-issue word is set, the op's placeholder results stand, and the call's trailing
+    /// poll unwinds; the thaw re-issues the call.
+    fn abandon_for_freeze(&self, mem: &mut Option<Mem>, host: &mut HostCell) -> bool {
+        let freezing = is_unwinding(mem) && host.with(|p| p.is_durable());
+        if freezing {
+            if let Some(m) = mem.as_mut() {
+                m.durable_set_reissue_at(self.durable_region_base);
+            }
+        }
+        freezing
+    }
+
     fn resume(
         &mut self,
         source: &ModuleSource,
@@ -17044,6 +17205,19 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
+                    // landing freeze only to reach its next freeze point, so nothing may leave it on the
+                    // way — a host call is abandoned rather than performed, for the thaw to re-issue.
+                    // (A serve op is `Op::SvcPoll`, which the freeze already makes inert.)
+                    if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
+                        && self.abandon_for_freeze(mem, host)
+                    {
+                        for i in 0..results.len() {
+                            self.regs[base + *dst as usize + i] = Reg::default();
+                        }
+                        pc += 1;
+                        continue;
+                    }
                     // FORK.md §8.6 / #1080 rung 4 — `pipe(fds)` (CAP_SELF op 16): the one mint
                     // ([`super::Host::mint_pipe`]). The generic dispatch below declines it (an engine
                     // serves it only where its reads and writes can park), so it is serviced here.
@@ -17222,6 +17396,11 @@ impl Vm {
                             pc += 1;
                             continue;
                         }
+                        if self.abandon_for_freeze(mem, host) {
+                            self.set_results(base + *dst as usize, &res, results);
+                            pc += 1;
+                            continue;
+                        }
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
@@ -17237,6 +17416,16 @@ impl Vm {
                     // it re-executes on wake after the driver parks the task. The cooperative driver owns
                     // both ([`Outcome::ForkSelf`]/[`Outcome::ReapWait`]); other drivers `ThreadFault`.
                     if let Some(ev) = parks.request {
+                        // A blocking `waitpid` would park: under a landing freeze it is abandoned.
+                        if matches!(
+                            ev,
+                            super::ParkEvent::TaskExit(_) | super::ParkEvent::TaskExitAny
+                        ) && self.abandon_for_freeze(mem, host)
+                        {
+                            self.set_results(base + *dst as usize, &res, results);
+                            pc += 1;
+                            continue;
+                        }
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
@@ -17309,6 +17498,9 @@ impl Vm {
                         if interrupted {
                             self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
                             pc += 1;
+                        } else if self.abandon_for_freeze(mem, host) {
+                            self.set_results(base + *dst as usize, &res, results);
+                            pc += 1;
                         } else if let Some(pipe) = pipe_read_park {
                             self.module = module;
                             self.cur = cur;
@@ -17325,10 +17517,7 @@ impl Vm {
                             });
                         }
                     } else {
-                        for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
-                            self.regs[base + *dst as usize + i] =
-                                Reg::from_value(slot_to_val(*ty, *s));
-                        }
+                        self.set_results(base + *dst as usize, &res, results);
                         pc += 1;
                         // #1198 — this syscall STOPPED its own domain (a background terminal read/write
                         // hit `tty_background_check` → SIGTTIN/SIGTTOU default-action stop; or a `^Z`
@@ -17361,6 +17550,16 @@ impl Vm {
                         let v = self.regs[base + *dst as usize].i64();
                         host.with(|p| p.svc_results.insert(t, v));
                         self.serve_count += 1;
+                    }
+                    // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
+                    // makes **no progress** — it delivers an inert sentinel so its trailing poll
+                    // spills with the queue untouched, and the transform's `SvcServe` re-issue arm
+                    // re-executes the drain on thaw (#1904).
+                    if is_unwinding(mem) && host.with(|p| p.is_durable()) {
+                        self.regs[base + *dst as usize] = Reg::from_i64(0);
+                        self.serve_count = 0;
+                        pc += 1;
+                        continue;
                     }
                     // Admit queued dispatches: un-servable ones settle inline with a probeable
                     // errno (the dispatch's fault, never the domain's — it keeps serving); the

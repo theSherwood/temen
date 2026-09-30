@@ -10,16 +10,16 @@
 //! - **`Pending`** names the issue that builds the row.
 //! - **`Unreachable`** says why the engine never parks there during a durable run.
 //!
-//! The oracle and the JIT each have a runner ([`run`]). The bytecode rows wait on #1904, which gives
-//! that engine the same park rules; enabling it is adding its runner and flipping its rows. Every
-//! engine keeps the fiber-safepoint countdown ([`arm_freeze_after`]), so the rows that fire the
-//! freeze in a sibling use it and run unchanged on each.
+//! Each engine has a runner ([`run`]). Every engine keeps the fiber-safepoint countdown
+//! ([`arm_freeze_after`]), so the rows that fire the freeze in a sibling use it and run unchanged on
+//! each; the oracle and the bytecode engine also keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]),
+//! which the one-vCPU rows use.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use temen_durable::{
     arm_freeze_after, arm_freeze_on_quiesce, begin_thaw, init_durable_window,
-    transform_module_assume_confined,
+    transform_module_assume_confined, ARM_QUIESCE_OFF,
 };
 use temen_interp::{
     run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
@@ -53,10 +53,7 @@ fn row(site: ParkSite, engine: Engine) -> Row {
     match engine {
         Engine::Interp => interp_row(site),
         Engine::Jit => jit_row(site),
-        Engine::Bytecode => Row::Pending {
-            issue: 1904,
-            why: "the same park rules on this engine, and its runner here",
-        },
+        Engine::Bytecode => bytecode_row(site),
     }
 }
 
@@ -118,6 +115,40 @@ fn jit_row(site: ParkSite) -> Row {
             issue: 1901,
             why: "a call in flight inside the cut (the JIT's `live_impl_call` reply and its \
                   punted-call completion); built with its re-park",
+        },
+        ParkSite::Admit => ADMIT_UNREACHABLE,
+    }
+}
+
+/// The bytecode engine's rows, run through its durable entry
+/// (`bytecode::compile_and_run_capture_reserved_with_host`). That entry runs one vCPU: it refuses
+/// `thread.*`, so the rows whose freeze fires in a sibling cannot run on it.
+fn bytecode_row(site: ParkSite) -> Row {
+    const NO_THREADS: &str =
+        "the durable bytecode entry refuses `thread.*`, and this row's park waits \
+                              on a sibling vCPU";
+    match site {
+        ParkSite::Svc => Row::Case(svc),
+        ParkSite::StreamRead => Row::Case(stream_read),
+        ParkSite::Join => Row::Unreachable { why: NO_THREADS },
+        ParkSite::Futex => Row::Case(futex_alone),
+        ParkSite::PipeRead | ParkSite::PipeWrite => Row::Pending {
+            issue: 1904,
+            why: "one vCPU's pipe park waits on the outside, and a pipe fed from outside the domain \
+                  crosses the cut (#1680)",
+        },
+        ParkSite::Stopped => Row::Case(stopped),
+        ParkSite::Reap | ParkSite::ReapAny => Row::Pending {
+            issue: 1904,
+            why: "a `waitpid` waits on a fork twin, and the bytecode census has no fork-twin decline \
+                  outside freeze-on-quiesce",
+        },
+        ParkSite::Lane => Row::Unreachable {
+            why: "the cooperative pump runs one task at a time and has no lanes",
+        },
+        ParkSite::Reply | ParkSite::Completion => Row::Pending {
+            issue: 1901,
+            why: "a call in flight inside the cut; built with its re-park",
         },
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
@@ -217,7 +248,21 @@ fn run(
                     Err(e) => panic!("the JIT refused the module: {e:?}"),
                 }
             }
-            Engine::Bytecode => unreachable!("no bytecode runner yet"),
+            Engine::Bytecode => {
+                let mut fuel = 10_000_000u64;
+                let (r, snap) = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                    &inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h,
+                )
+                .expect("the bytecode engine runs the module");
+                let r = match r {
+                    Ok(v) => match v[..] {
+                        [Value::I64(n)] => Ok(n),
+                        ref other => panic!("unexpected result {other:?}"),
+                    },
+                    Err(t) => Err(format!("{t:?}")),
+                };
+                (r, snap)
+            }
         };
         let _ = tx.send((r, snap, h));
     });
@@ -247,7 +292,7 @@ fn freeze_parked_then_thaw(
     uninterrupted: Uninterrupted,
     arm: fn(&mut [u8]),
     release: impl FnOnce(&mut Host),
-    want: i64,
+    want: Answer,
 ) -> Host {
     assert_ne!(site.freeze_rule(), FreezeRule::Decline, "{site:?}");
     let inst = instrumented(src);
@@ -261,7 +306,7 @@ fn freeze_parked_then_thaw(
             &init_durable_window(WINDOW, TEST_ARENA),
             h,
         );
-        assert_eq!(res, Ok(want), "{site:?}: the uninterrupted answer");
+        assert_eq!(res, want, "{site:?}: the uninterrupted answer");
     }
     let mut h = durable_host(&inst);
     let args = host(&mut h);
@@ -275,11 +320,13 @@ fn freeze_parked_then_thaw(
     let fibers = h.frozen_fibers().to_vec();
     h.set_frozen_fibers(fibers);
     let mut win2 = snap;
+    // The arm rides the window: a quiesce-frozen run that goes idle again would freeze again. The
+    // thaw runs disarmed, to give the uninterrupted answer.
+    win2[ARM_QUIESCE_OFF as usize] = 0;
     begin_thaw(&mut win2, TEST_ARENA, 0);
     let (res2, _, h) = run(engine, &inst, &args, &win2, h);
     assert_eq!(
-        res2,
-        Ok(want),
+        res2, want,
         "{site:?}: the thaw gives the uninterrupted answer"
     );
     h
@@ -368,7 +415,37 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1007,
+        Ok(1007),
+    );
+}
+
+/// `atomic.wait` on one vCPU — the root waits, indefinitely, on a word nothing can store to: the
+/// uninterrupted run is a deadlock (`ThreadFault`). Freeze-on-quiesce fires on the wait; the thaw
+/// re-issues it (#1769), so it deadlocks exactly as the uninterrupted run, never reloading the freeze's
+/// `WAIT_FROZEN` as the wait's answer.
+fn futex_alone(site: ParkSite, engine: Engine) {
+    let src = r#"
+memory 17
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
+    freeze_parked_then_thaw(
+        engine,
+        site,
+        src,
+        |_| vec![],
+        Uninterrupted::Runs,
+        arm_freeze_on_quiesce,
+        |_| {},
+        Err("ThreadFault".into()),
     );
 }
 
@@ -404,7 +481,7 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1007,
+        Ok(1007),
     );
 }
 
@@ -458,7 +535,7 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1000 + i64::from(b'x') + 7,
+        Ok(1000 + i64::from(b'x') + 7),
     );
 }
 
@@ -510,70 +587,80 @@ block 2 (va2: i64) {{
         Uninterrupted::Runs,
         arm_in_sibling,
         |_| {},
-        1007,
+        Ok(1007),
     );
 }
 
-/// A stream read — the root reads one byte from a blocking stdin with nothing waiting, while its
-/// sibling loops. The input arrives only after the freeze: `1000·1 + 'x' + 7`.
+/// A stream read — the root parks a fiber on a futex nothing will notify, then reads one byte from a
+/// blocking stdin with nothing waiting. (One vCPU, so the row runs on an engine whose durable entry
+/// refuses `thread.*`.) Freeze-on-quiesce fires with both parked; the input arrives only after the
+/// freeze: `1000·1 + 'x'`.
 fn stream_read(site: ParkSite, engine: Engine) {
-    let src = format!(
-        r#"
+    let src = r#"
 memory 17
-func (i32) -> (i64) {{
-block 0 (vin: i32) {{
+func (i32) -> (i64) {
+block 0 (vin: i32) {
+  vf = ref.func 1
+  vsp = i64.const 4096
+  vfk = cont.new vf vsp
   vz = i64.const 0
-  vt = thread.spawn 1 vz vz
+  vs, vx = cont.resume vfk vz
   vbuf = i64.const 66100
   vlen = i64.const 1
   vn = call.cap 0 0 (i64, i64) -> (i64) vin (vbuf, vlen)
-  vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vb = i32.load8_u vbuf
   vb64 = i64.extend_i32_u vb
-  vs = i64.add vnk vb64
-  vres = i64.add vs vj
+  vres = i64.add vnk vb64
   return vres
-  }}
-}}
-func (i64, i64) -> (i64) {{
-{SIBLING_LOOP}
-block 2 (va2: i64) {{
-  vr = i64.const 7
-  return vr
-  }}
-}}
-{FIBER}"#
-    );
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
     freeze_parked_then_thaw(
         engine,
         site,
-        &src,
+        src,
         |h| {
             let vin = h.grant_stream(StreamRole::In);
             h.set_stdin_blocking(true);
             vec![Value::I32(vin)]
         },
         Uninterrupted::WaitsOnTheOutside,
-        arm_in_sibling,
+        arm_freeze_on_quiesce,
         |h| h.push_stdin(b"x"),
-        1000 + i64::from(b'x') + 7,
+        Ok(1000 + i64::from(b'x')),
     );
 }
 
-/// A job-control stop with no personality behind it; [`Stopper::stop`] and [`Stopper::cont`] drive it.
+/// A job-control stop with no personality behind it; [`Stopper::set`] drives it. The oracle applies it
+/// through the door it installs ([`SignalSource::set_stop_apply`]); the bytecode engine reads
+/// [`SignalSource::stopped`].
 #[derive(Default)]
 struct Stopper {
     apply: Mutex<Option<StopApply>>,
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 type StopApply = Arc<dyn Fn(bool) + Send + Sync>;
 
 impl Stopper {
     fn set(&self, stopped: bool) {
-        let apply = self.apply.lock().unwrap().clone();
-        apply.expect("installed by the run")(stopped);
+        self.stopped
+            .store(stopped, std::sync::atomic::Ordering::SeqCst);
+        if let Some(apply) = self.apply.lock().unwrap().clone() {
+            apply(stopped);
+        }
     }
 }
 
@@ -583,6 +670,9 @@ impl SignalSource for Stopper {
     }
     fn set_stop_apply(&self, apply: StopApply) {
         self.apply.lock().unwrap().get_or_insert(apply);
+    }
+    fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -650,7 +740,7 @@ block 0 (vsp: i64, varg: i64) {
             );
             stopper.set(false);
         },
-        1001,
+        Ok(1001),
     );
     assert_eq!(h.stdout, b"x", "{site:?}: the thaw re-issued the write");
 }
@@ -699,7 +789,7 @@ block 0 (vx: i64) {
             let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
             *ticket.lock().unwrap() = Some(t);
         },
-        1041,
+        Ok(1041),
     );
     let t = ticket.lock().unwrap().expect("enqueued");
     assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
