@@ -1628,6 +1628,57 @@ pub extern "C" fn temen_par_inst_instantiate(
     }
 }
 
+/// #1865 — an op-17 spawn from **emitted** code: the child `v` runs its entry on the wasm tier, and
+/// its `instantiate_rec` arrived as the Worker's `env.instantiate_rec` bounce. The engine admits it as
+/// the interpreted op ([`bytecode::Vcpu::admit_record`]: `inst` resolved in `v`'s powerbox, the record
+/// read from `v`'s window, a v1 record through the one detached admission) and returns the admitted
+/// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and `(module << 32) | entry`
+/// in `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
+/// refusal, which the emitted parent reads as the spawn's result; `0` for a trap, which the Worker
+/// raises. Once the child's Worker is started, file it with [`temen_par_inst_file_child`].
+#[no_mangle]
+pub extern "C" fn temen_par_inst_instantiate_rec(v: *mut ParVcpu, inst: i32, rec: i64) -> i64 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    let v = unsafe { &mut *v };
+    match v.inner.admit_record(inst, rec as u64) {
+        Ok(Some((child, size_log2))) => {
+            let (module, entry) = child.module_entry();
+            v.b = size_log2 as i64;
+            v.d = ((module as i64) << 32) | entry as i64;
+            ticket(child)
+        }
+        Ok(None) => temen_ir::errno::EINVAL,
+        Err(_) => 0,
+    }
+}
+
+/// #1865 — file the Worker's `token` (the child's completion slot) for the child an emitted spawn
+/// just admitted, in `v`'s own child table, and return the handle the emitted code joins it by —
+/// the table and rule the interpreted spawn and join use ([`bytecode::Vcpu::file_child`]).
+#[no_mangle]
+pub extern "C" fn temen_par_inst_file_child(v: *mut ParVcpu, token: i64) -> i32 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.file_child(token as u64) }
+}
+
+/// #1865 — an emitted `join`: resolve `handle` in `v`'s child table by the oracle's rule
+/// ([`bytecode::Vcpu::join_child`]) and return the child's token (its completion slot) for the
+/// Worker to wait on, then [`temen_par_inst_end_join`]. `0` (no slot is at address 0) for the trap
+/// the interpreted join raises on a spent, negative or unissued handle.
+#[no_mangle]
+pub extern "C" fn temen_par_inst_join(v: *mut ParVcpu, handle: i32) -> i64 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.join_child(handle) }.map_or(0, |t| t as i64)
+}
+
+/// #1865 — the child an emitted join waited on has ended: its window's bytes go back to the budget
+/// that paid for them ([`bytecode::Vcpu::end_join`]).
+#[no_mangle]
+pub extern "C" fn temen_par_inst_end_join(v: *mut ParVcpu) {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.end_join() }
+}
+
 /// #1339 — [`temen_par_inst_call_interp`]'s **root** twin: service one `env.call_interp(func, …)`
 /// bounce on the ROOT vCPU, lending the process-global §22 slot mirror for the duration. A guest
 /// whose *emitted* frame defines and dispatches units (Forth's outer interpreter) reaches

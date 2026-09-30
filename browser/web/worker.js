@@ -69,6 +69,33 @@ self.onmessage = async (e) => {
   let fi32v = new Int32Array(fmem.buffer);
   const fi32 = () => fi32v.byteLength === fmem.buffer.byteLength ? fi32v : (fi32v = new Int32Array(fmem.buffer));
 
+  // Start a §5 detached child the engine admitted (ticket `t`, window `1 << cslog`, `am` =
+  // `(module << 32) | entry`): mint it a fresh shared Memory — one host header page (env cell,
+  // page-state, DETACHED_JIT.md §3.1) + the declared window, growable in place to the detached
+  // ceiling — and post it with the ticket to a new Worker, which starts the child over it; the engine
+  // seeds it there. A shared Memory posts by reference. Returns the child's completion slot. Used for
+  // an interpreted spawn (`PAR_INSTANTIATE_DETACHED`) and one from emitted code (`env.instantiate_rec`).
+  const postDetached = (t, cslog, am) => {
+    const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
+    const hdr = ex.temen_detached_header_bytes(), PAGE = 65536;
+    const cmem = new WebAssembly.Memory({
+      initial: Math.ceil((hdr + 2 ** cslog) / PAGE),
+      maximum: Math.ceil((hdr + Number(ex.temen_detached_max_bytes())) / PAGE),
+      shared: true,
+    });
+    const cslot = ex.temen_par_alloc(SLOT);
+    const cstackTop = ex.temen_par_alloc(STACK) + STACK;
+    const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+    // No `win`/`winSize` in the engine memory: the child's window is in its own. No tier-up bitmap:
+    // it binds the engine memory (a child of the granted unit runs that unit's emit instead).
+    self.postMessage({
+      kind: 'spawn', role: 'detached', ticket: t.toString(), childMem: cmem, slog: cslog,
+      smod: csmod, entry: centry, win: 0, winSize: 2 ** cslog, tierup: false,
+      slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
+    });
+    return cslot;
+  };
+
   // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
   // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
   // wasm-JIT tier-up (threads slice): this Worker enables the tier-up bitmap in this instance —
@@ -245,9 +272,9 @@ self.onmessage = async (e) => {
   // bounce mirrors the cell into engine-side scratch for `temen_par_inst_call_interp`, then back (as
   // `driveDetachedRun` does for the op-13 loop). Its `"mapped"` is its vCPU's committed extent, re-read
   // after each bounce: a bounced leaf's `vm_map` grows its memory. Only a child of the granted unit
-  // (module ≠ 0) runs it; a paged unit and spawns/threads from a detached child's emitted code are
-  // #1865 slice 3b–3d, so those keep the interpreter (or trap, as the interpreter's detached vCPU does
-  // for a carve spawn or a thread).
+  // (module ≠ 0) runs it. Its op-17 spawns are detached grandchildren (`env.instantiate_rec`); a
+  // paged unit and threads are #1865 slices 3c–3d, so those keep the interpreter (or trap, as the
+  // interpreter's detached vCPU does for a carve spawn or a thread).
   const detachedChild = role === 'detached';
   if ((role === 'confined' || (detachedChild && smod !== 0)) && instCodegen
       && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible(entry) === 1
@@ -297,7 +324,6 @@ self.onmessage = async (e) => {
       if (paged) syncPaged();
       else if (detachedChild) uexports.mapped.value = ex.temen_par_win_len(cv);
     };
-    const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
     const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
@@ -328,16 +354,26 @@ self.onmessage = async (e) => {
             slog: gslog, win: cwin + carve, winSize: 2 ** gslog,
             slot: gslot, stackTop: gstackTop, tlsBase: gtlsBase,
           });
-          const h = childSlots.length;
-          childSlots.push(gslot);
-          return h;
+          return ex.temen_par_inst_file_child(cv, BigInt(gslot));
         },
-        // §14 VM-in-VM join: block on the grandchild's completion slot — the same wait the
-        // interpreter JOIN arm does — and surface its result (or trap) to the emitted parent.
+        // #1865 — an op-17 spawn from emitted code: the engine admits the record against THIS child's
+        // vCPU as the interpreted op does, a v1 record as a DETACHED grandchild, started here exactly
+        // as the interpreter's INSTANTIATE_DETACHED event is and filed in the vCPU's own child table.
+        instantiate_rec: (_cwin, inst, rec) => {
+          const t = ex.temen_par_inst_instantiate_rec(cv, inst, rec);
+          if (t === 0n) throw new Error('instantiate_rec trapped');
+          if (t < 0n) return Number(t);
+          const gslot = postDetached(t, Number(ex.temen_par_ev_b(cv)), ex.temen_par_ev_d(cv));
+          return ex.temen_par_inst_file_child(cv, BigInt(gslot));
+        },
+        // A join from emitted code resolves in the vCPU's child table, by the rule the interpreted
+        // join uses; then wait on the child's slot, as the interpreter's JOIN arm does, and return
+        // its window's bytes to the budget that paid.
         join: (_inst, child) => {
-          const gslot = childSlots[child];
-          if (gslot === undefined) throw new Error('join of unknown child');
+          const gslot = Number(ex.temen_par_inst_join(cv, child));
+          if (gslot === 0) throw new Error('join of a spent or unissued child');
           Atomics.wait(i32(), gslot >> 2, 0);
+          ex.temen_par_inst_end_join(cv);
           if (Atomics.load(i32(), gslot >> 2) === 2) throw new Error('nested child trapped');
           return i64()[(gslot + 8) >> 3];
         },
@@ -537,30 +573,8 @@ self.onmessage = async (e) => {
     }
     if (evc === INSTANTIATE_DETACHED) {
       // §5 detached child (#1286 slice 3b): the engine admitted it (the Instantiator resolved, the
-      // WindowMinter's quota taken, the module compiled, its powerbox built); what is left is the
-      // window itself. Mint the child a fresh shared Memory — one host header page (env cell,
-      // page-state, DETACHED_JIT.md §3.1) + the declared window, growable in place to the detached
-      // ceiling — and post it with the ticket to a new Worker, which starts the child over it; the
-      // engine seeds it there. A shared Memory posts by reference.
-      const t = ex.temen_par_ev_a(v), cslog = Number(ex.temen_par_ev_b(v));
-      const am = ex.temen_par_ev_d(v); // (module << 32) | entry, for the child's emitted-tier gate
-      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
-      const hdr = ex.temen_detached_header_bytes(), PAGE = 65536;
-      const cmem = new WebAssembly.Memory({
-        initial: Math.ceil((hdr + 2 ** cslog) / PAGE),
-        maximum: Math.ceil((hdr + Number(ex.temen_detached_max_bytes())) / PAGE),
-        shared: true,
-      });
-      const cslot = ex.temen_par_alloc(SLOT);
-      const cstackTop = ex.temen_par_alloc(STACK) + STACK;
-      const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-      // No `win`/`winSize`: the child has no window in the engine memory. No tier-up: the emitted tier
-      // binds the engine memory (a separate-module child keeps the bitmap inert regardless).
-      self.postMessage({
-        kind: 'spawn', role: 'detached', ticket: t.toString(), childMem: cmem, slog: cslog,
-        smod: csmod, entry: centry, win: 0, winSize: 2 ** cslog, tierup: false,
-        slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
-      });
+      // budget charged, the module compiled, its powerbox built); what is left is the window itself.
+      const cslot = postDetached(ex.temen_par_ev_a(v), Number(ex.temen_par_ev_b(v)), ex.temen_par_ev_d(v));
       ex.temen_par_deliver_child(v, BigInt(cslot)); // the join hands the slot back
       continue;
     }

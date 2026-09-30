@@ -1571,6 +1571,51 @@ block 6 (vs3: i64) {{
     )
 }
 
+// #1865 — the detached twin of [`THREADS_INST_NESTED_UNIT`]: the child reads its own "K" (75), spawns
+// func 1 of its own module (a pure grandchild → 9) detached through an op-17 v1 record, paid from its
+// own `"budget"` — the node that paid for its window (#1944) — joins it and returns 75 + 9 = 84. With
+// [`inst_detached_root`]: 8 × 84 = 672. On the codegen tier the spawn and join arrive as the Worker's
+// `env.instantiate_rec`/`env.join`, admitted and resolved by the child's own vCPU; the `"budget"`
+// lookup (`self.resolve`, outside the emitter subset) is func 2, a bounce, so the entry emits.
+fn inst_nested_detached_unit() -> String {
+    let (seg, stores) =
+        temen_browser::plan::spawn_rec_ir(17408, &temen_ir::SpawnRec::v1(1), None, "vb");
+    format!(
+        r#"memory 16
+data 16384 "K"
+data 16392 "budget"
+{seg}func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vinst = i32.wrap_i64 va
+  vq = i64.const 16384
+  vk8 = i32.load8_u vq
+  vk = i64.extend_i32_u vk8
+  vb = call 2 ()
+{stores}  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vr = i64.add vk vj
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  v9 = i64.const 9
+  return v9
+  }}
+}}
+func () -> (i32) {{
+block 0 () {{
+  vbp = i64.const 16392
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  return vb
+  }}
+}}
+"#
+    )
+}
+
 // #1865 — a detached child that grows its own window: its entry calls func 1, which `vm_map`s
 // `[64 KiB, 128 KiB)` past its declared 64 KiB, then stores+loads `4242` at byte 100000 and returns
 // it. On the emitted tier func 1 is a bounce to the child's own vCPU, so the store after it passes
@@ -2350,6 +2395,10 @@ fn main() {
     emit("threads_inst_detached", &inst_detached_root(8));
     emit("threads_inst_detached_one", &inst_detached_root(1));
     emit("threads_inst_unit_grow", THREADS_INST_UNIT_GROW);
+    emit(
+        "threads_inst_nested_detached_unit",
+        &inst_nested_detached_unit(),
+    );
     emit("threads_inst_unit", THREADS_INST_UNIT);
     emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
     // #1151 — the page-op unit (→ 8 × 7509 = 60072) and its trap twin (store on the unmapped page).
