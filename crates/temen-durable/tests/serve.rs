@@ -1,15 +1,11 @@
-//! DURABILITY.md §13.4 step 3 — the serve-side freeze gates. The serve trio
-//! (`svc_queue`/`svc_results`/`svc_next_ticket`) is snapshot data now (the codec's v13
-//! serve section, pinned in `temen-snapshot`), but a freeze that lands **mid-handler** still
-//! fails closed: under `UNWINDING` a handler's exit is an unwind return, whose
-//! `(FIBER_RETURNED, 0)` would settle a bogus zero into the caller's completion cell — and
-//! even a genuine mid-freeze return's reply linkage (`serve_run`) is not yet in the
-//! snapshot (the step-4 record). The serve epilogue refuses the freeze instead
-//! (`FiberFault`, the `handler_parks` gate's shape); the previous snapshot stays the
-//! recovery point.
+//! DURABILITY.md §13.4 — freezing a serving domain. The serve trio
+//! (`svc_queue`/`svc_results`/`svc_next_ticket`) is snapshot data (the codec's serve section,
+//! pinned in `temen-snapshot`), and so, since #1676, is a handler the freeze catches mid-run:
+//! it unwinds as a fiber (`FIBER_FROZEN`, never a bogus `(FIBER_RETURNED, 0)` reply), its reply
+//! linkage rides the powerbox, and the thaw's serve loop resumes it to reply for real.
 
 use temen_durable::{arm_freeze_after, init_durable_window, transform_module_assume_confined};
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::Memory;
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -57,7 +53,9 @@ block 0 (va: i64, vb: i64) {
 "#;
 
 #[test]
-fn a_mid_handler_freeze_fails_closed_instead_of_settling_a_bogus_reply() {
+fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
+    use temen_durable::{begin_thaw, read_state, STATE_UNWINDING};
+
     let mut m = temen_text::parse_module(SRC_SERVING_HANDLER_FIBER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
@@ -88,24 +86,36 @@ fn a_mid_handler_freeze_fails_closed_instead_of_settling_a_bogus_reply() {
     }
 
     // Armed at the first fiber safepoint — the handler's own `cont.resume` — so the freeze
-    // lands mid-handler: the serve epilogue refuses it rather than settling the handler's
-    // unwind-zero as a reply.
-    {
-        let mut h = Host::new();
-        h.set_durable(true);
-        h.set_self_module(&inst);
-        h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
-        let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after(&mut win, 1);
-        let mut fuel = 1_000_000u64;
-        let (r, _) =
-            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
-        assert_eq!(
-            r,
-            Err(Trap::FiberFault),
-            "a mid-handler freeze refuses fail-closed (no bogus zero reply)"
-        );
-    }
+    // lands mid-handler: the handler unwinds as a fiber and nothing is settled; its ticket rides.
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_self_module(&inst);
+    let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, 1);
+    let mut fuel = 1_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(h.take_freeze_declined(), None, "not declined");
+    assert_eq!(h.svc_result(t), None, "no bogus reply settled");
+    assert_eq!(
+        h.frozen_handlers(),
+        vec![(0, t)],
+        "the handler's ticket rides"
+    );
+
+    // Thaw: the serve loop adopts the handler, which rewinds, finishes and replies.
+    let fibers = h.frozen_fibers().to_vec();
+    h.set_frozen_fibers(fibers);
+    let mut twin = snap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut fuel = 1_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut h);
+    assert_eq!(r, Ok(vec![Value::I64(1)]), "one dispatch served");
+    assert_eq!(h.svc_result(t), Some(42), "the handler's real reply");
+    assert!(h.frozen_handlers().is_empty(), "the serve loop took it");
 }
 
 /// The transform's local serve-op numbers must match the interp's reserved self-namespace ops
@@ -862,5 +872,120 @@ fn a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked() {
         thawed,
         Ok(vec![Value::I64(107)]),
         "the thawed root drove fwd(7) → C1 forwarded leaf(7) through the re-linked grandchild cap → 107"
+    );
+}
+
+/// #1676 — a serving domain whose handler is **parked**: `hold` (op 0) waits on a word only `poke`
+/// (op 1) sets, and the server loops `svc.wait` until two dispatches are served. With only `hold`
+/// queued, the handler parks, the serve loop idles, and freeze-on-quiesce fires: the handler rides
+/// as a fiber with its futex wait abandoned, and its ticket rides the powerbox. `poke` arrives after
+/// the freeze; on thaw the serve loop resumes the handler, which re-issues its wait, `poke` wakes it,
+/// and both reply: `hold` 100, `poke` 7.
+const SRC_PARKED_HANDLER: &str = r#"
+memory 17
+type 0 func (i64) -> (i64)
+type 1 interface { hold: 0, poke: 0 }
+export 0 interface "latch" 1 { hold: 1, poke: 2 }
+
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vacc: i64) {
+  vs = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vs ()
+  vacc2 = i64.add vacc vn
+  vtwo = i64.const 2
+  vmore = i64.lt_s vacc2 vtwo
+  br_if vmore 1(vacc2) 2(vacc2)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vr = i64.const 100
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vaddr = i64.const 66000
+  vone = i32.const 1
+  i32.atomic.store vaddr vone
+  vn = atomic.notify vaddr vone
+  vr = i64.const 7
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_parked_handler_freezes_and_its_thaw_replies() {
+    use temen_durable::{arm_freeze_on_quiesce, begin_thaw, read_state, STATE_UNWINDING};
+
+    let mut m = temen_text::parse_module(SRC_PARKED_HANDLER).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    temen_verify::verify_module(&inst).expect("verify");
+    let host = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.set_self_module(&inst);
+        h
+    };
+    let run = |h: &mut Host, win: &[u8]| {
+        let mut fuel = 1_000_000u64;
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, win, SIZE_LOG2, h)
+    };
+
+    // Uninterrupted: both queued; `hold` parks, `poke` wakes it, both reply.
+    let mut h = host();
+    let t_hold = h.svc_enqueue(0, 0, vec![0]).expect("enqueue");
+    let t_poke = h.svc_enqueue(0, 1, vec![0]).expect("enqueue");
+    let (r, _) = run(&mut h, &init_durable_window(WINDOW, TEST_ARENA));
+    assert_eq!(r, Ok(vec![Value::I64(2)]), "two served");
+    assert_eq!(
+        (h.svc_result(t_hold), h.svc_result(t_poke)),
+        (Some(100), Some(7))
+    );
+
+    // Frozen with `hold` parked.
+    let mut h = host();
+    let t_hold = h.svc_enqueue(0, 0, vec![0]).expect("enqueue");
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_on_quiesce(&mut win);
+    let (r, snap) = run(&mut h, &win);
+    assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(h.take_freeze_declined(), None, "not declined");
+    assert_eq!(
+        h.frozen_handlers(),
+        vec![(0, t_hold)],
+        "the parked handler's ticket rides"
+    );
+
+    // `poke` arrives; the thaw resumes `hold`, and `poke` wakes it.
+    let t_poke = h.svc_enqueue(0, 1, vec![0]).expect("enqueue");
+    let fibers = h.frozen_fibers().to_vec();
+    h.set_frozen_fibers(fibers);
+    let mut twin = snap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (r, _) = run(&mut h, &twin);
+    assert_eq!(r, Ok(vec![Value::I64(2)]), "two served across the cut");
+    assert_eq!(
+        (h.svc_result(t_hold), h.svc_result(t_poke)),
+        (Some(100), Some(7))
     );
 }

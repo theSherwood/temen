@@ -7982,7 +7982,6 @@ struct Seat<'a> {
     nested_children: &'a [NestedChildInfo],
     child_hosts: &'a BTreeMap<usize, Arc<Mutex<Host>>>,
     child_freeze: &'a BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
-    handler_parked: bool,
     /// Whether its window's image can be taken (no §13 region mapped).
     window_safe: bool,
     host: &'a Arc<Mutex<Host>>,
@@ -7998,7 +7997,6 @@ impl VCpu {
             nested_children: &self.nested_children,
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
-            handler_parked: !self.handler_parks.is_empty(),
             window_safe: self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe()),
             host: &self.host,
             registry: &self.registry,
@@ -8072,9 +8070,6 @@ fn freeze_census(
         }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in me.into_iter().chain(others.iter()) {
-            if seat.handler_parked {
-                return declined(DeclineCause::ServeHandlerParked, seat.id, None);
-            }
             let mut live_nested = false;
             let mut live_thread = false;
             for (slot, cid) in seat
@@ -12284,11 +12279,12 @@ impl VCpu {
     /// idle parked fibers; a fiber still on an active resume chain at freeze unwinds with the root and
     /// is a 3.1.5/3.2 follow-up.
     fn freeze_drive(&mut self) -> Result<(), Trap> {
-        // DURABILITY.md §13.4 step 2: serve-handler parks stay fail-closed until serve-state
-        // capture (step 3) — their reply linkage (`handler_parks`) is per-vCPU serve state no
-        // snapshot carries yet.
-        if !self.handler_parks.is_empty() {
-            return Err(Trap::FiberFault);
+        // #1676 — this vCPU's serve handlers, parked or caught mid-run, ride as fibers like any
+        // other; their reply linkage rides the powerbox, for the thaw's serve loop to adopt.
+        for (&slot, &(_, ticket)) in &self.handler_parks {
+            self.host
+                .lock_unpoisoned()
+                .hold_handler_for_thaw(slot, ticket);
         }
         // §13.4 step 2 classification (before anything is consumed): an event-parked fiber
         // freezes when its thaw can re-derive the park. A WOKEN park's delivered result is already
@@ -12975,7 +12971,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 nested_children: nested_children.as_slice(),
                 child_hosts: &*child_hosts,
                 child_freeze: &*child_freeze,
-                handler_parked: !handler_parks.is_empty(),
                 window_safe: $m.layout_snapshot_safe(),
                 host: &*host,
                 registry: &*registry,
@@ -15344,18 +15339,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // paths pushed `(status, value)` onto this frame — pop them and settle
                     // that dispatch before the rewound op runs the machine again.
                     if let Some(run) = serve_run.take() {
-                        // DURABILITY.md §13.4 step 3: a freeze that lands **mid-handler** fails
-                        // closed. Under `UNWINDING` the handler's exit is an unwind return —
-                        // its "(FIBER_RETURNED, 0)" would settle a bogus zero into the caller's
-                        // completion cell, and even a genuine return's reply linkage is not yet
-                        // in the snapshot (the step-4 serve_run record). Refuse the freeze
-                        // (same shape as the `handler_parks` gate); the previous snapshot
-                        // remains the recovery point.
-                        if durable
-                            && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
-                        {
-                            return Err(Trap::FiberFault);
-                        }
                         let value = frames[top].vals.pop().ok_or(Trap::Malformed)?.i64();
                         let status = frames[top].vals.pop().ok_or(Trap::Malformed)?.i32();
                         match status {
@@ -15381,7 +15364,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                                 *serve_count += 1;
                             }
-                            FIBER_PARKED => {
+                            // #1676 — a handler the freeze caught mid-run unwound as a fiber
+                            // does (#1835): it is kept like a parked one, and the freeze drive
+                            // hands its ticket to the thaw.
+                            FIBER_PARKED | FIBER_FROZEN => {
                                 handler_parks.insert(run.slot, (run.handle, run.ticket));
                             }
                             // A handler `suspend` has no resumer to receive its yield — the
@@ -15444,6 +15430,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // older than anything still queued); still-blocked ones are put back by
                     // the claim. A handler slot claimable any other way means the guest
                     // resumed a forged handle into it — the racing-claim fault family.
+                    // #1676 — a thaw hands this domain's frozen handlers to its serve loop.
+                    for (hslot, ticket) in host.lock_unpoisoned().take_frozen_handlers() {
+                        let handle = fiber_handle(hslot, registry.generation(hslot));
+                        handler_parks.insert(hslot, (handle, ticket));
+                    }
                     let parked_now: Vec<(usize, i64, u64)> = handler_parks
                         .iter()
                         .map(|(s_, (h_, t_))| (*s_, *h_, *t_))
@@ -15454,6 +15445,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             (_, Claimed::LiveWoken(f)) => {
                                 handler_parks.remove(&pslot);
                                 serve_switch!(pslot, phandle, pticket, f);
+                            }
+                            // A thawed handler: its entry frame only rewinds (#1676), so its
+                            // arguments are placeholders; its spilled frames hold the real ones.
+                            (_, Claimed::Start { func: hfunc, .. }) => {
+                                handler_parks.remove(&pslot);
+                                let params =
+                                    &funcs.get(hfunc as usize).ok_or(Trap::FiberFault)?.params;
+                                let vals = params
+                                    .iter()
+                                    .map(|ty| Reg::from_value(slot_to_val(*ty, 0)))
+                                    .collect();
+                                serve_switch!(
+                                    pslot,
+                                    phandle,
+                                    pticket,
+                                    vec![Frame {
+                                        func: hfunc as FuncIdx,
+                                        module: 0,
+                                        block: 0,
+                                        inst: 0,
+                                        vals,
+                                    }]
+                                );
                             }
                             _ => return Err(Trap::FiberFault),
                         }
@@ -19830,8 +19844,6 @@ pub enum DeclineCause {
     NestedChildFibers,
     /// A live detached child has no freeze doorbell, so nothing can reach it.
     DetachedUnreachable,
-    /// A serve handler is parked (#1677).
-    ServeHandlerParked,
     /// A fiber is parked where no scheduler waiter records it, so no rule applies (#1677).
     FiberParkedOnCall,
     /// A detached child's window has a §13 region mapped, so its image cannot be taken (#1679).
@@ -21675,6 +21687,10 @@ pub struct Host {
     /// dispatch stayed with its callee, so the context's re-issued call waits on this ticket instead
     /// of enqueueing the call again. Cut data: it rides the serve section.
     reply_waits: BTreeMap<u32, u64>,
+    /// #1676 — the serve handlers a freeze caught, parked or mid-run: `fiber slot → the ticket it
+    /// replies to`. The handler rides as a fiber; this is its reply linkage, which rides the serve
+    /// section, and which the thaw's serve loop adopts to resume it.
+    frozen_handlers: BTreeMap<u32, u64>,
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
     svc_next_ticket: u64,
@@ -22376,6 +22392,7 @@ impl Host {
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
             reply_waits: BTreeMap::new(),
+            frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
             handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -25809,6 +25826,31 @@ impl Host {
     /// [`Host::reply_waits`]). Replaces whatever is present.
     pub fn set_reply_waits(&mut self, waits: Vec<(u32, u64)>) {
         self.reply_waits = waits.into_iter().collect();
+    }
+
+    /// #1676 — the handler in fiber `slot` replies to `ticket`; its serve loop froze with it.
+    fn hold_handler_for_thaw(&mut self, slot: usize, ticket: u64) {
+        self.frozen_handlers.insert(slot as u32, ticket);
+    }
+
+    /// #1676 — the frozen handlers a serve loop adopts on thaw. Taken.
+    fn take_frozen_handlers(&mut self) -> Vec<(usize, u64)> {
+        std::mem::take(&mut self.frozen_handlers)
+            .into_iter()
+            .map(|(s, t)| (s as usize, t))
+            .collect()
+    }
+
+    /// #1676 — the frozen handlers for the snapshot codec, `(fiber slot, ticket)` in ascending slot
+    /// order (the artifact's canonical order).
+    pub fn frozen_handlers(&self) -> Vec<(u32, u64)> {
+        self.frozen_handlers.iter().map(|(&s, &t)| (s, t)).collect()
+    }
+
+    /// #1676 — restore the frozen handlers from a snapshot (the inverse of
+    /// [`Host::frozen_handlers`]). Replaces whatever is present.
+    pub fn set_frozen_handlers(&mut self, handlers: Vec<(u32, u64)>) {
+        self.frozen_handlers = handlers.into_iter().collect();
     }
 
     /// DURABILITY.md §13.3 — this domain's stable identity (see the field doc).

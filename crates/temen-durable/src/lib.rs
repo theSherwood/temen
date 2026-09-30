@@ -909,10 +909,11 @@ enum SuspendKind {
     /// arm delivers an inert sentinel on observing `UNWINDING` (no drain, no park; the queue
     /// stays untouched for the snapshot's serve section), the trailing poll unwinds, and the op
     /// is **re-issued on thaw** (like `atomic.wait`): the re-executed drain runs against the
-    /// *restored* queue — re-execution is the recovery, so the sentinel is never captured. A
-    /// mid-handler freeze is refused up front (the serve epilogue's fail-closed gate), so this
-    /// point is always the globally-deepest frozen frame on its thread: flip the state word to
-    /// `NORMAL` itself, then reload the handle + args and re-execute. The op immediates
+    /// *restored* queue — re-execution is the recovery, so the sentinel is never captured. This
+    /// point is always the deepest frozen frame of its own context: a handler the freeze caught is
+    /// a fiber context of its own, which the runtime re-arms `REWINDING` when the re-executed serve
+    /// op switches into it (#1676). So flip this context's word to `NORMAL` itself, then reload the
+    /// handle + args and re-execute. The op immediates
     /// (`type_id`/`op`/`sig`) reconstruct the instruction; `handle`/`args` are its block-local
     /// operands (spilled + reloaded).
     SvcServe {
@@ -1608,9 +1609,10 @@ fn transform_func(
             // timed out) delivers that status as it was. One the freeze ended (`WAIT_FROZEN`) is
             // re-issued with its reloaded operands, and re-checks the restored value.
             SuspendKind::MemoryWait { .. } => vec![],
-            // Serve-op re-issue (§13.4 slice 4b): the mid-handler gate guarantees this point is
-            // the globally-deepest frozen frame on its thread (no handler was in flight), so —
-            // like `atomic.wait` — flip the state word to `NORMAL` itself, then reload the
+            // Serve-op re-issue (§13.4 slice 4b): this point is the deepest frozen frame of its own
+            // context (a frozen handler is a fiber context of its own, re-armed when the serve op
+            // switches into it, #1676), so — like `atomic.wait` — flip the state word to `NORMAL`
+            // itself, then reload the
             // handle + args and re-execute. The re-executed drain runs against the restored
             // queue (the snapshot's serve section); an empty queue re-parks `svc.wait` exactly
             // as an uninterrupted run would.
