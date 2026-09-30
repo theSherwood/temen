@@ -166,7 +166,7 @@ fn non_durable_kind_of(c: Capability) -> Option<NonDurableKind> {
         | Capability::Instantiator
         | Capability::Jit
         | Capability::JitCode
-        // #1502: a Budget's remaining quotas ride the artifact verbatim.
+        // #1502, #1944: a Budget's node chain rides the artifact beside the handles.
         | Capability::Budget => return None,
         Capability::SharedRegion => NonDurableKind::SharedRegion,
         Capability::Module => NonDurableKind::Module,

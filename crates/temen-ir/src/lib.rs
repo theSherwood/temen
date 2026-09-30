@@ -170,15 +170,14 @@ pub mod cap_id {
     /// can add capabilities without touching the VM. The handler reads/writes the guest window
     /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
     pub const HOST_PROC: u32 = 13;
-    /// §15 / PROCESS.md §5 `Budget` — a passable, **splittable** resource-quota vector (fuel / mem /
-    /// spawn), §15's "every meterable resource is a capability with a quota" promoted to an object.
-    /// op 0 `split(fuel, mem, spawn) -> sub_handle | -errno`: mint a child `Budget` holding those
-    /// amounts, **deducted** from the holder's remaining — attenuation (a child can never exceed the
-    /// parent, D19); a field of `-1` means "all remaining"; asking for more than remains is `-EINVAL`.
-    /// op 1 `read(field) -> remaining | -EINVAL`: report one field's remaining quota (`0` fuel, `1`
-    /// mem, `2` spawn) — the §15 monitoring readout. Charging a domain's consumption against its budget
-    /// (the `create(module, window, budget)` accounting) is the follow-up; this is the passable object
-    /// + attenuation the rest builds on.
+    /// §15 / PROCESS.md §5 `Budget` — a node of the run's budget tree (#1944): per dimension (`0`
+    /// fuel, `1` mem, `2` spawn, `3` channel, `4` lane) a **ceiling** on the node's whole subtree, §15's
+    /// "every meterable resource is a capability with a quota" promoted to an object. A use charges
+    /// the paying node and every ancestor, all or nothing. op 0 `split(fuel, mem, spawn[, channel[,
+    /// lane]]) -> sub_handle | -errno`: mint a child node, each ceiling clamped to the holder's (`-1` =
+    /// unbounded on its own), deducting nothing. op 1 `read(field) -> room | -EINVAL`: the room left
+    /// along the chain — the §15 monitoring readout. op 2 `transfer(dst, fuel, mem, spawn) -> 0 |
+    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's.
     pub const BUDGET: u32 = 14;
     /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
     /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
