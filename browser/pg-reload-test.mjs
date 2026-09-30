@@ -13,7 +13,7 @@
 //   node build-pg-assets.mjs && node pg-reload-test.mjs
 import { startServer } from './serve.mjs';
 import { benignAssetMiss } from './play-test-errors.mjs';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -55,7 +55,9 @@ const fail = (m) => { failed = true; console.log(`  FAIL: ${m}`); };
 // Chromium's shutdown, so it cannot explain the CI signature (`browser.close()` taking exactly
 // Playwright's 30 s kill); only a browser process that stops answering, or a child that is stopped /
 // in uninterruptible sleep, can. So: did the new document commit, does the browser still answer CDP,
-// does the page, and which Chromium threads are stopped (T/t) or in D state — with their wait channel.
+// does the page, and what every Chromium thread is waiting in (state:wchan, grouped). A thread that is
+// stopped, in D, or waiting in a pipe also gets the fd its syscall names and every process holding
+// that pipe's ends, since a writer blocked on a full pipe sleeps in S, not D (#1135: `anon_pipe_write`).
 async function describeStall(page, navigations) {
   try { await describeStallOn(page, navigations); } catch (e) { console.log(`  stall: diagnostics failed: ${e.message}`); }
 }
@@ -68,17 +70,43 @@ async function describeStallOn(page, navigations) {
   const eva = await within(page.evaluate(() => document.readyState), 5000);
   console.log(`  stall: new-document commits=${navigations} · browser CDP ${cdp} · page ${eva}`);
   const rd = (p) => { try { return readFileSync(p, 'utf8'); } catch { return ''; } };
-  for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+  const ls = (p) => { try { return readdirSync(p); } catch { return []; } };
+  const link = (p) => { try { return readlinkSync(p); } catch { return '?'; } };
+  const pids = ls('/proc').filter((d) => /^\d+$/.test(d));
+  // Every readable process's pipe ends, by pipe: `comm/pid fdN r|w` (fdinfo flags' low bits: 0 = read).
+  const pipeEnds = new Map();
+  for (const pid of pids) {
+    for (const fd of ls(`/proc/${pid}/fd`)) {
+      const t = link(`/proc/${pid}/fd/${fd}`);
+      if (!t.startsWith('pipe:')) continue;
+      const rw = (parseInt((/flags:\s+(\d+)/.exec(rd(`/proc/${pid}/fdinfo/${fd}`)) || [, '0'])[1], 8) & 3) ? 'w' : 'r';
+      if (!pipeEnds.has(t)) pipeEnds.set(t, []);
+      pipeEnds.get(t).push(`${rd(`/proc/${pid}/comm`).trim()}/${pid} fd${fd} ${rw}`);
+    }
+  }
+  for (const pid of pids) {
     const cmd = rd(`/proc/${pid}/cmdline`).replace(/\0/g, ' ');
     if (!/headless_shell|chrom/.test(cmd.split(' ')[0])) continue;
-    const odd = [];
-    for (const tid of (() => { try { return readdirSync(`/proc/${pid}/task`); } catch { return []; } })()) {
+    const groups = new Map();
+    const stuck = [];
+    for (const tid of ls(`/proc/${pid}/task`)) {
       const st = rd(`/proc/${pid}/task/${tid}/stat`);
+      const name = st.slice(st.indexOf('(') + 1, st.lastIndexOf(')'));
       const state = st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3);
-      if (/[DTt]/.test(state)) odd.push(`${st.slice(st.indexOf('(') + 1, st.lastIndexOf(')'))}:${state}:${rd(`/proc/${pid}/task/${tid}/wchan`)}`);
+      const wchan = rd(`/proc/${pid}/task/${tid}/wchan`) || '-';
+      const key = `${state}:${wchan}`;
+      groups.set(key, (groups.get(key) || 0) + 1);
+      if (!/[DTt]/.test(state) && !/pipe/.test(wchan)) continue;
+      // `/proc/<tid>/syscall` is `nr arg0 …`; for read/write-family calls arg0 is the fd.
+      const [nr, arg0] = rd(`/proc/${pid}/task/${tid}/syscall`).trim().split(' ');
+      const target = arg0 ? link(`/proc/${pid}/fd/${parseInt(arg0, 16)}`) : '?';
+      const ends = pipeEnds.get(target);
+      stuck.push(`${name}(${tid}):${key} syscall ${nr ?? '?'} fd ${arg0 ? parseInt(arg0, 16) : '?'} → ${target}${ends ? ` [${ends.join(', ')}]` : ''}`);
     }
     const type = (/--type=([\w-]+)/.exec(cmd) || [, 'browser'])[1];
-    console.log(`  stall: ${type} ${pid} rss=${(/VmRSS:\s+(\d+)/.exec(rd(`/proc/${pid}/status`)) || [, '?'])[1]}kB ${odd.join(' ') || 'no stopped/D threads'}`);
+    const threads = [...groups].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}×${n}`).join(' ');
+    console.log(`  stall: ${type} ${pid} rss=${(/VmRSS:\s+(\d+)/.exec(rd(`/proc/${pid}/status`)) || [, '?'])[1]}kB threads ${threads}`);
+    for (const t of stuck) console.log(`  stall:   stuck ${t}`);
   }
   for (const f of ['cpu', 'memory', 'io']) console.log(`  stall: pressure ${f}: ${rd(`/proc/pressure/${f}`).split('\n')[0]}`);
 }
