@@ -3582,6 +3582,60 @@ int main(void) {{\n\
     );
 }
 
+/// `pspawn` (op 62) from C, on the tree-walker and both bytecode drivers: a new process running a
+/// registered command, its stdout a file through a `dup2` file action, reaped with `waitpid`. The
+/// command writes to its fd 1 and returns its `argc`: the file holds its bytes, the parent's own
+/// stdout holds none, and the status is the argv the spawn passed.
+#[test]
+fn c_pspawn_starts_a_command_with_its_file_actions_on_every_driver() {
+    const CMD: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+int main(int argc, char **argv) {
+  __px_write(0, 1, (long)"CMD!", 4);
+  return argc;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}\n\
+long __px_pspawn(int cap, long req);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_open(int cap, long path, long len, long flags);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static long req[5];\n\
+static long act[8];\n\
+static int status;\n\
+static char buf[8];\n\
+int main(void) {{\n\
+  long fd = __px_open(0, (long)\"/out\", 4, 66);\n\
+  if (fd < 0) return 1;\n\
+  act[0] = 2; act[1] = fd; act[2] = 1; act[3] = 0;\n\
+  act[4] = 1; act[5] = fd; act[6] = 0; act[7] = 0;\n\
+  req[0] = (long)\"/bin/px\"; req[1] = (long)av; req[2] = 0; req[3] = (long)act; req[4] = 2;\n\
+  long pid = __px_pspawn(0, (long)req);\n\
+  if (pid <= 0) return 100 - pid;\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 3;\n\
+  if (((status >> 8) & 0xff) != 2) return 200 + ((status >> 8) & 0xff);\n\
+  long rfd = __px_open(0, (long)\"/out\", 4, 0);\n\
+  if (__px_read(0, rfd, (long)buf, 8) != 4) return 5;\n\
+  if (buf[0] != 'C' || buf[3] != '!') return 6;\n\
+  return 42;\n\
+}}\n"
+    );
+    let stage = |host: &mut Host, posix: &Posix| stage_executable(host, posix, "/bin/px", CMD);
+    for (driver, e) in [
+        ("tree-walker", run_interp_setup(&src, stage)),
+        ("cooperative", run_bytecode_setup(&src, stage)),
+        ("parallel", run_bytecode_parallel_setup(&src, stage)),
+    ] {
+        assert_eq!(e.result, vec![Value::I32(42)], "{driver}");
+        assert!(
+            e.stdout.is_empty(),
+            "{driver}: the child's stdout was the file"
+        );
+    }
+}
+
 /// The `demos/shell` sources, compiled here as a **command** rather than a root program — the
 /// three files `c_shell.rs` already builds, reached the other way.
 const SH_SHIM: &str = include_str!("../../temen-run/demos/shell/shim.c");

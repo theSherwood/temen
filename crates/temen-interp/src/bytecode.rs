@@ -4520,6 +4520,7 @@ impl<'p> Vcpu<'p> {
                 // cooperative driver's task set (self-fork a twin, park until a child exits); a
                 // single-vCPU path has none, so fail closed like `Exec`/`CloneCaller`.
                 | Ok(VcpuStop::ForkSelf { .. })
+                | Ok(VcpuStop::SpawnSelf { .. })
                 | Ok(VcpuStop::ReapWait { .. })
                 | Ok(VcpuStop::PipeRead { .. })
                 | Ok(VcpuStop::PipeWrite { .. })
@@ -7351,6 +7352,7 @@ fn service_advance(
             Outcome::Reap { .. }
             | Outcome::Exec { .. }
             | Outcome::ForkSelf { .. }
+            | Outcome::SpawnSelf { .. }
             | Outcome::ReapWait { .. }
             | Outcome::PipeRead { .. }
             | Outcome::PipeWrite { .. } => return Serviced::Declined,
@@ -9227,6 +9229,29 @@ struct ExecBuilt {
     leaf: Option<LeafStart>,
 }
 
+/// #1896 — a leaf image tiers up at its entry: the host runs it whole, emitted, and its delivery ends
+/// the process. The step that starts task `ti`'s, over its window `win` — or `None` over a window one
+/// bound cannot describe, where an image emitted without the page check runs interpreted instead,
+/// over the same window.
+fn leaf_step(
+    start: LeafStart,
+    ti: usize,
+    win: Option<&Mem>,
+    pending_tierup: &mut Option<(usize, TierUpDst, Box<[ValType]>)>,
+) -> Option<CoopStep> {
+    let mapped = win.and_then(|m| match start.paged {
+        true => Some(m.reserved_size()),
+        false => m.scalar_extent(),
+    })?;
+    *pending_tierup = Some((ti, TierUpDst::Entry { parks: start.parks }, start.results));
+    Some(CoopStep::TierUp {
+        module: start.module,
+        func: start.entry,
+        argv: start.argv,
+        mapped,
+    })
+}
+
 /// How a leaf image tiers up at its entry ([`CoopStep::TierUp`]).
 struct LeafStart {
     module: u32,
@@ -9467,8 +9492,10 @@ fn run(
 struct DispatchParks {
     /// A `Stream{In}` read that found an empty buffer under `set_stdin_blocking`.
     stdin: bool,
-    /// A personality caller-request (`fork` / blocking `waitpid`).
+    /// A personality caller-request (`fork` / `execve` / `posix_spawn` / blocking `waitpid`).
     request: Option<super::ParkEvent>,
+    /// What a `posix_spawn` request's source staged ([`super::SignalSource::spawn_take`]).
+    spawn: Option<super::SpawnPlan>,
     /// A pipe read that found an empty FIFO with writers still open.
     pipe_read: Option<u32>,
     /// A pipe write that found a full FIFO with readers still open.
@@ -9480,9 +9507,14 @@ struct DispatchParks {
 impl DispatchParks {
     /// Drain every per-op flag from `p`. Call ONLY inside the dispatch's own lock scope.
     fn take(p: &mut Host) -> Self {
+        let request = p.take_park_request();
+        let spawn = matches!(request, Some(super::ParkEvent::SpawnSelf { .. }))
+            .then(|| p.take_spawn_plan())
+            .flatten();
         let parks = Self {
             stdin: p.take_stdin_parked(),
-            request: p.take_park_request(),
+            request,
+            spawn,
             pipe_read: p.take_pipe_read_parked(),
             pipe_write: p.take_pipe_write_parked(),
             sig_interrupt: p.take_sig_interrupt(),
@@ -9621,6 +9653,15 @@ enum Outcome {
     /// fork the parent's `dst` gets `-EAGAIN` (never a hang). Cooperative-driver-only (other drivers
     /// `ThreadFault`) — the port of the tree-walker's `Blocked::ForkSelf` → `fork_vcpu` engine.
     ForkSelf {
+        dst: u32,
+    },
+    /// A personality **`posix_spawn()`** caller-request (`ParkEvent::SpawnSelf`): the driver mints a
+    /// new process running `cmd`, with the state the personality staged (`plan`), and writes its pid
+    /// to `dst` (`-EAGAIN` when none could be minted). The port of the tree-walker's
+    /// `Blocked::SpawnSelf` → `spawn_vcpu`.
+    SpawnSelf {
+        cmd: super::ExecCmd,
+        plan: super::SpawnPlan,
         dst: u32,
     },
     /// #799 — a personality blocking **`waitpid()`** caller-request (`ParkEvent::TaskExit`/`TaskExitAny`):
@@ -10994,6 +11035,12 @@ enum VcpuStop {
     ForkSelf {
         dst: u32,
     },
+    /// A personality `posix_spawn()` caller-request ([`Outcome::SpawnSelf`]).
+    SpawnSelf {
+        cmd: super::ExecCmd,
+        plan: super::SpawnPlan,
+        dst: u32,
+    },
     /// #799 — personality blocking `waitpid()` caller-request surfaced to the cooperative driver
     /// ([`Outcome::ReapWait`]). `None` = any child.
     ReapWait {
@@ -11606,6 +11653,9 @@ fn step_vcpu(
                 })
             }
             Outcome::ForkSelf { dst } => return Ok(VcpuStop::ForkSelf { dst }),
+            Outcome::SpawnSelf { cmd, plan, dst } => {
+                return Ok(VcpuStop::SpawnSelf { cmd, plan, dst })
+            }
             Outcome::PipeRead { pipe } => return Ok(VcpuStop::PipeRead { pipe }),
             Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
             Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
@@ -13742,24 +13792,115 @@ impl CoopSched {
                             }
                         }
                     };
-                    // #1896 — a leaf image tiers up at its entry: the host runs it whole, emitted, and
-                    // its delivery ends the process. Over a window one bound cannot describe, an image
-                    // emitted without the page check runs interpreted instead, over the same window.
                     if let Some(start) = start {
                         let win = tasks[ti].env.and_then(|k| extra_envs[k].mem.as_ref());
-                        let mapped = win.and_then(|m| match start.paged {
-                            true => Some(m.reserved_size()),
-                            false => m.scalar_extent(),
-                        });
-                        if let Some(mapped) = mapped {
-                            *pending_tierup =
-                                Some((ti, TierUpDst::Entry { parks: start.parks }, start.results));
-                            return Ok(CoopStep::TierUp {
-                                module: start.module,
-                                func: start.entry,
-                                argv: start.argv,
-                                mapped,
-                            });
+                        if let Some(step) = leaf_step(start, ti, win, pending_tierup) {
+                            return Ok(step);
+                        }
+                    }
+                }
+                Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
+                    // A personality `posix_spawn`: mint a process as the fork arm mints a twin (its
+                    // pid is its task index + 1, and its parent reaps it) and build its image as the
+                    // exec arm builds one, in an env of its own: a fresh window of the caller's
+                    // geometry, with nothing of the caller copied. The caller runs on with the pid,
+                    // or `-EAGAIN` when no process could be minted. A process whose image cannot be
+                    // built still takes its task, done before it ran, so the settle retires it as it
+                    // retires any process and no later process is handed its pid.
+                    // The tree-walker's gate: a request from a fiber keeps its placeholder, and a
+                    // serve handler is not a clean root.
+                    if tasks[ti].vt.active_id != ROOT_FIBER {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
+                        continue;
+                    }
+                    if tasks[ti].vt.active.serve_ticket.is_some() {
+                        tasks[ti].vt.active.set(dst, Reg::from_i64(super::EINVAL));
+                        continue;
+                    }
+                    let child_ti = tasks.len();
+                    let pid = child_ti as u64 + 1;
+                    let (twin, child_fuel) = match tasks[ti].env {
+                        Some(k) => (
+                            extra_envs[k]
+                                .host
+                                .lock_unpoisoned()
+                                .spawn_powerbox(pid, plan),
+                            extra_envs[k].fuel,
+                        ),
+                        None => (host.spawn_powerbox(pid, plan), *fuel),
+                    };
+                    let Some(mut twin) = twin else {
+                        tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
+                        continue;
+                    };
+                    let caller = match tasks[ti].env {
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                        None => mem.as_ref(),
+                    };
+                    let built = exec_image_build(
+                        &mut twin,
+                        caller,
+                        dom,
+                        cmd,
+                        0,
+                        0,
+                        0,
+                        0,
+                        true,
+                        leaf.as_ref(),
+                    );
+                    let (child_mem, child_host, table, vt, state, start) = match built {
+                        Ok(built) => {
+                            // Its own park door and pump bell, as the fork arm wires a twin's.
+                            built.host.wire_park_door();
+                            if let Some(bell) = host.external_wake() {
+                                if let Some((_, source)) = built.host.signal_poll() {
+                                    wire_pump_bell(&source, &bell);
+                                }
+                            }
+                            let state = TaskState::Runnable;
+                            let (m, h) = (Some(built.mem), built.host);
+                            (m, h, built.table, built.vt, state, built.leaf)
+                        }
+                        Err(_) => {
+                            let mut vt = VTask {
+                                active: tasks[ti].vt.active.clone(),
+                                active_id: ROOT_FIBER,
+                                chain: Vec::new(),
+                                root_shadow_sp: 0,
+                                active_invoke: None,
+                            };
+                            vt.release();
+                            let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
+                            let state = TaskState::Done(failed);
+                            (None, twin, dom.table.fork(), vt, state, None)
+                        }
+                    };
+                    let eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: child_mem,
+                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+                        table,
+                        fuel: child_fuel,
+                        fibers: FiberTables::default(),
+                    });
+                    tasks.push(TaskSlot {
+                        vt,
+                        threads: Vec::new(),
+                        env: Some(eidx),
+                        state,
+                        suspended: None,
+                        lease: None,
+                    });
+                    forked_twins.insert(child_ti);
+                    tasks[ti].vt.active.set(dst, Reg::from_i64(pid as i64));
+                    if let Some(start) = start {
+                        let win = extra_envs[eidx].mem.as_ref();
+                        if let Some(step) = leaf_step(start, child_ti, win, pending_tierup) {
+                            return Ok(step);
                         }
                     }
                 }
@@ -15698,6 +15839,44 @@ fn drive_parallel(
     out
 }
 
+/// Run process `pid` of a parallel run on its own OS thread, over its own powerbox cell, window and
+/// table — a fork twin continuing its parent's image, or a spawned process starting a new one — and
+/// retire it when it ends: its pipe ends released (EOF/`-EPIPE` for peers) and its exit hooks fired
+/// once with the reap-encoded status (Live → Zombie in the personality table), THEN its exit
+/// published, so a woken waiter's re-issued `waitpid` finds the zombie already there.
+#[allow(clippy::too_many_arguments)]
+fn start_process<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    dom: &'env Domain,
+    reg: &'env ThreadRegistry,
+    host: std::sync::Arc<std::sync::Mutex<Host>>,
+    tbl: Option<std::sync::Arc<SharedSlots>>,
+    vt: VTask,
+    mem: Option<Mem>,
+    fuel: u64,
+    pid: i64,
+) {
+    // #1246 — the process's own terminate door, so a SIGKILL/SIGTERM to it sets its `term_flag` and its
+    // resume loop traps at the next op (its parent's `waitpid` then reaps the WIFSIGNALED death).
+    let domain = std::sync::Arc::new(ParDomain::default());
+    wire_parallel_doors(&host, reg, &domain);
+    let hooks_host = std::sync::Arc::clone(&host);
+    scope.spawn(move || {
+        let (r, _m) = run_vcpu_parallel(scope, dom, reg, host, domain, tbl, vt, mem, fuel);
+        let status = super::reap_status(&r);
+        let hooks = {
+            let g = hooks_host.lock_unpoisoned();
+            g.release_pipe_ends();
+            g.exit_hooks.clone()
+        };
+        for h in hooks {
+            h(status);
+        }
+        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        reg.publish_fork_exit(pid);
+    });
+}
+
 /// Run one vCPU of the parallel driver to completion on **this** OS thread, fanning each
 /// `thread.spawn` onto a fresh scoped thread (over a `fork_for_thread` view of the shared window) and
 /// blocking each `thread.join` on the [`ThreadRegistry`]. Mirrors the cooperative `drive`'s `Spawn` /
@@ -15989,45 +16168,81 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             active_invoke: None,
                         };
                         let twin_host = std::sync::Arc::new(std::sync::Mutex::new(twin_host));
-                        // #1246 — wire the twin's terminate door so a SIGKILL/SIGTERM to it sets its
-                        // `term_flag` and its resume loop traps at the next op (the parent's `waitpid`
-                        // then reaps the WIFSIGNALED death via the exit hook fired at thread return).
-                        let twin_domain = std::sync::Arc::new(ParDomain::default());
-                        wire_parallel_doors(&twin_host, reg, &twin_domain);
-                        let hooks_host = std::sync::Arc::clone(&twin_host);
                         // The twin continues the SAME image as its parent, so it dispatches over the
                         // same table (post-exec parents included — cf. the coop arm's fresh primary
                         // table, which a bare pre-exec caller also resolves to).
                         let twin_tbl = tbl.clone();
-                        scope.spawn(move || {
-                            let (r, _m) = run_vcpu_parallel(
-                                scope,
-                                dom,
-                                reg,
-                                twin_host,
-                                twin_domain,
-                                twin_tbl,
-                                twin_vt,
-                                twin_mem,
-                                fuel,
-                            );
-                            // The twin retired: fire ITS exit hooks once with the reap-encoded
-                            // status (Live → Zombie in the personality table) and release its
-                            // pipe ends (EOF/-EPIPE for peers), THEN publish — a woken waiter's
-                            // re-issued `waitpid` must find the zombie already there.
-                            let status = super::reap_status(&r);
-                            let hooks = {
-                                let g = hooks_host.lock_unpoisoned();
-                                g.release_pipe_ends();
-                                g.exit_hooks.clone()
-                            };
-                            for h in hooks {
-                                h(status);
-                            }
-                            reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                            reg.publish_fork_exit(twin_pid);
-                        });
+                        start_process(
+                            scope, dom, reg, twin_host, twin_tbl, twin_vt, twin_mem, fuel, twin_pid,
+                        );
                         vt.active.set(dst, Reg::from_i64(twin_pid));
+                    }
+                }
+            }
+            Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
+                // A personality `posix_spawn` on the parallel driver: mint a process as the fork
+                // arm does (its pid from the run's counter, its own OS thread, retired through its
+                // exit hooks) and build its image as the exec arm does, with nothing of the caller
+                // copied. The caller runs on with the pid, `-EAGAIN` when none could be minted; a
+                // process whose image cannot be built exits as it is born. The tree-walker's gate
+                // first: a request from a fiber keeps its placeholder, and a serve handler is not a
+                // clean root.
+                if vt.active_id != ROOT_FIBER {
+                    vt.active.set(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
+                    continue;
+                }
+                if vt.active.serve_ticket.is_some() {
+                    vt.active.set(dst, Reg::from_i64(super::EINVAL));
+                    continue;
+                }
+                let admitted =
+                    reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < super::MAX_VCPUS;
+                let twin = if admitted {
+                    let pid = reg
+                        .next_fork_pid
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let twin = host.lock_unpoisoned().spawn_powerbox(pid as u64, plan);
+                    twin.map(|t| (pid, t))
+                } else {
+                    None
+                };
+                match twin {
+                    None => {
+                        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        vt.active.set(dst, Reg::from_i64(super::EAGAIN));
+                    }
+                    Some((pid, mut twin)) => {
+                        let built = exec_image_build(
+                            &mut twin,
+                            mem.as_ref(),
+                            dom,
+                            cmd,
+                            0,
+                            0,
+                            0,
+                            0,
+                            true,
+                            None,
+                        );
+                        match built {
+                            Ok(built) => {
+                                built.host.wire_park_door();
+                                let child_host =
+                                    std::sync::Arc::new(std::sync::Mutex::new(built.host));
+                                let table = Some(std::sync::Arc::new(built.table));
+                                let child_mem = Some(built.mem);
+                                start_process(
+                                    scope, dom, reg, child_host, table, built.vt, child_mem, fuel,
+                                    pid,
+                                );
+                            }
+                            Err(_) => {
+                                let _ = twin.spawn_failed(super::SPAWN_EXEC_FAILED);
+                                reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                reg.publish_fork_exit(pid);
+                            }
+                        }
+                        vt.active.set(dst, Reg::from_i64(pid));
                     }
                 }
             }
@@ -17748,6 +17963,19 @@ impl Vm {
                                     dst: *dst,
                                     personality: true,
                                 });
+                            }
+                            // `posix_spawn` advances past the op: the driver writes the new pid
+                            // (or the errno) into `dst`. A source that asked without staging has
+                            // nothing to start, and the op's placeholder stands.
+                            super::ParkEvent::SpawnSelf { cmd } => {
+                                if let Some(plan) = parks.spawn {
+                                    self.pc = pc + 1;
+                                    return Ok(Outcome::SpawnSelf {
+                                        cmd,
+                                        plan,
+                                        dst: *dst,
+                                    });
+                                }
                             }
                         }
                     }

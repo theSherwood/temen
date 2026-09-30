@@ -5218,6 +5218,10 @@ enum Blocked {
     /// and both copies re-admit with their return-twice replies. On a failed fork the caller
     /// re-admits with `-EAGAIN` as the call's result (a value, never a hang — invariant 5).
     ForkSelf,
+    /// A personality **spawn request** ([`ParkEvent::SpawnSelf`]): not a park either — the drive
+    /// loop hands this vCPU to [`Scheduler::spawn_vcpu`], which mints the new process and
+    /// re-admits the caller with its pid (or the errno when none was created).
+    SpawnSelf(Box<SpawnReq>),
     /// Blocked in `atomic.wait`. `key` is the canonical rendezvous coordinate the wait-queue and
     /// `notify` match on (region-canonical for aliased pages — S1b); `addr` is the confined absolute
     /// address the driver re-reads to compare against `expected` under its lock (the futex
@@ -5423,6 +5427,53 @@ struct ExecReq {
     null_guard: u64,
     /// A personality exec's committed argv (#1768), written into the args region of the new window.
     args: Option<Vec<u8>>,
+}
+
+impl ExecReq {
+    /// The vCPU that runs this image as task `id`, in a fresh window of `caller`'s geometry
+    /// ([`Mem::exec_window`]): an exec's, whose caller's window is then released, or a spawned
+    /// process's, whose caller's window is untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn into_vcpu(
+        self,
+        caller: Option<&Mem>,
+        fuel: u64,
+        depth: u32,
+        id: TaskId,
+        sched: SchedRef,
+        quota: Quota,
+    ) -> VCpu {
+        // The image gets its own function table: an exec replaces the whole image, and the caller's
+        // table is sized for the CALLER's functions — an image with more of them trapped on its
+        // first indirect call past that size (a small shell exec'ing a big program:
+        // `IndirectCallType` from a table slot that was only ever padding).
+        let dt = Arc::new(DomainTable::new(&self.funcs, 0));
+        let mem = caller.map(|m| {
+            let back = m.twin_backing(m.window.reserved());
+            m.exec_window(back, &self.data, self.null_guard, self.args.as_deref())
+        });
+        VCpu::new(
+            self.funcs,
+            self.types,
+            self.entry as FuncIdx,
+            &self.entry_args,
+            mem,
+            Arc::new(Mutex::new(self.host)),
+            fuel,
+            depth,
+            id,
+            sched,
+            quota,
+            dt,
+        )
+    }
+}
+
+/// A personality `posix_spawn` the drive loop starts ([`Blocked::SpawnSelf`]): the command the new
+/// process runs, and what the personality staged for it ([`SpawnPlan`]).
+struct SpawnReq {
+    cmd: ExecCmd,
+    plan: SpawnPlan,
 }
 
 /// CONSOLIDATION.md §2.2: a demand process child's pager binding — the provider (parent) host
@@ -7108,6 +7159,64 @@ impl Scheduler {
         self.maybe_spawn_worker(&mut s);
         self.work.notify_all();
         Ok(twin_id as i64)
+    }
+
+    /// A personality `posix_spawn` ([`Blocked::SpawnSelf`]): mint the new process as
+    /// [`Self::fork_vcpu`] mints a twin — the same capacity gate, pid space and burn rule, reapable
+    /// by its parent alone — with nothing of the caller copied. Its powerbox is the caller's
+    /// duplicate with the spawn's staged state committed ([`Host::spawn_powerbox`]), and its image
+    /// is built there as `Step::Exec`'s is ([`admit_exec`]), in a fresh window of the caller's
+    /// geometry. The caller is re-admitted with the pid, or `-EAGAIN` when no process could be
+    /// minted; a process whose image cannot be built exits as it is born ([`Host::spawn_failed`]).
+    fn spawn_vcpu(self: &Arc<Self>, v: Box<VCpu>, req: SpawnReq) {
+        let SpawnReq { cmd, plan } = req;
+        let mut s = self.lock();
+        let mut zeroed = (Vec::new(), Vec::new());
+        let reply = if s.live >= self.cap || s.shutdown || s.dead.contains_key(&domain_key_of(&v)) {
+            EAGAIN
+        } else {
+            if s.next_task <= 1 {
+                s.next_task = 2;
+            }
+            let pid = s.next_task;
+            // #1648 — from here a factory may register a process under this pid: burn it.
+            s.next_task += 1;
+            let twin = v.host.lock_unpoisoned().spawn_powerbox(pid, plan);
+            match twin.map(|t| Arc::new(Mutex::new(t))) {
+                None => EAGAIN,
+                Some(twin) => {
+                    match admit_exec(&twin, v.mem.as_ref(), cmd, 0, 0, 0, 0) {
+                        Ok((mut img, z)) => {
+                            zeroed = z;
+                            img.args = img.host.exec_commit_args();
+                            let child = img.into_vcpu(
+                                v.mem.as_ref(),
+                                v.fuel,
+                                v.depth,
+                                pid,
+                                v.sched.clone(),
+                                v.quota,
+                            );
+                            s.live += 1;
+                            self.wire_signal_doors(&child.host);
+                            let parent = domain_key_of(&v);
+                            s.forked_twins.insert(pid, Twin { parent });
+                            s.runnable.push_back(Box::new(child));
+                        }
+                        Err(_) => zeroed = twin.lock_unpoisoned().spawn_failed(SPAWN_EXEC_FAILED),
+                    }
+                    pid as i64
+                }
+            }
+        };
+        if let Some(mut v) = park_gate(&mut s, v) {
+            v.pending = Some(Pending::CapResult(reply));
+            s.runnable.push_back(v);
+            self.maybe_spawn_worker(&mut s);
+        }
+        self.work.notify_all();
+        drop(s);
+        wake_zeroed_pipes(&SchedRef::Real(Arc::clone(self)), zeroed);
     }
 
     /// FORK.md §8.6 — the servicer side of `wait(pid)`. From within a serve handler, reap the twin
@@ -9063,6 +9172,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_one();
                 }
             }
+            Step::Park(Blocked::SpawnSelf(req)) => sched.spawn_vcpu(v, *req),
             Step::Park(Blocked::ReapWait { child }) => {
                 // #799 — bench a blocking `waitpid` until `child` exits. Park-vs-completion race
                 // (the CapRead/Stopped discipline): enqueue under the scheduler lock, but if the
@@ -9438,43 +9548,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // keeping its `TaskId` + fuel, then loop back to run it (like the page-fault fast lane, no
             // run-queue round trip). All fallible work was done in the eval loop; this is infallible.
             Step::Exec(req) => {
-                let ExecReq {
-                    funcs,
-                    types,
-                    data,
-                    entry,
-                    host,
-                    entry_args,
-                    null_guard,
-                    args,
-                } = *req;
-                // The replaced image gets its own function table: `execve` replaces the whole image,
-                // and the caller's table is sized for the CALLER's functions — an image with more of
-                // them trapped on its first indirect call past that size (a small shell exec'ing a
-                // big program: `IndirectCallType` from a table slot that was only ever padding).
-                let dt = Arc::new(DomainTable::new(&funcs, 0));
+                // The command's image, in a fresh window of the caller's geometry: an exec replaces
+                // the address space, and the caller's window is released with it.
+                let caller = v.mem.take();
                 let (fuel, depth, id, sched_ref, quota) =
                     (v.fuel, v.depth, v.id, v.sched.clone(), v.quota);
-                // The command's image, in a fresh window of the caller's geometry (`exec_window`): an
-                // exec replaces the address space, and the caller's window is released.
-                let mem = v.mem.take().map(|m| {
-                    let back = m.twin_backing(m.window.reserved());
-                    m.exec_window(back, &data, null_guard, args.as_deref())
-                });
-                *v = VCpu::new(
-                    funcs,
-                    types,
-                    entry as FuncIdx,
-                    &entry_args,
-                    mem,
-                    Arc::new(Mutex::new(host)),
-                    fuel,
-                    depth,
-                    id,
-                    sched_ref,
-                    quota,
-                    dt,
-                );
+                *v = req.into_vcpu(caller.as_ref(), fuel, depth, id, sched_ref, quota);
                 // #802 interactive — RE-wire the door over the rebuilt vCPU's host (fresh
                 // domain id): see [`Scheduler::wire_signal_doors`].
                 if let SchedRef::Real(sc) = &v.sched {
@@ -10240,7 +10319,8 @@ impl SchedDriver {
                     // #799: likewise no park-request door on the explorer — a personality op's
                     // request is take-and-dropped at the dispatch arms, so these never fire.
                     | Blocked::ReapWait { .. }
-                    | Blocked::ForkSelf,
+                    | Blocked::ForkSelf
+                    | Blocked::SpawnSelf(_),
                 ) => {
                     let id = v.id;
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
@@ -12562,8 +12642,11 @@ pub struct ParkTransients {
     /// A blocking pipe write, by the pipe's domain-local index, that found a full FIFO with readers
     /// open (backpressure).
     pub write_park: Option<u32>,
-    /// The #799 caller request: `fork`, `execve`, or a blocking `waitpid`'s bench.
+    /// The #799 caller request: `fork`, `execve`, `posix_spawn`, or a blocking `waitpid`'s bench.
     pub request: Option<ParkEvent>,
+    /// What a `posix_spawn` request's source staged ([`SignalSource::spawn_take`]), taken with the
+    /// request.
+    pub spawn: Option<SpawnPlan>,
     /// #796 L1 — a delivered signal interrupted a park this arm would otherwise have taken.
     pub sig_intr: bool,
 }
@@ -12576,6 +12659,9 @@ impl ParkTransients {
         let read_park = hg.take_pipe_read_parked();
         let write_park = hg.take_pipe_write_parked();
         let request = hg.take_park_request();
+        let spawn = matches!(request, Some(ParkEvent::SpawnSelf { .. }))
+            .then(|| hg.take_spawn_plan())
+            .flatten();
         // #796 L1 — consume the EINTR flag only when this op is actually about to park (a
         // completed read/write must not eat it). Short-circuits so `take_sig_interrupt` fires
         // only on a genuine park. (`fork` does not participate: POSIX fork is not interruptible —
@@ -12594,6 +12680,7 @@ impl ParkTransients {
             read_park,
             write_park,
             request,
+            spawn,
             sig_intr,
         }
     }
@@ -12634,9 +12721,12 @@ enum Decision {
     /// Replace this image. **Never returns**, which is what makes a guest's `execve(...);
     /// exitnow(127)` run `exitnow` only on failure.
     Exec(Box<ExecReq>),
-    /// The exec was refused: the op's `-ENOSYS` placeholder becomes this probeable errno, caller
-    /// still running (POSIX: `execve` returns only on failure).
-    ExecRefused(i64),
+    /// Hand this vCPU to [`Scheduler::spawn_vcpu`]: no rewind, no result push — the caller resumes
+    /// past the call through its `Pending::CapResult`.
+    Spawn(Box<SpawnReq>),
+    /// The exec or spawn was refused: the op's `-ENOSYS` placeholder becomes this probeable errno,
+    /// caller still running (POSIX: `execve` returns only on failure).
+    Refused(i64),
     /// #1672 — the op would park (a pipe read/write, a reap bench) but a freeze is landing on a
     /// durable domain. The op took no effect, so it is **abandoned**: the caller sets its context's
     /// re-issue word and continues with the op's placeholder results. The call's trailing poll
@@ -12664,7 +12754,7 @@ enum Decision {
 /// acquire a fifth answer (INVARIANTS #15).
 #[allow(clippy::too_many_arguments)]
 fn decide(
-    t: ParkTransients,
+    mut t: ParkTransients,
     cur: usize,
     sched: &SchedRef,
     host: &Arc<Mutex<Host>>,
@@ -12725,9 +12815,18 @@ fn decide(
                     req.args = req.host.exec_commit_args();
                     Decision::Exec(req)
                 }
-                Err(e) => Decision::ExecRefused(e),
+                Err(e) => Decision::Refused(e),
             }
         }
+        // Nothing of the caller is copied or replaced, but a spawn keeps exec's gate: a clean root
+        // context, whose vCPU the drive loop re-admits with the new pid. (A durable domain may
+        // spawn, as it may fork: its freeze declines while the child lives.) A source that asked
+        // without staging has nothing to start, and its op's placeholder stands.
+        ParkEvent::SpawnSelf { cmd } => match t.spawn.take() {
+            Some(plan) if clean_root => Decision::Spawn(Box::new(SpawnReq { cmd, plan })),
+            Some(_) => Decision::Refused(EINVAL),
+            None => Decision::None,
+        },
     }
 }
 
@@ -12779,6 +12878,24 @@ fn build_exec_req(
     if durable || !clean_root {
         return Err(EINVAL);
     }
+    let (req, zeroed) = admit_exec(host, mem, cmd, grants_ptr, grants_n, entry, size_log2)?;
+    wake_zeroed_pipes(sched, zeroed);
+    Ok(req)
+}
+
+/// The engine-independent half of [`build_exec_req`]: admit and build the image `cmd` names in
+/// `host`'s powerbox, for a process whose window has `mem`'s geometry. Also returns the pipes the
+/// old powerbox's release left with no writers or no readers, for the caller to wake once it may
+/// take the scheduler lock ([`wake_zeroed_pipes`]).
+fn admit_exec(
+    host: &Arc<Mutex<Host>>,
+    mem: Option<&Mem>,
+    cmd: ExecCmd,
+    grants_ptr: u64,
+    grants_n: u64,
+    entry: u64,
+    size_log2: i64,
+) -> Result<(Box<ExecReq>, ZeroedPipes), i64> {
     let m = mem.ok_or(EINVAL)?;
     // The inherited-cap grant list (same 16-byte record shape as op 13's named grants); a bad record
     // fails the whole exec closed, before anything is mutated.
@@ -12796,16 +12913,7 @@ fn build_exec_req(
             m.window.reserved(),
         )?
     };
-    // FORK.md §8.6 — wake any pipe the old image's released ends left with 0 writers (→ EOF for its
-    // readers) or 0 readers (→ `-EPIPE` for its writers).
-    let (zeroed_w, zeroed_r) = img.zeroed_pipes;
-    for pipe in zeroed_w {
-        sched.wake_pipe_readers(pipe);
-    }
-    for pipe in zeroed_r {
-        sched.wake_pipe_writers(pipe);
-    }
-    Ok(Box::new(ExecReq {
+    let req = Box::new(ExecReq {
         null_guard: temen_ir::module_null_guard(),
         funcs: img.funcs,
         types: img.types,
@@ -12814,7 +12922,23 @@ fn build_exec_req(
         host: img.host,
         entry_args: img.entry_args.into_iter().map(Value::I64).collect(),
         args: None,
-    }))
+    });
+    Ok((req, img.zeroed_pipes))
+}
+
+/// The pipes a released powerbox's ends left with no writers, and those left with no readers
+/// ([`Host::release_pipe_ends`]).
+type ZeroedPipes = (Vec<u32>, Vec<u32>);
+
+/// FORK.md §8.6 — wake any pipe a released powerbox's ends left with 0 writers (→ EOF for its
+/// readers) or 0 readers (→ `-EPIPE` for its writers).
+fn wake_zeroed_pipes(sched: &SchedRef, (zeroed_w, zeroed_r): ZeroedPipes) {
+    for pipe in zeroed_w {
+        sched.wake_pipe_readers(pipe);
+    }
+    for pipe in zeroed_r {
+        sched.wake_pipe_writers(pipe);
+    }
 }
 
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
@@ -16105,7 +16229,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = None;
+                    let mut refused = None;
                     match decide(
                         t,
                         *cur,
@@ -16116,8 +16240,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         serve_run.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused(e) => exec_refused = Some(e),
+                        Decision::Refused(e) => refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -16132,7 +16257,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = exec_refused {
+                        if let Some(e) = refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
                                 frames[top].vals.push(Reg::from_i64(e));
                             }
@@ -16309,7 +16434,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = None;
+                    let mut refused = None;
                     match decide(
                         t,
                         *cur,
@@ -16320,8 +16445,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         serve_run.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused(e) => exec_refused = Some(e),
+                        Decision::Refused(e) => refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -16336,7 +16462,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = exec_refused {
+                        if let Some(e) = refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
                                 frames[top].vals.push(Reg::from_i64(e));
                             }
@@ -16471,7 +16597,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = None;
+                    let mut refused = None;
                     match decide(
                         t,
                         *cur,
@@ -16482,8 +16608,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         serve_run.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused(e) => exec_refused = Some(e),
+                        Decision::Refused(e) => refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -16498,7 +16625,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = exec_refused {
+                        if let Some(e) = refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
                                 frames[top].vals.push(Reg::from_i64(e));
                             }
@@ -16555,7 +16682,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     drop(hg);
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
-                    let mut exec_refused = None;
+                    let mut refused = None;
                     match decide(
                         t,
                         *cur,
@@ -16566,8 +16693,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         serve_run.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
                         Decision::Exec(req) => return Ok(Inner::Exec(req)),
-                        Decision::ExecRefused(e) => exec_refused = Some(e),
+                        Decision::Refused(e) => refused = Some(e),
                         Decision::Reap(child) => {
                             frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
                             return Ok(Inner::Park(Blocked::ReapWait { child }));
@@ -16582,7 +16710,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = exec_refused {
+                        if let Some(e) = refused {
                             if !call_sig(&cur_types, *sig).results.is_empty() {
                                 frames[top].vals.push(Reg::from_i64(e));
                             }
@@ -21484,7 +21612,26 @@ pub enum ParkEvent {
     /// probeable errno completing the call (never a trap, never a hang): see [`Host::exec_module`]
     /// and [`Host::exec_image`] for which.
     ExecSelf { cmd: ExecCmd },
+    /// `posix_spawn()` through the personality: start a **new process** running `cmd`, the image a
+    /// fork twin would `execve` at once, with nothing of the caller copied. What the new process
+    /// is besides its image (its fd table after the file actions, its argv) the personality
+    /// staged; the engine takes it with this request ([`SignalSource::spawn_take`]) and hands it
+    /// to the process it mints ([`SignalSource::spawn_commit`]), whose image it then builds as an
+    /// exec builds one ([`Host::exec_image`]). The caller's call completes with the new pid, or a
+    /// probeable errno when no process was created. A child whose image cannot be built once it
+    /// exists exits `127`.
+    SpawnSelf { cmd: ExecCmd },
 }
+
+/// What a personality `posix_spawn` staged ([`ParkEvent::SpawnSelf`]), opaque to the engine, which
+/// only carries it from the caller's signal source ([`SignalSource::spawn_take`], taken in the
+/// request's own lock scope so a sibling thread's spawn cannot swap it) to the new process's
+/// ([`SignalSource::spawn_commit`]).
+pub struct SpawnPlan(pub Box<dyn std::any::Any + Send>);
+
+/// The exit status of a spawned process whose image could not be built once it existed
+/// ([`Host::spawn_failed`]): the one POSIX gives a spawned child whose exec failed.
+pub const SPAWN_EXEC_FAILED: i64 = 127;
 
 /// What an `execve` becomes (#1609, #763).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21507,6 +21654,14 @@ const EXEC_SELF_TAG: u64 = 0xFFFF_FFFF_0000_0000;
 /// #763 — the `park_request` cell's value for [`ParkEvent::ExecSelf`] of [`ExecCmd::Staged`].
 const EXEC_STAGED: u64 = u64::MAX - 2;
 
+/// The `park_request` cell's tag for [`ParkEvent::SpawnSelf`] of an [`ExecCmd::Granted`] command,
+/// its handle in the low 32 bits: the block just below [`EXEC_SELF_TAG`]'s, far above any `TaskId`.
+const SPAWN_SELF_TAG: u64 = 0xFFFF_FFFE_0000_0000;
+
+/// The `park_request` cell's value for [`ParkEvent::SpawnSelf`] of [`ExecCmd::Staged`]: the top of
+/// the spawn block, where no non-negative handle reaches.
+const SPAWN_STAGED: u64 = SPAWN_SELF_TAG | 0xFFFF_FFFF;
+
 impl ParkEvent {
     /// The `park_request` cell encoding. This lived as five identical copies of the same `match`
     /// at the five sites that install the request closure — which is precisely how a new variant
@@ -21526,12 +21681,19 @@ impl ParkEvent {
             ParkEvent::ExecSelf {
                 cmd: ExecCmd::Staged,
             } => EXEC_STAGED,
+            ParkEvent::SpawnSelf {
+                cmd: ExecCmd::Granted(h),
+            } => SPAWN_SELF_TAG | (h as u32 as u64),
+            ParkEvent::SpawnSelf {
+                cmd: ExecCmd::Staged,
+            } => SPAWN_STAGED,
         }
     }
 
     /// The inverse of [`Self::encode`] (`0` = no request). The three sentinels are matched before
     /// the granted-command block so the `-1`/`-2`/`-3` aliases resolve to them, and the block
-    /// itself admits only non-negative handles.
+    /// itself admits only non-negative handles; the spawn block below it likewise, its staged
+    /// value first.
     fn decode(v: u64) -> Option<ParkEvent> {
         match v {
             0 => None,
@@ -21543,6 +21705,14 @@ impl ParkEvent {
             v if v >= EXEC_SELF_TAG && (v as u32) <= i32::MAX as u32 => Some(ParkEvent::ExecSelf {
                 cmd: ExecCmd::Granted(v as u32 as i32),
             }),
+            SPAWN_STAGED => Some(ParkEvent::SpawnSelf {
+                cmd: ExecCmd::Staged,
+            }),
+            v if v >= SPAWN_SELF_TAG && (v as u32) <= i32::MAX as u32 => {
+                Some(ParkEvent::SpawnSelf {
+                    cmd: ExecCmd::Granted(v as u32 as i32),
+                })
+            }
             id => Some(ParkEvent::TaskExit(id)),
         }
     }
@@ -21719,6 +21889,27 @@ pub trait SignalSource: Send + Sync {
     /// then). [`Host::exec_module`] promotes them to a module. `None` when nothing is staged.
     /// Default `None`: a source with no exec op.
     fn exec_image(&self) -> Option<Arc<[u8]>> {
+        None
+    }
+
+    /// The staged spawn this source's [`ParkEvent::SpawnSelf`] asked for, handed over in the
+    /// request's own lock scope. `None` when nothing is staged. Default `None`: a source with no
+    /// spawn op.
+    fn spawn_take(&self) -> Option<SpawnPlan> {
+        None
+    }
+
+    /// The engine minted the process a [`ParkEvent::SpawnSelf`] asked for, and this is its source:
+    /// its powerbox is the spawning process's duplicate ([`Host::fork_powerbox`]), so its state is
+    /// that process's fork. Make it the process `plan` staged, and stage the exec it starts with as
+    /// its own `execve` would have, before the engine builds the image ([`Host::exec_image`]).
+    /// Default: nothing (a source with no spawn op stages none).
+    fn spawn_commit(&self, _plan: SpawnPlan) {}
+
+    /// The pipe ends this process can still reach, by handle: what an exec carries into the new
+    /// image ([`Host::exec_carry`]). An end no descriptor names is out of the new image's reach and
+    /// would only hold its pipe open. `None` carries every end. Default `None`.
+    fn exec_keeps(&self) -> Option<Vec<i32>> {
         None
     }
 
@@ -23501,6 +23692,14 @@ impl Host {
     /// [`ParkEvent::TaskExitAny`], else the [`ParkEvent::TaskExit`] task id.
     pub fn take_park_request(&self) -> Option<ParkEvent> {
         ParkEvent::decode(self.park_request.swap(0, Ordering::SeqCst))
+    }
+
+    /// What the source of a [`ParkEvent::SpawnSelf`] request staged ([`SignalSource::spawn_take`]).
+    /// Taken with the request, in the dispatch's own lock scope, so a sibling thread's spawn
+    /// cannot swap it.
+    pub fn take_spawn_plan(&self) -> Option<SpawnPlan> {
+        self.signal_poll()
+            .and_then(|(_, source)| source.spawn_take())
     }
 
     /// #1826 — every park transient the last dispatch left, drained at once ([`ParkTransients`]):
@@ -28412,6 +28611,35 @@ impl Host {
         Some(twin)
     }
 
+    /// A personality `posix_spawn` ([`ParkEvent::SpawnSelf`]): the powerbox of new process `pid`.
+    /// It is this, the spawning caller's, duplicated ([`Self::fork_powerbox`], whose factories
+    /// register the process), with the spawn's staged state committed to it
+    /// ([`SignalSource::spawn_commit`]); an engine then builds the process's image in it as an exec
+    /// builds one ([`Self::exec_image`]). A JIT window's page map stays with the caller: the new
+    /// process's window is a fresh one. `None` when the powerbox cannot be duplicated.
+    pub fn spawn_powerbox(&mut self, pid: u64, plan: SpawnPlan) -> Option<Host> {
+        let pages = self.cap_pages.take();
+        let twin = self.fork_powerbox(pid);
+        self.cap_pages = pages;
+        let twin = twin?;
+        if let Some((_, source)) = twin.signal_poll() {
+            source.spawn_commit(plan);
+        }
+        Some(twin)
+    }
+
+    /// A spawned process whose image could not be built in its powerbox (this, from
+    /// [`Self::spawn_powerbox`]): it exits with `status` as it is born. Its pipe ends are released,
+    /// returning the pipes that left with no writers or no readers for the engine to wake, and its
+    /// exit hooks fire, so its personality retires it to a zombie its parent reaps.
+    pub fn spawn_failed(&mut self, status: i64) -> (Vec<u32>, Vec<u32>) {
+        let zeroed = self.release_pipe_ends();
+        for hook in &self.exit_hooks {
+            hook(status);
+        }
+        zeroed
+    }
+
     /// #1768 — the exit hooks a fork twin's personalities rode in on ([`Self::fork_powerbox`]): an
     /// engine fires them with the twin's [`reap_status`] when it finishes, so each retires the process
     /// in its own table (Live → Zombie) before any parent waiting on it is woken.
@@ -28573,14 +28801,25 @@ impl Host {
         // guest manages its ends explicitly and its exec contract is drop-by-default. The count bumps
         // (`install_pipe_end`) happen BEFORE the driver's old-image release, so the shared counts never
         // dip through the image-replace.
+        //
+        // Of those, only the ends the process can still reach ([`SignalSource::exec_keeps`]: its
+        // descriptors name them): an end nothing names would ride into the new image only to hold
+        // its pipe open — a spawned child's own stdin writer, closed by a file action, would keep
+        // the child from ever reading EOF. The ends left behind go with the old powerbox.
         let mut remap: Vec<(i32, i32)> = Vec::new();
         let keep_fds = !self.exec_remap_hooks.is_empty();
+        let keeps = self
+            .signal_poll()
+            .and_then(|(_, source)| source.exec_keeps());
         for slot in 0..(if keep_fds { self.table.len() } else { 0 }) {
             let st = &self.table[slot];
             if st.entry.is_none() {
                 continue;
             }
             let old_h = ((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32;
+            if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
+                continue;
+            }
             if let Some((is_w, backing)) = self.resolve_pipe_end(old_h) {
                 let nh = child.install_pipe_end(is_w, backing);
                 remap.push((old_h, nh));
@@ -35064,10 +35303,19 @@ mod park_event_encoding_tests {
     fn park_event_roundtrip() {
         for ev in [
             ParkEvent::TaskExit(1),
-            // The largest id below the tagged block: task ids count up from 1 and never reach it.
-            ParkEvent::TaskExit(EXEC_SELF_TAG - 1),
+            // The largest id below the tagged blocks: task ids count up from 1 and never reach it.
+            ParkEvent::TaskExit(SPAWN_SELF_TAG - 1),
             ParkEvent::TaskExitAny,
             ParkEvent::ForkSelf,
+            ParkEvent::SpawnSelf {
+                cmd: ExecCmd::Granted(0),
+            },
+            ParkEvent::SpawnSelf {
+                cmd: ExecCmd::Granted(i32::MAX),
+            },
+            ParkEvent::SpawnSelf {
+                cmd: ExecCmd::Staged,
+            },
             ParkEvent::ExecSelf {
                 cmd: ExecCmd::Granted(0),
             },

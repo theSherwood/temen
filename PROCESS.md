@@ -116,7 +116,10 @@ Two layers above the (unchanged) core VM:
   (spawn/link/monitor/mailboxes ≈ `start`+`poll`/`kill`+async endpoints) and a
   deterministic-dataflow personality for durable pipelines. Personalities are recipes:
   `posix_spawn` = "detached window (nested until 2026-09-29) + my budget + `start` + endpoints named
-  stdin/stdout/stderr". The substrate never learns a recipe.
+  stdin/stdout/stderr". The substrate never learns a recipe. (The POSIX personality's own `pspawn`
+  is served on the process path its `fork` and `execve` share — a caller request, FORK.md §8.7 —
+  because its child must be a process its parent reaps with `wait4`, as a fork twin is; like a twin,
+  it is not charged to a `Budget`.)
 
 The discipline (prime directive): **design for two personalities, build for one.**
 Substrate ops land only as the POSIX personality needs them — but named and placed so the

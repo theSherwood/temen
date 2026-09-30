@@ -242,6 +242,45 @@ pub const OP_EXECVE: u32 = 60;
 /// pointer is `-EINVAL` — fail closed (invariant 9), and nothing nimony does passes one.
 pub const OP_WAIT4: u32 = 61;
 
+/// **`pspawn(req) -> pid | -errno`**: POSIX `posix_spawn`, a new process running the program at a
+/// path with its file actions applied, without copying the caller's window or its continuation. It
+/// is what a `fork` followed at once by an `execve` does, and what a caller that forks only to exec
+/// should use: a fork copies the whole window, needs the Cranelift JIT to reify its caller's frames
+/// (FORK.md §9.5), and cannot be taken from emitted wasm code at all (#1964).
+///
+/// `req` is one record of five words, as `spawn2`'s is (a request fits the on-ramp's four payload
+/// slots): `{path, argv, envp, actions, nactions}`. `path`, `argv` and `envp` are [`OP_EXECVE`]'s.
+/// `actions` points at `nactions` file actions of four words each, `{op, fd, arg, path}`, applied
+/// in order to the new process's copy of the caller's fd table before its program starts:
+/// [`PSPAWN_CLOSE`] `fd` (closing a closed fd is no error), [`PSPAWN_DUP2`] `fd` onto `arg`, and
+/// [`PSPAWN_CHDIR`] to `path`. A relative `path` resolves against the working directory the actions
+/// leave.
+///
+/// The new process is a fork twin in all but its image: its pid is a core `TaskId` its parent reaps
+/// with [`OP_WAIT4`], it inherits what [`Proc::fork`] gives a twin, and its program starts at its
+/// entry in a fresh window of the caller's geometry, as an `execve` would start it. The op resolves
+/// and stages, then asks through [`temen_interp::ParkEvent::SpawnSelf`]; the engine mints the
+/// process and builds its image with the one exec builder. A program the engine cannot start once
+/// the process exists (its bytes do not verify, or it imports what nothing serves) makes a child
+/// that exits `127`, the status POSIX gives a spawned child whose exec failed. A host command runs
+/// to completion inside this op, as it would inside the child's `execve`, and the child is then a
+/// zombie with its status.
+///
+/// Errors, with nothing created: [`OP_EXECVE`]'s `-ENOENT`, `-EACCES`, `-E2BIG`, `-EFAULT` and
+/// `-EINVAL`; `-EBADF` for a `dup2` from a closed fd; `-EINVAL` for an unknown action or more than
+/// [`PSPAWN_MAX_ACTIONS`]; `-EAGAIN` when the engine can start no more processes; and `-ENOSYS` on
+/// a route with no request door.
+pub const OP_PSPAWN: u32 = 62;
+
+/// [`OP_PSPAWN`] file action: close `fd`.
+pub const PSPAWN_CLOSE: u64 = 1;
+/// [`OP_PSPAWN`] file action: `dup2(fd, arg)`.
+pub const PSPAWN_DUP2: u64 = 2;
+/// [`OP_PSPAWN`] file action: change the working directory to `path`.
+pub const PSPAWN_CHDIR: u64 = 3;
+/// The most file actions one [`OP_PSPAWN`] takes.
+pub const PSPAWN_MAX_ACTIONS: u64 = 256;
+
 /// [`OP_EXECVE`] — the most argv/envp entries the pointer-array walk will follow, and the longest
 /// single string it will read. Bounds, not policy: the args region (16 KiB) refuses anything near
 /// these with `-E2BIG` long before they bite. They exist so a forged `char**` cannot walk the
@@ -569,6 +608,34 @@ fn read_guest_cstr_vec(mem: &dyn GuestMem, ptr: u64) -> Option<Vec<Vec<u8>>> {
     None
 }
 
+/// A NUL-terminated guest path ([`read_guest_cstr`]): `-EFAULT` when it cannot be read, `-EINVAL`
+/// when it is not UTF-8.
+fn read_guest_path(mem: &dyn GuestMem, ptr: u64) -> Result<String, i64> {
+    let bytes = read_guest_cstr(mem, ptr).ok_or(EFAULT)?;
+    String::from_utf8(bytes).map_err(|_| EINVAL)
+}
+
+/// `n` little-endian words at `ptr`; `None` when any of them cannot be read.
+fn read_guest_words(mem: &dyn GuestMem, ptr: u64, n: u64) -> Option<Vec<u64>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let bytes = mem.read_bytes(ptr, n.checked_mul(8)?)?;
+    Some(
+        bytes
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().expect("an 8-byte chunk")))
+            .collect(),
+    )
+}
+
+/// Guest strings as the personality keeps its argv: UTF-8, lossily.
+fn lossy_strings(v: &[Vec<u8>]) -> Vec<String> {
+    v.iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
 #[derive(Default)]
 struct MemFile {
     bytes: Vec<u8>,
@@ -596,6 +663,13 @@ pub type HostCommand = Arc<dyn Fn(&[String], &mut dyn CommandFiles) -> i32 + Sen
 pub trait CommandFiles {
     fn read(&mut self, path: &str) -> Option<Vec<u8>>;
     fn write(&mut self, path: &str, bytes: &[u8]) -> bool;
+}
+
+/// What [`Ctx::stage_exec`] staged: the image-replace to ask the engine for, or a host command,
+/// which is the caller's to run with its argv.
+enum Staged {
+    Image(temen_interp::ExecCmd),
+    Host(HostCommand, Vec<String>),
 }
 
 /// What an `execve` path resolves to ([`Ctx::resolve_exec_path`]).
@@ -1097,6 +1171,18 @@ struct World {
 }
 
 impl World {
+    /// A pid the personality allocates itself (a spawned child it runs, an anonymous fork mint):
+    /// the next past every pid the table knows. Fork twins occupy their `TaskId`s in the same
+    /// table, the root holds `1`, so the space is one.
+    fn mint_pid(&mut self) -> i32 {
+        while self.procs.contains_key(&self.next_pid) {
+            self.next_pid += 1;
+        }
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        pid
+    }
+
     /// Register `name` in the PATH registry. A later registration of the same name shadows the
     /// earlier (last wins), matching a `PATH` re-export.
     fn register(&mut self, name: &str, command: Command) {
@@ -1348,6 +1434,12 @@ struct Proc {
     /// file's bytes as the exec read them, which the engine promotes through the process's
     /// `ModuleLoader` ([`SignalDoor::exec_image`]). Cleared by every `execve` and by the commit.
     pending_exec_image: Option<Arc<[u8]>>,
+    /// A `pspawn` **staged, not yet started** ([`OP_PSPAWN`]): the new process as the spawn defines
+    /// it, which is this process's fork with the file actions applied and its exec staged. The
+    /// engine takes it in the request's own lock scope ([`SignalDoor::spawn_take`]), so it never
+    /// outlives the op that staged it, and hands it to the process it mints
+    /// ([`SignalDoor::spawn_commit`]).
+    pending_spawn: Option<Box<Proc>>,
     /// #799 — this process's pid **is a core scheduler `TaskId`** (a fork twin registered by the
     /// factory with the core-minted pid) — exactly the processes whose exit the core's
     /// twin-completion wake covers, so exactly the ones a blocking `waitpid` may bench on.
@@ -2028,6 +2120,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "fork" => OP_FORK,
         "waitpid" => OP_WAITPID,
         "wait4" => OP_WAIT4,
+        "pspawn" => OP_PSPAWN,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
         "kill" => OP_KILL,
@@ -2256,6 +2349,43 @@ impl SignalSource for SignalDoor {
             .clone()
     }
 
+    /// A staged `pspawn`, taken in the request's own lock scope. See [`Proc::pending_spawn`].
+    fn spawn_take(&self) -> Option<temen_interp::SpawnPlan> {
+        let staged = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_spawn
+            .take()?;
+        Some(temen_interp::SpawnPlan(staged))
+    }
+
+    /// The engine minted the process a `pspawn` asked for, and this is its door. It is the spawning
+    /// process's fork ([`fork_factory`]); it becomes the process the spawn staged: its descriptors
+    /// after the file actions, its working directory, and the exec it starts with.
+    fn spawn_commit(&self, plan: temen_interp::SpawnPlan) {
+        let Ok(staged) = plan.0.downcast::<Proc>() else {
+            return;
+        };
+        let staged = *staged;
+        let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        p.fds = staged.fds;
+        p.cwd = staged.cwd;
+        p.pending_exec = staged.pending_exec;
+        p.pending_exec_image = staged.pending_exec_image;
+        p.pending_exec_heap = staged.pending_exec_heap;
+    }
+
+    /// The pipe ends this process reaches: through its descriptors, and its terminal input end.
+    fn exec_keeps(&self) -> Option<Vec<i32>> {
+        let p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let fds = p.fds.iter().flatten().filter_map(|e| match e {
+            FdEntry::CorePipe(t) => Some(t.get()),
+            _ => None,
+        });
+        Some(fds.chain(p.term_in.as_ref().map(|t| t.get())).collect())
+    }
+
     /// #1896 — whether this personality's op `import` can park the process. The ops in
     /// [`NEVER_PARKS`] never do; a `read` or `write` does when the process holds something it could
     /// block on — a pipe end, a socket, or stdio on a terminal; every other op may. A core pipe end
@@ -2460,6 +2590,8 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             p.heap_end = end;
             p.free_list.clear();
             p.allocated.clear();
+            // The copies `getenv` handed out lived in that heap.
+            p.env_ptrs.clear();
         }
         // Every adopted pipe end re-points to its new handle — and so does the terminal input end
         // (#797 interactive rung 2), which rides the same exec carry as a PipeEnd binding, so an
@@ -2522,17 +2654,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         // #799 — a non-zero pid IS the twin's scheduler TaskId: exactly the processes the core's
         // twin-completion wake covers, so exactly the ones blocking `waitpid` may bench on.
         child.core_task = pid != 0;
-        let pid = if pid != 0 {
-            pid as i32
-        } else {
-            // Anonymous mint: allocate from the same space spawn zombies use (skip occupied).
-            while w.procs.contains_key(&w.next_pid) {
-                w.next_pid += 1;
-            }
-            let p = w.next_pid;
-            w.next_pid += 1;
-            p
-        };
+        let pid = if pid != 0 { pid as i32 } else { w.mint_pid() };
         child.pid = pid;
         let armed = child.sig_armed.clone();
         let child = Arc::new(Mutex::new(child));
@@ -2797,6 +2919,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         park_req: None,
         pending_exec: None,
         pending_exec_image: None,
+        pending_spawn: None,
         core_task: false,
         term_in: None,
     }
@@ -2870,6 +2993,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_EXEC_RESOLVE => st.exec_resolve(args, mem),
                 OP_EXECVE => st.execve(args, mem),
                 OP_WAIT4 => st.wait4(args, mem),
+                OP_PSPAWN => st.pspawn(args, mem),
                 OP_TCGETATTR => st.tcgetattr(args, mem),
                 OP_TCSETATTR => st.tcsetattr(args, mem),
                 OP_TCGETWINSIZE => st.tcgetwinsize(args, mem),
@@ -3227,6 +3351,7 @@ impl Proc {
             park_req: None, // the twin's own door lands at mint, like the wake/stop/kill
             pending_exec: None,
             pending_exec_image: None,
+            pending_spawn: None,
             core_task: false, // stamped by [`fork_factory`] beside the pid
             // #797 — the twin's own terminal token: same handle value (the twin's cloned
             // powerbox table keeps it valid), its own cell (an exec re-points per-process).
@@ -3931,13 +4056,8 @@ impl Ctx<'_> {
         // 2 — inheritance, as a prior `dup2(_, 1)` / `dup2(_, 2)` redirect lands each in a file or pipe).
         self.sink_write(if stdout_fd < 0 { 1 } else { stdout_fd }, &res.stdout);
         self.sink_write(if stderr_fd < 0 { 2 } else { stderr_fd }, &res.stderr);
-        // One pid space (#863 slice 2): allocate past any pid the table already knows (fork twins
-        // occupy their `TaskId`s, the root holds 1), then park the child as a reapable zombie.
-        while self.w.procs.contains_key(&self.w.next_pid) {
-            self.w.next_pid += 1;
-        }
-        let pid = self.w.next_pid;
-        self.w.next_pid += 1;
+        // One pid space (#863 slice 2), then park the child as a reapable zombie.
+        let pid = self.w.mint_pid();
         // Wait-encode the exit status: WEXITSTATUS occupies bits 8–15, low bits 0 (a normal exit).
         self.w.procs.insert(
             pid,
@@ -5296,21 +5416,12 @@ impl Ctx<'_> {
 
     /// [`OP_EXECVE`] — `execve(path, argv, envp)`: become the program at `path`.
     ///
-    /// Policy here, mechanism in the core: resolve the path ([`Self::resolve_exec_path`]),
-    /// bound-walk the two C pointer arrays, check the window fit, pack argv/envp into the powerbox
-    /// args region, then fire [`temen_interp::ParkEvent::ExecSelf`] — which lands on the same
-    /// `build_exec_req` the `CAP_SELF_EXEC` route uses, so there is one image-replace, not two.
+    /// Policy here, mechanism in the core: resolve and stage ([`Self::stage_exec`]), then fire
+    /// [`temen_interp::ParkEvent::ExecSelf`] — which lands on the same `build_exec_req` the
+    /// `CAP_SELF_EXEC` route uses, so there is one image-replace, not two.
     ///
     /// On success this **never returns** (the image-replace destroys the continuation); the
     /// `-ENOSYS` below is the no-door placeholder, the `fork` precedent.
-    ///
-    /// One honest residue: the args-region write happens before the core's final admissibility
-    /// pass, so a refusal there (an unclean context, a durable domain) leaves the region
-    /// overwritten under a still-running caller. `demos/posix_libc/exec.c` saves and restores
-    /// those bytes because it can see the refusal; an op cannot — the answer comes back after it
-    /// has returned. The refusals that remain reachable are all "this domain cannot exec at all"
-    /// conditions rather than per-call ones, because the two per-call failures — an unregistered
-    /// path and a command too big for this window — are both checked *above* the write.
     fn execve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         // #1768 — no engine to serve the image-replace (no caller-request door): refuse up front,
@@ -5322,43 +5433,57 @@ impl Ctx<'_> {
         let path_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let argv_ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let envp_ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
-        let Some(path) = read_guest_cstr(mem, path_ptr) else {
-            return Ok(vec![EFAULT]);
-        };
-        let Ok(path) = String::from_utf8(path) else {
-            return Ok(vec![EINVAL]);
-        };
-        self.p.pending_exec_image = None;
-        let (target, cmd_wl) = match self.resolve_exec_path(&path) {
-            Ok(v) => v,
+        let path = match read_guest_path(mem, path_ptr) {
+            Ok(p) => p,
             Err(e) => return Ok(vec![e]),
         };
-        // A host command runs here, to completion, and the process exits with its status: what an
-        // image-replace with the command would come to, with no image to replace.
-        if let ExecTarget::Host(run) = target {
-            let Some(argv) = read_guest_cstr_vec(mem, argv_ptr) else {
-                return Ok(vec![EFAULT]);
-            };
-            let argv: Vec<String> = argv
-                .iter()
-                .map(|a| String::from_utf8_lossy(a).into_owned())
-                .collect();
-            let status = run(&argv, &mut ProcessFiles(self));
-            return Err(Trap::Exit(status));
+        match self.stage_exec(&path, argv_ptr, envp_ptr, mem) {
+            Err(e) => Ok(vec![e]),
+            // A host command runs here, to completion, and the process exits with its status: what
+            // an image-replace with the command would come to, with no image to replace.
+            Ok(Staged::Host(run, argv)) => Err(Trap::Exit(run(&argv, &mut ProcessFiles(self)))),
+            Ok(Staged::Image(cmd)) => {
+                req(temen_interp::ParkEvent::ExecSelf { cmd });
+                Ok(vec![ENOSYS])
+            }
         }
-        // The §14 window ceiling, checked and refused rather than truncated: the image-replace
-        // reuses THIS window, so a command declaring more memory than the caller has cannot run
-        // here. `window_size` is the documented bound `exec_module` admits against; the core
+    }
+
+    /// The exec that becomes the program at `path`, **staged** on this process (its argv, its
+    /// image, its heap re-base) for the engine to collect when it commits: [`OP_EXECVE`]'s own, and
+    /// the one a [`OP_PSPAWN`] child starts with. Resolves the path ([`Self::resolve_exec_path`]),
+    /// bound-walks the two C pointer arrays, checks the window fit, and packs argv/envp into the
+    /// powerbox args blob. A host command is not staged: it is the caller's to run.
+    ///
+    /// Nothing is staged on a refusal, and the refusals are the per-call ones, all checked before
+    /// anything is written: an unregistered path, a command too big for this window, an argument
+    /// list that overflows the args region.
+    fn stage_exec(
+        &mut self,
+        path: &str,
+        argv_ptr: u64,
+        envp_ptr: u64,
+        mem: &dyn GuestMem,
+    ) -> Result<Staged, i64> {
+        self.p.pending_exec_image = None;
+        let (target, cmd_wl) = self.resolve_exec_path(path)?;
+        if let ExecTarget::Host(run) = target {
+            let argv = read_guest_cstr_vec(mem, argv_ptr).ok_or(EFAULT)?;
+            return Ok(Staged::Host(run, lossy_strings(&argv)));
+        }
+        // The §14 window ceiling, checked and refused rather than truncated: the image runs in a
+        // window of THIS window's geometry, so a command declaring more memory than the caller has
+        // cannot run. `window_size` is the documented bound `exec_module` admits against; the core
         // re-checks against the backed prefix and fails closed if that is stricter.
         let win = mem.window_size();
         if win == 0 || cmd_wl >= 64 || (1u64 << cmd_wl) > win {
-            return Ok(vec![E2BIG]);
+            return Err(E2BIG);
         }
         let (Some(argv), Some(envp)) = (
             read_guest_cstr_vec(mem, argv_ptr),
             read_guest_cstr_vec(mem, envp_ptr),
         ) else {
-            return Ok(vec![EFAULT]);
+            return Err(EFAULT);
         };
         // #801 exec ABI: the powerbox args blob, from its one definition — what a chibicc crt and a
         // nimony `_start` both parse (#1668: the latter is exec'd too now, so a second hand-packed
@@ -5370,7 +5495,7 @@ impl Ctx<'_> {
         };
         let base = temen_ir::module_args_base();
         if base + blob.len() as u64 > temen_ir::module_args_end() {
-            return Ok(vec![E2BIG]);
+            return Err(E2BIG);
         }
         // POSIX: `execve` **replaces the argument vector**. The packed blob above is what a C crt
         // reads, but the personality keeps its own vector too — what [`OP_ARGC`]/[`OP_ARGV`]
@@ -5391,21 +5516,98 @@ impl Ctx<'_> {
         // #1768 — both are STAGED, not applied: the engine collects them when it commits the
         // image-replace ([`SignalDoor::exec_commit`]), so an exec the engine refuses leaves the
         // caller's args region and argv exactly as they were.
-        let argv = argv
-            .iter()
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        self.p.pending_exec = Some((blob, argv));
-        let cmd = match target {
+        self.p.pending_exec = Some((blob, lossy_strings(&argv)));
+        Ok(Staged::Image(match target {
             ExecTarget::Command(h) => temen_interp::ExecCmd::Granted(h),
             ExecTarget::Image(bytes) => {
                 self.p.pending_exec_image = Some(bytes);
                 temen_interp::ExecCmd::Staged
             }
-            ExecTarget::Host(_) => unreachable!("a host command ran above"),
+            ExecTarget::Host(_) => unreachable!("returned above"),
+        }))
+    }
+
+    /// [`OP_PSPAWN`] — `pspawn(req)`: stage the new process and ask the engine to start it.
+    ///
+    /// The new process is staged whole, as the spawn defines it: this process's fork
+    /// ([`Proc::fork`], what a child inherits), the file actions applied to it by the ops they
+    /// name, and the exec it starts with staged on it ([`Self::stage_exec`], against the working
+    /// directory the actions leave). The engine mints the process and hands it the staged state
+    /// ([`SignalDoor::spawn_commit`]), so this process is untouched whatever happens next.
+    fn pspawn(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let Some(req) = self.p.park_req.clone() else {
+            return Ok(vec![ENOSYS]);
         };
-        req(temen_interp::ParkEvent::ExecSelf { cmd });
-        Ok(vec![ENOSYS])
+        let at = *args.first().ok_or(Trap::Malformed)? as u64;
+        let Some(&[path_ptr, argv_ptr, envp_ptr, acts_ptr, nacts]) =
+            read_guest_words(mem, at, 5).as_deref()
+        else {
+            return Ok(vec![EFAULT]);
+        };
+        if nacts > PSPAWN_MAX_ACTIONS {
+            return Ok(vec![EINVAL]);
+        }
+        let Some(acts) = read_guest_words(mem, acts_ptr, nacts * 4) else {
+            return Ok(vec![EFAULT]);
+        };
+        let path = match read_guest_path(mem, path_ptr) {
+            Ok(p) => p,
+            Err(e) => return Ok(vec![e]),
+        };
+        let mut child = self.p.fork();
+        let mut cx = Ctx {
+            w: &mut *self.w,
+            p: &mut child,
+            wake_after: Vec::new(),
+        };
+        for a in acts.chunks_exact(4) {
+            let (fd, arg) = (a[1] as i64, a[2] as i64);
+            match a[0] {
+                PSPAWN_CLOSE => {
+                    cx.close(&[fd]);
+                }
+                PSPAWN_DUP2 => {
+                    let r = cx.dup2(&[fd, arg]);
+                    if r < 0 {
+                        return Ok(vec![r]);
+                    }
+                }
+                PSPAWN_CHDIR => match read_guest_path(mem, a[3]) {
+                    Ok(dir) => cx.p.cwd = cx.join_cwd(&dir),
+                    Err(e) => return Ok(vec![e]),
+                },
+                _ => return Ok(vec![EINVAL]),
+            }
+        }
+        let staged = match cx.stage_exec(&path, argv_ptr, envp_ptr, mem) {
+            Ok(s) => s,
+            Err(e) => return Ok(vec![e]),
+        };
+        match staged {
+            // A host command runs to completion now, over the files the new process sees, as it
+            // would inside that process's `execve`; the process is then a zombie with its status.
+            Staged::Host(run, argv) => {
+                let status = run(&argv, &mut ProcessFiles(&mut cx));
+                let pgid = child.pgid;
+                let pid = self.w.mint_pid();
+                self.w.procs.insert(
+                    pid,
+                    ProcEntry::Zombie {
+                        status: (status & 0xff) << 8,
+                        pgid,
+                        ppid: self.p.pid,
+                    },
+                );
+                let _ = self.p.deliver_signal(SIGCHLD);
+                Ok(vec![pid as i64])
+            }
+            Staged::Image(cmd) => {
+                self.p.pending_spawn = Some(Box::new(child));
+                req(temen_interp::ParkEvent::SpawnSelf { cmd });
+                Ok(vec![ENOSYS])
+            }
+        }
     }
 
     /// `exec_win(module_handle) -> size_log2 | -1`: the declared window of the registered command with
@@ -7304,6 +7506,139 @@ block 0 (vph: i32) {\n\
             None,
             "a commit consumes the staged exec"
         );
+    }
+
+    /// `pspawn` stages the new process whole and leaves the caller as it was: the caller's fork with
+    /// the file actions applied (the pipe's read end onto stdin, both ends closed, a `chdir`), and the
+    /// exec it starts with, its relative path resolved in the directory the actions leave. The engine
+    /// takes the plan with the request and commits it to the process it mints, whose exec then
+    /// carries only the pipe end a descriptor still names.
+    #[test]
+    fn pspawn_stages_the_child_and_leaves_the_caller_as_it_was() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.register_executable("/bin/c", 5, 16);
+        let mut win = vec![0u8; WIN];
+        let put = |win: &mut [u8], at: usize, words: &[u64]| {
+            for (i, w) in words.iter().enumerate() {
+                win[at + i * 8..at + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        win[100_100..100_102].copy_from_slice(b"c\0");
+        win[100_200..100_205].copy_from_slice(b"/bin\0");
+        win[100_300..100_302].copy_from_slice(b"x\0");
+        put(&mut win, 100_400, &[100_300, 0]); // argv = ["x", NULL]
+        let (rfd, wfd) = (3, 4); // the pipe's ends, adopted below over handles 11 and 12
+        put(
+            &mut win,
+            100_600,
+            &[
+                PSPAWN_DUP2,
+                rfd,
+                0,
+                0, //
+                PSPAWN_CLOSE,
+                rfd,
+                0,
+                0, //
+                PSPAWN_CLOSE,
+                wfd,
+                0,
+                0, //
+                PSPAWN_CHDIR,
+                0,
+                0,
+                100_200,
+            ],
+        );
+        let request = |win: &mut [u8], nactions: u64| {
+            put(win, 100_000, &[100_100, 100_400, 0, 100_600, nactions]);
+        };
+        request(&mut win, 4);
+        {
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            assert_eq!(
+                st.pipe_adopt(&[11, 12, 100_500], Some(&mut mem)).unwrap(),
+                vec![0]
+            );
+            // No door: refused up front.
+            assert_eq!(st.pspawn(&[100_000], Some(&mut mem)).unwrap(), vec![ENOSYS]);
+        }
+        assert!(posix.root.lock().unwrap().pending_spawn.is_none());
+
+        let (door, _armed) = cap_signal_source(&posix);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&seen);
+        door.set_park_request(Arc::new(move |ev| rec.lock().unwrap().push(ev)));
+        let spawn = |win: &mut Vec<u8>| -> i64 {
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(win, WIN as u64);
+            st.pspawn(&[100_000], Some(&mut mem)).unwrap()[0]
+        };
+        // Refusals stage nothing and ask for nothing.
+        put(&mut win, 101_000, &[PSPAWN_DUP2, 9, 0, 0]);
+        put(&mut win, 100_000, &[100_100, 100_400, 0, 101_000, 1]);
+        assert_eq!(spawn(&mut win), EBADF, "dup2 from a closed fd");
+        put(&mut win, 101_000, &[99, 0, 0, 0]);
+        assert_eq!(spawn(&mut win), EINVAL, "an unknown action");
+        put(&mut win, 100_000, &[100_100, 100_400, 0, 100_600, 3]);
+        assert_eq!(spawn(&mut win), ENOENT, "`c` without the chdir is `/c`");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refusal asks for nothing"
+        );
+        assert!(posix.root.lock().unwrap().pending_spawn.is_none());
+
+        request(&mut win, 4);
+        assert_eq!(
+            spawn(&mut win),
+            ENOSYS,
+            "the placeholder: the engine answers"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![temen_interp::ParkEvent::SpawnSelf {
+                cmd: temen_interp::ExecCmd::Granted(5)
+            }]
+        );
+        {
+            let root = posix.root.lock().unwrap();
+            assert_eq!(root.cwd, "/", "the caller's directory");
+            assert!(
+                matches!(root.fds[3], Some(FdEntry::CorePipe(_))),
+                "the caller's fds"
+            );
+            assert!(matches!(root.fds[4], Some(FdEntry::CorePipe(_))));
+            assert!(root.pending_exec.is_none(), "the caller's exec");
+        }
+        let plan = door.spawn_take().expect("staged");
+        assert!(door.spawn_take().is_none(), "taken once");
+
+        // The engine mints the process (the fork factory, as `Host::fork_powerbox` runs it) and
+        // commits the plan to it.
+        let forked = fork_factory(Arc::clone(&posix.world), Arc::clone(&posix.root))(7);
+        let (child, _) = forked.signal.expect("the child's door");
+        child.spawn_commit(plan);
+        assert_eq!(
+            child.exec_keeps(),
+            Some(vec![11]),
+            "stdin's end, and only it"
+        );
+        assert_eq!(
+            child.exec_commit(),
+            Some(temen_ir::write_args_blob(&[b"x"], &[]))
+        );
+        let root = posix.root.lock().unwrap();
+        let w = posix.world.lock().unwrap();
+        let Some(ProcEntry::Live(c)) = w.procs.get(&7) else {
+            panic!("the child is registered live");
+        };
+        let c = c.lock().unwrap();
+        assert_eq!((c.ppid, c.cwd.as_str()), (root.pid, "/bin"));
+        assert_eq!(c.args, vec!["x".to_string()]);
+        assert!(c.fds[3].is_none() && c.fds[4].is_none());
+        assert!(matches!(c.fds[0], Some(FdEntry::CorePipe(_))));
     }
 
     /// #763 — a memfs file holding a runnable module's encoding is a program the process built:

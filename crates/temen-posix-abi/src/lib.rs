@@ -69,6 +69,7 @@ pub const OPS: &[(&str, usize)] = &[
     ("statp", 3),        // 59
     ("execve", 3),       // 60
     ("wait4", 4),        // 61
+    ("pspawn", 1),       // 62
 ];
 
 /// The vocabulary as `(import names, signatures)`, op-ordered: `__px_<name>` taking its `i64`

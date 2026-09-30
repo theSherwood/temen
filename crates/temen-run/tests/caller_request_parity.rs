@@ -83,6 +83,60 @@ block 0 (v0: i64) {\n\
   }\n\
 }\n";
 
+/// A command that reads its stdin (fd 0) to EOF through the personality, re-issuing a core pipe
+/// end's tag on the end itself as a libc shim does, and returns `70 +` the bytes it read (`200` on
+/// an error). A spawned child whose stdin is a pipe ends only if it sees EOF there, and it sees EOF
+/// only if no writer is left: not even one it holds itself.
+const STDIN_COMMAND: &str = "memory 17\n\
+import 0 \"__px_read\" (i64, i64, i64) -> (i64)\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  vz = i64.const 0\n\
+  br 1(vz)\n\
+  }\n\
+block 1 (vtot: i64) {\n\
+  vfd = i64.const 0\n\
+  vbuf = i64.const 40000\n\
+  vn = i64.const 8\n\
+  vr = call.import 0 (vfd, vbuf, vn)\n\
+  vtagb = i64.const -1048576\n\
+  vtag = i64.le_s vr vtagb\n\
+  br_if vtag 2(vtot, vr) 3(vtot, vr)\n\
+  }\n\
+block 2 (vtot: i64, vr: i64) {\n\
+  vtagb = i64.const -1048576\n\
+  vh = i64.sub vtagb vr\n\
+  vh32 = i32.wrap_i64 vh\n\
+  vbuf = i64.const 40000\n\
+  vn = i64.const 8\n\
+  vr2 = call.cap 0 0 (i64, i64) -> (i64) vh32 (vbuf, vn)\n\
+  br 3(vtot, vr2)\n\
+  }\n\
+block 3 (vtot: i64, vr: i64) {\n\
+  vz = i64.const 0\n\
+  vmore = i64.gt_s vr vz\n\
+  br_if vmore 4(vtot, vr) 5(vtot, vr)\n\
+  }\n\
+block 4 (vtot: i64, vr: i64) {\n\
+  vt2 = i64.add vtot vr\n\
+  br 1(vt2)\n\
+  }\n\
+block 5 (vtot: i64, vr: i64) {\n\
+  vseventy = i64.const 70\n\
+  vres = i64.add vtot vseventy\n\
+  vz = i64.const 0\n\
+  veof = i64.eq vr vz\n\
+  br_if veof 6(vres) 7()\n\
+  }\n\
+block 6 (vres: i64) {\n\
+  return vres\n\
+  }\n\
+block 7 () {\n\
+  verr = i64.const 200\n\
+  return verr\n\
+  }\n\
+}\n";
+
 /// A 64 KiB command that reports what is at 96 KiB, past its own image, plus 7: `7` in a fresh
 /// window, where nothing of the caller's carries over.
 const FRESH_COMMAND: &str = "memory 16\n\
@@ -153,6 +207,17 @@ enum Body {
     /// Leave `90` at 96 KiB, then `execve("/bin/c", NULL, NULL)` into [`FRESH_COMMAND`]: the new
     /// image's window is fresh, so the command returns `7`, not `97`.
     ExecStartsFresh,
+    /// `pspawn` of `/bin/c` with no file actions, then `wait4` it: `exit` with its `WEXITSTATUS`,
+    /// or with the spawn's errno, negated.
+    SpawnReap,
+    /// [`Body::SpawnReap`] with argv `["x", "x", "x"]`, into [`ARGC_COMMAND`]: the spawned image
+    /// reads the argv the spawn passed, so the child returns `3`.
+    SpawnArgv,
+    /// A pipe the guest mints and adopts as two fds, then `pspawn` of [`STDIN_COMMAND`] with the
+    /// file actions `dup2(read end, 0)`, `close(read end)`, `close(write end)`. The parent writes
+    /// `"x"`, closes its write end, reaps the child and exits with its status: `71`, the one byte
+    /// and then EOF, which the child sees only when it holds no write end of its own.
+    SpawnStdinEof,
     /// `fork()`; the child `execve`s and falls back to `exit(9)`; the parent `wait4`s and exits
     /// with the reaped `WEXITSTATUS`. Nim's `execShellCmd` is exactly this shape.
     ForkExecReap,
@@ -612,10 +677,135 @@ fn guest(form: Form, body: Body) -> String {
             form.call(3, "vkid, vst, vz2, vz2"),
             form.call(1, "vcode"),
         ),
+        Body::SpawnReap | Body::SpawnArgv => spawn_guest(form, body == Body::SpawnArgv),
+        Body::SpawnStdinEof => spawn_stdin_guest(form),
         Body::PipeImported => pipe_guest(form, false),
         Body::PipeMinted => pipe_guest(form, true),
         Body::PipeBackpressure => backpressure_guest(form),
     }
+}
+
+/// The spawn imports, after [`IMPORTS`]: the spawn itself, and the adopt that makes a minted pipe's
+/// ends two fds.
+const SPAWN_IMPORTS: &str = "import 5 \"pspawn\" (i64) -> (i64)\n\
+import 6 \"pipe_adopt\" (i64, i64, i64) -> (i64)\n";
+
+/// [`Body::SpawnReap`], or with `argv` [`Body::SpawnArgv`]: the request record at `47000`
+/// (`{path, argv, envp, actions, nactions}`), `argv` `["x", "x", "x", NULL]` at `43000`.
+fn spawn_guest(form: Form, argv: bool) -> String {
+    let argv_ptr = if argv { "\\xf8\\xa7" } else { "\\x00\\x00" };
+    format!(
+        "memory 17 shadow 65536 69632\n\n{IMPORTS}{SPAWN_IMPORTS}\n\
+         data 40000 \"/bin/c\\x00\"\n\
+         data 41000 \"\\xab\\xcd\\x00\\x00\"\n\
+         data 42000 \"x\\x00\"\n\
+         data 43000 \"\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+         data 47000 \"\\x40\\x9c\\x00\\x00\\x00\\x00\\x00\\x00{argv_ptr}\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\n\
+         func () -> () {{\n\
+         block 0 () {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vreq = i64.const 47000\n\
+         \x20 vpid = {}\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vok = i64.gt_s vpid vz\n\
+         \x20 br_if vok 1(vpid) 2(vpid)\n\
+         \x20 }}\n\
+         block 1 (vkid: i64) {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vst = i64.const 41000\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vw = {}\n\
+         \x20 vhi = i64.const 41001\n\
+         \x20 vcode = i32.load8_u vhi\n\
+         \x20 {}\n\
+         \x20 unreachable\n\
+         \x20 }}\n\
+         block 2 (verr: i64) {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vneg = i64.sub vz verr\n\
+         \x20 vc = i32.wrap_i64 vneg\n\
+         \x20 {}\n\
+         \x20 unreachable\n\
+         \x20 }}\n\
+         }}\n\
+         export 0 func \"_start\" 0\n",
+        form.call(5, "vreq"),
+        form.call(3, "vkid, vst, vz, vz"),
+        form.call(1, "vcode"),
+        form.call(1, "vc"),
+    )
+}
+
+/// [`Body::SpawnStdinEof`]. The minted ends' handles land at `44000`/`44004`, the adopted fds at
+/// `44100`/`44104`; the three file actions (four words each) at `48000`, the request at `47000`.
+fn spawn_stdin_guest(form: Form) -> String {
+    // A file action's words: `{op, fd, arg, path}`; the fds are stored at run time.
+    let action = |at: u64, op: u64, fd_at: u64, arg: u64| {
+        format!(
+            "\x20 va{at} = i64.const {at}\n\
+             \x20 vo{at} = i64.const {op}\n\
+             \x20 i64.store va{at} vo{at}\n\
+             \x20 vf{at}p = i64.const {fd_at}\n\
+             \x20 vf{at}32 = i32.load vf{at}p\n\
+             \x20 vf{at} = i64.extend_i32_s vf{at}32\n\
+             \x20 va{at}1 = i64.const {}\n\
+             \x20 i64.store va{at}1 vf{at}\n\
+             \x20 va{at}2 = i64.const {}\n\
+             \x20 vg{at} = i64.const {arg}\n\
+             \x20 i64.store va{at}2 vg{at}\n",
+            at + 8,
+            at + 16,
+        )
+    };
+    let actions = [
+        action(48000, temen_posix::PSPAWN_DUP2, 44100, 0),
+        action(48032, temen_posix::PSPAWN_CLOSE, 44100, 0),
+        action(48064, temen_posix::PSPAWN_CLOSE, 44104, 0),
+    ]
+    .concat();
+    format!(
+        "memory 17 shadow 65536 69632\n\n{IMPORTS}{SPAWN_IMPORTS}\n\
+         data 40000 \"/bin/c\\x00\"\n\
+         data 41000 \"\\xab\\xcd\\x00\\x00\"\n\
+         data 46000 \"x\"\n\
+         data 47000 \"\\x40\\x9c\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x80\\xbb\\x00\\x00\\x00\\x00\\x00\\x00\\x03\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\n\
+         func () -> () {{\n\
+         block 0 () {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vfds = i64.const 44000\n\
+         \x20 vm = call.cap 4294967295 16 (i64) -> (i64) vdummy (vfds)\n\
+         \x20 vrp = i64.const 44000\n\
+         \x20 vrh32 = i32.load vrp\n\
+         \x20 vrh = i64.extend_i32_s vrh32\n\
+         \x20 vwp = i64.const 44004\n\
+         \x20 vwh32 = i32.load vwp\n\
+         \x20 vwh = i64.extend_i32_s vwh32\n\
+         \x20 vout = i64.const 44100\n\
+         \x20 vad = {}\n\
+         {actions}\
+         \x20 vreq = i64.const 47000\n\
+         \x20 vpid = {}\n\
+         \x20 vmsg = i64.const 46000\n\
+         \x20 vone = i64.const 1\n\
+         \x20 vwr = call.cap 0 1 (i64, i64) -> (i64) vwh32 (vmsg, vone)\n\
+         \x20 vcw = call.cap 0 2 () -> (i64) vwh32 ()\n\
+         \x20 vcr = call.cap 0 2 () -> (i64) vrh32 ()\n\
+         \x20 vst = i64.const 41000\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vw = {}\n\
+         \x20 vhi = i64.const 41001\n\
+         \x20 vcode = i32.load8_u vhi\n\
+         \x20 {}\n\
+         \x20 unreachable\n\
+         \x20 }}\n\
+         }}\n\
+         export 0 func \"_start\" 0\n",
+        form.call(6, "vrh, vwh, vout"),
+        form.call(5, "vreq"),
+        form.call(3, "vpid, vst, vz, vz"),
+        form.call(1, "vcode"),
+    )
 }
 
 /// Run one cell of the table. `cmd` decides what `/bin/c` is, which is the difference between an
@@ -626,6 +816,8 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         Body::ExecRefusedUntouched => UNSTARTABLE,
         Body::ExecDeliversArgv => ARGC_COMMAND,
         Body::ExecStartsFresh => FRESH_COMMAND,
+        Body::SpawnArgv => ARGC_COMMAND,
+        Body::SpawnStdinEof => STDIN_COMMAND,
         _ => COMMAND,
     })
     .expect("parse command");
@@ -680,6 +872,8 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         .provide("fork", cap(temen_posix::OP_FORK))
         .provide("wait4", cap(temen_posix::OP_WAIT4))
         .provide("argc", cap(temen_posix::OP_ARGC))
+        .provide("pspawn", cap(temen_posix::OP_PSPAWN))
+        .provide("pipe_adopt", cap(temen_posix::OP_PIPE_ADOPT))
         .provide("pipe_read", pipe_end(false, 0))
         .provide("pipe_write", pipe_end(true, 1))
         .provide("pipe_close", pipe_end(true, 2));
@@ -715,7 +909,18 @@ fn assert_parity(body: Body, cmd: Cmd, want: Outcome) {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         for grant in Grant::all() {
             for form in Form::all() {
-                let got = run(form, grant, body, backend, cmd);
+                // A cell that never answers fails rather than hangs: a pipe or reap park is a resting
+                // state the engines leave for an outside wake (a signal, a terminal feed), so a row
+                // that loses its wake parks forever instead of trapping.
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(run(form, grant, body, backend, cmd));
+                });
+                let got = rx
+                    .recv_timeout(std::time::Duration::from_secs(120))
+                    .unwrap_or_else(|_| {
+                        panic!("{body:?} ({cmd:?}) never answered at {form:?} / {grant:?} / {backend:?}")
+                    });
                 assert_eq!(
                     got, want,
                     "{body:?} ({cmd:?}) disagreed at {form:?} / {grant:?} / {backend:?}"
@@ -779,6 +984,41 @@ fn an_execd_image_starts_in_a_fresh_window_on_every_route() {
         Cmd::Registered,
         Outcome::Returned(vec![Value::I64(7)]),
     );
+}
+
+/// `posix_spawn` starts a process running the command and returns its pid, which the parent reaps:
+/// the command's status on every route. What a spawn cannot start is an errno with nothing created,
+/// when the personality can tell (nothing at the path, a file that is not a program); an image the
+/// engine cannot start once the process exists (bytes that do not verify, a built program with no
+/// `ModuleLoader`) is a child that exits `127`, the status POSIX gives a spawned child whose exec
+/// failed.
+#[test]
+fn a_spawned_process_runs_and_its_parent_reaps_it_on_every_route() {
+    for (cmd, want) in [
+        (Cmd::Registered, 77),
+        (Cmd::Built, 77),
+        (Cmd::Absent, 2),
+        (Cmd::Plain, 13),
+        (Cmd::Corrupt, 127),
+        (Cmd::BuiltNoLoader, 127),
+    ] {
+        assert_parity(Body::SpawnReap, cmd, Outcome::Exited(want));
+    }
+}
+
+/// The spawned image reads the argv its `pspawn` passed, committed into its fresh window.
+#[test]
+fn a_spawned_process_reads_the_argv_it_was_given_on_every_route() {
+    assert_parity(Body::SpawnArgv, Cmd::Registered, Outcome::Exited(3));
+}
+
+/// A spawn's file actions make the child's stdin the pipe, and its copy of the write end is gone:
+/// the child reads the parent's byte and then EOF. The exec that starts the child carries only the
+/// pipe ends its descriptors name ([`temen_interp::SignalSource::exec_keeps`]); carrying the one
+/// the `close` action dropped, the child would wait on itself forever.
+#[test]
+fn a_spawned_child_reads_its_stdin_pipe_to_eof_on_every_route() {
+    assert_parity(Body::SpawnStdinEof, Cmd::Registered, Outcome::Exited(71));
 }
 
 /// #1635 — nim's `execShellCmd` shape. The twin must get its own process and its own door (so its

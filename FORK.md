@@ -718,6 +718,41 @@ process table; the core's contribution is the domain stop park, `Blocked::Stoppe
 surface a shell drives is complete. (Process groups — `setpgid`/`waitpid(-pgid)` — are the
 personality's, not the core's, since #973; see the §8.6 note above.)
 
+## 8.7 `posix_spawn` — a process without a fork
+
+A caller that forks only to `execve` at once (nimony's `osproc` and `execShellCmd`, a shell running a
+command) needs neither half of what a fork copies: the window, which the exec discards, or the
+continuation, which the exec never returns to. The personality's `pspawn` (op 62, POSIX.md) asks for
+the process directly. It **stages** the child whole — the caller's `Proc::fork`, its file actions
+(`close`, `dup2`, `chdir`) applied by the ops they name, and the exec it starts with, staged as its own
+`execve` would stage it — and fires `ParkEvent::SpawnSelf`. The engine takes the staged plan with the
+request, in the op's own lock scope (`SignalSource::spawn_take`), then:
+
+1. mints the process as it mints a fork twin: the same capacity gate, pid space and burn rule
+   (#1648), registered as the caller's child so `wait4` reaps it (`forked_twins` on the interpreters,
+   the tree on the Cranelift JIT);
+2. duplicates the caller's powerbox (`Host::spawn_powerbox`: `fork_powerbox`, whose personality
+   factory registers the process) and commits the plan to it (`SignalSource::spawn_commit`);
+3. builds the image in that powerbox as an exec builds one (`Host::exec_image`), in a fresh window of
+   the caller's geometry, and starts it at its entry.
+
+The caller's call completes with the pid. Nothing unwinds, so the Cranelift JIT serves a spawn in
+place (no fork plan, no shadow arena), and a spawning program needs no fork instrumentation at all.
+
+**Pipe ends.** An exec carries only the pipe ends the process's descriptors still name
+(`SignalSource::exec_keeps`; the terminal input end too): the others go with the old powerbox. A
+`close` or `dup2` a file action applies has no guest code to release the core end, so without this
+the child would hold the ends it closed — its own stdin's writer among them, and a read of its stdin
+would never see EOF. The rule is exec's, and it is POSIX's: what crosses an exec is the fd table.
+
+**Refusals.** What the personality can tell is an errno with nothing created (`-ENOENT`, `-EACCES`,
+`-E2BIG`, `-EBADF` for a `dup2` from a closed fd); a context no request is served from keeps the op's
+`-ENOSYS`, and a serve handler is refused `-EINVAL`, as for exec. An image the engine cannot start once
+the process exists (bytes that do not verify, a built program with no `ModuleLoader`, an import nothing
+serves) makes a child that exits `127` as it is born (`Host::spawn_failed`), POSIX's status for a
+spawned child whose exec failed. A durable domain may spawn, as it may fork: its freeze declines while
+the child lives. `caller_request_parity.rs` pins all of it on the three engines.
+
 ## 9. Fast-backend fork parity — bytecode DONE; Cranelift: the personality fork DONE (§9.5), `clone_caller` next
 
 Fork is a real parity gap we intend to close, not a by-design fold (INVARIANTS.md #9: "very few
