@@ -258,6 +258,81 @@ fn a_tasks_timed_wait_times_out_without_a_poller() {
     assert_eq!(run_jit(&p, &a, &b, 1), 200_000);
 }
 
+/// `n` timed waits of `ns` each on a word nobody stores; returns how many timed out.
+fn sleeper(n: i64, ns: i64) -> String {
+    format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vi = i64.const 0
+  vc = i64.const 0
+  br 1(vi, vc)
+}}
+block 1 (vi1: i64, vc1: i64) {{
+  vn = i64.const {n}
+  vlt = i64.lt_u vi1 vn
+  br_if vlt 2(vi1, vc1) 3(vc1)
+}}
+block 2 (vi2: i64, vc2: i64) {{
+  vx = i64.const 65552
+  ve = i32.const 0
+  vt = i64.const {ns}
+  vs = i32.atomic.wait vx ve vt
+  vtwo = i32.const 2
+  vto = i32.eq vs vtwo
+  vto64 = i64.extend_i32_u vto
+  vc3 = i64.add vc2 vto64
+  vone = i64.const 1
+  vi3 = i64.add vi2 vone
+  br 1(vi3, vc3)
+}}
+block 3 (vr: i64) {{
+  return vr
+  }}
+}}
+"#
+    )
+}
+
+/// **#2012 — a task's short timed wait ends at its deadline, not on the next cadence sweep.** An
+/// idle worker used to wake parked tasks only every `RECHECK` (20 ms), so each 1 ms wait inside a
+/// child lasted ~20 ms. It now wakes for the earliest parked deadline. All 100 time out (`100`, the
+/// trivial sibling `0` ⇒ `100000`).
+///
+/// The elapsed-time bound is the pin, taken relative to what 100 timed waits of 1 ms cost the host
+/// itself (a condvar's, as the executor's idle worker uses), since that is the floor: about 0.1 s
+/// on Linux and macOS, but ~1.5 s on Windows, whose default timer ticks every ~15.6 ms. Measured on
+/// a 4-core Linux box: ~0.1 s with the fix, 2.02 s without (100 waits × the 20 ms cadence). The
+/// bound, 1.5 × the host's own figure + 0.2 s, sits well under the broken figure wherever the host
+/// can wait 1 ms, and on Windows asks only that a child's wait cost about what the host's does.
+#[test]
+fn a_tasks_short_timed_waits_end_at_their_deadlines() {
+    let p = module(&parent(TAIL_SUM));
+    let a = module(&sleeper(100, 1_000_000));
+    let b = module(TRIVIAL);
+    assert_eq!(run_interp(&p, &a, &b, -1), 100_000, "the oracle");
+    let host = {
+        let (m, cv) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+        let t = std::time::Instant::now();
+        let mut g = m.lock().unwrap();
+        for _ in 0..100 {
+            g = cv
+                .wait_timeout(g, std::time::Duration::from_millis(1))
+                .unwrap()
+                .0;
+        }
+        t.elapsed()
+    };
+    let t = std::time::Instant::now();
+    assert_eq!(run_jit(&p, &a, &b, -1), 100_000);
+    let took = t.elapsed();
+    let bound = host.mul_f64(1.5) + std::time::Duration::from_millis(200);
+    assert!(
+        took < bound,
+        "100 timed waits of 1 ms took {took:?} in a child task, {host:?} on the host"
+    );
+}
+
 /// **Teardown unwinds a task parked forever.** The parent spawns a child that waits on a word no
 /// one stores, and returns without joining. Run teardown poisons the parked task (the domain is
 /// over — `DOMAIN_DONE`, D37 death-is-revocation), it unwinds through its trailing guard, and the
