@@ -38,21 +38,6 @@ block 0 (v0: i32) {
 }
 "#;
 
-/// Map the interpreter's captured protections to the codec's, refusing a §13 shared-region page
-/// (D-region: a durable freeze must reject those — there are none here).
-fn to_codec_prots(caps: &[CapturedProt]) -> Vec<PageProt> {
-    caps.iter()
-        .map(|c| match c {
-            CapturedProt::Rw => PageProt::Rw,
-            CapturedProt::Ro => PageProt::Ro,
-            CapturedProt::Unmapped => PageProt::Unmapped,
-            CapturedProt::Backed => {
-                panic!("freeze must refuse a §13 shared-region page (D-region)")
-            }
-        })
-        .collect()
-}
-
 #[test]
 fn readonly_data_segment_is_captured_and_survives_the_codec() {
     assert_eq!(RO_OFF, 20480);
@@ -98,8 +83,7 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
     );
 
     // Through the §12 codec: the protection is recorded and recovered (Phase-1 would have lost it).
-    let art =
-        freeze_with_prots(&m, &window, &to_codec_prots(&caps), SIZE_LOG2, &host).expect("freeze");
+    let art = freeze_with_prots(&m, &window, &caps, SIZE_LOG2, &host).expect("freeze");
     let mut rhost = Host::new();
     let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
     assert_eq!(
@@ -169,14 +153,8 @@ block 0 (v0: i32) {
     assert_eq!(caps[mark_page], CapturedProt::Rw, "grown page captured Rw");
 
     // Through the codec at the guest's real reservation: pre-v18 this was GeometryMismatch.
-    let art = freeze_with_prots(
-        &m,
-        &window,
-        &to_codec_prots(&caps),
-        GROW_RESERVED_LOG2,
-        &host,
-    )
-    .expect("freeze grown");
+    let art =
+        freeze_with_prots(&m, &window, &caps, GROW_RESERVED_LOG2, &host).expect("freeze grown");
     let mut rhost = Host::new();
     let (rwin, rprots, rreserved) =
         restore_with_prots(&art, &m, &mut rhost).expect("restore grown");
@@ -195,18 +173,6 @@ block 0 (v0: i32) {
         "the grown-region marker survives serialize/restore"
     );
     assert_eq!(rprots[mark_page], PageProt::Rw);
-}
-
-/// Map the codec's protections back to the interpreter's, for seeding a thawed run.
-fn to_captured(prots: &[PageProt]) -> Vec<CapturedProt> {
-    prots
-        .iter()
-        .map(|p| match p {
-            PageProt::Rw => CapturedProt::Rw,
-            PageProt::Ro => CapturedProt::Ro,
-            PageProt::Unmapped => CapturedProt::Unmapped,
-        })
-        .collect()
 }
 
 // Stores to page 5 (`RO_OFF`), then returns 0. With that page restored `Ro` the store faults;
@@ -249,7 +215,7 @@ fn restore_re_establishes_ro_so_a_thawed_write_faults() {
         &[Value::I32(0)],
         &mut fuel,
         &rwin,
-        Some(&to_captured(&rprots)),
+        Some(&rprots.clone()),
         SIZE_LOG2,
         &mut rhost,
     );
@@ -300,9 +266,9 @@ fn jit_re_establishes_ro_so_a_thawed_write_faults() {
     let jit_prots: Vec<WindowProt> = rprots
         .iter()
         .map(|p| match p {
-            PageProt::Rw => WindowProt::Rw,
             PageProt::Ro => WindowProt::Ro,
             PageProt::Unmapped => WindowProt::Unmapped,
+            PageProt::Rw | PageProt::Backed { .. } => WindowProt::Rw,
         })
         .collect();
 
@@ -627,7 +593,7 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
         .expect("freeze");
     let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut Host::new()).expect("restore");
     assert!(rwin == ibytes, "restored bytes");
-    assert_eq!(rprots, to_codec_prots(&iprots), "restored page map");
+    assert_eq!(rprots, iprots, "restored page map");
 }
 
 /// #1834: a thaw on the JIT re-applies the page map the artifact carries, as the interpreter's does.
@@ -675,7 +641,7 @@ fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
             &[Value::I32(ih)],
             &mut fuel,
             &rwin,
-            Some(&to_captured(&rprots)),
+            Some(&rprots.clone()),
             reserved,
             &mut hi,
         );

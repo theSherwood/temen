@@ -45,17 +45,6 @@ const STATE_UNWINDING: i32 = 1;
 const FREEZE_CLOCK: i64 = 42; // captured at freeze; replayed (not re-issued) on thaw
 const THAW_CLOCK: i64 = 9999; // deliberately different — a re-issue instead of a replay would show it
 
-fn to_codec_prots(caps: &[CapturedProt]) -> Vec<PageProt> {
-    caps.iter()
-        .map(|c| match c {
-            CapturedProt::Rw => PageProt::Rw,
-            CapturedProt::Ro => PageProt::Ro,
-            CapturedProt::Unmapped => PageProt::Unmapped,
-            CapturedProt::Backed => unreachable!("guest holds no §13 backed regions"),
-        })
-        .collect()
-}
-
 // A confined durable guest taking two caps: v0 = AddressSpace (vm_map), v1 = Clock. It grows its
 // window into the reserved tail, writes a marker into a grown page, reads the clock (the durable
 // unwind point), then reloads the marker *after* the call and returns clock + marker. Baseline
@@ -208,14 +197,8 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
 
     // Serialize the frozen (grown) domain through the §12 snapshot codec at its real reservation, then
     // restore it on a FRESH host — the cross-host boundary the browser crosses via IndexedDB.
-    let art = freeze_with_prots(
-        &freezable,
-        &fsnap,
-        &to_codec_prots(&fprots),
-        RESERVED_LOG2,
-        &fhost,
-    )
-    .expect("freeze grown durable domain to snapshot");
+    let art = freeze_with_prots(&freezable, &fsnap, &fprots, RESERVED_LOG2, &fhost)
+        .expect("freeze grown durable domain to snapshot");
     let mut thost = Host::new();
     thost.set_durable(true);
     let (rwin, rprots, rreserved) =
@@ -272,6 +255,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
                 PageProt::Ro => 0u8,
                 PageProt::Rw => 1,
                 PageProt::Unmapped => 2,
+                PageProt::Backed { .. } => unreachable!("guest holds no §13 region"),
             };
             (i as u64 * PAGE as u64, kind)
         })

@@ -2951,7 +2951,7 @@ fn window_prot(p: temen_interp::CapturedProt) -> temen_jit::WindowProt {
         temen_interp::CapturedProt::Ro => temen_jit::WindowProt::Ro,
         temen_interp::CapturedProt::Unmapped => temen_jit::WindowProt::Unmapped,
         // A §13 alias is not restorable (the codec refuses it); `Rw` is the default.
-        temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed => {
+        temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed { .. } => {
             temen_jit::WindowProt::Rw
         }
     }
@@ -4725,6 +4725,11 @@ impl SharedBacking for FileBacking {
     fn os_fd(&self) -> Option<i32> {
         use std::os::fd::AsRawFd;
         Some(self.file.as_raw_fd())
+    }
+    /// The file is the host's: another process can write it, so its bytes are no part of a
+    /// freeze (D-region, #2025).
+    fn outside_writers(&self) -> bool {
+        true
     }
 }
 
