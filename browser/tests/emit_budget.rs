@@ -82,7 +82,16 @@ fn over_budget_open_declines_and_the_engine_survives() {
     assert_eq!(temen_status(), STATUS_UNSUPPORTED);
     // …the tier-up fallback still ADMITS the same guest (its emit set degraded to fit — the chain
     // the playground actually takes)…
-    let coop = temen_coop_open(big.as_ptr(), big.len(), core::ptr::null(), 0, 0);
+    let coop = temen_coop_open(
+        big.as_ptr(),
+        big.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         coop, 0,
         "the fallback tier serves the guest with a degraded emit set"

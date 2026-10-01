@@ -30,6 +30,12 @@ use temen_browser::{
     COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
     STATUS_UNSUPPORTED,
 };
+use temen_browser::{
+    temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr, temen_coop_deliver_cap,
+    temen_coop_leaf_wasm_len, temen_coop_leaf_wasm_ptr, temen_coop_module, temen_coop_read,
+    temen_coop_read_ptr, temen_coop_run_for, COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS,
+    COOP_RUN_CAP_PARK, COOP_RUN_PAUSED, COOP_RUN_RESUME,
+};
 use temen_interp::{Host, StreamRole};
 use wasmi::{
     AsContextMut, Caller, Engine, Func, FuncRef, Instance, Linker, Memory, MemoryType,
@@ -461,7 +467,16 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         "oracle: worker 0 + unit(probe) = probe + UNIT_K, through the grown page"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -532,7 +547,16 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
     );
 
     // The cooperative tier-up pump under test.
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -617,7 +641,16 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
     // oracle is asserted on every arm — the gate must never change the result.
     let drive_at_floor = |floor: usize| -> u32 {
         temen_coop_set_tierup_floor(floor);
-        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        let opened = temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        );
         assert_eq!(opened, 0, "open (floor {floor}) status {}", temen_status());
         let n_results = m.funcs[2].results.len();
         let mut tierups = 0u32;
@@ -717,7 +750,21 @@ struct DriverData {
     bounce_syncs: u32,
     /// #1627 control: hand every bounce an empty spill, as a driver that forgot the cursor would.
     drop_spill: bool,
+    /// #1954: the scratch of the leaf call that parked (`temen_coop_call_interp` returned `2`), whose
+    /// results [`COOP_RUN_RESUME`] brings.
+    parked_args: Option<i32>,
 }
+
+/// #1954: the host error a parked leaf call unwinds wasmi with — resumable, as JSPI suspends the
+/// emitted frames on a promise.
+#[derive(Debug)]
+struct Parked;
+impl std::fmt::Display for Parked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("parked")
+    }
+}
+impl wasmi::core::HostError for Parked {}
 
 /// Key of an instantiated §22 unit: an **installed** slot's unit by its append-only `(domain, unit)`
 /// identity (packed, [`temen_coop_slot_unit`]) — its code handle may be `release`d while the slot
@@ -786,6 +833,13 @@ fn call_interp_host(
             .copy_from_slice(&words);
     }
     let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr(), spill_len);
+    if rc == 2 {
+        // #1954: the call parked — suspend the leaf's frames (the JS driver's JSPI promise) until
+        // `COOP_RUN_RESUME` brings its results.
+        c.data_mut().parked_args = Some(args_ptr);
+        c.data_mut().bounces.push(target as u32);
+        return Err(wasmi::Error::host(Parked));
+    }
     // #1312: the callback may have `vm_map`-grown the window, which reallocates and can relocate
     // the engine's backing — re-read BOTH base and length, and widen the mirror to match before
     // copying back.
@@ -991,9 +1045,18 @@ impl CoopB2Driver {
             d.engine = Some(engine);
             d.table = Some(table);
         }
-        let main_wasm =
-            unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) }
-                .to_vec();
+        // #1954: a run whose root runs whole as a leaf has no region emit — its program 0 is the leaf.
+        // SAFETY: the session's emitted bytes, live until it closes.
+        let main_wasm = unsafe {
+            match temen_coop_wasm_len() {
+                0 => std::slice::from_raw_parts(
+                    temen_coop_leaf_wasm_ptr(0),
+                    temen_coop_leaf_wasm_len(0),
+                ),
+                n => std::slice::from_raw_parts(temen_coop_wasm_ptr(), n),
+            }
+        }
+        .to_vec();
         let main = instantiate_in(&mut store, &main_wasm);
         store.data_mut().main = Some(main);
         CoopB2Driver { store, memory }
@@ -1290,7 +1353,16 @@ fn assert_grow_case(name: &str, off: u64, len: u64, declared: u8, ro: bool, want
     let bytes = temen_encode::encode_module(&m);
     let want = onramp_exec_root(&m, b"");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "[{name}] coop open (status {})", temen_status());
     assert!(
         temen_coop_paged() != 0,
@@ -1403,7 +1475,16 @@ export 0 func "_start" 0
     assert_eq!(want.status, STATUS_OK, "the oracle probes the refusal");
     assert!(want.value < 0, "the oracle refuses with a negative errno");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "coop open (status {})", temen_status());
     let opened_len = temen_coop_win_len();
     let (_d, _tierups) = drive_coop_b2_session_allow_trap(&m);
@@ -1450,7 +1531,16 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
             if want_trap { STATUS_TRAP } else { STATUS_OK },
             "oracle sanity (store={store})"
         );
-        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        let opened = temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        );
         assert_eq!(opened, 0, "coop open (status {})", temen_status());
         assert_ne!(
             temen_coop_paged(),
@@ -1485,7 +1575,16 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity (mid-invoke grow)");
     assert_eq!(want.value, X, "oracle value");
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "coop open (status {})", temen_status());
     assert_ne!(temen_coop_paged(), 0, "paged");
     let (d, tierups) = drive_coop_b2_session_allow_trap(&m);
@@ -1540,7 +1639,16 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
             if want_trap { STATUS_TRAP } else { STATUS_OK },
             "oracle sanity (store={store})"
         );
-        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        let opened = temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        );
         assert_eq!(opened, 0, "coop open (status {})", temen_status());
         assert_ne!(
             temen_coop_paged(),
@@ -1646,7 +1754,16 @@ fn coop_indirect_leaf_tiers_up_natively() {
         "oracle: call_indirect(f2)(probe) + 1, through the grown page"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -1785,7 +1902,16 @@ fn coop_leaf_reaches_installed_unit_natively() {
         "oracle: leaf → installed unit → +100"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -1945,7 +2071,16 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
         "oracle: bounce (+K, grow), grown-page store/load, native ×3"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -2118,7 +2253,16 @@ export 0 func "_start" 0
     let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -2187,7 +2331,16 @@ block 0 (vsp: i64, varg: i64) {{
         "both yielded values arrive"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (_d, _tierups, invokes) = drive_coop_b2_session(&m);
     assert_eq!(
@@ -2258,7 +2411,16 @@ export 0 func "_start" 0
     let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened, -STATUS_UNSUPPORTED,
         "nothing for the emitted tier to run → clean refusal (bytecode fallback)"
@@ -2347,7 +2509,16 @@ export 0 func "_start" 0
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, X + 7 + 100, "oracle: B → installed A → +100");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (d, _tierups, invokes) = drive_coop_b2_session(&m);
     assert!(invokes >= 1, "unit B must run emitted (non-vacuity)");
@@ -2432,7 +2603,16 @@ block 0 (v0: i64) {{
         "oracle: the dispatch reaches slot {TARGET}"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     assert!(
         (1u32 << temen_coop_table_log2()) >= m.funcs.len() as u32,
@@ -2526,7 +2706,16 @@ export 0 func "_start" 0
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 2 * X + BOUNCE_K, "oracle value");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the leaf must tier up");
@@ -2619,7 +2808,16 @@ export 0 func "_start" 0
         "oracle: bounce-created fiber + later resume"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open must admit (status {})", temen_status());
     let (d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the dispatching leaf must tier up");
@@ -2697,7 +2895,16 @@ export 0 func "_start" 0
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 7 + PLEAF_K + XT_K, "oracle value");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -2785,7 +2992,16 @@ export 0 func "_start" 0
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, PROBE + PLEAF_K, "oracle value");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -2852,7 +3068,16 @@ export 0 func "_start" 0
         "oracle sanity (notify with no waiters returns 0)"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "admitted (status {})", temen_status());
     let (_d, tierups, _invokes) = drive_coop_b2_session(&m);
     assert!(tierups >= 1, "the leaf tiered up before the concurrency op");
@@ -2922,7 +3147,16 @@ export 0 func "_start" 0
     let expect = HOT_K * (1..=HOT_N).sum::<i64>();
     assert_eq!(want.value, expect, "oracle value");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -2979,6 +3213,9 @@ fn coop_jacl_compiler_runs_through_the_driver() {
         bytes.len(),
         MACRO_SRC.as_ptr(),
         MACRO_SRC.len(),
+        0,
+        core::ptr::null(),
+        0,
         0,
     );
     if opened != 0 {
@@ -3067,6 +3304,9 @@ fn coop_forth_kernel_tiers_up_and_matches_the_oracle() {
         PROGRAM.as_ptr(),
         PROGRAM.len(),
         0,
+        core::ptr::null(),
+        0,
+        0,
     );
     assert_eq!(
         opened,
@@ -3148,6 +3388,9 @@ fn coop_forth_thread_words_decline_to_the_oracle() {
         bytes.len(),
         PROGRAM.as_ptr(),
         PROGRAM.len(),
+        0,
+        core::ptr::null(),
+        0,
         0,
     );
     assert_eq!(opened, 0, "the kernel must open on the coop tier");
@@ -3277,7 +3520,16 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
         "oracle: 22 + 16 + 21 + 21 (both markers landed)"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -3408,7 +3660,16 @@ fn coop_tierup_child_paged_traps_over_carve() {
         "oracle: the child's load of its own unmapped page traps"
     );
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(
         opened,
         0,
@@ -3923,7 +4184,16 @@ fn coop_compile_linked_invoke_matches_the_oracle() {
         );
         assert_eq!(want.value, LINK_PROBE * 2 + UNIT_K, "oracle value");
 
-        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        let opened = temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        );
         assert_eq!(opened, 0, "open (status {})", temen_status());
         assert_eq!(
             temen_coop_paged() != 0,
@@ -4079,7 +4349,16 @@ fn coop_jit_invoke_inside_a_bounce_matches_the_oracle() {
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, NEST_PROBE + UNIT_K + 1, "oracle value");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open (status {})", temen_status());
     let (d, tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
     eprintln!(
@@ -4201,7 +4480,16 @@ fn coop_jit_install_and_uninstall_inside_a_bounce_match_the_oracle() {
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, NEST_PROBE + UNIT_K + 1, "oracle value");
 
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open (status {})", temen_status());
     let (d, tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
     eprintln!(
@@ -4296,7 +4584,16 @@ fn open_gc_spill_guest() -> temen_ir::Module {
     let m = temen_text::parse_module(&gc_spill_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
     assert_eq!(opened, 0, "open (status {})", temen_status());
     m
 }
@@ -4340,4 +4637,387 @@ fn a_collecting_guest_tiers_up_and_its_spilled_roots_are_scanned() {
         "without the spill, ROOT + 8 is missed"
     );
     temen_coop_close();
+}
+
+// ---- #1954: the root program run whole as a leaf, parking on declared host-completed caps ------
+
+/// The ping guest: `_start` asks the embedder `ping(i)` for each `i` in `0..n` through the declared
+/// cap `ping`, sums the answers, writes the sum to stdout through the `write` import, and returns it.
+/// Both imports reach the host by name (the on-ramp binder), so the root can park only in `ping` —
+/// a declared cap the embedder answers.
+fn ping_guest(n: i64) -> Vec<u8> {
+    let src = format!(
+        r#"memory 16
+import 0 "ping" (i64) -> (i64)
+import 1 "write" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  br 1(vz, vz)
+}}
+block 1 (vi: i64, vs: i64) {{
+  vp = call.import 0 (vi)
+  vs2 = i64.add vs vp
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vn = i64.const {n}
+  vgo = i64.ne vi2 vn
+  br_if vgo 1(vi2, vs2) 2(vs2)
+}}
+block 2 (vr: i64) {{
+  vsl = i64.const {SLOT}
+  i64.store vsl vr
+  vlen8 = i64.const 8
+  vw = call.import 1 (vsl, vlen8)
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    temen_encode::encode_module(&m)
+}
+
+/// The embedder's answer to `ping(x)`.
+fn pong(x: i64) -> i64 {
+    2 * x + 1
+}
+
+/// What a tier-up session's run did: its value and stdout, and the events it took.
+#[derive(Debug, PartialEq)]
+struct CapRun {
+    value: i64,
+    stdout: Vec<u8>,
+    parks: usize,
+    tierups: usize,
+    resumes: usize,
+}
+
+/// A leaf call the driver holds suspended: wasmi's resumable invocation (the JS driver's pending
+/// JSPI promise) and the shape of the leaf entry's results.
+struct Suspended(wasmi::ResumableCallHostTrap, Vec<Val>);
+
+impl CoopB2Driver {
+    /// #1954: run the pending TIERUP's `f{func}` resumably — as the JS driver runs a leaf under JSPI —
+    /// until it returns (delivered) or a call in it parks (held, to resume at `COOP_RUN_RESUME`).
+    fn enter_leaf(&mut self) -> Option<Suspended> {
+        self.sync_table();
+        self.prime(temen_coop_mapped());
+        let func = temen_coop_func();
+        let main = self.store.data().main.expect("main instantiated");
+        let f = main
+            .get_func(&self.store, &format!("f{func}"))
+            .unwrap_or_else(|| panic!("f{func} not exported"));
+        // SAFETY: pending-event operand stash, stable until the deliver.
+        let argv =
+            unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
+        let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
+        params.extend(argv.iter().map(|a| Val::I64(*a)));
+        let shape: Vec<Val> = f
+            .ty(&self.store)
+            .results()
+            .iter()
+            .map(|t| Val::default(*t))
+            .collect();
+        let mut results = shape.clone();
+        let ran = f.call_resumable(&mut self.store, &params, &mut results);
+        self.settle_leaf(ran, shape, results)
+    }
+
+    /// #1954: `COOP_RUN_RESUME` — the parked call returned: its results go to the call's scratch, the
+    /// window and globals are re-synced as after any bounce, and the leaf's frames run on.
+    fn resume_leaf(&mut self, Suspended(call, shape): Suspended) -> Option<Suspended> {
+        let args_ptr = self
+            .store
+            .data_mut()
+            .parked_args
+            .take()
+            .expect("a parked call");
+        self.sync_table();
+        self.prime(temen_coop_mapped());
+        // SAFETY: the RESUME's staged results, stable until the next pump.
+        let words =
+            unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.memory
+            .write(&mut self.store, args_ptr as usize, &bytes)
+            .unwrap();
+        let mut results = shape.clone();
+        let ran = call.resume(&mut self.store, &[], &mut results);
+        self.settle_leaf(ran, shape, results)
+    }
+
+    fn settle_leaf(
+        &mut self,
+        ran: Result<wasmi::ResumableCall, wasmi::Error>,
+        shape: Vec<Val>,
+        results: Vec<Val>,
+    ) -> Option<Suspended> {
+        match ran {
+            Ok(wasmi::ResumableCall::HostTrap(t))
+                if t.host_error().downcast_ref::<Parked>().is_some() =>
+            {
+                Some(Suspended(t, shape))
+            }
+            Ok(wasmi::ResumableCall::Finished) => {
+                self.writeback();
+                let slots: Vec<i64> = results
+                    .iter()
+                    .map(|v| match v {
+                        Val::I64(x) => *x,
+                        Val::I32(x) => *x as i64,
+                        _ => panic!("non-integer leaf result"),
+                    })
+                    .collect();
+                temen_coop_deliver(slots.as_ptr(), slots.len());
+                None
+            }
+            _ => {
+                self.writeback();
+                temen_coop_deliver_trap();
+                None
+            }
+        }
+    }
+}
+
+/// Open `bytes` as a tier-up session with `caps` declared and root-leaf mode `leaf`, then pump it
+/// to the end — in `budget`-op slices when given — answering each park with `answer(cap, args)`,
+/// running each TIERUP as a leaf would run and holding it where it parks. Returns the run and how
+/// many slices it paused at, or `None` when the open refuses.
+fn drive_declared(
+    bytes: &[u8],
+    caps: &[&str],
+    leaf: i32,
+    budget: Option<u64>,
+    answer: &mut dyn FnMut(&str, &[i64]) -> i64,
+) -> Option<(CapRun, usize)> {
+    let names = caps.join("\n");
+    let cp = temen_alloc(names.len().max(1));
+    // SAFETY: `temen_alloc` returned a live allocation at least that long.
+    unsafe { core::ptr::copy_nonoverlapping(names.as_ptr(), cp, names.len()) };
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        cp,
+        names.len(),
+        leaf,
+    );
+    if opened != 0 {
+        return None;
+    }
+    let mut d = CoopB2Driver::new();
+    let mut run = CapRun {
+        value: 0,
+        stdout: Vec::new(),
+        parks: 0,
+        tierups: 0,
+        resumes: 0,
+    };
+    let mut held: Option<Suspended> = None;
+    let mut pauses = 0;
+    loop {
+        let ev = match budget {
+            Some(b) => temen_coop_run_for(b),
+            None => temen_coop_run(),
+        };
+        // A sliced run hands back each return's output; an unsliced one all of it at the end.
+        if budget.is_some() || ev == COOP_RUN_DONE {
+            let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
+            if !p.is_null() && n > 0 {
+                // SAFETY: the stash stays live until the next call that replaces it.
+                run.stdout
+                    .extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) });
+            }
+        }
+        match ev {
+            COOP_RUN_TIERUP => {
+                run.tierups += 1;
+                assert!(held.is_none(), "one leaf, held at most once");
+                assert_eq!(temen_coop_module(), 0, "the root's program");
+                held = d.enter_leaf();
+            }
+            COOP_RUN_RESUME => {
+                run.resumes += 1;
+                held = d.resume_leaf(held.take().expect("a held leaf"));
+            }
+            COOP_RUN_CAP_PARK => {
+                run.parks += 1;
+                // SAFETY: the request words stay live until the next deliver/run/close.
+                let words = unsafe {
+                    std::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len())
+                }
+                .to_vec();
+                let (id, value) = (
+                    words[0] as u64,
+                    answer(caps[words[1] as usize], &words[2..]),
+                );
+                assert_eq!(temen_coop_deliver_cap(id, value), 1);
+                assert_eq!(temen_coop_deliver_cap(id, value), 0, "answered once");
+            }
+            COOP_RUN_PAUSED => {
+                pauses += 1;
+                assert!(pauses < 1_000_000, "runaway slices");
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    assert!(held.is_none(), "the leaf ended");
+    assert_eq!(temen_status(), STATUS_OK);
+    run.value = temen_coop_value();
+    temen_coop_close();
+    Some((run, pauses))
+}
+
+/// **The tier-up session runs a root whole as a leaf and parks it on declared caps** (#1954): with
+/// `ping` declared and a host that suspends emitted frames, the root program tiers up once, as
+/// program 0 with no region emit, and each `ping` parks it — `COOP_RUN_CAP_PARK`, answered with
+/// `temen_coop_deliver_cap`, then `COOP_RUN_RESUME` resumes the held frames. The value, the stdout
+/// and the parks are the interpreted run's: the same session where the root is not offered (a host
+/// that cannot suspend) or with the leaf off, unsliced and in slices. Slices pause only interpreted
+/// code: the leaf runs to its parks.
+#[test]
+fn coop_root_leaf_parks_on_declared_caps_and_matches_interpreted() {
+    let _g = ffi_guard();
+    const N: i64 = 40;
+    let bytes = ping_guest(N);
+    let sum: i64 = (0..N).map(pong).sum();
+    let want = |tierups, resumes| CapRun {
+        value: sum,
+        stdout: sum.to_le_bytes().to_vec(),
+        parks: N as usize,
+        tierups,
+        resumes,
+    };
+    let mut answer = |cap: &str, args: &[i64]| {
+        assert_eq!(cap, "ping");
+        pong(args[0])
+    };
+    let mut drive = |leaf, budget| drive_declared(&bytes, &["ping"], leaf, budget, &mut answer);
+
+    let (leaf, _) = drive(COOP_LEAF_SUSPENDS, None).expect("opens");
+    assert_eq!(leaf, want(1, N as usize), "leaf");
+    let (sliced, pauses) = drive(COOP_LEAF_SUSPENDS, Some(1)).expect("opens");
+    assert_eq!(sliced, want(1, N as usize), "leaf, sliced");
+    assert_eq!(pauses, 0, "nothing interpreted to pause");
+
+    for (mode, name) in [
+        (COOP_LEAF_ROOT, "no suspension"),
+        (COOP_LEAF_OFF, "leaf off"),
+    ] {
+        assert_eq!(drive(mode, None).expect("opens").0, want(0, 0), "{name}");
+        let (sliced, pauses) = drive(mode, Some(1)).expect("opens");
+        assert_eq!(sliced, want(0, 0), "{name}, sliced");
+        assert!(pauses > 0, "{name}: the interpreted run pauses");
+    }
+
+    // The open's decision, seen from the host: program 0 is the root's leaf, and there is no region
+    // emit for a driver to instantiate.
+    let cp = temen_alloc(4);
+    unsafe { core::ptr::copy_nonoverlapping(b"ping".as_ptr(), cp, 4) };
+    let open = |leaf| {
+        temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            cp,
+            4,
+            leaf,
+        )
+    };
+    assert_eq!(open(COOP_LEAF_SUSPENDS), 0);
+    assert_eq!(
+        (temen_coop_wasm_len(), temen_coop_leaf_wasm_len(0) > 0),
+        (0, true)
+    );
+    assert_eq!(open(COOP_LEAF_ROOT), 0);
+    assert_eq!(
+        (temen_coop_wasm_len() > 0, temen_coop_leaf_wasm_len(0)),
+        (true, 0)
+    );
+    temen_coop_close();
+}
+
+/// A chibicc C program that asks the embedder through two declared caps: `ping` for each of 300
+/// values (printing as it goes) and `show` for a window read — c_interpret's graphics shape
+/// (`fb_present` names its pixels by address).
+const HOST_CAPS_C: &str = r#"#include <stdio.h>
+long __vm_resolve(const char *name, long len);
+__attribute__((temen_cap)) extern long ping(int h, long x);
+__attribute__((temen_cap)) extern long show(int h, unsigned char *p, long n);
+unsigned char buf[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+int main(void) {
+  int hp = (int)__vm_resolve("ping", 4);
+  int hs = (int)__vm_resolve("show", 4);
+  long s = 0;
+  for (long i = 0; i < 300; i++) {
+    s += ping(hp, i);
+    if (i % 100 == 0) printf("i %ld s %ld\n", i, s);
+  }
+  long t = show(hs, buf, 8);
+  printf("sum %ld show %ld\n", s, t);
+  return (int)(s % 97);
+}
+"#;
+
+/// **A real C program's root runs whole as a leaf** (#1954): chibicc's output — libc's `printf`,
+/// a `self.resolve`d handle per cap, the stdout stream — is offered and taken, and answers its
+/// declared caps exactly as interpreted: the same output and exit value, and the same 301 parks.
+/// `show` reads the window through `temen_coop_read` while the leaf is parked. Asset-gated.
+#[test]
+fn coop_root_leaf_runs_a_chibicc_program_with_declared_caps() {
+    let _g = ffi_guard();
+    let Ok(cc) = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/assets/chibicc.temen"
+    )) else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&cc).expect("decode chibicc.temen");
+    let mut files = temen_browser::playground_include_files();
+    files.push(("in.c".to_string(), HOST_CAPS_C.as_bytes().to_vec()));
+    let image = temen_fs::encode_image(&files, &["include".to_string()]);
+    let out = temen_browser::onramp_fs_exec(
+        &chibicc,
+        &image,
+        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        b"",
+    );
+    let ir = String::from_utf8(out.stdout).expect("IR utf8");
+    let m = temen_text::parse_module(&ir).expect("parse IR");
+    let bytes = temen_encode::encode_module(&m);
+    let mut answer = |cap: &str, args: &[i64]| match cap {
+        "ping" => 2 * args[0] + 1,
+        _ => {
+            let n = temen_coop_read(args[0] as u64, args[1] as usize);
+            // SAFETY: the read-back stays live until the next read.
+            unsafe { std::slice::from_raw_parts(temen_coop_read_ptr(), n) }
+                .iter()
+                .map(|&b| b as i64)
+                .sum()
+        }
+    };
+    let caps = ["ping", "show"];
+    let want = |tierups, resumes| CapRun {
+        value: 90000 % 97,
+        stdout: b"i 0 s 1\ni 100 s 10201\ni 200 s 40401\nsum 90000 show 36\n".to_vec(),
+        parks: 301,
+        tierups,
+        resumes,
+    };
+    let (leaf, _) =
+        drive_declared(&bytes, &caps, COOP_LEAF_SUSPENDS, None, &mut answer).expect("opens");
+    assert_eq!(leaf, want(1, 301), "leaf");
+    let (sliced, _) =
+        drive_declared(&bytes, &caps, COOP_LEAF_SUSPENDS, Some(1_000), &mut answer).expect("opens");
+    assert_eq!(sliced, want(1, 301), "leaf, sliced");
 }

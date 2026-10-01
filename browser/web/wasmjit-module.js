@@ -401,7 +401,8 @@ export async function driveCoopTierupRun(ex, memory, cacheKey, counts = {}) {
   } });
 
   // The run's own emit (program 0). A nimony build (`temen_nim_open`) emits none of its own: its
-  // programs are the leaf images its processes exec (#1896), each instantiated at its first TIERUP.
+  // programs are the leaf images its processes exec (#1896), each instantiated at its first TIERUP —
+  // and neither does a run whose root program runs whole as a leaf (#1954): its program 0 is that leaf.
   let emitted = {};
   if (ex.temen_coop_wasm_len() > 0) {
     const coopKey = cacheKey === undefined ? undefined : `${cacheKey}#coop`;
@@ -417,9 +418,14 @@ export async function driveCoopTierupRun(ex, memory, cacheKey, counts = {}) {
     }
     emitted = (await WebAssembly.instantiate(module, unitImports())).exports;
   }
-  const programs = new Map([[0, emitted]]);
+  // #1954: a program is a leaf image iff the engine emitted one for it — the engine's answer, not a
+  // guess from its index (a root leaf is program 0).
+  const isLeaf = (m) => ex.temen_coop_leaf_wasm_len(m) > 0;
+  const programs = new Map();
+  if (ex.temen_coop_wasm_len() > 0) programs.set(0, emitted);
   const programFor = async (m) => {
     let p = programs.get(m);
+    if (p === undefined && !isLeaf(m)) p = emitted;
     if (p === undefined) {
       const ptr = Number(ex.temen_coop_leaf_wasm_ptr(m));
       const bytes = u8().slice(ptr, ptr + ex.temen_coop_leaf_wasm_len(m));
@@ -703,7 +709,8 @@ export async function driveCoopTierupRun(ex, memory, cacheKey, counts = {}) {
       const func = ex.temen_coop_func();
       // Before the per-event fan-out below, so a program instantiated now gets this event's sync.
       const m = ex.temen_coop_module();
-      if (m !== 0) counts.leaves++;
+      const leaf = isLeaf(m);
+      if (leaf) counts.leaves++;
       const program = await programFor(m);
       const argvPtr = Number(ex.temen_coop_argv_ptr());
       const n = ex.temen_coop_argv_len();
@@ -722,7 +729,7 @@ export async function driveCoopTierupRun(ex, memory, cacheKey, counts = {}) {
       }
       armEnv();
       // #1896: a leaf program runs under JSPI where there is one, so that a call in it can park.
-      if (suspendsLeaves && m !== 0) {
+      if (suspendsLeaves && leaf) {
         const entry = WebAssembly.promising(program['f' + func]);
         await settle(ex.temen_coop_task(), () => entry(eventWin(), envCell, ...args));
         continue;
