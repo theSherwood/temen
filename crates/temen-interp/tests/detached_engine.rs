@@ -133,7 +133,7 @@ fn run_in(
     host.set_durable(durable);
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(&child);
-    let budget = host.grant_budget(0, (minter_quota) as i64, 0);
+    let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
     let back = Arc::new(Region::new(1u64 << 17, 4096));
     let root = bytecode::Vcpu::new_root_with_powerbox(
         &prog,

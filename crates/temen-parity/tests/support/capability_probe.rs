@@ -241,7 +241,7 @@ pub fn rows() -> Vec<Row> {
             &[0, 1],
             Box::new(|| {
                 let mut h = Host::new();
-                let x = h.grant_budget(0, 1 << 16, 4);
+                let x = h.grant_budget(-1, 1 << 16, 4);
                 (h, x)
             }),
         ),

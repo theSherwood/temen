@@ -591,7 +591,7 @@ fn run_topo(nifler_bytes: &[u8], seed: Vec<(String, Vec<u8>)>) -> Option<(i64, V
     host.register_cap_name("inst", inst);
     host.register_cap_name("nifler", modh);
     // nifler's window (one child live at a time), paid from this and returned when it ends.
-    let budget = host.grant_budget(0, 1 << nifler.memory.expect("nifler window").size_log2, 0);
+    let budget = host.grant_budget(-1, 1 << nifler.memory.expect("nifler window").size_log2, -1);
     host.register_cap_name("budget", budget);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);

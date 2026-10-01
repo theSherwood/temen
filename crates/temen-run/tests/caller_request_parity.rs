@@ -137,6 +137,36 @@ block 7 () {\n\
   }\n\
 }\n";
 
+/// A command that writes `"OUT"` to its stdout (fd 1) through the personality, re-issuing a core
+/// pipe end's tag on the end itself as [`STDIN_COMMAND`] does for its reads, and returns `7`.
+const WRITE_COMMAND: &str = "memory 17\n\
+import 0 \"__px_write\" (i64, i64, i64) -> (i64)\n\
+data 40000 \"OUT\"\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  vfd = i64.const 1\n\
+  vbuf = i64.const 40000\n\
+  vn = i64.const 3\n\
+  vr = call.import 0 (vfd, vbuf, vn)\n\
+  vtagb = i64.const -1048576\n\
+  vtag = i64.le_s vr vtagb\n\
+  br_if vtag 1(vr) 2()\n\
+  }\n\
+block 1 (vr: i64) {\n\
+  vtagb = i64.const -1048576\n\
+  vh = i64.sub vtagb vr\n\
+  vh32 = i32.wrap_i64 vh\n\
+  vbuf = i64.const 40000\n\
+  vn = i64.const 3\n\
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh32 (vbuf, vn)\n\
+  br 2()\n\
+  }\n\
+block 2 () {\n\
+  vseven = i64.const 7\n\
+  return vseven\n\
+  }\n\
+}\n";
+
 /// A 64 KiB command that reports what is at 96 KiB, past its own image, plus 7: `7` in a fresh
 /// window, where nothing of the caller's carries over.
 const FRESH_COMMAND: &str = "memory 16\n\
@@ -218,6 +248,12 @@ enum Body {
     /// `"x"`, closes its write end, reaps the child and exits with its status: `71`, the one byte
     /// and then EOF, which the child sees only when it holds no write end of its own.
     SpawnStdinEof,
+    /// `Command::output`'s shape: a pipe the guest mints and adopts, then `pspawn` of
+    /// [`WRITE_COMMAND`] with its stdout the write end. The parent reads the child's output to EOF
+    /// and reaps it. See [`spawn_output_guest`].
+    SpawnOutput,
+    /// [`Body::SpawnOutput`] from a spawned vCPU of a threaded program, which joins it.
+    SpawnOutputThreaded,
     /// `fork()`; the child `execve`s and falls back to `exit(9)`; the parent `wait4`s and exits
     /// with the reaped `WEXITSTATUS`. Nim's `execShellCmd` is exactly this shape.
     ForkExecReap,
@@ -679,6 +715,8 @@ fn guest(form: Form, body: Body) -> String {
         ),
         Body::SpawnReap | Body::SpawnArgv => spawn_guest(form, body == Body::SpawnArgv),
         Body::SpawnStdinEof => spawn_stdin_guest(form),
+        Body::SpawnOutput => spawn_output_guest(form, false),
+        Body::SpawnOutputThreaded => spawn_output_guest(form, true),
         Body::PipeImported => pipe_guest(form, false),
         Body::PipeMinted => pipe_guest(form, true),
         Body::PipeBackpressure => backpressure_guest(form),
@@ -737,31 +775,33 @@ fn spawn_guest(form: Form, argv: bool) -> String {
     )
 }
 
+/// The instructions that store one `pspawn` file action at `at`: its words `{op, fd, arg, path}`,
+/// `fd` loaded at run time from the `i32` at `fd_at` (an adopted pipe end's descriptor).
+fn file_action(at: u64, op: u64, fd_at: u64, arg: u64) -> String {
+    format!(
+        "\x20 va{at} = i64.const {at}\n\
+         \x20 vo{at} = i64.const {op}\n\
+         \x20 i64.store va{at} vo{at}\n\
+         \x20 vf{at}p = i64.const {fd_at}\n\
+         \x20 vf{at}32 = i32.load vf{at}p\n\
+         \x20 vf{at} = i64.extend_i32_s vf{at}32\n\
+         \x20 va{at}1 = i64.const {}\n\
+         \x20 i64.store va{at}1 vf{at}\n\
+         \x20 va{at}2 = i64.const {}\n\
+         \x20 vg{at} = i64.const {arg}\n\
+         \x20 i64.store va{at}2 vg{at}\n",
+        at + 8,
+        at + 16,
+    )
+}
+
 /// [`Body::SpawnStdinEof`]. The minted ends' handles land at `44000`/`44004`, the adopted fds at
 /// `44100`/`44104`; the three file actions (four words each) at `48000`, the request at `47000`.
 fn spawn_stdin_guest(form: Form) -> String {
-    // A file action's words: `{op, fd, arg, path}`; the fds are stored at run time.
-    let action = |at: u64, op: u64, fd_at: u64, arg: u64| {
-        format!(
-            "\x20 va{at} = i64.const {at}\n\
-             \x20 vo{at} = i64.const {op}\n\
-             \x20 i64.store va{at} vo{at}\n\
-             \x20 vf{at}p = i64.const {fd_at}\n\
-             \x20 vf{at}32 = i32.load vf{at}p\n\
-             \x20 vf{at} = i64.extend_i32_s vf{at}32\n\
-             \x20 va{at}1 = i64.const {}\n\
-             \x20 i64.store va{at}1 vf{at}\n\
-             \x20 va{at}2 = i64.const {}\n\
-             \x20 vg{at} = i64.const {arg}\n\
-             \x20 i64.store va{at}2 vg{at}\n",
-            at + 8,
-            at + 16,
-        )
-    };
     let actions = [
-        action(48000, temen_posix::PSPAWN_DUP2, 44100, 0),
-        action(48032, temen_posix::PSPAWN_CLOSE, 44100, 0),
-        action(48064, temen_posix::PSPAWN_CLOSE, 44104, 0),
+        file_action(48000, temen_posix::PSPAWN_DUP2, 44100, 0),
+        file_action(48032, temen_posix::PSPAWN_CLOSE, 44100, 0),
+        file_action(48064, temen_posix::PSPAWN_CLOSE, 44104, 0),
     ]
     .concat();
     format!(
@@ -808,6 +848,101 @@ fn spawn_stdin_guest(form: Form) -> String {
     )
 }
 
+/// [`Body::SpawnOutput`], or with `threaded` [`Body::SpawnOutputThreaded`], laid out as
+/// [`spawn_stdin_guest`]'s. The body is func 1, a thread entry: it mints and adopts a pipe, spawns
+/// [`WRITE_COMMAND`] with the file actions `dup2(write end, 1)`, `close(write end)`,
+/// `close(read end)`, and releases its own write end, so the child's copy is the pipe's only writer.
+/// It reads twice: the first read must wait for the child's `"OUT"` (answering `0` would be a false
+/// EOF: the writer is still open), the second must see EOF once the child's exit released its end.
+/// It then reaps the child and returns `10 * n1 + n2 + (WEXITSTATUS - 7)`: `30` when every step
+/// held, or the spawn's errno. Func 0 calls it, or runs it on a spawned vCPU and joins it, and exits
+/// with its answer.
+fn spawn_output_guest(form: Form, threaded: bool) -> String {
+    let actions = [
+        file_action(48000, temen_posix::PSPAWN_DUP2, 44104, 1),
+        file_action(48032, temen_posix::PSPAWN_CLOSE, 44104, 0),
+        file_action(48064, temen_posix::PSPAWN_CLOSE, 44100, 0),
+    ]
+    .concat();
+    let run_body = if threaded {
+        "vt = thread.spawn 1 vz vz\n  vr = thread.join vt"
+    } else {
+        "vr = call 1 (vz, vz)"
+    };
+    format!(
+        "memory 17 shadow 65536 69632\n\n{IMPORTS}{SPAWN_IMPORTS}\n\
+         data 40000 \"/bin/c\\x00\"\n\
+         data 41000 \"\\xab\\xcd\\x00\\x00\"\n\
+         data 47000 \"\\x40\\x9c\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x80\\xbb\\x00\\x00\\x00\\x00\\x00\\x00\\x03\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\n\
+         func () -> () {{\n\
+         block 0 () {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vz = i64.const 0\n\
+         \x20 {run_body}\n\
+         \x20 vc = i32.wrap_i64 vr\n\
+         \x20 {exit}\n\
+         \x20 unreachable\n\
+         \x20 }}\n\
+         }}\n\
+         func (i64, i64) -> (i64) {{\n\
+         block 0 (vsp: i64, varg: i64) {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vfds = i64.const 44000\n\
+         \x20 vm = call.cap 4294967295 16 (i64) -> (i64) vdummy (vfds)\n\
+         \x20 vrp = i64.const 44000\n\
+         \x20 vrh32 = i32.load vrp\n\
+         \x20 vrh = i64.extend_i32_s vrh32\n\
+         \x20 vwp = i64.const 44004\n\
+         \x20 vwh32 = i32.load vwp\n\
+         \x20 vwh = i64.extend_i32_s vwh32\n\
+         \x20 vout = i64.const 44100\n\
+         \x20 vad = {adopt}\n\
+         {actions}\
+         \x20 vreq = i64.const 47000\n\
+         \x20 vpid = {pspawn}\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vok = i64.gt_s vpid vz\n\
+         \x20 br_if vok 1(vpid) 2(vpid)\n\
+         \x20 }}\n\
+         block 1 (vkid: i64) {{\n\
+         \x20 vdummy = i32.const 0\n\
+         \x20 vrp = i64.const 44000\n\
+         \x20 vrh32 = i32.load vrp\n\
+         \x20 vwp = i64.const 44004\n\
+         \x20 vwh32 = i32.load vwp\n\
+         \x20 vcw = call.cap 0 2 () -> (i64) vwh32 ()\n\
+         \x20 vbuf = i64.const 45000\n\
+         \x20 veight = i64.const 8\n\
+         \x20 vn1 = call.cap 0 0 (i64, i64) -> (i64) vrh32 (vbuf, veight)\n\
+         \x20 vn2 = call.cap 0 0 (i64, i64) -> (i64) vrh32 (vbuf, veight)\n\
+         \x20 vst = i64.const 41000\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vw = {wait4}\n\
+         \x20 vhi = i64.const 41001\n\
+         \x20 vcode8 = i32.load8_u vhi\n\
+         \x20 vcode = i64.extend_i32_u vcode8\n\
+         \x20 vten = i64.const 10\n\
+         \x20 vt = i64.mul vn1 vten\n\
+         \x20 vn = i64.add vt vn2\n\
+         \x20 vseven = i64.const 7\n\
+         \x20 vdc = i64.sub vcode vseven\n\
+         \x20 vres = i64.add vn vdc\n\
+         \x20 return vres\n\
+         \x20 }}\n\
+         block 2 (verr: i64) {{\n\
+         \x20 vz = i64.const 0\n\
+         \x20 vneg = i64.sub vz verr\n\
+         \x20 return vneg\n\
+         \x20 }}\n\
+         }}\n\
+         export 0 func \"_start\" 0\n",
+        exit = form.call(1, "vc"),
+        adopt = form.call(6, "vrh, vwh, vout"),
+        pspawn = form.call(5, "vreq"),
+        wait4 = form.call(3, "vkid, vst, vz, vz"),
+    )
+}
+
 /// Run one cell of the table. `cmd` decides what `/bin/c` is, which is the difference between an
 /// exec that replaces the image and one that is refused.
 fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outcome {
@@ -818,6 +953,7 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         Body::ExecStartsFresh => FRESH_COMMAND,
         Body::SpawnArgv => ARGC_COMMAND,
         Body::SpawnStdinEof => STDIN_COMMAND,
+        Body::SpawnOutput | Body::SpawnOutputThreaded => WRITE_COMMAND,
         _ => COMMAND,
     })
     .expect("parse command");
@@ -1019,6 +1155,26 @@ fn a_spawned_process_reads_the_argv_it_was_given_on_every_route() {
 #[test]
 fn a_spawned_child_reads_its_stdin_pipe_to_eof_on_every_route() {
     assert_parity(Body::SpawnStdinEof, Cmd::Registered, Outcome::Exited(71));
+}
+
+/// `Command::output`: the parent reads a spawned child's stdout through a pipe. Its first read waits
+/// for the child's bytes and its second sees EOF once the child exits, on every route.
+#[test]
+fn a_parent_reads_its_spawned_childs_output_to_eof_on_every_route() {
+    assert_parity(Body::SpawnOutput, Cmd::Registered, Outcome::Exited(30));
+}
+
+/// #1969 — the same from a spawned vCPU of a threaded program. The oracle serves a spawn, a pipe
+/// park and a reap from any vCPU's root context. The Cranelift JIT ran a threaded program outside
+/// any process tree, with no door for these requests, so the spawn answered `-ENOSYS` there and this
+/// row was `Exited(38)`.
+#[test]
+fn a_thread_reads_its_spawned_childs_output_to_eof_on_every_route() {
+    assert_parity(
+        Body::SpawnOutputThreaded,
+        Cmd::Registered,
+        Outcome::Exited(30),
+    );
 }
 
 /// #1635 — nim's `execShellCmd` shape. The twin must get its own process and its own door (so its

@@ -62,7 +62,7 @@ fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(0, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     (host, [inst, modh, budget])
 }
 

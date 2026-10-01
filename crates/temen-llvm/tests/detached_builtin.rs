@@ -1,16 +1,16 @@
 //! `__vm_instantiate_detached`: the on-ramp lowers it to `call.cap INSTANTIATOR 15` on the handle in its
-//! first argument, passing the other nine (`budget, module, grants_ptr, grants_n, entry, size_log2,
-//! quota, args_ptr, args_len`) through in order — the detached spawn (PROCESS.md §5) reachable from C
-//! and Rust, beside `__vm_instantiate_rec` (op 17).
+//! first argument, passing the other eight (`budget, module, grants_ptr, grants_n, entry, size_log2,
+//! args_ptr, args_len`) through in order, with op 15's retired `quota` slot 0 (#1944 slice 3) — the
+//! detached spawn (PROCESS.md §5) reachable from C and Rust, beside `__vm_instantiate_rec` (op 17).
 
 use temen_ir::Inst;
 
 const LL: &str = r#"
-declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64, i64)
+declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
 declare i64 @__vm_join(i32, i64)
 
 define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {
-  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 21, i64 1000, i64 0, i64 0)
+  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 21, i64 0, i64 0)
   %r = call i64 @__vm_join(i32 %inst, i64 %h)
   ret i64 %r
 }

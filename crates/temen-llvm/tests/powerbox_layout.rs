@@ -25,7 +25,7 @@ define i64 @entry() {
 fn parent(child_log2: u8) -> String {
     format!(
         r#"
-declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64, i64)
+declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
 declare i64 @__vm_join(i32, i64)
 
 define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {{
@@ -34,7 +34,7 @@ define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {{
   %hi = getelementptr i64, ptr %buf, i64 1
   store i64 0, ptr %hi
   %p = ptrtoint ptr %buf to i64
-  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 {child_log2}, i64 1000000, i64 %p, i64 16)
+  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 {child_log2}, i64 %p, i64 16)
   %r = call i64 @__vm_join(i32 %inst, i64 %h)
   ret i64 %r
 }}
@@ -78,7 +78,8 @@ fn spawn(t: temen_llvm::Translated) -> i64 {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 1 << plog2);
     let module = host.grant_module(&image);
-    let budget = host.grant_budget(-1, -1, -1);
+    // The child's fuel is capped by the budget it is spawned with (#1944 slice 3).
+    let budget = host.grant_budget(1_000_000, -1, -1);
     let mut fuel = 10_000_000u64;
     let init = vec![0u8; 1 << plog2];
     let args = [

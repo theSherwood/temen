@@ -213,7 +213,7 @@ fn run_shell_ex(
         let _as_h = host.grant_address_space(0, win as u64);
         // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
         // returned when the child ends: room for the widest pipeline's three concurrent stages.
-        let _budget_h = host.grant_budget(0, 4 << 20, 0);
+        let _budget_h = host.grant_budget(-1, 4 << 20, -1);
         let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
             .iter()
             .map(|(n, m)| {
@@ -343,7 +343,7 @@ fn shell_bytecode_stdout(
     let _as_h = host.grant_address_space(0, win as u64);
     // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.
-    let _budget_h = host.grant_budget(0, 4 << 20, 0);
+    let _budget_h = host.grant_budget(-1, 4 << 20, -1);
     let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
         .iter()
         .map(|(n, cm)| {

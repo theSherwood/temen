@@ -12987,19 +12987,21 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
-        // long grants_ptr, long grants_n, long entry, long size_log2, long quota, long args_ptr,
-        // long args_len)` → `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n,
-        // entry, size_log2, quota, args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the
-        // child runs the host-granted `module` in a window **of its own** (`size_log2` must equal the
-        // module's declared memory), not a carve of the spawner's, with the same named-grant records as
-        // `__vm_instantiate_rec` and a spawn-time args payload copied to its `module_args_base()` (length 0
-        // seeds nothing). `budget` is a `Budget` handle the child's resources are drawn from. Returns
+        // long grants_ptr, long grants_n, long entry, long size_log2, long args_ptr, long args_len)` →
+        // `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n, entry, size_log2, 0,
+        // args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the child runs the
+        // host-granted `module` in a window **of its own** (`size_log2` must equal the module's
+        // declared memory), not a carve of the spawner's, with the same named-grant records as
+        // `__vm_instantiate_rec` and a spawn-time args payload copied to its `module_args_base()`
+        // (length 0 seeds nothing). `budget` is a `Budget` handle the child's resources are drawn
+        // from, its fuel included: op 15's retired `quota` slot is always 0 (#1944 slice 3). Returns
         // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
         "__vm_instantiate_detached" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
-            let args = (1..10)
+            let mut args = (1..9)
                 .map(|i| ctx.operand_i64(vm_arg(c, i)?))
                 .collect::<Result<Vec<_>, _>>()?;
+            args.insert(6, ctx.push(Inst::ConstI64(0))); // the retired `quota`
             let sig = temen_ir::FuncType {
                 params: vec![ValType::I64; 9],
                 results: vec![ValType::I64],

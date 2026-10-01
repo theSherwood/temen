@@ -3,16 +3,18 @@
 //! name (`__vm_cap_resolve("posix")`) and drives the process/fd ABI through `__vm_host_call`, exactly as
 //! `fs_cap.rs` drives the `fs` cap. This proves the ops a real shell needs — `pipe`/`dup2` and
 //! `posix_spawn`/`waitpid` with fd inheritance — are reachable under the on-ramp, not just from the
-//! chibicc/name-binding world (`crates/temen/tests/c_posix_spawn.rs`).
+//! chibicc/name-binding world (`crates/temen/tests/c_posix.rs`).
 //!
-//! The embedder wires `Posix::set_spawn` to an uppercasing delegate (exit 42); `spawn("up")` inherits the
-//! guest's preloaded stdin (`"hello"`) as the child's input and routes the child's stdout to fd 1, so the
-//! *personality's* captured stdout is `"HELLO"`. The guest's own `"posix probe ok"` marker goes to the
-//! *powerbox* stdout (the run's stdout) via `printf` — the two host worlds side by side in one program.
-//! Runs on all three engines.
+//! The embedder registers `/bin/up`, which uppercases its stdin and exits 42 ([`px_bin`]); spawned with
+//! no file actions, it inherits the guest's preloaded stdin (`"hello"`) as its input and fd 1 as its
+//! output, so the *personality's* captured stdout is `"HELLO"`. The guest's own `"posix probe ok"` marker
+//! goes to the *powerbox* stdout (the run's stdout) via `printf` — the two host worlds side by side in one
+//! program. Runs on all three engines.
 
-use temen_posix::SpawnResult;
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
+
+#[path = "support/px_bin.rs"]
+mod px_bin;
 
 fn instance() -> temen_run::Instance {
     let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/posix_probe.ll");
@@ -20,40 +22,26 @@ fn instance() -> temen_run::Instance {
     temen_run::instantiate(t.module).expect("instantiate")
 }
 
-fn config() -> RunConfig {
-    RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
-        },
-        stdin: vec![],
-        memory_size_log2: None,
-        args: vec![],
-        env: vec![],
-        ..RunConfig::default()
-    }
+/// Run `inst` on `backend` over a fresh `posix` cap (per backend, so state never leaks between runs)
+/// with `stdin` preloaded and the [`px_bin`] programs registered, and return (exit outcome, the run's
+/// powerbox stdout, the personality's captured stdout). Heap `0,0`: the guests use only static/stack
+/// storage, no personality `malloc`.
+fn run(inst: &temen_run::Instance, backend: Backend, stdin: &[u8]) -> (Outcome, Vec<u8>, Vec<u8>) {
+    let (cap, posix) = temen_run::posix::posix_cap(0, 0, stdin.to_vec());
+    let mut stage = |host: &mut temen_interp::Host| px_bin::stage(host, &posix);
+    let out = inst
+        .run_with_caps_and_host(
+            backend,
+            &RunConfig::default(),
+            &[("posix", cap)],
+            Some(&mut stage),
+        )
+        .expect("run");
+    (out.outcome, out.stdout, posix.stdout())
 }
 
-/// Build a fresh `posix` cap + handle (per backend, so state never leaks between runs), wire the
-/// uppercasing spawn delegate, run the probe, and return (exit outcome, the run's powerbox stdout, the
-/// personality's captured stdout). Heap `0,0`: the probe uses only static/stack storage, no personality
-/// `malloc`.
 fn run_probe(backend: Backend) -> (Outcome, Vec<u8>, Vec<u8>) {
-    let (cap, posix) = temen_run::posix::posix_cap(0, 0, b"hello".to_vec());
-    posix.set_spawn(|name: &str, _argv: &[String], stdin: &[u8]| {
-        assert_eq!(name, "up", "the probe spawns \"up\"");
-        SpawnResult {
-            stdout: stdin.to_ascii_uppercase(),
-            status: 42,
-            ..Default::default()
-        }
-    });
-    let out = instance()
-        .run_with_caps(backend, &config(), &[("posix", cap)])
-        .expect("run posix probe");
-    (out.outcome, out.stdout, posix.stdout())
+    run(&instance(), backend, b"hello")
 }
 
 fn check(backend: Backend) {
@@ -91,8 +79,8 @@ fn posix_probe_jit() {
 
 // A real shell **pipeline** `gen | up` (`pipeline.c` over the libc-shaped `posix_shim.h`): the plumbing a
 // shell does for `a | b` — wire stage 1's stdout to a pipe, run it, restore stdout, wire the pipe to
-// stage 2's stdin, run that — all through the personality's fork-free `sh_spawn`. `gen` emits "hello",
-// `up` uppercases it, so the personality's captured stdout is "HELLO".
+// stage 2's stdin, run that — all through `sh_spawn`, a `posix_spawn`. `/bin/gen` emits "hello",
+// `/bin/up` uppercases it, so the personality's captured stdout is "HELLO".
 fn pipeline_instance() -> temen_run::Instance {
     let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pipeline.ll");
     let t = temen_llvm::translate_ll_path(bc).expect("translate pipeline");
@@ -100,28 +88,7 @@ fn pipeline_instance() -> temen_run::Instance {
 }
 
 fn run_pipeline(backend: Backend) -> (Outcome, Vec<u8>, Vec<u8>) {
-    let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
-    posix.set_spawn(|name: &str, _argv: &[String], stdin: &[u8]| match name {
-        "gen" => SpawnResult {
-            stdout: b"hello".to_vec(),
-            status: 0,
-            ..Default::default()
-        },
-        "up" => SpawnResult {
-            stdout: stdin.to_ascii_uppercase(),
-            status: 0,
-            ..Default::default()
-        },
-        _ => SpawnResult {
-            stdout: Vec::new(),
-            status: 127,
-            ..Default::default()
-        },
-    });
-    let out = pipeline_instance()
-        .run_with_caps(backend, &config(), &[("posix", cap)])
-        .expect("run pipeline");
-    (out.outcome, out.stdout, posix.stdout())
+    run(&pipeline_instance(), backend, b"")
 }
 
 fn check_pipeline(backend: Backend) {

@@ -204,6 +204,9 @@ unsafe fn file_task(
     slot: Option<usize>,
     // #1361 step 4 — a durable detached child's freeze cell (see [`DurableCell`]).
     durable: Option<DurableCell>,
+    // #2001 — a detached child's own budget node, which its threads are charged to; `None` for a
+    // carve child.
+    node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 ) -> Filed {
     let futex_sched = rt.futex_sched;
     // #1586 — reserve a §15 live-vCPU slot before filing, so a parent cannot hold more concurrency
@@ -233,6 +236,7 @@ unsafe fn file_task(
             std::sync::Arc::clone(&done),
             copy_back,
             teardown,
+            node,
         )
     };
     let task = match task {
@@ -325,6 +329,7 @@ unsafe fn file_carve_task(
         teardown,
         None,
         None,
+        None,
     )
 }
 
@@ -339,12 +344,16 @@ unsafe fn granted_teardown(
     gc_ctx: *mut core::ffi::c_void,
     lane: i64,
     window: Option<(i32, u64)>,
+    fuel: Option<Box<crate::FuelCell>>,
 ) -> crate::child_exec::Teardown {
     let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
     let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
     let mem_give = rt.grant_budget_mem_give.load(Ordering::Acquire);
     Box::new(move |captured| {
         let (ctx, parent_ctx) = (ctx, parent_ctx);
+        // #1944 slice 3 — the child's fuel cell goes back as its task ends (or a freeze unwinds it):
+        // what it drew and did not burn returns to its budget chain.
+        drop(fuel);
         // #1971 — a child a freeze captured keeps its window charged: the artifact carries the
         // charge, and the thaw's relaunch files the lease again.
         let window = if captured { None } else { window };
@@ -357,7 +366,7 @@ unsafe fn granted_teardown(
     })
 }
 
-/// Hand a detached child's lane and window bytes back to its parent: at the child's end
+/// Hand a detached child's lane, window bytes and first vCPU back to its parent: at the child's end
 /// ([`granted_teardown`]), or when its spawn goes no further after the admission took them
 /// ([`undo_admission`]).
 ///
@@ -396,14 +405,6 @@ unsafe fn undo_admission(rt: &Nursery, budget: i32, bytes: u64, lane: i64) {
     );
 }
 
-/// D66 — the lane chain a granted child's task is gated on: its parent's lane over its own.
-fn lane_chain_of(gc: &crate::GrantChild) -> Vec<(usize, i64)> {
-    vec![
-        (gc.parent_domain as usize, gc.parent_lane_cap),
-        (gc.domain as usize, gc.lane_cap),
-    ]
-}
-
 /// D66 — file a **granted** carve child (ops 8/11/13): register its serve context on the shared
 /// powerbox first (CALLS.md 5c.1b — so a dispatch enqueued at any point of the child's life finds
 /// it; the releaser clears it before the module drops), then file it with its powerbox teardown.
@@ -422,7 +423,7 @@ unsafe fn file_granted_carve_task(
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, -1, None);
+    let teardown = granted_teardown(rt, release, gc.ctx, -1, None, None);
     match file_carve_task(
         rt,
         code,
@@ -431,7 +432,7 @@ unsafe fn file_granted_carve_task(
         parent_mem_base,
         args,
         n_results,
-        lane_chain_of(gc),
+        rt.lane_chain_of(gc),
         gc.retained_ctx as usize,
         teardown,
     ) {
@@ -488,21 +489,21 @@ pub(crate) struct Nursery {
     /// every child it spawned (a runaway child would otherwise hang the parent inside `instantiate` /
     /// `resume`, where the parent's own epoch checks can't fire).
     epoch_addr: usize,
-    /// Address of the parent run's **counted-fuel** cell (`0` ⇒ the parent isn't fuel-armed, so
-    /// children stay un-metered — byte-identical to before). Read (not decremented) at each spawn to
-    /// derive the child's budget `min(quota, *parent_fuel_addr)` — the JIT mirror of the interpreter's
-    /// `child_fuel` contract (INTERP_PERF.md "Fuel unification" step 5). Same-thread as the spawning
-    /// vCPU that owns this cell, so the read needs no synchronization.
+    /// Address of the parent run's **counted-fuel** cell ([`crate::FuelCell`]; `0` ⇒ the parent isn't
+    /// fuel-armed, so its carve children stay un-metered). Read (not charged) at each carve spawn to
+    /// derive the child's allowance `min(quota, what the parent can still burn)` — the JIT mirror of the
+    /// interpreter's carve `child_fuel` (#1944 slice 3 leaves the carve path's fuel as it was).
     parent_fuel_addr: usize,
-    /// Each fuel-armed child's own budget cell, kept alive here until run teardown (after
+    /// Each fuel-armed carve child's fixed allowance, kept alive here until run teardown (after
     /// [`Nursery::join_children`]) because an **async** child's OS thread — or a suspended **coro** —
-    /// decrements it after the spawning thunk has returned. `Box<u64>` gives a stable heap address to
-    /// bake into the child's code; the cells are never merged back into the parent (no credit-back,
-    /// exactly like the interpreter's value-copy `child_fuel`).
-    // `Box` is load-bearing: the baked address must survive a `push`, which a `Vec<u64>`'s realloc
-    // would move — so the clippy `vec_box` "simplification" would dangle the address in a child's code.
+    /// decrements it after the spawning thunk has returned. `Box` gives a stable heap address to bake
+    /// into the child's code; the cells are never merged back into the parent (no credit-back,
+    /// exactly like the interpreter's value-copy `child_fuel`). A detached child's cell, which draws
+    /// from its own budget node, is its task's instead ([`granted_teardown`]).
+    // `Box` is load-bearing: the baked address must survive a `push`, which a `Vec`'s realloc would
+    // move — so the clippy `vec_box` "simplification" would dangle the address in a child's code.
     #[allow(clippy::vec_box)]
-    child_fuel_cells: Mutex<Vec<Box<u64>>>,
+    child_fuel_cells: Mutex<Vec<Box<crate::FuelCell>>>,
     /// Address of the parent run's thread [`crate::os_thread_rt::Domain`] (`0` ⇒ none — the durable
     /// nested nursery). Children compile their `atomic.wait`/`notify` against this **shared** futex
     /// table, so concurrent children (and the parent's own vCPUs) rendezvous — the pipeline
@@ -577,6 +578,9 @@ pub(crate) struct Nursery {
     grant_premap_admit: std::sync::atomic::AtomicUsize,
     grant_premap_stage: std::sync::atomic::AtomicUsize,
     grant_premap_apply: std::sync::atomic::AtomicUsize,
+    /// #1944 slice 3 — the installed [`crate::ChildBudgetNode`] (0 = none: detached children run
+    /// un-metered, and their threads uncharged).
+    grant_budget_node: std::sync::atomic::AtomicUsize,
     /// #1854 — the installed child [`crate::HighWater`] (0 = none).
     grant_high_water: std::sync::atomic::AtomicUsize,
     /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
@@ -606,6 +610,23 @@ pub(crate) struct Nursery {
     /// The parent module's declared shadow arena — a same-module (op-0 self) child places its
     /// contexts in *its own* window at the same declared offsets.
     shadow: temen_ir::durable_abi::ShadowArena,
+    /// #1956 — whether this nursery files **carve** children (ops 0/5/13, v0 records): a run's does,
+    /// a detached child's does not. A carve child's task writes its image back into its parent's
+    /// window when it ends, and only a run's own window outlives every task. Carves go with #1867.
+    carves: bool,
+    /// #1956 — the lane chain above this nursery's domain: empty for a run's, the enclosing
+    /// domains' for a detached child's. With its children's own two lanes it makes the whole chain
+    /// a child's task is gated on ([`Nursery::lane_chain_of`]), as the oracle gates every vCPU.
+    ancestors: Vec<(usize, i64)>,
+    /// #1956 — the nurseries of this nursery's detached children that spawn in turn, held to the
+    /// run's teardown. Their addresses are baked into their children's code, and what they retain
+    /// is released only after every task has ended ([`Nursery::join_children`]): a grandchild's
+    /// teardown hands its lane and window back to its parent's host, which only that retained ref
+    /// keeps alive once the parent has ended. `Box` for the baked address (see `child_fuel_cells`).
+    #[allow(clippy::vec_box)]
+    kids: Mutex<Vec<Box<Nursery>>>,
+    /// #1956 — the installed [`crate::AsParent`] (0 = none: a detached child spawns nothing).
+    grant_as_parent: std::sync::atomic::AtomicUsize,
 }
 
 // SAFETY: the raw `cap_ctx` is the run's host pointer, valid for the whole run; the `Nursery` is
@@ -631,6 +652,9 @@ impl Nursery {
         frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
         serve_handlers: Box<[u32]>,
         shadow: temen_ir::durable_abi::ShadowArena,
+        // #1956 — the executor this nursery files its children on: a run's own (`None`, made here),
+        // or the run's, shared by a detached child's nursery.
+        child_exec: Option<std::sync::Arc<crate::child_exec::ChildExec>>,
     ) -> Nursery {
         Nursery {
             funcs,
@@ -645,7 +669,7 @@ impl Nursery {
             child_fuel_cells: Mutex::new(Vec::new()),
             futex_sched,
             children: Mutex::new(Vec::new()),
-            child_exec: {
+            child_exec: child_exec.unwrap_or_else(|| {
                 let e = crate::child_exec::ChildExec::new(futex_sched);
                 // D66 — the domain wakes parked tasks with its other parked waiters (a `notify`, a
                 // vCPU exit, the kill path, teardown), so it needs a ref. SAFETY: a nonzero
@@ -657,7 +681,11 @@ impl Nursery {
                     };
                 }
                 e
-            },
+            }),
+            carves: true,
+            ancestors: Vec::new(),
+            kids: Mutex::new(Vec::new()),
+            grant_as_parent: std::sync::atomic::AtomicUsize::new(0),
             grant_parent_domain: std::sync::atomic::AtomicU64::new(0),
             grant_parent_lane_cap: std::sync::atomic::AtomicI64::new(-1),
             durable: AtomicBool::new(false),
@@ -675,6 +703,7 @@ impl Nursery {
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
+            grant_budget_node: std::sync::atomic::AtomicUsize::new(0),
             grant_high_water: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
@@ -740,6 +769,12 @@ impl Nursery {
             hooks.map_or(0, |h| h.high_water as usize),
             Ordering::Release,
         );
+        self.grant_budget_node.store(
+            hooks.map_or(0, |h| h.budget_node as usize),
+            Ordering::Release,
+        );
+        self.grant_as_parent
+            .store(hooks.map_or(0, |h| h.as_parent as usize), Ordering::Release);
         self.grant_register_serve.store(rs, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
@@ -768,6 +803,70 @@ impl Nursery {
         }
     }
 
+    /// D66 — the lane chain a granted child's task is gated on: the lanes above this nursery's
+    /// domain, then its parent's over its own — the whole chain from the root, as the oracle's.
+    fn lane_chain_of(&self, gc: &crate::GrantChild) -> Vec<(usize, i64)> {
+        let mut chain = self.ancestors.clone();
+        chain.push((gc.parent_domain as usize, gc.parent_lane_cap));
+        chain.push((gc.domain as usize, gc.lane_cap));
+        chain
+    }
+
+    /// #1956 — the nursery a non-durable detached child spawns its own children through, or `None`
+    /// when it has no need of one (it names no `Instantiator` and can install no unit that would) or
+    /// no means: no [`crate::AsParent`] installed, or a powerbox nothing retains. Its powerbox `gc`
+    /// is the host its `Instantiator` resolves against and the parent its hooks charge, through the
+    /// family `as_parent` builds over it; the executor, futex domain and kill cell are the run's.
+    /// The program, shadow and fuel a carve child would take are empty: it files none.
+    ///
+    /// # Safety
+    /// `gc` is the live powerbox the installed hooks just built for the child.
+    unsafe fn for_child(&self, gc: &crate::GrantChild, funcs: &[Func]) -> Option<Box<Nursery>> {
+        let as_parent = self.grant_as_parent.load(Ordering::Acquire);
+        // A powerbox nothing retains dies with the child, while a grandchild's teardown still hands
+        // its lane and window back to it.
+        if as_parent == 0
+            || gc.retained_ctx.is_null()
+            || !(crate::funcs_use_instantiator(funcs) || gc.jit_table_log2 > 0)
+        {
+            return None;
+        }
+        let hooks = core::mem::transmute::<usize, crate::AsParent>(as_parent)(gc.ctx);
+        let mut n = Nursery::new(
+            Vec::new().into(),
+            Vec::new().into(),
+            hooks.thunk,
+            gc.ctx,
+            Some(hooks.resolve_module),
+            self.epoch_addr,
+            0,
+            self.futex_sched,
+            0,
+            self.task_counter(),
+            self.nested_sink(),
+            self.serve_handlers.clone(),
+            temen_ir::durable_abi::ShadowArena::EMPTY,
+            Some(std::sync::Arc::clone(&self.child_exec)),
+        );
+        n.carves = false;
+        n.ancestors = self.lane_chain_of(gc);
+        n.ancestors.pop(); // the child's own lane is its children's parent lane
+        n.set_grant_hooks(Some(hooks));
+        Some(Box::new(n))
+    }
+
+    /// #1956 — refuse a carve spawn on a nursery that files none (see [`Nursery::carves`]) with a
+    /// `CapFault`, as a detached child's carve record was refused before it had a nursery.
+    ///
+    /// # Safety
+    /// `trap_out` is the run's live trap cell.
+    unsafe fn refuses_carve(&self, trap_out: *mut i64) -> bool {
+        if !self.carves {
+            *trap_out = TrapKind::CapFault as i64;
+        }
+        !self.carves
+    }
+
     /// D66 — the lane chain a **plain** carve child (op 0/5) is gated on: its parent's lane alone.
     fn parent_lane_chain(&self) -> Vec<(usize, i64)> {
         vec![(
@@ -793,19 +892,45 @@ impl Nursery {
         if self.parent_fuel_addr == 0 {
             return 0; // parent un-metered ⇒ child un-metered
         }
-        let parent_remaining = *(self.parent_fuel_addr as *const u64);
+        let parent_can = (*(self.parent_fuel_addr as *const crate::FuelCell)).can_burn();
         let child_fuel = if quota <= 0 {
-            parent_remaining
+            parent_can
         } else {
-            (quota as u64).min(parent_remaining)
+            (quota as u64).min(parent_can)
         };
-        let cell = Box::new(child_fuel);
-        let addr = &*cell as *const u64 as usize;
+        let cell = crate::FuelCell::fixed(child_fuel);
+        let addr = &*cell as *const crate::FuelCell as usize;
         self.child_fuel_cells
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(cell);
         addr
+    }
+
+    /// #1944 slice 3 — the budget node child powerbox `ctx` holds as its own
+    /// ([`crate::ChildBudgetNode`]), and the fuel cell its vCPUs draw from it. The node is `None` when
+    /// no hook is installed. The cell draws whether or not this run is metered, so a child's budget
+    /// caps it on an unmetered root too (#1705); it is `None`, compiled un-metered, when the chain is
+    /// unbounded at the spawn (every level `-1`). The caller bakes the cell's address into the child
+    /// and hands the cell to the child's task, whose end returns what it did not burn, and the node to
+    /// its domain, which charges its threads (#2001).
+    ///
+    /// # Safety
+    /// `ctx` is a detached child's powerbox the installed hooks built.
+    unsafe fn detached_node(
+        &self,
+        ctx: *mut core::ffi::c_void,
+    ) -> (
+        Option<std::sync::Arc<dyn crate::BudgetNode>>,
+        Option<Box<crate::FuelCell>>,
+    ) {
+        let addr = self.grant_budget_node.load(Ordering::Acquire);
+        if addr == 0 {
+            return (None, None);
+        }
+        let node = core::mem::transmute::<usize, crate::ChildBudgetNode>(addr)(ctx);
+        let fuel = node.clone().and_then(crate::FuelCell::metering);
+        (node, fuel)
     }
 
     /// This nursery's §14 domain task id (`0` = root) — `instantiate` records it as a child's
@@ -904,12 +1029,20 @@ impl Nursery {
     pub(crate) fn join_children(&self, froze: bool) {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
         // unless this is a freeze the carve children end with the domain; then the workers are joined.
+        // It is the whole run's, so every descendant's task has ended too (#1956).
         self.child_exec.shutdown_and_join(!froze);
-        // CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted
-        // live-impls hold their own counted refs, so a parent-held offer handle stays valid at the
-        // host layer; the run is over regardless). After the joins above, so no child thread still
-        // runs against the `Host` while its last-but-one ref drops. Exactly once per child: `take`
-        // zeroes the field.
+        self.release_retained(froze);
+    }
+
+    /// CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted live-impls
+    /// hold their own counted refs, so a parent-held offer handle stays valid at the host layer; the
+    /// run is over regardless), and (#1956) every descendant nursery's. Only once the executor has
+    /// drained, so no child task still runs against a `Host` while its last-but-one ref drops.
+    /// Exactly once per child: `take` zeroes the field.
+    fn release_retained(&self, froze: bool) {
+        for kid in self.kids.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            kid.release_retained(froze);
+        }
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr != 0 {
             let release: crate::GrantChildReleaser = unsafe { core::mem::transmute(release_addr) };
@@ -1001,6 +1134,9 @@ impl Nursery {
         } else {
             self.cap_thunk
         };
+        // #1944 slice 3 — the thawed child draws from its budget node again, as at its spawn; what
+        // it drew before the freeze and did not burn went back as the freeze unwound it.
+        let (node, child_fuel) = self.detached_node(gc.ctx);
         let Ok(code) = crate::compile_child_windowed(
             &funcs,
             &types,
@@ -1010,7 +1146,9 @@ impl Nursery {
             child_thunk,
             gc.ctx,
             self.epoch_addr,
-            0, // a thawed child runs un-metered, as every durable JIT re-attach does
+            child_fuel
+                .as_deref()
+                .map_or(0, |c| c as *const crate::FuelCell as usize),
             self.futex_sched,
             crate::InstEnv::null(),
             &self.serve_handlers,
@@ -1027,7 +1165,7 @@ impl Nursery {
         let n_results = funcs.get(entry as usize).map_or(1, |f| f.results.len());
         let code = std::sync::Arc::new(code);
         register_serve(self, gc.ctx, &code);
-        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window);
+        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window, child_fuel);
         let thaw_off = shadow.thaw_state_off(0) as usize;
         let filed = file_task(
             self,
@@ -1053,7 +1191,7 @@ impl Nursery {
             None,
             vec![0; n_args], // inert under a rewind: the prologue reloads spilled values
             n_results,
-            lane_chain_of(&gc),
+            self.lane_chain_of(&gc),
             gc.retained_ctx as usize,
             teardown,
             Some(slot),
@@ -1064,6 +1202,7 @@ impl Nursery {
                 reserved_log2,
                 self.child_high_water(gc.retained_ctx),
             )),
+            node,
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -1269,6 +1408,9 @@ pub(crate) unsafe extern "C" fn instantiate(
 ) -> i32 {
     let rt_ptr = rt;
     let rt = &*rt;
+    if rt.refuses_carve(trap_out) {
+        return 0;
+    }
     let durable = rt.durable.load(Ordering::Acquire);
     // §14 op-5 — a **separate-module** child (`module >= 0`) gets a full attenuated powerbox: an
     // Instantiator + AddressSpace + its bound import manifest, so it can `vm_map` (malloc heap growth)
@@ -1521,6 +1663,9 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
+    if rt.refuses_carve(trap_out) {
+        return 0;
+    }
     if rt.durable.load(Ordering::Acquire) {
         return EINVAL as i32;
     }
@@ -1758,6 +1903,9 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
             trap_out,
         );
     }
+    if (*rt).refuses_carve(trap_out) {
+        return 0;
+    }
     let entry = sr.entry as i64;
     let off = sr.off as i64;
     let size_log2 = sr.size_log2;
@@ -1905,6 +2053,9 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
+    if rt.refuses_carve(trap_out) {
+        return 0;
+    }
     // A durable run may not spawn a separate-module child (host-supplied identity + freeze residue are
     // a later slice), matching the `instantiate` op-5 path.
     if rt.durable.load(Ordering::Acquire) {
@@ -2100,6 +2251,11 @@ unsafe fn spawn_detached_child(
     // a spawn that fails *after* that commit can hand them back.
     budget: i32,
     child_size: u64,
+    // #1944 slice 3 — the child's fuel cell, drawing from its own budget node (`None`: un-metered);
+    // its task's teardown returns what it did not burn.
+    fuel: Option<Box<crate::FuelCell>>,
+    // #2001 — that node, which the child's threads are charged to.
+    node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     // #1361 step 4 — `Some(arena)` for a durable parent's child: its window starts as a durable one
     // (context 0's shadow-SP word at its frame base) and carries a freeze cell recording `entry`.
     durable: Option<temen_ir::durable_abi::ShadowArena>,
@@ -2107,10 +2263,19 @@ unsafe fn spawn_detached_child(
     // #1760 — the parent is already unwinding for a freeze: the child's freeze word starts
     // `UNWINDING` (see [`init_durable_words`]).
     parent_freezing: bool,
+    // #1956 — the nursery `code` was compiled against, if the child spawns: kept once it is filed.
+    kid: Option<Box<Nursery>>,
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some((budget, child_size)));
+    let teardown = granted_teardown(
+        rt,
+        release,
+        gc.ctx,
+        gc.lane_cap,
+        Some((budget, child_size)),
+        fuel,
+    );
     let premap_ctx = SendRaw(gc.ctx);
     let filed = file_task(
         rt,
@@ -2153,7 +2318,7 @@ unsafe fn spawn_detached_child(
         None,
         args,
         n_results,
-        lane_chain_of(gc),
+        rt.lane_chain_of(gc),
         gc.retained_ctx as usize,
         teardown,
         None,
@@ -2166,9 +2331,15 @@ unsafe fn spawn_detached_child(
                 rt.child_high_water(gc.retained_ctx),
             )
         }),
+        node,
     );
     match filed {
-        Filed::Slot(slot) => slot,
+        Filed::Slot(slot) => {
+            if let Some(kid) = kid {
+                rt.kids.lock().unwrap_or_else(|e| e.into_inner()).push(kid);
+            }
+            slot
+        }
         Filed::AtCeiling => {
             *trap_out = TrapKind::ThreadFault as i64;
             0
@@ -2250,6 +2421,12 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
+    // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
+    // other value fails closed, checked first as the tree-walker's op-15 arm does.
+    if fuel != 0 {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
     // #1361 step 4 — a durable parent's detached child is captured by the parent's freeze (its window
     // rides the artifact as its own), so it spawns durable: an attested-freezable module with a shadow
     // arena of its own (§4, #1501). The authority half — freeze authority over detached progeny, #1440 —
@@ -2411,7 +2588,18 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
             return 0;
         }
     }
-    let child_fuel_addr = rt.arm_child_fuel(fuel);
+    // #1944 slice 3 — the child draws from the budget that paid for its window, its own node.
+    let (node, child_fuel) = rt.detached_node(gc.ctx);
+    let child_fuel_addr = child_fuel
+        .as_deref()
+        .map_or(0, |c| c as *const crate::FuelCell as usize);
+    // #1956 — a child that spawns gets a nursery of its own. A durable one does not yet: the freeze
+    // that captures it would have to reach its children too.
+    let kid = if durable {
+        None
+    } else {
+        rt.for_child(&gc, child_funcs)
+    };
     let compiled = crate::compile_child_windowed(
         child_funcs,
         child_types,
@@ -2423,7 +2611,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         rt.epoch_addr,
         child_fuel_addr,
         rt.futex_sched,
-        crate::InstEnv::null(),
+        kid.as_deref()
+            .map_or(crate::InstEnv::null(), crate::InstEnv::over),
         &rt.serve_handlers,
         gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,
         child_shadow,
@@ -2478,10 +2667,13 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         trap_out,
         budget as i32,
         child_size,
+        child_fuel,
+        node,
         durable.then_some(child_shadow),
         entry as u32,
         // SAFETY: a durable run's window is live and its first page holds the freeze word.
         durable && unsafe { crate::fiber_rt::window_is_unwinding(mem_base) },
+        kid,
     )
 }
 
@@ -2558,14 +2750,31 @@ pub(crate) unsafe extern "C" fn join(
         }
     };
     drop(children);
+    // #1956 — a detached child's root joins from a task, so the thread that would block is an
+    // executor worker: it parks the task instead, as `thread.join` does there, and the executor gives
+    // the task's lanes back while it is parked. A guest fiber inside the task cannot park the task
+    // from its own stack, so it fails closed rather than hold a worker the joined child may need.
+    let task = if crate::fiber_rt::in_task() {
+        match crate::fiber_rt::current_fiber_slot() {
+            Some(s) if s.is_platform() => Some(s),
+            _ => {
+                *trap_out = TrapKind::ThreadFault as i64;
+                return 0;
+            }
+        }
+    } else {
+        None
+    };
     // D66 — a parent joining its §14 child holds no lane while it waits. Load-bearing under a cap of
     // 1: the child task cannot be dispatched at all until the joining vCPU steps aside, so without
     // this every bounded `instantiate`-then-`join` would deadlock. Released before the completion
     // cell's lock, re-taken after — blocking for a lane while holding that lock would stop the child
-    // from publishing the very outcome being waited for. SAFETY: a nonzero `futex_sched` is the
-    // run's live `Domain`, which outlives every child.
-    let dom = (rt.futex_sched != 0)
-        .then(|| unsafe { &*(rt.futex_sched as *const crate::os_thread_rt::Domain) });
+    // from publishing the very outcome being waited for. They are the lanes of the joining vCPU's
+    // own domain (#1956: a detached child's thread runs under the child's chain). SAFETY: a nonzero
+    // `futex_sched` is the run's live `Domain`, which outlives every child.
+    let dom = (task.is_none() && rt.futex_sched != 0).then(|| unsafe {
+        crate::os_thread_rt::current_domain(rt.futex_sched as *const crate::os_thread_rt::Domain)
+    });
     let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
     if let Some(d) = dom {
         d.lane_give_back(&lane);
@@ -2614,11 +2823,20 @@ pub(crate) unsafe extern "C" fn join(
             {
                 return 0;
             }
-            st = done
-                .cv
-                .wait_timeout(st, std::time::Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            st = match &task {
+                // The child's end, or the cadence sweep, re-offers the task (`child_finished`).
+                Some(fib) => {
+                    drop(st);
+                    crate::fiber_rt::fiber_event_park(fib, false, None);
+                    done.state.lock().unwrap_or_else(|e| e.into_inner())
+                }
+                None => {
+                    done.cv
+                        .wait_timeout(st, std::time::Duration::from_millis(20))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+            };
         };
         drop(st);
         // #1904 — a child the freeze unwound is not joined: it stays for the harvest (its window rides

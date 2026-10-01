@@ -191,3 +191,116 @@ fn concurrent_charges_never_overdraw_a_shared_ancestor() {
         "the root's charge is the sum of its children's"
     );
 }
+
+/// `read(fuel)`: the fuel room left along `b`'s chain.
+fn fuel_room(h: &mut Host, b: i32) -> i64 {
+    h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[0], None)
+        .expect("read")[0]
+}
+
+/// #1944 slice 3 — fuel is drawn in chunks of at most half the chain's room, each charged to every
+/// level, and what a consumer drew and did not burn goes back to every level.
+#[test]
+fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
+    let mut h = Host::new();
+    let root = h.grant_budget(1000, -1, -1);
+    let node = h
+        .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[100, -1, -1], None)
+        .expect("split")[0] as i32;
+    let mut child = Host::new();
+    h.give_child_budget(node, &mut child);
+    let src = child.own_node();
+    assert_eq!(src.draw(), Some(50), "half the chain's room");
+    assert_eq!(fuel_room(&mut h, node), 50);
+    assert_eq!(fuel_room(&mut h, root), 950, "charged to every level");
+    src.give_back(20);
+    assert_eq!(fuel_room(&mut h, node), 70);
+    assert_eq!(fuel_room(&mut h, root), 970, "refunded to every level");
+
+    // A vCPU that ends hands back the rest of its draw: it drew 35 of the 70 and burned one.
+    let mut fuel = Fuel::drawn(child.own_node());
+    fuel.burn().expect("room left");
+    drop(fuel);
+    assert_eq!(fuel_room(&mut h, node), 69);
+
+    // A lone vCPU burns the chain to its last unit, then traps.
+    let mut fuel = Fuel::drawn(child.own_node());
+    for _ in 0..69 {
+        fuel.burn().expect("room left");
+    }
+    assert_eq!(fuel.burn(), Err(Trap::OutOfFuel));
+    drop(fuel);
+    assert_eq!(fuel_room(&mut h, node), 0);
+    assert_eq!(
+        fuel_room(&mut h, root),
+        900,
+        "the node's 100, charged to the root"
+    );
+}
+
+/// #1944 slice 3 — an activation's limit is its own node's fuel room, whatever earlier activations
+/// burned, and a chain with no bounded level has nothing to meter.
+#[test]
+fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() {
+    let mut h = Host::new();
+    assert_eq!(h.own_node().draw(), None, "no activation yet: unbounded");
+    let mut fuel = Fuel::drawn(h.begin_activation(10));
+    for _ in 0..4 {
+        fuel.burn().expect("room left");
+    }
+    drop(fuel);
+    assert_eq!(
+        h.fuel_left(),
+        6,
+        "read back once the vCPU handed back its rest"
+    );
+    let src = h.begin_activation(10);
+    assert_eq!(
+        h.fuel_left(),
+        10,
+        "a new activation starts with its own limit"
+    );
+    assert_eq!(src.draw(), Some(5));
+    let _ = h.begin_activation(u64::MAX);
+    assert_eq!(h.fuel_left(), u64::MAX, "u64::MAX: unbounded");
+    let mut fuel = Fuel::drawn(h.own_node());
+    fuel.burn().expect("unmetered");
+    assert_eq!(
+        fuel.remaining(),
+        i64::MAX,
+        "fuel.remaining reads unmetered as i64::MAX"
+    );
+}
+
+/// #1944 slice 3 — a guest's `read` and `split` see the budgets it holds, not the activation's limit
+/// above them (what is left of that moves with when each engine draws); a draw is bounded by it.
+#[test]
+fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
+    let mut h = Host::new();
+    let b = h.grant_budget(-1, -1, -1);
+    let mut root = Fuel::drawn(h.begin_activation(10));
+    root.burn().expect("room left"); // draws 5 of the activation's 10
+    assert_eq!(
+        fuel_room(&mut h, b),
+        -1,
+        "the activation's limit is not the guest's to read"
+    );
+    let sub = h
+        .cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, -1, -1], None)
+        .expect("split")[0] as i32;
+    assert_eq!(fuel_room(&mut h, sub), -1, "nor does it clamp a split");
+
+    let mut child = Host::new();
+    h.give_child_budget(sub, &mut child);
+    let mut fuel = Fuel::drawn(child.own_node());
+    for _ in 0..5 {
+        fuel.burn().expect("the activation's room");
+    }
+    assert_eq!(
+        fuel.burn(),
+        Err(Trap::OutOfFuel),
+        "a draw is bounded by the activation"
+    );
+    drop((root, fuel));
+    assert_eq!(h.fuel_left(), 4, "the root burned 1 and the child 5");
+}

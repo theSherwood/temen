@@ -109,7 +109,7 @@ fn module(text: &str) -> temen_ir::Module {
 fn powerbox(host: &mut Host, child: &temen_ir::Module, window: u64) -> Vec<Value> {
     let inst = host.grant_instantiator(0, window);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(0, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)]
 }
 
@@ -461,7 +461,7 @@ fn a_pipe_between_two_detached_children_reaches_eof_on_every_runner() {
         let inst = h.grant_instantiator(0, 1 << 16);
         let mw = h.grant_module(&writer);
         let mr = h.grant_module(&reader);
-        let budget = h.grant_budget(0, 1 << 20, 0);
+        let budget = h.grant_budget(-1, 1 << 20, -1);
         let args = [inst, mw, mr, budget].map(Value::I32).to_vec();
         (h, args)
     };

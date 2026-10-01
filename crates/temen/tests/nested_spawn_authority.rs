@@ -159,7 +159,7 @@ fn powerbox(spawn: impl Fn(Unheld) -> Spawn) -> (Host, [Value; 3]) {
     let unheld = Unheld {
         stdout: host.grant_stream(StreamRole::Out),
         other: host.grant_module(&grand),
-        budget: host.grant_budget(0, 1 << 20, 0),
+        budget: host.grant_budget(-1, 1 << 20, -1),
     };
     let mid = host.grant_module(&parse(&middle(spawn(unheld))));
     (

@@ -243,7 +243,7 @@ fn rust_driver_guest_op13_spawns_real_nimsem_byte_exact() {
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&nimsem);
     // nimsem's window, paid from this and returned when it ends.
-    let budget = host.grant_budget(0, 1 << nimsem.memory.expect("nimsem window").size_log2, 0);
+    let budget = host.grant_budget(-1, 1 << nimsem.memory.expect("nimsem window").size_log2, -1);
     let (fs_init, fs_init_state) = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);

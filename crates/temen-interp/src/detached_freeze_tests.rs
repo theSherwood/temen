@@ -69,7 +69,7 @@ fn powerbox(child: &Module) -> (Host, Vec<Value>) {
     host.set_durable(true);
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let modh = host.grant_durable_module(child);
-    let budget = host.grant_budget(0, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     host.grant_freeze_authority(FreezeScope::DetachedProgeny);
     (
         host,
@@ -202,7 +202,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
         host.set_durable(true);
         let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
         let modh = host.grant_durable_module(&child);
-        let budget = host.grant_budget(0, 1 << 20, 0);
+        let budget = host.grant_budget(-1, 1 << 20, -1);
         if authority {
             host.grant_freeze_authority(FreezeScope::DetachedProgeny);
         }

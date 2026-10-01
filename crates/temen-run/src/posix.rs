@@ -15,7 +15,7 @@ use temen_posix::Posix;
 
 /// Build the POSIX personality as a named powerbox capability. Returns the [`HostCap`] to grant (e.g.
 /// `("posix", cap)` in `run_with_caps`) and the shared [`Posix`] handle the embedder keeps to read the
-/// captured output, wire the spawn delegate ([`Posix::set_spawn`]), or raise a signal
+/// captured output, register the programs it may spawn ([`Posix::register_executable`]), or raise a signal
 /// ([`Posix::raise_signal`]). `heap_base`/`heap_end` bound the window-heap region the personality's
 /// `malloc` hands out (both window offsets, within the guest window and clear of its data/stack); pass
 /// `0, 0` when the guest brings its own allocator and only uses the process/fd/signal ops. `stdin`

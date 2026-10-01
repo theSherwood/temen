@@ -75,7 +75,7 @@ fn a_detached_child_serves_live_calls_from_a_window_its_parent_cannot_see() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 12) as i64, 0);
+    let hw = host.grant_budget(-1, (1 << 12) as i64, -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -140,7 +140,7 @@ fn a_detached_child_attests_window_unexposed_where_a_nested_one_attests_exposed(
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 12) as i64, 0);
+    let hw = host.grant_budget(-1, (1 << 12) as i64, -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -194,7 +194,7 @@ fn the_minter_quota_bounds_detached_mints() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 12) as i64, 0); // exactly one 2^12 window
+    let hw = host.grant_budget(-1, (1 << 12) as i64, -1); // exactly one 2^12 window
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -320,7 +320,7 @@ fn a_detached_child_does_not_rendezvous_with_its_parent_on_anonymous_memory() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 17) as i64, 0);
+    let hw = host.grant_budget(-1, (1 << 17) as i64, -1);
     let mut fuel = 50_000_000u64;
     let r = run_with_host(
         &a,
@@ -392,7 +392,7 @@ fn a_detached_child_receives_the_spawn_time_args_payload() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 16) as i64, 0);
+    let hw = host.grant_budget(-1, (1 << 16) as i64, -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -445,7 +445,7 @@ fn a_detached_child_grows_past_its_declared_window() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 16) as i64, 0);
+    let hw = host.grant_budget(-1, (1 << 16) as i64, -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -508,7 +508,7 @@ fn a_durable_domain_refuses_a_detached_spawn_until_the_capture_lands() {
     host.set_durable(true);
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 12) as i64, 0); // exactly the child's 2^12 window
+    let hw = host.grant_budget(-1, (1 << 12) as i64, -1); // exactly the child's 2^12 window
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -561,7 +561,7 @@ fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 12) as i64, 0);
+    let hw = host.grant_budget(-1, (1 << 12) as i64, -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,

@@ -125,12 +125,14 @@ fn child_module(src: &str) -> temen_ir::Module {
     verified(transform_module_assume_confined(&parse(src)).expect("transform"))
 }
 
+/// The parent's powerbox: its `Instantiator`, `child` as a durable `Module`, and a `Budget` of 1 MiB
+/// whose `spawn` ceiling is 4 ([`a_thawed_thread_is_charged_to_its_childs_budget_again`] reads it).
 fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let modh = host.grant_durable_module(child);
-    let budget = host.grant_budget(0, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, 4);
     host.grant_freeze_authority(FreezeScope::DetachedProgeny);
     (host, vec![inst as i64, modh as i64, budget as i64])
 }
@@ -740,4 +742,70 @@ fn a_durable_child_that_returns_under_a_freeze_is_joined_not_carried() {
         0,
         "the child returned: the join takes its result, and no image of it rides",
     );
+}
+
+/// A child (128 KiB) that spawns a thread, runs a polled loop a freeze cuts, then reads the `spawn`
+/// room left in its own `"budget"` while the thread still lives, releases the thread and joins it,
+/// returning the room. The thread waits on a word only the child sets, so it is live at the read.
+const CHILD_THREAD_ROOM: &str = "memory 17 shadow 16448 65536
+data 90112 \"budget\"
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1(vz, vt)
+}
+block 1 (vi: i64, vt1: i32) {
+  vn = i64.const 1000
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi, vt1) 3(vt1)
+}
+block 2 (vj: i64, vt2: i32) {
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk, vt2)
+}
+block 3 (vt3: i32) {
+  np = i64.const 90112
+  nl = i64.const 6
+  vb = self.resolve np nl
+  vf = i64.const 2
+  vroom = call.cap 14 1 (i64) -> (i64) vb (vf)
+  vw = i64.const 94208
+  vone = i32.const 1
+  i32.store vw vone
+  vcnt = i32.const 1
+  vwoke = atomic.notify vw vcnt
+  vj3 = thread.join vt3
+  return vroom
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  w0 = i64.const 94208
+  w1 = i32.const 0
+  w2 = i64.const -1
+  w3 = i32.atomic.wait w0 w1 w2
+  vr = i64.const 5
+  return vr
+  }
+}
+";
+
+/// #2001 — a thread live at the freeze hands its `spawn` back as it unwinds, and the thaw that
+/// re-creates it charges it again: while it lives, the child's budget ([`powerbox`]'s, ceiling 4) has
+/// the child and the thread out, room 2, after a thaw as on a fresh run. Uncharged it would read 3;
+/// charged twice, 1. The tree-walker's alone: the JIT hosts no `thread.spawn` in a durable child
+/// (`ChildRun::DurableTask`).
+#[test]
+fn a_thawed_thread_is_charged_to_its_childs_budget_again() {
+    let want = Some(Out::Ret(2));
+    let parent = parent();
+    assert_eq!(
+        fresh(Engine::Interp, &parent, CHILD_THREAD_ROOM),
+        want,
+        "fresh"
+    );
+    let thawed = thawed(Engine::Interp, Engine::Interp, &parent, CHILD_THREAD_ROOM);
+    assert_eq!(thawed, want, "frozen and thawed");
 }

@@ -1207,7 +1207,7 @@ int main(void) {
     mode: 'io',
     desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
       '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
-      'record into one call — `vm_spawn(module, entry, size_log2, quota, grants, n, args, args_len, ' +
+      'record into one call — `vm_spawn(module, entry, size_log2, grants, n, args, args_len, ' +
       'scratch)` — so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns ' +
       '`child` (a function of this same program, by funcref) twice, each into a **window of its own** ' +
       '(the program\'s size, paid from the `budget` grant and returned when the child ends): A with ' +
@@ -1244,9 +1244,9 @@ int main(void) {
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
-  long a = vm_spawn(-1, (long)child, 0, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
+  long a = vm_spawn(-1, (long)child, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
   long ra = vm_join(a);
-  long b = vm_spawn(-1, (long)child, 0, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
+  long b = vm_spawn(-1, (long)child, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
   long rb = vm_join(b);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);
@@ -1310,7 +1310,7 @@ int main(void) {
   long *p = (long *)(win - REGION_LEN); // the parent's view: its top 64 KiB, above all its data
   __vm_region_map(region, (long)p, 0, REGION_LEN, 3);
   for (int i = 0; i < N; i++) p[i] = i + 1;
-  long h = __vm_instantiate_detached(inst, budget, module, 0, 0, (long)child, lg, 0, 0, 0, region,
+  long h = __vm_instantiate_detached(inst, budget, module, 0, 0, (long)child, lg, 0, 0, region,
                                      CHILD_OFF);
   if (h < 0) {
     printf("spawn refused: %ld\\n", h);

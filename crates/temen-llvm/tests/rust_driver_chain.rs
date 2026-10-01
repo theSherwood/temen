@@ -305,7 +305,7 @@ fn drive_pipeline(with_link: bool) -> Option<Vec<(String, Vec<u8>)>> {
         let link_h = host.grant_module(&link);
         host.register_cap_name("link", link_h);
     }
-    let budget = host.grant_budget(0, largest, 0);
+    let budget = host.grant_budget(-1, largest, -1);
     host.register_cap_name("budget", budget);
 
     let mut fuel = 3_000_000_000_000u64;

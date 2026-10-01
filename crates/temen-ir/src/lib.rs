@@ -563,7 +563,7 @@ pub mod durable_abi {
 /// | 20 | `u32` pager | impl export / `u32::MAX` | same |
 /// | 24 | `i32` module | handle / `-1` self | same |
 /// | 28 | `i32` budget | `Budget` handle / 0 (funds the child; excludes `quota`) | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
-/// | 32 | `i64` quota | raw fuel | raw fuel |
+/// | 32 | `i64` quota | raw fuel | retired, must be 0 (#1944 slice 3: the budget caps the child's fuel) |
 /// | 40, 48 | `u64` grants ptr, count | named-grant list | same |
 /// | 56, 64 | `u64` args ptr, len | — | spawn-time args payload (len 0 = none) |
 /// | 72 | `i32` region | — | pre-mapped `SharedRegion` (−1 = none) |
@@ -587,7 +587,8 @@ pub struct SpawnRec {
     pub modh: i32,
     /// `Budget` handle, or `0` for none (offset 28) — see the table for its per-version meaning.
     pub budget: i32,
-    /// Raw fuel quota (offset 32).
+    /// Raw fuel quota (offset 32) — v0 only; retired in v1, where it must be 0 and a spawn naming
+    /// any other value traps `CapFault` (#1944 slice 3: the budget caps the child's fuel).
     pub quota: i64,
     /// Named-grant list pointer (offset 40).
     pub grants_ptr: u64,
@@ -653,8 +654,8 @@ impl SpawnRec {
     }
 
     /// A v1 (detached) record for `entry` with every other field at its "none" value: the module's
-    /// declared window (`size_log2` 0), no pager, the spawner's own module, no budget, no fuel cap,
-    /// no grants, no args, no region. Producers set the fields they use.
+    /// declared window (`size_log2` 0), no pager, the spawner's own module, no budget, the retired
+    /// `quota` 0, no grants, no args, no region. Producers set the fields they use.
     pub fn v1(entry: u32) -> SpawnRec {
         SpawnRec {
             detached: true,

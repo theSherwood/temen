@@ -51,8 +51,9 @@ use temen_ir::{
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, GuestMem, Host, LockUnpoisoned,
-    Mem, MemLayout, Reg, Trap, Value, VarValue, DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
+    LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue,
+    DEFAULT_RESERVED_LOG2,
 };
 
 // ---- Per-function call profiler (opt-in `callprof` feature; tier-up break-even measurement) -------
@@ -1491,8 +1492,10 @@ struct AdmittedChild {
     program: ChildProgram,
     /// The entry's arguments: the starter `Instantiator` (plus `AddressSpace` for a two-arg entry).
     args: Vec<Value>,
-    /// The child's fuel: a funding budget's, or the op's quota clamped to the parent's remaining.
-    fuel: u64,
+    /// The child's fuel (#1944 slice 3): a detached child draws from its own budget node, the one
+    /// that paid for its window; a carve child keeps its fixed allowance (the record's budget, or the
+    /// op's quota, capped at what its parent can still burn).
+    fuel: Fuel,
     /// A detached child's window lease `(budget, bytes)`: `Budget.mem` accounts live windows
     /// (INVARIANTS #3, 2026-09-29), so the driver gives these bytes back to the spawner's budget when
     /// the child ends. `None` for a confined (carve) child, which spends no `Budget.mem`.
@@ -1501,8 +1504,8 @@ struct AdmittedChild {
 
 /// Admit a §14 confined spawn and build the child. `host` is the spawning task's own powerbox, where
 /// its handles resolve and its budget is charged (#1727); `pm` its window — the holder the carve is
-/// cut from, the grant list is read from and a module's data segments land in; `parent_fuel` its
-/// remaining fuel; `spawner` the spawning frame, whose module a same-module child runs.
+/// cut from, the grant list is read from and a module's data segments land in; `parent_fuel` what it
+/// can still burn; `spawner` the spawning frame, whose module a same-module child runs.
 ///
 /// `Ok(None)` is a **probeable refusal**: the driver lands `-EINVAL`, and the budget is intact. `Err`
 /// is a trap: a forged module handle, a module this engine cannot lower, an unreadable grant record,
@@ -1577,7 +1580,9 @@ fn admit_confined_child(
     };
     // §3d: a record's budget funds the child here, after every other refusal. #989 slice 1b: its
     // `channel` ceiling is read before `take_spawn_budget` drains it.
-    let fuel = if s.budget != 0 {
+    // A carve child's fixed allowance, as it always was (#1944 slice 3 leaves the carve path's fuel
+    // alone until #1867 deletes it).
+    let fuel = Fuel::fixed(if s.budget != 0 {
         let channel = host.peek_budget(s.budget).map(|b| b.channel);
         let Some(fuel) = take_spawn_budget(host, s.budget, child_size, parent_fuel)? else {
             return Ok(None);
@@ -1590,7 +1595,7 @@ fn admit_confined_child(
         parent_fuel
     } else {
         (s.quota as u64).min(parent_fuel)
-    };
+    });
     Ok(Some(AdmittedChild {
         mem: pm.map(|m| m.nested_view(base, s.size_log2 as u8, m.shadow_arena())),
         host: child_host,
@@ -1713,12 +1718,12 @@ impl FreshWindow {
 
 /// Admit an op-15 spawn against `host` (the parent powerbox) and build the child, with its window
 /// still to be built over a backing the driver supplies. `pm` is the parent's window (the grant list
-/// and the args payload are read from it); `parent_fuel` its remaining fuel. `Ok(None)` is a
-/// **probeable refusal** — the driver lands `-EINVAL` and nothing was charged; `Err` is a trap (a
-/// forged handle, an unreadable payload). The checks — entry shape, the window = the module's
-/// declared memory, the payload fitting the args area, `premap_admit`, durability — run before the
-/// `Budget.mem` take, so a refusal charges nothing; one after it (the child's imports not binding)
-/// hands the take back (`Host::undo_detached_spawn`, #1975).
+/// and the args payload are read from it). `Ok(None)` is a **probeable refusal** — the driver lands
+/// `-EINVAL` and nothing was charged; `Err` is a trap (a forged handle, an unreadable payload, a
+/// nonzero `quota`). The checks — entry shape, the window = the module's declared memory, the payload
+/// fitting the args area, `premap_admit`, durability — run before the `Budget.mem` take, so a
+/// refusal charges nothing; one after it (the child's imports not binding) hands the take back
+/// (`Host::undo_detached_spawn`, #1975).
 ///
 /// `freezes_detached`: whether a freeze of this run captures a detached child. A durable domain
 /// spawns detached only an attested-freezable module, and only while it holds freeze authority over
@@ -1728,10 +1733,14 @@ impl FreshWindow {
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
-    parent_fuel: u64,
     s: DetachedSpawn,
     freezes_detached: bool,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
+    // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
+    // other value fails closed, checked first as the tree-walker's op-15 arm does.
+    if s.quota != 0 {
+        return Err(Trap::CapFault);
+    }
     let (cfuncs, cmem_log2, cdata, ctypes, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
         (
@@ -1823,11 +1832,8 @@ fn admit_detached_child(
     // spent while the child lives: the driver returns them at its end (`AdmittedChild::lease`).
     host.give_lane(lane);
     let args = child_entry_args(arity, cinst, cas);
-    let fuel = if s.quota <= 0 {
-        parent_fuel
-    } else {
-        (s.quota as u64).min(parent_fuel)
-    };
+    // #1944 slice 3 — the child draws its fuel from the budget that paid for its window, its own node.
+    let fuel = Fuel::drawn(child_host.own_node());
     let child = AdmittedChild {
         mem: None,
         host: child_host,
@@ -1850,10 +1856,9 @@ fn admit_detached_child(
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
-    parent_fuel: u64,
     s: DetachedSpawn,
 ) -> Result<Option<AdmittedChild>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, parent_fuel, s, false)? else {
+    let Some((mut child, window)) = admit_detached_child(host, pm, s, false)? else {
         return Ok(None);
     };
     child.mem = Some(window.build(None, &mut child.host)?);
@@ -2819,27 +2824,32 @@ pub fn compile_and_run_with_host_traced(
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
-    loop {
+    // #1944 slice 3 — an activation of `host`: the root draws its fuel from the host's own node.
+    let mut vfuel = Fuel::drawn(host.begin_activation(*fuel));
+    let r = loop {
         match vm.resume(
             &dom.source,
             &dom.table,
-            fuel,
+            &mut vfuel,
             &mut mem,
             &mut HostCell::Excl(&mut *host),
             1,
         ) {
             Ok(Outcome::Suspended) => continue, // one op done; keep stepping
-            Ok(Outcome::Done(vals)) => return Some((Ok(vals), Vec::new(), None)),
-            Ok(_) => return None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
+            Ok(Outcome::Done(vals)) => break Some((Ok(vals), Vec::new(), None)),
+            Ok(_) => break None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
             Err(t) => {
                 let bt = vm_trap_bt(&vm, &dom.source, &t);
                 // This single-step path only ever drives the **root** (a fiber/thread op is a seam →
                 // the `Ok(_)` arm above bails to the tree-walker), so a trap here is always the root —
                 // attributed `-1`, matching the JIT's root-trap convention.
-                return Some((Err(t), bt, Some(-1)));
+                break Some((Err(t), bt, Some(-1)));
             }
         }
-    }
+    };
+    drop(vfuel);
+    *fuel = host.fuel_left();
+    r
 }
 
 /// The trap-time backtrace of a `Vm` paused (by an `Err` from [`Vm::resume`]) on a faulting op:
@@ -3213,7 +3223,7 @@ impl SharedProgram {
         &self,
         entry: FuncIdx,
         args: &[Value],
-        mut fuel: u64,
+        fuel: u64,
         mut host: Host,
         tierup: Option<TierUpConfig>,
         back: std::sync::Arc<super::Region>,
@@ -3233,6 +3243,8 @@ impl SharedProgram {
             mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
+        // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
+        let mut fuel = Fuel::drawn(host.begin_activation(fuel));
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         Ok(CoopRun {
             dom,
@@ -3317,7 +3329,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
-    let (r, mem) = drive_parallel(dom, func, args, *fuel, mem, host);
+    let (r, mem) = drive_parallel(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3866,7 +3878,7 @@ pub struct Vcpu<'p> {
     fiber_sp: Vec<u64>,
     fiber_meta: Vec<(i32, i64)>,
     mem: Option<Mem>,
-    fuel: u64,
+    fuel: Fuel,
     host: Host,
     /// The run's **shared powerbox** (THREADS.md 4d): when set (see
     /// [`with_shared_host`](Vcpu::with_shared_host)), every host access — `call.cap` dispatch, §14
@@ -3928,17 +3940,21 @@ pub struct Vcpu<'p> {
     children: Vec<Option<VcpuChild>>,
     /// The just-admitted detached spawn's window lease `(budget, bytes)`, filed with its child.
     pending_lease: Option<(i32, u64)>,
-    /// The lease of the child whose join is in flight, given back on
+    /// #2001 — the just-spawned thread's `spawn` on this vCPU's domain node, filed with its child.
+    pending_live: LiveVcpu,
+    /// The child whose join is in flight, whose charges go back on
     /// [`deliver_join`](Self::deliver_join).
-    joining: Option<(i32, u64)>,
+    joining: Option<VcpuChild>,
 }
 
-/// A child in a [`Vcpu`]'s table: the host's token for it, and a detached child's window lease.
-/// `Budget.mem` accounts live windows (INVARIANTS #3), and the driver runs the child, so this engine
-/// sees its end only as the parent's join: that is when the lease's bytes go back to the budget.
+/// A child in a [`Vcpu`]'s table: the host's token for it, a detached child's window lease, and a
+/// thread's `spawn` (#2001). `Budget` accounts live windows and vCPUs (INVARIANTS #3), and the driver
+/// runs the child, so this engine sees its end only as the parent's join: that is when both go back
+/// to the budget.
 struct VcpuChild {
     token: u64,
     lease: Option<(i32, u64)>,
+    live: LiveVcpu,
 }
 
 /// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
@@ -3956,7 +3972,7 @@ pub struct PendingChild {
     module: u32,
     entry: u32,
     args: Vec<Value>,
-    fuel: u64,
+    fuel: Fuel,
     window: ChildWindow,
 }
 
@@ -4263,7 +4279,9 @@ impl<'p> Vcpu<'p> {
             fiber_sp: Vec::new(),
             fiber_meta: Vec::new(),
             mem,
-            fuel: u64::MAX,
+            // Unmetered, as a host-built vCPU has always been; a detached child's comes from its
+            // own budget node instead ([`PendingChild::start`], #1944 slice 3).
+            fuel: Fuel::fixed(u64::MAX),
             host,
             shared_host: None,
             shared_fibers: None,
@@ -4280,6 +4298,7 @@ impl<'p> Vcpu<'p> {
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
+            pending_live: LiveVcpu::none(),
             joining: None,
         })
     }
@@ -4292,7 +4311,7 @@ impl<'p> Vcpu<'p> {
         module: u32,
         entry: u32,
         mem: Mem,
-        fuel: u64,
+        fuel: Fuel,
         host: Host,
         args: Vec<Value>,
     ) -> Result<Vcpu<'p>, Trap> {
@@ -4332,6 +4351,7 @@ impl<'p> Vcpu<'p> {
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
+            pending_live: LiveVcpu::none(),
             joining: None,
         })
     }
@@ -4642,6 +4662,16 @@ impl<'p> Vcpu<'p> {
                     if !ok {
                         return VcpuEvent::Trapped(Trap::Malformed);
                     }
+                    // #2001 — the thread is one `spawn` of this vCPU's domain node until its join: a
+                    // full ceiling refuses it as the live cap does.
+                    let node = match self.shared_host {
+                        Some(m) => m.lock_unpoisoned().own_node(),
+                        None => self.host.own_node(),
+                    };
+                    let Some(live) = LiveVcpu::charge(node) else {
+                        return VcpuEvent::Trapped(Trap::ThreadFault);
+                    };
+                    self.pending_live = live;
                     self.pending = Some(dst);
                     return VcpuEvent::Spawn {
                         func,
@@ -4777,14 +4807,12 @@ impl<'p> Vcpu<'p> {
                         Some(m) => admit_detached_child(
                             &mut m.lock_unpoisoned(),
                             self.mem.as_ref(),
-                            self.fuel,
                             spawn,
                             true,
                         ),
                         None => admit_detached_child(
                             &mut self.host,
                             self.mem.as_ref(),
-                            self.fuel,
                             spawn,
                             true,
                         ),
@@ -4848,7 +4876,7 @@ impl<'p> Vcpu<'p> {
             Some(m) => admit_confined_child(
                 &mut m.lock_unpoisoned(),
                 self.mem.as_ref(),
-                self.fuel,
+                self.fuel.can_burn(),
                 source,
                 &self.vt.active,
                 spawn,
@@ -4856,7 +4884,7 @@ impl<'p> Vcpu<'p> {
             None => admit_confined_child(
                 &mut self.host,
                 self.mem.as_ref(),
-                self.fuel,
+                self.fuel.can_burn(),
                 source,
                 &self.vt.active,
                 spawn,
@@ -4891,6 +4919,7 @@ impl<'p> Vcpu<'p> {
         self.children.push(Some(VcpuChild {
             token,
             lease: self.pending_lease.take(),
+            live: std::mem::replace(&mut self.pending_live, LiveVcpu::none()),
         }));
         handle
     }
@@ -4901,15 +4930,21 @@ impl<'p> Vcpu<'p> {
     /// [`end_join`](Self::end_join). `Err` is the trap the interpreted join raises.
     pub fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
         let child = super::take_child(&mut self.children, handle)?;
-        self.joining = child.lease;
-        Ok(child.token)
+        let token = child.token;
+        self.joining = Some(child);
+        Ok(token)
     }
 
-    /// The child a join resolved has ended: its window's bytes go back to the budget that paid.
+    /// The child a join resolved has ended: its window's bytes and its first vCPU, or a thread's
+    /// `spawn`, go back to the budget that paid.
     pub fn end_join(&mut self) {
-        if let Some((budget, bytes)) = self.joining.take() {
-            self.budget_mem_give(budget, bytes);
+        let Some(VcpuChild { lease, live, .. }) = self.joining.take() else {
+            return;
+        };
+        if let Some((budget, bytes)) = lease {
+            self.release_detached(budget, bytes);
         }
+        drop(live);
     }
 
     /// An op-17 record this vCPU's **emitted** code spawned (the browser's `env.instantiate_rec`
@@ -4934,14 +4969,10 @@ impl<'p> Vcpu<'p> {
         }
         let spawn = DetachedSpawn::of(&sr);
         let admitted = match self.shared_host {
-            Some(m) => admit_detached_child(
-                &mut m.lock_unpoisoned(),
-                self.mem.as_ref(),
-                self.fuel,
-                spawn,
-                true,
-            ),
-            None => admit_detached_child(&mut self.host, self.mem.as_ref(), self.fuel, spawn, true),
+            Some(m) => {
+                admit_detached_child(&mut m.lock_unpoisoned(), self.mem.as_ref(), spawn, true)
+            }
+            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true),
         }?;
         let Some((child, window)) = admitted else {
             return Ok(None);
@@ -4952,11 +4983,11 @@ impl<'p> Vcpu<'p> {
         Ok(Some((child, size_log2)))
     }
 
-    /// Give `bytes` back to `budget` in this vCPU's powerbox.
-    fn budget_mem_give(&mut self, budget: i32, bytes: u64) {
+    /// Settle a detached child's window lease in this vCPU's powerbox ([`Host::release_detached`]).
+    fn release_detached(&mut self, budget: i32, bytes: u64) {
         match self.shared_host {
-            Some(m) => m.lock_unpoisoned().budget_mem_give(budget, bytes),
-            None => self.host.budget_mem_give(budget, bytes),
+            Some(m) => m.lock_unpoisoned().release_detached(budget, bytes),
+            None => self.host.release_detached(budget, bytes),
         }
     }
 
@@ -5478,6 +5509,7 @@ pub type ValueTrace = (Vec<(super::IrPc, Vec<Value>)>, Result<Vec<Value>, Trap>)
 /// reports tree-walker-identical locations, so breakpoints/stepping at [`crate::IrPc`] granularity
 /// land at the same program points on both backends.
 pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Option<IrTrace> {
+    let mut lent = LentFuel::new(fuel); // a debug tier's fixed allowance (#1944 slice 3)
     let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
@@ -5497,7 +5529,7 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         match vm.resume(
             &dom.source,
             &dom.table,
-            fuel,
+            &mut lent.fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
             1,
@@ -5527,6 +5559,7 @@ pub fn ir_window_trace(
     addr: u64,
     len: usize,
 ) -> Option<WindowTrace> {
+    let mut lent = LentFuel::new(fuel); // a debug tier's fixed allowance (#1944 slice 3)
     let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
@@ -5552,7 +5585,7 @@ pub fn ir_window_trace(
         match vm.resume(
             &dom.source,
             &dom.table,
-            fuel,
+            &mut lent.fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
             1,
@@ -5585,6 +5618,7 @@ pub fn ir_value_trace(
     if m.funcs.get(func as usize)?.blocks.len() != 1 {
         return None;
     }
+    let mut lent = LentFuel::new(fuel); // a debug tier's fixed allowance (#1944 slice 3)
     let types0 = temen_verify::func_value_types(
         &m.funcs[func as usize],
         &m.funcs,
@@ -5621,7 +5655,7 @@ pub fn ir_value_trace(
         match vm.resume(
             &dom.source,
             &dom.table,
-            fuel,
+            &mut lent.fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
             1,
@@ -5707,7 +5741,7 @@ fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
             .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
         module,
         host: e.host.replay_substate(),
-        fuel: e.fuel,
+        fuel: e.fuel.can_burn(),
         prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
         fibers: e.fibers.clone(),
     }
@@ -5737,7 +5771,7 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
         mem,
         host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
-        fuel: es.fuel,
+        fuel: Fuel::fixed(es.fuel),
         fibers: es.fibers.clone(),
     }
 }
@@ -6113,6 +6147,7 @@ fn journal_state(
                 state: t.state.clone(),
                 at_bp: t.at_bp,
                 lease: t.lease,
+                live: t.live.held(),
             })
             .collect(),
         fibers: fibers.to_vec(),
@@ -6183,7 +6218,7 @@ fn debug_advance_fiber(
     fibers: &mut Vec<FiberState>,
     source: &ModuleSource,
     table: &SharedSlots,
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
@@ -6872,6 +6907,8 @@ struct DbgTask {
     /// A detached child's window lease `(spawner env, budget, bytes)` — [`TaskSlot::lease`]'s
     /// counterpart, returned by [`dbg_refund_ended_windows`] once this task is `Done`.
     lease: Option<(Option<usize>, i32, u64)>,
+    /// #2001 — [`TaskSlot::live`]'s counterpart: a thread's `spawn`, handed back when it completes.
+    live: LiveVcpu,
 }
 
 /// A §14 `instantiate` **confined executor child**'s runtime under the multi-vCPU debug scheduler — the
@@ -6888,8 +6925,8 @@ fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [
         if matches!(t.state, DbgTaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
                 match env {
-                    None => host.budget_mem_give(budget, bytes),
-                    Some(k) => envs[k].host.budget_mem_give(budget, bytes),
+                    None => host.release_detached(budget, bytes),
+                    Some(k) => envs[k].host.release_detached(budget, bytes),
                 }
             }
         }
@@ -6900,7 +6937,8 @@ struct DbgEnv {
     mem: Option<Mem>,
     host: Host,
     table: SharedSlots,
-    fuel: u64,
+    /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
+    fuel: Fuel,
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
     /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
     fibers: Vec<FiberState>,
@@ -6923,6 +6961,8 @@ struct DbgTaskSnapshot {
     state: DbgTaskState,
     at_bp: bool,
     lease: Option<(Option<usize>, i32, u64)>,
+    /// #2001 — the task is a live thread holding a `spawn`, which a restore charges again.
+    live: bool,
 }
 
 /// A multi-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
@@ -7326,6 +7366,7 @@ fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>)
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
         tasks[done].state = DbgTaskState::Done(res.clone());
+        tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
         for (j, t) in tasks.iter_mut().enumerate() {
             let DbgTaskState::BlockedJoin { child, slot, dst } = t.state else {
                 continue;
@@ -7358,6 +7399,7 @@ fn dbg_spawn(
     dst: u32,
     module: usize,
     source: &ModuleSource,
+    node: NodeRef,
 ) -> Result<(), Trap> {
     // Module-aware, as the drive arms: `func` is the spawning frame's module's index.
     let cm = source.get(module).ok_or(Trap::Malformed)?;
@@ -7371,6 +7413,9 @@ fn dbg_spawn(
     if live >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
+    // #2001 — the thread is one `spawn` of its domain's node (`node`) while it lives: a full
+    // ceiling refuses it as the live cap does.
+    let live = LiveVcpu::charge(node).ok_or(Trap::ThreadFault)?;
     let mut vt = VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
     vt.active.module = module;
     vt.active.home = module;
@@ -7383,6 +7428,7 @@ fn dbg_spawn(
         state: DbgTaskState::Runnable,
         at_bp: false,
         lease: None,
+        live,
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -7401,7 +7447,7 @@ fn dbg_advance_task(
     fibers: &mut Vec<FiberState>,
     source: &ModuleSource,
     table: &SharedSlots,
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
@@ -7447,7 +7493,7 @@ fn service_advance(
     fibers: &mut Vec<FiberState>,
     source: &ModuleSource,
     table: &SharedSlots,
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut Host,
     clock: u64,
@@ -7485,7 +7531,11 @@ fn service_advance(
                 module,
             } => {
                 *turn += 1;
-                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source) {
+                let node = match tasks[ti].env {
+                    None => host.own_node(),
+                    Some(k) => extra_envs[k].host.own_node(),
+                };
+                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source, node) {
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
@@ -7513,7 +7563,7 @@ fn service_advance(
             Outcome::Instantiate { spawn, dst } => {
                 *turn += 1;
                 if let Err(t) = dbg_instantiate_confined(
-                    tasks, ti, extra_envs, source, mem, *fuel, host, spawn, dst,
+                    tasks, ti, extra_envs, source, mem, fuel, host, spawn, dst,
                 ) {
                     dbg_complete(tasks, ti, Err(t));
                 }
@@ -7523,9 +7573,9 @@ fn service_advance(
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
-                if let Err(t) = dbg_instantiate_detached(
-                    tasks, ti, extra_envs, source, mem, *fuel, host, spawn, dst,
-                ) {
+                if let Err(t) =
+                    dbg_instantiate_detached(tasks, ti, extra_envs, source, mem, host, spawn, dst)
+                {
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
@@ -7630,7 +7680,7 @@ fn dbg_instantiate_confined(
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
     shared_mem: &Option<Mem>,
-    shared_fuel: u64,
+    shared_fuel: &Fuel,
     host: &mut Host,
     spawn: ConfinedSpawn,
     dst: u32,
@@ -7640,10 +7690,17 @@ fn dbg_instantiate_confined(
         None => (shared_mem.as_ref(), host, shared_fuel),
         Some(k) => {
             let e = &mut extra_envs[k];
-            (e.mem.as_ref(), &mut e.host, e.fuel)
+            (e.mem.as_ref(), &mut e.host, &e.fuel)
         }
     };
-    let Some(child) = admit_confined_child(owner, pm, pfuel, source, &tasks[ti].vt.active, spawn)?
+    let Some(child) = admit_confined_child(
+        owner,
+        pm,
+        pfuel.can_burn(),
+        source,
+        &tasks[ti].vt.active,
+        spawn,
+    )?
     else {
         tasks[ti]
             .vt
@@ -7688,7 +7745,10 @@ fn dbg_start_child(
         mem,
         host,
         table,
-        fuel,
+        // The debugger runs every task on a fixed allowance: a detached child gets what its chain
+        // lets it burn at the spawn, where an executor's child draws from the chain as it goes
+        // (#1944 slice 3).
+        fuel: Fuel::fixed(fuel.can_burn()),
         fibers: Vec::new(),
     });
     let cidx = tasks.len();
@@ -7699,6 +7759,7 @@ fn dbg_start_child(
         state: DbgTaskState::Runnable,
         at_bp: false,
         lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
+        live: LiveVcpu::none(),
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -7716,20 +7777,19 @@ fn dbg_instantiate_detached(
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
     shared_mem: &Option<Mem>,
-    shared_fuel: u64,
     host: &mut Host,
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
-    // The parent's window and fuel, and the powerbox its handles resolve in: its own (#1727).
-    let (pm, owner, pfuel) = match tasks[ti].env {
-        None => (shared_mem.as_ref(), host, shared_fuel),
+    // The parent's window and the powerbox its handles resolve in: its own (#1727).
+    let (pm, owner) = match tasks[ti].env {
+        None => (shared_mem.as_ref(), host),
         Some(k) => {
             let e = &mut extra_envs[k];
-            (e.mem.as_ref(), &mut e.host, e.fuel)
+            (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, pfuel, spawn)? else {
+    let Some(child) = admit_detached_in_process(owner, pm, spawn)? else {
         tasks[ti]
             .vt
             .active
@@ -7912,7 +7972,7 @@ fn step_active_invoke(
     vt: &mut VTask,
     source: &ModuleSource,
     table: &SharedSlots,
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
@@ -8262,6 +8322,7 @@ impl ScheduledDebugRun {
                 state: DbgTaskState::Runnable,
                 at_bp: false,
                 lease: None,
+                live: LiveVcpu::none(),
             }],
             extra_envs: Vec::new(),
             fibers: Vec::new(),
@@ -8613,6 +8674,9 @@ impl ScheduledDebugRun {
         step: Option<(usize, Option<usize>)>,
         pause_at: Option<u64>,
     ) -> SchedStop {
+        // The shared tasks' counter is the caller's, lent for this call (#1944 slice 3).
+        let mut lent = LentFuel::new(fuel);
+        let fuel = &mut lent.fuel;
         let Self {
             source,
             table,
@@ -8963,6 +9027,9 @@ impl ScheduledDebugRun {
         if matches!(self.tasks[0].state, DbgTaskState::Done(_)) {
             return false;
         }
+        // The shared tasks' counter is the caller's, lent for this call (#1944 slice 3).
+        let mut lent = LentFuel::new(fuel);
+        let fuel = &mut lent.fuel;
         let Self {
             source,
             table,
@@ -9275,6 +9342,7 @@ impl ScheduledDebugRun {
                     state: t.state.clone(),
                     at_bp: t.at_bp,
                     lease: t.lease,
+                    live: t.live.held(),
                 })
                 .collect(),
             fibers: self.fibers.clone(),
@@ -9365,6 +9433,13 @@ impl ScheduledDebugRun {
                 },
                 at_bp: ts.at_bp,
                 lease: ts.lease,
+                // #2001 — a live thread is charged again; the task it replaces hands its charge
+                // back as it drops.
+                live: match (ts.live, ts.env) {
+                    (false, _) => LiveVcpu::none(),
+                    (true, None) => LiveVcpu::force(self.host.own_node()),
+                    (true, Some(k)) => LiveVcpu::force(self.extra_envs[k].host.own_node()),
+                },
             })
             .collect();
     }
@@ -9608,22 +9683,30 @@ fn spawn_task(
     dom: &Domain,
     mem: &Option<Mem>,
     host: &mut Host,
-    fuel: u64,
+    fuel: &Fuel,
     ti: usize,
     cmd: super::ExecCmd,
     plan: super::SpawnPlan,
 ) -> (i64, Option<CoopStep>) {
     let child_ti = tasks.len();
     let pid = child_ti as u64 + 1;
+    // #2001 — the process is one `spawn` of the node it shares with its spawner while it lives: a full
+    // ceiling refuses it as the live cap does.
+    let node = task_host(host, extra_envs, tasks[ti].env).with(|h| h.own_node());
+    let Some(live) = LiveVcpu::charge(node) else {
+        return (super::EAGAIN, None);
+    };
+    // The process shares its spawner's budget node (`spawn_powerbox`), so it draws from it as a thread
+    // would (#1944 slice 3).
     let (twin, child_fuel) = match tasks[ti].env {
         Some(k) => (
             extra_envs[k]
                 .host
                 .lock_unpoisoned()
                 .spawn_powerbox(pid, plan),
-            extra_envs[k].fuel,
+            extra_envs[k].fuel.for_thread(),
         ),
-        None => (host.spawn_powerbox(pid, plan), fuel),
+        None => (host.spawn_powerbox(pid, plan), fuel.for_thread()),
     };
     let Some(mut twin) = twin else {
         return (super::EAGAIN, None);
@@ -9633,7 +9716,7 @@ fn spawn_task(
         None => mem.as_ref(),
     };
     let built = exec_image_build(&mut twin, caller, dom, cmd, 0, 0, 0, 0, true, leaf);
-    let (child_mem, child_host, table, vt, state, start) = match built {
+    let (child_mem, child_host, table, vt, state, start, live) = match built {
         Ok(built) => {
             // Its own park door and pump bell, as the fork arm wires a twin's.
             built.host.wire_park_door();
@@ -9644,7 +9727,7 @@ fn spawn_task(
             }
             let state = TaskState::Runnable;
             let (m, h) = (Some(built.mem), built.host);
-            (m, h, built.table, built.vt, state, built.leaf)
+            (m, h, built.table, built.vt, state, built.leaf, live)
         }
         Err(_) => {
             let mut vt = VTask {
@@ -9657,7 +9740,15 @@ fn spawn_task(
             vt.release();
             let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
             let state = TaskState::Done(failed);
-            (None, twin, dom.table.fork(), vt, state, None)
+            (
+                None,
+                twin,
+                dom.table.fork(),
+                vt,
+                state,
+                None,
+                LiveVcpu::none(),
+            )
         }
     };
     let eidx = extra_envs.len();
@@ -9675,6 +9766,7 @@ fn spawn_task(
         state,
         suspended: None,
         lease: None,
+        live,
     });
     forked_twins.insert(child_ti);
     let win = extra_envs[eidx].mem.as_ref();
@@ -11039,7 +11131,7 @@ fn run_invoke(
     table: &SharedSlots,
     module: usize,
     args: &[Value],
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     beneath: Option<&Beneath<'_>>,
@@ -11110,7 +11202,7 @@ fn drive_nested(
     source: &ModuleSource,
     table: &SharedSlots,
     mut active: Vm,
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     // The registry this drive's fibers live in — locked per fiber transition when it is a run-shared
@@ -11645,7 +11737,7 @@ impl HostCell<'_> {
 /// [`step_vcpu`] takes one ref instead of four (and so the per-task selection has a single type).
 struct RunCtx<'a> {
     table: &'a SharedSlots,
-    fuel: &'a mut u64,
+    fuel: &'a mut Fuel,
     mem: &'a mut Option<Mem>,
     host: HostCell<'a>,
     /// DURABILITY.md §12.8: the domain is durable, so each fiber switch maintains the per-context
@@ -12241,7 +12333,8 @@ fn resolve_fiber_entry(
 /// is a `nested_view` sub-window sharing the parent's backing (the §14 shared data plane), its `host`
 /// an attenuated powerbox (an `Instantiator` + an `AddressSpace`, each over `[0, child_size)`), its
 /// `table` a fresh **natural** dispatch table over module 0 (no access to installed §22 units — like
-/// the tree-walker's fresh `DomainTable::new(&cfuncs, 0)`), and `fuel` a sub-allocated quota.
+/// the tree-walker's fresh `DomainTable::new(&cfuncs, 0)`), and `fuel` its own (#1944 slice 3: drawn
+/// from its budget node when detached, a fixed allowance when carved).
 struct ChildEnv {
     mem: Option<Mem>,
     /// The child's live powerbox. `Arc<Mutex<…>>` (single-threaded here, so uncontended) so a
@@ -12249,7 +12342,7 @@ struct ChildEnv {
     /// machinery expects — enqueue, offer-shape, and settle all go through the shared type.
     host: std::sync::Arc<std::sync::Mutex<Host>>,
     table: SharedSlots,
-    fuel: u64,
+    fuel: Fuel,
     /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
     /// per-domain [`ParDomain`] registry, here. The root domain's is [`CoopSched::fibers`].
@@ -12319,6 +12412,7 @@ fn coop_start_child(
         state: TaskState::Runnable,
         suspended: None,
         lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
+        live: LiveVcpu::none(),
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -12344,6 +12438,10 @@ struct TaskSlot {
     /// once the task is `Done` the scheduler returns the bytes to the spawner's budget
     /// ([`refund_ended_windows`]).
     lease: Option<(Option<usize>, i32, u64)>,
+    /// #2001 — the task's `spawn` on its domain's node, handed back when it completes
+    /// ([`complete`]). None on the root and on a §14/§5 child's root (a detached child's lease
+    /// holds its charge).
+    live: LiveVcpu,
 }
 
 /// Return the window bytes of every detached child whose root task has ended to the budget that paid
@@ -12354,7 +12452,7 @@ fn refund_ended_windows(tasks: &mut [TaskSlot], host: &mut Host, envs: &[ChildEn
     for t in tasks.iter_mut() {
         if matches!(t.state, TaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
-                task_host(host, envs, env).with(|h| h.budget_mem_give(budget, bytes));
+                task_host(host, envs, env).with(|h| h.release_detached(budget, bytes));
             }
         }
     }
@@ -12697,20 +12795,28 @@ fn drive(
     host: &mut Host,
     budget: u64,
 ) -> Result<Vec<Value>, Trap> {
-    // The native driver never enables tier-up (no eligibility bitmap), so `pump` runs the whole
-    // schedule and returns `Done`; a `TierUp` yield is impossible here.
-    let mut sched = CoopSched::new(&dom, entry, args, fuel, mem, host, None)?;
-    match sched.pump(&dom, mem, host, fuel, budget)? {
-        CoopStep::Done(vals) => Ok(vals),
-        CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
-        CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
-        CoopStep::TierUp { .. } | CoopStep::Resume { .. } => {
-            unreachable!("tier-up not enabled on the native driver")
+    // #1944 slice 3 — an activation of `host`: the root and its threads draw from the host's own
+    // node, and `fuel` reads back the room left once every task has handed back what it did not burn.
+    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel));
+    let r = (|| {
+        // The native driver never enables tier-up (no eligibility bitmap), so `pump` runs the whole
+        // schedule and returns `Done`; a `TierUp` yield is impossible here.
+        let mut sched = CoopSched::new(&dom, entry, args, &mut root_fuel, mem, host, None)?;
+        match sched.pump(&dom, mem, host, &mut root_fuel, budget)? {
+            CoopStep::Done(vals) => Ok(vals),
+            CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
+            CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
+            CoopStep::TierUp { .. } | CoopStep::Resume { .. } => {
+                unreachable!("tier-up not enabled on the native driver")
+            }
+            CoopStep::JitInvoke { .. } => {
+                unreachable!("Jit.invoke surfacing not enabled on the native driver")
+            }
         }
-        CoopStep::JitInvoke { .. } => {
-            unreachable!("Jit.invoke surfacing not enabled on the native driver")
-        }
-    }
+    })();
+    drop(root_fuel);
+    *fuel = host.fuel_left();
+    r
 }
 
 /// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a module-0 task hit an
@@ -12988,7 +13094,7 @@ impl CoopSched {
         dom: &Domain,
         entry: FuncIdx,
         args: &[Value],
-        fuel: &mut u64,
+        fuel: &mut Fuel,
         mem: &mut Option<Mem>,
         host: &mut Host,
         tierup: Option<TierUpConfig>,
@@ -13007,7 +13113,7 @@ impl CoopSched {
                 .as_ref()
                 .is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING);
         if !is_thaw {
-            *fuel = fuel.checked_sub(1).ok_or(Trap::OutOfFuel)?;
+            fuel.burn()?;
         }
         let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
             vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
@@ -13016,6 +13122,7 @@ impl CoopSched {
             state: TaskState::Runnable,
             suspended: None,
             lease: None,
+            live: LiveVcpu::none(),
         }];
         // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
         // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
@@ -13138,7 +13245,7 @@ impl CoopSched {
         dom: &Domain,
         mem: &mut Option<Mem>,
         host: &mut Host,
-        fuel: &mut u64,
+        fuel: &mut Fuel,
         budget: u64,
     ) -> Result<CoopStep, Trap> {
         let CoopSched {
@@ -13722,7 +13829,7 @@ impl CoopSched {
                     dom,
                     mem,
                     host,
-                    *fuel,
+                    fuel,
                     ti,
                     cmd,
                     plan,
@@ -13800,8 +13907,10 @@ impl CoopSched {
                     )
                 }
             };
-            let fuel_before = *ctx.fuel;
-            // Fuel is charged once per op, so what it dropped by is the ops this step ran.
+            // What this task can still burn drops by exactly what it burned: no other task runs
+            // while it steps, and a draw moves fuel from its chain into its hand (#1944 slice 3).
+            let fuel_before = ctx.fuel.can_burn();
+            // Fuel is charged once per safepoint, so what it dropped by is the work this step did.
             let charge_slice = |slice_left: &mut Option<u64>, fuel_after: u64| {
                 if let Some(left) = slice_left.as_mut() {
                     *left = left.saturating_sub(fuel_before.saturating_sub(fuel_after));
@@ -13831,7 +13940,7 @@ impl CoopSched {
                     Some(meta),
                     None,
                 );
-                charge_slice(slice_left, *ctx.fuel);
+                charge_slice(slice_left, ctx.fuel.can_burn());
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
                     (Ok(_), Some((vm, handoff))) => {
@@ -13860,7 +13969,7 @@ impl CoopSched {
                 true, // the cooperative scheduler: idle blocking `cont.resume.block` (I48)
                 preemptible, // #1157: yield at the op-count quantum when ≥2 tasks are runnable
             );
-            charge_slice(slice_left, *ctx.fuel);
+            charge_slice(slice_left, ctx.fuel.can_burn());
             match stop {
                 Err(trap) => {
                     // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's
@@ -14125,16 +14234,17 @@ impl CoopSched {
                                     Some(m) => Some(m.fork_private()?),
                                     None => None,
                                 };
-                                let twin_host = extra_envs[ck]
-                                    .host
-                                    .lock_unpoisoned()
-                                    .fork_powerbox(twin_pid)?;
-                                Some((ck, twin_mem, twin_host))
+                                let parent = extra_envs[ck].host.lock_unpoisoned();
+                                // #2001 — the twin is one `spawn` of the node it shares with its
+                                // parent while it lives: a full ceiling refuses the fork.
+                                let live = LiveVcpu::charge(parent.own_node())?;
+                                let twin_host = parent.fork_powerbox(twin_pid)?;
+                                Some((ck, twin_mem, twin_host, live))
                             })
                         } else {
                             None
                         };
-                        let Some((ck, twin_mem, twin_host)) = forked else {
+                        let Some((ck, twin_mem, twin_host, live)) = forked else {
                             break 'fork degrade(tasks, Some(caller_ti));
                         };
                         // The twin's continuation is the caller's — a bare root `Vm` cloned at its
@@ -14169,7 +14279,7 @@ impl CoopSched {
                             mem: twin_mem,
                             host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
                             table: twin_table,
-                            fuel: extra_envs[ck].fuel,
+                            fuel: extra_envs[ck].fuel.for_thread(),
                             fibers: FiberTables::default(),
                         });
                         let twin_ti = tasks.len();
@@ -14180,6 +14290,7 @@ impl CoopSched {
                             state: TaskState::Runnable,
                             suspended: None,
                             lease: None,
+                            live,
                         });
                         // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
                         // its exit status to the parent (FORK.md §8.6); retired when reaped.
@@ -14330,7 +14441,7 @@ impl CoopSched {
                                             built.host,
                                         )),
                                         table: built.table,
-                                        fuel: *fuel,
+                                        fuel: fuel.for_thread(),
                                         fibers: FiberTables::default(),
                                     });
                                     tasks[ti].env = Some(eidx);
@@ -14401,7 +14512,7 @@ impl CoopSched {
                         dom,
                         mem,
                         host,
-                        *fuel,
+                        fuel,
                         ti,
                         cmd,
                         plan,
@@ -14428,26 +14539,34 @@ impl CoopSched {
                         && tasks[ti].vt.chain.is_empty();
                     // The window + powerbox to duplicate: a confined child from its `extra_env`, or a
                     // **root** caller (`env: None`, e.g. `bash -c` forking) from the driver window/host.
-                    let forked: Option<(u64, Option<Mem>, Host)> = if bare {
-                        (|| match tasks[ti].env {
-                            Some(k) => {
-                                let tm = match &extra_envs[k].mem {
-                                    Some(m) => Some(m.fork_private()?),
-                                    None => None,
-                                };
-                                let th = extra_envs[k]
-                                    .host
-                                    .lock_unpoisoned()
-                                    .fork_powerbox(twin_pid)?;
-                                Some((extra_envs[k].fuel, tm, th))
-                            }
-                            None => {
-                                let tm = match mem.as_ref() {
-                                    Some(m) => Some(m.fork_private()?),
-                                    None => None,
-                                };
-                                let th = host.fork_powerbox(twin_pid)?;
-                                Some((*fuel, tm, th))
+                    // The twin shares the caller's budget node (`fork_powerbox`), so it draws from it
+                    // as a thread would (#1944 slice 3).
+                    // #2001 — the twin is one `spawn` of the node it shares with its parent while it
+                    // lives: a full ceiling refuses the fork, as the live cap does.
+                    let node = task_host(host, extra_envs, tasks[ti].env).with(|h| h.own_node());
+                    let forked: Option<(Fuel, Option<Mem>, Host, LiveVcpu)> = if bare {
+                        (|| {
+                            let live = LiveVcpu::charge(node)?;
+                            match tasks[ti].env {
+                                Some(k) => {
+                                    let tm = match &extra_envs[k].mem {
+                                        Some(m) => Some(m.fork_private()?),
+                                        None => None,
+                                    };
+                                    let th = extra_envs[k]
+                                        .host
+                                        .lock_unpoisoned()
+                                        .fork_powerbox(twin_pid)?;
+                                    Some((extra_envs[k].fuel.for_thread(), tm, th, live))
+                                }
+                                None => {
+                                    let tm = match mem.as_ref() {
+                                        Some(m) => Some(m.fork_private()?),
+                                        None => None,
+                                    };
+                                    let th = host.fork_powerbox(twin_pid)?;
+                                    Some((fuel.for_thread(), tm, th, live))
+                                }
                             }
                         })()
                     } else {
@@ -14457,7 +14576,7 @@ impl CoopSched {
                         None => {
                             tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
                         }
-                        Some((twin_fuel, twin_mem, twin_host)) => {
+                        Some((twin_fuel, twin_mem, twin_host, live)) => {
                             // #1080 pipeline rung — wire the twin's OWN park door. `fork_powerbox` mints
                             // the twin's personality with `park_req: None` (the door "lands at mint");
                             // the driver must install it, exactly as the tree-walker wires each child's
@@ -14529,6 +14648,7 @@ impl CoopSched {
                                 state: TaskState::Runnable,
                                 suspended: None,
                                 lease: None,
+                                live,
                             });
                             forked_twins.insert(twin_ti);
                             tasks[ti].vt.active.set(dst, Reg::from_i64(twin_pid as i64));
@@ -14575,6 +14695,13 @@ impl CoopSched {
                         complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                         continue;
                     }
+                    // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
+                    // ceiling refuses it as the live cap does.
+                    let node = task_host(host, extra_envs, tasks[ti].env).with(|h| h.own_node());
+                    let Some(live) = LiveVcpu::charge(node) else {
+                        complete(tasks, ti, Err(Trap::ThreadFault));
+                        continue;
+                    };
                     let mut child =
                         VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
                     child.active.module = module as usize;
@@ -14621,6 +14748,7 @@ impl CoopSched {
                         state: TaskState::Runnable,
                         suspended: None,
                         lease: None,
+                        live,
                     });
                     let handle = tasks[ti].threads.len() as i32;
                     tasks[ti].threads.push(Some(cidx));
@@ -14637,8 +14765,8 @@ impl CoopSched {
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
                     let pfuel = match tasks[ti].env {
-                        None => *fuel,
-                        Some(k) => extra_envs[k].fuel,
+                        None => fuel.can_burn(),
+                        Some(k) => extra_envs[k].fuel.can_burn(),
                     };
                     let spawner = &tasks[ti].vt.active;
                     let admitted = task_host(host, extra_envs, tasks[ti].env)
@@ -14701,12 +14829,8 @@ impl CoopSched {
                         None => mem.as_ref(),
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    let pfuel = match tasks[ti].env {
-                        None => *fuel,
-                        Some(k) => extra_envs[k].fuel,
-                    };
                     let admitted = task_host(host, extra_envs, tasks[ti].env)
-                        .with(|h| admit_detached_in_process(h, pm, pfuel, spawn));
+                        .with(|h| admit_detached_in_process(h, pm, spawn));
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
@@ -15318,7 +15442,8 @@ pub struct CoopRun {
     dom: Domain,
     mem: Option<Mem>,
     host: Host,
-    fuel: u64,
+    /// The root's fuel: drawn from the powerbox's own budget node (#1944 slice 3).
+    fuel: Fuel,
     sched: CoopSched,
 }
 
@@ -15426,7 +15551,7 @@ impl CoopRun {
         compiled: std::sync::Arc<Compiled>,
         entry: FuncIdx,
         args: &[Value],
-        mut fuel: u64,
+        fuel: u64,
         mut host: Host,
         tierup: Option<TierUpConfig>,
         init_mem: &[u8],
@@ -15444,6 +15569,8 @@ impl CoopRun {
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
             mm
         });
+        // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
+        let mut fuel = Fuel::drawn(host.begin_activation(fuel));
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         Ok(CoopRun {
             dom,
@@ -15458,7 +15585,7 @@ impl CoopRun {
         m: &Module,
         entry: FuncIdx,
         args: &[Value],
-        mut fuel: u64,
+        fuel: u64,
         mut host: Host,
         tierup: Option<TierUpConfig>,
         mut mem: Option<Mem>,
@@ -15468,6 +15595,8 @@ impl CoopRun {
             return Some(Err(Trap::Malformed));
         }
         let dom = Domain::new(c, host.jit_table_log2());
+        // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
+        let mut fuel = Fuel::drawn(host.begin_activation(fuel));
         let sched = match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)
         {
             Ok(s) => s,
@@ -15891,7 +16020,7 @@ fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
 fn coop_bounce(
     source: &ModuleSource,
     table: &SharedSlots,
-    fuel: &mut u64,
+    fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     fibers: &mut FiberCell,
@@ -16294,7 +16423,7 @@ fn drive_parallel(
     dom: Domain,
     entry: FuncIdx,
     args: &[Value],
-    fuel: u64,
+    fuel: &mut u64,
     mem: Option<Mem>,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
@@ -16302,6 +16431,9 @@ fn drive_parallel(
         Ok(v) => v,
         Err(t) => return (Err(t), mem),
     };
+    // #1944 slice 3 — an activation of `host`: every vCPU thread draws from the host's own node, and
+    // `fuel` reads back the room left once each has handed back what it did not burn.
+    let root_fuel = Fuel::drawn(host.begin_activation(*fuel));
     let reg = ThreadRegistry::new();
     // Share the caller's powerbox across every vCPU thread, then hand it back (so the caller reads its
     // stdout / final state). `Arc` (not a scope-borrowed `&Mutex`) because a personality fork twin
@@ -16323,7 +16455,7 @@ fn drive_parallel(
             None,
             root_vt,
             mem,
-            fuel,
+            root_fuel,
         )
     });
     *host = match std::sync::Arc::try_unwrap(shared) {
@@ -16331,6 +16463,7 @@ fn drive_parallel(
         // Unreachable in practice (the scope joined every holder), but never lose the powerbox.
         Err(a) => std::mem::take(&mut *a.lock().unwrap_or_else(|e| e.into_inner())),
     };
+    *fuel = host.fuel_left();
     out
 }
 
@@ -16348,8 +16481,9 @@ fn start_process<'scope, 'env>(
     tbl: Option<std::sync::Arc<SharedSlots>>,
     vt: VTask,
     mem: Option<Mem>,
-    fuel: u64,
+    fuel: Fuel,
     pid: i64,
+    live: LiveVcpu,
 ) {
     // #1246 — the process's own terminate door, so a SIGKILL/SIGTERM to it sets its `term_flag` and its
     // resume loop traps at the next op (its parent's `waitpid` then reaps the WIFSIGNALED death).
@@ -16367,6 +16501,7 @@ fn start_process<'scope, 'env>(
         for h in hooks {
             h(status);
         }
+        drop(live); // #2001: its `spawn` goes back before a reaper can see it ended
         reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         reg.publish_fork_exit(pid);
     });
@@ -16387,7 +16522,7 @@ fn run_vcpu_parallel<'scope, 'env>(
     tbl: Option<std::sync::Arc<SharedSlots>>,
     vt: VTask,
     mem: Option<Mem>,
-    fuel: u64,
+    fuel: Fuel,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
     let d = std::sync::Arc::clone(&domain);
     let out = run_vcpu_parallel_body(scope, dom, reg, host, domain, tbl, vt, mem, fuel);
@@ -16420,7 +16555,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
     mut tbl: Option<std::sync::Arc<SharedSlots>>,
     mut vt: VTask,
     mut mem: Option<Mem>,
-    mut fuel: u64,
+    mut fuel: Fuel,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
     // handle (index) → global vCPU id of a `thread.spawn` child (shares the cooperative handle scheme).
     let mut threads: Vec<Option<u64>> = Vec::new();
@@ -16546,6 +16681,12 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 if func as usize >= cm.progs.len() {
                     return (Err(Trap::Malformed), mem);
                 }
+                // #2001 — the thread is one `spawn` of its domain's node while it lives, handed back
+                // before its result is published, so its joiner can spawn in its place.
+                let node = host.lock_unpoisoned().own_node();
+                let Some(live) = LiveVcpu::charge(node) else {
+                    return (Err(Trap::ThreadFault), mem);
+                };
                 // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
                 if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
                     > super::MAX_VCPUS
@@ -16574,6 +16715,9 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 let child_host = std::sync::Arc::clone(&host);
                 let child_tbl = tbl.clone();
                 let child_domain = std::sync::Arc::clone(&domain);
+                // #1944 slice 3 — the domain's one fuel budget (INVARIANTS #6): the thread draws from
+                // the node its siblings do.
+                let child_fuel = fuel.for_thread();
                 scope.spawn(move || {
                     let (r, _m) = run_vcpu_parallel(
                         scope,
@@ -16584,8 +16728,9 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         child_tbl,
                         child_vt,
                         child_mem,
-                        fuel,
+                        child_fuel,
                     );
+                    drop(live);
                     reg.publish(id, r);
                 });
                 let handle = threads.len() as i32;
@@ -16625,7 +16770,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 if bare && !admitted {
                     reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                let forked: Option<(Option<Mem>, Host, i64)> = if admitted {
+                let forked: Option<(Option<Mem>, Host, i64, LiveVcpu)> = if admitted {
                     let twin_pid = reg
                         .next_fork_pid
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16634,8 +16779,12 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             Some(m) => Some(m.fork_private()?),
                             None => None,
                         };
-                        let th = host.lock_unpoisoned().fork_powerbox(twin_pid as u64)?;
-                        Some((tm, th, twin_pid))
+                        let parent = host.lock_unpoisoned();
+                        // #2001 — the twin is one `spawn` of the node it shares with its parent
+                        // while it lives: a full ceiling refuses the fork.
+                        let live = LiveVcpu::charge(parent.own_node())?;
+                        let th = parent.fork_powerbox(twin_pid as u64)?;
+                        Some((tm, th, twin_pid, live))
                     })();
                     if built.is_none() {
                         reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -16646,7 +16795,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 };
                 match forked {
                     None => vt.active.set(dst, Reg::from_i64(super::EAGAIN)),
-                    Some((twin_mem, twin_host, twin_pid)) => {
+                    Some((twin_mem, twin_host, twin_pid, live)) => {
                         // The twin's OWN park door (the #1112 lesson): `fork_powerbox` mints its
                         // personality with no park delegate, and without one the twin's own
                         // `fork()`/`waitpid()` cannot park (`-ENOSYS`/the ECHILD poll).
@@ -16668,7 +16817,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         // table, which a bare pre-exec caller also resolves to).
                         let twin_tbl = tbl.clone();
                         start_process(
-                            scope, dom, reg, twin_host, twin_tbl, twin_vt, twin_mem, fuel, twin_pid,
+                            scope,
+                            dom,
+                            reg,
+                            twin_host,
+                            twin_tbl,
+                            twin_vt,
+                            twin_mem,
+                            fuel.for_thread(), // the twin shares the budget node
+                            twin_pid,
+                            live,
                         );
                         vt.active.set(dst, Reg::from_i64(twin_pid));
                     }
@@ -16692,12 +16850,17 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 }
                 let admitted =
                     reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < super::MAX_VCPUS;
+                // #2001 — the process is one `spawn` of the node it shares with its spawner while
+                // it lives: a full ceiling refuses it as the live cap does.
+                let node = host.lock_unpoisoned().own_node();
                 let twin = if admitted {
-                    let pid = reg
-                        .next_fork_pid
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let twin = host.lock_unpoisoned().spawn_powerbox(pid as u64, plan);
-                    twin.map(|t| (pid, t))
+                    LiveVcpu::charge(node).and_then(|live| {
+                        let pid = reg
+                            .next_fork_pid
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let twin = host.lock_unpoisoned().spawn_powerbox(pid as u64, plan);
+                        twin.map(|t| (pid, t, live))
+                    })
                 } else {
                     None
                 };
@@ -16706,7 +16869,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         vt.active.set(dst, Reg::from_i64(super::EAGAIN));
                     }
-                    Some((pid, mut twin)) => {
+                    Some((pid, mut twin, live)) => {
                         let built = exec_image_build(
                             &mut twin,
                             mem.as_ref(),
@@ -16727,12 +16890,21 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                                 let table = Some(std::sync::Arc::new(built.table));
                                 let child_mem = Some(built.mem);
                                 start_process(
-                                    scope, dom, reg, child_host, table, built.vt, child_mem, fuel,
+                                    scope,
+                                    dom,
+                                    reg,
+                                    child_host,
+                                    table,
+                                    built.vt,
+                                    child_mem,
+                                    fuel.for_thread(), // a spawned process shares the budget node
                                     pid,
+                                    live,
                                 );
                             }
                             Err(_) => {
                                 let _ = twin.spawn_failed(super::SPAWN_EXEC_FAILED);
+                                drop(live);
                                 reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 reg.publish_fork_exit(pid);
                             }
@@ -17057,7 +17229,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     admit_confined_child(
                         &mut hg,
                         mem.as_ref(),
-                        fuel,
+                        fuel.can_burn(),
                         &dom.source,
                         &vt.active,
                         spawn,
@@ -17081,12 +17253,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // powerbox) on this driver, then `run_vcpu_parallel` over the child's `Mem` exactly as a
             // confined child, its result published to the parent's `reg` for `join`.
             Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
-                let admitted = admit_detached_in_process(
-                    &mut host.lock_unpoisoned(),
-                    mem.as_ref(),
-                    fuel,
-                    spawn,
-                );
+                let admitted =
+                    admit_detached_in_process(&mut host.lock_unpoisoned(), mem.as_ref(), spawn);
                 let child = match admitted {
                     Ok(Some(c)) => c,
                     Ok(None) => {
@@ -17158,7 +17326,7 @@ fn par_start_child<'scope, 'env>(
         // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
         // the result is published, so a joiner sees the refund.
         if let Some((parent, budget, bytes)) = lease {
-            parent.lock_unpoisoned().budget_mem_give(budget, bytes);
+            parent.lock_unpoisoned().release_detached(budget, bytes);
         }
         reg.publish(id, r);
     });
@@ -17174,6 +17342,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
         tasks[done].state = TaskState::Done(res.clone());
+        tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
         for (j, t) in tasks.iter_mut().enumerate() {
             let TaskState::BlockedJoin { child, slot, dst } = t.state else {
                 continue;
@@ -17491,7 +17660,7 @@ impl Vm {
         &mut self,
         source: &ModuleSource,
         table: &SharedSlots,
-        fuel: &mut u64,
+        fuel: &mut Fuel,
         mem: &mut Option<Mem>,
         host: &mut HostCell,
         mut budget: u64,

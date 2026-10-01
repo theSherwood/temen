@@ -1,8 +1,9 @@
-//! temen anonymous pipes: the `sys::pipe::Pipe` backing `std::process`'s child stdio. A pipe is a pair of
-//! fds over one in-personality byte FIFO (temen-posix `OP_PIPE`), read/written through the same
-//! `OP_READ`/`OP_WRITE` file ops the fs overlay uses and closed on drop (`OP_CLOSE`). The FIFO is
-//! non-blocking: reading an empty pipe returns `0` (EOF), which is exactly right for draining a spawned
-//! child's captured stdout after the (synchronous) spawn has run it to completion.
+//! temen anonymous pipes: the `sys::pipe::Pipe` backing `std::process`'s child stdio and `std::io::pipe`.
+//! A pipe is a core pipe (FORK.md §8.6) whose two ends are descriptors of this process (temen-posix
+//! `OP_PIPE_ADOPT`), read/written through the same `OP_READ`/`OP_WRITE` file ops the fs overlay uses and
+//! closed on drop (`OP_CLOSE`). A read of an empty pipe waits while a writer is left and reads `0` (EOF)
+//! once none is; a write to a full pipe waits while a reader is. A spawned child's descriptor for the
+//! pipe is an end of the same pipe, so a parent can stream into a live child and read it to EOF.
 #![deny(unsafe_op_in_unsafe_fn)]
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
@@ -13,12 +14,6 @@ pub struct Pipe {
 }
 
 impl Pipe {
-    /// Wrap an already-open personality pipe fd (from [`pipe`]). Not public API — the overlay's
-    /// `process` module builds pipes through [`pipe`] and this constructor.
-    pub(crate) fn from_fd(fd: i32) -> Pipe {
-        Pipe { fd }
-    }
-
     pub(crate) fn fd(&self) -> i32 {
         self.fd
     }
@@ -73,7 +68,7 @@ impl Pipe {
         loop {
             let n = self.read(&mut chunk)?;
             if n == 0 {
-                return Ok(total); // EOF (empty FIFO)
+                return Ok(total); // EOF: the pipe is empty and no writer is left
             }
             buf.extend_from_slice(&chunk[..n]);
             total += n;

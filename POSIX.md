@@ -139,8 +139,8 @@ only to mark the boundary.
 | 24 | `dup2(oldfd, newfd)` | `-> newfd \| -errno` | host fd table | **done** — the redirect primitive; pipe ends share the buffer, a `File` copies its description |
 | 25 | `dup(oldfd)` | `-> fd \| -errno` | host fd table | **done** — clone onto the lowest free fd |
 | 26 | `fcntl(fd, cmd, arg)` | `-> res \| -errno` | host fd table | **done** — `F_DUPFD`/`F_DUPFD_CLOEXEC` (dup ≥ arg); `F_GET/SETFD`/`F_GET/SETFL` accepted no-ops |
-| 27 | `spawn(name, nlen, argv, alen)` | `-> pid \| -errno` | embedder spawn delegate (`set_spawn`) | **done** — fork-free child; inherits fd 0/1 (drains stdin, routes stdout); `-ENOSYS` unwired. `posix_spawn(p)` bind here |
-| 28 | `waitpid(pid, status, opts)` | `-> pid \| -errno` | host process table | **done (#863/#799)** — reaps `pid` (or `-1` = any) from the one process table: spawn children **and exited fork twins** (their exit hook parks them as zombies); wait-encoded status (`WEXITSTATUS` bits 8–15); `WUNTRACED`/`WCONTINUED` report fresh stops/continues (`sig<<8\|0x7f` / `0xffff`, once each — #798). **BLOCKS** (#799): a specific-pid wait on a Live core-task twin without `WNOHANG`/`WUNTRACED`/`WCONTINUED` benches the caller through the park door (`SignalSource::set_park_request` → `ParkEvent::TaskExit`), woken at the twin's exit — EINTR/`SA_RESTART`-composed like every blocking call; `WNOHANG` (new) is the explicit poll; every other case (pid `-1`, `-pgid`, spawn clones, stop/continue reports, non-parking routes/tiers) keeps the `-ECHILD` poll; **`-pgid` group waits** (#799): reap by the zombie-retained pgid, stop/continue reports filter by the live pgid (non-blocking, like `-1`) |
+| 27 | — | — | — | **retired (#1969)** — was `spawn`, which ran a child to completion inside the call through an embedder delegate (`set_spawn`). `pspawn` (62) replaced it; the number stays reserved and serves nothing |
+| 28 | `waitpid(pid, status, opts)` | `-> pid \| -errno` | host process table | **done (#863/#799)** — reaps `pid` (or `-1` = any) from the one process table: **exited fork twins and spawned processes** (their exit hook parks them as zombies); wait-encoded status (`WEXITSTATUS` bits 8–15); `WUNTRACED`/`WCONTINUED` report fresh stops/continues (`sig<<8\|0x7f` / `0xffff`, once each — #798). **BLOCKS** (#799): a specific-pid wait on a Live core-task twin without `WNOHANG`/`WUNTRACED`/`WCONTINUED` benches the caller through the park door (`SignalSource::set_park_request` → `ParkEvent::TaskExit`), woken at the twin's exit — EINTR/`SA_RESTART`-composed like every blocking call; `WNOHANG` (new) is the explicit poll; every other case (pid `-1`, `-pgid`, spawn clones, stop/continue reports, non-parking routes/tiers) keeps the `-ECHILD` poll; **`-pgid` group waits** (#799): reap by the zombie-retained pgid, stop/continue reports filter by the live pgid (non-blocking, like `-1`) |
 | 29 | `wait(status)` | `-> pid \| -errno` | host child table | **done** — `waitpid(-1, status, 0)` |
 | 30 | `signal(signum, handler)` | `-> prev \| -errno` | host signal state | **done (L0)** — records disposition (`SIG_DFL`/`SIG_IGN`/handler ptr); returns previous; `SIGKILL`/`SIGSTOP` immutable (`-EINVAL`, #796); a reset to `SIG_DFL` runs a pending signal's default action |
 | 31 | `kill(pid, sig)` | `-> 0 \| -errno` | host process table | **done (#863/#798)** — pid-targeted: `0`/own pid = self (`raise`), a table pid = THAT process's pending set (+ its run woken when deliverable), `-pgid` = the **group sweep**; zombies exist-until-reaped; `-ESRCH` unknown. (`kill(0,s)` = raise-to-self, a deliberate POSIX divergence every pre-table guest relies on) |
@@ -155,7 +155,7 @@ only to mark the boundary.
 | 40 | `sigprocmask(how, set, oldset)` | `-> 0 \| -errno` | host signal state | **done (#796)** — the blocked set (`SIG_BLOCK`/`UNBLOCK`/`SETMASK`); a pending **blocked** signal is held by `sigcheck`, not delivered, until unblocked. `sigset_t` = a `u64` bitset; `SIGKILL`/`SIGSTOP` unblockable |
 | 41 | `sigaction(signum, act, oldact)` | `-> 0 \| -errno` | host signal state | **done (#796)** — the richer `signal`: records the disposition (delivered by the doorbell) + `sa_mask`/`sa_flags`, round-tripped through `oldact`. `struct sigaction` = `{sa_handler:i64, sa_mask:u64, sa_flags:i64}` |
 | 42 | `sigaltstack(sp, size)` | `-> 0` | host signal state | **done (#796 L2)** — register the dedicated **signal-handler stack** an async handler runs on (the interp can't reuse the interrupted frame's stack). `sp == 0` ⇒ async off (poll-only). Enables L2 delivery |
-| 43 | `spawn2(req_ptr)` | `-> pid \| -errno` | embedder spawn delegate | **done (#848)** — per-spawn fd-actions (44-byte request: target + stdin/stdout/stderr fds, `-1` = inherit); parallel-safe capture — never mutates the shared fd 0/1/2 |
+| 43 | — | — | — | **retired (#1969)** — was `spawn2`, `spawn` with per-child stdio fds (#848). Reserved like 27 |
 | 44 | `getpid()` | `-> pid` | host process table | **done (#863)** — `1` root, the `TaskId` a `fork()` returned for a twin, an allocated pid for a re-grant clone; one space with `kill`/`waitpid` |
 | 45 | `setpgid(pid, pgid)` | `-> 0 \| -errno` | host process table | **done (#798)** — `0` = self / own-id; table-routed; a `fork` twin **inherits** its parent's group |
 | 46 | `getpgid(pid)` | `-> pgid \| -errno` | host process table | **done (#798)** |
@@ -194,16 +194,14 @@ embedder:
   served in-personality — private per-instance byte FIFOs (the `pipe` machinery), ephemeral
   `:0` assignment, deterministic, playground-safe. No external authority exists here, so it
   needs no grant beyond the `net` cap itself.
-- **Beyond loopback = the embedder's `NetDelegate`** (`Posix::set_net`, the `set_spawn`
-  analog): `connect`/`resolve` route to it — a real socket, a scripted table, an allowlisting
-  proxy. **No delegate ⇒ fail closed** (`-ECONNREFUSED`/`-ENOENT`), exactly like spawn's
-  `-ENOSYS`. Non-loopback `bind` (a delegate-granted real listener) is the noted follow-up —
+- **Beyond loopback = the embedder's `NetDelegate`** (`Posix::set_net`): `connect`/`resolve`
+  route to it — a real socket, a scripted table, an allowlisting proxy. **No delegate ⇒ fail
+  closed** (`-ECONNREFUSED`/`-ENOENT`). Non-loopback `bind` (a delegate-granted real listener) is the noted follow-up —
   the *op* carries the request today; the delegate hook is what lands later.
 
 Blocking: a memnet `read`/`accept` on empty returns `-EAGAIN` (a single cooperative guest
 blocking on itself would deadlock; lockstep guests never see it, `set_nonblocking` programs
-get `WouldBlock`). A delegate-backed `recv` may block **host-side** inside the call, like a
-spawn running its child. A socket address travels as a tiny blob — `[family u8 (4|6),
+get `WouldBlock`). A delegate-backed `recv` may block **host-side** inside the call. A socket address travels as a tiny blob — `[family u8 (4|6),
 port u16 LE, addr 4|16 bytes]` — sized for the 4-arg call ABI.
 
 Ops on the `net` handle (own numbering; `-errno` on failure):

@@ -76,7 +76,7 @@ fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     host.set_durable(true);
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let modh = host.grant_durable_module(child);
-    let budget = host.grant_budget(0, 1 << 20, 0);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
     host.grant_freeze_authority(FreezeScope::DetachedProgeny);
     (host, vec![inst as i64, modh as i64, budget as i64])
 }

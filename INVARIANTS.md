@@ -76,7 +76,27 @@ reaped), its window's bytes return to every level charged for it, so a parent ca
 spawn again within one window's worth. A child frozen with its parent stays charged (the artifact
 carries the charge), and its relaunch after the thaw hands the window back when it ends (#1971). A
 spawn refused after its admission charges nothing (#1975). The bytecode drivers still return a child's
-*lane* at admission — a tracked gap (#1600), not a second rule.
+*lane* at admission — a tracked gap (#1600), not a second rule. *Fuel (2026-09-30, #1944 slice 3):*
+fuel is charged up the chain like the window: a domain's vCPUs draw it in chunks from the node that
+pays for the domain (the run's root node, or the budget named in a detached spawn), each draw charged
+to every level, and a vCPU that ends or freezes refunds the unburned rest of its chunk. So no subtree
+burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
+one on op 15 or a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
+(`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
+budgets below it, since what is left of it differs by engine (their default limits differ, and each
+draws on its own schedule). The carve ops (0/5/13, v0 records) keep a fixed
+allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
+ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
+vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
+with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
+process) is one `spawn` of the domain's node from when it is made until it ends, refused past a ceiling
+as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posix_spawn` return
+`-EAGAIN`) (#2001). A thaw re-charges the threads it re-creates. On the resumable `Vcpu` engine a
+thread's charge goes back at its join, where that engine learns it ended. A run's root is its
+embedder's and is charged to nothing, and the Cranelift JIT charges nothing to the run's own node,
+which no guest reads. A pipe's worst-case FIFO is charged to the
+`channel` of the node of the domain that minted it, and every ancestor, until its last end closes. An
+exec keeps its domain's node, so a child cannot exec its way out of its budget.
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,
@@ -120,7 +140,8 @@ ISSUES.md I41 — retired, resolve via `git log`.)
 
 ## 6. One world per domain
 
-A domain's handlers, threads, and fibers share one window, one powerbox, one fuel budget.
+A domain's handlers, threads, and fibers share one window, one powerbox, one fuel budget (its
+threads draw from the domain's budget node; #1944 slice 3).
 A handler trap is terminal for the domain — never resume over half-mutated state. Safety is
 serial-by-default with explicit opt-in ladders (multi-consumer serving, threading) whose
 cost — the threading discipline — is the guest's stated choice. *Violated by:* partial-state

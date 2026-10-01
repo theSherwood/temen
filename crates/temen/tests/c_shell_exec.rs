@@ -108,7 +108,7 @@ int main(int argc, char **argv){
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = (int)out;
-  long child = vm_spawn(mod, 0, 17, 0, g, 1, ab, p - ab, scratch);
+  long child = vm_spawn(mod, 0, 17, g, 1, ab, p - ab, scratch);
   return (int)vm_join(child);
 }
 "#;
@@ -142,9 +142,9 @@ int main(int argc, char **argv){
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = (int)out;
-  long a = vm_spawn(mod, 0, 17, 0, g, 1, 0, 0, scratch);
+  long a = vm_spawn(mod, 0, 17, g, 1, 0, 0, scratch);
   long ra = vm_join(a);
-  long b = vm_spawn(mod, 0, 17, 0, g, 0, 0, 0, scratch);
+  long b = vm_spawn(mod, 0, 17, g, 0, 0, 0, scratch);
   long rb = vm_join(b);
   return (int)(ra * 10 + rb);
 }
@@ -213,7 +213,7 @@ fn run(
     let out_h = host.grant_stream(StreamRole::Out);
     let _inst_h = host.grant_instantiator(0, win as u64);
     // The `Budget` each child's detached window spends (`vm_spawn` finds it by reflection).
-    let _budget_h = host.grant_budget(0, 1 << 20, 0);
+    let _budget_h = host.grant_budget(-1, 1 << 20, -1);
     let echo_h = host.grant_module(cmd);
     let _exec_h = host.grant_host_proc(exec_host(out_h, echo_h), temen_interp::CapState::Stateless);
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
