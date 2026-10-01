@@ -19677,9 +19677,9 @@ pub enum FreezeScope {
     /// granting itself authority there documents a fact. A detached child's window is *not* readable
     /// by its parent — that is what detached means — so authority over one is a real new power, and a
     /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
-    /// from above (the embedder, or an ancestor re-granting downward) or not at all, which holds by
-    /// construction: no guest-reachable op mints a capability, and the §14 spawn path mints only the
-    /// [`Carve`](FreezeScope::Carve) form.
+    /// from above (the embedder, or an ancestor re-granting downward through a spawn's named grants,
+    /// #2018) or not at all, which holds by construction: no guest-reachable op mints a capability,
+    /// and the §14 spawn path mints only the [`Carve`](FreezeScope::Carve) form.
     DetachedProgeny,
 }
 
@@ -28740,6 +28740,17 @@ impl Host {
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
             || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
+            || self.progeny_authority(handle).is_some()
+    }
+
+    /// #2018 — the freeze authority over **detached progeny** `handle` names, the one form a spawn
+    /// re-grants ([`Self::regrant_into_child`]). Never the [`FreezeScope::Carve`] form: that names a
+    /// range of this domain's window, which is no range of the child's.
+    fn progeny_authority(&self, handle: i32) -> Option<FreezeScope> {
+        match self.resolve(handle, cap_id::FREEZE_AUTHORITY) {
+            Ok(Binding::FreezeAuthority(s @ FreezeScope::DetachedProgeny)) => Some(s),
+            _ => None,
+        }
     }
 
     /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
@@ -28891,6 +28902,13 @@ impl Host {
             let cid = child.modules.len() as u32;
             child.modules.push(g);
             return Some(child.grant(cap_id::MODULE, Binding::Module(cid)));
+        }
+        // #2018 — **freeze authority over detached progeny** (#1440), handed down the grant graph:
+        // the one way INVARIANTS' R1 ruling lets an ancestor's authority reach a descendant ("only by
+        // grant"). A copy, so the parent keeps its own. A durable child holding it may spawn detached
+        // children of its own, which a freeze of the tree then captures (`admit_detached_spawn`).
+        if let Some(scope) = self.progeny_authority(handle) {
+            return child.try_grant_freeze_authority(scope);
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         // §7c stdin inheritance (#1720): alias the stdin THIS handle reads — its own carried cell if it
