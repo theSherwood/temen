@@ -249,16 +249,34 @@ impl ChildTask {
         self.dom.as_ref().is_some_and(|d| d.live_threads() > 0)
     }
 
-    /// #1937 — whether a teardown that finds this task parked wakes it rather than poisoning it: a
-    /// durable child parked in a futex wait whose own freeze word a freeze has rung. That wait ends
-    /// on the word when re-checked, so the child unwinds and rides the artifact; a poisoned one would
-    /// end in a trap and leave no image. Any other park may never come back, so it is poisoned.
-    fn unwinds_when_woken(&self) -> bool {
-        self.done.durable.is_some()
-            && self.slot.took_futex_park()
+    /// #1937, #2010 — what a run's teardown does with this task, found parked. A durable child whose
+    /// own freeze word a freeze has rung unwinds and rides the artifact; poisoned, it would end in a
+    /// trap and leave no image.
+    fn at_teardown(&self) -> AtTeardown {
+        let rung = self.done.durable.is_some()
             // SAFETY: the task's window is live while the task is; its first page holds the word.
-            && unsafe { fiber_rt::window_is_unwinding(self.window.base() as u64) }
+            && unsafe { fiber_rt::window_is_unwinding(self.window.base() as u64) };
+        match self.slot.parked_on() {
+            // Its futex wait ends on that word when re-checked.
+            fiber_rt::ParkOn::Futex(_) if rung => AtTeardown::Wake,
+            // Its join waits on a child the same freeze rang (`Nursery::ring_detached`), whose end
+            // re-offers it. Woken any sooner, it would only park again.
+            fiber_rt::ParkOn::Child if rung => AtTeardown::Wait,
+            // Any other park may never come back.
+            _ => AtTeardown::Poison,
+        }
     }
+}
+
+/// What a run's teardown does with a parked task ([`ChildTask::at_teardown`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtTeardown {
+    /// Poison its cell, so its park returns and its trailing guard unwinds it.
+    Poison,
+    /// Wake it: its park ends on its own freeze word.
+    Wake,
+    /// Leave it parked until the event it waits for.
+    Wait,
 }
 
 /// In/out cell for the `Entry`-shaped [`resume_shim`]: the fiber to resume, and what it did.
@@ -623,16 +641,21 @@ impl ChildExec {
                     if shutdown {
                         // Teardown: a park now would wait for a wake that can never come. Poison the
                         // task's cell so its wait returns and the trailing guard unwinds it — unless
-                        // it parked after a freeze rang it, when the re-check below ends its wait.
+                        // it parked after a freeze rang it, when its re-check ends its wait, or it
+                        // waits on a child that freeze rang (`at_teardown`).
                         let t = task.as_ref().expect("held");
-                        if !t.unwinds_when_woken() {
-                            t.vm.trap
-                                .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
-                            if let Some(d) = &t.dom {
-                                d.wake_own_parked(); // its vCPUs share the cell
+                        match t.at_teardown() {
+                            AtTeardown::Poison => {
+                                t.vm.trap
+                                    .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                                if let Some(d) = &t.dom {
+                                    d.wake_own_parked(); // its vCPUs share the cell
+                                }
+                                e.woken = true;
                             }
+                            AtTeardown::Wake => e.woken = true,
+                            AtTeardown::Wait => {}
                         }
-                        e.woken = true;
                     }
                     e.task = task.take();
                     if e.woken {
@@ -877,17 +900,21 @@ impl ChildExec {
     /// it, running or not yet started, as the oracle ends them. Their cell gets the completion
     /// sentinel, which their entry and back-edge polls observe (`emit_domain_poll`). A
     /// freeze skips this, so a child the freeze reaches still unwinds under its own freeze word.
-    /// For the same reason a **durable** child waiting under a word the freeze rang
-    /// (`Nursery::ring_detached`) is only woken, here or when it parks later, and unwinds and rides,
-    /// where a poisoned one would end in a trap and leave no image (#1937,
-    /// [`ChildTask::unwinds_when_woken`]).
+    /// For the same reason a **durable** child under a word the freeze rang
+    /// (`Nursery::ring_detached`) is never poisoned, here or when it parks later, and unwinds and
+    /// rides, where a poisoned one would end in a trap and leave no image: its futex wait is woken
+    /// (#1937), and its join is left for the joined child's end to re-offer (#2010,
+    /// [`ChildTask::at_teardown`]).
     pub(crate) fn shutdown_and_join(self: &Arc<Self>, end_domain: bool) {
         let workers = {
             let mut g = lock(&self.state);
             g.shutdown = true;
             for e in g.tasks.values_mut() {
-                let unwinds = e.task.as_ref().is_some_and(|t| t.unwinds_when_woken());
-                let poisoned = if e.parked && !unwinds {
+                let spared = e
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| t.at_teardown() != AtTeardown::Poison);
+                let poisoned = if e.parked && !spared {
                     if let Some(t) = &e.task {
                         t.vm.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);

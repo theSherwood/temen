@@ -854,6 +854,10 @@ pub(crate) struct HostCursor {
     pub(crate) cap_consumed: usize,
     pub(crate) cap_record_len: usize,
     pub(crate) mem_mapped_bytes: u64,
+    /// The `Jit` tables' [`compile_mark`](Host::jit_compile_mark) — not restored but compared: a
+    /// `compile` adds a unit and a `JitCode` handle, which a cursor cannot take back, so an undo across
+    /// one declines (#2015).
+    pub(crate) jit_mark: (usize, u64),
 }
 
 /// The run-mutable host substate a time-travel checkpoint restores — see [`Host::replay_substate`].
@@ -893,6 +897,11 @@ struct HostReplaySubstate {
     /// the artifact cannot drift apart. `None` for a capability that isn't [`CapState::Captured`] —
     /// the common case (`display` is pure output).
     cap_states: Vec<Option<Vec<u8>>>,
+    /// Each granted `Jit` table's remaining compile quota, `(units, blob bytes)`, positional over
+    /// `jit_tables` (#2015). A checkpoint is only taken while no table holds a unit
+    /// ([`Host::checkpoint_safe`]), so the quota is all that can differ from the fresh grant a restore
+    /// lands in: a rejected `compile` still charges its bytes.
+    jit_quota: Vec<(u32, u64)>,
 }
 
 /// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
@@ -995,6 +1004,21 @@ pub enum VarValue {
     Value(Value),
     Bytes(Vec<u8>),
 }
+
+/// #1366 / #1953 — a call parked on a **declared host-completed cap**
+/// ([`Host::grant_declared_host_caps`]): its completion id, the cap's name, and the guest's flat
+/// call arguments (the guest's own op rides in `args[0]` by convention, like `vm_fs`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapRequest {
+    pub id: u64,
+    pub name: String,
+    pub args: Vec<i64>,
+}
+
+/// The calls parked on one session's declared host-completed caps, keyed by completion id: filled by
+/// the procs' submit hooks, read and cleared by the embedder. Shared (`Arc`) so a rebuilt run's procs
+/// file into the same map.
+pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
 
 /// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
 /// guest passed and the result slots the host returned, for a **nondeterministic input** capability
@@ -1488,7 +1512,7 @@ impl Inspector {
                 .continuation()
                 .as_shadow_stack()
                 .expect("a single-threaded seek ladder holds only ShadowStack moments");
-            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem(), clock);
+            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem().as_deref(), clock);
             cp.restore_host(&mut host.lock_unpoisoned());
         }
         self.host = host;
@@ -19677,9 +19701,9 @@ pub enum FreezeScope {
     /// granting itself authority there documents a fact. A detached child's window is *not* readable
     /// by its parent — that is what detached means — so authority over one is a real new power, and a
     /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
-    /// from above (the embedder, or an ancestor re-granting downward) or not at all, which holds by
-    /// construction: no guest-reachable op mints a capability, and the §14 spawn path mints only the
-    /// [`Carve`](FreezeScope::Carve) form.
+    /// from above (the embedder, or an ancestor re-granting downward through a spawn's named grants,
+    /// #2018) or not at all, which holds by construction: no guest-reachable op mints a capability,
+    /// and the §14 spawn path mints only the [`Carve`](FreezeScope::Carve) form.
     DetachedProgeny,
 }
 
@@ -24607,6 +24631,12 @@ impl Host {
     /// captured in the run snapshot. (The DAP backend grants no modules, so this only affects a direct
     /// embedder driving `snapshot`/`restore` itself, which rebuilds its own powerbox.)
     ///
+    /// **A `Jit` table without units is admitted (#2015).** The grant creates the table, so refusing
+    /// any table refused every guest that imports `Jit`, compiled or not. A unit is what the restore
+    /// cannot rebuild — its `JitCode` handle and any install. Until the first one, a rebuilt run's
+    /// fresh grant matches the table except for the compile quota a rejected `compile` still charges,
+    /// and the replay substate carries that.
+    ///
     /// **Named host capabilities are admitted (#1455).** A host-fn used to disqualify the whole run,
     /// which self-disabled the ladder for *every* interesting guest — a debugged C program that does
     /// file I/O holds `vm_fs`; a playground reactor holds `display`/`keyboard`/`fs` — leaving them on
@@ -24625,7 +24655,10 @@ impl Host {
         self.regions.is_empty()
             && self.blockings.is_empty()
             && self.every_host_proc_reconstructible()
-            && self.jit_tables.is_empty()
+            // #2015: a unit is a `JitCode` handle and an install the restore cannot rebuild, but a
+            // table that holds none matches the fresh grant a restore lands in, up to the quota the
+            // replay substate carries.
+            && self.jit_tables.iter().all(|d| d.units.is_empty())
     }
 
     /// The **undo journal's** compact host cursor (#1557): the few scalars and append-only lengths
@@ -24648,7 +24681,16 @@ impl Host {
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
             mem_mapped_bytes: self.mem_mapped_bytes,
+            jit_mark: self.jit_compile_mark(),
         }
+    }
+
+    /// Every `Jit` table's units, counted, and remaining blob bytes, summed: it moves with every
+    /// `compile` attempt, a rejected one included (its bytes are charged).
+    pub(crate) fn jit_compile_mark(&self) -> (usize, u64) {
+        self.jit_tables
+            .iter()
+            .fold((0, 0), |(u, b), d| (u + d.units.len(), b + d.bytes_left))
     }
 
     /// Put back a [`journal_cursor`](Host::journal_cursor): truncate the append-only buffers to the
@@ -24737,6 +24779,11 @@ impl Host {
             svc_next_ticket,
             cap_states: self.capture_cap_states(),
             mem_mapped_bytes: self.mem_mapped_bytes,
+            jit_quota: self
+                .jit_tables
+                .iter()
+                .map(|d| (d.units_left, d.bytes_left))
+                .collect(),
         }
     }
 
@@ -24769,6 +24816,15 @@ impl Host {
         // capability (see `cap_dispatch_slots_impl`), so from here its state follows the replay
         // forward, and a store rewound to the checkpoint shows the files the guest had written by then.
         self.restore_cap_states(&s.cap_states);
+        for (d, &(units, bytes)) in self.jit_tables.iter_mut().zip(&s.jit_quota) {
+            d.units_left = units;
+            d.bytes_left = bytes;
+        }
+    }
+
+    /// Whether this domain holds a `Jit` table at all, unit or none.
+    pub(crate) fn has_jit_table(&self) -> bool {
+        !self.jit_tables.is_empty()
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -26533,6 +26589,47 @@ impl Host {
             vtable: None,
             state,
         })
+    }
+
+    /// #1366 / #1953 — grant the embedder's **declared host-completed caps**: for each of `names`
+    /// (in order) that `imports` imports, an offloadable proc that always punts to the embedder
+    /// ([`OffloadOutcome::Host`]). The guest's flat `call.sym "<name>"` (its own op in `args[0]`)
+    /// parks the run; the proc's submit hook files the call in `requests` under its completion id,
+    /// and the embedder answers it with the driver's `deliver_cap`. Each is registered under its
+    /// name. Returns the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. Nothing here
+    /// is embedder-specific: temen never learns what a name means. The one grant every session
+    /// that serves declared caps uses (the DAP debug session, the browser release session).
+    pub fn grant_declared_host_caps(
+        &mut self,
+        imports: &[temen_ir::Import],
+        names: &[String],
+        requests: &CapRequests,
+    ) -> Vec<(String, i32)> {
+        let mut declared = Vec::new();
+        for name in names {
+            if !imports.iter().any(|im| &im.name == name) {
+                continue;
+            }
+            let requests = Arc::clone(requests);
+            let cap = name.clone();
+            let h = self.grant_host_proc_offloadable(
+                Box::new(move |_op: u32, args: &[i64]| {
+                    let requests = Arc::clone(&requests);
+                    let name = cap.clone();
+                    let args = args.to_vec();
+                    OffloadOutcome::Host(Box::new(move |id| {
+                        requests
+                            .lock_unpoisoned()
+                            .insert(id, CapRequest { id, name, args });
+                    }))
+                }),
+                // Each call is answered afresh by the embedder; nothing is held between calls.
+                CapState::Stateless,
+            );
+            self.register_cap_name(name, h);
+            declared.push((name.clone(), h));
+        }
+        declared
     }
 
     /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
@@ -28743,6 +28840,17 @@ impl Host {
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
             || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
+            || self.progeny_authority(handle).is_some()
+    }
+
+    /// #2018 — the freeze authority over **detached progeny** `handle` names, the one form a spawn
+    /// re-grants ([`Self::regrant_into_child`]). Never the [`FreezeScope::Carve`] form: that names a
+    /// range of this domain's window, which is no range of the child's.
+    fn progeny_authority(&self, handle: i32) -> Option<FreezeScope> {
+        match self.resolve(handle, cap_id::FREEZE_AUTHORITY) {
+            Ok(Binding::FreezeAuthority(s @ FreezeScope::DetachedProgeny)) => Some(s),
+            _ => None,
+        }
     }
 
     /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
@@ -28894,6 +29002,13 @@ impl Host {
             let cid = child.modules.len() as u32;
             child.modules.push(g);
             return Some(child.grant(cap_id::MODULE, Binding::Module(cid)));
+        }
+        // #2018 — **freeze authority over detached progeny** (#1440), handed down the grant graph:
+        // the one way INVARIANTS' R1 ruling lets an ancestor's authority reach a descendant ("only by
+        // grant"). A copy, so the parent keeps its own. A durable child holding it may spawn detached
+        // children of its own, which a freeze of the tree then captures (`admit_detached_spawn`).
+        if let Some(scope) = self.progeny_authority(handle) {
+            return child.try_grant_freeze_authority(scope);
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         // §7c stdin inheritance (#1720): alias the stdin THIS handle reads — its own carried cell if it

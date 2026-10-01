@@ -82,7 +82,21 @@ pub fn nif_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
 /// Parse a NIF document into a single root node. A document is a sequence of top-level forms;
 /// leading `(.nif…)`/`(.indexat…)` directives are dropped and the **last** non-directive form (the
 /// `(stmts …)` module) is returned. (Leng modules are a single `stmts`; a bare sequence is wrapped.)
+///
+/// hexer's dead-code analysis, `(dce (roots …) (uses …) (offers …))`, is dropped too: hexer writes
+/// it as the first statement of a module's `.x.nif` for nimony's own DCE pass (`dce1.nim`), and it
+/// is not code. Dropping it here keeps every pass from having to skip it.
 pub fn parse(src: &str) -> Result<Node, String> {
+    let mut root = parse_document(src)?;
+    if let Node::List(items) = &mut root {
+        if items.first().and_then(Node::as_atom) == Some("stmts") {
+            items.retain(|n| n.tag() != Some("dce"));
+        }
+    }
+    Ok(root)
+}
+
+fn parse_document(src: &str) -> Result<Node, String> {
     let mut p = Parser {
         b: src.as_bytes(),
         i: 0,

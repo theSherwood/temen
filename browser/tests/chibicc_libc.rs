@@ -70,7 +70,7 @@ fn a_release_run_pumps_in_slices() {
         // SAFETY: `temen_alloc` returned a live allocation of that length.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
         assert_eq!(
-            temen_release_open(p, bytes.len(), core::ptr::null(), 0),
+            temen_release_open(p, bytes.len(), core::ptr::null(), 0, core::ptr::null(), 0),
             STATUS_OK
         );
     };

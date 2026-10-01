@@ -33,20 +33,10 @@ use temen_interp::{
 };
 use temen_ir::{FuncIdx, Module};
 
-/// #1366 slice (c) — a **declared host-completed cap** the launch named (`hostCaps`) is parked on:
-/// the completion id the run parked with, the cap's name, and the guest's call arguments (a flat
-/// `call.sym "<name>"` — the guest's op rides in `args[0]` by convention, like `vm_fs`). Filled by
-/// the proc's submit hook, read back by the DAP `stopped` event, cleared by `provideCap`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CapRequest {
-    pub id: u64,
-    pub name: String,
-    pub args: Vec<i64>,
-}
-
-/// The parked-request cell one session's declared procs share with its backend (`Arc` so a rebuilt
-/// run's procs write the same cell).
-pub type SharedCapRequest = std::sync::Arc<std::sync::Mutex<Option<CapRequest>>>;
+/// #1366 slice (c) — the calls parked on a session's **declared host-completed caps** (`hostCaps`),
+/// keyed by completion id: filled by the procs' submit hooks, read by the DAP `stopped` event, cleared
+/// by `provideCap`. One map per session, shared by every rebuilt run's procs.
+pub type SharedCapRequest = temen_interp::CapRequests;
 
 /// Grant the **on-ramp I/O powerbox** on `host` for module `m`: the §3e prefix (stdout/stdin/exit/
 /// memory/addrspace), each registered under its `self.resolve` name, plus the module's manifest
@@ -89,29 +79,7 @@ fn grant_io_powerbox(
     // it. Granted in launch order on every rebuild, so a reverse `seek`'s replay finds the same
     // handles the tape recorded. Nothing here is graphics- or embedder-specific: temen never
     // learns what a name means.
-    let mut declared: Vec<(String, i32)> = Vec::new();
-    for name in host_caps {
-        if !m.imports.iter().any(|im| &im.name == name) {
-            continue;
-        }
-        let cell = std::sync::Arc::clone(parked);
-        let cap_name = name.clone();
-        let h = host.grant_host_proc_offloadable(
-            Box::new(move |_op: u32, args: &[i64]| {
-                let cell = std::sync::Arc::clone(&cell);
-                let name = cap_name.clone();
-                let args = args.to_vec();
-                temen_interp::OffloadOutcome::Host(Box::new(move |id| {
-                    *cell.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(CapRequest { id, name, args });
-                }))
-            }),
-            // Each call is answered afresh by the debugger's user; nothing is held between calls.
-            temen_interp::CapState::Stateless,
-        );
-        host.register_cap_name(name, h);
-        declared.push((name.clone(), h));
-    }
+    let declared = host.grant_declared_host_caps(&m.imports, host_caps, parked);
     // #1528 — the §14 **by-name spawn set**, the same frontier the two reference powerboxes present
     // (`temen-run`'s `grant_powerbox_prefix` caller and the browser's `grant_onramp_caps`): an
     // `Instantiator` over the guest's own window under `"instantiator"`, and — only for a guest that
@@ -1566,16 +1534,17 @@ impl Debuggee for BytecodeBackend {
     fn provide_cap(&mut self, id: u64, value: i64) -> bool {
         let ok = self.run.deliver_cap(id, value);
         if ok {
-            *self.parked_cap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.parked_cap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
         }
         ok
     }
     fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
         let parked = self.run.cap_parked()?;
         let g = self.parked_cap.lock().unwrap_or_else(|e| e.into_inner());
-        g.as_ref()
-            .filter(|r| r.id == parked)
-            .map(|r| (r.name.clone(), r.args.clone()))
+        g.get(&parked).map(|r| (r.name.clone(), r.args.clone()))
     }
     /// The guest's captured stdout at the current stop (the on-ramp powerbox's `write` output). On a
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the

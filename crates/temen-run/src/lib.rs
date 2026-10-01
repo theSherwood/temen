@@ -1921,18 +1921,15 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
 /// #1361 step 4 — the captured detached children a restore seeded, as JIT re-launch seeds: each child's
 /// program resolved and its powerbox prepared by the same [`Host::prepare_detached_relaunch`] the
 /// interpreter's thaw uses, then built into a shared child powerbox exactly as a spawn builds one
-/// ([`finish_child_build`]). A child whose program the host no longer grants refuses the thaw whole,
-/// leaving the residue in place.
+/// ([`finish_child_build`]). A child the JIT cannot re-launch, at any depth, refuses the thaw whole
+/// ([`jit_relaunches`]), leaving the residue in place. #2010 — each seed carries its own captured
+/// children, taken from its own powerbox.
 fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen_jit::JitError> {
     // Checked before anything is taken, so the refusal leaves the residue on the Host (as the other
     // refusals in `jit_durable_enter` do) for a thaw that re-grants the program.
-    if host
-        .thawed_detached()
-        .iter()
-        .any(|td| host.durable_module_by_digest(&td.launch.digest).is_none())
-    {
+    if !jit_relaunches(host) {
         return Err(temen_jit::JitError::Unsupported(
-            "durable JIT thaw: a detached child's program is not granted",
+            "durable JIT thaw: a detached child the JIT cannot re-launch",
         ));
     }
     let mut out = Vec::new();
@@ -1959,6 +1956,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
         }
         // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
         let window_lease = host.relaunch_lease(&r.host, r.memory_log2);
+        let children = detached_seeds(&mut r.host)?;
         let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
         let mut trap = 0i64;
         // SAFETY: `gc`/`trap` are live out-cells for the call.
@@ -1984,21 +1982,65 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
             child: unsafe { gc.assume_init() },
             window: window_lease,
+            children,
         });
     }
     Ok(out)
+}
+
+/// #2010 — whether the JIT can re-launch every detached child a restore seeded on `host`, at every
+/// depth: its program is granted, and its own powerbox holds no residue but its captured children.
+/// Fibers, threads, nested and completed children, and child state the JIT re-creates only for a
+/// run's root (`jit_durable_enter`), so a child carrying any of them refuses rather than drops it.
+fn jit_relaunches(host: &Host) -> bool {
+    host.thawed_detached().iter().all(|td| {
+        let c = &td.host;
+        host.durable_module_by_digest(&td.launch.digest).is_some()
+            && c.frozen_fibers().is_empty()
+            && c.frozen_vcpus().is_empty()
+            && c.frozen_nested().is_empty()
+            && c.frozen_detached().is_empty()
+            && c.frozen_child_state().is_empty()
+            && jit_relaunches(c)
+    })
 }
 
 /// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the
 /// interpreter's harvest leaves them: an unwound child as a [`temen_interp::CapturedDetached`] (its
 /// window, its powerbox, its launch record), one that completed before the cut as a
 /// [`temen_interp::FrozenDetached`] result, and one that never reached its poll (or trapped) as
-/// unreached — which the codec refuses whole rather than emit part of the tree.
+/// unreached — which the codec refuses whole rather than emit part of the tree. #2010 — a captured
+/// child's own children land on its powerbox the same way, and every unreached one in the tree on
+/// the root's, as the oracle's recursive harvest leaves them.
 fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
+    let mut unreached = Vec::new();
+    let (captured, completed) = detached_left(cm.take_detached_harvest(), host, &mut unreached);
+    if !captured.is_empty() {
+        host.set_captured_detached(captured);
+    }
+    if !completed.is_empty() {
+        host.set_frozen_detached(completed);
+    }
+    if !unreached.is_empty() {
+        host.set_unreached_detached(unreached);
+    }
+}
+
+/// [`jit_detached_leave`] for one domain, whose powerbox is `host`: its captured and its completed
+/// children. The unreached ones go to `unreached`, as do a non-captured child's captured children:
+/// it rides no artifact, so their continuations would be lost. Its completed children are dropped,
+/// as their results can reach no one.
+fn detached_left(
+    harvest: Vec<temen_jit::DetachedHarvest>,
+    host: &Host,
+    unreached: &mut Vec<temen_interp::PendingDetached>,
+) -> (
+    Vec<temen_interp::CapturedDetached>,
+    Vec<temen_interp::FrozenDetached>,
+) {
     let mut captured = Vec::new();
     let mut completed = Vec::new();
-    let mut unreached = Vec::new();
-    for h in cm.take_detached_harvest() {
+    for h in harvest {
         if h.powerbox.is_null() {
             continue; // a builder that shared no powerbox: nothing to carry (never the detached one)
         }
@@ -2021,60 +2063,80 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
             module: std::sync::Arc::clone(&module),
             same_module,
         };
+        let (grand_captured, grand_completed) = detached_left(
+            h.children,
+            &child.lock().unwrap_or_else(|e| e.into_inner()),
+            unreached,
+        );
         // A finished child's `join` outcome — its value, or its trap (#1674); `None` for a trap cell
         // that names no trap, which stays unreached.
         let outcome = h.outcome.and_then(|(result, trap)| match trap {
             0 => Some(Ok(result)),
             t => temen_interp::Trap::from_code(t).map(Err),
         });
-        match (h.image, outcome) {
-            (Some(image), _) => {
-                // The page map the child's Memory capability kept, as the root's capture reads its
-                // own (#1854): a page the guest grew or protected rides the artifact.
-                let window = jit_layout(
-                    &module,
-                    &child.lock().unwrap_or_else(|e| e.into_inner()),
-                    image,
-                );
-                captured.push(temen_interp::CapturedDetached {
+        let Some(image) = h.image else {
+            unreached.extend(grand_captured.into_iter().map(pending_detached));
+            match outcome {
+                Some(outcome) => completed.push(temen_interp::FrozenDetached {
                     parent_task: 0,
                     slot: h.slot,
-                    window,
-                    reserved_log2: h.reserved_log2,
+                    completed_result: outcome,
+                }),
+                None => unreached.push(temen_interp::PendingDetached {
+                    parent_task: 0,
+                    slot: h.slot,
+                    child_task: 0,
                     host: child,
-                    module,
-                    launch: temen_interp::DetachedLaunch {
-                        task: 0,
-                        entry: h.entry,
-                        digest: spawn.digest,
-                        lane,
-                        same_module,
-                        names,
-                    },
-                });
+                    spawn,
+                }),
             }
-            (None, Some(outcome)) => completed.push(temen_interp::FrozenDetached {
-                parent_task: 0,
-                slot: h.slot,
-                completed_result: outcome,
-            }),
-            _ => unreached.push(temen_interp::PendingDetached {
-                parent_task: 0,
-                slot: h.slot,
-                child_task: 0,
-                host: child,
-                spawn,
-            }),
-        }
+            continue;
+        };
+        // The page map the child's Memory capability kept, as the root's capture reads its own
+        // (#1854): a page the guest grew or protected rides the artifact.
+        let window = {
+            let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+            if !grand_captured.is_empty() {
+                c.set_captured_detached(grand_captured);
+            }
+            if !grand_completed.is_empty() {
+                c.set_frozen_detached(grand_completed);
+            }
+            jit_layout(&module, &c, image)
+        };
+        captured.push(temen_interp::CapturedDetached {
+            parent_task: 0,
+            slot: h.slot,
+            window,
+            reserved_log2: h.reserved_log2,
+            host: child,
+            module,
+            launch: temen_interp::DetachedLaunch {
+                task: 0,
+                entry: h.entry,
+                digest: spawn.digest,
+                lane,
+                same_module,
+                names,
+            },
+        });
     }
-    if !captured.is_empty() {
-        host.set_captured_detached(captured);
-    }
-    if !completed.is_empty() {
-        host.set_frozen_detached(completed);
-    }
-    if !unreached.is_empty() {
-        host.set_unreached_detached(unreached);
+    (captured, completed)
+}
+
+/// #2010 — a captured child no artifact can carry, as the unreached record that refuses the freeze.
+fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingDetached {
+    temen_interp::PendingDetached {
+        parent_task: c.parent_task,
+        slot: c.slot,
+        child_task: c.launch.task,
+        host: c.host,
+        spawn: temen_interp::DetachedSpawn {
+            entry: c.launch.entry,
+            digest: c.launch.digest,
+            module: c.module,
+            same_module: c.launch.same_module,
+        },
     }
 }
 
@@ -5973,6 +6035,11 @@ block 2 (inst: i32, c: i32) {{
     )
 }
 
+/// The search paths nimony itself puts first, as [`nim_module_suffix`] takes them, for a build run at
+/// the root of nimony's tree (`semos.setupPaths`): its stdlib, and `src/lib`, the compiler-internal
+/// modules it has kept on the path since nim-lang/nimony bdf5398c.
+pub const NIMONY_TREE_PATHS: [&str; 2] = ["lib", "src/lib"];
+
 /// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
 ///
 /// A faithful port of `nimony/src/gear2/modnames.nim`'s `moduleSuffix`: the first three characters
@@ -5987,11 +6054,11 @@ block 2 (inst: i32, c: i32) {{
 /// closed off the "just stage the cache" idea in #1609. Computing it here means a driver can write
 /// the file nimsem will actually ask for.
 ///
-/// `search_paths` mirrors nimony's `--path` list: the shortest of the given spelling and each
-/// `<search>/`-stripped one wins, exactly as `moduleSuffix` picks the shortest `relativePath`. Only
-/// the prefix case is handled — a path outside every search path keeps the spelling it came in with,
-/// where nim would render a `../` walk. Every layout a seeded memfs produces is a prefix case, and a
-/// wrong stem is visible immediately (nimsem re-parses) rather than silently wrong.
+/// `search_paths` mirrors nimony's search path list, spelled from the same place as `path` (both
+/// relative to one cwd, or both absolute): the shortest of the given spelling and its `relativePath`
+/// from each search path wins, `../` walks included. A walk can win: nimony keeps its tree's `src/lib`
+/// on the path ([`NIMONY_TREE_PATHS`]), so `src/nifmake/nifmake.nim` is hashed as
+/// `../nifmake/nifmake.nim`.
 pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
     /// `tinyhashes.uhash` — mix each byte, then finish. All arithmetic wraps at 32 bits.
     fn uhash(s: &str) -> u32 {
@@ -6007,17 +6074,29 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
     }
     const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
-    let mut f = path;
+    /// `os.relativePath(path, base, '/')`: the walk up out of `base`, then down into `path`.
+    fn relative_path(path: &str, base: &str) -> String {
+        let split = |s: &str| -> Vec<String> {
+            s.split('/')
+                .filter(|c| !c.is_empty() && *c != ".")
+                .map(str::to_string)
+                .collect()
+        };
+        let (p, b) = (split(path), split(base));
+        let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let mut out = vec!["..".to_string(); b.len() - common];
+        out.extend_from_slice(&p[common..]);
+        out.join("/")
+    }
+
+    let mut f = path.to_string();
     for sp in search_paths {
-        let sp = sp.trim_end_matches('/');
-        if let Some(rest) = path
-            .strip_prefix(sp)
-            .and_then(|r| r.strip_prefix('/'))
-            .filter(|r| r.len() < f.len())
-        {
-            f = rest;
+        let candidate = relative_path(path, sp);
+        if candidate.len() < f.len() {
+            f = candidate;
         }
     }
+    let f = f.as_str();
     let name = f.rsplit('/').next().unwrap_or(f);
     let stem = name.rsplit_once('.').map_or(name, |(base, _)| base);
 
@@ -6037,13 +6116,15 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
 /// modules, whatever else a shared `nimcache` holds — the programs its compile-time evaluation
 /// built, or other programs built in the same tree.
 ///
-/// `<main>` is the stem of `src`, the program's path as nimony was given it (relative to its cwd):
-/// [`nim_module_suffix`] with no search path, which is how the driver names a main module.
+/// `<main>` is the stem of `src`, the program's path as nimony was given it (relative to its cwd),
+/// over `search_paths`, nimony's search paths spelled from that cwd: [`NIMONY_TREE_PATHS`] for a
+/// build at the root of nimony's tree, none for a program built elsewhere.
 pub fn nim_program_units(
     nimcache: &std::path::Path,
     src: &str,
+    search_paths: &[&str],
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let main = nim_module_suffix(src, &[]);
+    let main = nim_module_suffix(src, search_paths);
     let dir = nimcache.join(&main);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("{src}: no build directory {}: {e}", dir.display()))?;
@@ -8566,6 +8647,26 @@ mod nim_module_suffix_tests {
         assert_eq!(
             nim_module_suffix("lib/system/basic_types.nim", &[]),
             "bas9s4yu5"
+        );
+    }
+
+    #[test]
+    fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
+        use super::NIMONY_TREE_PATHS;
+        // Observed verbatim: nimony 6ca46f17, run at the root of its tree, built these programs in
+        // `nimcache/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
+        // walk, one character shorter than the spelling it was given.
+        for (prog, stem) in [
+            ("src/nifmake/nifmake.nim", "niffw7j0b1"),
+            ("src/nifler2/nifler2.nim", "nif6gnbnq1"),
+            ("src/nimony/nimony.nim", "nimwe39eh1"),
+        ] {
+            assert_eq!(nim_module_suffix(prog, &NIMONY_TREE_PATHS), stem, "{prog}");
+        }
+        // A program at the root, the lane's `prog.nim`, keeps its own spelling.
+        assert_eq!(
+            nim_module_suffix("prog.nim", &NIMONY_TREE_PATHS),
+            nim_module_suffix("prog.nim", &[])
         );
     }
 

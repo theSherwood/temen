@@ -1315,7 +1315,10 @@ fn a_step_moves_the_thread_it_names_and_step_back_undoes_the_last_step() {
     // Split view steps one thread at a time: `singleThread` keeps the other frozen.
     let mut go = |s: &mut DapServer, cmd: &str, tid: i64| {
         seq += 1;
-        let args = vec![("threadId", Json::i(tid)), ("singleThread", Json::Bool(true))];
+        let args = vec![
+            ("threadId", Json::i(tid)),
+            ("singleThread", Json::Bool(true)),
+        ];
         s.handle(&req(seq, cmd, Json::obj(args)))
     };
     let at = |s: &mut DapServer, tid: i64| thread_top(s, 900 + tid, tid);
@@ -1445,7 +1448,11 @@ fn a_step_over_a_spin_wait_lands_and_so_does_a_run() {
         }
         s.handle(&req(seq, "next", Json::obj(vec![("threadId", Json::i(1))])));
     }
-    assert_eq!(lines.last(), Some(&12), "the steps got past the spin loop: {lines:?}");
+    assert_eq!(
+        lines.last(),
+        Some(&12),
+        "the steps got past the spin loop: {lines:?}"
+    );
 
     // A plain run of the same program ends.
     let mut s = DapServer::new();
@@ -1518,11 +1525,18 @@ fn the_scheduler_trace_records_calls_and_returns() {
         .map(<[Json]>::to_vec)
         .expect("a trace tape");
     let field = |e: &Json, k: &str| e.get(k).cloned();
-    let kind = |e: &Json| e.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
+    let kind = |e: &Json| {
+        e.get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let task = |e: &Json| e.get("task").and_then(|t| t.as_i64()).unwrap_or(-1);
     let call_worker = tape
         .iter()
-        .position(|e| kind(e) == "call" && task(e) == 1 && field(e, "func") == Some(Json::s("worker")))
+        .position(|e| {
+            kind(e) == "call" && task(e) == 1 && field(e, "func") == Some(Json::s("worker"))
+        })
         .expect("the worker's call into `worker` is on the tape");
     assert!(
         tape[call_worker..]
@@ -1601,7 +1615,10 @@ fn a_deadlock_names_its_cycle() {
     let ((m2, held_by_2), (m1, held_by_1)) = (wait(1), wait(2));
     assert_ne!(m1, m2, "each waits on a different mutex");
     // Ids are pthread's (0 = main = DAP thread 1); the word holds id + 1.
-    assert_eq!(held_by_2, 2, "thread 1 waits on m2, held by the worker (id 1)");
+    assert_eq!(
+        held_by_2, 2,
+        "thread 1 waits on m2, held by the worker (id 1)"
+    );
     assert_eq!(held_by_1, 1, "thread 2 waits on m1, held by main (id 0)");
 }
 
@@ -1672,8 +1689,13 @@ fn the_race_detector_finds_an_unprotected_counter_and_not_a_locked_one() {
     };
     let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let racy = races_of(&chibicc, RACE_SRC);
-    let thread = |r: &Json, side: &str| r.get(side).and_then(|s| s.get("thread")).and_then(|t| t.as_i64());
-    let write = |r: &Json, side: &str| r.get(side).and_then(|s| s.get("write")) == Some(&Json::Bool(true));
+    let thread = |r: &Json, side: &str| {
+        r.get(side)
+            .and_then(|s| s.get("thread"))
+            .and_then(|t| t.as_i64())
+    };
+    let write =
+        |r: &Json, side: &str| r.get(side).and_then(|s| s.get("write")) == Some(&Json::Bool(true));
     assert!(
         racy.iter().any(|r| {
             let mut pair = [thread(r, "first"), thread(r, "second")];
@@ -1684,4 +1706,236 @@ fn the_race_detector_finds_an_unprotected_counter_and_not_a_locked_one() {
     );
     let locked = races_of(&chibicc, &format!("#define LOCK\n{RACE_SRC}"));
     assert!(locked.is_empty(), "no race under the mutex: {locked:?}");
+}
+
+/// A program that calls two **declared host-completed caps** (#1953): `ping(x)` 300 times in a loop,
+/// then `show(p, n)` over a global buffer the host reads back out of the window. Every call is
+/// answered by the embedder: `ping` with `2x + 1`, `show` with the sum of the `n` bytes at `p`.
+const HOST_CAPS_SRC: &str = r#"#include <stdio.h>
+long __vm_resolve(const char *name, long len);
+__attribute__((temen_cap)) extern long ping(int h, long x);
+__attribute__((temen_cap)) extern long show(int h, unsigned char *p, long n);
+unsigned char buf[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+int main(void) {
+  int hp = (int)__vm_resolve("ping", 4);
+  int hs = (int)__vm_resolve("show", 4);
+  long s = 0;
+  for (long i = 0; i < 300; i++) {
+    s += ping(hp, i);
+    if (i % 100 == 0) printf("i %ld s %ld\n", i, s);
+  }
+  long t = show(hs, buf, 8);
+  printf("sum %ld show %ld\n", s, t);
+  return (int)(s % 97);
+}
+"#;
+
+/// The embedder's answer to a declared-cap call, given a window reader.
+fn answer_cap(name: &str, args: &[i64], read: &mut dyn FnMut(u64, usize) -> Vec<u8>) -> i64 {
+    match name {
+        "ping" => 2 * args[0] + 1,
+        "show" => read(args[0] as u64, args[1] as usize)
+            .iter()
+            .map(|&b| b as i64)
+            .sum(),
+        other => panic!("unexpected cap {other}"),
+    }
+}
+
+/// Decode standard base64 (the DAP `readMemory` body).
+fn b64_decode(s: &str) -> Vec<u8> {
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        _ => 63,
+    };
+    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=').map(val).collect();
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |a, (i, &v)| a | (v as u32) << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    out
+}
+
+/// The debug session's run of `ir` with `hostCaps` `ping`/`show`, answering each `stopped{cap}` with
+/// `provideCap`: `(stdout, exit code, parks)`.
+fn debug_host_caps_run(ir: &str) -> (String, Option<i64>, usize) {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(ir)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+            (
+                "hostCaps",
+                Json::Arr(vec![Json::s("ping"), Json::s("show")]),
+            ),
+        ]),
+    ));
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    let mut seq = 10;
+    let mut parks = 0;
+    let mut out = s.handle(&req(seq, "continue", Json::obj(vec![])));
+    loop {
+        if stopped_reason(&out).as_deref() != Some("cap") {
+            break;
+        }
+        parks += 1;
+        let body = out
+            .iter()
+            .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("stopped"))
+            .and_then(|m| m.get("body"))
+            .expect("stopped body")
+            .clone();
+        let id = body.get("capId").and_then(|v| v.as_i64()).expect("capId");
+        let name = body
+            .get("capName")
+            .and_then(|v| v.as_str())
+            .expect("capName")
+            .to_string();
+        let args: Vec<i64> = match body.get("args") {
+            Some(Json::Arr(a)) => a.iter().filter_map(|v| v.as_i64()).collect(),
+            _ => Vec::new(),
+        };
+        let mut read = |addr: u64, len: usize| {
+            seq += 1;
+            let r = s.handle(&req(
+                seq,
+                "readMemory",
+                Json::obj(vec![
+                    ("memoryReference", Json::s(addr.to_string())),
+                    ("count", Json::i(len as i64)),
+                ]),
+            ));
+            let data = response(&r)
+                .get("body")
+                .and_then(|b| b.get("data"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            b64_decode(&data)
+        };
+        let value = answer_cap(&name, &args, &mut read);
+        seq += 1;
+        let r = s.handle(&req(
+            seq,
+            "provideCap",
+            Json::obj(vec![("id", Json::i(id)), ("value", Json::i(value))]),
+        ));
+        assert_eq!(response(&r).get("success"), Some(&Json::Bool(true)));
+        seq += 1;
+        out = s.handle(&req(seq, "continue", Json::obj(vec![])));
+    }
+    let stdout = output_text(&out).unwrap_or_default();
+    let code = out
+        .iter()
+        .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("exited"))
+        .and_then(|m| m.get("body")?.get("exitCode")?.as_i64());
+    (stdout, code, parks)
+}
+
+/// The release session's run of `module` with the same declared caps, pumped in `budget`-op slices:
+/// `(stdout, exit code, parks)`.
+fn release_host_caps_run(module: &temen_ir::Module, budget: u64) -> (String, Option<i64>, usize) {
+    use temen_browser::{
+        temen_alloc, temen_exit_code, temen_release_cap_len, temen_release_cap_ptr,
+        temen_release_deliver_cap, temen_release_open, temen_release_read, temen_release_read_ptr,
+        temen_release_run, temen_release_value, temen_status, temen_stdout_len, temen_stdout_ptr,
+        RELEASE_CAP_PARK, RELEASE_DONE, RELEASE_RUNNING, STATUS_EXIT, STATUS_OK,
+    };
+    let bytes = temen_encode::encode_module(module);
+    let p = temen_alloc(bytes.len());
+    // SAFETY: `temen_alloc` returned a live allocation of that length.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+    let caps = b"ping\nshow";
+    let cp = temen_alloc(caps.len());
+    unsafe { core::ptr::copy_nonoverlapping(caps.as_ptr(), cp, caps.len()) };
+    assert_eq!(
+        temen_release_open(p, bytes.len(), core::ptr::null(), 0, cp, caps.len()),
+        temen_browser::STATUS_OK
+    );
+    let names = ["ping", "show"];
+    let mut out = Vec::new();
+    let mut parks = 0;
+    loop {
+        let r = temen_release_run(budget);
+        let (sp, sn) = (temen_stdout_ptr(), temen_stdout_len());
+        if !sp.is_null() && sn > 0 {
+            // SAFETY: the stash stays live until the next call that replaces it.
+            out.extend_from_slice(unsafe { core::slice::from_raw_parts(sp, sn) });
+        }
+        match r {
+            RELEASE_DONE => break,
+            RELEASE_RUNNING => {}
+            RELEASE_CAP_PARK => {
+                parks += 1;
+                // SAFETY: the request words stay live until the next deliver/run/close.
+                let words = unsafe {
+                    core::slice::from_raw_parts(temen_release_cap_ptr(), temen_release_cap_len())
+                }
+                .to_vec();
+                let (id, name, args) = (words[0] as u64, names[words[1] as usize], &words[2..]);
+                let mut read = |addr: u64, len: usize| {
+                    let n = temen_release_read(addr, len);
+                    // SAFETY: as above, until the next read.
+                    unsafe { core::slice::from_raw_parts(temen_release_read_ptr(), n) }.to_vec()
+                };
+                let value = answer_cap(name, args, &mut read);
+                assert_eq!(temen_release_deliver_cap(id, value), 1);
+                assert_eq!(temen_release_deliver_cap(id, value), 0, "answered once");
+            }
+            other => panic!("unexpected release status {other}"),
+        }
+    }
+    // `main`'s return: an `exit` status, or (a C entry that returns) the run's value — the DAP
+    // session reports either as its exit code.
+    let code = match temen_status() {
+        STATUS_EXIT => Some(temen_exit_code() as i64),
+        STATUS_OK => Some(temen_release_value()),
+        _ => None,
+    };
+    (String::from_utf8_lossy(&out).into_owned(), code, parks)
+}
+
+/// **The release session serves declared host-completed caps as the debug session does** (#1953):
+/// the same program, its calls answered the same way, gives the same output, exit code and number
+/// of parks on both — the release run unsliced and in 1000-op slices. `show` proves the release
+/// session's bounded window read sees what the debug session's `readMemory` sees.
+#[test]
+fn the_release_session_serves_declared_caps_as_the_debug_session_does() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
+    let ir = compile_g(&chibicc, HOST_CAPS_SRC);
+    let module = temen_text::parse_module(&ir).expect("parse IR");
+    let want = (
+        "i 0 s 1\ni 100 s 10201\ni 200 s 40401\nsum 90000 show 36\n".to_string(),
+        Some(90000 % 97),
+        301,
+    );
+    assert_eq!(debug_host_caps_run(&ir), want, "the debug session");
+    assert_eq!(
+        release_host_caps_run(&module, u64::MAX),
+        want,
+        "release, unsliced"
+    );
+    assert_eq!(
+        release_host_caps_run(&module, 1_000),
+        want,
+        "release, sliced"
+    );
 }

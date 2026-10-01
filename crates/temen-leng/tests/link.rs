@@ -965,3 +965,40 @@ fn a_siblings_proc_taken_as_a_funcref() {
         "dbl(21) called through a funcref to a sibling unit's proc"
     );
 }
+
+#[test]
+fn a_siblings_proc_bound_to_a_local() {
+    // nimony 6ca46f17's hexer and driver: `sort(xs, cmpNames)` binds the comparator to a local,
+    // `(var :cmp . T cmpNames.0.<sym>)`, whose type `T` is a proctype a *third* unit instantiated
+    // (nimony keeps one instance of a generic proc type). The local's type is unknown here, so the
+    // initializer is lowered as a plain value, and a sibling's proc name there must still be its
+    // funcref, not a `data.sym` no unit exports (`Unresolved("cmpNames.0.symkyk35i1")`).
+    let a = temen_leng::WholeModule {
+        stem: "moda",
+        src: "\
+(stmts
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2)))))",
+    };
+    let b = temen_leng::WholeModule {
+        stem: "modb",
+        src: "\
+(stmts
+ (proc :useit.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :f.0 . IntFn.0.modc dbl.0.moda)
+   (ret (call (cast (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))) f.0) v.0)))))",
+    };
+    let m = temen_leng::link_whole_units(&[a, b]).unwrap_or_else(|e| panic!("link: {e}"));
+    let idx = m
+        .exports
+        .iter()
+        .find(|e| e.name == "useit.0.modb")
+        .expect("useit exported")
+        .func;
+    assert_eq!(
+        run(&m, idx, &[18432, 21]),
+        42,
+        "dbl(21) called through a local bound to a sibling unit's proc"
+    );
+}
