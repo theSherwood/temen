@@ -9796,7 +9796,9 @@ fn leaf_step(
 /// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
 /// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
 /// (whose freeze could not meet emitted frames) and a window emitted code cannot address flat run
-/// interpreted, as before.
+/// interpreted, as before. Both `CoopRun` constructors that hold the image ask it (`assemble`,
+/// `new_reserved_over_compiled`); a [`SharedProgram`] run (a warm restore) keeps only compiled code,
+/// so its root interprets — a tier it forgoes, not a behaviour it changes.
 #[allow(clippy::too_many_arguments)]
 fn root_leaf(
     emit: &LeafEmitter,
@@ -15707,9 +15709,14 @@ impl CoopRun {
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
             mm
         });
+        let root_leaf = tierup
+            .as_ref()
+            .and_then(|t| t.leaf.as_ref())
+            .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
         let mut fuel = Fuel::drawn(host.begin_activation(fuel));
-        let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        sched.root_leaf = root_leaf;
         Ok(CoopRun {
             dom,
             mem,

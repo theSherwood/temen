@@ -592,8 +592,13 @@ fn drive_leaf(mut run: bytecode::CoopRun, requests: &CapRequests) -> Ran {
     }
 }
 
+/// A run of `m` over a window **reserved at its declared size**. A root leaf needs a window emitted
+/// code can address flat: unix's lazy `mmap` gives the default 1-TiB reservation one, but elsewhere
+/// (Windows, wasm) that reservation is a sparse table, and only a reservation within the flat-buffer
+/// cap is backed flat — so a run at the default runs its root interpreted there, by design.
 fn coop_with(m: &temen_ir::Module, host: Host, tierup: Option<TierUpConfig>) -> bytecode::CoopRun {
-    bytecode::CoopRun::new(m, 0, &[], FUEL, host, tierup)
+    let declared = m.memory.expect("a window").size_log2;
+    bytecode::CoopRun::new_reserved(m, 0, &[], FUEL, host, tierup, &[], declared)
         .expect("in subset")
         .expect("entry in range")
 }
@@ -635,13 +640,35 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
     assert_eq!(
         leaf,
         Ran {
-            end: want,
+            end: want.clone(),
             parks: 2,
             tierups: 1,
             resumes: 1
         },
         "one tier-up at the entry, two parks inside it, one resume of its frames"
     );
+
+    // Every constructor that holds the image offers it: `CoopRun::new` too, whose default 1-TiB
+    // reservation only unix's lazy `mmap` backs flat (elsewhere that root interprets, by design).
+    #[cfg(unix)]
+    {
+        let offers: Offers = Arc::default();
+        let (host, requests) = declared_ping(&m);
+        let run = bytecode::CoopRun::new(&m, 0, &[], FUEL, host, Some(leaf_config(&offers, true)))
+            .expect("in subset")
+            .expect("entry in range");
+        let ran = drive_leaf(run, &requests);
+        assert_eq!(
+            offers.lock().unwrap().clone(),
+            vec![(0, 0, true)],
+            "CoopRun::new"
+        );
+        assert_eq!(
+            (ran.end, ran.tierups, ran.resumes),
+            (want, 1, 1),
+            "CoopRun::new"
+        );
+    }
 }
 
 /// An emitter that declines the root (a host that cannot suspend its frames) leaves it interpreted,
