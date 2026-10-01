@@ -61,8 +61,8 @@ pub(crate) struct DurableCell {
     /// The child's live window base while its window exists, `0` once its task frees it. The lock
     /// orders a freeze's doorbell store against that free.
     pub(crate) base: Mutex<usize>,
-    /// The child's window image, deposited by its task at finish **iff** it unwound for a freeze.
-    pub(crate) image: Mutex<Option<Vec<u8>>>,
+    /// What the child's task left for the harvest at finish, **iff** it unwound for a freeze.
+    pub(crate) capture: Mutex<Option<crate::DetachedCapture>>,
     /// The child module's shadow arena: its context-0 region is where the child spills.
     pub(crate) shadow: temen_ir::durable_abi::ShadowArena,
     /// What the spawn knew that a thaw needs: the entry and the window geometry.
@@ -84,7 +84,7 @@ impl DurableCell {
     ) -> DurableCell {
         DurableCell {
             base: Mutex::new(0),
-            image: Mutex::new(None),
+            capture: Mutex::new(None),
             shadow,
             entry,
             mapped_log2,
@@ -112,9 +112,9 @@ impl DurableCell {
         *base != 0
     }
 
-    /// Whether the child unwound for a freeze (its task deposited its image).
+    /// Whether the child unwound for a freeze (its task deposited its capture).
     pub(crate) fn unwound(&self) -> bool {
-        self.image
+        self.capture
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
@@ -231,6 +231,9 @@ unsafe fn file_task(
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     // #2010 — the nursery `code` was compiled against, if the child spawns (see [`Child::kid`]).
     kid: Option<std::sync::Arc<Nursery>>,
+    // #2010 — a thawed durable child's `thread.spawn` vCPUs and its root's extent (see
+    // [`crate::child_exec::ChildTask::thaw`]).
+    threads: Option<(Vec<crate::FrozenVCpu>, u64)>,
 ) -> Filed {
     let futex_sched = rt.futex_sched;
     // #1586 — reserve a §15 live-vCPU slot before filing, so a parent cannot hold more concurrency
@@ -263,7 +266,7 @@ unsafe fn file_task(
             node,
         )
     };
-    let task = match task {
+    let mut task = match task {
         Ok(t) => t,
         Err(teardown) => {
             teardown(false);
@@ -297,6 +300,7 @@ unsafe fn file_task(
         }
     };
     drop(children);
+    task.thaw = threads;
     rt.child_exec.spawn(task);
     Filed::Slot(slot as i32)
 }
@@ -352,6 +356,7 @@ unsafe fn file_carve_task(
         chain,
         retained_ctx,
         teardown,
+        None,
         None,
         None,
         None,
@@ -1164,7 +1169,7 @@ impl Nursery {
                 mapped_log2: d.mapped_log2,
                 reserved_log2: d.reserved_log2,
                 powerbox: std::mem::take(&mut c.retained) as *mut core::ffi::c_void,
-                image: d.image.lock().unwrap_or_else(|e| e.into_inner()).take(),
+                capture: d.capture.lock().unwrap_or_else(|e| e.into_inner()).take(),
                 outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
                 children: c
                     .kid
@@ -1201,6 +1206,7 @@ impl Nursery {
             child: gc,
             window,
             children,
+            threads,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr == 0 {
@@ -1243,7 +1249,7 @@ impl Nursery {
             &self.serve_handlers,
             gc.jit_table_log2,
             shadow,
-            // A thawed child runs as a durable executor task: fibers, no thread domain (#1469).
+            // A thawed child runs as a durable executor task, as at its spawn.
             crate::ChildRun::DurableTask,
         ) else {
             release(gc.ctx);
@@ -1293,6 +1299,7 @@ impl Nursery {
             )),
             node,
             kid,
+            threads,
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -2428,6 +2435,7 @@ unsafe fn spawn_detached_child(
         }),
         node,
         kid,
+        None,
     );
     match filed {
         Filed::Slot(slot) => {
@@ -2710,8 +2718,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         &rt.serve_handlers,
         gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,
         child_shadow,
-        // An executor task (#1469); a durable one hosts no `thread.spawn` (its vCPUs would escape the
-        // freeze that captures the child).
+        // An executor task (#1469), durable when its parent is: its vCPUs unwind with it (#2010).
         if durable {
             crate::ChildRun::DurableTask
         } else {

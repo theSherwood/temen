@@ -393,15 +393,42 @@ block 0 (v0: i64, v1: i64) {
 /// What [`NEST_ROOT`] returns uninterrupted: the grandchild's 7, plus 100 from the child.
 const NEST_TOTAL: i64 = 107;
 
-/// [`NEST_ROOT`] and [`NEST`], instrumented. Both touch memory, so they take the confined transform.
-fn nest_modules() -> (temen_ir::Module, temen_ir::Module) {
+/// #2010 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place: it spawns a thread, joins it, and
+/// returns 100 more than it. The thread waits a second on a futex nothing notifies, so it is live
+/// when the freeze lands, then returns 7.
+const THREAD_NEST: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vj = thread.join vt
+  vhundred = i64.const 100
+  vr = i64.add vj vhundred
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vr = i64.const 7
+  return vr
+  }
+}
+";
+
+/// [`NEST_ROOT`] and the `child` it spawns ([`NEST`] or [`THREAD_NEST`]), instrumented. Both touch
+/// memory, so they take the confined transform.
+fn nest_modules(child: &str) -> (temen_ir::Module, temen_ir::Module) {
     let confined = |src: &str| {
         let m = transform_module_assume_confined(&temen_text::parse_module(src).expect("parse"))
             .expect("transform");
         temen_verify::verify_module(&m).expect("instrumented module verifies");
         m
     };
-    (confined(NEST_ROOT), confined(NEST))
+    (confined(NEST_ROOT), confined(child))
 }
 
 /// [`NEST_ROOT`]'s powerbox: its `Instantiator`, `nest` as a durable `Module`, a `Budget` of 1 MiB
@@ -464,6 +491,24 @@ fn nest_run(
     }
 }
 
+/// For each captured child, how many of its `thread.spawn` vCPUs its own artifact carries live.
+fn carried_threads(host: &Host) -> Vec<usize> {
+    assert!(
+        host.unreached_detached().is_empty(),
+        "a child never reached its poll"
+    );
+    host.captured_detached()
+        .iter()
+        .map(|c| {
+            let h = c.host.lock().unwrap_or_else(|e| e.into_inner());
+            h.frozen_vcpus()
+                .iter()
+                .filter(|v| v.completed_result.is_none())
+                .count()
+        })
+        .collect()
+}
+
 /// For each captured child, how many children its own artifact carries.
 fn carried(host: &Host) -> Vec<usize> {
     assert!(
@@ -493,24 +538,69 @@ fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &temen_ir::Module) ->
     (host, win)
 }
 
-/// Every engine's thaw of `art` that does not answer [`NEST_TOTAL`], described.
+/// Each of `runs`' thaws of `art` that does not answer [`NEST_TOTAL`], described. `runs` are the
+/// engines that run the tree at all: one of them refusing the thaw is wrong too.
 fn nest_thaws(
     art: &[u8],
     froze: Engine,
     root: &temen_ir::Module,
     nest: &temen_ir::Module,
     args: &[i64],
+    runs: &[Engine],
 ) -> Vec<String> {
     let mut wrong = Vec::new();
-    for thaws in [Engine::Interp, Engine::Jit] {
+    for &thaws in runs {
         let (mut host, win) = nest_restore(art, root, nest);
-        if let Some((r, _)) = nest_run(thaws, root, args, &win, &mut host, None) {
-            if r != NEST_TOTAL {
-                wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: {r}"));
-            }
+        match nest_run(thaws, root, args, &win, &mut host, None) {
+            Some((r, _)) if r == NEST_TOTAL => {}
+            Some((r, _)) => wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: {r}")),
+            None => wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: refused")),
         }
     }
     wrong
+}
+
+/// Freeze [`NEST_ROOT`] over `child` on every engine at the root's fiber safepoint: at once, and
+/// after a settle of 100 ms. `carried` reads what each freeze carried, which must be `want`, and every
+/// engine thaws every engine's artifact to the uninterrupted [`NEST_TOTAL`]. An engine that runs the
+/// tree uninterrupted must freeze and thaw it too.
+fn rides_every_engine(child: &str, carried: impl Fn(&Host) -> Vec<usize>, want: &[usize]) {
+    use Engine::*;
+    let (root, child) = nest_modules(child);
+    let mut wrong = Vec::new();
+    let mut runs = Vec::new();
+    for e in [Interp, Jit] {
+        let (mut host, args) = nest_powerbox(&child, 0);
+        let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        let Some((r, _)) = nest_run(e, &root, &args, &win, &mut host, None) else {
+            continue; // a target without the JIT's child executor
+        };
+        if r != NEST_TOTAL {
+            wrong.push(format!("uninterrupted on {e:?}: {r}"));
+        }
+        runs.push(e);
+    }
+    for &froze in &runs {
+        for settle_ms in [0, 100] {
+            let (mut fhost, args) = nest_powerbox(&child, settle_ms);
+            let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+            arm_freeze_after(&mut win, 1);
+            let Some((r, fsnap)) = nest_run(froze, &root, &args, &win, &mut fhost, None) else {
+                wrong.push(format!("freeze on {froze:?} after {settle_ms} ms: refused"));
+                continue;
+            };
+            let got = carried(&fhost);
+            if (r, &got[..]) != (0, want) {
+                wrong.push(format!(
+                    "freeze on {froze:?} after {settle_ms} ms: {r}, carrying {got:?}"
+                ));
+                continue;
+            }
+            let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
+            wrong.extend(nest_thaws(&art, froze, &root, &child, &args, &runs));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// #2010 — **a durable detached child spawns and joins a grandchild, and a freeze carries both**, on
@@ -524,38 +614,7 @@ fn nest_thaws(
 /// before any parked task is poisoned, and the child's join is left parked for the grandchild's end.
 #[test]
 fn a_durable_childs_grandchild_rides_its_freeze_on_every_engine() {
-    use Engine::*;
-    let (root, nest) = nest_modules();
-    let mut wrong = Vec::new();
-    for e in [Interp, Jit] {
-        let (mut host, args) = nest_powerbox(&nest, 0);
-        let win = init_durable_window(1 << PARENT_LOG2, ARENA);
-        if let Some((r, _)) = nest_run(e, &root, &args, &win, &mut host, None) {
-            if r != NEST_TOTAL {
-                wrong.push(format!("uninterrupted on {e:?}: {r}"));
-            }
-        }
-    }
-    for froze in [Interp, Jit] {
-        for settle_ms in [0, 100] {
-            let (mut fhost, args) = nest_powerbox(&nest, settle_ms);
-            let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-            arm_freeze_after(&mut win, 1);
-            let Some((r, fsnap)) = nest_run(froze, &root, &args, &win, &mut fhost, None) else {
-                continue;
-            };
-            if (r, carried(&fhost)) != (0, vec![1]) {
-                wrong.push(format!(
-                    "freeze on {froze:?} after {settle_ms} ms: {r}, carrying {:?}",
-                    carried(&fhost)
-                ));
-                continue;
-            }
-            let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
-            wrong.extend(nest_thaws(&art, froze, &root, &nest, &args));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    rides_every_engine(NEST, carried, &[1]);
 }
 
 /// #2010 — **the JIT's freeze reaches a grandchild through the joins.** The embedder's
@@ -566,10 +625,39 @@ fn a_durable_childs_grandchild_rides_its_freeze_on_every_engine() {
 /// return, and be joined rather than carried.
 #[test]
 fn a_controller_freeze_reaches_a_grandchild_through_the_joins_on_the_jit() {
-    let (root, nest) = nest_modules();
-    let (mut fhost, args) = nest_powerbox(&nest, 0);
+    controller_freeze(NEST, |host| {
+        assert_eq!(
+            carried(host),
+            vec![1],
+            "the freeze must carry the child, and the grandchild in the child's artifact"
+        );
+    });
+}
+
+/// #2010 — **the same, for a thread.** The freeze lands while the root is parked joining the child
+/// and the child is parked joining its thread. The child's join ends on the word the root's join
+/// rang; its root unwinds while the thread is still parked, so it has no outcome to publish until the
+/// thread has unwound too and the capture is taken. Published early, the root's join would take the
+/// child's placeholder for its result.
+#[test]
+fn a_controller_freeze_reaches_a_childs_thread_through_the_joins_on_the_jit() {
+    controller_freeze(THREAD_NEST, |host| {
+        assert_eq!(
+            carried_threads(host),
+            vec![1],
+            "the freeze must carry the child, and its thread in the child's artifact"
+        );
+    });
+}
+
+/// The embedder's [`temen_jit::FreezeController`] freezes [`NEST_ROOT`] over `child` on the JIT,
+/// while the root and the child are parked in their joins; `check` checks what the freeze carried,
+/// and every engine's thaw must answer [`NEST_TOTAL`].
+fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
+    let (root, child) = nest_modules(child);
+    let (mut fhost, args) = nest_powerbox(&child, 0);
     let fc = temen_jit::FreezeController::new();
-    // Well inside the grandchild's second-long wait, so the root and the child are parked in their
+    // Well inside the innermost wait of a second, so the root and the child are parked in their
     // joins. (Landing sooner, it would cut the root's wait for both to be live, and the teardown's
     // ring would carry the same tree.)
     let ctl = {
@@ -585,13 +673,17 @@ fn a_controller_freeze_reaches_a_grandchild_through_the_joins_on_the_jit() {
     let Some((r, fsnap)) = run else {
         return;
     };
-    assert_eq!(
-        (r, carried(&fhost)),
-        (0, vec![1]),
-        "the freeze must carry the child, and the grandchild in the child's artifact"
-    );
+    assert_eq!(r, 0, "the root froze");
+    check(&fhost);
     let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
-    let wrong = nest_thaws(&art, Engine::Jit, &root, &nest, &args);
+    let wrong = nest_thaws(
+        &art,
+        Engine::Jit,
+        &root,
+        &child,
+        &args,
+        &[Engine::Interp, Engine::Jit],
+    );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -601,7 +693,7 @@ fn a_controller_freeze_reaches_a_grandchild_through_the_joins_on_the_jit() {
 /// on the host for a thaw on the interpreter.
 #[test]
 fn a_jit_thaw_refuses_a_captured_childs_residue_it_cannot_recreate() {
-    let (root, nest) = nest_modules();
+    let (root, nest) = nest_modules(NEST);
     let (mut fhost, args) = nest_powerbox(&nest, 0);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     arm_freeze_after(&mut win, 1);
@@ -635,4 +727,16 @@ fn a_jit_thaw_refuses_a_captured_childs_residue_it_cannot_recreate() {
         refused.as_ref().map(|(o, _)| o)
     );
     assert_eq!(host.thawed_detached().len(), 1, "and keeps the residue");
+}
+
+/// #2010 — **a durable detached child's thread unwinds with it, and rides its artifact**, on every
+/// engine. The child spawns the thread while its window is `NORMAL`, so on the JIT the thread is an OS
+/// thread with a shadow context of its own; the freeze lands while the child is parked joining it and
+/// the thread is parked on its futex. The child's join ends on its own freeze word and the child
+/// unwinds; its task waits for the thread to unwind into its own region, then the capture takes the
+/// child's window with the thread's residue beside it. Every engine thaws every engine's artifact,
+/// re-creating the thread, to the uninterrupted [`NEST_TOTAL`].
+#[test]
+fn a_durable_childs_thread_rides_its_freeze_on_every_engine() {
+    rides_every_engine(THREAD_NEST, carried_threads, &[1]);
 }

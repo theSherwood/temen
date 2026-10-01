@@ -3618,7 +3618,7 @@ propagation sites for every future scheduling change (invariant 14's burden) is 
 
 *A child task's own fibers and threads* (#1469): a task carries a fiber runtime of its own — its own
 `SharedFiberTable` and call trampoline — so a child's `cont.*` handles number from 0 and never reach
-another domain's fibers, as in the oracle's per-domain registry. A non-durable task whose child uses
+another domain's fibers, as in the oracle's per-domain registry. A task whose child uses
 `thread.spawn`/`join` also gets a `Domain` of its own for what the oracle keeps per domain — the handle
 table, its vCPUs' window, table and fiber registry, the lane chain — while the futex, the park count,
 the lanes and the run-wide live count stay the run's (the child's domain names the run's as its
@@ -3630,8 +3630,11 @@ park rather than block a worker; from a guest fiber inside the task, which canno
 its own stack, it fails closed (`ThreadFault`). A root that returns while its vCPUs run publishes its
 outcome at once — the oracle's rule: a child domain ends on a member's trap or with the run, not at its
 root's return — and the task *retires*, keeping its window and powerbox until its last vCPU ends; run
-teardown poisons a retiring task as it poisons a parked one. A durable task still refuses
-`thread.spawn`: its vCPUs would run outside the freeze that captures it. Pins:
+teardown poisons a retiring task as it poisons a parked one. A durable task's vCPUs run under its
+freeze word (#2010): each reserves a shadow context in the child's window, so a freeze unwinds each
+into its own region, as the run's root's vCPUs unwind. A root that unwound for a freeze has no
+outcome to publish, so its task retires without one, and the capture is taken once its last vCPU has
+unwound too (DURABILITY.md §4). Pins:
 `temen-run/tests/jit_child_fibers.rs`, `jit_child_threads.rs`, and the Forth `sandbox` on all three
 tiers (`forth_sandbox.rs`).
 
@@ -3649,10 +3652,10 @@ drained: a grandchild that outlives its parent still hands its lane and window b
 host, and that retained ref is what keeps the host alive. A durable child's nursery is durable, so
 its children are, and a freeze reaches them through it (DURABILITY.md §4, "The JIT captures them
 too"). Still refused: a carve spawn from a detached child (`CapFault`; its task would write back into
-a window that can be freed first, and #1867 deletes carves), and a durable detached child's
-`thread.spawn` (#2010). Pins: `temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the
-chain), `temen/tests/instantiate_record.rs` on every backend, and
-`temen/tests/durable_detached_jit.rs` (durable).
+a window that can be freed first, and #1867 deletes carves). Pins:
+`temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the chain),
+`temen/tests/instantiate_record.rs` on every backend, and `temen/tests/durable_detached_jit.rs`
+(durable).
 
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 

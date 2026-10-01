@@ -1917,13 +1917,26 @@ pub struct DetachedHarvest {
     /// Its powerbox: the nursery's retained ref ([`GrantChild::retained_ctx`]) — one counted ref to
     /// the child `Host`, which the embedder now owns and must release.
     pub powerbox: *mut core::ffi::c_void,
-    /// Its window image, **iff** it unwound for the freeze.
-    pub image: Option<Vec<u8>>,
+    /// What it left, **iff** it unwound for the freeze.
+    pub capture: Option<DetachedCapture>,
     /// `(result, trap)` once its task finished: it completed before the cut (`trap == 0` and no
-    /// image), or was torn down unreached (it never polled — parked, #1584).
+    /// capture), or was torn down unreached (it never polled — parked, #1584).
     pub outcome: Option<(i64, i64)>,
     /// #2010 — its own unjoined durable detached children, harvested the same way.
     pub children: Vec<DetachedHarvest>,
+}
+
+/// #1361 step 4 — what a durable detached child that unwound for a freeze left for the harvest.
+pub struct DetachedCapture {
+    /// Its window image.
+    pub image: Vec<u8>,
+    /// #2010 — its root's extent: context 0's shadow-SP.
+    pub root_sp: u64,
+    /// #2010 — the `thread.spawn` vCPUs it hosted: each that unwound, and each that finished
+    /// unjoined, which its root's re-issued join is owed.
+    pub vcpus: Vec<FrozenVCpu>,
+    /// #2010 — the fibers those vCPUs flattened as they unwound.
+    pub fibers: Vec<FrozenFiber>,
 }
 
 /// #1361 step 4 — a captured detached child a JIT **thaw** re-launches (see
@@ -1949,6 +1962,9 @@ pub struct DetachedSeed {
     pub window: Option<(i32, u64)>,
     /// #2010 — its own captured children, re-launched into its nursery before it runs.
     pub children: Vec<DetachedSeed>,
+    /// #2010 — its `thread.spawn` vCPUs and its root's extent, re-spawned into its domain, each
+    /// rewinding from its own, before its root runs. `None` when it hosted none.
+    pub threads: Option<(Vec<FrozenVCpu>, u64)>,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
@@ -6129,9 +6145,8 @@ pub(crate) enum ChildRun {
     /// own for `thread.spawn`/`join`.
     Task,
     /// As a **durable** task (a durable parent's detached child, or a thawed one): a fiber runtime
-    /// of its own, and a domain of its own, whose window's freeze word ends its waits (#1937);
-    /// `thread.spawn` stays refused — its vCPUs would run outside the freeze that captures the
-    /// child.
+    /// of its own, and a domain of its own, whose window's freeze word ends its waits (#1937). Its
+    /// `thread.spawn` vCPUs unwind under that word too, and their residue rides its capture (#2010).
     DurableTask,
 }
 
@@ -6145,8 +6160,8 @@ pub(crate) enum ChildRun {
 /// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
 /// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no
 /// setjmp / nursery runtime of its own (those ops are rejected below). A child that runs as an
-/// executor task may use `cont.*` fibers and `gc.roots`, and a non-durable one `thread.spawn`/`join`
-/// (#1469): the thunks are static and find the running fiber runtime and thread domain through
+/// executor task may use `cont.*` fibers, `gc.roots` and `thread.spawn`/`join` (#1469; a durable one
+/// since #2010): the thunks are static and find the running fiber runtime and thread domain through
 /// thread-locals, and each task brings its own (`child_exec`), so the code stays shareable across
 /// spawns. Being the root's shape is what
 /// lets a child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
@@ -6168,8 +6183,8 @@ fn compile_child_windowed(
     table_reserve_log2: u8,
     // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     shadow: temen_ir::durable_abi::ShadowArena,
-    // How the child runs (see [`ChildRun`]): only a task has a fiber runtime of its own, and only a
-    // non-durable one spawns threads.
+    // How the child runs (see [`ChildRun`]): only a task has a fiber runtime and a thread domain of
+    // its own.
     run: ChildRun,
 ) -> Result<CompiledModule, JitError> {
     let in_task = run != ChildRun::Inline;
@@ -6196,9 +6211,9 @@ fn compile_child_windowed(
         // with; without them they would compile against null thread thunks — reject. Likewise
         // `cont.*` in a child that has no fiber runtime of its own (not a task), or no domain for
         // `cont.resume.block` to bake.
-        if f.uses_threads() && !(run == ChildRun::Task && cfg!(fiber_rt) && futex_sched != 0) {
+        if f.uses_threads() && !(in_task && cfg!(fiber_rt) && futex_sched != 0) {
             return Err(JitError::Unsupported(
-                "a §14 JIT child using thread.spawn/join needs a non-durable task and its parent's domain",
+                "a §14 JIT child using thread.spawn/join needs a task and its parent's domain",
             ));
         }
         if !(in_task && cfg!(fiber_rt) && futex_sched != 0) && f.uses_fibers_or_threads() {

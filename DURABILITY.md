@@ -632,7 +632,17 @@ own, so its children are durable too, and the freeze reaches them through it:
 - **The thaw.** It re-launches a child's captured children into its nursery before the child itself,
   so the child's rewound `join` finds them. A captured child whose powerbox carries residue the JIT
   re-creates only for a run's root refuses the JIT thaw whole instead of dropping it. That residue is
-  fibers, threads, nested or completed children, and child state.
+  fibers, nested or completed children, and child state.
+- **Its threads.** A durable child's `thread.spawn` vCPUs run as the root's do on a freezable run:
+  each reserves a shadow context in the child's window, so a ring unwinds each into its own region. A
+  `thread.join` parked when the ring lands returns for re-issue, as an OS thread's does. A root that
+  unwinds while its threads run publishes no outcome; its task retires, and the capture is taken
+  once the last thread has unwound. It carries the threads' residue (`FrozenVCpu`s, including the
+  unjoined ones that finished) and the root's extent beside the image. `jit_cap_run` puts them on the
+  child's powerbox where the interpreter's harvest leaves them. A thaw re-spawns them into the
+  child's domain, each rewinding from its own extent, before the child's root runs. The JIT numbers a
+  child's vCPUs from its root, 0, and the interpreter numbers them run-wide, so the thaw re-parents
+  the threads the root spawned.
 
 **The gate is lifted on all three engines (step 4).** A durable parent spawns detached exactly when it
 holds `FreezeScope::DetachedProgeny` (#1440) and the module is attested freezable (#1501) — the
@@ -647,8 +657,8 @@ join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
 missing grant refuses), `temen/tests/durable_detached_jit.rs` (freeze on the JIT → codec → thaw on the
 JIT **and** on the interpreter; freeze on the interpreter → thaw on the JIT; without the doorbell nothing
-is captured, without the re-launch the thaw's join traps; and a grandchild, carried in its parent's
-artifact, every engine freezing and every engine thawing, #2010), and `durable_detached_parity.rs` (the
+is captured, without the re-launch the thaw's join traps; and a grandchild or a thread, carried in its
+parent's artifact, every engine freezing and every engine thawing, #2010), and `durable_detached_parity.rs` (the
 oracle and the resumable engine admit with the authority and refuse without it, alike).
 
 > **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).

@@ -122,6 +122,9 @@ pub(crate) struct ChildTask {
     /// never resumed again, until the last of them ends, and only then frees its window and
     /// powerbox ([`ChildExec::finish`]).
     retiring: bool,
+    /// #2010 — a thawed durable child's `thread.spawn` vCPUs, with its root's extent: re-spawned
+    /// into its domain when it is filed, each rewinding from its own ([`ChildExec::spawn`]).
+    pub(crate) thaw: Option<(Vec<crate::FrozenVCpu>, u64)>,
 }
 
 // SAFETY: a task moves between workers only through the executor's queue, and is touched only by
@@ -176,22 +179,24 @@ impl ChildTask {
         // live here, numbered from 0 and out of every other domain's reach, as the oracle's
         // per-domain registry. A child compiled without `cont.*` gets an unused one-slot table; the
         // runtime still carries the `yielders` / `active_slots` bookkeeping that
-        // `fiber_event_park` and `current_fiber_slot` read.
+        // `fiber_event_park` and `current_fiber_slot` read. A durable child's table knows its shadow
+        // arena, where its `thread.spawn` vCPUs reserve their contexts (#2010).
+        let shadow = done
+            .durable
+            .as_ref()
+            .map_or(temen_ir::durable_abi::ShadowArena::EMPTY, |d| d.shadow);
         let mut rt = match (code.fiber_cfg, code.call_tramp) {
             (Some((type_id, mask)), Some(t)) => {
                 let table = Arc::new(SharedFiberTable::new(
                     temen_ir::Quota::default().max_fibers,
-                    temen_ir::durable_abi::ShadowArena::EMPTY,
+                    shadow,
                 ));
                 let mut rt = Box::new(FiberRuntime::new(table, type_id, mask));
                 rt.set_call_tramp(t);
                 rt
             }
             _ => {
-                let table = Arc::new(SharedFiberTable::new(
-                    1,
-                    temen_ir::durable_abi::ShadowArena::EMPTY,
-                ));
+                let table = Arc::new(SharedFiberTable::new(1, shadow));
                 Box::new(FiberRuntime::new(table, 0, code.fn_table_mask))
             }
         };
@@ -233,6 +238,7 @@ impl ChildTask {
             dom: None,
             node,
             retiring: false,
+            thaw: None,
         })
     }
 }
@@ -255,15 +261,41 @@ impl ChildTask {
         let rung = self.done.durable.is_some()
             // SAFETY: the task's window is live while the task is; its first page holds the word.
             && unsafe { fiber_rt::window_is_unwinding(self.window.base() as u64) };
+        // A retiring task's root has returned while its vCPUs run on. Under a freeze of its window
+        // they unwind too, and the last one's end re-offers it; any other teardown ends them.
+        if self.retiring {
+            return if rung {
+                AtTeardown::Wait
+            } else {
+                AtTeardown::Poison
+            };
+        }
         match self.slot.parked_on() {
-            // Its futex wait ends on that word when re-checked.
-            fiber_rt::ParkOn::Futex(_) if rung => AtTeardown::Wake,
+            // Its futex wait or thread join ends on that word when re-checked.
+            fiber_rt::ParkOn::Futex(_) | fiber_rt::ParkOn::Thread if rung => AtTeardown::Wake,
             // Its join waits on a child the same freeze rang (`Nursery::ring_detached`), whose end
             // re-offers it. Woken any sooner, it would only park again.
             fiber_rt::ParkOn::Child if rung => AtTeardown::Wait,
             // Any other park may never come back.
             _ => AtTeardown::Poison,
         }
+    }
+
+    /// #1361 step 4 — whether a durable child's root unwound for a freeze: it spilled past its
+    /// frame base under its window's `UNWINDING`, the rule a thread vCPU's end follows
+    /// (`os_thread_rt::run_child`). The word alone is not enough (#1937): a doorbell that lands after
+    /// the child's last safepoint leaves one that returned normally with its word `UNWINDING`.
+    fn root_unwound(&self) -> bool {
+        let Some(d) = self.done.durable.as_ref() else {
+            return false;
+        };
+        let base = self.window.base() as u64;
+        self.vm.trap.load(Ordering::Relaxed) == 0
+            // SAFETY: the window is live while the task is; its first page holds the freeze word at
+            // `STATE_OFF`, and context 0's region the root's shadow-SP word.
+            && unsafe { fiber_rt::window_is_unwinding(base) }
+            && unsafe { fiber_rt::read_shadow_sp(base, d.shadow.region_base(0)) }
+                > d.shadow.frame_base(0)
     }
 }
 
@@ -399,6 +431,17 @@ impl ChildExec {
                     task._code.instance.epoch as usize,
                     durable,
                 );
+                // #2010 — a durable child's vCPUs each reserve a shadow context of their own, so a
+                // freeze of its window unwinds each into its own region, wherever its root is. A
+                // thaw re-spawns the ones its capture carried, rewinding, before its root runs.
+                if durable {
+                    d.engage_concurrent_durable();
+                    if let Some((vcpus, root_sp)) = task.thaw.take() {
+                        // SAFETY: the env just set is the task's: its window (seeded with its image)
+                        // and code live until the task finishes, after its vCPUs are joined.
+                        unsafe { d.thaw_reattach_and_run(&vcpus, root_sp) };
+                    }
+                }
                 task.dom = Some(d);
             }
         }
@@ -632,9 +675,12 @@ impl ChildExec {
                     if shutdown {
                         // Run teardown ends the domain its vCPUs outlived its root in, as the
                         // oracle's teardown sweep reaps them: poison the cell they share and wake
-                        // the parked ones.
-                        t.vm.trap
-                            .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                        // the parked ones. Under a freeze of a durable child's window they are only
+                        // woken, to unwind (#2010).
+                        if t.at_teardown() == AtTeardown::Poison {
+                            t.vm.trap
+                                .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                        }
                         if let Some(d) = &t.dom {
                             d.wake_own_parked();
                         }
@@ -750,16 +796,9 @@ impl ChildExec {
         if let Some(d) = &task.dom {
             d.join_all();
         }
-        if task.retiring {
-            // `settle` published the outcome and dropped the live count; free what remains.
-            task.window.restore_rw();
-            if let Some(t) = task.teardown.take() {
-                t(false); // a durable child hosts no vCPUs, so a retiring one was never captured
-            }
-            return;
-        }
         let trap = task.vm.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
+        let unwound = task.root_unwound();
         task.window.restore_rw();
         // #1361 step 4 — a durable child that unwound for a freeze leaves its window image for the
         // harvest (the parent's artifact carries it). Retire the base under the cell's lock first, so
@@ -767,17 +806,6 @@ impl ChildExec {
         let mut captured = false;
         if let Some(d) = task.done.durable.as_ref() {
             *d.base.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-            // It unwound iff it spilled past its frame base under the freeze, the rule a thread
-            // vCPU's end follows (`os_thread_rt::run_child`). The word alone is not enough (#1937): a
-            // doorbell that lands after the child's last safepoint leaves one that returned normally
-            // with its word `UNWINDING`, and its image would ride with nothing to rewind.
-            // SAFETY: the window is live (freed only by the `drop(task)` below); its first page holds
-            // the freeze word at `STATE_OFF`, and context 0's region the child's shadow-SP word.
-            let base = task.window.base() as u64;
-            let unwound = trap == 0
-                && unsafe { fiber_rt::window_is_unwinding(base) }
-                && unsafe { fiber_rt::read_shadow_sp(base, d.shadow.region_base(0)) }
-                    > d.shadow.frame_base(0);
             if unwound {
                 // #1854 — up to the child's high-water, as the root's capture reaches its own, so a
                 // page it grew through the Memory capability rides the artifact.
@@ -792,7 +820,25 @@ impl ChildExec {
                 } else {
                     task.window.rw_mut().to_vec()
                 };
-                *d.image.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+                // #2010 — with what its vCPUs left as they ended: the ones that unwound, the ones
+                // that finished unjoined, and the fibers they flattened.
+                let (mut vcpus, fibers) = task.dom.as_ref().map_or_else(Default::default, |dom| {
+                    (dom.take_frozen_vcpus(), dom.take_frozen_fibers())
+                });
+                if let Some(dom) = &task.dom {
+                    vcpus.extend(dom.take_completed_children_residue());
+                }
+                // SAFETY: as `root_unwound`, which read the same word.
+                let root_sp = unsafe {
+                    fiber_rt::read_shadow_sp(task.window.base() as u64, d.shadow.region_base(0))
+                };
+                *d.capture.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::DetachedCapture {
+                        image,
+                        root_sp,
+                        vcpus,
+                        fibers,
+                    });
                 captured = true;
             }
         }
@@ -802,14 +848,21 @@ impl ChildExec {
         if let Some(t) = task.teardown.take() {
             t(captured);
         }
+        // A retiring task published at `settle`, unless its root unwound, whose capture this is.
         {
             let mut st = task.done.state.lock().unwrap_or_else(|e| e.into_inner());
-            *st = Some((result, trap));
-            task.done.cv.notify_all();
+            if st.is_none() {
+                *st = Some((result, trap));
+                task.done.cv.notify_all();
+            }
         }
+        let retiring = task.retiring;
         drop(task);
-        if let Some(d) = self.domain() {
-            d.child_finished();
+        // `settle` dropped a retiring task's live count when its root returned.
+        if !retiring {
+            if let Some(d) = self.domain() {
+                d.child_finished();
+            }
         }
     }
 
@@ -817,7 +870,9 @@ impl ChildExec {
     /// the oracle does at the root's completion (a `join` of the child returns), and drop it from
     /// the run's live count. Its window and powerbox stay until the vCPUs end ([`Self::finish`]).
     /// A carve child's copy-back happens here, so the parent's join sees the child's writes; what
-    /// the vCPUs write after it stays in the child's image.
+    /// the vCPUs write after it stays in the child's image. A durable root that unwound for a freeze
+    /// has no outcome yet (#2010): its vCPUs are unwinding too, and the capture `finish` takes once
+    /// they have ended is what its parent's join is owed.
     fn settle(&self, task: &mut ChildTask) {
         task.retiring = true;
         let trap = task.vm.trap.load(Ordering::Relaxed);
@@ -832,7 +887,7 @@ impl ChildExec {
             task.window.restore_rw();
             c(task.window.rw_mut());
         }
-        {
+        if !task.root_unwound() {
             let mut st = task.done.state.lock().unwrap_or_else(|e| e.into_inner());
             *st = Some((result, trap));
             task.done.cv.notify_all();
@@ -883,8 +938,9 @@ impl ChildExec {
                 } else {
                     false
                 };
-                // #1469 — the child's own parked vCPUs share the poisoned cell.
-                if poisoned {
+                // #1469 — the child's own parked vCPUs share the poisoned cell; a spared child's
+                // re-check the word the freeze rang (#2010).
+                if poisoned || spared {
                     if let Some(d) = &e.dom {
                         d.wake_own_parked();
                     }
