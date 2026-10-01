@@ -255,7 +255,7 @@ pub unsafe fn park_host_call(
                 mark_reissue(unwind_base);
                 return HostPark::Frozen;
             }
-            fiber_rt::fiber_event_park(&slot, false, None);
+            fiber_rt::fiber_event_park(&slot, None, None);
             if ended() {
                 return HostPark::Ended;
             }
@@ -2367,7 +2367,7 @@ unsafe fn task_join(
         if epoch_fired(epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
             return 0;
         }
-        fiber_rt::fiber_event_park(slot, false, None);
+        fiber_rt::fiber_event_park(slot, None, None);
     }
 }
 
@@ -2571,7 +2571,7 @@ unsafe fn fiber_futex_wait_loop(
         // #1631 — a park with its own deadline comes back by itself, so it is a potential
         // notifier and must not count toward `Domain::parked`. Same rule the OS park applies to a
         // timed `futex_wait` (#1625); this is the task half of it.
-        fiber_rt::fiber_event_park(slot, deadline.is_some(), Some(cell));
+        fiber_rt::fiber_event_park(slot, deadline, Some(cell));
         // Re-entered: a `cont.resume` polled this fiber. Completed?
         let st = cell.status.load(Ordering::Acquire);
         if st != PENDING_WAIT {
@@ -2683,7 +2683,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         if fiber_rt::in_task() {
             match fiber_rt::current_fiber_slot() {
                 Some(s) if s.is_platform() => {
-                    fiber_rt::fiber_event_park(&s, fiber_rt::park_is_self_resolving(handle), None);
+                    fiber_rt::fiber_event_park(&s, fiber_rt::park_deadline(handle), None);
                     continue;
                 }
                 _ => {
@@ -2714,7 +2714,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // counting it let a *sibling*'s indefinite wait read `live == parked` and trap a
                 // correct program. Same rule as the OS park (#1625) and the task park, asked of the
                 // one park this vCPU is actually waiting on.
-                let self_resolving = fiber_rt::park_is_self_resolving(handle);
+                let self_resolving = fiber_rt::park_deadline(handle).is_some();
                 let cell = fiber_rt::park_cell(handle);
                 let g = lock(&hub.futex);
                 // A `notify` that claimed the fiber's wait since the poll above: re-poll at once
