@@ -8,8 +8,7 @@
 //! where the host can suspend its emitted frames, such as nimsem — runs whole on the emitted tier
 //! (#1896).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint, LeafEmitter, LeafOffer, TierUpConfig};
 use temen_interp::Trap;
@@ -213,52 +212,10 @@ fn native_link(argv: &[String], files: &mut dyn temen_posix::CommandFiles) -> i3
 }
 
 /// #1896 — a nimony build open as a cooperative tier-up session ([`temen_nim_open`]): the
-/// personality whose memfs holds the tree, and the leaf images the build emitted.
+/// personality whose memfs holds the tree. The leaf images the build emitted are the session's
+/// ([`crate::Leaves`]).
 pub(crate) struct NimSession {
     posix: temen_posix::Posix,
-    leaves: Leaves,
-}
-
-/// The emitted wasm of each leaf image a build offered, by program index, and whether it carries the
-/// page check; `None` for an image the emitter declined (it runs interpreted).
-type Leaves = Arc<Mutex<HashMap<u32, Option<(Arc<[u8]>, bool)>>>>;
-
-impl NimSession {
-    /// Leaf image `module`'s emitted wasm and whether it is paged.
-    pub(crate) fn leaf(&self, module: u32) -> Option<(Arc<[u8]>, bool)> {
-        self.leaves.lock().ok()?.get(&module).cloned().flatten()
-    }
-}
-
-/// The session's leaf emitter: emit an image whole, wasm-driven from its entry — page-checked when
-/// the engine says its page state can change — once per program. An image that is not wasm-drivable
-/// (it could suspend a frame) runs interpreted, and so does one that can park when the host cannot
-/// suspend its frames (`suspends`).
-fn leaf_emitter(leaves: Leaves, suspends: bool) -> LeafEmitter {
-    Arc::new(move |o: &LeafOffer| {
-        if o.parks && !suspends {
-            return false;
-        }
-        let Ok(mut leaves) = leaves.lock() else {
-            return false;
-        };
-        let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
-            let shape = temen_wasm_jit::Shape::Batch { entry: o.entry };
-            let a = match o.paged {
-                true => {
-                    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
-                    temen_wasm_jit::compile_jit_page_checked(o.image, shape, true, page_log2)
-                }
-                false => temen_wasm_jit::compile_jit(o.image, shape, true),
-            }
-            .ok()?;
-            let temen_wasm_jit::DriveMode::WasmDriven { .. } = a.drive else {
-                return None;
-            };
-            Some((a.wasm.into(), o.paged))
-        });
-        leaf.is_some()
-    })
 }
 
 // ---- nimony's module-stem hash (gear2/modnames.nim + lib/tinyhashes.nim), reproduced exactly -------
@@ -408,14 +365,15 @@ pub unsafe extern "C" fn temen_nim_open(
         let mut argv: Vec<&[u8]> = argv.split(|&b| b == 0).collect();
         argv.pop();
         let cwd = core::str::from_utf8(cwd).map_err(|_| STATUS_DECODE_ERR)?;
-        let leaves = Leaves::default();
-        let emit = leaf_emitter(Arc::clone(&leaves), suspend != 0);
+        let leaves = crate::Leaves::default();
+        // A nim build runs on the threads cdylib, over shared memory.
+        let emit = crate::leaf_emitter(Arc::clone(&leaves), suspend != 0, true);
         let (run, posix) = nim_open(&driver, &commands, &files, &argv, cwd, Some(emit))
             .ok_or(STATUS_UNSUPPORTED)?;
         // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
         unsafe {
             *core::ptr::addr_of_mut!(crate::COOP_RUN) =
-                Some(crate::CoopTierupRun::nim(run, NimSession { posix, leaves }));
+                Some(crate::CoopTierupRun::nim(run, NimSession { posix }, leaves));
         }
         Ok(STATUS_OK)
     })()

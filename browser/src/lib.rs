@@ -7245,11 +7245,12 @@ struct ReleaseSession {
     requests: temen_interp::CapRequests,
 }
 static mut RELEASE: Option<ReleaseSession> = None;
-/// #1953: the request a [`RELEASE_CAP_PARK`] reports — `[id, cap index, args…]` (see
-/// [`temen_release_cap_ptr`]). Empty when the run is not parked.
-static mut RELEASE_CAP: Vec<i64> = Vec::new();
-/// #1953: the bytes the last [`temen_release_read`] copied out of the window.
-static mut RELEASE_READ: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+/// #1953/#1954: the request a [`RELEASE_CAP_PARK`] or [`COOP_RUN_CAP_PARK`] reports — `[id, cap
+/// index, args…]` (see [`cap_park_words`]). Empty when no run is parked.
+static mut CAP_REQUEST: Vec<i64> = Vec::new();
+/// #1953/#1954: the bytes the last [`temen_release_read`] or [`temen_coop_read`] copied out of the
+/// window.
+static mut WINDOW_READ: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut RELEASE_VALUE: i64 = 0;
 /// The release run's `vm_fs` files as an fs-image blob ([`temen_release_fs_image`]): the open run's
 /// as of the last call, or those the last run ended with.
@@ -7292,17 +7293,8 @@ pub extern "C" fn temen_release_open(
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let caps: Vec<String> = if caps_ptr.is_null() || caps_len == 0 {
-        Vec::new()
-    } else {
-        let raw = unsafe { core::slice::from_raw_parts(caps_ptr, caps_len) };
-        let Ok(text) = core::str::from_utf8(raw) else {
-            return STATUS_DECODE_ERR;
-        };
-        text.split('\n')
-            .filter(|n| !n.is_empty())
-            .map(str::to_string)
-            .collect()
+    let Some(caps) = host_cap_names(caps_ptr, caps_len) else {
+        return STATUS_DECODE_ERR;
     };
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return STATUS_DECODE_ERR;
@@ -7334,6 +7326,42 @@ pub extern "C" fn temen_release_open(
     }
 }
 
+/// #1953/#1954: the host-completed cap names an open takes at `[ptr, len)` — UTF-8, separated by
+/// `\n` (empty for none). `None` for invalid UTF-8.
+fn host_cap_names(ptr: *const u8, len: usize) -> Option<Vec<String>> {
+    if ptr.is_null() || len == 0 {
+        return Some(Vec::new());
+    }
+    // SAFETY: the host guarantees the range is a live `temen_alloc`ation it just filled.
+    let raw = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let text = core::str::from_utf8(raw).ok()?;
+    Some(
+        text.split('\n')
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// #1953/#1954: the words a cap park reports for completion `id` — `[id, cap index (into `caps`),
+/// the guest's args…]` — from the request its proc filed; `None` if none was filed (impossible: only
+/// the declared procs punt to the host, and they file before the park surfaces).
+fn cap_park_words(
+    caps: &[String],
+    requests: &temen_interp::CapRequests,
+    id: u64,
+) -> Option<Vec<i64>> {
+    let req = requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned()?;
+    let index = caps.iter().position(|n| *n == req.name).unwrap_or(0) as i64;
+    let mut words = vec![id as i64, index];
+    words.extend(req.args);
+    Some(words)
+}
+
 /// Pump the open release run for at most about `budget` ops. The output this slice produced is in
 /// the stdout/stderr read-back slots (only this slice's — the caller accumulates). Returns
 /// [`RELEASE_RUNNING`] if the slice was spent, or [`RELEASE_DONE`] when the program ended, with
@@ -7356,22 +7384,11 @@ pub extern "C" fn temen_release_run(budget: u64) -> i32 {
     let (status, value, exit_code, trap) = match ev {
         bytecode::CoopEvent::Paused => return RELEASE_RUNNING,
         bytecode::CoopEvent::CapPark { id } => {
-            // The proc's submit hook filed the call before the park surfaced; a park on a call
-            // no declared cap filed is impossible (only those procs punt to the host).
-            let req = s
-                .requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&id)
-                .cloned();
-            let Some(req) = req else {
+            let Some(words) = cap_park_words(&s.caps, &s.requests, id) else {
                 return RELEASE_RUNNING;
             };
-            let index = s.caps.iter().position(|n| *n == req.name).unwrap_or(0) as i64;
-            let mut words = vec![id as i64, index];
-            words.extend(req.args);
             // SAFETY: single-threaded access to the read-back slot.
-            unsafe { *core::ptr::addr_of_mut!(RELEASE_CAP) = words };
+            unsafe { *core::ptr::addr_of_mut!(CAP_REQUEST) = words };
             return RELEASE_CAP_PARK;
         }
         bytecode::CoopEvent::Done(vals) => match vals.first() {
@@ -7440,13 +7457,13 @@ pub extern "C" fn temen_release_value() -> i64 {
 #[no_mangle]
 pub extern "C" fn temen_release_cap_len() -> usize {
     // SAFETY: single-threaded wasm.
-    unsafe { (*core::ptr::addr_of!(RELEASE_CAP)).len() }
+    unsafe { (*core::ptr::addr_of!(CAP_REQUEST)).len() }
 }
 /// Pointer to the request words [`temen_release_cap_len`] counts.
 #[no_mangle]
 pub extern "C" fn temen_release_cap_ptr() -> *const i64 {
     // SAFETY: single-threaded wasm.
-    unsafe { (*core::ptr::addr_of!(RELEASE_CAP)).as_ptr() }
+    unsafe { (*core::ptr::addr_of!(CAP_REQUEST)).as_ptr() }
 }
 
 /// #1953: answer the host-completed cap call the run is parked on: `value` is the call's result.
@@ -7465,7 +7482,7 @@ pub extern "C" fn temen_release_deliver_cap(id: u64, value: i64) -> i32 {
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
     // SAFETY: as above.
-    unsafe { (*core::ptr::addr_of_mut!(RELEASE_CAP)).clear() };
+    unsafe { (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear() };
     1
 }
 
@@ -7479,14 +7496,14 @@ pub extern "C" fn temen_release_read(addr: u64, len: usize) -> usize {
         .and_then(|s| s.run.read_window(addr, len).ok())
         .unwrap_or_default();
     let n = bytes.len();
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(RELEASE_READ), bytes) };
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(WINDOW_READ), bytes) };
     n
 }
 /// Pointer to the bytes the last [`temen_release_read`] copied.
 #[no_mangle]
 pub extern "C" fn temen_release_read_ptr() -> *const u8 {
     // SAFETY: single-threaded wasm.
-    unsafe { (*core::ptr::addr_of!(RELEASE_READ)).0 }
+    unsafe { (*core::ptr::addr_of!(WINDOW_READ)).0 }
 }
 
 /// Drop the open release run, if any (a Stop, or a new compile).
@@ -7495,7 +7512,7 @@ pub extern "C" fn temen_release_close() {
     // SAFETY: single-threaded access to the session statics.
     unsafe {
         *core::ptr::addr_of_mut!(RELEASE) = None;
-        (*core::ptr::addr_of_mut!(RELEASE_CAP)).clear();
+        (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear();
     }
 }
 
@@ -8283,36 +8300,19 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     // drops this run before freeing it.
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
-            run,
             back: Some(s.back.clone()),
-            nim: None,
-            module: 0,
             warm: true,
             emitted_wasm: std::sync::Arc::clone(&wc.wasm),
-            func: 0,
-            mapped: 0,
-            argv: Vec::new(),
-            jit_code: 0,
-            jit_wasm: None,
-            jit_param_types: Vec::new(),
-            jit_result_types: Vec::new(),
             sigs: wc
                 .m
                 .funcs
                 .iter()
                 .map(|f| (f.params.clone(), f.results.clone()))
                 .collect(),
-            shim_wasm: Vec::new(),
-            jit_wasm_by_handle: None,
-            pending_bounce_trap: None,
-            value: 0,
             frame,
             paged: wc.paged,
-            pagestate: Vec::new(),
-            pagestate_version: u64::MAX,
-            pagestate_env: i64::MIN,
-            pagestate_cover: 0,
             spill: spill_region(wc.spill),
+            ..CoopTierupRun::over(run)
         });
     }
     set(STATUS_OK);
@@ -13630,6 +13630,12 @@ pub const COOP_RUN_JIT_INVOKE: i32 = 3;
 /// parked `call_interp`'s scratch and resumes the leaf's suspended frames ([`temen_coop_task`]
 /// names the leaf).
 pub const COOP_RUN_RESUME: i32 = 4;
+/// #1954: [`temen_coop_run_for`]'s slice was spent and the program is still running; pump again.
+pub const COOP_RUN_PAUSED: i32 = 5;
+/// #1954: the program is waiting on a declared host-completed cap call. Read the request
+/// ([`temen_coop_cap_len`]/[`temen_coop_cap_ptr`]), answer it with [`temen_coop_deliver_cap`], and
+/// pump again.
+pub const COOP_RUN_CAP_PARK: i32 = 6;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
 /// (mirrors the relevant fields of `TierupRun`). The window `Region` is shared with `CoopRun`'s
@@ -13651,11 +13657,22 @@ struct CoopTierupRun {
     /// `None` for a nimony build ([`nimony::temen_nim_open`]): its root window is the engine's own,
     /// and each process it tiers up runs over a window of that process's.
     back: Option<std::sync::Arc<temen_interp::Region>>,
-    /// #1896 — a nimony build's session: its personality and the leaf images it emitted. `None` for
-    /// every other run.
+    /// #1896 — a nimony build's session: its personality. `None` for every other run.
     nim: Option<nimony::NimSession>,
-    /// The program the pending TIERUP runs: `0`, this run's own emit, or a nim session's leaf image.
+    /// #1896/#1954 — the leaf images this run emitted, by program: a nim build's exec'd processes, or
+    /// (program `0`) a [`temen_coop_open`] run's whole root program.
+    leaves: Leaves,
+    /// The program the pending TIERUP runs: a leaf image, or (`0` with no root leaf) this run's own
+    /// region emit.
     module: u32,
+    /// #1954: the host-completed cap names declared at open, in order — a parked request names its
+    /// cap by index into this list ([`COOP_RUN_CAP_PARK`]).
+    caps: Vec<String>,
+    /// #1954: the calls parked on those caps, by completion id (filled by the procs' submit hooks).
+    requests: temen_interp::CapRequests,
+    /// #1954: the run is pumped in slices ([`temen_coop_run_for`]), so each return hands back the
+    /// output produced since the last, not the whole run's at the end.
+    sliced: bool,
     /// #816 item 4: a warm-coop run — at DONE/TRAP the warm session's heap high-water advances (so
     /// the next restore zeroes what this eval dirtied), and [`temen_warm_close`] must drop this run
     /// before freeing the window it borrows.
@@ -13704,15 +13721,56 @@ struct CoopTierupRun {
     spill: Vec<u64>,
 }
 
+/// The emitted wasm of each leaf image a run offered, by program index, and whether it carries the
+/// page check; `None` for an image the emitter declined (it runs interpreted).
+pub(crate) type Leaves = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<u32, Option<(std::sync::Arc<[u8]>, bool)>>>,
+>;
+
+/// #1896/#1954 — a session's leaf emitter: emit an image whole, wasm-driven from its entry —
+/// page-checked when the engine says its page state can change — once per program, over `shared`
+/// memory or not. An image that is not wasm-drivable (it could suspend a frame) runs interpreted, and
+/// so does one that can park when the host cannot suspend its emitted frames (`suspends`).
+pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> bytecode::LeafEmitter {
+    std::sync::Arc::new(move |o: &bytecode::LeafOffer| {
+        if o.parks && !suspends {
+            return false;
+        }
+        let Ok(mut leaves) = leaves.lock() else {
+            return false;
+        };
+        let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
+            let shape = temen_wasm_jit::Shape::Batch { entry: o.entry };
+            let a = match o.paged {
+                true => {
+                    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+                    temen_wasm_jit::compile_jit_page_checked(o.image, shape, shared, page_log2)
+                }
+                false => temen_wasm_jit::compile_jit(o.image, shape, shared),
+            }
+            .ok()?;
+            let temen_wasm_jit::DriveMode::WasmDriven { .. } = a.drive else {
+                return None;
+            };
+            Some((a.wasm.into(), o.paged))
+        });
+        leaf.is_some()
+    })
+}
+
 impl CoopTierupRun {
-    /// #1896 — a nimony build's session over `run`: nothing of its own emitted, so every field but
-    /// the run and the nim session starts empty.
-    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession) -> Self {
+    /// A session over `run` with nothing of its own: no window, no emit, no leaves, no caps. The
+    /// opens fill in what they have over it.
+    fn over(run: bytecode::CoopRun) -> Self {
         CoopTierupRun {
             run,
             back: None,
-            nim: Some(nim),
+            nim: None,
+            leaves: Leaves::default(),
             module: 0,
+            caps: Vec::new(),
+            requests: temen_interp::CapRequests::default(),
+            sliced: false,
             warm: false,
             emitted_wasm: std::sync::Arc::from([]),
             func: 0,
@@ -13737,13 +13795,25 @@ impl CoopTierupRun {
         }
     }
 
-    /// Whether the pending event's program carries the page check (#1009): this run's own emit's
-    /// mode, or a leaf image's own (#1896).
-    fn event_paged(&self) -> bool {
-        match (&self.nim, self.module) {
-            (Some(nim), m) if m != 0 => nim.leaf(m).is_some_and(|(_, paged)| paged),
-            _ => self.paged,
+    /// #1896 — a nimony build's session over `run`: its personality and the leaves its emitter fills.
+    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession, leaves: Leaves) -> Self {
+        CoopTierupRun {
+            nim: Some(nim),
+            leaves,
+            ..CoopTierupRun::over(run)
         }
+    }
+
+    /// Leaf image `module`'s emitted wasm and whether it is paged.
+    fn leaf(&self, module: u32) -> Option<(std::sync::Arc<[u8]>, bool)> {
+        self.leaves.lock().ok()?.get(&module).cloned().flatten()
+    }
+
+    /// Whether the pending event's program carries the page check (#1009): a leaf image's own mode
+    /// (#1896), else this run's own emit's.
+    fn event_paged(&self) -> bool {
+        self.leaf(self.module)
+            .map_or(self.paged, |(_, paged)| paged)
     }
 
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
@@ -13939,6 +14009,15 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     })
 }
 
+/// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.
+pub const COOP_LEAF_OFF: i32 = 0;
+/// `temen_coop_open`'s `leaf` (#1954): run the whole root program as one emitted leaf when it can
+/// never park, so it never comes back to the interpreter.
+pub const COOP_LEAF_ROOT: i32 = 1;
+/// `temen_coop_open`'s `leaf` (#1954): as [`COOP_LEAF_ROOT`], and also when the root can park in a
+/// call its host suspends the emitted frames at (JSPI): a stream call, or a declared cap.
+pub const COOP_LEAF_SUSPENDS: i32 = 2;
+
 /// Open a cooperative tier-up run over the guest module `[mod_ptr, mod_len)` (stdin optional,
 /// `shared` = SharedArrayBuffer memory). Returns `0`/`STATUS_OK` on success, a negative `STATUS_*`
 /// on refusal (decode error, an op outside the engine subset, nothing for the emitted tier to run,
@@ -13949,24 +14028,135 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
 /// commits real memory instead of `-EINVAL`ing. Growing reallocates and can move the window, so the
 /// driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`] after every bounce and
 /// publish the base to each emitted instance's `"win"` global.
+///
+/// #1954: `[caps_ptr, caps_len)` names the **host-completed caps** the embedder services, as
+/// [`temen_release_open`] takes them; a call to one parks the run ([`COOP_RUN_CAP_PARK`]) until
+/// [`temen_coop_deliver_cap`] answers it. `leaf` ([`COOP_LEAF_OFF`], [`COOP_LEAF_ROOT`],
+/// [`COOP_LEAF_SUSPENDS`]) offers the root program to run whole as an emitted leaf: when the
+/// emitter takes it, the TIERUP of program `0` is the leaf's ([`temen_coop_leaf_wasm_ptr`]) and the
+/// run has no region emit; when it doesn't, the run is the region run it would have been. A JS host
+/// leaves both out (they read as zero).
 #[no_mangle]
+#[allow(clippy::too_many_arguments)] // the FFI open takes each input as a (ptr, len) pair
 pub extern "C" fn temen_coop_open(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
     shared: i32,
+    caps_ptr: *const u8,
+    caps_len: usize,
+    leaf: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     temen_coop_close();
     // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m0) = temen_encode::decode_module(bytes) else {
+    let (Ok(m0), Some(caps)) = (
+        temen_encode::decode_module(bytes),
+        host_cap_names(caps_ptr, caps_len),
+    ) else {
         set(STATUS_DECODE_ERR);
         return -STATUS_DECODE_ERR;
     };
+    if onramp_check(&m0).is_err() || m0.memory.is_none() {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    }
     let declared = m0.memory.map_or(0, |mc| mc.size_log2);
     let win_log2 = JIT_RUN_WIN_LOG2.max(declared);
+    // #1312: a **growable** window. `win_log2` is the *initial* size (and the emit-time mask domain);
+    // a guest allocator's `vm_map` grows the backing past it on demand, exactly as it grows the
+    // oracle's own reservation, instead of `-EINVAL`ing at a pre-sized ceiling (INVARIANTS.md #14).
+    // Growing relocates, so nothing may cache the base — see `CoopTierupRun::back`.
+    let Some(region) =
+        temen_interp::Region::growable(1u64 << win_log2, temen_interp::host_page_size())
+    else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    let back = std::sync::Arc::new(region);
+    let stdin = if stdin_ptr.is_null() || stdin_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the host guarantees the stdin range is a live `temen_alloc`ation it just filled.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
+    };
+    let requests = temen_interp::CapRequests::default();
+    // The on-ramp powerbox and environment the plain run gives `m` — the release session's.
+    let init = onramp_env_init(&run_env());
+    let host_for = |m: &temen_ir::Module| {
+        let mut host = Host::new();
+        host.stdin = stdin.clone();
+        let frame = grant_onramp_caps(&mut host, m, None, Some((&caps, &requests))).frame;
+        (host, frame)
+    };
+    // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
+    // (#1312). It used to be clamped to `win_log2`, which made a `vm_map` past the declared window
+    // `-EINVAL` here and succeed on `onramp_exec` — the divergence this issue is about. Growth into
+    // `[declared, 1 << DEFAULT_RESERVED_LOG2)` is now admitted exactly as the oracle admits it, and
+    // the growable backing commits the pages; only a map past the reservation is still `-EINVAL`.
+    let open_run = |m: &temen_ir::Module, host: Host, tierup: bytecode::TierUpConfig| {
+        bytecode::CoopRun::new_over(
+            m,
+            0,
+            &[],
+            u64::MAX,
+            host,
+            Some(tierup),
+            &init,
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            back.clone(),
+        )
+    };
+    let install = |s: CoopTierupRun| {
+        // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
+        unsafe { *core::ptr::addr_of_mut!(COOP_RUN) = Some(s) };
+        set(STATUS_OK);
+        0
+    };
+    // #1954: offer the root first. When the emitter takes it, the whole program runs emitted and a
+    // region emit would never run — so there is none. The run is over the outlined module (#889), as
+    // the region run's is: a root's inline `call.import`/`call.cap` sites become plain calls to
+    // appended wrappers, which the emitted root reaches by bouncing to the interpreter — the one
+    // module both tiers number functions in.
+    if leaf != COOP_LEAF_OFF {
+        let mut m = m0.clone();
+        temen_wasm_jit::outline_cap_calls(&mut m);
+        let leaves = Leaves::default();
+        let tierup = bytecode::TierUpConfig {
+            eligible: std::sync::Arc::from([]),
+            page_checked: false,
+            leaf: Some(leaf_emitter(
+                leaves.clone(),
+                leaf == COOP_LEAF_SUSPENDS,
+                shared != 0,
+            )),
+        };
+        let (host, frame) = host_for(&m);
+        match open_run(&m, host, tierup) {
+            Some(Ok(run))
+                if leaves
+                    .lock()
+                    .is_ok_and(|l| matches!(l.get(&0), Some(Some(_)))) =>
+            {
+                return install(CoopTierupRun {
+                    back: Some(back.clone()),
+                    leaves,
+                    caps: caps.clone(),
+                    requests: requests.clone(),
+                    frame,
+                    ..CoopTierupRun::over(run)
+                });
+            }
+            Some(Err(_)) => {
+                set(STATUS_TRAP);
+                return -STATUS_TRAP;
+            }
+            // Not taken: the region run below, over a fresh powerbox.
+            _ => requests.lock().unwrap_or_else(|e| e.into_inner()).clear(),
+        }
+    }
     let CoopEmit {
         m,
         wasm,
@@ -13983,25 +14173,7 @@ pub extern "C" fn temen_coop_open(
             return -status;
         }
     };
-    // #1312: a **growable** window. `win_log2` is the *initial* size (and the emit-time mask domain);
-    // a guest allocator's `vm_map` grows the backing past it on demand, exactly as it grows the
-    // oracle's own reservation, instead of `-EINVAL`ing at a pre-sized ceiling (INVARIANTS.md #14).
-    // Growing relocates, so nothing may cache the base — see `CoopTierupRun::back`.
-    let Some(region) =
-        temen_interp::Region::growable(1u64 << win_log2, temen_interp::host_page_size())
-    else {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    };
-    let back = std::sync::Arc::new(region);
-    let mut host = Host::new();
-    host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: the host guarantees the stdin range is a live `temen_alloc`ation it just filled.
-        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
-    };
-    let frame = grant_onramp_caps(&mut host, &m, None, None).frame;
+    let (mut host, frame) = host_for(&m);
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
@@ -14031,22 +14203,7 @@ pub extern "C" fn temen_coop_open(
         page_checked: paged,
         leaf: None,
     };
-    // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
-    // (#1312). It used to be clamped to `win_log2`, which made a `vm_map` past the declared window
-    // `-EINVAL` here and succeed on `onramp_exec` — the divergence this issue is about. Growth into
-    // `[declared, 1 << DEFAULT_RESERVED_LOG2)` is now admitted exactly as the oracle admits it, and
-    // the growable backing commits the pages; only a map past the reservation is still `-EINVAL`.
-    let run = match bytecode::CoopRun::new_over(
-        &m,
-        0,
-        &[],
-        u64::MAX,
-        host,
-        Some(tierup),
-        &[],
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        back.clone(),
-    ) {
+    let run = match open_run(&m, host, tierup) {
         Some(Ok(r)) => r,
         Some(Err(_)) => {
             set(STATUS_TRAP);
@@ -14057,42 +14214,21 @@ pub extern "C" fn temen_coop_open(
             return -STATUS_UNSUPPORTED;
         }
     };
-    // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
-    unsafe {
-        *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
-            run,
-            back: Some(back),
-            nim: None,
-            module: 0,
-            warm: false,
-            emitted_wasm: wasm.into(),
-            func: 0,
-            mapped: 0,
-            argv: Vec::new(),
-            jit_code: 0,
-            jit_wasm: None,
-            jit_param_types: Vec::new(),
-            jit_result_types: Vec::new(),
-            sigs: m
-                .funcs
-                .iter()
-                .map(|f| (f.params.clone(), f.results.clone()))
-                .collect(),
-            shim_wasm: Vec::new(),
-            jit_wasm_by_handle: None,
-            pending_bounce_trap: None,
-            value: 0,
-            frame,
-            paged,
-            pagestate: Vec::new(),
-            pagestate_version: u64::MAX,
-            pagestate_env: i64::MIN,
-            pagestate_cover: 0,
-            spill: spill_region(spill),
-        });
-    }
-    set(STATUS_OK);
-    0
+    install(CoopTierupRun {
+        back: Some(back.clone()),
+        caps: caps.clone(),
+        requests: requests.clone(),
+        emitted_wasm: wasm.into(),
+        sigs: m
+            .funcs
+            .iter()
+            .map(|f| (f.params.clone(), f.results.clone()))
+            .collect(),
+        frame,
+        paged,
+        spill: spill_region(spill),
+        ..CoopTierupRun::over(run)
+    })
 }
 
 /// Pump the cooperative run to its next host event: `COOP_RUN_TIERUP` (read the operands via the
@@ -14101,12 +14237,44 @@ pub extern "C" fn temen_coop_open(
 /// into the shared accessor slots). All concurrency is multiplexed inside the pump.
 #[no_mangle]
 pub extern "C" fn temen_coop_run() -> i32 {
+    coop_pump(None)
+}
+
+/// #1954: [`temen_coop_run`] for at most about `budget` interpreted ops — [`COOP_RUN_PAUSED`] when the
+/// slice is spent. Emitted code is not counted: a leaf runs until it returns or parks. Once a run is
+/// pumped this way, every return leaves in the stdout/stderr slots the output produced since the
+/// last (the caller accumulates), where an unsliced run's are filled once, at the end.
+#[no_mangle]
+pub extern "C" fn temen_coop_run_for(budget: u64) -> i32 {
+    coop_pump(Some(budget))
+}
+
+fn coop_pump(budget: Option<u64>) -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
         return COOP_RUN_TRAP;
     };
-    let (status, value, exit_code, ev) = match s.run.run() {
+    s.sliced |= budget.is_some();
+    let ev = match budget {
+        Some(ops) => s.run.run_for(ops),
+        None => s.run.run(),
+    };
+    if s.sliced
+        && !matches!(
+            ev,
+            bytecode::CoopEvent::Done(_) | bytecode::CoopEvent::Trapped(_)
+        )
+    {
+        let host = s.run.host_mut();
+        let (out, err) = (host.take_stdout(), host.take_stderr());
+        // SAFETY: single-threaded wasm; the capture slots are read back only via the accessors.
+        unsafe {
+            stash(&mut *core::ptr::addr_of_mut!(OUT), out);
+            stash(&mut *core::ptr::addr_of_mut!(ERR), err);
+        }
+    }
+    let (status, value, exit_code, ev) = match ev {
         bytecode::CoopEvent::TierUp {
             module,
             func,
@@ -14170,13 +14338,16 @@ pub extern "C" fn temen_coop_run() -> i32 {
         },
         bytecode::CoopEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, 0, code, COOP_RUN_DONE),
         bytecode::CoopEvent::Trapped(_) => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
+        bytecode::CoopEvent::Paused => return COOP_RUN_PAUSED,
+        bytecode::CoopEvent::CapPark { id } => {
+            let words = cap_park_words(&s.caps, &s.requests, id).unwrap_or_default();
+            // SAFETY: single-threaded access to the read-back slot.
+            unsafe { *core::ptr::addr_of_mut!(CAP_REQUEST) = words };
+            return COOP_RUN_CAP_PARK;
+        }
         // Never surfaced here: the tier-up driver does not arm `set_suspend_on_idle` (#1122 route (a)
         // is the bash coop session's driver, below). Fail closed rather than spin.
-        // Neither suspension nor slicing is enabled on this session, and it grants no
-        // host-completed caps (#1953), so nothing could park it on one.
-        bytecode::CoopEvent::Idle
-        | bytecode::CoopEvent::Paused
-        | bytecode::CoopEvent::CapPark { .. } => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
+        bytecode::CoopEvent::Idle => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
     };
     s.value = value;
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next
@@ -14238,6 +14409,61 @@ pub extern "C" fn temen_coop_run() -> i32 {
     ev
 }
 
+/// #1954: the length, in `i64` words, of the request the last [`COOP_RUN_CAP_PARK`] reported (`0`
+/// when none): `[completion id, cap index (into the names given at open), the guest's args…]`.
+#[no_mangle]
+pub extern "C" fn temen_coop_cap_len() -> usize {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(CAP_REQUEST)).len() }
+}
+/// Pointer to the request words [`temen_coop_cap_len`] counts.
+#[no_mangle]
+pub extern "C" fn temen_coop_cap_ptr() -> *const i64 {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(CAP_REQUEST)).as_ptr() }
+}
+
+/// #1954: answer the host-completed cap call the run is parked on: `value` is the call's result.
+/// Returns `1`, or `0` if no call is outstanding on `id` (or no session is open). Then pump again —
+/// a leaf whose call parked comes back as [`COOP_RUN_RESUME`].
+#[no_mangle]
+pub extern "C" fn temen_coop_deliver_cap(id: u64, value: i64) -> i32 {
+    // SAFETY: single-threaded access to the session statics.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        return 0;
+    };
+    if !s.run.deliver_cap(id, value) {
+        return 0;
+    }
+    s.requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+    // SAFETY: as above.
+    unsafe { (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear() };
+    1
+}
+
+/// #1954: copy `len` bytes of the run's root window at `addr` (bounded: an out-of-window range copies
+/// nothing) — e.g. the pixels a parked `present` call names. Returns the length copied (`len`, or
+/// `0`); the bytes are at [`temen_coop_read_ptr`] until the next call.
+#[no_mangle]
+pub extern "C" fn temen_coop_read(addr: u64, len: usize) -> usize {
+    // SAFETY: single-threaded access to the session statics and the read-back slot.
+    let bytes = unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.run.read_window(addr, len).ok())
+        .unwrap_or_default();
+    let n = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(WINDOW_READ), bytes) };
+    n
+}
+/// Pointer to the bytes the last [`temen_coop_read`] copied.
+#[no_mangle]
+pub extern "C" fn temen_coop_read_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(WINDOW_READ)).0 }
+}
+
 /// #1896: the task the pending TIERUP or RESUME is for, or `-1`. A driver that suspends a leaf's
 /// frames where a call parks keys them by it.
 #[no_mangle]
@@ -14247,19 +14473,21 @@ pub extern "C" fn temen_coop_task() -> i32 {
         .map_or(-1, |t| t as i32)
 }
 
-/// #1896: the program the pending TIERUP's `func` is in — `0`, this run's own emit
-/// ([`temen_coop_wasm_ptr`]), or a leaf image a nimony build emitted ([`temen_coop_leaf_wasm_ptr`]).
+/// #1896: the program the pending TIERUP's `func` is in — a leaf image the run emitted
+/// ([`temen_coop_leaf_wasm_ptr`]: a nimony build's exec'd process, or program `0`, a root program
+/// run whole, #1954), else `0`, this run's own region emit ([`temen_coop_wasm_ptr`]). A driver tells
+/// them apart by [`temen_coop_leaf_wasm_len`].
 #[no_mangle]
 pub extern "C" fn temen_coop_module() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
 }
 
-/// #1896: the emitted wasm of leaf image `module` of a nimony build (`null` when there is none). The
-/// bytes live as long as the session.
+/// #1896: the emitted wasm of leaf image `module` (`null` when there is none). The bytes live as long
+/// as the session.
 #[no_mangle]
 pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.nim.as_ref()?.leaf(module))
+        .and_then(|s| s.leaf(module))
         .map_or(core::ptr::null(), |(wasm, _)| wasm.as_ptr())
 }
 
@@ -14267,7 +14495,7 @@ pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
 #[no_mangle]
 pub extern "C" fn temen_coop_leaf_wasm_len(module: u32) -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.nim.as_ref()?.leaf(module))
+        .and_then(|s| s.leaf(module))
         .map_or(0, |(wasm, _)| wasm.len())
 }
 
@@ -14710,6 +14938,7 @@ pub extern "C" fn temen_coop_close() {
     // SAFETY: single-threaded wasm; take + drop the session.
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = None;
+        (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear();
     }
 }
 
@@ -15386,8 +15615,11 @@ int main(void) {
 "#;
 
     fn compile(src: &str) -> Option<temen_ir::Module> {
-        let bytes =
-            std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen")).ok()?;
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/web/assets/chibicc.temen"
+        ))
+        .ok()?;
         let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
         let mut files = playground_include_files();
         files.push(("in.c".to_string(), src.as_bytes().to_vec()));
@@ -15413,9 +15645,10 @@ int main(void) {
         });
         // 16 MiB: room for the libc's heap, and within the cap every platform backs flat.
         let reserved = m.memory.expect("a window").size_log2.max(24);
-        let mut run = bytecode::CoopRun::new_reserved(m, 0, &[], u64::MAX, host, tierup, &[], reserved)
-            .expect("in subset")
-            .expect("starts");
+        let mut run =
+            bytecode::CoopRun::new_reserved(m, 0, &[], u64::MAX, host, tierup, &[], reserved)
+                .expect("in subset")
+                .expect("starts");
         let (mut parks, mut tierups, mut resumes) = (0, 0, 0);
         let end = loop {
             match run.run() {
@@ -15466,7 +15699,11 @@ int main(void) {
             true
         });
         let leafed = run(&m, Some(leaf));
-        assert_eq!(offers.lock().unwrap().clone(), vec![(0, true)], "the root, parking");
+        assert_eq!(
+            offers.lock().unwrap().clone(),
+            vec![(0, true)],
+            "the root, parking"
+        );
         assert_eq!(
             leafed,
             (end, stdout, 5, 1, 1),
