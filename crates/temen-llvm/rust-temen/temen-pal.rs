@@ -38,6 +38,21 @@ pub(crate) mod host {
     unsafe extern "C" {
         fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
         fn __vm_host_call(handle: i32, op: i32, a: i64, b: i64, c: i64, d: i64) -> i64;
+        // The core pipe builtins (temen-llvm, FORK.md §8.6): mint a pipe into this process's
+        // powerbox, and read, write or close one of its ends by handle.
+        fn __vm_pipe(fds: *mut i32) -> i64;
+        fn __vm_read(h: i32, buf: *mut u8, len: i64) -> i64;
+        fn __vm_write(h: i32, buf: *const u8, len: i64) -> i64;
+        fn __vm_close(h: i32) -> i64;
+    }
+
+    /// The bound at or below which a personality answer is a **tag**, `TAG_BASE - handle` (temen-posix
+    /// `PX_TAG_BASE`, #972): the fd is a core pipe end, and the call belongs on that end's own handle.
+    const TAG_BASE: i64 = -(1 << 20);
+
+    /// The pipe-end handle a personality answer `r` redirects to, if it is a tag.
+    fn tagged(r: i64) -> Option<i32> {
+        (r <= TAG_BASE).then(|| (TAG_BASE - r) as i32)
     }
 
     // `-1` = not-yet-resolved sentinel (a real handle is non-negative); resolved once, then cached.
@@ -103,10 +118,18 @@ pub(crate) mod host {
         unsafe { __vm_host_call(posix(), 5, path as i64, plen, flags, 0) }
     }
 
-    /// `close(fd) -> 0 | -errno` (temen-posix `OP_CLOSE` = 6).
+    /// `close(fd) -> 0 | -errno` (temen-posix `OP_CLOSE` = 6). The last close of a core pipe end's
+    /// descriptor answers a tag, and the end's handle is released here.
     #[inline(always)]
     pub(crate) fn close(fd: i64) -> i64 {
-        unsafe { __vm_host_call(posix(), 6, fd, 0, 0, 0) }
+        let r = unsafe { __vm_host_call(posix(), 6, fd, 0, 0, 0) };
+        match tagged(r) {
+            Some(h) => {
+                unsafe { __vm_close(h) };
+                0
+            }
+            None => r,
+        }
     }
 
     /// `lseek(fd, offset, whence) -> new_offset | -errno` (temen-posix `OP_LSEEK` = 7).
@@ -141,17 +164,28 @@ pub(crate) mod host {
     }
 
     /// `read(fd, buf, len) -> n | -errno` (temen-posix `OP_READ` = 1). Distinct from the stdio PAL's
-    /// `extern "C" read` (the powerbox stdin stream) — this drives a `posix`-personality file fd.
+    /// `extern "C" read` (the powerbox stdin stream) — this drives a `posix`-personality file fd. A
+    /// core pipe end's descriptor answers a tag, and the read is made on the end: it waits while the
+    /// pipe is empty and a writer is left.
     #[inline(always)]
     pub(crate) fn read_fd(fd: i64, buf: *mut u8, len: i64) -> i64 {
-        unsafe { __vm_host_call(posix(), 1, fd, buf as i64, len, 0) }
+        let r = unsafe { __vm_host_call(posix(), 1, fd, buf as i64, len, 0) };
+        match tagged(r) {
+            Some(h) => unsafe { __vm_read(h, buf, len) },
+            None => r,
+        }
     }
 
     /// `write(fd, buf, len) -> n | -errno` (temen-posix `OP_WRITE` = 0). The file-fd counterpart of the
-    /// stdio PAL's powerbox `write`.
+    /// stdio PAL's powerbox `write`; a core pipe end's descriptor is written on the end, as
+    /// [`read_fd`] reads it.
     #[inline(always)]
     pub(crate) fn write_fd(fd: i64, buf: *const u8, len: i64) -> i64 {
-        unsafe { __vm_host_call(posix(), 0, fd, buf as i64, len, 0) }
+        let r = unsafe { __vm_host_call(posix(), 0, fd, buf as i64, len, 0) };
+        match tagged(r) {
+            Some(h) => unsafe { __vm_write(h, buf, len) },
+            None => r,
+        }
     }
 
     /// `stat(path, plen, statbuf) -> 0 | -errno` (temen-posix `OP_STAT` = 13). Fills the caller's
@@ -180,56 +214,71 @@ pub(crate) mod host {
         unsafe { __vm_host_call(posix(), 16, dir, 0, 0, 0) }
     }
 
-    // ---- pipes + spawn/wait (temen-posix `OP_PIPE`/`OP_DUP2`/`OP_SPAWN`/… — the `std::process` surface) --
+    // ---- pipes + spawn/wait (temen-posix `OP_PIPE_ADOPT`/`OP_PSPAWN`/… — the `std::process` surface) --
 
-    /// `pipe(fds_ptr) -> 0 | -errno` (temen-posix `OP_PIPE` = 23). Writes `[read_fd, write_fd]` (two
-    /// little-endian `i32`s) at `fds_ptr`; the two ends share one in-personality FIFO (non-blocking).
-    #[inline(always)]
+    /// `pipe(fds_ptr) -> 0 | -errno`: mint a core pipe into this process's powerbox (`__vm_pipe`) and
+    /// adopt its two ends as descriptors (temen-posix `OP_PIPE_ADOPT` = 52), written at `fds_ptr` as two
+    /// little-endian `i32`s, read end first. A read of the empty pipe waits while a writer is left, and a
+    /// write to the full pipe while a reader is — across processes: a spawned child's end is the same
+    /// pipe.
     pub(crate) fn pipe(fds_ptr: *mut u8) -> i64 {
-        unsafe { __vm_host_call(posix(), 23, fds_ptr as i64, 0, 0, 0) }
+        let mut h = [0i32; 2];
+        let r = unsafe { __vm_pipe(h.as_mut_ptr()) };
+        if r != 0 {
+            return r;
+        }
+        let r = unsafe { __vm_host_call(posix(), 52, h[0] as i64, h[1] as i64, fds_ptr as i64, 0) };
+        if r != 0 {
+            unsafe {
+                __vm_close(h[0]);
+                __vm_close(h[1]);
+            }
+        }
+        r
     }
 
     /// `dup2(oldfd, newfd) -> newfd | -errno` (temen-posix `OP_DUP2` = 24). Re-points `newfd` at `oldfd`'s
-    /// object, closing whatever `newfd` referred to — the redirect primitive (`dup2(pipe_w, 1)`).
+    /// object, closing whatever `newfd` referred to.
     #[inline(always)]
     pub(crate) fn dup2(oldfd: i64, newfd: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 24, oldfd, newfd, 0, 0) }
     }
 
-    /// `dup(oldfd) -> fd | -errno` (temen-posix `OP_DUP` = 25). Clones `oldfd` onto the lowest free fd —
-    /// used to save fd 1 across a spawn's stdout redirect.
+    /// `dup(oldfd) -> fd | -errno` (temen-posix `OP_DUP` = 25). Clones `oldfd` onto the lowest free fd.
     #[inline(always)]
     pub(crate) fn dup(oldfd: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 25, oldfd, 0, 0, 0) }
     }
 
-    /// `spawn(name, name_len, argv, argv_len) -> pid | -errno` (temen-posix `OP_SPAWN` = 27). Runs a
-    /// command to completion (fork-free, sequential) via the embedder's spawn delegate; the child
-    /// inherits fd 0 (stdin) and routes its stdout to the caller's current fd 1. `argv` is a
-    /// NUL-separated blob (`argv[0]` = program name; empty ⇒ `[name]`). `-ENOSYS` if no delegate.
+    /// `pspawn(req) -> pid | -errno` (temen-posix `OP_PSPAWN` = 62): POSIX `posix_spawn`, a new process
+    /// running the program at a path. `req` points at five little-endian words, `{path, argv, envp,
+    /// actions, nactions}`: a NUL-terminated path, NULL-terminated arrays of NUL-terminated strings
+    /// (`envp` may be NULL), and `nactions` file actions of four words each, `{op, fd, arg, path}`,
+    /// applied in order to the child's copy of this process's descriptors.
     #[inline(always)]
-    pub(crate) fn spawn(name: *const u8, name_len: i64, argv: *const u8, argv_len: i64) -> i64 {
-        unsafe { __vm_host_call(posix(), 27, name as i64, name_len, argv as i64, argv_len) }
+    pub(crate) fn pspawn(req: *const u64) -> i64 {
+        unsafe { __vm_host_call(posix(), 62, req as i64, 0, 0, 0) }
     }
 
-    /// `spawn2(req_ptr) -> pid | -errno` (temen-posix `OP_SPAWN2` = 43). The **parallel-safe** spawn+capture:
-    /// `req_ptr` points at a 44-byte little-endian request struct — `{ name_ptr:u64, name_len:u64,
-    /// argv_ptr:u64, argv_len:u64, stdin_fd:i32, stdout_fd:i32, stderr_fd:i32 }` — binding the child's
-    /// stdio to those fds *inside* the one op (a `-1` fd inherits fd 0 / 1 / 2). Unlike the `dup2(pipe,1)`
-    /// bracket around `spawn`, this never mutates the shared fd table, so concurrent captures on the
-    /// parallel driver can't race (#848). The extra args ride a struct because the FFI has four slots
-    /// and the command target already fills them.
-    #[inline(always)]
-    pub(crate) fn spawn2(req_ptr: *const u8) -> i64 {
-        unsafe { __vm_host_call(posix(), 43, req_ptr as i64, 0, 0, 0) }
-    }
-
-    /// `waitpid(pid, status_ptr, options) -> pid | -errno` (temen-posix `OP_WAITPID` = 28). Reaps `pid`
-    /// (or any child when `pid == -1`), writing the wait-encoded status (`WEXITSTATUS` in bits 8–15) as
-    /// an `i32` to `status_ptr` when non-null. A spawned child has already run, so this never blocks.
+    /// `waitpid(pid, status_ptr, options) -> pid | 0 | -errno` (temen-posix `OP_WAITPID` = 28). Reaps
+    /// `pid` (or any child when `pid == -1`), writing the wait-encoded status (`WEXITSTATUS` in bits
+    /// 8–15) as an `i32` to `status_ptr` when non-null. Waits for a running child to exit, unless
+    /// `options` holds `WNOHANG` (`1`): then a running child answers `0`.
     #[inline(always)]
     pub(crate) fn waitpid(pid: i64, status_ptr: *mut u8, options: i64) -> i64 {
         unsafe { __vm_host_call(posix(), 28, pid, status_ptr as i64, options, 0) }
+    }
+
+    /// `kill(pid, sig) -> 0 | -errno` (temen-posix `OP_KILL` = 31).
+    #[inline(always)]
+    pub(crate) fn kill(pid: i64, sig: i64) -> i64 {
+        unsafe { __vm_host_call(posix(), 31, pid, sig, 0, 0) }
+    }
+
+    /// `getpid() -> pid` (temen-posix `OP_GETPID` = 44): this process's pid — `1` for a run's root.
+    #[inline(always)]
+    pub(crate) fn getpid() -> i64 {
+        unsafe { __vm_host_call(posix(), 44, 0, 0, 0, 0) }
     }
 
     // ---- the `net` capability (POSIX.md §5a — `std::net`) ---------------------------------------

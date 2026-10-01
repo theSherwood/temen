@@ -267,6 +267,11 @@ impl OpenOptions {
 }
 
 impl File {
+    /// The file's descriptor — what a spawned child's stdio `dup2`s from (the overlay's `process`).
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         if !host::have_posix() {
             return Err(unsupported_err());

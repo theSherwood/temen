@@ -14,6 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/px_bin.rs"]
+mod px_bin;
+
 /// The temen `std` build lane (`crates/temen-llvm/rust-temen/`).
 fn lane_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-temen")
@@ -58,9 +61,14 @@ fn lane_ready() -> Option<PathBuf> {
     applied.then_some(std_src)
 }
 
+/// The lean target spec (`singlethread`, `no_threads` sync/TLS).
+const LEAN: &str = "x86_64-unknown-temen.json";
+/// The threaded target spec (futex sync, native TLS, `std::thread`).
+const THREADS: &str = "x86_64-unknown-temen-threads.json";
+
 /// Build the inline `std` program `src` for the temen target and return the fat-LTO'd `.ll`.
 fn build_std_bin_ll(name: &str, src: &str) -> Option<PathBuf> {
-    build_std_bin_ll_target(name, src, "x86_64-unknown-temen.json")
+    build_std_bin_ll_target(name, src, LEAN)
 }
 
 /// Build `src` for a specific temen target spec (the lean `x86_64-unknown-temen.json` or the threaded
@@ -191,26 +199,36 @@ fn find_ll(target: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Translate + verify + run `src` on the powerbox **with a granted `posix` cap** (`run_with_caps`),
-/// letting `seed` stage the personality (env, a pinned clock, a seeded memfs, …) → `(stdout, exit)`.
-/// This is the richer-`std::sys` path (`time`/`env`/`fs`) that reaches the host via `__vm_host_call`.
+/// Translate + verify + run `src`, built for `target_file`, on the powerbox **with a granted `posix`
+/// cap** (`run_with_caps`), letting `seed` stage the personality (env, a pinned clock, a seeded memfs,
+/// …) → `(stdout, exit)`. With `bin`, the programs a spawn can run are registered too
+/// ([`px_bin::stage`]). This is the richer-`std::sys` path (`time`/`env`/`fs`/`process`) that reaches
+/// the host via `__vm_host_call`.
 fn temen_run_std_posix(
     name: &str,
     src: &str,
+    target_file: &str,
+    bin: bool,
     seed: impl FnOnce(&temen_posix::Posix),
 ) -> Option<(Vec<u8>, u8)> {
-    let ll = build_std_bin_ll(name, src)?;
+    let ll = build_std_bin_ll_target(name, src, target_file)?;
     let t =
         temen_llvm::translate_ll_path(&ll).expect("on-ramp translates the std binary's LLVM IR");
     temen_verify::verify_module(&t.module).expect("the translated std binary verifies");
     let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
     seed(&posix);
+    let mut stage = |host: &mut temen_interp::Host| {
+        if bin {
+            px_bin::stage(host, &posix);
+        }
+    };
     let out = temen_run::instantiate(t.module)
         .expect("instantiate")
-        .run_with_caps(
+        .run_with_caps_and_host(
             temen_run::Backend::Jit,
             &temen_run::RunConfig::default(),
             &[("posix", cap)],
+            Some(&mut stage),
         )
         .expect("run_with_caps");
     let exit = match out.outcome {
@@ -286,7 +304,7 @@ fn temen_run_std(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
 /// #823 follow-up), so this proves the threaded-`std` codegen builds, translates, verifies, and runs
 /// identically to the lean spec's oracle.
 fn temen_run_std_threads(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
-    let ll = build_std_bin_ll_target(name, src, "x86_64-unknown-temen-threads.json")?;
+    let ll = build_std_bin_ll_target(name, src, THREADS)?;
     let t = temen_llvm::translate_ll_path(&ll)
         .expect("on-ramp translates the threaded std binary's LLVM IR");
     temen_verify::verify_module(&t.module).expect("the translated threaded std binary verifies");
@@ -311,7 +329,7 @@ fn temen_run_std_threads(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
 /// several vCPUs share one personality (its `Inner` is behind a host-side `Mutex`), so a second thread
 /// can drive the memnet peer of a socket the first thread blocks (retries) on.
 fn temen_run_std_threads_net(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
-    let ll = build_std_bin_ll_target(name, src, "x86_64-unknown-temen-threads.json")?;
+    let ll = build_std_bin_ll_target(name, src, THREADS)?;
     let t = temen_llvm::translate_ll_path(&ll)
         .expect("on-ramp translates the threaded std binary's LLVM IR");
     temen_verify::verify_module(&t.module).expect("the translated threaded std binary verifies");
@@ -343,7 +361,7 @@ fn temen_run_std_threads_net(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
 /// still match the oracle even though the interleaving is real. Used to prove the same threaded `std`
 /// programs the cooperative entries pin exactly also run correctly on real OS threads.
 fn temen_run_std_threads_parallel(name: &str, src: &str) -> Option<(Vec<u8>, u8)> {
-    let ll = build_std_bin_ll_target(name, src, "x86_64-unknown-temen-threads.json")?;
+    let ll = build_std_bin_ll_target(name, src, THREADS)?;
     let t = temen_llvm::translate_ll_path(&ll)
         .expect("on-ramp translates the threaded std binary's LLVM IR");
     temen_verify::verify_module(&t.module).expect("the translated threaded std binary verifies");
@@ -657,9 +675,9 @@ fn std_time_reads_the_posix_clock() {
 
     // Pin the clock to 1.7e18 ns = 1_700_000_000 s, so the output is fully determined.
     let seeded_nanos: i64 = 1_700_000_000_000_000_000;
-    let Some((stdout, _)) =
-        temen_run_std_posix("temen_std_time", src, |p| p.set_clock(seeded_nanos))
-    else {
+    let Some((stdout, _)) = temen_run_std_posix("temen_std_time", src, LEAN, false, |p| {
+        p.set_clock(seeded_nanos)
+    }) else {
         eprintln!("note: skipping std_guest time (build-std produced no .ll)");
         return;
     };
@@ -696,9 +714,9 @@ fn std_env_var_os_round_trips() {
          \x20   println!(\"after_remove_present={}\", std::env::var_os(\"SEEDED\").is_some());\n\
          }\n";
 
-    let Some((stdout, _)) =
-        temen_run_std_posix("temen_std_env", src, |p| p.set_env("SEEDED", "from_host"))
-    else {
+    let Some((stdout, _)) = temen_run_std_posix("temen_std_env", src, LEAN, false, |p| {
+        p.set_env("SEEDED", "from_host")
+    }) else {
         eprintln!("note: skipping std_guest env (build-std produced no .ll)");
         return;
     };
@@ -746,7 +764,7 @@ fn std_fs_round_trips() {
          \x20   println!(\"exists_after_remove={}\", fs::exists(\"/data/hello.txt\").unwrap());\n\
          }\n";
 
-    let Some((stdout, _)) = temen_run_std_posix("temen_std_fs", src, |p| {
+    let Some((stdout, _)) = temen_run_std_posix("temen_std_fs", src, LEAN, false, |p| {
         p.write_file("/data/seed.txt", b"seed")
     }) else {
         eprintln!("note: skipping std_guest fs (build-std produced no .ll)");
@@ -764,12 +782,10 @@ fn std_fs_round_trips() {
     );
 }
 
-/// S2 (process) — `std::process::Command` via the posix-cap path: the temen `process` module reaches the
-/// personality's **fork-free** spawn (`OP_SPAWN2`/`OP_WAITPID`) through the PAL `host` bridge. A spawn
-/// runs the named command to completion synchronously; `output` captures its stdout/stderr by routing
-/// them to `OP_PIPE` write ends carried **in the `spawn2` request** (per-child, no fd-1/fd-2 redirect —
-/// parallel-safe, #848), and `status`/`wait` reap the exit code. The embedder wires a scripted spawn
-/// delegate (`set_spawn`) — `echo` echoes its args, `true`/`false` set the exit code.
+/// S2 (process) — `std::process::Command` via the posix-cap path: the temen `process` module spawns a
+/// real process through the personality's `posix_spawn` (`OP_PSPAWN`), looking the name up along
+/// `PATH`, and reaps it with `OP_WAITPID`. `output` reads the child's stdout and stderr through core
+/// pipes to EOF while the child runs; a piped stdin streams into a live `cat`.
 #[test]
 fn std_process_round_trips() {
     if lane_ready().is_none() {
@@ -780,6 +796,7 @@ fn std_process_round_trips() {
     }
 
     let src = "#![feature(restricted_std)]\n\
+         use std::io::Write;\n\
          use std::process::{Command, Stdio};\n\
          fn main() {\n\
          \x20   let out = Command::new(\"echo\").arg(\"hello\").arg(\"world\").output().expect(\"output\");\n\
@@ -792,30 +809,17 @@ fn std_process_round_trips() {
          \x20   let noisy = Command::new(\"noisy\").output().expect(\"output\");\n\
          \x20   println!(\"noisy_out={:?}\", String::from_utf8_lossy(&noisy.stdout).trim_end());\n\
          \x20   println!(\"noisy_err={:?}\", String::from_utf8_lossy(&noisy.stderr).trim_end());\n\
+         \x20   let mut cat = Command::new(\"/bin/cat\").stdin(Stdio::piped()).stdout(Stdio::piped())\n\
+         \x20       .spawn().expect(\"spawn cat\");\n\
+         \x20   cat.stdin.take().expect(\"stdin\").write_all(b\"streamed\").expect(\"write\");\n\
+         \x20   let piped = cat.wait_with_output().expect(\"wait_with_output\");\n\
+         \x20   println!(\"cat_stdout={:?}\", String::from_utf8_lossy(&piped.stdout));\n\
+         \x20   println!(\"missing={:?}\", Command::new(\"nope\").status().unwrap_err().kind());\n\
          \x20   println!(\"pid={}\", std::process::id());\n\
          }\n";
 
-    let Some((stdout, _)) = temen_run_std_posix("temen_std_process", src, |p| {
-        p.set_spawn(|name: &str, argv: &[String], _stdin: &[u8]| {
-            let (stdout, stderr, status) = match name {
-                "echo" => (
-                    format!("{}\n", argv[1..].join(" ")).into_bytes(),
-                    Vec::new(),
-                    0,
-                ),
-                "true" => (Vec::new(), Vec::new(), 0),
-                "false" => (Vec::new(), Vec::new(), 1),
-                // Emits on *both* streams, so `output()` capturing stderr separately is exercised.
-                "noisy" => (b"on stdout\n".to_vec(), b"on stderr\n".to_vec(), 0),
-                _ => (Vec::new(), Vec::new(), 127),
-            };
-            temen_posix::SpawnResult {
-                stdout,
-                stderr,
-                status,
-            }
-        })
-    }) else {
+    let Some((stdout, _)) = temen_run_std_posix("temen_std_process", src, LEAN, true, |_| {})
+    else {
         eprintln!("note: skipping std_guest process (build-std produced no .ll)");
         return;
     };
@@ -827,8 +831,42 @@ fn std_process_round_trips() {
          true_ok=true\n\
          noisy_out=\"on stdout\"\n\
          noisy_err=\"on stderr\"\n\
+         cat_stdout=\"streamed\"\n\
+         missing=NotFound\n\
          pid=1\n",
-        "Command output (stdout+stderr)/status/spawn+wait round-trip through the fork-free spawn"
+        "Command output (stdout+stderr)/status/spawn+wait/piped stdin through posix_spawn"
+    );
+}
+
+/// #1969 — a threaded program spawns from a `std::thread`: the Cranelift JIT serves `posix_spawn`, its
+/// pipes and the reap to every vCPU of a threaded process, as the interpreters do. It answered
+/// `-ENOSYS` there before (a threaded program ran outside any process tree).
+#[test]
+fn std_threads_process_spawns_from_a_thread() {
+    if lane_ready().is_none() {
+        eprintln!(
+            "note: skipping std_guest threaded process (need the temen std overlay — see rust-temen/)"
+        );
+        return;
+    }
+
+    let src = "#![feature(restricted_std)]\n\
+         use std::process::Command;\n\
+         fn main() {\n\
+         \x20   let t = std::thread::spawn(|| Command::new(\"echo\").arg(\"from\").arg(\"thread\").output());\n\
+         \x20   let out = t.join().expect(\"join\").expect(\"output\");\n\
+         \x20   println!(\"code={:?} stdout={:?}\", out.status.code(), String::from_utf8_lossy(&out.stdout));\n\
+         }\n";
+
+    let Some((stdout, _)) = temen_run_std_posix("temen_stdt_process", src, THREADS, true, |_| {})
+    else {
+        eprintln!("note: skipping std_guest threaded process (build-std produced no .ll)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "code=Some(0) stdout=\"from thread\\n\"\n",
+        "a spawned thread's Command::output through posix_spawn"
     );
 }
 
@@ -865,7 +903,7 @@ fn std_fs_dir_ops() {
          \x20   println!(\"clone_read={s:?}\");\n\
          }\n";
 
-    let Some((stdout, _)) = temen_run_std_posix("temen_std_fs_dir", src, |p| {
+    let Some((stdout, _)) = temen_run_std_posix("temen_std_fs_dir", src, LEAN, false, |p| {
         p.write_file("/data/seed", b"x")
     }) else {
         eprintln!("note: skipping std_guest fs-dir (build-std produced no .ll)");

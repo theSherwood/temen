@@ -3581,11 +3581,11 @@ a handful of `temen` leaf-arms + one allocator `imp`.
 **Status (what works, byte-identical to native).** The whole platform layer landed: `std::{io (stdout/
 stderr/exit), env::args, time (Instant/SystemTime via `OP_CLOCK`), env (var/var_os/set/remove/vars), fs
 (File/metadata/read_dir/dir-ops over the memfs), net (TCP over memnet + the `net` cap), process::Command
-(fork-free spawn+capture via `OP_SPAWN2`), thread + sync + TLS (spawn/join, futex `Mutex`/`Condvar`/`mpsc`,
+(a child process via `OP_PSPAWN`, its stdio over core pipes, #1969), thread + sync + TLS (spawn/join, futex `Mutex`/`Condvar`/`mpsc`,
 Tier-2 per-vCPU TLS), collections::HashMap}`. Most of "std" (`Vec`/`String`/`fmt`/`iter`/collections) is
 re-exported `core`/`alloc` and always ran. The temen-posix ops the PAL needed — `OP_CLOCK`, `OP_GETENV_R`/
-`OP_UNSETENV`/`OP_ENVIRON`, `OP_SPAWN2`, the `net` cap — are all in (`POSIX.md`). **Deferred:** unwinding
-(#883); a real randomness op; live-child `Command` streaming (rides the fork/exec/bash epic, #799/#801).
+`OP_UNSETENV`/`OP_ENVIRON`, `OP_PSPAWN`, the `net` cap — are all in (`POSIX.md`). **Deferred:** unwinding
+(#883); a real randomness op.
 
 **Trust framing.** Everything here is untrusted, re-verified frontend + personality + guest code — the
 translator, the `temen-posix` personality, and `std` itself compiled as guest code. Zero escape-TCB, same

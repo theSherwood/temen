@@ -27,8 +27,8 @@ now works (see "Status" below).
 | `temen-time-imp.rs` | The time module (copied to `sys/time/temen.rs`). `Instant`/`SystemTime::now()` call the PAL `host` bridge's `clock` op (temen-posix `OP_CLOCK`) — monotonic for `Instant`, realtime for `SystemTime`. Needs a granted `posix` cap (`run_with_caps`); without one the clock reads zero. |
 | `temen-env-imp.rs` | The env module (copied to `sys/env/temen.rs`). `getenv`/`setenv`/`unsetenv`/`vars` reach the posix env map via the `host` bridge's **buffer-writing** ops (`OP_GETENV_R`/`OP_SETENV`/`OP_UNSETENV`/`OP_ENVIRON`) — copies into guest memory, no personality arena. |
 | `temen-fs-imp.rs` | The fs module (copied to `sys/fs/temen.rs`). `File` (open/read/write/seek/`try_clone`), `metadata`/`read_dir`/`remove_file`/`exists`, and the directory ops `create_dir`/`create_dir_all`/`rename`/`remove_dir` reach the personality's in-memory filesystem via the `host` bridge's file ops (`OP_OPEN`/`OP_READ`/`OP_WRITE`/`OP_LSEEK`/`OP_CLOSE`/`OP_UNLINK`/`OP_STAT`/`OP_OPENDIR`/`OP_READDIR`/`OP_CLOSEDIR`/`OP_MKDIR`/`OP_RENAME`/`OP_RMDIR`/`OP_DUP`). The memfs has no symlinks or mutable perms, so `lstat==stat`, perms are always-writable, and `symlink`/hard-link/perms/times/`canonicalize` stay `Unsupported`. Needs a granted `posix` cap. |
-| `temen-pipe-imp.rs` | The anonymous-pipe module (copied to `sys/pipe/temen.rs`). `sys::pipe::Pipe` is a pair of fds over one in-personality byte FIFO (`OP_PIPE`), read/written through `OP_READ`/`OP_WRITE` and closed on drop — the plumbing `std::process` captures child stdout through. |
-| `temen-process-imp.rs` | The process module (copied to `sys/process/temen.rs`). `std::process::Command` over the personality's **fork-free** spawn (`OP_SPAWN2`/`OP_WAITPID`): a spawn runs the named command to completion synchronously, `output` captures **stdout and stderr** by routing them to `OP_PIPE` write ends carried **per-child in the `OP_SPAWN2` request** (parallel-safe — no global fd-1/fd-2 redirect dance, #848), and `wait`/`status` reap the exit code. The command is resolved by the embedder's spawn delegate (`Posix::set_spawn` → `SpawnResult { stdout, stderr, status }`); without one, spawning is `Unsupported`. Synchronous model ⇒ no live child to stream stdin into (stdin is whatever fd 0 holds). |
+| `temen-pipe-imp.rs` | The anonymous-pipe module (copied to `sys/pipe/temen.rs`). `sys::pipe::Pipe` is a core pipe (`__vm_pipe`) whose ends are adopted as fds (`OP_PIPE_ADOPT`), read/written through `OP_READ`/`OP_WRITE` (re-issued on the end's handle, the tag protocol) and closed on drop. A read of an empty pipe waits for a writer — the plumbing `std::process` streams child stdio through. |
+| `temen-process-imp.rs` | The process module (copied to `sys/process/temen.rs`). `std::process::Command` over the personality's `posix_spawn` (`OP_PSPAWN`/`OP_WAITPID`, #1969): a child is a real process running beside its parent, its program a path the embedder registered (a bare name is looked up along `PATH`). Each child stream is a file action: a `dup2` from a core pipe's end, a `ChildPipe`, a file, or the parent's stdout/stderr. So `output` reads **stdout and stderr** to EOF while the child runs, a piped stdin streams into a live child, and `wait`/`try_wait`/`kill` reach it. |
 | `temen-net-imp.rs` | The net module (copied to `sys/net/connection/temen.rs`). `TcpStream`/`TcpListener`/`lookup_host` over the **`net` capability** (POSIX.md §5a) — a named handle separate from `posix` holding only the authority surface (`connect`/`bind`/`accept`/`shutdown`/`resolve`); a connected socket is an ordinary fd, so data rides the posix `read`/`write` ops. Loopback = the deterministic in-personality memnet; beyond loopback = the embedder's `NetDelegate` (`Posix::set_net`) or fail closed. Socket knobs with no memnet meaning are accept-and-ignore; `UdpSocket` fails closed (the datagram slice is a follow-up). Needs a granted `net` cap. |
 | `apply-overlay.sh` | Applies the overlay to the active nightly's `rust-src` (idempotent). |
 
@@ -117,7 +117,7 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   **`std::fs`** (`File` open/read/write/seek/`try_clone`, `metadata`/`read_dir`/
   `remove_file`/`exists`, `create_dir`/`create_dir_all`/`rename`/`remove_dir`, via a
   granted posix cap), **`std::process`** (`Command` spawn/`output`/
-  `status`/`wait`, via a granted posix cap + spawn delegate), **`std::net`**
+  `status`/`wait` of a real child process, via a granted posix cap), **`std::net`**
   (`TcpStream`/`TcpListener`/`lookup_host`: loopback over the memnet, egress via a
   granted `net` cap + `NetDelegate`; `UdpSocket` is a follow-up), heap/`Vec`,
   collections (incl. **`HashMap`**, deterministic per-guest seed), `fmt`, iterators,
@@ -134,13 +134,13 @@ one module whose only undefined externals are `malloc`/`free`/`realloc` and the
   `canonicalize` (no host op / no perm-time model on the memfs backend — they return
   `Unsupported`). `create_dir`/`rename`/`remove_dir`/`try_clone` now work (memfs dir
   ops `OP_MKDIR`/`OP_RENAME`/`OP_RMDIR` + `OP_DUP`). See LLVM.md §10.
-- **process caveats:** spawn is **fork-free and synchronous** (the child runs to
-  completion inside `spawn`), so there is no live child to stream stdin into
-  (`StdioPipes` yields no writable stdin — a piped-stdin write after `spawn` can't
-  reach an already-exited child; the child's stdin is whatever fd 0 holds at spawn),
-  and `Command::spawn` returns an already-exited child. `output()` **does** capture
-  both stdout and stderr (via the parallel-safe per-child `OP_SPAWN2`, #848).
-  `fork`/`exec`-in-place stay parked (they ride the fork/exec/bash epic). See LLVM.md §10.
+- **process caveats:** the personality has no close-on-exec, so a child inherits
+  every descriptor its parent holds but the ones its file actions close (a pipe end
+  held for another live child keeps that pipe open until this child exits too).
+  `Command::env` changes do not reach the child (an exec carries the environment).
+  The memfs has no `/dev/null`: a null stdout/stderr is closed in the child. And
+  `output` reads stdout to EOF before stderr, so a child that fills its stderr pipe
+  (64 KiB) first deadlocks with its parent. See LLVM.md §10.
 
 ## Reproducibility note
 
