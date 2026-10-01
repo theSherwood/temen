@@ -295,8 +295,11 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
     let files = blob_entries(top["files"]);
     let at = |p: &str| files.iter().position(|(n, _)| *n == p);
     let lib = format!("{cwd}/lib/");
+    let src = format!("{cwd}/src/");
     let cache = format!("{cwd}/nimcache/");
-    let last_source = files.iter().rposition(|(n, _)| n.starts_with(&lib));
+    let last_source = files
+        .iter()
+        .rposition(|(n, _)| n.starts_with(&lib) || n.starts_with(&src));
     let first_cached = files.iter().position(|(n, _)| n.starts_with(&cache));
     assert!(
         at(&format!("{lib}std/system.nim")).is_some(),
@@ -311,4 +314,105 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
         "the pack is seeded after the sources it was built from"
     );
     assert!(at("/lib/temen/libc.temeno").is_some(), "the guest libc");
+}
+
+/// nimony's library reaches into its compiler's own sources: `std/json` imports
+/// `../../src/lib/nifcore`, and `std/macros` the nifler2 grammar. Those modules build in the card only
+/// if the card ships what they reach (#2033), so from the library, every module a `..`-relative import
+/// reaches must be shipped. (The compiler's sources also carry imports nothing in a build reaches, in
+/// branches only its own builds take; those are not the card's.)
+#[test]
+fn every_relative_import_the_library_reaches_is_shipped() {
+    let Some(blob) = committed_toolchain() else {
+        eprintln!("SKIP: gzip unavailable to inflate nimony.blob.gz");
+        return;
+    };
+    let top: std::collections::HashMap<&str, &[u8]> = blob_entries(&blob).into_iter().collect();
+    let cwd = std::str::from_utf8(top["cwd"]).expect("cwd is text");
+    let lib = format!("{cwd}/lib/");
+    let shipped: std::collections::HashMap<&str, &[u8]> =
+        blob_entries(top["files"]).into_iter().collect();
+    let mut todo: Vec<String> = shipped
+        .keys()
+        .filter(|n| n.starts_with(&lib) && n.ends_with(".nim"))
+        .map(|n| n.to_string())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut missing = Vec::new();
+    while let Some(path) = todo.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let dir = &path[..path.rfind('/').unwrap_or(0)];
+        for target in relative_imports(&String::from_utf8_lossy(shipped[path.as_str()])) {
+            let resolved = normalize(&format!("{dir}/{target}.nim"));
+            if shipped.contains_key(resolved.as_str()) {
+                todo.push(resolved);
+            } else {
+                missing.push(format!(
+                    "{path} imports {target}, but {resolved} is not shipped"
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "rebuild with ONLY=nim_card bash scripts/rebuild-assets.sh:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// The `..`-relative modules a Nim source imports: `import ../a/b`, `import ../a/[b, c]`,
+/// `from ../a/b import x`, `import ".." / a / b except x` and `import ../a/b as c`. Any other import
+/// resolves through the search path.
+fn relative_imports(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim_start) {
+        let Some(rest) = ["import ", "from ", "include "]
+            .iter()
+            .find_map(|k| line.strip_prefix(k))
+        else {
+            continue;
+        };
+        // A `from` names its module before ` import `; `except` and `as` follow it.
+        let module = [" import ", " except ", " as "]
+            .iter()
+            .fold(rest, |m, k| m.split(k).next().unwrap_or(m));
+        let module: String = module
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"')
+            .collect();
+        if !module.starts_with("..") {
+            continue;
+        }
+        match module.split_once('[') {
+            Some((prefix, items)) => out.extend(
+                items
+                    .trim_end_matches(']')
+                    .split(',')
+                    .filter(|i| !i.is_empty())
+                    .map(|i| format!("{prefix}{i}")),
+            ),
+            None => out.push(module),
+        }
+    }
+    out
+}
+
+/// `/a/b/../c` → `/a/c`.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for p in path.split('/') {
+        match p {
+            ".." => {
+                parts.pop();
+            }
+            "." => {}
+            _ => parts.push(p),
+        }
+    }
+    parts.join("/")
 }
