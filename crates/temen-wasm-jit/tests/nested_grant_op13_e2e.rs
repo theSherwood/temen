@@ -1,5 +1,5 @@
 //! **§14 op-13 end-to-end on the emitted tier** (issue #1123, slice B) — the wasmi twin of the native
-//! `rust_guest_op13` / `nifler_child_jit`: an **emitted op-13 parent** spawns a **separate-module child
+//! `rust_guest_op13`: an **emitted op-13 parent** spawns a **separate-module child
 //! that does real granted work** (a `call.cap` on a re-granted `"fs"`), and the whole thing runs on
 //! emitted wasm, byte-identical to the interpreter.
 //!

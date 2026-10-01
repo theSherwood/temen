@@ -1,5 +1,5 @@
 //! **§14 nested child on the *emitted* tier** (issue #1123) — the wasm-JIT twin of the native
-//! `compile_child` (`temen-run/tests/nifler_child_jit.rs`, `temen-llvm/tests/rust_guest_op13.rs`). Where
+//! `compile_child` (`temen-llvm/tests/rust_guest_op13.rs`). Where
 //! `nested_vm.rs` services the `env.instantiate` bounce by running the child on the tree-walk
 //! interpreter, this file services it by **emitting a *separate* child module and running it as its own
 //! `wasmi` instance over a sub-window carve** — so both the parent and the confined child execute on

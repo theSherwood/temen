@@ -1050,27 +1050,6 @@ export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, flags = 
   return driveJitRun(ex, memory, cacheKey);
 }
 
-// Run the **nifler** compiler phase on the wasm-JIT (#1011 slice 1): feed it the editor's Nim (`srcBytes`,
-// seeded at `/in.nim`) and emit its `_start`, so the browser parses Nim on emitted wasm instead of the
-// tree-walker (nifler's `fopen`/`write`/`exit` bounce cross-tier). The cdylib assembles the same memfs +
-// argv (`temen_run_nifler_jit_open`, sharing `temen_run_nifler_fs`'s setup) and retains the memfs handle, so
-// after `driveJitRun`'s finish the produced `.p.nif` comes back on `temen_stdout_*` — identical to the
-// bytecode card, which reads the written file, not stdout.
-export async function runJitNifler(ex, memory, moduleBytes, srcBytes, cacheKey) {
-  const u8 = () => new Uint8Array(memory.buffer);
-  const modP = Number(ex.temen_alloc(moduleBytes.length));
-  const srcP = Number(ex.temen_alloc(srcBytes.length));
-  u8().set(moduleBytes, modP);
-  u8().set(srcBytes, srcP);
-  const opened = ex.temen_run_nifler_jit_open(modP, moduleBytes.length, srcP, srcBytes.length);
-  ex.temen_dealloc(modP, moduleBytes.length);
-  ex.temen_dealloc(srcP, srcBytes.length);
-  if (opened !== 0) {
-    throw new Error(`JIT nifler open failed: status ${ex.temen_status()} (2 = _start not emittable)`);
-  }
-  return driveJitRun(ex, memory, cacheKey);
-}
-
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of
 // its own cc1 TUs (`tuBytes`, a memfs-relative path like `frontend/chibicc/hashmap.c`) to a linkable
 // object, reading the TU + its glibc header closure from `imgBytes` (the committed closure image). Same

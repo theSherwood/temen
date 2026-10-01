@@ -131,9 +131,9 @@ import is a **fresh** `WebAssembly.Memory` created for it, not the engine's shar
   the bound would admit reads of uncommitted zero pages the interpreter faults on — an
   INVARIANT #9 trap-parity divergence. The `& MASK` (2^40 − 1, already vestigial on wasm32)
   becomes pure defense-in-depth and may be dropped later; not in this slice.
-- **Emit reuse**: because the emit is position-independent (S1), the cached
-  `nifler_ce`/`nimsem_ce` compile serves detached children unchanged (`OP13_CHILD_EMIT` keys on
-  the module hash only; `env.memory` is imported with min 0). Nothing in `temen-wasm-jit`'s
+- **Emit reuse**: because the emit is position-independent (S1), a cached child compile serves
+  detached children unchanged (`OP13_CHILD_EMIT` keys on the module hash only; `env.memory` is
+  imported with min 0). Nothing in `temen-wasm-jit`'s
   codegen changes for this slice. What *does* degrade: a `WebAssembly.Instance` binds its
   memory at instantiate, so `jitInstanceCache` collapses to compiled-`Module` reuse — one
   `instantiate` per child, cheap next to the ~2 s compile.

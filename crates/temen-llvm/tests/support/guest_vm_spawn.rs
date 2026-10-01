@@ -1,6 +1,6 @@
 // ---- §14 spawn: the op-17 v1 record (#1863, #1864) ----
-// Appended to every Rust-on-Temen driver guest's source by its test (`support/guest_vm_spawn.rs`), so
-// there is one guest-side spawn to keep right. Not a module of the test crate: it is guest code, built
+// Appended to the source of every Rust-on-Temen guest that spawns, by its test, so there is one
+// guest-side spawn to keep right. Not a module of the test crate: it is guest code, built
 // by `rustc --emit=llvm-ir` with the guest. A pointer in a guest is a window offset, so a record,
 // name or payload address is just the Rust pointer.
 

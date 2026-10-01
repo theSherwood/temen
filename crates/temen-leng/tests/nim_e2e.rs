@@ -2836,9 +2836,9 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
     );
 }
 
-/// **#763 spike — `nifler2` through the no-C path.** Today's `nifler.temen` is built
-/// `nifler.nim → (stock nim c) → C → clang → bitcode → temen-llvm-translate`, and that clang hop is
-/// exactly the "no C compiler" dependency the capstone exists to remove. v0.6.2 ships **nifler2**,
+/// **#763 spike — `nifler2` through the no-C path.** The retired LLVM route built `nifler.temen`
+/// `nifler.nim → (stock nim c) → C → clang → bitcode → temen-llvm-translate`, and that clang hop was
+/// exactly the "no C compiler" dependency the capstone existed to remove. v0.6.2 ships **nifler2**,
 /// which hexer's own builder calls "a NIMONY program" — it has no stock-compiler dependency, so it
 /// can go `nimony c → Leng → link_nim_powerbox` with no C anywhere.
 ///
@@ -3058,8 +3058,7 @@ fn nifler2_links_through_leng() {
 }
 
 /// Drive the Temen-linked nifler2 over an in-memory fs and diff its `.nif` against the **native**
-/// nifler2 binary the same `nimony c` just produced — the same oracle shape as
-/// `temen-run/tests/nifler_asset.rs`, which does this for the LLVM-built `nifler.temen`.
+/// nifler2 binary the same `nimony c` just produced.
 ///
 /// The guest runs on the **POSIX personality** ([`run_io_capture`]): the retained `sysOpen`/
 /// `sysRead`/`sysWrite`/`sysClose`/`sysLseek` leaves bind to `temen_posix`'s real fd ops over an

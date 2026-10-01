@@ -471,7 +471,6 @@ fn child_case(store_to_ro: bool) {
             false,
             host,
             Vec::new(),
-            None,
             cinst as u64,
             cas as u64,
             None,

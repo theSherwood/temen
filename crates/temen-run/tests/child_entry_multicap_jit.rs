@@ -1,22 +1,19 @@
-//! **Multi-record grant marshaling on the emitted tier** (#1221, NIM.md §3c).
+//! **Multi-record grant marshaling, on the emitted tier and the tree-walker** (#1221).
 //!
-//! The front-end drivers hand a §14 child a **four**-record grant list — `{fs, stdout, exit, exec}` —
-//! through [`temen_run::conductor`]. `nifler_child_asset.rs` covers that on the **tree-walker**;
-//! `nifler_child_jit.rs` covers it on the **JIT** with the real nifler, but it is `#[ignore]`d:
-//! Cranelift-compiling nifler's 100+ funcs takes ~250 s in debug. This is the cheap per-PR stand-in:
-//! two small text-IR modules, no asset, no toolchain, a child the JIT compiles in well under a second.
+//! A parent hands a §14 child a **four**-record grant list through [`temen_run::conductor`], as the
+//! nim front-end drivers once did with `{fs, stdout, exit, exec}`. Two small text-IR modules, no
+//! asset, no toolchain: the same spawn runs on the JIT and on the tree-walker.
 //!
 //! The sensitivity comes from *where* the used caps sit. The grant list is ordered
 //! `[extra, exit, stdout, fs]`, so the two caps the child actually exercises are the **last two**
 //! records — index 2 and index 3. A conductor or spawn that miscomputes the 16-byte record stride, or
 //! the name-offset/length packing in a record's first word, resolves them to the wrong handle or to
-//! nothing at all, and the child fails to write. `extra` is offered and ignored, mirroring the spare
-//! record in `nifler_child_asset.rs`'s four-cap list.
+//! nothing at all, and the child fails to write. `extra` is offered and ignored.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use temen_interp::{ForkedProc, Host, HostProcFork, StreamRole};
+use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, StreamRole, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// What the child writes through the granted `fs`, and through the granted `stdout`.
@@ -58,20 +55,28 @@ block 0 (vstarter: i64) {
 }
 "#;
 
-/// The production granted-spawn hook table, as `nifler_child_jit` and `rust_guest_op13` install it.
+/// The production granted-spawn hook table, as `rust_guest_op13` installs it.
 fn grant_hooks(host: *mut Host) -> GrantChildHooks {
     temen_run::production_grant_hooks(temen_run::CapCtx::Raw(host))
 }
 
-/// A four-record grant list marshaled by a parent running on **emitted code**, with the two caps the
-/// child uses sitting at records 2 and 3 so the stride and name packing both have to be right.
-#[test]
-fn multi_record_grant_list_marshals_on_the_jit() {
+/// The conductor parent, a host holding the four grants, the parent's args, and what the child's two
+/// used caps write to: the shared memfs and the shared `stdout` sink.
+struct Spawn {
+    parent: temen_ir::Module,
+    host: Host,
+    args: [i32; 7],
+    fs: temen_run::fs::MemFsHandle,
+    stdout: Arc<Mutex<Vec<u8>>>,
+}
+
+/// The grant list is `[extra, exit, stdout, fs]`: the two caps the child uses sit at records 2 and 3.
+fn spawn() -> Spawn {
     let child = temen_text::parse_module(CHILD).expect("parse child");
     temen_verify::verify_module(&child).expect("child verifies");
     let parent = temen_run::conductor(&["extra", "exit", "stdout", "fs"], &[]);
 
-    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
+    let (factory, fs) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
     let factory = Arc::new(factory);
 
     let mut host = Host::new();
@@ -84,22 +89,57 @@ fn multi_record_grant_list_marshals_on_the_jit() {
         })
     };
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
-    let sink = host.shared_stdout();
+    let stdout = host.shared_stdout();
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
     // The spare: a second stream, offered in record 0 and never resolved by the child.
     let extra_h = host.grant_stream(StreamRole::Out);
     let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
+    Spawn {
+        parent,
+        host,
+        args: [inst, modh, budget, extra_h, exit_h, stdout_h, fs_h],
+        fs,
+        stdout,
+    }
+}
 
-    let args = [
-        inst as i64,
-        modh as i64,
-        budget as i64,
-        extra_h as i64,
-        exit_h as i64,
-        stdout_h as i64,
-        fs_h as i64,
-    ];
+/// The child joined back with its `fs` write's byte count, wrote the file through record 3 (`fs`), and
+/// wrote the stream through record 2 (`stdout`).
+fn check(joined: i64, fs: &temen_run::fs::MemFsHandle, stdout: &Mutex<Vec<u8>>, engine: &str) {
+    assert_eq!(
+        joined,
+        FILE_BODY.len() as i64,
+        "{engine}: the child joined back with the byte count its granted `fs` write returned"
+    );
+    let (files, _dirs) = fs.seed();
+    let emitted = files
+        .into_iter()
+        .find(|(k, _)| k == "out.bin")
+        .map(|(_, b)| b)
+        .unwrap_or_else(|| {
+            panic!("{engine}: the child wrote no out.bin — record 3 (`fs`) did not resolve")
+        });
+    assert_eq!(emitted, FILE_BODY.as_bytes());
+    let streamed = stdout.lock().unwrap().clone();
+    assert_eq!(
+        String::from_utf8_lossy(&streamed),
+        STREAM_BODY,
+        "{engine}: the child wrote nothing to `stdout` — record 2 did not resolve"
+    );
+}
+
+/// A four-record grant list marshaled by a parent running on **emitted code**.
+#[test]
+fn multi_record_grant_list_marshals_on_the_jit() {
+    let Spawn {
+        parent,
+        mut host,
+        args,
+        fs,
+        stdout,
+    } = spawn();
+    let args = args.map(i64::from);
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         &parent,
         0,
@@ -117,26 +157,26 @@ fn multi_record_grant_list_marshals_on_the_jit() {
         JitOutcome::Exited(c) => c as i64,
         ref o => panic!("jit ended abnormally: {o:?}"),
     };
-    assert_eq!(
-        joined,
-        FILE_BODY.len() as i64,
-        "the child joined back with the byte count its granted `fs` write returned"
-    );
+    check(joined, &fs, &stdout, "jit");
+}
 
-    // Record 3 (`fs`): the file the child wrote through the re-granted memfs.
-    let (files, _dirs) = handle.seed();
-    let emitted = files
-        .into_iter()
-        .find(|(k, _)| k == "out.bin")
-        .map(|(_, b)| b)
-        .expect("the child wrote no out.bin — record 3 (`fs`) did not resolve on the JIT");
-    assert_eq!(emitted, FILE_BODY.as_bytes());
-
-    // Record 2 (`stdout`): the bytes the child put on the re-granted stream.
-    let streamed = sink.lock().unwrap().clone();
-    assert_eq!(
-        String::from_utf8_lossy(&streamed),
-        STREAM_BODY,
-        "the child wrote nothing to `stdout` — record 2 did not resolve on the JIT"
-    );
+/// The same grant list, marshaled by a parent on the **tree-walker**.
+#[test]
+fn multi_record_grant_list_marshals_on_the_tree_walker() {
+    let Spawn {
+        parent,
+        mut host,
+        args,
+        fs,
+        stdout,
+    } = spawn();
+    let args = args.map(Value::I32);
+    let mut fuel = 200_000_000u64;
+    let r = run_with_host(&parent, 0, &args, &mut fuel, &mut host).expect("tree-walker run");
+    let joined = match r.as_slice() {
+        [Value::I64(x)] => *x,
+        [Value::I32(x)] => *x as i64,
+        other => panic!("tree-walker result: {other:?}"),
+    };
+    check(joined, &fs, &stdout, "tree-walker");
 }
