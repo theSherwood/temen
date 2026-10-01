@@ -184,7 +184,6 @@ dependencies = [
  "temen-dap",
  "temen-durable",
  "temen-encode",
- "temen-exec",
  "temen-fs",
  "temen-interp",
  "temen-ir",
@@ -220,14 +219,6 @@ dependencies = [
 name = "temen-encode"
 version = "0.0.0"
 dependencies = [
- "temen-ir",
-]
-
-[[package]]
-name = "temen-exec"
-version = "0.0.0"
-dependencies = [
- "temen-interp",
  "temen-ir",
 ]
 

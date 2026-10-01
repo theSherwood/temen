@@ -230,7 +230,7 @@ fn try_main() -> Result<(), String> {
             host.set_stdin_source(Box::new(|| {
                 let mut line = Vec::new();
                 let _ = std::io::stdin().lock().read_until(b'\n', &mut line);
-                line
+                Some(line)
             }));
             host.set_stdout_tee(Box::new(|bytes: &[u8]| {
                 let mut out = std::io::stdout().lock();

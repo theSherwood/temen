@@ -1471,11 +1471,11 @@ static MAX_EST_EMITTED_FN_BYTES_OVERRIDE: core::sync::atomic::AtomicUsize =
 /// of its emit set **before** allocating: the whole-program/reactor entries decline (`Unsupported` —
 /// the open chain falls through to the tier-up driver), the tier-up entries degrade (drop the
 /// largest-estimate functions to cross-tier leaves until the total fits), and the §22 unit emitter
-/// declines (the invoke runs interpreted). Calibrated on the shipped assets (reactor emit sets):
-/// the largest legitimate card is nifler at 94 MiB — which emits and runs fine in the 1 GiB
-/// browser build — then nimsem 34 MiB, SQLite 24 MiB; the known engine-killer (Postgres,
-/// 15 067 funcs) estimates 117 MiB. 104 MiB sits mid-gap: ~11% headroom over the largest known-good
-/// emit and ~11% under the known-fatal size. Fail-safe like the per-function valve: a
+/// declines (the invoke runs interpreted). Calibrated on the assets shipped then (reactor emit sets):
+/// the largest legitimate card was nifler at 94 MiB (the LLVM-route build, since retired, #2028) —
+/// which emitted and ran fine in the 1 GiB browser build — then nimsem 34 MiB, SQLite 24 MiB; the
+/// known engine-killer (Postgres, 15 067 funcs) estimates 117 MiB. 104 MiB sits mid-gap: ~11%
+/// headroom over the largest known-good emit and ~11% under the known-fatal size. Fail-safe like the per-function valve: a
 /// decline/degrade only routes more code to the interpreter oracle, never an escape.
 const MAX_EST_EMITTED_MODULE_BYTES: usize = 104 << 20;
 

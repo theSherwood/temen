@@ -2927,7 +2927,7 @@ pub(crate) unsafe extern "C" fn join(
                 // The child's end, or the cadence sweep, re-offers the task (`child_finished`).
                 Some(fib) => {
                     drop(st);
-                    crate::fiber_rt::fiber_event_park(fib, false, crate::fiber_rt::ParkOn::Child);
+                    crate::fiber_rt::fiber_event_park(fib, None, crate::fiber_rt::ParkOn::Child);
                     done.state.lock().unwrap_or_else(|e| e.into_inner())
                 }
                 None => {

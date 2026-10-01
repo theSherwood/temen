@@ -26,8 +26,8 @@ OPT="${LLVM_OPT:-opt}"
 # source). `--emit=llvm-ir`, release, panic=abort with panic_immediate_abort.
 echo "[1/4] build-std (default rustc) ..."
 # `-Cpanic=immediate-abort`, not `-Zbuild-std-features=panic_immediate_abort`: rustc promoted it to a
-# real panic strategy, and the old spelling is now a hard `compile_error!` in `core`. Same form as the
-# sibling `build_nim_link.sh`, which already carried the new one.
+# real panic strategy, and the old spelling is now a hard `compile_error!` in `core`. Same form as
+# `demos/temen_link/build.sh`.
 ( cd "$GUEST" && RUSTFLAGS='--emit=llvm-ir -Zunstable-options -Cpanic=immediate-abort' CARGO_TARGET_DIR="$CACHE/target" RUSTC_BOOTSTRAP=1 \
     cargo build --release \
       -Zbuild-std=std,panic_abort \

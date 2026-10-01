@@ -58,9 +58,9 @@ name = "temen-llvm-translate"
 path = "src/bin/translate.rs"
 
 # CI wall clock: this crate's suite is the longest job in the tree, and it is **test-execution**
-# bound, not compile bound — ~30 min of the ~32 min `cargo test` is guests *running* (the
-# `rust_driver_*` drivers put real nimsem/hexer through the tree-walker; the `lua_*` battery puts
-# the Lua VM through it). All of that work happens inside the path dependencies, so building them
+# bound, not compile bound — ~30 min of the ~32 min `cargo test` was guests *running* (the
+# `rust_driver_*` drivers, since retired, put real nimsem/hexer through the tree-walker; the `lua_*`
+# battery puts the Lua VM through it). All of that work happens inside the path dependencies, so building them
 # unoptimized is paying a ~7x interpreter tax on every test. Measured on `tests/lua_math.rs`:
 # 60.4s -> 8.6s for +77s of one-time dependency compile (which `Swatinem/rust-cache` then keeps).
 #

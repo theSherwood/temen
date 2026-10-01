@@ -4158,17 +4158,35 @@ fn bash_run_over_compiled(
 }
 
 /// #1144 — the cross-Run **bash program cache**: the decoded `Module` + its `Arc<Compiled>` bytecode
-/// program, keyed by a cheap content hash of the module bytes (the [`NiflerEmitCache`] shape). The
-/// browser card passes the same ~2.2 MB `bash.temen` every Run, so decoding (~100 ms wasm) and
-/// compiling (~120 ms wasm) it each time is pure waste — cache both and reuse on every later Run.
-/// Single-threaded wasm ⇒ a plain static; one slot (the card runs one bash). A rebuilt asset changes
-/// the key and re-decodes+re-compiles.
+/// program, keyed by a cheap content hash of the module bytes ([`module_key`]). The browser card
+/// passes the same ~2.2 MB `bash.temen` every Run, so decoding (~100 ms wasm) and compiling (~120 ms
+/// wasm) it each time is pure waste — cache both and reuse on every later Run. Single-threaded wasm ⇒
+/// a plain static; one slot (the card runs one bash). A rebuilt asset changes the key and
+/// re-decodes+re-compiles.
 struct BashProgramCache {
     key: u64,
     module: temen_ir::Module,
     compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
 }
 static mut BASH_PROGRAM: Option<BashProgramCache> = None;
+
+/// A cheap content key for module bytes: FNV-1a over the length plus the first and last 4 KiB.
+/// Distinct committed `.temen` assets differ in length or head/tail, so this keys a cache without
+/// hashing the whole module on every Run; a rebuilt asset changes the key.
+fn module_key(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce4_84222325u64;
+    let mut mix = |b: u8| h = (h ^ b as u64).wrapping_mul(0x1000_0001b3);
+    for &b in &(bytes.len() as u64).to_le_bytes() {
+        mix(b);
+    }
+    let n = bytes.len();
+    let head = &bytes[..n.min(4096)];
+    let tail = &bytes[n.saturating_sub(4096)..];
+    for &b in head.iter().chain(tail) {
+        mix(b);
+    }
+    h
+}
 
 /// Decode + compile `bytes` as bash, or reuse the cached program when the content key matches. `None`
 /// if it doesn't decode or isn't the bytecode subset. Returns borrows into the static cache (valid
@@ -4180,8 +4198,7 @@ fn cached_bash_program(
     &'static temen_ir::Module,
     std::sync::Arc<temen_interp::bytecode::Compiled>,
 )> {
-    // The same cheap FNV(len + head/tail 4 KiB) content key as the nifler emit cache.
-    let key = nifler_module_key(bytes);
+    let key = module_key(bytes);
     // SAFETY: single-threaded wasm; the cache is touched only here and only while no run borrows it.
     let slot = unsafe { &mut *core::ptr::addr_of_mut!(BASH_PROGRAM) };
     if slot.as_ref().map(|c| c.key) != Some(key) {
@@ -4569,76 +4586,6 @@ pub fn onramp_fs_exec(
         stderr: host.take_stderr(),
         framebuffer: None,
     }
-}
-
-/// Like [`onramp_fs_exec`], but after the run **reads one named file back out of the seeded memfs** —
-/// for a guest phase whose real output is a *file* it wrote through the `fs` cap, not stdout. `nifler
-/// p /in.nim /out.p.nif` (NIM.md §3c/§3e, "nimony in the browser" slice 4) parses to a `.p.nif` file;
-/// [`onramp_fs_exec`] drops the fs handle, so this keeps it and, after the run, seeds it back out and
-/// returns the bytes at `out_key` (the memfs strips a leading `/`, so pass the slashless key). The
-/// file is `Vec::new()` if the phase never wrote it (a parse error — the caller shows the guest's
-/// stderr instead). The run's own `stdout`/`stderr` still ride the returned [`PbOutcome`].
-pub fn onramp_fs_exec_readback(
-    m: &temen_ir::Module,
-    image: &[u8],
-    argv: &[&[u8]],
-    stdin: &[u8],
-    out_key: &str,
-) -> (PbOutcome, Vec<u8>) {
-    let unsupported = |status: i32| PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
-    let (mut host, init_mem, fs) = match pg_setup(m, image, argv) {
-        Ok(setup) => setup,
-        Err(status) => return (unsupported(status), Vec::new()),
-    };
-    host.stdin = stdin.to_vec();
-    let mut fuel = u64::MAX;
-    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
-        m,
-        0,
-        &[],
-        &mut fuel,
-        &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        &mut host,
-    ) {
-        None => (STATUS_UNSUPPORTED, 0, 0),
-        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
-        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
-        Some((Ok(vals), _)) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_BAD_RESULT, 0, 0),
-        },
-    };
-    // Read the emitted file back out of the live store (the `MemFsHandle` observes what the guest wrote).
-    let (files, _dirs) = fs.seed();
-    let produced = files
-        .into_iter()
-        .find(|(k, _)| k == out_key)
-        .map(|(_, v)| v)
-        .unwrap_or_default();
-    (
-        PbOutcome {
-            trap: None,
-            fault_addr: None,
-            status,
-            value,
-            exit_code,
-            stdout: host.take_stdout(),
-            stderr: host.take_stderr(),
-            framebuffer: None,
-        },
-        produced,
-    )
 }
 
 /// **Boot Postgres in wasm.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the data image
@@ -5087,180 +5034,6 @@ pub extern "C" fn temen_run_onramp_fs(
         FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
-}
-
-/// **Compile Nim in the browser — the nimony front-end card** (NIM.md §3c/§3e, "nimony in the browser"
-/// slice 4). Run `nifler.temen` — the *first real nimony compiler phase* (Nim source → parsed NIF),
-/// itself a Nim program on-ramped to Temen through the C on-ramp (slice 1) — over the editor's Nim.
-/// Decode + verify the phase module at `[mod_ptr, mod_len)`, seed an in-memory `fs` cap with the user's
-/// source at `in.nim`, run `nifler p /in.nim /out.p.nif` (the parse command), and hand the emitted
-/// `.p.nif` **text** back on `temen_stdout_ptr`/`_len` — the same real nifler that parses Nim natively,
-/// now running client-side in the sandbox on the reader's own code. Unlike the pre-built
-/// `nim (Nim → Temen, runs)` card (whose front-end ran at *build* time), this runs a front-end phase
-/// **in the browser**; unlike the `temen-leng` back-end card (Leng → IR), this is the front edge (Nim →
-/// NIF). The guest reaches only the seeded `fs` — no ambient authority. Sets [`temen_status`]/
-/// [`temen_exit_code`]; returns the guest's `i64` result (`0` on any non-`OK`/`EXIT`). On a parse error
-/// (`nifler` wrote no `.p.nif`) the guest's own stderr rides `temen_stderr_ptr`/`_len` and the stdout
-/// capture is empty, so the card can surface the diagnostic.
-#[no_mangle]
-pub extern "C" fn temen_run_nifler_fs(
-    mod_ptr: *const u8,
-    mod_len: usize,
-    src_ptr: *const u8,
-    src_len: usize,
-) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
-    };
-    if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return 0;
-    }
-    // Seed the source as `in.nim`; nifler parses `/in.nim` and writes `/out.p.nif` (both memfs keys,
-    // slashless in the store). The emitted `.p.nif` is the file we read back and show.
-    let image = temen_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
-    let argv: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.p.nif"];
-    let (out, produced) = onramp_fs_exec_readback(&m, &image, &argv, &[], "out.p.nif");
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    // The produced `.p.nif` is the visible output (stdout slot); the guest's diagnostics ride stderr.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), produced);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
-}
-
-/// A cached nifler emit (#1011 slice 1): the `Arc`-shared emit products keyed by a content hash of the
-/// phase module bytes, so a re-Run of the same `nifler.temen` skips the ~2 s `compile_jit` **and** the
-/// ~2 s `Module` clone — a re-parse becomes build-window + drive. Single-threaded wasm ⇒ a plain static;
-/// one slot (the card runs one nifler). Populated on the first JIT parse, reused on every later one.
-struct NiflerEmitCache {
-    key: u64,
-    emit: CachedEmit,
-}
-static mut NIFLER_EMIT: Option<NiflerEmitCache> = None;
-
-/// A cheap content key for the phase module bytes: FNV-1a over the length plus the first and last 4 KiB.
-/// Distinct committed `.temen` assets differ in length or head/tail, so this keys the cache without
-/// hashing all ~17 MB on every Run; a rebuilt asset changes the key and re-emits.
-fn nifler_module_key(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce4_84222325u64;
-    let mut mix = |b: u8| h = (h ^ b as u64).wrapping_mul(0x1000_0001b3);
-    for &b in &(bytes.len() as u64).to_le_bytes() {
-        mix(b);
-    }
-    let n = bytes.len();
-    let head = &bytes[..n.min(4096)];
-    let tail = &bytes[n.saturating_sub(4096)..];
-    for &b in head.iter().chain(tail) {
-        mix(b);
-    }
-    h
-}
-
-/// **Wasm-JIT twin of [`temen_run_nifler_fs`]** (#1011 slice 1 — route the nifler phase run through the
-/// wasm-JIT). Decode + verify `nifler.temen`, seed the editor's Nim as `/in.nim`, and open a single-shot
-/// JIT run of `nifler p /in.nim /out.p.nif` rooted at `_start` — so the ~8k-func nifler phase runs on
-/// **emitted wasm** (its `fopen`/`write`/`exit` bounce cross-tier) instead of the tree-walker. Its output
-/// is the `.p.nif` file it writes, so the run **retains the memfs handle** and
-/// [`temen_onramp_jit_run_finish`] reads `out.p.nif` back onto the stdout slot — the card reads it via the
-/// usual [`temen_stdout_ptr`] accessor, identical to the bytecode path. Drive it with the shared
-/// `temen_onramp_jit_run_*` exports. Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]) —
-/// notably [`STATUS_UNSUPPORTED`] if `_start` isn't wasm-drivable (the card falls back to
-/// [`temen_run_nifler_fs`]).
-///
-/// The emit is **cached** ([`NiflerEmitCache`]): the first parse pays the emit + `Module` clone; every
-/// later parse of the same nifler reuses the `Arc`-shared emit and only rebuilds the fresh window + memfs
-/// (with the new source), so a re-parse runs near the emitted-wasm run cost rather than re-emitting.
-#[no_mangle]
-pub extern "C" fn temen_run_nifler_jit_open(
-    mod_ptr: *const u8,
-    mod_len: usize,
-    src_ptr: *const u8,
-    src_len: usize,
-) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    // Same memfs + argv the bytecode `temen_run_nifler_fs` builds: source at `/in.nim`, parse to `/out.p.nif`.
-    let image = temen_fs::encode_image(&[("in.nim".to_string(), src.to_vec())], &[]);
-    let argv: [&[u8]; 4] = [b"nifler", b"p", b"/in.nim", b"/out.p.nif"];
-    let key = nifler_module_key(bytes);
-    // Cache hit: reuse the shared emit (no decode / verify / emit / clone). The cached module is a valid
-    // `&Module` for the (unused-on-hit) `m` param, so a hit never touches the raw module bytes.
-    // SAFETY: single-threaded wasm; exclusive access to the cache.
-    let cached = unsafe { (*core::ptr::addr_of!(NIFLER_EMIT)).as_ref() }
-        .filter(|c| c.key == key)
-        .map(|c| c.emit.clone());
-    // The play threads build imports a **shared** memory, so the emitted module must too.
-    let opened = if let Some(emit) = cached {
-        let module_ref = std::sync::Arc::clone(&emit.0);
-        JitOnrampRun::open_owned_run_fs_readback(
-            &module_ref,
-            JIT_RUN_WIN_LOG2,
-            true,
-            &image,
-            &argv,
-            "out.p.nif".to_string(),
-            Some(emit),
-        )
-    } else {
-        // Miss: decode + verify + emit, then stash the emit for next time.
-        let m = match temen_encode::decode_module(bytes) {
-            Ok(m) => m,
-            Err(_) => {
-                set(STATUS_DECODE_ERR);
-                return -STATUS_DECODE_ERR;
-            }
-        };
-        if temen_verify::verify_module(&m).is_err() {
-            set(STATUS_VERIFY_ERR);
-            return -STATUS_VERIFY_ERR;
-        }
-        JitOnrampRun::open_owned_run_fs_readback(
-            &m,
-            JIT_RUN_WIN_LOG2,
-            true,
-            &image,
-            &argv,
-            "out.p.nif".to_string(),
-            None,
-        )
-        .inspect(|r| {
-            // SAFETY: single-threaded wasm; exclusive access to the cache.
-            unsafe {
-                *core::ptr::addr_of_mut!(NIFLER_EMIT) = Some(NiflerEmitCache {
-                    key,
-                    emit: r.cached_emit(),
-                });
-            }
-        })
-    };
-    match opened {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => {
-            set(status);
-            -status
-        }
-    }
 }
 
 /// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.temen` in
@@ -6283,10 +6056,9 @@ impl JitOnrampReactor {
 /// window up front (the emitted `_start` seeds only the heap), then `f0(win, env)` runs the
 /// program. `stdout`/`stderr`/`exit_code` are read back from the host afterward, exactly as
 /// [`onramp_exec`] captures them — so the two tiers are a stdout/exit differential.
-/// A cached emit shared across Runs (#1011 slice 1): the outlined module, its compiled interpreter
-/// program (for cross-tier bounces), the emitted `_start` wasm, and the per-function emit bitmap. All
-/// cheaply `Arc`-cloned — reusing them skips the ~2 s emit + ~2 s `Module` clone on a re-Run of the same
-/// guest (nifler). The interpreter's `SharedProgram` is already an `Arc`-backed cheap clone.
+/// The emit a run is built around ([`JitOnrampRun::emit_for_run`]): the outlined module, its compiled
+/// interpreter program (for cross-tier bounces), the emitted `_start` wasm, and the per-function emit
+/// bitmap. A caller that emits before it opens the run (to learn a decline first) passes it as `cached`.
 type CachedEmit = (
     std::sync::Arc<temen_ir::Module>,
     std::sync::Arc<bytecode::SharedProgram>,
@@ -6295,18 +6067,15 @@ type CachedEmit = (
 );
 
 pub struct JitOnrampRun {
-    /// The outlined module. `Arc` so a cached emit (nifler, #1011 slice 1) is shared with the run
-    /// instead of deep-cloned — a nifler `Module` clone costs ~2 s, as much as the emit itself.
+    /// The outlined module.
     module: std::sync::Arc<temen_ir::Module>,
-    /// The compiled interpreter program for cross-tier bounces. `Arc` so the nifler emit cache shares it
-    /// across Runs (its data image is otherwise copied per Run).
+    /// The compiled interpreter program for cross-tier bounces.
     program: std::sync::Arc<bytecode::SharedProgram>,
     host: Host,
     _backing: Option<Box<[u8]>>,
     back: std::sync::Arc<temen_interp::Region>,
     win_base: usize,
-    /// The emitted `_start` wasm. `Arc<[u8]>` for the same reason as `module` — the nifler emit cache
-    /// shares these ~40 MB across Runs (the JS driver's V8-compiled Module is cached separately).
+    /// The emitted `_start` wasm.
     emitted_wasm: std::sync::Arc<[u8]>,
     emitted: Vec<bool>,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
@@ -6328,12 +6097,6 @@ pub struct JitOnrampRun {
     /// cross-tier `Exit`), a throw that did not `exit` is a trap. Keeps the runner from reporting a
     /// truncated run as `STATUS_OK` (INVARIANT 9: a fast backend never runs wrong — it traps or declines).
     trapped: bool,
-    /// A phase guest whose output is a **file it wrote to the memfs**, not stdout (nifler `p /in.nim
-    /// /out.p.nif` — #1011 slice 1): the retained `MemFsHandle` + the memfs key to read back. When set,
-    /// [`output`](Self::output) returns that file's bytes instead of `stdout`, so `temen_onramp_jit_run_finish`
-    /// hands the produced file to the card exactly as the bytecode `onramp_fs_exec_readback` does. `None`
-    /// for a stdout guest (Lua/chibicc), whose memfs handle is dropped.
-    fs_readback: Option<(temen_fs::MemFsHandle, String)>,
     /// #1153 — **growth state** carried across cross-tier bounces so the emitted `_start` can `vm_map`-grow
     /// the live window instead of pre-sizing a fixed one (invariant 14, runtime-backend parity with the
     /// coop tier). `prots` is the committed page map, re-seeded into (and re-captured from) the fresh
@@ -6384,10 +6147,6 @@ enum RunInput {
         image: Vec<u8>,
         argv: Vec<Vec<u8>>,
         stdin: Vec<u8>,
-        /// `Some(key)` for a guest whose output is a file it writes to the memfs (nifler's `.p.nif`): the
-        /// mounted `MemFsHandle` is retained and this key read back after the run. `None` for a stdout
-        /// guest (chibicc), whose handle is dropped.
-        readback: Option<String>,
     },
     /// A **detached child** run (#1285, DETACHED_JIT.md §3): the on-ramp powerbox (as `Stdin`) plus
     /// `argv` seeded at `module_args_base()` — the spawn-time args payload a detached child needs because
@@ -6409,7 +6168,6 @@ enum RunInput {
     PreGranted {
         host: Box<Host>,
         init_mem: Vec<u8>,
-        readback: Option<(temen_fs::MemFsHandle, String)>,
         /// The child entry's data-stack pointer, passed as its first `i64` param for a §14 child-entry
         /// module (`child_entry_ok`: `[I64]->[I64]`). `0` for a paramless `_start` child (the param is
         /// then not emitted, so the value is unused). The emitted `f{entry}` is called with the module's
@@ -6484,7 +6242,6 @@ impl JitOnrampRun {
                 image: image.to_vec(),
                 argv: argv.iter().map(|a| a.to_vec()).collect(),
                 stdin,
-                readback: None,
             },
         )
     }
@@ -6492,7 +6249,7 @@ impl JitOnrampRun {
     /// Open a single-shot JIT run over an **owned** (heap-backed) window with a **caller-provided granted
     /// `Host`** (#1025 Path 1 — the owned-window twin of [`open_shared_run_over_host`]). The run executes
     /// its emitted `_start` over `host` verbatim (an op-13 phase child's marshaled powerbox); `init_mem`
-    /// seeds the window prefix (argv), and `readback` retains a memfs handle + key for a file-output phase.
+    /// seeds the window prefix (argv).
     /// The child's `call.cap` leaves resolve over `host` on the reactor cross-tier bounce, exactly as a
     /// top-level phase's `fs` resolves. Used by the browser op-13-child-on-JIT servicer.
     pub fn open_owned_run_over_host(
@@ -6501,7 +6258,6 @@ impl JitOnrampRun {
         shared_memory: bool,
         host: Host,
         init_mem: Vec<u8>,
-        readback: Option<(temen_fs::MemFsHandle, String)>,
     ) -> Result<JitOnrampRun, i32> {
         Self::open_owned_run_with(
             m,
@@ -6510,38 +6266,9 @@ impl JitOnrampRun {
             RunInput::PreGranted {
                 host: Box::new(host),
                 init_mem,
-                readback,
                 entry_sp: 0,
                 entry_as: 0,
             },
-        )
-    }
-
-    /// Like [`open_owned_run_fs`](Self::open_owned_run_fs), but the guest's output is a **file it writes
-    /// to the memfs** (at key `readback`), not stdout — the single-shot JIT twin of
-    /// [`onramp_fs_exec_readback`], for a phase guest like nifler (`p /in.nim /out.p.nif`, #1011 slice 1).
-    /// `temen_onramp_jit_run_finish` reads that key back and hands it to the card on the stdout slot, exactly
-    /// as the bytecode path does.
-    pub fn open_owned_run_fs_readback(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        image: &[u8],
-        argv: &[&[u8]],
-        readback: String,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with_cached(
-            m,
-            win_log2,
-            shared_memory,
-            RunInput::Fs {
-                image: image.to_vec(),
-                argv: argv.iter().map(|a| a.to_vec()).collect(),
-                stdin: Vec::new(),
-                readback: Some(readback),
-            },
-            cached,
         )
     }
 
@@ -6578,23 +6305,12 @@ impl JitOnrampRun {
         )
     }
 
-    /// The run's cached-emit products, cheaply `Arc`-cloned for the nifler emit cache (#1011 slice 1).
-    fn cached_emit(&self) -> CachedEmit {
-        (
-            self.module.clone(),
-            self.program.clone(),
-            self.emitted_wasm.clone(),
-            self.emitted.clone(),
-        )
-    }
-
     /// Open a single-shot JIT run over a **caller-owned** window with a **caller-provided granted
     /// `Host`** (#1025 Path 1 — the emitted nested phase child). The run executes its emitted `_start`
     /// over `host` verbatim: the parent already marshaled exactly the caps the child holds (a shared
     /// `fs`/`stdout`) across the op-13 bounce, so the child's `call.cap` leaves resolve over this granted
     /// powerbox on the reactor cross-tier bounce — no on-ramp caps are added. `init_mem` seeds the window
-    /// prefix (argv at `POWERBOX_ARGS_BASE`, or empty); `readback` retains a memfs handle + key for a
-    /// file-output phase (nifler's `.p.nif`), else `None` for a stdout guest.
+    /// prefix (argv at `POWERBOX_ARGS_BASE`, or empty).
     ///
     /// # Safety
     /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
@@ -6608,7 +6324,6 @@ impl JitOnrampRun {
         shared_memory: bool,
         host: Host,
         init_mem: Vec<u8>,
-        readback: Option<(temen_fs::MemFsHandle, String)>,
         entry_sp: u64,
         entry_as: u64,
         cached: Option<CachedEmit>,
@@ -6626,7 +6341,6 @@ impl JitOnrampRun {
             RunInput::PreGranted {
                 host: Box::new(host),
                 init_mem,
-                readback,
                 entry_sp,
                 entry_as,
             },
@@ -6665,47 +6379,6 @@ impl JitOnrampRun {
                 image: image.to_vec(),
                 argv: argv.iter().map(|a| a.to_vec()).collect(),
                 stdin,
-                readback: None,
-            },
-            None,
-        )
-    }
-
-    /// Like [`open_shared_run_fs`](Self::open_shared_run_fs), but for a phase guest whose output is a
-    /// **file it writes to the memfs** at key `readback` (nifler `p /in.nim /out.p.nif`), not stdout —
-    /// the shared-window (wasmi-drivable) twin of [`open_owned_run_fs_readback`](Self::open_owned_run_fs_readback).
-    /// After the run [`output`](Self::output) returns that file's bytes. Used by the headless
-    /// nifler-on-wasm-JIT differential gate; the shipped card reaches the same path via the FFI `_finish`.
-    ///
-    /// # Safety
-    /// As [`open_shared_run_fs`](Self::open_shared_run_fs): `[win_ptr, win_size)` must be a live region of
-    /// this module's linear memory, used solely as this run's window, valid until the run is dropped.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn open_shared_run_fs_readback(
-        m: &temen_ir::Module,
-        win_ptr: *mut u8,
-        win_size: u64,
-        win_log2: u8,
-        shared_memory: bool,
-        image: &[u8],
-        argv: &[&[u8]],
-        readback: String,
-    ) -> Result<JitOnrampRun, i32> {
-        let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
-        Self::open_over_run(
-            m,
-            back,
-            None,
-            win_size,
-            win_base,
-            win_log2,
-            shared_memory,
-            RunInput::Fs {
-                image: image.to_vec(),
-                argv: argv.iter().map(|a| a.to_vec()).collect(),
-                stdin: Vec::new(),
-                readback: Some(readback),
             },
             None,
         )
@@ -6717,27 +6390,9 @@ impl JitOnrampRun {
         shared_memory: bool,
         input: RunInput,
     ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with_cached(m, win_log2, shared_memory, input, None)
-    }
-
-    /// [`open_owned_run_with`](Self::open_owned_run_with) with an optional pre-built emit — the seam the
-    /// nifler emit cache (#1011 slice 1) uses to skip the ~2 s emit + `Module` clone on a re-Run. On a hit
-    /// only the fresh window backing + per-run powerbox are built around the shared emit; on a miss the
-    /// emit runs and `cached` is `None`.
-    fn open_owned_run_with_cached(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        input: RunInput,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        // A cached module already declares the enlarged window; a fresh one uses the module's own
-        // declared size as the floor. Either way the owned backing must equal the size the emitter masks.
-        let declared = cached
-            .as_ref()
-            .and_then(|(md, ..)| md.memory.map(|mc| mc.size_log2))
-            .unwrap_or_else(|| m.memory.map_or(0, |mc| mc.size_log2));
-        let win_log2 = win_log2.max(declared);
+        // The owned backing must equal the size the emitter masks: the module's declared window is the
+        // floor.
+        let win_log2 = win_log2.max(m.memory.map_or(0, |mc| mc.size_log2));
         let win_size = 1u64 << win_log2;
         let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
         let ptr = backing.as_mut_ptr();
@@ -6754,13 +6409,13 @@ impl JitOnrampRun {
             win_log2,
             shared_memory,
             input,
-            cached,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// The single-shot emit (outline → interp program → `compile_jit`) a run is built around — the
-    /// products a re-Run reuses via `cached` (#1011 slice 1). `Err(STATUS_UNSUPPORTED)` is the decline:
+    /// The single-shot emit (outline → interp program → `compile_jit`) a run is built around.
+    /// `Err(STATUS_UNSUPPORTED)` is the decline:
     /// `_start` out of subset, a suspending reachable set, or a module that manages its own pages
     /// (`unmap`/`protect` — the mask-only emit can't honor page state, DESIGN.md §14). Factored out so a
     /// caller that has somewhere else to run the guest (the op-13 loop's interpreter child) can learn
@@ -6790,7 +6445,7 @@ impl JitOnrampRun {
         // `"mapped"` re-sync — parity with the coop tier (invariant 14). The declared window stays
         // the guest's own, so `mapped` starts small and grows; a `vm_map` past the window gets the
         // same result the interpreter oracle gives, and the emitted access to it then declines.
-        // Compile once — reused for every cross-tier bounce (and shared across Runs via the cache).
+        // Compile once — reused for every cross-tier bounce.
         let program = std::sync::Arc::new(
             bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
         );
@@ -6841,10 +6496,8 @@ impl JitOnrampRun {
             1u64 << win_log2,
             "window backing must equal 1 << win_log2"
         );
-        // The emit (outline → interp program → `compile_jit`) is what a re-Run reuses via `cached`
-        // (#1011 slice 1): a nifler emit is ~2 s and its `Module` clone another ~2 s, so a cache hand
-        // here turns a re-Run into build-window + drive. On a miss we emit fresh and return the products
-        // (all `Arc`-shared) so the caller can stash them for next time.
+        // A caller that already emitted (to learn a decline before committing its powerbox) hands the
+        // emit in as `cached`; otherwise emit here.
         let (module, program, emitted_wasm, emitted): CachedEmit = match cached {
             Some(c) => c,
             None => Self::emit_for_run(m, shared_memory)?,
@@ -6852,14 +6505,7 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (mut host, init_mem, frame, fs_readback, entry_sp, entry_as): (
-            Host,
-            Vec<u8>,
-            _,
-            _,
-            u64,
-            u64,
-        ) = match input {
+        let (mut host, init_mem, frame, entry_sp, entry_as) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -6867,24 +6513,16 @@ impl JitOnrampRun {
                 // by name; `display` too (unused by a pure compute guest, present for parity with
                 // `onramp_exec`). No `fs` (input comes from stdin).
                 let frame = grant_onramp_caps(&mut host, &module, None, None).frame;
-                (host, Vec::new(), frame, None, 0, 0)
+                (host, Vec::new(), frame, 0, 0)
             }
-            RunInput::Fs {
-                image,
-                argv,
-                stdin,
-                readback,
-            } => {
+            RunInput::Fs { image, argv, stdin } => {
                 // The headless memfs powerbox (`fs` image + argv at POWERBOX_ARGS_BASE), exactly as
-                // the bytecode `onramp_fs_exec` builds it. The `MemFsHandle` is retained only when a
-                // `readback` key was requested (a file-output phase guest like nifler); otherwise it is
-                // dropped, as a stdout guest (chibicc) needs no snapshot.
+                // the bytecode `onramp_fs_exec` builds it.
                 let argv_refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
-                let (mut host, init_mem, fsh) = pg_setup(&module, &image, &argv_refs)?;
+                let (mut host, init_mem, _fsh) = pg_setup(&module, &image, &argv_refs)?;
                 host.stdin = stdin;
                 let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let fs_readback = readback.map(|key| (fsh, key));
-                (host, init_mem, frame, fs_readback, 0, 0)
+                (host, init_mem, frame, 0, 0)
             }
             RunInput::Detached { stdin, argv } => {
                 // The on-ramp powerbox, exactly as `Stdin`, plus argv at the module's args base — the
@@ -6893,19 +6531,18 @@ impl JitOnrampRun {
                 host.stdin = stdin;
                 let frame = grant_onramp_caps(&mut host, &module, None, None).frame;
                 let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
-                (host, args_init_mem(&refs), frame, None, 0, 0)
+                (host, args_init_mem(&refs), frame, 0, 0)
             }
             RunInput::PreGranted {
                 host,
                 init_mem,
-                readback,
                 entry_sp,
                 entry_as,
             } => {
                 // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
                 // here; the parent granted exactly what the child holds (the confinement default).
                 let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                (*host, init_mem, frame, readback, entry_sp, entry_as)
+                (*host, init_mem, frame, entry_sp, entry_as)
             }
         };
         // The emitted `f{entry}` is called `f{entry}(win, env, ...declared params)`. A paramless `_start`
@@ -6975,7 +6612,6 @@ impl JitOnrampRun {
             exited: false,
             returned_value: 0,
             trapped: false,
-            fs_readback,
             grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
             prots: Some(temen_interp::PageMap::empty()),
             mapped,
@@ -7069,7 +6705,6 @@ impl JitOnrampRun {
             exited: false,
             returned_value: 0,
             trapped: false,
-            fs_readback: None,
             // Warm+JIT keeps its pre-sized window and the prior `run_over` bounce (`grow: false`), so the
             // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
             grow: false,
@@ -7248,24 +6883,6 @@ impl JitOnrampRun {
     pub fn stderr(&self) -> Vec<u8> {
         self.host.stderr_bytes()
     }
-    /// The run's **primary output**: the retained memfs file for a file-output phase guest (nifler's
-    /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `temen_onramp_jit_run_finish` hands
-    /// this to the card on the stdout slot, so a JIT phase guest surfaces its produced file exactly as the
-    /// bytecode `onramp_fs_exec_readback` does.
-    pub fn output(&self) -> Vec<u8> {
-        match &self.fs_readback {
-            Some((fsh, key)) => {
-                let (files, _dirs) = fsh.seed();
-                files
-                    .into_iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v)
-                    .unwrap_or_default()
-            }
-            None => self.host.stdout_bytes(),
-        }
-    }
-
     pub fn exited(&self) -> bool {
         self.exited
     }
@@ -11489,9 +11106,7 @@ pub extern "C" fn temen_onramp_jit_run_finish() -> i32 {
     let Some(run) = (unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }) else {
         return STATUS_UNSUPPORTED;
     };
-    // `output()` is `stdout` for a stdout guest (Lua/chibicc) and the produced memfs file for a
-    // file-output phase guest (nifler's `.p.nif`) — the card reads both off the stdout slot.
-    let stdout = run.output();
+    let stdout = run.stdout();
     let stderr = run.stderr().to_vec();
     // Exit is checked first (a cross-tier `Exit` sets both `exited` and, via the JS driver, `trapped`);
     // then a trap; then a clean return carrying the guest's result value. This mirrors `temen_run_onramp`'s
@@ -11900,7 +11515,6 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     RunInput::PreGranted {
                         host: Box::new(host),
                         init_mem,
-                        readback: None,
                         entry_sp: cinst,
                         entry_as: cas,
                     },
@@ -15243,7 +14857,6 @@ block 0 () {
                 false,
                 host,
                 Vec::new(),
-                None,
                 0,
                 0,
                 None,
@@ -15276,7 +14889,7 @@ block 0 () {
         let m = temen_text::parse_module(CHILD).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let (host, counter) = granted_fs_host();
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new(), None)
+        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new())
             .expect("open an owned JIT run over the granted host");
         let r = run
             .run_cross_tier(0, &[])
@@ -15314,9 +14927,8 @@ block 0 () {
             .spawn_named_child_from_window(&window, 32, 1, 1 << 12)
             .expect("marshal the grant list into a child powerbox");
 
-        let mut run =
-            JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
-                .expect("open a JIT run over the *marshaled* granted host");
+        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new())
+            .expect("open a JIT run over the *marshaled* granted host");
         let r = run
             .run_cross_tier(0, &[])
             .expect("child f0 runs over the marshaled host");
@@ -15361,9 +14973,8 @@ block 0 () {
         let (child_host, _i, _a) = parent
             .spawn_named_child_from_window(&window, 32, 2, 1 << 12)
             .expect("marshal a two-cap grant list");
-        let mut run =
-            JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
-                .expect("open over the two-cap marshaled host");
+        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new())
+            .expect("open over the two-cap marshaled host");
         let r = run
             .run_cross_tier(0, &[])
             .expect("child f0 runs over the marshaled host");

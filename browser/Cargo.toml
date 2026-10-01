@@ -63,13 +63,9 @@ temen-dap    = { path = "../crates/temen-dap" }
 # `Module` is named by the fixture/corpus bins and by `powerbox_exec` (shared with the cdylib).
 temen-ir     = { path = "../crates/temen-ir" }
 temen-fs     = { path = "../crates/temen-fs" }
-# The `exec` capability ABI + `JobTable`/`run_args` (EXEC.md) — the multibinary driver's child-spawn
-# surface. Pure (deps `temen-ir` + `temen-interp`), so it builds for wasm. Used by the in-browser nimony
-# compiler card (#958): `nimsem` spawns `nifler` as an `exec` child over the shared memfs.
-temen-exec = { path = "../crates/temen-exec" }
-# The Leng→TEMEN-IR translator + the nim→powerbox / runtime-shim linkers (NIM.md §3d/§3e). Pure
-# (deps `temen-ir` + `temen-text` + `temen-encode`), so it builds for wasm — it links the compiled Nim
-# in-browser (the same `link_nim_powerbox`/`link_whole_with_runtime` the headless driver uses).
+# The Leng→TEMEN-IR translator and linker (NIM.md §3d/§3e). Pure (deps `temen-ir` + `temen-text` +
+# `temen-encode`), so it builds for wasm: the nim card serves the toolchain's `temen-link` with it,
+# natively (`nimony.rs`).
 temen-leng = { path = "../crates/temen-leng" }
 # The escape-freedom verifier — the security hinge of the guest-driven `Jit` cap's validator
 # (decode → verify → preconditions). Pure (only deps `temen-ir`), so it builds for wasm.

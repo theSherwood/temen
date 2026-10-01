@@ -449,9 +449,11 @@ const FIXTURES: &[Fixture] = &[
         expect: Expect::Runs,
         ticket: None,
     },
+    // `discard x.id`, not `discard x`: since nimony 6ca46f17 `discard x` destroys a copy of `x`, so
+    // the destructor would run twice (84, natively too), and this row is about the one at scope exit.
     Fixture {
         feature: "object + ARC destructor",
-        source: "var freed {.global.}: int = 0\ntype Res = object\n  id: int\nproc `=destroy`(x: Res) =\n  freed = freed + x.id\nproc run() =\n  var x = Res(id: 42)\n  discard x\nrun()\nlet r = freed\n",
+        source: "var freed {.global.}: int = 0\ntype Res = object\n  id: int\nproc `=destroy`(x: Res) =\n  freed = freed + x.id\nproc run() =\n  var x = Res(id: 42)\n  discard x.id\nrun()\nlet r = freed\n",
         expected: 42,
         io: None,
         expect: Expect::Runs,

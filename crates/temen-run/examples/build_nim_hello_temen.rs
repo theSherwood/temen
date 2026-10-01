@@ -117,7 +117,13 @@ fn main() {
     // the same source links. They are named by the path nimony was handed — `file`, relative to its
     // cwd `dir` — so an in-tree build, whose `nimcache` holds other programs too, links its own.
     let given = file.to_str().expect("utf-8 program path");
-    let mods = temen_run::nim_program_units(&cache, given).unwrap_or_else(|e| {
+    // In tree, nimony's own search paths name the program too (`src/lib` can win).
+    let paths: &[&str] = if root.is_some() {
+        &temen_run::NIMONY_TREE_PATHS
+    } else {
+        &[]
+    };
+    let mods = temen_run::nim_program_units(&cache, given, paths).unwrap_or_else(|e| {
         panic!("{e}\n    for an in-tree source pass `--root <tree> <path-relative-to-tree>`")
     });
     assert!(

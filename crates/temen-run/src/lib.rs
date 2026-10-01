@@ -6056,6 +6056,11 @@ block 2 (inst: i32, c: i32) {{
     )
 }
 
+/// The search paths nimony itself puts first, as [`nim_module_suffix`] takes them, for a build run at
+/// the root of nimony's tree (`semos.setupPaths`): its stdlib, and `src/lib`, the compiler-internal
+/// modules it has kept on the path since nim-lang/nimony bdf5398c.
+pub const NIMONY_TREE_PATHS: [&str; 2] = ["lib", "src/lib"];
+
 /// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
 ///
 /// A faithful port of `nimony/src/gear2/modnames.nim`'s `moduleSuffix`: the first three characters
@@ -6070,11 +6075,11 @@ block 2 (inst: i32, c: i32) {{
 /// closed off the "just stage the cache" idea in #1609. Computing it here means a driver can write
 /// the file nimsem will actually ask for.
 ///
-/// `search_paths` mirrors nimony's `--path` list: the shortest of the given spelling and each
-/// `<search>/`-stripped one wins, exactly as `moduleSuffix` picks the shortest `relativePath`. Only
-/// the prefix case is handled — a path outside every search path keeps the spelling it came in with,
-/// where nim would render a `../` walk. Every layout a seeded memfs produces is a prefix case, and a
-/// wrong stem is visible immediately (nimsem re-parses) rather than silently wrong.
+/// `search_paths` mirrors nimony's search path list, spelled from the same place as `path` (both
+/// relative to one cwd, or both absolute): the shortest of the given spelling and its `relativePath`
+/// from each search path wins, `../` walks included. A walk can win: nimony keeps its tree's `src/lib`
+/// on the path ([`NIMONY_TREE_PATHS`]), so `src/nifmake/nifmake.nim` is hashed as
+/// `../nifmake/nifmake.nim`.
 pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
     /// `tinyhashes.uhash` — mix each byte, then finish. All arithmetic wraps at 32 bits.
     fn uhash(s: &str) -> u32 {
@@ -6090,17 +6095,29 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
     }
     const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
-    let mut f = path;
+    /// `os.relativePath(path, base, '/')`: the walk up out of `base`, then down into `path`.
+    fn relative_path(path: &str, base: &str) -> String {
+        let split = |s: &str| -> Vec<String> {
+            s.split('/')
+                .filter(|c| !c.is_empty() && *c != ".")
+                .map(str::to_string)
+                .collect()
+        };
+        let (p, b) = (split(path), split(base));
+        let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let mut out = vec!["..".to_string(); b.len() - common];
+        out.extend_from_slice(&p[common..]);
+        out.join("/")
+    }
+
+    let mut f = path.to_string();
     for sp in search_paths {
-        let sp = sp.trim_end_matches('/');
-        if let Some(rest) = path
-            .strip_prefix(sp)
-            .and_then(|r| r.strip_prefix('/'))
-            .filter(|r| r.len() < f.len())
-        {
-            f = rest;
+        let candidate = relative_path(path, sp);
+        if candidate.len() < f.len() {
+            f = candidate;
         }
     }
+    let f = f.as_str();
     let name = f.rsplit('/').next().unwrap_or(f);
     let stem = name.rsplit_once('.').map_or(name, |(base, _)| base);
 
@@ -6120,13 +6137,15 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
 /// modules, whatever else a shared `nimcache` holds — the programs its compile-time evaluation
 /// built, or other programs built in the same tree.
 ///
-/// `<main>` is the stem of `src`, the program's path as nimony was given it (relative to its cwd):
-/// [`nim_module_suffix`] with no search path, which is how the driver names a main module.
+/// `<main>` is the stem of `src`, the program's path as nimony was given it (relative to its cwd),
+/// over `search_paths`, nimony's search paths spelled from that cwd: [`NIMONY_TREE_PATHS`] for a
+/// build at the root of nimony's tree, none for a program built elsewhere.
 pub fn nim_program_units(
     nimcache: &std::path::Path,
     src: &str,
+    search_paths: &[&str],
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let main = nim_module_suffix(src, &[]);
+    let main = nim_module_suffix(src, search_paths);
     let dir = nimcache.join(&main);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("{src}: no build directory {}: {e}", dir.display()))?;
@@ -8649,6 +8668,26 @@ mod nim_module_suffix_tests {
         assert_eq!(
             nim_module_suffix("lib/system/basic_types.nim", &[]),
             "bas9s4yu5"
+        );
+    }
+
+    #[test]
+    fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
+        use super::NIMONY_TREE_PATHS;
+        // Observed verbatim: nimony 6ca46f17, run at the root of its tree, built these programs in
+        // `nimcache/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
+        // walk, one character shorter than the spelling it was given.
+        for (prog, stem) in [
+            ("src/nifmake/nifmake.nim", "niffw7j0b1"),
+            ("src/nifler2/nifler2.nim", "nif6gnbnq1"),
+            ("src/nimony/nimony.nim", "nimwe39eh1"),
+        ] {
+            assert_eq!(nim_module_suffix(prog, &NIMONY_TREE_PATHS), stem, "{prog}");
+        }
+        // A program at the root, the lane's `prog.nim`, keeps its own spelling.
+        assert_eq!(
+            nim_module_suffix("prog.nim", &NIMONY_TREE_PATHS),
+            nim_module_suffix("prog.nim", &[])
         );
     }
 

@@ -21287,9 +21287,11 @@ struct SharedStdin {
 
 /// A **lazy stdin source** ([`Host::set_stdin_source`]): called when a `Stream(In)` `read` finds the
 /// stdin buffer exhausted, to fetch more bytes — a CLI reads the next line of the real stdin here, so
-/// an interactive guest sees input as it is typed. An empty return is end of input (the read returns
-/// 0, as an exhausted buffer always did). The dual of [`StdoutTee`].
-pub type StdinSource = Box<dyn FnMut() -> Vec<u8> + Send>;
+/// an interactive guest sees input as it is typed. `Some` of an empty buffer is end of input (the
+/// read returns 0, as an exhausted buffer always did). `None` is "nothing yet": the read returns
+/// `-EAGAIN` and the guest may try again later, so a source that never blocks lets a guest wait on
+/// its terminal and something else at once (#2019). The dual of [`StdoutTee`].
+pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
@@ -21334,6 +21336,10 @@ struct HostProcEntry {
     /// #1455 / #1699 — the provider's own answer to "what host-side state does this capability
     /// hold?", given wherever a handler is minted ([`CapState`]).
     state: CapState,
+    /// #1954 — a **declared host-completed cap** ([`Host::grant_declared_host_caps`]): every call is
+    /// finished by the embedder, so a call parks without needing the caller's frames
+    /// ([`OpParks::OnHost`]).
+    on_host: bool,
 }
 
 /// #1699 — a host capability's **host-side state**, declared by its provider wherever a handler is
@@ -22315,6 +22321,10 @@ pub enum OpParks {
     /// for one to be started ([`ParkEvent::SpawnSelf`]). The engine serves both without the
     /// caller's frames, so a leaf whose host suspends them may make these calls.
     OnChildren,
+    /// #1954 — only on its embedder: a declared host-completed cap ([`Host::parks_on_host`]), which
+    /// the embedder answers later. The rest of the call waits without the caller's frames, as for
+    /// [`OpParks::OnChildren`], so a leaf whose host suspends them may make these calls.
+    OnHost,
     /// Some other way: a fork or an exec, which need the caller's frames, a signal, a read of
     /// something only another process can fill.
     Otherwise,
@@ -23482,6 +23492,7 @@ impl Host {
                 // #1455 — not the parent's serializer, which closes over the *parent's* state: the
                 // factory's answer for the handler it minted (#1699).
                 state: forked.state,
+                on_host: e.on_host,
             });
         }
         // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
@@ -25778,6 +25789,7 @@ impl Host {
                 mints: false,
                 vtable: None,
                 state,
+                on_host: false,
             });
         }
         self.named_cap_registrar = registrar;
@@ -26420,8 +26432,9 @@ impl Host {
     }
 
     /// Install a **lazy stdin source** (see [`Host::stdin_source`]): `src` is asked for more bytes
-    /// each time a `Stream(In)` `read` exhausts the buffer; an empty answer is end of input. The CLI's
-    /// interactive mode reads the real stdin a line at a time through it.
+    /// each time a `Stream(In)` `read` exhausts the buffer; an empty answer is end of input, and
+    /// none is "nothing yet" (`-EAGAIN`, [`StdinSource`]). The CLI's interactive mode reads the real
+    /// stdin a line at a time through it.
     pub fn set_stdin_source(&mut self, src: StdinSource) {
         self.stdin_source = Some(src);
     }
@@ -26566,6 +26579,7 @@ impl Host {
             mints: false,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -26585,6 +26599,7 @@ impl Host {
             mints: false,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -26623,10 +26638,23 @@ impl Host {
                 // Each call is answered afresh by the embedder; nothing is held between calls.
                 CapState::Stateless,
             );
+            if let Ok(Binding::HostProc(idx)) = self.resolve(h, cap_id::HOST_PROC) {
+                self.host_procs[idx as usize].on_host = true;
+            }
             self.register_cap_name(name, h);
             declared.push((name.clone(), h));
         }
         declared
+    }
+
+    /// #1954 — whether `handle` names a declared host-completed cap ([`Host::grant_declared_host_caps`]),
+    /// whose calls the embedder finishes: one parks without the caller's frames ([`OpParks::OnHost`]).
+    pub fn parks_on_host(&self, handle: i32) -> bool {
+        matches!(
+            self.resolve(handle, cap_id::HOST_PROC),
+            Ok(Binding::HostProc(idx))
+                if self.host_procs.get(idx as usize).is_some_and(|e| e.on_host)
+        )
     }
 
     /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
@@ -26685,6 +26713,7 @@ impl Host {
             mints: false,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -26701,6 +26730,7 @@ impl Host {
             mints: true,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -30834,7 +30864,9 @@ impl Host {
                     let mut st = cell.lock_unpoisoned();
                     if st.pos >= st.bytes.len() {
                         if let Some(src) = st.source.as_mut() {
-                            let more = src();
+                            let Some(more) = src() else {
+                                return ret(EAGAIN);
+                            };
                             st.bytes.extend_from_slice(&more);
                         }
                     }
@@ -30854,7 +30886,9 @@ impl Host {
                 // own bytes), so a parking host never consults it.
                 if self.stdin_pos >= self.stdin.len() && !self.stdin_block {
                     if let Some(src) = self.stdin_source.as_mut() {
-                        let more = src();
+                        let Some(more) = src() else {
+                            return ret(EAGAIN);
+                        };
                         self.stdin.extend_from_slice(&more);
                     }
                 }

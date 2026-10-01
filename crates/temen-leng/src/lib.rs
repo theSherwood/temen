@@ -8,14 +8,15 @@
 //!
 //! ## This crate ships **inside a sandbox guest**
 //!
-//! `temen-leng` is compiled into the nim-link guest (`demos/nim_frontend/nim_link_guest`, the
-//! committed `nim-link.temen.gz` asset): the linker running *on Temen*, over the LLVM on-ramp. That
-//! on-ramp provides a deliberately tiny C bottom edge — `read`/`write`/`mem*`/`malloc`/`free` and the
-//! `__vm_*` ops — and `build_nim_link.sh`'s stub audit **fails the build** on any other extern in the
-//! link closure. So this crate must not reach for anything that pulls in libc: no `std::env` (a
-//! `getenv`), no `eprintln!`/`println!` (thread-local stdio drags in `pthread_key_*`, `abort`,
-//! `__errno_location`). A `TEMEN_LENG_DUMP_LAYOUT` diagnostic knob added here during #1593 tripped
-//! exactly that audit — the guest is not a place where an environment exists to read.
+//! `temen-leng` is compiled into guests that run *on Temen*, over the LLVM on-ramp: `temen-link`
+//! (`demos/temen_link`, the linker the self-hosted lane builds every run) and the translator asset
+//! `temen-leng.temen` (`demos/leng_selfhost`). That on-ramp provides a deliberately tiny C bottom
+//! edge — `read`/`write`/`mem*`/`malloc`/`free` and the `__vm_*` ops — and each builder's extern audit
+//! **fails the build** on any other extern in the link closure. So this crate must not reach for
+//! anything that pulls in libc: no `std::env` (a `getenv`), no `eprintln!`/`println!` (thread-local
+//! stdio drags in `pthread_key_*`, `abort`, `__errno_location`). A `TEMEN_LENG_DUMP_LAYOUT` diagnostic
+//! knob added here during #1593 tripped exactly that audit — the guest is not a place where an
+//! environment exists to read.
 //!
 //! Diagnostics belong in the **callers** (`temen-run`, the tests), which are ordinary host binaries.
 //!
@@ -1212,6 +1213,13 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // serves it ([`POSIX_SERVED_LEAVES`]). This powerbox has no process table, so here it fails
     // closed on `pipe`'s stub (row 43), the same `(ptr) -> -1`. **Pinned** (#1499).
     ("pspawn", sig(&[I64], &[I32]), 43),
+    // Two more fail-closed file and process stubs, both **pinned** (#1499). `std/posix`'s
+    // `chmod(path, mode) -> cint` has `mkdir`'s shape and posture (row 29: no filesystem to change).
+    // `std/cpuinfo` sizes a pool from `sched_getaffinity(pid, size, mask) -> cint` first. -1 here
+    // (row 83's stub, the same shape) makes it count nothing and fall back to `sysconf`
+    // (row 48), as it did before it asked for the affinity mask.
+    ("chmod", sig(&[I64, I32], &[I32]), 29),
+    ("schedGetaffinity", sig(&[I32, I64, I64], &[I32]), 83),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the

@@ -1,6 +1,7 @@
 # NIM.md — running Nim (nimony) on Temen, and self-hosting it
 
-Status: **scoping / design doc + phase-1 in progress**, written 2026-07-28. This is the
+Status: written 2026-07-28 as a scoping doc. **Phase 1, the C on-ramp path, is retired (#2028):**
+the Phase-2 backend's no-C toolchain (§3a) replaced it, and nimony now builds itself on Temen. This is the
 work-breakdown and the load-bearing decisions for targeting Temen from
 [nimony](https://github.com/nim-lang/nimony) — the in-development next-generation Nim
 compiler. It leans on the on-ramp (`LLVM.md`), the C-selfhost template (`SELFHOST_C.md`),
@@ -17,14 +18,14 @@ separate concerns, even where they touch the same seams.
 - **Goal.** Compile Nim → Temen IR, and eventually **self-host nimony on Temen** — the same
   shape as chibicc-on-Temen (`SELFHOST_C.md`) and the Postgres/QuickJS guest assets.
 - **Two phases, cheapest-first.**
-  - **Phase 1 (this doc's active work): the C on-ramp path — zero nimony code.**
+  - **Phase 1 (retired, #2028): the C on-ramp path — zero nimony code.**
     nimony already emits C; Temen already ingests C→bitcode→TEMEN-IR via the proven LLVM
     on-ramp (`LLVM.md`). So `nim → nimony → Leng → lengc(C) → clang -O2 → temen-llvm-translate
     → prep_temen`. This retires the real risk (does Nim-shaped codegen — ARC, error-flag
     exceptions, raw-pointer objects, the `system` runtime — survive the on-ramp and run
     correctly under confinement?) and delivers **nimony-on-Temen for free**, exactly as
     `chibicc.temen` came for free from the same pipeline.
-  - **Phase 2 (optional, if warranted): a native `Leng → TEMEN-IR` backend.** A
+  - **Phase 2 (the path taken): a native `Leng → TEMEN-IR` backend.** A
     `lengc`-style backend written in Nim, consuming Leng NIF and emitting Temen text — the
     supported multi-backend seam (C/C++/LLVM-IR/arkham already coexist behind Leng). The
     **"arkham-for-Temen"** play: drops the clang/LLVM build-time dependency and shapes TEMEN-IR
@@ -97,7 +98,11 @@ The Nim-derived module is an **untrusted frontend artifact** (`DESIGN.md` §2a):
 re-checks everything at load, so a nimony/backend bug is a **clean error, never an escape**.
 No self-hosting convenience may bypass verification (INVARIANTS §9).
 
-## 2. Phase 1 — the C on-ramp path (active)
+## 2. Phase 1 — the C on-ramp path (retired)
+
+**Retired (#2028).** The no-C toolchain (§3a) replaced this path. Its demos, assets, tests and
+examples are deleted, so the paths this section names live only in git history. It stays as the
+record of what Phase 1 proved.
 
 **Pipeline.** `nim → nimony/hexer → Leng → lengc c → clang-18 -O2 -emit-llvm →
 temen-llvm-translate → prep_temen (decode → verify → bytecode-compile gate)`, then run on
@@ -750,8 +755,8 @@ at? Measured directly from `hexer`-compiled `sysvq0asl.x.nif`, the runtime's **e
 | Dynamic linking | `dlopen`, `dlsym`, `dlclose`, `dlerror` | unused by a static program → stub / fail-closed |
 
 **The key finding: W3's hard part is already retired.** This is the *same* C bottom edge Phase 1's
-on-ramp already binds — `crates/temen-run/demos/nimony/` runs a nimony-shaped module on all three
-engines today, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX personality + Memory
+on-ramp already binds — `crates/temen-run/demos/nimony/` (since retired, #2028) ran a nimony-shaped
+module on all three engines, with `write`/`mmap`/`_exit`/`memcpy` resolved through the POSIX personality + Memory
 cap. So the bindings exist and are proven; W3 is *wiring*, not invention. `resolve_imports_with`
 already lowers a named import to a host capability (`Cap`) — that's the seam.
 
@@ -941,8 +946,9 @@ self-seeding brk — no open architecture question.
 
 nimony marks its allocator and exception state `__thread` (thread-local); `hexer` emits these as Leng
 **`tvar`** (thread-var, the sibling of `gvar`). Phase 1's C on-ramp had no `llvm.threadlocal.address`
-lowering, so `demos/nimony/build_nimony.sh` **strips `__thread`** before clang (a `sed` pass with a
-`grep` guard that fails the build if any survives) — valid because the guest is single-threaded. This
+lowering, so its build (`demos/nimony/build_nimony.sh`, retired with it) **stripped `__thread`** before
+clang (a `sed` pass with a `grep` guard that failed the build if any survived) — valid because the guest
+is single-threaded. This
 section commits the Phase-2 backend's model. It is a **two-tier** answer, and Tier 1 is done.
 
 **What temen actually offers (measured).** temen has exactly **one** thread-local primitive: a single
@@ -1187,12 +1193,12 @@ architecture**.
 - Matching every Nim 2 feature — nimony's own coverage at v0.4.0 is the ceiling; effect
   inference etc. are upstream gaps.
 - A general Nim package/build tool on Temen (nimble, etc.). The unit is a compiled Temen module.
-- Making the Phase-2 backend the *only* path — the on-ramp (Phase 1) stays the low-risk lane
-  and the self-host shipping path, exactly as the LLVM-built `chibicc.temen` ships (§3 there).
+- ~~Making the Phase-2 backend the *only* path.~~ Reversed by #2028: the Phase-2 backend self-hosts
+  with no C compiler, so the on-ramp lane (Phase 1) was retired rather than kept as a second route.
 
 ---
 
-## Appendix — recorded toolchain commands (Phase 1 step 2, for when a nim toolchain is present)
+## Appendix — recorded toolchain commands (Phase 1 step 2, retired; kept as the record)
 
 ```sh
 # Nim 2.x (apt's 1.6 is too old for nimony)
