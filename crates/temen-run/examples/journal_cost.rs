@@ -390,10 +390,6 @@ const LADDER_STRIDE: u64 = 1024;
 /// The checkpoint ladder the DAP backend keeps for `seek`, recorded over the same run (#1459): how
 /// much a rung holds once it shares the pages it agrees on with the rung below, against the flat
 /// window images it held before, and what taking one costs (the page compare included).
-///
-/// Each rung is the window read at its turn, not [`ScheduledDebugRun::snapshot`]: these guests are
-/// built with the full capability set, whose `Jit` table refuses a checkpoint, and the paging only
-/// ever looks at the window.
 fn ladder_cost(g: &Guest, module: &temen_ir::Module, turns: u64, window: u64) {
     let Some(mut run) = build(g, module) else {
         return;
@@ -406,15 +402,12 @@ fn ladder_cost(g: &Guest, module: &temen_ir::Module, turns: u64, window: u64) {
         if reached < at {
             break;
         }
-        let Ok(bytes) = run.read_window(0, window as usize) else {
-            return;
+        let Some(snap) = run.snapshot() else {
+            // A guest that compiles a `Jit` unit (forth defines its words that way) stops being
+            // checkpointable there (#2015); the rungs before it are still worth reporting.
+            println!("  ladder            not checkpointable from turn {at}");
+            break;
         };
-        let layout = temen_interp::MemLayout::image(bytes);
-        let snap = temen_interp::moment::Moment::new(
-            Some(layout),
-            &temen_interp::Host::new(),
-            temen_interp::moment::Continuation::None,
-        );
         flat += snap.byte_len();
         let t0 = Instant::now();
         ladder.take(at, snap);

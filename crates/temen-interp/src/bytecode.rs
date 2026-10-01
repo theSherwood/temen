@@ -8426,7 +8426,14 @@ impl ScheduledDebugRun {
         }
         // Undo only goes backward. A turn past the run's own position is not history, and the
         // nearest-at-or-before anchor lookup would otherwise happily answer with the last boundary.
-        turn < self.turn && self.journal.can_undo_to(turn)
+        // Nor across a `Jit` compile (#2015): the unit and its handle stay, and the replay would
+        // compile again under a different handle.
+        turn < self.turn
+            && self.journal.can_undo_to(turn)
+            && self
+                .journal
+                .state_at(turn)
+                .is_some_and(|st| st.cursor.jit_mark == self.host.jit_compile_mark())
     }
 
     /// Undo back to `turn`, putting the run where it stood **before** that turn's op ran: the window
@@ -8439,6 +8446,9 @@ impl ScheduledDebugRun {
     pub fn undo_to(&mut self, turn: u64) -> bool {
         if turn == self.turn {
             return true; // already here; see `can_undo_to`
+        }
+        if !self.can_undo_to(turn) {
+            return false;
         }
         let Some(st) = self.journal.state_at(turn) else {
             return false;
@@ -9299,8 +9309,12 @@ impl ScheduledDebugRun {
                             | FiberState::HostParked { .. }
                     )
                 })
+            // A child's host is rebuilt with only its `Instantiator` and `AddressSpace`
+            // (`rebuild_env`), so a child holding a `Jit` table is out of the subset.
             && self.extra_envs.iter().all(|e| {
-                e.host.checkpoint_safe() && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
+                e.host.checkpoint_safe()
+                    && !e.host.has_jit_table()
+                    && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
             })
     }
 

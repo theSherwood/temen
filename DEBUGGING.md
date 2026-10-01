@@ -2513,14 +2513,20 @@ byte budget bounds, counts a shared page once.
 It costs one compare of the window per rung taken and nothing between rungs. No write is tracked,
 so it works the same on every tier, the playground's emitted reactors included, and touches nothing
 in the confinement path. `journal_cost` measures it on the DAP's checkpoint ladder (a rung every 1024
-turns, 300 000 turns):
+turns, 300 000 turns), taking the debug engine's own snapshots:
 
 | guest | window | rungs | flat | held | per rung after the first | take |
 | --- | --- | --- | --- | --- | --- | --- |
-| gradient | 256 KiB | 292 | 73.0 MiB | 1.4 MiB (1.9%) | 4.1 KiB | 10 µs |
-| forth | 1 MiB | 292 | 292 MiB | 2.8 MiB (0.95%) | 6.2 KiB | 79 µs |
-| chibicc | 2 MiB | 292 | 584 MiB | 3.6 MiB (0.62%) | 5.7 KiB | 172 µs |
+| gradient | 256 KiB | 292 | 73.0 MiB | 1.4 MiB (1.9%) | 4.1 KiB | 12 µs |
+| forth | 1 MiB | 103 | 103 MiB | 1.7 MiB (1.6%) | 6.7 KiB | 83 µs |
+| chibicc | 2 MiB | 292 | 602 MiB | 4.6 MiB (0.77%) | 9.3 KiB | 193 µs |
 | synthetic, 1% of pages rewritten | 16 MiB | 32 | 512 MiB | 21 MiB | — | 3.9–4.5 ms |
+
+forth stops at 103 rungs because it compiles its word definitions as `Jit` units, and a unit ends
+the checkpointable subset. A granted `Jit` table with no unit in it does not (#2015): the rebuilt
+run's fresh grant matches it but for the compile quota, which the replay substate carries. The undo
+journal restores into the same run instead, so it cannot take a unit back either; an undo across any
+`compile` attempt declines and `seek` serves it.
 
 #1459's second mechanism, a write-protect overlay that records which pages a guest writes, would
 replace the compare with a fault per first write. At these costs there is nothing yet for it to win
