@@ -284,3 +284,131 @@ fn debug_forged_handle_traps_identically() {
         );
     }
 }
+
+/// Guest `(jit)`: a `compile` of 64 zero bytes (rejected, but its bytes are charged to the quota), a
+/// 20-iteration loop, a `compile` of the real blob, and another 20-iteration loop. Returns the second
+/// compile's result: a code handle, or `-ENOMEM` when the quota left after the first is too small.
+const QUOTA_GUEST: &str = "memory 16\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+     v1 = i64.const 24576\n  v2 = i64.const 64\n  \
+     v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
+     v4 = i32.const 20\n  br 1(v0, v4)\n}\n\
+     block 1 (vj: i32, vk: i32) {\n  vm1 = i32.const -1\n  vn = i32.add vk vm1\n  \
+     br_if vn 1(vj, vn) 2(vj)\n}\n\
+     block 2 (vj2: i32) {\n  v5 = i64.const 20480\n  v6 = i64.const BLOBLEN\n  \
+     v7 = call.cap 11 0 (i64, i64) -> (i64) vj2 (v5, v6)\n  v8 = i32.const 20\n  br 3(v7, v8)\n}\n\
+     block 3 (vr: i64, vt: i32) {\n  vm2 = i32.const -1\n  vt2 = i32.add vt vm2\n  \
+     br_if vt2 3(vr, vt2) 4(vr)\n}\n\
+     block 4 (vr2: i64) {\n  return vr2\n  }\n}\n";
+
+fn quota_guest() -> temen_ir::Module {
+    guest_module(
+        QUOTA_GUEST,
+        &blob(
+            "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  \
+             v2 = i32.add v0 v1\n  return v2\n  }\n}\n",
+        ),
+    )
+}
+
+/// A debug run of [`quota_guest`] whose quota holds one byte less than both compiles together, so
+/// the second fails only if the first one's charge is still on the books.
+fn quota_run(m: &temen_ir::Module) -> ScheduledDebugRun {
+    let blob_len = m.data.last().expect("the blob segment").bytes.len() as u64;
+    let (mut host, jit) = jit_host(m, 0);
+    host.set_jit_quota(4, 64 + blob_len - 1);
+    ScheduledDebugRun::new_with_host(m, 0, &[Value::I32(jit)], host).expect("in the debug subset")
+}
+
+/// **#2015 — a granted `Jit` table with no unit in it does not refuse a checkpoint**, and the compile
+/// quota rides it. The guest's first `compile` is rejected but charges its bytes; a checkpoint taken
+/// after it, restored into a freshly built run, must still leave the second `compile` short of quota,
+/// as the uninterrupted run is. Before, the granted table alone refused every checkpoint.
+#[test]
+fn a_jit_table_without_units_checkpoints_and_keeps_its_quota() {
+    let m = quota_guest();
+    let mut fuel = 50_000_000u64;
+    let want = sched_to_end(&mut quota_run(&m), &mut fuel);
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(-12)]),
+        "the rejected compile's charge leaves the second one short (-ENOMEM)"
+    );
+
+    let mut run = quota_run(&m);
+    let mut fuel = 50_000_000u64;
+    while run.op_turn() < 30 && run.tick(&mut fuel) {}
+    let turn = run.op_turn();
+    let snap = run
+        .snapshot()
+        .expect("a granted, unit-less Jit table is checkpointable");
+
+    let mut warm = quota_run(&m);
+    warm.restore(turn, &snap);
+    let mut fuel = 50_000_000u64;
+    assert_eq!(
+        sched_to_end(&mut warm, &mut fuel),
+        want,
+        "restored at turn {turn}, the run ends as the uninterrupted one does"
+    );
+}
+
+/// The other side of #2015: once a unit is compiled the table holds a `JitCode` handle a restore
+/// cannot rebuild, so the run stops being checkpointable.
+#[test]
+fn a_compiled_unit_still_refuses_a_checkpoint() {
+    let m = quota_guest();
+    let (host, jit) = jit_host(&m, 0); // the default quota: both compiles fit
+    let mut run =
+        ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(jit)], host).expect("in the subset");
+    let mut fuel = 50_000_000u64;
+    while run.op_turn() < 30 && run.tick(&mut fuel) {}
+    assert!(run.snapshot().is_some(), "no unit yet");
+    assert!(
+        matches!(sched_to_end(&mut run, &mut fuel), Ok(v) if matches!(v[..], [Value::I64(h)] if h > 0)),
+        "the second compile succeeds"
+    );
+    assert!(run.snapshot().is_none(), "a unit is held: refused");
+}
+
+/// **#2015, the journal's half.** The undo journal restores into the same run, so it cannot take back
+/// a `compile`: the unit and its `JitCode` handle stay, and a replay would compile again under the
+/// next handle (it returned 258 where the run had 257). An undo across a compile declines, and `seek`
+/// serves it; one after the last compile still undoes and agrees.
+#[test]
+fn undo_declines_across_a_compile() {
+    let m = quota_guest();
+    let fresh = || {
+        let (host, jit) = jit_host(&m, 0);
+        ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(jit)], host).expect("in the subset")
+    };
+    let mut fuel = 50_000_000u64;
+    let want = sched_to_end(&mut fresh(), &mut fuel);
+
+    let mut run = fresh();
+    run.set_journal_armed(true);
+    run.set_journal_policy(temen_interp::journal::JournalPolicy {
+        state_stride: 1,
+        ..Default::default()
+    });
+    let mut fuel = 50_000_000u64;
+    assert_eq!(sched_to_end(&mut run, &mut fuel), want);
+    let end = run.op_turn();
+    for t in [1u64, 30] {
+        assert!(
+            !run.can_undo_to(t),
+            "turn {t} is before a compile: declined"
+        );
+        assert!(!run.undo_to(t), "and undo_to agrees");
+    }
+    let after = end - 1;
+    assert!(
+        run.can_undo_to(after),
+        "turn {after} is after the last compile"
+    );
+    assert!(run.undo_to(after));
+    assert_eq!(
+        sched_to_end(&mut run, &mut fuel),
+        want,
+        "undo to {after}, then on"
+    );
+}
