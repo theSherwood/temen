@@ -3042,7 +3042,22 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         thunk: cap_thunk_locked,
         register_serve: child_register_serve,
         parent_ctx: ctx.ptr(),
+        resolve_module: if locked {
+            module_resolver_locked
+        } else {
+            module_resolver
+        },
+        as_parent: child_as_parent,
     }
+}
+
+/// #1956 — the [`temen_jit::AsParent`]: [`production_grant_hooks`] over a detached child's powerbox,
+/// which is always the shared form, so the child spawns its own children as a concurrent run does.
+///
+/// # Safety
+/// `child_ctx` is a live child powerbox a builder returned.
+unsafe fn child_as_parent(child_ctx: *mut c_void) -> temen_jit::GrantChildHooks {
+    production_grant_hooks(CapCtx::Locked(child_ctx as *const Mutex<Host>))
 }
 
 /// The production [`temen_jit::BudgetTaker`] for a run with this cap ctx — the `set_budget_taker`

@@ -854,11 +854,15 @@ impl Domain {
     /// The §14 child finished — drop it from the live count (see [`Self::child_started`]) and wake
     /// the futex waiters so a parked infinite waiter re-evaluates `peers_live` promptly (not only
     /// on the `KILL_RECHECK` cadence, which an unarmed run doesn't have), exactly as when a spawned
-    /// vCPU exits (`run_child`'s decrement + wake).
+    /// vCPU exits (`run_child`'s decrement + wake). The parked child tasks re-check too: one may be
+    /// a detached child's root joining this child (#1956).
     pub(crate) fn child_finished(&self) {
         lock(&self.threads).live -= 1;
-        let _g = lock(&self.futex);
-        self.futex_cv.notify_all();
+        {
+            let _g = lock(&self.futex);
+            self.futex_cv.notify_all();
+        }
+        self.wake_child_tasks();
     }
 
     /// D66 — install the lane chain this domain's own vCPUs run under (see [`Domain::lane_chain`]).
@@ -1351,7 +1355,7 @@ pub(crate) fn set_current_domain(dom: *const Domain) -> *const Domain {
 /// # Safety
 /// `sched` is the run's live `Domain`; a current domain, when set, outlives the code running it.
 #[inline(never)]
-unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
+pub(crate) unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
     let cur = CURRENT_DOMAIN.with(|c| c.get());
     &*(if cur.is_null() { sched } else { cur })
 }

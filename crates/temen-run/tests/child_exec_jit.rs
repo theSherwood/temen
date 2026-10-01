@@ -541,3 +541,148 @@ fn a_notify_racing_a_tasks_park_is_not_lost() {
         assert_eq!(run_jit(&p, &a, &b, -1), want, "run {run}");
     }
 }
+
+/// #1956 — `v0` Instantiator, `v1` AddressSpace, `v2` the [`GRANDCHILD_SPINS`] module, `v4` Budget.
+/// Mints a 64 KiB region, maps it at 65536 of its own window and grants it to the child by name
+/// (`"r"`). The child hands it on to a grandchild that spins over it; the root joins the child, then
+/// spins over the region itself, and returns `1000·VIOL + the child's result`.
+const ROOT_SPINS_BESIDE_GRANDCHILD: &str = r#"memory 17
+data 18464 "r"
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vrec = i64.const 18432
+  vname = i64.const 4294985760
+  i64.store vrec vname
+  vrec2 = i64.const 18440
+  vh64 = i64.extend_i32_u vrh
+  i64.store vrec2 vh64
+  vmh = i64.extend_i32_u v2
+  vb = i64.extend_i32_u v4
+  vz = i64.const 0
+  vone = i64.const 1
+  vlog = i64.const 17
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vrec, vone, vz, vlog, vz, vz, vz)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vrun = i64.const 65536
+  vold = i64.atomic.rmw.add vrun vone
+  vge = i64.ge_s vold vone
+  br_if vge 1(vj) 2(vj)
+}
+block 1 (vj1: i64) {
+  vviol = i64.const 65544
+  vone1 = i64.const 1
+  vx = i64.atomic.rmw.add vviol vone1
+  br 2(vj1)
+}
+block 2 (vj2: i64) {
+  vz2 = i64.const 0
+  br 3(vj2, vz2)
+}
+block 3 (vj3: i64, vi: i64) {
+  vlim = i64.const 1000000
+  vlt = i64.lt_u vi vlim
+  vone3 = i64.const 1
+  vi1 = i64.add vi vone3
+  br_if vlt 3(vj3, vi1) 4(vj3)
+}
+block 4 (vj4: i64) {
+  vrun4 = i64.const 65536
+  vneg = i64.const -1
+  vd = i64.atomic.rmw.add vrun4 vneg
+  vviol4 = i64.const 65544
+  vv = i64.load vviol4
+  vk = i64.const 1000
+  vm = i64.mul vv vk
+  vr = i64.add vm vj4
+  return vr
+  }
+}
+"#;
+
+/// #1956 — the child (func 0) and the grandchild (func 1) of [`ROOT_SPINS_BESIDE_GRANDCHILD`]. The
+/// child spawns its own module's func 1 detached from its own `"budget"`, with the region it was
+/// granted as `"r"` pre-mapped at 65536, and returns its handle plus 7 without joining it. The
+/// grandchild spins over the region as [`SPINNER`] does.
+const GRANDCHILD_SPINS: &str = r#"memory 17
+data 20000 "budget"
+data 20016 "r"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnp = i64.const 20000
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  vbw = i64.extend_i32_u vb
+  vrp = i64.const 20016
+  vrl = i64.const 1
+  vr = self.resolve vrp vrl
+  vrw = i64.extend_i32_u vr
+  vself = i64.const -1
+  vz = i64.const 0
+  ve = i64.const 1
+  vlog = i64.const 17
+  voff = i64.const 65536
+  vinst = i32.wrap_i64 v0
+  vg = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vself, vz, vz, ve, vlog, vz, vz, vz, vrw, voff)
+  vg64 = i64.extend_i32_s vg
+  v7 = i64.const 7
+  vres = i64.add vg64 v7
+  return vres
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vrun = i64.const 65536
+  vone = i64.const 1
+  vold = i64.atomic.rmw.add vrun vone
+  vge = i64.ge_s vold vone
+  br_if vge 1() 2()
+}
+block 1 () {
+  vviol = i64.const 65544
+  vone1 = i64.const 1
+  vx = i64.atomic.rmw.add vviol vone1
+  br 2()
+}
+block 2 () {
+  vz = i64.const 0
+  br 3(vz)
+}
+block 3 (vi: i64) {
+  vlim = i64.const 1000000
+  vlt = i64.lt_u vi vlim
+  vone3 = i64.const 1
+  vi1 = i64.add vi vone3
+  br_if vlt 3(vi1) 4()
+}
+block 4 () {
+  vrun2 = i64.const 65536
+  vneg = i64.const -1
+  vd = i64.atomic.rmw.add vrun2 vneg
+  vz4 = i64.const 0
+  return vz4
+  }
+}
+"#;
+
+/// #1956 — **a grandchild is gated on every lane up to the root's**, on the JIT as on the
+/// interpreter. Under a root lane cap of 1 the root and a grandchild it never joins never spin at
+/// once: the grandchild's chain holds the root's lane, so it runs only while the root is parked in
+/// its join, or after the root's spin. (A chain of the child's and the grandchild's lanes alone,
+/// both unbounded, let them overlap on ≥2 cores — the mutation the pin was checked against.)
+#[test]
+fn a_grandchild_is_gated_on_the_roots_lane_on_the_jit() {
+    let p = module(ROOT_SPINS_BESIDE_GRANDCHILD);
+    let c = module(GRANDCHILD_SPINS);
+    // `host`'s two modules are the same one here: the child spawns its own.
+    assert_eq!(run_interp(&p, &c, &c, 1), 7, "the oracle");
+    for run in 0..3 {
+        assert_eq!(run_jit(&p, &c, &c, 1), 7, "run {run}: no overlap");
+    }
+}

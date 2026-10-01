@@ -115,6 +115,11 @@ fn run_jit(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i
 
 /// Run `parent` on the JIT over `(host, handles)`, with no fuel armed for the root.
 fn jit_outcome(parent: &temen_ir::Module, (mut host, h): (Host, [i32; 3])) -> JitOutcome {
+    jit_on(parent, &mut host, h)
+}
+
+/// [`jit_outcome`] over a host the caller keeps.
+fn jit_on(parent: &temen_ir::Module, host: &mut Host, h: [i32; 3]) -> JitOutcome {
     let args = [h[0] as i64, h[1] as i64, h[2] as i64];
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         parent,
@@ -123,9 +128,9 @@ fn jit_outcome(parent: &temen_ir::Module, (mut host, h): (Host, [i32; 3])) -> Ji
         &[],
         temen_ir::DEFAULT_RESERVED_LOG2,
         temen_run::cap_thunk,
-        &mut host as *mut Host as *mut c_void,
+        host as *mut Host as *mut c_void,
         Some(temen_run::module_resolver),
-        Some(grant_hooks(&mut host as *mut Host)),
+        Some(grant_hooks(host as *mut Host)),
     )
     .expect("jit run");
     jo
@@ -146,13 +151,18 @@ fn interp_result(
     parent: &temen_ir::Module,
     (mut host, h): (Host, [i32; 3]),
 ) -> Result<Vec<Value>, Trap> {
+    interp_on(parent, &mut host, h)
+}
+
+/// [`interp_result`] over a host the caller keeps.
+fn interp_on(parent: &temen_ir::Module, host: &mut Host, h: [i32; 3]) -> Result<Vec<Value>, Trap> {
     let mut fuel = 50_000_000u64;
     run_with_host(
         parent,
         0,
         &[Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])],
         &mut fuel,
-        &mut host,
+        host,
     )
 }
 
@@ -811,4 +821,228 @@ fn a_pre_map_overrunning_the_child_window_refuses_probeably_on_both_backends() {
         -22,
         "EINVAL, not a trap, on the JIT too"
     );
+}
+
+/// #1956 — a detached child (`memory 16`) that reads a depth `d` from its payload. While `d > 0` it
+/// spawns its own module detached from its own `"budget"`, with `d - 1` as the payload, joins it and
+/// returns `10 * result + d`; at `d = 0` it returns 7. `orphan` makes the `d = 1` level return 5
+/// without joining, and the `d = 0` level count down 200 000 first, so it outlives its parent.
+fn nester(orphan: bool) -> String {
+    let (join, leaf) = if orphan {
+        (
+            "vfive = i64.const 5\n  return vfive",
+            "vn = i64.const 200000\n  br 3(vn)",
+        )
+    } else {
+        (
+            "vj = call.cap 6 1 (i32) -> (i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
+            "v7 = i64.const 7\n  return v7",
+        )
+    };
+    format!(
+        r#"memory 16
+data 20000 "budget"
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vab = i64.const {args}
+  vd = i64.load vab
+  vz = i64.const 0
+  vleaf = i64.eq vd vz
+  br_if vleaf 2() 1(v0, vd)
+}}
+block 1 (vi: i64, vd1: i64) {{
+  vone = i64.const 1
+  vnext = i64.sub vd1 vone
+  vpp = i64.const 24576
+  i64.store vpp vnext
+  vnp = i64.const 20000
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  vbw = i64.extend_i32_u vb
+  vself = i64.const -1
+  vzero = i64.const 0
+  vlog = i64.const 16
+  vpl = i64.const 8
+  vinst = i32.wrap_i64 vi
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vself, vzero, vzero, vzero, vlog, vzero, vpp, vpl)
+  {join}
+}}
+block 2 () {{
+  {leaf}
+}}
+block 3 (vc: i64) {{
+  vdec = i64.const 1
+  vc1 = i64.sub vc vdec
+  vdone = i64.eqz vc1
+  br_if vdone 4() 3(vc1)
+}}
+block 4 () {{
+  v7l = i64.const 7
+  return v7l
+  }}
+}}
+"#,
+        args = temen_ir::module_args_base(),
+    )
+}
+
+/// `v0` Instantiator, `v1` the [`nester`] module, `v2` the `Budget`: spawn it detached with depth `d`
+/// as its payload, join it, and return its result.
+fn nest_root(d: i64) -> String {
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vpp = i64.const 18432
+  vd = i64.const {d}
+  i64.store vpp vd
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 16
+  vpl = i64.const 8
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vpp, vpl)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vj
+  }}
+}}
+"#
+    )
+}
+
+/// Run `f` on a thread of its own: a run that deadlocks fails here instead of hanging the suite.
+fn within_a_minute<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("{what}: no result within a minute (deadlocked?)"))
+}
+
+/// The `mem` room left along `budget`'s chain (Budget op 1, field 1).
+fn mem_room(host: &mut Host, budget: i32) -> i64 {
+    host.cap_dispatch_slots(cap_id::BUDGET, 1, budget, &[1], None)
+        .expect("read")[0]
+}
+
+/// #1956 — a detached child spawns and joins detached children of its own on the JIT, as on the
+/// interpreter, at every depth: each level has a nursery of its own, which spawns through the
+/// child's own powerbox and pays from its own budget.
+#[test]
+fn detached_children_nest_three_deep_on_the_jit_as_on_the_interpreter() {
+    let c = module(&nester(false));
+    for (d, want) in [(0, 7), (1, 71), (2, 712), (3, 7123)] {
+        let p = module(&nest_root(d));
+        assert_eq!(run_interp(&p, &c, 1 << 20), want, "interpreter, depth {d}");
+        assert_eq!(run_jit(&p, &c, 1 << 20), want, "the JIT, depth {d}");
+    }
+}
+
+/// #1956 — a grandchild its parent never joins outlives it, on the JIT as on the interpreter: the
+/// child returns while the grandchild still runs, and the grandchild's end still hands its window
+/// back to the child's budget, so every byte of the run's budget is free again after the run. On the
+/// JIT the grandchild's teardown reaches the ended child's host, which its nursery keeps alive.
+#[test]
+fn a_grandchild_outlives_its_parent_and_hands_its_window_back_on_the_jit() {
+    let c = module(&nester(true));
+    let p = module(&nest_root(1));
+    let (mut host, h) = host(&c, 1 << 20);
+    assert_eq!(
+        interp_on(&p, &mut host, h),
+        Ok(vec![Value::I64(5)]),
+        "interpreter"
+    );
+    assert_eq!(
+        mem_room(&mut host, h[2]),
+        1 << 20,
+        "interpreter: all returned"
+    );
+    let (mut host, h) = self::host(&c, 1 << 20);
+    assert_eq!(
+        jit_on(&p, &mut host, h),
+        JitOutcome::Returned(vec![5]),
+        "the JIT"
+    );
+    assert_eq!(mem_room(&mut host, h[2]), 1 << 20, "the JIT: all returned");
+}
+
+/// #1956 — under a run lane cap of 1, a child that joins its own child must step aside for it, on
+/// the JIT as on the interpreter. The child runs as a task on the JIT's executor, so its `join`
+/// parks the task (handing its worker and its lanes back) rather than blocking the worker, and the
+/// grandchild, gated on every lane up to the root's, runs in its place.
+#[test]
+fn a_child_joining_its_child_under_a_lane_cap_of_one_steps_aside_on_the_jit() {
+    let (interp, jit) = within_a_minute("depth 2 under a lane cap of 1", || {
+        let c = module(&nester(false));
+        let p = module(&nest_root(2));
+        let capped = || {
+            let (mut host, h) = host(&c, 1 << 20);
+            host.set_lane_cap(1);
+            (host, h)
+        };
+        (interp_result(&p, capped()), jit_outcome(&p, capped()))
+    });
+    assert_eq!(interp, Ok(vec![Value::I64(712)]), "interpreter");
+    assert_eq!(jit, JitOutcome::Returned(vec![712]), "the JIT");
+}
+
+/// A detached child (`memory 16`) whose thread spawns a grandchild (func 2, which returns 5) from the
+/// child's `"budget"` and joins it; the child joins the thread, which returns the result plus 100.
+const CHILD_THREAD_SPAWNS: &str = r#"memory 16
+data 20000 "budget"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz v0
+  vj = thread.join vt
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vi: i64) {
+  vnp = i64.const 20000
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  vbw = i64.extend_i32_u vb
+  vself = i64.const -1
+  vz = i64.const 0
+  ve = i64.const 2
+  vlog = i64.const 16
+  vinst = i32.wrap_i64 vi
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vself, vz, vz, ve, vlog, vz, vz, vz)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vk = i64.const 100
+  vr = i64.add vj vk
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v = i64.const 5
+  return v
+  }
+}
+"#;
+
+/// #1956 — a detached child's thread that joins a grandchild gives back its own lanes while it waits,
+/// on the JIT as on the interpreter: the child's budget holds one lane, which the thread runs in and
+/// the grandchild needs too.
+#[test]
+fn a_childs_thread_joining_a_grandchild_gives_back_the_childs_lane_on_the_jit() {
+    let (interp, jit) = within_a_minute("a child's thread joining a grandchild", || {
+        let c = module(CHILD_THREAD_SPAWNS);
+        let p = module(SPAWN_JOIN);
+        // The run's budget, narrowed to a node with one lane: the child's lane.
+        let one_lane = || {
+            let (mut host, mut h) = host(&c, 1 << 20);
+            h[2] = host
+                .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[-1, 1 << 20, -1, -1, 1], None)
+                .expect("split")[0] as i32;
+            (host, h)
+        };
+        (interp_result(&p, one_lane()), jit_outcome(&p, one_lane()))
+    });
+    assert_eq!(interp, Ok(vec![Value::I64(105)]), "interpreter");
+    assert_eq!(jit, JitOutcome::Returned(vec![105]), "the JIT");
 }
