@@ -203,8 +203,13 @@ proc prelude(s: string): int = s.len
 const atCompileTime = prelude("prebuilt")
 echo "prelude ", atCompileTime
 NIM
+  # The card's tree is nimony's library and nimony's own sources, which the library imports: `std/json`
+  # imports `src/lib`, and a macro's plugin build puts `src/lib` and `src/nimony/lib` on its path and
+  # reaches the nifler2 grammar (#2033). All of `src/` (+1.4 MB gzipped), not a list of what those
+  # imports reach today, which drifts whenever upstream's does. browser/tests/nimony.rs checks the
+  # library's relative imports resolve.
   if [ -n "${NIMONY_BIN:-}" ] && [ -n "${NIM_BIN:-}" ] && bash scripts/nim-toolchain.sh "$T" \
-     && ln -s "$T/nimony/lib" "$T/card/lib" \
+     && ln -s "$T/nimony/lib" "$T/card/lib" && ln -s "$T/nimony/src" "$T/card/src" \
      && ( cd browser && cargo build --release -q --bin nimbuild ) \
      && browser/target/release/nimbuild "$T" "$T/card" prelude.nim --at /nim --leaves --bundle "$T/nimony.blob" \
      && gzip -9 -n -c "$T/nimony.blob" > browser/web/assets/nimony.blob.gz; then

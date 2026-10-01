@@ -103,14 +103,20 @@ jobs:
   # nimony's own phases on the interpreters) and the test binaries ~4; run one after the other they
   # made this the PR run's critical path. Their setup is identical, so the split is a matrix row, as
   # in `browser-real-nim`, rather than a second job repeating these steps.
+  #
+  # #2034 — the nightly (and a manual dispatch) adds a third part, `upstream`: both parts' checks,
+  # lane step 4 included, against nimony's master instead of the pinned submodule. The pin does not
+  # move. It is the early warning for the next bump: a red `upstream` names the upstream change that
+  # broke a carried patch, temen-leng or the POSIX layer while that change is one commit old.
   nim-e2e:
     name: nim end-to-end · ${{ matrix.part }} (real toolchain → temen)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # `upstream` does both parts' work on one runner, with nothing cached.
+    timeout-minutes: ${{ matrix.part == 'upstream' && 75 || 45 }}
     strategy:
       fail-fast: false # one part failing must not cancel the other — we want both signals
       matrix:
-        part: [tests, selfhost]
+        part: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["tests", "selfhost", "upstream"]' || '["tests", "selfhost"]') }}
     steps:
       # `submodules: recursive` fetches the vendored nimony + nativenif submodules that
       # provision-nimony.sh builds. Only this job needs them, so the other jobs' checkouts stay bare.
@@ -138,7 +144,10 @@ jobs:
       # #1839 — the Nim compiler rides the same cache: provision-nimony.sh builds it from the
       # commit pinned there (NIM_SRC_REV), so the script's hash in the key covers it too. That
       # replaced `setup-nim`'s moving devel nightly and the wait loop around its re-cut window (#856).
+      # Not for `upstream`: its toolchain is built from master, and saved under this key (the pinned
+      # gitlink) it would be the toolchain later runs restore.
       - name: Cache nimony toolchain build
+        if: matrix.part != 'upstream'
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
           path: |
@@ -150,12 +159,14 @@ jobs:
           # makes consequential. Exact key or rebuild.
           key: nimony-${{ runner.os }}-${{ steps.nimony-rev.outputs.sha }}-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
       - name: Build nimony toolchain
+        env:
+          NIMONY_REV: ${{ matrix.part == 'upstream' && 'master' || '' }}
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Nim end-to-end tests (both engines)
-        if: matrix.part == 'tests'
+        if: matrix.part != 'selfhost'
         run: cargo test -p temen-leng --test nim_e2e -- --nocapture
       - name: Nim language conformance matrix (#956)
-        if: matrix.part == 'tests'
+        if: matrix.part != 'selfhost'
         run: cargo test -p temen-leng --test nim_conformance -- --nocapture
       # #1609: the self-hosted lane end to end, release mode — nimony's own driver (Temen, no C)
       # builds a program in-guest (nifmake → nifler/nimsem/hexer/temen-link through the POSIX
@@ -166,12 +177,12 @@ jobs:
       # #1609: the lane builds `temen-link` through the LLVM on-ramp (rustc IR → llvm-link/opt →
       # temen-llvm-translate), so it needs the LLVM tools pinned to the stable rustc's major.
       - name: install LLVM (the lane's temen-link build)
-        if: matrix.part == 'selfhost'
+        if: matrix.part != 'tests'
         uses: ./.github/actions/install-llvm
       - name: Self-hosted nimony lane (must match native)
-        if: matrix.part == 'selfhost'
+        if: matrix.part != 'tests'
         env:
-          NIM_LANE_SELF: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
+          NIM_LANE_SELF: ${{ matrix.part == 'selfhost' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
         run: bash scripts/ci/nim-selfhost-lane.sh
   # Three mechanical consistency gates that share a runner. Each was its own job; each ran in ~6
   # SECONDS and then held one of the account's ~20 concurrency slots, which is the thing actually

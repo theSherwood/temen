@@ -12,6 +12,10 @@
 # commit is pinned by the gitlink in `.gitmodules`, reproducible in-tree, and bumped deliberately in
 # lockstep with any temen-leng change the newer frontend requires (`git -C nimony checkout <ref>` +
 # commit the submodule). This replaces the old in-script clone-and-checkout of a hard-coded SHA.
+#
+# `NIMONY_REV=<branch or commit>` builds another nimony than the pinned one, for the nightly canary
+# against upstream master (#2034). It moves the working tree's submodules; `git submodule update`
+# puts them back.
 set -euo pipefail
 
 # The caller appends our stdout to $GITHUB_ENV, so ONLY the final `KEY=value` lines may go there —
@@ -28,6 +32,16 @@ cd "$WORK"
 # required to resolve it. `nativenif` must sit beside `nimony` (the native backend's nim.cfg reaches
 # it via `../nativenif`); both are repo-root submodules, so that sibling layout holds.
 git submodule update --init nimony nativenif
+# The canary's nimony, over the update above, and the nativenif it names, so the pin check below holds
+# for the pair.
+if [ -n "${NIMONY_REV:-}" ]; then
+  git -C nimony fetch -q origin "$NIMONY_REV"
+  git -C nimony checkout -q --detach FETCH_HEAD
+  rev="$(awk '{print $1; exit}' nimony/src/nativenif.commit)"
+  git -C nativenif fetch -q origin "$rev"
+  git -C nativenif checkout -q --detach "$rev"
+  echo "provision-nimony: nimony $NIMONY_REV is $(git -C nimony rev-parse HEAD); nativenif $rev" >&2
+fi
 
 # `nativenif` is pinned TWICE and both pins must agree. Ours is the submodule gitlink; nimony's own
 # is `src/nativenif.commit`, which `hastur build all` checks out into `../nativenif` before building
@@ -133,7 +147,8 @@ toolchain_works() {
   return "$rc"
 }
 
-if toolchain_works; then
+# A NIMONY_REV build always builds: a toolchain a cache restored is the pinned one.
+if [ -z "${NIMONY_REV:-}" ] && toolchain_works; then
   echo "provision-nimony: restored nimony/bin compiles a probe — skipping the hastur build." >&2
 else
   # `src/hastur/hastur.nim`, not `src/hastur`: hastur became a directory of modules, so the bare
