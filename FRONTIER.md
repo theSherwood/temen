@@ -32,7 +32,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `Exit` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Clock` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `PipeEnd` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
-| `SharedRegion` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | 🔶 |
+| `SharedRegion` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | ✅ | ⛔ | 🔶 |
 | `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
@@ -51,7 +51,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *durability* 🔶 — a pipe the tree minted rides the cut (#1680); an embedder-fed pipe, or one with an end outside the cut, is the boundary, not yet carried
 
 **`SharedRegion`**
-- *durability* ⛔ — a snapshot cannot reproduce a live alias into shared backing (#14 exception)
+- *durability* 🔶 — a region the cut wholly holds rides with its aliases (#2025); one held outside the cut or host-file-backed is the boundary, and a detached child's or the native JIT's region pages are not yet carried (#2025)
 - *debugger* 🔶 — map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by name in the bytecode lowering
 
 **`AddressSpace`**

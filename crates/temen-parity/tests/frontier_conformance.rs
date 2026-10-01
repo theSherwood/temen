@@ -167,8 +167,9 @@ fn non_durable_kind_of(c: Capability) -> Option<NonDurableKind> {
         | Capability::Jit
         | Capability::JitCode
         // #1502, #1944: a Budget's node chain rides the artifact beside the handles.
-        | Capability::Budget => return None,
-        Capability::SharedRegion => NonDurableKind::SharedRegion,
+        | Capability::Budget
+        // #2025: a region's bytes ride beside the handles; the cut-wide holder check is the freeze's.
+        | Capability::SharedRegion => return None,
         Capability::Module => NonDurableKind::Module,
         Capability::ModuleLoader => NonDurableKind::ModuleLoader,
         Capability::Blocking => NonDurableKind::Blocking,

@@ -20739,7 +20739,8 @@ pub struct NonDurableHandle {
 /// Which non-re-grantable binding kind a live slot held (the [`NonDurableHandle`] reason).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NonDurableKind {
-    SharedRegion,
+    // SharedRegion: retired (#2025) — the handle rides as `DurableBinding::SharedRegion` and the
+    // region's bytes beside the handles; a region the cut cannot own refuses `RegionNotCaptured`.
     Module,
     /// A §14 module loader (iface 7) — mints `Module` grants, which are themselves non-durable; a
     /// live loader makes the domain non-snapshottable, re-granted by the embedder after restore.
