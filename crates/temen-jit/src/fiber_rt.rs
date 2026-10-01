@@ -342,11 +342,23 @@ pub(crate) struct FiberSlot {
     /// sleeping on its own deadline answers yes, exactly as a *timed* 1:1 `futex_wait` does
     /// (#1625), so it must not be counted.
     park_self_resolving: AtomicBool,
-    /// The futex wait cell this event park is waiting on — `None` for a host-thunk park, which has
-    /// none. Written and cleared beside [`Self::event_park`] by [`fiber_event_park`]. A vCPU idling
-    /// on this fiber in `cont.resume.block` counts its park through the cell, so the `notify` that
-    /// claims the fiber's wait also ends the vCPU's park, under the futex lock (#1625's rule).
-    park_cell: Mutex<Option<Arc<crate::os_thread_rt::WaitCell>>>,
+    /// What this event park waits for. Written and cleared beside [`Self::event_park`] by
+    /// [`fiber_event_park`].
+    park_on: Mutex<ParkOn>,
+}
+
+/// What an event park ([`fiber_event_park`]) waits for, as the fiber's resumer and a run's teardown
+/// read it.
+#[derive(Clone)]
+pub(crate) enum ParkOn {
+    /// Its own event, and nothing else: a host call's, a `thread.join`'s.
+    Event,
+    /// A futex wait on this cell. A vCPU idling on the fiber in `cont.resume.block` counts its park
+    /// through the cell, so the `notify` that claims the wait also ends the vCPU's park, under the
+    /// futex lock (#1625's rule). The wait also ends on the waiter's own freeze word (#1937).
+    Futex(Arc<crate::os_thread_rt::WaitCell>),
+    /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
+    Child,
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -471,7 +483,7 @@ impl SharedFiberTable {
             sp,
             event_park: AtomicBool::new(false),
             park_self_resolving: AtomicBool::new(false),
-            park_cell: Mutex::new(None),
+            park_on: Mutex::new(ParkOn::Event),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
         });
@@ -508,7 +520,7 @@ impl FiberSlot {
             sp: 0,
             event_park: AtomicBool::new(false),
             park_self_resolving: AtomicBool::new(false),
-            park_cell: Mutex::new(None),
+            park_on: Mutex::new(ParkOn::Event),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
         })
@@ -532,13 +544,12 @@ impl FiberSlot {
         self.park_self_resolving.load(Ordering::Relaxed)
     }
 
-    /// #1937 — whether that event park is a futex wait (it holds a [`Self::park_cell`]): the one park
-    /// whose re-check also ends on the waiter's freeze word. Read while the fiber is still suspended.
-    pub(crate) fn took_futex_park(&self) -> bool {
-        self.park_cell
+    /// #1937, #2010 — what that event park waits for. Read while the fiber is still suspended.
+    pub(crate) fn parked_on(&self) -> ParkOn {
+        self.park_on
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+            .clone()
     }
 
     /// D66 — the single-owner claim for a platform slot's resume (generation 0, never recycled).
@@ -604,7 +615,7 @@ impl SharedFiberTable {
             sp,
             event_park: AtomicBool::new(false),
             park_self_resolving: AtomicBool::new(false),
-            park_cell: Mutex::new(None),
+            park_on: Mutex::new(ParkOn::Event),
             consumed: AtomicBool::new(consumed), // #1538: delivers at its rewound suspend
             pending: Mutex::new(None),
         }));
@@ -627,7 +638,7 @@ impl SharedFiberTable {
             park_self_resolving: AtomicBool::new(false),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
-            park_cell: Mutex::new(None),
+            park_on: Mutex::new(ParkOn::Event),
         }));
         t.free.push(Reverse(slot));
         slot
@@ -1351,18 +1362,18 @@ pub(crate) unsafe fn park_is_self_resolving(handle: i64) -> bool {
         .is_some_and(|(_, slot)| slot.took_self_resolving_park())
 }
 
-/// The futex wait cell `handle`'s fiber is event-parked on, if any (see [`FiberSlot::park_cell`]).
+/// The futex wait cell `handle`'s fiber is event-parked on, if any (see [`ParkOn::Futex`]).
 ///
 /// # Safety
 /// As [`park_is_self_resolving`].
 pub(crate) unsafe fn park_cell(handle: i64) -> Option<Arc<crate::os_thread_rt::WaitCell>> {
     let rt = &*current();
-    rt.table.resolve(handle).and_then(|(_, slot)| {
-        slot.park_cell
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    })
+    rt.table
+        .resolve(handle)
+        .and_then(|(_, slot)| match slot.parked_on() {
+            ParkOn::Futex(cell) => Some(cell),
+            _ => None,
+        })
 }
 
 /// #1469 — is this thread running a child-domain task (its root or a guest fiber inside it)?
@@ -1391,11 +1402,7 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
 /// # Safety
 /// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
 /// thunk resolves it via [`current_fiber_slot`]).
-pub(crate) unsafe fn fiber_event_park(
-    slot: &Arc<FiberSlot>,
-    self_resolving: bool,
-    cell: Option<&Arc<crate::os_thread_rt::WaitCell>>,
-) {
+pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>, self_resolving: bool, on: ParkOn) {
     let y = {
         let rt = &mut *current();
         rt.yielders
@@ -1407,11 +1414,11 @@ pub(crate) unsafe fn fiber_event_park(
     // sees the two together and never a stale answer from the previous park.
     slot.park_self_resolving
         .store(self_resolving, Ordering::Relaxed);
-    *slot.park_cell.lock().unwrap_or_else(|e| e.into_inner()) = cell.cloned();
+    *slot.park_on.lock().unwrap_or_else(|e| e.into_inner()) = on;
     let _ = (*y).suspend(0); // the poll's resume arg is deliberately not delivered
     slot.event_park.store(false, Ordering::Relaxed);
     slot.park_self_resolving.store(false, Ordering::Relaxed);
-    *slot.park_cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *slot.park_on.lock().unwrap_or_else(|e| e.into_inner()) = ParkOn::Event;
     // Back from the poll — possibly on a different OS thread (a sibling vCPU's `cont.resume`):
     // push the yielder onto the *resuming* thread's runtime, exactly as `fiber_suspend` does.
     {

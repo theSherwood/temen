@@ -176,7 +176,7 @@ pub unsafe fn fiber_park_current() {
     let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
     // #1631 — a bare host-thunk park carries no deadline: nothing wakes it on its own, so it
     // counts as parked.
-    fiber_rt::fiber_event_park(&slot, false, None);
+    fiber_rt::fiber_event_park(&slot, false, fiber_rt::ParkOn::Event);
 }
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
@@ -1922,6 +1922,8 @@ pub struct DetachedHarvest {
     /// `(result, trap)` once its task finished: it completed before the cut (`trap == 0` and no
     /// image), or was torn down unreached (it never polled — parked, #1584).
     pub outcome: Option<(i64, i64)>,
+    /// #2010 — its own unjoined durable detached children, harvested the same way.
+    pub children: Vec<DetachedHarvest>,
 }
 
 /// #1361 step 4 — a captured detached child a JIT **thaw** re-launches (see
@@ -1945,6 +1947,8 @@ pub struct DetachedSeed {
     /// the budget that paid, and the bytes it paid. Handed back when the thawed child ends. `None`
     /// when the parent holds no handle on that budget.
     pub window: Option<(i32, u64)>,
+    /// #2010 — its own captured children, re-launched into its nursery before it runs.
+    pub children: Vec<DetachedSeed>,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
@@ -4920,10 +4924,7 @@ impl CompiledModule {
         if let Some(n) = &(*this)._nursery {
             let froze =
                 (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
-            n.join_children(froze);
-            if froze {
-                (*this).detached_out = n.take_detached_harvest();
-            }
+            (*this).detached_out = n.join_children(froze);
         }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]

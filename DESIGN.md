@@ -3635,7 +3635,7 @@ teardown poisons a retiring task as it poisons a parked one. A durable task stil
 `temen-run/tests/jit_child_fibers.rs`, `jit_child_threads.rs`, and the Forth `sandbox` on all three
 tiers (`forth_sandbox.rs`).
 
-*A detached child that spawns* (#1956): a non-durable detached child whose code names the
+*A detached child that spawns* (#1956, #2010): a detached child whose code names the
 `Instantiator`, or can install a unit that would, compiles against a `Nursery` of its own, so it
 spawns and joins children of its own as a run does. That nursery is the run's with the domain swapped.
 The child's powerbox is the host its `Instantiator` resolves against and the parent its hooks charge,
@@ -3646,11 +3646,13 @@ chain. The child's root joins from a task, so its `join` parks the task, as `thr
 a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A parent's nursery holds its
 children's to the run's teardown, which releases what each one retains only after the executor has
 drained: a grandchild that outlives its parent still hands its lane and window back to the parent's
-host, and that retained ref is what keeps the host alive. Still refused: a carve spawn from a detached
-child (`CapFault`; its task would write back into a window that can be freed first, and #1867 deletes
-carves), and any spawn from a durable detached child, whose freeze would have to reach its children
-too (#2010). Pins: `temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the chain), and
-`temen/tests/instantiate_record.rs` on every backend.
+host, and that retained ref is what keeps the host alive. A durable child's nursery is durable, so
+its children are, and a freeze reaches them through it (DURABILITY.md §4, "The JIT captures them
+too"). Still refused: a carve spawn from a detached child (`CapFault`; its task would write back into
+a window that can be freed first, and #1867 deletes carves), and a durable detached child's
+`thread.spawn` (#2010). Pins: `temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the
+chain), `temen/tests/instantiate_record.rs` on every backend, and
+`temen/tests/durable_detached_jit.rs` (durable).
 
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 
