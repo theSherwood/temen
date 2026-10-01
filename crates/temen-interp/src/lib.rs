@@ -26821,6 +26821,21 @@ impl Host {
         declared
     }
 
+    /// #1954 — whether `handle` names a host capability whose handler answers **synchronously**
+    /// ([`Host::grant_host_proc`]'s face, not an offloadable one): it cannot punt, so its call completes
+    /// inside the dispatch. Its only route to a park is a personality's park request, which the
+    /// bytecode engine's leaf predicate (`image_parks`) asks the personality about first.
+    pub fn host_proc_is_sync(&self, handle: i32) -> bool {
+        matches!(
+            self.resolve(handle, cap_id::HOST_PROC),
+            Ok(Binding::HostProc(idx))
+                if matches!(
+                    self.host_procs.get(idx as usize).map(|e| &e.handler),
+                    Some(ProcHandler::Sync(_))
+                )
+        )
+    }
+
     /// #1954 — whether `handle` names a declared host-completed cap ([`Host::grant_declared_host_caps`]),
     /// whose calls the embedder finishes: one parks without the caller's frames ([`OpParks::OnHost`]).
     pub fn parks_on_host(&self, handle: i32) -> bool {

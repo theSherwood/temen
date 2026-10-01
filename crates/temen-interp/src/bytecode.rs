@@ -9862,25 +9862,41 @@ struct LeafStart {
 /// §12 concurrency op may (a join or a futex wait parks, and a thread or a fiber needs the
 /// interpreter to schedule it); an import `import.attach` may retarget may; any other import or
 /// capability call may, a dynamic one included. (A linked program has no `call.sym` left: linking
-/// rewrote each to one of these.)
+/// rewrote each to one of these.) #1954 tells apart the ops an on-ramp C program makes, so that one
+/// can run whole too: an `exit` never parks; a stream import parks exactly as the same op inline; a
+/// synchronous host capability cannot park without a personality to ask it to; a declared
+/// host-completed cap parks on the embedder ([`super::OpParks::OnHost`]); and the self namespace's
+/// reflection, `resolve`, `label`, attestation, fuel and pipe ops answer at once.
 fn image_parks(host: &Host, m: &Module) -> Parks {
     use super::OpParks;
-    use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
+    use temen_ir::cap_id::{ADDRESS_SPACE, EXIT, HOST_PROC, STREAM};
     let source = host.signal_poll().map(|(_, s)| s);
-    let import_parks = |(import, b): (&temen_ir::Import, &super::BoundImport)| match b.type_id {
-        _ if b.rebindable => OpParks::Otherwise,
-        ADDRESS_SPACE => OpParks::Never,
-        HOST_PROC => source
-            .as_ref()
-            .and_then(|s| s.import_parks(&import.name))
-            .or_else(|| host.parks_on_host(b.handle).then_some(OpParks::OnHost))
-            .unwrap_or(OpParks::Otherwise),
-        _ => OpParks::Otherwise,
-    };
     let holds_pipe = host
         .table
         .iter()
         .any(|s| matches!(s.entry, Some(super::Binding::PipeEnd { .. })));
+    // A stream op parks on a pipe end, or (a read) on a blocking stdin; ops past 2 may park anyhow.
+    // One rule for an inline `call.cap` and an import bound to the same op (#1954).
+    let stream_op_parks =
+        |op: u32| (op == 0 && (holds_pipe || host.stdin_block)) || (op == 1 && holds_pipe);
+    let import_parks = |(import, b): (&temen_ir::Import, &super::BoundImport)| match b.type_id {
+        _ if b.rebindable => OpParks::Otherwise,
+        // #1954: an exit ends the process, and a stream op's parking is decided below, with the
+        // inline ones'.
+        ADDRESS_SPACE | EXIT => OpParks::Never,
+        STREAM if b.op <= 2 => OpParks::Never,
+        HOST_PROC => source
+            .as_ref()
+            .and_then(|s| s.import_parks(&import.name))
+            .or_else(|| host.parks_on_host(b.handle).then_some(OpParks::OnHost))
+            // #1954: without a personality, a handler that answers synchronously (an in-memory
+            // file system) has no way to park: only a personality's request parks such a call.
+            .or_else(|| {
+                (source.is_none() && host.host_proc_is_sync(b.handle)).then_some(OpParks::Never)
+            })
+            .unwrap_or(OpParks::Otherwise),
+        _ => OpParks::Otherwise,
+    };
     // A call that parks other than in a stream call.
     let may_park = |i: &Inst| match *i {
         Inst::CapCall {
@@ -9891,12 +9907,16 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         Inst::CapCall {
             type_id: ADDRESS_SPACE,
             ..
-        }
-        | Inst::CapCall {
-            type_id: temen_ir::CAP_SELF_TYPE_ID,
-            op: super::CAP_SELF_PIPE,
-            ..
         } => false,
+        // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
+        // `type_id`, `covers`, `export.handle`, `list`, `schema`), `resolve`, `label`, `attest`,
+        // `provenance`, `fuel.remaining` and the `pipe` mint. Its serve, fork, reap and exec ops
+        // park or need the caller's frames.
+        Inst::CapCall {
+            type_id: temen_ir::CAP_SELF_TYPE_ID,
+            op,
+            ..
+        } => !matches!(op & 0xFF, 0..=8 | 13 | 16..=18),
         Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
         _ => false,
     };
@@ -9905,9 +9925,14 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
             type_id: STREAM,
             op,
             ..
-        } => (op == 0 && (holds_pipe || host.stdin_block)) || (op == 1 && holds_pipe),
+        } => stream_op_parks(op),
         _ => false,
     };
+    let import_streams = m
+        .imports
+        .iter()
+        .zip(&host.import_bindings)
+        .any(|(_, b)| !b.rebindable && b.type_id == STREAM && stream_op_parks(b.op));
     let insts = || {
         m.funcs
             .iter()
@@ -9928,7 +9953,7 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         return Parks::Otherwise;
     }
     let suspendable = parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost);
-    match suspendable || insts().any(stream_parks) {
+    match suspendable || import_streams || insts().any(stream_parks) {
         true => Parks::Suspendably,
         false => Parks::Never,
     }

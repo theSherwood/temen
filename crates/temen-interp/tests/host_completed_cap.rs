@@ -716,3 +716,82 @@ fn a_host_completed_call_in_a_tierup_region_declines() {
         }
     );
 }
+
+// --- #1954: what the root-leaf predicate admits -------------------------------------------------
+
+/// A root that writes to stdout and exits through its imports — what every on-ramp C program
+/// does — and imports a stdin read it never makes.
+const ROOT_IO: &str = r#"memory 16
+import 0 "write" (i64, i64) -> (i64)
+import 1 "read" (i64, i64) -> (i64)
+import 2 "exit" (i32) -> ()
+data 16384 "hi\n"
+func () -> (i64) {
+block 0 () {
+  vbuf = i64.const 16384
+  vn = i64.const 3
+  vw = call.import 0 (vbuf, vn)
+  vseven = i32.const 7
+  call.import 2 (vseven)
+  unreachable
+  }
+}
+"#;
+
+/// A root that serves through `svc.wait` (self op 10), which parks until a caller arrives.
+const ROOT_SVC_WAIT: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+"#;
+
+/// The §3e powerbox prefix bound to `write`/`read`/`exit`, as an on-ramp host binds them.
+fn io_host(stdin_blocking: bool) -> Host {
+    let mut host = Host::new();
+    let [stdout, stdin, exit, _, _] = host.grant_powerbox_prefix(1 << 16);
+    host.set_import_bindings(vec![
+        BoundImport::required(temen_ir::cap_id::STREAM, 1, stdout),
+        BoundImport::required(temen_ir::cap_id::STREAM, 0, stdin),
+        BoundImport::required(temen_ir::cap_id::EXIT, 0, exit),
+    ]);
+    host.set_stdin_blocking(stdin_blocking);
+    host
+}
+
+/// An `exit` never parks, and a stream import parks exactly as the same op inline: without a pipe
+/// or a blocking stdin the root cannot park, so it is offered (`parks = false`) and runs whole; with
+/// a blocking stdin its read can park, so it is offered only to a host that suspends.
+#[test]
+fn a_root_writing_and_exiting_through_its_imports_is_offered() {
+    let m = parse(ROOT_IO);
+    let none = CapRequests::default();
+
+    let offers: Offers = Arc::default();
+    let ran = drive_leaf(
+        coop_with(&m, io_host(false), Some(leaf_config(&offers, true))),
+        &none,
+    );
+    assert_eq!(offers.lock().unwrap().clone(), vec![(0, 0, false)]);
+    assert_eq!((ran.end, ran.tierups), (Err(Trap::Exit(7)), 1));
+
+    let offers: Offers = Arc::default();
+    let _ = coop_with(&m, io_host(true), Some(leaf_config(&offers, false)));
+    assert_eq!(
+        offers.lock().unwrap().clone(),
+        vec![(0, 0, true)],
+        "a blocking stdin read can park"
+    );
+}
+
+/// A self op that parks (`svc.wait`) keeps the root off the emitted tier: it is never offered.
+#[test]
+fn a_root_that_can_park_in_a_self_op_is_not_offered() {
+    let m = parse(ROOT_SVC_WAIT);
+    let offers: Offers = Arc::default();
+    let _ = coop_with(&m, Host::new(), Some(leaf_config(&offers, true)));
+    assert!(offers.lock().unwrap().is_empty());
+}

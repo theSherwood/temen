@@ -15361,3 +15361,116 @@ pub extern "C" fn temen_detached_oracle_run(
     set(status);
     value
 }
+
+#[cfg(test)]
+mod root_leaf_onramp_tests {
+    //! #1954 — a real on-ramp **C program** runs as an emitted root leaf: compiled by the shipped
+    //! chibicc and granted the on-ramp powerbox plus a declared host-completed cap, it is offered to
+    //! the leaf emitter at its entry (it parks only on that cap), and run that way — served as the
+    //! browser host's stand-in serves a leaf, by bouncing its entry — it ends exactly as it does
+    //! interpreted. Its imports are the ones every such program makes (`stream_write`, `exit`,
+    //! `vm_map`, `vm_fs`), and it calls `self.resolve` inline to find the cap.
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const SRC: &str = r#"#include <stdio.h>
+long __vm_resolve(const char *name, long len);
+__attribute__((temen_cap)) extern long ping(int h, long x);
+int main(void) {
+  int hp = (int)__vm_resolve("ping", 4);
+  long s = 0;
+  for (long i = 0; i < 5; i++) s += ping(hp, i);
+  printf("s %ld\n", s);
+  return (int)s;
+}
+"#;
+
+    fn compile(src: &str) -> Option<temen_ir::Module> {
+        let bytes =
+            std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen")).ok()?;
+        let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
+        let mut files = playground_include_files();
+        files.push(("in.c".to_string(), src.as_bytes().to_vec()));
+        let image = temen_fs::encode_image(&files, &["include".to_string()]);
+        let argv: [&[u8]; 5] = [b"chibicc", b"--data-page", b"65536", b"-g", b"/in.c"];
+        let out = onramp_fs_exec(&chibicc, &image, &argv, b"");
+        let ir = String::from_utf8(out.stdout).expect("IR utf8");
+        Some(temen_text::parse_module(&ir).expect("parse IR"))
+    }
+
+    /// How a run ended: its result, its stdout, the parks it surfaced, its tier-ups and resumes.
+    type Ran = (Result<Vec<Value>, Trap>, Vec<u8>, usize, usize, usize);
+
+    fn run(m: &temen_ir::Module, leaf: Option<bytecode::LeafEmitter>) -> Ran {
+        let mut host = Host::new();
+        let requests = temen_interp::CapRequests::default();
+        let caps = vec!["ping".to_string()];
+        grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)));
+        let tierup = leaf.map(|leaf| bytecode::TierUpConfig {
+            eligible: Arc::from([]),
+            page_checked: false,
+            leaf: Some(leaf),
+        });
+        // 16 MiB: room for the libc's heap, and within the cap every platform backs flat.
+        let reserved = m.memory.expect("a window").size_log2.max(24);
+        let mut run = bytecode::CoopRun::new_reserved(m, 0, &[], u64::MAX, host, tierup, &[], reserved)
+            .expect("in subset")
+            .expect("starts");
+        let (mut parks, mut tierups, mut resumes) = (0, 0, 0);
+        let end = loop {
+            match run.run() {
+                bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                    tierups += 1;
+                    let mut io = argv.to_vec();
+                    io.resize(io.len().max(1), 0);
+                    match run.bounce(func, &mut io, None) {
+                        Ok(Some(n)) => run.deliver_tierup(&io[..n]),
+                        Ok(None) => {}
+                        Err(t) => run.deliver_tierup_trap(t),
+                    }
+                }
+                bytecode::CoopEvent::Resume { results } => {
+                    resumes += 1;
+                    run.deliver_tierup(&results);
+                }
+                bytecode::CoopEvent::CapPark { id } => {
+                    parks += 1;
+                    let req = requests.lock().unwrap().remove(&id).expect("filed");
+                    assert!(run.deliver_cap(id, 2 * req.args[0] + 1));
+                }
+                bytecode::CoopEvent::Done(v) => break Ok(v),
+                bytecode::CoopEvent::Trapped(t) => break Err(t),
+                _ => panic!("unexpected coop event"),
+            }
+        };
+        let stdout = std::mem::take(&mut run.host_mut().stdout);
+        (end, stdout, parks, tierups, resumes)
+    }
+
+    #[test]
+    fn a_c_program_runs_as_an_emitted_root_leaf_and_parks_on_its_declared_cap() {
+        let Some(m) = compile(SRC) else {
+            eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+            return;
+        };
+        let (end, stdout, parks, tierups, resumes) = run(&m, None);
+        // 1 + 3 + 5 + 7 + 9 = 25, returned from main.
+        assert_eq!(end, Ok(vec![Value::I32(25)]), "interpreted");
+        assert_eq!(String::from_utf8_lossy(&stdout), "s 25\n");
+        assert_eq!((parks, tierups, resumes), (5, 0, 0));
+
+        let offers = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&offers);
+        let leaf: bytecode::LeafEmitter = Arc::new(move |o: &bytecode::LeafOffer| {
+            seen.lock().unwrap().push((o.module, o.parks));
+            true
+        });
+        let leafed = run(&m, Some(leaf));
+        assert_eq!(offers.lock().unwrap().clone(), vec![(0, true)], "the root, parking");
+        assert_eq!(
+            leafed,
+            (end, stdout, 5, 1, 1),
+            "one tier-up at the entry; five parks in it; one resume; the same ending"
+        );
+    }
+}
