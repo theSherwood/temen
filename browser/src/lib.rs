@@ -14427,10 +14427,11 @@ pub extern "C" fn temen_coop_run() -> i32 {
         bytecode::CoopEvent::Trapped(_) => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
         // Never surfaced here: the tier-up driver does not arm `set_suspend_on_idle` (#1122 route (a)
         // is the bash coop session's driver, below). Fail closed rather than spin.
-        // Neither suspension nor slicing is enabled on this session.
-        bytecode::CoopEvent::Idle | bytecode::CoopEvent::Paused => {
-            (STATUS_TRAP, 0, 0, COOP_RUN_TRAP)
-        }
+        // Neither suspension nor slicing is enabled on this session, and it grants no
+        // host-completed caps (#1953), so nothing could park it on one.
+        bytecode::CoopEvent::Idle
+        | bytecode::CoopEvent::Paused
+        | bytecode::CoopEvent::CapPark { .. } => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
     };
     s.value = value;
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next
