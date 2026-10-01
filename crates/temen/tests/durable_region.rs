@@ -2,8 +2,9 @@
 //!
 //! A region a domain holds or maps is captured once, its bytes keyed by an artifact number; the
 //! window's aliased pages name it instead of carrying bytes; and the restore rebuilds it and the run
-//! re-aliases it before the guest resumes. A region that something outside the cut also holds
-//! declines, as does a freeze given no page map.
+//! re-aliases it before the guest resumes — on the interpreter and on the native JIT, whose page map
+//! names the region each aliased page maps (step 3). A region that something outside the cut also
+//! holds declines, as does a freeze given no page map.
 //!
 //! Both guests map a 64 KiB region at 128 KiB, store `1111` into it, read the clock (where the freeze
 //! lands), store `2222`, and return `first + 2·second` read back through the window. The thawed run
@@ -16,11 +17,12 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_UNWINDING,
 };
 use temen_interp::{
-    run_capture_reserved_with_host_prots, CapturedProt, Host, RegionNotCaptured, RegionRefusal,
-    SharedBacking, Value,
+    run_capture_reserved_with_host_prots, CapturedProt, Host, MemLayout, RegionNotCaptured,
+    RegionRefusal, SharedBacking, Value,
 };
 use temen_ir::Module;
-use temen_snapshot::{freeze, freeze_with_prots, restore_with_prots, FreezeError};
+use temen_jit::JitOutcome;
+use temen_snapshot::{freeze, freeze_layout, freeze_with_prots, restore_with_prots, FreezeError};
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -116,10 +118,44 @@ fn run(
     run_capture_reserved_with_host_prots(m, func, args, &mut fuel, win, prots, SIZE_LOG2, host)
 }
 
+/// [`run`] on the native JIT: `m`'s `func` over `layout`, its result (`None` for a run the freeze
+/// unwound) and the window it left, page map included.
+fn run_jit(
+    m: &Module,
+    func: u32,
+    host: &mut Host,
+    args: &[Value],
+    layout: &MemLayout,
+) -> (Option<i64>, MemLayout) {
+    let args: Vec<i64> = args
+        .iter()
+        .map(|a| match a {
+            Value::I32(x) => *x as i64,
+            other => panic!("unexpected arg {other:?}"),
+        })
+        .collect();
+    let (out, left) =
+        temen_run::jit_cap_run(m, func, &args, layout, SIZE_LOG2, 0, host, None).expect("JIT run");
+    let res = match out {
+        JitOutcome::Returned(v) if read_state(left.bytes()) != STATE_UNWINDING => Some(v[0]),
+        JitOutcome::Returned(_) => None,
+        other => panic!("unexpected outcome {other:?}"),
+    };
+    (res, left)
+}
+
+/// A restored window as the JIT is handed it: its bytes set rewinding, under its page map.
+fn thaw_layout(mut win: Vec<u8>, prots: &[CapturedProt]) -> MemLayout {
+    begin_thaw(&mut win, TEST_ARENA, 0);
+    MemLayout::from_dense(win, prots, WINDOW as u64)
+}
+
 /// The creating guest's host: a whole-window `AddressSpace` and a clock.
 fn creating_host() -> (Host, [Value; 2]) {
     let mut host = Host::new();
     host.set_durable(true);
+    // An OS-backed region, which the JIT maps for real (the interpreter reads it the same).
+    host.set_region_factory(temen_run::new_shared_region);
     let asp = host.grant_address_space(0, WINDOW as u64);
     let clk = host.grant_clock();
     (host, [Value::I32(asp), Value::I32(clk)])
@@ -188,8 +224,59 @@ fn a_created_region_rides_a_freeze_and_thaws_aliased() {
     );
 }
 
-/// A plain in-memory region backing, so the test can keep a reference to it the way an embedder
-/// might.
+/// **Step 3 — a region the guest created rides a freeze of its native JIT run.** The JIT's page map
+/// names the region each aliased page maps, so the capture is the interpreter's page for page and
+/// the artifact the interpreter's byte for byte; and either engine thaws it, the JIT re-aliasing the
+/// rebuilt region into its fresh window before the guest resumes.
+#[test]
+fn a_created_region_rides_a_jit_freeze_and_thaws_on_either_engine() {
+    let (m, ihost, args, isnap, iprots) = frozen_creating();
+    let oracle =
+        freeze_with_prots(&m, &isnap, &iprots, SIZE_LOG2, &ihost).expect("the oracle's artifact");
+
+    let (mut host, _) = creating_host();
+    let fresh = MemLayout::image(init_durable_window(WINDOW, TEST_ARENA));
+    let plain = instrumented(false);
+    assert_eq!(
+        run_jit(&plain, 0, &mut host, &args, &fresh).0,
+        Some(WANT),
+        "uninterrupted run"
+    );
+
+    let (mut fhost, _) = creating_host();
+    let (res, snap) = run_jit(&m, 0, &mut fhost, &args, &fresh);
+    assert_eq!(res, None, "frozen");
+    let prots = snap.dense_prots();
+    assert_eq!(
+        prots[AT / temen_snapshot::PAGE..(AT + LEN) / temen_snapshot::PAGE],
+        iprots[AT / temen_snapshot::PAGE..(AT + LEN) / temen_snapshot::PAGE],
+        "the JIT names the region its pages alias, as the interpreter does"
+    );
+    let artifact = freeze_layout(&m, &snap, SIZE_LOG2, &fhost).expect("rides");
+    assert_eq!(artifact, oracle, "the JIT's artifact is the interpreter's");
+
+    let restored = || {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.set_region_factory(temen_run::new_shared_region);
+        let (rwin, rprots, _) = restore_with_prots(&artifact, &m, &mut thost).expect("restores");
+        (thost, rwin, rprots)
+    };
+    let (mut thost, rwin, rprots) = restored();
+    assert_eq!(
+        run_jit(&m, 0, &mut thost, &args, &thaw_layout(rwin, &rprots)).0,
+        Some(WANT),
+        "the JIT thaw reads the carried bytes through its re-aliased window"
+    );
+    let (mut thost, mut rwin, rprots) = restored();
+    begin_thaw(&mut rwin, TEST_ARENA, 0);
+    assert_eq!(
+        run(&m, 0, &mut thost, &args, &rwin, Some(&rprots)).0,
+        Ok(vec![Value::I64(WANT)]),
+        "and so does the interpreter's"
+    );
+}
+
 /// A heap backing; `.1` says whether something outside the VM can write it (a host file can).
 struct TestBacking(std::sync::Mutex<Vec<u8>>, bool);
 
@@ -215,10 +302,14 @@ impl SharedBacking for TestBacking {
     }
 }
 
+/// A `LEN`-byte heap region nothing outside the VM writes.
+fn heap_region() -> Arc<dyn SharedBacking> {
+    Arc::new(TestBacking(std::sync::Mutex::new(vec![0; LEN]), false))
+}
+
 /// Grant a region whose backing the caller keeps a reference to: a holder after the run.
 fn region_kept_outside(host: &mut Host) -> (i32, Arc<dyn SharedBacking>) {
-    let backing: Arc<dyn SharedBacking> =
-        Arc::new(TestBacking(std::sync::Mutex::new(vec![0; LEN]), false));
+    let backing = heap_region();
     let h = host.grant_shared_region_backed(Arc::clone(&backing));
     (h, backing)
 }
@@ -368,17 +459,18 @@ fn confined(src: &str) -> Module {
 }
 
 /// The parent's powerbox over `child`, with the authority to freeze its detached progeny, and a
-/// region holding `1111` at byte 8 that only the powerbox keeps.
-fn sharing_host(child: &Module) -> (Host, [Value; 4]) {
+/// region holding `1111` at byte 8 that only the powerbox keeps: `backing`, which the native JIT
+/// needs OS-backed ([`temen_run::new_shared_region`]).
+fn sharing_host(child: &Module, backing: Arc<dyn SharedBacking>) -> (Host, [Value; 4]) {
     let mut host = Host::new();
     host.set_durable(true);
     let inst = host.grant_instantiator(0, WINDOW as u64);
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, 4);
-    let mut bytes = vec![0u8; LEN];
-    bytes[8..16].copy_from_slice(&1111i64.to_le_bytes());
-    let rh =
-        host.grant_shared_region_backed(Arc::new(TestBacking(std::sync::Mutex::new(bytes), false)));
+    for (o, b) in 1111i64.to_le_bytes().into_iter().enumerate() {
+        backing.write_byte(8 + o as u64, b);
+    }
+    let rh = host.grant_shared_region_backed(backing);
     host.grant_freeze_authority(temen_interp::FreezeScope::DetachedProgeny);
     (
         host,
@@ -400,12 +492,12 @@ fn sharing_host(child: &Module) -> (Host, [Value; 4]) {
 fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
     let child = confined(SHARING_CHILD);
     let parent = confined(SHARING_PARENT);
-    let (mut host, args) = sharing_host(&child);
+    let (mut host, args) = sharing_host(&child, heap_region());
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let (base, ..) = run(&parent, 0, &mut host, &args, &win, None);
     assert_eq!(base, Ok(vec![Value::I64(SHARED_WANT)]), "uninterrupted run");
 
-    let (mut fhost, args) = sharing_host(&child);
+    let (mut fhost, args) = sharing_host(&child, heap_region());
     let mut fwin = win.clone();
     temen_durable::write_state(&mut fwin, STATE_UNWINDING);
     let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &fwin, None);
@@ -460,5 +552,86 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
         thawed,
         Ok(vec![Value::I64(SHARED_WANT)]),
         "both domains of the thaw alias one region"
+    );
+}
+
+/// **Step 3 — a region a JIT parent shares with its detached child rides the cut.** The JIT freeze
+/// lands at the spawn, before the parent's own `map`: the child's JIT page map names the region its
+/// pre-mapped pages alias, and the parent holds the handle. The thaw rebuilds one backing; the
+/// re-launched child re-aliases it into its fresh window and reads the bytes carried from before the
+/// cut, and the parent maps the same backing and reads what the child stores after it — on the
+/// JIT, and on the interpreter from the same artifact.
+#[test]
+fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
+    let child = confined(SHARING_CHILD);
+    let parent = confined(SHARING_PARENT);
+    let shm = || temen_run::new_shared_region(LEN);
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (mut host, args) = sharing_host(&child, shm());
+    assert_eq!(
+        run_jit(
+            &parent,
+            0,
+            &mut host,
+            &args,
+            &MemLayout::image(fresh.clone())
+        )
+        .0,
+        Some(SHARED_WANT),
+        "uninterrupted run"
+    );
+
+    let mut fwin = fresh;
+    temen_durable::write_state(&mut fwin, STATE_UNWINDING);
+    // The JIT runs the child on its own thread, so on a loaded runner it can finish its loop before
+    // the freeze reaches it; that run is not the case under test (as #1760).
+    let mut attempts = 0;
+    let (fhost, snap) = loop {
+        let (mut fhost, _) = sharing_host(&child, shm());
+        let (res, snap) = run_jit(
+            &parent,
+            0,
+            &mut fhost,
+            &args,
+            &MemLayout::image(fwin.clone()),
+        );
+        assert_eq!(res, None, "frozen");
+        if fhost.captured_detached().len() == 1 {
+            break (fhost, snap);
+        }
+        attempts += 1;
+        assert!(attempts < 50, "the JIT never froze the child live");
+    };
+    let child_aliased = fhost.captured_detached()[0].window.dense_prots()
+        [AT / temen_snapshot::PAGE..(AT + LEN) / temen_snapshot::PAGE]
+        .iter()
+        .all(|p| matches!(p, CapturedProt::Backed { writable: true, .. }));
+    assert!(
+        child_aliased,
+        "the child's pre-mapped pages are captured Backed"
+    );
+
+    let artifact = freeze_layout(&parent, &snap, SIZE_LOG2, &fhost).expect("rides");
+    let restored = || {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.set_region_factory(temen_run::new_shared_region);
+        thost.grant_durable_module(&child);
+        let (rwin, rprots, _) =
+            restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+        (thost, rwin, rprots)
+    };
+    let (mut thost, rwin, rprots) = restored();
+    assert_eq!(
+        run_jit(&parent, 0, &mut thost, &args, &thaw_layout(rwin, &rprots)).0,
+        Some(SHARED_WANT),
+        "both domains of the JIT thaw alias one region"
+    );
+    let (mut thost, mut rwin, rprots) = restored();
+    begin_thaw(&mut rwin, TEST_ARENA, 0);
+    assert_eq!(
+        run(&parent, 0, &mut thost, &args, &rwin, Some(&rprots)).0,
+        Ok(vec![Value::I64(SHARED_WANT)]),
+        "and of the interpreter's"
     );
 }

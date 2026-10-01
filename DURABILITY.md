@@ -1263,7 +1263,13 @@ re-freezes to the same numbers) and maps its `Backed` runs onto them, so a regio
 with its detached child stays shared. A region with a holder outside the cut (including a nested
 child, for now) refuses `FreezeError::RegionNotCaptured(HolderOutsideCut)`; a backing that
 something outside the VM can write (`SharedBacking::outside_writers`, e.g. a host file) refuses
-`OutsideWriters`. Not yet: the native JIT's `Backed` pages (#2025 step 3) still refuse.
+`OutsideWriters`. The native JIT carries them as the interpreter does: its window page map
+(`temen_ir::PageState`) names the region and offset each aliased page maps, so its capture and its
+artifact are the interpreter's; a JIT thaw starts the window private and, once the window exists
+and before the guest runs, re-aliases each `Backed` run onto the rebuilt region through the same
+`SharedRegion.map` path as the op-15 pre-map (`Host::apply_premap`), on a root's window and on a
+re-launched child's. A JIT thaw needs an OS-backed region factory (`temen_run::new_shared_region`),
+as a live JIT run does to map a region at all.
 
 *Optimization (not v1):* diff against the post-instantiation image (`Module::data`
 segments) instead of storing all committed pages. Correctness doesn't need it.

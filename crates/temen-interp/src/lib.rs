@@ -3751,17 +3751,13 @@ pub enum CapturedProt {
     /// Unmapped / uncommitted — any access faults.
     Unmapped,
     /// A §13 `SharedRegion`-aliased page: its bytes are the region's at `off`. `region` is the
-    /// capturing host's region id ([`UNKNOWN_REGION`] where the capture cannot say which).
+    /// capturing host's region id.
     Backed {
         region: u32,
         off: u64,
         writable: bool,
     },
 }
-
-/// The region a [`CapturedProt::Backed`] page names when the capture has no region identity — the
-/// Cranelift JIT's page map records only that a page is aliased (#2025 step 3). A freeze declines it.
-pub const UNKNOWN_REGION: u32 = u32::MAX;
 
 /// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
 /// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
@@ -19639,10 +19635,10 @@ pub trait GuestMem {
     }
 }
 
-/// §4/§7 a JIT cap-path window **page map**: page index → state code (the flat-window backend, e.g.
-/// `temen_run`, owns the encoding; absent ⇒ region default). Shared + persistent across a run's
-/// `call.cap`s (see [`Host::cap_window_pages`]) so a guest-grown page stays borrowable.
-pub type CapPageMap = Arc<Mutex<BTreeMap<u64, u8>>>;
+/// §4/§7 a JIT cap-path window **page map**: host page index → its state (absent ⇒ region default).
+/// Shared + persistent across a run's `call.cap`s (see [`Host::cap_window_pages`]) so a guest-grown
+/// page stays borrowable.
+pub type CapPageMap = Arc<Mutex<BTreeMap<u64, temen_ir::PageState>>>;
 
 /// A [`GuestMem`] over a flat, contiguous window slice — the JIT's representation. The
 /// slice may include trailing guard bytes; `size` is the *logical* window so the §7
@@ -20746,6 +20742,47 @@ pub fn capture_cut_regions(
     Ok(out)
 }
 
+/// #2025 — one §13 alias to re-establish: `[win_off, win_off + len)` names `region`'s bytes from
+/// `region_off` on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RegionAlias {
+    win_off: u64,
+    len: u64,
+    region: u32,
+    region_off: u64,
+    writable: bool,
+}
+
+/// #2025 — `backed` pages (`(page index, region, region offset, writable)`, ascending, in `page`-byte
+/// pages) as maximal aliases: one per run of pages that continue one region at consecutive offsets
+/// with one protection, so each run re-maps in one `map`.
+fn region_aliases(
+    page: u64,
+    backed: impl IntoIterator<Item = (u64, u32, u64, bool)>,
+) -> Vec<RegionAlias> {
+    let mut out: Vec<RegionAlias> = Vec::new();
+    for (p, region, region_off, writable) in backed {
+        let win_off = p * page;
+        if let Some(a) = out.last_mut() {
+            if (a.region, a.writable) == (region, writable)
+                && a.win_off + a.len == win_off
+                && a.region_off + a.len == region_off
+            {
+                a.len += page;
+                continue;
+            }
+        }
+        out.push(RegionAlias {
+            win_off,
+            len: page,
+            region,
+            region_off,
+            writable,
+        });
+    }
+    out
+}
+
 /// A region backing's identity: every alias of one region, in any domain, shares it.
 fn region_key(b: &RegionBacking) -> usize {
     Arc::as_ptr(b) as *const () as usize
@@ -20759,8 +20796,7 @@ pub enum RegionRefusal {
     HolderOutsideCut,
     /// Something outside the VM writes the region's bytes — a host file the mmap bridge aliases.
     OutsideWriters,
-    /// No region by this id: a capture that cannot say which region a page aliases (the Cranelift
-    /// JIT's page map, #2025 step 3), or a stale id.
+    /// No region by this id: a page names a region its host does not hold.
     Unknown,
     /// The freeze was given no page map (the codec's flat `freeze`), so it cannot tell where in the
     /// window the region is mapped.
@@ -22553,6 +22589,9 @@ pub struct Host {
     /// child would get by `map`ping the handle itself. `None` for every root and every child spawned
     /// without one.
     premap: Option<(u32, u64)>,
+    /// #2025 — the §13 aliases a JIT thaw's window is restored with ([`Host::reset_cap_pages`]),
+    /// re-established with the op-15 pre-map by [`Host::apply_premap`] once the window exists.
+    realias: Vec<RegionAlias>,
     /// §15 / PROCESS.md §5, #1944 — the run's budget tree, whose node ids the [`Binding::Budget`]s in
     /// this table carry. A fork twin shares it, as a forked process stays in its cgroup.
     budgets: Arc<BudgetTree>,
@@ -23331,6 +23370,7 @@ impl Host {
             regions: Vec::new(),
             region_hook: None,
             premap: None,
+            realias: Vec::new(),
             budgets: Arc::default(),
             own_budget: BudgetTree::RUN_NODE,
             pipes: Vec::new(),
@@ -25048,21 +25088,33 @@ impl Host {
     /// Start the JIT window page map (see [`Host::cap_window_pages`]) of a run about to build a fresh
     /// window: `map`'s deviations — none for a fresh run, the artifact's for a thaw (#1834) — and
     /// nothing of an earlier run's, whose window the new one may reuse the address of. The window's
-    /// base is not known yet, so the map is claimed by the first base that asks for one.
+    /// base is not known yet, so the map is claimed by the first base that asks for one. #2025 —
+    /// `map`'s §13 pages are staged for [`Host::apply_premap`] instead: the window starts private, and
+    /// each is aliased back onto its region once the window exists, which records it here again.
     pub fn reset_cap_pages(&mut self, map: &PageMap) {
-        use temen_ir::page_state as ps;
-        let pages: BTreeMap<u64, u8> = map
+        use temen_ir::PageState as ps;
+        let pages: BTreeMap<u64, ps> = map
             .rebased_to(host_page_size())
             .into_iter()
             .filter_map(|(p, prot)| match prot {
-                PageProt::Rw => Some((p, ps::RW)),
-                PageProt::Ro => Some((p, ps::RO)),
-                PageProt::Unmapped => Some((p, ps::UNMAPPED)),
-                // Not restorable: a layout never carries one (`MemLayout::from_parts`).
+                PageProt::Rw => Some((p, ps::Rw)),
+                PageProt::Ro => Some((p, ps::Ro)),
+                PageProt::Unmapped => Some((p, ps::Unmapped)),
                 PageProt::Backed { .. } => None,
             })
             .collect();
         self.cap_pages = (!pages.is_empty()).then(|| (UNCLAIMED_BASE, Arc::new(Mutex::new(pages))));
+        self.realias = region_aliases(
+            map.page,
+            map.prot.iter().filter_map(|(&p, prot)| match *prot {
+                PageProt::Backed {
+                    region,
+                    region_off,
+                    writable,
+                } => Some((p, region, region_off, writable)),
+                _ => None,
+            }),
+        );
     }
 
     /// #1810 — how far the guest grew JIT window `base` through the Memory capability: one past the
@@ -25143,22 +25195,25 @@ impl Host {
             let m = map.lock().unwrap();
             for (p, slot) in out.iter_mut().enumerate() {
                 let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
-                use temen_ir::page_state as ps;
+                use temen_ir::PageState as ps;
                 match m.get(&hp).copied() {
-                    Some(ps::RW) => *slot = CapturedProt::Rw,
-                    Some(ps::RO) => *slot = CapturedProt::Ro,
-                    Some(ps::UNMAPPED) => *slot = CapturedProt::Unmapped,
-                    // A §13 alias: this page map records that the page is aliased, not which
-                    // region it names (#2025 step 3), so a freeze declines it rather than taking
-                    // it for a private page.
-                    Some(st @ (ps::BACKED_RW | ps::BACKED_RO)) => {
+                    Some(ps::Rw) => *slot = CapturedProt::Rw,
+                    Some(ps::Ro) => *slot = CapturedProt::Ro,
+                    Some(ps::Unmapped) => *slot = CapturedProt::Unmapped,
+                    // A §13 alias names its region (#2025): this codec page's bytes are the
+                    // region's at the host page's offset plus this page's place in it.
+                    Some(ps::Backed {
+                        region,
+                        off,
+                        writable,
+                    }) => {
                         *slot = CapturedProt::Backed {
-                            region: UNKNOWN_REGION,
-                            off: 0,
-                            writable: st == ps::BACKED_RW,
+                            region,
+                            off: off + (p as u64 * DURABLE_SNAPSHOT_PAGE - hp * host),
+                            writable,
                         }
                     }
-                    _ => {}
+                    None => {}
                 }
             }
         }
@@ -25726,45 +25781,34 @@ impl Host {
         self.regions.get(id as usize).map(region_key)
     }
 
-    /// #2025 — alias back into `mem` every region `prots` names, one `map` per run of pages that
-    /// continue one region at consecutive offsets with one protection: the thaw half of a captured
-    /// `Backed` page. Through [`Self::region_map`], the path a guest's own `map` takes, so a page an
-    /// artifact names is checked as a live mapping is. `false` if one names no region of this host
-    /// or does not map.
-    fn realias_regions(&self, mem: &mut Mem, prots: &[CapturedProt]) -> bool {
-        let page = DURABLE_SNAPSHOT_PAGE;
-        let mut i = 0;
-        while i < prots.len() {
-            let CapturedProt::Backed {
-                region,
-                off,
-                writable,
-            } = prots[i]
-            else {
-                i += 1;
-                continue;
-            };
-            let mut n = 1;
-            while prots.get(i + n)
-                == Some(&CapturedProt::Backed {
+    /// #2025 — alias back into `mem` every region `prots` names: the thaw half of a captured
+    /// `Backed` page. `false` if one names no region of this host or does not map.
+    fn realias_regions(&self, mem: &mut dyn GuestMem, prots: &[CapturedProt]) -> bool {
+        let backed = prots
+            .iter()
+            .enumerate()
+            .filter_map(|(p, prot)| match *prot {
+                CapturedProt::Backed {
                     region,
-                    off: off + n as u64 * page,
+                    off,
                     writable,
-                })
-            {
-                n += 1;
-            }
-            let Some(backing) = self.regions.get(region as usize).cloned() else {
+                } => Some((p as u64, region, off, writable)),
+                _ => None,
+            });
+        self.map_aliases(mem, &region_aliases(DURABLE_SNAPSHOT_PAGE, backed))
+    }
+
+    /// #2025 — map each of `aliases` into `mem` through [`Self::region_map`], the path a guest's own
+    /// `map` takes, so a page an artifact names is checked as a live mapping is. `false` at the
+    /// first that names no region of this host or does not map.
+    fn map_aliases(&self, mem: &mut dyn GuestMem, aliases: &[RegionAlias]) -> bool {
+        aliases.iter().all(|a| {
+            let Some(backing) = self.regions.get(a.region as usize).cloned() else {
                 return false;
             };
-            let prot = PROT_READ | if writable { PROT_WRITE } else { 0 };
-            let (win_off, len) = (i as u64 * page, n as u64 * page);
-            if self.region_map(mem, win_off, off, len, prot, region, backing) != 0 {
-                return false;
-            }
-            i += n;
-        }
-        true
+            let prot = PROT_READ | if a.writable { PROT_WRITE } else { 0 };
+            self.region_map(mem, a.win_off, a.region_off, a.len, prot, a.region, backing) == 0
+        })
     }
 
     /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: the
@@ -28142,9 +28186,10 @@ impl Host {
         true
     }
 
-    /// Whether an op-15 pre-map is staged and not yet applied.
+    /// Whether [`Host::apply_premap`] has anything to map: an op-15 pre-map, or a JIT thaw's §13
+    /// pages (#2025).
     pub fn has_premap(&self) -> bool {
-        self.premap.is_some()
+        self.premap.is_some() || !self.realias.is_empty()
     }
     /// Take the staged op-15 pre-map — `(the region's backing, window offset)` — **instead of**
     /// applying it, for a driver whose emitted tier cannot alias (#1527): the browser's op-13
@@ -28162,9 +28207,15 @@ impl Host {
 
     /// Op-15 **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
     /// `mem` at the staged offset through [`region_map`](Self::region_map) — the child's own
-    /// `SharedRegion.map` path. `0` with nothing staged; otherwise the map's result (`< 0` only where
-    /// the backend cannot alias this backing, e.g. a software-only region on the native JIT).
+    /// `SharedRegion.map` path. #2025 — and the §13 aliases a JIT thaw's window is restored with
+    /// ([`Host::reset_cap_pages`]), on a root's window as on a child's. `0` with nothing staged;
+    /// otherwise the map's result (`< 0` only where the backend cannot alias this backing, e.g. a
+    /// software-only region on the native JIT).
     pub fn apply_premap(&mut self, mem: &mut dyn GuestMem) -> i64 {
+        let realias = std::mem::take(&mut self.realias);
+        if !self.map_aliases(mem, &realias) {
+            return EINVAL;
+        }
         let Some((id, off)) = self.premap.take() else {
             return 0;
         };

@@ -373,8 +373,8 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             conditional(
                 "a region the cut wholly holds rides with its aliases, across detached children \
-                 too (#2025); one held outside the cut or host-file-backed is the boundary, and the \
-                 native JIT's region pages are not yet carried (#2025)",
+                 and on the native JIT too (#2025); one held outside the cut or host-file-backed is \
+                 the boundary",
             ),
             B,
             U,
