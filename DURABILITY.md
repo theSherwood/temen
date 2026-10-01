@@ -615,7 +615,12 @@ powerbox. `temen_run::jit_cap_run` turns that harvest into the interpreter's `Ca
 child through the same `Host::prepare_detached_relaunch` the interpreter uses, builds its powerbox as a
 spawn does, and re-files its task **at its recorded join slot** on a window holding its image, freeze
 word `NORMAL` and thaw word `REWINDING`. The child records its program on its own powerbox at spawn
-(the import-binding hook sets `self_module`), which is how the harvest names it by digest.
+(the import-binding hook sets `self_module`), which is how the harvest names it by digest. A child
+that completed but was not joined rides as its `join` outcome (`FrozenDetached`), and a thaw
+re-creates it at its join slot as a finished child, so the rewound `join` reloads the value or
+re-raises the trap without spawning the child again (#2041). The interpreter keeps a join table per
+spawning vCPU and the JIT one per domain, so a JIT thaw where two of a domain's children claim one
+slot is refused whole.
 
 **A durable child's own children (#2010).** A durable child that spawns gets a durable nursery of its
 own, so its children are durable too, and the freeze reaches them through it:
@@ -629,10 +634,11 @@ own, so its children are durable too, and the freeze reaches them through it:
 - **The harvest.** It nests each child's children under it, and `jit_cap_run` puts a captured child's
   children on its powerbox, as the oracle's recursive harvest does. A child that rides no artifact
   cannot carry its captured children, so they count as unreached and the freeze is refused.
-- **The thaw.** It re-launches a child's captured children into its nursery before the child itself,
-  so the child's rewound `join` finds them. A captured child whose powerbox carries residue the JIT
-  re-creates only for a run's root refuses the JIT thaw whole instead of dropping it. That residue is
-  nested or completed children, and child state.
+- **The thaw.** It re-creates a child's children in its nursery before the child itself runs, the
+  captured ones re-launched and the completed ones as their outcomes (#2041), so the child's rewound
+  `join` finds them. A captured child whose powerbox carries residue the JIT re-creates only for a
+  run's root refuses the JIT thaw whole instead of dropping it. That residue is the carve path's:
+  nested children and their host state.
 - **Its threads.** A durable child's `thread.spawn` vCPUs run as the root's do on a freezable run:
   each reserves a shadow context in the child's window, so a ring unwinds each into its own region. A
   `thread.join` parked when the ring lands returns for re-issue, as an OS thread's does. A root that
@@ -662,8 +668,9 @@ join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
 missing grant refuses), `temen/tests/durable_detached_jit.rs` (freeze on the JIT → codec → thaw on the
 JIT **and** on the interpreter; freeze on the interpreter → thaw on the JIT; without the doorbell nothing
-is captured, without the re-launch the thaw's join traps; and a grandchild, a thread or a fiber,
-carried in its parent's artifact, every engine freezing and every engine thawing, #2010, #2031), and
+is captured, without the re-launch the thaw's join traps; a grandchild, a thread or a fiber,
+carried in its parent's artifact, every engine freezing and every engine thawing, #2010, #2031; and a
+child or a grandchild that completed unjoined, with its value or its trap, #2041), and
 `durable_detached_parity.rs` (the
 oracle and the resumable engine admit with the authority and refuse without it, alike).
 
@@ -1878,8 +1885,8 @@ vcpus, nested, root_sp }` — the interpreter's residue, piece for piece — and
 carry all of it through the `Host` both ways. An async freeze controller now always engages the
 concurrent path, so a child spawned while `NORMAL` has its own shadow context rather than unwinding into
 the root's (#1691). Residue the JIT cannot re-create yet (a separate-module nested child, a nested
-child's host state, a detached child that completed before the cut, a live detached child
-whose program the thawing host no longer grants — #1692) is refused whole as `Unsupported` and
+child's host state, a live detached child whose program the thawing host no longer grants — #1692 —
+or two detached children of one domain at one join slot, #2041) is refused whole as `Unsupported` and
 left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
 (`the_embedder_jit_path_carries_the_vcpu_residue_both_ways`, `…_refuses_residue_it_cannot_recreate_and_keeps_it`).
 

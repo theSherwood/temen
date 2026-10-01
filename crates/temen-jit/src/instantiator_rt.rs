@@ -370,10 +370,13 @@ unsafe fn file_carve_task(
 /// # Safety
 /// As [`Nursery::relaunch_detached`]'s seed: each holds two live counted refs, owned here.
 unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::DetachedSeed) {
-    release(seed.child.ctx);
-    release(seed.child.retained_ctx);
-    for c in seed.children {
-        release_seed(release, c);
+    // A completed child's seed holds no powerbox.
+    if let crate::DetachedSeed::Captured(seed) = seed {
+        release(seed.child.ctx);
+        release(seed.child.retained_ctx);
+        for c in seed.children {
+            release_seed(release, c);
+        }
     }
 }
 
@@ -1066,8 +1069,9 @@ impl Nursery {
     }
 
     /// §4 thaw: publish a re-attached child's (rewound) result at its join-table `slot`, so the
-    /// parent's re-executed `join` resolves without re-running the child. The freeze recorded slots in
-    /// ascending order; pad any gap with an inert placeholder to keep the index alignment.
+    /// parent's re-executed `join` resolves without re-running the child; and (#2041) a detached child
+    /// that had completed but was not joined. The freeze recorded slots in ascending order; pad any gap
+    /// with an inert placeholder to keep the index alignment.
     pub(crate) fn seed_child_result(&self, slot: usize, result: i64, trap: i64) {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         while children.len() <= slot {
@@ -1186,14 +1190,24 @@ impl Nursery {
     /// rewound `join` then parks on it as before the cut. `false` if its code will not compile or the
     /// executor refuses it; the slot is then left to fail closed at the join.
     ///
-    /// #2010 — a child that spawned gets its nursery back, and its own captured children are
-    /// re-launched into it first, so its rewound `join` parks on them as before the cut too.
+    /// #2010 — a child that spawned gets its nursery back, and its own children are re-created in
+    /// it first, so its rewound `join` parks on them as before the cut too.
+    ///
+    /// #2041 — a child that had completed but was not joined is re-created as its outcome only: it
+    /// owns no window to restore, so the rewound `join` reloads its result.
     ///
     /// # Safety
-    /// `seed.child` holds two live counted refs to the child's powerbox, owned from here on, and so
-    /// does each of `seed.children`, at every depth.
+    /// A captured seed's `child` holds two live counted refs to the child's powerbox, owned from here
+    /// on, and so does each of its captured `children`, at every depth.
     pub(crate) unsafe fn relaunch_detached(&self, seed: crate::DetachedSeed) -> bool {
-        let crate::DetachedSeed {
+        let seed = match seed {
+            crate::DetachedSeed::Completed { slot, result, trap } => {
+                self.seed_child_result(slot, result, trap);
+                return true;
+            }
+            crate::DetachedSeed::Captured(seed) => *seed,
+        };
+        let crate::CapturedSeed {
             slot,
             entry,
             mapped_log2,
