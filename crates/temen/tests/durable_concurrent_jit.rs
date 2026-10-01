@@ -454,11 +454,14 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
     // mid-resume-chain case is now covered deterministically by
     // `concurrent_child_owns_active_chain_fiber_through_freeze_thaw`), or after the child finished — a
     // different (valid) freeze shape that doesn't exercise B.1's *parked* path. Only assert the strong
-    // B.1 properties when the clean shape occurred; otherwise skip.
-    let clean = read_state(&fsnap) == STATE_UNWINDING
-        && matches!(fout, JitOutcome::Returned(_))
-        && fvcpus.len() == 1
-        && ffibers.len() == 1;
+    // B.1 properties when the clean shape occurred; otherwise skip. Every shape returns, though: the
+    // root's and the child's freeze drivers both walk the shared table, and the one that loses a
+    // parked fiber's claim to the other skips it rather than faulting (#2032).
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "a freeze returns whatever its shape: {fout:?}"
+    );
+    let clean = read_state(&fsnap) == STATE_UNWINDING && fvcpus.len() == 1 && ffibers.len() == 1;
     if !clean {
         return;
     }
@@ -572,11 +575,12 @@ fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
     // The fiber signals from inside the chain then loops K, so the freeze should land while it is active
     // on the chain — the same residue shape as B.1 (one frozen child vCPU owning one frozen fiber). On a
     // badly-scheduled runner the freeze can still miss (fiber finished, or never entered): only assert
-    // the strong active-chain properties when that clean shape occurred.
-    let clean = read_state(&fsnap) == STATE_UNWINDING
-        && matches!(fout, JitOutcome::Returned(_))
-        && fvcpus.len() == 1
-        && ffibers.len() == 1;
+    // the strong active-chain properties when that clean shape occurred. Every shape returns (#2032).
+    assert!(
+        matches!(fout, JitOutcome::Returned(_)),
+        "a freeze returns whatever its shape: {fout:?}"
+    );
+    let clean = read_state(&fsnap) == STATE_UNWINDING && fvcpus.len() == 1 && ffibers.len() == 1;
     if !clean {
         return;
     }
