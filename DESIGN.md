@@ -2423,6 +2423,17 @@ tree runs meanwhile, a schedule the interpreter could also have chosen. A leaf t
 busy-waits on another process's effect through ops that do not park (polling for a file, say) never
 sees it and spins where the interpreter would complete: tracked debt on #1896.
 
+**The root as a leaf; parks on the embedder (#1954).** The run's own image is offered the same way,
+at its entry (`root_leaf`, module 0), under the same predicate. It isn't offered when the run is
+durable, or when emitted code can't address the root window flat. A third kind of suspendable park
+joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
+answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
+leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
+the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and `CoopRun::deliver_cap`
+writes the answer into that continuation; the pump runs it and `Resume` hands the frames its results.
+Anywhere nothing holds the frames (a tier-up region, a `Jit.invoke` unit) the call declines with
+`CapFault`: no one could ever complete it there.
+
 ---
 
 ## 15. Resource monitoring & metering  [SETTLED]

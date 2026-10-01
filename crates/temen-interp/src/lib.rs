@@ -21336,6 +21336,10 @@ struct HostProcEntry {
     /// #1455 / #1699 — the provider's own answer to "what host-side state does this capability
     /// hold?", given wherever a handler is minted ([`CapState`]).
     state: CapState,
+    /// #1954 — a **declared host-completed cap** ([`Host::grant_declared_host_caps`]): every call is
+    /// finished by the embedder, so a call parks without needing the caller's frames
+    /// ([`OpParks::OnHost`]).
+    on_host: bool,
 }
 
 /// #1699 — a host capability's **host-side state**, declared by its provider wherever a handler is
@@ -22317,6 +22321,10 @@ pub enum OpParks {
     /// for one to be started ([`ParkEvent::SpawnSelf`]). The engine serves both without the
     /// caller's frames, so a leaf whose host suspends them may make these calls.
     OnChildren,
+    /// #1954 — only on its embedder: a declared host-completed cap ([`Host::parks_on_host`]), which
+    /// the embedder answers later. The rest of the call waits without the caller's frames, as for
+    /// [`OpParks::OnChildren`], so a leaf whose host suspends them may make these calls.
+    OnHost,
     /// Some other way: a fork or an exec, which need the caller's frames, a signal, a read of
     /// something only another process can fill.
     Otherwise,
@@ -23484,6 +23492,7 @@ impl Host {
                 // #1455 — not the parent's serializer, which closes over the *parent's* state: the
                 // factory's answer for the handler it minted (#1699).
                 state: forked.state,
+                on_host: e.on_host,
             });
         }
         // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
@@ -25780,6 +25789,7 @@ impl Host {
                 mints: false,
                 vtable: None,
                 state,
+                on_host: false,
             });
         }
         self.named_cap_registrar = registrar;
@@ -26569,6 +26579,7 @@ impl Host {
             mints: false,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -26588,6 +26599,7 @@ impl Host {
             mints: false,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -26626,10 +26638,23 @@ impl Host {
                 // Each call is answered afresh by the embedder; nothing is held between calls.
                 CapState::Stateless,
             );
+            if let Ok(Binding::HostProc(idx)) = self.resolve(h, cap_id::HOST_PROC) {
+                self.host_procs[idx as usize].on_host = true;
+            }
             self.register_cap_name(name, h);
             declared.push((name.clone(), h));
         }
         declared
+    }
+
+    /// #1954 — whether `handle` names a declared host-completed cap ([`Host::grant_declared_host_caps`]),
+    /// whose calls the embedder finishes: one parks without the caller's frames ([`OpParks::OnHost`]).
+    pub fn parks_on_host(&self, handle: i32) -> bool {
+        matches!(
+            self.resolve(handle, cap_id::HOST_PROC),
+            Ok(Binding::HostProc(idx))
+                if self.host_procs.get(idx as usize).is_some_and(|e| e.on_host)
+        )
     }
 
     /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
@@ -26688,6 +26713,7 @@ impl Host {
             mints: false,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 
@@ -26704,6 +26730,7 @@ impl Host {
             mints: true,
             vtable: None,
             state,
+            on_host: false,
         })
     }
 

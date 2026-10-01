@@ -9792,6 +9792,51 @@ fn leaf_step(
     })
 }
 
+/// #1954 — the **root program** as a leaf: the rule an exec'd image meets ([`exec_image_build`]),
+/// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
+/// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
+/// (whose freeze could not meet emitted frames) and a window emitted code cannot address flat run
+/// interpreted, as before. Both `CoopRun` constructors that hold the image ask it (`assemble`,
+/// `new_reserved_over_compiled`); a [`SharedProgram`] run (a warm restore) keeps only compiled code,
+/// so its root interprets — a tier it forgoes, not a behaviour it changes.
+#[allow(clippy::too_many_arguments)]
+fn root_leaf(
+    emit: &LeafEmitter,
+    m: &Module,
+    dom: &Domain,
+    entry: FuncIdx,
+    args: &[Value],
+    host: &Host,
+    mem: Option<&Mem>,
+) -> Option<LeafStart> {
+    if host.is_durable() || mem.is_some_and(|w| w.flat_win_base().is_none()) {
+        return None;
+    }
+    let parks = match image_parks(host, m) {
+        Parks::Never => false,
+        Parks::Suspendably => true,
+        Parks::Otherwise => return None,
+    };
+    let paged = image_pages(host, m);
+    let offer = LeafOffer {
+        module: 0,
+        image: m,
+        entry,
+        paged,
+        parks,
+    };
+    emit(&offer).then(|| LeafStart {
+        module: 0,
+        entry,
+        argv: args.iter().map(|v| val_to_slot(*v)).collect(),
+        results: dom.source.primary().result_types[entry as usize]
+            .clone()
+            .into(),
+        paged,
+        parks,
+    })
+}
+
 /// How a leaf image tiers up at its entry ([`CoopStep::TierUp`]).
 struct LeafStart {
     module: u32,
@@ -9809,8 +9854,9 @@ struct LeafStart {
 /// #1896 — how a process running image `m` can **park**: block in an op until another process, or
 /// another of its own threads, acts. An emitted frame cannot wait by itself, so an image runs on the
 /// emitted tier ([`TierUpConfig::leaf`]) when it cannot park, or when it parks only where its host
-/// can suspend the emitted frames ([`LeafOffer::parks`]): in a **stream** call, or on its
-/// **children** ([`super::OpParks::OnChildren`]). A stream read parks on a pipe end or a blocking
+/// can suspend the emitted frames ([`LeafOffer::parks`]): in a **stream** call, on its
+/// **children** ([`super::OpParks::OnChildren`]), or in a declared host-completed cap the embedder
+/// answers ([`super::OpParks::OnHost`], #1954). A stream read parks on a pipe end or a blocking
 /// stdin, and a stream write on a pipe end. The process's signal source answers for the ops bound to
 /// it ([`super::SignalSource::import_parks`]); the address-space ops and the pipe mint cannot park; a
 /// §12 concurrency op may (a join or a futex wait parks, and a thread or a fiber needs the
@@ -9827,6 +9873,7 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         HOST_PROC => source
             .as_ref()
             .and_then(|s| s.import_parks(&import.name))
+            .or_else(|| host.parks_on_host(b.handle).then_some(OpParks::OnHost))
             .unwrap_or(OpParks::Otherwise),
         _ => OpParks::Otherwise,
     };
@@ -9880,7 +9927,8 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
     {
         return Parks::Otherwise;
     }
-    match parks.contains(&OpParks::OnChildren) || insts().any(stream_parks) {
+    let suspendable = parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost);
+    match suspendable || insts().any(stream_parks) {
         true => Parks::Suspendably,
         false => Parks::Never,
     }
@@ -9889,7 +9937,8 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
 /// How a process running an image can park ([`image_parks`]).
 enum Parks {
     Never,
-    /// Only where its host can suspend its emitted frames: in a stream call, or on its children.
+    /// Only where its host can suspend its emitted frames: in a stream call, on its children, or in
+    /// a declared host-completed cap.
     Suspendably,
     Otherwise,
 }
@@ -11241,8 +11290,24 @@ fn drive_nested(
             // (the unit is a seam-free atomic leaf, DESIGN §22: no park surface exists here,
             // so blocking in place is the contract, not a divergence). Because every cap call
             // completes inline, an invoke fiber is never `CapParked` — no drain arm needed.
+            //
+            // #1954 — a **host-completed** call is the exception: only the embedder finishes it, so
+            // waiting here would never return. In a bounce out of a leaf whose host suspends its
+            // emitted frames it parks, as a pipe read does below — but not rewound: the task waits in
+            // `BlockedHostCap` with the call's continuation, and `deliver_cap` writes its result
+            // into it. Anywhere else it declines, fail-closed, rather than hang.
             Outcome::CapPending { id, dst } => {
-                let r = host.with(|p| p.completions()).wait(id);
+                let comps = host.with(|p| p.completions());
+                if comps.is_host_owned(id) {
+                    let slot = run_meta
+                        .as_mut()
+                        .and_then(|c| c.park.as_deref_mut())
+                        .filter(|_| chain.is_empty())
+                        .ok_or(Trap::CapFault)?;
+                    *slot = Some((active, Handoff::Park(TaskState::BlockedHostCap { id, dst })));
+                    return Ok(Vec::new());
+                }
+                let r = comps.wait(id);
                 active.set(dst, Reg::from_i64(r));
             }
             Outcome::ContNew { funcref, sp, dst } => {
@@ -13084,6 +13149,9 @@ struct CoopSched {
     /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
     /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
     freeze_on_quiesce: bool,
+    /// #1954 — the root program's leaf start, when the host's emitter took the root image
+    /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
+    root_leaf: Option<LeafStart>,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -13268,6 +13336,7 @@ impl CoopSched {
             slice_left: None,
             freeze_on_quiesce: host.is_durable()
                 && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
+            root_leaf: None,
         })
     }
 
@@ -13309,7 +13378,15 @@ impl CoopSched {
             suspend_on_idle,
             slice_left,
             freeze_on_quiesce,
+            root_leaf,
         } = self;
+        // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
+        // (over a window one bound cannot describe it runs interpreted instead, as an exec'd leaf).
+        if let Some(start) = root_leaf.take() {
+            if let Some(step) = leaf_step(start, 0, mem.as_ref(), pending_tierup) {
+                return Ok(step);
+            }
+        }
         // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
         // (rather than always lowest-index) is what lets the preemption quantum actually rotate: a
         // just-preempted task is re-admitted `Runnable`, and the next pick advances past it to a sibling
@@ -15632,9 +15709,14 @@ impl CoopRun {
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
             mm
         });
+        let root_leaf = tierup
+            .as_ref()
+            .and_then(|t| t.leaf.as_ref())
+            .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
         let mut fuel = Fuel::drawn(host.begin_activation(fuel));
-        let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        sched.root_leaf = root_leaf;
         Ok(CoopRun {
             dom,
             mem,
@@ -15658,13 +15740,18 @@ impl CoopRun {
             return Some(Err(Trap::Malformed));
         }
         let dom = Domain::new(c, host.jit_table_log2());
+        let root_leaf = tierup
+            .as_ref()
+            .and_then(|t| t.leaf.as_ref())
+            .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
         let mut fuel = Fuel::drawn(host.begin_activation(fuel));
-        let sched = match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)
-        {
-            Ok(s) => s,
-            Err(e) => return Some(Err(e)),
-        };
+        let mut sched =
+            match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+        sched.root_leaf = root_leaf;
         Some(Ok(CoopRun {
             dom,
             mem,
@@ -15765,7 +15852,13 @@ impl CoopRun {
             let _ = self.host.completions().try_take(id);
             let t = &mut self.sched.tasks[ti];
             if let TaskState::BlockedHostCap { dst, .. } = t.state {
-                t.vt.active.set(dst, Reg::from_i64(value));
+                // #1954: a call that parked in a bounce out of an emitted leaf waits in the call's
+                // continuation (`suspended`), which the pump runs next; any other in the task's own.
+                let vm = match t.suspended.as_mut() {
+                    Some(s) => &mut s.vm,
+                    None => &mut t.vt.active,
+                };
+                vm.set(dst, Reg::from_i64(value));
             }
             t.state = TaskState::Runnable;
         }
