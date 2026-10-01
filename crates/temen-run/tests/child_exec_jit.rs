@@ -299,21 +299,37 @@ block 3 (vr: i64) {{
 /// child lasted ~20 ms. It now wakes for the earliest parked deadline. All 100 time out (`100`, the
 /// trivial sibling `0` ⇒ `100000`).
 ///
-/// The elapsed-time bound is the pin. Measured on a 4-core box: ~0.1 s with the fix, 2.02 s
-/// without. The broken figure is wall-clock (100 waits × the 20 ms cadence), so it is
-/// machine-independent; the threshold sits between, well over a healthy run on a loaded runner.
+/// The elapsed-time bound is the pin, taken relative to what 100 timed waits of 1 ms cost the host
+/// itself (a condvar's, as the executor's idle worker uses), since that is the floor: about 0.1 s
+/// on Linux and macOS, but ~1.5 s on Windows, whose default timer ticks every ~15.6 ms. Measured on
+/// a 4-core Linux box: ~0.1 s with the fix, 2.02 s without (100 waits × the 20 ms cadence). The
+/// bound, 1.5 × the host's own figure + 0.2 s, sits well under the broken figure wherever the host
+/// can wait 1 ms, and on Windows asks only that a child's wait cost about what the host's does.
 #[test]
 fn a_tasks_short_timed_waits_end_at_their_deadlines() {
     let p = module(&parent(TAIL_SUM));
     let a = module(&sleeper(100, 1_000_000));
     let b = module(TRIVIAL);
     assert_eq!(run_interp(&p, &a, &b, -1), 100_000, "the oracle");
+    let host = {
+        let (m, cv) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+        let t = std::time::Instant::now();
+        let mut g = m.lock().unwrap();
+        for _ in 0..100 {
+            g = cv
+                .wait_timeout(g, std::time::Duration::from_millis(1))
+                .unwrap()
+                .0;
+        }
+        t.elapsed()
+    };
     let t = std::time::Instant::now();
     assert_eq!(run_jit(&p, &a, &b, -1), 100_000);
     let took = t.elapsed();
+    let bound = host.mul_f64(1.5) + std::time::Duration::from_millis(200);
     assert!(
-        took < std::time::Duration::from_millis(1000),
-        "100 timed waits of 1 ms took {took:?}"
+        took < bound,
+        "100 timed waits of 1 ms took {took:?} in a child task, {host:?} on the host"
     );
 }
 
