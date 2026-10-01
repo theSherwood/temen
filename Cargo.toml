@@ -72,8 +72,8 @@ temen-parity = { path = "crates/temen-parity" }
 # CI wall clock + the local pre-push hook: this tree's tests are **execution** bound, not compile
 # bound. A `cargo test --workspace` run spends its time with guests *running* inside the engines
 # (`temen-interp`'s tree-walker above all), so building those engines unoptimized charges an
-# order-of-magnitude tax on every test. Measured on `temen-run`'s `nimlink_asset` — the dominant test
-# in the `build · test · fmt · clippy` job — **599s -> 58s**.
+# order-of-magnitude tax on every test. Measured on `temen-run`'s `nimlink_asset` (since retired, #2028)
+# — then the dominant test in the `build · test · fmt · clippy` job — **599s -> 58s**.
 #
 # It has to be `[profile.dev]`, not `[profile.dev.package."*"]`: the `"*"` glob is dependencies only
 # and explicitly excludes workspace members, which is exactly where the hot code lives here.

@@ -1,16 +1,16 @@
-//! **#1011 slice 3c — a Rust guest drives a §14 spawn.** The nim-compiler driver's endgame is to move
-//! phase orchestration *into* the sandbox: a Rust-on-Temen guest that spawns each nimony phase child
-//! over a shared `fs`, instead of the native exec cap. This is the enabling first light: the on-ramp
-//! lowers `__vm_instantiate_rec`/`__vm_join` (§14 Instantiator ops 17 and 1) to a `call.cap` on a
-//! name-resolved handle, so a real Rust guest — not a hand-written shell — can issue the spawn, through
-//! the one guest-side helper every driver guest shares (`support/guest_vm_spawn.rs`: an op-17 v1
-//! record, the child in a window of its own). The C precedent is `temen/tests/c_shell_exec.rs`.
+//! **A Rust guest drives a §14 spawn.** The on-ramp lowers `__vm_instantiate_rec`/`__vm_join` (§14
+//! Instantiator ops 17 and 1) to a `call.cap` on a name-resolved handle, so a real Rust guest — not a
+//! hand-written shell — can issue the spawn, through the guest-side helper `support/guest_vm_spawn.rs`
+//! (an op-17 v1 record, the child in a window of its own). The C precedent is
+//! `temen/tests/c_shell_exec.rs`. This was first light for the nim driver guest of #1011 slice 3c,
+//! which nimony's own driver has since replaced.
 //!
 //! The guest resolves the `Instantiator`, the child `Module`, its `Budget` and the shared `fs` by name
 //! (`__vm_cap_resolve`) and spawns the child with `{"fs"}` re-granted, then joins it. The child (a
 //! separate module) resolves `fs` by name and calls it — a granted counter returning `1`. So a correct
 //! run returns `1` and the shared counter ticks once. Window confinement (§2) is untouched: the `fs`
-//! grant is authority (§3), a cross-tier `call.cap`, not a window access.
+//! grant is authority (§3), a cross-tier `call.cap`, not a window access. A second guest spawns twice
+//! from one budget, each child with an argv payload the guest built.
 //!
 //! Gated to Linux + a present `rustc` (like the other on-ramp guest tests); skips cleanly otherwise.
 
@@ -75,6 +75,66 @@ pub extern "C" fn run() -> i64 {
 }
 "##;
 
+// A child that reads its spawn-time args payload: `{argc, envc}` at `module_args_base()` (16512),
+// then the NUL-terminated strings from 16520. It returns `argc * 1000 + argv[0][0]`.
+const ARGV_CHILD: &str = r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vbase = i64.const 16512
+  vargc = i64.load32_u vbase
+  vs = i64.const 16520
+  vb = i64.load8_u vs
+  vk = i64.const 1000
+  vm = i64.mul vargc vk
+  vr = i64.add vm vb
+  return vr
+  }
+}
+"#;
+
+// A guest that spawns the argv child twice, one after the other, each with its own argv, and joins
+// each. The budget holds one child window, so the second spawn runs only if the first child's window
+// went back to the budget when it ended.
+const ARGV_GUEST_SRC: &str = r##"
+#![no_std]
+#![allow(internal_features)]
+
+#[panic_handler]
+fn ph(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
+
+extern "C" {
+    fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
+    fn __vm_join(inst: i32, child: i64) -> i64;
+}
+
+#[no_mangle]
+pub extern "C" fn run() -> i64 {
+    unsafe {
+        let inst = __vm_cap_resolve(b"inst".as_ptr(), 4);
+        let child_mod = __vm_cap_resolve(b"child".as_ptr(), 5);
+        let budget = __vm_cap_resolve(b"budget".as_ptr(), 6);
+        if inst < 0 || child_mod < 0 || budget < 0 {
+            return -1;
+        }
+        let first = vm_spawn(inst, budget, child_mod, &[], &[b"a"]);
+        if first < 0 {
+            return first;
+        }
+        let r1 = __vm_join(inst, first);
+        let second = vm_spawn(inst, budget, child_mod, &[], &[b"zz", b"y"]);
+        if second < 0 {
+            return second;
+        }
+        let r2 = __vm_join(inst, second);
+        r1 * 10000 + r2
+    }
+}
+"##;
+
 /// The shared guest-side spawn, appended to every driver guest's source.
 const VM_SPAWN: &str = include_str!("support/guest_vm_spawn.rs");
 
@@ -122,8 +182,8 @@ fn rustc_emit_ll(src_path: &std::path::Path, ll_path: &std::path::Path) -> bool 
         .unwrap_or(false)
 }
 
-fn parse_child() -> temen_ir::Module {
-    let m = temen_text::parse_module(CHILD).expect("parse child");
+fn parse_child(src: &str) -> temen_ir::Module {
+    let m = temen_text::parse_module(src).expect("parse child");
     temen_verify::verify_module(&m).expect("verify child");
     m
 }
@@ -200,19 +260,18 @@ fn run_jit(
     (out, cval)
 }
 
-#[test]
-fn rust_guest_spawns_a_child() {
-    let dir = std::env::temp_dir().join(format!("rust_guest_op13_{}", std::process::id()));
+/// Build a guest (`src` plus the shared spawn) through `rustc` and the on-ramp: `(module, entry of
+/// `run`, its sp, its window)`. `None` if `rustc` is absent or codegen fails.
+fn build_guest(src: &str, tag: &str) -> Option<(temen_ir::Module, u32, i64, u64)> {
+    let dir = std::env::temp_dir().join(format!("rust_guest_op13_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create work dir");
-    let src = dir.join("guest.rs");
+    let src_path = dir.join("guest.rs");
     let ll = dir.join("guest.ll");
-    std::fs::write(&src, format!("{GUEST_SRC}\n{VM_SPAWN}")).expect("write guest source");
-
-    if !rustc_emit_ll(&src, &ll) {
+    std::fs::write(&src_path, format!("{src}\n{VM_SPAWN}")).expect("write guest source");
+    if !rustc_emit_ll(&src_path, &ll) {
         eprintln!("note: skipping (rustc --emit=llvm-ir unavailable or failed)");
-        return;
+        return None;
     }
-
     let t = temen_llvm::translate_ll_path(&ll).expect("temen-llvm translates the Rust guest");
     temen_verify::verify_module(&t.module).expect("the translated guest verifies");
     let entry = t
@@ -223,11 +282,18 @@ fn rust_guest_spawns_a_child() {
         .1;
     let sp = t.entry_sp as i64;
     let win = 1u64 << t.module.memory.expect("guest window").size_log2;
+    Some((t.module, entry, sp, win))
+}
 
-    let child = parse_child();
+#[test]
+fn rust_guest_spawns_a_child() {
+    let Some((guest, entry, sp, win)) = build_guest(GUEST_SRC, "fs") else {
+        return;
+    };
+    let child = parse_child(CHILD);
 
-    let (io, ic) = run_interp(&t.module, entry, sp, &child, win);
-    let (jo, jc) = run_jit(&t.module, entry, sp, &child, win);
+    let (io, ic) = run_interp(&guest, entry, sp, &child, win);
+    let (jo, jc) = run_jit(&guest, entry, sp, &child, win);
 
     assert_eq!(
         io, 1,
@@ -240,4 +306,25 @@ fn rust_guest_spawns_a_child() {
         (1, 1),
         "the re-granted `fs` ran once inside the confined child on each engine"
     );
+}
+
+/// The guest builds each spawn's args payload itself (`vm_spawn`'s argv) and spawns twice from one
+/// budget. Each child reads its own argv: `["a"]` gives `1 * 1000 + 'a'` (1097) and `["zz", "y"]`
+/// gives `2 * 1000 + 'z'` (2122).
+#[test]
+fn rust_guest_spawns_children_with_argv() {
+    let Some((guest, entry, sp, win)) = build_guest(ARGV_GUEST_SRC, "argv") else {
+        return;
+    };
+    let child = parse_child(ARGV_CHILD);
+
+    let (io, _) = run_interp(&guest, entry, sp, &child, win);
+    let (jo, _) = run_jit(&guest, entry, sp, &child, win);
+
+    assert_eq!(
+        io,
+        1097 * 10000 + 2122,
+        "interp: each child read the argv its spawn carried, in spawn order"
+    );
+    assert_eq!(io, jo, "§9 the guest's two spawns agree on both engines");
 }

@@ -801,10 +801,8 @@ jobs:
     # The browser crate's Rust **host** tests (built for the runner, not wasm) run a real compiler
     # phase on the **wasm-JIT** via `wasmi` — playing the browser's JS host — and assert the emitted
     # output is byte-identical to the interpreter oracle: the compiler-tier JIT correctness contract.
-    # These were previously only local/dev gates (no `cargo test` ran them in CI). `nifler_jit` uses the
-    # committed `nifler.temen.gz` and needs no staging; `chibicc_jit`/`jit_module` SKIP fail-soft when
-    # their built assets are absent (those are staged only in the `browser-real` job), so this job gates
-    # the nimony-front-end tier immediately and picks the others up wherever their assets are present.
+    # These were previously only local/dev gates (no `cargo test` ran them in CI). Both run committed
+    # assets (`chibicc.temen`, `hello_c.temen`) and need no staging; a test whose asset is absent SKIPs.
     name: browser wasm-JIT host gates (compiler tier)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -814,9 +812,9 @@ jobs:
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: browser }
-      - name: nifler / chibicc / jit_module on the wasm-JIT (differential)
+      - name: chibicc / jit_module on the wasm-JIT (differential)
         working-directory: browser
-        run: cargo test --test nifler_jit --test chibicc_jit --test jit_module -- --test-threads=1 --nocapture
+        run: cargo test --test chibicc_jit --test jit_module -- --test-threads=1 --nocapture
 
   browser-host-guests:
     # The browser crate is its OWN cargo workspace, so the gating `check` job's
@@ -1273,7 +1271,7 @@ jobs:
         with: { path: _site }
 
   # The nim card battery and the op-13 loop, split out of `browser-real`, whose critical path they used
-  # to be. Every script here needs only the *committed* `web/assets` (`nimony.blob`, `nifler`) plus the
+  # to be. Every script here needs only the *committed* `web/assets` (`nimony.blob`) plus the
   # threads wasm module. So this job *drops* the LLVM install and the Postgres / bash / chibicc /
   # self-host staging rather than duplicating them — sharding here removes work instead of copying it.
   #
@@ -1320,7 +1318,7 @@ jobs:
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
-      - name: shard a — op-13 loop · nifler
+      - name: shard a — op-13 loop
         if: matrix.shard == 'a'
         working-directory: browser
         run: |
@@ -1330,13 +1328,6 @@ jobs:
           # driver joins it. The browser realization of `plan::drive_op13` with the child tiered up. No
           # assets (parses in-page); reuses the threads module built above.
           node browser-op13jit-e2e-test.mjs
-          # The nifler card on the wasm-JIT vs the interpreter, the `.p.nif` both write byte-compared.
-          # This is the V8 home of a differential that used to live in `tests/nifler_jit.rs` on wasmi —
-          # the rebuilt nifler asset carries enough front-end growth that one function now exceeds
-          # wasmi's per-function register budget, so wasmi refuses the module outright while V8 runs it
-          # fine (the same split already ignores Lua/SQLite in `jit_module.rs`). The Rust test is
-          # `#[ignore]`d pointing here; without this line the coverage would simply be gone.
-          node browser-nifler-jit-test.mjs
       - name: shard b — nim card · worker reuse · prewarm gate
         if: matrix.shard == 'b'
         working-directory: browser

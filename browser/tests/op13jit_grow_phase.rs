@@ -269,7 +269,6 @@ fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
             false,
             host,
             Vec::new(),
-            None,
             cinst as u64,
             cas as u64,
             None,

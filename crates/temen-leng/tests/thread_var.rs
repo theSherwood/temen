@@ -4,8 +4,8 @@
 //! real `system` module are thread-vars). temen-leng lowers a `tvar` **identically to a `gvar`**: one
 //! plain, zero-initialized global at a fixed window offset. This is sound because every guest we
 //! target — each nimony compiler phase, each temen domain — runs single-threaded, so a thread-local has
-//! exactly one instance and a plain global *is* that instance. It mirrors the C on-ramp, which strips
-//! `__thread` before clang (`demos/nimony/build_nimony.sh`). These tests pin that model: a `tvar`
+//! exactly one instance and a plain global *is* that instance. It mirrors the retired C on-ramp path,
+//! which stripped `__thread` before clang (NIM.md §3d). These tests pin that model: a `tvar`
 //! must behave as a persistent global — writes survive across calls, non-zero initializers seed it,
 //! and it links across modules the same as a `gvar` — on both engines. The real multi-threaded
 //! `__thread` lowering over `vcpu.tls` (NIM.md §3d Tier 2) is implemented behind `tls_mode` and

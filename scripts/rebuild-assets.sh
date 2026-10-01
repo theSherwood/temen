@@ -2,16 +2,14 @@
 # Rebuild **every committed `.temen` playground/self-host asset** in one pass — the single entry point
 # for the "a wire-format / encoder / IR change invalidated the prebuilt binary assets" chore (which
 # recurs on every such change: the committed modules decode as `BadOpcode` under the new format and
-# their asset-gate tests — leng_selfhost_asset, nifler_asset, nim_hello_asset, and the real-browser
-# play cards — go red until regenerated).
+# their asset-gate tests — leng_selfhost_asset, nim_hello_asset, browser/tests/nimony.rs, and the
+# real-browser play cards — go red until regenerated).
 #
 # This orchestrates the existing per-asset builders (it does NOT reimplement them) and, crucially,
 # wires up the toolchain env each one expects — the tribal knowledge that otherwise gets rediscovered
-# by hand every time:
-#   * the Nim toolchain whose `../lib/nimbase.h` the nifler C backend needs (the `nim` shim on PATH
-#     usually has no adjacent lib dir — point at the real choosenim toolchain),
-#   * NIFLER_BIN / NIMONY_BIN / NIM_BIN for the nimony pipeline (what scripts/ci/provision-nimony.sh
-#     exports), reusing the vendored `nimony/bin/{nifler,nimony}` when present.
+# by hand every time: NIMONY_BIN / NIM_BIN for the nimony steps (what scripts/ci/provision-nimony.sh
+# exports), reusing the vendored `nimony/bin` when present and a real Nim toolchain dir over a bare
+# `nim` shim.
 #
 # Every step is **fail-soft**: a missing toolchain SKIPs that asset (matching each builder's own
 # contract) so a partial environment still rebuilds what it can. Each rebuilt module is re-validated
@@ -19,12 +17,13 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nifler nim_hello
-#           nim_driver_guest nim_card nim_link lua_snapshot
+#   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nim_hello nim_card
+#           lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
-# in-tree chibicc; nifler & nim_hello need the nimony toolchain (Nim + nimony/bin) — see NIM.md §2.
+# in-tree chibicc; nim_hello & nim_card need the nimony toolchain (Nim + nimony/bin, as
+# scripts/ci/provision-nimony.sh builds it).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -35,10 +34,8 @@ want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 declare -a RESULTS=()
 note() { RESULTS+=("$1"); echo "  >> $1"; }
 
-# --- toolchain env: the setup each nimony builder assumes (see the header) ---------------------------
-# Prefer a real Nim toolchain dir (adjacent ../lib/nimbase.h) over a bare `nim` shim. `.nimtool/` is
-# the repo-local toolchain dir the nim demos already key off (`demos/nim_e2e_chain`,
-# `demos/nifler_temen`); a checkout whose Nim lives only there had every nimony asset SKIP silently.
+# --- toolchain env: the setup each nimony step assumes (see the header) ------------------------------
+# Prefer a real Nim toolchain dir (its `lib/` beside `bin/`) over a bare `nim` shim.
 pick_nim() {
   local c
   for c in \
@@ -57,19 +54,9 @@ if [ -n "$NIM_EXE" ]; then
   export PATH="$(dirname "$NIM_EXE"):$PATH"
   export NIM_BIN="$(dirname "$NIM_EXE")"
 fi
-if [ -x "$REPO/nimony/bin/nifler" ]; then
+if [ -x "$REPO/nimony/bin/nimony" ]; then
   export PATH="$REPO/nimony/bin:$PATH"
-  export NIFLER_BIN="$REPO/nimony/bin/nifler"
   export NIMONY_BIN="$REPO/nimony/bin"
-  export NIMONY_TOOLCHAIN_BIN="$REPO/nimony/bin" # the chain builders find nimony's `lib/` beside it
-  [ -x "$REPO/nimony/bin/hexer" ] && export HEXER_BIN="$REPO/nimony/bin/hexer"
-fi
-# The nim C backend #include's `nimbase.h` from the Nim lib. build_e2e_chain.sh falls back to
-# `.nimtool/nim-src/lib` when `nim dump` doesn't print the lib path (some toolchains don't) — point
-# that at the picked Nim's lib so the fallback resolves.
-if [ -n "${NIM_BIN:-}" ] && [ -f "$NIM_BIN/../lib/nimbase.h" ] && [ ! -f "$REPO/.nimtool/nim-src/lib/nimbase.h" ]; then
-  mkdir -p "$REPO/.nimtool/nim-src"
-  ln -sfn "$NIM_BIN/../lib" "$REPO/.nimtool/nim-src/lib"
 fi
 
 # --- shared build products --------------------------------------------------------------------------
@@ -185,22 +172,7 @@ if want uxn; then
   fi
 fi
 
-# --- 5) nifler.temen.gz (nimony pipeline; TEMEN_NIFLER_EMIT_ASSET gzips it + the expected fixtures) --
-if want nifler; then
-  echo "=== [nifler] crates/temen-run/demos/nifler_temen/build_nifler_temen.sh (EMIT_ASSET=1) ==="
-  if TEMEN_NIFLER_EMIT_ASSET=1 bash crates/temen-run/demos/nifler_temen/build_nifler_temen.sh; then
-    if gunzip -c browser/web/assets/nifler.temen.gz > /tmp/rebuild_nifler.temen 2>/dev/null \
-       && validate /tmp/rebuild_nifler.temen; then
-      note "nifler ✓ (nifler.temen.gz + expected/*.p.nif)"
-    else
-      note "nifler SKIP (toolchain absent — script SKIPs without rebuilding)"
-    fi
-  else
-    note "nifler ✗ (nim + nimony/bin/nifler + clang/llvm-nm?)"
-  fi
-fi
-
-# --- 6) nim_hello.temen (nimony → temen-leng powerbox bridge) ----------------------------------------
+# --- 5) nim_hello.temen (nimony → temen-leng powerbox bridge) ----------------------------------------
 if want nim_hello; then
   echo "=== [nim_hello] build_nim_hello_temen example ==="
   if cargo run --release -p temen-run --example build_nim_hello_temen -- \
@@ -212,22 +184,7 @@ if want nim_hello; then
   fi
 fi
 
-# --- 6c) nimsem driver-guest fixtures (crates/temen-llvm/tests/rust_driver_nimsem.rs): the step-9 guest
-# op-13-spawns child-entry nimsem over the system import closure. build_frontend.sh (TEMEN_NIMSEM_EMIT_
-# ASSET=1) rebuilds nimsem_ce.temen.gz + syslib.tar.gz + sysvq0asl.{p,s}.nif together. Toolchain-gated. -
-if want nim_driver_guest; then
-  echo "=== [nim_driver_guest] build_frontend.sh (emit) → nimsem_ce + syslib + sys.{p,s}.nif fixtures ==="
-  FX=crates/temen-run/demos/nim_frontend/fixtures
-  if TEMEN_NIMSEM_EMIT_ASSET=1 bash crates/temen-run/demos/nim_frontend/build_frontend.sh >/dev/null 2>&1 \
-     && [ -f "$FX/nimsem_ce.temen.gz" ] && gunzip -c "$FX/nimsem_ce.temen.gz" > /tmp/rebuild_nimsem_ce.temen 2>/dev/null \
-     && validate /tmp/rebuild_nimsem_ce.temen; then
-    note "nim_driver_guest ✓ (nimsem_ce.temen.gz + syslib.tar.gz + sysvq0asl.{p,s}.nif)"
-  else
-    note "nim_driver_guest SKIP/✗ (nimony toolchain — see build_frontend.sh; then refresh the expected via the test)"
-  fi
-fi
-
-# --- 6c') nimony.blob.gz (the nim card's toolchain, #958): nimony's own tools, each built by nimony with
+# --- 6) nimony.blob.gz (the nim card's toolchain, #958): nimony's own tools, each built by nimony with
 # no C compiler (scripts/nim-toolchain.sh — the self-hosted lane's), with nimony's library and that
 # library prebuilt. `nimbuild --bundle` builds the program below with them at `/nim`, where the card
 # builds, and writes what it ran with plus the library pack the build left. Nothing in the blob is
@@ -256,42 +213,6 @@ NIM
     note "nim_card SKIP/✗ (nimony toolchain — NIMONY_BIN/NIM_BIN; see scripts/nim-toolchain.sh)"
   fi
   rm -rf "$T"
-fi
-
-# --- 6d) the in-guest linkers (nim-link.temen.gz + nim-link-fs.temen.gz): `temen_leng::link_nim_powerbox`
-# compiled to Temen, so they go stale on ANY change to temen-leng's link — its window layout included —
-# whatever the wire format does. Their own step, so a linker change rebuilds just them (they share no
-# build with the nimony frontend fixtures above). Toolchain: rustc + rust-src + llvm-link/opt of
-# rustc's LLVM major (see the summary note). ----------------------------------------------------------
-if want nim_link; then
-  echo "=== [nim_link] build_nim_link.sh + build_nim_link_fs.sh → nim-link(-fs).temen.gz ==="
-  FX=crates/temen-run/demos/nim_frontend/fixtures
-  # The nim->powerbox link guest (link-in-guest) — the build-std pipeline of the leng step (default
-  # rustc + rust-src + llvm-link/opt of rustc's LLVM major); no nimony toolchain. Gzips
-  # fixtures/nim-link.temen.gz itself.
-  if bash crates/temen-run/demos/nim_frontend/build_nim_link.sh >/dev/null 2>&1 \
-     && gunzip -c "$FX/nim-link.temen.gz" > /tmp/rebuild_nim_link.temen 2>/dev/null \
-     && validate /tmp/rebuild_nim_link.temen; then
-    note "nim_link ✓ (nim-link.temen.gz)"
-  else
-    note "nim_link SKIP/✗ (rustc + rust-src + llvm-link/opt of rustc\'s LLVM major — see below)"
-  fi
-  # Its **memfs-I/O twin** (`nim-link-fs.temen.gz`): the same `link_nim_powerbox`, but reading its
-  # inputs from and writing its output to the shared memfs instead of stdin/stdout. Same build-std
-  # pipeline, same gate shape (`nim_link_fs_asset`), so it is rebuilt here beside `nim_link` — it is
-  # coupled to exactly the same leng changes, and leaving it out of this script meant a leng change
-  # silently left it stale while its byte-identical gate went red.
-  # NOT `validate`d here: that runs `prep_temen`, which asserts a module declaring imports is a named
-  # **powerbox entry** — and this one is `--child-entry`, so func 0 is the child ABI and the assert
-  # legitimately fires. Its gate is the op-13 test (`tests/nim_link_fs_asset.rs`), exactly as the
-  # builder's own last line says. Decode is still checked, so a truncated gzip cannot pass silently.
-  if bash crates/temen-run/demos/nim_frontend/build_nim_link_fs.sh >/dev/null 2>&1 \
-     && gunzip -c "$FX/nim-link-fs.temen.gz" > /tmp/rebuild_nim_link_fs.temen 2>/dev/null \
-     && [ -s /tmp/rebuild_nim_link_fs.temen ]; then
-    note "nim_link_fs ✓ (nim-link-fs.temen.gz — gated by tests/nim_link_fs_asset.rs)"
-  else
-    note "nim_link_fs SKIP/✗ (rustc + rust-src + llvm-link/opt — see build_nim_link_fs.sh)"
-  fi
 fi
 
 # --- 7) lua_snapshot.temen (Lua 5.4.7 core+libs + the two-phase snapshot harness → translate) -------
@@ -337,16 +258,16 @@ for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo
 # A SKIP here is easy to read as "not applicable" when it actually means "this asset is now STALE and
 # nothing regenerated it" — which is silent until CI fails on a byte-comparison gate. That happened
-# on the v0.6.2 bump with `nim_link`/`nim_link_fs` (the in-guest linker IS temen-leng, so it goes
-# stale whenever the linker changes, wire format or not). Call the skipped steps out again,
-# separately, with what unblocks each.
+# on the v0.6.2 bump with the in-guest linker assets, which embedded temen-leng and so went stale
+# whenever the linker changed, wire format or not. Call the skipped steps out again, separately, with
+# what unblocks each.
 SKIPPED=()
 for r in "${RESULTS[@]}"; do case "$r" in *SKIP*|*✗*) SKIPPED+=("$r");; esac; done
 if [ "${#SKIPPED[@]}" -gt 0 ]; then
   echo "!!! ${#SKIPPED[@]} step(s) did NOT regenerate — each may now be STALE:"
   for r in "${SKIPPED[@]}"; do echo "    $r"; done
   echo
-  echo "    These are not advisory. An asset that embeds compiled code (the nim-link guests embed"
+  echo "    These are not advisory. An asset that embeds compiled code (temen-leng.temen embeds"
   echo "    temen-leng) goes stale on any change to what it embeds, and the gate that catches it is a"
   echo "    byte-comparison in CI, not here."
   echo "    The LLVM steps need the LLVM whose major matches rustc's on PATH"

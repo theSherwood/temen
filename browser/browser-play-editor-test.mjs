@@ -247,33 +247,6 @@ try {
     ? ok('temen-leng interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
     : fail(`temen-leng parity: ${JSON.stringify(lengP)}`);
 
-  // The nifler front-end card (NIM.md §3c/§3e slice 4, "compile Nim in the browser"): its editor holds
-  // a small Nim program, and running it inflates the committed `nifler.temen.gz` (the first real nimony
-  // phase, always present) and parses that Nim to nimony's NIF — the front edge of the toolchain, run
-  // client-side on the Temen. Assert the editor holds Nim and the run emits a parsed `.p.nif`.
-  const niflerCard = 'nifler: parse real Nim → NIF (nimony front-end, in your browser)';
-  const niflerSrc = await page.evaluate(
-    (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
-    card(niflerCard),
-  );
-  niflerSrc.includes('proc fib') && niflerSrc.includes('echo')
-    ? ok('nifler card → editor holds a Nim program')
-    : fail(`nifler editor: ${niflerSrc.slice(0, 80)}`);
-  await runCard(page, niflerCard, 40_000);
-  const nifler = await page.evaluate((sel) => ({
-    state: document.querySelector(`${sel} .state`).dataset.state,
-    msg: document.querySelector(`${sel} .state`).textContent,
-    result: document.querySelector(`${sel} .result`).textContent.trim(),
-    stdout: document.querySelector(`${sel} .stdout`).textContent,
-  }), card(niflerCard));
-  // #1011 slice 1: nifler now runs the parse on the **wasm-JIT** first (the `.state` message reports
-  // `(wasm-JIT)`, so a silent interpreter fallback would fail here — the parse is the emitted-wasm run).
-  nifler.state === 'done' && nifler.result.endsWith('B') &&
-    nifler.stdout.includes('(.nif') && nifler.stdout.includes('(proc fib') &&
-    nifler.msg.includes('wasm-JIT')
-    ? ok('nifler front-end card: real Nim → parsed NIF in-browser (Nim parsed on the Temen, wasm-JIT)')
-    : fail(`nifler run: state=${nifler.state} msg=${nifler.msg} result=${nifler.result} stdout=${nifler.stdout.slice(0, 100)}`);
-
   // The whole-program nim compiler card (#958, #763): nimony's own driver, `nimony t -r --isMain
   // prog.nim`, over the committed toolchain (`nimony.blob.gz`: every tool built by nimony with no C
   // compiler, nimony's library and that library prebuilt) builds the editor's program **client-side**

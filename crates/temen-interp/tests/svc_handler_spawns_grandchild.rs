@@ -8,8 +8,8 @@
 //! enqueues one dispatch onto the servicer's inbound queue (the embedder-enqueue path proven in
 //! `svc_serve_loop.rs`), the servicer `svc.poll`s, and its **handler op-5-spawns a toy grandchild and
 //! joins it**, returning the grandchild's status. The caller-parking layer (a child *calls* the
-//! offer, re-granted a self-offer over the driver's export) is increment 2; a real nifler grandchild
-//! over a shared memfs is increment 3.
+//! offer, re-granted a self-offer over the driver's export) is increment 2. Increment 3 put a real
+//! nifler grandchild over a shared memfs; it went with the LLVM-route nifler (#2028).
 //!
 //! Because the module both serves (`svc.poll`, `has_svc`) and instantiates (`has_instantiate`), the
 //! §9 serve-qualification veto (`svc_park_veto`) folds it to the tree-walk oracle — exactly right:
@@ -102,8 +102,7 @@ fn module(src: &str) -> Arc<temen_ir::Module> {
 ///
 /// Composite return: `join(C) * 1000 + join(S)` = 99*1000 + 1 (S served exactly one) = 99001. This is
 /// the full guest-serves-via-grandchild shape (toy grandchild): nimsem(C) calls exec(the re-granted
-/// offer), the driver(S) services it by spawning nifler(the grandchild). Increment 3 swaps the toy
-/// grandchild for a real nifler_ce over a shared memfs.
+/// offer), the driver(S) services it by spawning nifler(the grandchild).
 const SIBLING_DRIVEN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)

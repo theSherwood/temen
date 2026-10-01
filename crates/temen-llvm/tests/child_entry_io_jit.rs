@@ -2,9 +2,9 @@
 //! child-entry `write("hi")` guest binds its `write` import to a re-granted `stdout` on the cooperative
 //! engine; `child_entry_io_resumable` does it on the resumable engine. This is the **JIT** case — the
 //! smallest real phase child (one `Stream` manifest import, no `malloc`, no `fs`), spawned by
-//! `temen_run::conductor` and run through the granted-spawn hooks — isolating the `call.import`-in-a-JIT-child dispatch that the full `nifler`
-//! child (`nifler_child_jit`) trips a `CapFault` on. If this passes, nifler's fault is `malloc`/`fs`;
-//! if it faults, the Stream import dispatch is the culprit. Gated to Linux + `rustc`.
+//! `temen_run::conductor` and run through the granted-spawn hooks — isolating the
+//! `call.import`-in-a-JIT-child dispatch that the full `nifler` child of the since-retired LLVM route
+//! tripped a `CapFault` on. Gated to Linux + `rustc`.
 
 #![cfg(target_os = "linux")]
 

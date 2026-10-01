@@ -822,8 +822,8 @@ impl Translator {
                 // one plain, zero-initialized global at a fixed window offset. This is the committed
                 // **single-threaded** TLS model (NIM.md §3d) — every guest we target (each nimony
                 // compiler phase; each temen domain) runs single-threaded, so a thread-local has exactly
-                // one instance and a plain global *is* that instance. It mirrors the C on-ramp, which
-                // strips `__thread` before clang (`demos/nimony/build_nimony.sh`). A genuinely
+                // one instance and a plain global *is* that instance. It mirrors the retired C on-ramp
+                // path, which stripped `__thread` before clang (NIM.md §3d). A genuinely
                 // multi-threaded Nim guest instead uses the real per-CPU-block scheme over `vcpu.tls`
                 // (NIM.md §3d Tier 2) — implemented behind `tls_mode` in the branch just below; this
                 // default Tier-1 collapse applies when TLS mode is off, sound only single-threaded.
