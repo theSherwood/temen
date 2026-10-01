@@ -487,12 +487,13 @@ fn main() {
     );
     // The driver quits with `FAILURE: <cmd>` on any failed step; that is an ordinary exit, so ask
     // the memfs what was built: `nimcache/<main>.temen/<prog>.temen`, `<main>` named by the path
-    // the driver was given, as it names a main module ([`temen_run::nim_module_suffix`]).
+    // the driver was given, as it names a main module ([`temen_run::nim_module_suffix`]). The driver
+    // runs at the root of a nimony tree (its `bin/` and `lib/`), so the tree's search paths apply.
     let out_name = Path::new(&prog_name)
         .with_extension("temen")
         .to_string_lossy()
         .into_owned();
-    let main_stem = temen_run::nim_module_suffix(prog, &[]);
+    let main_stem = temen_run::nim_module_suffix(prog, &temen_run::NIMONY_TREE_PATHS);
     let linked = posix.read_file(&format!("{cache}{main_stem}.temen/{out_name}"));
     dump_cache(&posix, &cache, dump);
     let (Ok(()), Some(linked)) = (&outcome, linked) else {

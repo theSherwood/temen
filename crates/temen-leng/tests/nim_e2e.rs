@@ -2751,7 +2751,7 @@ fn nim_forks_and_execs_a_nim_program() {
         "import std/syncio\nimport std/posix/posix\n\
          var path = \"/bin/child\"\n\
          var arg1 = \"hi\"\n\
-         let argv = cast[ptr UncheckedArray[cstring]](alloc0(3 * sizeof(cstring)))\n\
+         let argv = cast[ptr UncheckedArray[nil cstring]](alloc0(3 * sizeof(cstring)))\n\
          argv[0] = path.toCString\n\
          argv[1] = arg1.toCString\n\
          argv[2] = nil.cstring\n\
