@@ -3632,9 +3632,10 @@ outcome at once — the oracle's rule: a child domain ends on a member's trap or
 root's return — and the task *retires*, keeping its window and powerbox until its last vCPU ends; run
 teardown poisons a retiring task as it poisons a parked one. A durable task's vCPUs run under its
 freeze word (#2010): each reserves a shadow context in the child's window, so a freeze unwinds each
-into its own region, as the run's root's vCPUs unwind. A root that unwound for a freeze has no
-outcome to publish, so its task retires without one, and the capture is taken once its last vCPU has
-unwound too (DURABILITY.md §4). Pins:
+into its own region, as the run's root's vCPUs unwind. Its fiber runtime is armed over that window
+too, and its capture flattens its fibers as a run's root's are (#2031). A root that unwound for a
+freeze has no outcome to publish, so its task retires without one, and the capture is taken once its
+last vCPU has unwound too (DURABILITY.md §4). Pins:
 `temen-run/tests/jit_child_fibers.rs`, `jit_child_threads.rs`, and the Forth `sandbox` on all three
 tiers (`forth_sandbox.rs`).
 

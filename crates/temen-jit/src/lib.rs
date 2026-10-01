@@ -1930,13 +1930,10 @@ pub struct DetachedHarvest {
 pub struct DetachedCapture {
     /// Its window image.
     pub image: Vec<u8>,
-    /// #2010 — its root's extent: context 0's shadow-SP.
-    pub root_sp: u64,
-    /// #2010 — the `thread.spawn` vCPUs it hosted: each that unwound, and each that finished
-    /// unjoined, which its root's re-issued join is owed.
-    pub vcpus: Vec<FrozenVCpu>,
-    /// #2010 — the fibers those vCPUs flattened as they unwound.
-    pub fibers: Vec<FrozenFiber>,
+    /// What a run's root leaves beside its image, less nested children (a detached child spawns
+    /// none): its fibers (#2031), its `thread.spawn` vCPUs, including each that finished unjoined,
+    /// which its root's re-issued join is owed (#2010), and its root's extent.
+    pub residue: DurableResidue,
 }
 
 /// #1361 step 4 — a captured detached child a JIT **thaw** re-launches (see
@@ -1962,9 +1959,10 @@ pub struct DetachedSeed {
     pub window: Option<(i32, u64)>,
     /// #2010 — its own captured children, re-launched into its nursery before it runs.
     pub children: Vec<DetachedSeed>,
-    /// #2010 — its `thread.spawn` vCPUs and its root's extent, re-spawned into its domain, each
-    /// rewinding from its own, before its root runs. `None` when it hosted none.
-    pub threads: Option<(Vec<FrozenVCpu>, u64)>,
+    /// Its [`DetachedCapture::residue`], re-created before its root runs: its fibers re-seeded in its
+    /// table (#2031), and its `thread.spawn` vCPUs re-spawned into its domain, each rewinding from its
+    /// own extent (#2010).
+    pub residue: DurableResidue,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →

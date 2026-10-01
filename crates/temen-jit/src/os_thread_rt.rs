@@ -812,7 +812,7 @@ impl Domain {
 
     /// The module-declared shadow arena this domain places its contexts in (`EMPTY` when the module
     /// declared none — then nothing durable can be placed and a durable run is refused upstream).
-    fn shadow(&self) -> temen_ir::durable_abi::ShadowArena {
+    pub(crate) fn shadow(&self) -> temen_ir::durable_abi::ShadowArena {
         self.fiber_table()
             .map_or(temen_ir::durable_abi::ShadowArena::EMPTY, |t| t.shadow)
     }

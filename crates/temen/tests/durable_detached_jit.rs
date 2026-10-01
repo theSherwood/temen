@@ -419,6 +419,96 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
+/// #2031 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place whose root holds a parked fiber when
+/// the freeze lands. The fiber suspends 5; the root waits a second on a futex nothing notifies, then
+/// resumes it, and it returns 2. Beside it runs a thread that waits as long and returns 0, which the
+/// root joins, so [`NEST_ROOT`] sees two live vCPUs. The root returns 100 more than the three.
+const FIBER_NEST: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  vf = ref.func 1
+  vsp = i64.const 100000
+  vk = cont.new vf vsp
+  vs, vx = cont.resume vk vz
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vs2, vx2 = cont.resume vk vz
+  vj = thread.join vt
+  vhundred = i64.const 100
+  vr0 = i64.add vx vx2
+  vr1 = i64.add vr0 vj
+  vr = i64.add vr1 vhundred
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vfive = i64.const 5
+  vy = suspend vfive
+  vtwo = i64.const 2
+  return vtwo
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  va = i64.const 66004
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vr = i64.const 0
+  return vr
+  }
+}
+";
+
+/// #2031 — [`FIBER_NEST`] without the thread: the child's root is its only vCPU, so nothing but its
+/// own capture can flatten the fiber. A first fiber, made before it, runs to its end, so the freeze
+/// finds slot 0 free below the parked fiber in slot 1. A thaw that rebuilt only the parked one would
+/// seed it at slot 0, where the root's handle to it does not resolve (#1684).
+const FIBER_ONLY_NEST: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vfa = ref.func 2
+  vspa = i64.const 90000
+  vka = cont.new vfa vspa
+  vf = ref.func 1
+  vsp = i64.const 100000
+  vk = cont.new vf vsp
+  vsa, vxa = cont.resume vka vz
+  vs, vx = cont.resume vk vz
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vs2, vx2 = cont.resume vk vz
+  vhundred = i64.const 100
+  vr0 = i64.add vx vx2
+  vr1 = i64.add vr0 vxa
+  vr = i64.add vr1 vhundred
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vfive = i64.const 5
+  vy = suspend vfive
+  vtwo = i64.const 2
+  return vtwo
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vr = i64.const 0
+  return vr
+  }
+}
+";
+
 /// [`NEST_ROOT`] and the `child` it spawns ([`NEST`] or [`THREAD_NEST`]), instrumented. Both touch
 /// memory, so they take the confined transform.
 fn nest_modules(child: &str) -> (temen_ir::Module, temen_ir::Module) {
@@ -505,6 +595,21 @@ fn carried_threads(host: &Host) -> Vec<usize> {
                 .iter()
                 .filter(|v| v.completed_result.is_none())
                 .count()
+        })
+        .collect()
+}
+
+/// For each captured child, how many fibers its own artifact carries, each as it parked.
+fn carried_fibers(host: &Host) -> Vec<usize> {
+    assert!(
+        host.unreached_detached().is_empty(),
+        "a child never reached its poll"
+    );
+    host.captured_detached()
+        .iter()
+        .map(|c| {
+            let h = c.host.lock().unwrap_or_else(|e| e.into_inner());
+            h.frozen_fibers().iter().filter(|f| !f.is_free()).count()
         })
         .collect()
 }
@@ -650,9 +755,10 @@ fn a_controller_freeze_reaches_a_childs_thread_through_the_joins_on_the_jit() {
     });
 }
 
-/// The embedder's [`temen_jit::FreezeController`] freezes [`NEST_ROOT`] over `child` on the JIT,
-/// while the root and the child are parked in their joins; `check` checks what the freeze carried,
-/// and every engine's thaw must answer [`NEST_TOTAL`].
+/// The embedder's [`temen_jit::FreezeController`] freezes [`NEST_ROOT`] over `child` on the JIT, 200
+/// ms in, while the child waits out its second: the root is parked joining it, or still polling it
+/// (a child with no thread never shows [`NEST_ROOT`] two live vCPUs). `check` checks what the freeze
+/// carried, and every engine's thaw must answer [`NEST_TOTAL`].
 fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
     let (root, child) = nest_modules(child);
     let (mut fhost, args) = nest_powerbox(&child, 0);
@@ -739,4 +845,29 @@ fn a_jit_thaw_refuses_a_captured_childs_residue_it_cannot_recreate() {
 #[test]
 fn a_durable_childs_thread_rides_its_freeze_on_every_engine() {
     rides_every_engine(THREAD_NEST, carried_threads, &[1]);
+}
+
+/// #2031 — **a durable detached child's parked fiber rides its freeze**, on every engine. The freeze
+/// lands while the child's root is parked on its futex with the fiber suspended, and its thread
+/// parked beside it. On the JIT the thread flattens the fiber as it unwinds, since a vCPU's flattening
+/// walks its domain's whole table, so the fiber's record must say that the root already took its 5.
+/// Recorded as unconsumed, a thaw re-delivers that 5 to the root's next resume, which then answers
+/// 110. Every engine thaws every engine's artifact to the uninterrupted [`NEST_TOTAL`].
+#[test]
+fn a_durable_childs_fiber_rides_its_freeze_on_every_engine() {
+    rides_every_engine(FIBER_NEST, carried_fibers, &[1]);
+}
+
+/// #2031 — **the same, for a child with no vCPU but its root.** No thread unwinds to flatten the
+/// fiber, so the child's own capture flattens it, as a run's root's does, before the image is taken.
+/// The embedder's controller lands the freeze while the child waits and the root polls it.
+#[test]
+fn a_controller_freeze_flattens_a_childs_own_fiber_on_the_jit() {
+    controller_freeze(FIBER_ONLY_NEST, |host| {
+        assert_eq!(
+            carried_fibers(host),
+            vec![1],
+            "the freeze must carry the child, and its fiber in the child's artifact"
+        );
+    });
 }

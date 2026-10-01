@@ -231,9 +231,9 @@ unsafe fn file_task(
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     // #2010 — the nursery `code` was compiled against, if the child spawns (see [`Child::kid`]).
     kid: Option<std::sync::Arc<Nursery>>,
-    // #2010 — a thawed durable child's `thread.spawn` vCPUs and its root's extent (see
-    // [`crate::child_exec::ChildTask::thaw`]).
-    threads: Option<(Vec<crate::FrozenVCpu>, u64)>,
+    // #2010 — what a thawed durable child's capture left beside its image (see
+    // [`crate::child_exec::ChildTask::thaw`]); empty for a fresh spawn.
+    thaw: crate::DurableResidue,
 ) -> Filed {
     let futex_sched = rt.futex_sched;
     // #1586 — reserve a §15 live-vCPU slot before filing, so a parent cannot hold more concurrency
@@ -300,7 +300,7 @@ unsafe fn file_task(
         }
     };
     drop(children);
-    task.thaw = threads;
+    task.thaw = thaw;
     rt.child_exec.spawn(task);
     Filed::Slot(slot as i32)
 }
@@ -360,7 +360,7 @@ unsafe fn file_carve_task(
         None,
         None,
         None,
-        None,
+        crate::DurableResidue::default(),
     )
 }
 
@@ -1206,7 +1206,7 @@ impl Nursery {
             child: gc,
             window,
             children,
-            threads,
+            residue,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr == 0 {
@@ -1299,7 +1299,7 @@ impl Nursery {
             )),
             node,
             kid,
-            threads,
+            residue,
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -2435,7 +2435,7 @@ unsafe fn spawn_detached_child(
         }),
         node,
         kid,
-        None,
+        crate::DurableResidue::default(),
     );
     match filed {
         Filed::Slot(slot) => {
