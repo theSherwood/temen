@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**353 exports** in 37 families — 298 referenced from JS, 55 referenced by nothing, 10 behind a `cfg`.
+**358 exports** in 37 families — 298 referenced from JS, 60 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -31,7 +31,7 @@
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
-| `release` | 6 | 0 | 0 |
+| `release` | 11 | 0 | 0 |
 | `run` | 21 | 20 | 0 |
 | `run0` | 1 | 1 | 0 |
 | `selfhost` | 2 | 2 | 0 |
@@ -413,10 +413,15 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `release`
 
+- `temen_release_cap_len` — *unreferenced*
+- `temen_release_cap_ptr` — *unreferenced*
 - `temen_release_close` — *unreferenced*
+- `temen_release_deliver_cap` — *unreferenced*
 - `temen_release_fs_image` — *unreferenced*
 - `temen_release_fs_ptr` — *unreferenced*
 - `temen_release_open` — *unreferenced*
+- `temen_release_read` — *unreferenced*
+- `temen_release_read_ptr` — *unreferenced*
 - `temen_release_run` — *unreferenced*
 - `temen_release_value` — *unreferenced*
 

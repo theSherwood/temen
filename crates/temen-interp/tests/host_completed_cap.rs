@@ -9,9 +9,15 @@
 //! asynchronous I/O powerbox. Pinned here: the park/deliver round-trip, byte-parity with the pool
 //! posture (decline-never-diverge, INVARIANTS 9), the sync face's fail-closed decline (it has no
 //! completer — it must not hang), and the §12 "sync ops never pay" pin.
+//!
+//! #1953 carries the posture to the cooperative multiplex driver ([`bytecode::CoopRun`], the engine
+//! behind the browser's release session): a task or fiber parks on the call, the pump surfaces
+//! [`CoopEvent::CapPark`] once nothing else can run, and [`CoopRun::deliver_cap`] resumes it —
+//! pinned below against the same pool-completed twin, unsliced and sliced, on the root, a spawned
+//! thread, and a fiber.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::{self, VcpuEvent};
+use temen_interp::bytecode::{self, CoopEvent, VcpuEvent};
 use temen_interp::{run_with_host, Host, OffloadOutcome, Trap, Value};
 
 /// Two `HOST_PROC` (iface 13) calls on one handle: op 0 with 5, op 1 with 7; the composite
@@ -268,5 +274,201 @@ fn host_completed_declines_on_the_oracle() {
         matches!(r, Err(Trap::CapFault)),
         "the oracle declines a host-completed punt with CapFault, got {r:?}"
     );
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+// --- #1953: the cooperative multiplex driver (`CoopRun`) -----------------------------------------
+
+/// Fuel for the cooperative runs: bounded, so a lost wake is a loud `OutOfFuel`, never a hang.
+const FUEL: u64 = 2_000_000_000;
+
+/// The root spawns a thread that makes the host-completed call (op 1, arg 7) while the root makes
+/// the inline one (op 0, arg 5), then joins it: the same composite, `105 * 1000 + 107`, with the
+/// park on a spawned thread. The thread gets the handle as its argument.
+const THREADED: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  vh64 = i64.extend_i32_u vh
+  vt = thread.spawn 1 vz vh64
+  vfive = i64.const 5
+  vr0 = call.cap 13 0 (i64) -> (i64) vh (vfive)
+  vr1 = thread.join vt
+  vk = i64.const 1000
+  vm = i64.mul vr0 vk
+  vsum = i64.add vm vr1
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vseven = i64.const 7
+  vr = call.cap 13 1 (i64) -> (i64) vh (vseven)
+  return vr
+  }
+}
+"#;
+
+/// The root runs a fiber that makes the host-completed call (op 1, arg 7) and `cont.resume.block`s
+/// it, so the root idles on the parked fiber: status `1` (returned) and value 107 → `10_107`.
+const FIBER: &str = r#"memory 16 shadow 16448 65536
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vf = ref.func 1
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vh64 = i64.extend_i32_u v0
+  vs, vv = cont.resume.block vk vh64
+  vk4 = i64.const 10000
+  vse = i64.extend_i32_s vs
+  va = i64.mul vse vk4
+  vr = i64.add va vv
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vseven = i64.const 7
+  vr = call.cap 13 1 (i64) -> (i64) vh (vseven)
+  return vr
+  }
+}
+"#;
+
+fn parse(src: &str) -> temen_ir::Module {
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+fn coop(m: &temen_ir::Module, host: Host, h: i32) -> bytecode::CoopRun {
+    bytecode::CoopRun::new(m, 0, &[Value::I32(h)], FUEL, host, None)
+        .expect("in subset")
+        .expect("entry in range")
+}
+
+/// Pump a `CoopRun` to the end — unsliced, or in `slice`-op slices — answering every surfaced park
+/// from what the submit hook recorded (`arg + 100`). Returns the results and the parks surfaced.
+fn drive_coop(
+    run: &mut bytecode::CoopRun,
+    recorded: &Recorded,
+    slice: Option<u64>,
+) -> (Vec<Value>, usize) {
+    let mut parks = 0;
+    loop {
+        let ev = match slice {
+            Some(n) => run.run_for(n),
+            None => run.run(),
+        };
+        match ev {
+            CoopEvent::Done(v) => return (v, parks),
+            CoopEvent::Paused => {}
+            CoopEvent::CapPark { id } => {
+                parks += 1;
+                let a = recorded
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(rid, _)| *rid == id)
+                    .map(|(_, a)| *a)
+                    .expect("the submit hook recorded this id before the park surfaced");
+                assert!(
+                    run.deliver_cap(id, a + 100),
+                    "the surfaced id is deliverable"
+                );
+            }
+            CoopEvent::Trapped(t) => panic!("guest trapped: {t:?}"),
+            _ => panic!("unexpected coop event"),
+        }
+    }
+}
+
+/// The cooperative round-trip: the root parks on op 1, the pump surfaces the id the submit hook
+/// recorded, a foreign id is refused, and the delivered value lands in the call's slot.
+#[test]
+fn coop_run_parks_on_a_host_completed_cap_and_resumes() {
+    let m = module();
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let (host, h) = host_completed(&recorded);
+    let comps = host.completions();
+    let mut run = coop(&m, host, h);
+    let id = match run.run() {
+        CoopEvent::CapPark { id } => id,
+        _ => panic!("the host-completed call parks the run"),
+    };
+    assert_eq!(recorded.lock().unwrap().clone(), vec![(id, 7)]);
+    assert!(
+        matches!(run.run(), CoopEvent::CapPark { id: again } if again == id),
+        "pumping while parked surfaces the same call again"
+    );
+    assert!(!run.deliver_cap(id + 1, 0), "a foreign id is refused");
+    assert!(run.deliver_cap(id, 107));
+    assert!(
+        !run.deliver_cap(id, 107),
+        "a delivered call is no longer outstanding"
+    );
+    assert!(matches!(run.run(), CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]));
+    assert_eq!(comps.outstanding(), 0, "the delivered completion settled");
+}
+
+/// **Host-completed ≡ pool-completed on `CoopRun`**, for each shape of parked caller — the root, a
+/// spawned thread, and a fiber idled on by a blocking resume — unsliced and pumped in 1-op slices,
+/// against the pool posture on the same driver and on the tree-walk oracle.
+#[test]
+fn coop_host_completed_matches_pool_completed() {
+    for (name, m, want) in [
+        ("root", module(), WANT),
+        ("thread", parse(THREADED), WANT),
+        ("fiber", parse(FIBER), 10_107),
+    ] {
+        for slice in [None, Some(1)] {
+            let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+            let (host, h) = host_completed(&recorded);
+            let comps = host.completions();
+            let mut run = coop(&m, host, h);
+            let (hosted, parks) = drive_coop(&mut run, &recorded, slice);
+            assert_eq!(hosted, vec![Value::I64(want)], "{name} {slice:?}");
+            assert_eq!(
+                parks, 1,
+                "{name} {slice:?}: exactly the host-completed call parked"
+            );
+            assert_eq!(comps.outstanding(), 0, "{name} {slice:?}");
+        }
+        let (host, h) = pool_completed();
+        let mut run = coop(&m, host, h);
+        let pooled = match run.run() {
+            CoopEvent::Done(r) => r,
+            _ => panic!("{name}: the pool posture never parks the run"),
+        };
+        let (mut host, h) = pool_completed();
+        let mut fuel = FUEL;
+        let oracle = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");
+        host.quiesce_pool();
+        assert_eq!(
+            pooled,
+            vec![Value::I64(want)],
+            "{name}: pool ≡ host on CoopRun"
+        );
+        assert_eq!(
+            oracle,
+            vec![Value::I64(want)],
+            "{name}: ≡ the tree-walk oracle"
+        );
+    }
+}
+
+/// Only an embedder-driven `CoopRun` admits host-completed calls: the native cooperative driver
+/// (the one-shot face with threads) has no one to answer one, so it declines with `CapFault`.
+#[test]
+fn host_completed_declines_on_the_native_coop_driver() {
+    let m = parse(THREADED);
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let (mut host, h) = host_completed(&recorded);
+    let mut fuel = FUEL;
+    let r = bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host)
+        .expect("in subset");
+    assert!(matches!(r, Err(Trap::CapFault)), "declines, got {r:?}");
     assert!(recorded.lock().unwrap().is_empty());
 }

@@ -4471,25 +4471,17 @@ impl<'p> Vcpu<'p> {
             .take()
             .expect("deliver_cap with no pending CapPending");
         let comps = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().completions(),
-            None => self.host.completions(),
-        };
-        let prefix = comps.complete_host(id, value);
-        let r = comps.try_take(id).unwrap_or(value);
-        if let Some((type_id, op, handle, args)) = prefix {
-            let rec = super::CapRecord {
-                type_id,
-                op,
-                handle,
-                args,
-                result: Ok(vec![value]),
-                mem_writes: Vec::new(),
-            };
-            match self.shared_host {
-                Some(m) => m.lock_unpoisoned().tape_cap_record(rec),
-                None => self.host.tape_cap_record(rec),
+            Some(m) => {
+                let mut h = m.lock_unpoisoned();
+                settle_host_cap(&mut h, id, value);
+                h.completions()
             }
-        }
+            None => {
+                settle_host_cap(&mut self.host, id, value);
+                self.host.completions()
+            }
+        };
+        let r = comps.try_take(id).unwrap_or(value);
         self.vt.active.set(dst, Reg::from_i64(r));
     }
 
@@ -9239,19 +9231,8 @@ impl ScheduledDebugRun {
         else {
             return false;
         };
-        let comps = self.host.completions();
-        let prefix = comps.complete_host(id, value);
-        let _ = comps.try_take(id);
-        if let Some((type_id, op, handle, args)) = prefix {
-            self.host.tape_cap_record(super::CapRecord {
-                type_id,
-                op,
-                handle,
-                args,
-                result: Ok(vec![value]),
-                mem_writes: Vec::new(),
-            });
-        }
+        settle_host_cap(&mut self.host, id, value);
+        let _ = self.host.completions().try_take(id);
         self.tasks[ti].vt.active.set(dst, Reg::from_i64(value));
         self.tasks[ti].state = DbgTaskState::Runnable;
         self.turn += 1;
@@ -12552,8 +12533,41 @@ enum TaskState {
     BlockedOnFiber {
         fiber: usize,
     },
+    /// #1953 — parked on a **host-completed cap call** ([`crate::OffloadOutcome::Host`]): the
+    /// embedder answers completion `id` ([`CoopRun::deliver_cap`]), whose value lands in `dst`.
+    /// Only a [`CoopRun`] admits such calls, and only on its root powerbox; once nothing else can
+    /// run, the pump surfaces the smallest outstanding id as [`CoopStep::CapPark`]. The task twin
+    /// of a fiber's [`FiberState::CapParked`], and of `ScheduledDebugRun`'s `CapParked` thread.
+    BlockedHostCap {
+        id: u64,
+        dst: u32,
+    },
     /// Finished — its result (or trap) is retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
+}
+
+/// #1366 — settle a host-completed cap call the embedder answered: post `value` for completion
+/// `id` (waking whoever waits on it), and, when `host` is recording its cap tape, record the
+/// delivered value as the call's [`super::CapRecord`] so a replay serves it without re-parking.
+/// `false` if `id` is not an outstanding host-completed call. The one delivery every driver that
+/// surfaces cap parks shares ([`Vcpu::deliver_cap`], [`ScheduledDebugRun::deliver_cap`],
+/// [`CoopRun::deliver_cap`]); each then hands the value to its parked task its own way.
+fn settle_host_cap(host: &mut Host, id: u64, value: i64) -> bool {
+    let comps = host.completions();
+    if !comps.is_host_owned(id) {
+        return false;
+    }
+    if let Some((type_id, op, handle, args)) = comps.complete_host(id, value) {
+        host.tape_cap_record(super::CapRecord {
+            type_id,
+            op,
+            handle,
+            args,
+            result: Ok(vec![value]),
+            mem_writes: Vec::new(),
+        });
+    }
+    true
 }
 
 /// Park `vt`'s running fiber (never fiber 0) as `park(vm)` — §3.6 slice 5a, the one route every
@@ -12680,6 +12694,9 @@ impl TaskState {
             TaskState::BlockedPipeRead { .. } => Some(ParkSite::PipeRead),
             TaskState::BlockedPipeWrite { .. } => Some(ParkSite::PipeWrite),
             TaskState::BlockedStdin => Some(ParkSite::StreamRead),
+            // A durable run never parks here (its host-completed calls decline), but the site is
+            // the oracle's punted-completion wait.
+            TaskState::BlockedHostCap { .. } => Some(ParkSite::Completion),
         }
     }
 }
@@ -12820,6 +12837,9 @@ fn drive(
             CoopStep::Done(vals) => Ok(vals),
             CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
             CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
+            // This driver never admits host-completed calls (only `CoopRun` does), so nothing
+            // could answer one: decline fail-closed, as its inline wait always has.
+            CoopStep::CapPark { .. } => Err(Trap::CapFault),
             CoopStep::TierUp { .. } | CoopStep::Resume { .. } => {
                 unreachable!("tier-up not enabled on the native driver")
             }
@@ -12842,6 +12862,9 @@ enum CoopStep {
     Done(Vec<Value>),
     /// The slice of a [`CoopRun::run_for`] pump is spent; the run is live and resumable.
     Paused,
+    /// #1953 — nothing can run until the embedder answers host-completed cap call `id`
+    /// ([`CoopEvent::CapPark`]).
+    CapPark { id: u64 },
     /// #1122 route (a) — every task is parked, nothing internal can wake one, and at least one park is
     /// externally wakeable (a terminal/pipe read or a blocking stdin read): with
     /// [`CoopSched::suspend_on_idle`] set the pump RETURNS here instead of blocking on the doorbell,
@@ -13612,6 +13635,10 @@ impl CoopSched {
                 // order), deliver through the ordered drain, and loop — the woken fibers'
                 // resumers observe the wake at their next poll (or their own timers fire below on
                 // a later pass).
+                //
+                // #1953 — a host-completed call (a task's `BlockedHostCap`, or a fiber's `CapParked`
+                // on a host-owned id) is the same pending work, finished by the embedder instead of
+                // the pool: when the smallest outstanding id is one, surface it rather than wait.
                 let min_cap = fibers
                     .iter()
                     .filter_map(|f| match f {
@@ -13620,9 +13647,16 @@ impl CoopSched {
                         } => Some(*id),
                         _ => None,
                     })
+                    .chain(tasks.iter().filter_map(|t| match t.state {
+                        TaskState::BlockedHostCap { id, .. } => Some(id),
+                        _ => None,
+                    }))
                     .min();
                 if let Some(id) = min_cap {
                     let comps = host.completions();
+                    if comps.is_host_owned(id) {
+                        return Ok(CoopStep::CapPark { id });
+                    }
                     let r = comps.wait(id);
                     for f in fibers.iter_mut() {
                         if let FiberState::CapParked {
@@ -14135,12 +14169,22 @@ impl CoopSched {
                         ) {
                             tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
                         }
+                    } else if tasks[ti].env.is_none()
+                        && !durable
+                        && host.completions().is_host_owned(id)
+                    {
+                        // #1953: a host-completed punt, which only a `CoopRun` admits (on its root
+                        // powerbox): park the task until the embedder answers it. The pump surfaces
+                        // the park once nothing else can run.
+                        tasks[ti].state = TaskState::BlockedHostCap { id, dst };
                     } else {
                         let comps = match tasks[ti].env {
                             None => host.completions(),
                             Some(k) => extra_envs[k].host.lock_unpoisoned().completions(),
                         };
-                        // #1366: a host-completed punt has no completer on this driver — decline.
+                        // #1366: a host-completed punt no one here can surface — decline. (A
+                        // confined child's host never admits one; a durable run's freeze cannot
+                        // meet a park.)
                         match comps.wait_unless_host_owned(id) {
                             Some(r) => tasks[ti].vt.active.set(dst, Reg::from_i64(r)),
                             None => complete(tasks, ti, Err(Trap::CapFault)),
@@ -15409,6 +15453,11 @@ pub enum CoopEvent {
     /// call [`run`](CoopRun::run) again. Never surfaced with the flag off (the pump blocks on the
     /// doorbell instead, or faults as a deadlock).
     Idle,
+    /// #1953 — every runnable task is waiting on the embedder: completion `id` is a
+    /// **host-completed cap call** (a proc granted with [`crate::OffloadOutcome::Host`]) whose
+    /// request the proc's submit hook recorded. The run is live: answer it with
+    /// [`CoopRun::deliver_cap`] and pump again. The guest saw a plain synchronous call.
+    CapPark { id: u64 },
     /// The run finished; these are the root task's results.
     Done(Vec<Value>),
     /// The run trapped (the root task, or a fatal driver fault).
@@ -15702,6 +15751,36 @@ impl CoopRun {
         &mut self.host
     }
 
+    /// #1953 — answer the host-completed cap call a [`CoopEvent::CapPark`] surfaced: `value` is the
+    /// call's result. A parked task gets it in its result slot and runs again; a parked fiber is
+    /// woken by the pump's ordered drain. `false` if no call is outstanding on `id`. Then pump again.
+    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
+        if !settle_host_cap(&mut self.host, id, value) {
+            return false;
+        }
+        let parked = self.sched.tasks.iter().position(
+            |t| matches!(t.state, TaskState::BlockedHostCap { id: pid, .. } if pid == id),
+        );
+        if let Some(ti) = parked {
+            let _ = self.host.completions().try_take(id);
+            let t = &mut self.sched.tasks[ti];
+            if let TaskState::BlockedHostCap { dst, .. } = t.state {
+                t.vt.active.set(dst, Reg::from_i64(value));
+            }
+            t.state = TaskState::Runnable;
+        }
+        true
+    }
+
+    /// Read `len` bytes of the root window at `addr` (bounded — an out-of-window range is an error):
+    /// e.g. the pixels a parked `present` call names. `Err(Malformed)` for a memory-less run.
+    pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        match self.mem.as_ref() {
+            Some(m) => m.read_window(addr, len),
+            None => Err(Trap::Malformed),
+        }
+    }
+
     /// #926 slice 2f / #1233 — the `(domain, unit)` identity installed at dispatch-table `slot`
     /// (`None` = empty or natural-prefix): the browser B2 driver's slot mirror, from which it
     /// rebuilds its `WebAssembly.Table` when the generation moves (a slot at or past the program's
@@ -15769,6 +15848,9 @@ impl CoopRun {
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
     /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
     pub fn run(&mut self) -> CoopEvent {
+        // #1953: this driver surfaces cap parks (`CoopEvent::CapPark`) — admit host-completed
+        // punts on its root powerbox, as the single-vCPU and debug drivers do. A cheap flag store.
+        self.host.completions().allow_host_completed();
         // `budget` is the per-step op budget `step_vcpu` hands `Vm::resume` (a `0` would run zero ops
         // and spin on `Outcome::Suspended`); the native `drive` runs unsliced, so match it with
         // `u64::MAX` — run each vCPU to its next stop. It doubles as the §3d spawn record budget
@@ -15782,6 +15864,7 @@ impl CoopRun {
         ) {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
             Ok(CoopStep::Idle) => CoopEvent::Idle,
+            Ok(CoopStep::CapPark { id }) => CoopEvent::CapPark { id },
             Ok(CoopStep::Paused) => CoopEvent::Paused,
             Ok(CoopStep::TierUp {
                 module,

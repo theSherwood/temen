@@ -1005,6 +1005,21 @@ pub enum VarValue {
     Bytes(Vec<u8>),
 }
 
+/// #1366 / #1953 — a call parked on a **declared host-completed cap**
+/// ([`Host::grant_declared_host_caps`]): its completion id, the cap's name, and the guest's flat
+/// call arguments (the guest's own op rides in `args[0]` by convention, like `vm_fs`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapRequest {
+    pub id: u64,
+    pub name: String,
+    pub args: Vec<i64>,
+}
+
+/// The calls parked on one session's declared host-completed caps, keyed by completion id: filled by
+/// the procs' submit hooks, read and cleared by the embedder. Shared (`Arc`) so a rebuilt run's procs
+/// file into the same map.
+pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
+
 /// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
 /// guest passed and the result slots the host returned, for a **nondeterministic input** capability
 /// (e.g. `Clock`). Replayed verbatim so a re-execution (time-travel `seek`) sees identical host
@@ -26571,6 +26586,47 @@ impl Host {
             vtable: None,
             state,
         })
+    }
+
+    /// #1366 / #1953 — grant the embedder's **declared host-completed caps**: for each of `names`
+    /// (in order) that `imports` imports, an offloadable proc that always punts to the embedder
+    /// ([`OffloadOutcome::Host`]). The guest's flat `call.sym "<name>"` (its own op in `args[0]`)
+    /// parks the run; the proc's submit hook files the call in `requests` under its completion id,
+    /// and the embedder answers it with the driver's `deliver_cap`. Each is registered under its
+    /// name. Returns the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. Nothing here
+    /// is embedder-specific: temen never learns what a name means. The one grant every session
+    /// that serves declared caps uses (the DAP debug session, the browser release session).
+    pub fn grant_declared_host_caps(
+        &mut self,
+        imports: &[temen_ir::Import],
+        names: &[String],
+        requests: &CapRequests,
+    ) -> Vec<(String, i32)> {
+        let mut declared = Vec::new();
+        for name in names {
+            if !imports.iter().any(|im| &im.name == name) {
+                continue;
+            }
+            let requests = Arc::clone(requests);
+            let cap = name.clone();
+            let h = self.grant_host_proc_offloadable(
+                Box::new(move |_op: u32, args: &[i64]| {
+                    let requests = Arc::clone(&requests);
+                    let name = cap.clone();
+                    let args = args.to_vec();
+                    OffloadOutcome::Host(Box::new(move |id| {
+                        requests
+                            .lock_unpoisoned()
+                            .insert(id, CapRequest { id, name, args });
+                    }))
+                }),
+                // Each call is answered afresh by the embedder; nothing is held between calls.
+                CapState::Stateless,
+            );
+            self.register_cap_name(name, h);
+            declared.push((name.clone(), h));
+        }
+        declared
     }
 
     /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
