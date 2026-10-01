@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**362 exports** in 37 families — 296 referenced from JS, 66 referenced by nothing, 10 behind a `cfg`.
+**353 exports** in 36 families — 296 referenced from JS, 57 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,7 +11,7 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
-| `coop` | 52 | 40 | 0 |
+| `coop` | 54 | 40 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 5 | 5 | 1 |
@@ -31,7 +31,6 @@
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
-| `release` | 11 | 0 | 0 |
 | `run` | 19 | 18 | 0 |
 | `run0` | 1 | 1 | 0 |
 | `selfhost` | 2 | 2 | 0 |
@@ -109,6 +108,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_deliver_jit`
 - `temen_coop_deliver_jit_trap`
 - `temen_coop_deliver_trap`
+- `temen_coop_fs_image` — *unreferenced*
+- `temen_coop_fs_ptr` — *unreferenced*
 - `temen_coop_func`
 - `temen_coop_jit_code`
 - `temen_coop_jit_param_types_ptr`
@@ -416,20 +417,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `prep`
 
 - `temen_prep_bench`
-
-### `release`
-
-- `temen_release_cap_len` — *unreferenced*
-- `temen_release_cap_ptr` — *unreferenced*
-- `temen_release_close` — *unreferenced*
-- `temen_release_deliver_cap` — *unreferenced*
-- `temen_release_fs_image` — *unreferenced*
-- `temen_release_fs_ptr` — *unreferenced*
-- `temen_release_open` — *unreferenced*
-- `temen_release_read` — *unreferenced*
-- `temen_release_read_ptr` — *unreferenced*
-- `temen_release_run` — *unreferenced*
-- `temen_release_value` — *unreferenced*
 
 ### `run`
 

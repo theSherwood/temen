@@ -50,15 +50,19 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
 }
 
-/// **A release run pumped in slices** (`temen_release_open` / `temen_release_run`): each slice hands
-/// back the output it produced, a program that never ends keeps reporting `RELEASE_RUNNING` (so the
-/// embedder can stream it and stop pumping on Pause), and a finite program pumped in small slices ends
-/// with exactly the one-shot run's output and exit code.
+/// **A release run pumped in slices** — the tier-up session with no regions (`COOP_NO_REGIONS`,
+/// `temen_coop_run_for`): each slice hands back the output it produced, a program that never ends
+/// keeps reporting `COOP_RUN_PAUSED` (so the embedder can stream it and stop pumping on Pause), and a
+/// finite program pumped in small slices ends with exactly the one-shot run's output and exit code.
+/// A trap ends it with the one-shot run's trap name and fault address, and the files the program
+/// wrote stay readable (`temen_coop_fs_image`) after the session closes.
 #[test]
 fn a_release_run_pumps_in_slices() {
     use temen_browser::{
-        temen_alloc, temen_exit_code, temen_release_close, temen_release_open, temen_release_run,
-        temen_status, temen_stdout_len, temen_stdout_ptr, RELEASE_DONE, RELEASE_RUNNING,
+        temen_alloc, temen_coop_close, temen_coop_fs_image, temen_coop_fs_ptr, temen_coop_open,
+        temen_coop_run_for, temen_exit_code, temen_fault_addr, temen_status, temen_stdout_len,
+        temen_stdout_ptr, temen_trap_len, temen_trap_ptr, COOP_NO_REGIONS, COOP_RUN_DONE,
+        COOP_RUN_PAUSED, COOP_RUN_TRAP,
     };
     let Some(chibicc) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen absent");
@@ -69,10 +73,17 @@ fn a_release_run_pumps_in_slices() {
         let p = temen_alloc(bytes.len());
         // SAFETY: `temen_alloc` returned a live allocation of that length.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
-        assert_eq!(
-            temen_release_open(p, bytes.len(), core::ptr::null(), 0, core::ptr::null(), 0),
-            STATUS_OK
+        let opened = temen_coop_open(
+            p,
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            COOP_NO_REGIONS,
         );
+        assert_eq!(opened, STATUS_OK);
     };
     let slice_out = || {
         let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
@@ -81,6 +92,19 @@ fn a_release_run_pumps_in_slices() {
         }
         // SAFETY: the stash stays live until the next call that replaces it.
         unsafe { core::slice::from_raw_parts(p, n) }.to_vec()
+    };
+    // Pump to the end in `budget`-op slices: the output, and how many slices it took.
+    let drain = |budget: u64| {
+        let (mut out, mut slices) = (Vec::new(), 0);
+        loop {
+            let r = temen_coop_run_for(budget);
+            out.extend(slice_out());
+            slices += 1;
+            if r == COOP_RUN_DONE || r == COOP_RUN_TRAP {
+                return (out, slices);
+            }
+            assert_eq!(r, COOP_RUN_PAUSED);
+        }
     };
 
     let spin = compile(
@@ -91,8 +115,8 @@ fn a_release_run_pumps_in_slices() {
     let mut out = Vec::new();
     for _ in 0..50 {
         assert_eq!(
-            temen_release_run(100_000),
-            RELEASE_RUNNING,
+            temen_coop_run_for(100_000),
+            COOP_RUN_PAUSED,
             "an endless loop keeps running"
         );
         out.extend(slice_out());
@@ -102,7 +126,7 @@ fn a_release_run_pumps_in_slices() {
         "line 0\nline 1\nline 2\n",
         "streamed as it ran"
     );
-    temen_release_close();
+    temen_coop_close();
 
     let finite = compile(
         &chibicc,
@@ -110,23 +134,52 @@ fn a_release_run_pumps_in_slices() {
     );
     let one_shot = onramp_exec(&finite, b"");
     open(&finite);
-    let mut out = Vec::new();
-    let mut slices = 0;
-    loop {
-        let r = temen_release_run(1_000);
-        out.extend(slice_out());
-        slices += 1;
-        if r == RELEASE_DONE {
-            break;
-        }
-        assert_eq!(r, RELEASE_RUNNING);
-    }
+    let (out, slices) = drain(1_000);
+    temen_coop_close();
     assert!(slices > 10, "it took many slices ({slices})");
     assert_eq!(out, one_shot.stdout, "the same output as the one-shot run");
     assert_eq!(
         (temen_status(), temen_exit_code()),
         (one_shot.status, one_shot.exit_code),
         "and the same ending"
+    );
+
+    let faults = compile(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  int *p = (int *)8;\n  printf(\"before\\n\");\n  return *p;\n}\n",
+    );
+    let one_shot = onramp_exec(&faults, b"");
+    open(&faults);
+    let (out, _) = drain(1_000);
+    temen_coop_close();
+    // SAFETY: the trap name is a static string.
+    let trap = unsafe { core::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
+    assert_eq!(out, b"before\n");
+    assert_eq!(
+        (temen_status(), trap, temen_fault_addr()),
+        (
+            one_shot.status,
+            one_shot.trap.map_or("", |t| t.name()).as_bytes(),
+            one_shot.fault_addr.map_or(-1, |a| a as i64),
+        ),
+        "a trap ends it as the one-shot run's does"
+    );
+    assert!(!trap.is_empty(), "it trapped");
+
+    let writes = compile(
+        &chibicc,
+        "#include <stdio.h>\nint main(void) {\n  FILE *f = fopen(\"notes.txt\", \"w\");\n  fputs(\"kept\\n\", f);\n  fclose(f);\n  return 0;\n}\n",
+    );
+    open(&writes);
+    drain(1_000);
+    temen_coop_close();
+    let n = temen_coop_fs_image();
+    // SAFETY: the blob stays live until the next call.
+    let image = unsafe { core::slice::from_raw_parts(temen_coop_fs_ptr(), n) };
+    let has = |needle: &[u8]| image.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        has(b"notes.txt") && has(b"kept\n"),
+        "the files the run ended with outlive its session"
     );
 }
 
