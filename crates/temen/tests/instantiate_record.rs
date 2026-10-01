@@ -1756,16 +1756,12 @@ block 0 (va: i64) {{
     )
 }
 
-/// The tiers a §14 child can spawn on. The JIT compiles every non-durable child with a null
-/// `InstEnv`, so a child's spawn traps there (#1956).
-const NESTING_BACKENDS: [Backend; 2] = [Backend::TreeWalk, Backend::Bytecode];
-
 /// #1944: a detached child spawns and joins a detached grandchild paid from its own budget — the one
 /// that paid for its window.
 #[test]
 fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
     let src = three_generations(1 << 18);
-    for b in NESTING_BACKENDS {
+    for b in BACKENDS {
         assert_eq!(run_detached(b, &src).expect("run"), 123, "{b:?}");
     }
 }
@@ -1776,7 +1772,7 @@ fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
 #[test]
 fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
     let src = three_generations(1 << 17);
-    for b in NESTING_BACKENDS {
+    for b in BACKENDS {
         assert_eq!(run_detached(b, &src).expect("run"), 78, "{b:?}");
     }
 }

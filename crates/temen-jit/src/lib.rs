@@ -1082,7 +1082,17 @@ pub struct GrantChildHooks {
     /// `-1` = unbounded.
     pub parent_domain: u64,
     pub parent_lane_cap: i64,
+    /// #1956 — the [`ModuleResolver`] for `parent_ctx`'s shape: what a detached child's spawns
+    /// resolve their `Module` against. (A run's own spawns use the resolver it was compiled with.)
+    pub resolve_module: ModuleResolver,
+    /// #1956 — the family a **detached** child spawns its own children with (see [`AsParent`]).
+    pub as_parent: AsParent,
 }
+
+/// #1956 — this hook family for a detached child as a parent: the same hooks over its powerbox
+/// `child_ctx` (always the shared form), which becomes `parent_ctx`, with the child's lane
+/// coordinates as `parent_domain` / `parent_lane_cap`. A plain Rust fn: it hands back a Rust struct.
+pub type AsParent = unsafe fn(child_ctx: *mut core::ffi::c_void) -> GrantChildHooks;
 
 /// Register / clear a granted child's serve context on its shared powerbox — see
 /// [`GrantChildHooks::register_serve`].
@@ -3475,6 +3485,7 @@ impl CompiledModule {
                         .collect::<Vec<u32>>()
                         .into_boxed_slice(),
                     shadow,
+                    None, // the run's own child executor
                 )))
             } else {
                 None
@@ -3486,25 +3497,7 @@ impl CompiledModule {
             n.set_null_guard(temen_ir::module_null_guard());
         }
         #[cfg(fiber_rt)]
-        let inst = if let Some(n) = &nursery {
-            InstEnv {
-                nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
-                instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
-                join_thunk: instantiator_rt::join as *const () as i64,
-                poll_thunk: instantiator_rt::poll as *const () as i64,
-                detach_thunk: instantiator_rt::detach as *const () as i64,
-                kill_thunk: instantiator_rt::kill as *const () as i64,
-                instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
-                instantiate_module_named_thunk: instantiator_rt::instantiate_module_named
-                    as *const () as i64,
-                child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
-                instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const ()
-                    as i64,
-                self_prog: 0, // the module's own program (#1726)
-            }
-        } else {
-            InstEnv::null()
-        };
+        let inst = nursery.as_deref().map_or(InstEnv::null(), InstEnv::over);
         #[cfg(not(fiber_rt))]
         let inst = InstEnv::null();
 
@@ -5663,61 +5656,35 @@ pub(crate) unsafe fn compile_child_and_run(
     // child keeps the pre-existing `InstEnv::null()` (can't nest) — behavior unchanged. `child_win_size`
     // is declared before `child_nursery` so it outlives the nursery that borrows it.
     let child_win_size: Box<u64> = Box::new(child_size);
-    let child_uses_instantiator = funcs.iter().any(|f| {
-        f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::INSTANTIATOR,
-                        ..
-                    }
-                )
-            })
-        })
-    });
-    let child_nursery: Option<Box<instantiator_rt::Nursery>> = if durable && child_uses_instantiator
-    {
-        let n = Box::new(instantiator_rt::Nursery::new(
-            funcs.to_vec().into(),
-            types.to_vec().into(),
-            instantiator_rt::child_instantiator_thunk,
-            &*child_win_size as *const u64 as *mut core::ffi::c_void,
-            None, // same-module grandchildren only (separate-module is a later slice)
-            epoch_addr,
-            fuel_addr, // §5 parent-fuel: a grandchild clamps its budget against this child's remaining
-            0,         // durable subtree: no shared futex domain (child futex ops stay rejected)
-            my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
-            std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
-            std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
-            Box::new([]), // durable grandchildren are not offer targets (a later slice)
-            child_shadow,
-        ));
-        n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
-        n.set_freeze(freeze.clone());
-        Some(n)
-    } else {
-        None
-    };
-    let child_inst = match &child_nursery {
-        Some(n) => InstEnv {
-            nursery_addr: (&**n as *const instantiator_rt::Nursery) as i64,
-            instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
-            join_thunk: instantiator_rt::join as *const () as i64,
-            poll_thunk: instantiator_rt::poll as *const () as i64,
-            detach_thunk: instantiator_rt::detach as *const () as i64,
-            kill_thunk: instantiator_rt::kill as *const () as i64,
-            // A durable nested child never installs grant hooks, and the thunks fail durable
-            // spawns closed anyway — wired only so the `InstEnv` is fully populated.
-            instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
-                as i64,
-            instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
-            child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
-            instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
-            self_prog: 0, // the module's own program (#1726)
-        },
-        None => InstEnv::null(),
-    };
+    let child_nursery: Option<Box<instantiator_rt::Nursery>> =
+        if durable && funcs_use_instantiator(funcs) {
+            let n = Box::new(instantiator_rt::Nursery::new(
+                funcs.to_vec().into(),
+                types.to_vec().into(),
+                instantiator_rt::child_instantiator_thunk,
+                &*child_win_size as *const u64 as *mut core::ffi::c_void,
+                None, // same-module grandchildren only (separate-module is a later slice)
+                epoch_addr,
+                fuel_addr, // §5 parent-fuel: a grandchild clamps its budget against this child's remaining
+                0,       // durable subtree: no shared futex domain (child futex ops stay rejected)
+                my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
+                std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
+                std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
+                Box::new([]), // durable grandchildren are not offer targets (a later slice)
+                child_shadow,
+                None, // an executor of its own, with no domain: it files no task
+            ));
+            n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
+            n.set_freeze(freeze.clone());
+            Some(n)
+        } else {
+            None
+        };
+    // A durable nested child never installs grant hooks, and the thunks fail its granted spawns
+    // closed anyway, so of this env only `instantiate` and the lifecycle ops do anything.
+    let child_inst = child_nursery
+        .as_deref()
+        .map_or(InstEnv::null(), InstEnv::over);
     // The synchronous child's non-nesting powerbox is empty (an inert `call.cap` → `CapFault`); its
     // `Instantiator` (if any) is routed by `child_inst` above.
     let child = compile_child(
@@ -7004,9 +6971,11 @@ impl ThreadEnv {
 }
 
 /// The §14 nesting runtime address + the `instantiate`/`join` thunk addresses, baked into the
-/// module's `Instantiator` `call.cap` sites. All `0` when the module holds no `Instantiator`, or in a
-/// **child** compilation (a JIT child cannot itself nest yet — its `Instantiator` call.cap falls
-/// through to the ordinary `call.cap` path, i.e. an inert `CapFault`).
+/// module's `Instantiator` `call.cap` sites. All `0` when the compile has no nursery: a module that
+/// holds no `Instantiator`, or a §14 child that cannot spawn — a non-durable carve child, or a
+/// durable detached one. Its `Instantiator` `call.cap` then takes the ordinary `call.cap` path, an
+/// inert `CapFault`. A durable carve child and a non-durable detached child (#1956) that use the
+/// `Instantiator` each get a nursery of their own.
 #[derive(Clone, Copy)]
 struct InstEnv {
     nursery_addr: i64,
@@ -7053,6 +7022,25 @@ impl InstEnv {
             self_prog: 0,
         }
     }
+    /// The env that lowers a compile's `Instantiator` calls to `n`, for code of module 0's program.
+    #[cfg(fiber_rt)]
+    fn over(n: &instantiator_rt::Nursery) -> InstEnv {
+        InstEnv {
+            nursery_addr: (n as *const instantiator_rt::Nursery) as i64,
+            instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
+            join_thunk: instantiator_rt::join as *const () as i64,
+            poll_thunk: instantiator_rt::poll as *const () as i64,
+            detach_thunk: instantiator_rt::detach as *const () as i64,
+            kill_thunk: instantiator_rt::kill as *const () as i64,
+            instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
+            instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
+                as i64,
+            child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
+            instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
+            self_prog: 0, // the module's own program (#1726)
+        }
+    }
+
     /// True when this compilation may lower `Instantiator` call.cap calls to the nesting runtime (the
     /// parent compile with a live `Nursery`); `false` ⇒ they take the ordinary `call.cap` path.
     fn is_active(&self) -> bool {
