@@ -912,23 +912,24 @@ fn the_ring_is_bounded_and_pins_the_start() {
     assert_eq!(play(&mut t, &mut r, 1), vec![recorded[0]]);
 }
 
-/// The **byte** bound, which is the one that matters for a real guest: a rung's cost is the guest's
-/// window, so a count alone means "8 rungs" is a few KiB for `bounce` and 128 MiB for Doom. A budget
-/// that admits two rungs holds two however big the count allows — and never drops below the pin.
+/// The **byte** bound, which is the one that matters for a real guest: a count alone means "8 rungs"
+/// is a few KiB for `bounce` and 128 MiB for Doom. The ladder holds each rung as the pages it changed
+/// since the rung below (#1459), so the ceiling counts those, and it still bites before the count
+/// does — never dropping below the pin.
 #[test]
 fn the_ring_honours_a_byte_budget_under_the_count() {
     let mut r = OnrampReactor::open_fixture(LIFE);
     let one = r.moment().expect("capturable").byte_len();
-    // Room for two rungs, against a count that would allow sixteen.
-    let mut t = ReactorTimeline::new(4, 16, one * 2 + one / 2);
+    // Room for the first rung's whole window and a page more, against a count of sixteen.
+    let budget = one + 4096;
+    let mut t = ReactorTimeline::new(4, 16, budget);
     let recorded = record(&mut t, &mut r, 40);
 
     let rungs = t.keyframe_ticks();
     assert!(
-        rungs.len() <= 2 && t.held_bytes() <= one * 2 + one / 2,
-        "the byte ceiling bit before the count did: {rungs:?} holding {} of {}",
+        rungs.len() < 10 && t.held_bytes() <= budget,
+        "the byte ceiling bit before the count did: {rungs:?} holding {} of {budget}",
         t.held_bytes(),
-        one * 2 + one / 2
     );
     assert_eq!(rungs[0], 0, "the pin survives a budget that tight");
     assert!(
@@ -936,6 +937,30 @@ fn the_ring_honours_a_byte_budget_under_the_count() {
         "and the run is still fully seekable through it"
     );
     assert_eq!(play(&mut t, &mut r, 1), vec![recorded[21]]);
+}
+
+/// What #1459 buys: a rung holds only the pages the guest changed since the rung below, so a budget
+/// of two and a half windows, which held two flat rungs, holds every rung of a short `life` run, and
+/// each still replays its frame.
+#[test]
+fn rungs_hold_only_the_pages_the_guest_changed() {
+    let mut r = OnrampReactor::open_fixture(LIFE);
+    let one = r.moment().expect("capturable").byte_len();
+    let budget = one * 2 + one / 2;
+    let mut t = ReactorTimeline::new(4, 16, budget);
+    let recorded = record(&mut t, &mut r, 40);
+
+    let rungs = t.keyframe_ticks();
+    assert_eq!(rungs.len(), 10, "every rung fits: {rungs:?}");
+    assert!(
+        t.held_bytes() < 2 * one,
+        "ten rungs in less than two windows: {} of {one} each",
+        t.held_bytes()
+    );
+    for tick in [0, 9, 21, 39] {
+        assert!(t.seek(&mut r, tick));
+        assert_eq!(play(&mut t, &mut r, 1), vec![recorded[tick]], "tick {tick}");
+    }
 }
 
 /// **Inertness pin** (INVARIANTS #9b): a run recorded and keyframed presents exactly the frames a

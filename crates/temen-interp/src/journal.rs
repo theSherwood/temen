@@ -98,6 +98,10 @@ pub struct JournalStats {
     /// cost. Amortized compaction keeps this a small multiple of `appended_bytes`; growing with its
     /// square is the quadratic the policy exists to avoid.
     pub rewalked_bytes: usize,
+    /// The earliest turn undo can still restore: the first anchor the byte budget has left whole.
+    /// `None` when it can restore none, which is what a budget smaller than one segment's writes
+    /// leaves (every backward step is then served by `seek`).
+    pub reach: Option<u64>,
 }
 
 /// The engine state as it stood **before** the op at `coord` ran: the continuation plus the compact
@@ -127,7 +131,9 @@ pub struct JournalPolicy {
     /// Ceiling on retained pre-image bytes. Past it the **oldest** history is dropped, which bounds how
     /// far back undo reaches without ever making a reachable position wrong: a dropped turn simply has
     /// no state entry, so [`Journal::can_undo_to`] declines it and the checkpoint-plus-replay path
-    /// serves. `0` means unbounded.
+    /// serves. `0` means unbounded. A budget smaller than the writes of one
+    /// [`state_stride`](Self::state_stride) leaves no anchor whole, and undo then reaches nothing;
+    /// [`JournalStats::reach`] says so.
     pub byte_budget: usize,
     /// Turns between **continuation snapshots** — the segment boundaries `undo_to` lands on before
     /// replaying the remainder forward. `1` journals one per op.
@@ -264,6 +270,11 @@ impl Journal {
             appended: self.appended,
             appended_bytes: self.appended_bytes,
             rewalked_bytes: self.rewalked_bytes,
+            reach: self
+                .states
+                .iter()
+                .find(|s| s.coord >= self.floor)
+                .map(|s| s.coord),
         }
     }
 
@@ -434,15 +445,12 @@ impl Journal {
         // Drop oldest-first. Undo reaching a given turn needs only the entries from that turn forward,
         // so shedding the tail of history shortens the reach without corrupting what remains.
         //
-        // **A budget below one `state_stride` of writes turns undo off entirely**, and does so quietly:
-        // `state_at` resolves a target to the nearest boundary at or before it, so once the floor
-        // passes the last boundary every target resolves below it and `can_undo_to` declines
-        // universally. That is *safe* — declining is the fail-closed answer and `seek` serves — but it
-        // is a trap for an embedder who sets a tight budget and wonders why `step_back` never uses the
-        // journal it is paying for. Keeping the live segment regardless of the budget looks like the
-        // fix and is not a one-liner: it has to keep the floor honest about which pre-images survive,
-        // and a first attempt at it restored windows that never existed. Left as a documented
-        // constraint rather than a hasty fix; #1558 carries it.
+        // **A budget below one segment's writes turns undo off entirely**: `state_at` resolves a
+        // target to the nearest boundary at or before it, so once the floor passes the last boundary
+        // every target resolves below it and `can_undo_to` declines universally. That is safe —
+        // declining is the fail-closed answer and `seek` serves — and it is reported rather than
+        // silent: `JournalStats::reach` reads `None`. Keeping the live segment over budget would avoid
+        // it, but one bulk write could then hold any amount, so the budget stays a ceiling.
         //
         // The running `held_bytes` makes the common case O(1); when something does go, the oldest
         // entries leave in one `drain` rather than one `remove(0)` apiece.
@@ -456,10 +464,13 @@ impl Journal {
         }
         let last_dropped = self.entries[drop - 1].coord;
         self.entries.drain(..drop);
-        // History before the *next* remaining entry is now incomplete: that is the new floor, and
-        // `can_undo_to` declines every anchor below it. Fail-closed by construction — a dropped turn
-        // becomes unreachable, never wrong.
-        self.floor = self.entries.first().map_or(last_dropped + 1, |e| e.coord);
+        // History up to the last dropped turn is now incomplete, so the floor goes just past it and
+        // `can_undo_to` declines every anchor below. Not the next remaining entry's turn: entries
+        // share a turn (an op that writes several spans, and every entry of a coalesced segment,
+        // which coalescing tags with the segment's first turn), so the drop can stop partway through
+        // one, and an anchor at that turn would put back only part of the window. Fail-closed by
+        // construction — a dropped turn becomes unreachable, never wrong.
+        self.floor = last_dropped + 1;
         self.states.retain(|s| s.coord >= self.floor);
     }
 

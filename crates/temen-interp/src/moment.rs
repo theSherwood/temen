@@ -23,7 +23,10 @@
 //! envs), and `ShadowStack` (the tree-walk oracle's call stack + fuel). One `Moment`, one `Ladder`, one
 //! serialization ([`temen-snapshot`] writes a `ShadowStack` moment as a §12 artifact).
 
-use crate::{Host, HostReplaySubstate, MemLayout};
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use crate::{Host, HostReplaySubstate, MemLayout, PageMap};
 
 /// The engine's half of a [`Moment`] — whatever it needs to resume execution from this boundary. The
 /// shared halves (window image + host substate) live on the `Moment`; this is the part that differs by
@@ -104,9 +107,85 @@ impl ShadowStack {
 /// (#1455) — the identical set a §12 freeze writes into an artifact, so a moment and a save-state
 /// cannot disagree about what "the host's state" is (INVARIANTS #13).
 pub struct Moment {
-    mem: Option<MemLayout>,
+    mem: Option<Image>,
     host: HostReplaySubstate,
     continuation: Continuation,
+}
+
+/// The unit a [`Ladder`] shares window bytes in: the §12 codec's page.
+const SHARED_PAGE: usize = crate::DURABLE_SNAPSHOT_PAGE as usize;
+
+/// A moment's window image: flat as captured, or paged once a [`Ladder`] holds it (#1459).
+///
+/// A ladder compares each page of a rung it takes with the same page of the rung below, and the two
+/// share one copy where they agree. So a run that writes a few pages between rungs holds a few pages
+/// per rung, not a window. Every rung still owns its whole image (the sharing is reference counted),
+/// so a rung restores and evicts on its own and no rung is a delta another one depends on.
+enum Image {
+    Flat(MemLayout),
+    Paged {
+        /// The image in [`SHARED_PAGE`] pages; the last one holds the remainder.
+        pages: Vec<Arc<[u8]>>,
+        map: PageMap,
+    },
+}
+
+impl Image {
+    /// The image as a [`MemLayout`]: borrowed if flat, assembled from its pages if paged.
+    fn layout(&self) -> Cow<'_, MemLayout> {
+        match self {
+            Image::Flat(l) => Cow::Borrowed(l),
+            Image::Paged { pages, map } => Cow::Owned(MemLayout {
+                bytes: pages.concat(),
+                map: map.clone(),
+            }),
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        match self {
+            Image::Flat(l) => l.byte_len(),
+            Image::Paged { pages, .. } => pages.iter().map(|p| p.len()).sum(),
+        }
+    }
+
+    /// This image in pages, each one shared with `below`'s page at the same index when the bytes
+    /// agree. An image already paged is left as it is.
+    fn paged(self, below: Option<&Image>) -> Image {
+        let Image::Flat(MemLayout { bytes, map }) = self else {
+            return self;
+        };
+        let below: &[Arc<[u8]>] = match below {
+            Some(Image::Paged { pages, .. }) => pages,
+            _ => &[],
+        };
+        let pages = bytes
+            .chunks(SHARED_PAGE)
+            .enumerate()
+            .map(|(i, page)| match below.get(i) {
+                Some(b) if **b == *page => Arc::clone(b),
+                _ => Arc::from(page),
+            })
+            .collect();
+        Image::Paged { pages, map }
+    }
+
+    /// The pages this image holds that `below` does not share — what holding it adds to a ladder.
+    fn bytes_beyond(&self, below: Option<&Image>) -> usize {
+        let Image::Paged { pages, .. } = self else {
+            return self.byte_len();
+        };
+        let below: &[Arc<[u8]>] = match below {
+            Some(Image::Paged { pages, .. }) => pages,
+            _ => &[],
+        };
+        pages
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| !below.get(*i).is_some_and(|b| Arc::ptr_eq(b, p)))
+            .map(|(_, p)| p.len())
+            .sum()
+    }
 }
 
 impl Moment {
@@ -114,15 +193,16 @@ impl Moment {
     /// halves describe the same one.
     pub fn new(mem: Option<MemLayout>, host: &Host, continuation: Continuation) -> Moment {
         Moment {
-            mem,
+            mem: mem.map(Image::Flat),
             host: host.replay_substate(),
             continuation,
         }
     }
 
-    /// The window image, for the engine to seed back into whatever holds its window.
-    pub fn mem(&self) -> Option<&MemLayout> {
-        self.mem.as_ref()
+    /// The window image, for the engine to seed back into whatever holds its window. A moment a
+    /// [`Ladder`] holds assembles it from the pages it shares with its neighbours.
+    pub fn mem(&self) -> Option<Cow<'_, MemLayout>> {
+        self.mem.as_ref().map(Image::layout)
     }
 
     /// The engine's half.
@@ -135,10 +215,11 @@ impl Moment {
         host.restore_replay_substate(&self.host);
     }
 
-    /// What holding this moment costs: the window image's byte length (the other halves are a
-    /// handful of words, or the engine's frames). A ladder sizes its ring against this.
+    /// The window image's byte length (the other halves are a handful of words, or the engine's
+    /// frames). On its own this is what holding the moment costs; in a [`Ladder`] the pages it shares
+    /// with its neighbours are counted once ([`Ladder::held_bytes`]).
     pub fn byte_len(&self) -> usize {
-        self.mem.as_ref().map_or(0, MemLayout::byte_len)
+        self.mem.as_ref().map_or(0, Image::byte_len)
     }
 
     /// Capture `layout` with `host`'s substate as a reactor moment (continuation [`Continuation::None`]).
@@ -152,9 +233,8 @@ impl Moment {
 
     /// The window image. A reactor moment always carries one — it is only ever built by
     /// [`capture`](Self::capture), which takes it by value.
-    pub fn layout(&self) -> &MemLayout {
-        self.mem
-            .as_ref()
+    pub fn layout(&self) -> Cow<'_, MemLayout> {
+        self.mem()
             .expect("a reactor moment is built from a window image and always carries it")
     }
 }
@@ -186,8 +266,8 @@ pub struct Ladder {
 
 impl Ladder {
     /// A ladder with a rung due every `stride` coordinates, holding at most `ring` rungs and
-    /// `budget` bytes of window image — `0` for either bound means unbounded. `stride` is clamped to
-    /// at least 1.
+    /// `budget` bytes of window image ([`held_bytes`](Self::held_bytes)) — `0` for either bound means
+    /// unbounded. `stride` is clamped to at least 1.
     pub fn new(stride: u64, ring: usize, budget: usize) -> Ladder {
         Ladder {
             rungs: Vec::new(),
@@ -219,10 +299,16 @@ impl Ladder {
     /// Hold `moment` at `coord`, keeping the ladder sorted and bounded. A coordinate already held is
     /// left as it was: a replay re-crossing a rung it took on the way out captures the same state, so
     /// there is nothing to replace.
-    pub fn take(&mut self, coord: u64, moment: Moment) {
+    ///
+    /// The window image is held in pages, sharing every page that equals the rung below's (#1459).
+    /// That is one compare of the window per rung taken, and no cost at all between rungs, on any
+    /// tier: the run's writes are never tracked.
+    pub fn take(&mut self, coord: u64, mut moment: Moment) {
         let Err(at) = self.rungs.binary_search_by_key(&coord, |(c, _)| *c) else {
             return;
         };
+        let below = at.checked_sub(1).and_then(|i| self.rungs[i].1.mem.as_ref());
+        moment.mem = moment.mem.map(|m| m.paged(below));
         self.rungs.insert(at, (coord, moment));
         self.evict(coord);
     }
@@ -260,9 +346,23 @@ impl Ladder {
         self.rungs.iter().map(|(c, _)| *c).collect()
     }
 
-    /// What the ladder is holding, in bytes: the sum of its rungs' window images.
+    /// What the ladder is holding, in bytes: its rungs' window images, a page shared by neighbouring
+    /// rungs counted once.
+    ///
+    /// Rungs share a page only with the rung below at the time they were taken, so a shared page is
+    /// held by a run of adjacent rungs. A rung taken later between two that share a page breaks that
+    /// run, and the page is then counted on both sides of it: an overcount, so a byte budget errs
+    /// towards holding less.
     pub fn held_bytes(&self) -> usize {
-        self.rungs.iter().map(|(_, m)| m.byte_len()).sum()
+        let mut below = None;
+        let mut held = 0;
+        for (_, m) in &self.rungs {
+            if let Some(image) = &m.mem {
+                held += image.bytes_beyond(below);
+                below = Some(image);
+            }
+        }
+        held
     }
 
     /// Bring the ladder back inside both bounds, never below the pinned lowest rung. `here` is the
@@ -387,9 +487,10 @@ impl ReactorTimeline {
     /// A timeline over a reactor standing at tick 0.
     ///
     /// `stride` is how often a rung is taken; `ring` how many are held; `budget` a ceiling on their
-    /// total bytes. The last one matters because a rung's cost is the guest's window: a `bounce` rung
-    /// is a few KiB and a Doom one is 16 MiB, so a count alone would mean 8 rungs is either nothing or
-    /// 128 MiB depending on the guest. Whichever bound bites first wins, and neither can take the ring
+    /// total bytes. The last one matters because a rung's cost depends on the guest: the first rung
+    /// holds the whole window (a few KiB for `bounce`, 16 MiB for Doom) and each later one the pages
+    /// the guest changed since the rung below, so a count alone could mean almost nothing or most of a
+    /// window per rung. Whichever bound bites first wins, and neither can take the ring
     /// below the pinned tick-0 rung. `stride` and `ring` are clamped to at least 1; a `budget` of 0
     /// means no byte ceiling.
     pub fn new(stride: usize, ring: usize, budget: usize) -> ReactorTimeline {
@@ -578,10 +679,19 @@ mod ladder_tests {
     }
 
     fn moment_with(pages: usize, continuation: Continuation) -> Moment {
-        let n = pages * 4096;
-        let layout = MemLayout::from_parts(vec![0; n], 4096, n as u64, &[])
-            .expect("a whole number of pages is a valid layout");
+        image_moment(vec![0; pages * 4096], continuation)
+    }
+
+    fn image_moment(bytes: Vec<u8>, continuation: Continuation) -> Moment {
+        let n = bytes.len() as u64;
+        let layout =
+            MemLayout::from_parts(bytes, 4096, n, &[]).expect("a window is a valid layout");
         Moment::new(Some(layout), &Host::new(), continuation)
+    }
+
+    /// A one-page moment filled with `fill`, so neighbouring rungs share nothing.
+    fn filled(fill: u8) -> Moment {
+        image_moment(vec![fill; 4096], Continuation::None)
     }
 
     /// **One parameterised warm≡cold property over the three continuation variants** (#1517 slice 5).
@@ -707,11 +817,115 @@ mod ladder_tests {
         // Room for two one-page rungs against a count that would allow sixteen.
         let mut l: Ladder = Ladder::new(1, 16, 2 * 4096 + 100);
         for c in [0u64, 1, 2, 3] {
-            l.take(c, moment(1));
+            l.take(c, filled(c as u8 + 1));
         }
         assert_eq!(l.len(), 2, "two rungs fit the budget: {:?}", l.coords());
         assert!(l.held_bytes() <= 2 * 4096 + 100);
         assert!(l.holds(0), "and the pin survives a budget that tight");
+    }
+
+    #[test]
+    fn rungs_share_the_pages_they_agree_on() {
+        // Four pages; each rung after the first rewrites one of them.
+        let mut image = vec![0u8; 4 * 4096];
+        let mut l: Ladder = Ladder::new(1, 0, 0);
+        l.take(0, image_moment(image.clone(), Continuation::None));
+        assert_eq!(
+            l.held_bytes(),
+            4 * 4096,
+            "the first rung holds its whole window"
+        );
+        image[2 * 4096 + 7] = 1;
+        l.take(1, image_moment(image.clone(), Continuation::None));
+        image[4096] = 2;
+        l.take(2, image_moment(image.clone(), Continuation::None));
+        assert_eq!(
+            l.held_bytes(),
+            6 * 4096,
+            "each later rung adds only the page that changed"
+        );
+        // A rung with nothing new adds nothing.
+        l.take(3, image_moment(image.clone(), Continuation::None));
+        assert_eq!(l.held_bytes(), 6 * 4096);
+        // Dropping a rung in the middle keeps every other rung's image whole.
+        let mut l2: Ladder = Ladder::new(1, 3, 0);
+        let mut img = vec![0u8; 4 * 4096];
+        let mut want = Vec::new();
+        for c in 0..4u64 {
+            img[(c as usize % 4) * 4096] = c as u8 + 1;
+            want.push(img.clone());
+            l2.take(c, image_moment(img.clone(), Continuation::None));
+        }
+        assert_eq!(l2.coords(), vec![0, 2, 3], "1 is furthest from 3 and goes");
+        for c in [0u64, 2, 3] {
+            let (_, m) = l2.nearest_at_or_before(c).unwrap();
+            assert_eq!(m.mem().unwrap().bytes(), &want[c as usize][..]);
+        }
+        assert_eq!(
+            l2.held_bytes(),
+            7 * 4096,
+            "4, then 2 for rung 2 (its own page and the one 1 changed, now shared with nothing \
+             below), then 1 for rung 3"
+        );
+    }
+
+    /// The page sharing is invisible to a restore: under a random workload of writes, takes at any
+    /// coordinate (in order, out of order and repeated), truncation and both bounds, every rung a
+    /// ladder holds gives back exactly the image it was taken with, and the ladder never holds more
+    /// than the images would flat.
+    #[test]
+    fn a_held_rung_restores_the_image_it_was_taken_with() {
+        let mut seed = 0x1459_u64;
+        let mut rand = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for case in 0..64 {
+            let pages = 1 + rand(6) as usize;
+            let tail = rand(4096) as usize; // a window need not be whole pages
+            let mut image = vec![0u8; pages * 4096 + tail];
+            let budget = if case % 3 == 0 { image.len() * 3 } else { 0 };
+            let mut l = Ladder::new(1, rand(8) as usize, budget);
+            let mut taken = std::collections::BTreeMap::new();
+            for _ in 0..200 {
+                match rand(10) {
+                    0..=5 => {
+                        // A few writes, of a byte or a run, anywhere in the window.
+                        for _ in 0..1 + rand(4) {
+                            let at = rand(image.len() as u64) as usize;
+                            let len = (1 + rand(300) as usize).min(image.len() - at);
+                            let v = rand(256) as u8;
+                            image[at..at + len].fill(v);
+                        }
+                    }
+                    6..=8 => {
+                        let c = rand(64);
+                        if !l.holds(c) {
+                            taken.insert(c, image.clone());
+                        }
+                        l.take(c, image_moment(image.clone(), Continuation::None));
+                    }
+                    _ => {
+                        let c = rand(64);
+                        l.truncate_after(c);
+                        taken.retain(|&k, _| k <= c);
+                    }
+                }
+                let flat: usize = l.coords().len() * image.len();
+                assert!(l.held_bytes() <= flat, "never more than the flat images");
+                for c in l.coords() {
+                    let (at, m) = l.nearest_at_or_before(c).unwrap();
+                    assert_eq!(at, c);
+                    assert_eq!(
+                        m.mem().unwrap().bytes(),
+                        &taken[&c][..],
+                        "case {case}: rung {c} restores what it was taken with"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

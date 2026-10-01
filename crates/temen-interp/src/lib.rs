@@ -854,6 +854,10 @@ pub(crate) struct HostCursor {
     pub(crate) cap_consumed: usize,
     pub(crate) cap_record_len: usize,
     pub(crate) mem_mapped_bytes: u64,
+    /// The `Jit` tables' [`compile_mark`](Host::jit_compile_mark) — not restored but compared: a
+    /// `compile` adds a unit and a `JitCode` handle, which a cursor cannot take back, so an undo across
+    /// one declines (#2015).
+    pub(crate) jit_mark: (usize, u64),
 }
 
 /// The run-mutable host substate a time-travel checkpoint restores — see [`Host::replay_substate`].
@@ -893,6 +897,11 @@ struct HostReplaySubstate {
     /// the artifact cannot drift apart. `None` for a capability that isn't [`CapState::Captured`] —
     /// the common case (`display` is pure output).
     cap_states: Vec<Option<Vec<u8>>>,
+    /// Each granted `Jit` table's remaining compile quota, `(units, blob bytes)`, positional over
+    /// `jit_tables` (#2015). A checkpoint is only taken while no table holds a unit
+    /// ([`Host::checkpoint_safe`]), so the quota is all that can differ from the fresh grant a restore
+    /// lands in: a rejected `compile` still charges its bytes.
+    jit_quota: Vec<(u32, u64)>,
 }
 
 /// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
@@ -1488,7 +1497,7 @@ impl Inspector {
                 .continuation()
                 .as_shadow_stack()
                 .expect("a single-threaded seek ladder holds only ShadowStack moments");
-            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem(), clock);
+            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem().as_deref(), clock);
             cp.restore_host(&mut host.lock_unpoisoned());
         }
         self.host = host;
@@ -24605,6 +24614,12 @@ impl Host {
     /// captured in the run snapshot. (The DAP backend grants no modules, so this only affects a direct
     /// embedder driving `snapshot`/`restore` itself, which rebuilds its own powerbox.)
     ///
+    /// **A `Jit` table without units is admitted (#2015).** The grant creates the table, so refusing
+    /// any table refused every guest that imports `Jit`, compiled or not. A unit is what the restore
+    /// cannot rebuild — its `JitCode` handle and any install. Until the first one, a rebuilt run's
+    /// fresh grant matches the table except for the compile quota a rejected `compile` still charges,
+    /// and the replay substate carries that.
+    ///
     /// **Named host capabilities are admitted (#1455).** A host-fn used to disqualify the whole run,
     /// which self-disabled the ladder for *every* interesting guest — a debugged C program that does
     /// file I/O holds `vm_fs`; a playground reactor holds `display`/`keyboard`/`fs` — leaving them on
@@ -24623,7 +24638,10 @@ impl Host {
         self.regions.is_empty()
             && self.blockings.is_empty()
             && self.every_host_proc_reconstructible()
-            && self.jit_tables.is_empty()
+            // #2015: a unit is a `JitCode` handle and an install the restore cannot rebuild, but a
+            // table that holds none matches the fresh grant a restore lands in, up to the quota the
+            // replay substate carries.
+            && self.jit_tables.iter().all(|d| d.units.is_empty())
     }
 
     /// The **undo journal's** compact host cursor (#1557): the few scalars and append-only lengths
@@ -24646,7 +24664,16 @@ impl Host {
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
             mem_mapped_bytes: self.mem_mapped_bytes,
+            jit_mark: self.jit_compile_mark(),
         }
+    }
+
+    /// Every `Jit` table's units, counted, and remaining blob bytes, summed: it moves with every
+    /// `compile` attempt, a rejected one included (its bytes are charged).
+    pub(crate) fn jit_compile_mark(&self) -> (usize, u64) {
+        self.jit_tables
+            .iter()
+            .fold((0, 0), |(u, b), d| (u + d.units.len(), b + d.bytes_left))
     }
 
     /// Put back a [`journal_cursor`](Host::journal_cursor): truncate the append-only buffers to the
@@ -24735,6 +24762,11 @@ impl Host {
             svc_next_ticket,
             cap_states: self.capture_cap_states(),
             mem_mapped_bytes: self.mem_mapped_bytes,
+            jit_quota: self
+                .jit_tables
+                .iter()
+                .map(|d| (d.units_left, d.bytes_left))
+                .collect(),
         }
     }
 
@@ -24767,6 +24799,15 @@ impl Host {
         // capability (see `cap_dispatch_slots_impl`), so from here its state follows the replay
         // forward, and a store rewound to the checkpoint shows the files the guest had written by then.
         self.restore_cap_states(&s.cap_states);
+        for (d, &(units, bytes)) in self.jit_tables.iter_mut().zip(&s.jit_quota) {
+            d.units_left = units;
+            d.bytes_left = bytes;
+        }
+    }
+
+    /// Whether this domain holds a `Jit` table at all, unit or none.
+    pub(crate) fn has_jit_table(&self) -> bool {
+        !self.jit_tables.is_empty()
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard

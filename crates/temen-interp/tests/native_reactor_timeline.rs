@@ -156,7 +156,7 @@ impl MomentReactor for NativeReactor {
         ))
     }
     fn restore(&mut self, m: &ReactorMoment) -> bool {
-        if !self.inst.restore_window(m.layout()) {
+        if !self.inst.restore_window(&m.layout()) {
             return false;
         }
         m.restore_host(&mut self.host);
