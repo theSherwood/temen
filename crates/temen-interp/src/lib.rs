@@ -21263,9 +21263,11 @@ struct SharedStdin {
 
 /// A **lazy stdin source** ([`Host::set_stdin_source`]): called when a `Stream(In)` `read` finds the
 /// stdin buffer exhausted, to fetch more bytes — a CLI reads the next line of the real stdin here, so
-/// an interactive guest sees input as it is typed. An empty return is end of input (the read returns
-/// 0, as an exhausted buffer always did). The dual of [`StdoutTee`].
-pub type StdinSource = Box<dyn FnMut() -> Vec<u8> + Send>;
+/// an interactive guest sees input as it is typed. `Some` of an empty buffer is end of input (the
+/// read returns 0, as an exhausted buffer always did). `None` is "nothing yet": the read returns
+/// `-EAGAIN` and the guest may try again later, so a source that never blocks lets a guest wait on
+/// its terminal and something else at once (#2019). The dual of [`StdoutTee`].
+pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
@@ -26364,8 +26366,9 @@ impl Host {
     }
 
     /// Install a **lazy stdin source** (see [`Host::stdin_source`]): `src` is asked for more bytes
-    /// each time a `Stream(In)` `read` exhausts the buffer; an empty answer is end of input. The CLI's
-    /// interactive mode reads the real stdin a line at a time through it.
+    /// each time a `Stream(In)` `read` exhausts the buffer; an empty answer is end of input, and
+    /// none is "nothing yet" (`-EAGAIN`, [`StdinSource`]). The CLI's interactive mode reads the real
+    /// stdin a line at a time through it.
     pub fn set_stdin_source(&mut self, src: StdinSource) {
         self.stdin_source = Some(src);
     }
@@ -30719,7 +30722,9 @@ impl Host {
                     let mut st = cell.lock_unpoisoned();
                     if st.pos >= st.bytes.len() {
                         if let Some(src) = st.source.as_mut() {
-                            let more = src();
+                            let Some(more) = src() else {
+                                return ret(EAGAIN);
+                            };
                             st.bytes.extend_from_slice(&more);
                         }
                     }
@@ -30739,7 +30744,9 @@ impl Host {
                 // own bytes), so a parking host never consults it.
                 if self.stdin_pos >= self.stdin.len() && !self.stdin_block {
                     if let Some(src) = self.stdin_source.as_mut() {
-                        let more = src();
+                        let Some(more) = src() else {
+                            return ret(EAGAIN);
+                        };
                         self.stdin.extend_from_slice(&more);
                     }
                 }

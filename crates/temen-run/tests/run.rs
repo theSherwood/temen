@@ -116,6 +116,63 @@ fn echoes_stdin_to_stdout() {
 }
 
 #[test]
+fn a_stdin_source_may_have_nothing_yet() {
+    // #2019: a lazy stdin source answers `None` when it has nothing yet, and the read returns
+    // `-EAGAIN` rather than blocking or ending the input; the next read asks again. Here: nothing
+    // (-11), then "ab" (2), then end of input (0); the guest echoes what it read and returns
+    // `r1 + 100·r2 + 10000·r3` = 189, on every engine.
+    let m = load(
+        "memory 16\n\
+         export 0 func \"_start\" 0\n\
+         func () -> (i32) {\n\
+         block 0 () {\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 v1 = i64.const 16384\n\
+         \x20 v2 = i64.const 64\n\
+         \x20 v3 = call.sym \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v4 = call.sym \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v5 = call.sym \"write\" (i64, i64) -> (i64) v0(v1, v4)\n\
+         \x20 v6 = call.sym \"read\" (i64, i64) -> (i64) v0(v1, v2)\n\
+         \x20 v7 = i64.const 100\n\
+         \x20 v8 = i64.mul v4 v7\n\
+         \x20 v9 = i64.const 10000\n\
+         \x20 v10 = i64.mul v6 v9\n\
+         \x20 v11 = i64.add v3 v8\n\
+         \x20 v12 = i64.add v11 v10\n\
+         \x20 v13 = i32.wrap_i64 v12\n\
+         \x20 return v13\n\
+           }\n\
+         }\n",
+    );
+    let inst = temen_run::instantiate(m).expect("instantiate");
+    for backend in [
+        temen_run::Backend::TreeWalk,
+        temen_run::Backend::Bytecode,
+        temen_run::Backend::Jit,
+    ] {
+        let mut answers = vec![None, Some(b"ab".to_vec()), Some(Vec::new())].into_iter();
+        let mut setup = |h: &mut temen_interp::Host| {
+            let mut answers = std::mem::take(&mut answers);
+            h.set_stdin_source(Box::new(move || answers.next().unwrap_or_default()));
+        };
+        let run = inst
+            .run_with_caps_and_host(
+                backend,
+                &temen_run::RunConfig::default(),
+                &[],
+                Some(&mut setup),
+            )
+            .expect("run");
+        assert_eq!(run.stdout, b"ab", "{backend:?}");
+        assert_eq!(
+            run.outcome,
+            Outcome::Returned(vec![Value::I32(189)]),
+            "{backend:?}"
+        );
+    }
+}
+
+#[test]
 fn bare_kernel_returns_value() {
     // A non-powerbox entry — a pure function (i64 x) -> (i64) returning x + 1.
     let m = load(
