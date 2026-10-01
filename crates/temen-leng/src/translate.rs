@@ -4958,7 +4958,10 @@ impl<'a> FuncGen<'a> {
                 // handlers, callback tables). Without this the name fell to the `data.sym` path
                 // below and failed to resolve (a proc exports as a *func*, not data). Frame-needing
                 // procs still fail closed inside `funcref_value` (no `$sp` to hand an indirect call).
-                if self.t.procs.contains_key(a) {
+                // A **sibling unit's** proc is a funcref too, read from its `xmod_funcref_slots`
+                // slot: `sort(xs, cmpNames)` binds the comparator to a local first, and nimony
+                // keeps that comparator's proctype in the one module that instantiated it.
+                if self.t.procs.contains_key(a) || self.t.xmod_funcref_slots.contains_key(a) {
                     let id = self.funcref_value(e)?;
                     return Ok(Val {
                         id,

@@ -1212,6 +1212,13 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // serves it ([`POSIX_SERVED_LEAVES`]). This powerbox has no process table, so here it fails
     // closed on `pipe`'s stub (row 43), the same `(ptr) -> -1`. **Pinned** (#1499).
     ("pspawn", sig(&[I64], &[I32]), 43),
+    // Two more fail-closed file and process stubs, both **pinned** (#1499). `std/posix`'s
+    // `chmod(path, mode) -> cint` has `mkdir`'s shape and posture (row 29: no filesystem to change).
+    // `std/cpuinfo` sizes a pool from `sched_getaffinity(pid, size, mask) -> cint` first. -1 here
+    // (row 83's stub, the same shape) makes it count nothing and fall back to `sysconf`
+    // (row 48), as it did before it asked for the affinity mask.
+    ("chmod", sig(&[I64, I32], &[I32]), 29),
+    ("schedGetaffinity", sig(&[I32, I64, I64], &[I32]), 83),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the

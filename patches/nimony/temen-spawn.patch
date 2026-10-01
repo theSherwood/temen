@@ -21,13 +21,13 @@ the self-hosted lane holds Temen's build to. `temen_spawn.c` is `.compile`d into
 refuses with -ENOSYS. A Temen build (`nimony t`) compiles no C, so it never sees that file.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the vendored
-`nimony/` submodule is never modified. Against the submodule pin (v0.6.2, 851fe262). Temen-specific,
+`nimony/` submodule is never modified. Against the submodule pin (6ca46f17). Temen-specific,
 like temen-backend.patch, which it goes with.
 diff --git a/lib/std/os.nim b/lib/std/os.nim
-index 0b609e3..70a8ac1 100644
+index d8e01f1..a949842 100644
 --- a/lib/std/os.nim
 +++ b/lib/std/os.nim
-@@ -242,15 +242,21 @@ proc execShellCmd*(command: string): int {.tags: [ExecIOEffect].} =
+@@ -278,15 +278,21 @@ proc execShellCmd*(command: string): int {.tags: [ExecIOEffect].} =
      argv[1] = dashc.toCString
      argv[2] = cmd.toCString
      argv[3] = nil.cstring
@@ -147,10 +147,10 @@ index 81d224e..bd1b503 100644
      result = Process(options: options, exitFlag: false, id: pid,
                       inHandle: 0'i32, outHandle: 0'i32, errHandle: 0'i32,
 diff --git a/lib/std/posix/posix.nim b/lib/std/posix/posix.nim
-index df8d94a..6aa9ccb 100644
+index fb517db..5eef266 100644
 --- a/lib/std/posix/posix.nim
 +++ b/lib/std/posix/posix.nim
-@@ -568,6 +568,32 @@ when defined(posix):
+@@ -581,6 +581,32 @@ when defined(posix):
    proc read*(fildes: cint; buf: pointer; nbyte: int): int {.importc: "read", sideEffect.}
    proc write*(fildes: cint; buf: pointer; nbyte: int): int {.importc: "write", sideEffect.}
  
