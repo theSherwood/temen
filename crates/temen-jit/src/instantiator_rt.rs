@@ -95,8 +95,9 @@ impl DurableCell {
 
     /// Ring the child's doorbell: store `UNWINDING` into its **own** freeze word (what
     /// [`crate::FreezeController::request_freeze`] does for the root), so it unwinds at its next poll
-    /// and its task deposits its window image at finish. A no-op once its window is gone.
-    pub(crate) fn ring(&self) {
+    /// and its task deposits its window image at finish. A no-op once its window is gone, which the
+    /// answer says: whether the child was live.
+    pub(crate) fn ring(&self) -> bool {
         let base = self.base.lock().unwrap_or_else(|e| e.into_inner());
         if *base != 0 {
             // SAFETY: a nonzero base is the child's live window (its task retires the base under
@@ -108,6 +109,7 @@ impl DurableCell {
                     .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
             }
         }
+        *base != 0
     }
 
     /// Whether the child unwound for a freeze (its task deposited its image).
@@ -133,9 +135,27 @@ struct Child {
     /// §4 — a durable §14 child's freeze record, and whether it unwound into its carve. Recorded when
     /// its parent unwinds with the child still unjoined ([`Nursery::freeze_unjoined`]).
     nested: Option<(crate::FrozenNested, bool)>,
+    /// #2010 — the nursery this child spawns its own children through, if it has one (#1956; also
+    /// held in [`Nursery::kids`]). A freeze reaches them through it, and its harvest nests theirs.
+    kid: Option<std::sync::Arc<Nursery>>,
 }
 
 impl Child {
+    /// #1361 step 4, #2010 — a freeze reached this child's parent: ring a durable child's doorbell,
+    /// then its own children's, if the ring found it live or it already unwound for this freeze.
+    /// The whole live subtree is rung before the run's teardown begins, so a grandchild parked under
+    /// a word nobody rang yet is never poisoned there (`ChildExec::shutdown_and_join`). A child that
+    /// already returned rings nothing: its children run on, as the oracle's do.
+    fn ring(&self) {
+        if let Some(d) = self.done.durable.as_ref() {
+            if d.ring() || d.unwound() {
+                if let Some(kid) = &self.kid {
+                    kid.ring_detached();
+                }
+            }
+        }
+    }
+
     /// A child whose outcome is **already known** (the synchronous path): a cell pre-filled with
     /// `(result, trap)`.
     fn finished(result: i64, trap: i64) -> Child {
@@ -148,6 +168,7 @@ impl Child {
             joined: false,
             retained: 0,
             nested: None,
+            kid: None,
         }
     }
 
@@ -159,6 +180,7 @@ impl Child {
             joined: false,
             retained: 0,
             nested: None,
+            kid: None,
         }
     }
 }
@@ -207,6 +229,8 @@ unsafe fn file_task(
     // #2001 — a detached child's own budget node, which its threads are charged to; `None` for a
     // carve child.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
+    // #2010 — the nursery `code` was compiled against, if the child spawns (see [`Child::kid`]).
+    kid: Option<std::sync::Arc<Nursery>>,
 ) -> Filed {
     let futex_sched = rt.futex_sched;
     // #1586 — reserve a §15 live-vCPU slot before filing, so a parent cannot hold more concurrency
@@ -258,6 +282,7 @@ unsafe fn file_task(
     let mut child = Child::pending(done);
     // 5c.0 — retain the shared child powerbox for `child_offer` (released at join_children).
     child.retained = retained_ctx;
+    child.kid = kid;
     let slot = match slot {
         None => {
             children.push(child);
@@ -330,7 +355,21 @@ unsafe fn file_carve_task(
         None,
         None,
         None,
+        None,
     )
+}
+
+/// #2010 — give back the powerbox refs a thaw's seed holds, and its children's, for a re-launch that
+/// has no nursery to file them in.
+///
+/// # Safety
+/// As [`Nursery::relaunch_detached`]'s seed: each holds two live counted refs, owned here.
+unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::DetachedSeed) {
+    release(seed.child.ctx);
+    release(seed.child.retained_ctx);
+    for c in seed.children {
+        release_seed(release, c);
+    }
 }
 
 /// D66 — a granted child's teardown: release its powerbox and, for a detached child, return its
@@ -622,9 +661,9 @@ pub(crate) struct Nursery {
     /// run's teardown. Their addresses are baked into their children's code, and what they retain
     /// is released only after every task has ended ([`Nursery::join_children`]): a grandchild's
     /// teardown hands its lane and window back to its parent's host, which only that retained ref
-    /// keeps alive once the parent has ended. `Box` for the baked address (see `child_fuel_cells`).
-    #[allow(clippy::vec_box)]
-    kids: Mutex<Vec<Box<Nursery>>>,
+    /// keeps alive once the parent has ended. Each is held from its birth ([`Nursery::for_child`]),
+    /// whether or not its child is ever filed: a thaw files its children into it first (#2010).
+    kids: Mutex<Vec<std::sync::Arc<Nursery>>>,
     /// #1956 — the installed [`crate::AsParent`] (0 = none: a detached child spawns nothing).
     grant_as_parent: std::sync::atomic::AtomicUsize,
 }
@@ -812,16 +851,21 @@ impl Nursery {
         chain
     }
 
-    /// #1956 — the nursery a non-durable detached child spawns its own children through, or `None`
-    /// when it has no need of one (it names no `Instantiator` and can install no unit that would) or
-    /// no means: no [`crate::AsParent`] installed, or a powerbox nothing retains. Its powerbox `gc`
-    /// is the host its `Instantiator` resolves against and the parent its hooks charge, through the
-    /// family `as_parent` builds over it; the executor, futex domain and kill cell are the run's.
-    /// The program, shadow and fuel a carve child would take are empty: it files none.
+    /// #1956 — the nursery a detached child spawns its own children through, or `None` when it has
+    /// no need of one (it names no `Instantiator` and can install no unit that would) or no means:
+    /// no [`crate::AsParent`] installed, or a powerbox nothing retains. Its powerbox `gc` is the
+    /// host its `Instantiator` resolves against and the parent its hooks charge, through the family
+    /// `as_parent` builds over it; the executor, futex domain and kill cell are the run's. The
+    /// program, shadow and fuel a carve child would take are empty: it files none. It is durable
+    /// when this one is (#2010): a durable domain's children are durable, and so are theirs.
     ///
     /// # Safety
     /// `gc` is the live powerbox the installed hooks just built for the child.
-    unsafe fn for_child(&self, gc: &crate::GrantChild, funcs: &[Func]) -> Option<Box<Nursery>> {
+    unsafe fn for_child(
+        &self,
+        gc: &crate::GrantChild,
+        funcs: &[Func],
+    ) -> Option<std::sync::Arc<Nursery>> {
         let as_parent = self.grant_as_parent.load(Ordering::Acquire);
         // A powerbox nothing retains dies with the child, while a grandchild's teardown still hands
         // its lane and window back to it.
@@ -852,7 +896,13 @@ impl Nursery {
         n.ancestors = self.lane_chain_of(gc);
         n.ancestors.pop(); // the child's own lane is its children's parent lane
         n.set_grant_hooks(Some(hooks));
-        Some(Box::new(n))
+        n.set_durable(self.durable.load(Ordering::Acquire));
+        let n = std::sync::Arc::new(n);
+        self.kids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(std::sync::Arc::clone(&n));
+        Some(n)
     }
 
     /// #1956 — refuse a carve spawn on a nursery that files none (see [`Nursery::carves`]) with a
@@ -1026,33 +1076,38 @@ impl Nursery {
     /// finished (a `join`/`detach` waited on it, or it ran to completion and the run is ending); a still-
     /// running **detached** child blocks here exactly as a detached `thread.spawn` vCPU does at
     /// `Domain::join_all` — the run's contract is that every vCPU/child is joined before the window dies.
-    pub(crate) fn join_children(&self, froze: bool) {
+    ///
+    /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
+    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
+    pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
         // unless this is a freeze the carve children end with the domain; then the workers are joined.
         // It is the whole run's, so every descendant's task has ended too (#1956).
         self.child_exec.shutdown_and_join(!froze);
-        self.release_retained(froze);
+        let harvest = if froze {
+            self.take_detached_harvest()
+        } else {
+            Vec::new()
+        };
+        self.release_retained();
+        harvest
     }
 
     /// CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted live-impls
     /// hold their own counted refs, so a parent-held offer handle stays valid at the host layer; the
     /// run is over regardless), and (#1956) every descendant nursery's. Only once the executor has
     /// drained, so no child task still runs against a `Host` while its last-but-one ref drops.
-    /// Exactly once per child: `take` zeroes the field.
-    fn release_retained(&self, froze: bool) {
+    /// Exactly once per child: `take` zeroes the field, as the harvest's does for the ones it hands
+    /// over.
+    fn release_retained(&self) {
         for kid in self.kids.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            kid.release_retained(froze);
+            kid.release_retained();
         }
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr != 0 {
             let release: crate::GrantChildReleaser = unsafe { core::mem::transmute(release_addr) };
             let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
             for c in children.iter_mut() {
-                // #1361 step 4 — a frozen run keeps each unjoined durable detached child's powerbox:
-                // it rides the artifact ([`Nursery::take_detached_harvest`] hands it over).
-                if froze && !c.joined && c.done.durable.is_some() {
-                    continue;
-                }
                 let retained = std::mem::take(&mut c.retained);
                 if retained != 0 {
                     // SAFETY: `retained` is a live `GrantChild::retained_ctx` this nursery owns,
@@ -1066,19 +1121,34 @@ impl Nursery {
     /// #1361 step 4 — a freeze reached this domain: ring every live durable detached child's doorbell,
     /// which is a store of `UNWINDING` into the child's **own** freeze word (what
     /// [`crate::FreezeController::request_freeze`] does for the root). The child unwinds at its next
-    /// poll like any root and its task deposits its window image at finish.
+    /// poll like any root and its task deposits its window image at finish. A child being joined is
+    /// rung too (#2010): its joiner is a domain the same freeze reaches, which may itself be parked.
     pub(crate) fn ring_detached(&self) {
-        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        for c in children.iter().filter(|c| !c.joined) {
-            if let Some(d) = c.done.durable.as_ref() {
-                d.ring();
-            }
+        for c in self
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            c.ring();
         }
     }
 
-    /// #1361 step 4 — after a frozen run's [`Nursery::join_children`]: every unjoined durable detached
-    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]).
-    pub(crate) fn take_detached_harvest(&self) -> Vec<crate::DetachedHarvest> {
+    /// #2010 — ring the child at `slot` the way [`Nursery::ring_detached`] rings each one.
+    fn ring_slot(&self, slot: usize) {
+        if let Some(c) = self
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slot)
+        {
+            c.ring();
+        }
+    }
+
+    /// #1361 step 4 — every unjoined durable detached child after a frozen run's teardown, with its
+    /// powerbox handed over, and (#2010) its own harvest nested in it.
+    fn take_detached_harvest(&self) -> Vec<crate::DetachedHarvest> {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         for (slot, c) in children.iter_mut().enumerate() {
@@ -1096,6 +1166,10 @@ impl Nursery {
                 powerbox: std::mem::take(&mut c.retained) as *mut core::ffi::c_void,
                 image: d.image.lock().unwrap_or_else(|e| e.into_inner()).take(),
                 outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
+                children: c
+                    .kid
+                    .as_ref()
+                    .map_or_else(Vec::new, |k| k.take_detached_harvest()),
             });
         }
         out
@@ -1107,8 +1181,12 @@ impl Nursery {
     /// rewound `join` then parks on it as before the cut. `false` if its code will not compile or the
     /// executor refuses it; the slot is then left to fail closed at the join.
     ///
+    /// #2010 — a child that spawned gets its nursery back, and its own captured children are
+    /// re-launched into it first, so its rewound `join` parks on them as before the cut too.
+    ///
     /// # Safety
-    /// `seed.child` holds two live counted refs to the child's powerbox, owned from here on.
+    /// `seed.child` holds two live counted refs to the child's powerbox, owned from here on, and so
+    /// does each of `seed.children`, at every depth.
     pub(crate) unsafe fn relaunch_detached(&self, seed: crate::DetachedSeed) -> bool {
         let crate::DetachedSeed {
             slot,
@@ -1122,6 +1200,7 @@ impl Nursery {
             prots,
             child: gc,
             window,
+            children,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr == 0 {
@@ -1134,6 +1213,15 @@ impl Nursery {
         } else {
             self.cap_thunk
         };
+        let kid = self.for_child(&gc, &funcs);
+        for c in children {
+            match &kid {
+                Some(kid) => {
+                    kid.relaunch_detached(c);
+                }
+                None => release_seed(release, c),
+            }
+        }
         // #1944 slice 3 — the thawed child draws from its budget node again, as at its spawn; what
         // it drew before the freeze and did not burn went back as the freeze unwound it.
         let (node, child_fuel) = self.detached_node(gc.ctx);
@@ -1150,7 +1238,8 @@ impl Nursery {
                 .as_deref()
                 .map_or(0, |c| c as *const crate::FuelCell as usize),
             self.futex_sched,
-            crate::InstEnv::null(),
+            kid.as_deref()
+                .map_or(crate::InstEnv::null(), crate::InstEnv::over),
             &self.serve_handlers,
             gc.jit_table_log2,
             shadow,
@@ -1203,6 +1292,7 @@ impl Nursery {
                 self.child_high_water(gc.retained_ctx),
             )),
             node,
+            kid,
         );
         matches!(filed, Filed::Slot(_))
     }
@@ -2260,12 +2350,17 @@ unsafe fn spawn_detached_child(
     // (context 0's shadow-SP word at its frame base) and carries a freeze cell recording `entry`.
     durable: Option<temen_ir::durable_abi::ShadowArena>,
     entry: u32,
-    // #1760 — the parent is already unwinding for a freeze: the child's freeze word starts
-    // `UNWINDING` (see [`init_durable_words`]).
-    parent_freezing: bool,
-    // #1956 — the nursery `code` was compiled against, if the child spawns: kept once it is filed.
-    kid: Option<Box<Nursery>>,
+    // #1760, #2010 — the spawner's window, whose freeze word a durable child's follows: one spawned
+    // by a parent already unwinding for a freeze starts `UNWINDING` (see [`init_durable_words`]),
+    // and one a freeze's ring missed while it was being filed is rung once it is.
+    spawner_base: u64,
+    // #1956 — the nursery `code` was compiled against, if the child spawns.
+    kid: Option<std::sync::Arc<Nursery>>,
 ) -> i32 {
+    // SAFETY: a durable spawner's window is live for the call, and its first page holds the word.
+    let parent_freezing =
+        || durable.is_some() && unsafe { crate::fiber_rt::window_is_unwinding(spawner_base) };
+    let freezing = parent_freezing();
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
     let teardown = granted_teardown(
@@ -2302,7 +2397,7 @@ unsafe fn spawn_detached_child(
                 rw[off..off + s.bytes.len()].copy_from_slice(&s.bytes);
             }
             if let Some(a) = durable {
-                init_durable_words(rw, a, parent_freezing);
+                init_durable_words(rw, a, freezing);
             }
             for s in seeds.iter().filter(|s| s.readonly) {
                 w.protect_ro(s.offset, s.bytes.len() as u64);
@@ -2332,11 +2427,14 @@ unsafe fn spawn_detached_child(
             )
         }),
         node,
+        kid,
     );
     match filed {
         Filed::Slot(slot) => {
-            if let Some(kid) = kid {
-                rt.kids.lock().unwrap_or_else(|e| e.into_inner()).push(kid);
+            // #2010 — a freeze that reached the spawner while the child was being filed rang its
+            // children without this one: ring it now, as that ring would have.
+            if parent_freezing() {
+                rt.ring_slot(slot as usize);
             }
             slot
         }
@@ -2593,13 +2691,9 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     let child_fuel_addr = child_fuel
         .as_deref()
         .map_or(0, |c| c as *const crate::FuelCell as usize);
-    // #1956 — a child that spawns gets a nursery of its own. A durable one does not yet: the freeze
-    // that captures it would have to reach its children too.
-    let kid = if durable {
-        None
-    } else {
-        rt.for_child(&gc, child_funcs)
-    };
+    // #1956 — a child that spawns gets a nursery of its own; a durable child's is durable, and a
+    // freeze reaches its children through it (#2010).
+    let kid = rt.for_child(&gc, child_funcs);
     let compiled = crate::compile_child_windowed(
         child_funcs,
         child_types,
@@ -2671,8 +2765,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         node,
         durable.then_some(child_shadow),
         entry as u32,
-        // SAFETY: a durable run's window is live and its first page holds the freeze word.
-        durable && unsafe { crate::fiber_rt::window_is_unwinding(mem_base) },
+        mem_base,
         kid,
     )
 }
@@ -2827,7 +2920,7 @@ pub(crate) unsafe extern "C" fn join(
                 // The child's end, or the cadence sweep, re-offers the task (`child_finished`).
                 Some(fib) => {
                     drop(st);
-                    crate::fiber_rt::fiber_event_park(fib, false, None);
+                    crate::fiber_rt::fiber_event_park(fib, false, crate::fiber_rt::ParkOn::Child);
                     done.state.lock().unwrap_or_else(|e| e.into_inner())
                 }
                 None => {

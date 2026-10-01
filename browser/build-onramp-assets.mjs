@@ -406,7 +406,8 @@ try {
   const kb = (readFileSync(fixture).length / 1024).toFixed(0);
   console.log(`  ✓ shell.temen (${kb} KB)`);
   // The `__stage` ring-filter runner — granted alongside the shell so pipelines take the concurrent
-  // ring path (op 11 + SharedRegion + futex). Committed next to shell.temen by the same generator.
+  // ring path (detached §14 children + SharedRegion + futex). Committed next to shell.temen by the
+  // same generator.
   const runner = join(HERE, 'tests', 'fixtures', 'stage_runner.temen');
   if (!existsSync(runner)) throw new Error('tests/fixtures/stage_runner.temen missing (run the generator)');
   copyFileSync(runner, join(ASSETS, 'stage_runner.temen'));

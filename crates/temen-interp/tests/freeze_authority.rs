@@ -192,3 +192,50 @@ fn detached_progeny_authority_round_trips() {
     thawed.restore_durable_handles(&captured);
     assert!(thawed.holds_freeze_authority(FreezeScope::DetachedProgeny));
 }
+
+/// #2018 — **an ancestor hands detached-progeny authority down by grant**, the one way INVARIANTS' R1
+/// ruling lets it reach a descendant. A durable detached child has no other source of it, and without
+/// it the shared admission refuses every detached spawn of its own, so a durable tree could never be
+/// deeper than one level. The parent keeps its own, and the carve form, which names a range of the
+/// parent's window, is never handed down.
+#[test]
+fn detached_progeny_authority_is_handed_down_by_grant() {
+    let mut parent = Host::new();
+    parent.set_durable(true);
+    let progeny = parent.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    let carve = parent.grant_freeze_authority(FreezeScope::Carve {
+        base: 0,
+        size: 1 << 16,
+    });
+    let budget = parent.grant_budget(-1, 1 << 20, -1);
+    let (mut child, _, _) = parent
+        .spawn_detached_child(&[("freeze".to_string(), progeny)], 1 << 16, budget, -1)
+        .expect("detached-progeny authority re-grants");
+    assert!(child.holds_freeze_authority(FreezeScope::DetachedProgeny));
+    assert!(
+        parent.holds_freeze_authority(FreezeScope::DetachedProgeny),
+        "the parent keeps its own"
+    );
+    let own = child
+        .resolve_cap_name("budget")
+        .expect("the child's budget");
+    assert!(
+        child.admit_detached_spawn(own, 1 << 16).is_some(),
+        "so the durable child may spawn detached children of its own"
+    );
+
+    let (mut bare, _, _) = parent
+        .spawn_detached_child(&[], 1 << 16, budget, -1)
+        .expect("spawn");
+    let own = bare.resolve_cap_name("budget").expect("the child's budget");
+    assert!(
+        bare.admit_detached_spawn(own, 1 << 16).is_none(),
+        "without the grant it holds none, and its detached spawn is refused"
+    );
+    assert!(
+        parent
+            .spawn_detached_child(&[("freeze".to_string(), carve)], 1 << 16, budget, -1)
+            .is_none(),
+        "the carve form is never handed down"
+    );
+}

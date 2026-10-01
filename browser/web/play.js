@@ -1685,9 +1685,9 @@ echo toUpperAscii("temen")
       'output appears below. Builtins include echo (with $VARs), cd/pwd, cat/grep/wc/head/tail/sort/' +
       'uniq/ls, test/[ ], redirection (> >> <), command lists (; && ||), if/then/else, and globbing ' +
       '— all over an in-memory filesystem. Pipelines run as concurrent stages over shared-memory ' +
-      'rings (op 11 + SharedRegion + futex); an unknown name like `primes` (a generator) or `upper` ' +
-      '(a filter that reads stdin) is exec’d as a separate compiled-C program (op 13 §14 child) — all ' +
-      'spawned client-side in the sandbox.',
+      'rings (detached §14 children + SharedRegion + futex); an unknown name like `primes` (a ' +
+      'generator) or `upper` (a filter that reads stdin) is exec’d as a separate compiled-C program, ' +
+      'a detached §14 child (op 17) — all spawned client-side in the sandbox.',
     src: `# A real shell, running in the sandbox. Type commands, then click Run.
 echo hello from the sandbox
 
@@ -2284,8 +2284,8 @@ function buildCmdsBlob(cmds) {
 // `temen_run_shell` entry (STAGE1.md) — it grants the POSIX personality and (when `cmdsBlob` is given)
 // the shell's PATH registry: the `__stage` ring-filter runner and any external commands. The editor
 // text feeds the shell's stdin as the script. With `__stage` registered, `cat f | sort | uniq`-style
-// pipelines take the concurrent ring path (op 11 + SharedRegion + futex); external commands (`primes`)
-// spawn as op-13 §14 children. Returns { rv, status, stdout }.
+// pipelines take the concurrent ring path (detached §14 children + SharedRegion + futex); external
+// commands (`primes`) spawn as detached §14 children (op 17). Returns { rv, status, stdout }.
 function shellInterp(bytes, stdinBytes, cmdsBlob) {
   const p = eng.ex.temen_alloc(bytes.length);
   let stdinP = 0;
@@ -2332,9 +2332,9 @@ async function runShell(c) {
   }
   logTo(c, `fetched ${ex.url}: ${bytes.length}B shell`);
   // The PATH registry (`ex.cmds`: `[{ name, url }]`) — the `__stage` ring runner (concurrent pipelines:
-  // op 11 + SharedRegion + futex) and external commands like `primes`. Each is an optional companion
-  // asset: a fetch failure drops just that command (pipelines fall back to memfs staging; a missing
-  // external command is `not found`), so it is logged, not fatal.
+  // detached §14 children + SharedRegion + futex) and external commands like `primes`. Each is an
+  // optional companion asset: a fetch failure drops just that command (pipelines fall back to memfs
+  // staging; a missing external command is `not found`), so it is logged, not fatal.
   const cmds = [];
   for (const cmd of ex.cmds || []) {
     try {

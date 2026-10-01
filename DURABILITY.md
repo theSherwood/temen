@@ -617,10 +617,29 @@ spawn does, and re-files its task **at its recorded join slot** on a window hold
 word `NORMAL` and thaw word `REWINDING`. The child records its program on its own powerbox at spawn
 (the import-binding hook sets `self_module`), which is how the harvest names it by digest.
 
+**A durable child's own children (#2010).** A durable child that spawns gets a durable nursery of its
+own, so its children are durable too, and the freeze reaches them through it:
+- **The ring.** It reaches a child's whole subtree: the children of a child it finds live or already
+  unwound, never those of one that returned, which run on as the oracle's do. All of it is rung
+  before the run's teardown begins, so no task is poisoned under a word nobody has rung yet. A spawn
+  rings a child it files while the ring is under way, which the ring may have missed.
+- **The teardown.** It poisons no durable child whose word was rung. Its futex wait is woken, since
+  the wait ends on that word (#1937). Its `join` is left parked: the child it joins was rung too, and
+  that child's end re-offers it.
+- **The harvest.** It nests each child's children under it, and `jit_cap_run` puts a captured child's
+  children on its powerbox, as the oracle's recursive harvest does. A child that rides no artifact
+  cannot carry its captured children, so they count as unreached and the freeze is refused.
+- **The thaw.** It re-launches a child's captured children into its nursery before the child itself,
+  so the child's rewound `join` finds them. A captured child whose powerbox carries residue the JIT
+  re-creates only for a run's root refuses the JIT thaw whole instead of dropping it. That residue is
+  fibers, threads, nested or completed children, and child state.
+
 **The gate is lifted on all three engines (step 4).** A durable parent spawns detached exactly when it
 holds `FreezeScope::DetachedProgeny` (#1440) and the module is attested freezable (#1501) — the
 authority half inside the one shared admission, `Host::admit_detached_spawn`, which the oracle, the
-JIT's budget-take hook and the resumable engine all call. The resumable engine hands its child to its
+JIT's budget-take hook and the resumable engine all call. A durable detached child holds that
+authority only if its parent hands it down as one of the spawn's named grants (#2018). Nothing mints
+it, so a durable tree grows only as deep as each holder lets it. The resumable engine hands its child to its
 embedder's driver, so capturing that child is the driver's; the browser's grants neither the authority
 nor an attested module, so its durable reactors refuse op 15 on the same rule. Pinned by
 `temen-interp/src/detached_freeze_tests.rs` (oracle: freeze a live child → harvest → re-launch → the
@@ -628,8 +647,9 @@ join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
 missing grant refuses), `temen/tests/durable_detached_jit.rs` (freeze on the JIT → codec → thaw on the
 JIT **and** on the interpreter; freeze on the interpreter → thaw on the JIT; without the doorbell nothing
-is captured, without the re-launch the thaw's join traps), and `durable_detached_parity.rs` (the oracle
-and the resumable engine admit with the authority and refuse without it, alike).
+is captured, without the re-launch the thaw's join traps; and a grandchild, carried in its parent's
+artifact, every engine freezing and every engine thawing, #2010), and `durable_detached_parity.rs` (the
+oracle and the resumable engine admit with the authority and refuse without it, alike).
 
 > **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
 > The detached equivalent is `DetachedLaunch`'s module digest, resolved against the restoring host
