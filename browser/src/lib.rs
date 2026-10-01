@@ -1745,7 +1745,7 @@ pub extern "C" fn temen_par_powerbox_onramp(
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    grant_onramp_caps(&mut host, &m, None);
+    grant_onramp_caps(&mut host, &m, None, None);
     par_publish_io(host, None, onramp_env_init(&run_env()));
     1
 }
@@ -3624,6 +3624,7 @@ fn grant_onramp_caps(
     host: &mut Host,
     m: &temen_ir::Module,
     fs: Option<(String, Vec<u8>)>,
+    declared: Option<(&[String], &temen_interp::CapRequests)>,
 ) -> OnrampCaps {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     // §3.5: register the running module's self-referential surface, as `temen-run`'s `grant_caps`
@@ -3711,8 +3712,15 @@ fn grant_onramp_caps(
     // #1323: the `vm_fs` file-I/O seam is a flat `call.sym` (base op 0) on the memfs HostProc
     // granted above; the guest's fs op rides in arg0. Absent (not imported) ⇒ not overridden,
     // and `vm_fs` is not a powerbox row, so the slot stays unbound exactly as before.
-    let fs_seam: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
-    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &fs_seam);
+    // #1953: the embedder's **declared host-completed caps** (the release session's `fb_present`/
+    // `fb_poll` for c_interpret), granted last so every handle above keeps its value — the same
+    // shared grant the DAP debug session's `hostCaps` uses.
+    let declared = declared
+        .map(|(names, requests)| host.grant_declared_host_caps(&m.imports, names, requests))
+        .unwrap_or_default();
+    let mut seams: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
+    seams.extend(declared.iter().map(|(n, h)| (n.as_str(), *h)));
+    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &seams);
     caps
 }
 
@@ -3890,7 +3898,7 @@ fn onramp_run(
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
-    let frame = grant_onramp_caps(&mut host, m, None).frame;
+    let frame = grant_onramp_caps(&mut host, m, None, None).frame;
     // #1720: the card runs **nested** where it can — a §14 child of a generated root (a one-node
     // [`plan::Plan`]), re-granted by name every on-ramp capability this powerbox holds that can cross
     // into a child. The module runs exactly as built (a powerbox `_start` is an admitted child entry),
@@ -5596,7 +5604,7 @@ impl OnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs);
+        let caps = grant_onramp_caps(&mut host, m, fs, None);
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
         // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
@@ -5669,7 +5677,7 @@ impl OnrampReactor {
         // which is what keeps a guest-held handle value valid across the save; a capability the guest
         // had dropped before the freeze is absent from the artifact and stays dropped.
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs);
+        let caps = grant_onramp_caps(&mut host, m, fs, None);
         host.set_named_cap_registrar(caps.registrar());
 
         let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
@@ -5850,7 +5858,7 @@ impl SharedOnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs);
+        let caps = grant_onramp_caps(&mut host, m, fs, None);
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
         // slot bindings deliver the capabilities) to run the C initializer, seeding +
         // data-initialising the window (the once). The window then persists in the shared backing
@@ -6075,7 +6083,7 @@ impl JitOnrampReactor {
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, &module, fs);
+        let caps = grant_onramp_caps(&mut host, &module, fs, None);
         // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
@@ -6858,7 +6866,7 @@ impl JitOnrampRun {
                 // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
                 // by name; `display` too (unused by a pure compute guest, present for parity with
                 // `onramp_exec`). No `fs` (input comes from stdin).
-                let frame = grant_onramp_caps(&mut host, &module, None).frame;
+                let frame = grant_onramp_caps(&mut host, &module, None, None).frame;
                 (host, Vec::new(), frame, None, 0, 0)
             }
             RunInput::Fs {
@@ -6883,7 +6891,7 @@ impl JitOnrampRun {
                 // one thing a detached child cannot receive in-band (#1285).
                 let mut host = Host::new();
                 host.stdin = stdin;
-                let frame = grant_onramp_caps(&mut host, &module, None).frame;
+                let frame = grant_onramp_caps(&mut host, &module, None, None).frame;
                 let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
                 (host, args_init_mem(&refs), frame, None, 0, 0)
             }
@@ -7011,7 +7019,7 @@ impl JitOnrampRun {
         // The powerbox the interpreter warm path grants (`temen_warm_eval`) — a fresh host is re-granted per
         // Run via [`reset_warm`]; this one seeds `open`, replaced before the first drive.
         let mut host = Host::new();
-        let frame = grant_onramp_caps(&mut host, &module, None).frame;
+        let frame = grant_onramp_caps(&mut host, &module, None, None).frame;
         // Compiled once — reused for every cross-tier bounce (`write`/`read`/`exit` off the emitted eval).
         let program = std::sync::Arc::new(
             bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
@@ -7085,7 +7093,7 @@ impl JitOnrampRun {
         if let Some(t) = stream_tee() {
             host.set_stdout_tee(t);
         }
-        let frame = grant_onramp_caps(&mut host, &self.module, None).frame;
+        let frame = grant_onramp_caps(&mut host, &self.module, None, None).frame;
         self.host = host;
         self.frame = frame;
         self.exit_code = 0;
@@ -7613,8 +7621,18 @@ pub extern "C" fn temen_run_onramp_stream(
 
 struct ReleaseSession {
     run: bytecode::CoopRun,
+    /// #1953: the host-completed cap names declared at open, in order — a parked request names its
+    /// cap by index into this list.
+    caps: Vec<String>,
+    /// #1953: the calls parked on those caps, by completion id (filled by the procs' submit hooks).
+    requests: temen_interp::CapRequests,
 }
 static mut RELEASE: Option<ReleaseSession> = None;
+/// #1953: the request a [`RELEASE_CAP_PARK`] reports — `[id, cap index, args…]` (see
+/// [`temen_release_cap_ptr`]). Empty when the run is not parked.
+static mut RELEASE_CAP: Vec<i64> = Vec::new();
+/// #1953: the bytes the last [`temen_release_read`] copied out of the window.
+static mut RELEASE_READ: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut RELEASE_VALUE: i64 = 0;
 /// The release run's `vm_fs` files as an fs-image blob ([`temen_release_fs_image`]): the open run's
 /// as of the last call, or those the last run ended with.
@@ -7625,26 +7643,49 @@ static mut RELEASE_FS: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 pub const RELEASE_DONE: i32 = 0;
 /// `temen_release_run`: the slice was spent and the program is still running; pump again.
 pub const RELEASE_RUNNING: i32 = 1;
+/// `temen_release_run` (#1953): the program is waiting on a declared host-completed cap call. Read
+/// the request ([`temen_release_cap_len`]/[`temen_release_cap_ptr`]), answer it with
+/// [`temen_release_deliver_cap`], and pump again.
+pub const RELEASE_CAP_PARK: i32 = 2;
 
 /// Open a sliced release run of the encoded module `[mod_ptr, mod_len)` with `stdin` seeded — the
 /// on-ramp powerbox and environment [`temen_run_onramp`] gives it (run at the root, as
 /// [`onramp_exec_root`] does). Nothing runs yet: pump with [`temen_release_run`]. Returns
 /// `STATUS_OK`, or the status the one-shot run would have failed with (`STATUS_DECODE_ERR`,
 /// `STATUS_UNSUPPORTED`, `STATUS_TRAP` if seeding trapped). Closes any open session first.
+///
+/// #1953: `[caps_ptr, caps_len)` names the **host-completed caps** the embedder services, as UTF-8
+/// separated by `\n` (empty for none) — the release twin of the debug session's `hostCaps`. A call
+/// to one parks the run ([`RELEASE_CAP_PARK`]) until [`temen_release_deliver_cap`] answers it.
+/// Invalid UTF-8 is `STATUS_DECODE_ERR`.
 #[no_mangle]
 pub extern "C" fn temen_release_open(
     mod_ptr: *const u8,
     mod_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
+    caps_ptr: *const u8,
+    caps_len: usize,
 ) -> i32 {
     temen_release_close();
-    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
+    // SAFETY: the host guarantees the ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let caps: Vec<String> = if caps_ptr.is_null() || caps_len == 0 {
+        Vec::new()
+    } else {
+        let raw = unsafe { core::slice::from_raw_parts(caps_ptr, caps_len) };
+        let Ok(text) = core::str::from_utf8(raw) else {
+            return STATUS_DECODE_ERR;
+        };
+        text.split('\n')
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect()
     };
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return STATUS_DECODE_ERR;
@@ -7654,14 +7695,21 @@ pub extern "C" fn temen_release_open(
     }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    grant_onramp_caps(&mut host, &m, None);
+    let requests = temen_interp::CapRequests::default();
+    grant_onramp_caps(&mut host, &m, None, Some((&caps, &requests)));
     let init = onramp_env_init(&run_env());
     // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(RELEASE_FS), Vec::new()) };
     match bytecode::CoopRun::new_seeded(&m, 0, &[], u64::MAX, host, &init) {
         Some(Ok(run)) => {
             // SAFETY: single-threaded access to the session statics (one Worker owns this driver).
-            unsafe { *core::ptr::addr_of_mut!(RELEASE) = Some(ReleaseSession { run }) };
+            unsafe {
+                *core::ptr::addr_of_mut!(RELEASE) = Some(ReleaseSession {
+                    run,
+                    caps,
+                    requests,
+                })
+            };
             STATUS_OK
         }
         Some(Err(_)) => STATUS_TRAP,
@@ -7690,6 +7738,25 @@ pub extern "C" fn temen_release_run(budget: u64) -> i32 {
     }
     let (status, value, exit_code, trap) = match ev {
         bytecode::CoopEvent::Paused => return RELEASE_RUNNING,
+        bytecode::CoopEvent::CapPark { id } => {
+            // The proc's submit hook filed the call before the park surfaced; a park on a call
+            // no declared cap filed is impossible (only those procs punt to the host).
+            let req = s
+                .requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
+            let Some(req) = req else {
+                return RELEASE_RUNNING;
+            };
+            let index = s.caps.iter().position(|n| *n == req.name).unwrap_or(0) as i64;
+            let mut words = vec![id as i64, index];
+            words.extend(req.args);
+            // SAFETY: single-threaded access to the read-back slot.
+            unsafe { *core::ptr::addr_of_mut!(RELEASE_CAP) = words };
+            return RELEASE_CAP_PARK;
+        }
         bytecode::CoopEvent::Done(vals) => match vals.first() {
             Some(Value::I64(x)) => (STATUS_OK, *x, 0, None),
             Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0, None),
@@ -7751,11 +7818,68 @@ pub extern "C" fn temen_release_value() -> i64 {
     unsafe { RELEASE_VALUE }
 }
 
+/// #1953: the length, in `i64` words, of the request the last [`RELEASE_CAP_PARK`] reported (`0` when
+/// none): `[completion id, cap index (into the names given at open), the guest's args…]`.
+#[no_mangle]
+pub extern "C" fn temen_release_cap_len() -> usize {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(RELEASE_CAP)).len() }
+}
+/// Pointer to the request words [`temen_release_cap_len`] counts.
+#[no_mangle]
+pub extern "C" fn temen_release_cap_ptr() -> *const i64 {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(RELEASE_CAP)).as_ptr() }
+}
+
+/// #1953: answer the host-completed cap call the run is parked on: `value` is the call's result.
+/// Returns `1`, or `0` if no call is outstanding on `id` (or no session is open). Then pump again.
+#[no_mangle]
+pub extern "C" fn temen_release_deliver_cap(id: u64, value: i64) -> i32 {
+    // SAFETY: single-threaded access to the session statics.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(RELEASE)).as_mut() }) else {
+        return 0;
+    };
+    if !s.run.deliver_cap(id, value) {
+        return 0;
+    }
+    s.requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+    // SAFETY: as above.
+    unsafe { (*core::ptr::addr_of_mut!(RELEASE_CAP)).clear() };
+    1
+}
+
+/// #1953: copy `len` bytes of the open run's window at `addr` (bounded: an out-of-window range copies
+/// nothing) — e.g. the pixels a parked `present` call names. Returns the length copied (`len`, or `0`);
+/// the bytes are at [`temen_release_read_ptr`] until the next call.
+#[no_mangle]
+pub extern "C" fn temen_release_read(addr: u64, len: usize) -> usize {
+    // SAFETY: single-threaded access to the session statics and the read-back slot.
+    let bytes = unsafe { (*core::ptr::addr_of!(RELEASE)).as_ref() }
+        .and_then(|s| s.run.read_window(addr, len).ok())
+        .unwrap_or_default();
+    let n = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(RELEASE_READ), bytes) };
+    n
+}
+/// Pointer to the bytes the last [`temen_release_read`] copied.
+#[no_mangle]
+pub extern "C" fn temen_release_read_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm.
+    unsafe { (*core::ptr::addr_of!(RELEASE_READ)).0 }
+}
+
 /// Drop the open release run, if any (a Stop, or a new compile).
 #[no_mangle]
 pub extern "C" fn temen_release_close() {
     // SAFETY: single-threaded access to the session statics.
-    unsafe { *core::ptr::addr_of_mut!(RELEASE) = None };
+    unsafe {
+        *core::ptr::addr_of_mut!(RELEASE) = None;
+        (*core::ptr::addr_of_mut!(RELEASE_CAP)).clear();
+    }
 }
 
 // ===== warm-runtime snapshot: init once, restore-per-Run for a two-phase on-ramp guest ============
@@ -7965,7 +8089,7 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         w[t..t + 8].copy_from_slice(&hb);
     }
     let mut host = Host::new();
-    let _ = grant_onramp_caps(&mut host, &m, None);
+    let _ = grant_onramp_caps(&mut host, &m, None, None);
     let mut fuel = u64::MAX;
     // The reservation is clamped to the backing (#816): a `map` past `win` fails with `-EINVAL`
     // instead of minting pages whose writes the backing silently drops.
@@ -8062,7 +8186,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     if let Some(t) = stream_tee() {
         host.set_stdout_tee(t);
     }
-    let _ = grant_onramp_caps(&mut host, &s.module, None);
+    let _ = grant_onramp_caps(&mut host, &s.module, None, None);
     let mut fuel = u64::MAX;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
     // the bytes), so a `vm_map`-grown warm heap is addressable again — and its `protect`ed rodata
@@ -8500,7 +8624,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let frame = grant_onramp_caps(&mut host, &wc.m, None).frame;
+    let frame = grant_onramp_caps(&mut host, &wc.m, None, None).frame;
     // The B2 table/unit-emitter arming, exactly as `temen_coop_open` (the emit was made with the
     // same `table_log2`/window, so the engine table and the emitted mask agree).
     if wc.all_shimmable {
@@ -14256,7 +14380,7 @@ pub extern "C" fn temen_coop_open(
         // SAFETY: the host guarantees the stdin range is a live `temen_alloc`ation it just filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let frame = grant_onramp_caps(&mut host, &m, None).frame;
+    let frame = grant_onramp_caps(&mut host, &m, None, None).frame;
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
@@ -15581,7 +15705,7 @@ pub extern "C" fn temen_detached_oracle_run(
         // SAFETY: same host guarantee for the stdin range.
         host.stdin = unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec();
     }
-    let _ = grant_onramp_caps(&mut host, &m, None);
+    let _ = grant_onramp_caps(&mut host, &m, None, None);
     let argv = argv_from_payload(args_ptr, args_len);
     let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let init_mem = args_init_mem(&refs);
