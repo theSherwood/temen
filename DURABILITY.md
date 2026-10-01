@@ -866,11 +866,26 @@ story yet, the same exclusion as the separate-module child (`temen-jit/src/insta
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
 defaults it (PROCESS.md O14).)*
 
-**Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
-durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
-shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable
-domain can't share outside its subtree, or regions carry a snapshot protocol. This is
-the only place the unit-of-durability question has a real design consequence.
+**Ruling (R4, 2026-10-01, #1679): a region is captured with its sharing group.** Cross-tree
+sharing (`SharedRegion`, `DESIGN.md` §13) is resolved by co-snapshot, not by forbidding sharing
+and not by journaling the shared edge:
+
+- **A region is part of a cut when every domain that holds or maps it is inside the cut.** Its
+  bytes are captured once, keyed by the region; each member's window image names it with `Backed`
+  page entries instead of carrying the bytes; and the restore re-creates it and re-aliases it into
+  every member before any member runs. A region created and shared inside one frozen tree, or one
+  debugged run, is then just more state to capture.
+- **A cut that would split a group declines**, as a freeze of any region-holding domain does
+  today: a holder outside the cut, or a backing with writers outside the VM (a host file aliased by
+  the mmap bridge), keeps writing after the capture. The refusal moves from "holds a region" to
+  "holds a region the cut cannot close over".
+- **The same capture serves every snapshot** (INVARIANTS #13): the §12 artifact, the debugger's
+  checkpoint ladder and the undo journal read one definition of a region's state.
+- **Not chosen.** Forbidding a durable domain to share outside its subtree refuses sharing up front
+  that B refuses only when a cut would split it. Journaling the shared edge, which would let one
+  sharer be frozen while its peers run, is a distributed-snapshot protocol plus a write barrier on
+  every shared access; nothing needs it yet. Revisit if freezing part of a sharing group becomes a
+  requirement; a host-file region's freeze behaviour can then be declared at grant (#1902).
 
 ---
 
@@ -1110,7 +1125,7 @@ extra mechanism beyond snapshot/restore.
 | R1 | Phase-3 quiesce vs. D57 migratable-fiber single-owner protocol (a fiber may be mid-migration / owned by another OS thread at safepoint request). The crux of the schedule variance. | §5, §9 | open |
 | R2 | `Blocking.work` cancellation needed before snapshot-latency guarantees are tight. | §5 | open |
 | R3 | escape-TCB growth from the page+prot **restore** path in `temen-mem`. | §6, §9 | open |
-| R4 | `SharedRegion` cross-tree sharing: co-snapshot the sharing group, or regions carry a snapshot protocol? Decide as a `SharedRegion` constraint. | §4 | open |
+| R4 | `SharedRegion` cross-tree sharing: co-snapshot the sharing group, or regions carry a snapshot protocol? | §4 | **decided 2026-10-01: co-snapshot the group; a cut that would split it declines** (§4 ruling, #1679) |
 | R5 | Snapshot-format identity: artifact is coupled to the *instrumented-module* hash, not just backend-independent. Must be pinned in the format. | §1, §9 | open |
 | R6 | v1 latency bound includes "longest poll-free path" until back-edge polls (phase 4); a tight direct-call compute loop is un-preemptable in v1. | §5, §6 | open |
 | R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `temen-bench`. | §6 | open |
@@ -1198,7 +1213,8 @@ The in-window shadow stacks + state words ride along in this image for free (§1
 **[DECISION D-region — RESOLVED: no `PageProt::Backed` in v1.]** §13 `SharedRegion`-aliased pages
 name a host backing shared across the nesting tree — that's the cross-tree-sharing
 edge (R4). v1 **freeze refuses** if `Mem::has_regions` is set for any domain in the
-subtree. (Lifting this is the R4 work: co-snapshot the sharing group.)
+subtree. (Lifting this is the R4 work, decided as co-snapshot of the sharing group — §4 ruling,
+#1679: a group wholly inside the cut rides as region sections plus `Backed` entries.)
 
 *Optimization (not v1):* diff against the post-instantiation image (`Module::data`
 segments) instead of storing all committed pages. Correctness doesn't need it.
