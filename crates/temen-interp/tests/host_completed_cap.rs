@@ -15,10 +15,16 @@
 //! [`CoopEvent::CapPark`] once nothing else can run, and [`CoopRun::deliver_cap`] resumes it —
 //! pinned below against the same pool-completed twin, unsliced and sliced, on the root, a spawned
 //! thread, and a fiber.
+//!
+//! #1954 runs the **root program as an emitted leaf**: a root that parks only in declared
+//! host-completed caps is offered to the host's leaf emitter, and each call parks in a bounce out of
+//! the emitted frames, which the host holds until [`CoopEvent::Resume`]. Served here, as
+//! `leaf_tierup.rs` does, by bouncing the entry — the nested interpretation the emitted image's own
+//! calls bounce into.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::{self, CoopEvent, VcpuEvent};
-use temen_interp::{run_with_host, Host, OffloadOutcome, Trap, Value};
+use temen_interp::bytecode::{self, CoopEvent, LeafOffer, TierUpConfig, VcpuEvent};
+use temen_interp::{run_with_host, BoundImport, CapRequests, Host, OffloadOutcome, Trap, Value};
 
 /// Two `HOST_PROC` (iface 13) calls on one handle: op 0 with 5, op 1 with 7; the composite
 /// `r0 * 1000 + r1` proves both results landed in the right slots and in order.
@@ -471,4 +477,215 @@ fn host_completed_declines_on_the_native_coop_driver() {
         .expect("in subset");
     assert!(matches!(r, Err(Trap::CapFault)), "declines, got {r:?}");
     assert!(recorded.lock().unwrap().is_empty());
+}
+
+// --- #1954: the root program as an emitted leaf ----------------------------------------------------
+
+/// The root calls the declared cap `ping` twice, through an import: `ping(5) * 1000 + ping(7)`.
+const ROOT_PINGS: &str = r#"memory 16
+import 0 "ping" (i64) -> (i64)
+func () -> (i64) {
+block 0 () {
+  vfive = i64.const 5
+  vr0 = call.import 0 (vfive)
+  vseven = i64.const 7
+  vr1 = call.import 0 (vseven)
+  vk = i64.const 1000
+  vm = i64.mul vr0 vk
+  vsum = i64.add vm vr1
+  return vsum
+  }
+}
+"#;
+
+/// The same `ping`, reached from function 1, which tiers up as a region (not a leaf): `ping(7)`.
+const REGION_PING: &str = r#"memory 16
+import 0 "ping" (i64) -> (i64)
+func () -> (i64) {
+block 0 () {
+  vr = call 1 ()
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vseven = i64.const 7
+  vr = call.import 0 (vseven)
+  return vr
+  }
+}
+"#;
+
+/// A host granting `ping` as a declared host-completed cap, bound to import 0.
+fn declared_ping(m: &temen_ir::Module) -> (Host, CapRequests) {
+    let mut host = Host::new();
+    let requests = CapRequests::default();
+    let seams = host.grant_declared_host_caps(&m.imports, &["ping".to_string()], &requests);
+    assert_eq!(seams.len(), 1, "ping is imported, so granted");
+    host.set_import_bindings(vec![BoundImport::required(
+        temen_ir::cap_id::HOST_PROC,
+        0,
+        seams[0].1,
+    )]);
+    (host, requests)
+}
+
+/// Offers seen by a leaf emitter: `(module, entry, parks)`.
+type Offers = Arc<Mutex<Vec<(usize, u32, bool)>>>;
+
+fn leaf_config(offers: &Offers, take: bool) -> TierUpConfig {
+    let offers = Arc::clone(offers);
+    TierUpConfig {
+        eligible: Arc::from([]),
+        page_checked: false,
+        leaf: Some(Arc::new(move |o: &LeafOffer| {
+            offers.lock().unwrap().push((o.module, o.entry, o.parks));
+            take
+        })),
+    }
+}
+
+/// What a run of `m` did: its result, the parks it surfaced, its tier-ups, and its resumes.
+#[derive(Debug, PartialEq)]
+struct Ran {
+    end: Result<Vec<Value>, Trap>,
+    parks: usize,
+    tierups: usize,
+    resumes: usize,
+}
+
+/// Pump `run` to the end, answering each park from the request its proc filed (`arg + 100`) and
+/// serving each tier-up by bouncing its function, as `leaf_tierup.rs` does.
+fn drive_leaf(mut run: bytecode::CoopRun, requests: &CapRequests) -> Ran {
+    let (mut parks, mut tierups, mut resumes) = (0, 0, 0);
+    let end = loop {
+        match run.run() {
+            CoopEvent::TierUp { func, argv, .. } => {
+                tierups += 1;
+                let mut io = argv.to_vec();
+                io.resize(io.len().max(1), 0);
+                match run.bounce(func, &mut io, None) {
+                    Ok(Some(n)) => run.deliver_tierup(&io[..n]),
+                    Ok(None) => {}
+                    Err(t) => run.deliver_tierup_trap(t),
+                }
+            }
+            CoopEvent::Resume { results } => {
+                resumes += 1;
+                run.deliver_tierup(&results);
+            }
+            CoopEvent::CapPark { id } => {
+                parks += 1;
+                let arg = requests.lock().unwrap().remove(&id).expect("filed").args[0];
+                assert!(run.deliver_cap(id, arg + 100));
+            }
+            CoopEvent::Done(v) => break Ok(v),
+            CoopEvent::Trapped(t) => break Err(t),
+            _ => panic!("unexpected coop event"),
+        }
+    };
+    Ran {
+        end,
+        parks,
+        tierups,
+        resumes,
+    }
+}
+
+fn coop_with(m: &temen_ir::Module, host: Host, tierup: Option<TierUpConfig>) -> bytecode::CoopRun {
+    bytecode::CoopRun::new(m, 0, &[], FUEL, host, tierup)
+        .expect("in subset")
+        .expect("entry in range")
+}
+
+/// **The root runs as an emitted leaf and parks in it.** A root whose only parking calls are declared
+/// host-completed caps is offered at its entry (module 0, parks = true), tiers up there, and each
+/// call parks in a bounce out of the emitted frames: the park surfaces, the answer is delivered, and
+/// `Resume` hands the frames the entry's results. The run ends exactly as the interpreted run does,
+/// with the same parks.
+#[test]
+fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
+    let m = parse(ROOT_PINGS);
+    let want = Ok(vec![Value::I64(WANT)]);
+
+    let (host, requests) = declared_ping(&m);
+    let interpreted = drive_leaf(coop_with(&m, host, None), &requests);
+    assert_eq!(
+        interpreted,
+        Ran {
+            end: want.clone(),
+            parks: 2,
+            tierups: 0,
+            resumes: 0
+        },
+        "interpreted"
+    );
+
+    let offers: Offers = Arc::default();
+    let (host, requests) = declared_ping(&m);
+    let leaf = drive_leaf(
+        coop_with(&m, host, Some(leaf_config(&offers, true))),
+        &requests,
+    );
+    assert_eq!(
+        offers.lock().unwrap().clone(),
+        vec![(0, 0, true)],
+        "the root, at its entry"
+    );
+    assert_eq!(
+        leaf,
+        Ran {
+            end: want,
+            parks: 2,
+            tierups: 1,
+            resumes: 1
+        },
+        "one tier-up at the entry, two parks inside it, one resume of its frames"
+    );
+}
+
+/// An emitter that declines the root (a host that cannot suspend its frames) leaves it interpreted,
+/// with the same ending.
+#[test]
+fn a_declined_root_leaf_runs_interpreted() {
+    let m = parse(ROOT_PINGS);
+    let offers: Offers = Arc::default();
+    let (host, requests) = declared_ping(&m);
+    let ran = drive_leaf(
+        coop_with(&m, host, Some(leaf_config(&offers, false))),
+        &requests,
+    );
+    assert_eq!(offers.lock().unwrap().len(), 1, "offered once");
+    assert_eq!(
+        ran,
+        Ran {
+            end: Ok(vec![Value::I64(WANT)]),
+            parks: 2,
+            tierups: 0,
+            resumes: 0
+        }
+    );
+}
+
+/// A tier-up **region** (not a leaf: nothing holds its frames) that reaches a host-completed call
+/// declines with `CapFault` — it never waits on an id only the embedder could complete.
+#[test]
+fn a_host_completed_call_in_a_tierup_region_declines() {
+    let m = parse(REGION_PING);
+    let (host, requests) = declared_ping(&m);
+    let tierup = TierUpConfig {
+        eligible: Arc::from([false, true]),
+        page_checked: false,
+        leaf: None,
+    };
+    let ran = drive_leaf(coop_with(&m, host, Some(tierup)), &requests);
+    assert_eq!(
+        ran,
+        Ran {
+            end: Err(Trap::CapFault),
+            parks: 0,
+            tierups: 1,
+            resumes: 0
+        }
+    );
 }
