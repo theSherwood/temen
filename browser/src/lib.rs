@@ -12966,7 +12966,9 @@ pub extern "C" fn temen_durable_thaw_resume(
     };
     let back = std::sync::Arc::new(back);
     back.write_from(0, &rwin);
-    let entries: Vec<(u64, u8)> = rprots
+    // A §13 region page (`Backed`) needs the region re-aliased, which this byte-backed resume
+    // doesn't do — refuse it rather than resume over a private copy.
+    let Some(entries) = rprots
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -12974,10 +12976,15 @@ pub extern "C" fn temen_durable_thaw_resume(
                 temen_snapshot::PageProt::Ro => 0u8,
                 temen_snapshot::PageProt::Rw => 1,
                 temen_snapshot::PageProt::Unmapped => 2,
+                temen_snapshot::PageProt::Backed { .. } => return None,
             };
-            (i as u64 * temen_snapshot::PAGE as u64, kind)
+            Some((i as u64 * temen_snapshot::PAGE as u64, kind))
         })
-        .collect();
+        .collect::<Option<Vec<(u64, u8)>>>()
+    else {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    };
     host.clock_ns = clock;
     let mut fuel = 50_000_000u64;
     let (r, _, _) = prog.run_over_grown(

@@ -55,13 +55,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    Attestation, BudgetState, BudgetThawRefused, CapturedDetached, CapturedProt, DetachedLaunch,
-    DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap,
-    DurablePipe, FreezeScope, FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested,
-    FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena, StreamRole, SvcDispatch,
-    ThawedDetached, Trap,
+    Attestation, BudgetState, BudgetThawRefused, CapturedDetached, DetachedLaunch, DurableBinding,
+    DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap, DurablePipe,
+    FreezeScope, FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host,
+    MemLayout, NonDurableHandle, RegionNotCaptured, RegionRefusal, ShadowArena, StreamRole,
+    SvcDispatch, ThawedDetached, Trap,
 };
 use temen_ir::Module;
 
@@ -251,7 +252,10 @@ use temen_ir::Module;
 /// v38 (#1944 slice 3): a detached child's launch record drops its fuel, channel cap and vCPU
 /// ceiling. Its budget chain (Section 10) carries all three: what it burned, its channel ceiling, and
 /// its `spawn` ceiling with the one vCPU its window's lease holds.
-const FORMAT_VERSION: u16 = 38;
+/// v39 (#2025, R4): §13 regions inside the cut ride. Section 11 carries each region's bytes by
+/// artifact number; a window page aliasing one is `PROT_BACKED` (3) + region number + region offset +
+/// writable, with no bytes of its own; a `SharedRegion` handle is `B_SHARED_REGION` (16) + number.
+const FORMAT_VERSION: u16 = 39;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -287,6 +291,9 @@ const TAG_PIPES: u64 = 9;
 /// Section 10 (v37, #1944): the budget nodes the handles reach, by artifact number. Emitted only when
 /// a `Budget` handle rides.
 const TAG_BUDGETS: u64 = 10;
+/// Section 11 (v39, #2025): the §13 regions inside the cut, by artifact number — each one's bytes.
+/// Emitted only when a region rides.
+const TAG_REGIONS: u64 = 11;
 /// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
 /// untrusted artifact must not choose the depth; freeze refuses past the same bound, so it never emits
 /// an artifact restore would reject.
@@ -325,25 +332,21 @@ const B_FREEZE_DETACHED: u8 = 13;
 const B_MODULE: u8 = 14;
 /// v32 (#1680): a pipe end — the pipe's artifact number (Section 9) and which end.
 const B_PIPE_END: u8 = 15;
+/// v39 (#2025): a §13 `SharedRegion` handle — the region's artifact number (Section 11).
+const B_SHARED_REGION: u8 = 16;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
 const PROT_UNMAPPED: u8 = 2;
+/// v39 (#2025): a page aliasing a region inside the cut — no bytes; the region's carry them.
+const PROT_BACKED: u8 = 3;
 
-/// Per-page protection carried in the window image (§12.3), mirroring the runtime page model
-/// (`temen-interp`'s `PageProt` / the JIT window). A `Backed` (§13 `SharedRegion`-aliased) page
-/// is **not** representable — D-region: v1 freeze refuses a domain with shared regions, so the
-/// caller rejects those before serializing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PageProt {
-    /// Read/write — the default. A zero `Rw` page is elided from the image (restore re-zeros it).
-    Rw,
-    /// Read-only (e.g. a D40 `readonly` data segment). Always stored (bytes + prot), even if
-    /// zero, so restore can re-establish the protection.
-    Ro,
-    /// Unmapped / uncommitted — no bytes stored; restore leaves it zero and inaccessible.
-    Unmapped,
-}
+/// Per-page protection carried in the window image (§12.3): the interpreter's `CapturedProt`, one
+/// type for the capture and the codec. A `Rw` zero page is elided from the image, `Ro`/`Unmapped`
+/// are always stored, and a `Backed` page stores no bytes — its region's ride Section 11 (#2025).
+/// On freeze a `Backed` page's `region` is the capturing host's region id; on restore, the id the
+/// restoring host rebuilt it under.
+pub use temen_interp::CapturedProt as PageProt;
 
 /// Why a domain can't be frozen.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -376,6 +379,10 @@ pub enum FreezeError {
     /// A child's `"budget"` is its spawner's node, so the cut is one tree and its numbers name nodes
     /// across every artifact; a child outside it could not be numbered.
     DetachedBudgetTree { parent_task: usize, slot: usize },
+    /// #2025 — a §13 region the domain holds or maps cannot ride: something outside the cut also
+    /// holds it, something outside the VM writes it, or the freeze cannot tell where it is mapped
+    /// (R4: a cut that would split a sharing group declines).
+    RegionNotCaptured(RegionNotCaptured),
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -424,6 +431,9 @@ pub enum RestoreError {
     /// carried. The other half of the same seam: an artifact carries what the domain had *left*, and
     /// the thaw may narrow that, never widen it (INVARIANTS #3).
     BudgetRefused(BudgetThawRefused),
+    /// #2025 — the artifact maps a §13 region into a window restored as a [`MemLayout`] (a detached
+    /// child's, or a reactor's), which does not re-alias regions yet (#2025 step 2).
+    RegionInLayout,
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -509,6 +519,19 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
     if !window.len().is_power_of_two() || window.len() < PAGE {
         return Err(FreezeError::WindowGeometry(window.len()));
     }
+    // #2025: without a page map a region's mapping cannot be told from private bytes, so a region
+    // handle declines here; [`freeze_with_prots`] carries it.
+    if let Some(region) = host.capture_durable_handles().ok().and_then(|hs| {
+        hs.iter().find_map(|h| match h.binding {
+            DurableBinding::SharedRegion { region } => Some(region),
+            _ => None,
+        })
+    }) {
+        return Err(FreezeError::RegionNotCaptured(RegionNotCaptured {
+            region,
+            why: RegionRefusal::NoPageMap,
+        }));
+    }
     let npages = window.len() / PAGE;
     let reserved_log2 = window.len().trailing_zeros() as u8;
     freeze_with_prots(
@@ -533,26 +556,10 @@ pub fn freeze_layout(
     freeze_with_prots(
         module,
         layout.bytes(),
-        &layout_prots(layout),
+        &layout.dense_prots(),
         reserved_log2,
         host,
     )
-}
-
-/// A [`MemLayout`]'s dense page map as the codec's [`PageProt`]s.
-fn layout_prots(layout: &MemLayout) -> Vec<PageProt> {
-    layout
-        .dense_prots()
-        .into_iter()
-        .map(|p| match p {
-            CapturedProt::Rw => PageProt::Rw,
-            CapturedProt::Ro => PageProt::Ro,
-            CapturedProt::Unmapped => PageProt::Unmapped,
-            // A `MemLayout` carries no §13 alias by construction (`Mem::layout_snapshot_safe`,
-            // `MemLayout::from_parts`), so this arm is unreachable rather than a silent `Rw`.
-            CapturedProt::Backed => unreachable!("a MemLayout never carries a Backed page"),
-        })
-        .collect()
 }
 
 /// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
@@ -661,6 +668,8 @@ fn freeze_at(
         &mut child_state,
     )?;
     number_budgets(cut, &mut handles, &child_state)?;
+    let (regions, prots) = number_regions(host, &mut handles, &child_state, prots)?;
+    let prots = &prots[..];
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
             .memory
@@ -694,7 +703,7 @@ fn freeze_at(
             .enumerate()
             .filter(|&(i, p)| match prots[i] {
                 PageProt::Rw => p.iter().any(|&x| x != 0),
-                PageProt::Ro | PageProt::Unmapped => true,
+                PageProt::Ro | PageProt::Unmapped | PageProt::Backed { .. } => true,
             })
             .collect();
         write_uleb(b, entries.len() as u64);
@@ -710,6 +719,17 @@ fn freeze_at(
                     b.extend_from_slice(page);
                 }
                 PageProt::Unmapped => b.push(PROT_UNMAPPED), // no bytes
+                // #2025: no bytes — the region's ride Section 11.
+                PageProt::Backed {
+                    region,
+                    off,
+                    writable,
+                } => {
+                    b.push(PROT_BACKED);
+                    write_uleb(b, region as u64);
+                    write_uleb(b, off);
+                    b.push(writable as u8);
+                }
             }
         }
     });
@@ -912,7 +932,86 @@ fn freeze_at(
         section(&mut out, TAG_BUDGETS, |b| write_budgets(b, &cut.nodes));
     }
 
+    // Section 11 — the regions inside the cut (#2025, v39), by number. Elided when none rides.
+    if !regions.is_empty() {
+        section(&mut out, TAG_REGIONS, |b| {
+            write_uleb(b, regions.len() as u64);
+            for r in &regions {
+                write_uleb(b, r.len() as u64);
+                b.extend_from_slice(r);
+            }
+        });
+    }
+
     Ok(out)
+}
+
+/// #2025 — number the §13 regions this artifact's domain names, its handles' and its window pages',
+/// and check the cut holds each (R4, [`Host::capture_durable_regions`]). A region's number is its
+/// order among the captured backings, by lowest host id, so a restored host — which rebuilds them in
+/// number order — re-freezes to the same numbers (§12.6). Rewrites every named id to its number;
+/// returns each region's bytes by number, and the page map with its `Backed` entries renumbered.
+///
+/// A nested (carve) child's host is not this one, so a region it holds is not one this artifact can
+/// name; carves retire with #1867, and until then such a child declines the freeze.
+fn number_regions(
+    host: &Host,
+    root: &mut [DurableHandle],
+    children: &[FrozenChildState],
+    prots: &[PageProt],
+) -> Result<(Vec<Vec<u8>>, Vec<PageProt>), FreezeError> {
+    let refused = |region, why| FreezeError::RegionNotCaptured(RegionNotCaptured { region, why });
+    if let Some(region) = children
+        .iter()
+        .flat_map(|c| &c.handles)
+        .find_map(|h| match h.binding {
+            DurableBinding::SharedRegion { region } => Some(region),
+            _ => None,
+        })
+    {
+        return Err(refused(region, RegionRefusal::HolderOutsideCut));
+    }
+    let named: BTreeSet<u32> = root
+        .iter()
+        .filter_map(|h| match h.binding {
+            DurableBinding::SharedRegion { region } => Some(region),
+            _ => None,
+        })
+        .chain(prots.iter().filter_map(|p| match *p {
+            PageProt::Backed { region, .. } => Some(region),
+            _ => None,
+        }))
+        .collect();
+    let regions = host
+        .capture_durable_regions(&named)
+        .map_err(FreezeError::RegionNotCaptured)?;
+    let number = |id: u32| {
+        regions
+            .iter()
+            .position(|r| r.ids.contains(&id))
+            .expect("every named region was captured") as u32
+    };
+    for h in root.iter_mut() {
+        if let DurableBinding::SharedRegion { region } = &mut h.binding {
+            *region = number(*region);
+        }
+    }
+    let prots = prots
+        .iter()
+        .map(|&p| match p {
+            PageProt::Backed {
+                region,
+                off,
+                writable,
+            } => PageProt::Backed {
+                region: number(region),
+                off,
+                writable,
+            },
+            other => other,
+        })
+        .collect();
+    Ok((regions.into_iter().map(|r| r.bytes).collect(), prots))
 }
 
 /// #1944 — the budget nodes a freeze carries: every node the cut's domains name — the root's handles
@@ -1141,7 +1240,7 @@ fn write_detached(
     for c in order {
         let art = {
             let h = c.host.lock().unwrap_or_else(|e| e.into_inner());
-            let prots = layout_prots(&c.window);
+            let prots = c.window.dense_prots();
             freeze_at(
                 &c.module,
                 c.window.bytes(),
@@ -1219,6 +1318,29 @@ fn decode_named(body: Option<&[u8]>) -> Result<Vec<Option<DurableNamedCap>>, Res
     }
     if !r.at_end() {
         return Err(RestoreError::Malformed); // canonical: no trailing bytes
+    }
+    Ok(out)
+}
+
+/// Decode Section 11 ([`TAG_REGIONS`], v39): each region's bytes, by artifact number. Absent ⇒ no
+/// region rides; present but empty is non-canonical. A region is a whole number of pages, as every
+/// region a host grants or a guest mints is.
+fn decode_regions(body: Option<&[u8]>) -> Result<Vec<Vec<u8>>, RestoreError> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed);
+    }
+    let mut out = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let len = r.uleb()? as usize;
+        out.push(r.take(len)?.to_vec());
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
     }
     Ok(out)
 }
@@ -1312,14 +1434,9 @@ fn restore_layout_at(
 ) -> Result<(MemLayout, u8), RestoreError> {
     let (bytes, prots, reserved_log2) = restore_at(artifact, module, host, depth, cut)?;
     let mapped = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let prots: Vec<CapturedProt> = prots
-        .iter()
-        .map(|p| match p {
-            PageProt::Rw => CapturedProt::Rw,
-            PageProt::Ro => CapturedProt::Ro,
-            PageProt::Unmapped => CapturedProt::Unmapped,
-        })
-        .collect();
+    if prots.iter().any(|p| matches!(p, PageProt::Backed { .. })) {
+        return Err(RestoreError::RegionInLayout);
+    }
     Ok((MemLayout::from_dense(bytes, &prots, mapped), reserved_log2))
 }
 
@@ -1380,6 +1497,7 @@ fn restore_at(
     let mut detached_body = None;
     let mut pipes_body = None;
     let mut budgets_body = None;
+    let mut regions_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -1396,6 +1514,7 @@ fn restore_at(
             TAG_DETACHED => detached_body = Some(body),
             TAG_PIPES => pipes_body = Some(body),
             TAG_BUDGETS => budgets_body = Some(body),
+            TAG_REGIONS => regions_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -1426,6 +1545,11 @@ fn restore_at(
     }
     let reserved = 1u64 << reserved_log2;
 
+    // ---- Regions inside the cut (#2025, v39), by number — decoded first so a `Backed` page and a
+    // region handle can be checked against them. ----
+    let regions = decode_regions(regions_body)?;
+    let mut region_named = vec![false; regions.len()];
+
     // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
     let mut window = vec![0u8; mapped];
     let mut prots = vec![PageProt::Rw; mapped / PAGE];
@@ -1452,6 +1576,31 @@ fn restore_at(
                 prots[page] = PageProt::Ro;
             }
             PROT_UNMAPPED => prots[page] = PageProt::Unmapped, // no bytes; window stays zero
+            // #2025: the page aliases a carried region at a page-aligned offset inside it; no bytes.
+            PROT_BACKED => {
+                let region = u32::try_from(w.uleb()?).map_err(|_| RestoreError::Malformed)?;
+                let off = w.uleb()?;
+                let writable = match w.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(RestoreError::Malformed),
+                };
+                let len = regions
+                    .get(region as usize)
+                    .ok_or(RestoreError::Malformed)?
+                    .len() as u64;
+                if !off.is_multiple_of(PAGE as u64)
+                    || off.checked_add(PAGE as u64).is_none_or(|end| end > len)
+                {
+                    return Err(RestoreError::Malformed);
+                }
+                region_named[region as usize] = true;
+                prots[page] = PageProt::Backed {
+                    region,
+                    off,
+                    writable,
+                };
+            }
             _ => return Err(RestoreError::Malformed),
         }
     }
@@ -1619,6 +1768,34 @@ fn restore_at(
     for h in ends {
         if let DurableBinding::PipeEnd { pipe, .. } = &mut h.binding {
             *pipe = ids[*pipe as usize];
+        }
+    }
+    // #2025: every region handle names a carried region, and every carried region is named by a
+    // handle or a page (canonical: a freeze carries only those). A nested child names none (the
+    // freeze refuses one). Then rebuild them and rewrite each number to the id it was minted under.
+    for h in &handles {
+        if let DurableBinding::SharedRegion { region } = h.binding {
+            *region_named
+                .get_mut(region as usize)
+                .ok_or(RestoreError::Malformed)? = true;
+        }
+    }
+    let nested_region = child_state
+        .iter()
+        .flat_map(|c| &c.handles)
+        .any(|h| matches!(h.binding, DurableBinding::SharedRegion { .. }));
+    if nested_region || region_named.contains(&false) {
+        return Err(RestoreError::Malformed);
+    }
+    let region_ids = host.restore_durable_regions(&regions);
+    for h in handles.iter_mut() {
+        if let DurableBinding::SharedRegion { region } = &mut h.binding {
+            *region = region_ids[*region as usize];
+        }
+    }
+    for p in prots.iter_mut() {
+        if let PageProt::Backed { region, .. } = p {
+            *region = region_ids[*region as usize];
         }
     }
     host.restore_durable_handles(&handles);
@@ -2253,6 +2430,10 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, pipe as u64);
             b.push(write as u8);
         }
+        DurableBinding::SharedRegion { region } => {
+            b.push(B_SHARED_REGION);
+            write_uleb(b, region as u64);
+        }
         DurableBinding::JitTable { idx } => {
             b.push(B_JIT_TABLE);
             write_uleb(b, idx as u64);
@@ -2318,6 +2499,9 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         },
         B_JIT_TABLE => DurableBinding::JitTable {
             idx: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_SHARED_REGION => DurableBinding::SharedRegion {
+            region: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         B_PIPE_END => DurableBinding::PipeEnd {
             pipe: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,

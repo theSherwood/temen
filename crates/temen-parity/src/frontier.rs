@@ -90,7 +90,8 @@
 //! ## What the first rendering already showed
 //!
 //! Put side by side, the two axes are near-complements: almost everything a §14 child can be granted
-//! is **non-durable** (`SharedRegion`, `Module`, `Offer`, pipe ends, `HostProc`), and the two purely
+//! is **non-durable** (`SharedRegion`, `Module`, `Offer`, pipe ends, `HostProc`; regions and pipe ends
+//! became conditionally durable later, #2025/#1680), and the two purely
 //! window-coordinate caps a child can *never* be granted — `AddressSpace`, `Instantiator` — are
 //! exactly the ones that **are** durable. `Stream`/`Exit`/`Clock` and `Jit` are both; `Budget` is
 //! durable but never crosses into a child (it hands down a *sub*-budget by `split`/`transfer`, not
@@ -365,12 +366,16 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
         ],
 
-        // Re-granting aliases the SAME backing into the child (the explicit data plane); a byte
-        // snapshot cannot reproduce a live alias into shared backing — INVARIANTS #14's one recorded
-        // (provisional) exception.
+        // Re-granting aliases the SAME backing into the child (the explicit data plane). A region
+        // co-snapshots with its sharing group when every holder is in the cut (R4 ruling, #2025);
+        // a split group, or a backing written from outside the VM, is the boundary.
         Capability::SharedRegion => [
             F,
-            declines("a snapshot cannot reproduce a live alias into shared backing (#14 exception)"),
+            conditional(
+                "a region the cut wholly holds rides with its aliases (#2025); one held outside the \
+                 cut or host-file-backed is the boundary, and a detached child's or the native \
+                 JIT's region pages are not yet carried (#2025)",
+            ),
             B,
             U,
             K,

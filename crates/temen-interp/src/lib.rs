@@ -3735,8 +3735,9 @@ pub const DURABLE_SNAPSHOT_PAGE: u64 = 4096;
 const UNCLAIMED_BASE: usize = usize::MAX;
 
 /// Per-page protection of a captured window region, for the durable snapshot (DURABILITY.md
-/// §12.3). A faithful view of the interpreter's page model; `Backed` is the §13
-/// `SharedRegion`-aliased case a durable snapshot must reject (D-region — freeze refuses).
+/// §12.3). A faithful view of the interpreter's page model, `Backed` included: a §13
+/// `SharedRegion`-aliased page names its region, and rides an artifact when the cut holds every
+/// holder of that region (R4, #2025).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CapturedProt {
     /// Read/write (the default for a committed prefix page).
@@ -3745,17 +3746,26 @@ pub enum CapturedProt {
     Ro,
     /// Unmapped / uncommitted — any access faults.
     Unmapped,
-    /// A §13 `SharedRegion`-aliased page — not snapshottable in v1 (D-region).
-    Backed,
+    /// A §13 `SharedRegion`-aliased page: its bytes are the region's at `off`. `region` is the
+    /// capturing host's region id ([`UNKNOWN_REGION`] where the capture cannot say which).
+    Backed {
+        region: u32,
+        off: u64,
+        writable: bool,
+    },
 }
+
+/// The region a [`CapturedProt::Backed`] page names when the capture has no region identity — the
+/// Cranelift JIT's page map records only that a page is aliased (#2025 step 3). A freeze declines it.
+pub const UNKNOWN_REGION: u32 = u32::MAX;
 
 /// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
 /// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
 /// as the frozen one would) and **returns** the post-run protection map (the durable-freeze step),
 /// both one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). Pass
 /// `init_prots = None` to capture only (every page starts at its default). A `Backed` entry in
-/// `init_prots` is ignored — a §13 shared-region alias is not restorable (D-region; freeze refuses
-/// it), so the embedder re-grants the region instead.
+/// `init_prots` re-aliases the region it names, which must already be in `host` (the codec's restore
+/// rebuilt it, #2025); one that does not map traps the run `Malformed` before it starts.
 #[allow(clippy::too_many_arguments)]
 pub fn run_capture_reserved_with_host_prots(
     m: &Module,
@@ -3780,6 +3790,11 @@ pub fn run_capture_reserved_with_host_prots(
         }
         mm
     });
+    if let (Some(mm), Some(prots)) = (mem.as_mut(), init_prots) {
+        if !host.realias_regions(mm, prots) {
+            return (Err(Trap::Malformed), Vec::new(), Vec::new());
+        }
+    }
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
@@ -19425,6 +19440,12 @@ pub trait SharedBacking: Send + Sync {
     fn os_section(&self) -> Option<isize> {
         None
     }
+
+    /// Whether something outside the VM can write these bytes — a host file the mmap bridge
+    /// aliases. A freeze cannot capture such a region: it keeps changing after the cut (R4).
+    fn outside_writers(&self) -> bool {
+        false
+    }
 }
 
 /// A reference to a shared region backing (see [`SharedBacking`]); cloning shares the same object.
@@ -20493,6 +20514,13 @@ pub enum DurableBinding {
         pipe: u32,
         write: bool,
     },
+    /// #2025 — a §13 `SharedRegion` handle (R4: a region rides with its sharing group). `region` is
+    /// the host's region id; the codec renumbers it to the region's artifact number, checks that the
+    /// cut holds every holder of the region, and back to the id
+    /// [`Host::restore_durable_regions`] minted on restore.
+    SharedRegion {
+        region: u32,
+    },
     /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
     /// `jit_tables`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
     /// index pair is its whole authority — durable once the domain's units are captured.
@@ -20674,6 +20702,38 @@ pub struct DurablePipe {
     pub readers: usize,
 }
 
+/// #2025 — a §13 region inside the cut, for a snapshot (R4: a region rides with its sharing group).
+/// One per backing: `ids` are every id this host holds the backing under, ascending, so two ids
+/// aliasing one region restore as one region again.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurableRegion {
+    pub ids: Vec<u32>,
+    pub bytes: Vec<u8>,
+}
+
+/// #2025 — why a region could not ride a freeze (R4: a cut that would split a sharing group, or
+/// that a writer outside the VM keeps changing, declines).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionRefusal {
+    /// Something the freeze does not carry also holds the region: another domain, or the embedder.
+    HolderOutsideCut,
+    /// Something outside the VM writes the region's bytes — a host file the mmap bridge aliases.
+    OutsideWriters,
+    /// No region by this id: a capture that cannot say which region a page aliases (the Cranelift
+    /// JIT's page map, #2025 step 3), or a stale id.
+    Unknown,
+    /// The freeze was given no page map (the codec's flat `freeze`), so it cannot tell where in the
+    /// window the region is mapped.
+    NoPageMap,
+}
+
+/// #2025 — a freeze named a region it cannot carry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RegionNotCaptured {
+    pub region: u32,
+    pub why: RegionRefusal,
+}
+
 /// #1680 — a restore offered a pipe larger than a pipe can hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PipeRestoreError {
@@ -20694,7 +20754,8 @@ pub struct NonDurableHandle {
 /// Which non-re-grantable binding kind a live slot held (the [`NonDurableHandle`] reason).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NonDurableKind {
-    SharedRegion,
+    // SharedRegion: retired (#2025) — the handle rides as `DurableBinding::SharedRegion` and the
+    // region's bytes beside the handles; a region the cut cannot own refuses `RegionNotCaptured`.
     Module,
     /// A §14 module loader (iface 7) — mints `Module` grants, which are themselves non-durable; a
     /// live loader makes the domain non-snapshottable, re-granted by the embedder after restore.
@@ -25047,10 +25108,16 @@ impl Host {
                     Some(ps::RW) => *slot = CapturedProt::Rw,
                     Some(ps::RO) => *slot = CapturedProt::Ro,
                     Some(ps::UNMAPPED) => *slot = CapturedProt::Unmapped,
-                    // A §13 alias is not snapshot state — a domain holding a shared region is not
-                    // freezable (its handle is non-durable), so the capture never gets this far
-                    // with one; reported as what it is rather than as a private page.
-                    Some(ps::BACKED_RW | ps::BACKED_RO) => *slot = CapturedProt::Backed,
+                    // A §13 alias: this page map records that the page is aliased, not which
+                    // region it names (#2025 step 3), so a freeze declines it rather than taking
+                    // it for a private page.
+                    Some(st @ (ps::BACKED_RW | ps::BACKED_RO)) => {
+                        *slot = CapturedProt::Backed {
+                            region: UNKNOWN_REGION,
+                            off: 0,
+                            writable: st == ps::BACKED_RW,
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -25306,9 +25373,8 @@ impl Host {
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
                 Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
                 Binding::FreezeAuthority(scope) => DurableBinding::FreezeAuthority(scope),
-                Binding::SharedRegion(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
-                }
+                // #2025: durable here; whether the cut holds every holder is the codec's check.
+                Binding::SharedRegion(region) => DurableBinding::SharedRegion { region },
                 // #1361: a module grant the granting host attested **freezable** (§4) is durable —
                 // named by its content digest, which the thaw resolves against the restoring host's
                 // re-granted modules (the same rule a separate-module nested child re-attaches by).
@@ -25421,8 +25487,9 @@ impl Host {
                 | Binding::JitCode { .. }
                 // #1502, #1944: a Budget is durable (its node chain rides beside the handles) — a
                 // drain keeps it, the complement of `capture` above.
-                | Binding::Budget(_) => continue,
-                Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
+                | Binding::Budget(_)
+                // #2025: a region rides with its sharing group, so a drain keeps it.
+                | Binding::SharedRegion(_) => continue,
                 // #1361: the complement of `capture` above — an attested-freezable grant is
                 // durable and a drain keeps it; an un-attested one is still relinquished.
                 Binding::Module(id) => match self.modules.get(id as usize) {
@@ -25513,6 +25580,14 @@ impl Host {
                     }
                     None => continue,
                 },
+                // #2025: re-pin onto the region `restore_durable_regions` rebuilt (the codec rewrote
+                // the id to it). An id naming no region leaves the slot closed, as for a pipe.
+                DurableBinding::SharedRegion { region }
+                    if (region as usize) < self.regions.len() =>
+                {
+                    Binding::SharedRegion(region)
+                }
+                DurableBinding::SharedRegion { .. } => continue,
                 // #1361: re-resolve the module the artifact *names* against what this host has been
                 // granted. `check_modules_for_thaw` validated every carried digest before any slot
                 // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
@@ -25605,6 +25680,105 @@ impl Host {
             );
         }
         Some(ids)
+    }
+
+    /// #2025 — the regions `ids` name (this host's region ids, from its handles and its window's
+    /// `Backed` pages), one per backing, applying R4's holder rule: every reference to a backing must
+    /// be one of this host's own region entries. The run's windows are gone by the time a freeze
+    /// serializes, so any other reference is a holder the cut does not carry — another domain's
+    /// host, or the embedder — and the region declines. So does a backing written from outside the
+    /// VM. Ordered by the lowest id holding each backing.
+    pub fn capture_durable_regions(
+        &self,
+        ids: &BTreeSet<u32>,
+    ) -> Result<Vec<DurableRegion>, RegionNotCaptured> {
+        let mut out: Vec<DurableRegion> = Vec::new();
+        for &id in ids {
+            let refuse = |why| RegionNotCaptured { region: id, why };
+            let b = self
+                .regions
+                .get(id as usize)
+                .ok_or(refuse(RegionRefusal::Unknown))?;
+            if b.outside_writers() {
+                return Err(refuse(RegionRefusal::OutsideWriters));
+            }
+            let held: Vec<u32> = (0..self.regions.len() as u32)
+                .filter(|&i| Arc::ptr_eq(&self.regions[i as usize], b))
+                .collect();
+            if Arc::strong_count(b) != held.len() {
+                return Err(refuse(RegionRefusal::HolderOutsideCut));
+            }
+            if out.iter().any(|r| r.ids.contains(&id)) {
+                continue; // an alias of a region already captured
+            }
+            out.push(DurableRegion {
+                ids: held,
+                bytes: (0..b.size()).map(|o| b.read_byte(o)).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// #2025 — alias back into `mem` every region `prots` names, one `map` per run of pages that
+    /// continue one region at consecutive offsets with one protection: the thaw half of a captured
+    /// `Backed` page. Through [`Self::region_map`], the path a guest's own `map` takes, so a page an
+    /// artifact names is checked as a live mapping is. `false` if one names no region of this host
+    /// or does not map.
+    fn realias_regions(&self, mem: &mut Mem, prots: &[CapturedProt]) -> bool {
+        let page = DURABLE_SNAPSHOT_PAGE;
+        let mut i = 0;
+        while i < prots.len() {
+            let CapturedProt::Backed {
+                region,
+                off,
+                writable,
+            } = prots[i]
+            else {
+                i += 1;
+                continue;
+            };
+            let mut n = 1;
+            while prots.get(i + n)
+                == Some(&CapturedProt::Backed {
+                    region,
+                    off: off + n as u64 * page,
+                    writable,
+                })
+            {
+                n += 1;
+            }
+            let Some(backing) = self.regions.get(region as usize).cloned() else {
+                return false;
+            };
+            let prot = PROT_READ | if writable { PROT_WRITE } else { 0 };
+            let (win_off, len) = (i as u64 * page, n as u64 * page);
+            if self.region_map(mem, win_off, off, len, prot, region, backing) != 0 {
+                return false;
+            }
+            i += n;
+        }
+        true
+    }
+
+    /// #2025 — rebuild the cut's regions before [`Self::restore_durable_handles`] re-pins their
+    /// handles: each a fresh backing (the embedder's factory, as a guest mint uses) holding its
+    /// captured bytes. Returns each region's new id, in order; the caller rewrites the carried
+    /// handles' and window pages' region ids to them.
+    pub fn restore_durable_regions(&mut self, regions: &[Vec<u8>]) -> Vec<u32> {
+        regions
+            .iter()
+            .map(|bytes| {
+                let backing = match self.region_factory {
+                    Some(f) => f(bytes.len()),
+                    None => Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))),
+                };
+                for (o, &b) in bytes.iter().enumerate() {
+                    backing.write_byte(o as u64, b);
+                }
+                self.regions.push(backing);
+                self.regions.len() as u32 - 1
+            })
+            .collect()
     }
 
     /// #1680 — the tree-minted pipes this domain's live ends name, with those its nested children
@@ -33370,7 +33544,15 @@ fn dense_prots(
                 Some(PageProt::Rw) => CapturedProt::Rw,
                 Some(PageProt::Ro) => CapturedProt::Ro,
                 Some(PageProt::Unmapped) => CapturedProt::Unmapped,
-                Some(PageProt::Backed { .. }) => CapturedProt::Backed,
+                Some(&PageProt::Backed {
+                    region,
+                    region_off,
+                    writable,
+                }) => CapturedProt::Backed {
+                    region,
+                    off: region_off + byte_off % page,
+                    writable,
+                },
                 None if byte_off < mapped => CapturedProt::Rw,
                 None => CapturedProt::Unmapped,
             }
@@ -33394,7 +33576,7 @@ fn sparse_prots(
             CapturedProt::Ro => Some((host_page, PageProt::Ro)),
             CapturedProt::Unmapped => Some((host_page, PageProt::Unmapped)),
             CapturedProt::Rw if byte_off >= mapped => Some((host_page, PageProt::Rw)),
-            CapturedProt::Rw | CapturedProt::Backed => None,
+            CapturedProt::Rw | CapturedProt::Backed { .. } => None,
         }
     })
 }

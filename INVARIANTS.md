@@ -406,10 +406,12 @@ child as its own artifact inside the parent's (DURABILITY.md §4).
 **Accepted exceptions** — a *genuine impossibility* on some axis, each carrying the owner's dated
 approval; adding one always requires owner sign-off:
 
-- **Durability / §13 `Backed` shared regions** *(provisional — pending owner review, 2026-08-27):* a
-  byte snapshot cannot reproduce a live alias into shared backing, so `layout_snapshot_safe`
-  fail-closes on a `Backed` region. Recorded as the current behavior; **not yet ratified** as a
-  permanent exception.
+- ~~**Durability / §13 `Backed` shared regions**~~ *(provisional 2026-08-27; **withdrawn** by the owner's
+  R4 ruling, 2026-10-01, #1679):* not an impossibility. A region co-snapshots with its sharing group
+  when every holder is in the cut (#2025): the artifact carries its bytes once and the thaw re-aliases
+  its pages. A cut that splits a group, or a backing written from outside the VM, is the cut's
+  boundary (as for pipes, #1680). What still fail-closes (a detached child's regions, the native
+  JIT's `Backed` pages) is un-wired support tracked in #2025.
 
 ## 15. One path per behaviour
 

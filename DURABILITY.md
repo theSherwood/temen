@@ -886,11 +886,26 @@ story yet, the same exclusion as the separate-module child (`temen-jit/src/insta
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
 defaults it (PROCESS.md O14).)*
 
-**Open edge (R4):** cross-tree sharing (`SharedRegion`, `DESIGN.md` §13; in-flight
-durable-sibling comms) forces co-snapshot of the sharing group or journaling at the
-shared edge (consistent-cut). Decide as a `SharedRegion` constraint: either a durable
-domain can't share outside its subtree, or regions carry a snapshot protocol. This is
-the only place the unit-of-durability question has a real design consequence.
+**Ruling (R4, 2026-10-01, #1679): a region is captured with its sharing group.** Cross-tree
+sharing (`SharedRegion`, `DESIGN.md` §13) is resolved by co-snapshot, not by forbidding sharing
+and not by journaling the shared edge:
+
+- **A region is part of a cut when every domain that holds or maps it is inside the cut.** Its
+  bytes are captured once, keyed by the region; each member's window image names it with `Backed`
+  page entries instead of carrying the bytes; and the restore re-creates it and re-aliases it into
+  every member before any member runs. A region created and shared inside one frozen tree, or one
+  debugged run, is then just more state to capture.
+- **A cut that would split a group declines**, as a freeze of any region-holding domain does
+  today: a holder outside the cut, or a backing with writers outside the VM (a host file aliased by
+  the mmap bridge), keeps writing after the capture. The refusal moves from "holds a region" to
+  "holds a region the cut cannot close over".
+- **The same capture serves every snapshot** (INVARIANTS #13): the §12 artifact, the debugger's
+  checkpoint ladder and the undo journal read one definition of a region's state.
+- **Not chosen.** Forbidding a durable domain to share outside its subtree refuses sharing up front
+  that B refuses only when a cut would split it. Journaling the shared edge, which would let one
+  sharer be frozen while its peers run, is a distributed-snapshot protocol plus a write barrier on
+  every shared access; nothing needs it yet. Revisit if freezing part of a sharing group becomes a
+  requirement; a host-file region's freeze behaviour can then be declared at grant (#1902).
 
 ---
 
@@ -1130,7 +1145,7 @@ extra mechanism beyond snapshot/restore.
 | R1 | Phase-3 quiesce vs. D57 migratable-fiber single-owner protocol (a fiber may be mid-migration / owned by another OS thread at safepoint request). The crux of the schedule variance. | §5, §9 | open |
 | R2 | `Blocking.work` cancellation needed before snapshot-latency guarantees are tight. | §5 | open |
 | R3 | escape-TCB growth from the page+prot **restore** path in `temen-mem`. | §6, §9 | open |
-| R4 | `SharedRegion` cross-tree sharing: co-snapshot the sharing group, or regions carry a snapshot protocol? Decide as a `SharedRegion` constraint. | §4 | open |
+| R4 | `SharedRegion` cross-tree sharing: co-snapshot the sharing group, or regions carry a snapshot protocol? | §4 | **decided 2026-10-01: co-snapshot the group; a cut that would split it declines** (§4 ruling, #1679) |
 | R5 | Snapshot-format identity: artifact is coupled to the *instrumented-module* hash, not just backend-independent. Must be pinned in the format. | §1, §9 | open |
 | R6 | v1 latency bound includes "longest poll-free path" until back-edge polls (phase 4); a tight direct-call compute loop is un-preemptable in v1. | §5, §6 | open |
 | R7 | Breadth of instrumentation: "any indirect call = may-suspend" instruments more ordinary C than "compute is free" suggests. Validate on `temen-bench`. | §6 | open |
@@ -1210,15 +1225,25 @@ Captured at the quiescent point. Sparse over **committed** pages, with zero-page
 elision. Per entry:
 
 - `page_index: uleb` (window offset ÷ page)
-- `prot: u8` — `Rw=0, Ro=1, Unmapped=2` (mirrors `PageProt`, `temen-interp` `:5962`)
+- `prot: u8` — `Rw=0, Ro=1, Unmapped=2, Backed=3` (mirrors `CapturedProt`, `temen-interp`)
 - if `prot ∈ {Rw, Ro}`: page bytes (run-length / zero-eliding to keep it small)
+- if `prot = Backed` (#2025, v39): `region: uleb` (the region's number in Section 11), `off: uleb`
+  (page-aligned byte offset into it), `writable: u8`. No bytes: the page's contents are the
+  region's, which Section 11 carries once however many pages alias it.
 
 The in-window shadow stacks + state words ride along in this image for free (§12.0).
 
-**[DECISION D-region — RESOLVED: no `PageProt::Backed` in v1.]** §13 `SharedRegion`-aliased pages
-name a host backing shared across the nesting tree — that's the cross-tree-sharing
-edge (R4). v1 **freeze refuses** if `Mem::has_regions` is set for any domain in the
-subtree. (Lifting this is the R4 work: co-snapshot the sharing group.)
+**[DECISION D-region — RESOLVED: co-snapshot when the group is inside the cut (R4 ruling, §4,
+#1679; landed #2025, v39).]** §13 `SharedRegion`-aliased pages name a host backing that may be
+shared across the nesting tree. A region rides when every holder of it (handles and mapped pages)
+is inside the cut: **Section 11** carries each such region's bytes once (`count: uleb`, then per
+region `len: uleb` + bytes, numbered by position), its handles ride as `SharedRegion { region }`,
+and its pages as `Backed` entries. The thaw rebuilds each region with a fresh backing and maps the
+`Backed` runs onto it, so aliasing survives. A region with a holder outside the cut (including a
+nested child, for now) refuses `FreezeError::RegionNotCaptured(HolderOutsideCut)`; a backing that
+something outside the VM can write (`SharedBacking::outside_writers`, e.g. a host file) refuses
+`OutsideWriters`. Not yet: a region a parent shares with a detached child (step 2) and the native
+JIT's `Backed` pages (step 3) still refuse.
 
 *Optimization (not v1):* diff against the post-instantiation image (`Module::data`
 segments) instead of storing all committed pages. Correctness doesn't need it.
@@ -1269,6 +1294,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant |
 | `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
 | `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance: the root's table by slot, then each nested child's in record order) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
+| `SharedRegion { region }` (#2025, v39) | the region's number in Section 11 | `Host::restore_durable_regions` rebuilds each region (the embedder's region factory, else a heap backing) with the frozen bytes; the handle and every `Backed` page re-open on it. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
 | `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its five **ceilings** (fuel, mem, spawn, channel, lane; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared. A nested (carve) child's `Budget` refuses `FreezeError::NestedBudget`: no spawn gives a carve child one |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
@@ -1276,7 +1302,7 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 **freeze refuses** unless they're closed/drained first (the drain is
 `Host::drain_non_durable`, below):
 
-`SharedRegion(u32)` (R4), `Blocking(u32)` (§5 + cancellation R2), and a `Module(u32)` grant the
+`Blocking(u32)` (§5 + cancellation R2), and a `Module(u32)` grant the
 granting host did **not** attest freezable (#1361, below). *(The §22 `JitTable`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
@@ -1441,8 +1467,7 @@ both **seeds** an initial per-page protection map (restore) and **returns** the 
 data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
 flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
 makes a write to a restored `Ro` page fault — while the same window without it writes through. A
-`Backed` page maps to a freeze refusal / is skipped on restore (D-region: the embedder re-grants
-the region). **JIT re-establish parity** also landed:
+`Backed` page rides as a region reference and is re-aliased on thaw (D-region, §12.3). **JIT re-establish parity** also landed:
 `temen_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
 it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
 `mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
