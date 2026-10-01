@@ -850,8 +850,7 @@ and window bytes — to a **cold** one (replays from 0) across checkpoint-stride
 sweep, and one-at-a-time `step_back`. The **multithreaded** (`turn`-coordinate) ladder is landed too:
 the DAP backend keeps a `sched_checkpoints` ladder keyed on the global turn, and
 `dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_{replay_from_zero,with_live_fibers,with_a_host_capability}`
-hold it to the same warm ≡ cold oracle. *Still open:* dirty-page-tracked window copies (today's
-snapshot is the full mapped prefix — #1459), RNG via a dedicated iface (vs a host-fn), and capturing
+hold it to the same warm ≡ cold oracle. *Still open:* RNG via a dedicated iface (vs a host-fn), and capturing
 a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is the debug engine by design, so this
 is lower priority). *The ladder itself is shared (#1460):* both this engine's `checkpoints` and the DAP
 backend's two ladders are `temen_interp::moment::Ladder<C>` over `Moment<C>` — the same type the
@@ -2491,8 +2490,38 @@ the snapshot it replaces), and the slowdown is 1.0–1.6×. Journaling is armed 
 backend on that basis, and `backward_counts()` reports which path served each backward step so the
 wiring cannot silently stop being used.
 
+**The byte budget.** It drops pre-images oldest-first and raises a floor past the last turn it
+touched; `can_undo_to` declines every anchor below the floor. The floor has to sit past that turn,
+not at the next remaining entry's: entries share a turn (every entry of a coalesced segment carries
+the segment's first turn), so a drop can stop partway through one, and an anchor there would put
+back only part of the window
+(`undo_journal.rs::a_budget_that_splits_a_coalesced_segment_declines_it`). A budget smaller than
+one segment's writes leaves no anchor whole and undo reaches nothing; `JournalStats::reach` reports
+that as `None` instead of leaving every backward step to fall to `seek` unremarked.
+
 Open: DURABILITY.md **R4** (§13 shared-region edges — a design call, since a `Backed`/`SharedRegion`
-page has writers the journal cannot see); a byte budget below one `state_stride` of writes leaves every
-anchor under the floor and turns undo off quietly rather than shortening it (#1558); and the
-level-2 measured bound against #1459's per-moment page-scan cost, which #1556 asks for and which needs
-#1459 to exist first.
+page has writers the journal cannot see).
+
+## 15. Ladder rungs share pages (#1459)
+
+A `Ladder` rung holds the window as 4 KiB pages, and each page equal to the same page of the rung
+below is shared with it rather than copied (`moment::Image`). So the first rung holds a window and
+each later one the pages the guest changed since. Rungs stay whole, reference-counted images: any
+one restores and evicts on its own, and none is a delta another depends on. `held_bytes`, which the
+byte budget bounds, counts a shared page once.
+
+It costs one compare of the window per rung taken and nothing between rungs. No write is tracked,
+so it works the same on every tier, the playground's emitted reactors included, and touches nothing
+in the confinement path. `journal_cost` measures it on the DAP's checkpoint ladder (a rung every 1024
+turns, 300 000 turns):
+
+| guest | window | rungs | flat | held | per rung after the first | take |
+| --- | --- | --- | --- | --- | --- | --- |
+| gradient | 256 KiB | 292 | 73.0 MiB | 1.4 MiB (1.9%) | 4.1 KiB | 10 µs |
+| forth | 1 MiB | 292 | 292 MiB | 2.8 MiB (0.95%) | 6.2 KiB | 79 µs |
+| chibicc | 2 MiB | 292 | 584 MiB | 3.6 MiB (0.62%) | 5.7 KiB | 172 µs |
+| synthetic, 1% of pages rewritten | 16 MiB | 32 | 512 MiB | 21 MiB | — | 3.9–4.5 ms |
+
+#1459's second mechanism, a write-protect overlay that records which pages a guest writes, would
+replace the compare with a fault per first write. At these costs there is nothing yet for it to win
+on the interpreters; it waits for a guest whose window makes the compare the bottleneck.

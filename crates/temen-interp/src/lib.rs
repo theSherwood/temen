@@ -1488,7 +1488,7 @@ impl Inspector {
                 .continuation()
                 .as_shadow_stack()
                 .expect("a single-threaded seek ladder holds only ShadowStack moments");
-            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem(), clock);
+            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem().as_deref(), clock);
             cp.restore_host(&mut host.lock_unpoisoned());
         }
         self.host = host;
