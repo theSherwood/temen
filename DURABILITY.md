@@ -1252,14 +1252,18 @@ The in-window shadow stacks + state words ride along in this image for free (§1
 **[DECISION D-region — RESOLVED: co-snapshot when the group is inside the cut (R4 ruling, §4,
 #1679; landed #2025, v39).]** §13 `SharedRegion`-aliased pages name a host backing that may be
 shared across the nesting tree. A region rides when every holder of it (handles and mapped pages)
-is inside the cut: **Section 11** carries each such region's bytes once (`count: uleb`, then per
-region `len: uleb` + bytes, numbered by position), its handles ride as `SharedRegion { region }`,
-and its pages as `Backed` entries. The thaw rebuilds each region with a fresh backing and maps the
-`Backed` runs onto it, so aliasing survives. A region with a holder outside the cut (including a
-nested child, for now) refuses `FreezeError::RegionNotCaptured(HolderOutsideCut)`; a backing that
+is inside the cut — the root and every captured detached descendant, whose holders are counted
+together: the **depth-0** artifact's **Section 11** carries each such region's bytes once
+(`count: uleb`, then per region `len: uleb` + bytes, numbered by first appearance: the root's ids
+ascending, then each detached child's in `(parent_task, slot)` order, parents first), and every
+artifact of the cut names it by that number — its handles as `SharedRegion { region }`, its pages as
+`Backed` entries. A detached child's artifact carries no Section 11. The thaw rebuilds each region
+once with a fresh backing; each domain adopts the regions it names in number order (so a thawed tree
+re-freezes to the same numbers) and maps its `Backed` runs onto them, so a region a parent shares
+with its detached child stays shared. A region with a holder outside the cut (including a nested
+child, for now) refuses `FreezeError::RegionNotCaptured(HolderOutsideCut)`; a backing that
 something outside the VM can write (`SharedBacking::outside_writers`, e.g. a host file) refuses
-`OutsideWriters`. Not yet: a region a parent shares with a detached child (step 2) and the native
-JIT's `Backed` pages (step 3) still refuse.
+`OutsideWriters`. Not yet: the native JIT's `Backed` pages (#2025 step 3) still refuse.
 
 *Optimization (not v1):* diff against the post-instantiation image (`Module::data`
 segments) instead of storing all committed pages. Correctness doesn't need it.
@@ -1310,7 +1314,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant |
 | `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
 | `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance: the root's table by slot, then each nested child's in record order) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
-| `SharedRegion { region }` (#2025, v39) | the region's number in Section 11 | `Host::restore_durable_regions` rebuilds each region (the embedder's region factory, else a heap backing) with the frozen bytes; the handle and every `Backed` page re-open on it. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
+| `SharedRegion { region }` (#2025, v39) | the region's number in the depth-0 artifact's Section 11 | the depth-0 restore rebuilds each region once (`Host::rebuild_region`: the embedder's region factory, else a heap backing) with the frozen bytes; each domain adopts the ones it names (`Host::adopt_region`) and its handles and `Backed` pages re-open on them, so a region shared across the tree stays shared. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
 | `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its five **ceilings** (fuel, mem, spawn, channel, lane; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared. A nested (carve) child's `Budget` refuses `FreezeError::NestedBudget`: no spawn gives a carve child one |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their

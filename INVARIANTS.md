@@ -410,8 +410,8 @@ approval; adding one always requires owner sign-off:
   R4 ruling, 2026-10-01, #1679):* not an impossibility. A region co-snapshots with its sharing group
   when every holder is in the cut (#2025): the artifact carries its bytes once and the thaw re-aliases
   its pages. A cut that splits a group, or a backing written from outside the VM, is the cut's
-  boundary (as for pipes, #1680). What still fail-closes (a detached child's regions, the native
-  JIT's `Backed` pages) is un-wired support tracked in #2025.
+  boundary (as for pipes, #1680). What still fail-closes (the native JIT's `Backed` pages) is
+  un-wired support tracked in #2025.
 
 ## 15. One path per behaviour
 

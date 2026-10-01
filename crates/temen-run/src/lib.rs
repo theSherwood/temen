@@ -1981,11 +1981,17 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
 /// depth: its program is granted, and its own powerbox holds no residue but its captured children,
 /// its fibers (#2031) and its `thread.spawn` vCPUs. Nested and completed children, and child state
 /// the JIT re-creates only for a run's root (`jit_durable_enter`), so a child carrying any of them
-/// refuses rather than drops it.
+/// refuses rather than drops it. So does a §13 page in its window, which the JIT does not re-alias
+/// yet (#2025 step 3).
 fn jit_relaunches(host: &Host) -> bool {
     host.thawed_detached().iter().all(|td| {
         let c = &td.host;
         host.durable_module_by_digest(&td.launch.digest).is_some()
+            && !td
+                .window
+                .dense_prots()
+                .iter()
+                .any(|p| matches!(p, temen_interp::CapturedProt::Backed { .. }))
             && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
             && c.frozen_nested().is_empty()
             && c.frozen_detached().is_empty()
