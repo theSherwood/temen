@@ -1232,3 +1232,52 @@ fn a_detached_childs_pipes_are_capped_by_its_budget() {
     };
     agree_on_every_driver("op 15, a one-pipe channel ceiling", &m, &setup, &ok(1));
 }
+
+// ---- #2001: a domain's threads are `spawn`s of its node while they live ----
+
+/// A detached child that spawns a thread, joins it, then spawns another and joins it, returning the
+/// sum of their results: each thread returns its `arg` plus one, 11 and 21.
+const CHILD_SPAWNS_THREADS_IN_TURN: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  va = i64.const 10
+  vt1 = thread.spawn 1 vz va
+  vj1 = thread.join vt1
+  vb = i64.const 20
+  vt2 = thread.spawn 1 vz vb
+  vj2 = thread.join vt2
+  vr = i64.add vj1 vj2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vone = i64.const 1
+  vr = i64.add varg vone
+  return vr
+  }
+}
+";
+
+/// On every driver, a detached child's threads are `spawn`s of the budget that pays for it while they
+/// live: a child whose ceiling is one vCPU fills it itself, so its first `thread.spawn` traps, and one
+/// whose ceiling is two runs a thread, joins it, and runs another in its place.
+#[test]
+fn a_detached_childs_threads_are_capped_by_its_budget() {
+    let m = module(&op15(false));
+    let child = module(CHILD_SPAWNS_THREADS_IN_TURN);
+    for (spawn, want) in [(1, trapped(Trap::ThreadFault)), (2, ok(11 + 21))] {
+        let setup = || {
+            let (mut h, mut args) = op15_setup(&child, 1 << 20)();
+            args[2] = Value::I32(h.grant_budget(-1, 1 << 20, spawn));
+            (h, args)
+        };
+        agree_on_every_driver(
+            &format!("op 15, a child whose budget holds {spawn} vCPUs spawning threads in turn"),
+            &m,
+            &setup,
+            &want,
+        );
+    }
+}

@@ -313,6 +313,76 @@ fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
     );
 }
 
+/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
+/// 2^16, no payload) and join it.
+const SPAWN_JOIN: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 16
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vj
+  }
+}
+"#;
+
+/// A detached child (`memory 16`) that spawns a thread, joins it, then spawns another and joins it,
+/// returning the sum of their results: each thread returns its `arg` plus one, 11 and 21.
+const CHILD_SPAWNS_THREADS_IN_TURN: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  va = i64.const 10
+  vt1 = thread.spawn 1 vz va
+  vj1 = thread.join vt1
+  vb = i64.const 20
+  vt2 = thread.spawn 1 vz vb
+  vj2 = thread.join vt2
+  vr = i64.add vj1 vj2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vone = i64.const 1
+  vr = i64.add varg vone
+  return vr
+  }
+}
+"#;
+
+/// #2001 — a detached child's threads are `spawn`s of the budget that pays for it while they live, on
+/// the JIT as on the interpreter: a child whose ceiling is one vCPU fills it itself, so its first
+/// `thread.spawn` traps, and one whose ceiling is two runs a thread, joins it and runs another in its
+/// place (`Done::publish` hands the first one's charge back).
+#[test]
+fn a_detached_childs_threads_are_capped_by_its_budget_on_the_jit() {
+    let p = module(SPAWN_JOIN);
+    let c = module(CHILD_SPAWNS_THREADS_IN_TURN);
+    for (spawn, want_interp, want_jit) in [
+        (
+            1,
+            Err(Trap::ThreadFault),
+            JitOutcome::Trapped(TrapKind::ThreadFault),
+        ),
+        (2, Ok(vec![Value::I64(32)]), JitOutcome::Returned(vec![32])),
+    ] {
+        assert_eq!(
+            interp_result(&p, spawn_host(&c, spawn)),
+            want_interp,
+            "interpreter, a {spawn}-vCPU budget"
+        );
+        assert_eq!(
+            jit_outcome(&p, spawn_host(&c, spawn)),
+            want_jit,
+            "the JIT, a {spawn}-vCPU budget"
+        );
+    }
+}
+
 /// A detached child (`memory 16`) importing `exit`, which no grant binds.
 const CHILD_IMPORTS_EXIT: &str = r#"memory 16
 import 0 "exit" (i32) -> ()

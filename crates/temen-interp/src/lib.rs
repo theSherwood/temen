@@ -3019,6 +3019,9 @@ fn seed_thread(
     child.registry = Arc::clone(&p.registry);
     child.freeze_sink = p.freeze_sink.clone();
     child.kill = p.kill.clone();
+    // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
+    // it: charged again past any ceiling.
+    child.live = LiveVcpu::force(p.host.lock_unpoisoned().own_node());
     child.durable = true;
     child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
     child.root_shadow_sp = ff.shadow_sp;
@@ -7119,6 +7122,12 @@ impl Scheduler {
             },
             None => None,
         };
+        // #2001 — the twin is one `spawn` of its parent's node (which it shares) while it lives: a
+        // full ceiling refuses the fork as the live cap does.
+        let node = v.host.lock_unpoisoned().own_node();
+        let Some(live) = LiveVcpu::charge(node) else {
+            put_back_none!();
+        };
         // The twin's TaskId — read before the powerbox duplicate so the fork factories learn the
         // pid the parent's `fork()` will return (#863 slice 2: a personality registers the new
         // process in its table at birth). Stable under `s` (the scheduler lock is held throughout).
@@ -7163,6 +7172,7 @@ impl Scheduler {
         self.wire_signal_doors(&twin_host);
         let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
+        twin.live = live;
         twin.pending = Some(Pending::CapResult(reply_twin));
         // FORK.md §8.6: mark the twin reapable so a later servicer-side `wait()` (`reap`) can
         // deliver its exit status to the parent; removed when reaped (or swept at teardown). The
@@ -7189,9 +7199,12 @@ impl Scheduler {
         let SpawnReq { cmd, plan } = req;
         let mut s = self.lock();
         let mut zeroed = (Vec::new(), Vec::new());
+        // #2001 — the process is one `spawn` of its spawner's node (which it shares) while it
+        // lives: a full ceiling refuses it as the live cap does.
+        let node = v.host.lock_unpoisoned().own_node();
         let reply = if s.live >= self.cap || s.shutdown || s.dead.contains_key(&domain_key_of(&v)) {
             EAGAIN
-        } else {
+        } else if let Some(live) = LiveVcpu::charge(node) {
             if s.next_task <= 1 {
                 s.next_task = 2;
             }
@@ -7206,7 +7219,7 @@ impl Scheduler {
                         Ok((mut img, z)) => {
                             zeroed = z;
                             img.args = img.host.exec_commit_args();
-                            let child = img.into_vcpu(
+                            let mut child = img.into_vcpu(
                                 v.mem.as_ref(),
                                 v.fuel.for_thread(),
                                 v.depth,
@@ -7214,6 +7227,7 @@ impl Scheduler {
                                 v.sched.clone(),
                                 v.quota,
                             );
+                            child.live = live;
                             s.live += 1;
                             self.wire_signal_doors(&child.host);
                             let parent = domain_key_of(&v);
@@ -7225,6 +7239,8 @@ impl Scheduler {
                     pid as i64
                 }
             }
+        } else {
+            EAGAIN
         };
         if let Some(mut v) = park_gate(&mut s, v) {
             v.pending = Some(Pending::CapResult(reply));
@@ -9568,7 +9584,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let caller = v.mem.take();
                 let fuel = std::mem::replace(&mut v.fuel, Fuel::fixed(0));
                 let (depth, id, sched_ref, quota) = (v.depth, v.id, v.sched.clone(), v.quota);
+                // #2001 — the process's budget charges carry over: its `spawn`, and a detached
+                // child's window lease (the fresh window has the caller's geometry).
+                let live = std::mem::replace(&mut v.live, LiveVcpu::none());
+                let lease = v.window_lease.take();
                 *v = req.into_vcpu(caller.as_ref(), fuel, depth, id, sched_ref, quota);
+                v.live = live;
+                v.window_lease = lease;
                 // #802 interactive — RE-wire the door over the rebuilt vCPU's host (fresh
                 // domain id): see [`Scheduler::wire_signal_doors`].
                 if let SchedRef::Real(sc) = &v.sched {
@@ -11882,6 +11904,11 @@ struct VCpu {
     /// arm, or [`reap`] at a teardown): `Budget.mem` accounts live windows (owner, 2026-09-29), the
     /// same moment the Cranelift executor's teardown gives them back.
     window_lease: Option<(Arc<Mutex<Host>>, i32, u64)>,
+    /// #2001 — this vCPU's `spawn` charge on its domain's node, handed back when the vCPU is
+    /// dropped. Taken by what makes the vCPU: `thread.spawn`, a fork, a `posix_spawn`, or a thaw
+    /// re-creating a thread. None on a run's root, which its embedder makes ([`LiveVcpu`]), on a
+    /// detached child's root (its [`Self::window_lease`] holds the charge) and on a carve child.
+    live: LiveVcpu,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
     /// (a different unmasked signal can interrupt a running handler — the source blocks the
@@ -12054,6 +12081,7 @@ impl VCpu {
             kill: None,
             freeze_bell: None,
             window_lease: None,
+            live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -12134,6 +12162,7 @@ impl VCpu {
             kill: None,
             freeze_bell: None,
             window_lease: None,
+            live: LiveVcpu::none(),
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -12236,6 +12265,7 @@ impl VCpu {
             kill: None,
             freeze_bell: None,
             window_lease: None,
+            live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
@@ -13101,6 +13131,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         admit_retry,
         unit_ref_cache,
         window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
+        live: _,         // #2001: handed back when the vCPU is dropped
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -17255,6 +17286,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #1686: its freeze residue goes where its spawner's does — the root host for a
                     // thread inside a §14 subtree, whose own powerbox is private.
                     let sink_inherit = freeze_sink.clone();
+                    // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
+                    // ceiling refuses it as the live cap does (dropped with the closure if that does).
+                    let live = LiveVcpu::charge(host.lock_unpoisoned().own_node())
+                        .ok_or(Trap::ThreadFault)?;
                     let slot = threads.len(); // the handle `threads.push` below returns
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
@@ -17289,6 +17324,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
                         child.freeze_sink = sink_inherit;
                         child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
+                        child.live = live;
                         Box::new(child)
                     });
                     match made {
@@ -19815,7 +19851,7 @@ const BUDGET_FUEL: usize = 0;
 const BUDGET_MEM: usize = 1;
 /// The `spawn` dimension's index: one per live vCPU of the subtree (#1944 slice 3, the cgroups
 /// `pids.max` model). A detached child's first vCPU is charged with its window at the admission and
-/// handed back with it ([`Host::admit_detached_spawn`]); a domain's other vCPUs are not charged yet
+/// handed back with it ([`Host::admit_detached_spawn`]); a domain's other vCPUs hold a [`LiveVcpu`]
 /// (#2001).
 const BUDGET_SPAWN: usize = 2;
 /// The `channel` dimension's index: a host-served pipe's worst-case FIFO, [`PIPE_CAP`], charged to
@@ -20149,6 +20185,67 @@ impl NodeRef {
             BudgetTree::left(&nodes, self.node, BUDGET_FUEL)
         } else {
             0
+        }
+    }
+
+    /// Charge one live vCPU to the chain, all or nothing: `false` when a level's `spawn` is full. An
+    /// embedder that keeps its own vCPUs (the Cranelift JIT's threads, #2001) pairs it with
+    /// [`Self::vcpu_ended`]; the interpreters hold a [`LiveVcpu`] instead.
+    pub fn charge_vcpu(&self) -> bool {
+        self.tree.charge(self.node, BUDGET_SPAWN, 1)
+    }
+
+    /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the
+    /// freeze.
+    pub fn force_vcpu(&self) {
+        self.tree.force_charge(self.node, BUDGET_SPAWN, 1);
+    }
+
+    /// Hand back a vCPU's charge when it ends.
+    pub fn vcpu_ended(&self) {
+        self.tree.refund(self.node, BUDGET_SPAWN, 1);
+    }
+}
+
+/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node: one `spawn`, taken when the vCPU
+/// is made and handed back when this is dropped, so a node's `spawn` counts the live vCPUs of its
+/// subtree (the cgroups `pids.max` model).
+///
+/// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
+/// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
+/// either the run's own, which no guest reads, or a detached child's, whose admission charged the
+/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]).
+pub struct LiveVcpu(Option<NodeRef>);
+
+impl LiveVcpu {
+    /// Charge one vCPU to `node` and every ancestor: `None`, with nothing charged, when a level's
+    /// `spawn` is full.
+    pub(crate) fn charge(node: NodeRef) -> Option<LiveVcpu> {
+        node.charge_vcpu().then_some(LiveVcpu(Some(node)))
+    }
+
+    /// Charge one vCPU past any ceiling ([`NodeRef::force_vcpu`]).
+    pub(crate) fn force(node: NodeRef) -> LiveVcpu {
+        node.force_vcpu();
+        LiveVcpu(Some(node))
+    }
+
+    /// A vCPU that holds no charge: a run's root, a detached child's first (its window's lease holds
+    /// it), or a carve child's, which the carve path leaves uncharged until #1867 deletes it.
+    pub(crate) fn none() -> LiveVcpu {
+        LiveVcpu(None)
+    }
+
+    /// Whether this holds a charge.
+    pub(crate) fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for LiveVcpu {
+    fn drop(&mut self) {
+        if let Some(n) = &self.0 {
+            n.vcpu_ended();
         }
     }
 }

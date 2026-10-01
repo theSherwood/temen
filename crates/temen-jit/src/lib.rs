@@ -187,7 +187,7 @@ mod vcpu_tls;
 mod vmctx;
 pub use vmctx::{InstanceAddrs, VmCtx};
 mod fuel;
-pub use fuel::{FuelCell, FuelSource};
+pub use fuel::{BudgetNode, FuelCell};
 
 // §12.8 4A.5 durable-runtime-internal per-OS-thread shadow-region base (`durable.shadow_base`): the
 // base of the region the running durable context spills into, so concurrent vCPUs each have their own
@@ -1008,11 +1008,12 @@ pub type PremapApply = unsafe extern "C" fn(
     reserved: u64,
 ) -> i32;
 
-/// #1944 slice 3 — the budget chain a detached child's vCPUs draw their fuel from: its own node (the
-/// budget that paid for its window), read off child powerbox `child_ctx` (always the shared form).
-/// `None` when the child holds none. A plain Rust fn: it hands back a Rust trait object.
-pub type ChildFuelSource =
-    unsafe fn(child_ctx: *mut core::ffi::c_void) -> Option<std::sync::Arc<dyn FuelSource>>;
+/// #1944 slice 3 — a detached child's own budget node (the budget that paid for its window), read off
+/// child powerbox `child_ctx` (always the shared form): its vCPUs draw their fuel from it, and its
+/// threads are charged to it (#2001). `None` when the child holds none. A plain Rust fn: it hands back
+/// a Rust trait object.
+pub type ChildBudgetNode =
+    unsafe fn(child_ctx: *mut core::ffi::c_void) -> Option<std::sync::Arc<dyn BudgetNode>>;
 
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
@@ -1038,9 +1039,8 @@ pub struct GrantChildHooks {
     /// detached child grew its window, so a freeze's capture of it reaches its grown pages, as the
     /// root's does.
     pub high_water: HighWater,
-    /// #1944 slice 3 — the budget chain a **detached** child's vCPUs draw their fuel from (see
-    /// [`ChildFuelSource`]).
-    pub fuel_source: ChildFuelSource,
+    /// #1944 slice 3 — a **detached** child's own budget node (see [`ChildBudgetNode`]).
+    pub budget_node: ChildBudgetNode,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the

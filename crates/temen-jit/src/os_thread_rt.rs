@@ -187,6 +187,8 @@ impl Done {
         let mut st = lock(&self.state);
         cell_unpark(&self.joiner_parked, &hub.parked);
         lock(&dom.threads).live -= 1;
+        // #2001 — its `spawn` goes back with its live slot.
+        dom.vcpu_ended();
         // A §14 child's vCPU also held a slot of the run-wide count (see `thread_spawn`).
         if !std::ptr::eq(hub, dom) {
             lock(&hub.threads).live -= 1;
@@ -424,6 +426,10 @@ pub(crate) struct Domain {
     /// fiber registry, its lane chain — and shares the rest, because the oracle runs every vCPU of
     /// the run under one scheduler: one live cap, one futex, one deadlock count.
     hub: usize,
+    /// #2001 — the budget node this domain's spawned vCPUs are charged to, one `spawn` each while
+    /// it lives: a detached child's own. `None` for a run's own domain, whose vCPUs would charge the
+    /// run's node, which no guest reads, and for a carve child's (#1867).
+    node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -704,6 +710,7 @@ impl Domain {
             lane_cv: Condvar::new(),
             lane_chain: Mutex::new(Vec::new()),
             hub: 0,
+            node: None,
         }
     }
 
@@ -711,12 +718,29 @@ impl Domain {
     /// Its `live` counts only the child's spawned vCPUs, from 0: the task itself is counted on the
     /// hub when it is filed ([`Domain::try_child_start`]), and each vCPU spawned here is counted on
     /// both. [`Domain::set_env`] supplies the child's window before any of its vCPUs can spawn.
-    pub(crate) fn new_child(hub: &Domain, lane_chain: Vec<(usize, i64)>) -> Domain {
+    pub(crate) fn new_child(
+        hub: &Domain,
+        lane_chain: Vec<(usize, i64)>,
+        node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
+    ) -> Domain {
         let mut d = Domain::new(hub.max_vcpus);
         d.threads = Mutex::new(Threads::default());
         d.lane_chain = Mutex::new(lane_chain);
         d.hub = hub as *const Domain as usize;
+        d.node = node;
         d
+    }
+
+    /// #2001 — charge one spawned vCPU to [`Self::node`]: `false` when a level's `spawn` is full.
+    fn charge_vcpu(&self) -> bool {
+        self.node.as_ref().is_none_or(|n| n.charge_vcpu())
+    }
+
+    /// Hand a spawned vCPU's charge back.
+    fn vcpu_ended(&self) {
+        if let Some(n) = &self.node {
+            n.vcpu_ended();
+        }
     }
 
     /// The domain holding the futex, park count, lanes and run-wide live count this one uses:
@@ -1639,7 +1663,13 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         } else {
             !hub.try_child_start()
         };
-        if at_ceiling {
+        // #2001 — the vCPU is also one `spawn` of its domain's budget node while it lives
+        // ([`Done::publish`] hands it back): a full ceiling refuses it as the live cap does.
+        let unfunded = !at_ceiling && !dom.charge_vcpu();
+        if unfunded && !std::ptr::eq(hub, dom) {
+            lock(&hub.threads).live -= 1; // the slot `try_child_start` took
+        }
+        if at_ceiling || unfunded {
             if let Some(dc) = &durable_child {
                 if let Some(table) = dom.fiber_table() {
                     table.free_vcpu_context(dc.ctx);
@@ -1684,6 +1714,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 // reserved shadow context (if any) leaks for this run — a spawn failure aborts the run.
                 t.cells.pop();
                 t.joined.pop();
+                dom.vcpu_ended();
                 if !std::ptr::eq(hub, dom) {
                     lock(&hub.threads).live -= 1; // the slot `try_child_start` took
                 }
@@ -1735,7 +1766,8 @@ unsafe fn defer_spawn(
     // §15 concurrent-live quota (the global counter, like the OS-thread path) — bound it the same way.
     {
         let mut t = lock(&dom.threads);
-        if t.live >= dom.max_vcpus {
+        // #2001 — and its domain's budget node, as `thread_spawn` charges it.
+        if t.live >= dom.max_vcpus || !dom.charge_vcpu() {
             table.free_vcpu_context(ctx);
             store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
@@ -2057,6 +2089,10 @@ impl Domain {
                 continue; // already-done: no re-run, no §15 live count, no context
             }
             lock(&self.threads).live += 1;
+            // #2001 — it handed its `spawn` back as it unwound for the freeze, and lived before it.
+            if let Some(n) = &self.node {
+                n.force_vcpu();
+            }
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
             runs.push(Run {
                 task: v.task as u64,

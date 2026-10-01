@@ -2873,11 +2873,11 @@ unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
         .cap_high_water(base)
 }
 
-/// #1944 slice 3 — a budget node's fuel as the JIT meters it: a [`temen_jit::FuelCell`] draws from
-/// it and hands back what it did not burn.
-struct HostFuel(temen_interp::NodeRef);
+/// #1944 slice 3 — a budget node as the JIT sees it: a [`temen_jit::FuelCell`] draws from it and
+/// hands back what it did not burn, and a domain charges its threads to it (#2001).
+struct HostNode(temen_interp::NodeRef);
 
-impl temen_jit::FuelSource for HostFuel {
+impl temen_jit::BudgetNode for HostNode {
     fn draw(&self) -> Option<u64> {
         self.0.draw()
     }
@@ -2887,16 +2887,25 @@ impl temen_jit::FuelSource for HostFuel {
     fn room(&self) -> i64 {
         self.0.fuel_room()
     }
+    fn charge_vcpu(&self) -> bool {
+        self.0.charge_vcpu()
+    }
+    fn force_vcpu(&self) {
+        self.0.force_vcpu()
+    }
+    fn vcpu_ended(&self) {
+        self.0.vcpu_ended()
+    }
 }
 
-/// #1944 slice 3 — a detached child's [`temen_jit::ChildFuelSource`] over its powerbox (always the
-/// shared form): the node it draws from is its own, the budget that paid for its window.
-unsafe fn child_fuel_source(ctx: *mut c_void) -> Option<Arc<dyn temen_jit::FuelSource>> {
-    let src = (*(ctx as *const Mutex<Host>))
+/// #1944 slice 3 — a detached child's [`temen_jit::ChildBudgetNode`] over its powerbox (always the
+/// shared form): its own node, the budget that paid for its window.
+unsafe fn child_budget_node(ctx: *mut c_void) -> Option<Arc<dyn temen_jit::BudgetNode>> {
+    let node = (*(ctx as *const Mutex<Host>))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .own_node();
-    Some(Arc::new(HostFuel(src)))
+    Some(Arc::new(HostNode(node)))
 }
 
 /// #1834 — the page map a run seeded with `init` builds its window under: the host's view of it,
@@ -3001,7 +3010,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         },
         premap_apply,
         high_water: high_water_locked,
-        fuel_source: child_fuel_source,
+        budget_node: child_budget_node,
         release: grant_child_release,
         bind_imports: if locked {
             child_bind_imports_locked
@@ -6383,7 +6392,7 @@ fn jit_run(
     // or an unbounded limit leaves the run un-metered: its deadline stops a runaway.
     let mut root_fuel = limits
         .fuel
-        .and_then(|n| temen_jit::FuelCell::metering(Arc::new(HostFuel(host.begin_activation(n)))));
+        .and_then(|n| temen_jit::FuelCell::metering(Arc::new(HostNode(host.begin_activation(n)))));
     let fuel = root_fuel
         .as_deref_mut()
         .map(|c| c as *mut temen_jit::FuelCell);
