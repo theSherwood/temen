@@ -225,6 +225,7 @@ fn main() {
         "# undo-journal cost, {turns} turns per guest, state_stride={} (#1556 bail criteria)\n",
         stride()
     );
+    synthetic_ladder();
 
     for g in GUESTS {
         if !only.is_empty() && !only.iter().any(|o| o == g.name) {
@@ -267,6 +268,7 @@ fn main() {
         // Undo first: coalescing below collapses the fine tail too, and `step_back` asks about the
         // tail. Measuring after it would only ever report "declined".
         undo_vs_replay(g, &module, cold.turns);
+        ladder_cost(g, &module, cold.turns, window);
 
         // Level 2 over the whole history: the bound the design rests on.
         let l1 = stats.bytes;
@@ -380,4 +382,92 @@ fn undo_vs_replay(g: &Guest, module: &temen_ir::Module, turns: u64) {
         ),
         (_, None) => println!("  step_back         replay build failed"),
     }
+}
+
+/// The DAP backend's checkpoint stride: a rung every this many turns.
+const LADDER_STRIDE: u64 = 1024;
+
+/// The checkpoint ladder the DAP backend keeps for `seek`, recorded over the same run (#1459): how
+/// much a rung holds once it shares the pages it agrees on with the rung below, against the flat
+/// window images it held before, and what taking one costs (the page compare included).
+///
+/// Each rung is the window read at its turn, not [`ScheduledDebugRun::snapshot`]: these guests are
+/// built with the full capability set, whose `Jit` table refuses a checkpoint, and the paging only
+/// ever looks at the window.
+fn ladder_cost(g: &Guest, module: &temen_ir::Module, turns: u64, window: u64) {
+    let Some(mut run) = build(g, module) else {
+        return;
+    };
+    let mut ladder = temen_interp::moment::Ladder::new(LADDER_STRIDE, 0, 0);
+    let (mut flat, mut taking) = (0usize, Duration::ZERO);
+    let mut at = LADDER_STRIDE;
+    while at <= turns {
+        let (reached, _) = drive(&mut run, at);
+        if reached < at {
+            break;
+        }
+        let Ok(bytes) = run.read_window(0, window as usize) else {
+            return;
+        };
+        let layout = temen_interp::MemLayout::image(bytes);
+        let snap = temen_interp::moment::Moment::new(
+            Some(layout),
+            &temen_interp::Host::new(),
+            temen_interp::moment::Continuation::None,
+        );
+        flat += snap.byte_len();
+        let t0 = Instant::now();
+        ladder.take(at, snap);
+        taking += t0.elapsed();
+        at += LADDER_STRIDE;
+    }
+    let rungs = ladder.len();
+    if rungs == 0 {
+        return;
+    }
+    let held = ladder.held_bytes();
+    println!(
+        "  ladder (#1459)    {rungs} rungs every {LADDER_STRIDE} turns: {} held of {} flat ({}), \
+         {} per rung after the first; take {:.0} µs mean",
+        kib(held),
+        kib(flat),
+        pct(held, flat as u64),
+        kib(held.saturating_sub(window as usize) / rungs.saturating_sub(1).max(1)),
+        taking.as_secs_f64() * 1e6 / rungs as f64
+    );
+}
+
+/// What taking a rung costs on a large window, the case #1459 estimated at 2–4 ms per 16 MiB: a
+/// 16 MiB image with 1% of its pages rewritten between rungs.
+fn synthetic_ladder() {
+    const WINDOW: usize = 16 << 20;
+    const PAGE: usize = 4096;
+    const RUNGS: u64 = 32;
+    let mut image = vec![0u8; WINDOW];
+    let mut ladder = temen_interp::moment::Ladder::new(1, 0, 0);
+    let host = temen_interp::Host::new();
+    let mut taking = Duration::ZERO;
+    for r in 0..RUNGS {
+        for p in (r as usize..WINDOW / PAGE).step_by(100) {
+            image[p * PAGE] = r as u8 + 1;
+        }
+        let layout =
+            temen_interp::MemLayout::from_parts(image.clone(), PAGE as u64, WINDOW as u64, &[])
+                .expect("a whole number of pages");
+        let m = temen_interp::moment::Moment::new(
+            Some(layout),
+            &host,
+            temen_interp::moment::Continuation::None,
+        );
+        let t0 = Instant::now();
+        ladder.take(r, m);
+        taking += t0.elapsed();
+    }
+    println!(
+        "## synthetic ladder — a 16 MiB window, 1% of its pages rewritten between rungs\n  \
+         {RUNGS} rungs: {} held of {} flat; take {:.2} ms mean\n",
+        kib(ladder.held_bytes()),
+        kib(WINDOW * RUNGS as usize),
+        taking.as_secs_f64() * 1e3 / RUNGS as f64
+    );
 }

@@ -5749,7 +5749,7 @@ impl OnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if !self.inst.restore_window(moment.layout()) {
+        if !self.inst.restore_window(&moment.layout()) {
             return false;
         }
         moment.restore_host(&mut self.host);
@@ -5936,7 +5936,7 @@ impl SharedOnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if !self.reactor.restore_window(moment.layout()) {
+        if !self.reactor.restore_window(&moment.layout()) {
             return false;
         }
         moment.restore_host(&mut self.host.lock().unwrap());

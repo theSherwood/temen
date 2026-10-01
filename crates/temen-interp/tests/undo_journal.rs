@@ -718,3 +718,127 @@ fn a_deep_stack_spaces_its_boundaries_by_what_they_clone() {
         "a shallow run's boundaries stay one per stride"
     );
 }
+
+/// Eight cells 4 KiB apart written once each, then a loop on one hot cell. The first op is the first
+/// cell's store, so the segment's earliest pre-image shares a turn with its anchor.
+const SPREAD_THEN_HOT: &str = r#"memory 17
+func (i64) -> (i64) {
+block 0 (vbase: i64) {
+  i64.store vbase vbase
+  v1 = i32.const 1
+  br 1(vbase, v1)
+}
+block 1 (vb: i64, vc: i32) {
+  vcx = i64.extend_i32_u vc
+  vsh = i64.const 12
+  voff = i64.shl vcx vsh
+  vaddr = i64.add vb voff
+  i64.store vaddr vb
+  vone = i32.const 1
+  vnc = i32.add vc vone
+  veight = i32.const 8
+  vmore = i32.lt_u vnc veight
+  br_if vmore 1(vb, vnc) 2(veight)
+}
+block 2 (vk: i32) {
+  vhot = i64.const 16384
+  vkx = i64.extend_i32_u vk
+  i64.store vhot vkx
+  vm1 = i32.const -1
+  vnext = i32.add vk vm1
+  br_if vnext 2(vnext) 3()
+}
+block 3 () {
+  vend = i64.const 16384
+  vr = i64.load vend
+  return vr
+  }
+}
+"#;
+
+/// **A byte budget that drops part of a coalesced segment makes the whole segment unreachable.**
+///
+/// Coalescing tags every pre-image in a segment with the segment's first turn, and the budget drops
+/// pre-images oldest-first. A drop that stops partway through that segment leaves the segment's
+/// anchor in place with some of its pre-images gone, so an undo into it would put back only part of
+/// the window. The floor has to sit past the last turn the drop touched, so the anchor declines and
+/// `seek` serves those turns.
+#[test]
+fn a_budget_that_splits_a_coalesced_segment_declines_it() {
+    let module = || temen_text::parse_module(SPREAD_THEN_HOT).expect("parse");
+    let fresh = || {
+        ScheduledDebugRun::new(&module(), 0, &[temen_interp::Value::I64(32768)])
+            .expect("in the debug subset")
+    };
+    let policy = |byte_budget| temen_interp::journal::JournalPolicy {
+        fine_turns: u64::MAX,
+        byte_budget,
+        state_stride: 4,
+    };
+    let mut r = fresh();
+    r.set_journal_armed(true);
+    r.set_journal_policy(policy(0));
+    let mut fuel = FUEL;
+    while r.op_turn() < 120 && r.tick(&mut fuel) {}
+    // One segment over the eight cells and the hot cell's start, as level 2 holds it: nine spans,
+    // all tagged with turn 0.
+    r.coalesce_journal(100);
+    // A budget that drops the first few of those spans and keeps the rest.
+    r.set_journal_policy(policy(r.journal_stats().bytes - 24));
+    while r.tick(&mut fuel) {}
+    let end = r.op_turn();
+
+    let oracle = |t: u64| {
+        let mut f = fresh();
+        let mut fuel = FUEL;
+        while f.op_turn() < t && f.tick(&mut fuel) {}
+        observe(&f)
+    };
+    assert!(
+        !r.can_undo_to(75),
+        "a turn in the part-dropped segment declines"
+    );
+    let mut served = 0;
+    for t in (0..end).rev() {
+        if !r.can_undo_to(t) {
+            continue;
+        }
+        assert!(r.undo_to(t), "undo_to({t}) accepted then failed");
+        assert_eq!(
+            observe(&r),
+            oracle(t),
+            "undo_to({t}) must restore the window a fresh run has at {t}, or decline"
+        );
+        served += 1;
+    }
+    assert!(served > 0, "the turns after the segment still undo");
+}
+
+/// **A budget that leaves undo nothing is reported, not silent** (#1556). With the default stride
+/// this fixture has one anchor, at turn 0, so a budget below its writes drops part of every segment
+/// and undo declines every turn. `reach` reads `None` then, and the turn an unbudgeted journal reaches
+/// otherwise.
+#[test]
+fn the_journal_reports_how_far_back_undo_reaches() {
+    let (r, _) = armed_run_to_end();
+    assert_eq!(
+        r.journal_stats().reach,
+        Some(0),
+        "unbudgeted, undo reaches the start"
+    );
+
+    let mut r = run();
+    r.set_journal_armed(true);
+    r.set_journal_policy(temen_interp::journal::JournalPolicy {
+        byte_budget: 16,
+        ..Default::default()
+    });
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let end = r.op_turn();
+    assert!(
+        (0..end).all(|t| !r.can_undo_to(t)),
+        "a budget below one segment's writes leaves nothing to undo into"
+    );
+    assert_eq!(r.journal_stats().reach, None, "and the stats say so");
+}

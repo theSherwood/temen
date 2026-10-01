@@ -9311,7 +9311,7 @@ impl ScheduledDebugRun {
             .as_bytecode()
             .expect("a scheduled seek ladder holds only Bytecode moments");
         if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
-            m.restore_layout(layout);
+            m.restore_layout(&layout);
         }
         self.install_continuation(c, true);
         snap.restore_host(&mut self.host);
