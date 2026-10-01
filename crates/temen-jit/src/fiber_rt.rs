@@ -1085,7 +1085,13 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // delivery consumes; a fresh (`OWNED`) one may be a thaw-seeded consumed fiber.
         let was_runnable = slot.own.is_runnable();
         if !slot.own.claim_gen(fiber_handle_generation(handle)) {
-            fault(trap_out);
+            // #2032 — a freeze driver resumes the handles of its own snapshot of the table, and
+            // another vCPU's driver (or a guest resume under the freeze) may have flattened one
+            // since: that claimant records it, so this one skips it. Only a guest's lost claim is a
+            // forged, running or finished handle.
+            if !rt.flattening {
+                fault(trap_out);
+            }
             *status_out = 1;
             return 0;
         }
@@ -1952,5 +1958,50 @@ mod vcpu_ctx_tests {
             None,
             "the reserve is full once every fitting context is live"
         );
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod flatten_claim_tests {
+    use super::{fiber_handle, fiber_resume, set_current, FiberRuntime, SharedFiberTable};
+    use crate::TrapKind;
+    use std::sync::Arc;
+    use temen_ir::durable_abi::ShadowArena;
+
+    /// #2032 — two freeze drivers walk one table: each snapshots the parked fibers, then claims
+    /// them. A rival that claimed and flattened one first leaves its slot free at the next
+    /// generation, as the race left it, so this driver's claim of its snapshot's handle loses. That
+    /// is a stale snapshot, not a forgery: a flattening resume skips the fiber, where a guest's
+    /// resume of the same handle still faults.
+    #[test]
+    fn a_flattening_resume_that_loses_its_claim_skips_the_fiber() {
+        let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY));
+        let slot = table.seed_free(1);
+        let snapshot = fiber_handle(slot, 0);
+        let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
+        let prev = set_current(rt);
+        let mut status = 0i64;
+        let mut trap = 0i64;
+        let trap_out = &mut trap as *mut i64 as u64;
+        // SAFETY: `rt` is published as this thread's runtime for both calls, and the claim fails
+        // before any stack switch, so no fiber runs.
+        unsafe {
+            (*rt).flattening = true;
+            fiber_resume(snapshot, 0, &mut status, trap_out);
+        }
+        assert_eq!(trap, 0, "a driver's stale snapshot is not a forgery");
+        // SAFETY: as above.
+        unsafe {
+            (*rt).flattening = false;
+            fiber_resume(snapshot, 0, &mut status, trap_out);
+        }
+        assert_eq!(
+            trap,
+            TrapKind::FiberFault as i64,
+            "a guest's resume of a flattened fiber still faults"
+        );
+        set_current(prev);
+        // SAFETY: `rt` came from `Box::into_raw` above and is no longer published.
+        drop(unsafe { Box::from_raw(rt) });
     }
 }

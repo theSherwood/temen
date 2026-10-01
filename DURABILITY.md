@@ -1734,7 +1734,10 @@ against `temen_interp`'s `SHADOW_*`). Slice **3.3.2 landed**: the JIT **freeze d
 resuming it under `UNWINDING` via the ordinary `fiber_resume` path — its post-suspend poll fires
 before any guest code runs, so it unwinds with zero forward progress and its `Fiber` completes. It
 runs host-side and unguarded — a flattening fiber touches only the committed reserve, so no guard
-page can fault. Tested by a **cross-backend freeze comparison** (`jit_freeze_driver_flattens_a_fiber_matching_interp`):
+page can fault. A domain's vCPUs each run a driver as they unwind (B.1), and each walks the whole
+shared table, so two can snapshot one parked fiber: the claim arbitrates, the winner records the
+fiber, and a driver that loses the claim skips it rather than faulting. Its snapshot was stale, not
+forged (#2032). Tested by a **cross-backend freeze comparison** (`jit_freeze_driver_flattens_a_fiber_matching_interp`):
 interp and JIT freeze the same instrumented fiber module into a **byte-identical durable reserve**.
 Slice **3.3.3 landed**, closing JIT parity: the freeze driver **exports** a `temen_jit::FrozenFiber`
 residue per flattened fiber (entry funcref + data-SP retained in the `FiberSlot` at `cont.new`,
