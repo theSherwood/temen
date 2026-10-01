@@ -812,7 +812,7 @@ impl Domain {
 
     /// The module-declared shadow arena this domain places its contexts in (`EMPTY` when the module
     /// declared none — then nothing durable can be placed and a durable run is refused upstream).
-    fn shadow(&self) -> temen_ir::durable_abi::ShadowArena {
+    pub(crate) fn shadow(&self) -> temen_ir::durable_abi::ShadowArena {
         self.fiber_table()
             .map_or(temen_ir::durable_abi::ShadowArena::EMPTY, |t| t.shadow)
     }
@@ -1609,7 +1609,10 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     // ([`Domain::drive_frozen_spawns`]), exactly as the interp enqueues a child and dispatches it only
     // once the spawning vCPU unwinds. This keeps the one shared set of durable control words unraced
     // *and* reproduces the interp's side-effect interleaving (root runs to its unwind point first).
-    if env.durable && fiber_rt::window_is_durable_active(env.mem_base) {
+    // #2010 — the run's own domain only: a durable §14 child's root is an executor task, which has no
+    // stack to drive deferred children on, so its domain runs concurrently durable throughout
+    // (`ChildExec::spawn`) and a child spawned under its freeze word unwinds at its first poll.
+    if env.durable && std::ptr::eq(hub, dom) && fiber_rt::window_is_durable_active(env.mem_base) {
         return defer_spawn(dom, code, func_idx, sp, arg, trap_out);
     }
     // §12.8 4A.5 stage (ii): on a freezable (interruptible) durable run, a child spawned during NORMAL
@@ -2070,6 +2073,12 @@ impl Domain {
         }
         let mut ordered: Vec<&crate::FrozenVCpu> = seed.iter().collect();
         ordered.sort_by_key(|v| v.task);
+        // #2010 — a vCPU spawned after the thaw takes an id above every re-attached one, so a later
+        // freeze's residue names each vCPU once.
+        if let Some(last) = ordered.last() {
+            let mut nt = lock(&self.next_task);
+            *nt = (*nt).max(last.task as u64 + 1);
+        }
         let mut runs: Vec<Run> = Vec::with_capacity(ordered.len());
         for v in &ordered {
             // §12.8 4A.5 follow-up A: a child that **completed** before the freeze point (no frozen
@@ -2170,9 +2179,10 @@ impl Domain {
         }
         // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
         // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
-        // §12.8 4A.5: the root's extent goes into context 0's own region word.
+        // §12.8 4A.5: the root's extent goes into context 0's own region word. The thread that runs the
+        // root seeds its own shadow-base register to that region (`run_inner` before its guarded call,
+        // a child task's residency, #2010), so nothing here touches the calling thread's.
         fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
-        crate::durable_shadow::seed(self.shadow().region_base(0));
         fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
 
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)
@@ -2347,6 +2357,10 @@ pub(crate) unsafe extern "C" fn thread_join(
 /// back the task's lanes while it is parked, and re-offers it at the joined vCPU's exit broadcast
 /// (`run_child` → [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown.
 ///
+/// #2010 — in a durable child it follows the OS-thread join's freeze rule: a freeze of the child's
+/// window ends the wait for re-issue on thaw, and a vCPU that unwound leaves its placeholder,
+/// marked for re-issue too. So a teardown under that freeze wakes the park rather than poison it.
+///
 /// # Safety
 /// Called on the task's own stack (`slot` is its platform slot); `trap_out` is its live trap cell.
 unsafe fn task_join(
@@ -2355,19 +2369,28 @@ unsafe fn task_join(
     done: &Done,
     trap_out: u64,
 ) -> i64 {
-    let epoch_addr = dom.env().epoch_addr;
+    let env = dom.env();
+    let unwind_base = if env.durable { env.mem_base } else { 0 };
     loop {
         if let Some((result, trap)) = *lock(&done.state) {
             if trap != 0 {
                 store_trap(trap_out as *mut i64, trap);
             }
+            if done.unwound.load(Ordering::Relaxed) {
+                // A vCPU unwinds only on a durable run, whose window is committed.
+                mark_reissue(env.mem_base);
+            }
             return result;
         }
         // Killed, or the child's domain is over: return; the join's trailing guards unwind.
-        if epoch_fired(epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
+        if epoch_fired(env.epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
             return 0;
         }
-        fiber_rt::fiber_event_park(slot, None, fiber_rt::ParkOn::Event);
+        if unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base) {
+            mark_reissue(unwind_base);
+            return 0; // a freeze: the join's trailing safepoint unwinds
+        }
+        fiber_rt::fiber_event_park(slot, None, fiber_rt::ParkOn::Thread);
     }
 }
 

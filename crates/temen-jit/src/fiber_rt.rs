@@ -359,6 +359,8 @@ pub(crate) enum ParkOn {
     /// through the cell, so the `notify` that claims the wait also ends the vCPU's park, under the
     /// futex lock (#1625's rule). The wait also ends on the waiter's own freeze word (#1937).
     Futex(Arc<crate::os_thread_rt::WaitCell>),
+    /// #2010 — a `thread.join`: it also ends on the joiner's own freeze word, as a futex wait does.
+    Thread,
     /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
     Child,
 }

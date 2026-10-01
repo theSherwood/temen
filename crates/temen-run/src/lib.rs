@@ -1863,59 +1863,39 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
             "durable JIT thaw: residue the JIT cannot re-create (#1692)",
         ));
     }
-    let fibers = host
-        .frozen_fibers()
-        .iter()
-        .map(|f| temen_jit::FrozenFiber {
-            slot: f.slot,
-            func: f.func,
-            sp: f.sp,
-            shadow_sp: f.shadow_sp,
-            generation: f.generation,
-            consumed: f.consumed,
-        })
-        .collect();
-    let vcpus = host
-        .frozen_vcpus()
-        .iter()
-        .map(|v| temen_jit::FrozenVCpu {
-            task: v.task,
-            parent_task: v.parent_task,
-            slot: v.slot,
-            func: v.func,
-            args: v.args.clone(),
-            shadow_sp: v.shadow_sp,
-            completed_result: v.completed_result,
-        })
-        .collect();
-    let nested = host
-        .frozen_nested()
-        .iter()
-        .map(|n| temen_jit::FrozenNested {
-            parent_task: n.parent_task,
-            task: n.task,
-            slot: n.slot,
-            carve_off: n.carve_off,
-            size_log2: n.size_log2,
-            entry: n.entry,
-            completed_result: n
-                .completed_result
-                .map(|r| r.map_err(temen_interp::Trap::code)),
-        })
-        .collect();
     let detached = detached_seeds(host)?;
+    cm.set_detached_seed(detached);
+    cm.set_durable(take_residue(host));
+    Ok(())
+}
+
+/// The residue a freeze left on `host`, taken for a JIT thaw to re-create: a run root's, or a
+/// captured detached child's on its powerbox (#2010, #2031). [`leave_residue`]'s inverse.
+fn take_residue(host: &mut Host) -> temen_jit::DurableResidue {
+    let r = temen_jit::DurableResidue {
+        fibers: host.frozen_fibers().iter().map(jit_fiber).collect(),
+        vcpus: host.frozen_vcpus().iter().map(jit_vcpu).collect(),
+        nested: host
+            .frozen_nested()
+            .iter()
+            .map(|n| temen_jit::FrozenNested {
+                parent_task: n.parent_task,
+                task: n.task,
+                slot: n.slot,
+                carve_off: n.carve_off,
+                size_log2: n.size_log2,
+                entry: n.entry,
+                completed_result: n
+                    .completed_result
+                    .map(|r| r.map_err(temen_interp::Trap::code)),
+            })
+            .collect(),
+        root_sp: host.take_frozen_root_sp(),
+    };
     host.set_frozen_fibers(Vec::new());
     host.set_frozen_vcpus(Vec::new());
     host.set_frozen_nested(Vec::new());
-    let root_sp = host.take_frozen_root_sp();
-    cm.set_detached_seed(detached);
-    cm.set_durable(temen_jit::DurableResidue {
-        fibers,
-        vcpus,
-        nested,
-        root_sp,
-    });
-    Ok(())
+    r
 }
 
 /// #1361 step 4 — the captured detached children a restore seeded, as JIT re-launch seeds: each child's
@@ -1957,6 +1937,14 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
         // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
         let window_lease = host.relaunch_lease(&r.host, r.memory_log2);
         let children = detached_seeds(&mut r.host)?;
+        // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
+        // from the id an interpreter capture gave it.
+        let mut residue = take_residue(&mut r.host);
+        for v in &mut residue.vcpus {
+            if v.parent_task == launch.task as usize {
+                v.parent_task = 0;
+            }
+        }
         let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
         let mut trap = 0i64;
         // SAFETY: `gc`/`trap` are live out-cells for the call.
@@ -1983,21 +1971,22 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             child: unsafe { gc.assume_init() },
             window: window_lease,
             children,
+            residue,
         });
     }
     Ok(out)
 }
 
 /// #2010 — whether the JIT can re-launch every detached child a restore seeded on `host`, at every
-/// depth: its program is granted, and its own powerbox holds no residue but its captured children.
-/// Fibers, threads, nested and completed children, and child state the JIT re-creates only for a
-/// run's root (`jit_durable_enter`), so a child carrying any of them refuses rather than drops it.
+/// depth: its program is granted, and its own powerbox holds no residue but its captured children,
+/// its fibers (#2031) and its `thread.spawn` vCPUs. Nested and completed children, and child state
+/// the JIT re-creates only for a run's root (`jit_durable_enter`), so a child carrying any of them
+/// refuses rather than drops it.
 fn jit_relaunches(host: &Host) -> bool {
     host.thawed_detached().iter().all(|td| {
         let c = &td.host;
         host.durable_module_by_digest(&td.launch.digest).is_some()
-            && c.frozen_fibers().is_empty()
-            && c.frozen_vcpus().is_empty()
+            && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
             && c.frozen_nested().is_empty()
             && c.frozen_detached().is_empty()
             && c.frozen_child_state().is_empty()
@@ -2074,7 +2063,7 @@ fn detached_left(
             0 => Some(Ok(result)),
             t => temen_interp::Trap::from_code(t).map(Err),
         });
-        let Some(image) = h.image else {
+        let Some(capture) = h.capture else {
             unreached.extend(grand_captured.into_iter().map(pending_detached));
             match outcome {
                 Some(outcome) => completed.push(temen_interp::FrozenDetached {
@@ -2102,7 +2091,9 @@ fn detached_left(
             if !grand_completed.is_empty() {
                 c.set_frozen_detached(grand_completed);
             }
-            jit_layout(&module, &c, image)
+            // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too.
+            leave_residue(&mut c, capture.residue);
+            jit_layout(&module, &c, capture.image)
         };
         captured.push(temen_interp::CapturedDetached {
             parent_task: 0,
@@ -2140,42 +2131,72 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
     }
 }
 
+/// A JIT vCPU's freeze residue, as the interpreter records it: one record serves both engines.
+fn interp_vcpu(v: temen_jit::FrozenVCpu) -> temen_interp::FrozenVCpu {
+    temen_interp::FrozenVCpu {
+        task: v.task,
+        parent_task: v.parent_task,
+        slot: v.slot,
+        func: v.func,
+        args: v.args,
+        shadow_sp: v.shadow_sp,
+        completed_result: v.completed_result,
+    }
+}
+
+/// [`interp_vcpu`]'s inverse, for a JIT thaw.
+fn jit_vcpu(v: &temen_interp::FrozenVCpu) -> temen_jit::FrozenVCpu {
+    temen_jit::FrozenVCpu {
+        task: v.task,
+        parent_task: v.parent_task,
+        slot: v.slot,
+        func: v.func,
+        args: v.args.clone(),
+        shadow_sp: v.shadow_sp,
+        completed_result: v.completed_result,
+    }
+}
+
+/// A JIT fiber's freeze residue, as the interpreter records it.
+fn interp_fiber(f: temen_jit::FrozenFiber) -> temen_interp::FrozenFiber {
+    temen_interp::FrozenFiber {
+        slot: f.slot,
+        func: f.func,
+        sp: f.sp,
+        shadow_sp: f.shadow_sp,
+        generation: f.generation,
+        consumed: f.consumed,
+    }
+}
+
+/// [`interp_fiber`]'s inverse, for a JIT thaw.
+fn jit_fiber(f: &temen_interp::FrozenFiber) -> temen_jit::FrozenFiber {
+    temen_jit::FrozenFiber {
+        slot: f.slot,
+        func: f.func,
+        sp: f.sp,
+        shadow_sp: f.shadow_sp,
+        generation: f.generation,
+        consumed: f.consumed,
+    }
+}
+
 /// The freeze residue of a durable [`jit_cap_run`], handed to the embedder on the `Host` exactly where
 /// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
 /// both engines. The whole residue, not just the fibers (#1690).
 fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
     jit_detached_leave(cm, host);
-    let r = cm.take_durable_residue();
+    leave_residue(host, cm.take_durable_residue());
+}
+
+/// A JIT freeze's residue onto `host`, where the interpreter's freeze leaves it: a run root's, or a
+/// captured detached child's on its powerbox (#2010, #2031). [`take_residue`]'s inverse.
+fn leave_residue(host: &mut Host, r: temen_jit::DurableResidue) {
     if !r.fibers.is_empty() {
-        host.set_frozen_fibers(
-            r.fibers
-                .into_iter()
-                .map(|f| temen_interp::FrozenFiber {
-                    slot: f.slot,
-                    func: f.func,
-                    sp: f.sp,
-                    shadow_sp: f.shadow_sp,
-                    generation: f.generation,
-                    consumed: f.consumed,
-                })
-                .collect(),
-        );
+        host.set_frozen_fibers(r.fibers.into_iter().map(interp_fiber).collect());
     }
     if !r.vcpus.is_empty() {
-        host.set_frozen_vcpus(
-            r.vcpus
-                .into_iter()
-                .map(|v| temen_interp::FrozenVCpu {
-                    task: v.task,
-                    parent_task: v.parent_task,
-                    slot: v.slot,
-                    func: v.func,
-                    args: v.args,
-                    shadow_sp: v.shadow_sp,
-                    completed_result: v.completed_result,
-                })
-                .collect(),
-        );
+        host.set_frozen_vcpus(r.vcpus.into_iter().map(interp_vcpu).collect());
     }
     if let Some(sp) = r.root_sp {
         host.set_frozen_root_sp(sp);

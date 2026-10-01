@@ -137,7 +137,7 @@ fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     (host, vec![inst as i64, modh as i64, budget as i64])
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Engine {
     Interp,
     Jit,
@@ -249,21 +249,29 @@ fn check_child(src: &str, want: Out) {
     check_with(&parent(), src, want);
 }
 
-/// [`check_child`] under `parent`.
+/// [`check_child`] under `parent`. An engine that runs the child fresh must freeze and thaw it too:
+/// only a target without the JIT's child executor skips a cell.
 fn check_with(parent: &temen_ir::Module, src: &str, want: Out) {
     use Engine::*;
     let mut wrong = Vec::new();
+    let mut runs = Vec::new();
     for e in [Interp, Jit] {
-        match fresh(e, parent, src) {
-            Some(o) if o != want => wrong.push(format!("fresh on {e:?}: {o:?}")),
-            _ => {}
+        let Some(o) = fresh(e, parent, src) else {
+            continue;
+        };
+        if o != want {
+            wrong.push(format!("fresh on {e:?}: {o:?}"));
         }
+        runs.push(e);
     }
     for froze in [Interp, Jit] {
         for thaws in [Interp, Jit] {
             match thawed(froze, thaws, parent, src) {
                 Some(o) if o != want => {
                     wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: {o:?}"))
+                }
+                None if runs.contains(&froze) && runs.contains(&thaws) => {
+                    wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: refused"))
                 }
                 _ => {}
             }
@@ -795,17 +803,9 @@ block 0 (v0: i64, v1: i64) {
 /// #2001 — a thread live at the freeze hands its `spawn` back as it unwinds, and the thaw that
 /// re-creates it charges it again: while it lives, the child's budget ([`powerbox`]'s, ceiling 4) has
 /// the child and the thread out, room 2, after a thaw as on a fresh run. Uncharged it would read 3;
-/// charged twice, 1. The tree-walker's alone: the JIT hosts no `thread.spawn` in a durable child
-/// (`ChildRun::DurableTask`).
+/// charged twice, 1. #2010 — on every engine: a durable child's thread unwinds with it on the JIT
+/// too, its residue riding the child's artifact, and a thaw on either engine re-creates it.
 #[test]
 fn a_thawed_thread_is_charged_to_its_childs_budget_again() {
-    let want = Some(Out::Ret(2));
-    let parent = parent();
-    assert_eq!(
-        fresh(Engine::Interp, &parent, CHILD_THREAD_ROOM),
-        want,
-        "fresh"
-    );
-    let thawed = thawed(Engine::Interp, Engine::Interp, &parent, CHILD_THREAD_ROOM);
-    assert_eq!(thawed, want, "frozen and thawed");
+    check_child(CHILD_THREAD_ROOM, Out::Ret(2));
 }
