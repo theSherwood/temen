@@ -190,6 +190,9 @@ export async function runCases({ ex, memory, drive, suspends }) {
     results.spinLeaf = await run({ stopAfter: 20 });
     if (open(TICKS, [], leafMode) !== 0) throw new Error('open ticks leaf');
     results.ticksLeaf = await run();
+    // #1822: a fault in the leaf's emitted code reaches the guest as the trap its `env.trap` named.
+    if (open(FAULTS, [], leafMode) !== 0) throw new Error('open faults leaf');
+    results.faultsLeaf = { ...(await run({ trapDeclines: false })), trap: trapName() };
   }
   if (open(TICKS, [], COOP_NO_REGIONS) !== 0) throw new Error('open ticks');
   results.ticks = await run();

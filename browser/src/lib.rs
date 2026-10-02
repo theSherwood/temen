@@ -2860,10 +2860,19 @@ pub extern "C" fn temen_par_deliver_tierup(v: *mut ParVcpu, results_ptr: *const 
 
 /// Deliver a **trap** from a tier-up region (the emitted `f{func}` threw — memory fault / fuel /
 /// div-by-zero / `unreachable`). The vCPU traps on its next `temen_par_run`, as if interp had trapped.
+/// `code` names the trap: see [`emitted_trap`].
 #[no_mangle]
-pub extern "C" fn temen_par_deliver_tierup_trap(v: *mut ParVcpu) {
+pub extern "C" fn temen_par_deliver_tierup_trap(v: *mut ParVcpu, code: i32) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_tierup_trap(Trap::Unreachable) };
+    unsafe { (*v).inner.deliver_tierup_trap(emitted_trap(code)) };
+}
+
+/// #1822 — the trap emitted code threw, from the code its last `env.trap(code)` call reported
+/// (`temen_ir::trap_code`: a memory fault, spent fuel, a spill-stack overflow). The host records that
+/// code and passes it with the deliver; `0` means the frames called no `env.trap` — a native wasm trap
+/// (division by zero, an `unreachable`), which carries no kind, and is delivered as `Unreachable`.
+fn emitted_trap(code: i32) -> Trap {
+    Trap::from_code(i64::from(code)).unwrap_or(Trap::Unreachable)
 }
 
 /// The code handle of a pending [`PAR_JIT_INVOKE`] — the Worker keys its per-unit emitted-instance
@@ -2945,11 +2954,12 @@ pub extern "C" fn temen_par_deliver_jit_invoke(v: *mut ParVcpu, results_ptr: *co
 }
 
 /// Deliver a **trap** from a §22 unit run on emitted wasm (the emitted region threw). The vCPU traps
-/// on its next `temen_par_run`, as if the interpreted invoke had trapped.
+/// on its next `temen_par_run`, as if the interpreted invoke had trapped. `code` names the trap: see
+/// [`emitted_trap`].
 #[no_mangle]
-pub extern "C" fn temen_par_deliver_jit_invoke_trap(v: *mut ParVcpu) {
+pub extern "C" fn temen_par_deliver_jit_invoke_trap(v: *mut ParVcpu, code: i32) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_jit_invoke_trap(Trap::Unreachable) };
+    unsafe { (*v).inner.deliver_jit_invoke_trap(emitted_trap(code)) };
 }
 
 /// Free a finished vCPU.
@@ -14681,12 +14691,16 @@ pub extern "C" fn temen_coop_deliver(rptr: *const i64, n: usize) {
 
 /// Deliver a trap from the emitted `f{func}` for the pending TIERUP. A bounce callback's staged trap
 /// (see [`temen_coop_call_interp`]) is delivered in preference, so a callback's `exit` ends the run as
-/// `STATUS_EXIT` exactly as the interpreted call would.
+/// `STATUS_EXIT` exactly as the interpreted call would; otherwise `code` names it (see
+/// [`emitted_trap`]).
 #[no_mangle]
-pub extern "C" fn temen_coop_deliver_trap() {
+pub extern "C" fn temen_coop_deliver_trap(code: i32) {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
-        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
+        let t = s
+            .pending_bounce_trap
+            .take()
+            .unwrap_or_else(|| emitted_trap(code));
         s.run.deliver_tierup_trap(t);
     }
 }
@@ -14748,12 +14762,16 @@ pub extern "C" fn temen_coop_deliver_jit(rptr: *const i64, n: usize) {
 }
 
 /// Deliver a trap from the emitted unit for the pending JIT_INVOKE (a bounce callback's staged trap in
-/// preference, so a callback's `exit` ends the run as `STATUS_EXIT` exactly as interpreted).
+/// preference, so a callback's `exit` ends the run as `STATUS_EXIT` exactly as interpreted; otherwise
+/// `code` names it — see [`emitted_trap`]).
 #[no_mangle]
-pub extern "C" fn temen_coop_deliver_jit_trap() {
+pub extern "C" fn temen_coop_deliver_jit_trap(code: i32) {
     // SAFETY: single-threaded wasm; exclusive access to the session.
     if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
-        let t = s.pending_bounce_trap.take().unwrap_or(Trap::Unreachable);
+        let t = s
+            .pending_bounce_trap
+            .take()
+            .unwrap_or_else(|| emitted_trap(code));
         s.run.deliver_jit_invoke_trap(t);
     }
 }

@@ -10,6 +10,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { engineImports } from './engine-imports.mjs';
+// #1822: the code emitted frames last passed to `env.trap`, handed to the trap deliver.
+let lastTrap = 0;
 
 const WASM = fileURLToPath(new URL('./target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url));
 const PAR_DONE = 0, PAR_TRAP = 1, PAR_JIT_INVOKE = 8;
@@ -86,7 +88,7 @@ async function main() {
   u8().set(guestBytes, gptr);
 
   const unitEnv = {
-    env: { memory, trap: () => {}, call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); } },
+    env: { memory, trap: (c) => { lastTrap = c; }, call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); } },
   };
 
   const run = (codegen) => {
@@ -120,6 +122,7 @@ async function main() {
         // re-arm the per-region budget on the exported global (the old env-cell write was here).
         f.fuel.value = 1n << 61n;
         try {
+          lastTrap = 0;
           const ret = f['f0'](win, envCell, ...args);
           const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
           const rn = Number(ex.temen_par_jit_result_types_len(v));
@@ -129,7 +132,7 @@ async function main() {
           for (let i = 0; i < rets.length; i++) o64[(rptr >> 3) + i] = jitRes(rets[i], rtypes[i]);
           ex.temen_par_deliver_jit_invoke(v, rptr, rets.length);
         } catch {
-          ex.temen_par_deliver_jit_invoke_trap(v);
+          ex.temen_par_deliver_jit_invoke_trap(v, lastTrap);
         }
         continue;
       }

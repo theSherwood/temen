@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**354 exports** in 36 families — 304 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
+**357 exports** in 36 families — 307 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,7 +11,7 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
-| `coop` | 55 | 45 | 0 |
+| `coop` | 58 | 48 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 5 | 5 | 1 |
@@ -120,6 +120,9 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_jit_wasm_by_slot_len`
 - `temen_coop_jit_wasm_len`
 - `temen_coop_jit_wasm_ptr`
+- `temen_coop_leaf_emits`
+- `temen_coop_leaf_key`
+- `temen_coop_leaf_key_ptr`
 - `temen_coop_leaf_wasm_len`
 - `temen_coop_leaf_wasm_ptr`
 - `temen_coop_mapped`

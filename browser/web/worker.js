@@ -96,6 +96,12 @@ self.onmessage = async (e) => {
     return cslot;
   };
 
+  // #1822 — the code the running emitted frames last passed to `env.trap` before aborting (a memory
+  // fault, spent fuel, a spill overflow); the trap deliver hands it to the engine so the guest sees
+  // that trap. Reset before each emitted call; `0` (no `env.trap`) is a native wasm trap, kindless.
+  let lastTrap = 0;
+  const recordTrap = (code) => { lastTrap = code; };
+
   // wasm-JIT tier-up (threads slice): this Worker enables the tier-up bitmap in this instance —
   // `temen_par_enable_jit` emits the tier-up module (a pure leaf reachable only via `thread.spawn`
   // still emits, since the guest keeps interpreting), stashes its bytes + the decoded module (so a
@@ -112,7 +118,7 @@ self.onmessage = async (e) => {
     const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
       env: {
         memory,
-        trap: () => {}, // an TEMEN-specific fault; the following `unreachable` throws, caught below
+        trap: recordTrap, // a Temen fault's code; the following `unreachable` throws, caught below
         call_interp: (f, argsPtr) => { if (ex.temen_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
       },
     });
@@ -134,7 +140,7 @@ self.onmessage = async (e) => {
     const uinst = new WebAssembly.Instance(umod, {
       env: {
         memory,
-        trap: () => {},
+        trap: recordTrap,
         call_interp: (f, argsPtr) => { if (ex.temen_wasmjit_call_interp(f, argsPtr) !== 0) throw new Error('cross-tier trap'); },
       },
     });
@@ -163,7 +169,7 @@ self.onmessage = async (e) => {
     new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
-        trap: () => {},
+        trap: recordTrap,
         call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
         __indirect_function_table: jitTable,
       },
@@ -544,6 +550,7 @@ self.onmessage = async (e) => {
         emitted.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(v));
       new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true); // ample fuel; preempt = write < 0
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
+      lastTrap = 0;
       try {
         const ret = emitted['f' + func](win, envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
@@ -551,7 +558,7 @@ self.onmessage = async (e) => {
         for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
         ex.temen_par_deliver_tierup(v, rptr, rets.length);
       } catch {
-        ex.temen_par_deliver_tierup_trap(v);
+        ex.temen_par_deliver_tierup_trap(v, lastTrap);
       }
       continue;
     }
@@ -579,7 +586,7 @@ self.onmessage = async (e) => {
         // Worker instantiates + caches per handle; the emitted bytes live on the shared host).
         unit = jitUnitForPending();
       }
-      if (!unit) { ex.temen_par_deliver_jit_invoke_trap(v); continue; }
+      if (!unit) { ex.temen_par_deliver_jit_invoke_trap(v, 0); continue; }
       // #717 host sync: the event's committed-extent snapshot → the unit instance's `"mapped"`
       // global (same contract as TIERUP above; an invoke the scalar can't describe never surfaces
       // here — the engine services it on the interpreter instead).
@@ -593,6 +600,7 @@ self.onmessage = async (e) => {
           emitted.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(v));
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
       }
+      lastTrap = 0;
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
@@ -602,7 +610,7 @@ self.onmessage = async (e) => {
         for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = jitRes(rets[i], rtypes[i]);
         ex.temen_par_deliver_jit_invoke(v, rptr, rets.length);
       } catch {
-        ex.temen_par_deliver_jit_invoke_trap(v);
+        ex.temen_par_deliver_jit_invoke_trap(v, lastTrap);
       }
       continue;
     }
