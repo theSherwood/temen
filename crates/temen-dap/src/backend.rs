@@ -822,7 +822,7 @@ impl BytecodeBackend {
                 break;
             }
             // At a positive stride boundary short of `t`, snapshot before executing the op (so the
-            // checkpoint's turn is exactly the boundary). Deduped + subset-guarded by `maybe_checkpoint`.
+            // checkpoint's turn is exactly the boundary). The ladder dedupes, and latches off on a refusal.
             if self.checkpoints.admits(turn) {
                 self.checkpoints.offer(turn, run.snapshot());
             }
@@ -1053,7 +1053,7 @@ impl Debuggee for BytecodeBackend {
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
     // plus a recorded cap tape, so seeking to an earlier turn = rebuild a fresh run and replay to that
     // many turns. `step_back` = one stoppable op earlier. The `seek` replay is bounded by the
-    // **checkpoint ladder** (see `drive_to`/`maybe_checkpoint`): a restart from the nearest snapshot
+    // **checkpoint ladder** (see `drive_to`): a restart from the nearest snapshot
     // replays at most `CHECKPOINT_STRIDE` turns instead of O(t) from turn 0.
     fn step_back(&mut self) -> Stop {
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
