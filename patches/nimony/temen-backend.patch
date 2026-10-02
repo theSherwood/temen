@@ -21,10 +21,13 @@ Temen, it builds the programs it runs itself for Temen too, since there is no C 
 Temen host and only Temen modules run there. So `prepareEval` precompiles `std/writenif` with `t`, a
 plugin is built with `t`, and `nimony s` (the program a compile-time evaluation runs) uses the Temen
 backend, whose output `runProgram` then executes. A macro's plugin is built the same way (#2046): its
-setup build with `t`, its executable named `.temen`, which is what `t` writes for `-o:`, and nimony
-found with `findTool`, as `semos` finds it, since a Temen host serves no `/proc/self/exe` and
-`getAppDir()` is empty there. `nimsem e` (`buildGraphForEval`) still plans the C toolchain itself; no
-build uses it.
+setup build with `t`, and nimony found with `findTool`, as `semos` finds it, since a Temen host
+serves no `/proc/self/exe` and `getAppDir()` is empty there. Where the plugin's platform is the outer
+build's (no target triple, as on Temen), it builds as compile-time evaluation builds its program, in
+the outer cache with the outer command line, instead of compiling the library again in a cache of
+its own (#2049); its executable is `<stem>.plugin`, since `<stem>` (`<stem>.temen` for `t`) is the
+plugin module's backend directory there. `nimsem e` (`buildGraphForEval`) still plans the C
+toolchain itself; no build uses it.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
 vendored `nimony/` submodule is never modified. Against the submodule pin (6ca46f17).
@@ -198,16 +201,61 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
  
  type
    MacroPlugin* = object
-@@ -279,6 +280,8 @@ proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
-   result = nifcachePath / macroFileStem(macroSym)
+@@ -276,7 +277,9 @@ proc macroFileStem(macroSym: SymId): string =
+       result.add '_'
+ 
+ proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
+-  result = nifcachePath / macroFileStem(macroSym)
++  # Not the bare stem: built in the outer cache, the plugin module's backend
++  # directory is `<stem>/` (`<stem>.temen/` for `t`). `-o:` keeps an extension.
++  result = nifcachePath / macroFileStem(macroSym) & ".plugin"
    when defined(windows):
      result.add ".exe"
-+  elif defined(temen):
-+    result.add ".temen"   # what the Temen backend writes for `-o:`
  
- proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
-   ## True when a compiled plugin binary for `macroSym` already sits in the
-@@ -337,7 +340,9 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+@@ -290,7 +293,7 @@ proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
+ 
+ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymId;
+                          info: NifLineInfo;
+-                         hostCommandLineArgs: string): string =
++                         commandLineArgs, hostCommandLineArgs: string): string =
+   ## Build the plugin module straight from NIF (no Nim text round-trip), write
+   ## it as a `.p.nif`, and have Nimony compile it through `s` (the NIF-input
+   ## entry point — same one CTFE uses in `semos.runEval`).
+@@ -309,7 +312,16 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+   # target triple (`parseCommonOption` decides what a compile-time-eval
+   # process may see). The `macro_*` prefix keeps it out of any target-side
+   # artifact collection.
+-  let pluginCache = nifcachePath / pluginBaseName & ".host"
++  #
++  # The cache is isolated only for that difference. A build without one (no
++  # target triple: a build for the platform the compiler runs on, as a native
++  # `c` build is, and a `t` build on Temen) builds the plugin as compile-time
++  # evaluation builds its program
++  # (`semos.runProgram`): in the outer cache, with the outer command line, so
++  # nifmake's per-command signatures match and the library the outer build
++  # compiled is reused rather than compiled again.
++  let shared = hostCommandLineArgs == commandLineArgs
++  let pluginCache = if shared: nifcachePath else: nifcachePath / pluginBaseName & ".host"
+   try:
+     createDir path(pluginCache)
+   except:
+@@ -327,9 +339,15 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+   # `nimony s` opens `<progfile>.p.deps.nif` unconditionally — write an empty
+   # `(stmts)` (the plugin module has no external NIF dependencies of its own,
+   # only stdlib imports which Nimony discovers via its normal search path).
++  # In the outer cache it names the scaffold's imports instead, so `s` plans
++  # them as the outer build did: current there already when the module that
++  # declares the macro imports `std/macros` (their closure is the same), and
++  # built there when it does not.
+   let depsFile = pluginCache / pluginBaseName & ".p.deps.nif"
+   var deps = createTokenBuf(4)
+   deps.addParLe StmtsS, info
++  if shared:
++    emitImportStdMacros(deps, info)
+   deps.addParRi()
+   try:
+     writeFile(depsFile, toString(deps, true))
+@@ -337,7 +355,9 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
      echo "Macro plugin: failed to write ", depsFile
      return ""
  
@@ -218,15 +266,53 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
    let srcLibPath = getAppDir().parentDir() / "src" / "lib"
  
    # Pre-populate the isolated plugin cache with a HOST-bits stdlib. `nimony s`
-@@ -357,7 +362,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
-   let setupCmd = quoteShell(nimonyExe) & hostCommandLineArgs &
-                  " --path:" & quoteShell(srcLibPath) &
-                  " --nimcache:" & quoteShell(pluginCache) &
+@@ -348,21 +368,22 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+   # closure the plugin needs (incl. the NimNode/NIF-reader machinery). The
+   # native link of this setup may fail (harmless — we only need the `.s.nif`/
+   # `.c.nif`), and `nimony c` is incremental so repeat calls are cheap.
+-  let setupFile = pluginCache / "macro_setup.nim"
+-  try:
+-    writeFile(setupFile, "import std/[syncio, macros]\n")
+-  except:
+-    echo "Macro plugin: failed to write ", setupFile
+-    return ""
+-  let setupCmd = quoteShell(nimonyExe) & hostCommandLineArgs &
+-                 " --path:" & quoteShell(srcLibPath) &
+-                 " --nimcache:" & quoteShell(pluginCache) &
 -                 " c " & quoteShell(setupFile)
-+                 " " & hostBackend & " " & quoteShell(setupFile)
-   try:
-     discard execCmdEx(setupCmd)   # ignore exit: a failed native link still leaves the .s.nif/.c.nif
-   except:
+-  try:
+-    discard execCmdEx(setupCmd)   # ignore exit: a failed native link still leaves the .s.nif/.c.nif
+-  except:
+-    echo "Macro plugin: failed to setup host stdlib: ", setupCmd
+-    return ""
++  if not shared:
++    let setupFile = pluginCache / "macro_setup.nim"
++    try:
++      writeFile(setupFile, "import std/[syncio, macros]\n")
++    except:
++      echo "Macro plugin: failed to write ", setupFile
++      return ""
++    let setupCmd = quoteShell(nimonyExe) & hostCommandLineArgs &
++                   " --path:" & quoteShell(srcLibPath) &
++                   " --nimcache:" & quoteShell(pluginCache) &
++                   " " & hostBackend & " " & quoteShell(setupFile)
++    try:
++      discard execCmdEx(setupCmd)   # ignore exit: a failed native link still leaves the .s.nif/.c.nif
++    except:
++      echo "Macro plugin: failed to setup host stdlib: ", setupCmd
++      return ""
+ 
+   # Forward `--nimcache:` so the sub-compile reads the `.p.deps.nif` from the
+   # same per-worker directory we wrote it to. Without this, `nimony s` falls
+@@ -377,7 +398,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+   # nimsem (currently paused waiting on this exec) still has it mmap'd.
+   # Same rationale as `semos.runProgram` / `semos.prepareEval`.
+   let cmd = quoteShell(nimonyExe) & hostCommandLineArgs &
+-            " --path:" & quoteShell(srcLibPath) &
++            (if shared: "" else: " --path:" & quoteShell(srcLibPath)) &
+             " --nimcache:" & quoteShell(pluginCache) &
+             " -o:" & quoteShell(exePath) &
+             " s " & quoteShell(progfile)
 --- a/src/nimony/nifconfig.nim
 +++ b/src/nimony/nifconfig.nim
 @@ -106,6 +106,7 @@ type
@@ -276,6 +362,17 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
    let nativeBackend = c.config.backend == backendNative
    let optOutAll = c.config.isDefined("useLibc")
    if nativeBackend or not (optOutAll or c.config.isDefined("useMimalloc")):
+--- a/src/nimony/semdecls.nim
++++ b/src/nimony/semdecls.nim
+@@ -1314,7 +1314,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
+   if kind == MacroY and pass == checkBody:
+     let macroDecl = cursorAt(dest, declStart)
+     let macroBinPath = compileMacroPlugin(c.g.config.nifcachePath, macroDecl, symId, info,
+-                                          c.hostCommandLineArgs)
++                                          c.commandLineArgs, c.hostCommandLineArgs)
+     if macroBinPath.len > 0:
+       c.compiledMacros[symId] = macroBinPath
+ 
 --- a/src/nimony/semos.nim
 +++ b/src/nimony/semos.nim
 @@ -28,6 +28,12 @@ import nimony_model, symtabs, builtintypes, decls, asthelpers,

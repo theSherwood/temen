@@ -194,10 +194,12 @@ if want nim_card; then
   T="$(mktemp -d)"
   mkdir -p "$T/card"
   # The library a playground program reaches for, compiled once so a build compiles only its own
-  # modules; the `const` makes compile-time evaluation build its helper too.
+  # modules; the `const` makes compile-time evaluation build its helper too. `std/macros` brings the
+  # plugins its grammar declares (parsegen, regex), which the pack carries built, so a program's
+  # macro builds only its own plugin, in the program's cache (#2049).
   cat >"$T/card/prelude.nim" <<'NIM'
 import std/[syncio, strutils, sequtils, tables, sets, hashes, algorithm, math, options, deques,
-  parseutils, bitops, intsets]
+  parseutils, bitops, intsets, macros]
 
 proc prelude(s: string): int = s.len
 const atCompileTime = prelude("prebuilt")
