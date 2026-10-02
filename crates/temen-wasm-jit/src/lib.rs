@@ -3375,6 +3375,11 @@ pub enum Shape {
     Batch { entry: u32 },
     /// A long-lived reactor re-entered at `entry` (`tick`) each activation.
     Reactor { entry: u32 },
+    /// A whole process image run once from `entry` by a host whose cross-tier bounces can park: it
+    /// suspends the emitted frames beneath one (#1896's leaf with `parks`, under JSPI). A reachable
+    /// `atomic.wait` then runs on the interpreter in such a bounce, which parks the process
+    /// (#2050), instead of making the image interpreter-driven. Otherwise [`Shape::Batch`].
+    Leaf { entry: u32 },
     /// Threaded / no single root — vCPUs enter through `thread.spawn`, so there is no top-level
     /// wasm frame the host can own; the interpreter must drive.
     Threaded,
@@ -3408,10 +3413,15 @@ pub struct Artifact {
 
 /// Whether any function reachable from `entry` uses a §12 concurrency op (`cont.*`/`suspend`/
 /// `thread.*`/futex). Such a guest cannot be wasm-driven: the interpreter must own the stack so it can
-/// unwind across a suspension / block a vCPU (a wasm frame can neither).
-fn reachable_concurrency(m: &Module, entry: u32) -> bool {
+/// unwind across a suspension / block a vCPU (a wasm frame can neither). With `waits_park`, a
+/// `atomic.wait` does not count: the host's bounces park, and the wait runs in one ([`Shape::Leaf`]).
+fn reachable_concurrency(m: &Module, entry: u32, waits_park: bool) -> bool {
     let a = analyze_from(m, entry);
-    (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_concurrency())
+    let blocks = |f: &Func| match waits_park {
+        true => f.uses_concurrency_besides_wait(),
+        false => f.uses_concurrency(),
+    };
+    (0..m.funcs.len()).any(|i| a.reachable[i] && blocks(&m.funcs[i]))
 }
 
 /// Whether any function reachable from `entry` uses `setjmp`/`longjmp` ([`Func::uses_setjmp`]). Such a
@@ -3500,14 +3510,15 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
     match shape {
         // No single top-level frame the host can own → the interpreter drives, hot regions tier up.
         Shape::Threaded => interp_driven(m),
-        Shape::Batch { entry } | Shape::Reactor { entry } => {
+        Shape::Batch { entry } | Shape::Reactor { entry } | Shape::Leaf { entry } => {
             // Wasm-drivable iff rooted-eligible AND nothing reachable can suspend across a wasm frame
             // AND nothing reachable uses setjmp/longjmp (#1081: a root `setjmp` bounces the whole hot
             // path to the interpreter, which under `WasmDriven` never tiers back up — interpreter-driven
             // tier-up is strictly better there). The concurrency check makes this selection strictly
             // more conservative than the raw `compile_module_reactor` entry (which would emit a
             // suspending cross-tier callee it can't safely unwind) — closing that latent sharp edge.
-            if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
+            let waits_park = matches!(shape, Shape::Leaf { .. });
+            if !reachable_concurrency(m, entry, waits_park) && !reachable_setjmp(m, entry) {
                 if let Ok((wasm, emitted)) = compile_module_reactor(m, entry, shared_memory) {
                     return Ok(Artifact {
                         wasm,
@@ -3568,9 +3579,10 @@ pub fn compile_jit_page_checked(
     };
     match shape {
         Shape::Threaded => interp_driven(m),
-        Shape::Batch { entry } | Shape::Reactor { entry } => {
+        Shape::Batch { entry } | Shape::Reactor { entry } | Shape::Leaf { entry } => {
             // The same wasm-drivability gate as `compile_jit`: rooted, no suspension, no setjmp.
-            if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
+            let waits_park = matches!(shape, Shape::Leaf { .. });
+            if !reachable_concurrency(m, entry, waits_park) && !reachable_setjmp(m, entry) {
                 if let Ok((wasm, emitted)) =
                     compile_module_reactor_paged(m, entry, shared_memory, page_log2)
                 {

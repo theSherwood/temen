@@ -593,6 +593,54 @@ fn a_leaf_that_exits_after_a_parked_call_ends_there() {
 /// A leaf may spawn and wait: both park only on its children, which the engine serves beneath the
 /// emitted frames. Its spawn is handed back to the pump, which starts the child (itself a leaf) and
 /// runs the call on; its wait parks as a pipe read does. The tree ends as it does interpreted.
+/// `/bin/leaf` that sleeps, as nim's `nanosleep` does (#2050): a timed wait on a word that holds
+/// what it expects parks until it times out (2), and a wait on a word that does not answers
+/// not-equal (1) at once. It returns `10 * the first + the second`, 21. Its entry only calls, and the
+/// helper it calls waits, as nim's runtime does.
+const SLEEPING: &str = "memory 17\n\
+func (i64) -> (i64) {\n\
+block 0 (vcap: i64) {\n\
+  vs = call 1 ()\n\
+  return vs\n\
+  }\n\
+}\n\
+func () -> (i64) {\n\
+block 0 () {\n\
+  vword = i64.const 40000\n\
+  vzero = i32.const 0\n\
+  vns = i64.const 1000000\n\
+  vto = i32.atomic.wait vword vzero vns\n\
+  vone = i32.const 1\n\
+  vne = i32.atomic.wait vword vone vns\n\
+  vten = i32.const 10\n\
+  vhi = i32.mul vto vten\n\
+  vsum = i32.add vhi vne\n\
+  vr = i64.extend_i32_u vsum\n\
+  return vr\n\
+  }\n\
+}\n";
+
+/// #2050 — a leaf that sleeps parks in its bounce and runs on where it slept, as interpreted. A
+/// timed wait is the one §12 op an image can hold and still run emitted: nim's `nanosleep` is one,
+/// and before, a nim tool that linked it (nimsem, through `osproc.waitForExit`) ran interpreted.
+#[test]
+fn a_leaf_that_sleeps_parks_and_resumes() {
+    let (interpreted, _) = run_tree(&guest(false), SLEEPING, false);
+    assert_eq!(
+        interpreted.root,
+        Ok(21),
+        "the timed wait timed out, then the other answered not-equal, and the root exited with it"
+    );
+    let (emitted, leaves) = run_tree(&guest(false), SLEEPING, true);
+    assert_eq!(emitted, interpreted);
+    assert_eq!(leaves.offered, [(false, true)], "offered once, parking");
+    assert_eq!(leaves.tierups.len(), 1, "it ran emitted: {leaves:?}");
+    assert_eq!(
+        leaves.resumes, 1,
+        "the timed wait parked and ran on; the not-equal one answered at once: {leaves:?}"
+    );
+}
+
 #[test]
 fn a_leaf_spawns_and_waits_and_ends_as_interpreted() {
     let spawner = spawn_leaf("/bin/kid");

@@ -68,6 +68,29 @@ fn reachable_suspension_forces_interp_driver() {
     assert_eq!(a.drive, DriveMode::InterpDriven);
 }
 
+/// #2050 — a reachable `atomic.wait`: a `Batch` guest is interpreter-driven, as for any §12 op, but
+/// a `Leaf` (whose host's bounces park) stays wasm-driven, the waiting function left to the
+/// interpreter, in a bounce, and everything else emitted.
+#[test]
+fn a_leaf_with_a_reachable_wait_stays_wasm_driven() {
+    let m = build(
+        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = call 1 ()\n  v1 = i64.const 1\n  v2 = i64.add v0 v1\n  return v2\n  }\n}\n\
+         func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 16\n  v1 = i32.const 0\n  v2 = i64.const 1000\n  v3 = i32.atomic.wait v0 v1 v2\n  v4 = i64.extend_i32_u v3\n  return v4\n  }\n}\n",
+    );
+    let a = compile_jit(&m, Shape::Batch { entry: 0 }, false).expect("compile");
+    assert_eq!(a.drive, DriveMode::InterpDriven);
+    let a = compile_jit(&m, Shape::Leaf { entry: 0 }, false).expect("compile");
+    assert_eq!(a.drive, DriveMode::WasmDriven { entry: 0 });
+    assert_eq!(a.emitted, vec![true, false], "the wait runs in a bounce");
+
+    // Any other §12 op still makes even a leaf interpreter-driven: a notify wakes another vCPU.
+    let notifies = build(
+        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 16\n  v1 = i32.const 1\n  v2 = atomic.notify v0 v1\n  v3 = i64.extend_i32_u v2\n  return v3\n  }\n}\n",
+    );
+    let a = compile_jit(&notifies, Shape::Leaf { entry: 0 }, false).expect("compile");
+    assert_eq!(a.drive, DriveMode::InterpDriven);
+}
+
 /// A guest whose **entry** is outside the emit subset for a non-concurrency reason (scalar `fma`, no
 /// core-wasm opcode) can't be rooted for a wasm driver → falls back to the interpreter driver, which
 /// simply emits nothing for that function.

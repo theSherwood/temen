@@ -13500,7 +13500,11 @@ pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> byte
             return false;
         };
         let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
-            let shape = temen_wasm_jit::Shape::Batch { entry: o.entry };
+            // Whole from its entry; its waits park in a bounce when it can park (#2050).
+            let shape = match o.parks {
+                true => temen_wasm_jit::Shape::Leaf { entry: o.entry },
+                false => temen_wasm_jit::Shape::Batch { entry: o.entry },
+            };
             let a = match o.paged {
                 true => {
                     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;

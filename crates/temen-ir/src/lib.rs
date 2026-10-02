@@ -3679,6 +3679,19 @@ impl Func {
         })
     }
 
+    /// Whether this function uses a §12 op other than `atomic.wait`: a fiber or thread op, or
+    /// `notify` ([`uses_concurrency`](Func::uses_concurrency) minus the wait). A process image whose
+    /// only §12 op is the wait runs on one vCPU, and its waits only park it: a host whose cross-tier
+    /// bounces can park runs them in one (#2050), as it runs a pipe read.
+    pub fn uses_concurrency_besides_wait(&self) -> bool {
+        self.uses_fibers_or_threads()
+            || self.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::MemoryNotify { .. }))
+            })
+    }
+
     /// Whether this function contains a futex op (`atomic.wait`/`notify`). Split out of
     /// [`uses_concurrency`](Func::uses_concurrency) for the §14 JIT child compile: waits/notifies
     /// are allowed when the child shares its parent domain's futex, rejected otherwise.
