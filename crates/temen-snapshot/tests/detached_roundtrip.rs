@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use temen_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
 use temen_interp::{
     module_digest, run_capture_reserved_with_host, CapturedDetached, CapturedProt, DetachedLaunch,
-    Host, MemLayout, ThawedDetached, Value,
+    DurableBinding, Host, MemLayout, StreamRole, ThawedDetached, Value,
 };
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::Module;
@@ -185,6 +185,50 @@ fn a_live_detached_child_round_trips_through_its_parents_artifact() {
     );
 
     // §12.6 canonicality: freezing the restored tree reproduces the artifact byte for byte.
+    let mut again = Host::new();
+    again.set_durable(true);
+    again.grant_durable_module(&c);
+    again.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
+    assert_eq!(freeze(&p, &win, &again).expect("re-freeze"), art);
+}
+
+/// #2054 — a stream the spawner re-granted its child (§7c) rides the child's artifact as inherited,
+/// so the child's thaw can alias it to its spawner's stream again. Restored and not yet re-launched,
+/// it is still inherited, so a re-freeze of the restored tree is byte-identical.
+#[test]
+fn a_childs_inherited_stdout_rides_its_artifact_as_inherited() {
+    let (p, c) = (parent(), child());
+    let mut spawner = Host::new();
+    spawner.set_durable(true);
+    let out = spawner.grant_stream(StreamRole::Out);
+    let (chost, _, _) = spawner
+        .spawn_detached_child(&[("stdout".to_string(), out)], 1 << 17, -1, 2)
+        .expect("the child's powerbox");
+    let inherited = DurableBinding::Stream {
+        role: StreamRole::Out,
+        inherited: true,
+    };
+    let holds = |h: &Host| {
+        h.capture_durable_handles()
+            .expect("durable")
+            .iter()
+            .any(|d| d.binding == inherited)
+    };
+    assert!(holds(&chost), "the child's stdout is its spawner's");
+    let (window, _) = frozen_root(&c);
+    let (win, host) = parent_with(&c, (window, chost));
+    let art = freeze(&p, &win, &host).expect("freeze the tree");
+
+    let mut rhost = Host::new();
+    rhost.set_durable(true);
+    rhost.grant_durable_module(&c);
+    restore_with_prots(&art, &p, &mut rhost).expect("restore");
+    let thawed = rhost.take_thawed_detached();
+    assert!(
+        holds(&thawed[0].host),
+        "restored, the stream is still inherited"
+    );
+
     let mut again = Host::new();
     again.set_durable(true);
     again.grant_durable_module(&c);

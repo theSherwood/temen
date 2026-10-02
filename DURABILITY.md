@@ -310,7 +310,7 @@ where it sits, not what kind it is:
   instead, so the thaw does not repeat it.
 - **Across the boundary, it rides as a named edge.** This covers anything with an end outside the
   tree: the embedder's streams, a pipe to the host or to an unfrozen domain, a named host
-  capability. The artifact records the edge, and the thawing embedder re-binds it, as `Stream(role)`
+  capability. The artifact records the edge, and the thawing embedder re-binds it, as `Stream`
   and `Named` already do (§12.5). An edge the thaw does not re-bind reaches the guest as the ordinary
   failure it must already handle (EOF, `EPIPE`, a closed handle), never as a trap.
 - **An operation in flight across the boundary** (a capability call, a ticket, `Blocking.work`)
@@ -599,7 +599,8 @@ decides what the whole tree gets back; a child whose module it no longer grants 
 `ModuleUnresolved`. The oracle's thaw re-launches each child (`relaunch_detached`) on its own window
 under `REWINDING`, seeds its residue through the same `seed_domain` as the run's root (resolving its
 residue's `parent_task`s through its frozen id), and re-links the spawner's join slot, doorbell, kill
-flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut. Nesting
+flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut — and the
+stdio the spawner had re-granted it, aliased to the spawner's streams again (#2054). Nesting
 depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). A binding in an artifact
 is bounded by the window's **reservation**, not its committed image: a detached child's starter caps
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
@@ -1322,7 +1323,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 
 | `Binding` | Stored | Re-grant path |
 | --- | --- | --- |
-| `Stream(role)` | role | `grant_stream` |
+| `Stream { role, inherited }` (inherited: #2054, v40) | role; `B_STREAM_INHERITED` for a stream the spawner re-granted (§7c) | `grant_stream`. An inherited one is re-pinned on the child's own buffer and left pending until the relaunch (`Host::prepare_detached_relaunch`) aliases it to its spawner's stream of that role, as the spawn's re-grant did; all of a tree's inherited cells of one role are its root's. Restored and not yet re-launched, it still captures as inherited, so a re-freeze is canonical |
 | `Exit` / `Clock` / `Memory` / `Yielder` | — | `grant_exit`/`grant_clock`/`grant_memory`/`grant_yielder` |
 | `AddressSpace { base, size }` | base, size | `grant_address_space` |
 | `Instantiator { base, size }` | base, size | `grant_instantiator` |

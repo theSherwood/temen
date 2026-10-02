@@ -20465,7 +20465,13 @@ impl Attestation {
 /// non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
-    Stream(StreamRole),
+    /// A stdio stream. `inherited` (#2054): it is one its spawner re-granted (§7c), so its bytes
+    /// are the spawner's, not this domain's own buffer; the relaunch aliases it to the spawner's
+    /// again ([`Host::prepare_detached_relaunch`]).
+    Stream {
+        role: StreamRole,
+        inherited: bool,
+    },
     Exit,
     Clock,
     // Memory: retired (CONSOLIDATION §4) — whole-window authority is `AddressSpace { 0, u64::MAX }`.
@@ -21600,6 +21606,26 @@ type HostFnVtable = Arc<(Vec<String>, Vec<FuncType>)>;
 /// A slot's retained §3.5 requirement set: the manifest's `(names, sigs)`, shared with the
 /// attach-time coverage walk.
 type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
+
+/// #1866 — a detached child's powerbox as the scheduled debugger's checkpoint carries it, in memory:
+/// its handle table by the freeze's own durable capture, and what its spawn decided beside it — its
+/// names, import bindings, program, attestation, budget node and lane. Only a table of plain values
+/// is carried (streams, the exit and clock, address spaces, instantiators, freeze authority,
+/// budgets), so a rebuild needs no thaw seam; any other binding keeps the run out of the
+/// checkpointable subset, and a seek replays from an earlier checkpoint ([`Host::child_powerbox`]).
+#[derive(Clone)]
+pub(crate) struct ChildPowerbox {
+    handles: Vec<DurableHandle>,
+    names: Vec<(String, i32)>,
+    import_bindings: Vec<BoundImport>,
+    import_remaps: Vec<Option<Arc<[u32]>>>,
+    import_reqs: Vec<Option<ImportReq>>,
+    self_module: Option<Arc<Module>>,
+    attestation: Attestation,
+    durable: bool,
+    own_budget: u32,
+    lane_cap: i64,
+}
 
 /// §3.5 coverage walk: for every required `(name, sig)`, find the same-named,
 /// signature-equal provider op; extra provider ops are ignored. Name-less providers (legacy
@@ -22770,6 +22796,10 @@ pub struct Host {
     /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
     /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
     pending_live_impls: Vec<(u32, usize, u32)>,
+    /// #2054 — restored stdio streams its spawner had re-granted, `(slot, role)`: re-pinned by
+    /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
+    /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
+    pending_inherited: Vec<(u32, StreamRole)>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -23407,6 +23437,7 @@ impl Host {
             handoff_trap: 0,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
+            pending_inherited: Vec::new(),
             pool: None,
             completions: Arc::new(Completions::new()),
             completion_notify: None,
@@ -24588,13 +24619,15 @@ impl Host {
     /// #1361 step 4 — prepare a thawed detached child's re-launch, the one preparation both engines use:
     /// resolve its program by digest among this (spawner's) powerbox's durable grants, and re-apply to
     /// its restored powerbox what the spawner decided — durability, its lane cap, its program
-    /// as self module, its grant names, and its import bindings (leniently for a same-module child,
-    /// #1234). `None` if the grant is gone, it declares no memory, or its imports no longer bind.
+    /// as self module, its grant names, the stdio it inherited (#2054), and its import bindings
+    /// (leniently for a same-module child, #1234). `None` if the grant is gone, it declares no memory,
+    /// or its imports no longer bind.
     pub fn prepare_detached_relaunch(
-        &self,
+        &mut self,
         launch: &DetachedLaunch,
         mut host: Host,
     ) -> Option<DetachedRelaunch> {
+        self.alias_inherited_stdio(&mut host);
         let (_, g) = self.grant_by_digest(&launch.digest)?;
         let memory_log2 = g.memory_log2?;
         host.set_durable(true);
@@ -24823,10 +24856,15 @@ impl Host {
     /// append-only) and each capability's opaque declared state — is excluded by
     /// [`journal_invertible`](Host::journal_invertible) instead of being restored wrongly.
     pub(crate) fn journal_cursor(&self) -> HostCursor {
+        // #2055: a stream promoted into a shared cell (a child re-granted it) writes there.
+        let len = |cell: &Option<Arc<Mutex<Vec<u8>>>>, own: &Vec<u8>| {
+            cell.as_ref()
+                .map_or(own.len(), |c| c.lock_unpoisoned().len())
+        };
         HostCursor {
             stdin_pos: self.stdin_pos,
-            stdout_len: self.stdout.len(),
-            stderr_len: self.stderr.len(),
+            stdout_len: len(&self.out_sink, &self.stdout),
+            stderr_len: len(&self.err_sink, &self.stderr),
             clock_ns: self.clock_ns,
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
@@ -24849,8 +24887,15 @@ impl Host {
     /// journal by construction rather than by separate bookkeeping.
     pub(crate) fn restore_journal_cursor(&mut self, c: &HostCursor) {
         self.stdin_pos = c.stdin_pos;
-        self.stdout.truncate(c.stdout_len);
-        self.stderr.truncate(c.stderr_len);
+        // #2055: truncate where the bytes went — the shared cell, once promoted.
+        match &self.out_sink {
+            Some(cell) => cell.lock_unpoisoned().truncate(c.stdout_len),
+            None => self.stdout.truncate(c.stdout_len),
+        }
+        match &self.err_sink {
+            Some(cell) => cell.lock_unpoisoned().truncate(c.stderr_len),
+            None => self.stderr.truncate(c.stderr_len),
+        }
         self.clock_ns = c.clock_ns;
         self.cap_consumed = c.cap_consumed;
         if let Some(slot) = self.cap_replay.as_mut() {
@@ -24917,10 +24962,12 @@ impl Host {
     /// clones (`stdout`/`stderr` and the debug-run serve queue are typically tiny).
     fn replay_substate(&self) -> HostReplaySubstate {
         let (svc_queue, svc_results, svc_next_ticket) = self.svc_state();
+        // #2055: each stream as it stands, wherever it lives — its own field, or the shared cell
+        // a child's re-grant promoted it into.
         HostReplaySubstate {
-            stdin_pos: self.stdin_pos,
-            stdout: self.stdout.clone(),
-            stderr: self.stderr.clone(),
+            stdin_pos: self.stdin_copy().1,
+            stdout: self.stdout_bytes(),
+            stderr: self.stderr_bytes(),
             clock_ns: self.clock_ns,
             cap_cursor: self.cap_consumed,
             cap_record: self.cap_record.clone().unwrap_or_default(),
@@ -24942,9 +24989,20 @@ impl Host {
     /// cap-replay cursor and reinstates the I/O streams + clock, so a replay resumed from the
     /// checkpoint's logical time draws the same subsequent inputs and accumulates onto the same output.
     fn restore_replay_substate(&mut self, s: &HostReplaySubstate) {
-        self.stdin_pos = s.stdin_pos;
-        self.stdout = s.stdout.clone();
-        self.stderr = s.stderr.clone();
+        // #2055: back where reads and writes now go, which a restored child's inherited stdio may
+        // already have promoted into a shared cell.
+        match &self.in_shared {
+            Some(cell) => cell.lock_unpoisoned().pos = s.stdin_pos,
+            None => self.stdin_pos = s.stdin_pos,
+        }
+        match &self.out_sink {
+            Some(cell) => *cell.lock_unpoisoned() = s.stdout.clone(),
+            None => self.stdout = s.stdout.clone(),
+        }
+        match &self.err_sink {
+            Some(cell) => *cell.lock_unpoisoned() = s.stderr.clone(),
+            None => self.stderr = s.stderr.clone(),
+        }
         self.clock_ns = s.clock_ns;
         self.cap_consumed = s.cap_cursor;
         if let Some(slot) = self.cap_replay.as_mut() {
@@ -25460,9 +25518,17 @@ impl Host {
         for (slot, s) in self.table.iter().enumerate() {
             let Some(binding) = s.entry else { continue };
             let binding = match binding {
-                // The sink association (inherited stdio) is not durable — same as the
-                // pre-§7c field it replaced; a thawed stream writes to the thawing host's stdio.
-                Binding::Stream { role, .. } => DurableBinding::Stream(role),
+                // #2054: a stream the spawner re-granted (§7c) rides as inherited, and the relaunch
+                // aliases it to the spawner's again. One a restore left pending is inherited too,
+                // so a re-freeze before the relaunch is canonical (§12.6).
+                Binding::Stream { role, sink } => DurableBinding::Stream {
+                    role,
+                    inherited: sink.is_some()
+                        || self
+                            .pending_inherited
+                            .iter()
+                            .any(|&(p, _)| p as usize == slot),
+                },
                 Binding::Exit => DurableBinding::Exit,
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
@@ -25634,7 +25700,13 @@ impl Host {
         }
         for h in handles {
             let binding = match h.binding {
-                DurableBinding::Stream(role) => Binding::Stream { role, sink: None },
+                DurableBinding::Stream { role, inherited } => {
+                    // #2054: the spawner's cell is not known yet; the relaunch aliases it.
+                    if inherited {
+                        self.pending_inherited.push((h.slot, role));
+                    }
+                    Binding::Stream { role, sink: None }
+                }
                 DurableBinding::Exit => Binding::Exit,
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
@@ -29284,56 +29356,133 @@ impl Host {
             return child.try_grant_freeze_authority(scope);
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
-        // §7c stdin inheritance (#1720): alias the stdin THIS handle reads — its own carried cell if it
-        // was itself inherited, else this host's promoted stdin — into the child's source table.
-        if let Binding::Stream {
-            role: StreamRole::In,
-            sink,
-        } = binding
-        {
-            let shared = match sink {
-                Some(i) => Arc::clone(self.sources.get(i as usize)?),
-                None => self.shared_stdin(),
-            };
-            let idx = child.sources.len() as u32;
-            child.sources.push(shared);
+        if let Binding::Stream { role, sink } = binding {
+            let sink = self.alias_stream(role, sink, child)?;
             return Some(child.grant(
                 tid,
                 Binding::Stream {
-                    role: StreamRole::In,
-                    sink: Some(idx),
-                },
-            ));
-        }
-        if let Binding::Stream {
-            role: r @ (StreamRole::Out | StreamRole::Err),
-            sink,
-        } = binding
-        {
-            // §7c: stdio inheritance rides the table entry. Alias this host's sink — the one THIS
-            // handle writes to (its own carried sink if it was itself inherited, else this host's
-            // promoted buffer) — into the child's sink table, and grant a `Stream` carrying it.
-            // No child host field is touched: revoking the entry revokes the authority.
-            let shared = match sink {
-                Some(i) => Arc::clone(self.sinks.get(i as usize)?),
-                None if r == StreamRole::Out => self.shared_stdout(),
-                None => self.shared_stderr(),
-            };
-            let idx = child.sinks.len() as u32;
-            child.sinks.push(shared);
-            // The live tee follows stdout into the child (#1720), so nested output streams too.
-            if r == StreamRole::Out {
-                child.out_tee = self.out_tee.clone();
-            }
-            return Some(child.grant(
-                tid,
-                Binding::Stream {
-                    role: r,
-                    sink: Some(idx),
+                    role,
+                    sink: Some(sink),
                 },
             ));
         }
         Some(child.grant(tid, binding))
+    }
+
+    /// §7c stdio inheritance (#1720): alias into `child` the stream a handle of this host's with
+    /// `role` and `sink` reads or writes — its own carried cell if it was itself inherited, else this
+    /// host's promoted buffer — and return the child's index of it, for a `Stream` that carries it.
+    /// Inheritance rides the table entry and no other child field is touched, so revoking the entry
+    /// revokes the authority; only the live stdout tee follows, so nested output streams too.
+    fn alias_stream(
+        &mut self,
+        role: StreamRole,
+        sink: Option<u32>,
+        child: &mut Host,
+    ) -> Option<u32> {
+        if role == StreamRole::In {
+            let shared = match sink {
+                Some(i) => Arc::clone(self.sources.get(i as usize)?),
+                None => self.shared_stdin(),
+            };
+            child.sources.push(shared);
+            return Some(child.sources.len() as u32 - 1);
+        }
+        let shared = match sink {
+            Some(i) => Arc::clone(self.sinks.get(i as usize)?),
+            None if role == StreamRole::Out => self.shared_stdout(),
+            None => self.shared_stderr(),
+        };
+        child.sinks.push(shared);
+        if role == StreamRole::Out {
+            child.out_tee = self.out_tee.clone();
+        }
+        Some(child.sinks.len() as u32 - 1)
+    }
+
+    /// #2054 — alias each stream `child`'s restore left pending ([`Host::restore_durable_handles`])
+    /// to this spawner's stream of its role, as the spawn's re-grant aliased it: a thawed child's
+    /// output reaches its spawner's again. All of a tree's inherited cells of one role are its root's,
+    /// so any of this host's streams of that role names the right one. With none (closed since the
+    /// spawn), this host's own buffer stands in.
+    fn alias_inherited_stdio(&mut self, child: &mut Host) {
+        for (slot, role) in std::mem::take(&mut child.pending_inherited) {
+            let own = self.table.iter().find_map(|s| match s.entry {
+                Some(Binding::Stream { role: r, sink }) if r == role => Some(sink),
+                _ => None,
+            });
+            let Some(idx) = self.alias_stream(role, own.flatten(), child) else {
+                continue;
+            };
+            if let Some(Binding::Stream { sink, .. }) = child
+                .table
+                .get_mut(slot as usize)
+                .and_then(|s| s.entry.as_mut())
+            {
+                *sink = Some(idx);
+            }
+        }
+    }
+
+    /// #1866 — this (detached child's) powerbox as a [`ChildPowerbox`], or `None` when its table holds
+    /// a binding that is not a plain value.
+    pub(crate) fn child_powerbox(&self) -> Option<ChildPowerbox> {
+        let handles = self.capture_durable_handles().ok()?;
+        let plain = handles.iter().all(|h| {
+            matches!(
+                h.binding,
+                DurableBinding::Stream { .. }
+                    | DurableBinding::Exit
+                    | DurableBinding::Clock
+                    | DurableBinding::AddressSpace { .. }
+                    | DurableBinding::Instantiator { .. }
+                    | DurableBinding::FreezeAuthority(_)
+                    | DurableBinding::Budget { .. }
+            )
+        });
+        plain.then(|| ChildPowerbox {
+            handles,
+            names: self.cap_names.clone(),
+            import_bindings: self.import_bindings.clone(),
+            import_remaps: self.import_remaps.clone(),
+            import_reqs: self.import_reqs.clone(),
+            self_module: self.self_module.clone(),
+            attestation: self.attestation,
+            durable: self.durable,
+            own_budget: self.own_budget,
+            lane_cap: self.lane_cap,
+        })
+    }
+
+    /// #1866 — rebuild a child's [`ChildPowerbox`] under this, its spawner's, powerbox: its handles
+    /// re-pinned as a thaw re-pins them, its node in this run's budget tree, and the stdio it inherited
+    /// aliased to this host's, as the spawn aliased it ([`Host::alias_inherited_stdio`]).
+    pub(crate) fn rebuild_child_powerbox(&mut self, pb: &ChildPowerbox) -> Host {
+        let mut child = Host::new();
+        child.durable = pb.durable;
+        child.attestation = pb.attestation;
+        child.budgets = Arc::clone(&self.budgets);
+        child.own_budget = pb.own_budget;
+        child.lane_cap = pb.lane_cap;
+        child.restore_durable_handles(&pb.handles);
+        child.cap_names = pb.names.clone();
+        child.import_bindings = pb.import_bindings.clone();
+        child.import_remaps = pb.import_remaps.clone();
+        child.import_reqs = pb.import_reqs.clone();
+        child.set_self_module_opt(pb.self_module.clone());
+        self.alias_inherited_stdio(&mut child);
+        child
+    }
+
+    /// #1866 — every node of this run's budget tree, with its ceilings and charges. Every domain of the
+    /// run shares the tree, so one copy puts them all back ([`Host::set_budget_tree`]).
+    pub(crate) fn budget_tree(&self) -> Vec<BudgetNode> {
+        self.budgets.0.lock_unpoisoned().clone()
+    }
+
+    /// #1866 — put this run's budget tree back as [`Host::budget_tree`] captured it.
+    pub(crate) fn set_budget_tree(&self, nodes: &[BudgetNode]) {
+        *self.budgets.0.lock_unpoisoned() = nodes.to_vec();
     }
 
     /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding

@@ -616,10 +616,13 @@ different things depending on which pair you compare:
   *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
   on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping windows**
   (`map`/`unmap`/`protect`/grow) — root *and* child, plus **demand** (`fault_yields`) coroutines — the
-  page-protection map is captured alongside the bytes. (The child half rests on the carve, which is
-  being retired — INVARIANTS #13, 2026-09-29: `child_checkpointable` admits a child only inside its
-  parent's captured prefix, so a detached child's env never checkpoints and its runs replay from 0.
-  No detached equivalent yet — tracked in #1289.) Follow-ups: the §3.6 serve/live-call machinery
+  page-protection map is captured alongside the bytes. (A carve child's bytes ride the parent's image,
+  and the carve is being retired — INVARIANTS #13, 2026-09-29. A **detached** child's env carries its
+  own window image and its powerbox, the handle table by the freeze's own durable capture with
+  inherited stdio re-aliased to the spawner's on restore, and the checkpoint carries the run's budget
+  tree, which the child's spawn charged (#1866). A child whose powerbox holds anything but plain values
+  doesn't checkpoint. The undo journal records none of a detached child's writes, so its anchors carry
+  the same image and count it toward their stride (#2058).) Follow-ups: the §3.6 serve/live-call machinery
   inside a confined child, env teardown / D37 revocation, and — if a use case demands it — extending the
   checkpointable subset to §13 **region-aliased** windows (cross-domain shared bytes) and children carved
   beyond the parent's captured prefix — today those fall back to replay-from-0, which stays correct, just
@@ -2462,6 +2465,11 @@ What holds it up:
 - **What cannot be recorded fails closed** — `Host::journal_invertible`: the §3.6 serve queue (it
   drains, so it is not append-only), a capability's opaque declared state, a mid-invoke task, an
   event-parked fiber. Those journal no state entry, `can_undo_to` declines, and `seek` serves.
+- **A detached child's window is its own** (#2058). The pre-images cover the root window only, so
+  each anchor carries a live detached child's window image and powerbox, as a checkpoint does (§1,
+  #1866), and the image counts toward the anchor's stride. A child whose powerbox holds anything but
+  plain values journals no state entry. A **carve** child's writes are not journaled at all (#2064);
+  the carve's retirement (#1867) removes that case.
 
 **Floats are not a hazard here, and it is worth saying why rather than assuming it.** The IR's scalar
 float unops are `abs`/`neg`/`sqrt`, all IEEE-754 correctly rounded and therefore bit-exact; there are

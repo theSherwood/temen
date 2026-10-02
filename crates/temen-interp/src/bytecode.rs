@@ -5728,8 +5728,29 @@ fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> bool {
 /// Capture a live `instantiate`-child [`DbgEnv`] into an [`EnvSnapshot`]: its window geometry
 /// (`nested_view` base + size) + host replay substate + fuel + its own page-protection map. Its bytes ride
 /// in the shared window snapshot (the view shares the root backing region).
-fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
-    EnvSnapshot {
+///
+/// #1866 — a detached child's env carries its own window image and powerbox instead, or nothing of
+/// either once it is `spent` ([`env_spent`]). `None` when a live one's powerbox holds a binding that
+/// is not a plain value ([`Host::child_powerbox`]).
+fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Option<EnvSnapshot> {
+    let detached = match e.place {
+        EnvPlace::Carve => None,
+        EnvPlace::Detached { spawner } => Some(DetachedEnv {
+            spawner,
+            live: match (&e.mem, spent) {
+                (_, true) => None,
+                (Some(m), false) => Some(DetachedLive {
+                    image: m.layout_snapshot(),
+                    reserved_log2: m.window.reserved().trailing_zeros() as u8,
+                    mapped_log2: m.window.mapped().trailing_zeros() as u8,
+                    shadow: m.shadow,
+                    powerbox: e.host.child_powerbox()?,
+                }),
+                (None, false) => return None,
+            },
+        }),
+    };
+    Some(EnvSnapshot {
         win_base: e.mem.as_ref().map_or(0, |m| m.window.base()),
         size_log2: e
             .mem
@@ -5740,7 +5761,8 @@ fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
         fuel: e.fuel.can_burn(),
         prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
         fibers: e.fibers.clone(),
-    }
+        detached,
+    })
 }
 
 /// Rebuild a §14 `instantiate`-child [`DbgEnv`] from an [`EnvSnapshot`] on restore — the inverse of
@@ -5769,6 +5791,53 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
         table: build_table_for(progs_len, table_log2, es.module as u32),
         fuel: Fuel::fixed(es.fuel),
         fibers: es.fibers.clone(),
+        place: EnvPlace::Carve,
+    }
+}
+
+/// #1866 — rebuild a detached child's [`DbgEnv`] under `spawner`, the powerbox of the env that spawned
+/// it (already rebuilt: envs come back in spawn order). Its window is built as op 15 builds it, then
+/// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
+/// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
+/// back empty: nothing runs in it again.
+fn rebuild_detached_env(
+    es: &EnvSnapshot,
+    d: &DetachedEnv,
+    spawner: &mut Host,
+    source: &ModuleSource,
+) -> DbgEnv {
+    let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
+    let place = EnvPlace::Detached { spawner: d.spawner };
+    let Some(live) = &d.live else {
+        let host = Host::new();
+        let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
+        return DbgEnv {
+            mem: None,
+            host,
+            table,
+            fuel: Fuel::fixed(es.fuel),
+            fibers: Vec::new(),
+            place,
+        };
+    };
+    let mut mem = Mem::detached(
+        live.reserved_log2,
+        live.mapped_log2,
+        Some(live.shadow),
+        &[],
+        None,
+    );
+    mem.restore_layout(&live.image);
+    let mut host = spawner.rebuild_child_powerbox(&live.powerbox);
+    host.restore_replay_substate(&es.host);
+    let table_log2 = host.jit_table_log2();
+    DbgEnv {
+        mem: Some(mem),
+        host,
+        table: build_table_for(progs_len, table_log2, es.module as u32),
+        fuel: Fuel::fixed(es.fuel),
+        fibers: es.fibers.clone(),
+        place,
     }
 }
 
@@ -6091,8 +6160,9 @@ fn journal_op(
 /// **Fail-closed.** Nothing is recorded — so `undo_to` will decline this turn — when the state is not
 /// invertible in place: a host using the §3.6 serve queue or holding a capability with opaque declared
 /// state (`Host::journal_invertible`), a task stepping inside a §22 invoke (its transient `Vm` is not
-/// captured, the same exclusion `checkpointable` makes), or an event-parked fiber (a non-deterministic
-/// wall-clock deadline). Those runs still time-travel by checkpoint-plus-replay, exactly as today.
+/// captured, the same exclusion `checkpointable` makes), an event-parked fiber (a non-deterministic
+/// wall-clock deadline), or a live detached child whose powerbox is not plain values (`env_snapshot`).
+/// Those runs still time-travel by checkpoint-plus-replay, exactly as today.
 #[allow(clippy::too_many_arguments)]
 fn journal_state(
     journal: &mut super::journal::Journal,
@@ -6129,6 +6199,20 @@ fn journal_state(
     if !invertible {
         return;
     }
+    let Some(extra) = extra_envs
+        .iter()
+        .enumerate()
+        .map(|(k, e)| {
+            let module = tasks
+                .iter()
+                .find(|t| t.env == Some(k))
+                .map_or(0, |t| t.vt.active.module);
+            env_snapshot(e, module, env_spent(tasks, extra_envs, k))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
     let cont = ScheduledContinuation {
         clock,
         tasks: tasks
@@ -6147,21 +6231,14 @@ fn journal_state(
             })
             .collect(),
         fibers: fibers.to_vec(),
-        extra_envs: extra_envs
-            .iter()
-            .enumerate()
-            .map(|(k, e)| {
-                let module = tasks
-                    .iter()
-                    .find(|t| t.env == Some(k))
-                    .map_or(0, |t| t.vt.active.module);
-                env_snapshot(e, module)
-            })
-            .collect(),
+        extra_envs: extra,
         extra_units: source.extra_units(),
+        budgets: host.budget_tree(),
     };
     // #1958 — the next boundary waits out as many turns as this one cloned slots, so the clone's cost
-    // per op stays constant at any call depth (`JournalPolicy::state_stride`).
+    // per op stays constant at any call depth (`JournalPolicy::state_stride`). A live detached child's
+    // window image counts too, in register-sized slots: `journal_op` records none of its writes, so
+    // each anchor copies it whole (#2058).
     let slots: u64 = cont
         .tasks
         .iter()
@@ -6177,6 +6254,12 @@ fn journal_state(
                 | FiberState::HostParked { vm, .. } => vm.clone_slots(),
                 _ => 0,
             })
+            .sum::<u64>()
+        + cont
+            .extra_envs
+            .iter()
+            .filter_map(|e| e.detached.as_ref()?.live.as_ref())
+            .map(|l| (l.image.bytes.len() / std::mem::size_of::<super::Reg>()) as u64)
             .sum::<u64>();
     journal.record_state(turn, cont, host.journal_cursor(), turn + stride.max(slots));
 }
@@ -6938,6 +7021,33 @@ struct DbgEnv {
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
     /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
     fibers: Vec<FiberState>,
+    /// Where its window lives, which decides what a checkpoint carries of it (#1866).
+    place: EnvPlace,
+}
+
+/// Where a [`DbgEnv`]'s window lives (#1866).
+#[derive(Clone, Copy)]
+enum EnvPlace {
+    /// A carve: a view of the root window, whose bytes ride the root's image.
+    Carve,
+    /// A §5 detached child's window of its own. `spawner` is the env whose powerbox spawned it
+    /// (`None`: the root's), whose stdio its inherited streams alias on a rebuild.
+    Detached { spawner: Option<usize> },
+}
+
+/// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
+/// finished, no live task's window lease is owed to its powerbox, and no live child env was spawned
+/// from it. A checkpoint carries such an env as spent rather than copying its window and powerbox.
+fn env_spent(tasks: &[DbgTask], envs: &[DbgEnv], k: usize) -> bool {
+    let live = |t: &&DbgTask| !matches!(t.state, DbgTaskState::Done(_));
+    !tasks
+        .iter()
+        .filter(live)
+        .any(|t| t.env == Some(k) || matches!(t.lease, Some((Some(e), _, _)) if e == k))
+        && !envs.iter().enumerate().any(|(i, e)| {
+            matches!(e.place, EnvPlace::Detached { spawner: Some(sp) } if sp == k)
+                && tasks.iter().filter(live).any(|t| t.env == Some(i))
+        })
 }
 
 /// One scheduled vCPU's captured state inside a [`ScheduledSnapshot`] — its full `VTask` continuation
@@ -6985,6 +7095,9 @@ pub struct ScheduledContinuation {
     /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
     /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
+    /// #1866 — the run's budget tree, which every domain of the run shares: a detached child's spawn
+    /// charges its window to the spawner's node, and a fresh run's tree has not been charged.
+    budgets: Vec<super::BudgetNode>,
 }
 
 impl ScheduledContinuation {
@@ -7000,6 +7113,7 @@ impl ScheduledContinuation {
             fibers: Vec::new(),
             extra_envs: Vec::new(),
             extra_units: Vec::new(),
+            budgets: Vec::new(),
         }
     }
 }
@@ -7033,6 +7147,27 @@ struct EnvSnapshot {
     prot: Vec<(u64, super::PageProt)>,
     /// The child's fiber registry (its `Vm`s' bytes ride in the shared snapshot, like the root's).
     fibers: Vec<FiberState>,
+    /// #1866 — a detached child's own window and powerbox, which a carve's need not carry.
+    detached: Option<DetachedEnv>,
+}
+
+/// #1866 — what a checkpoint carries of a detached child's env beyond a carve's: the env that spawned
+/// it, and, unless it is spent ([`env_spent`]), its own window and powerbox.
+#[derive(Clone)]
+struct DetachedEnv {
+    spawner: Option<usize>,
+    live: Option<DetachedLive>,
+}
+
+/// #1866 — a live detached child's window (its image, and the geometry op 15 built it with) and its
+/// powerbox.
+#[derive(Clone)]
+struct DetachedLive {
+    image: MemLayout,
+    reserved_log2: u8,
+    mapped_log2: u8,
+    shadow: super::ShadowArena,
+    powerbox: super::ChildPowerbox,
 }
 
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
@@ -7704,12 +7839,22 @@ fn dbg_instantiate_confined(
             .set(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    dbg_start_child(tasks, ti, extra_envs, source, child, spawn.entry, dst)
+    dbg_start_child(
+        tasks,
+        ti,
+        extra_envs,
+        source,
+        child,
+        spawn.entry,
+        dst,
+        EnvPlace::Carve,
+    )
 }
 
 /// Schedule an admitted §14/§5 child as a debug task over its own [`DbgEnv`], registered as a child
 /// handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it), and land the handle in `dst`.
 /// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`).
+#[allow(clippy::too_many_arguments)]
 fn dbg_start_child(
     tasks: &mut Vec<DbgTask>,
     ti: usize,
@@ -7718,6 +7863,7 @@ fn dbg_start_child(
     child: AdmittedChild,
     entry: i64,
     dst: u32,
+    place: EnvPlace,
 ) -> Result<(), Trap> {
     let live = tasks
         .iter()
@@ -7746,6 +7892,7 @@ fn dbg_start_child(
         // (#1944 slice 3).
         fuel: Fuel::fixed(fuel.can_burn()),
         fibers: Vec::new(),
+        place,
     });
     let cidx = tasks.len();
     tasks.push(DbgTask {
@@ -7792,7 +7939,19 @@ fn dbg_instantiate_detached(
             .set(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    dbg_start_child(tasks, ti, extra_envs, source, child, spawn.entry, dst)
+    let place = EnvPlace::Detached {
+        spawner: tasks[ti].env,
+    };
+    dbg_start_child(
+        tasks,
+        ti,
+        extra_envs,
+        source,
+        child,
+        spawn.entry,
+        dst,
+        place,
+    )
 }
 
 /// `thread.join`: deliver a finished child's result now, else park the joiner. Mirrors `drive`'s `Join`.
@@ -9294,12 +9453,23 @@ impl ScheduledDebugRun {
                             | FiberState::HostParked { .. }
                     )
                 })
-            // A child's host is rebuilt with only its `Instantiator` and `AddressSpace`
-            // (`rebuild_env`), so a child holding a `Jit` table is out of the subset.
-            && self.extra_envs.iter().all(|e| {
-                e.host.checkpoint_safe()
-                    && !e.host.has_jit_table()
-                    && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
+            // A carve child's host is rebuilt with only its `Instantiator` and `AddressSpace`
+            // (`rebuild_env`), so a child holding a `Jit` table is out of the subset. A detached
+            // child's window is its own (#1866): its image rides its env's snapshot, so only a §13
+            // region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
+            // values, which the capture itself checks (`env_snapshot`).
+            && self.extra_envs.iter().enumerate().all(|(k, e)| match e.place {
+                EnvPlace::Carve => {
+                    e.host.checkpoint_safe()
+                        && !e.host.has_jit_table()
+                        && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
+                }
+                EnvPlace::Detached { .. } => {
+                    env_spent(&self.tasks, &self.extra_envs, k)
+                        || (e.host.checkpoint_safe()
+                            && !e.host.has_jit_table()
+                            && e.mem.as_ref().is_some_and(|m| m.layout_snapshot_safe()))
+                }
             })
     }
 
@@ -9312,7 +9482,7 @@ impl ScheduledDebugRun {
         if !self.checkpointable() {
             return None;
         }
-        let continuation = self.build_continuation();
+        let continuation = self.build_continuation()?;
         Some(super::moment::Moment::new(
             self.mem.as_ref().map(|m| m.layout_snapshot()),
             &self.host,
@@ -9325,8 +9495,9 @@ impl ScheduledDebugRun {
     /// ([`snapshot`](Self::snapshot), which pairs it with the window image and the host substate) and by
     /// the **undo journal** (#1557), which pairs it with a compact [`HostCursor`](crate::HostCursor)
     /// and the window pre-images instead — one definition of "what the continuation is", two costs.
-    fn build_continuation(&self) -> ScheduledContinuation {
-        ScheduledContinuation {
+    /// `None` when a live detached child's powerbox is not plain values (`env_snapshot`).
+    fn build_continuation(&self) -> Option<ScheduledContinuation> {
+        Some(ScheduledContinuation {
             clock: self.clock,
             tasks: self
                 .tasks
@@ -9357,11 +9528,12 @@ impl ScheduledDebugRun {
                         .iter()
                         .find(|t| t.env == Some(k))
                         .map_or(0, |t| t.vt.active.module);
-                    env_snapshot(e, module)
+                    env_snapshot(e, module, env_spent(&self.tasks, &self.extra_envs, k))
                 })
-                .collect(),
+                .collect::<Option<_>>()?,
             extra_units: self.source.extra_units(),
-        }
+            budgets: self.host.budget_tree(),
+        })
     }
 
     /// Restore a [`snapshot`](ScheduledDebugRun::snapshot) into this **freshly built** run (its
@@ -9401,16 +9573,25 @@ impl ScheduledDebugRun {
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
         self.source.reset_extra(&c.extra_units);
-        // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
+        // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and carve
         // windows are `nested_view`s over the shared window (their bytes — shared via the backing
-        // region — are already correct); each table is rebuilt over the child's own module.
-        let shared_mem = self.mem.as_ref();
-        let source = &*self.source;
-        self.extra_envs = c
-            .extra_envs
-            .iter()
-            .map(|es| rebuild_env(es, shared_mem, source))
-            .collect();
+        // region — are already correct); each table is rebuilt over the child's own module. A
+        // detached child's env is rebuilt under its spawner's, which comes back first (#1866).
+        let mut envs: Vec<DbgEnv> = Vec::with_capacity(c.extra_envs.len());
+        for es in &c.extra_envs {
+            let env = match &es.detached {
+                None => rebuild_env(es, self.mem.as_ref(), &self.source),
+                Some(d) => {
+                    let spawner = match d.spawner {
+                        None => &mut self.host,
+                        Some(k) => &mut envs[k].host,
+                    };
+                    rebuild_detached_env(es, d, spawner, &self.source)
+                }
+            };
+            envs.push(env);
+        }
+        self.extra_envs = envs;
         self.tasks = c
             .tasks
             .iter()
@@ -9441,6 +9622,9 @@ impl ScheduledDebugRun {
                 },
             })
             .collect();
+        // #1866 — last, once the replaced tasks have handed their charges back: the tree as it stood,
+        // which already holds every charge the restored tasks and windows carry.
+        self.host.set_budget_tree(&c.budgets);
     }
 
     /// The run's result once the root has finished (`None` while still running).
