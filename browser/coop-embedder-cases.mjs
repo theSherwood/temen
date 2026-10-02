@@ -78,6 +78,43 @@ block 0 () {
 export 0 func "_start" 0
 `;
 
+// A guest that writes "tick\n" 50 times, spinning 2000 back-edges between writes, and returns 50.
+const TICKS = `memory 16
+import 0 "write" (i64, i64) -> (i64)
+data 34816 "tick\n"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vsl = i64.const 34816
+  vlen = i64.const 5
+  vw = call.import 0 (vsl, vlen)
+  vz = i64.const 0
+  br 2(vi, vz)
+}
+block 2 (vi2: i64, vj: i64) {
+  vone = i64.const 1
+  vj2 = i64.add vj vone
+  vn = i64.const 2000
+  vgo = i64.ne vj2 vn
+  br_if vgo 2(vi2, vj2) 3(vi2)
+}
+block 3 (vi3: i64) {
+  vone3 = i64.const 1
+  vi4 = i64.add vi3 vone3
+  vm = i64.const 50
+  vmore = i64.ne vi4 vm
+  br_if vmore 1(vi4) 4(vi4)
+}
+block 4 (vr: i64) {
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
+
 export const pong = (x) => 2n * x + 1n;
 export const PINGS = 30;
 
@@ -109,11 +146,11 @@ export async function runCases({ ex, memory, drive, suspends }) {
   };
   // Drive the open session with the embedder hooks, recording what they saw.
   const run = async (opts = {}) => {
-    const seen = { out: '', err: '', slices: 0, parks: 0, counts: {} };
+    const seen = { out: '', err: '', chunks: 0, slices: 0, parks: 0, counts: {} };
     const status = await drive(ex, memory, {
       counts: seen.counts,
       budget: 1000,
-      onOutput: (o, e) => { seen.out += dec.decode(o); seen.err += dec.decode(e); },
+      onOutput: (o, e) => { seen.chunks++; seen.out += dec.decode(o); seen.err += dec.decode(e); },
       onSlice: async () => {
         seen.slices++;
         await new Promise((r) => setTimeout(r, 0)); // the embedder's event loop gets a turn
@@ -145,6 +182,17 @@ export async function runCases({ ex, memory, drive, suspends }) {
   // to `onSlice` until emitted code checks a budget (#1954 step 4).
   if (open(SPIN, [], COOP_NO_REGIONS) !== 0) throw new Error('open spin');
   results.spin = await run({ stopAfter: 20 });
+  // #1954 step 4 — where the host suspends, a leaf is sliced at its own safepoints: an endless leaf
+  // stops at a checkpoint, a long one ends with its output streamed from inside it. (Where it cannot,
+  // a leaf that never parks runs to its end without a checkpoint, so these run only under JSPI.)
+  if (suspends) {
+    if (open(SPIN, [], leafMode) !== 0) throw new Error('open spin leaf');
+    results.spinLeaf = await run({ stopAfter: 20 });
+    if (open(TICKS, [], leafMode) !== 0) throw new Error('open ticks leaf');
+    results.ticksLeaf = await run();
+  }
+  if (open(TICKS, [], COOP_NO_REGIONS) !== 0) throw new Error('open ticks');
+  results.ticks = await run();
   if (open(FAULTS, [], COOP_NO_REGIONS) !== 0) throw new Error('open faults');
   results.faults = { ...(await run({ trapDeclines: false })), trap: trapName(), addr: ex.temen_fault_addr() };
   if (open(FAULTS, [], COOP_NO_REGIONS) !== 0) throw new Error('open faults again');

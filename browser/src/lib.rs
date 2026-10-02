@@ -14278,6 +14278,28 @@ pub extern "C" fn temen_coop_read_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(WINDOW_READ)).0 }
 }
 
+/// #1954: put the output a sliced run produced since the last pump return in the stdout/stderr slots
+/// — for a driver at a budget checkpoint inside a leaf, which returns to the pump only when the leaf
+/// ends or parks, to stream what the leaf's calls printed meanwhile. A no-op for an unsliced run
+/// (its output is handed over once, at the end) or when no session is open.
+#[no_mangle]
+pub extern "C" fn temen_coop_take_output() {
+    // SAFETY: single-threaded wasm; no engine frame is live while a leaf's host import runs.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        return;
+    };
+    if !s.sliced {
+        return;
+    }
+    let host = s.run.host_mut();
+    let (out, err) = (host.take_stdout(), host.take_stderr());
+    // SAFETY: as above; the capture slots are read back only via the accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), out);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), err);
+    }
+}
+
 /// #1954: the run's `vm_fs` files as a Temen fs-image blob ([`temen_fs::encode_image`], the DAP
 /// `fsImage` format): the open run's now, or, once it has ended, the files it ended with. Returns the
 /// length; the bytes are at [`temen_coop_fs_ptr`] until the next call or the next run's end. Empty

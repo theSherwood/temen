@@ -78,11 +78,14 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 // - `counts`: an object to fill with what ran on the emitted tier (#1896): `leaves`, how many programs
 //   ran whole there, and `resumes`, how many parked calls in them resumed.
 // - `budget` (#1954): pump in slices of about this many interpreted ops (`temen_coop_run_for`), so the
-//   embedder gets control back between them. Emitted code is not counted: a leaf runs until it returns
-//   or parks.
+//   embedder gets control back between them. Where the host suspends emitted frames (JSPI), a leaf is
+//   sliced too: its fuel counter is armed with `leafBudget` (default `budget`) units — one per function
+//   entry and taken back-edge — and when it runs out the leaf's frames suspend for `onSlice`, then run
+//   on with a fresh slice. Elsewhere emitted code is not counted: a leaf runs until it returns or parks.
+// - `leafBudget`: a leaf's slice, in emitted safepoints (see `budget`).
 // - `onOutput(stdout, stderr)`: a sliced run's output (`Uint8Array`s), handed over as each pump return
 //   produces it. Without `budget`, output is read from the stdout/stderr slots once the run is over.
-// - `onSlice()`: called, and awaited, when a slice is spent. Resolve to carry on; resolve to `false` to
+// - `onSlice()`: called, and awaited, when a slice is spent — interpreted or a leaf's. Resolve to carry on; resolve to `false` to
 //   stop the run here (the session is closed and the driver returns `null`). This is where an embedder
 //   yields to its event loop, and where it waits out a Pause.
 // - `onCapPark({ id, index, args })`: a call to a declared host-completed cap (`temen_coop_open`'s
@@ -96,7 +99,10 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 // The driver closes the session before it returns; the run's value is `temen_run_value`, its files
 // `temen_coop_fs_image`.
 export async function driveCoopTierupRun(ex, memory, opts = {}) {
-  const { cacheKey, counts = {}, budget, onOutput, onSlice, onCapPark, trapDeclines = true } = opts;
+  const {
+    cacheKey, counts = {}, budget, leafBudget = budget, onOutput, onSlice, onCapPark,
+    trapDeclines = true,
+  } = opts;
   // #1896: how many processes ran whole on the emitted tier, and how many parked calls in them
   // resumed. A caller that wants to know passes the object to fill.
   counts.leaves = 0;
@@ -189,10 +195,32 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       if (rc !== 0) throw new Error('bounce trap');
     })
     : callInterp;
-  const unitImports = (call_interp = callInterp) => ({ env: {
+  // #1954 — a sliced leaf's budget checkpoint under JSPI. Its emitted code calls `env.trap(OUT_OF_FUEL)`
+  // when its fuel counter runs out and aborts only if the counter is still negative afterwards; this
+  // import suspends the leaf's frames there, hands over what its calls printed, gives the embedder
+  // its turn (`onSlice`), and refills the counter, so the frames run on. `onSlice` resolving `false`
+  // drops the frames instead and tells `settle` the run is stopped. Any other trap code returns, and
+  // the emitted code aborts as it always does.
+  const sliceLeaves = suspendsLeaves && budget !== undefined;
+  const leafFuel = BigInt(leafBudget ?? 0);
+  const leafFuelGlobals = []; // the sliced leaves' "fuel" globals, armed with `leafFuel` per event
+  let stopLeaf = () => {}; // tells `settle` the embedder stopped the run at a leaf's checkpoint
+  const leafTrap = sliceLeaves
+    ? new WebAssembly.Suspending(async (code) => {
+      if (code !== 11 /* temen_ir::trap_code::OUT_OF_FUEL */) return;
+      ex.temen_coop_take_output();
+      if (onOutput) handOutput();
+      if (onSlice && (await onSlice()) === false) {
+        stopLeaf();
+        return new Promise(() => {}); // never resumed: the session closes under the frames
+      }
+      for (const g of leafFuelGlobals) g.value = leafFuel;
+    })
+    : () => {};
+  const unitImports = (call_interp = callInterp, trap = () => {}) => ({ env: {
     memory,
     __indirect_function_table: table,
-    trap: () => {},
+    trap,
     call_interp,
   } });
 
@@ -238,7 +266,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       } else {
         jitCacheStats.hits++;
       }
-      p = (await WebAssembly.instantiate(module, unitImports(leafCallInterp))).exports;
+      p = (await WebAssembly.instantiate(module, unitImports(leafCallInterp, leafTrap))).exports;
+      if (sliceLeaves && p.fuel) leafFuelGlobals.push(p.fuel);
       registerGlobals(p);
       programs.set(m, p);
     }
@@ -418,14 +447,19 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   // #1896 — run a leaf's frames, its entry or its frames resuming, until the leaf ends or a call in
   // it parks: deliver the end, or hold the frames (`suspended`, by task) until the call returns.
   const suspended = new Map();
+  // Resolves to `true` when the embedder stopped the run at one of the leaf's budget checkpoints.
   const settle = async (task, go) => {
     const parks = new Promise((r) => { parked = r; });
+    const stops = new Promise((r) => { stopLeaf = r; });
     const run = go();
     const end = await Promise.race([
       run.then((ret) => ({ ret }), () => ({ trapped: true })),
       parks.then(() => ({ parks: true })),
+      stops.then(() => ({ stopped: true })),
     ]);
     parked = () => {};
+    stopLeaf = () => {};
+    if (end.stopped) return true;
     if (end.parks) {
       suspended.set(task, { run, ...parking });
       parking = null;
@@ -434,6 +468,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     } else {
       deliver(end.ret);
     }
+    return false;
   };
 
   // A sliced run's output since the last pump return, to the embedder.
@@ -487,11 +522,16 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         await syncTable();
         afterBounce(0);
         for (const g of fuelGlobals) g.value = 1n << 61n;
+        for (const g of leafFuelGlobals) g.value = leafFuel;
         armEnv();
-        await settle(task, () => {
+        const stop = await settle(task, () => {
           leaf.resolve();
           return leaf.run;
         });
+        if (stop) {
+          stopped = true;
+          break;
+        }
         continue;
       }
       if (ev === 3 /* COOP_RUN_JIT_INVOKE */) {
@@ -551,6 +591,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       const tmapped = ex.temen_coop_mapped();
       for (const g of mappedGlobals) g.value = tmapped;
       for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on the reused instance
+      for (const g of leafFuelGlobals) g.value = leafFuel; // #1954: a sliced leaf's own slice
       // #1009 paged: point the emitted page check at the freshly rebuilt table (base can move as the
       // pump's Vec reallocates, so read it every event). Empty set / `_paged==0` on an unpaged run.
       if (ex.temen_coop_paged()) {
@@ -561,7 +602,10 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       // #1896: a leaf program runs under JSPI where there is one, so that a call in it can park.
       if (suspendsLeaves && leaf) {
         const entry = WebAssembly.promising(program['f' + func]);
-        await settle(ex.temen_coop_task(), () => entry(eventWin(), envCell, ...args));
+        if (await settle(ex.temen_coop_task(), () => entry(eventWin(), envCell, ...args))) {
+          stopped = true;
+          break;
+        }
         continue;
       }
       try {

@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**353 exports** in 36 families — 296 referenced from JS, 57 referenced by nothing, 10 behind a `cfg`.
+**354 exports** in 36 families — 304 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,13 +11,13 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
-| `coop` | 54 | 40 | 0 |
+| `coop` | 55 | 45 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 5 | 5 | 1 |
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
-| `fault` | 1 | 0 | 0 |
+| `fault` | 1 | 1 | 0 |
 | `foreign` | 3 | 3 | 3 |
 | `framebuffer` | 4 | 4 | 0 |
 | `jspb` | 7 | 7 | 0 |
@@ -39,7 +39,7 @@
 | `status` | 1 | 1 | 0 |
 | `stderr` | 2 | 2 | 0 |
 | `stdout` | 2 | 2 | 0 |
-| `trap` | 2 | 0 | 0 |
+| `trap` | 2 | 2 | 0 |
 | `warm` | 16 | 16 | 0 |
 | `wasmjit` | 9 | 9 | 0 |
 
@@ -100,11 +100,11 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_argv_len`
 - `temen_coop_argv_ptr`
 - `temen_coop_call_interp`
-- `temen_coop_cap_len` — *unreferenced*
-- `temen_coop_cap_ptr` — *unreferenced*
+- `temen_coop_cap_len`
+- `temen_coop_cap_ptr`
 - `temen_coop_close`
 - `temen_coop_deliver`
-- `temen_coop_deliver_cap` — *unreferenced*
+- `temen_coop_deliver_cap`
 - `temen_coop_deliver_jit`
 - `temen_coop_deliver_jit_trap`
 - `temen_coop_deliver_trap`
@@ -133,7 +133,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_read` — *unreferenced*
 - `temen_coop_read_ptr` — *unreferenced*
 - `temen_coop_run`
-- `temen_coop_run_for` — *unreferenced*
+- `temen_coop_run_for`
 - `temen_coop_set_emit_cap` — *unreferenced*
 - `temen_coop_set_tierup_floor`
 - `temen_coop_shim_ptr`
@@ -143,6 +143,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_spill_ptr`
 - `temen_coop_table_gen`
 - `temen_coop_table_log2`
+- `temen_coop_take_output`
 - `temen_coop_task`
 - `temen_coop_tierup_win_len` — *unreferenced*
 - `temen_coop_tierup_win_ptr`
@@ -184,7 +185,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `fault`
 
-- `temen_fault_addr` — *unreferenced*
+- `temen_fault_addr`
 
 ### `foreign`
 
@@ -474,8 +475,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `trap`
 
-- `temen_trap_len` — *unreferenced*
-- `temen_trap_ptr` — *unreferenced*
+- `temen_trap_len`
+- `temen_trap_ptr`
 
 ### `warm`
 

@@ -5523,7 +5523,8 @@ fn emit_win_reload(code: &mut Vec<u8>) {
     uleb(code, 0); // win
 }
 
-/// Debit one fuel unit from the fuel counter global and trap `TRAP_OUT_OF_FUEL` when it goes negative.
+/// Debit one fuel unit from the fuel counter global and trap `TRAP_OUT_OF_FUEL` when it goes negative
+/// (unless the host's `env.trap` refilled the counter — see the body).
 /// Emitted at the IR-anchored safepoints — once at function entry and once per taken back-edge
 /// (`emit_edge`), matching the tree-walk/bytecode/Cranelift oracle exactly (INVARIANTS.md #9), so a run
 /// traps `OutOfFuel` at the identical safepoint for any budget.
@@ -5547,7 +5548,24 @@ fn emit_fuel_check(cx: &mut FnCtx, code: &mut Vec<u8>) {
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_trap(code, TRAP_OUT_OF_FUEL);
+    // #1954: `env.trap(OUT_OF_FUEL)`, then abort only if the counter is *still* negative. A host
+    // that only records the code (every host but one) traps exactly where it always did; a host
+    // that suspends emitted frames (JSPI) may instead give its embedder a turn inside the call and
+    // refill the `"fuel"` export before returning, and the frame runs on — the budget checkpoint
+    // that lets a leaf which never parks still pause.
+    code.push(OP_I32_CONST);
+    sleb32(code, TRAP_OUT_OF_FUEL);
+    code.push(OP_CALL);
+    uleb(code, 0); // func 0 = the env.trap import
+    code.push(0x23); // global.get
+    uleb(code, FUEL_GLOBAL_IDX as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, 0);
+    code.push(0x53); // i64.lt_s
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    code.push(OP_UNREACHABLE);
+    code.push(OP_END);
     code.push(OP_END);
     cx.depth -= 1;
 }

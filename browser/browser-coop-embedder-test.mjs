@@ -9,6 +9,8 @@
 // leaf's frames; where it cannot (Node), it runs interpreted. Resolving a park to `null` stops the
 // run; so does `onSlice` resolving `false` on a program that never ends, after its output has streamed.
 // A trap with `trapDeclines: false` returns its status, name and fault address; by default it throws.
+// Under JSPI a leaf is sliced at its own safepoints (step 4): a leaf that never ends stops at a budget
+// checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
 //
 // Usage:  node browser-coop-embedder-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -54,6 +56,24 @@ const check = (host, r, suspends) => {
   }
   if (r.spin.status !== null || r.spin.slices !== 20 || r.spin.out !== 'hi\n') {
     fail(`${host}: onSlice false stops an endless run: status ${r.spin.status}, ${r.spin.slices} slices, out ${JSON.stringify(r.spin.out)}`);
+  }
+  const ticks = 'tick\n'.repeat(50);
+  const ticked = (name, x, leaves) => {
+    if (x.status !== 0 || x.value !== 50n || x.out !== ticks || x.counts.leaves !== leaves) {
+      fail(`${host}: ${name}: status ${x.status}, value ${x.value}, ${x.out.length} bytes out, ${x.counts.leaves} leaves`);
+    }
+    if (x.slices < 10 || x.chunks < 10) {
+      fail(`${host}: ${name}: sliced and streamed as it ran: ${x.slices} slices, ${x.chunks} chunks`);
+    }
+  };
+  ticked('ticks, interpreted', r.ticks, 0);
+  if (suspends) {
+    ticked('ticks, a sliced leaf', r.ticksLeaf, 1);
+    const sl = r.spinLeaf;
+    if (sl.status !== null || sl.slices !== 20 || sl.out !== 'hi\n' || sl.counts.leaves !== 1) {
+      fail(`${host}: onSlice false stops an endless leaf at a checkpoint: status ${sl.status}, `
+        + `${sl.slices} slices, out ${JSON.stringify(sl.out)}, ${sl.counts.leaves} leaves`);
+    }
   }
   const f = r.faults;
   if (f.status !== 3 || f.trap !== 'MemoryFault' || f.addr !== 8n || f.out !== 'before\n') {
@@ -105,4 +125,5 @@ if (chromium === null) {
 if (process.exitCode) process.exit(process.exitCode);
 console.log('ok — an embedder\'s Release run: declared caps answered through onCapPark, output through '
   + 'onOutput, slices through onSlice, stops at a park and at a slice, and a trap reported or declined'
-  + `${chromium ? '; in Chromium the parking root ran as one leaf, suspended and resumed' : ''}`);
+  + `${chromium ? '; in Chromium the parking root ran as one leaf, suspended and resumed, and a leaf '
+    + 'was sliced at its own budget checkpoints' : ''}`);
