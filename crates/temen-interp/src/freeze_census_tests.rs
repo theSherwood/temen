@@ -38,7 +38,6 @@ impl Fixture {
             nested_children: &[],
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
-            window_safe: true,
             host: &self.root,
             registry: &self.registry,
         }
@@ -135,29 +134,6 @@ fn a_child_domain_holding_a_non_durable_handle_declines() {
             ..
         }))
     ));
-}
-
-#[test]
-fn a_detached_window_with_a_shared_region_mapped_declines() {
-    let f = Fixture::new();
-    let child_registry = Arc::new(FiberRegistry::new());
-    let child_seat = Seat {
-        id: 7,
-        window_safe: false,
-        host: &f.child,
-        registry: &child_registry,
-        ..f.root_seat()
-    };
-    assert_eq!(
-        f.census(&child_seat),
-        Some(DeclineCause::SharedRegionWindow)
-    );
-    // The run root's own window is the embedder's to capture; the census leaves it alone.
-    let root_seat = Seat {
-        window_safe: false,
-        ..f.root_seat()
-    };
-    assert_eq!(f.census(&root_seat), None);
 }
 
 /// #1688 — an unreaped fork twin runs in a window and powerbox of its own that no artifact records.

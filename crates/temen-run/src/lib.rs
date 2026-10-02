@@ -1707,6 +1707,8 @@ pub fn jit_cap_run(
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     let restore = jit_restore_prots(m, host, init);
+    // #2025 — an `init` that names §13 pages has them aliased back onto their regions.
+    let realias = host.has_premap();
     let init_mem = init.bytes();
     // #1810: a durable run's capture is its freeze image, so it reaches the guest's high-water.
     let durable = host.is_durable();
@@ -1748,6 +1750,9 @@ pub fn jit_cap_run(
         cm.set_budget_taker(Some(production_budget_taker(cc)));
         if durable {
             cm.set_high_water(Some(cc.high_water()));
+        }
+        if realias {
+            cm.set_window_ready(Some(cc.window_ready()));
         }
         cm.set_restore_prots(restore);
         cm.set_freeze_controller(freeze);
@@ -1805,6 +1810,9 @@ pub fn jit_cap_run(
     cm.set_budget_taker(Some(production_budget_taker(cc)));
     if durable {
         cm.set_high_water(Some(cc.high_water()));
+    }
+    if realias {
+        cm.set_window_ready(Some(cc.window_ready()));
     }
     cm.set_restore_prots(restore);
     cm.set_freeze_controller(freeze);
@@ -2952,6 +2960,29 @@ impl CapCtx {
         };
         (f, self.ptr())
     }
+
+    /// #2025 — the root window's [`temen_jit::PremapApply`] in this shape: a durable thaw's §13
+    /// pages aliased back onto their regions ([`window_aliases`]).
+    fn window_ready(self) -> (temen_jit::PremapApply, *mut c_void) {
+        let f: temen_jit::PremapApply = match self {
+            CapCtx::Raw(_) => window_ready,
+            CapCtx::Locked(_) => premap_apply,
+        };
+        (f, self.ptr())
+    }
+}
+
+/// [`premap_apply`] over a raw host: a single-threaded run's root window.
+///
+/// # Safety
+/// `ctx` is the run's live `*mut Host`; `[base, base+reserved)` its live reservation.
+unsafe extern "C" fn window_ready(
+    ctx: *mut c_void,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+) -> i32 {
+    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved)
 }
 
 /// [`temen_jit::HighWater`] over a raw host: [`Host::cap_high_water`].
@@ -3033,7 +3064,7 @@ fn window_prot(p: temen_interp::CapturedProt) -> temen_jit::WindowProt {
     match p {
         temen_interp::CapturedProt::Ro => temen_jit::WindowProt::Ro,
         temen_interp::CapturedProt::Unmapped => temen_jit::WindowProt::Unmapped,
-        // A §13 alias is not restorable (the codec refuses it); `Rw` is the default.
+        // A §13 alias starts as the window's own page; `Host::apply_premap` re-aliases it (#2025).
         temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed { .. } => {
             temen_jit::WindowProt::Rw
         }
@@ -3758,19 +3789,28 @@ pub unsafe extern "C" fn premap_apply(
 ) -> i32 {
     let child_cell = &*(child_ctx as *const Mutex<Host>);
     let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
+    window_aliases(&mut child, base, mapped, reserved)
+}
+
+/// `Host::apply_premap` over `host`'s fresh window `[base, base+mapped)`: the op-15 pre-map and a
+/// durable thaw's §13 pages (#2025), through the window view its first `call.cap` would set up.
+///
+/// # Safety
+/// `[base, base+reserved)` is `host`'s live reservation.
+unsafe fn window_aliases(host: &mut Host, base: *mut u8, mapped: u64, reserved: u64) -> i32 {
     #[cfg(any(unix, windows))]
     {
-        install_region_hook(&mut child, base, reserved);
-        let pages = child.cap_window_pages(base as usize);
+        install_region_hook(host, base, reserved);
+        let pages = host.cap_window_pages(base as usize);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
         // #1506: the guard is a constant of the layout, read from its one chokepoint — the same
         // port d964db3 made for the root window above. (`Host::null_guard()` no longer exists.)
         wm.set_null_guard(temen_ir::module_null_guard());
-        i32::from(child.apply_premap(&mut wm) >= 0)
+        i32::from(host.apply_premap(&mut wm) >= 0)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (base, mapped, reserved, &mut child);
+        let _ = (base, mapped, reserved, host);
         0
     }
 }
@@ -3929,7 +3969,7 @@ pub struct MprotectWindow {
     reserved: u64,
     /// Host page size (`host_page_size()`), the protection granularity (matches `temen_interp`).
     page: u64,
-    /// Page index ⇒ explicit state code (1=Rw, 2=Ro, 3=Unmapped); absent ⇒ region default (rw in
+    /// Page index ⇒ explicit [`PageState`]; absent ⇒ region default (rw in
     /// `[0, mapped)`, unmapped in the reserved tail). Mirrors `temen_interp`'s page map so the two
     /// backends agree page-for-page. **Shared** ([`Arc<Mutex<…>>`]) so it persists across the run's
     /// `call.cap`s (the JIT rebuilds the window view per call): guest-grown pages stay borrowable. The
@@ -3945,42 +3985,7 @@ pub struct MprotectWindow {
 }
 
 #[cfg(any(unix, windows))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PageState {
-    Rw,
-    Ro,
-    Unmapped,
-    /// A §13 `SharedRegion` alias (writable or not): committed, but another object's memory — a
-    /// fork cannot duplicate it (#1768), exactly as the interpreter's `PageProt::Backed`.
-    Backed {
-        writable: bool,
-    },
-}
-
-#[cfg(any(unix, windows))]
-impl PageState {
-    fn code(self) -> u8 {
-        use temen_ir::page_state as ps;
-        match self {
-            PageState::Rw => ps::RW,
-            PageState::Ro => ps::RO,
-            PageState::Unmapped => ps::UNMAPPED,
-            PageState::Backed { writable: true } => ps::BACKED_RW,
-            PageState::Backed { writable: false } => ps::BACKED_RO,
-        }
-    }
-    fn from_code(c: u8) -> Option<PageState> {
-        use temen_ir::page_state as ps;
-        match c {
-            ps::RW => Some(PageState::Rw),
-            ps::RO => Some(PageState::Ro),
-            ps::UNMAPPED => Some(PageState::Unmapped),
-            ps::BACKED_RW => Some(PageState::Backed { writable: true }),
-            ps::BACKED_RO => Some(PageState::Backed { writable: false }),
-            _ => None,
-        }
-    }
-}
+use temen_ir::PageState;
 
 #[cfg(any(unix, windows))]
 impl MprotectWindow {
@@ -4040,16 +4045,11 @@ impl MprotectWindow {
 
     /// Read one page's explicit state from the shared map (locks; `None` ⇒ absent / region default).
     fn prot_get(&self, page: u64) -> Option<PageState> {
-        self.prot
-            .lock()
-            .unwrap()
-            .get(&page)
-            .copied()
-            .and_then(PageState::from_code)
+        self.prot.lock().unwrap().get(&page).copied()
     }
     /// Set one page's explicit state in the shared map.
     fn prot_set(&self, page: u64, st: PageState) {
-        self.prot.lock().unwrap().insert(page, st.code());
+        self.prot.lock().unwrap().insert(page, st);
     }
     /// Clear one page back to the region default (absent).
     fn prot_clear(&self, page: u64) {
@@ -4067,7 +4067,7 @@ impl MprotectWindow {
         match self.prot_get(page) {
             Some(PageState::Rw) => Some(true),
             Some(PageState::Ro) => Some(false),
-            Some(PageState::Backed { writable }) => Some(writable),
+            Some(PageState::Backed { writable, .. }) => Some(writable),
             Some(PageState::Unmapped) => None,
             None => (page * self.page < self.mapped).then_some(true),
         }
@@ -4123,6 +4123,30 @@ impl MprotectWindow {
             self.prot_set(page, PageState::Ro);
         } else {
             self.prot_set(page, PageState::Unmapped);
+        }
+    }
+
+    /// Mirror a §13 alias in the software page state: each page of `pages` is committed (RW or RO,
+    /// for in-call §7 borrow checks) and names the bytes of `region` it aliases, from `region_off`
+    /// on — what a freeze records in place of the page's bytes (#2025).
+    fn mark_backed(
+        &self,
+        pages: std::ops::RangeInclusive<u64>,
+        region: u32,
+        region_off: u64,
+        writable: bool,
+    ) {
+        let first = *pages.start();
+        for page in pages {
+            let off = region_off + (page - first) * self.page;
+            self.prot_set(
+                page,
+                PageState::Backed {
+                    region,
+                    off,
+                    writable,
+                },
+            );
         }
     }
 
@@ -4385,9 +4409,11 @@ impl GuestMem for MprotectWindow {
             // A §13 alias stays an alias — only its writability changes, or it is gone if neither
             // R nor W is left — exactly the interpreter's `Mem::protect`.
             match self.prot_get(page) {
-                Some(PageState::Backed { .. }) if prot & 3 != 0 => self.prot_set(
+                Some(PageState::Backed { region, off, .. }) if prot & 3 != 0 => self.prot_set(
                     page,
                     PageState::Backed {
+                        region,
+                        off,
                         writable: prot & 2 != 0,
                     },
                 ),
@@ -4418,7 +4444,7 @@ impl GuestMem for MprotectWindow {
         region_off: u64,
         len: u64,
         prot: i32,
-        _region: u32,
+        region: u32,
         backing: RegionBacking,
     ) -> i64 {
         #[cfg(unix)]
@@ -4466,11 +4492,7 @@ impl GuestMem for MprotectWindow {
             if p == libc::MAP_FAILED {
                 return EINVAL;
             }
-            // Mirror the software page state (committed; RW or RO) for in-call §7 borrow checks.
-            let state = PageState::Backed { writable };
-            for page in pages {
-                self.prot_set(page, state);
-            }
+            self.mark_backed(pages, region, region_off, writable);
             0
         }
         // §13 windows (issue #1): real shared mappings via **placeholder reservations**. The JIT
@@ -4556,16 +4578,12 @@ impl GuestMem for MprotectWindow {
                     }
                 }
             }
-            // Mirror the software page state (committed; RW or RO) for in-call §7 borrow checks.
-            let state = PageState::Backed { writable };
-            for page in pages {
-                self.prot_set(page, state);
-            }
+            self.mark_backed(pages, region, region_off, writable);
             0
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (win_off, region_off, len, prot, backing);
+            let _ = (win_off, region_off, len, prot, region, backing);
             EINVAL
         }
     }

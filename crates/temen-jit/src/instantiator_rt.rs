@@ -1262,6 +1262,12 @@ impl Nursery {
         register_serve(self, gc.ctx, &code);
         let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window, child_fuel);
         let thaw_off = shadow.thaw_state_off(0) as usize;
+        // #2025 — its §13 pages, aliased back onto their regions once its window exists, by the
+        // same host hook that applies a spawn's op-15 pre-map.
+        let apply_addr = self.grant_premap_apply.load(Ordering::Acquire);
+        let premap_apply = (apply_addr != 0)
+            .then(|| core::mem::transmute::<usize, crate::PremapApply>(apply_addr));
+        let premap_ctx = SendRaw(gc.ctx);
         let filed = file_task(
             self,
             code,
@@ -1282,7 +1288,11 @@ impl Nursery {
                 let mapped = rw.len() as u64;
                 w.apply_prots(0, &prots, mapped, &image);
             },
-            |_, _, _| true,
+            |base, mapped, reserved| match premap_apply {
+                // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
+                Some(apply) => apply(premap_ctx.0, base, mapped, reserved) != 0,
+                None => true,
+            },
             None,
             vec![0; n_args], // inert under a rewind: the prologue reloads spilled values
             n_results,

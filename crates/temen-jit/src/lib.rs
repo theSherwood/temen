@@ -2020,14 +2020,18 @@ impl ForkPoint<'_> {
 
     /// The twin's window: a private duplicate of this one (the JIT's `Mem::fork_private`) — every
     /// committed page's bytes and protection — with `reply` injected as the fork call's result and
-    /// its root set rewinding. `pages` is the run's page-state map (host page → a
-    /// [`temen_ir::page_state`] code, absent ⇒ the default), which says which tail pages the guest
+    /// its root set rewinding. `pages` is the run's page-state map (host page → its
+    /// [`temen_ir::PageState`], absent ⇒ the default), which says which tail pages the guest
     /// committed and which pages it protected; together with the module's read-only data segments
     /// and NULL guard it describes every page. `None` when the window cannot be duplicated: a page
     /// aliases a §13 shared region (fork shares no memory — the interpreter's `fork_private` refuses
     /// the same window), or the address space has no room for another window.
-    pub fn twin(&self, pages: &BTreeMap<u64, u8>, reply: i64) -> Option<TwinWindow> {
-        use temen_ir::page_state as ps;
+    pub fn twin(
+        &self,
+        pages: &BTreeMap<u64, temen_ir::PageState>,
+        reply: i64,
+    ) -> Option<TwinWindow> {
+        use temen_ir::PageState as ps;
         let page = mem::page_size() as u64;
         let mut prots: BTreeMap<usize, mem::Prot> = BTreeMap::new();
         // The seed-time protections: the NULL guard, then the read-only data segments (host-page
@@ -2052,12 +2056,12 @@ impl ForkPoint<'_> {
         }
         // What the guest changed since, which overrides them (the same order a live window saw).
         let prefix = (self.window.mapped() as u64).div_ceil(page);
-        for (&p, &code) in pages {
-            let prot = match code {
-                ps::RW => mem::Prot::Rw,
-                ps::RO => mem::Prot::Ro,
-                ps::UNMAPPED => mem::Prot::None,
-                _ => return None, // a §13 alias (or a code this build does not know): refuse
+        for (&p, &state) in pages {
+            let prot = match state {
+                ps::Rw => mem::Prot::Rw,
+                ps::Ro => mem::Prot::Ro,
+                ps::Unmapped => mem::Prot::None,
+                ps::Backed { .. } => return None, // a §13 alias: refuse
             };
             if prot == mem::Prot::Rw && p < prefix {
                 prots.remove(&(p as usize)); // the prefix default
@@ -2873,6 +2877,9 @@ pub struct CompiledModule {
     freeze_ctl: Option<Arc<FreezeController>>,
     /// #1810 — a durable run's capture reaches the guest's high-water (see [`HighWater`]).
     high_water: Option<(HighWater, *mut core::ffi::c_void)>,
+    /// #2025 — the embedder's hook over a fresh root window, before the guest runs
+    /// ([`Self::set_window_ready`]).
+    window_ready: Option<(PremapApply, *mut core::ffi::c_void)>,
     /// #1768 — the embedder's fork hook ([`Self::set_fork_hook`]): set on a run armed to fork, whose
     /// root unwinds at a fork call for the hook to duplicate. `None` for every other run.
     fork_hook: Option<ForkHook>,
@@ -3964,6 +3971,7 @@ impl CompiledModule {
             thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
             high_water: None,
+            window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
             fiber_rt,
@@ -4184,6 +4192,7 @@ impl CompiledModule {
             thaw_root_sp: self.shadow.frame_base(0),
             freeze_ctl: None,
             high_water: None,
+            window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
             fiber_rt: None,
@@ -4321,6 +4330,14 @@ impl CompiledModule {
     /// other captures keep their fixed span (a grown heap is not worth copying for them).
     pub fn set_high_water(&mut self, hook: Option<(HighWater, *mut core::ffi::c_void)>) {
         self.high_water = hook;
+    }
+
+    /// #2025 — run `hook` over each fresh root window once it is seeded and protected, before the
+    /// guest runs: a durable thaw's §13 pages are aliased back onto their regions there, as a
+    /// child's op-15 pre-map is ([`PremapApply`], with `ctx` the root's powerbox). `0` from it fails
+    /// the run.
+    pub fn set_window_ready(&mut self, hook: Option<(PremapApply, *mut core::ffi::c_void)>) {
+        self.window_ready = hook;
     }
 
     /// #1834 — the page map the next run's window is built under (DURABILITY.md §12.3): a thaw's,
@@ -4534,6 +4551,19 @@ impl CompiledModule {
             // (`restore_rw`/`read_low`) before any host read.
             if t.null_guard <= t.cap_mapped {
                 window.seed_null_guard(t.sub_base, t.null_guard);
+            }
+            if let Some((ready, ctx)) = t.window_ready {
+                if ready(
+                    ctx,
+                    window.base(),
+                    t.win_mapped as u64,
+                    t.win_reserved as u64,
+                ) == 0
+                {
+                    return Err(JitError::Unsupported(
+                        "durable JIT thaw: a §13 page did not re-alias",
+                    ));
+                }
             }
             // #1768 — a run armed to fork keeps its root's shadow stack in context 0 of the
             // declared arena; a fresh window starts it empty (the durable `init_durable_window`
@@ -6528,6 +6558,7 @@ fn compile_child_windowed(
         shadow,
         freeze_ctl: None,
         high_water: None,
+        window_ready: None,
         fork_hook: None,
         fiber_rt: None,
         domain: None,

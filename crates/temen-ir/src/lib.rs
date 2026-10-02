@@ -277,23 +277,28 @@ pub mod errno {
     pub const ECONNREFUSED: i64 = -111;
 }
 
-/// The state codes of a JIT window's **page map** (`temen_interp::CapPageMap`): host page index →
-/// one of these, absent ⇒ the region default (read-write in the backed prefix, unmapped in the
-/// reserved tail). One definition for the three readers: the flat-window backend that writes them
+/// One entry of a JIT window's **page map** (`temen_interp::CapPageMap`): host page index → its
+/// state, absent ⇒ the region default (read-write in the backed prefix, unmapped in the reserved
+/// tail). One definition for the readers: the flat-window backend that writes them
 /// (`temen_run::MprotectWindow`), the durable capture that turns them into a snapshot's page map
 /// (`temen_interp::Host::capture_window_prots`), and the JIT's fork copy (`temen_jit`).
-pub mod page_state {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageState {
     /// Committed read-write.
-    pub const RW: u8 = 1;
+    Rw,
     /// Committed read-only.
-    pub const RO: u8 = 2;
+    Ro,
     /// Inaccessible — an `unmap` (zeroed) or a `protect(none)` (contents kept).
-    pub const UNMAPPED: u8 = 3;
-    /// A §13 `SharedRegion` alias, read-write: the page *is* another object's memory, so it cannot
-    /// be copied into a private duplicate (a fork refuses the window, as the interpreter's does).
-    pub const BACKED_RW: u8 = 4;
-    /// A §13 `SharedRegion` alias, read-only.
-    pub const BACKED_RO: u8 = 5;
+    Unmapped,
+    /// A §13 `SharedRegion` alias: the page *is* the bytes at `off` in the host's region `region`,
+    /// so it cannot be copied into a private duplicate (a fork refuses the window, as the
+    /// interpreter's does), and a freeze names the region rather than taking the page's bytes
+    /// (#2025).
+    Backed {
+        region: u32,
+        off: u64,
+        writable: bool,
+    },
 }
 
 /// The **trap wire code** (#1735): how every engine, thunk and embedder status says *which* trap
