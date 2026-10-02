@@ -25,9 +25,11 @@
 # --expect`, no normalization, no tolerance), the module linked in-guest must be the host's link of
 # the same `.c.nif`s, and the program must print what the native binary prints.
 #
-# With NIM_LANE_SELF=1 the lane also has nimony build each of its own tools in-guest (#763): the
-# driver, nifmake, nifler2, nimsem and hexer. Each must be byte for byte the tool that ran in the
-# build (`--fixed-point`), and nimsem's artifacts must also match native nimony's. nifler2 takes its
+# With NIM_LANE_SELF=1 the lane also builds a program with a macro in-guest (#2046): nimsem builds
+# the macro's plugin for Temen and runs it there, and the program must print what native nimony's
+# build of it prints. And it has nimony build each of its own tools in-guest (#763): the driver,
+# nifmake, nifler2, nimsem and hexer. Each must be byte for byte the tool that ran in the build
+# (`--fixed-point`), and nimsem's artifacts must also match native nimony's. nifler2 takes its
 # plugins, parsegen and regex, which nimsem builds for Temen and runs in-guest. The nightly run (and
 # a manual dispatch) sets it; a PR run leaves it out.
 #
@@ -92,9 +94,31 @@ fi
 echo "✅ the program built on Temen prints what the native build prints: $(cat "$W/temen.out")"
 
 if [ -z "${NIM_LANE_SELF:-}" ]; then
-  echo "[5/5] skipped: nimony building its tools in-guest runs with NIM_LANE_SELF=1 (the nightly run)"
+  echo "[5/5] skipped: a macro, and nimony building its tools in-guest, run with NIM_LANE_SELF=1 (the nightly run)"
   exit 0
 fi
+echo "[5/5] a macro: nimsem builds its plugin on Temen and runs it there"
+# Not `--expect`: the plugin's own build caches are a Temen build in-guest and a C one natively.
+# The tree is nimony's whole one: `std/macros` imports nimony's own sources (`src/`), and native
+# nimony validates a plugin against `doc/tags.md`.
+M="$W/macro"
+mkdir -p "$M"
+cp -r "$N/bin" "$N/lib" "$N/src" "$N/doc" "$M/"
+cat >"$M/prog.nim" <<'NIM'
+import std/[syncio, macros]
+macro hello(): untyped =
+  result = newCall("echo", [newStrLitNode("hello from a macro")])
+hello()
+NIM
+(cd "$M" && ./bin/nimony c -d:temen --isMain prog.nim >/dev/null)
+"$(ls "$M"/nimcache/*/prog | head -1)" >"$W/macro-native.out"
+lane --engine jit "$M" prog.nim "$W/cache-macro" >"$W/macro-temen.out"
+if ! diff -u "$W/macro-native.out" "$W/macro-temen.out"; then
+  echo "the macro program built on Temen does not print what the native build prints (diff above)" >&2
+  exit 1
+fi
+echo "✅ the macro program built on Temen prints what the native build prints: $(cat "$W/macro-temen.out")"
+
 echo "[5/5] nimony builds each of its tools on Temen, and each is the tool that built it"
 # Each against the .temen the toolchain linked (`--fixed-point`); nimsem also against the
 # toolchain's native build of it, in the tree's nimcache (`--expect`).
