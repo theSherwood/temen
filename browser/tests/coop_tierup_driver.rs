@@ -34,7 +34,7 @@ use temen_browser::{
     temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr, temen_coop_deliver_cap,
     temen_coop_leaf_wasm_len, temen_coop_leaf_wasm_ptr, temen_coop_module, temen_coop_read,
     temen_coop_read_ptr, temen_coop_run_for, COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS,
-    COOP_RUN_CAP_PARK, COOP_RUN_PAUSED, COOP_RUN_RESUME,
+    COOP_NO_REGIONS, COOP_RUN_CAP_PARK, COOP_RUN_PAUSED, COOP_RUN_RESUME,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -1045,20 +1045,20 @@ impl CoopB2Driver {
             d.engine = Some(engine);
             d.table = Some(table);
         }
-        // #1954: a run whose root runs whole as a leaf has no region emit — its program 0 is the leaf.
+        // #1954: a run whose root runs whole as a leaf has no region emit — its program 0 is the leaf;
+        // an interpreted run (`COOP_NO_REGIONS`, root not a leaf) has nothing emitted at all.
         // SAFETY: the session's emitted bytes, live until it closes.
         let main_wasm = unsafe {
-            match temen_coop_wasm_len() {
-                0 => std::slice::from_raw_parts(
-                    temen_coop_leaf_wasm_ptr(0),
-                    temen_coop_leaf_wasm_len(0),
-                ),
-                n => std::slice::from_raw_parts(temen_coop_wasm_ptr(), n),
+            match (temen_coop_wasm_len(), temen_coop_leaf_wasm_len(0)) {
+                (0, 0) => Vec::new(),
+                (0, n) => std::slice::from_raw_parts(temen_coop_leaf_wasm_ptr(0), n).to_vec(),
+                (n, _) => std::slice::from_raw_parts(temen_coop_wasm_ptr(), n).to_vec(),
             }
+        };
+        if !main_wasm.is_empty() {
+            let main = instantiate_in(&mut store, &main_wasm);
+            store.data_mut().main = Some(main);
         }
-        .to_vec();
-        let main = instantiate_in(&mut store, &main_wasm);
-        store.data_mut().main = Some(main);
         CoopB2Driver { store, memory }
     }
 
@@ -4901,15 +4901,26 @@ fn coop_root_leaf_parks_on_declared_caps_and_matches_interpreted() {
     };
     let mut drive = |leaf, budget| drive_declared(&bytes, &["ping"], leaf, budget, &mut answer);
 
-    let (leaf, _) = drive(COOP_LEAF_SUSPENDS, None).expect("opens");
-    assert_eq!(leaf, want(1, N as usize), "leaf");
-    let (sliced, pauses) = drive(COOP_LEAF_SUSPENDS, Some(1)).expect("opens");
-    assert_eq!(sliced, want(1, N as usize), "leaf, sliced");
-    assert_eq!(pauses, 0, "nothing interpreted to pause");
+    for (mode, name) in [
+        (COOP_LEAF_SUSPENDS, "leaf"),
+        (COOP_LEAF_SUSPENDS | COOP_NO_REGIONS, "leaf, no regions"),
+    ] {
+        let (leaf, _) = drive(mode, None).expect("opens");
+        assert_eq!(leaf, want(1, N as usize), "{name}");
+        let (sliced, pauses) = drive(mode, Some(1)).expect("opens");
+        assert_eq!(sliced, want(1, N as usize), "{name}, sliced");
+        assert_eq!(pauses, 0, "{name}: nothing interpreted to pause");
+    }
 
+    // Not offered to a host that cannot suspend: the region run, or the interpreted one.
     for (mode, name) in [
         (COOP_LEAF_ROOT, "no suspension"),
         (COOP_LEAF_OFF, "leaf off"),
+        (
+            COOP_LEAF_ROOT | COOP_NO_REGIONS,
+            "no suspension, no regions",
+        ),
+        (COOP_NO_REGIONS, "interpreted"),
     ] {
         assert_eq!(drive(mode, None).expect("opens").0, want(0, 0), "{name}");
         let (sliced, pauses) = drive(mode, Some(1)).expect("opens");

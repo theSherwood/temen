@@ -1846,14 +1846,15 @@ fn debug_host_caps_run(ir: &str) -> (String, Option<i64>, usize) {
     (stdout, code, parks)
 }
 
-/// The release session's run of `module` with the same declared caps, pumped in `budget`-op slices:
-/// `(stdout, exit code, parks)`.
+/// The release run of `module` — the tier-up session with no regions — with the same declared caps,
+/// pumped in `budget`-op slices: `(stdout, exit code, parks)`.
 fn release_host_caps_run(module: &temen_ir::Module, budget: u64) -> (String, Option<i64>, usize) {
     use temen_browser::{
-        temen_alloc, temen_exit_code, temen_release_cap_len, temen_release_cap_ptr,
-        temen_release_deliver_cap, temen_release_open, temen_release_read, temen_release_read_ptr,
-        temen_release_run, temen_release_value, temen_status, temen_stdout_len, temen_stdout_ptr,
-        RELEASE_CAP_PARK, RELEASE_DONE, RELEASE_RUNNING, STATUS_EXIT, STATUS_OK,
+        temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr, temen_coop_close,
+        temen_coop_deliver_cap, temen_coop_open, temen_coop_read, temen_coop_read_ptr,
+        temen_coop_run_for, temen_coop_value, temen_exit_code, temen_status, temen_stdout_len,
+        temen_stdout_ptr, COOP_NO_REGIONS, COOP_RUN_CAP_PARK, COOP_RUN_DONE, COOP_RUN_PAUSED,
+        STATUS_EXIT, STATUS_OK,
     };
     let bytes = temen_encode::encode_module(module);
     let p = temen_alloc(bytes.len());
@@ -1862,50 +1863,58 @@ fn release_host_caps_run(module: &temen_ir::Module, budget: u64) -> (String, Opt
     let caps = b"ping\nshow";
     let cp = temen_alloc(caps.len());
     unsafe { core::ptr::copy_nonoverlapping(caps.as_ptr(), cp, caps.len()) };
-    assert_eq!(
-        temen_release_open(p, bytes.len(), core::ptr::null(), 0, cp, caps.len()),
-        temen_browser::STATUS_OK
+    let opened = temen_coop_open(
+        p,
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        cp,
+        caps.len(),
+        COOP_NO_REGIONS,
     );
+    assert_eq!(opened, temen_browser::STATUS_OK);
     let names = ["ping", "show"];
     let mut out = Vec::new();
     let mut parks = 0;
     loop {
-        let r = temen_release_run(budget);
+        let r = temen_coop_run_for(budget);
         let (sp, sn) = (temen_stdout_ptr(), temen_stdout_len());
         if !sp.is_null() && sn > 0 {
             // SAFETY: the stash stays live until the next call that replaces it.
             out.extend_from_slice(unsafe { core::slice::from_raw_parts(sp, sn) });
         }
         match r {
-            RELEASE_DONE => break,
-            RELEASE_RUNNING => {}
-            RELEASE_CAP_PARK => {
+            COOP_RUN_DONE => break,
+            COOP_RUN_PAUSED => {}
+            COOP_RUN_CAP_PARK => {
                 parks += 1;
                 // SAFETY: the request words stay live until the next deliver/run/close.
                 let words = unsafe {
-                    core::slice::from_raw_parts(temen_release_cap_ptr(), temen_release_cap_len())
+                    core::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len())
                 }
                 .to_vec();
                 let (id, name, args) = (words[0] as u64, names[words[1] as usize], &words[2..]);
                 let mut read = |addr: u64, len: usize| {
-                    let n = temen_release_read(addr, len);
+                    let n = temen_coop_read(addr, len);
                     // SAFETY: as above, until the next read.
-                    unsafe { core::slice::from_raw_parts(temen_release_read_ptr(), n) }.to_vec()
+                    unsafe { core::slice::from_raw_parts(temen_coop_read_ptr(), n) }.to_vec()
                 };
                 let value = answer_cap(name, args, &mut read);
-                assert_eq!(temen_release_deliver_cap(id, value), 1);
-                assert_eq!(temen_release_deliver_cap(id, value), 0, "answered once");
+                assert_eq!(temen_coop_deliver_cap(id, value), 1);
+                assert_eq!(temen_coop_deliver_cap(id, value), 0, "answered once");
             }
-            other => panic!("unexpected release status {other}"),
+            other => panic!("unexpected release event {other}"),
         }
     }
     // `main`'s return: an `exit` status, or (a C entry that returns) the run's value — the DAP
     // session reports either as its exit code.
     let code = match temen_status() {
         STATUS_EXIT => Some(temen_exit_code() as i64),
-        STATUS_OK => Some(temen_release_value()),
+        STATUS_OK => Some(temen_coop_value()),
         _ => None,
     };
+    temen_coop_close();
     (String::from_utf8_lossy(&out).into_owned(), code, parks)
 }
 
