@@ -31,7 +31,7 @@ fn blob(src: &str) -> Vec<u8> {
 }
 
 /// Parse `guest_src` (with `BLOBLEN` replaced by `b.len()`) and inject `b` as a data segment at
-/// [`BLOB_OFF`] — the debug engines seed memory from the module's data segments (`build_mem`), so this
+/// [`BLOB_OFF`] — the debug engines seed memory from the module's data segments (`Mem::root`), so this
 /// is how the blob reaches the guest (the tree-walker seeds the same segment, keeping them identical).
 fn guest_module(guest_src: &str, b: &[u8]) -> temen_ir::Module {
     let src = guest_src.replace("BLOBLEN", &b.len().to_string());

@@ -1200,14 +1200,18 @@ impl Inspector {
         seek_target: Option<u64>,
         null_guard: u64,
     ) -> Box<VCpu> {
+        // #964/#1094: this harness gets bare funcs/data, never the module, so the caller threads the
+        // module's guard extent in — `[0, guard)` seeds `Unmapped` and a NULL deref traps on a debugger
+        // attach/seek exactly as on a direct run (unconditional; `0` only for a sub-window).
         let mem = memory.map(|mc| {
-            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-            mm.init_data(data);
-            // #964/#1094: this harness gets bare funcs/data, never the module, so the caller threads
-            // the module's guard extent in — `[0, guard)` seeds `Unmapped` and a NULL deref traps on a
-            // debugger attach/seek exactly as on a direct run (unconditional; `0` only for a sub-window).
-            mm.seed_null_guard(null_guard);
-            mm
+            Mem::from_spec(WindowSpec {
+                reserved_log2: DEFAULT_RESERVED_LOG2,
+                mapped_log2: mc.size_log2,
+                shadow: mc.shadow,
+                data,
+                null_guard,
+                ..WindowSpec::default()
+            })
         });
         let quota = Quota::default();
         let sched = Arc::new(Scheduler::new(quota.max_vcpus, MAX_WORKERS));
@@ -1356,13 +1360,17 @@ impl Inspector {
         turn_limit: Option<u64>,
         null_guard: u64,
     ) -> SchedState {
+        // #964/#1059: bare funcs/data, no module marker in reach — the caller threads the extent in so
+        // a scheduled attach/seek guards `[0, guard)` too (see `fresh_single_root`).
         let mem = memory.map(|mc| {
-            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-            mm.init_data(data);
-            // #964/#1059: bare funcs/data, no module marker in reach — the caller threads the extent
-            // in so a scheduled attach/seek guards `[0, guard)` too (see `fresh_single_root`).
-            mm.seed_null_guard(null_guard);
-            mm
+            Mem::from_spec(WindowSpec {
+                reserved_log2: DEFAULT_RESERVED_LOG2,
+                mapped_log2: mc.size_log2,
+                shadow: mc.shadow,
+                data,
+                null_guard,
+                ..WindowSpec::default()
+            })
         });
         let det = Arc::new(DetSched::new(0, MAX_VCPUS));
         let root_id = {
@@ -2173,12 +2181,7 @@ pub fn run_with_host_traced(
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
     // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-        mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host)
 }
 
@@ -3102,7 +3105,14 @@ fn relaunch_detached(
     // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
     // `begin_thaw`, on the child's own window.
-    let mut mem = Mem::detached(reserved_log2, memory_log2, shadow, &module.data, None);
+    let mut mem = Mem::from_spec(WindowSpec {
+        reserved_log2,
+        mapped_log2: memory_log2,
+        shadow,
+        data: &module.data,
+        null_guard: temen_ir::module_null_guard(),
+        ..WindowSpec::default()
+    });
     mem.restore_layout(&window);
     // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds.
     if !host.realias_regions(&mut mem, &window.dense_prots()) {
@@ -3575,13 +3585,7 @@ pub fn run_capture_reserved(
     if m.funcs.get(func as usize).is_none() {
         return (Err(Trap::Malformed), Vec::new());
     }
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
-        mm.seed(init_mem);
-        mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mut mem = Mem::root(m, reserved_log2, None, init_mem);
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
@@ -3613,13 +3617,7 @@ pub fn run_capture_reserved_with_host(
     if m.funcs.get(func as usize).is_none() {
         return (Err(Trap::Malformed), Vec::new());
     }
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mut mem = Mem::root(m, reserved_log2, None, init_mem);
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
@@ -3783,17 +3781,9 @@ pub fn run_capture_reserved_with_host_prots(
     if m.funcs.get(func as usize).is_none() {
         return (Err(Trap::Malformed), Vec::new(), Vec::new());
     }
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        if let Some(prots) = init_prots {
-            mm.apply_prots(prots, init_mem);
-        }
-        mm
-    });
+    let mut mem = Mem::root(m, reserved_log2, None, init_mem);
     if let (Some(mm), Some(prots)) = (mem.as_mut(), init_prots) {
+        mm.apply_prots(prots, init_mem);
         if !host.realias_regions(mm, prots) {
             return (Err(Trap::Malformed), Vec::new(), Vec::new());
         }
@@ -3863,12 +3853,7 @@ pub fn run_scheduled(
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
     let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
-    let mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let det = Arc::new(DetSched::new(seed, MAX_VCPUS));
     let root_id = {
         let mut s = det.lock();
@@ -4648,12 +4633,16 @@ fn run_one_schedule(
     fuel: u64,
     policy: Policy,
 ) -> Result<Vec<Value>, Trap> {
+    // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
+    // `fresh_single_root`).
     let mem = memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-        mm.init_data(data);
-        // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
-        // `fresh_single_root`).
-        mm
+        Mem::from_spec(WindowSpec {
+            reserved_log2: DEFAULT_RESERVED_LOG2,
+            mapped_log2: mc.size_log2,
+            shadow: mc.shadow,
+            data,
+            ..WindowSpec::default()
+        })
     });
     let det = Arc::new(DetSched::new(0, MAX_VCPUS)); // seed unused under the exhaustive policy
     let root_id = {
@@ -15409,13 +15398,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_lane_val = admitted.unwrap_or(-1);
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
-                                let mut fm = Mem::detached(
-                                    DEFAULT_RESERVED_LOG2,
-                                    size_log2 as u8,
-                                    cm.shadow,
-                                    &cm.data,
-                                    None,
-                                );
+                                let mut fm = Mem::from_spec(WindowSpec {
+                                    reserved_log2: DEFAULT_RESERVED_LOG2,
+                                    mapped_log2: size_log2 as u8,
+                                    shadow: cm.shadow,
+                                    data: &cm.data,
+                                    null_guard: temen_ir::module_null_guard(),
+                                    ..WindowSpec::default()
+                                });
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
@@ -27364,12 +27354,7 @@ impl Host {
             .collect();
         // The provider's window, exactly as a run of `m` would build it (§3a data segments
         // included) — the exporter's own memory, not the wirer's and not any caller's.
-        let mem = m.memory.map(|mc| {
-            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-            mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-            mm
-        });
+        let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
         // A bare fn-list wire carries no op names — the anonymous-shape family (#1109).
         let type_id = self.intern_interface(&[], &sigs);
         let idx = self.offers.len() as u32;
@@ -27935,13 +27920,7 @@ impl Host {
         let state = self
             .self_instance
             .get_or_insert_with(|| {
-                let mem = m.memory.map(|mc| {
-                    let mut mm =
-                        Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-                    mm.init_data(&m.data);
-                    mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-                    mm
-                });
+                let mem = Mem::root(&m, DEFAULT_RESERVED_LOG2, None, &[]);
                 Arc::new(Mutex::new(ProviderState {
                     mem,
                     host: Arc::new(Mutex::new(Host::new())),
@@ -32110,24 +32089,64 @@ struct AddrSpace {
     regions: BTreeMap<u32, Weak<dyn SharedBacking>>,
 }
 
+/// How a fresh window starts (#1737): its geometry, the backing it sits on, and what is laid into it,
+/// in the one order every window is built by — reserve, `seed`, the data segments, the NULL guard
+/// ([`Mem::from_spec`]). Root runs, detached (op 15) children, thaws and forks all build through it,
+/// so no copy of the recipe can forget a step (#1730, #1733, #1206 each did). What a caller lays over
+/// the result — a thaw's image, a reactor's page map, a child's args — stays the caller's.
+#[derive(Default)]
+pub(crate) struct WindowSpec<'a> {
+    /// The mask domain, `1 << reserved_log2` bytes; raised to at least `mapped_log2`.
+    pub(crate) reserved_log2: u8,
+    /// The backed prefix, `1 << mapped_log2` bytes.
+    pub(crate) mapped_log2: u8,
+    /// The module's durable shadow arena (INVARIANTS #16), if it declared one.
+    pub(crate) shadow: Option<ShadowArena>,
+    /// A backing the host minted; `None` reserves one here.
+    pub(crate) back: Option<Arc<Region>>,
+    /// Bytes written from offset 0 before the data segments: the escape oracle's seed, or the §3e
+    /// args/env blob a host lays out at `module_args_base()`.
+    pub(crate) seed: &'a [u8],
+    /// The data segments, `readonly` ones mapped RO (§3a/D40).
+    pub(crate) data: &'a [Data],
+    /// The #964 NULL guard extent; `0` for none.
+    pub(crate) null_guard: u64,
+}
+
 impl Mem {
-    /// A detached (op 15) child's window as it starts: a fresh reservation holding its module's data
-    /// segments (the `readonly` ones RO) under the #964 NULL guard. The one build for a spawn and for
-    /// a thaw, which lays its captured image over it (#1733), so the two cannot drift. `back` is a
-    /// backing its host minted (a `Vcpu` embedder's, #1414); `None` reserves one here.
-    fn detached(
+    /// A module's root window: its declared geometry over a `reserved_log2` reservation (on `back`, a
+    /// backing the host minted, or one reserved here), `seed` then its data segments laid in, behind
+    /// its NULL guard. `None` for a module with no memory.
+    pub(crate) fn root(
+        m: &Module,
         reserved_log2: u8,
-        mapped_log2: u8,
-        shadow: Option<ShadowArena>,
-        data: &[Data],
         back: Option<Arc<Region>>,
-    ) -> Mem {
-        let mut m = match back {
-            Some(back) => Mem::with_reservation_over(reserved_log2, mapped_log2, back, shadow),
-            None => Mem::with_reservation(reserved_log2, mapped_log2, shadow),
+        seed: &[u8],
+    ) -> Option<Mem> {
+        m.memory.map(|mc| {
+            Mem::from_spec(WindowSpec {
+                reserved_log2,
+                mapped_log2: mc.size_log2,
+                shadow: mc.shadow,
+                back,
+                seed,
+                data: &m.data,
+                null_guard: temen_ir::module_null_guard(), // #964
+            })
+        })
+    }
+
+    /// Build a fresh window from `spec` (#1737): the only constructor outside `Mem`'s own tests.
+    pub(crate) fn from_spec(spec: WindowSpec) -> Mem {
+        let mut m = match spec.back {
+            Some(back) => {
+                Mem::with_reservation_over(spec.reserved_log2, spec.mapped_log2, back, spec.shadow)
+            }
+            None => Mem::with_reservation(spec.reserved_log2, spec.mapped_log2, spec.shadow),
         };
-        m.init_data(data);
-        m.seed_null_guard(temen_ir::module_null_guard());
+        m.seed(spec.seed);
+        m.init_data(spec.data);
+        m.seed_null_guard(spec.null_guard);
         m
     }
 
@@ -32363,13 +32382,14 @@ impl Mem {
         if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
             return None;
         }
-        let mut twin = Mem::with_reservation_over(
-            reserved.trailing_zeros() as u8,
-            mapped.trailing_zeros() as u8,
-            Arc::new(self.twin_backing(reserved)),
-            Some(self.shadow),
-        );
-        twin.seed(&self.window_snapshot());
+        let mut twin = Mem::from_spec(WindowSpec {
+            reserved_log2: reserved.trailing_zeros() as u8,
+            mapped_log2: mapped.trailing_zeros() as u8,
+            shadow: Some(self.shadow),
+            back: Some(Arc::new(self.twin_backing(reserved))),
+            seed: &self.window_snapshot(),
+            ..WindowSpec::default()
+        });
         if !prot_copy.is_empty() {
             twin.space_write().prot = prot_copy;
         }
@@ -32732,10 +32752,11 @@ impl Mem {
     /// is the caller's window zeroed or copied, which for a compiler's forked child was most of what
     /// an exec cost.
     ///
-    /// The image arrives as a fresh instantiation's does: behind the NULL guard (#1094: a null
-    /// dereference in an exec'd program faults where the same program loaded fresh faults, and where
-    /// its emitted twin, whose guard compare is baked, faults too, #1896), with its data segments
-    /// written. One region carries over, the **args region** `[null_guard + EXEC_ARGS_BASE,
+    /// The image arrives as a fresh instantiation's does ([`Mem::from_spec`], #1737): its data
+    /// segments written, the `readonly` ones RO, behind the NULL guard (#1094: a null dereference in
+    /// an exec'd program faults where the same program loaded fresh faults, and where its emitted
+    /// twin, whose guard compare is baked, faults too, #1896). Admission bounds the image's declared
+    /// window by this one's backed prefix, so every segment lands inside it. One region carries over, the **args region** `[null_guard + EXEC_ARGS_BASE,
     /// null_guard + EXEC_ARGS_END)`: the caller packs `{argc, envc}` and its NUL-packed argv/envp there
     /// right before `exec_module`, and the command's child-entry runtime reads them there (the #801
     /// exec ABI). A personality exec's committed argv (`args`, #1768) is written last, over it.
@@ -32747,21 +32768,28 @@ impl Mem {
         args: Option<&[u8]>,
     ) -> Mem {
         let (reserved, mapped) = (self.window.reserved(), self.window.mapped());
-        let mut m = Mem::with_reservation_over(
-            reserved.trailing_zeros() as u8,
-            mapped.trailing_zeros() as u8,
-            Arc::new(back),
-            Some(self.shadow),
-        );
-        m.seed_null_guard(null_guard);
+        // The args region rides in as the image's seed, as a host's args blob does for a fresh
+        // instantiation: under the data segments, so a segment laid over the region keeps its bytes.
         let args_base = null_guard + EXEC_ARGS_BASE;
-        let args_len = (null_guard + EXEC_ARGS_END)
-            .min(mapped)
-            .saturating_sub(args_base);
-        if let Ok(carried) = self.read_window(args_base, args_len as usize) {
-            m.write_run(args_base, &carried);
+        let args_end = (null_guard + EXEC_ARGS_END).min(mapped);
+        let mut seed = Vec::new();
+        if let Some(carried) = self
+            .read_window(args_base, args_end.saturating_sub(args_base) as usize)
+            .ok()
+            .filter(|c| !c.is_empty())
+        {
+            seed.resize(args_base as usize, 0);
+            seed.extend_from_slice(&carried);
         }
-        m.write_segments(0, data, mapped);
+        let m = Mem::from_spec(WindowSpec {
+            reserved_log2: reserved.trailing_zeros() as u8,
+            mapped_log2: mapped.trailing_zeros() as u8,
+            shadow: Some(self.shadow),
+            back: Some(Arc::new(back)),
+            seed: &seed,
+            data,
+            null_guard,
+        });
         if let Some(blob) = args {
             m.write_exec_args(blob);
         }
