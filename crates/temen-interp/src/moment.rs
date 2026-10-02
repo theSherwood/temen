@@ -26,7 +26,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::{Host, HostReplaySubstate, MemLayout, PageMap};
+use crate::{Host, HostReplaySubstate, MemLayout, PageMap, RegionTable};
 
 /// The engine's half of a [`Moment`] — whatever it needs to resume execution from this boundary. The
 /// shared halves (window image + host substate) live on the `Moment`; this is the part that differs by
@@ -106,9 +106,16 @@ impl ShadowStack {
 /// the cap-tape cursor, serve state, growth accounting, and each named capability's own declared state
 /// (#1455) — the identical set a §12 freeze writes into an artifact, so a moment and a save-state
 /// cannot disagree about what "the host's state" is (INVARIANTS #13).
+///
+/// A debugger checkpoint ([`checkpoint`](Self::checkpoint)) also carries the §13 regions the host
+/// holds (#2026): each backing's bytes, held in pages like the window image, and the
+/// [`RegionTable`] naming them.
 pub struct Moment {
     mem: Option<Image>,
     host: HostReplaySubstate,
+    /// `None` for a host holding no region, and for a reactor moment, whose restore lands on the
+    /// live host and keeps its regions.
+    regions: Option<(Vec<Image>, RegionTable)>,
     continuation: Continuation,
 }
 
@@ -195,8 +202,34 @@ impl Moment {
         Moment {
             mem: mem.map(Image::Flat),
             host: host.replay_substate(),
+            regions: None,
             continuation,
         }
+    }
+
+    /// A debugger checkpoint: [`new`](Self::new), plus the §13 regions `host` holds, which its
+    /// [`restore_host`](Self::restore_host) rebuilds on the host a seek starts from (#2026). `None`
+    /// when a region cannot ride ([`Host::capture_regions`]).
+    pub fn checkpoint(
+        mem: Option<MemLayout>,
+        host: &Host,
+        continuation: Continuation,
+    ) -> Option<Moment> {
+        let regions = match host.region_count() {
+            0 => None,
+            _ => {
+                let (bytes, table) = host.capture_regions()?;
+                let images = bytes
+                    .into_iter()
+                    .map(|b| Image::Flat(MemLayout::image(b)))
+                    .collect();
+                Some((images, table))
+            }
+        };
+        Some(Moment {
+            regions,
+            ..Moment::new(mem, host, continuation)
+        })
     }
 
     /// The window image, for the engine to seed back into whatever holds its window. A moment a
@@ -210,25 +243,81 @@ impl Moment {
         &self.continuation
     }
 
-    /// Put the host half back — the other side of [`new`](Self::new).
+    /// Put the host half back — the other side of [`new`](Self::new) — and a checkpoint's regions.
+    /// Before the window: its aliases are re-mapped onto the regions this rebuilds.
     pub fn restore_host(&self, host: &mut Host) {
         host.restore_replay_substate(&self.host);
+        if let Some((images, table)) = &self.regions {
+            let backings: Vec<_> = images
+                .iter()
+                .map(|i| host.rebuild_region(&i.layout().bytes))
+                .collect();
+            host.restore_regions(&backings, table);
+        }
     }
 
-    /// The window image's byte length (the other halves are a handful of words, or the engine's
-    /// frames). On its own this is what holding the moment costs; in a [`Ladder`] the pages it shares
-    /// with its neighbours are counted once ([`Ladder::held_bytes`]).
+    /// The window image's and the regions' byte length (the other halves are a handful of words, or
+    /// the engine's frames). On its own this is what holding the moment costs; in a [`Ladder`] the
+    /// pages it shares with its neighbours are counted once ([`Ladder::held_bytes`]).
     pub fn byte_len(&self) -> usize {
-        self.mem.as_ref().map_or(0, Image::byte_len)
+        self.images().map(Image::byte_len).sum()
+    }
+
+    /// The images this moment holds: the window's, then each region's.
+    fn images(&self) -> impl Iterator<Item = &Image> {
+        self.mem
+            .iter()
+            .chain(self.regions.iter().flat_map(|(r, _)| r))
+    }
+
+    /// The region images, or none.
+    fn region_images(&self) -> &[Image] {
+        self.regions.as_ref().map_or(&[], |(r, _)| r)
+    }
+
+    /// This moment with each image in pages, sharing every page that equals `below`'s at the same
+    /// place: the window's with the window's, a region's with the region's at the same index.
+    fn paged(self, below: Option<&Moment>) -> Moment {
+        let mem = self
+            .mem
+            .map(|m| m.paged(below.and_then(|b| b.mem.as_ref())));
+        let regions = self.regions.map(|(images, table)| {
+            let under = below.map_or(&[][..], Moment::region_images);
+            let images = images
+                .into_iter()
+                .enumerate()
+                .map(|(i, im)| im.paged(under.get(i)))
+                .collect();
+            (images, table)
+        });
+        Moment {
+            mem,
+            regions,
+            ..self
+        }
+    }
+
+    /// The pages this moment holds that `below` does not share — what holding it adds to a ladder.
+    fn bytes_beyond(&self, below: Option<&Moment>) -> usize {
+        let under = below.map_or(&[][..], Moment::region_images);
+        self.mem
+            .as_ref()
+            .map_or(0, |m| m.bytes_beyond(below.and_then(|b| b.mem.as_ref())))
+            + self
+                .region_images()
+                .iter()
+                .enumerate()
+                .map(|(i, im)| im.bytes_beyond(under.get(i)))
+                .sum::<usize>()
     }
 
     /// Capture `layout` with `host`'s substate as a reactor moment (continuation [`Continuation::None`]).
     /// A reactor moment always carries a window image (this takes it by value); restoring one gives
     /// **rewind**, a [`Ladder`] of them a keyframe ladder, re-running forward over recorded input the
     /// frames between rungs. A moment restored into a fresh reactor is a save-state; restored twice, a
-    /// branch. `None` for a window that aliases a §13 region: a moment carries no region's bytes, so a
-    /// restore would show the region as it is then, not as it was (#2051) — a §12 artifact, which
-    /// carries them, is the save-state for such a window.
+    /// branch. `None` for a window that aliases a §13 region: a reactor moment carries no region's
+    /// bytes, so a restore would show the region as it is then, not as it was (#2051) — a §12
+    /// artifact, which carries them, is the save-state for such a window.
     pub fn capture(layout: MemLayout, host: &Host) -> Option<ReactorMoment> {
         (!layout.aliases_regions()).then(|| Moment::new(Some(layout), host, Continuation::None))
     }
@@ -302,15 +391,16 @@ impl Ladder {
     /// left as it was: a replay re-crossing a rung it took on the way out captures the same state, so
     /// there is nothing to replace.
     ///
-    /// The window image is held in pages, sharing every page that equals the rung below's (#1459).
+    /// The window image is held in pages, sharing every page that equals the rung below's (#1459), and
+    /// so is each region's (#2026).
     /// That is one compare of the window per rung taken, and no cost at all between rungs, on any
     /// tier: the run's writes are never tracked.
-    pub fn take(&mut self, coord: u64, mut moment: Moment) {
+    pub fn take(&mut self, coord: u64, moment: Moment) {
         let Err(at) = self.rungs.binary_search_by_key(&coord, |(c, _)| *c) else {
             return;
         };
-        let below = at.checked_sub(1).and_then(|i| self.rungs[i].1.mem.as_ref());
-        moment.mem = moment.mem.map(|m| m.paged(below));
+        let below = at.checked_sub(1).map(|i| &self.rungs[i].1);
+        let moment = moment.paged(below);
         self.rungs.insert(at, (coord, moment));
         self.evict(coord);
     }
@@ -348,8 +438,8 @@ impl Ladder {
         self.rungs.iter().map(|(c, _)| *c).collect()
     }
 
-    /// What the ladder is holding, in bytes: its rungs' window images, a page shared by neighbouring
-    /// rungs counted once.
+    /// What the ladder is holding, in bytes: its rungs' window and region images, a page shared by
+    /// neighbouring rungs counted once.
     ///
     /// Rungs share a page only with the rung below at the time they were taken, so a shared page is
     /// held by a run of adjacent rungs. A rung taken later between two that share a page breaks that
@@ -359,10 +449,8 @@ impl Ladder {
         let mut below = None;
         let mut held = 0;
         for (_, m) in &self.rungs {
-            if let Some(image) = &m.mem {
-                held += image.bytes_beyond(below);
-                below = Some(image);
-            }
+            held += m.bytes_beyond(below);
+            below = Some(m);
         }
         held
     }
@@ -940,6 +1028,54 @@ mod ladder_tests {
             l.len(),
             64,
             "the debug ladders' shape: nothing is ever evicted"
+        );
+    }
+
+    /// **A checkpoint carries the regions its host holds** (#2026): the ladder holds their bytes in
+    /// pages, sharing with the rung below what did not change, and counts them in
+    /// [`Ladder::held_bytes`]; a restore rebuilds each region on a fresh host under the same id, its
+    /// handle at the same value. A region something else also holds does not ride.
+    #[test]
+    fn a_checkpoint_carries_its_regions_paged_and_counted() {
+        let mut host = Host::new();
+        let handle = host.grant_shared_region(4 * SHARED_PAGE);
+        let take = |host: &Host| {
+            Moment::checkpoint(None, host, Continuation::None)
+                .expect("a region its host alone holds rides")
+        };
+        let mut ladder = Ladder::new(1, 0, 0);
+        ladder.take(1, take(&host));
+        assert_eq!(
+            ladder.held_bytes(),
+            4 * SHARED_PAGE,
+            "the region's bytes are held"
+        );
+        host.regions[0].write_byte(SHARED_PAGE as u64, 7);
+        ladder.take(2, take(&host));
+        assert_eq!(
+            ladder.held_bytes(),
+            5 * SHARED_PAGE,
+            "the second rung holds only the page that changed"
+        );
+
+        let mut fresh = Host::new();
+        let (_, rung) = ladder.nearest_at_or_before(2).expect("held");
+        rung.restore_host(&mut fresh);
+        let region = fresh
+            .resolve_region(handle)
+            .expect("the handle names the region again");
+        assert_eq!(
+            region.read_byte(SHARED_PAGE as u64),
+            7,
+            "with the bytes it had"
+        );
+        assert!(Arc::ptr_eq(&region, &fresh.regions[0]), "under the same id");
+
+        let mut shared = Host::new();
+        shared.grant_shared_region_backed(Arc::clone(&host.regions[0]));
+        assert!(
+            Moment::checkpoint(None, &shared, Continuation::None).is_none(),
+            "a region another holder can write declines"
         );
     }
 }
