@@ -402,11 +402,14 @@ fn ladder_cost(g: &Guest, module: &temen_ir::Module, turns: u64, window: u64) {
         if reached < at {
             break;
         }
-        let Some(snap) = run.snapshot() else {
+        let snap = match run.snapshot() {
+            Ok(snap) => snap,
             // A guest that compiles a `Jit` unit (forth defines its words that way) stops being
             // checkpointable there (#2015); the rungs before it are still worth reporting.
-            println!("  ladder            not checkpointable from turn {at}");
-            break;
+            Err(why) => {
+                println!("  ladder            not checkpointable from turn {at}: {why:?}");
+                break;
+            }
         };
         flat += snap.byte_len();
         let t0 = Instant::now();
