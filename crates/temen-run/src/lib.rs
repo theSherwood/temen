@@ -1855,7 +1855,8 @@ fn hg_restore(host: &mut Host, host_mutex: Mutex<Host>) {
 /// leaves the run byte-identical.
 ///
 /// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): a
-/// separate-module nested child, a nested child's host state, a detached child (#1692, #1361). The embedder then thaws on the interpreter, which carries all of it.
+/// separate-module nested child, a nested child's host state (#1692), and the detached children
+/// [`jit_relaunches`] refuses. The embedder then thaws on the interpreter, which carries all of it.
 fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
     if !host.is_durable() {
         return Ok(());
@@ -1864,8 +1865,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
         .frozen_nested()
         .iter()
         .any(|n| n.module_digest.is_some())
-        || !host.frozen_child_state().is_empty()
-        || !host.frozen_detached().is_empty();
+        || !host.frozen_child_state().is_empty();
     if jit_unrepresentable {
         return Err(temen_jit::JitError::Unsupported(
             "durable JIT thaw: residue the JIT cannot re-create (#1692)",
@@ -1963,43 +1963,73 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 "durable JIT thaw: child powerbox",
             ));
         }
-        out.push(temen_jit::DetachedSeed {
-            slot,
-            entry: launch.entry,
-            mapped_log2: r.memory_log2,
-            reserved_log2,
-            funcs: r.funcs,
-            types: r.types,
-            shadow: r
-                .shadow
-                .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
-            image: window.bytes().to_vec(),
-            prots: window.dense_prots().into_iter().map(window_prot).collect(),
-            // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
-            child: unsafe { gc.assume_init() },
-            window: window_lease,
-            children,
-            residue,
+        out.push(temen_jit::DetachedSeed::Captured(Box::new(
+            temen_jit::CapturedSeed {
+                slot,
+                entry: launch.entry,
+                mapped_log2: r.memory_log2,
+                reserved_log2,
+                funcs: r.funcs,
+                types: r.types,
+                shadow: r
+                    .shadow
+                    .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
+                image: window.bytes().to_vec(),
+                prots: window.dense_prots().into_iter().map(window_prot).collect(),
+                // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
+                child: unsafe { gc.assume_init() },
+                window: window_lease,
+                children,
+                residue,
+            },
+        )));
+    }
+    // #2041 — and each child that had completed but was not joined, as its outcome. The JIT keeps
+    // one join table per domain, so its spawner (`parent_task`) needs no table of its own:
+    // `jit_relaunches` has checked that no two of a domain's children claim one slot.
+    let completed = host.frozen_detached().to_vec();
+    host.set_frozen_detached(Vec::new());
+    for fd in completed {
+        let (result, trap) = match fd.completed_result {
+            Ok(v) => (v, 0),
+            Err(t) => (0, t.code()),
+        };
+        out.push(temen_jit::DetachedSeed::Completed {
+            slot: fd.slot,
+            result,
+            trap,
         });
     }
     Ok(out)
 }
 
-/// #2010 — whether the JIT can re-launch every detached child a restore seeded on `host`, at every
-/// depth: its program is granted, and its own powerbox holds no residue but its captured children,
-/// its fibers (#2031) and its `thread.spawn` vCPUs. Nested and completed children, and child state
-/// the JIT re-creates only for a run's root (`jit_durable_enter`), so a child carrying any of them
+/// #2010 — whether the JIT can re-create every detached child a restore seeded on `host`, at every
+/// depth: its program is granted, and its own powerbox holds no residue but its children (captured
+/// or completed, #2041), its fibers (#2031) and its `thread.spawn` vCPUs. Nested children and child
+/// state the JIT re-creates only for a run's root (`jit_durable_enter`), so a child carrying either
 /// refuses rather than drops it.
+///
+/// #2041 — and no two of a domain's detached children claim one join slot. The interpreter keeps a
+/// join table per spawning vCPU, so two children of different spawners can share a slot number; the
+/// JIT keeps one per domain, where both handles would name one child.
 fn jit_relaunches(host: &Host) -> bool {
-    host.thawed_detached().iter().all(|td| {
-        let c = &td.host;
-        host.durable_module_by_digest(&td.launch.digest).is_some()
-            && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
-            && c.frozen_nested().is_empty()
-            && c.frozen_detached().is_empty()
-            && c.frozen_child_state().is_empty()
-            && jit_relaunches(c)
-    })
+    let mut slots: Vec<usize> = host
+        .thawed_detached()
+        .iter()
+        .map(|td| td.slot)
+        .chain(host.frozen_detached().iter().map(|fd| fd.slot))
+        .collect();
+    slots.sort_unstable();
+    let distinct = slots.windows(2).all(|w| w[0] != w[1]);
+    distinct
+        && host.thawed_detached().iter().all(|td| {
+            let c = &td.host;
+            host.durable_module_by_digest(&td.launch.digest).is_some()
+                && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
+                && c.frozen_nested().is_empty()
+                && c.frozen_child_state().is_empty()
+                && jit_relaunches(c)
+        })
 }
 
 /// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the

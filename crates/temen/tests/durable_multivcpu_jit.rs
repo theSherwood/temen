@@ -1286,19 +1286,21 @@ fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
 }
 
 /// #1690 — residue the JIT cannot re-create yet is refused whole, and left on the `Host` so the
-/// embedder can thaw on the interpreter instead: never silently dropped.
+/// embedder can thaw on the interpreter instead: never silently dropped. Here, two completed detached
+/// children of different spawners at one join slot: the interpreter's join tables are per vCPU, the
+/// JIT's one per domain (#2041).
 #[test]
 fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
     let inst = instrument();
     let mut h = Host::new();
     h.set_durable(true);
     let clk = h.grant_clock();
-    let detached = temen_interp::FrozenDetached {
-        parent_task: 0,
+    let detached = [0, 3].map(|parent_task| temen_interp::FrozenDetached {
+        parent_task,
         slot: 0,
         completed_result: Ok(7),
-    };
-    h.set_frozen_detached(vec![detached]);
+    });
+    h.set_frozen_detached(detached.to_vec());
     let r = temen_run::jit_cap_run(
         &inst,
         0,
@@ -1316,7 +1318,7 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
     );
     assert_eq!(
         h.frozen_detached(),
-        &[detached],
+        &detached,
         "and the residue is still there"
     );
 }

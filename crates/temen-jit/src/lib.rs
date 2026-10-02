@@ -1936,9 +1936,18 @@ pub struct DetachedCapture {
     pub residue: DurableResidue,
 }
 
-/// #1361 step 4 — a captured detached child a JIT **thaw** re-launches (see
-/// [`CompiledModule::set_detached_seed`]).
-pub struct DetachedSeed {
+/// #1361 step 4 — a detached child a JIT **thaw** re-creates in its parent's nursery, at the join
+/// slot it was spawned at (see [`CompiledModule::set_detached_seed`]).
+pub enum DetachedSeed {
+    /// One the freeze captured live: re-launched under `REWINDING`.
+    Captured(Box<CapturedSeed>),
+    /// #2041 — one that had completed but was not joined: its `join` outcome, which the parent's
+    /// rewound `join` reloads, as the interpreter's thaw delivers it.
+    Completed { slot: usize, result: i64, trap: i64 },
+}
+
+/// #1361 step 4 — what a captured detached child's re-launch needs.
+pub struct CapturedSeed {
     pub slot: usize,
     pub entry: u32,
     pub mapped_log2: u8,
@@ -1957,7 +1966,7 @@ pub struct DetachedSeed {
     /// the budget that paid, and the bytes it paid. Handed back when the thawed child ends. `None`
     /// when the parent holds no handle on that budget.
     pub window: Option<(i32, u64)>,
-    /// #2010 — its own captured children, re-launched into its nursery before it runs.
+    /// #2010 — its own children, re-created in its nursery before it runs.
     pub children: Vec<DetachedSeed>,
     /// Its [`DetachedCapture::residue`], re-created before its root runs: its fibers re-seeded in its
     /// table (#2031), and its `thread.spawn` vCPUs re-spawned into its domain, each rewinding from its
@@ -4266,8 +4275,8 @@ impl CompiledModule {
         std::mem::take(&mut self.detached_out)
     }
 
-    /// #1361 step 4 — the captured detached children the next (thaw) run re-launches, each at its
-    /// recorded join slot, before the root re-enters under `REWINDING`.
+    /// #1361 step 4 — the detached children the next (thaw) run re-creates, each at its recorded join
+    /// slot, before the root re-enters under `REWINDING`.
     pub fn set_detached_seed(&mut self, seed: Vec<DetachedSeed>) {
         self.detached_seed = seed;
     }
@@ -4740,9 +4749,10 @@ impl CompiledModule {
             }
         }
 
-        // #1361 step 4 — re-launch the captured detached children at their recorded slots, each on its
-        // own restored window under `REWINDING`, before the root re-enters: its rewound `join` then
-        // parks on them exactly as before the cut.
+        // #1361 step 4 — re-create the detached children at their recorded slots before the root
+        // re-enters: a captured one re-launched on its own restored window under `REWINDING`, a
+        // completed one (#2041) as its outcome. The root's rewound `join` then parks on, or reloads,
+        // each exactly as before the cut.
         #[cfg(fiber_rt)]
         if (*this).durable && !(*this).detached_seed.is_empty() {
             let seed = std::mem::take(&mut (*this).detached_seed);
