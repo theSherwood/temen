@@ -13,7 +13,7 @@
 //! runs** — proof the image was truly replaced — so the run returns `42` and the sink holds `"EXEC"`.
 
 use std::sync::Arc;
-use temen_interp::{run_with_host, Host, StreamRole, Value};
+use temen_interp::{run_with_host, Host, PreparedModule, StreamRole, Value};
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(text).expect("parse");
@@ -110,6 +110,43 @@ fn exec_module_replaces_the_image_with_a_separate_command_module() {
         &bytes, b"EXEC",
         "the exec'd command wrote through the inherited stdout"
     );
+}
+
+/// #2087 — a command **prepared once** ([`PreparedModule`]) execs from every host it is granted into,
+/// as a plain grant does: a toolchain keeps its commands prepared across builds, each build's host a
+/// fresh one.
+#[test]
+fn a_command_prepared_once_execs_from_every_host_it_is_granted_into() {
+    let guest = module(GUEST);
+    let cmd = PreparedModule::new(module(CMD));
+    for _ in 0..2 {
+        let mut host = Host::new();
+        host.set_self_module(&guest);
+        let sink = host.shared_stdout();
+        let inst = host.grant_instantiator(0, 1u64 << 12);
+        let stream = host.grant_stream(StreamRole::Out);
+        let cmd_h = host.grant_prepared(&cmd);
+        let mut fuel = 40_000_000u64;
+        let r = run_with_host(
+            &guest,
+            0,
+            &[
+                Value::I32(inst),
+                Value::I64(cmd_h as i64),
+                Value::I32(stream),
+            ],
+            &mut fuel,
+            &mut host,
+        )
+        .expect("run");
+        assert_eq!(
+            r,
+            vec![Value::I64(42)],
+            "the command ran in the guest's place"
+        );
+        let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(&bytes, b"EXEC", "and wrote through the inherited stdout");
+    }
 }
 
 /// #1080 — the **bytecode engine image-replaces natively** (no tree-walker fallback), the path the

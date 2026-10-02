@@ -23421,6 +23421,23 @@ impl ModuleGrant {
 #[derive(Clone)]
 pub struct ExecModule(ModuleGrant);
 
+/// #2087 — a module ready to grant: its grant record derived once, so [`Host::grant_prepared`] grants
+/// it into any number of hosts without deriving it again. A host that grants the same modules run
+/// after run (a toolchain's commands) prepares them once.
+#[derive(Clone)]
+pub struct PreparedModule(ModuleGrant);
+
+impl PreparedModule {
+    pub fn new(m: Arc<Module>) -> PreparedModule {
+        PreparedModule(ModuleGrant::of(m, false))
+    }
+
+    /// The module it grants.
+    pub fn module(&self) -> &Arc<Module> {
+        &self.0.module
+    }
+}
+
 /// The §4 nested-child module-identity digest: a content hash of a grant's **semantic image**
 /// (functions, memory, data, exports), computed the same way at freeze-grant and thaw-grant so a
 /// separate-module child re-attaches against the matching re-granted module. Debug info and
@@ -28224,8 +28241,18 @@ impl Host {
     /// keeps `m` itself, so a grant of the **running** module (`set_self_module`'s Arc) stays
     /// recognizable as such ([`Host::is_self_module`]).
     fn grant_module_shared(&mut self, m: Arc<Module>, durable: bool) -> i32 {
+        self.grant_record(ModuleGrant::of(m, durable))
+    }
+
+    /// Grant a prepared module ([`PreparedModule`]): the `Module` capability [`Host::grant_module`]
+    /// mints, without deriving its record again.
+    pub fn grant_prepared(&mut self, m: &PreparedModule) -> i32 {
+        self.grant_record(m.0.clone())
+    }
+
+    fn grant_record(&mut self, g: ModuleGrant) -> i32 {
         let id = self.modules.len() as u32;
-        self.modules.push(ModuleGrant::of(m, durable));
+        self.modules.push(g);
         self.grant(cap_id::MODULE, Binding::Module(id))
     }
 

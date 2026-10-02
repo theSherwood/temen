@@ -25,7 +25,7 @@
 
 use std::alloc::Layout;
 
-use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
+use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
@@ -4077,8 +4077,10 @@ pub fn bash_exec_with(
     let Some(compiled) = bytecode::compile_reserved(m) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        bins.iter().map(|&(path, cm)| (cm, vec![path])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = bins
+        .iter()
+        .map(|&(path, cm)| (prepare(cm), vec![path]))
+        .collect();
     bash_run_over_compiled(m, compiled, argv, stdin, &commands)
 }
 
@@ -4100,7 +4102,7 @@ fn bash_run_over_compiled(
     compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
     argv: &[&[u8]],
     stdin: &[u8],
-    commands: &[(&temen_ir::Module, Vec<&str>)],
+    commands: &[(PreparedModule, Vec<&str>)],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         trap: None,
@@ -4222,7 +4224,7 @@ struct PosixRun<'a> {
     env: &'a [(&'a str, &'a str)],
     stdin: &'a [u8],
     /// The commands its processes can `execve`: each module is granted once, at every path listed.
-    commands: &'a [(&'a temen_ir::Module, Vec<&'a str>)],
+    commands: &'a [(PreparedModule, Vec<&'a str>)],
     /// #1122 — an interactive session: the #797 controlling terminal (keystrokes arrive via
     /// `feed_terminal`, from another wasm-thread instantiation over the shared memory) and the
     /// external-wake doorbell, so the cooperative pump blocks its Worker when every process waits on
@@ -4241,6 +4243,13 @@ struct PosixRun<'a> {
 /// ops), `grant` wiring what the native `bash_probe` and the nim lane's runs do. It serves no heap
 /// (`0,0`): each program brings its own allocator, which grows into the window's reserved tail through
 /// the core's memory ops. It owns stdin (`read(0)`) and stdout/stderr.
+/// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
+/// [`Host::grant_module`] would grant it. A caller that grants the same commands run after run keeps
+/// them prepared instead (a nim build's toolchain, #2087).
+fn prepare(m: &temen_ir::Module) -> PreparedModule {
+    PreparedModule::new(std::sync::Arc::new(m.clone()))
+}
+
 fn posix_host_build(
     m: &temen_ir::Module,
     run: &PosixRun,
@@ -4280,8 +4289,8 @@ fn posix_host_build(
         .collect();
     host.set_import_bindings(bindings);
     for (cm, paths) in run.commands {
-        let ch = host.grant_module(cm);
-        let wl = cm.memory.map_or(0, |mc| mc.size_log2);
+        let ch = host.grant_prepared(cm);
+        let wl = cm.module().memory.map_or(0, |mc| mc.size_log2);
         for path in paths {
             posix.register_executable(path, ch, wl);
         }
@@ -8234,8 +8243,10 @@ pub extern "C" fn temen_run_bash(
     // entries): bash runs, and an unresolvable command reports `not found` — the same degradation as
     // the shell card. Each command's window log2 comes from its own decoded module.
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = owned
+        .iter()
+        .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
+        .collect();
     let out = bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &commands);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
@@ -8302,8 +8313,10 @@ pub extern "C" fn temen_bash_session(
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = owned
+        .iter()
+        .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
+        .collect();
     let env = bash_env(true);
     let session = PosixRun {
         argv: &[b"bash", b"-i"],
@@ -8479,8 +8492,10 @@ pub extern "C" fn temen_bash_coop_open(
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = owned
+        .iter()
+        .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
+        .collect();
     let env = bash_env(true);
     let session = PosixRun {
         argv: &[b"bash", b"-i"],

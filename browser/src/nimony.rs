@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint, LeafEmitter, LeafOffer, TierUpConfig};
-use temen_interp::Trap;
+use temen_interp::{PreparedModule, Trap};
 use temen_ir::Module;
 
 use crate::{
-    blob_entries, posix_host_build, stash, PosixRun, LAST_STATUS, STATUS_DECODE_ERR, STATUS_EXIT,
-    STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    blob_entries, posix_host_build, prepare, stash, PosixRun, LAST_STATUS, STATUS_DECODE_ERR,
+    STATUS_EXIT, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 
 /// What a build left: how the driver ended, what it printed, what the run held at its end, and the
@@ -45,7 +45,7 @@ pub struct NimBuild {
 /// carry it.
 pub fn nim_open(
     driver: &Module,
-    commands: &[(&Module, Vec<&str>)],
+    commands: &[(PreparedModule, Vec<&str>)],
     files: &[(&str, &[u8])],
     argv: &[&[u8]],
     cwd: &str,
@@ -110,7 +110,11 @@ pub fn nim_build(
         true => Some(Arc::new(|_: &LeafOffer| true)),
         false => None,
     };
-    let (mut run, posix) = nim_open(driver, commands, files, argv, cwd, leaf)?;
+    let commands: Vec<(PreparedModule, Vec<&str>)> = commands
+        .iter()
+        .map(|(m, paths)| (prepare(m), paths.clone()))
+        .collect();
+    let (mut run, posix) = nim_open(driver, &commands, files, argv, cwd, leaf)?;
     let (mut ran, mut resumes) = (0, 0);
     let end = loop {
         match run.run() {
@@ -306,6 +310,59 @@ pub unsafe extern "C" fn temen_nim_module_suffix(path_ptr: *const u8, path_len: 
 
 /// The memfs of the most recent nimony build, which [`temen_nim_file`] reads.
 static mut LAST_BUILD: Option<temen_posix::Posix> = None;
+
+/// #2087 — a build's toolchain, decoded and prepared: nimony, and its commands with their paths.
+struct Toolchain {
+    driver_bytes: Vec<u8>,
+    cmds_bytes: Vec<u8>,
+    driver: Module,
+    commands: Vec<(Vec<String>, PreparedModule)>,
+}
+
+/// The toolchain the last build opened ([`toolchain`]).
+static mut TOOLCHAIN: Option<Toolchain> = None;
+
+/// The toolchain of `driver` and `cmds` (a [`temen_nim_open`]'s), kept in [`TOOLCHAIN`].
+#[allow(static_mut_refs)]
+fn toolchain(driver: &[u8], cmds: &[u8]) -> Result<&'static Toolchain, i32> {
+    // SAFETY: single-threaded wasm; the cache is touched only here, and a session holds what it
+    // granted by `Arc`, never by borrow.
+    toolchain_in(
+        unsafe { &mut *core::ptr::addr_of_mut!(TOOLCHAIN) },
+        driver,
+        cmds,
+    )
+}
+
+/// The toolchain of `driver` and `cmds`: `slot`'s when its bytes are these, else decoded and prepared
+/// now and kept in `slot` for the next build. Every build of the nim card passes the same ones, so
+/// only its first decodes and prepares them (#2087).
+fn toolchain_in<'s>(
+    slot: &'s mut Option<Toolchain>,
+    driver: &[u8],
+    cmds: &[u8],
+) -> Result<&'s Toolchain, i32> {
+    if !slot
+        .as_ref()
+        .is_some_and(|t| t.driver_bytes == driver && t.cmds_bytes == cmds)
+    {
+        let decode = |b| temen_encode::decode_module(b).map_err(|_| STATUS_DECODE_ERR);
+        let commands = blob_entries(cmds)
+            .into_iter()
+            .map(|(paths, b)| {
+                let m = PreparedModule::new(Arc::new(decode(b)?));
+                Ok((paths.lines().map(String::from).collect(), m))
+            })
+            .collect::<Result<_, i32>>()?;
+        *slot = Some(Toolchain {
+            driver_bytes: driver.to_vec(),
+            cmds_bytes: cmds.to_vec(),
+            driver: decode(driver)?,
+            commands,
+        });
+    }
+    slot.as_ref().ok_or(STATUS_DECODE_ERR)
+}
 /// The file the most recent [`temen_nim_file`] read ([`temen_nim_file_ptr`]).
 static mut FILE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
@@ -358,17 +415,11 @@ pub unsafe extern "C" fn temen_nim_open(
         )
     };
     let status = (|| {
-        let driver = temen_encode::decode_module(driver).map_err(|_| STATUS_DECODE_ERR)?;
-        let decoded: Vec<(Vec<&str>, Module)> = blob_entries(cmds)
-            .into_iter()
-            .map(|(paths, b)| {
-                let m = temen_encode::decode_module(b).map_err(|_| STATUS_DECODE_ERR)?;
-                Ok((paths.lines().collect(), m))
-            })
-            .collect::<Result<_, i32>>()?;
-        let commands: Vec<(&Module, Vec<&str>)> = decoded
+        let tc = toolchain(driver, cmds)?;
+        let commands: Vec<(PreparedModule, Vec<&str>)> = tc
+            .commands
             .iter()
-            .map(|(paths, m)| (m, paths.clone()))
+            .map(|(paths, m)| (m.clone(), paths.iter().map(String::as_str).collect()))
             .collect();
         let files = blob_entries(files);
         // Each argument ends at its NUL; what follows the last one is not an argument.
@@ -378,7 +429,7 @@ pub unsafe extern "C" fn temen_nim_open(
         let leaves = crate::Leaves::default();
         // A nim build runs on the threads cdylib, over shared memory.
         let emit = crate::leaf_emitter(Arc::clone(&leaves), suspend != 0, true);
-        let (run, posix) = nim_open(&driver, &commands, &files, &argv, cwd, Some(emit))
+        let (run, posix) = nim_open(&tc.driver, &commands, &files, &argv, cwd, Some(emit))
             .ok_or(STATUS_UNSUPPORTED)?;
         // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
         unsafe {
@@ -427,4 +478,43 @@ pub unsafe extern "C" fn temen_nim_file(path_ptr: *const u8, path_len: usize) ->
 pub extern "C" fn temen_nim_file_ptr() -> *const u8 {
     // SAFETY: single-threaded wasm; a plain read of the slot.
     unsafe { (*core::ptr::addr_of!(FILE)).0 }
+}
+
+#[cfg(test)]
+mod toolchain_tests {
+    use super::*;
+
+    fn encoded(value: i64) -> Vec<u8> {
+        let text = format!(
+            "func () -> (i64) {{\nblock 0 () {{\n  vr = i64.const {value}\n  return vr\n  }}\n}}\n"
+        );
+        temen_encode::encode_module(&temen_text::parse_module(&text).expect("parse"))
+    }
+
+    /// #2087 — a build whose toolchain bytes are the last build's keeps its decoded, prepared
+    /// commands; other bytes are decoded and prepared afresh, and bytes that do not decode fail.
+    #[test]
+    fn a_build_with_the_last_builds_toolchain_keeps_it() {
+        let (one, two) = (encoded(1), encoded(2));
+        let cmds = crate::registry_blob(&[("bin/one\n/bin/one", one.as_slice())]);
+        let other = crate::registry_blob(&[("bin/one\n/bin/one", two.as_slice())]);
+        let mut slot = None;
+        let first = toolchain_in(&mut slot, &one, &cmds).expect("decodes");
+        assert_eq!(first.commands[0].0, ["bin/one", "/bin/one"]);
+        let kept = Arc::clone(first.commands[0].1.module());
+        let again = toolchain_in(&mut slot, &one, &cmds).expect("decodes");
+        assert!(
+            Arc::ptr_eq(again.commands[0].1.module(), &kept),
+            "the same bytes keep it"
+        );
+        let changed = toolchain_in(&mut slot, &one, &other).expect("decodes");
+        assert!(
+            !Arc::ptr_eq(changed.commands[0].1.module(), &kept),
+            "other bytes decode afresh"
+        );
+        assert_eq!(
+            toolchain_in(&mut slot, b"not a module", &cmds).err(),
+            Some(STATUS_DECODE_ERR)
+        );
+    }
 }
