@@ -2053,6 +2053,15 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
     }
 }
 
+/// A finished child's `join` outcome from its `(result, trap)` cell — its value, or its trap (#1674);
+/// `None` for a child not finished, or a trap cell that names no trap.
+fn join_outcome(outcome: Option<(i64, i64)>) -> Option<Result<i64, temen_interp::Trap>> {
+    outcome.and_then(|(result, trap)| match trap {
+        0 => Some(Ok(result)),
+        t => temen_interp::Trap::from_code(t).map(Err),
+    })
+}
+
 /// [`jit_detached_leave`] for one domain, whose powerbox is `host`: its captured and its completed
 /// children. The unreached ones go to `unreached`, as do a non-captured child's captured children:
 /// it rides no artifact, so their continuations would be lost. Its completed children are dropped,
@@ -2069,7 +2078,15 @@ fn detached_left(
     let mut completed = Vec::new();
     for h in harvest {
         if h.powerbox.is_null() {
-            continue; // a builder that shared no powerbox: nothing to carry (never the detached one)
+            // #2044 — a child a thaw delivered as completed, still unjoined: its outcome rides again.
+            if let Some(completed_result) = join_outcome(h.outcome) {
+                completed.push(temen_interp::FrozenDetached {
+                    parent_task: 0,
+                    slot: h.slot,
+                    completed_result,
+                });
+            }
+            continue;
         }
         // SAFETY: the harvest hands over the nursery's retained ref — one counted `Arc` to the
         // child's `Mutex<Host>`, built by `finish_child_build` — now ours.
@@ -2095,12 +2112,7 @@ fn detached_left(
             &child.lock().unwrap_or_else(|e| e.into_inner()),
             unreached,
         );
-        // A finished child's `join` outcome — its value, or its trap (#1674); `None` for a trap cell
-        // that names no trap, which stays unreached.
-        let outcome = h.outcome.and_then(|(result, trap)| match trap {
-            0 => Some(Ok(result)),
-            t => temen_interp::Trap::from_code(t).map(Err),
-        });
+        let outcome = join_outcome(h.outcome);
         let Some(capture) = h.capture else {
             unreached.extend(grand_captured.into_iter().map(pending_detached));
             match outcome {

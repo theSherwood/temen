@@ -138,6 +138,9 @@ struct Child {
     /// #2010 — the nursery this child spawns its own children through, if it has one (#1956; also
     /// held in [`Nursery::kids`]). A freeze reaches them through it, and its harvest nests theirs.
     kid: Option<std::sync::Arc<Nursery>>,
+    /// #2044 — a detached child a thaw delivered as completed ([`crate::DetachedSeed::Completed`]):
+    /// only its outcome exists, and a freeze before its `join` carries it again ([`Nursery::take_detached_harvest`]).
+    delivered: bool,
 }
 
 impl Child {
@@ -169,6 +172,7 @@ impl Child {
             retained: 0,
             nested: None,
             kid: None,
+            delivered: false,
         }
     }
 
@@ -181,6 +185,7 @@ impl Child {
             retained: 0,
             nested: None,
             kid: None,
+            delivered: false,
         }
     }
 }
@@ -1156,12 +1161,26 @@ impl Nursery {
     }
 
     /// #1361 step 4 — every unjoined durable detached child after a frozen run's teardown, with its
-    /// powerbox handed over, and (#2010) its own harvest nested in it.
+    /// powerbox handed over, and (#2010) its own harvest nested in it. #2044 — and every one a thaw
+    /// delivered as completed, as its outcome alone: it has no powerbox, window or children.
     fn take_detached_harvest(&self) -> Vec<crate::DetachedHarvest> {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         for (slot, c) in children.iter_mut().enumerate() {
             if c.joined {
+                continue;
+            }
+            if c.delivered {
+                out.push(crate::DetachedHarvest {
+                    slot,
+                    entry: 0,
+                    mapped_log2: 0,
+                    reserved_log2: 0,
+                    powerbox: core::ptr::null_mut(),
+                    capture: None,
+                    outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
+                    children: Vec::new(),
+                });
                 continue;
             }
             let Some(d) = c.done.durable.as_ref() else {
@@ -1203,6 +1222,14 @@ impl Nursery {
         let seed = match seed {
             crate::DetachedSeed::Completed { slot, result, trap } => {
                 self.seed_child_result(slot, result, trap);
+                if let Some(c) = self
+                    .children
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(slot)
+                {
+                    c.delivered = true;
+                }
                 return true;
             }
             crate::DetachedSeed::Captured(seed) => *seed,

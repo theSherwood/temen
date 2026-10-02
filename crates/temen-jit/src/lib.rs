@@ -1915,7 +1915,9 @@ pub struct DetachedHarvest {
     pub mapped_log2: u8,
     pub reserved_log2: u8,
     /// Its powerbox: the nursery's retained ref ([`GrantChild::retained_ctx`]) — one counted ref to
-    /// the child `Host`, which the embedder now owns and must release.
+    /// the child `Host`, which the embedder now owns and must release. Null for a child a thaw
+    /// delivered as completed (#2044): its `outcome` is all there is, and `entry` and the geometry
+    /// are unused.
     pub powerbox: *mut core::ffi::c_void,
     /// What it left, **iff** it unwound for the freeze.
     pub capture: Option<DetachedCapture>,

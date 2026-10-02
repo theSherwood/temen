@@ -1040,3 +1040,92 @@ fn a_captured_childs_completed_child_rides_its_freeze_on_every_engine() {
         Ok(NEST_TOTAL),
     );
 }
+
+/// #2044 — [`NEST_ROOT`] with a second fiber safepoint before its `join`: a thaw from the first can be
+/// armed to freeze again at the second, with the child still unjoined.
+fn refreeze_root() -> String {
+    let once = "  vs, vx = cont.resume vk vz2\n";
+    assert!(NEST_ROOT.contains(once));
+    NEST_ROOT.replace(
+        once,
+        &format!("{once}  vsp2 = i64.const 220000\n  vk2 = cont.new vf vsp2\n  vs2, vx2 = cont.resume vk2 vz2\n"),
+    )
+}
+
+/// #2044 — **a detached child a thaw delivered as completed rides the next freeze**, on every engine
+/// triple. The first freeze lands at the root's first fiber safepoint with [`QUICK_NEST`] finished
+/// and unjoined, so the artifact carries only its `join` outcome; the thaw delivers that outcome at
+/// the child's join slot and, armed again, freezes at the root's second safepoint, still before the
+/// `join`. That freeze must carry the outcome again, and every engine thaws it to the uninterrupted
+/// [`NEST_TOTAL`] — reloaded at the rewound `join`, not lost to a `ThreadFault`.
+#[test]
+fn a_delivered_completed_child_rides_a_second_freeze_on_every_engine() {
+    refreezes_every_engine(QUICK_NEST, Ok(NEST_TOTAL));
+}
+
+/// #2044 — **the same for a child that trapped**: its trap rides both freezes as its `join` outcome,
+/// and every engine's last thaw re-raises it from the root's rewound `join`.
+#[test]
+fn a_delivered_trapped_child_rides_a_second_freeze_on_every_engine() {
+    refreezes_every_engine(TRAP_NEST, Err(temen_ir::trap_code::UNREACHABLE));
+}
+
+/// Freeze [`refreeze_root`] over `child` (which ends at once) on each engine at its first fiber
+/// safepoint, thaw each artifact on each engine armed to freeze again at the second, and thaw each
+/// of those on each engine. Both freezes must carry the child as completed, and every last thaw
+/// answers `answer`, the uninterrupted run's.
+fn refreezes_every_engine(child: &str, answer: Answer) {
+    use Engine::*;
+    let confined = |src: &str| {
+        let m = transform_module_assume_confined(&temen_text::parse_module(src).expect("parse"))
+            .expect("transform");
+        temen_verify::verify_module(&m).expect("instrumented module verifies");
+        m
+    };
+    let (root, child) = (confined(&refreeze_root()), confined(child));
+    let mut wrong = Vec::new();
+    let mut runs = Vec::new();
+    for e in [Interp, Jit] {
+        let (mut host, args) = nest_powerbox(&child, 0, 1);
+        let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        match nest_run(e, &root, &args, &win, &mut host, None) {
+            Some((r, _)) if r == answer => runs.push(e),
+            Some((r, _)) => wrong.push(format!("uninterrupted on {e:?}: {r:?}")),
+            None => {} // a target without the JIT's child executor
+        }
+    }
+    for &first in &runs {
+        let (mut fhost, args) = nest_powerbox(&child, 0, 1);
+        let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        arm_freeze_after(&mut win, 1);
+        let (r, fsnap) = nest_run(first, &root, &args, &win, &mut fhost, None).expect("runs");
+        if (r, fhost.frozen_detached().len()) != (Ok(0), 1) {
+            wrong.push(format!(
+                "first freeze on {first:?}: {r:?}, carrying {} completed",
+                fhost.frozen_detached().len()
+            ));
+            continue;
+        }
+        let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
+        for &second in &runs {
+            let (mut shost, mut swin) = nest_restore(&art, &root, &child);
+            arm_freeze_after(&mut swin, 1);
+            let Some((r, ssnap)) = nest_run(second, &root, &args, &swin, &mut shost, None) else {
+                wrong.push(format!("{first:?} → second freeze on {second:?}: refused"));
+                continue;
+            };
+            if (r, shost.frozen_detached().len()) != (Ok(0), 1) {
+                wrong.push(format!(
+                    "{first:?} → second freeze on {second:?}: {r:?}, carrying {} completed",
+                    shost.frozen_detached().len()
+                ));
+                continue;
+            }
+            let art2 = temen_snapshot::freeze(&root, &ssnap, &shost).expect("serialize");
+            for w in nest_thaws(&art2, second, &root, &child, &args, &runs, answer) {
+                wrong.push(format!("{first:?} → {w}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

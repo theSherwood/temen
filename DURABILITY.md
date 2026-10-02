@@ -618,9 +618,13 @@ word `NORMAL` and thaw word `REWINDING`. The child records its program on its ow
 (the import-binding hook sets `self_module`), which is how the harvest names it by digest. A child
 that completed but was not joined rides as its `join` outcome (`FrozenDetached`), and a thaw
 re-creates it at its join slot as a finished child, so the rewound `join` reloads the value or
-re-raises the trap without spawning the child again (#2041). The interpreter keeps a join table per
-spawning vCPU and the JIT one per domain, so a JIT thaw where two of a domain's children claim one
-slot is refused whole.
+re-raises the trap without spawning the child again (#2041). A thawed run frozen again before that
+`join` carries the outcome again (#2044): the interpreter's spawner remembers each `(slot, task)` it
+was delivered, and the JIT's nursery marks the child, so the next freeze records it as completed as
+it did the first time. A thaw can be armed for that next freeze: a context's `REWINDING` is its own
+thaw word's, and the thaw leaves an `ARMED` freeze word alone (it clears only the `UNWINDING` the
+artifact froze with). The interpreter keeps a join table per spawning vCPU and the JIT one per
+domain, so a JIT thaw where two of a domain's children claim one slot is refused whole.
 
 **A durable child's own children (#2010).** A durable child that spawns gets a durable nursery of its
 own, so its children are durable too, and the freeze reaches them through it:
