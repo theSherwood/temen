@@ -922,6 +922,31 @@ mod frame_bound_tests {
         v.stack.push((0, 0, 0, 0, 0));
         assert_eq!(v.open_frame(regs + 2), Err(Trap::StackOverflow));
         assert_eq!(v.regs.len(), regs + 1, "nothing allocated");
+        // A tail call pushes no frame, so only the register file's bound applies (#2082).
+        assert_eq!(
+            v.grow_regs(regs + 2),
+            Ok(()),
+            "a tail call at the frame bound"
+        );
+        assert_eq!(v.grow_regs(MAX_REG_SLOTS + 1), Err(Trap::StackOverflow));
+        assert_eq!(v.regs.len(), regs + 2, "nothing allocated");
+    }
+
+    /// #2082 — the register file grows geometrically but stops at its ceiling: `Vec::resize` alone
+    /// would double past it, allocating up to twice the bound.
+    #[test]
+    fn the_register_file_grows_no_further_than_its_ceiling() {
+        assert_eq!(grown_capacity(100, 150, 1000), 200, "doubles");
+        assert_eq!(
+            grown_capacity(100, 300, 1000),
+            300,
+            "or takes what the window needs"
+        );
+        assert_eq!(
+            grown_capacity(600, 700, 1000),
+            1000,
+            "but stops at the ceiling, not 1200"
+        );
     }
 }
 
@@ -18093,20 +18118,47 @@ struct Vm {
 /// (The tree-walker's `MAX_CALL_DEPTH` is an oracle bound, not a production one.)
 const MAX_FRAMES: usize = 1 << 17;
 
-/// #1958 — the register file's ceiling in slots (16 bytes each: 256 MiB live, at most twice that
-/// allocated as the `Vec` grows), past which a call traps `StackOverflow`. A backstop for fat frames:
-/// the depth bound alone lets a many-slot function's recursion exhaust the host first. Only a chain
-/// averaging over 128 slots a frame meets it before [`MAX_FRAMES`].
-const MAX_REG_SLOTS: usize = 1 << 24;
+/// #1958 — the register file's ceiling in slots (16 bytes each: 512 MiB), past which a call traps
+/// `StackOverflow`. A backstop for fat frames: the depth bound alone lets a many-slot function's
+/// recursion exhaust the host first. Only a chain averaging over 256 slots a frame meets it before
+/// [`MAX_FRAMES`]. [`Vm::grow_regs`] grows the file no further, so this is also the most it ever
+/// allocates.
+///
+/// It sits above what real programs reach. A function's window is a slot per IR value, so Lua's
+/// `luaV_execute` takes 115,599 slots in the `ltests` build, and `cstack.lua`'s recursive `gsub`
+/// peaks below `21 << 20` slots when Lua's own C-stack limit stops it (#2082).
+const MAX_REG_SLOTS: usize = 1 << 25;
+const _: () = assert!(MAX_REG_SLOTS > 21 << 20);
+
+/// The capacity the register file grows to for a window ending at slot `need`: geometric, so a deep
+/// recursion grows it O(log n) times, but never past `max` (#2082).
+fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
+    need.max(capacity.saturating_mul(2)).min(max)
+}
 
 impl Vm {
-    /// Open a callee window ending at slot `need` for a call that pushes a return entry: the one place
-    /// a call grows the register file, bounded by [`MAX_FRAMES`] and [`MAX_REG_SLOTS`] (#1958).
+    /// Open a callee window ending at slot `need` for a call that pushes a return entry, bounded by
+    /// [`MAX_FRAMES`] and by the register file's own bound (#1958).
     fn open_frame(&mut self, need: usize) -> Result<(), Trap> {
-        if self.stack.len() >= MAX_FRAMES || need > MAX_REG_SLOTS {
+        if self.stack.len() >= MAX_FRAMES {
+            return Err(Trap::StackOverflow);
+        }
+        self.grow_regs(need)
+    }
+
+    /// Grow the register file to end at slot `need`: the one place it grows, for a call's window
+    /// ([`Self::open_frame`]) and a tail call's, which reuses its caller's base. Past
+    /// [`MAX_REG_SLOTS`] it traps `StackOverflow` before it allocates anything (#1958); below it, it
+    /// grows no further than the bound (#2082).
+    fn grow_regs(&mut self, need: usize) -> Result<(), Trap> {
+        if need > MAX_REG_SLOTS {
             return Err(Trap::StackOverflow);
         }
         if self.regs.len() < need {
+            if need > self.regs.capacity() {
+                let cap = grown_capacity(self.regs.capacity(), need, MAX_REG_SLOTS);
+                self.regs.reserve_exact(cap - self.regs.len());
+            }
             self.regs.resize(need, Reg::default());
         }
         Ok(())
@@ -18855,10 +18907,7 @@ impl Vm {
                     if module == 0 {
                         callprof::hit(callee);
                     }
-                    let need = base + c.progs[callee].nslots as usize;
-                    if self.regs.len() < need {
-                        self.regs.resize(need, Reg::default());
-                    }
+                    self.grow_regs(base + c.progs[callee].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
                         self.scratch.push(self.regs[base + *a as usize]);
@@ -18887,10 +18936,7 @@ impl Vm {
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
-                    let need = base + tm.progs[tfunc].nslots as usize;
-                    if self.regs.len() < need {
-                        self.regs.resize(need, Reg::default());
-                    }
+                    self.grow_regs(base + tm.progs[tfunc].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
                         self.scratch.push(self.regs[base + *a as usize]);
