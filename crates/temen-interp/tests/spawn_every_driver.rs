@@ -124,35 +124,37 @@ block 0 (v0: i64) {{
     )
 }
 
-/// A same-module op-17 parent `(i32 inst, i32 out, i32 err) -> i64` that re-grants `stdout` and
-/// `stderr` by name to func 1, which writes `O` and `E` through them and returns 7.
+/// A same-module op-17 parent `(i32 inst, i32 out, i32 err, i32 budget) -> i64` that re-grants
+/// `stdout` and `stderr` by name to func 1, spawned detached by the v1 record at 17408 and paid from
+/// `budget`. Func 1 resolves the two names from the module's data, writes `O` and `E` through them and
+/// returns 7.
 fn op17_same_module_granted() -> String {
-    let f0 = 1i64 << 32;
-    let f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64;
+    let child = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 2,
+        ..SpawnRec::v1(1)
+    };
     format!(
         "memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vout: i32, verr: i32) {{
-{g0}{g1}  vf0 = i64.const {f0}
-  vf8 = i64.const 65536
-  vf16 = i64.const {f16}
-  vf24 = i64.const 4294967295
-  vf32 = i64.const 0
-  vf40 = i64.const 16384
-  vf48 = i64.const 2
-{rec}  vrp = i64.const 17408
+data 17700 \"stdout\"
+data 17710 \"stderr\"
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vout: i32, verr: i32, vbud: i32) {{
+{g0}{g1}  vbf = i64.const 17436
+  i32.store vbf vbud
+  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
 {JOIN_OR_ERRNO}func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-{n0}  l6 = i64.const 6
-  ho = i64.const 16384
+  l6 = i64.const 6
+  ho = i64.const 17700
   hout = self.resolve ho l6
-{n1}  he = i64.const 16416
+  he = i64.const 17710
   herr = self.resolve he l6
-  bo = i64.const 16400
+  bo = i64.const 17720
   co = i32.const 79
   i32.store8 bo co
-  be = i64.const 16424
+  be = i64.const 17721
   ce = i32.const 69
   i32.store8 be ce
   one = i64.const 1
@@ -162,12 +164,10 @@ block 0 (v0: i64) {{
   return v7
   }}
 }}
-",
-        g0 = store_grant("g0", 16384, 16484, "stdout", "vout"),
-        g1 = store_grant("g1", 16400, 16494, "stderr", "verr"),
-        rec = store_record(17408),
-        n0 = store_name("c0", 16384, "stdout"),
-        n1 = store_name("c1", 16416, "stderr"),
+{rec}",
+        g0 = store_grant("g0", 17600, 17700, "stdout", "vout"),
+        g1 = store_grant("g1", 17616, 17710, "stderr", "verr"),
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -237,28 +237,22 @@ block 0 (vinst: i32, vmod: i32, vout: i32) {{
     )
 }
 
-/// A module-form op-17 parent `(i32 inst, i32 module, i64 budget) -> i64`: `module`'s entry 0 in a
-/// 4 KiB carve at 64 KiB, funded by `budget`.
+/// A module-form op-17 parent `(i32 inst, i32 module, i64 budget) -> i64`: `module`'s entry 0 in its
+/// declared window, spawned detached by the v1 record at 17536 and paid from `budget`.
 fn op17_module_funded() -> String {
-    let f16 = (12u64 | (0xFFFF_FFFFu64 << 32)) as i64;
     format!(
         "memory 17
 func (i32, i32, i64) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i64) {{
-  vf0 = i64.const 0
-  vf8 = i64.const 65536
-  vf16 = i64.const {f16}
-  vm = i64.extend_i32_u vmod
-  vsh = i64.const 32
-  vbs = i64.shl vbud vsh
-  vf24 = i64.or vm vbs
-  vf32 = i64.const 0
-  vf40 = i64.const 0
-  vf48 = i64.const 0
-{rec}  vrp = i64.const 17536
+  vma = i64.const 17560
+  i32.store vma vmod
+  vb = i32.wrap_i64 vbud
+  vba = i64.const 17564
+  i32.store vba vb
+  vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-{JOIN_OR_ERRNO}",
-        rec = store_record(17536),
+{JOIN_OR_ERRNO}{rec}",
+        rec = rec::segment(17536, &SpawnRec::v1(0)),
     )
 }
 
@@ -334,10 +328,15 @@ fn a_grant_carrying_same_module_record_spawn() {
     let m = module(&op17_same_module_granted());
     let setup = || {
         let mut h = Host::new();
+        h.set_self_module(&std::sync::Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 17);
         let o = h.grant_stream(StreamRole::Out);
         let e = h.grant_stream(StreamRole::Err);
-        (h, vec![Value::I32(i), Value::I32(o), Value::I32(e)])
+        let b = h.grant_budget(-1, 1 << 20, -1);
+        (
+            h,
+            vec![Value::I32(i), Value::I32(o), Value::I32(e), Value::I32(b)],
+        )
     };
     let want = Ran {
         result: Ok(vec![Value::I64(7)]),
