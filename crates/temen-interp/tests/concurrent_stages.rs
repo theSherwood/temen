@@ -390,8 +390,17 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
 }
 "#;
 
-#[test]
-fn two_detached_stages_pipe_through_a_shared_region_ring() {
+/// The run's entry: the tree-walker, or the bytecode entry.
+type Entry = fn(
+    &temen_ir::Module,
+    temen_ir::FuncIdx,
+    &[Value],
+    &mut u64,
+    &mut Host,
+) -> Result<Vec<Value>, temen_interp::Trap>;
+
+/// Run [`DETACHED_PIPELINE_PARENT`] over [`DETACHED_STAGES`] through `entry`.
+fn detached_pipeline(entry: Entry) -> Vec<Value> {
     let a = temen_text::parse_module(DETACHED_PIPELINE_PARENT).expect("parse parent");
     temen_verify::verify_module(&a).expect("verify parent");
     let b = temen_text::parse_module(DETACHED_STAGES).expect("parse stages");
@@ -402,7 +411,7 @@ fn two_detached_stages_pipe_through_a_shared_region_ring() {
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (2 << 17) as i64, -1); // exactly two 2^17 windows
     let mut fuel = 50_000_000u64;
-    let r = run_with_host(
+    entry(
         &a,
         0,
         &[
@@ -414,36 +423,27 @@ fn two_detached_stages_pipe_through_a_shared_region_ring() {
         &mut fuel,
         &mut host,
     )
-    .expect("no trap, no hang");
+    .expect("no trap, no hang")
+}
+
+#[test]
+fn two_detached_stages_pipe_through_a_shared_region_ring() {
     assert_eq!(
-        r,
+        detached_pipeline(run_with_host),
         vec![Value::I64(410)],
         "the same ring, between two windows nobody's parent can read — private memory \
          and an explicit shared channel compose"
     );
 }
 
-/// The bytecode entry serves the pipeline identically via the standing oracle fallback
-/// (Instantiator ops decline to compile → whole-module tree-walk).
+/// The bytecode entry runs the detached pipeline identically to the tree-walker.
 #[test]
 fn the_bytecode_entry_runs_the_pipeline_identically() {
-    let m = temen_text::parse_module(PIPELINE).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let m = Arc::new(m);
-    let mut host = Host::new();
-    host.set_self_module(&m);
-    let hi = host.grant_instantiator(0, 1u64 << 19);
-    let ha = host.grant_address_space(0, 1u64 << 19);
-    let mut fuel = 50_000_000u64;
-    let r = temen_interp::run_with_host_fast(
-        &m,
-        0,
-        &[Value::I32(hi), Value::I32(ha)],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("no trap, no hang");
-    assert_eq!(r, vec![Value::I64(410)], "identical to the tree-walk run");
+    assert_eq!(
+        detached_pipeline(temen_interp::run_with_host_fast),
+        vec![Value::I64(410)],
+        "identical to the tree-walk run"
+    );
 }
 
 #[test]

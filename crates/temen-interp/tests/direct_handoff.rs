@@ -6,12 +6,17 @@
 //! worker wake, no reply round-trip. The invariant is **handoff-on ≡ handoff-off** on observable
 //! results and served counts (transport choice may never change semantics, §9/§10.2).
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{run_with_host, Host, Value};
+use temen_ir::SpawnRec;
 
 /// One module, three functions: func 0 is the root caller, func 1 is a child **serve loop** (parks
 /// at `svc.wait`, serves, loops), func 2 is the `add` handler behind the child's `adder` offer. The
-/// root spawns the child, takes a live offer over it, and calls it **twice**: the first call parks
+/// root spawns the child detached (the record at 17536, paid from the `Budget` `v1`), takes a live
+/// offer over it, and calls it **twice**: the first call parks
 /// the root (the child hasn't reached `svc.wait` yet), the child serves it and re-parks — so the
 /// **second** call finds the serve loop parked and takes the handoff path when it is enabled. Both
 /// results are the same with handoff on or off: add(40,2) + add(10,3) = 55.
@@ -21,29 +26,12 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vrb = i64.const 17564
+  i32.store vrb v1
+  vrp = i64.const 17536
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
@@ -76,8 +64,8 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// Like [`HANDOFF_CALLER`] but the `add` handler **parks mid-serve** (a 2 ms timed `atomic.wait`
-/// that times out) before returning. Under handoff the second call donates its thread, the handler
+/// Like [`HANDOFF_CALLER`] (its record at 17600) but the `add` handler **parks mid-serve** (a 2 ms
+/// timed `atomic.wait` on a word above the child's NULL guard, which times out) before returning. Under handoff the second call donates its thread, the handler
 /// parks mid-handoff — so there is no inline reply and the caller falls back to parking on the
 /// ticket exactly as the enqueue path would (4d.2), completing when the handler's timer resumes it.
 /// Same result, on or off.
@@ -87,29 +75,12 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 65536
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vrb = i64.const 17628
+  i32.store vrb v1
+  vrp = i64.const 17600
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
@@ -136,7 +107,7 @@ block 1 () {
 
 func (i64, i64) -> (i64) {
 block 0 (va: i64, vb: i64) {
-  vaddr = i64.const 8
+  vaddr = i64.const 17408
   vexp = i32.const 0
   vto = i64.const 2000000
   vst = i32.atomic.wait vaddr vexp vto
@@ -154,8 +125,20 @@ fn run_handoff(
     host.set_self_module(module);
     host.set_handoff(handoff);
     let h = host.grant_instantiator(0, 1u64 << 17);
+    let b = host.grant_budget(-1, 1 << 20, -1);
     let mut fuel = 5_000_000u64;
-    run_with_host(module, 0, &[Value::I32(h)], &mut fuel, &mut host)
+    run_with_host(
+        module,
+        0,
+        &[Value::I32(h), Value::I32(b)],
+        &mut fuel,
+        &mut host,
+    )
+}
+
+/// `src` with the v1 record that spawns its serve loop (func 1) at `at`.
+fn with_record(src: &str, at: u64) -> String {
+    format!("{src}{}", rec::segment(at, &SpawnRec::v1(1)))
 }
 
 /// **4d.1 — run-to-completion handoff ≡ enqueue+park.** The same program serves its second live
@@ -164,7 +147,7 @@ fn run_handoff(
 #[test]
 fn direct_handoff_matches_enqueue_park_run_to_completion() {
     let m = Arc::new({
-        let m = temen_text::parse_module(HANDOFF_CALLER).expect("parse");
+        let m = temen_text::parse_module(&with_record(HANDOFF_CALLER, 17536)).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         m
     });
@@ -187,7 +170,8 @@ fn direct_handoff_matches_enqueue_park_run_to_completion() {
 #[test]
 fn direct_handoff_matches_enqueue_park_with_a_parking_handler() {
     let m = Arc::new({
-        let m = temen_text::parse_module(HANDOFF_PARKING_CALLER).expect("parse");
+        let m =
+            temen_text::parse_module(&with_record(HANDOFF_PARKING_CALLER, 17600)).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         m
     });

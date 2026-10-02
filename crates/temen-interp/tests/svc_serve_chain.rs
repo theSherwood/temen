@@ -7,10 +7,14 @@
 //! is a general serving-correctness bug (a front-end server delegating to a back-end is the common
 //! jacl shape), reproduced here with zero durability.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 use temen_interp::{run_with_host, Host, Trap, Value};
+use temen_ir::SpawnRec;
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(text).expect("parse");
@@ -24,35 +28,22 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
 /// the reply threads back C2 -> C1's handler -> root, which returns 107. Child entries take the
 /// `(i64)` starter arg the spawn-ABI enforces; C1 uses `i32.wrap_i64` on it (no durable transform
 /// here, so conversions are fine) to get the `i32` instantiator handle for spawning C2.
+///
+/// Both spawns are detached, by the records [`chain`] appends: root pays for C1 from the `Budget`
+/// `v1`, and C1 pays for C2 from its own `"budget"`.
 const CHAIN: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
 type 1 interface { call: 0 }
 export 0 interface "leaf" 1 { call: 1 }
 export 1 interface "fwd" 1 { call: 3 }
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=2 off=262144 sl=18 quota=0
-  q0v0 = i64.const 8589934592
-  q0v1 = i64.const 262144
-  q0v2 = i64.const -4294967278
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  vc1 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+data 17408 "budget"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vrb = i64.const 17564
+  i32.store vrb v1
+  vrp = i64.const 17536
+  vc1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vexp = i64.const 1
   vh1 = call.cap 6 14 (i32, i64) -> (i32) v0 (vc1, vexp)
   varg = i64.const 7
@@ -70,27 +61,13 @@ block 0 (vx: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vh = i32.wrap_i64 v0
-  ; spawn via record (op 17): entry=4 off=131072 sl=17 quota=0
-  q1v0 = i64.const 17179869184
-  q1v1 = i64.const 131072
-  q1v2 = i64.const -4294967279
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
-  vc2 = call.cap 6 17 (i64) -> (i32) vh (q1a0)
+  vnp = i64.const 17408
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  vrb = i64.const 17692
+  i32.store vrb vb
+  vrp = i64.const 17664
+  vc2 = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vexp = i64.const 0
   vh2 = call.cap 6 14 (i32, i64) -> (i32) vh (vc2, vexp)
   vk = i64.const 81984
@@ -119,6 +96,15 @@ block 0 (v0: i64) {
 }
 "#;
 
+/// [`CHAIN`] with its spawn records: C1 (func 2) at 17536 and C2 (func 4) at 17664.
+fn chain() -> String {
+    format!(
+        "{CHAIN}{}{}",
+        rec::segment(17536, &SpawnRec::v1(2)),
+        rec::segment(17664, &SpawnRec::v1(4))
+    )
+}
+
 /// Drive the chain on a worker thread under a wall-clock **watchdog** (ISSUES.md I52).
 ///
 /// The forwarding-chain rendezvous can, on the slower/serialized macOS + Windows CI runners, hit a
@@ -138,12 +124,19 @@ block 0 (v0: i64) {
 fn run_chain_with_watchdog() -> Result<Vec<Value>, Trap> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let m = module(CHAIN);
+        let m = module(&chain());
         let mut host = Host::new();
         host.set_self_module(&m);
         let ih = host.grant_instantiator(0, 1u64 << 19);
+        let hb = host.grant_budget(-1, 4 << 20, -1);
         let mut fuel = 20_000_000u64;
-        let r = run_with_host(&m, 0, &[Value::I32(ih)], &mut fuel, &mut host);
+        let r = run_with_host(
+            &m,
+            0,
+            &[Value::I32(ih), Value::I32(hb)],
+            &mut fuel,
+            &mut host,
+        );
         // The receiver is gone if the watchdog already fired; the send error is expected there.
         let _ = tx.send(r);
     });
