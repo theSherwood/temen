@@ -141,6 +141,9 @@ struct Child {
     /// #2044 — a detached child a thaw delivered as completed ([`crate::DetachedSeed::Completed`]):
     /// only its outcome exists, and a freeze before its `join` carries it again ([`Nursery::take_detached_harvest`]).
     delivered: bool,
+    /// #2074 — the child's executor task, for `kill` (`0`: none, as for a child already finished at
+    /// its filing).
+    task: u64,
 }
 
 impl Child {
@@ -173,6 +176,7 @@ impl Child {
             nested: None,
             kid: None,
             delivered: false,
+            task: 0,
         }
     }
 
@@ -186,6 +190,7 @@ impl Child {
             nested: None,
             kid: None,
             delivered: false,
+            task: 0,
         }
     }
 }
@@ -306,7 +311,15 @@ unsafe fn file_task(
     };
     drop(children);
     task.thaw = thaw;
-    rt.child_exec.spawn(task);
+    let id = rt.child_exec.spawn(task);
+    if let Some(c) = rt
+        .children
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(slot)
+    {
+        c.task = id;
+    }
     Filed::Slot(slot as i32)
 }
 
@@ -1145,6 +1158,38 @@ impl Nursery {
             .iter()
         {
             c.ring();
+        }
+    }
+
+    /// `Instantiator.kill` (#2074): end the child at `slot` and every child under it, running or
+    /// parked ([`crate::child_exec::ChildExec::kill`]). A child that has finished is left as it is.
+    /// `false` if there is no such slot.
+    fn kill_slot(&self, slot: usize) -> bool {
+        let target = self
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slot)
+            .map(|c| (c.task, c.kid.clone()));
+        let Some((task, kid)) = target else {
+            return false;
+        };
+        self.child_exec.kill(task);
+        if let Some(kid) = kid {
+            kid.kill_all();
+        }
+        true
+    }
+
+    /// [`Nursery::kill_slot`] for every child of this nursery: its spawner was killed.
+    fn kill_all(&self) {
+        let n = self
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        for slot in 0..n {
+            self.kill_slot(slot);
         }
     }
 
@@ -3128,11 +3173,9 @@ pub(crate) unsafe extern "C" fn detach(
     }
 }
 
-/// PROCESS.md S3 `kill(child) -> 0` (JIT). Acknowledges the request as a success. A synchronous child is
-/// already finished; an **async** op-0/5 child (S1c) still runs on its own thread — it is reached only by
-/// the run-wide §5 kill-path (the parent's `epoch_addr` cell, which the child bakes), not yet by a
-/// per-child targeted interrupt (deferred: that lands with the confinement-codegen kill point). A forged
-/// / already-joined handle is a `CapFault`.
+/// PROCESS.md S3 `kill(child) -> 0` (JIT, #2074): end the child and every child under it with
+/// `ThreadFault`, running or parked ([`Nursery::kill_slot`]), as the interpreter's op-12 arm does. A
+/// child that has finished is left as it is. A forged / already-joined handle is a `CapFault`.
 ///
 /// # Safety
 /// As [`join`].
@@ -3147,14 +3190,10 @@ pub(crate) unsafe extern "C" fn kill(
     if rt.resolve(mem_base, inst, trap_out).is_none() {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
-    let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    match children.get(handle as usize) {
-        Some(_) => 0,
-        None => {
-            *trap_out = TrapKind::CapFault as i64;
-            0
-        }
+    if !rt.kill_slot(handle as usize) {
+        *trap_out = TrapKind::CapFault as i64;
     }
+    0
 }
 
 /// Whether the §5 kill-path interrupt cell at `addr` has fired (`0` ⇒ no kill-path armed) — so a
