@@ -871,6 +871,75 @@ fn out_of_fuel() {
     diff("out_of_fuel", SPIN, &[0], 100_000);
 }
 
+/// **A host that refills the fuel counter runs on** (#1954): emitted code calls `env.trap(OUT_OF_FUEL)`
+/// when its counter goes negative and aborts only if the counter is *still* negative after the call,
+/// so a host that refills the `"fuel"` export inside the call (a JSPI host giving its embedder a turn
+/// there) gets the frame back, and the run ends as the oracle's does with ample fuel. With `b` units
+/// per refill a run of `C` safepoints refills exactly `C / (b + 1)` times: the debit that went
+/// negative is the slice's last. A host that only records the code still traps (`fuel_parity_exact`).
+#[test]
+fn a_host_that_refills_fuel_runs_on() {
+    for (name, src, arg) in [("alu", ALU, 40i64), ("call", CALL, 25i64)] {
+        let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
+        let wasm = compile_module(&m).unwrap_or_else(|e| panic!("{name}: emit: {e}"));
+        let args = vec![Value::I64(arg)];
+        let want = oracle(&m, &args, FUEL);
+        let mut fuel = FUEL;
+        temen_interp::run(&m, 0, &args, &mut fuel).expect("the oracle completes");
+        let consumed = FUEL - fuel;
+        for b in [1u64, 3, 7] {
+            let engine = Engine::default();
+            let module = WModule::new(&engine, &wasm).expect("emitted wasm must validate");
+            let mut store: Store<u64> = Store::new(&engine, 0);
+            let pages = 2 + m.memory.map_or(0, |mc| (mc.size() >> 16) as u32);
+            let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+            let mut linker: Linker<u64> = Linker::new(&engine);
+            linker.define("env", "memory", memory).unwrap();
+            linker
+                .func_wrap("env", "trap", move |mut c: Caller<'_, u64>, code: i32| {
+                    assert_eq!(code, TRAP_OUT_OF_FUEL, "only fuel runs out here");
+                    *c.data_mut() += 1;
+                    let g = c.get_export("fuel").and_then(|e| e.into_global()).unwrap();
+                    g.set(&mut c, Val::I64(b as i64)).unwrap();
+                })
+                .unwrap();
+            linker
+                .func_wrap::<_, ()>(
+                    "env",
+                    "call_interp",
+                    |_: Caller<'_, u64>, _: i32, _: i32| unreachable!("fully in-subset"),
+                )
+                .unwrap();
+            let instance = linker
+                .instantiate(&mut store, &module)
+                .unwrap()
+                .start(&mut store)
+                .unwrap();
+            let g = instance.get_global(&store, "fuel").expect("fuel exported");
+            g.set(&mut store, Val::I64(b as i64)).unwrap();
+            let f = instance.get_func(&store, "f0").expect("f0 exported");
+            let params = [
+                Val::I32(WIN_BASE as i32),
+                Val::I32(ENV_PTR as i32),
+                Val::I64(arg),
+            ];
+            let mut results = [Val::I64(0)];
+            f.call(&mut store, &params, &mut results)
+                .unwrap_or_else(|e| panic!("{name}: refilled every {b}: {e}"));
+            let Val::I64(got) = results[0] else {
+                panic!("{name}: non-i64 result")
+            };
+            assert_eq!(Outcome::Vals(vec![Value::I64(got)]), want, "{name}: b={b}");
+            assert_eq!(
+                *store.data(),
+                consumed / (b + 1),
+                "{name}: refills with {b} per refill over {consumed} safepoints"
+            );
+        }
+    }
+}
+
 /// **Exact fuel parity** (INVARIANTS.md #9). The wasm tier charges at the *same* IR safepoints as
 /// the tree-walk oracle — one per function entry, one per taken back-edge — so for *any* budget it
 /// completes-or-traps identically, not merely "both eventually trap on an infinite loop". Measure
