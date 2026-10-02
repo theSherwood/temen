@@ -528,7 +528,7 @@ pub struct BytecodeBackend {
     /// respectively, and that gap widens with session length, because undo does not care how far from
     /// a checkpoint the target is.
     ///
-    /// Cleared the first time a run turns out not to be journalable, exactly as `checkpointing` is:
+    /// Cleared the first time a run turns out not to be journalable, as the checkpoint ladder is refused:
     /// the replay `seek` is always available and is what serves those sessions.
     journaling: bool,
 
@@ -540,12 +540,6 @@ pub struct BytecodeBackend {
     undo_steps: usize,
     replay_steps: usize,
 
-    /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
-    /// boundary falls outside the [`ScheduledDebugRun::snapshot`] subset (a
-    /// fiber/coroutine/§14-child seam, a non-pristine memory layout, or a host that grew unrestorable
-    /// state), after which `seek` reverts to replay-from-0 for the rest of the session — mirroring
-    /// `Inspector::maybe_checkpoint`.
-    checkpointing: bool,
     /// The session's shared access-sink consumer (INTERACTIVE_EMBEDDING.md slice 3), re-installed
     /// into the live engine on every `seek` rebuild (the `watch_specs` pattern) — so a model fed by
     /// it observes the replay too and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
@@ -685,7 +679,6 @@ impl BytecodeBackend {
             tape,
             rev_trace: None,
             checkpoints: Ladder::new(CHECKPOINT_STRIDE, 0, 0),
-            checkpointing: true,
             journaling: true,
             undo_steps: 0,
             replay_steps: 0,
@@ -742,6 +735,12 @@ impl BytecodeBackend {
     /// layout, a stateful host), which replays from turn 0.
     pub fn checkpoint_count(&self) -> usize {
         self.checkpoints.len()
+    }
+
+    /// Why this session takes no checkpoints, or `None` while it still does (#1460) — the reason a
+    /// reverse `seek` replays from turn 0. Mirrors `Inspector::checkpoint_refusal`.
+    pub fn checkpoint_refusal(&self) -> Option<temen_interp::moment::Refusal> {
+        self.checkpoints.refusal()
     }
 
     /// Rebuild a fresh run with this session's engine config — under the on-ramp I/O powerbox
@@ -823,31 +822,14 @@ impl BytecodeBackend {
                 break;
             }
             // At a positive stride boundary short of `t`, snapshot before executing the op (so the
-            // checkpoint's turn is exactly the boundary). Deduped + subset-guarded by `maybe_checkpoint`.
-            if self.checkpointing && turn > 0 && turn.is_multiple_of(CHECKPOINT_STRIDE) {
-                self.maybe_checkpoint(run);
+            // checkpoint's turn is exactly the boundary). The ladder dedupes, and latches off on a refusal.
+            if self.checkpoints.admits(turn) {
+                self.checkpoints.offer(turn, run.snapshot());
             }
             if !run.tick(fuel) {
                 break;
             }
         }
-    }
-
-    /// Snapshot `run` into the checkpoint ladder at its current turn, if checkpointing is still on and
-    /// the continuation is [`ScheduledDebugRun::snapshot`]-able; otherwise disable checkpointing and
-    /// drop the ladder (the run left the snapshottable subset, so `seek` reverts to replay-from-0). A
-    /// turn already in the ladder is not duplicated. Mirrors `Inspector::maybe_checkpoint`.
-    fn maybe_checkpoint(&mut self, run: &ScheduledDebugRun) {
-        if !self.checkpointing {
-            return;
-        }
-        let Some(snap) = run.snapshot() else {
-            self.checkpointing = false;
-            self.checkpoints.clear();
-            return;
-        };
-        // Sorted insert, deduped, is the ladder's own contract now.
-        self.checkpoints.take(run.op_turn(), snap);
     }
 
     /// Push the recorded writes into the live engine (slice 8) — its cursor lands past entries at
@@ -1071,7 +1053,7 @@ impl Debuggee for BytecodeBackend {
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
     // plus a recorded cap tape, so seeking to an earlier turn = rebuild a fresh run and replay to that
     // many turns. `step_back` = one stoppable op earlier. The `seek` replay is bounded by the
-    // **checkpoint ladder** (see `drive_to`/`maybe_checkpoint`): a restart from the nearest snapshot
+    // **checkpoint ladder** (see `drive_to`): a restart from the nearest snapshot
     // replays at most `CHECKPOINT_STRIDE` turns instead of O(t) from turn 0.
     fn step_back(&mut self) -> Stop {
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
@@ -1150,10 +1132,8 @@ impl Debuggee for BytecodeBackend {
         run.set_scheduled_writes(self.writes.clone());
         // Restart from the nearest checkpoint at or before `t` (ladder kept sorted by turn) instead
         // of turn 0, when still checkpointable — bounding the replay to the stride.
-        if self.checkpointing {
-            if let Some((turn, cp)) = self.checkpoints.nearest_at_or_before(t) {
-                run.restore(turn, cp);
-            }
+        if let Some((turn, cp)) = self.checkpoints.nearest_at_or_before(t) {
+            run.restore(turn, cp);
         }
         self.drive_to(&mut run, t, &mut fuel);
         run.apply_writes_due_now(); // a write made at `t` is part of the state at `t`

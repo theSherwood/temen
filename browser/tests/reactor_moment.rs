@@ -21,7 +21,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use temen_browser::{
-    Frame, MomentReactor, OnrampReactor, ReactorMoment, ReactorTimeline, SharedOnrampReactor,
+    Frame, Moment, MomentReactor, OnrampReactor, ReactorTimeline, Refusal, SharedOnrampReactor,
     SteppableReactor, STATUS_OK,
 };
 
@@ -703,10 +703,10 @@ impl<R: MomentReactor> MomentReactor for Counting<R> {
     fn push_mouse(&self, kind: i32, payload: i32) {
         self.inner.push_mouse(kind, payload);
     }
-    fn moment(&self) -> Option<ReactorMoment> {
+    fn moment(&self) -> Result<Moment, Refusal> {
         self.inner.moment()
     }
-    fn restore(&mut self, m: &ReactorMoment) -> bool {
+    fn restore(&mut self, m: &Moment) -> bool {
         self.inner.restore(m)
     }
 }

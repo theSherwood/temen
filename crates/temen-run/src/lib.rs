@@ -7771,7 +7771,7 @@ impl Instance {
     /// quota and handoff, and the same argv/env blob seeded at `module_args_base`.
     ///
     /// This is what makes the debug engine usable on a *real* guest rather than on hand-written test
-    /// modules. #1455 lifted `Host::checkpoint_safe`'s refusal of cap-using guests (it reads
+    /// modules. #1455 lifted `Host::admits_checkpoint`'s refusal of cap-using guests (it reads
     /// `every_host_proc_reconstructible()` now), but nothing assembled the powerbox for a `ScheduledDebugRun`,
     /// so the "debug-tier time travel on cap-using guests" cell of #1454 stayed theoretical. The host
     /// setup here is deliberately the *same code path* as `run_with_caps_and_host`'s — a second way to

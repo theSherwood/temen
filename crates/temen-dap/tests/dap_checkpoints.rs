@@ -1,17 +1,77 @@
-//! Warm≡cold oracle for the bytecode engine's time-travel **checkpoint ladder** (DEBUGGING.md W1) —
-//! the `BytecodeBackend` port of the tree-walker `crates/temen/tests/debug_checkpoints.rs`.
+//! The **warm≡cold gate** for time travel: one harness, [`warm_matches_cold`], over every
+//! continuation a [`Moment`](temen_interp::moment::Moment) carries (#1460) — the tree-walk oracle's
+//! `ShadowStack`, the bytecode engine's `Bytecode`, and a reactor's `None` — and over every guest
+//! shape the bytecode ladder admits (fibers, threads, host capabilities, regions).
 //!
-//! A **warm** backend (its ladder populated by a prior deep `seek`, so `seek` *restores* from the
-//! nearest snapshot `clock <= t` and replays only the tail) must observe **identical** state — the
-//! logical clock, the call stack, and guest memory — as a **cold** backend (fresh, empty ladder,
-//! replaying from clock 0). The cold path is the pre-existing, trusted replay; the warm path exercises
-//! snapshot capture + restore. If restore is faithful they agree at every probed time, including
-//! across stride boundaries and a full backward sweep. Behavior is a pure optimization: correctness is
+//! A **warm** driver (its ladder populated by a prior deep seek, so a seek *restores* the nearest
+//! moment at or before the target and replays only the tail) must observe **identical** state to a
+//! **cold** one (fresh, empty ladder, replaying from the start). The cold path is the trusted replay;
+//! the warm path exercises capture and restore. Behavior is a pure optimization: correctness is
 //! *defined* by the cold path.
+//!
+//! This harness is also the differential that keeps the tree-walker's continuation a separate
+//! implementation from the bytecode engine's (INVARIANTS #15's exemption): both are held to the same
+//! gate here, cell by cell.
 
+use std::fmt::Debug;
 use temen_dap::{BytecodeBackend, Debuggee};
-use temen_interp::Value;
+use temen_interp::moment::{Moment, MomentReactor, ReactorTimeline, Refusal, SteppableReactor};
+use temen_interp::{bytecode, Host, Inspector, Value};
 use temen_text::parse_module;
+
+/// The gate. `mk` opens a fresh driver; `observe` moves one to a coordinate and reads what a user
+/// could read there; `rungs` counts its ladder. Every probe is observed cold (a fresh driver each) and
+/// then warm (one driver, after a seek to the deepest probe laid its ladder down), forwards and then
+/// backwards, and the two must agree. The ladder must still hold rungs at the end, which a refusal
+/// anywhere in the sweep would have dropped. Returns the cold observations, for a cell's own sanity
+/// checks on the guest, and the warm driver's rung count.
+fn warm_matches_cold<T, O: PartialEq + Debug + Clone>(
+    mk: impl Fn() -> T,
+    observe: impl Fn(&mut T, u64) -> O,
+    rungs: impl Fn(&T) -> usize,
+    probes: &[u64],
+) -> (Vec<O>, usize) {
+    let cold: Vec<O> = probes.iter().map(|&t| observe(&mut mk(), t)).collect();
+
+    let mut warm = mk();
+    observe(&mut warm, *probes.iter().max().expect("probes"));
+    assert!(
+        rungs(&warm) > 0,
+        "a seek to the deepest probe lays down a ladder — it is exercised, not dormant"
+    );
+    let warm_fwd: Vec<O> = probes.iter().map(|&t| observe(&mut warm, t)).collect();
+    assert_eq!(warm_fwd, cold, "warm ≡ cold at every forward probe");
+    let warm_back: Vec<O> = probes
+        .iter()
+        .rev()
+        .map(|&t| observe(&mut warm, t))
+        .collect();
+    let cold_back: Vec<O> = cold.iter().rev().cloned().collect();
+    assert_eq!(warm_back, cold_back, "warm ≡ cold seeking backwards");
+    let held = rungs(&warm);
+    assert!(held > 0, "the ladder was never refused");
+    (cold, held)
+}
+
+/// A fresh bytecode debug session over `src` with `args`; `powerbox` grants the on-ramp I/O powerbox
+/// (`vm_fs`, `memory`).
+fn bytecode_session(src: &str, args: Vec<Value>, powerbox: bool) -> impl Fn() -> BytecodeBackend {
+    let m = parse_module(src).expect("parses");
+    move || {
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            powerbox,
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .expect("the bytecode engine accepts the guest")
+    }
+}
 
 /// A counter loop that also stores its running sum to window address 16384 (above the #1094 NULL
 /// guard) each iteration, so a faithful
@@ -252,7 +312,7 @@ block 3 (vi2: i64, vacc2: i64, vfd2: i64) {
 
 /// The **threaded** twin of [`FILE_WRITE_LOOP`]: the root opens nothing, each of two spawned workers
 /// opens the scratch file through `vm_fs` and appends bytes in a loop, accumulating into the shared
-/// counter at 16384. The scheduled engine's `checkpointable` consults the *same* `Host::checkpoint_safe`
+/// counter at 16384. The scheduled engine's checkpoint consults the *same* `Host::admits_checkpoint`
 /// — over the root host and every `extra_envs` child — so admitting a named capability admits it here
 /// too; this pins that rather than assuming it (INVARIANTS #14).
 const FILE_WRITE_THREADS: &str = r#"
@@ -334,7 +394,7 @@ block 3 (vi2: i64, vfd2: i64) {
 /// A stable per-`seek` observation: the logical clock, the call stack (each frame's IR pc), and the
 /// running-sum window bytes. Identical between a from-0 replay and a checkpoint-restored replay iff
 /// restore is faithful.
-fn obs(b: &mut BytecodeBackend, t: u64) -> (u64, String, Vec<u8>) {
+fn obs(b: &mut impl Debuggee, t: u64) -> (u64, String, Vec<u8>) {
     b.seek(t);
     let clock = b.clock();
     let stack = b
@@ -347,121 +407,127 @@ fn obs(b: &mut BytecodeBackend, t: u64) -> (u64, String, Vec<u8>) {
     (clock, stack, mem)
 }
 
+/// The `ShadowStack` cell: the tree-walk oracle's `Inspector`, seeking by op clock.
 #[test]
-fn bytecode_checkpoint_warm_seek_matches_cold_replay_from_zero() {
+fn shadow_stack_warm_seek_matches_cold() {
     let m = parse_module(LOOP_WITH_MEM).expect("parses");
-    let args = [Value::I32(800)]; // several thousand ops ⇒ several stride boundaries
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            false,
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the bytecode engine accepts the single-vCPU loop")
-    };
+    let mk = || Inspector::attach(&m, 0, &[Value::I32(800)], 50_000_000);
+    let probes: Vec<u64> = (0..=6000).step_by(137).chain([1023, 1024, 1025]).collect();
+    warm_matches_cold(mk, obs, Inspector::checkpoint_count, &probes);
+}
 
-    // Probe times spread across the run — deliberately not stride-aligned, so restores land at a
-    // checkpoint strictly below the target and must replay a nonzero tail.
+/// The `Bytecode` cell: the same loop on the bytecode debug engine, seeking by turn. Several thousand
+/// ops cross several stride boundaries, and the probes are deliberately not stride-aligned, so a
+/// restore lands strictly below its target and replays a nonzero tail.
+#[test]
+fn bytecode_warm_seek_matches_cold() {
     let probes: Vec<u64> = (0..=6000).step_by(137).collect();
-
-    // Cold baseline: a *fresh* backend per probe (empty ladder ⇒ always a from-0 replay, the trusted
-    // path that defines correctness).
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs(&mut b, t)
-        })
-        .collect();
-
-    // Warm: one backend, a deep seek first to populate the ladder, then the probes reuse it.
-    let mut warm = mk();
-    warm.seek(6000);
-    assert!(
-        warm.checkpoint_count() > 0,
-        "a deep seek past the stride lays down checkpoints — the ladder is exercised, not dormant",
-    );
-
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
-    assert_eq!(
-        warm_fwd, cold,
-        "warm (checkpoint-restored) seek ≡ cold (replay-from-0) at every forward probe",
-    );
-
-    // A full backward sweep restarts each seek from a checkpoint below the target — must also match.
-    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(
-        warm_back, cold_back,
-        "warm backward sweep ≡ cold (restore is faithful seeking in either direction)",
-    );
-
-    // The loop never leaves the checkpointable subset, so checkpointing stayed on the whole run.
-    assert!(
-        warm.checkpoint_count() > 0,
-        "checkpointing stays on for a pure single-vCPU memory loop",
+    warm_matches_cold(
+        bytecode_session(LOOP_WITH_MEM, vec![Value::I32(800)], false),
+        obs,
+        BytecodeBackend::checkpoint_count,
+        &probes,
     );
 }
 
+/// The bulk of this run executes *inside* the fiber (root parked on the resume chain), so nearly
+/// every checkpoint captures a live §12 fiber continuation.
 #[test]
-fn bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber() {
-    // The bulk of this run executes *inside* the fiber (root parked on the resume chain), so nearly
-    // every checkpoint captures a live §12 fiber continuation. A checkpoint-restored `seek` must
-    // reproduce the fiber's stack and the final result exactly as a from-0 replay.
-    let m = parse_module(FIBER_LOOP).expect("parses");
-    let args = [Value::I64(900)]; // fiber loops 900× before its first suspend ⇒ several strides deep
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            false,
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the single-vCPU engine accepts the fiber generator")
-    };
-
+fn bytecode_warm_seek_matches_cold_with_a_live_fiber() {
     let probes: Vec<u64> = (0..=5000).step_by(131).collect();
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs(&mut b, t)
-        })
-        .collect();
-    // Sanity: the run genuinely executes inside the fiber (func 1), so the checkpoints below capture a
-    // live fiber continuation rather than only the root.
+    let (cold, _) = warm_matches_cold(
+        bytecode_session(FIBER_LOOP, vec![Value::I64(900)], false),
+        obs,
+        BytecodeBackend::checkpoint_count,
+        &probes,
+    );
     assert!(
         cold.iter().any(|(_, stack, _)| stack.contains("0:1:")),
         "the run spends time inside the fiber body (func 1)",
     );
+}
 
-    let mut warm = mk();
-    warm.seek(5000);
-    assert!(
-        warm.checkpoint_count() > 0,
-        "a deep seek through the fiber body lays down checkpoints with a live fiber",
-    );
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
+/// A reactor for the `None` cell: each tick adds 1 to a counter at 16384 and returns it. It holds no
+/// capability, so the timeline's tape stays empty and a moment is the window alone.
+const TICK: &str = "\
+memory 16
+func () -> (i64) {
+block 0 () {
+  va = i64.const 16384
+  vx = i64.load va
+  v1 = i64.const 1
+  vy = i64.add vx v1
+  i64.store va vy
+  return vy
+  }
+}
+";
+
+struct TickReactor {
+    inst: bytecode::Reactor,
+    host: Host,
+}
+
+impl MomentReactor for TickReactor {
+    fn push_key(&self, _: i32, _: i32) {}
+    fn push_mouse(&self, _: i32, _: i32) {}
+    fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            self.inst.window_layout().ok_or(Refusal::NoWindow)?,
+            &self.host,
+        )
+    }
+    fn restore(&mut self, m: &Moment) -> bool {
+        let ok = self.inst.restore_window(&m.layout(), &self.host);
+        m.restore_host(&mut self.host);
+        ok
+    }
+}
+
+impl SteppableReactor for TickReactor {
+    fn step(&mut self) -> i32 {
+        let mut fuel = u64::MAX;
+        match self.inst.call(0, &[], &mut fuel, &mut self.host) {
+            Ok(_) => 0,
+            Err(_) => -1,
+        }
+    }
+}
+
+/// A reactor and its timeline, moved by tick: back inside the recording by a seek, past its end by
+/// recording forward.
+struct Scrub {
+    r: TickReactor,
+    t: ReactorTimeline,
+}
+
+fn scrub(s: &mut Scrub, tick: u64) -> (u64, Vec<u8>) {
+    let tick = tick as usize;
+    assert!(s.t.seek(&mut s.r, tick.min(s.t.len())), "seek to {tick}");
+    while s.t.tick() < tick {
+        assert_eq!(s.t.frame(&mut s.r), 0, "the tick runs");
+    }
+    let layout = s.r.inst.window_layout().expect("a window");
+    (s.t.tick() as u64, layout.bytes()[16384..16392].to_vec())
+}
+
+/// The `None` cell: a reactor's keyframe ladder, seeking by tick.
+#[test]
+fn reactor_warm_seek_matches_cold() {
+    let m = parse_module(TICK).expect("parses");
+    let mk = || Scrub {
+        r: TickReactor {
+            inst: bytecode::Reactor::open(&m).expect("open the reactor"),
+            host: Host::new(),
+        },
+        t: ReactorTimeline::new(16, 64, 0),
+    };
+    let probes: Vec<u64> = (0..=200).step_by(7).chain([16, 17, 200]).collect();
+    let (cold, _) = warm_matches_cold(mk, scrub, |s| s.t.keyframe_ticks().len(), &probes);
     assert_eq!(
-        warm_fwd, cold,
-        "warm (checkpoint-restored) seek ≡ cold at every forward probe with a live fiber",
-    );
-    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(
-        warm_back, cold_back,
-        "warm backward sweep ≡ cold with a live fiber (fiber chain + registry restore is faithful)",
+        cold.last().unwrap().1,
+        200i64.to_le_bytes(),
+        "200 ticks ran"
     );
 }
 
@@ -489,125 +555,33 @@ fn obs_sched(b: &mut BytecodeBackend, t: u64) -> (u64, usize, Option<u64>, Vec<u
     (turn, threads.len(), stopped, mem, stacks.join(";"))
 }
 
+/// Two workers × 400 iterations ⇒ several thousand turns, many strides, on the scheduled engine.
 #[test]
-fn scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero() {
-    let m = parse_module(LOOP_THREADS).expect("parses");
-    let args = [Value::I64(400)]; // two workers × 400 iters ⇒ several thousand turns, many strides
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            false,
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the scheduled bytecode engine accepts the thread.spawn loop")
-    };
-
+fn scheduled_warm_seek_matches_cold() {
     let probes: Vec<u64> = (0..=6000).step_by(149).collect();
-
-    // Cold baseline: a fresh backend per probe (empty ladder ⇒ always a from-turn-0 replay).
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs_sched(&mut b, t)
-        })
-        .collect();
-
-    // Warm: one backend, a deep seek to populate the scheduled ladder, then the probes reuse it.
-    let mut warm = mk();
-    warm.seek(6000);
-    assert!(
-        warm.checkpoint_count() > 0,
-        "a deep scheduled seek past the stride lays down checkpoints",
-    );
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs_sched(&mut warm, t)).collect();
-    assert_eq!(
-        warm_fwd, cold,
-        "warm (checkpoint-restored) scheduled seek ≡ cold (replay-from-turn-0) at every forward probe",
-    );
-
-    let warm_back: Vec<_> = probes
-        .iter()
-        .rev()
-        .map(|&t| obs_sched(&mut warm, t))
-        .collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(
-        warm_back, cold_back,
-        "warm scheduled backward sweep ≡ cold (restore is faithful across the whole task set)",
-    );
-
-    assert!(
-        warm.checkpoint_count() > 0,
-        "checkpointing stays on for a pure thread.spawn/join loop (no fibers/coroutines/§14 children)",
+    warm_matches_cold(
+        bytecode_session(LOOP_THREADS, vec![Value::I64(400)], false),
+        obs_sched,
+        BytecodeBackend::checkpoint_count,
+        &probes,
     );
 }
 
+/// Two worker vCPUs each drive a fiber (the increment loop runs inside the fiber), so nearly every
+/// scheduled checkpoint captures live per-task fibers + the run-shared registry, interleaved.
 #[test]
-fn scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers() {
-    // Two worker vCPUs each drive a fiber (the increment loop runs inside the fiber), so nearly every
-    // scheduled checkpoint captures live per-task fibers + the run-shared registry, interleaved. A
-    // checkpoint-restored `seek` must reproduce the whole cross-thread state exactly as a from-turn-0
-    // replay — proving the scheduled fiber snapshot/restore is faithful.
-    let m = parse_module(THREADS_WITH_FIBERS).expect("parses");
-    let args = [Value::I64(400)]; // two fibers × 400 iters ⇒ several thousand turns, many strides
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            false,
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the scheduled bytecode engine accepts thread.spawn workers driving fibers")
-    };
-
+fn scheduled_warm_seek_matches_cold_with_live_fibers() {
     let probes: Vec<u64> = (0..=6000).step_by(149).collect();
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs_sched(&mut b, t)
-        })
-        .collect();
-    // Sanity: the run genuinely executes inside a fiber body (func 2) on a worker, so the checkpoints
-    // below capture live fibers, not just the root/worker frames.
+    let (cold, _) = warm_matches_cold(
+        bytecode_session(THREADS_WITH_FIBERS, vec![Value::I64(400)], false),
+        obs_sched,
+        BytecodeBackend::checkpoint_count,
+        &probes,
+    );
     assert!(
         cold.iter()
             .any(|(_, _, _, _, stacks)| stacks.contains(":2:")),
         "the run spends turns inside a fiber body (func 2)",
-    );
-
-    let mut warm = mk();
-    warm.seek(6000);
-    assert!(
-        warm.checkpoint_count() > 0,
-        "a deep scheduled seek through the fiber bodies lays down checkpoints with live fibers",
-    );
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs_sched(&mut warm, t)).collect();
-    assert_eq!(
-        warm_fwd, cold,
-        "warm scheduled seek ≡ cold at every forward probe with live per-task fibers",
-    );
-    let warm_back: Vec<_> = probes
-        .iter()
-        .rev()
-        .map(|&t| obs_sched(&mut warm, t))
-        .collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(
-        warm_back, cold_back,
-        "warm scheduled backward sweep ≡ cold (per-task chains + run-shared registry restore faithfully)",
     );
 }
 
@@ -620,22 +594,7 @@ fn scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers() {
 #[ignore = "timing benchmark; run manually with --ignored --nocapture"]
 fn bytecode_checkpoint_reverse_sweep_is_bounded() {
     use std::time::Instant;
-    let m = parse_module(LOOP_WITH_MEM).expect("parses");
-    let args = [Value::I32(8_000)]; // ~64k ops — many strides deep
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            false,
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .unwrap()
-    };
+    let mk = bytecode_session(LOOP_WITH_MEM, vec![Value::I32(8_000)], false); // ~64k ops
     let deep = 60_000u64;
     let steps = 60u64;
 
@@ -681,67 +640,20 @@ fn bytecode_checkpoint_reverse_sweep_is_bounded() {
 /// capability's own declared state rides the checkpoint alongside (`Host::capture_cap_states`), which is
 /// the half that matters once a replay runs past the tape's end.
 #[test]
-fn bytecode_checkpoint_warm_seek_matches_cold_with_a_host_capability() {
-    let m = parse_module(FILE_WRITE_LOOP).expect("parses");
-    let args = [Value::I64(600)]; // ~8k ops ⇒ several stride boundaries, ~600 cap crossings
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            true, // the on-ramp I/O powerbox — this is what grants `vm_fs`
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the bytecode engine accepts the file-writing loop")
-    };
-
+fn bytecode_warm_seek_matches_cold_with_a_host_capability() {
+    // ~8k ops ⇒ several stride boundaries, ~600 cap crossings; the on-ramp powerbox grants `vm_fs`.
     let probes: Vec<u64> = (0..=6000).step_by(137).collect();
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs(&mut b, t)
-        })
-        .collect();
-    // Sanity: the run really does cross the capability boundary and the accumulator really moves —
+    let (cold, _) = warm_matches_cold(
+        bytecode_session(FILE_WRITE_LOOP, vec![Value::I64(600)], true),
+        obs,
+        BytecodeBackend::checkpoint_count,
+        &probes,
+    );
+    // The run really does cross the capability boundary and the accumulator really moves —
     // otherwise "warm ≡ cold" would be a statement about a guest that never touched its powerbox.
     assert!(
-        cold.iter()
-            .map(|(_, _, mem)| mem)
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|w| w[0] != w[1]),
+        cold.windows(2).any(|w| w[0].2 != w[1].2),
         "the guest's byte count advances across the probes",
-    );
-
-    let mut warm = mk();
-    warm.seek(6000);
-    assert!(
-        warm.checkpoint_count() > 0,
-        "a cap-holding guest now lays down checkpoints — before #1455 the ladder self-disabled the \
-         moment the powerbox granted `vm_fs`, and this count was forced to 0",
-    );
-
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
-    assert_eq!(
-        warm_fwd, cold,
-        "warm (checkpoint-restored) seek ≡ cold (replay-from-0) at every forward probe",
-    );
-
-    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(
-        warm_back, cold_back,
-        "warm backward sweep ≡ cold (restore is faithful seeking in either direction)",
-    );
-
-    assert!(
-        warm.checkpoint_count() > 0,
-        "checkpointing stays on for the whole run — holding a named capability never leaves the subset",
     );
 }
 
@@ -749,58 +661,18 @@ fn bytecode_checkpoint_warm_seek_matches_cold_with_a_host_capability() {
 /// across global turns. One predicate governs both engines, so this is the propagation pin rather than
 /// a second mechanism.
 #[test]
-fn scheduled_checkpoint_warm_seek_matches_cold_with_a_host_capability() {
-    let m = parse_module(FILE_WRITE_THREADS).expect("parses");
-    let args = [Value::I64(300)];
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            true, // the on-ramp I/O powerbox — this is what grants `vm_fs`
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the scheduled engine accepts the threaded file-writing loop")
-    };
-
+fn scheduled_warm_seek_matches_cold_with_a_host_capability() {
     let probes: Vec<u64> = (0..=6000).step_by(139).collect();
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs(&mut b, t)
-        })
-        .collect();
+    let (cold, _) = warm_matches_cold(
+        bytecode_session(FILE_WRITE_THREADS, vec![Value::I64(300)], true),
+        obs,
+        BytecodeBackend::checkpoint_count,
+        &probes,
+    );
     assert!(
-        cold.iter()
-            .map(|(_, _, mem)| mem)
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|w| w[0] != w[1]),
+        cold.windows(2).any(|w| w[0].2 != w[1].2),
         "the workers' byte count advances across the probes",
     );
-
-    let mut warm = mk();
-    warm.seek(6000);
-    assert!(
-        warm.checkpoint_count() > 0,
-        "the scheduled ladder admits a cap-holding run too — same `checkpoint_safe`, over the root \
-         host and every child env",
-    );
-
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
-    assert_eq!(
-        warm_fwd, cold,
-        "warm (checkpoint-restored) seek ≡ cold (replay-from-turn-0) at every forward probe",
-    );
-
-    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(warm_back, cold_back, "warm backward sweep ≡ cold");
 }
 
 /// #2026 — a guest that **creates, maps and writes a §13 region** mid-run. Phase one bumps a window
@@ -883,33 +755,19 @@ fn obs_region(b: &mut BytecodeBackend, t: u64) -> (u64, String, Vec<u8>) {
 }
 
 #[test]
-fn bytecode_checkpoint_warm_seek_matches_cold_with_a_region() {
-    let m = parse_module(REGION_LOOP).expect("parses");
-    let args = [Value::I32(MEMORY_HANDLE), Value::I64(400)];
-    let mk = || {
-        BytecodeBackend::new(
-            m.clone(),
-            0,
-            &args,
-            u64::MAX,
-            true, // the on-ramp powerbox: its `memory` capability mints the regions
-            Vec::new(),
-            false,
-            None,
-            None,
-        )
-        .expect("the bytecode engine accepts the region loop")
-    };
-
+fn bytecode_warm_seek_matches_cold_with_a_region() {
     let end = 8100; // past the end: the run finishes at turn 8024
     let probes: Vec<u64> = (0..=end).step_by(131).chain([end]).collect();
-    let cold: Vec<_> = probes
-        .iter()
-        .map(|&t| {
-            let mut b = mk();
-            obs_region(&mut b, t)
-        })
-        .collect();
+    let (cold, held) = warm_matches_cold(
+        bytecode_session(
+            REGION_LOOP,
+            vec![Value::I32(MEMORY_HANDLE), Value::I64(400)],
+            true, // the on-ramp powerbox: its `memory` capability mints the regions
+        ),
+        obs_region,
+        BytecodeBackend::checkpoint_count,
+        &probes,
+    );
     // The run really maps the region and writes through it, and really mints the second one.
     let last = &cold.last().expect("probes").2;
     assert_eq!(
@@ -919,25 +777,9 @@ fn bytecode_checkpoint_warm_seek_matches_cold_with_a_region() {
     );
     assert_ne!(&last[8..16], &[0; 8], "the first region's handle");
     assert_ne!(&last[16..24], &[0; 8], "the second region's handle");
-
-    let mut warm = mk();
-    warm.seek(end);
     assert!(
-        warm.checkpoint_count() > 4,
+        held > 4,
         "checkpoints are laid down past the mint and the map — before #2026 the ladder dropped \
          itself the moment the guest minted a region",
     );
-
-    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs_region(&mut warm, t)).collect();
-    assert_eq!(
-        warm_fwd, cold,
-        "warm (checkpoint-restored) seek ≡ cold (replay-from-0) at every forward probe",
-    );
-    let warm_back: Vec<_> = probes
-        .iter()
-        .rev()
-        .map(|&t| obs_region(&mut warm, t))
-        .collect();
-    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
-    assert_eq!(warm_back, cold_back, "warm backward sweep ≡ cold");
 }

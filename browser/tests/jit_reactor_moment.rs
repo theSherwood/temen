@@ -22,7 +22,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use temen_browser::{
-    Frame, JitOnrampReactor, JitStart, MomentReactor, ReactorMoment, ReactorTimeline,
+    Frame, JitOnrampReactor, JitStart, Moment, MomentReactor, ReactorTimeline, Refusal,
     SteppableReactor, STATUS_OK,
 };
 use temen_interp::Value;
@@ -247,10 +247,10 @@ impl MomentReactor for JitDriver {
     fn push_mouse(&self, kind: i32, payload: i32) {
         self.reactor().push_mouse(kind, payload);
     }
-    fn moment(&self) -> Option<ReactorMoment> {
+    fn moment(&self) -> Result<Moment, Refusal> {
         self.reactor().moment()
     }
-    fn restore(&mut self, m: &ReactorMoment) -> bool {
+    fn restore(&mut self, m: &Moment) -> bool {
         self.reactor_mut().restore(m)
     }
 }
@@ -262,7 +262,7 @@ fn rewind_replays_the_recorded_future(fixture: &[u8]) {
     for _ in 0..4 {
         d.hashed();
     }
-    let moment: ReactorMoment = d.reactor().moment().expect("the JIT window is capturable");
+    let moment: Moment = d.reactor().moment().expect("the JIT window is capturable");
     let recorded: Vec<u64> = (0..8).map(|_| d.hashed()).collect();
 
     assert!(d.reactor_mut().restore(&moment), "restore the JIT reactor");

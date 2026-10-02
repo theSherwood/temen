@@ -220,7 +220,7 @@ different things depending on which pair you compare:
   rederives them from the task states after the replay. `BytecodeBackend` carries a second turn-keyed
   ladder (`sched_checkpoints`); the threaded `seek` restarts from the nearest snapshot and
   `drive_scheduled_to`/`maybe_sched_checkpoint` mirror the single-vCPU pair. Gated by a threaded
-  warm≡cold oracle (`dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_replay_from_zero`):
+  warm≡cold oracle (`dap_checkpoints.rs::scheduled_warm_seek_matches_cold`):
   a checkpoint-restored `seek` reproduces the global turn, live-thread count, stopped thread, shared
   counter, and **every** thread's stack (`select_task` each) — forward and on a full backward sweep.
 
@@ -237,7 +237,7 @@ different things depending on which pair you compare:
   an `instantiate` sibling. Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
   **maps its own pages** (non-pristine `nested_view` layout — a **demand** coroutine), plus event-parked
   (`memory.wait`) fibers. Oracles:
-  `dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
+  `dap_checkpoints.rs::scheduled_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
   worker vCPUs each driving a fiber body) and
   `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
   (`ScheduledDebugRun`-level — granting its own Instantiator, as the DAP powerbox now does too
@@ -275,7 +275,7 @@ different things depending on which pair you compare:
   `layout_snapshot_safe`, whose sole disqualifier is §13 region aliasing (a `Backed` page's bytes live in a
   shared cross-domain `SharedRegion`, not this window's backing). **#2026 lifts that for the root:** the
   checkpoint carries the root host's regions (bytes, ids, handles) and the restore re-aliases the
-  window's `Backed` pages onto them (`bytecode_checkpoint_warm_seek_matches_cold_with_a_region`). Oracle: `bytecode_debug_page_mapping.rs`
+  window's `Backed` pages onto them (`bytecode_warm_seek_matches_cold_with_a_region`). Oracle: `bytecode_debug_page_mapping.rs`
   — a fixture that grows/protects/unmaps then loads the unmapped page (a terminal `MemoryFault`),
   round-tripped warm≡cold at **every** checkpointable clock on both the single-vCPU `DebugRun` and the
   threaded `ScheduledDebugRun`; the forward replay re-executes the grown-page load (would fault if the `Rw`
@@ -313,7 +313,7 @@ different things depending on which pair you compare:
   and `restore` rebuilds the view over the reseeded parent + a fresh Yielder host. Excluded (→ fall back
   to replay-from-0): **demand** coroutines (`fault_yields` / non-pristine `nested_view` layout, caught by
   the coroutine's own `snapshot_safe`) and **separate-module** coroutines (`vm.module != 0` — they push a
-  unit into the shared source, which a fresh restore lacks). Oracles: `dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber`
+  unit into the shared source, which a fresh restore lacks). Oracles: `dap_checkpoints.rs::bytecode_warm_seek_matches_cold_with_a_live_fiber`
   (backend ladder, fiber active across the strides) and `bytecode_debug_coroutines.rs::coroutine_checkpoint_snapshot_restore_round_trips`
   (`DebugRun`-level — granting its own Instantiator, as the DAP powerbox now does too (#1528) —
   restoring at *every* checkpointable clock,
@@ -846,8 +846,9 @@ substate (`stdout`/`stderr`/`clock_ns`/`stdin_pos`/cap-replay cursor + record); 
 structure is rebuilt by `fresh_single_root`, so neither needs to be `Clone`. Captured only for the
 **root-only, non-fiber, non-durable, no-installed-units, simple-memory** subset where `frames` + window
 bytes fully determine the continuation (and the host carries no §13/§14/§22 residue a restore would
-drop) — `VCpu::checkpointable` + `Host::checkpoint_safe`; anything richer turns checkpointing off and
-falls back to the (correct) replay-from-0. **A guest holding a host capability is in the subset
+drop) — `VCpu::checkpointable` + `Host::admits_checkpoint`; anything richer refuses the ladder with a
+named `moment::Refusal` (#1460, read back by `checkpoint_refusal`) and falls back to the (correct)
+replay-from-0. **A guest holding a host capability is in the subset
 (#1455):** a `HostProc` used to veto the whole run, which self-disabled the ladder for every guest that
 does file I/O or drives a device; one carrying a registered **name** is now admitted (an unnamed one
 still vetoes, fail-closed), because every `HOST_PROC` crossing is taped — a replay serves it rather than
@@ -860,20 +861,22 @@ run's own tape) never rewinds it — which is also why a recorded stateful capab
 undo journal. The `vm_fs` memfs declares its whole store (files, directories, open table, `opendir`
 handles, mappings), so a debugged C guest that seeks back and runs on past the tape reads its own
 writes. *Oracles:* `file_io.rs::a_reverse_seek_keeps_the_files_the_guest_wrote`,
-`dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_host_capability` (a `vm_fs`
+`dap_checkpoints.rs::bytecode_warm_seek_matches_cold_with_a_host_capability` (a `vm_fs`
 write loop under the real DAP powerbox) and `bytecode_debug_cap_checkpoint.rs` (the named/unnamed
 split, and a stateful capability restored against a live host). *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
 (ladder populated, so `seek` restores) is asserted state-identical — result, paused location, clock,
 and window bytes — to a **cold** one (replays from 0) across checkpoint-stride boundaries, a backward
 sweep, and one-at-a-time `step_back`. The **multithreaded** (`turn`-coordinate) ladder is landed too:
 the DAP backend keeps a `sched_checkpoints` ladder keyed on the global turn, and
-`dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_{replay_from_zero,with_live_fibers,with_a_host_capability}`
+`dap_checkpoints.rs::scheduled_warm_seek_matches_cold{,_with_live_fibers,_with_a_host_capability}`
 hold it to the same warm ≡ cold oracle. *Still open:* RNG via a dedicated iface (vs a host-fn), and capturing
 a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is the debug engine by design, so this
 is lower priority). *The ladder itself is shared (#1460):* both this engine's `checkpoints` and the DAP
-backend's two ladders are `temen_interp::moment::Ladder<C>` over `Moment<C>` — the same type the
-playground's reactor keyframes use — keyed on the op clock or the global turn; only the continuation
-`C` is the engine's own. The tree-walk checkpoint's window is a `MemLayout` now rather than raw bytes
+backend's ladder are one `temen_interp::moment::Ladder` over one `Moment` — the same type the
+playground's reactor keyframes use — keyed on the op clock or the global turn; only the `Continuation`
+variant is the engine's own. A refused capture latches the ladder off and keeps its named
+`moment::Refusal` (`checkpoint_refusal` reads it). One harness holds every continuation to the warm ≡
+cold oracle: `dap_checkpoints.rs::warm_matches_cold`. The tree-walk checkpoint's window is a `MemLayout` now rather than raw bytes
 (under `snapshot_safe` the two capture the same bytes; it is the one image form, #1456).
 
 *Toward one bytecode debug engine (#1517).* A single-vCPU `DebugRun` is a `ScheduledDebugRun` with

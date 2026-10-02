@@ -3153,7 +3153,7 @@ type MouseQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i64
 /// The `fs` capability's per-`open` byte cursors, shared between the capability closure and whoever
 /// granted it. Shared (rather than owned by the closure) because it is **host-side guest state**: a
 /// reactor moment must capture and restore it alongside the window, or a rewound guest reads its file
-/// from a cursor the moment never had. See [`ReactorMoment`].
+/// from a cursor the moment never had. See [`Moment`].
 type FsCursors = std::sync::Arc<std::sync::Mutex<Vec<u64>>>;
 
 /// The host-side halves of the on-ramp powerbox's **stateful** capabilities, handed back to whoever
@@ -3546,13 +3546,13 @@ fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout>
 // implementations (INVARIANTS #15; the page had exactly that before this). Re-exported here so the
 // cdylib's consumers and the reactor tests keep one name for them.
 pub use temen_interp::moment::{
-    MomentReactor, ReactorInput, ReactorMoment, ReactorTimeline, SteppableReactor,
+    Moment, MomentReactor, ReactorInput, ReactorTimeline, Refusal, SteppableReactor,
 };
 
 // The capability-side half of a moment is **each capability's own state**, declared once by the
 // provider that owns it (its `CapState`) and read two ways: an in-session
 // rewind puts it straight back into the live handler, and a freeze writes it into the artifact's
-// named-capability section (#1455). `ReactorMoment::capture` takes both halves at one instant, so
+// named-capability section (#1455). `Moment::capture` takes both halves at one instant, so
 // they always describe the same one.
 
 /// Drive an [`OnrampReactor`]-shaped reactor through the shared [`MomentReactor`] surface. Both
@@ -3574,10 +3574,10 @@ macro_rules! impl_moment_reactor {
             fn push_mouse(&self, kind: i32, payload: i32) {
                 <$t>::push_mouse(self, kind, payload);
             }
-            fn moment(&self) -> Option<ReactorMoment> {
+            fn moment(&self) -> Result<Moment, Refusal> {
                 <$t>::moment(self)
             }
-            fn restore(&mut self, m: &ReactorMoment) -> bool {
+            fn restore(&mut self, m: &Moment) -> bool {
                 <$t>::restore(self, m)
             }
         }
@@ -3598,10 +3598,10 @@ impl MomentReactor for JitOnrampReactor {
     fn push_mouse(&self, kind: i32, payload: i32) {
         JitOnrampReactor::push_mouse(self, kind, payload);
     }
-    fn moment(&self) -> Option<ReactorMoment> {
+    fn moment(&self) -> Result<Moment, Refusal> {
         JitOnrampReactor::moment(self)
     }
-    fn restore(&mut self, m: &ReactorMoment) -> bool {
+    fn restore(&mut self, m: &Moment) -> bool {
         JitOnrampReactor::restore(self, m)
     }
 }
@@ -5512,12 +5512,13 @@ impl OnrampReactor {
         self.caps.push_mouse(kind, payload);
     }
 
-    /// Capture a [`ReactorMoment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
-    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
-    pub fn moment(&self) -> Option<ReactorMoment> {
-        ReactorMoment::capture(
-            self.inst.window_layout()?,
+    /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
+    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
+    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
+    /// fiction).
+    pub fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            self.inst.window_layout().ok_or(Refusal::NoWindow)?,
             &self.host,
         )
     }
@@ -5529,7 +5530,7 @@ impl OnrampReactor {
     /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
-    pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
+    pub fn restore(&mut self, moment: &Moment) -> bool {
         if !self.inst.restore_window(&moment.layout(), &self.host) {
             return false;
         }
@@ -5699,12 +5700,13 @@ impl SharedOnrampReactor {
         self.caps.push_mouse(kind, payload);
     }
 
-    /// Capture a [`ReactorMoment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
-    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
-    pub fn moment(&self) -> Option<ReactorMoment> {
-        ReactorMoment::capture(
-            self.reactor.window_layout()?,
+    /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
+    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
+    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
+    /// fiction).
+    pub fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            self.reactor.window_layout().ok_or(Refusal::NoWindow)?,
             &self.host.lock().unwrap(),
         )
     }
@@ -5716,7 +5718,7 @@ impl SharedOnrampReactor {
     /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
-    pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
+    pub fn restore(&mut self, moment: &Moment) -> bool {
         let mut host = self.host.lock().unwrap();
         if !self.reactor.restore_window(&moment.layout(), &host) {
             return false;
@@ -5999,12 +6001,13 @@ impl JitOnrampReactor {
         self.caps.push_mouse(kind, payload);
     }
 
-    /// Capture a [`ReactorMoment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
-    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
-    pub fn moment(&self) -> Option<ReactorMoment> {
-        ReactorMoment::capture(
-            region_layout(&self.back)?,
+    /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
+    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
+    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
+    /// fiction).
+    pub fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            region_layout(&self.back).ok_or(Refusal::NoWindow)?,
             &self.host,
         )
     }
@@ -6036,7 +6039,7 @@ impl JitOnrampReactor {
     /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
-    pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
+    pub fn restore(&mut self, moment: &Moment) -> bool {
         if moment.byte_len() as u64 != self.back.len() {
             return false;
         }
@@ -9546,7 +9549,7 @@ pub extern "C" fn temen_onramp_close() {
 
 // ---- reactor moments: the keyframe store behind the page's scrub bar (#1457) ---------------------
 //
-// A [`ReactorMoment`] is a whole window image (16 MiB for the Doom reactor), so it stays **here**, in
+// A [`Moment`] is a whole window image (16 MiB for the Doom reactor), so it stays **here**, in
 // the engine's own memory: the page holds an `i32` slot and never sees the bytes. Copying an image
 // across the FFI to hold it in JS would double the cost of every keyframe for nothing.
 //
@@ -9557,11 +9560,11 @@ pub extern "C" fn temen_onramp_close() {
 
 /// The live moment slots (single-threaded wasm ⇒ a plain static). A freed slot is `None` and is
 /// reused by the next take, so a ladder that evicts as it goes does not grow this vector.
-static mut MOMENTS: Vec<Option<ReactorMoment>> = Vec::new();
+static mut MOMENTS: Vec<Option<Moment>> = Vec::new();
 
 /// Store `moment` in a free slot (or a fresh one) and return its index; `-1` if there was nothing to
 /// capture — no reactor open, or a window that cannot be faithfully imaged.
-fn moment_store(moment: Option<ReactorMoment>) -> i32 {
+fn moment_store(moment: Option<Moment>) -> i32 {
     let Some(moment) = moment else { return -1 };
     // SAFETY: single-threaded wasm; the slot table is touched only by these accessors.
     let slots = unsafe { &mut *core::ptr::addr_of_mut!(MOMENTS) };
@@ -9578,7 +9581,7 @@ fn moment_store(moment: Option<ReactorMoment>) -> i32 {
 
 /// Run `f` against the moment in `slot`. `-1` for an empty or out-of-range slot, else `f`'s verdict as
 /// `0` (applied) / `-1` (refused) — a restore refuses rather than half-applying (INVARIANTS #9c).
-fn moment_with(slot: i32, f: impl FnOnce(&ReactorMoment) -> bool) -> i32 {
+fn moment_with(slot: i32, f: impl FnOnce(&Moment) -> bool) -> i32 {
     // SAFETY: single-threaded wasm; shared read of the slot table for this call.
     let slots = unsafe { &*core::ptr::addr_of!(MOMENTS) };
     let Some(m) = usize::try_from(slot)
@@ -9602,7 +9605,7 @@ fn moment_with(slot: i32, f: impl FnOnce(&ReactorMoment) -> bool) -> i32 {
 #[no_mangle]
 pub extern "C" fn temen_onramp_moment_take() -> i32 {
     // SAFETY: single-threaded wasm; shared read of the reactor.
-    let m = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.and_then(|r| r.moment());
+    let m = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.and_then(|r| r.moment().ok());
     moment_store(m)
 }
 
@@ -9626,7 +9629,7 @@ pub extern "C" fn temen_onramp_moment_restore(slot: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn temen_onramp_jit_moment_take() -> i32 {
     // SAFETY: single-threaded wasm; shared read of the reactor.
-    let m = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.moment());
+    let m = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.moment().ok());
     moment_store(m)
 }
 

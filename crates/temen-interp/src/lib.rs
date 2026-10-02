@@ -828,14 +828,10 @@ pub struct Inspector {
     /// Time-travel **checkpoint ladder** (W1): snapshots of the sole vCPU at ascending `clock`s,
     /// captured during single-threaded `seek` replays so a later `seek`/`step_back` restarts from the
     /// nearest one (`clock ≤ t`) instead of clock 0 — turning a backward sweep from O(t²) into
-    /// ~O(t·stride). Keyed on the op clock; unbounded. Empty in scheduled mode or once `checkpointing`
-    /// is off.
+    /// ~O(t·stride). Keyed on the op clock; unbounded. Refused in scheduled mode, and from the first
+    /// replay that observes state outside the checkpointable subset ([`VCpu::checkpointable`]), after
+    /// which `seek` is exactly the original replay-from-clock-0 path.
     checkpoints: moment::Ladder,
-    /// Whether this run is eligible for checkpointing — the single-threaded, **root-only, non-fiber,
-    /// non-durable, simple-memory** subset where `frames` + window bytes fully capture the
-    /// continuation. Starts `true`; the first replay that observes state outside the subset clears it
-    /// (and the ladder), after which `seek` is exactly the original replay-from-clock-0 path.
-    checkpointing: bool,
 }
 
 /// Capture a checkpoint at most every this many ops. Small enough that `step_back` replays a bounded
@@ -911,7 +907,7 @@ struct HostReplaySubstate {
     cap_states: Vec<Option<Vec<u8>>>,
     /// Each granted `Jit` table's remaining compile quota, `(units, blob bytes)`, positional over
     /// `jit_tables` (#2015). A checkpoint is only taken while no table holds a unit
-    /// ([`Host::checkpoint_safe`]), so the quota is all that can differ from the fresh grant a restore
+    /// ([`Host::admits_checkpoint`]), so the quota is all that can differ from the fresh grant a restore
     /// lands in: a rejected `compile` still charges its bytes.
     jit_quota: Vec<(u32, u64)>,
 }
@@ -1183,7 +1179,6 @@ impl Inspector {
             }),
             finished: None,
             checkpoints: moment::Ladder::new(SEEK_CHECKPOINT_STRIDE, 0, 0),
-            checkpointing: true,
         }
     }
 
@@ -1332,9 +1327,12 @@ impl Inspector {
             }),
             finished: None,
             // Scheduled (multithreaded) seek targets the global turn coordinate and is not
-            // checkpointed in this slice — checkpointing is the single-threaded path only.
-            checkpoints: moment::Ladder::new(SEEK_CHECKPOINT_STRIDE, 0, 0),
-            checkpointing: false,
+            // checkpointed: the tree-walker's continuation is one vCPU's.
+            checkpoints: {
+                let mut l = moment::Ladder::new(SEEK_CHECKPOINT_STRIDE, 0, 0);
+                l.refuse(moment::Refusal::Thread);
+                l
+            },
         }
     }
 
@@ -1497,15 +1495,11 @@ impl Inspector {
     /// from the nearest **checkpoint** (`clock ≤ t`) rather than clock 0 when the run is in the
     /// checkpointable subset, and laying down fresh checkpoints (every [`SEEK_CHECKPOINT_STRIDE`] ops)
     /// along the way. This bounds `seek`/`step_back` to the checkpoint stride instead of O(t). For a
-    /// run outside the subset it is exactly the original replay-from-clock-0 (`checkpointing` is off,
-    /// no checkpoint is found, none is captured).
+    /// run outside the subset it is exactly the original replay-from-clock-0 (the ladder is refused,
+    /// so no checkpoint is found and none is captured).
     fn seek_single(&mut self, init: &SeekInit, host: Arc<Mutex<Host>>, t: u64) -> Stop {
         // Nearest checkpoint at or before `t` (the ladder is kept sorted by `clock`).
-        let start = if self.checkpointing {
-            self.checkpoints.nearest_at_or_before(t)
-        } else {
-            None
-        };
+        let start = self.checkpoints.nearest_at_or_before(t);
         let mut root = Self::fresh_single_root(
             init.funcs.clone(),
             init.types.clone(),
@@ -1545,7 +1539,7 @@ impl Inspector {
         loop {
             let clock = root.debug_clock();
             // Next pause: the upcoming stride boundary (strictly after `clock`), capped at `t`.
-            let next = if self.checkpointing && clock < t {
+            let next = if self.checkpoints.refusal().is_none() && clock < t {
                 (clock / SEEK_CHECKPOINT_STRIDE + 1) * SEEK_CHECKPOINT_STRIDE
             } else {
                 t
@@ -1581,48 +1575,31 @@ impl Inspector {
         }
     }
 
-    /// Snapshot `root` into the checkpoint ladder at its current `clock`, if checkpointing is still on
-    /// and the continuation is [`VCpu::checkpointable`]; otherwise disable checkpointing and drop the
-    /// ladder (the run is outside the snapshottable subset, so `seek` reverts to replay-from-0). A
-    /// `clock` already present in the ladder is not duplicated.
+    /// Offer the checkpoint ladder a snapshot of `root` at its current `clock`: a [`Moment`] when the
+    /// continuation is [`VCpu::checkpointable`] and the moment admits the host and its regions, and
+    /// otherwise the refusal, which drops the ladder and keeps `seek` on replay-from-0 for the rest of
+    /// the session. A refused ladder, or a `clock` already held, takes nothing.
+    ///
+    /// [`Moment`]: moment::Moment
     fn maybe_checkpoint(&mut self, root: &VCpu) {
-        if !self.checkpointing {
-            return;
-        }
         let clock = root.debug_clock();
-        if self.checkpoints.holds(clock) {
+        if self.checkpoints.refusal().is_some() || self.checkpoints.holds(clock) {
             return;
         }
-        let cp = {
-            let h = self.host.lock_unpoisoned();
-            // Leave the subset (and drop the ladder) if the continuation or the host has grown state a
-            // checkpoint can't faithfully restore.
-            if !root.checkpointable() || !h.checkpoint_safe() {
-                drop(h);
-                self.checkpointing = false;
-                self.checkpoints.clear();
-                return;
-            }
+        let cp = root.checkpointable().and_then(|()| {
             // The window as a `MemLayout` (bytes + page map), the one image form (#1456). Under
-            // `snapshot_safe` — which `checkpointable` requires — the map holds only in-prefix `Rw`
-            // commits and the NULL guard, so this captures exactly the bytes `window_snapshot` did and
-            // restores them the same way; it is the same datum in the shared form. `None` when a
-            // region the host holds cannot ride (#2026).
+            // `snapshot_safe`, which `checkpointable` requires, the map holds only in-prefix `Rw`
+            // commits and the NULL guard.
             moment::Moment::checkpoint(
                 root.mem.as_ref().map(|m| m.layout_snapshot()),
-                &h,
+                &self.host.lock_unpoisoned(),
                 moment::Continuation::ShadowStack(moment::ShadowStack::new(
                     root.frames.clone(),
                     root.fuel.can_burn(),
                 )),
             )
-        };
-        let Some(cp) = cp else {
-            self.checkpointing = false;
-            self.checkpoints.clear();
-            return;
-        };
-        self.checkpoints.take(clock, cp);
+        });
+        self.checkpoints.offer(clock, cp);
     }
 
     /// The current call frame's pc, if any (innermost frame).
@@ -1981,6 +1958,12 @@ impl Inspector {
     /// which falls back to replay-from-0. Introspection / test hook; does not affect results.
     pub fn checkpoint_count(&self) -> usize {
         self.checkpoints.len()
+    }
+
+    /// Why this run takes no checkpoints, or `None` while it still does (#1460) — the reason `seek`
+    /// replays from clock 0. Introspection / test hook; does not affect results.
+    pub fn checkpoint_refusal(&self) -> Option<moment::Refusal> {
+        self.checkpoints.refusal()
     }
 
     /// The focused thread's call stack, innermost frame first ([`select_task`] chooses the thread;
@@ -12486,20 +12469,33 @@ impl VCpu {
     /// (no fiber resume-chain or parked root), nothing durable/frozen, no `thread.spawn`/coroutine
     /// children, and memory has a pristine layout (no `map`/`unmap`/`protect`/grow or §13 region
     /// aliasing, so `snapshot`/`seed` of the mapped prefix round-trips). Outside this subset the
-    /// `Inspector` stops checkpointing and falls back to replay-from-clock-0.
-    fn checkpointable(&self) -> bool {
-        self.cur == ROOT_FIBER
-            && self.chain.as_slice() == [ROOT_FIBER]
-            && self.root_parked.is_none()
-            // §3.6 5a/5b: an event-parked fiber's frames (incl. a parked serve handler's) live
-            // in the registry, outside the frames+window capture — no checkpoint.
-            && !self.registry.has_blocked_parks()
-            && self.handler_parks.is_empty()
-            && self.frozen.is_empty()
-            && !self.durable
-            && self.threads.is_empty()
-            && self.invoked.is_none() // no guest-installed §22 units (would need the domain table rebuilt)
-            && self.mem.as_ref().is_none_or(|m| m.snapshot_safe())
+    /// `Inspector` stops checkpointing and falls back to replay-from-clock-0, and this names why.
+    fn checkpointable(&self) -> Result<(), moment::Refusal> {
+        use moment::Refusal;
+        // §3.6 5a/5b: an event-parked fiber's frames (incl. a parked serve handler's) live in the
+        // registry, outside the frames+window capture — no checkpoint.
+        if self.cur != ROOT_FIBER
+            || self.chain.as_slice() != [ROOT_FIBER]
+            || self.root_parked.is_some()
+            || self.registry.has_blocked_parks()
+            || !self.handler_parks.is_empty()
+        {
+            return Err(Refusal::Fiber);
+        }
+        if !self.frozen.is_empty() || self.durable {
+            return Err(Refusal::Durable);
+        }
+        if !self.threads.is_empty() {
+            return Err(Refusal::Thread);
+        }
+        // Guest-installed §22 units would need the domain table rebuilt.
+        if self.invoked.is_some() {
+            return Err(Refusal::Invoke);
+        }
+        if !self.mem.as_ref().is_none_or(|m| m.snapshot_safe()) {
+            return Err(Refusal::WindowLayout);
+        }
+        Ok(())
     }
 
     /// Restore a checkpoint's continuation into this freshly-built root vCPU (from
@@ -24910,13 +24906,14 @@ impl Host {
         self.replay_caps(tape.records.into());
     }
 
-    /// Whether the only run-mutable state this host has accumulated is the **restorable** replay
-    /// substate (I/O streams, clock, cap cursor) — i.e. no stateful host capability has left residue a
-    /// checkpoint restore would silently drop. A fresh seek-host starts with all of these empty; the
-    /// guest minting a §12 blocking / async ring / §22 JIT domain, or the embedder granting a host-fn,
-    /// populates one. While they stay empty a checkpoint restored to an earlier logical time
-    /// reproduces the host faithfully (W1); otherwise the `Inspector` stops checkpointing and falls back
-    /// to replay-from-clock-0.
+    /// The host half of a debugger checkpoint's admission ([`Moment::checkpoint`] calls it): `Ok` when
+    /// the only run-mutable state this host has accumulated is the **restorable** replay substate (I/O
+    /// streams, clock, cap cursor), i.e. no stateful host capability has left residue a checkpoint
+    /// restore would silently drop. A fresh seek-host starts with all of these empty; the guest minting
+    /// a §12 blocking / async ring / §22 JIT domain, or the embedder granting a host-fn, populates one.
+    /// While they stay empty a checkpoint restored to an earlier logical time reproduces the host
+    /// faithfully (W1); otherwise the refusal names what is in the way and the ladder falls back to
+    /// replay-from-clock-0.
     ///
     /// **§13 regions are the checkpoint's own to decide (#2026).** A [`Moment::checkpoint`] carries
     /// the regions a host holds, and declines when one cannot ride
@@ -24953,13 +24950,20 @@ impl Host {
     ///   set in the same order — handle values in restored frames stay valid, and the positional
     ///   cap-state vector in [`HostReplaySubstate`] lines up. An **unnamed** host-fn is an opaque closure
     ///   with no such rule and still disqualifies the run, exactly as before (fail-closed).
-    fn checkpoint_safe(&self) -> bool {
-        self.blockings.is_empty()
-            && self.every_host_proc_reconstructible()
-            // #2015: a unit is a `JitCode` handle and an install the restore cannot rebuild, but a
-            // table that holds none matches the fresh grant a restore lands in, up to the quota the
-            // replay substate carries.
-            && self.jit_tables.iter().all(|d| d.units.is_empty())
+    pub(crate) fn admits_checkpoint(&self) -> Result<(), moment::Refusal> {
+        if !self.blockings.is_empty() {
+            return Err(moment::Refusal::Blocking);
+        }
+        if !self.every_host_proc_reconstructible() {
+            return Err(moment::Refusal::HostProc);
+        }
+        // #2015: a unit is a `JitCode` handle and an install the restore cannot rebuild, but a
+        // table that holds none matches the fresh grant a restore lands in, up to the quota the
+        // replay substate carries.
+        if self.jit_tables.iter().any(|d| !d.units.is_empty()) {
+            return Err(moment::Refusal::JitUnit);
+        }
+        Ok(())
     }
 
     /// The **undo journal's** compact host cursor (#1557): the few scalars and append-only lengths
@@ -31709,7 +31713,7 @@ pub fn host_region_granularity() -> u64 {
 /// capturable subset (see [`Mem::layout_snapshot_safe`]).
 ///
 /// **This is the one window-image form.** The time-travel checkpoint ladder, the reactor moment
-/// (`temen-browser`'s `ReactorMoment`), and the §12 snapshot codec's window section all describe the
+/// (`temen-browser`'s `Moment`), and the §12 snapshot codec's window section all describe the
 /// same datum — bytes plus a protection map — so they carry it as this type rather than as a private
 /// pair of fields each (INVARIANTS #13/#15). A holder that has no live [`Mem`] (a reactor between
 /// frames, whose window is a bare `Region`; a run driver carrying the page list a previous run handed

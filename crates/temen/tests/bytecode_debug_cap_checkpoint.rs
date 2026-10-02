@@ -24,6 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::ScheduledDebugRun;
+use temen_interp::moment::Refusal;
 use temen_interp::{run_with_host, GuestMem, Host, RegionMinter, Value};
 use temen_text::parse_module;
 
@@ -169,7 +170,7 @@ fn a_named_host_capability_checkpoints_and_restores() {
         let mut at_c = session(true);
         let mut f = FUEL;
         while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
-        let Some(snap) = at_c.snapshot() else {
+        let Ok(snap) = at_c.snapshot() else {
             continue;
         };
         checkpoints += 1;
@@ -219,8 +220,9 @@ fn an_unnamed_host_capability_still_refuses_a_checkpoint() {
             break;
         }
     }
-    assert!(
-        run.snapshot().is_none(),
+    assert_eq!(
+        run.snapshot().err(),
+        Some(Refusal::HostProc),
         "an unnamed host capability has nothing to re-grant it by — the ladder must refuse rather \
          than restore a guest beside a capability the rebuild could not reproduce"
     );
@@ -238,6 +240,6 @@ fn the_refusal_is_the_name_not_the_capability() {
         named.tick(&mut f);
         unnamed.tick(&mut f);
     }
-    assert!(named.snapshot().is_some());
-    assert!(unnamed.snapshot().is_none());
+    assert!(named.snapshot().is_ok());
+    assert_eq!(unnamed.snapshot().err(), Some(Refusal::HostProc));
 }

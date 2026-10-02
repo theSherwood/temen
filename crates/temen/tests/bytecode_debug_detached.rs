@@ -208,7 +208,7 @@ fn rides_every_checkpoint(child: &str) -> (String, String) {
 
     let mut wrong = Vec::new();
     for (c, snap) in snaps.iter().enumerate() {
-        let Some(snap) = snap else {
+        let Ok(snap) = snap else {
             wrong.push(format!("turn {c}: no checkpoint"));
             continue;
         };
