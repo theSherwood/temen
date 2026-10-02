@@ -1798,9 +1798,10 @@ INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only 
 owner decided on 2026-10-01 (#1866) which grant: **inspecting a detached child is the freeze
 grant**, since a snapshot is a read. An ancestor may inspect a child it holds
 `FreezeScope::DetachedProgeny` over and that attests `freeze_exposed`; a child nobody may freeze is
-uninspectable. No domain-held inspection surface exists yet — D-DBG-5 keeps the `Inspector`
-host-only — so that is the gate for the first one built. The platform's debugger holds authority over
-every domain and reads, writes and checkpoints any task's window (§1).)
+uninspectable. No domain-held inspection surface exists: D-DBG-5 keeps the `Inspector` host-only,
+and none is built until a consumer needs one (owner, 2026-10-02, #1866), so that grant is the gate
+for the first one. The platform's debugger holds authority over every domain and reads, writes and
+checkpoints any task's window (§1).)
 
 **Dependencies.** None upstream; it is the integration point. Build the shell first so W1/W2/W3
 land verbs onto it incrementally.

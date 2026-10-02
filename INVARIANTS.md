@@ -365,7 +365,9 @@ over a descendant *only by grant*, attenuating down the grant graph like any oth
 (PROCESS.md §6), freeze-ability follows window-read authority: a **nested carve** child's window is a
 sub-range of its parent's, so the parent can read — hence freeze — it by construction (the grant is
 implied by the aliasing, the current behavior); a **detached** child owns its window, so an ancestor
-can freeze it *only if granted*. (The nested case is being retired with the carve path — #13's 2026-09-29 ruling — after which every
+can freeze it *only if granted*. The converse holds too (owner, 2026-10-01, #1866): reading a detached
+child's window, as a debugger does, *is* that grant, with no separate inspect authority; no guest-held
+inspection surface is built until a consumer needs one (2026-10-02). (The nested case is being retired with the carve path — #13's 2026-09-29 ruling — after which every
 child is the detached case.) Placement is therefore orthogonal to durability, and §6's rule reads:
 *confidential = freezable by nobody below the platform; a domain is confidential **or**
 ancestor-freezable per grant, not per placement* — a detached child may be platform-durable **and**

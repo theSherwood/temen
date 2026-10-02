@@ -783,7 +783,7 @@ What the substrate can recreate, graded. "Faithful" = a program using it cannot 
 | zombies & reaping | `join`/`detach` with auto-reap — leak-free by construction |
 | `mmap(MAP_SHARED)`, SysV/POSIX shm + semaphores | `SharedRegion` + futex (personality lib) |
 | orphan reparenting to init | supervisor personality |
-| `ptrace` / `strace` | nested-window visibility (`temen-dap` exists) + endpoint interposition of the cap set — *stronger* than POSIX |
+| `ptrace` / `strace` | nested-window visibility (`temen-dap` exists) + endpoint interposition of the cap set — *stronger* than POSIX. Nested-window visibility retires with the carve (#1867); reading a detached child's window is the freeze grant, built when a consumer needs it (#1866) |
 
 **Faithful with caveats:**
 
