@@ -1,7 +1,7 @@
 // #1312 — **the cooperative tier-up window grows**, checked through the real JS driver.
 //
 // The native `coop_tierup_driver.rs` differential plays the browser's role with wasmi; this is the
-// other half: the *actual* `driveCoopTierupRun` in `web/wasmjit-module.js`, over the *actual* wasm
+// other half: the *actual* `driveCoopTierupRun` in `web/coop-driver.js`, over the *actual* wasm
 // cdylib, on the path the playground takes (`runJitModule` → whole-program open declines → coop).
 // It is the only place the `"win"` fan-out after a bounce is exercised, because only here is the
 // window the engine's own (relocating) backing rather than a mirrored copy.
@@ -202,7 +202,7 @@ if (opened !== 0) {
       return r;
     } };
   const leafCounts = {};
-  const leafStatus = await driveCoopTierupRun(exLeaf, memory, undefined, leafCounts);
+  const leafStatus = await driveCoopTierupRun(exLeaf, memory, { counts: leafCounts });
   const leafGot = { status: ex.temen_status(), out: readStdout() };
   if (leafOpen.region !== 0 || leafOpen.leaf === 0) {
     fail(`program 0 must be the root's leaf with no region emit: ${JSON.stringify(leafOpen)}`);
