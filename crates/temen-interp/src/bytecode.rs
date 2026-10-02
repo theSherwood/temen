@@ -18108,6 +18108,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
 /// children *it* spawns) — publishing its result to this vCPU's `reg`, where `join` finds it. Returns
 /// the join handle; `Err(ThreadFault)` on the cross-thread vCPU-count bomb (the cooperative driver's
 /// `live >= MAX_VCPUS`).
+#[allow(clippy::too_many_arguments)] // the spawn's context, as `coop_start_child`'s
 fn par_start_child<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
