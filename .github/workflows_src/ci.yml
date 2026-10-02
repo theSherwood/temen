@@ -1074,6 +1074,11 @@ jobs:
           # runs interpreted — and each tree ends as it does interpreted. The native pin is
           # `temen-posix/tests/leaf_tierup.rs`.
           node browser-nim-leaf-test.mjs
+          # #1954: an embedder's Release run through the shared JS driver (`web/coop-driver.js`):
+          # declared caps answered through `onCapPark`, slices through `onSlice`, streamed output,
+          # stops, and traps reported or declined — and, in Chromium, a parking root run whole as one
+          # JSPI-suspended leaf.
+          node browser-coop-embedder-test.mjs
           # #1233: the Forth kernel on the cooperative tier through the REAL JS driver — its outer
           # interpreter tiers up and defines/dispatches §22 words from the emitted frame (a mid-bounce
           # install + the by-slot unit fetch), byte-identical to the interpreter; thread words pin the
