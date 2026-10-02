@@ -154,6 +154,15 @@ impl Copies {
 /// A resolved branch edge: its arg copies plus the target op index (`pc`).
 type Edge = (Copies, u32);
 
+/// Which of the child lifecycle probes an [`Op::ChildCtl`] is (PROCESS.md S3, Instantiator ops
+/// 9/10/12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildCtl {
+    Poll,
+    Detach,
+    Kill,
+}
+
 /// One resolved operation. Operands and results are **frame-window-relative slot indices** (added
 /// to the activation's `base` at run time); branch targets are op indices (`pc`) within the same
 /// function. Edge copies are `(src_slot, dst_slot)` pairs applied on a taken branch.
@@ -426,6 +435,16 @@ enum Op {
         /// The `call.cap` result slot — receives `-EINVAL` on a refused exec (a successful exec never
         /// returns to this activation).
         dst: u32,
+    },
+    /// PROCESS.md S3 — `Instantiator.poll`/`detach`/`kill` (ops 9/10/12) on child `child`: how it
+    /// stands (0 running, 1 returned, 2 trapped), drop the join claim, or end it and its subtree
+    /// (#2074). The authority check runs in the op exec; the rest needs the driver's task set
+    /// ([`Outcome::ChildCtl`]).
+    ChildCtl {
+        handle: u32,
+        child: u32,
+        dst: u32,
+        ctl: ChildCtl,
     },
     /// §3.6 (I36 slice 2) — `Instantiator.child_offer` (op 14): mint a live-callee offer over a
     /// running child's impl-export into the wirer's table. The authority check (the Instantiator
@@ -1210,16 +1229,15 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                 match inst {
                     // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
                     // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec,
-                    // op 18 = wait (all executor children,
+                    // op 18 = wait, ops 9/10/12 = poll/detach/kill (all executor children,
                     // scheduler-driven — the grant-carrying spawns re-grant caps but spawn the same
-                    // kind of confined task); everything else on INSTANTIATOR is the legacy coroutine
-                    // residue. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
+                    // kind of confined task); every other INSTANTIATOR op is a deleted one (#2069). Classifying the named spawns as `has_instantiate` (not `has_coro`) is
                     // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
                     // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 13 | 14 | 15 | 17 | 18,
+                        op: 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -2469,6 +2487,16 @@ fn compile_inst(
                 // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
                 // child's export. The mint needs the child's live env, so the op surfaces to the
                 // driver; the compile only marshals `(child, export)`.
+                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if !args.is_empty() => Op::ChildCtl {
+                    handle: g(*handle),
+                    child: g(args[0]),
+                    dst,
+                    ctl: match op {
+                        9 => ChildCtl::Poll,
+                        10 => ChildCtl::Detach,
+                        _ => ChildCtl::Kill,
+                    },
+                },
                 (cap_id::INSTANTIATOR, 14) if args.len() >= 2 => Op::ChildOffer {
                     handle: g(*handle),
                     child: g(args[0]),
@@ -3430,6 +3458,24 @@ impl VcpuProgram {
     /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
     /// cooperative oracle uses. `0` ⇒ natural size (no install room).
     pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
+        // `poll`/`detach`/`kill` (Instantiator ops 9/10/12) act on a child's run, which this
+        // engine's host drives (`VcpuEvent::Join` hands it the token), so it has nothing to answer
+        // or end them with: decline, and the host runs the module on an engine that can (#2068).
+        let child_ctl = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: super::cap_id::INSTANTIATOR,
+                        op: 9 | 10 | 12,
+                        ..
+                    }
+                )
+            })
+        });
+        if child_ctl {
+            return None;
+        }
         let c = compile_module_for(m)?;
         let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
@@ -4665,7 +4711,10 @@ impl<'p> Vcpu<'p> {
                 // `cooperative: false`, so it never arises here); fail closed like its neighbours.
                 | Ok(VcpuStop::BlockOnFiber { .. })
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
-                | Ok(VcpuStop::Preempted) => return VcpuEvent::Trapped(Trap::ThreadFault),
+                | Ok(VcpuStop::Preempted)
+                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns:
+                // `VcpuProgram::compile` declines a module that uses them, so none arrives here.
+                | Ok(VcpuStop::ChildCtl { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
                     let froze = durable
@@ -7837,6 +7886,10 @@ fn service_advance(
                 *turn += 1;
                 dbg_join(tasks, ti, handle, dst, wait);
             }
+            Outcome::ChildCtl { child, dst, ctl } => {
+                *turn += 1;
+                dbg_child_ctl(tasks, extra_envs, ti, child, dst, ctl);
+            }
             Outcome::MemoryWait {
                 base,
                 expected,
@@ -8149,6 +8202,65 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32, wait: bool)
                 dst,
                 wait,
             }
+        }
+    }
+}
+
+/// PROCESS.md S3 `poll`/`detach`/`kill` under the debug engine, as the cooperative driver's arm.
+fn dbg_child_ctl(
+    tasks: &mut [DbgTask],
+    envs: &[DbgEnv],
+    ti: usize,
+    child: i32,
+    dst: u32,
+    ctl: ChildCtl,
+) {
+    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
+        Ok(s) => s,
+        Err(t) => {
+            dbg_complete(tasks, ti, Err(t));
+            return;
+        }
+    };
+    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+    let answer = match ctl {
+        ChildCtl::Poll => match &tasks[c].state {
+            DbgTaskState::Done(Ok(_)) => 1,
+            DbgTaskState::Done(Err(_)) => 2,
+            _ => 0,
+        },
+        ChildCtl::Detach => {
+            tasks[ti].threads[slot] = None;
+            0
+        }
+        ChildCtl::Kill => {
+            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env) {
+                dbg_kill_env(tasks, envs, k);
+            }
+            0
+        }
+    };
+    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
+}
+
+/// `Instantiator.kill` (#2074) under the debug engine: [`coop_kill_env`]'s rule, descending through
+/// the detached children env `k` spawned. (A carve child's env records no spawner; the carve path
+/// is being deleted, #1867.)
+fn dbg_kill_env(tasks: &mut [DbgTask], envs: &[DbgEnv], k: usize) {
+    let live: Vec<usize> = (0..tasks.len())
+        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, DbgTaskState::Done(_)))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for i in live {
+        if !matches!(tasks[i].state, DbgTaskState::Done(_)) {
+            dbg_complete(tasks, i, Err(Trap::ThreadFault));
+        }
+    }
+    for j in 0..envs.len() {
+        if matches!(envs[j].place, EnvPlace::Detached { spawner: Some(s) } if s == k) {
+            dbg_kill_env(tasks, envs, j);
         }
     }
 }
@@ -10128,6 +10240,7 @@ fn spawn_task(
         table,
         fuel: child_fuel,
         fibers: FiberTables::default(),
+        spawner: None,
     });
     tasks.push(TaskSlot {
         vt,
@@ -10614,6 +10727,13 @@ enum Outcome {
     /// domain until a caller's enqueue re-admits it. The cursor is persisted AT the op, so the
     /// wake re-executes the whole serve drain (the tree-walker's rewound park).
     SvcWait,
+    /// PROCESS.md S3 — `poll`/`detach`/`kill` on child `child` ([`Op::ChildCtl`]); driver-side, as
+    /// it owns the task set. The answer (`poll`'s status, else 0) lands at `dst`.
+    ChildCtl {
+        child: i32,
+        dst: u32,
+        ctl: ChildCtl,
+    },
     /// §3.6 (I36 slice 2) — `child_offer`: mint a live offer over child `child`'s export
     /// `export` (driver-side — it owns the child envs); the handle (or `-EINVAL`) lands at `dst`.
     ChildOffer {
@@ -12025,6 +12145,7 @@ fn drive_nested(
             Outcome::Instantiate { .. }
             | Outcome::InstantiateDetached { .. }
             | Outcome::ChildOffer { .. }
+            | Outcome::ChildCtl { .. }
                 if run_meta.is_none() =>
             {
                 return Err(Trap::CapFault)
@@ -12060,6 +12181,12 @@ enum VcpuStop {
     },
     /// §3.6 (I36 slice 2): park this task in `svc.wait` on its own domain ([`Outcome::SvcWait`]).
     SvcWait,
+    /// PROCESS.md S3: `poll`/`detach`/`kill` on child `child` ([`Outcome::ChildCtl`]).
+    ChildCtl {
+        child: i32,
+        dst: u32,
+        ctl: ChildCtl,
+    },
     /// §3.6 (I36 slice 2): mint a live offer over child `child`'s export ([`Outcome::ChildOffer`]).
     ChildOffer {
         child: i32,
@@ -12674,6 +12801,9 @@ fn step_vcpu(
                 })
             }
             Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
+            Outcome::ChildCtl { child, dst, ctl } => {
+                return Ok(VcpuStop::ChildCtl { child, dst, ctl })
+            }
             Outcome::ChildOffer { child, export, dst } => {
                 return Ok(VcpuStop::ChildOffer { child, export, dst })
             }
@@ -12845,6 +12975,33 @@ struct ChildEnv {
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
     /// per-domain [`ParDomain`] registry, here. The root domain's is [`CoopSched::fibers`].
     fibers: FiberTables,
+    /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
+    /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
+    spawner: Option<usize>,
+}
+
+/// `Instantiator.kill` (#2074), cooperative form: end every live task of env `k` with
+/// `ThreadFault`, wherever it is parked ([`complete`] overwrites any blocked state and wakes its
+/// joiners), then the child envs it spawned, as the tree-walker's kill ends a child and its subtree.
+/// An env with nothing left alive is left as it is, its children with it: killing a child that has
+/// ended does nothing.
+fn coop_kill_env(tasks: &mut [TaskSlot], envs: &[ChildEnv], k: usize) {
+    let live: Vec<usize> = (0..tasks.len())
+        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, TaskState::Done(_)))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for i in live {
+        if !matches!(tasks[i].state, TaskState::Done(_)) {
+            complete(tasks, i, Err(Trap::ThreadFault));
+        }
+    }
+    for j in 0..envs.len() {
+        if envs[j].spawner == Some(k) {
+            coop_kill_env(tasks, envs, j);
+        }
+    }
 }
 
 /// #1727 — the powerbox a task's own handles live in: its §14 [`ChildEnv`]'s, or the domain's for the
@@ -12901,6 +13058,7 @@ fn coop_start_child(
         table,
         fuel,
         fibers: FiberTables::default(),
+        spawner: tasks[ti].env,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
@@ -14886,6 +15044,7 @@ impl CoopSched {
                             table: twin_table,
                             fuel: extra_envs[ck].fuel.for_thread(),
                             fibers: FiberTables::default(),
+                            spawner: None,
                         });
                         let twin_ti = tasks.len();
                         tasks.push(TaskSlot {
@@ -15048,6 +15207,7 @@ impl CoopSched {
                                         table: built.table,
                                         fuel: fuel.for_thread(),
                                         fibers: FiberTables::default(),
+                                        spawner: None,
                                     });
                                     tasks[ti].env = Some(eidx);
                                     built.leaf
@@ -15240,6 +15400,7 @@ impl CoopSched {
                                 table: twin_table,
                                 fuel: twin_fuel,
                                 fibers: FiberTables::default(),
+                                spawner: None,
                             });
                             debug_assert_eq!(
                                 tasks.len(),
@@ -15463,6 +15624,41 @@ impl CoopSched {
                     if let Err(t) = started {
                         complete(tasks, ti, Err(t));
                     }
+                }
+                // PROCESS.md S3 — `poll`/`detach`/`kill`, as the tree-walker's op 9/10/12 arms: a
+                // forged or spent handle is a `ThreadFault`, like `join`'s.
+                Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
+                    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
+                        Ok(s) => s,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+                    let answer = match ctl {
+                        ChildCtl::Poll => match &tasks[c].state {
+                            TaskState::Done(Ok(_)) => 1,
+                            TaskState::Done(Err(_)) => 2,
+                            _ => 0,
+                        },
+                        // The result dies with its env; its window lease is refunded once it is
+                        // done (`refund_ended_windows`); its lane went back at admission.
+                        ChildCtl::Detach => {
+                            tasks[ti].threads[slot] = None;
+                            0
+                        }
+                        // A `thread.spawn` handle shares this task's env: nothing to kill, as on
+                        // the tree-walker (no `child_kill` entry).
+                        ChildCtl::Kill => {
+                            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env)
+                            {
+                                coop_kill_env(tasks, extra_envs, k);
+                            }
+                            0
+                        }
+                    };
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
                 }
                 Ok(VcpuStop::Join { handle, dst, wait }) => {
                     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
@@ -16884,7 +17080,13 @@ mod par_futex_tests {
 struct ParDomain {
     fibers: SharedFibers,
     dead: std::sync::Mutex<Option<Trap>>,
+    /// #2074 — the §14 children this domain's vCPUs spawned, by their id in its registry: the domain
+    /// each runs in and the registry its own vCPUs join through. A kill reaches them through it.
+    kids: std::sync::Mutex<std::collections::BTreeMap<u64, ParChild>>,
 }
+
+/// A §14 child of a [`ParDomain`]: its own domain, and the registry its vCPUs join through.
+type ParChild = (std::sync::Arc<ParDomain>, std::sync::Arc<ThreadRegistry>);
 
 impl ParDomain {
     /// This domain's trap, once a member has died.
@@ -16908,6 +17110,18 @@ impl ParDomain {
             reg.woken.notify_all();
         }
         reg.wake_fork_waiters();
+    }
+
+    /// `Instantiator.kill` (#2074): end this child domain, whose vCPUs join through `reg`, and every
+    /// child domain under it, with `ThreadFault` ([`ParDomain::kill`] wakes its parked members; a
+    /// running one stops at its next safepoint). The parallel driver's child scope joins its
+    /// children before it ends, so a domain that has ended has none left alive.
+    fn kill_tree(&self, reg: &ThreadRegistry) {
+        self.kill(&Trap::ThreadFault, reg);
+        let kids: Vec<ParChild> = self.kids.lock_unpoisoned().values().cloned().collect();
+        for (d, r) in kids {
+            d.kill_tree(&r);
+        }
     }
 }
 
@@ -17402,6 +17616,37 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 let handle = threads.len() as i32;
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
+            }
+            // PROCESS.md S3 — `poll`/`detach`/`kill`, as the cooperative driver's arm.
+            Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
+                let slot = match super::resolve_thread(&threads, child) {
+                    Ok(s) => s,
+                    Err(t) => return (Err(t), mem),
+                };
+                let id = threads[slot].expect("resolve_thread checked liveness");
+                let answer = match ctl {
+                    ChildCtl::Poll => match reg.done.lock_unpoisoned().get(&id) {
+                        None => 0,
+                        Some(Ok(_)) => 1,
+                        Some(Err(_)) => 2,
+                    },
+                    // A result published later stays in `done` until the run ends, as the oracle
+                    // discards a detached child's at teardown.
+                    ChildCtl::Detach => {
+                        threads[slot] = None;
+                        reg.done.lock_unpoisoned().remove(&id);
+                        0
+                    }
+                    // A `thread.spawn` handle names no child domain: nothing to kill.
+                    ChildCtl::Kill => {
+                        let kid = domain.kids.lock_unpoisoned().get(&id).cloned();
+                        if let Some((d, r)) = kid {
+                            d.kill_tree(&r);
+                        }
+                        0
+                    }
+                };
+                vt.active.set(dst, Reg::from_i32(answer));
             }
             Ok(VcpuStop::Join { handle, dst, wait }) => {
                 let slot = match super::resolve_thread(&threads, handle) {
@@ -17910,7 +18155,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &host, &mut threads, child, spawn.entry) {
+                match par_start_child(
+                    scope,
+                    dom,
+                    reg,
+                    &host,
+                    &domain,
+                    &mut threads,
+                    child,
+                    spawn.entry,
+                ) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -17934,7 +18188,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &host, &mut threads, child, spawn.entry) {
+                match par_start_child(
+                    scope,
+                    dom,
+                    reg,
+                    &host,
+                    &domain,
+                    &mut threads,
+                    child,
+                    spawn.entry,
+                ) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -17948,11 +18211,14 @@ fn run_vcpu_parallel_body<'scope, 'env>(
 /// children *it* spawns) — publishing its result to this vCPU's `reg`, where `join` finds it. Returns
 /// the join handle; `Err(ThreadFault)` on the cross-thread vCPU-count bomb (the cooperative driver's
 /// `live >= MAX_VCPUS`).
+#[allow(clippy::too_many_arguments)] // the spawn's context, as `coop_start_child`'s
 fn par_start_child<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
     reg: &'env ThreadRegistry,
     parent_host: &std::sync::Arc<std::sync::Mutex<Host>>,
+    // The spawner's domain, which records the child for a kill (#2074).
+    parent_domain: &ParDomain,
     threads: &mut Vec<Option<u64>>,
     child: AdmittedChild,
     entry: i64,
@@ -17976,8 +18242,20 @@ fn par_start_child<'scope, 'env>(
     let id = reg
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let child_reg = ThreadRegistry::new();
+    let child_par = std::sync::Arc::new(ParDomain::default());
+    parent_domain.kids.lock_unpoisoned().insert(
+        id,
+        (
+            std::sync::Arc::clone(&child_par),
+            std::sync::Arc::clone(&child_reg),
+        ),
+    );
+    // A kill that reached the spawner while this child was being filed missed it: it dies too.
+    if parent_domain.dead().is_some() {
+        child_par.kill_tree(&child_reg);
+    }
     scope.spawn(move || {
-        let child_reg = ThreadRegistry::new();
         let child_host = std::sync::Arc::new(std::sync::Mutex::new(host));
         let (r, _m) = std::thread::scope(|cscope| {
             run_vcpu_parallel(
@@ -17985,7 +18263,7 @@ fn par_start_child<'scope, 'env>(
                 &child_dom,
                 &child_reg,
                 std::sync::Arc::clone(&child_host),
-                std::sync::Arc::new(ParDomain::default()),
+                child_par,
                 None,
                 vt,
                 mem,
@@ -19617,6 +19895,22 @@ impl Vm {
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
                 // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
                 // confined child (it owns the task set + the per-child environments).
+                Op::ChildCtl {
+                    handle,
+                    child,
+                    dst,
+                    ctl,
+                } => {
+                    let ih = r!(*handle).i32();
+                    host.with(|p| p.resolve_instantiator(ih))?; // authority, as `ChildOffer`
+                    let child = r!(*child).i32();
+                    let (dst, ctl) = (*dst, *ctl);
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ChildCtl { child, dst, ctl });
+                }
                 Op::ChildOffer {
                     handle,
                     child,

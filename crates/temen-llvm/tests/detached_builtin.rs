@@ -115,3 +115,43 @@ fn budget_split_read_and_wait_lower_to_their_ops() {
         "split, read, spawn detached, wait, join"
     );
 }
+
+const LL_SUPERVISE: &str = r#"
+declare i64 @__vm_poll(i32, i64)
+declare i64 @__vm_detach(i32, i64)
+declare i64 @__vm_kill(i32, i64)
+
+define i64 @supervise(i32 %inst, i64 %h) {
+  %p = call i64 @__vm_poll(i32 %inst, i64 %h)
+  %k = call i64 @__vm_kill(i32 %inst, i64 %h)
+  %d = call i64 @__vm_detach(i32 %inst, i64 %h)
+  %s = add i64 %p, %k
+  %t = add i64 %s, %d
+  ret i64 %t
+}
+"#;
+
+/// #1706 — a spawner supervises its children: `__vm_poll`, `__vm_kill` and `__vm_detach` lower to
+/// `call.cap INSTANTIATOR` ops 9, 12 and 10 with the child handle, as `__vm_wait` is op 18.
+#[test]
+fn poll_kill_and_detach_lower_to_their_ops() {
+    let t = temen_llvm::translate_ll_str(LL_SUPERVISE).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let caps: Vec<(u32, u32, usize)> = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
+        .filter_map(|i| match i {
+            Inst::CapCall {
+                type_id, op, args, ..
+            } => Some((*type_id, *op, args.len())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        caps,
+        vec![(6, 9, 1), (6, 12, 1), (6, 10, 1)],
+        "poll, kill, detach"
+    );
+}
