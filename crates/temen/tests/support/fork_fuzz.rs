@@ -12,8 +12,12 @@
 //! Driven by the `fork_diff` libFuzzer target and a stable seed-sweep test (`fork_fuzz.rs`).
 #![allow(dead_code)]
 
+#[path = "../../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, StreamRole, Trap, Value};
+use temen_ir::SpawnRec;
 
 /// The `SRC_TWIN` topology with the two reply constants tokenized: a manager spawns a server + a
 /// guest, the guest `fork()`s (`clone_caller(__RO__, __RT__)`), the twin runs over a private window +
@@ -27,30 +31,12 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 131072
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
-  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  q1b = i64.const 17564
+  i32.store q1b vbud
+  q1p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
@@ -69,28 +55,10 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  q2v0 = i64.const 17179869184
-  q2v1 = i64.const 135168
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2v5 = i64.const 16640
-  q2v6 = i64.const 2
-  q2a0 = i64.const 17664
-  i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
-  i64.store q2a5 q2v5
-  q2a6 = i64.const 17712
-  i64.store q2a6 q2v6
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  q2b = i64.const 17692
+  i32.store q2b vbud
+  q2p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
@@ -123,16 +91,10 @@ block 0 (vpid: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
@@ -157,7 +119,7 @@ block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
   br_if visechild 1(vhsvc, vho) 4(vr, vho)
   }
 block 4 (vr: i64, vho: i32) {
-  vp16 = i64.const 16
+  vp16 = i64.const 17408
   i64.store vp16 vr
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
@@ -187,9 +149,18 @@ fn params(data: &[u8]) -> (i64, i64) {
 }
 
 fn build(ro: i64, rt: i64) -> Option<Arc<temen_ir::Module>> {
+    // The spawn records, both detached and paid from the root's budget: S (func 1) at 17536, and C
+    // (func 4) at 17664, granted `"svc"` and `"o"` by the list at 16640.
+    let caller = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 2,
+        ..SpawnRec::v1(4)
+    };
     let src = TEMPLATE
         .replace("__RO__", &ro.to_string())
-        .replace("__RT__", &rt.to_string());
+        .replace("__RT__", &rt.to_string())
+        + &rec::segment(17536, &SpawnRec::v1(1))
+        + &rec::segment(17664, &caller);
     let m = temen_text::parse_module(&src).ok()?;
     temen_verify::verify_module(&m).ok()?;
     Some(Arc::new(m))
@@ -226,7 +197,12 @@ fn observe(
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out = host.grant_stream(StreamRole::Out);
-    let r = run(m, &[Value::I32(inst), Value::I32(out)], &mut host)?;
+    let budget = host.grant_budget(-1, 64 << 20, -1);
+    let r = run(
+        m,
+        &[Value::I32(inst), Value::I32(out), Value::I32(budget)],
+        &mut host,
+    )?;
     let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Some((r, sorted_i64(&bytes)))
 }

@@ -1,16 +1,16 @@
 //! FORK.md §8.5 — a program forking on temen with **real posix libc**, end to end under the manager
 //! topology. This is the capstone of Track 2 minus the chibicc frontend: it exercises the same
-//! wiring a compiled-C `fork()` will use — forkable libc (slice 1), libc re-granted into a nested
-//! child (slice 3), and the manager/server/guest topology — with a hand-written-IR guest (so the
+//! wiring a compiled-C `fork()` will use — forkable libc (slice 1), libc re-granted into a child
+//! (slice 3), and the manager/server/guest topology — with a hand-written-IR guest (so the
 //! guest resolves its caps by name, sidestepping the `__px_` import-manifest binder that is the one
 //! remaining piece for pure compiled-C).
 //!
 //! Topology (all one module; task ids are deterministic: manager root = 0, server = 1, guest = 2,
 //! twin = 3):
-//! - **manager** (func 0, args = instantiator + the granted libc handle): spawns the **server**
-//!   (func 1), mints a `child_offer` over its `fork` export, then spawns the **guest** (func 3) via
-//!   `instantiate_named`, re-granting BOTH the fork offer (as `"fork"`) and the libc (as `"libc"`)
-//!   into it; joins the guest and returns its result.
+//! - **manager** (func 0, args = instantiator + the granted libc handle + a budget): spawns the
+//!   **server** (func 1), mints a `child_offer` over its `fork` export, then spawns the **guest**
+//!   (func 3), re-granting BOTH the fork offer (as `"fork"`) and the libc (as `"libc"`) into it;
+//!   joins the guest and returns its result. Both children are detached, paid from the budget.
 //! - **server** (func 1): a `svc.wait` loop whose handler (func 2) runs **pid-mode `clone_caller`**.
 //! - **guest** (func 3): resolves `"libc"` + `"fork"` by name, calls `fork()` (retrying on the
 //!   `-EAGAIN` serve/park race — the realistic `while ((pid = fork()) < 0)` shell idiom, see
@@ -24,15 +24,15 @@
 //! Interp only: the serve-loop / caller-parking substrate `fork()` rides is eval-loop-only (as for
 //! every `clone_caller` test).
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 
 use temen_interp::{run_with_host, Host, Value};
+use temen_ir::SpawnRec;
 use temen_text::parse_module;
 use temen_verify::verify_module;
-
-/// `"libc"` and `"fork"` as little-endian `i64`s, for the guest to stage in its window and resolve.
-const LIBC_LE: i64 = 0x6362_696c; // b"libc"
-const FORK_LE: i64 = 0x6b72_6f66; // b"fork"
 
 const SRC: &str = r#"
 memory 19
@@ -41,31 +41,12 @@ type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 data 16684 "fork"
 data 16694 "libc"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vlibc: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  ; spawn via record (op 17): entry=1 off=262144 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 262144
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  vs = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vlibc: i32, vbud: i32) {
+  q0b = i64.const 17564
+  i32.store q0b vbud
+  q0p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
   vz0 = i64.const 0
   vforkoff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
@@ -83,29 +64,10 @@ block 0 (v0: i32, vlibc: i32) {
   i32.store va4 vfour
   va5 = i64.const 16664
   i32.store va5 vlibc
-  ; spawn via record (op 17): entry=3 off=266240 sl=12 quota=0
-  q1v0 = i64.const 12884901888
-  q1v1 = i64.const 266240
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1v5 = i64.const 16640
-  q1v6 = i64.const 2
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v5
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v6
-  vg = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+  q1b = i64.const 17692
+  i32.store q1b vbud
+  q1p = i64.const 17664
+  vg = call.cap 6 17 (i64) -> (i32) v0 (q1p)
   vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
   return vjg
   }
@@ -130,16 +92,10 @@ block 0 (vx: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vln = i64.const 1667393900
-  vz0 = i64.const 0
-  i64.store vz0 vln
-  vp0 = i64.const 0
+  vp0 = i64.const 16694
   vl4 = i64.const 4
   vlibc = self.resolve vp0 vl4
-  vfn = i64.const 1802661734
-  vz8 = i64.const 8
-  i64.store vz8 vfn
-  vp8 = i64.const 8
+  vp8 = i64.const 16684
   vfork = self.resolve vp8 vl4
   br 1(vlibc, vfork)
 }
@@ -151,7 +107,7 @@ block 1 (vlibc: i32, vfork: i32) {
   br_if vforkfail 1(vlibc, vfork) 2(vlibc, vr)
 }
 block 2 (vlibc: i32, vr: i64) {
-  vp16 = i64.const 16
+  vp16 = i64.const 17408
   i64.store vp16 vr
   vfd1 = i64.const 1
   veight = i64.const 8
@@ -161,13 +117,25 @@ block 2 (vlibc: i32, vr: i64) {
 }
 "#;
 
+/// [`SRC`] with its spawn records, both detached and paid from the manager's budget: the server
+/// (func 1) at 17536, and the guest (func 3) at 17664, granted `"fork"` and `"libc"` by the list at
+/// 16640.
+fn src() -> String {
+    let guest = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 2,
+        ..SpawnRec::v1(3)
+    };
+    format!(
+        "{SRC}{}{}",
+        rec::segment(17536, &SpawnRec::v1(1)),
+        rec::segment(17664, &guest)
+    )
+}
+
 #[test]
 fn a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs() {
-    // The two staged names must match the data-segment names the manager re-grants under.
-    assert_eq!(LIBC_LE, 1_667_393_900);
-    assert_eq!(FORK_LE, 1_802_661_734);
-
-    let m = Arc::new(parse_module(SRC).expect("parse"));
+    let m = Arc::new(parse_module(&src()).expect("parse"));
     verify_module(&m).expect("verify");
 
     let mut host = Host::new();
@@ -176,12 +144,13 @@ fn a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs()
     // Forkable posix libc on the manager's host (slice 1). The guest inherits it re-granted (slice 3).
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
     let inst = host.grant_instantiator(0, win);
+    let budget = host.grant_budget(-1, 64 << 20, -1);
 
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(inst), Value::I32(libc)],
+        &[Value::I32(inst), Value::I32(libc), Value::I32(budget)],
         &mut fuel,
         &mut host,
     )
