@@ -251,15 +251,18 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     let p = programs.get(m);
     if (p === undefined && !isLeaf(m)) p = emitted;
     if (p === undefined) {
-      const ptr = Number(ex.temen_coop_leaf_wasm_ptr(m));
-      const bytes = u8().slice(ptr, ptr + ex.temen_coop_leaf_wasm_len(m));
-      // A leaf image's program index is the run's own, so the cross-Run cache keys its emitted bytes
-      // by content. Holding the compiled Module keeps its code for the next build in this page: V8
-      // otherwise frees a Module nothing references, and the next build compiles it cold again.
-      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-      const key = `leaf:${Array.from(digest, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+      // A leaf image's program index is the run's own, so the cross-Run cache keys it by the engine's
+      // key: its image's digest and how it was emitted (#2087). A later build's image of the same
+      // command is found without reading, hashing or compiling its bytes. Holding the compiled Module
+      // keeps its code for the next build in this page: V8 otherwise frees a Module nothing
+      // references, and the next build compiles it cold again.
+      const kn = ex.temen_coop_leaf_key(m);
+      const kp = Number(ex.temen_coop_leaf_key_ptr());
+      const key = `leaf:${Array.from(u8().subarray(kp, kp + kn), (b) => b.toString(16).padStart(2, '0')).join('')}`;
       let module = cacheGet(key);
       if (module === undefined) {
+        const ptr = Number(ex.temen_coop_leaf_wasm_ptr(m));
+        const bytes = u8().slice(ptr, ptr + ex.temen_coop_leaf_wasm_len(m));
         module = await WebAssembly.compile(bytes);
         cachePut(key, module);
         jitCacheStats.compiles++;

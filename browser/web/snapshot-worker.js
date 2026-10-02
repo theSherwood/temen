@@ -257,9 +257,9 @@ self.onmessage = async (e) => {
       const run = nimTurn.then(() => nimCompileRun(ex, memory, nim, msg.source));
       nimTurn = run.catch(() => {});
       const r = await run;
-      // The compiled-module cache's counters, so a caller can see a later build reuse this worker's
-      // compiled leaf modules.
-      const cache = { compiles: jitCacheStats.compiles, hits: jitCacheStats.hits };
+      // The compiled-module cache's counters and the engine's emits, so a caller can see a later build
+      // reuse this worker's leaf images: compiled, and emitted (#2087).
+      const cache = { compiles: jitCacheStats.compiles, hits: jitCacheStats.hits, emits: ex.temen_coop_leaf_emits() };
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r, ...cache });
       return;
     }
