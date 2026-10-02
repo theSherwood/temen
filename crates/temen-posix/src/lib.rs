@@ -1562,6 +1562,47 @@ impl Posix {
         files.into_iter().map(|(_, k)| k.clone()).collect()
     }
 
+    /// #2099 — continue in `from`'s directory tree: its memfs moves here, each file with its bytes
+    /// and its write stamp, and its empty directories with it. A build tool that runs here finds
+    /// what ran there up to date, as it does in a directory it builds in again. This personality's
+    /// write clock continues after `from`'s, so whatever is written from now on is newer than all of
+    /// it. `from` is left with no files.
+    pub fn adopt_files(&self, from: &Posix) {
+        if Arc::ptr_eq(&self.world, &from.world) {
+            return;
+        }
+        let mut src = from.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dst = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        dst.files.extend(std::mem::take(&mut src.files));
+        dst.explicit_dirs
+            .extend(std::mem::take(&mut src.explicit_dirs));
+        dst.fs_clock = dst.fs_clock.max(src.fs_clock);
+    }
+
+    /// Remove a memfs file, as a host deletes one before running a tool there. Returns whether it
+    /// was there.
+    pub fn remove_file(&self, path: &str) -> bool {
+        self.world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .remove(&rooted(path))
+            .is_some()
+    }
+
+    /// [`Posix::write_file`], unless `path` already holds `bytes`: an unchanged file keeps its write
+    /// stamp, so a build tool's freshness check finds it unchanged, as an editor that saves an
+    /// unmodified file leaves it alone. Returns whether it wrote.
+    pub fn write_file_if_changed(&self, path: &str, bytes: &[u8]) -> bool {
+        let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        let path = rooted(path);
+        if w.files.get(&path).is_some_and(|f| f.bytes == bytes) {
+            return false;
+        }
+        w.file_put(path, bytes.to_vec());
+        true
+    }
+
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
     /// guest `getenv`s. Invalidates any cached `getenv` pointer for the name.
     pub fn set_env(&self, name: &str, value: &str) {
@@ -8106,6 +8147,43 @@ block 0 (vph: i32) {\n\
             ["/a.p.nif", "/c.s.nif", "/b.nim"],
             "a rewrite moves a file to the end"
         );
+    }
+
+    /// #2099 — a personality that adopts another's files continues in its directory: they keep
+    /// their write order, its empty directories come along, what it writes next is newer than all
+    /// of them, a file rewritten with the bytes it holds keeps its place, and the personality they
+    /// came from is left with none.
+    #[test]
+    fn a_personality_continues_in_the_files_it_adopts() {
+        let mut host = Host::new();
+        let (_h, last) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        last.write_file("/src.nim", b"echo 1");
+        last.write_file("/cache/src.nif", b"built");
+        last.world
+            .lock()
+            .unwrap()
+            .explicit_dirs
+            .insert("/empty".into());
+        let mut host = Host::new();
+        let (_h, next) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        next.adopt_files(&last);
+        assert_eq!(next.file_names_by_write(), ["/src.nim", "/cache/src.nif"]);
+        assert!(next.world.lock().unwrap().explicit_dirs.contains("/empty"));
+        assert!(last.file_names().is_empty(), "moved, not copied");
+        assert!(
+            !next.write_file_if_changed("/src.nim", b"echo 1"),
+            "the same bytes are not written"
+        );
+        assert_eq!(next.file_names_by_write(), ["/src.nim", "/cache/src.nif"]);
+        assert!(next.write_file_if_changed("/src.nim", b"echo 2"));
+        assert_eq!(
+            next.file_names_by_write(),
+            ["/cache/src.nif", "/src.nim"],
+            "an edit outruns what was built from the old source"
+        );
+        assert!(next.remove_file("cache/src.nif"));
+        assert!(!next.remove_file("/cache/src.nif"), "already gone");
+        assert_eq!(next.file_names_by_write(), ["/src.nim"]);
     }
 
     #[test]

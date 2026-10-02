@@ -41,11 +41,17 @@ pub struct NimBuild {
 /// ([`CoopEvent::TierUp`]); without `leaf` every process interprets. `None` when the driver is not a
 /// program this tier runs.
 ///
+/// With `dir`, the personality of an earlier build, this one continues in its directory (#2099):
+/// its files move here, and of `files` only those that differ from what it holds are written. A
+/// file left as it was keeps its write stamp, so nimony's freshness checks find what that build made
+/// from it up to date, as they would in a directory on a host that it builds in again.
+///
 /// `temen-link` is served natively at both of its paths ([`native_link`]), so `commands` need not
 /// carry it.
 pub fn nim_open(
     driver: &Module,
     commands: &[(PreparedModule, Vec<&str>)],
+    dir: Option<&temen_posix::Posix>,
     files: &[(&str, &[u8])],
     argv: &[&[u8]],
     cwd: &str,
@@ -61,6 +67,9 @@ pub fn nim_open(
         loader: true,
     };
     let (host, posix, init_mem) = posix_host_build(driver, &run)?;
+    if let Some(dir) = dir {
+        posix.adopt_files(dir);
+    }
     for path in [
         format!("{cwd}/bin/temen-link"),
         "/bin/temen-link".to_string(),
@@ -70,9 +79,9 @@ pub fn nim_open(
     posix.set_cwd(cwd);
     // In the order given: the memfs stamps write order into `st_mtim`, which the freshness checks
     // of nimony's `deps.nim` and of nifmake read, so a tree's sources go in before anything made
-    // from them.
+    // from them. Over `dir`, a file it already holds keeps its stamp.
     for (path, bytes) in files {
-        posix.write_file(path, bytes);
+        posix.write_file_if_changed(path, bytes);
     }
     // No function of the driver tiers up: it spawns and waits, and a tiered-up function cannot park.
     let tierup = leaf.map(|leaf| TierUpConfig {
@@ -101,6 +110,7 @@ pub fn nim_open(
 pub fn nim_build(
     driver: &Module,
     commands: &[(&Module, Vec<&str>)],
+    dir: Option<&temen_posix::Posix>,
     files: &[(&str, &[u8])],
     argv: &[&[u8]],
     cwd: &str,
@@ -114,7 +124,7 @@ pub fn nim_build(
         .iter()
         .map(|(m, paths)| (prepare(m), paths.clone()))
         .collect();
-    let (mut run, posix) = nim_open(driver, &commands, files, argv, cwd, leaf)?;
+    let (mut run, posix) = nim_open(driver, &commands, dir, files, argv, cwd, leaf)?;
     let (mut ran, mut resumes) = (0, 0);
     let end = loop {
         match run.run() {
@@ -308,15 +318,16 @@ pub unsafe extern "C" fn temen_nim_module_suffix(path_ptr: *const u8, path_len: 
     len
 }
 
-/// The memfs of the most recent nimony build, which [`temen_nim_file`] reads.
-static mut LAST_BUILD: Option<temen_posix::Posix> = None;
-
 /// #2087 — a build's toolchain, decoded and prepared: nimony, and its commands with their paths.
 struct Toolchain {
     driver_bytes: Vec<u8>,
     cmds_bytes: Vec<u8>,
     driver: Arc<Module>,
     commands: Vec<(Vec<String>, PreparedModule)>,
+    /// #2099 — the directory its builds share: the personality of the last one to end, whose memfs
+    /// [`temen_nim_file`] reads and the next build continues in. A new toolchain starts from the
+    /// files it is given.
+    dir: Option<temen_posix::Posix>,
 }
 
 /// The toolchain the last build opened ([`toolchain`]).
@@ -324,7 +335,7 @@ static mut TOOLCHAIN: Option<Toolchain> = None;
 
 /// The toolchain of `driver` and `cmds` (a [`temen_nim_open`]'s), kept in [`TOOLCHAIN`].
 #[allow(static_mut_refs)]
-fn toolchain(driver: &[u8], cmds: &[u8]) -> Result<&'static Toolchain, i32> {
+fn toolchain(driver: &[u8], cmds: &[u8]) -> Result<&'static mut Toolchain, i32> {
     // SAFETY: single-threaded wasm; the cache is touched only here, and a session holds what it
     // granted by `Arc`, never by borrow.
     toolchain_in(
@@ -341,7 +352,7 @@ fn toolchain_in<'s>(
     slot: &'s mut Option<Toolchain>,
     driver: &[u8],
     cmds: &[u8],
-) -> Result<&'s Toolchain, i32> {
+) -> Result<&'s mut Toolchain, i32> {
     if !slot
         .as_ref()
         .is_some_and(|t| t.driver_bytes == driver && t.cmds_bytes == cmds)
@@ -365,18 +376,22 @@ fn toolchain_in<'s>(
             cmds_bytes: cmds.to_vec(),
             driver: module,
             commands,
+            dir: None,
         });
     }
-    slot.as_ref().ok_or(STATUS_DECODE_ERR)
+    slot.as_mut().ok_or(STATUS_DECODE_ERR)
 }
 /// The file the most recent [`temen_nim_file`] read ([`temen_nim_file_ptr`]).
 static mut FILE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
-/// A nim session's run ended: keep its memfs for [`temen_nim_file`] and hand back what it printed.
+/// A nim session's run ended: keep its memfs as its toolchain's directory, for [`temen_nim_file`]
+/// and the next build, and hand back what it printed.
 pub(crate) fn finish(nim: NimSession) -> (Vec<u8>, Vec<u8>) {
     let out = (nim.posix.stdout(), nim.posix.stderr());
-    // SAFETY: single-threaded wasm; the build's memfs is read only through `temen_nim_file`.
-    unsafe { *core::ptr::addr_of_mut!(LAST_BUILD) = Some(nim.posix) };
+    // SAFETY: single-threaded wasm; the toolchain is touched only by the nim exports.
+    if let Some(tc) = unsafe { (*core::ptr::addr_of_mut!(TOOLCHAIN)).as_mut() } {
+        tc.dir = Some(nim.posix);
+    }
     out
 }
 
@@ -385,7 +400,8 @@ pub(crate) fn finish(nim: NimSession) -> (Vec<u8>, Vec<u8>) {
 /// pauses the run as a `COOP_RUN_TIERUP` of its own program ([`crate::temen_coop_module`]) to run whole
 /// on the emitted tier (#1896). `[driver)` is nimony's module; `[cmds)` the commands, a registry blob
 /// ([`blob_entries`]) whose entry names list a module's paths, one per line; `[files)` the tree it
-/// builds in, a blob of `path → bytes`; `[argv)` its arguments, each NUL-terminated; `[cwd)` the
+/// builds in, a blob of `path → bytes`, written over the directory the toolchain's last build left
+/// ([`nim_open`]); `[argv)` its arguments, each NUL-terminated; `[cwd)` the
 /// directory it runs in. `suspend` is non-zero when the driver can suspend a leaf's emitted frames
 /// where a call parks (JSPI): a leaf process that parks only on its pipes and its children then runs
 /// emitted too, and a parked call surfaces as [`crate::COOP_RUN_RESUME`] once it returns. Returns
@@ -422,6 +438,7 @@ pub unsafe extern "C" fn temen_nim_open(
     };
     let status = (|| {
         let tc = toolchain(driver, cmds)?;
+        let dir = tc.dir.take();
         let commands: Vec<(PreparedModule, Vec<&str>)> = tc
             .commands
             .iter()
@@ -435,8 +452,16 @@ pub unsafe extern "C" fn temen_nim_open(
         let leaves = crate::Leaves::default();
         // A nim build runs on the threads cdylib, over shared memory.
         let emit = crate::leaf_emitter(Arc::clone(&leaves), suspend != 0, true);
-        let (run, posix) = nim_open(&tc.driver, &commands, &files, &argv, cwd, Some(emit))
-            .ok_or(STATUS_UNSUPPORTED)?;
+        let (run, posix) = nim_open(
+            &tc.driver,
+            &commands,
+            dir.as_ref(),
+            &files,
+            &argv,
+            cwd,
+            Some(emit),
+        )
+        .ok_or(STATUS_UNSUPPORTED)?;
         // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
         unsafe {
             *core::ptr::addr_of_mut!(crate::COOP_RUN) =
@@ -462,8 +487,9 @@ pub unsafe extern "C" fn temen_nim_open(
 pub unsafe extern "C" fn temen_nim_file(path_ptr: *const u8, path_len: usize) -> i64 {
     // SAFETY: the caller's contract.
     let path = unsafe { crate::host_slice(path_ptr, path_len) };
-    // SAFETY: single-threaded wasm; the build's memfs and the slot are touched only here.
-    let build = unsafe { (*core::ptr::addr_of!(LAST_BUILD)).as_ref() };
+    // SAFETY: single-threaded wasm; the build's memfs and the slot are touched only by the nim
+    // exports.
+    let build = unsafe { (*core::ptr::addr_of!(TOOLCHAIN)).as_ref() }.and_then(|t| t.dir.as_ref());
     let bytes = core::str::from_utf8(path)
         .ok()
         .zip(build)
@@ -477,6 +503,24 @@ pub unsafe extern "C" fn temen_nim_file(path_ptr: *const u8, path_len: usize) ->
         )
     };
     len
+}
+
+/// Remove `[path)` from the directory the toolchain's next build continues in ([`Toolchain::dir`]):
+/// `1` when it was there. A host that tells whether a build linked its program by the program's file
+/// removes it first, since the build otherwise finds the last build's in its place (#2099).
+///
+/// # Safety
+/// `(path_ptr, path_len)` must be a live [`crate::temen_alloc`]ation the host filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_remove(path_ptr: *const u8, path_len: usize) -> i32 {
+    // SAFETY: the caller's contract.
+    let path = unsafe { crate::host_slice(path_ptr, path_len) };
+    // SAFETY: single-threaded wasm; the build's memfs is touched only by the nim exports.
+    let dir = unsafe { (*core::ptr::addr_of!(TOOLCHAIN)).as_ref() }.and_then(|t| t.dir.as_ref());
+    core::str::from_utf8(path)
+        .ok()
+        .zip(dir)
+        .is_some_and(|(path, posix)| posix.remove_file(path)) as i32
 }
 
 /// Pointer to the bytes the most recent [`temen_nim_file`] read.

@@ -128,6 +128,7 @@ fn the_toolchain_runs_at_its_paths_and_runs_what_it_built() {
         let b = nim_build(
             &driver,
             &[(&tool, vec!["/w/bin/c", "/bin/c"])],
+            None,
             &[("/w/p", &built)],
             &[b"bin/driver"],
             "/w",
@@ -154,6 +155,54 @@ fn the_toolchain_runs_at_its_paths_and_runs_what_it_built() {
     }
 }
 
+/// #2099 — a build given an earlier one's personality continues in its directory: what that build
+/// left is there, a file given with the bytes it already holds keeps its write stamp, so a tool finds
+/// what was made from it up to date, and an edited file is newer than everything made before.
+#[test]
+fn a_build_continues_in_the_directory_the_last_one_left() {
+    let driver = module(&driver(&["/bin/c"], &["./p"]));
+    let tool = module(SEVEN);
+    let built = temen_encode::encode_module(&module(THREE_AND_FOUR));
+    let build = |dir: Option<&temen_posix::Posix>, src: &[u8]| {
+        nim_build(
+            &driver,
+            &[(&tool, vec!["/w/bin/c", "/bin/c"])],
+            dir,
+            &[("/w/src.nim", src), ("/w/p", &built)],
+            &[b"bin/driver"],
+            "/w",
+            false,
+        )
+        .expect("the interpreter tier runs the driver")
+    };
+    let first = build(None, b"echo 1");
+    // What a tool made from the source.
+    first.posix.write_file("/w/src.x.nif", b"from echo 1");
+    let again = build(Some(&first.posix), b"echo 1");
+    assert_eq!((again.status, again.exit_code), (STATUS_EXIT, 14));
+    assert!(first.posix.file_names().is_empty(), "the directory moved");
+    let order = again.posix.file_names_by_write();
+    let at = |p: &str| order.iter().position(|n| n == p);
+    assert!(
+        at("/w/src.nim") < at("/w/src.x.nif"),
+        "the unchanged source is still older than what was made from it: {order:?}"
+    );
+    let edited = build(Some(&again.posix), b"echo 2");
+    assert_eq!(
+        edited
+            .posix
+            .file_names_by_write()
+            .last()
+            .map(String::as_str),
+        Some("/w/src.nim"),
+        "an edit is newer than everything made before it"
+    );
+    assert_eq!(
+        edited.posix.read_file("/w/src.x.nif").as_deref(),
+        Some(&b"from echo 1"[..])
+    );
+}
+
 /// nimony's Temen backend links through `temen-link`, which the engine serves natively ([`nim_build`]
 /// registers it): a build finds it where the driver looks for a tool and where the shell does, without
 /// being given it, and it is [`temen_leng::link_command`] over the files of the process that exec'd
@@ -169,6 +218,7 @@ fn temen_link_is_served_natively_at_its_paths() {
     let b = nim_build(
         &driver,
         &[],
+        None,
         &[("/w/m.c.nif", unit)],
         &[b"bin/driver"],
         "/w",

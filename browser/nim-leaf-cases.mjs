@@ -328,9 +328,12 @@ export async function runCases({ ex, memory, drive, suspends }) {
       put(enc.encode('/w')),
     ].flat();
     args.push(suspends ? 1 : 0);
+    // A tree opened with the last one's toolchain continues in its directory (#2099): remove the file
+    // this one is judged by, so what is there after it is its own.
+    const [pp, pl] = put(enc.encode('/w/out.txt'));
+    ex.temen_nim_remove(pp, pl);
     if (ex.temen_nim_open(...args) !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
     await drive(counted, memory);
-    const [pp, pl] = put(enc.encode('/w/out.txt'));
     const n = Number(ex.temen_nim_file(pp, pl));
     const at = Number(ex.temen_nim_file_ptr());
     const wrote = n >= 0 ? dec.decode(u8().slice(at, at + n)) : null;

@@ -302,10 +302,11 @@ export function nimToolchain(bundle) {
 // `nimony t -r --isMain prog.nim`, one `temen_nim_open` session over `toolchain` ([`nimToolchain`])
 // that `driveCoopTierupRun` runs. The process tree (nimony, nifmake, nimsem, the shell) runs on the
 // interpreter, each leaf process (nifler2, hexer, the program itself) whole on the emitted tier
-// (#1896), and temen-link natively. nimony prints nothing when a build succeeds, so what the session
-// prints is the program's. When the build fails, nothing is linked and what it printed is nimony's
-// diagnostics. Resolves `{ status, exit, stdout, stderr, built, leaves, resumes }`: `built` is
-// whether the program was linked, and so ran.
+// (#1896), and temen-link natively. Each build continues in the directory the engine's last one left
+// (#2099), so nimony redoes only what `source` changed. nimony prints nothing when a build succeeds,
+// so what the session prints is the program's. When the build fails, nothing is linked and what it
+// printed is nimony's diagnostics. Resolves `{ status, exit, stdout, stderr, built, leaves, resumes }`:
+// `built` is whether this build linked the program, and so ran it.
 export async function nimCompileRun(ex, memory, toolchain, source) {
   const enc = new TextEncoder();
   const text = (p, n) => new TextDecoder().decode(new Uint8Array(memory.buffer, p, n).slice());
@@ -317,6 +318,13 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
     return [p, bytes.length];
   };
   const { cwd } = toolchain;
+  // `nimcache/<stem>.temen/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
+  // slot (read it only after the call: the slot moves).
+  const stemLen = ex.temen_nim_module_suffix(...put(enc.encode('prog.nim')));
+  const program = enc.encode(`${cwd}/nimcache/${text(Number(ex.temen_stdout_ptr()), stemLen)}.temen/prog.temen`);
+  // A build continues in the directory the last one left (#2099), so the program there may be the
+  // last build's: remove it, and the program after this build is this build's.
+  ex.temen_nim_remove(...put(program));
   const files = registryBlob([...toolchain.files, [`${cwd}/prog.nim`, enc.encode(source)]]);
   const argv = enc.encode(['bin/nimony', 't', '-r', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
   const args = [put(toolchain.nimony), put(toolchain.commands), put(files), put(argv), put(enc.encode(cwd))];
@@ -329,11 +337,7 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
   const stdout = text(Number(ex.temen_stdout_ptr()), ex.temen_stdout_len());
   const stderr = text(Number(ex.temen_stderr_ptr()), ex.temen_stderr_len());
   const exit = ex.temen_exit_code();
-  // `nimcache/<stem>.temen/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
-  // slot (read it only after the call: the slot moves).
-  const stemLen = ex.temen_nim_module_suffix(...put(enc.encode('prog.nim')));
-  const stem = text(Number(ex.temen_stdout_ptr()), stemLen);
-  const built = Number(ex.temen_nim_file(...put(enc.encode(`${cwd}/nimcache/${stem}.temen/prog.temen`)))) >= 0;
+  const built = Number(ex.temen_nim_file(...put(program))) >= 0;
   for (const [p, n] of held.splice(0)) ex.temen_dealloc(p, n);
   return { status, exit, stdout, stderr, built, ...counts };
 }
