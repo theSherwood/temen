@@ -206,8 +206,8 @@ const atCompileTime = prelude("prebuilt")
 echo "prelude ", atCompileTime
 NIM
   # The card's tree is nimony's library and nimony's own sources, which the library imports: `std/json`
-  # imports `src/lib`, and a macro's plugin build puts `src/lib` and `src/nimony/lib` on its path and
-  # reaches the nifler2 grammar (#2033). All of `src/` (+1.4 MB gzipped), not a list of what those
+  # imports `src/lib`, `std/macros` reaches the nifler2 grammar, and a plugin's build puts `src/lib`
+  # and `src/nimony/lib` on its path (#2033). All of `src/` (+1.4 MB gzipped), not a list of what those
   # imports reach today, which drifts whenever upstream's does. browser/tests/nimony.rs checks the
   # library's relative imports resolve.
   if [ -n "${NIMONY_BIN:-}" ] && [ -n "${NIM_BIN:-}" ] && bash scripts/nim-toolchain.sh "$T" \
