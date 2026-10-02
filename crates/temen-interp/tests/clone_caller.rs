@@ -1018,7 +1018,6 @@ block 2 (vs: i64) {
         host.set_self_module(&m);
         let ih = host.grant_instantiator(0, 1u64 << 18);
         let hb = host.grant_budget(-1, 8 << 20, -1);
-        let hb = host.grant_budget(-1, 8 << 20, -1);
         let out_h = host.grant_stream(StreamRole::Out);
         let mut fuel = 60_000_000u64;
         let _ = tx.send(run_with_host(
