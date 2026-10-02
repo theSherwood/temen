@@ -10328,6 +10328,7 @@ fn root_leaf(
     let offer = LeafOffer {
         module: 0,
         image: m,
+        digest: super::module_digest(m),
         entry,
         paged,
         parks,
@@ -10562,6 +10563,7 @@ fn exec_image_build(
         let offer = LeafOffer {
             module: cm,
             image: &img.module,
+            digest: img.digest,
             entry: entry as u32,
             paged,
             parks,
@@ -16181,6 +16183,9 @@ pub struct LeafOffer<'a> {
     /// The program index the image's [`CoopEvent::TierUp`] names.
     pub module: usize,
     pub image: &'a Module,
+    /// The image's content digest ([`super::module_digest`]): equal digests are equal images, so a
+    /// host can keep what it emitted for one across runs (#2087).
+    pub digest: [u8; 32],
     /// The function it runs whole from.
     pub entry: u32,
     /// It can change its page state: emit it with the per-access page check (#750).

@@ -25,7 +25,7 @@
 
 use std::alloc::Layout;
 
-use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
+use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
@@ -4077,8 +4077,10 @@ pub fn bash_exec_with(
     let Some(compiled) = bytecode::compile_reserved(m) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        bins.iter().map(|&(path, cm)| (cm, vec![path])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = bins
+        .iter()
+        .map(|&(path, cm)| (prepare(cm), vec![path]))
+        .collect();
     bash_run_over_compiled(m, compiled, argv, stdin, &commands)
 }
 
@@ -4100,7 +4102,7 @@ fn bash_run_over_compiled(
     compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
     argv: &[&[u8]],
     stdin: &[u8],
-    commands: &[(&temen_ir::Module, Vec<&str>)],
+    commands: &[(PreparedModule, Vec<&str>)],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         trap: None,
@@ -4222,7 +4224,7 @@ struct PosixRun<'a> {
     env: &'a [(&'a str, &'a str)],
     stdin: &'a [u8],
     /// The commands its processes can `execve`: each module is granted once, at every path listed.
-    commands: &'a [(&'a temen_ir::Module, Vec<&'a str>)],
+    commands: &'a [(PreparedModule, Vec<&'a str>)],
     /// #1122 — an interactive session: the #797 controlling terminal (keystrokes arrive via
     /// `feed_terminal`, from another wasm-thread instantiation over the shared memory) and the
     /// external-wake doorbell, so the cooperative pump blocks its Worker when every process waits on
@@ -4231,6 +4233,14 @@ struct PosixRun<'a> {
     /// #763 — whether its processes may run programs they build: a `ModuleLoader`, which every
     /// fork and exec carries, promotes a file holding a module's encoding at its `execve`.
     loader: bool,
+}
+
+/// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
+/// [`Host::grant_module`] would grant it: from a clone, whose vectors are exact where a decoded
+/// module's keep their growth slack. A caller that grants the same commands run after run keeps them
+/// prepared instead (a nim build's toolchain, #2087).
+fn prepare(m: &temen_ir::Module) -> PreparedModule {
+    PreparedModule::new(std::sync::Arc::new(m.clone()))
 }
 
 /// The powerbox of a POSIX process the browser runs — bash ([`bash_exec_with`], the #1122 sessions)
@@ -4280,8 +4290,8 @@ fn posix_host_build(
         .collect();
     host.set_import_bindings(bindings);
     for (cm, paths) in run.commands {
-        let ch = host.grant_module(cm);
-        let wl = cm.memory.map_or(0, |mc| mc.size_log2);
+        let ch = host.grant_prepared(cm);
+        let wl = cm.module().memory.map_or(0, |mc| mc.size_log2);
         for path in paths {
             posix.register_executable(path, ch, wl);
         }
@@ -8237,8 +8247,10 @@ pub extern "C" fn temen_run_bash(
     // entries): bash runs, and an unresolvable command reports `not found` — the same degradation as
     // the shell card. Each command's window log2 comes from its own decoded module.
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = owned
+        .iter()
+        .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
+        .collect();
     let out = bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &commands);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
@@ -8305,8 +8317,10 @@ pub extern "C" fn temen_bash_session(
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = owned
+        .iter()
+        .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
+        .collect();
     let env = bash_env(true);
     let session = PosixRun {
         argv: &[b"bash", b"-i"],
@@ -8482,8 +8496,10 @@ pub extern "C" fn temen_bash_coop_open(
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
-    let commands: Vec<(&temen_ir::Module, Vec<&str>)> =
-        owned.iter().map(|(n, cm)| (cm, vec![n.as_str()])).collect();
+    let commands: Vec<(PreparedModule, Vec<&str>)> = owned
+        .iter()
+        .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
+        .collect();
     let env = bash_env(true);
     let session = PosixRun {
         argv: &[b"bash", b"-i"],
@@ -13485,17 +13501,93 @@ struct CoopTierupRun {
     spill: Vec<u64>,
 }
 
-/// The emitted wasm of each leaf image a run offered, by program index, and whether it carries the
-/// page check; `None` for an image the emitter declined (it runs interpreted).
-pub(crate) type Leaves = std::sync::Arc<
-    std::sync::Mutex<std::collections::HashMap<u32, Option<(std::sync::Arc<[u8]>, bool)>>>,
->;
+/// #2087 — what an emitted leaf image is: its image's content digest and how it was emitted. Equal
+/// keys emit equal wasm, so a later session reuses one ([`EmittedCache`]), and a driver keys its compiled
+/// module by it ([`temen_coop_leaf_key`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LeafKey {
+    digest: [u8; 32],
+    entry: u32,
+    parks: bool,
+    paged: bool,
+    shared: bool,
+}
+
+const LEAF_KEY_LEN: usize = 37;
+
+impl LeafKey {
+    /// The digest, the entry (LE), then a byte of flags.
+    fn bytes(&self) -> [u8; LEAF_KEY_LEN] {
+        let mut b = [0; LEAF_KEY_LEN];
+        b[..32].copy_from_slice(&self.digest);
+        b[32..36].copy_from_slice(&self.entry.to_le_bytes());
+        b[36] = self.parks as u8 | (self.paged as u8) << 1 | (self.shared as u8) << 2;
+        b
+    }
+}
+
+/// A leaf image the emitter took: its emitted wasm, and its key.
+#[derive(Clone)]
+pub(crate) struct Leaf {
+    wasm: std::sync::Arc<[u8]>,
+    key: LeafKey,
+}
+
+/// The leaf images a run offered, by program index; `None` for an image the emitter declined (it
+/// runs interpreted).
+pub(crate) type Leaves =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<Leaf>>>>;
+
+type EmittedMap = std::collections::HashMap<LeafKey, Option<std::sync::Arc<[u8]>>>;
+
+/// #2087 — emitted leaf images across sessions, by key: a nim build emits the same tools every
+/// build. It holds what this session used and what the last one did, so an image no session has used
+/// since the one before (an old build's program) is dropped.
+#[derive(Default)]
+struct EmittedCache {
+    used: EmittedMap,
+    last: EmittedMap,
+}
+
+impl EmittedCache {
+    /// A new session: what the last one used carries over, and what it did not goes.
+    fn rotate(&mut self) {
+        self.last = std::mem::take(&mut self.used);
+    }
+
+    /// The image for `key`, made by `emit` only when neither this session nor the last made it.
+    fn get(
+        &mut self,
+        key: LeafKey,
+        emit: impl FnOnce() -> Option<std::sync::Arc<[u8]>>,
+    ) -> Option<std::sync::Arc<[u8]>> {
+        if let Some(wasm) = self.used.get(&key) {
+            return wasm.clone();
+        }
+        let wasm = self.last.remove(&key).unwrap_or_else(emit);
+        self.used.insert(key, wasm.clone());
+        wasm
+    }
+}
+
+/// This engine's [`EmittedCache`].
+static EMITTED: std::sync::Mutex<Option<EmittedCache>> = std::sync::Mutex::new(None);
+
+/// [`EMITTED`], however a holder left it.
+fn emitted() -> std::sync::MutexGuard<'static, Option<EmittedCache>> {
+    EMITTED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many leaf images this engine has emitted rather than reused ([`temen_coop_leaf_emits`]).
+static EMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// #1896/#1954 — a session's leaf emitter: emit an image whole, wasm-driven from its entry —
 /// page-checked when the engine says its page state can change — once per program, over `shared`
-/// memory or not. An image that is not wasm-drivable (it could suspend a frame) runs interpreted, and
-/// so does one that can park when the host cannot suspend its emitted frames (`suspends`).
+/// memory or not, or reuse what an earlier session emitted for it (#2087). An image that is not
+/// wasm-drivable (it could suspend a frame) runs interpreted, and so does one that can park when the
+/// host cannot suspend its emitted frames (`suspends`).
 pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> bytecode::LeafEmitter {
+    emitted().get_or_insert_with(Default::default).rotate();
     std::sync::Arc::new(move |o: &bytecode::LeafOffer| {
         if o.parks && !suspends {
             return false;
@@ -13504,26 +13596,42 @@ pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> byte
             return false;
         };
         let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
-            // Whole from its entry; its waits park in a bounce when it can park (#2050).
-            let shape = match o.parks {
-                true => temen_wasm_jit::Shape::Leaf { entry: o.entry },
-                false => temen_wasm_jit::Shape::Batch { entry: o.entry },
+            let key = LeafKey {
+                digest: o.digest,
+                entry: o.entry,
+                parks: o.parks,
+                paged: o.paged,
+                shared,
             };
-            let a = match o.paged {
-                true => {
-                    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
-                    temen_wasm_jit::compile_jit_page_checked(o.image, shape, shared, page_log2)
-                }
-                false => temen_wasm_jit::compile_jit(o.image, shape, shared),
-            }
-            .ok()?;
-            let temen_wasm_jit::DriveMode::WasmDriven { .. } = a.drive else {
-                return None;
-            };
-            Some((a.wasm.into(), o.paged))
+            let wasm = emitted()
+                .get_or_insert_with(Default::default)
+                .get(key, || emit_leaf(o, shared))?;
+            Some(Leaf { wasm, key })
         });
         leaf.is_some()
     })
+}
+
+/// Emit `o` whole from its entry, wasm-driven (its waits park in a bounce when it can park, #2050),
+/// or decline it.
+fn emit_leaf(o: &bytecode::LeafOffer, shared: bool) -> Option<std::sync::Arc<[u8]>> {
+    EMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shape = match o.parks {
+        true => temen_wasm_jit::Shape::Leaf { entry: o.entry },
+        false => temen_wasm_jit::Shape::Batch { entry: o.entry },
+    };
+    let a = match o.paged {
+        true => {
+            let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+            temen_wasm_jit::compile_jit_page_checked(o.image, shape, shared, page_log2)
+        }
+        false => temen_wasm_jit::compile_jit(o.image, shape, shared),
+    }
+    .ok()?;
+    let temen_wasm_jit::DriveMode::WasmDriven { .. } = a.drive else {
+        return None;
+    };
+    Some(a.wasm.into())
 }
 
 impl CoopTierupRun {
@@ -13572,16 +13680,15 @@ impl CoopTierupRun {
         }
     }
 
-    /// Leaf image `module`'s emitted wasm and whether it is paged.
-    fn leaf(&self, module: u32) -> Option<(std::sync::Arc<[u8]>, bool)> {
+    /// Leaf image `module`, as the emitter took it.
+    fn leaf(&self, module: u32) -> Option<Leaf> {
         self.leaves.lock().ok()?.get(&module).cloned().flatten()
     }
 
     /// Whether the pending event's program carries the page check (#1009): a leaf image's own mode
     /// (#1896), else this run's own emit's.
     fn event_paged(&self) -> bool {
-        self.leaf(self.module)
-            .map_or(self.paged, |(_, paged)| paged)
+        self.leaf(self.module).map_or(self.paged, |l| l.key.paged)
     }
 
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
@@ -14351,7 +14458,7 @@ pub extern "C" fn temen_coop_module() -> u32 {
 pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .and_then(|s| s.leaf(module))
-        .map_or(core::ptr::null(), |(wasm, _)| wasm.as_ptr())
+        .map_or(core::ptr::null(), |l| l.wasm.as_ptr())
 }
 
 /// #1896: the byte length of [`temen_coop_leaf_wasm_ptr`]'s wasm.
@@ -14359,7 +14466,81 @@ pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
 pub extern "C" fn temen_coop_leaf_wasm_len(module: u32) -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .and_then(|s| s.leaf(module))
-        .map_or(0, |(wasm, _)| wasm.len())
+        .map_or(0, |l| l.wasm.len())
+}
+
+/// The key [`temen_coop_leaf_key`] read last.
+static mut LEAF_KEY: [u8; LEAF_KEY_LEN] = [0; LEAF_KEY_LEN];
+
+/// #2087: leaf image `module`'s key ([`LeafKey`]): its length, `0` when there is no such image. The
+/// bytes are at [`temen_coop_leaf_key_ptr`] until the next call. Equal keys are equal emitted wasm, so
+/// a driver keys its compiled module by it, and a later build finds that without reading or hashing
+/// the image's bytes.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_key(module: u32) -> usize {
+    let key = unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.leaf(module))
+        .map(|l| l.key.bytes());
+    // SAFETY: single-threaded wasm; the slot is written only here.
+    unsafe { *core::ptr::addr_of_mut!(LEAF_KEY) = key.unwrap_or([0; LEAF_KEY_LEN]) };
+    key.map_or(0, |_| LEAF_KEY_LEN)
+}
+
+/// #2087: where [`temen_coop_leaf_key`] put the key.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_key_ptr() -> *const u8 {
+    core::ptr::addr_of!(LEAF_KEY) as *const u8
+}
+
+/// #2087: how many leaf images this engine has emitted rather than reused: what a driver's tests count
+/// to see a later build reuse them.
+#[no_mangle]
+pub extern "C" fn temen_coop_leaf_emits() -> u32 {
+    EMITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod emitted_cache_tests {
+    use super::*;
+
+    fn key(n: u8) -> LeafKey {
+        LeafKey {
+            digest: [n; 32],
+            entry: 0,
+            parks: false,
+            paged: false,
+            shared: true,
+        }
+    }
+
+    /// #2087 — an image is emitted once while each session uses it or the one before did, and again
+    /// once a session has gone by without it. A declined image is remembered as declined.
+    #[test]
+    fn an_image_is_emitted_once_while_sessions_use_it() {
+        let mut c = EmittedCache::default();
+        let emits = std::cell::Cell::new(0);
+        let get = |c: &mut EmittedCache, k: LeafKey, made: bool| {
+            c.get(k, || {
+                emits.set(emits.get() + 1);
+                made.then(|| std::sync::Arc::from(&b"wasm"[..]))
+            })
+        };
+        assert!(get(&mut c, key(1), true).is_some());
+        assert!(get(&mut c, key(1), true).is_some());
+        assert_eq!(emits.get(), 1, "emitted once in its session");
+        c.rotate();
+        assert!(get(&mut c, key(1), true).is_some());
+        assert_eq!(emits.get(), 1, "the next session reuses it");
+        c.rotate();
+        c.rotate();
+        assert!(get(&mut c, key(1), true).is_some());
+        assert_eq!(emits.get(), 2, "a session that did not use it dropped it");
+        assert!(get(&mut c, key(2), false).is_none());
+        assert!(get(&mut c, key(2), false).is_none());
+        assert_eq!(emits.get(), 3, "a declined image is declined once");
+        assert!(get(&mut c, key(1), true).is_some());
+        assert_eq!(emits.get(), 3, "keys apart");
+    }
 }
 
 /// The pending TIERUP's function index.

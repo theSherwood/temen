@@ -38,7 +38,7 @@ const res = await page.evaluate(async () => {
   const caches = [];
   const run = async () => {
     const r = await client.nimCompile(getAssets, src);
-    caches.push({ compiles: r.compiles, hits: r.hits });
+    caches.push({ compiles: r.compiles, hits: r.hits, emits: r.emits });
     return typeof r.stdout === 'string' ? r.stdout : (r.stdout && r.stdout.length ? td.decode(r.stdout) : '');
   };
   // Mimic runNimc's real flow: cancelNim() before each compile.
@@ -53,11 +53,14 @@ const allOk = [res.out1, res.out2, res.out3].every((o) => (o || '').includes('he
 // Reuse ⇒ the nim worker is spawned exactly once across three cancelNim+compile cycles (was 3 before).
 const reused = res.spawns === 1;
 // A reused worker keeps its compiled leaf modules too: the later builds compile none of their own,
-// and take each from the cache instead.
+// and take each from the cache instead. Its engine keeps what it emitted (#2087): the later builds,
+// of the same program, emit no leaf image either.
 const [c1, , c3] = res.caches;
 const cached = c1.compiles > 0 && c3.compiles === c1.compiles && c3.hits > c1.hits;
-const ok = allOk && reused && cached;
+const reemitted = !(c1.emits > 0 && c3.emits === c1.emits);
+const ok = allOk && reused && cached && !reemitted;
 console.log(`  nim-worker-reuse: spawns=${res.spawns} (want 1) · outputs ok=${allOk} · ` +
-  `leaf compiles ${c1.compiles} → ${c3.compiles} (want unchanged), cache hits ${c1.hits} → ${c3.hits}`);
+  `leaf compiles ${c1.compiles} → ${c3.compiles} (want unchanged), cache hits ${c1.hits} → ${c3.hits}, ` +
+  `leaf emits ${c1.emits} → ${c3.emits} (want unchanged)`);
 console.log(ok ? 'PASS — idle nim worker reused across Runs (cancelNim no-ops when idle), output correct' : 'FAIL');
 process.exit(ok ? 0 : 1);
