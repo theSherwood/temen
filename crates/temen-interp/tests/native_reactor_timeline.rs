@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use temen_interp::moment::{MomentReactor, ReactorMoment, ReactorTimeline, SteppableReactor};
+use temen_interp::moment::{Moment, MomentReactor, ReactorTimeline, SteppableReactor};
 use temen_interp::{bytecode, Host, Value};
 use temen_text::parse_module;
 
@@ -149,10 +149,10 @@ impl MomentReactor for NativeReactor {
             .unwrap()
             .push_back(((kind as i64) << 32) | (payload as i64 & 0xffff_ffff));
     }
-    fn moment(&self) -> Option<ReactorMoment> {
-        ReactorMoment::capture(self.inst.window_layout()?, &self.host)
+    fn moment(&self) -> Option<Moment> {
+        Moment::capture(self.inst.window_layout()?, &self.host)
     }
-    fn restore(&mut self, m: &ReactorMoment) -> bool {
+    fn restore(&mut self, m: &Moment) -> bool {
         if !self.inst.restore_window(&m.layout(), &self.host) {
             return false;
         }

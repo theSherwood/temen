@@ -31709,7 +31709,7 @@ pub fn host_region_granularity() -> u64 {
 /// capturable subset (see [`Mem::layout_snapshot_safe`]).
 ///
 /// **This is the one window-image form.** The time-travel checkpoint ladder, the reactor moment
-/// (`temen-browser`'s `ReactorMoment`), and the §12 snapshot codec's window section all describe the
+/// (`temen-browser`'s `Moment`), and the §12 snapshot codec's window section all describe the
 /// same datum — bytes plus a protection map — so they carry it as this type rather than as a private
 /// pair of fields each (INVARIANTS #13/#15). A holder that has no live [`Mem`] (a reactor between
 /// frames, whose window is a bare `Region`; a run driver carrying the page list a previous run handed

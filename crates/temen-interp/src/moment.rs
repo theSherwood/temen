@@ -318,7 +318,7 @@ impl Moment {
     /// branch. `None` for a window that aliases a §13 region: a reactor moment carries no region's
     /// bytes, so a restore would show the region as it is then, not as it was (#2051) — a §12
     /// artifact, which carries them, is the save-state for such a window.
-    pub fn capture(layout: MemLayout, host: &Host) -> Option<ReactorMoment> {
+    pub fn capture(layout: MemLayout, host: &Host) -> Option<Moment> {
         (!layout.aliases_regions()).then(|| Moment::new(Some(layout), host, Continuation::None))
     }
 
@@ -329,10 +329,6 @@ impl Moment {
             .expect("a reactor moment is built from a window image and always carries it")
     }
 }
-
-/// A reactor's moment: a window image and the host substate, its continuation [`Continuation::None`].
-/// The name marks intent at reactor call sites; it is the one [`Moment`] type.
-pub type ReactorMoment = Moment;
 
 /// A sorted ring of [`Moment`]s keyed on a monotonic coordinate — a keyframe ladder.
 ///
@@ -484,7 +480,7 @@ pub enum ReactorInput {
     Mouse { kind: i32, payload: i32 },
 }
 
-/// A reactor a [`ReactorTimeline`] can record: take input, capture and restore a [`ReactorMoment`].
+/// A reactor a [`ReactorTimeline`] can record: take input, capture and restore a [`Moment`].
 ///
 /// Deliberately **not** "and run a tick". A wasm-JIT reactor's `tick` is *emitted wasm*, compiled and
 /// called by whoever emitted it — a browser page's JS host in production — so for that tier running a
@@ -503,9 +499,9 @@ pub trait MomentReactor {
     fn push_mouse(&self, kind: i32, payload: i32);
     /// Capture this reactor's state at the current frame boundary, or `None` if it cannot be imaged
     /// faithfully (a §13 region alias — refuse rather than hand back a fiction, INVARIANTS #9c).
-    fn moment(&self) -> Option<ReactorMoment>;
+    fn moment(&self) -> Option<Moment>;
     /// Put the reactor back at `m`. `false` if it has no window to restore into.
-    fn restore(&mut self, m: &ReactorMoment) -> bool;
+    fn restore(&mut self, m: &Moment) -> bool;
 
     /// Hand one recorded input back to the reactor — the replay side of the tape.
     fn feed(&self, ev: ReactorInput) {
@@ -528,7 +524,7 @@ pub trait SteppableReactor: MomentReactor {
 /// A [`Ladder`] of reactor moments plus a tick-indexed input tape — the two things that turn a rewind
 /// into a **scrub** (#1457).
 ///
-/// A [`ReactorMoment`] on its own only goes *back* to a point someone thought to save. A timeline
+/// A [`Moment`] on its own only goes *back* to a point someone thought to save. A timeline
 /// records what the driver fed the guest each tick, so any recorded position can be reconstructed —
 /// restore the nearest rung at or before it, then re-feed the tape forward.
 ///

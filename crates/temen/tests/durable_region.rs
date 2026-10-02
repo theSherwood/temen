@@ -705,7 +705,7 @@ fn tick(
 /// reactor re-freezes byte-identical. A moment, which carries no region bytes, still refuses.
 #[test]
 fn a_bytecode_reactor_save_state_carries_its_region() {
-    use temen_interp::{bytecode::Reactor, moment::ReactorMoment};
+    use temen_interp::{bytecode::Reactor, moment::Moment};
     let m = temen_text::parse_module(REACTOR_SRC).expect("parse");
     let mut host = Host::new();
     let asp = host.grant_address_space(0, WINDOW as u64);
@@ -723,7 +723,7 @@ fn a_bytecode_reactor_save_state_carries_its_region() {
         "the mapped pages are captured as the region"
     );
     assert!(
-        ReactorMoment::capture(layout.clone(), &host).is_none(),
+        Moment::capture(layout.clone(), &host).is_none(),
         "a moment cannot carry the region's bytes"
     );
     let reserved = r.window_reserved_log2().expect("a window");
@@ -788,7 +788,7 @@ fn a_bytecode_reactor_region_the_embedder_holds_declines() {
 /// other holder reads.
 #[test]
 fn rewinding_a_reactor_past_a_region_map_leaves_the_region_alone() {
-    use temen_interp::{bytecode::Reactor, moment::ReactorMoment};
+    use temen_interp::{bytecode::Reactor, moment::Moment};
     let m = temen_text::parse_module(REACTOR_SRC).expect("parse");
     let mut host = Host::new();
     let (rh, kept) = region_kept_outside(&mut host);
@@ -796,8 +796,8 @@ fn rewinding_a_reactor_past_a_region_map_leaves_the_region_alone() {
         kept.write_byte(8 + o as u64, b);
     }
     let mut r = Reactor::open(&m).expect("open");
-    let before = ReactorMoment::capture(r.window_layout().expect("a window"), &host)
-        .expect("nothing aliased yet");
+    let before =
+        Moment::capture(r.window_layout().expect("a window"), &host).expect("nothing aliased yet");
     assert_eq!(
         tick(&mut r, &mut host, 1, &[Value::I32(rh)]),
         Value::I64(0),
