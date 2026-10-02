@@ -151,11 +151,13 @@ pub fn nim_build(
 
 /// The **library pack** of a build run in `at`: every file it wrote under `<at>/nimcache/` for a
 /// library module, in the order it wrote them, and nimony's memo of the options the cache was built
-/// with. A library module is one whose `.p.nif` records a source under `lib/`; its files include
-/// what a build of it as a program wrote (`<stem>.temen/…`), such as the helper compile-time
-/// evaluation runs. Seeded into a later build in the same directory, after the library's sources
-/// and in this order, they are newer than everything they were made from, so that build compiles
-/// only its own modules (#958).
+/// with. A library module is one whose `.p.nif` records a source in nimony's tree: under `lib/`,
+/// or under `src/`, which the library imports (#2033). Its files include what a build of it as a
+/// program wrote (`<stem>.temen/…`), such as the helper compile-time evaluation runs. So do the
+/// plugins the library declares (#2049): their executables, which nimony links into the cache's
+/// root (`deps.nim`'s `pluginExe`). Seeded into a later build in the same directory, after the
+/// library's sources and in this order, they are newer than everything they were made from, so that
+/// build compiles only its own modules (#958).
 pub fn library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8>)> {
     let cache = format!("{at}/nimcache/");
     let mut library = std::collections::HashMap::new();
@@ -164,14 +166,22 @@ pub fn library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8
         let Some(rest) = name.strip_prefix(&cache) else {
             continue;
         };
+        let Some(bytes) = posix.read_file(&name) else {
+            continue;
+        };
         let stem = rest.split(['.', '/']).next().unwrap_or(rest).to_string();
         let keep = rest == OPTIONS_MEMO
+            || (!rest.contains('/') && temen_encode::wire::is_module_blob(&bytes))
             || *library.entry(stem).or_insert_with_key(|stem| {
                 posix
                     .read_file(&format!("{cache}{stem}.p.nif"))
-                    .is_some_and(|nif| nif_source(&nif).is_some_and(|src| src.starts_with("lib/")))
+                    .is_some_and(|nif| {
+                        nif_source(&nif).is_some_and(|src| {
+                            src.starts_with("lib/") || src.starts_with("src/")
+                        })
+                    })
             });
-        if let (true, Some(bytes)) = (keep, posix.read_file(&name)) {
+        if keep {
             pack.push((name, bytes));
         }
     }

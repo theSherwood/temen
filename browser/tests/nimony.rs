@@ -195,14 +195,17 @@ fn temen_link_is_served_natively_at_its_paths() {
 }
 
 /// A build's library pack is what it wrote under its `nimcache/` for library modules — each module
-/// told by the source its `.p.nif` records — and nimony's options memo, in the order they were
-/// written, which is the order that keeps them newer than their sources when seeded.
+/// told by the source its `.p.nif` records, in nimony's `lib/` or `src/` — the plugins it built
+/// into the cache's root, and nimony's options memo, in the order they were written, which is the
+/// order that keeps them newer than their sources when seeded.
 #[test]
 fn a_library_pack_is_the_librarys_cache_in_write_order() {
     let mut host = temen_interp::Host::new();
     let (_px, posix) = temen_posix::grant(&mut host, 0, 0, Vec::new());
-    let files: [(&str, &[u8]); 9] = [
+    let executable = temen_encode::encode_module(&module(SEVEN));
+    let files: [(&str, &[u8]); 14] = [
         ("/w/lib/std/sys.nim", b"proc x() = discard"),
+        ("/w/src/lib/nifcore.nim", b"proc y() = discard"),
         ("/w/prog.nim", b"echo 1"),
         ("/w/nimcache/cachedconfigfile.txt", b" -d:temen"),
         (
@@ -210,26 +213,38 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
             b"(.nif24)\n(stmts@,1,lib/std/sys.nim (proc))",
         ),
         (
+            "/w/nimcache/nif3.p.nif",
+            b"(.nif24)\n(stmts@,1,src/lib/nifcore.nim (proc))",
+        ),
+        (
             "/w/nimcache/pro2.p.nif",
             b"(.nif24)\n(stmts@,1,prog.nim (call))",
         ),
         ("/w/nimcache/sys1.s.nif", b"sem"),
+        ("/w/nimcache/nif3.s.nif", b"sem"),
         ("/w/nimcache/pro2.s.nif", b"sem"),
+        // A plugin the library declares, which nimony links into the cache's root.
+        ("/w/nimcache/regex", &executable),
         ("/w/nimcache/sys1.temen/sys1.c.nif", b"lowered"),
         ("/w/nimcache/pro2.temen/sys1.c.nif", b"lowered for pro2"),
+        // The program: an executable too, but in its own backend directory.
+        ("/w/nimcache/pro2.temen/prog.temen", &executable),
     ];
     for (path, bytes) in files {
         posix.write_file(path, bytes);
     }
     // Rewritten last: it goes where its latest write puts it.
-    posix.write_file("/w/nimcache/sys1.p.nif", files[3].1);
+    posix.write_file("/w/nimcache/sys1.p.nif", files[4].1);
     let pack = library_pack(&posix, "/w");
     let names: Vec<&str> = pack.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
         [
             "/w/nimcache/cachedconfigfile.txt",
+            "/w/nimcache/nif3.p.nif",
             "/w/nimcache/sys1.s.nif",
+            "/w/nimcache/nif3.s.nif",
+            "/w/nimcache/regex",
             "/w/nimcache/sys1.temen/sys1.c.nif",
             "/w/nimcache/sys1.p.nif",
         ]

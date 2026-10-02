@@ -26,12 +26,12 @@
 # the same `.c.nif`s, and the program must print what the native binary prints.
 #
 # With NIM_LANE_SELF=1 the lane also builds a program with a macro in-guest (#2046): nimsem builds
-# the macro's plugin for Temen and runs it there, and the program must print what native nimony's
-# build of it prints. And it has nimony build each of its own tools in-guest (#763): the driver,
-# nifmake, nifler2, nimsem and hexer. Each must be byte for byte the tool that ran in the build
-# (`--fixed-point`), and nimsem's artifacts must also match native nimony's. nifler2 takes its
-# plugins, parsegen and regex, which nimsem builds for Temen and runs in-guest. The nightly run (and
-# a manual dispatch) sets it; a PR run leaves it out.
+# the macro's plugin for Temen, in the program's cache (#2049), and runs it there, and the program
+# must print what native nimony's build of it prints. And it has nimony build each of its own tools
+# in-guest (#763): the driver, nifmake, nifler2, nimsem and hexer. Each must be byte for byte the
+# tool that ran in the build (`--fixed-point`), and nimsem's artifacts must also match native
+# nimony's. nifler2 takes its plugins, parsegen and regex, which nimsem builds for Temen and runs
+# in-guest. The nightly run (and a manual dispatch) sets it; a PR run leaves it out.
 #
 #   NIMONY_BIN=<nimony/bin> NIM_BIN=<dir holding nim> [NIM_LANE_SELF=1] bash scripts/ci/nim-selfhost-lane.sh
 #
@@ -98,9 +98,9 @@ if [ -z "${NIM_LANE_SELF:-}" ]; then
   exit 0
 fi
 echo "[5/5] a macro: nimsem builds its plugin on Temen and runs it there"
-# Not `--expect`: the plugin's own build caches are a Temen build in-guest and a C one natively.
-# The tree is nimony's whole one: `std/macros` imports nimony's own sources (`src/`), and native
-# nimony validates a plugin against `doc/tags.md`.
+# Not `--expect`: the grammar's plugins (parsegen, regex) build in caches of their own, a Temen
+# build in-guest and a C one natively. The tree is nimony's whole one: `std/macros` imports nimony's
+# own sources (`src/`), and native nimony validates a plugin against `doc/tags.md`.
 M="$W/macro"
 mkdir -p "$M"
 cp -r "$N/bin" "$N/lib" "$N/src" "$N/doc" "$M/"
@@ -118,6 +118,14 @@ if ! diff -u "$W/macro-native.out" "$W/macro-temen.out"; then
   exit 1
 fi
 echo "✅ the macro program built on Temen prints what the native build prints: $(cat "$W/macro-temen.out")"
+# The macro's plugin builds over the library the program's build compiled, not in a cache of its own
+# that compiles the library again (#2049).
+for h in "$M"/nimcache/*.host "$W"/cache-macro/*.host; do
+  if [ -e "$h" ]; then
+    echo "the macro's plugin compiled the library again, in a cache of its own: $h" >&2
+    exit 1
+  fi
+done
 
 echo "[5/5] nimony builds each of its tools on Temen, and each is the tool that built it"
 # Each against the .temen the toolchain linked (`--fixed-point`); nimsem also against the

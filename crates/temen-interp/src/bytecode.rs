@@ -10047,8 +10047,10 @@ struct LeafStart {
 /// answers ([`super::OpParks::OnHost`], #1954). A stream read parks on a pipe end or a blocking
 /// stdin, and a stream write on a pipe end. The process's signal source answers for the ops bound to
 /// it ([`super::SignalSource::import_parks`]); the address-space ops and the pipe mint cannot park; a
-/// §12 concurrency op may (a join or a futex wait parks, and a thread or a fiber needs the
-/// interpreter to schedule it); an import `import.attach` may retarget may; any other import or
+/// futex wait parks where its host can suspend, in its bounce, as a stream call does (#2050: nim's
+/// `nanosleep` is one); any other §12 op may park otherwise (a join parks on another vCPU, a notify
+/// wakes one, and a thread or a fiber needs the interpreter to schedule it); an import
+/// `import.attach` may retarget may; any other import or
 /// capability call may, a dynamic one included. (A linked program has no `call.sym` left: linking
 /// rewrote each to one of these.) #1954 tells apart the ops an on-ramp C program makes, so that one
 /// can run whole too: an `exit` never parks; a stream import parks exactly as the same op inline; a
@@ -10135,12 +10137,17 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         .collect();
     if m.imports.len() != host.import_bindings.len()
         || parks.contains(&OpParks::Otherwise)
-        || m.funcs.iter().any(temen_ir::Func::uses_concurrency)
+        || m.funcs
+            .iter()
+            .any(temen_ir::Func::uses_concurrency_besides_wait)
         || insts().any(may_park)
     {
         return Parks::Otherwise;
     }
-    let suspendable = parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost);
+    // #2050: past the check above, a futex op is a wait, which parks the process in its bounce.
+    let suspendable = parks.contains(&OpParks::OnChildren)
+        || parks.contains(&OpParks::OnHost)
+        || m.funcs.iter().any(temen_ir::Func::uses_futex);
     match suspendable || import_streams || insts().any(stream_parks) {
         true => Parks::Suspendably,
         false => Parks::Never,
@@ -11523,6 +11530,32 @@ fn drive_nested(
                 let r = comps.wait(id);
                 active.set(dst, Reg::from_i64(r));
             }
+            // #2050 — a futex wait in a bounce out of a leaf whose host suspends its emitted frames
+            // parks as an interpreted task's does (the pump's `VcpuStop::Wait` arm): the value is
+            // re-read here, so a word that changed answers not-equal at once; else the task waits in
+            // `BlockedWait` with the call's continuation, not rewound, and the wake writes the status
+            // into it. Anywhere else it faults, as ever: nothing beneath could wait.
+            Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => {
+                let slot = run_meta
+                    .as_mut()
+                    .and_then(|c| c.park.as_deref_mut())
+                    .filter(|_| chain.is_empty())
+                    .ok_or(Trap::CapFault)?;
+                let w = mem.as_ref().ok_or(Trap::CapFault)?;
+                if w.atomic_value(base, width) != expected {
+                    active.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+                    continue;
+                }
+                let key = w.futex_key(base);
+                *slot = Some((active, Handoff::Wait { key, timeout, dst }));
+                return Ok(Vec::new());
+            }
             Outcome::ContNew { funcref, sp, dst } => {
                 // Run-registry mode (#880): keep the parallel arrays index-aligned with the run's
                 // (`step_vcpu`'s ContNew arm, minus the durable shadow bookkeeping — see the
@@ -12717,6 +12750,18 @@ struct TaskSlot {
     live: LiveVcpu,
 }
 
+impl TaskSlot {
+    /// Where the result of this task's parked call lands: the continuation of a call that parked in
+    /// a bounce out of the task's emitted leaf ([`Suspended`], #1896), which the pump runs next, or
+    /// else the task's own frame.
+    fn parked_frame(&mut self) -> &mut Vm {
+        match self.suspended.as_mut() {
+            Some(s) => &mut s.vm,
+            None => &mut self.vt.active,
+        }
+    }
+}
+
 /// Return the window bytes of every detached child whose root task has ended to the budget that paid
 /// for them, in the spawner's own powerbox — `Budget.mem` accounts live windows (INVARIANTS #3,
 /// 2026-09-29). Run at the top of every scheduling round, so the refund lands before any task runs
@@ -13053,7 +13098,7 @@ fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
         }
         // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
         if let TaskState::BlockedWait { dst, .. } = t.state {
-            t.vt.active
+            t.parked_frame()
                 .set(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
         }
         t.state = TaskState::Runnable;
@@ -13214,6 +13259,13 @@ struct SpawnAsk {
 enum Handoff {
     /// It parked: the state its task waits in.
     Park(TaskState),
+    /// #2050 — it waits on a futex word whose value it found unchanged: [`hand_off`] parks the task
+    /// in [`TaskState::BlockedWait`], its deadline taken on the pump's clock.
+    Wait {
+        key: super::FutexKey,
+        timeout: Option<u64>,
+        dst: u32,
+    },
     /// It asked for a process, which only the pump can start.
     Spawn(Box<SpawnAsk>),
 }
@@ -13227,10 +13279,18 @@ fn hand_off(
     hooked_twins: &std::collections::BTreeSet<usize>,
     ti: usize,
     handoff: Handoff,
+    clock: u64,
 ) -> Option<Box<SpawnAsk>> {
     match handoff {
         Handoff::Park(state) => {
             park_task(tasks, forked_twins, hooked_twins, ti, state);
+            None
+        }
+        Handoff::Wait { key, timeout, dst } => {
+            // The interpreted wait's park (the pump's `VcpuStop::Wait` arm): `None` for an
+            // infinite wait (#1638).
+            let deadline = timeout.map(|t| clock.saturating_add(t));
+            tasks[ti].state = TaskState::BlockedWait { key, deadline, dst };
             None
         }
         Handoff::Spawn(ask) => {
@@ -14003,7 +14063,8 @@ impl CoopSched {
                             } = t.state
                             {
                                 if deadline <= *clock {
-                                    t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                                    t.parked_frame()
+                                        .set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
                                     t.state = TaskState::Runnable;
                                 }
                             }
@@ -14282,7 +14343,8 @@ impl CoopSched {
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
                     (Ok(_), Some((vm, handoff))) => {
-                        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff);
+                        let spawn =
+                            hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
                         tasks[ti].suspended = Some(Box::new(Suspended {
                             vm,
                             dst,
@@ -14307,6 +14369,7 @@ impl CoopSched {
                 true, // the cooperative scheduler: idle blocking `cont.resume.block` (I48)
                 preemptible, // #1157: yield at the op-count quantum when ≥2 tasks are runnable
             );
+
             charge_slice(slice_left, ctx.fuel.can_burn());
             match stop {
                 Err(trap) => {
@@ -15348,7 +15411,7 @@ impl CoopSched {
                         } = t.state
                         {
                             if wkey == key {
-                                t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
+                                t.parked_frame().set(wdst, Reg::from_i32(super::WAIT_WOKEN));
                                 t.state = TaskState::Runnable;
                                 woken += 1;
                             }
@@ -16066,12 +16129,8 @@ impl CoopRun {
             let t = &mut self.sched.tasks[ti];
             if let TaskState::BlockedHostCap { dst, .. } = t.state {
                 // #1954: a call that parked in a bounce out of an emitted leaf waits in the call's
-                // continuation (`suspended`), which the pump runs next; any other in the task's own.
-                let vm = match t.suspended.as_mut() {
-                    Some(s) => &mut s.vm,
-                    None => &mut t.vt.active,
-                };
-                vm.set(dst, Reg::from_i64(value));
+                // continuation, which the pump runs next; any other in the task's own frame.
+                t.parked_frame().set(dst, Reg::from_i64(value));
             }
             t.state = TaskState::Runnable;
         }
@@ -16282,6 +16341,7 @@ impl CoopRun {
             pending_tierup,
             forked_twins,
             hooked_twins,
+            clock,
             ..
         } = sched;
         // #1896: a leaf whose host suspends its frames can park in a bounce.
@@ -16374,7 +16434,7 @@ impl CoopRun {
         // #1896: the call stopped. Its task waits with the rest of the call, and its host with the
         // emitted frames.
         let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
-        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff);
+        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
         tasks[ti].suspended = Some(Box::new(Suspended {
             vm,
             dst,
