@@ -5377,8 +5377,9 @@ enum Blocked {
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
 enum Pending {
-    /// Finish a `thread.join`: take the child's result from `threads[slot]`.
-    Join { slot: usize },
+    /// Finish a `thread.join`: take the child's result from `threads[slot]`. With `wait`
+    /// (`Instantiator.wait`, op 18), push how the child ended instead ([`join_delivery`]).
+    Join { slot: usize, wait: bool },
     /// Finish a `reap` (FORK.md §8.6 — servicer-side `wait()`): take the twin's outcome from the
     /// scheduler by `TaskId` and push its **exit status** (a clean `Ok(first i64)`; a trapped twin
     /// becomes a nonzero crash status — never a propagated trap, so the waiting shell survives).
@@ -7444,6 +7445,29 @@ enum ReapOutcome {
     NoChild,
     /// The caller's waiter is not registered yet (serve/park race) — retryable, `-EAGAIN`.
     Retry,
+}
+
+/// What a finished child's outcome `res` gives the vCPU that joined it (`join`, op 1, or
+/// `thread.join`) or waited on it (`Instantiator.wait`, op 18), and whether the child stays in its
+/// slot. `join` takes the child: its first value, or its trap to re-raise. `wait` answers how it
+/// ended without inheriting a trap: 0 for a child that returned, which stays for its `join` (its
+/// value), else its trap's wire code ([`Trap::code`]), the child taken — a trapped child has nothing
+/// left to join. One rule for every driver.
+pub(crate) fn join_delivery(
+    res: &Result<Vec<Value>, Trap>,
+    wait: bool,
+) -> (Result<Reg, Trap>, bool) {
+    match (res, wait) {
+        (Ok(_), true) => (Ok(Reg::from_i64(0)), true),
+        (Ok(vals), false) => (
+            Ok(Reg::from_value(
+                vals.first().copied().unwrap_or(Value::I64(0)),
+            )),
+            false,
+        ),
+        (Err(t), true) => (Ok(Reg::from_i64(t.code())), false),
+        (Err(t), false) => (Err(*t), false),
+    }
 }
 
 /// FORK.md §8.6 — a twin's exit status for servicer-side `wait()`. A clean finish yields the twin's
@@ -9772,13 +9796,14 @@ impl SchedRef {
             SchedRef::Det(d) => d.lock().results.remove(&id),
         }
     }
-    /// PROCESS.md S3 — non-destructive lifecycle probe for `poll`: `None` if `id` is still running,
-    /// `Some(true)` if it returned cleanly, `Some(false)` if it trapped. Leaves the result in place so
-    /// a later `join`/`take_result` still gets it.
-    fn poll_status(&self, id: TaskId) -> Option<bool> {
+    /// PROCESS.md S3 — non-destructive lifecycle probe for `poll` and `wait`: `None` if `id` is still
+    /// running, `Some(0)` if it returned, else its trap's wire code. Leaves the result in place so a
+    /// later `join`/`take_result` still gets it.
+    fn outcome_code(&self, id: TaskId) -> Option<i64> {
+        let code = |o: &Outcome| o.result.as_ref().err().map_or(0, |t| t.code());
         match self {
-            SchedRef::Real(s) => s.lock().results.get(&id).map(|o| o.result.is_ok()),
-            SchedRef::Det(d) => d.lock().results.get(&id).map(|o| o.result.is_ok()),
+            SchedRef::Real(s) => s.lock().results.get(&id).map(code),
+            SchedRef::Det(d) => d.lock().results.get(&id).map(code),
         }
     }
     /// Whether `id` has already completed (result posted, unjoined) — a non-destructive probe the
@@ -13021,7 +13046,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut svc_timed_out = false;
     // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
-        Some(Pending::Join { slot }) => {
+        Some(Pending::Join { slot, wait }) => {
             let child = v
                 .threads
                 .get(slot)
@@ -13036,6 +13061,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 let top = v.frames.len() - 1;
                 v.frames[top].vals.push(Reg::from_i64(0));
+            } else if wait && v.sched.outcome_code(child) == Some(0) {
+                // op 18 on a child that returned: it stays for its `join` ([`join_delivery`]).
+                let top = v.frames.len() - 1;
+                v.frames[top].vals.push(Reg::from_i64(0));
             } else {
                 v.threads[slot] = None; // a handle is joined once
                 credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
@@ -13046,11 +13075,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 }
                 let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
-                let vals = out.result?; // a child trap propagates as this vCPU's trap
+                // A child trap propagates as this vCPU's trap, but to a `wait` it is a value.
+                let r = join_delivery(&out.result, wait).0?;
                 let top = v.frames.len() - 1;
-                v.frames[top].vals.push(Reg::from_value(
-                    vals.first().copied().unwrap_or(Value::I64(0)),
-                ));
+                v.frames[top].vals.push(r);
             }
         }
         Some(Pending::ReapPid { pid }) => {
@@ -15036,12 +15064,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // join(child) -> result: park only this fiber until the child finishes (its
                         // result/trap is delivered on resume via `Pending::Join`); siblings run on.
-                        1 => {
+                        //
+                        // wait(child) -> 0 | trap code (op 18): park as `join` does, then answer how
+                        // the child ended: 0 if it returned (it stays for its `join`), else its trap's
+                        // wire code (`temen_ir::trap_code`), the child reaped ([`join_delivery`]). So
+                        // a spawner learns its child ran out of fuel, or crashed, without inheriting
+                        // the trap (INVARIANTS #5).
+                        1 | 18 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            *pending = Some(Pending::Join { slot });
+                            *pending = Some(Pending::Join {
+                                slot,
+                                wait: op == 18,
+                            });
                             return Ok(Inner::Park(Blocked::Join { child }));
                         }
                         // poll(child) -> 0 running | 1 returned | 2 trapped (PROCESS.md S3). Never
@@ -15054,10 +15091,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            let status = match sched.poll_status(child) {
-                                None => 0,        // still running
-                                Some(true) => 1,  // returned cleanly
-                                Some(false) => 2, // trapped
+                            let status = match sched.outcome_code(child) {
+                                None => 0,    // still running
+                                Some(0) => 1, // returned cleanly
+                                Some(_) => 2, // trapped
                             };
                             frames[top].vals.push(Reg::from_i32(status));
                         }
@@ -17376,7 +17413,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let slot = resolve_thread(threads, h)?;
                     let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                    *pending = Some(Pending::Join { slot });
+                    *pending = Some(Pending::Join { slot, wait: false });
                     return Ok(Inner::Park(Blocked::Join { child }));
                 }
                 // §12 futex wait: validate the address (confine/align/prot — traps surface here), then

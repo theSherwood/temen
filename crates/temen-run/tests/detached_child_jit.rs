@@ -62,11 +62,15 @@ block 0 (v0: i64) {
 /// payload `(18432, 24)`, no grants, entry 0, window 2^16), then joins it — or, in the refusal probe,
 /// returns the spawn's own result.
 fn parent(join: bool) -> String {
-    let tail = if join {
+    parent_then(if join {
         "vr = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  return vr"
     } else {
         "vr = i64.extend_i32_s vh\n  return vr"
-    };
+    })
+}
+
+/// [`parent`], ending in `tail` (which sees `v0` and the child handle `vh`).
+fn parent_then(tail: &str) -> String {
     format!(
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
@@ -264,6 +268,49 @@ fn a_detached_childs_budget_bounds_its_fuel_under_an_unmetered_jit_root() {
             "the JIT, ceiling {fuel}"
         );
     }
+}
+
+/// #2053 — `wait` (op 18) on the JIT answers as the interpreter does: a child that loops past its
+/// node's fuel ceiling answers `OUT_OF_FUEL` and the parent runs on, unmetered as its root is, the
+/// child reaped; one with room answers 0 and stays for its `join`.
+#[test]
+fn wait_reports_a_detached_childs_fuel_running_out_on_the_jit() {
+    let wait = module(&parent_then(
+        "vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  return vr",
+    ));
+    let wait_join = module(&parent_then(
+        "vw = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
+         vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  \
+         vk = i64.const 1000\n  \
+         vs = i64.mul vw vk\n  \
+         vr = i64.add vs vj\n  \
+         return vr",
+    ));
+    let c = module(CHILD_LOOPS);
+    for (p, fuel, want) in [
+        (&wait_join, 2000, 7),
+        (&wait, 500, temen_ir::trap_code::OUT_OF_FUEL),
+    ] {
+        assert_eq!(
+            interp_result(p, fuel_host(&c, fuel)),
+            Ok(vec![Value::I64(want)]),
+            "interpreter, ceiling {fuel}"
+        );
+        assert_eq!(
+            jit_outcome(p, fuel_host(&c, fuel)),
+            JitOutcome::Returned(vec![want]),
+            "the JIT, ceiling {fuel}"
+        );
+    }
+    // The wait reaped the trapped child: joining it after is a spent handle.
+    assert_eq!(
+        interp_result(&wait_join, fuel_host(&c, 500)),
+        Err(Trap::ThreadFault)
+    );
+    assert_eq!(
+        jit_outcome(&wait_join, fuel_host(&c, 500)),
+        JitOutcome::Trapped(TrapKind::ThreadFault)
+    );
 }
 
 /// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
