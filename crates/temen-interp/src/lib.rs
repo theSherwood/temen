@@ -33489,34 +33489,29 @@ impl Mem {
     /// Bytes first so a `Ro`/grown page has its contents before the protection is applied. The fresh
     /// window has no regions, so this reproduces the guest-visible state exactly.
     fn restore_layout(&mut self, layout: &MemLayout) {
-        // Bulk fast path, the mirror of the capture above (and of `seed`): no §13 region ⇒ no page is
-        // `Backed`, so the image writes straight through to `back` in one pass. Same root-only offset
-        // convention as `layout_snapshot`.
-        if !self.has_regions.load(Ordering::Relaxed) {
-            self.back.write_from(0, &layout.bytes);
-        } else {
-            for (i, &b) in layout.bytes.iter().enumerate() {
-                self.set_byte(i as u64, b);
-            }
-        }
-        // Install the captured map, *replacing* whatever this window carries. The guard is only the
-        // fast-path one: a window with no explicit protections restoring an image that has none stays
-        // off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries the map
-        // is assigned outright — restoring into a **live** window (a reactor rewinding to an earlier
-        // moment) must drop the pages the guest has `map`-grown since, or they would survive as
-        // addressable memory the moment never had. A fresh window (the checkpoint ladder's target) has
-        // an empty map, so this is unchanged there.
+        // Install the captured map first, *replacing* whatever this window carries. The guard is only
+        // the fast-path one: a window with no explicit protections restoring an image that has none
+        // stays off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries
+        // the map is assigned outright — restoring into a **live** window (a reactor rewinding to an
+        // earlier moment) must drop the pages the guest has `map`-grown since, or they would survive
+        // as addressable memory the moment never had. A fresh window (the checkpoint ladder's target)
+        // has an empty map, so this is unchanged there. The layout may be in another page unit (a §12
+        // artifact's fixed 4 KiB, or a 16 KiB native capture); `rebased_to` is identity when they
+        // already agree. A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which
+        // installs its entry with the region it names.
         if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
             let mut space = self.space_write(); // marks prot_dirty, matching the captured window
-                                                // The layout may be in another page unit (a §12 artifact's fixed 4 KiB, or a 16 KiB native
-                                                // capture); `rebased_to` is identity when they already agree.
-                                                // A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which installs
-                                                // its entry with the region it names.
             space.prot = layout.map.rebased_to(self.page);
             space
                 .prot
                 .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
         }
+        // Then the image, straight into `back` in one pass (the mirror of the capture above and of
+        // `seed`). No page is `Backed` now (an alias dirties the map, so the map above replaced it),
+        // so every byte is the window's own: a region the live window aliased since the moment was
+        // taken keeps its bytes out of the restore (#2059). Same root-only offset convention as
+        // `layout_snapshot`.
+        self.back.write_from(0, &layout.bytes);
     }
 
     /// Capture just this window's page-protection map (window-relative page ⇒ state) for checkpointing a

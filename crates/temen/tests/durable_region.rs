@@ -781,3 +781,44 @@ fn a_bytecode_reactor_region_the_embedder_holds_declines() {
     );
     drop(kept);
 }
+
+/// **#2059 — rewinding a reactor to a moment leaves a region it has mapped since untouched.** The
+/// moment was taken before the guest mapped the embedder's region, so it holds the window's own
+/// bytes there; the restore writes them into the window, not through the alias into the region every
+/// other holder reads.
+#[test]
+fn rewinding_a_reactor_past_a_region_map_leaves_the_region_alone() {
+    use temen_interp::{bytecode::Reactor, moment::ReactorMoment};
+    let m = temen_text::parse_module(REACTOR_SRC).expect("parse");
+    let mut host = Host::new();
+    let (rh, kept) = region_kept_outside(&mut host);
+    for (o, b) in 0xabcdi64.to_le_bytes().into_iter().enumerate() {
+        kept.write_byte(8 + o as u64, b);
+    }
+    let mut r = Reactor::open(&m).expect("open");
+    let before = ReactorMoment::capture(r.window_layout().expect("a window"), &host)
+        .expect("nothing aliased yet");
+    assert_eq!(
+        tick(&mut r, &mut host, 1, &[Value::I32(rh)]),
+        Value::I64(0),
+        "mapped"
+    );
+
+    assert!(r.restore_window(&before.layout(), &host), "rewinds");
+    let region: Vec<u8> = (8..16).map(|o| kept.read_byte(o)).collect();
+    assert_eq!(
+        region,
+        0xabcdi64.to_le_bytes(),
+        "the region keeps what the embedder wrote"
+    );
+    let window = r.window_layout().expect("a window");
+    assert!(
+        !window.aliases_regions(),
+        "the rewound window is the moment's: private"
+    );
+    assert_eq!(
+        &window.bytes()[AT + 8..AT + 16],
+        &[0u8; 8],
+        "and reads the moment's bytes"
+    );
+}
