@@ -41,7 +41,13 @@ fn durable_handles_round_trip_through_capture_restore() {
     );
     // Value-typed bindings survive verbatim.
     assert_eq!(captured[0].binding, DurableBinding::Clock);
-    assert_eq!(captured[1].binding, DurableBinding::Stream(StreamRole::Out));
+    assert_eq!(
+        captured[1].binding,
+        DurableBinding::Stream {
+            role: StreamRole::Out,
+            inherited: false
+        }
+    );
     assert!(captured.iter().any(|h| h.binding
         == DurableBinding::AddressSpace {
             base: 0x2000,

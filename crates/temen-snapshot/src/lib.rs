@@ -256,7 +256,9 @@ use temen_ir::Module;
 /// v39 (#2025, R4): §13 regions inside the cut ride. Section 11 carries each region's bytes by
 /// artifact number; a window page aliasing one is `PROT_BACKED` (3) + region number + region offset +
 /// writable, with no bytes of its own; a `SharedRegion` handle is `B_SHARED_REGION` (16) + number.
-const FORMAT_VERSION: u16 = 39;
+/// v40 (#2054): a stdio stream its spawner re-granted is `B_STREAM_INHERITED` (17) + role, so a
+/// detached child's thaw aliases it to its spawner's stream again instead of a buffer nothing reads.
+const FORMAT_VERSION: u16 = 40;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -335,6 +337,8 @@ const B_MODULE: u8 = 14;
 const B_PIPE_END: u8 = 15;
 /// v39 (#2025): a §13 `SharedRegion` handle — the region's artifact number (Section 11).
 const B_SHARED_REGION: u8 = 16;
+/// v40 (#2054): a stdio stream its spawner re-granted (§7c) — `B_STREAM`'s role byte follows.
+const B_STREAM_INHERITED: u8 = 17;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -2456,8 +2460,12 @@ fn write_handle_recs(b: &mut Vec<u8>, handles: &[DurableHandle]) {
 
 fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
     match *binding {
-        DurableBinding::Stream(role) => {
-            b.push(B_STREAM);
+        DurableBinding::Stream { role, inherited } => {
+            b.push(if inherited {
+                B_STREAM_INHERITED
+            } else {
+                B_STREAM
+            });
             b.push(match role {
                 StreamRole::In => 0,
                 StreamRole::Out => 1,
@@ -2524,12 +2532,15 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
 
 fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
     Ok(match r.u8()? {
-        B_STREAM => DurableBinding::Stream(match r.u8()? {
-            0 => StreamRole::In,
-            1 => StreamRole::Out,
-            2 => StreamRole::Err,
-            _ => return Err(RestoreError::Malformed),
-        }),
+        tag @ (B_STREAM | B_STREAM_INHERITED) => DurableBinding::Stream {
+            role: match r.u8()? {
+                0 => StreamRole::In,
+                1 => StreamRole::Out,
+                2 => StreamRole::Err,
+                _ => return Err(RestoreError::Malformed),
+            },
+            inherited: tag == B_STREAM_INHERITED,
+        },
         B_EXIT => DurableBinding::Exit,
         B_CLOCK => DurableBinding::Clock,
         // B_MEMORY (3): retired with the §4 Memory→AddressSpace fold — a pre-§4 artifact carrying

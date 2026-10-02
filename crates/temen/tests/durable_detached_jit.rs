@@ -9,7 +9,9 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module,
     transform_module_assume_confined, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, MemLayout, Value};
+use temen_interp::{
+    run_capture_reserved_with_host, FreezeScope, Host, MemLayout, StreamRole, Value,
+};
 use temen_ir::durable_abi::ShadowArena;
 use temen_jit::{JitError, JitOutcome};
 
@@ -276,18 +278,19 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
 
 /// #2010 — the root of a depth-2 durable tree: `v0` its `Instantiator`, `v1` the [`NEST`] module, `v2`
 /// a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]), `v3`
-/// freeze authority over detached progeny, `v4` a settle time in ms. It spawns `NEST` detached at
-/// entry 0 with two named grants (#2018): the authority as `"freeze"`, so the durable child may spawn
-/// in turn, and the module as `"nest"`. It waits until the budget's `spawn` room shows the tree
-/// settled, or the child has ended, parking 1 ms a time (a durable run on the oracle has one worker,
-/// so a waiter must give it up), then the settle time. Then one fiber resume: the run's only fiber
-/// safepoint, where `arm_freeze_after(win, 1)` freezes the settled tree. Last, it joins the child and
-/// returns what the child returns.
+/// freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout. It spawns
+/// `NEST` detached at entry 0 with three named grants (#2018): the authority as `"freeze"`, so the
+/// durable child may spawn in turn, the module as `"nest"`, and its stdout as `"stdout"` (#2054). It
+/// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking 1 ms
+/// a time (a durable run on the oracle has one worker, so a waiter must give it up), then the settle
+/// time. Then one fiber resume: the run's only fiber safepoint, where `arm_freeze_after(win, 1)`
+/// freezes the settled tree. Last, it joins the child and returns what the child returns.
 const NEST_ROOT: &str = "memory 18 shadow 16448 65536
 data 70000 \"freeze\"
 data 70008 \"nest\"
-func (i32, i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
+data 70064 \"stdout\"
+func (i32, i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {
   vr0 = i64.const 70016
   vn0 = i32.const 70000
   i32.store vr0 vn0
@@ -304,10 +307,18 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   i32.store vr4 vl1
   vr5 = i64.const 70040
   i32.store vr5 v1
+  vr6 = i64.const 70048
+  vn2 = i32.const 70064
+  i32.store vr6 vn2
+  vr7 = i64.const 70052
+  vl2 = i32.const 6
+  i32.store vr7 vl2
+  vr8 = i64.const 70056
+  i32.store vr8 v5
   vmh = i64.extend_i32_u v1
   vb = i64.extend_i32_u v2
   vgp = i64.const 70016
-  vgn = i64.const 2
+  vgn = i64.const 3
   vz = i64.const 0
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz)
@@ -531,6 +542,89 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
+/// #2054 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place that resolves the stdout its spawner
+/// re-granted it, waits a second on a futex nothing notifies, so it is live when the freeze lands,
+/// then writes `X` to that stdout and returns [`NEST_TOTAL`].
+const PRINT_NEST: &str = "memory 17 shadow 16448 65536
+data 90112 \"stdout\"
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vp = i64.const 90112
+  vl = i64.const 6
+  vo = self.resolve vp vl
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vb = i64.const 90200
+  vx = i32.const 88
+  i32.store8 vb vx
+  vn = i64.const 1
+  vwr = call.cap 0 1 (i64, i64) -> (i64) vo (vb, vn)
+  vr = i64.const 107
+  return vr
+  }
+}
+";
+
+/// #2054 — the same one level down: a child that re-grants the grandchild (entry 1) the stdout it
+/// inherited, joins it, and returns 100 more than it. The grandchild resolves that stdout, waits a
+/// second, writes `X` to it and returns 7, so its bytes reach the root through the child's stream.
+const PRINT_GRAND_NEST: &str = "memory 17 shadow 16448 65536
+data 90112 \"budget\"
+data 90120 \"nest\"
+data 90128 \"stdout\"
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vbp = i64.const 90112
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vmp = i64.const 90120
+  vml = i64.const 4
+  vm = self.resolve vmp vml
+  vop = i64.const 90128
+  vol = i64.const 6
+  vo = self.resolve vop vol
+  vga = i64.const 90144
+  vgw = i64.const 25769893904
+  i64.store vga vgw
+  vgh = i64.const 90152
+  vo64 = i64.extend_i32_u vo
+  i64.store vgh vo64
+  vbw = i64.extend_i32_u vb
+  vmw = i64.extend_i32_u vm
+  vz = i64.const 0
+  vgn = i64.const 1
+  ve = i64.const 1
+  vlog = i64.const 17
+  vinst = i32.wrap_i64 v0
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vga, vgn, ve, vlog, vz)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vhundred = i64.const 100
+  vr = i64.add vj vhundred
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vp = i64.const 90128
+  vl = i64.const 6
+  vo = self.resolve vp vl
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 1000000000
+  vw = i32.atomic.wait va vw0 vto
+  vb = i64.const 90200
+  vx = i32.const 88
+  i32.store8 vb vx
+  vn = i64.const 1
+  vwr = call.cap 0 1 (i64, i64) -> (i64) vo (vb, vn)
+  vr = i64.const 7
+  return vr
+  }
+}
+";
+
 /// #2041 — the same one level down: a child that spawns a grandchild that returns at once, waits for
 /// it to end without joining it, then spawns two that wait a second, and joins those first. Its tree
 /// settles with the child and the slow two live, which it reaches only after the quick one has ended:
@@ -613,9 +707,9 @@ fn nest_modules(child: &str) -> (temen_ir::Module, temen_ir::Module) {
 }
 
 /// [`NEST_ROOT`]'s powerbox: its `Instantiator`, `nest` as a durable `Module`, a `Budget` of 1 MiB,
-/// and freeze authority over detached progeny; and its arguments, with `settle_ms` last. The tree has
-/// settled once `live` of the root's descendants are live, so the budget's `spawn` ceiling is 2 more
-/// than `live`: its room then falls to the 2 the root waits for.
+/// freeze authority over detached progeny, and stdout; and its arguments, `settle_ms` among them. The
+/// tree has settled once `live` of the root's descendants are live, so the budget's `spawn` ceiling
+/// is 2 more than `live`: its room then falls to the 2 the root waits for.
 fn nest_powerbox(nest: &temen_ir::Module, settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
@@ -623,7 +717,8 @@ fn nest_powerbox(nest: &temen_ir::Module, settle_ms: i32, live: i64) -> (Host, V
     let modh = host.grant_durable_module(nest);
     let budget = host.grant_budget(-1, 1 << 20, live + 2);
     let freeze = host.grant_freeze_authority(FreezeScope::DetachedProgeny);
-    let args = [inst, modh, budget, freeze, settle_ms].map(i64::from);
+    let out = host.grant_stream(StreamRole::Out);
+    let args = [inst, modh, budget, freeze, settle_ms, out].map(i64::from);
     (host, args.to_vec())
 }
 
@@ -633,11 +728,13 @@ enum Engine {
     Jit,
 }
 
-/// What a run of [`NEST_ROOT`] answers: its result, or the code of the trap it ended in.
-type Answer = Result<i64, i64>;
+/// What a run of [`NEST_ROOT`] answers: its result, or the code of the trap it ended in, and what
+/// it wrote to stdout.
+type Answer<'a> = (Result<i64, i64>, &'a str);
 
-/// Run `root` over `win` on `engine`, the JIT with `fc` as its freeze controller: its answer and its
-/// final window. `None` on a target without the JIT's child executor.
+/// Run `root` over `win` on `engine`, the JIT with `fc` as its freeze controller: its result (or
+/// trap code), what it wrote to stdout, and its final window. `None` on a target without the JIT's
+/// child executor.
 fn nest_run(
     engine: Engine,
     root: &temen_ir::Module,
@@ -645,18 +742,18 @@ fn nest_run(
     win: &[u8],
     host: &mut Host,
     fc: Option<std::sync::Arc<temen_jit::FreezeController>>,
-) -> Option<(Answer, Vec<u8>)> {
-    match engine {
+) -> Option<(Result<i64, i64>, String, Vec<u8>)> {
+    let (r, snap) = match engine {
         Engine::Interp => {
             let iargs: Vec<Value> = args.iter().map(|&a| Value::I32(a as i32)).collect();
             let mut fuel = u64::MAX / 2;
             match run_capture_reserved_with_host(root, 0, &iargs, &mut fuel, win, PARENT_LOG2, host)
             {
                 (Ok(v), snap) => match v[..] {
-                    [Value::I64(n)] => Some((Ok(n), snap)),
+                    [Value::I64(n)] => (Ok(n), snap),
                     ref other => panic!("unexpected result {other:?}"),
                 },
-                (Err(t), snap) => Some((Err(t.code()), snap)),
+                (Err(t), snap) => (Err(t.code()), snap),
             }
         }
         Engine::Jit => match temen_run::jit_cap_run(
@@ -669,13 +766,15 @@ fn nest_run(
             host,
             fc,
         ) {
-            Ok((JitOutcome::Returned(v), snap)) => Some((Ok(v[0]), snap.bytes().to_vec())),
-            Ok((JitOutcome::Trapped(t), snap)) => Some((Err(t as i64), snap.bytes().to_vec())),
+            Ok((JitOutcome::Returned(v), snap)) => (Ok(v[0]), snap.bytes().to_vec()),
+            Ok((JitOutcome::Trapped(t), snap)) => (Err(t as i64), snap.bytes().to_vec()),
             Ok((other, _)) => panic!("the run neither returned nor trapped: {other:?}"),
-            Err(JitError::Unsupported(_)) => None, // a target without the child executor
+            Err(JitError::Unsupported(_)) => return None, // a target without the child executor
             Err(e) => panic!("JIT run failed: {e:?}"),
         },
-    }
+    };
+    let out = String::from_utf8_lossy(&host.take_stdout()).into_owned();
+    Some((r, out, snap))
 }
 
 /// For each captured child, how many of its `thread.spawn` vCPUs its own artifact carries live.
@@ -768,8 +867,9 @@ fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &temen_ir::Module) ->
     (host, win)
 }
 
-/// Each of `runs`' thaws of `art` that does not answer `answer`, described. `runs` are the engines
-/// that run the tree at all: one of them refusing the thaw is wrong too.
+/// Each of `runs`' thaws of `art` that does not answer `answer`, described: what the thaw returns
+/// and writes. `runs` are the engines that run the tree at all: one of them refusing the thaw is
+/// wrong too.
 fn nest_thaws(
     art: &[u8],
     froze: Engine,
@@ -783,8 +883,10 @@ fn nest_thaws(
     for &thaws in runs {
         let (mut host, win) = nest_restore(art, root, nest);
         match nest_run(thaws, root, args, &win, &mut host, None) {
-            Some((r, _)) if r == answer => {}
-            Some((r, _)) => wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: {r:?}")),
+            Some((r, out, _)) if (r, out.as_str()) == answer => {}
+            Some((r, out, _)) => wrong.push(format!(
+                "frozen on {froze:?}, thawed on {thaws:?}: {r:?}, writing {out:?}"
+            )),
             None => wrong.push(format!("frozen on {froze:?}, thawed on {thaws:?}: refused")),
         }
     }
@@ -794,8 +896,9 @@ fn nest_thaws(
 /// Freeze [`NEST_ROOT`] over `child`, whose tree has settled once `live` of the root's descendants
 /// are live, on every engine at the root's fiber safepoint: at once, and after a settle of 100 ms.
 /// `carried` reads what each freeze carried, which must be `want`, and every engine thaws every
-/// engine's artifact to `answer`, the tree's uninterrupted answer on every engine. An engine that
-/// runs the tree uninterrupted must freeze and thaw it too.
+/// engine's artifact to `answer`, the tree's uninterrupted answer on every engine: its result, and
+/// the rest of its output after what the frozen run wrote (#2054). An engine that runs the tree
+/// uninterrupted must freeze and thaw it too.
 fn rides_every_engine(
     child: &str,
     live: i64,
@@ -810,11 +913,11 @@ fn rides_every_engine(
     for e in [Interp, Jit] {
         let (mut host, args) = nest_powerbox(&child, 0, live);
         let win = init_durable_window(1 << PARENT_LOG2, ARENA);
-        let Some((r, _)) = nest_run(e, &root, &args, &win, &mut host, None) else {
+        let Some((r, out, _)) = nest_run(e, &root, &args, &win, &mut host, None) else {
             continue; // a target without the JIT's child executor
         };
-        if r != answer {
-            wrong.push(format!("uninterrupted on {e:?}: {r:?}"));
+        if (r, out.as_str()) != answer {
+            wrong.push(format!("uninterrupted on {e:?}: {r:?}, writing {out:?}"));
         }
         runs.push(e);
     }
@@ -823,19 +926,23 @@ fn rides_every_engine(
             let (mut fhost, args) = nest_powerbox(&child, settle_ms, live);
             let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
             arm_freeze_after(&mut win, 1);
-            let Some((r, fsnap)) = nest_run(froze, &root, &args, &win, &mut fhost, None) else {
+            let Some((r, out, fsnap)) = nest_run(froze, &root, &args, &win, &mut fhost, None)
+            else {
                 wrong.push(format!("freeze on {froze:?} after {settle_ms} ms: refused"));
                 continue;
             };
             let got = carried(&fhost);
-            if (r, &got[..]) != (Ok(0), want) {
+            let rest = answer.1.strip_prefix(out.as_str());
+            if (r, &got[..]) != (Ok(0), want) || rest.is_none() {
                 wrong.push(format!(
-                    "freeze on {froze:?} after {settle_ms} ms: {r:?}, carrying {got:?}"
+                    "freeze on {froze:?} after {settle_ms} ms: {r:?}, writing {out:?}, carrying \
+                     {got:?}"
                 ));
                 continue;
             }
             let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
-            wrong.extend(nest_thaws(&art, froze, &root, &child, &args, &runs, answer));
+            let thawed = (answer.0, rest.unwrap_or_default());
+            wrong.extend(nest_thaws(&art, froze, &root, &child, &args, &runs, thawed));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -852,7 +959,7 @@ fn rides_every_engine(
 /// before any parked task is poisoned, and the child's join is left parked for the grandchild's end.
 #[test]
 fn a_durable_childs_grandchild_rides_its_freeze_on_every_engine() {
-    rides_every_engine(NEST, 2, carried, &[1], Ok(NEST_TOTAL));
+    rides_every_engine(NEST, 2, carried, &[1], (Ok(NEST_TOTAL), ""));
 }
 
 /// #2010 — **the JIT's freeze reaches a grandchild through the joins.** The embedder's
@@ -909,7 +1016,7 @@ fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
     let win = init_durable_window(1 << PARENT_LOG2, ARENA);
     let run = nest_run(Engine::Jit, &root, &args, &win, &mut fhost, Some(fc));
     ctl.join().expect("controller");
-    let Some((r, fsnap)) = run else {
+    let Some((r, _, fsnap)) = run else {
         return;
     };
     assert_eq!(r, Ok(0), "the root froze");
@@ -922,7 +1029,7 @@ fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
         &child,
         &args,
         &[Engine::Interp, Engine::Jit],
-        Ok(NEST_TOTAL),
+        (Ok(NEST_TOTAL), ""),
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
@@ -938,7 +1045,7 @@ fn a_jit_thaw_refuses_two_detached_children_at_one_join_slot() {
     let (mut fhost, args) = nest_powerbox(&nest, 0, 2);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     arm_freeze_after(&mut win, 1);
-    let (_, fsnap) =
+    let (_, _, fsnap) =
         nest_run(Engine::Interp, &root, &args, &win, &mut fhost, None).expect("oracle");
     let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
     let (mut host, win) = nest_restore(&art, &root, &nest);
@@ -979,7 +1086,7 @@ fn a_jit_thaw_refuses_two_detached_children_at_one_join_slot() {
 /// re-creating the thread, to the uninterrupted [`NEST_TOTAL`].
 #[test]
 fn a_durable_childs_thread_rides_its_freeze_on_every_engine() {
-    rides_every_engine(THREAD_NEST, 2, carried_threads, &[1], Ok(NEST_TOTAL));
+    rides_every_engine(THREAD_NEST, 2, carried_threads, &[1], (Ok(NEST_TOTAL), ""));
 }
 
 /// #2031 — **a durable detached child's parked fiber rides its freeze**, on every engine. The freeze
@@ -990,7 +1097,7 @@ fn a_durable_childs_thread_rides_its_freeze_on_every_engine() {
 /// 110. Every engine thaws every engine's artifact to the uninterrupted [`NEST_TOTAL`].
 #[test]
 fn a_durable_childs_fiber_rides_its_freeze_on_every_engine() {
-    rides_every_engine(FIBER_NEST, 2, carried_fibers, &[1], Ok(NEST_TOTAL));
+    rides_every_engine(FIBER_NEST, 2, carried_fibers, &[1], (Ok(NEST_TOTAL), ""));
 }
 
 /// #2031 — **the same, for a child with no vCPU but its root.** No thread unwinds to flatten the
@@ -1014,7 +1121,13 @@ fn a_controller_freeze_flattens_a_childs_own_fiber_on_the_jit() {
 /// `join` reloads it instead of spawning the child again.
 #[test]
 fn a_completed_detached_child_rides_its_parents_freeze_on_every_engine() {
-    rides_every_engine(QUICK_NEST, 2, completed_children, &[1], Ok(NEST_TOTAL));
+    rides_every_engine(
+        QUICK_NEST,
+        2,
+        completed_children,
+        &[1],
+        (Ok(NEST_TOTAL), ""),
+    );
 }
 
 /// #2041 — **the same for a child that trapped**: its trap rides the artifact as its `join` outcome,
@@ -1022,8 +1135,25 @@ fn a_completed_detached_child_rides_its_parents_freeze_on_every_engine() {
 /// run does.
 #[test]
 fn a_completed_detached_childs_trap_rides_its_parents_freeze_on_every_engine() {
-    let unreachable = Err(temen_ir::trap_code::UNREACHABLE);
+    let unreachable = (Err(temen_ir::trap_code::UNREACHABLE), "");
     rides_every_engine(TRAP_NEST, 2, completed_children, &[1], unreachable);
+}
+
+/// #2054 — **a durable detached child's inherited stdout rides its freeze**, on every engine. Its
+/// spawner re-granted it the root's stdout, which aliases the root's buffer (§7c); the freeze lands
+/// while the child waits, before it writes. A thaw re-aliases the stream to the thawing root's
+/// stdout, so the `X` the child writes after the cut reaches the root as it does uninterrupted.
+/// Captured without its sink, the stream came back as the child's own buffer, which nothing reads.
+#[test]
+fn a_detached_childs_inherited_stdout_rides_its_freeze_on_every_engine() {
+    rides_every_engine(PRINT_NEST, 1, carried, &[0], (Ok(NEST_TOTAL), "X"));
+}
+
+/// #2054 — **the same one level down.** The grandchild's stdout is the one its spawner inherited,
+/// so its thaw aliases it to the child's stream, which the child's own thaw aliased to the root's.
+#[test]
+fn a_grandchilds_inherited_stdout_rides_its_freeze_on_every_engine() {
+    rides_every_engine(PRINT_GRAND_NEST, 2, carried, &[1], (Ok(NEST_TOTAL), "X"));
 }
 
 /// #2041 — **the same one level down.** The freeze captures the child live, joining its slow
@@ -1037,6 +1167,6 @@ fn a_captured_childs_completed_child_rides_its_freeze_on_every_engine() {
         3,
         completed_grandchildren,
         &[1],
-        Ok(NEST_TOTAL),
+        (Ok(NEST_TOTAL), ""),
     );
 }
