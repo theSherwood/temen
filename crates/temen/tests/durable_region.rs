@@ -705,7 +705,10 @@ fn tick(
 /// reactor re-freezes byte-identical. A moment, which carries no region bytes, still refuses.
 #[test]
 fn a_bytecode_reactor_save_state_carries_its_region() {
-    use temen_interp::{bytecode::Reactor, moment::Moment};
+    use temen_interp::{
+        bytecode::Reactor,
+        moment::{Moment, Refusal},
+    };
     let m = temen_text::parse_module(REACTOR_SRC).expect("parse");
     let mut host = Host::new();
     let asp = host.grant_address_space(0, WINDOW as u64);
@@ -722,8 +725,9 @@ fn a_bytecode_reactor_save_state_carries_its_region() {
         layout.aliases_regions(),
         "the mapped pages are captured as the region"
     );
-    assert!(
-        Moment::capture(layout.clone(), &host).is_none(),
+    assert_eq!(
+        Moment::capture(layout.clone(), &host).err(),
+        Some(Refusal::Region),
         "a moment cannot carry the region's bytes"
     );
     let reserved = r.window_reserved_log2().expect("a window");

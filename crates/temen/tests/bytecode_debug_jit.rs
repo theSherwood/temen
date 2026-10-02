@@ -12,6 +12,7 @@
 
 use temen_encode::encode_module;
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
+use temen_interp::moment::Refusal;
 use temen_interp::{run_with_host, Host, IrPc, Trap, Value};
 use temen_ir::Data;
 use temen_run::grant_jit;
@@ -362,12 +363,16 @@ fn a_compiled_unit_still_refuses_a_checkpoint() {
         ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(jit)], host).expect("in the subset");
     let mut fuel = 50_000_000u64;
     while run.op_turn() < 30 && run.tick(&mut fuel) {}
-    assert!(run.snapshot().is_some(), "no unit yet");
+    assert!(run.snapshot().is_ok(), "no unit yet");
     assert!(
         matches!(sched_to_end(&mut run, &mut fuel), Ok(v) if matches!(v[..], [Value::I64(h)] if h > 0)),
         "the second compile succeeds"
     );
-    assert!(run.snapshot().is_none(), "a unit is held: refused");
+    assert_eq!(
+        run.snapshot().err(),
+        Some(Refusal::JitUnit),
+        "a unit is held: refused"
+    );
 }
 
 /// **#2015, the journal's half.** The undo journal restores into the same run, so it cannot take back

@@ -117,7 +117,7 @@ fn scheduled_child_page_mapping_checkpoint_snapshot_restore_round_trips() {
         let mut at_c = sched_session();
         let mut f = FUEL;
         while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
-        let Some(snap) = at_c.snapshot() else {
+        let Ok(snap) = at_c.snapshot() else {
             continue;
         };
         checkpoints += 1;

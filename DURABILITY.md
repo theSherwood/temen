@@ -88,7 +88,7 @@ M:N runtime (orthogonal; honours D22/D56 — the VM ships *mechanism, not a
 scheduler*).
 
 **Clarification — a reactor *moment* is not a counter-example to the first non-goal (2026-09-15,
-#1457).** A reactor moment (`temen-browser`'s `ReactorMoment`) captures an **un-instrumented**
+#1457).** A reactor moment (a `temen_interp::moment::Moment` whose continuation is `None`) captures an **un-instrumented**
 guest — a Doom/bounce/life reactor pays none of §2's transform cost — which reads like the
 non-goal above until you see what it does *not* capture: a continuation. A reactor's `tick`
 returns to the host every frame, so at a frame boundary there is no guest stack, no shadow stack
@@ -152,7 +152,7 @@ value.
 `temen-browser`, and the playground page already had one of its own in JavaScript (#1458, when the
 engine offered only take/restore/free and policy was left to the page). Two implementations of one
 behaviour, already disagreeing on eviction and on whether the start of a run stays reachable — so this
-slice collapsed them instead of adding a third. `ReactorMoment`, `MomentReactor`, `ReactorInput` and
+slice collapsed them instead of adding a third. The reactor moment, `MomentReactor`, `ReactorInput` and
 `ReactorTimeline` now live in **`temen_interp::moment`**, the page drives that one through a new
 `temen_onramp_timeline_*` FFI, and `web/play.js` keeps only what is genuinely the page's: the frame
 loop, the DOM, and a cached picture beside each rung (the presented frame is *output* — no guest reads

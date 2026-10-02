@@ -199,7 +199,7 @@ fn a_live_detached_child_rides_every_checkpoint() {
 
     let mut wrong = Vec::new();
     for (c, snap) in snaps.iter().enumerate() {
-        let Some(snap) = snap else {
+        let Ok(snap) = snap else {
             wrong.push(format!("turn {c}: no checkpoint"));
             continue;
         };

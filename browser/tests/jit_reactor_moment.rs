@@ -22,8 +22,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use temen_browser::{
-    Frame, JitOnrampReactor, JitStart, Moment, MomentReactor, ReactorTimeline, SteppableReactor,
-    STATUS_OK,
+    Frame, JitOnrampReactor, JitStart, Moment, MomentReactor, ReactorTimeline, Refusal,
+    SteppableReactor, STATUS_OK,
 };
 use temen_interp::Value;
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -247,7 +247,7 @@ impl MomentReactor for JitDriver {
     fn push_mouse(&self, kind: i32, payload: i32) {
         self.reactor().push_mouse(kind, payload);
     }
-    fn moment(&self) -> Option<Moment> {
+    fn moment(&self) -> Result<Moment, Refusal> {
         self.reactor().moment()
     }
     fn restore(&mut self, m: &Moment) -> bool {

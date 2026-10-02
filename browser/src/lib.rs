@@ -3546,7 +3546,7 @@ fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout>
 // implementations (INVARIANTS #15; the page had exactly that before this). Re-exported here so the
 // cdylib's consumers and the reactor tests keep one name for them.
 pub use temen_interp::moment::{
-    Moment, MomentReactor, ReactorInput, ReactorTimeline, SteppableReactor,
+    Moment, MomentReactor, ReactorInput, ReactorTimeline, Refusal, SteppableReactor,
 };
 
 // The capability-side half of a moment is **each capability's own state**, declared once by the
@@ -3574,7 +3574,7 @@ macro_rules! impl_moment_reactor {
             fn push_mouse(&self, kind: i32, payload: i32) {
                 <$t>::push_mouse(self, kind, payload);
             }
-            fn moment(&self) -> Option<Moment> {
+            fn moment(&self) -> Result<Moment, Refusal> {
                 <$t>::moment(self)
             }
             fn restore(&mut self, m: &Moment) -> bool {
@@ -3598,7 +3598,7 @@ impl MomentReactor for JitOnrampReactor {
     fn push_mouse(&self, kind: i32, payload: i32) {
         JitOnrampReactor::push_mouse(self, kind, payload);
     }
-    fn moment(&self) -> Option<Moment> {
+    fn moment(&self) -> Result<Moment, Refusal> {
         JitOnrampReactor::moment(self)
     }
     fn restore(&mut self, m: &Moment) -> bool {
@@ -5513,10 +5513,14 @@ impl OnrampReactor {
     }
 
     /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
-    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
-    pub fn moment(&self) -> Option<Moment> {
-        Moment::capture(self.inst.window_layout()?, &self.host)
+    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
+    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
+    /// fiction).
+    pub fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            self.inst.window_layout().ok_or(Refusal::NoWindow)?,
+            &self.host,
+        )
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -5697,10 +5701,14 @@ impl SharedOnrampReactor {
     }
 
     /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
-    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
-    pub fn moment(&self) -> Option<Moment> {
-        Moment::capture(self.reactor.window_layout()?, &self.host.lock().unwrap())
+    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
+    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
+    /// fiction).
+    pub fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            self.reactor.window_layout().ok_or(Refusal::NoWindow)?,
+            &self.host.lock().unwrap(),
+        )
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -5994,10 +6002,14 @@ impl JitOnrampReactor {
     }
 
     /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
-    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
-    pub fn moment(&self) -> Option<Moment> {
-        Moment::capture(region_layout(&self.back)?, &self.host)
+    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
+    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
+    /// fiction).
+    pub fn moment(&self) -> Result<Moment, Refusal> {
+        Moment::capture(
+            region_layout(&self.back).ok_or(Refusal::NoWindow)?,
+            &self.host,
+        )
     }
 
     /// Freeze this reactor into a §12 save-state artifact — the emitted tier's twin of
@@ -9593,7 +9605,7 @@ fn moment_with(slot: i32, f: impl FnOnce(&Moment) -> bool) -> i32 {
 #[no_mangle]
 pub extern "C" fn temen_onramp_moment_take() -> i32 {
     // SAFETY: single-threaded wasm; shared read of the reactor.
-    let m = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.and_then(|r| r.moment());
+    let m = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.and_then(|r| r.moment().ok());
     moment_store(m)
 }
 
@@ -9617,7 +9629,7 @@ pub extern "C" fn temen_onramp_moment_restore(slot: i32) -> i32 {
 #[no_mangle]
 pub extern "C" fn temen_onramp_jit_moment_take() -> i32 {
     // SAFETY: single-threaded wasm; shared read of the reactor.
-    let m = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.moment());
+    let m = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.moment().ok());
     moment_store(m)
 }
 

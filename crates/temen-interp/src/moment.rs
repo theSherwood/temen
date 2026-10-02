@@ -68,6 +68,45 @@ impl Continuation {
     }
 }
 
+/// Why a run cannot be captured as a [`Moment`] right now (#1460). Every capture route refuses with
+/// one of these, so a driver that falls back to replay can say why (INVARIANTS #9c: refuse, never
+/// fiction).
+///
+/// A moment has three halves, and each refuses for its own reasons. The **host** half is checked by
+/// [`Moment::checkpoint`] itself, through [`Host::admits_checkpoint`]: a debugger rebuilds the powerbox
+/// on a seek, so every capability must be reconstructible. A reactor keeps its powerbox, so
+/// [`Moment::capture`] checks only the regions. The **window** half is the window's layout. The
+/// **continuation** half is the engine's: each engine checks its own state before it builds one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A `Blocking` capability is live: its work runs outside the run, where a restore cannot reach.
+    Blocking,
+    /// A host capability without a reconstruction rule: it has no registered name, or its provider
+    /// holds state it does not capture (#1455, #1699).
+    HostProc,
+    /// A guest-JIT table holds a unit, whose handle and install a restore cannot rebuild (#2015).
+    JitUnit,
+    /// A §13 region the moment cannot carry: one held outside the run or aliasing a host file, one in
+    /// a child's window, or any alias in a reactor's window (which carries no region bytes).
+    Region,
+    /// The window's layout is one the engine cannot image: the tree-walker's is no longer pristine, or
+    /// a child's window lies outside its parent's captured prefix.
+    WindowLayout,
+    /// There is no window to image.
+    NoWindow,
+    /// A fiber is off the root continuation, or parked on an event a replay cannot reproduce.
+    Fiber,
+    /// A `thread.spawn` child or coroutine is live, which the tree-walker's one-vCPU continuation does
+    /// not hold.
+    Thread,
+    /// The run is durable or holds frozen state.
+    Durable,
+    /// A task is inside a §22 `Jit.invoke`, or the guest has installed units.
+    Invoke,
+    /// A live detached child's powerbox is not plain values, so it cannot be rebuilt.
+    ChildPowerbox,
+}
+
 /// The tree-walk oracle's half of a single-threaded time-travel **checkpoint** (W1): the sole vCPU's
 /// call stack and fuel, so [`Inspector::seek`](crate::Inspector) can restart a replay at the
 /// checkpoint's clock rather than from clock 0. Captured only for the root-only / non-fiber /
@@ -208,17 +247,19 @@ impl Moment {
     }
 
     /// A debugger checkpoint: [`new`](Self::new), plus the §13 regions `host` holds, which its
-    /// [`restore_host`](Self::restore_host) rebuilds on the host a seek starts from (#2026). `None`
-    /// when a region cannot ride ([`Host::capture_regions`]).
+    /// [`restore_host`](Self::restore_host) rebuilds on the host a seek starts from (#2026). Refused
+    /// when the host half cannot be rebuilt ([`Host::admits_checkpoint`]) or a region cannot ride
+    /// ([`Host::capture_regions`]).
     pub fn checkpoint(
         mem: Option<MemLayout>,
         host: &Host,
         continuation: Continuation,
-    ) -> Option<Moment> {
+    ) -> Result<Moment, Refusal> {
+        host.admits_checkpoint()?;
         let regions = match host.region_count() {
             0 => None,
             _ => {
-                let (bytes, table) = host.capture_regions()?;
+                let (bytes, table) = host.capture_regions().ok_or(Refusal::Region)?;
                 let images = bytes
                     .into_iter()
                     .map(|b| Image::Flat(MemLayout::image(b)))
@@ -226,7 +267,7 @@ impl Moment {
                 Some((images, table))
             }
         };
-        Some(Moment {
+        Ok(Moment {
             regions,
             ..Moment::new(mem, host, continuation)
         })
@@ -315,11 +356,17 @@ impl Moment {
     /// A reactor moment always carries a window image (this takes it by value); restoring one gives
     /// **rewind**, a [`Ladder`] of them a keyframe ladder, re-running forward over recorded input the
     /// frames between rungs. A moment restored into a fresh reactor is a save-state; restored twice, a
-    /// branch. `None` for a window that aliases a §13 region: a reactor moment carries no region's
-    /// bytes, so a restore would show the region as it is then, not as it was (#2051) — a §12
-    /// artifact, which carries them, is the save-state for such a window.
-    pub fn capture(layout: MemLayout, host: &Host) -> Option<Moment> {
-        (!layout.aliases_regions()).then(|| Moment::new(Some(layout), host, Continuation::None))
+    /// branch. Refused ([`Refusal::Region`]) for a window that aliases a §13 region: a reactor moment
+    /// carries no region's bytes, so a restore would show the region as it is then, not as it was
+    /// (#2051) — a §12 artifact, which carries them, is the save-state for such a window.
+    ///
+    /// The host half is not checked: a reactor keeps its powerbox across a restore, so its
+    /// capabilities need no reconstruction rule.
+    pub fn capture(layout: MemLayout, host: &Host) -> Result<Moment, Refusal> {
+        if layout.aliases_regions() {
+            return Err(Refusal::Region);
+        }
+        Ok(Moment::new(Some(layout), host, Continuation::None))
     }
 
     /// The window image. A reactor moment always carries one — it is only ever built by
@@ -349,6 +396,8 @@ pub struct Ladder {
     stride: u64,
     ring: usize,
     budget: usize,
+    /// Why the ladder stopped taking rungs, once a capture was refused ([`offer`](Self::offer)).
+    refused: Option<Refusal>,
 }
 
 impl Ladder {
@@ -361,6 +410,7 @@ impl Ladder {
             stride: stride.max(1),
             ring,
             budget,
+            refused: None,
         }
     }
 
@@ -380,7 +430,29 @@ impl Ladder {
     /// checkpointable" half stays with the engine, which reads its own state. `coord == 0` is never a
     /// rung — the from-scratch replay start needs no checkpoint to reach.
     pub fn admits(&self, coord: u64) -> bool {
-        coord > 0 && self.is_due(coord)
+        self.refused.is_none() && coord > 0 && self.is_due(coord)
+    }
+
+    /// Offer the capture a driver made at `coord`: hold it, or, if it was refused, drop every rung and
+    /// take none from now on, keeping the reason ([`refusal`](Self::refusal)). The run has left the
+    /// subset a moment can hold, so every seek replays from the start, as it would with no ladder.
+    pub fn offer(&mut self, coord: u64, capture: Result<Moment, Refusal>) {
+        match capture {
+            _ if self.refused.is_some() => {}
+            Ok(m) => self.take(coord, m),
+            Err(r) => self.refuse(r),
+        }
+    }
+
+    /// Drop every rung and take none from now on, because of `why`.
+    pub fn refuse(&mut self, why: Refusal) {
+        self.rungs.clear();
+        self.refused = Some(why);
+    }
+
+    /// Why the ladder takes no rungs, or `None` while it still does.
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.refused
     }
 
     /// Hold `moment` at `coord`, keeping the ladder sorted and bounded. A coordinate already held is
@@ -412,11 +484,6 @@ impl Ladder {
     pub fn truncate_after(&mut self, coord: u64) {
         let n = self.rungs.partition_point(|(c, _)| *c <= coord);
         self.rungs.truncate(n);
-    }
-
-    /// Drop every rung.
-    pub fn clear(&mut self) {
-        self.rungs.clear();
     }
 
     /// How many rungs are held.
@@ -497,9 +564,10 @@ pub trait MomentReactor {
     fn push_key(&self, keycode: i32, pressed: i32);
     /// Enqueue a pointer event for the guest to poll next tick.
     fn push_mouse(&self, kind: i32, payload: i32);
-    /// Capture this reactor's state at the current frame boundary, or `None` if it cannot be imaged
-    /// faithfully (a §13 region alias — refuse rather than hand back a fiction, INVARIANTS #9c).
-    fn moment(&self) -> Option<Moment>;
+    /// Capture this reactor's state at the current frame boundary, or say why it cannot be imaged
+    /// faithfully (no window, or a §13 region alias — refuse rather than hand back a fiction,
+    /// INVARIANTS #9c).
+    fn moment(&self) -> Result<Moment, Refusal>;
     /// Put the reactor back at `m`. `false` if it has no window to restore into.
     fn restore(&mut self, m: &Moment) -> bool;
 
@@ -677,7 +745,7 @@ impl ReactorTimeline {
         if self.ladder.is_due(coord) {
             // An uncapturable window leaves the ladder as it was and `seek` refuses rather than
             // holding a partial image that would restore a fiction (#9c).
-            if let Some(m) = r.moment() {
+            if let Ok(m) = r.moment() {
                 self.ladder.take(coord, m);
             }
         }
@@ -830,6 +898,24 @@ mod ladder_tests {
             l.is_due(12) && !l.is_due(8) && !l.is_due(13),
             "due = on-stride and not held"
         );
+    }
+
+    /// A refused capture latches the ladder off (#1460): every rung goes, no coordinate is admitted
+    /// from then on, a later capture is not taken, and the ladder keeps the reason.
+    #[test]
+    fn a_refused_offer_latches_the_ladder_off() {
+        let mut l = Ladder::new(4, 0, 0);
+        l.offer(4, Ok(moment(1)));
+        l.offer(8, Ok(moment(1)));
+        assert_eq!((l.len(), l.refusal()), (2, None));
+        assert!(l.admits(12));
+
+        l.offer(12, Err(Refusal::Fiber));
+        assert_eq!((l.len(), l.refusal()), (0, Some(Refusal::Fiber)));
+        assert!(!l.admits(12) && !l.admits(16));
+        assert!(l.nearest_at_or_before(100).is_none());
+        l.offer(16, Ok(moment(1)));
+        assert_eq!(l.len(), 0, "a refused ladder takes nothing");
     }
 
     #[test]
@@ -1069,8 +1155,9 @@ mod ladder_tests {
 
         let mut shared = Host::new();
         shared.grant_shared_region_backed(Arc::clone(&host.regions[0]));
-        assert!(
-            Moment::checkpoint(None, &shared, Continuation::None).is_none(),
+        assert_eq!(
+            Moment::checkpoint(None, &shared, Continuation::None).err(),
+            Some(Refusal::Region),
             "a region another holder can write declines"
         );
     }

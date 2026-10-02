@@ -55,7 +55,7 @@ use super::{
     LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue,
     DEFAULT_RESERVED_LOG2,
 };
-use crate::moment::Moment;
+use crate::moment::{Moment, Refusal};
 
 // ---- Per-function call profiler (opt-in `callprof` feature; tier-up break-even measurement) -------
 // A thread-local histogram indexed by primary-module function index, bumped once per `Op::Call`. Off
@@ -5759,10 +5759,44 @@ impl ModuleDebug {
 /// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
 /// lies within the parent's snapshotted prefix ([`Mem::nested_within_prefix`], so its bytes ride in the
 /// parent reseed rather than a separate copy). A memoryless child is trivially fine. Shared by the
-/// single-vCPU and scheduled checkpointable gates, for both coroutines and `instantiate` children.
-fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> bool {
-    child.is_none_or(|m| {
-        m.layout_snapshot_safe() && parent.is_some_and(|p| m.nested_within_prefix(p))
+/// scheduled checkpointable gate's carve arm.
+fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> Result<(), Refusal> {
+    let Some(m) = child else {
+        return Ok(());
+    };
+    if !m.layout_snapshot_safe() {
+        return Err(Refusal::Region);
+    }
+    if !parent.is_some_and(|p| m.nested_within_prefix(p)) {
+        return Err(Refusal::WindowLayout);
+    }
+    Ok(())
+}
+
+/// Whether a child env's host is one a restore rebuilds: a checkpoint rebuilds a child's host with
+/// only its `Instantiator` and `AddressSpace` (`rebuild_env`), so on top of the root host's rule it
+/// must hold no `Jit` table and no §13 region.
+fn child_host_admits(host: &Host) -> Result<(), Refusal> {
+    host.admits_checkpoint()?;
+    if host.has_jit_table() {
+        return Err(Refusal::JitUnit);
+    }
+    if host.region_count() != 0 {
+        return Err(Refusal::Region);
+    }
+    Ok(())
+}
+
+/// Whether any of `fibers` is parked on an event a replay cannot reproduce (a `memory.wait` deadline,
+/// a cap or host completion), which keeps a checkpoint and a journal state record out.
+fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> bool {
+    fibers.any(|f| {
+        matches!(
+            f,
+            FiberState::WaitParked { .. }
+                | FiberState::CapParked { .. }
+                | FiberState::HostParked { .. }
+        )
     })
 }
 
@@ -5773,7 +5807,7 @@ fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> bool {
 /// #1866 — a detached child's env carries its own window image and powerbox instead, or nothing of
 /// either once it is `spent` ([`env_spent`]). `None` when a live one's powerbox holds a binding that
 /// is not a plain value ([`Host::child_powerbox`]).
-fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Option<EnvSnapshot> {
+fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Result<EnvSnapshot, Refusal> {
     let detached = match e.place {
         EnvPlace::Carve => None,
         EnvPlace::Detached { spawner } => Some(DetachedEnv {
@@ -5785,13 +5819,13 @@ fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Option<EnvSnapshot> {
                     reserved_log2: m.window.reserved().trailing_zeros() as u8,
                     mapped_log2: m.window.mapped().trailing_zeros() as u8,
                     shadow: m.shadow,
-                    powerbox: e.host.child_powerbox()?,
+                    powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
                 }),
-                (None, false) => return None,
+                (None, false) => return Err(Refusal::NoWindow),
             },
         }),
     };
-    Some(EnvSnapshot {
+    Ok(EnvSnapshot {
         win_base: e.mem.as_ref().map_or(0, |m| m.window.base()),
         size_log2: e
             .mem
@@ -6232,18 +6266,11 @@ fn journal_state(
     let invertible = host.journal_invertible()
         && extra_envs.iter().all(|e| e.host.region_count() == 0)
         && tasks.iter().all(|t| t.vt.active_invoke.is_none())
-        && !fibers.iter().any(|f| {
-            matches!(
-                f,
-                FiberState::WaitParked { .. }
-                    | FiberState::CapParked { .. }
-                    | FiberState::HostParked { .. }
-            )
-        });
+        && !any_event_parked(fibers.iter());
     if !invertible {
         return;
     }
-    let Some(extra) = extra_envs
+    let Ok(extra) = extra_envs
         .iter()
         .enumerate()
         .map(|(k, e)| {
@@ -6253,7 +6280,7 @@ fn journal_state(
                 .map_or(0, |t| t.vt.active.module);
             env_snapshot(e, module, env_spent(tasks, extra_envs, k))
         })
-        .collect::<Option<Vec<_>>>()
+        .collect::<Result<Vec<_>, _>>()
     else {
         return;
     };
@@ -6540,7 +6567,7 @@ fn debug_advance_fiber(
         }
         // F2 — a punted host call in a debug advance keeps the pre-F2 inline wait (the debug
         // drivers' whole-vCPU-park shape is sanctioned tiering, invariant 9 observability
-        // corollary; checkpointing across one is already excluded by `checkpoint_safe`'s
+        // corollary; checkpointing across one is already excluded by `admits_checkpoint`'s
         // replay-substate rules — the wait happens inside the advance, leaving no parked state).
         Ok(Outcome::CapPending { id, dst }) => {
             match host.completions().wait_unless_host_owned(id) {
@@ -9496,9 +9523,10 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// Whether the scheduled continuation is fully captured by the per-task active `Vm`s + the shared
-    /// window bytes + the host substate + the scheduler clocks — the subset a multi-vCPU time-travel
-    /// **checkpoint** (W1) snapshots, over every task:
+    /// The continuation half of a checkpoint's admission (the root host's half is the moment's own,
+    /// [`Moment::checkpoint`]): `Ok` when the scheduled continuation is fully captured by the per-task
+    /// active `Vm`s + the shared window bytes + the host substate + the scheduler clocks, the subset a
+    /// multi-vCPU time-travel **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
     /// wall-clock deadline); **§14 coroutines** are admitted (not demand, pristine `nested_view`),
@@ -9513,55 +9541,49 @@ impl ScheduledDebugRun {
     /// ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its window's aliases in its
     /// page map. Still excluded (→ replay-from-turn-0): a child holding or aliasing a region, or one
     /// carved beyond the parent's captured prefix.
-    fn checkpointable(&self) -> bool {
-        self.host.checkpoint_safe()
-            // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
-            && self.tasks.iter().all(|t| t.vt.active_invoke.is_none())
-            && !self
-                .fibers
+    fn checkpointable(&self) -> Result<(), Refusal> {
+        // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
+        if self.tasks.iter().any(|t| t.vt.active_invoke.is_some()) {
+            return Err(Refusal::Invoke);
+        }
+        if any_event_parked(
+            self.fibers
                 .iter()
-                .chain(self.extra_envs.iter().flat_map(|e| e.fibers.iter()))
-                .any(|f| {
-                    matches!(
-                        f,
-                        FiberState::WaitParked { .. }
-                            | FiberState::CapParked { .. }
-                            | FiberState::HostParked { .. }
-                    )
-                })
-            // A carve child's host is rebuilt with only its `Instantiator` and `AddressSpace`
-            // (`rebuild_env`), so a child holding a `Jit` table is out of the subset. A detached
-            // child's window is its own (#1866): its image rides its env's snapshot, so only a §13
-            // region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
-            // values, which the capture itself checks (`env_snapshot`).
-            // A child's host is rebuilt without regions, so one holding a region is out too.
-            && self.extra_envs.iter().enumerate().all(|(k, e)| match e.place {
+                .chain(self.extra_envs.iter().flat_map(|e| e.fibers.iter())),
+        ) {
+            return Err(Refusal::Fiber);
+        }
+        // A detached child's window is its own (#1866): its image rides its env's snapshot, so only a
+        // §13 region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
+        // values, which the capture itself checks (`env_snapshot`).
+        for (k, e) in self.extra_envs.iter().enumerate() {
+            match e.place {
                 EnvPlace::Carve => {
-                    e.host.checkpoint_safe()
-                        && !e.host.has_jit_table()
-                        && e.host.region_count() == 0
-                        && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
+                    child_host_admits(&e.host)?;
+                    child_checkpointable(e.mem.as_ref(), self.mem.as_ref())?;
                 }
+                EnvPlace::Detached { .. } if env_spent(&self.tasks, &self.extra_envs, k) => {}
                 EnvPlace::Detached { .. } => {
-                    env_spent(&self.tasks, &self.extra_envs, k)
-                        || (e.host.checkpoint_safe()
-                            && !e.host.has_jit_table()
-                            && e.host.region_count() == 0
-                            && e.mem.as_ref().is_some_and(|m| m.layout_snapshot_safe()))
+                    child_host_admits(&e.host)?;
+                    match &e.mem {
+                        None => return Err(Refusal::NoWindow),
+                        Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
+                        Some(_) => {}
+                    }
                 }
-            })
+            }
+        }
+        Ok(())
     }
 
     /// Snapshot the scheduled continuation at the current [`turn`](ScheduledDebugRun::op_turn) for the
-    /// backend's checkpoint ladder — `None` outside the [`checkpointable`](ScheduledDebugRun::checkpointable)
-    /// subset, or when a region the root holds cannot ride. Captures each task's active `Vm` + join
+    /// backend's checkpoint ladder — refused outside the [`checkpointable`](ScheduledDebugRun::checkpointable)
+    /// subset, or when the moment refuses the host or a region it holds ([`Moment::checkpoint`]). Captures each task's active `Vm` + join
     /// table + state, the shared window bytes, the host replay substate and regions, and both scheduler
     /// clocks; the transient `stopped`/`focus`/`last_watch` are *not* captured —
     /// [`locate`](ScheduledDebugRun::locate) rederives them from the task states.
-    pub fn snapshot(&self) -> Option<Moment> {
-        if !self.checkpointable() {
-            return None;
-        }
+    pub fn snapshot(&self) -> Result<Moment, Refusal> {
+        self.checkpointable()?;
         let continuation = self.build_continuation()?;
         super::moment::Moment::checkpoint(
             self.mem.as_ref().map(|m| m.layout_snapshot()),
@@ -9575,9 +9597,9 @@ impl ScheduledDebugRun {
     /// ([`snapshot`](Self::snapshot), which pairs it with the window image and the host substate) and by
     /// the **undo journal** (#1557), which pairs it with a compact [`HostCursor`](crate::HostCursor)
     /// and the window pre-images instead — one definition of "what the continuation is", two costs.
-    /// `None` when a live detached child's powerbox is not plain values (`env_snapshot`).
-    fn build_continuation(&self) -> Option<ScheduledContinuation> {
-        Some(ScheduledContinuation {
+    /// Refused when a live detached child's powerbox is not plain values (`env_snapshot`).
+    fn build_continuation(&self) -> Result<ScheduledContinuation, Refusal> {
+        Ok(ScheduledContinuation {
             clock: self.clock,
             tasks: self
                 .tasks
@@ -9610,7 +9632,7 @@ impl ScheduledDebugRun {
                         .map_or(0, |t| t.vt.active.module);
                     env_snapshot(e, module, env_spent(&self.tasks, &self.extra_envs, k))
                 })
-                .collect::<Option<_>>()?,
+                .collect::<Result<_, _>>()?,
             extra_units: self.source.extra_units(),
             budgets: self.host.budget_tree(),
         })
