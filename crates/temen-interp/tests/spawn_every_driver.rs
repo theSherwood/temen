@@ -1427,7 +1427,8 @@ const WAIT_KILL_JOIN: &str = "\
 /// - `detach` spends the handle, so a `join` after it is a `ThreadFault`;
 /// - a kill of a child that has ended does nothing: its `join` still gets its value.
 ///
-/// The `Vcpu`'s host runs its children, so it declines these modules rather than diverge.
+/// The `Vcpu`'s host runs its children and has no surface to answer these yet (#2083), so each
+/// one traps `ThreadFault` there when it runs.
 #[test]
 fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
     use temen_ir::trap_code;
@@ -1457,9 +1458,36 @@ fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
         let m = module(&op15_then(false, 0, tail));
         let setup = op15_fuel_setup(child, fuel);
         agree_on(&SCHEDULING, what, &m, &setup, &want);
-        assert!(
-            run_on(Driver::Vcpu, &m, &setup).is_none(),
-            "{what}: the Vcpu declines"
+        assert_eq!(
+            run_on(Driver::Vcpu, &m, &setup),
+            Some(trapped(Trap::ThreadFault)),
+            "{what}: the Vcpu fails closed"
         );
     }
+}
+
+/// A parent that `join`s, with a `kill` on a branch it never takes.
+const JOIN_THEN_DEAD_KILL: &str = "\
+  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  z = i32.const 0
+  br_if z 1(vinst, vch) 2(jr)
+}
+block 1 (ki: i32, kc: i32) {
+  k1 = call.cap 6 12 (i32) -> (i32) ki (kc)
+  r = i64.extend_i32_s k1
+  return r
+}
+block 2 (rv: i64) {
+  return rv
+  }
+}
+";
+
+/// #2083 — a module that contains `kill` but never runs it runs on every driver, the `Vcpu`
+/// included: every JACL program links `unir_kill`, and the browser's Worker driver is a `Vcpu`.
+#[test]
+fn a_kill_that_never_runs_does_not_stop_a_module_on_any_driver() {
+    let loops = module(CHILD_LOOPS);
+    let m = module(&op15_then(false, 0, JOIN_THEN_DEAD_KILL));
+    agree_on_every_driver("dead kill", &m, &op15_fuel_setup(&loops, -1), &ok(7));
 }

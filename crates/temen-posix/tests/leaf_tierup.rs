@@ -47,6 +47,21 @@ block 0 (vcap: i64) {\n\
   }\n\
 }\n";
 
+/// `/bin/leaf` storing into its own `readonly` data segment, then exiting 7.
+const RO_LEAF: &str = "memory 17\n\
+import 0 \"__px_exit\" (i64) -> ()\n\
+data ro 40000 \"const\"\n\
+func (i64) -> (i64) {\n\
+block 0 (vcap: i64) {\n\
+  vat = i64.const 40000\n\
+  vone = i64.const 1\n\
+  i64.store vat vone\n\
+  vseven = i64.const 7\n\
+  call.import 0 (vseven)\n\
+  unreachable\n\
+  }\n\
+}\n";
+
 /// `/bin/leaf` that spawns `kid` (a [`LEAF`], or [`forking`] one: it writes `out.txt` and exits 5),
 /// waits for it, and ends with its status plus 20, returned from its entry. Its entry only calls,
 /// and the helper it calls makes the personality calls, as a real nim module does.
@@ -369,6 +384,22 @@ fn an_execd_image_starts_behind_the_null_guard() {
     let (emitted, leaves) = run_tree(&guest(false), NULL_LEAF, true);
     assert_eq!(emitted, interpreted);
     assert_eq!(leaves.tierups.len(), 1);
+}
+
+/// An exec'd image's `readonly` data is read-only, as a freshly loaded image's is (#1737): a store
+/// into it crashes the process, which its parent reaps as 128, where the exec'd window once wrote
+/// its segments RW and the store landed.
+#[test]
+fn an_execd_images_readonly_data_is_read_only() {
+    let (interpreted, _) = run_tree(&guest(false), RO_LEAF, false);
+    assert_eq!(
+        interpreted,
+        Ending {
+            root: Ok(128),
+            wrote: None,
+        },
+        "the child crashed on the store into its readonly segment"
+    );
 }
 
 /// The C shim's `read`/`write` over a core pipe end, as IR (`c_posix.rs`'s `PIPE_SHIM`): the

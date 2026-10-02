@@ -52,7 +52,7 @@ use temen_ir::{
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
-    LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue,
+    LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue, WindowSpec,
     DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
@@ -1739,20 +1739,22 @@ struct FreshWindow {
 
 impl FreshWindow {
     /// Build the window over `back` (`None`: a reservation of the engine's own) the way the
-    /// tree-walker builds it ([`Mem::detached`]), and alias in the pre-mapped region the child's
+    /// tree-walker builds it ([`Mem::from_spec`]), and alias in the pre-mapped region the child's
     /// powerbox `host` carries.
     fn build(
         &self,
         back: Option<std::sync::Arc<super::Region>>,
         host: &mut Host,
     ) -> Result<Mem, Trap> {
-        let mut mem = Mem::detached(
-            DEFAULT_RESERVED_LOG2,
-            self.size_log2,
-            self.shadow,
-            &self.data,
+        let mut mem = Mem::from_spec(WindowSpec {
+            reserved_log2: DEFAULT_RESERVED_LOG2,
+            mapped_log2: self.size_log2,
+            shadow: self.shadow,
             back,
-        );
+            data: &self.data,
+            null_guard: temen_ir::module_null_guard(),
+            ..WindowSpec::default()
+        });
         if !self.payload.is_empty() {
             let _ = mem.write_bytes(temen_ir::module_args_base(), &self.payload);
         }
@@ -2780,20 +2782,6 @@ fn compile_inst(
     })
 }
 
-/// Build the linear-memory window from `m`'s memory declaration + data segments, exactly like
-/// [`crate::run`] (a module with no memory yields `None`).
-/// `m`'s window: `init_mem` seeded at offset 0 (the §3e args/env blob a host places at
-/// `module_args_base()`; empty for none), then `m`'s data segments over it, then the NULL guard.
-fn build_mem(m: &Module, init_mem: &[u8]) -> Option<Mem> {
-    m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    })
-}
-
 /// Compile `m`'s function `func` and run it on the bytecode engine, or `None` if it (or any
 /// function it can reach by direct call) uses an op outside this slice's subset. Builds a fresh
 /// linear-memory window from `m`'s memory declaration + data segments, exactly like
@@ -2847,7 +2835,7 @@ pub fn compile_and_run_seeded_with_host(
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = build_mem(m, init_mem);
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     let r = run(dom, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
@@ -2895,7 +2883,7 @@ pub fn compile_and_run_with_host_traced(
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = build_mem(m, &[]);
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
@@ -3003,13 +2991,7 @@ pub fn compile_and_run_capture(
     }
     let mut host = Host::new();
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem);
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
@@ -3041,18 +3023,12 @@ pub fn compile_and_run_capture_over(
     }
     let mut host = Host::new();
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation_over(
-            DEFAULT_RESERVED_LOG2,
-            mc.size_log2,
-            std::sync::Arc::clone(&back),
-            mc.shadow,
-        );
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mut mem = Mem::root(
+        m,
+        DEFAULT_RESERVED_LOG2,
+        Some(std::sync::Arc::clone(&back)),
+        init_mem,
+    );
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
@@ -3086,14 +3062,18 @@ pub fn compile_and_run_over_shared_with_host(
         return Some(Err(Trap::Malformed));
     }
     let dom = Domain::new(c, host.jit_table_log2());
+    // #1206: this `Mem` carries its own page map over the shared window, so it seeds the guard on
+    // every call, as the cached form does; only the data waits for `seed_data`.
     let mut mem = m.memory.map(|mc| {
-        let mut mm =
-            Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back, mc.shadow);
-        if seed_data {
-            mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        }
-        mm
+        Mem::from_spec(WindowSpec {
+            reserved_log2: DEFAULT_RESERVED_LOG2,
+            mapped_log2: mc.size_log2,
+            shadow: mc.shadow,
+            back: Some(back),
+            data: if seed_data { &m.data } else { &[] },
+            null_guard: temen_ir::module_null_guard(), // #964
+            ..WindowSpec::default()
+        })
     });
     Some(run(dom, func, args, fuel, &mut mem, host))
 }
@@ -3243,11 +3223,15 @@ impl SharedProgram {
             None => Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0)),
         };
         let mut mem = self.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
-            if seed_data {
-                mm.init_data(&self.data);
-            }
-            mm.seed_null_guard(self.null_guard); // #964
+            let mut mm = Mem::from_spec(WindowSpec {
+                reserved_log2,
+                mapped_log2: sl,
+                shadow: self.shadow,
+                back: Some(back),
+                data: if seed_data { &self.data } else { &[] },
+                null_guard: self.null_guard, // #964
+                ..WindowSpec::default()
+            });
             if let Some(map) = prots {
                 // The map carries the prefix its entries are relative to, so the two cannot disagree —
                 // they were a `prots` slice and a `mapped` argument that had to be kept in step by
@@ -3314,8 +3298,14 @@ impl SharedProgram {
             build_table(self.n_funcs, host.jit_table_log2()),
         );
         let mut mem = self.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
-            mm.seed_null_guard(self.null_guard); // #964
+            let mut mm = Mem::from_spec(WindowSpec {
+                reserved_log2,
+                mapped_log2: sl,
+                shadow: self.shadow,
+                back: Some(back),
+                null_guard: self.null_guard, // #964
+                ..WindowSpec::default()
+            });
             mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
@@ -3393,18 +3383,12 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
     // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` arms below never surface.
     host.wire_park_door();
-    let mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation_over(
-            DEFAULT_RESERVED_LOG2,
-            mc.size_log2,
-            std::sync::Arc::clone(&back),
-            mc.shadow,
-        );
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mem = Mem::root(
+        m,
+        DEFAULT_RESERVED_LOG2,
+        Some(std::sync::Arc::clone(&back)),
+        init_mem,
+    );
     let (r, mem) = drive_parallel(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
@@ -3429,13 +3413,8 @@ pub fn compile_and_run_capture_over_parallel_with_host(
 pub struct VcpuProgram {
     dom: Domain,
     mem_size_log2: Option<u8>,
-    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
-    shadow: Option<super::ShadowArena>,
     /// The module compiled — see [`module`](VcpuProgram::module).
     module: std::sync::Arc<Module>,
-    /// #964: the module's NULL-guard extent (`0` = unmarked/legacy), captured at compile so every
-    /// window this program is run over seeds the same guard the module's layout was built for.
-    null_guard: u64,
     /// The run's fiber registry (#1761) — run-level state, like `dom`'s §22 install slots: see
     /// [`fibers`](VcpuProgram::fibers).
     fibers: SharedFibers,
@@ -3459,32 +3438,12 @@ impl VcpuProgram {
     /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
     /// cooperative oracle uses. `0` ⇒ natural size (no install room).
     pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
-        // `poll`/`detach`/`kill` (Instantiator ops 9/10/12) act on a child's run, which this
-        // engine's host drives (`VcpuEvent::Join` hands it the token), so it has nothing to answer
-        // or end them with: decline, and the host runs the module on an engine that can (#2068).
-        let child_ctl = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR,
-                        op: 9 | 10 | 12,
-                        ..
-                    }
-                )
-            })
-        });
-        if child_ctl {
-            return None;
-        }
         let c = compile_module_for(m)?;
         let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
-            shadow: m.memory.as_ref().and_then(|mc| mc.shadow),
             module: std::sync::Arc::new(m.clone()),
-            null_guard: temen_ir::module_null_guard(),
             fibers: SharedFibers::new(),
             next_vcpu: std::sync::atomic::AtomicU64::new(1),
         })
@@ -3547,7 +3506,7 @@ impl Reactor {
         Some(Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
-            mem: build_mem(m, &[]),
+            mem: Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]),
         })
     }
 
@@ -4197,13 +4156,7 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         init_mem: &[u8],
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
-            mm.seed(init_mem);
-            mm.init_data(&prog.module.data);
-            mm.seed_null_guard(prog.null_guard); // #964
-            mm
-        });
+        let mem = Mem::root(&prog.module, DEFAULT_RESERVED_LOG2, Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, Host::new())
     }
 
@@ -4222,13 +4175,7 @@ impl<'p> Vcpu<'p> {
         init_mem: &[u8],
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
-            mm.seed(init_mem);
-            mm.init_data(&prog.module.data);
-            mm.seed_null_guard(prog.null_guard); // #964
-            mm
-        });
+        let mem = Mem::root(&prog.module, DEFAULT_RESERVED_LOG2, Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, host)
     }
 
@@ -4247,13 +4194,7 @@ impl<'p> Vcpu<'p> {
         host: Host,
         reserved_log2: u8,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation(reserved_log2, sl, prog.shadow);
-            mm.seed(init_mem);
-            mm.init_data(&prog.module.data);
-            mm.seed_null_guard(prog.null_guard); // #964
-            mm
-        });
+        let mem = Mem::root(&prog.module, reserved_log2, None, init_mem);
         Vcpu::with_mem(prog, func, args, mem, host)
     }
 
@@ -4272,13 +4213,7 @@ impl<'p> Vcpu<'p> {
         reserved_log2: u8,
         back: std::sync::Arc<super::Region>,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, prog.shadow);
-            mm.seed(init_mem);
-            mm.init_data(&prog.module.data);
-            mm.seed_null_guard(prog.null_guard); // #964
-            mm
-        });
+        let mem = Mem::root(&prog.module, reserved_log2, Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, host)
     }
 
@@ -4331,17 +4266,18 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         size_log2: Option<u8>,
     ) -> Result<Vcpu<'p>, Trap> {
+        // #1206: a spawned thread's `Mem` carries its own page map over the shared window, so it seeds
+        // the guard itself — a thread storing at NULL traps exactly as its spawner does. It lays no
+        // data: the window is already live with the root's image.
         let mem = size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(
-                DEFAULT_RESERVED_LOG2,
-                sl,
-                back,
-                prog.dom.source.get(module as usize).and_then(|c| c.shadow),
-            );
-            // #1206: a spawned thread's `Mem` carries its own page map over the shared window, so it
-            // seeds the guard itself — a thread storing at NULL traps exactly as its spawner does.
-            mm.seed_null_guard(temen_ir::module_null_guard());
-            mm
+            Mem::from_spec(WindowSpec {
+                reserved_log2: DEFAULT_RESERVED_LOG2,
+                mapped_log2: sl,
+                shadow: prog.dom.source.get(module as usize).and_then(|c| c.shadow),
+                back: Some(back),
+                null_guard: temen_ir::module_null_guard(),
+                ..WindowSpec::default()
+            })
         });
         Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
@@ -4713,8 +4649,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::BlockOnFiber { .. })
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
                 | Ok(VcpuStop::Preempted)
-                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns:
-                // `VcpuProgram::compile` declines a module that uses them, so none arrives here.
+                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns and has no
+                // surface to answer yet (#2083): fail closed when one runs, like `Exec`. Compiling
+                // still admits a module that merely contains one (every JACL program links a kill).
                 | Ok(VcpuStop::ChildCtl { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
@@ -5606,13 +5543,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
     // #799/#1080 — install the personality fork/waitpid park-request door (see `compile_and_run_with_host`).
     host.wire_park_door();
     let dom = Domain::over_primary(compiled, host.jit_table_log2());
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
-        mm.seed(init_mem);
-        mm.init_data(&m.data);
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
+    let mut mem = Mem::root(m, reserved_log2, None, init_mem);
     let r = run(dom, func, args, fuel, &mut mem, host);
     let snap = mem
         .as_ref()
@@ -5649,7 +5580,7 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m, &[]);
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
@@ -5699,7 +5630,7 @@ pub fn ir_window_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m, &[]);
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
@@ -5767,7 +5698,7 @@ pub fn ir_value_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m, &[]);
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
@@ -5994,13 +5925,13 @@ fn rebuild_detached_env(
             place,
         };
     };
-    let mut mem = Mem::detached(
-        live.reserved_log2,
-        live.mapped_log2,
-        Some(live.shadow),
-        &[],
-        None,
-    );
+    let mut mem = Mem::from_spec(WindowSpec {
+        reserved_log2: live.reserved_log2,
+        mapped_log2: live.mapped_log2,
+        shadow: Some(live.shadow),
+        null_guard: temen_ir::module_null_guard(),
+        ..WindowSpec::default()
+    });
     mem.restore_layout(&live.image);
     let mut host = spawner.rebuild_child_powerbox(&live.powerbox);
     host.restore_replay_substate(&es.host);
@@ -8772,7 +8703,7 @@ impl ScheduledDebugRun {
         let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: debug stepping (Slice 5a)
         let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
         let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
-        let mem = build_mem(m, &[]);
+        let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
         let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         Some(ScheduledDebugRun {
             source,
@@ -10142,7 +10073,7 @@ pub fn compile_and_run_sliced(
         return Some(Err(Trap::Malformed));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m, &[]);
+    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
     Some(drive(
         dom,
@@ -15614,7 +15545,7 @@ impl CoopSched {
                     }
                 }
                 // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
-                // **fresh window of its own** (`Mem::detached`, its own guard) — not a carve — the
+                // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
                 // tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative driver.
                 // Admission first (entry shape, the window = the module's declared memory, the args
                 // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
@@ -16322,7 +16253,15 @@ impl CoopRun {
         tierup: Option<TierUpConfig>,
     ) -> Option<Result<CoopRun, Trap>> {
         // A fresh engine-sized window built from `m`'s declaration + data (the native/test path).
-        Self::assemble(m, entry, args, fuel, host, tierup, build_mem(m, &[]))
+        Self::assemble(
+            m,
+            entry,
+            args,
+            fuel,
+            host,
+            tierup,
+            Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]),
+        )
     }
 
     /// The resumable twin of [`compile_and_run_seeded_with_host`]: the same window (`init_mem` seeded
@@ -16338,7 +16277,15 @@ impl CoopRun {
     ) -> Option<Result<CoopRun, Trap>> {
         host.wire_park_door();
         super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
-        Self::assemble(m, entry, args, fuel, host, None, build_mem(m, init_mem))
+        Self::assemble(
+            m,
+            entry,
+            args,
+            fuel,
+            host,
+            None,
+            Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem),
+        )
     }
 
     /// Like [`new`](Self::new), but the linear-memory window is built **over a caller-provided
@@ -16358,13 +16305,7 @@ impl CoopRun {
         reserved_log2: u8,
         back: std::sync::Arc<super::Region>,
     ) -> Option<Result<CoopRun, Trap>> {
-        let mem = m.memory.map(|mc| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back, mc.shadow);
-            mm.seed(init_mem);
-            mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-            mm
-        });
+        let mem = Mem::root(m, reserved_log2, Some(back), init_mem);
         Self::assemble(m, entry, args, fuel, host, tierup, mem)
     }
 
@@ -16423,13 +16364,7 @@ impl CoopRun {
         }
         host.wire_park_door();
         let dom = Domain::over_primary(compiled, host.jit_table_log2());
-        let mut mem = m.memory.map(|mc| {
-            let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
-            mm.seed(init_mem);
-            mm.init_data(&m.data);
-            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-            mm
-        });
+        let mut mem = Mem::root(m, reserved_log2, None, init_mem);
         let root_leaf = tierup
             .as_ref()
             .and_then(|t| t.leaf.as_ref())
