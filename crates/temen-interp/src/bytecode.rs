@@ -10501,8 +10501,8 @@ fn image_pages(host: &Host, m: &Module) -> bool {
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
 /// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
 /// window). Resolves + compiles the command, admits it (entry sig, command window `<=` the
-/// caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] — the same
-/// personality carry the tree-walker uses), materializes the command image into a fresh window of
+/// caller's), builds the command powerbox ([`Host::exec_image`] — the same build and personality
+/// carry the tree-walker uses), materializes the command image into a fresh window of
 /// the caller's geometry ([`Mem::exec_window`]; flat for a leaf image the host emitted), and pushes
 /// the compiled command as a new domain unit. Returns the rebuilt process ([`ExecBuilt`]) for the
 /// caller to install where the task's `env` points; `Err(())` on any admissibility failure (the

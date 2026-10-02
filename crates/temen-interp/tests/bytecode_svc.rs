@@ -10,6 +10,9 @@
 //! — `compile_module` returns `None` — and the fast entry then falls back to the tree-walker,
 //! which serves.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, run_with_host_fast, Host, Value, SVC_QUEUE_CAP};
 
@@ -210,20 +213,21 @@ fn a_park_seam_vetoes_the_native_serve_and_falls_back() {
     assert_eq!(rf, Ok(vec![Value::I64(2042)]));
 }
 
-/// The §3.6 separate-module corpus, verbatim: the parent spawns a serving child from a granted
-/// module (op 5), mints a live offer over its export (op 14), calls through it (enqueue + park),
+/// The §3.6 separate-module corpus: the parent spawns a serving child from a granted module, detached
+/// (`v1` the module, `v2` the `Budget` its window spends, patched into the v1 record [`sep_caller`]
+/// appends at 17408), mints a live offer over its export (op 14), calls through it (enqueue + park),
 /// and joins — 142 = join(served=1)*100 + add(40,2).
 const SEP_CALLER: &str = r#"
 memory 17
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vlog = i64.const 12
-  vq = i64.const 0
-  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17432
+  i32.store vrm v1
+  vrb = i64.const 17436
+  i32.store vrb v2
+  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
@@ -260,18 +264,26 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// I36 slice 2 — the whole caller ↔ servicer round-trip runs natively: op-5 spawn, op-14 offer
-/// mint, live-call enqueue + `BlockedTicket` park, the child's `svc.wait` park + enqueue wake,
+/// [`SEP_CALLER`] with its spawn record: the module's entry 0 in its declared window.
+fn sep_caller() -> String {
+    format!(
+        "{SEP_CALLER}{}",
+        rec::segment(17408, &temen_ir::SpawnRec::v1(0))
+    )
+}
+
+/// I36 slice 2 — the whole caller ↔ servicer round-trip runs natively: a detached spawn, op-14
+/// offer mint, live-call enqueue + `BlockedTicket` park, the child's `svc.wait` park + enqueue wake,
 /// handler dispatch, settle-wake of the caller, join. Both modules must compile natively (the
 /// caller has no svc ops; the serving child qualifies), and the result matches the tree-walker.
 #[test]
 fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
-    let a = module(SEP_CALLER);
+    let a = module(&sep_caller());
     let b = temen_text::parse_module(SEP_SERVER).expect("parse server");
     temen_verify::verify_module(&b).expect("verify server");
     assert!(
         bytecode::compile_module(&a.funcs, &a.types, a.memory.and_then(|x| x.shadow)).is_some(),
-        "the caller (op 5 + op 14 + a live call) must be admitted natively"
+        "the caller (a detached spawn + op 14 + a live call) must be admitted natively"
     );
     assert!(
         bytecode::compile_module(&b.funcs, &b.types, b.memory.and_then(|x| x.shadow)).is_some(),
@@ -281,11 +293,12 @@ fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
         let mut host = Host::new();
         let hi = host.grant_instantiator(0, 1u64 << 17);
         let hm = host.grant_module(&b);
+        let hb = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = 5_000_000u64;
         entry(
             &a,
             0,
-            &[Value::I32(hi), Value::I32(hm)],
+            &[Value::I32(hi), Value::I32(hm), Value::I32(hb)],
             &mut fuel,
             &mut host,
         )

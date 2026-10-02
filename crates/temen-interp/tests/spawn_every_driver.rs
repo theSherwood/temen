@@ -11,6 +11,8 @@
 
 #[path = "support/drivers.rs"]
 mod drivers;
+#[path = "support/rec.rs"]
+mod rec;
 
 use drivers::{agree_on, agree_on_every_driver, run_on, Driver, Ran, SCHEDULING};
 use temen_interp::{cap_id, Attestation, Host, StreamRole, Trap, Value};
@@ -945,13 +947,6 @@ fn a_handle_masks_onto_the_table() {
 
 // ---- #1944: a detached child pays for its own detached child ------------------------------------
 
-/// A data segment holding a v1 spawn record of this module's function `entry` (its declared window;
-/// the budget field filled at run time), at `at`.
-fn rec_segment(at: u64, rec: &SpawnRec) -> String {
-    let esc: String = rec.encode().iter().map(|b| format!("\\x{b:02x}")).collect();
-    format!("data {at} \"{esc}\"\n")
-}
-
 /// Three generations of one `memory 16` module, each window 64 KiB. The root resolves its `"budget"`,
 /// splits a node with a `mem` ceiling of `mem` and a `spawn` ceiling of `spawn` (`-1` = unbounded),
 /// and spawns func 1 detached, paid from it.
@@ -1013,8 +1008,8 @@ block 0 (va: i64) {{
   }}
 }}
 ",
-        r1 = rec_segment(17408, &SpawnRec::v1(1)),
-        r2 = rec_segment(17504, &SpawnRec::v1(2)),
+        r1 = rec::segment(17408, &SpawnRec::v1(1)),
+        r2 = rec::segment(17504, &SpawnRec::v1(2)),
     )
 }
 
@@ -1056,7 +1051,7 @@ block 0 (va: i64) {{
   }}
 }}
 ",
-        r = rec_segment(17408, rec),
+        r = rec::segment(17408, rec),
     )
 }
 

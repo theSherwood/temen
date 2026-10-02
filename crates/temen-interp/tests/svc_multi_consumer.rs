@@ -12,8 +12,12 @@
 //! pure or disjoint). The fast backends' serve veto already declines svc+thread modules —
 //! pinned below — so the oracle is the only backend that runs these shapes, by design.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, Value};
+use temen_ir::SpawnRec;
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(text).expect("parse");
@@ -141,7 +145,7 @@ fn a_timed_svc_wait_with_no_work_returns_zero() {
 
 /// The serving CHILD spawns two internal worker threads that both consume the domain queue,
 /// while the parent makes three sequential live calls through a `child_offer`-minted handle:
-/// `add(40,2)`, `add(1,2)`, then `finish()` (whose handler sets the done flag at mem[8]).
+/// `add(40,2)`, `add(1,2)`, then `finish()` (whose handler sets the done flag at mem[17408]).
 /// Consumers **work-steal** — either worker may serve any subset, including all of it — so
 /// each worker loops on a TIMED `svc.wait` (100ms) and exits when the flag is set: a spare
 /// consumer parked when the last dispatch lands is re-admitted by its deadline at the latest,
@@ -151,18 +155,19 @@ fn a_timed_svc_wait_with_no_work_returns_zero() {
 /// joins both and returns the sum (3), and the parent packs
 /// `join*100 + add(40,2) + add(1,2) + finish()` = 300 + 42 + 3 + 0 = 345. Every scheduler
 /// interleaving must complete — including both-workers-parked, the ordering the old
-/// single-slot `svc_waiters` map dropped a vCPU on.
+/// single-slot `svc_waiters` map dropped a vCPU on. The child runs module `v1`, spawned detached
+/// by the record [`sep_caller`] appends at 17408 and paid from the `Budget` `v2`.
 const SEP_CALLER: &str = r#"
 memory 17
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vlog = i64.const 12
-  vq = i64.const 0
-  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17432
+  i32.store vrm v1
+  vrb = i64.const 17436
+  i32.store vrb v2
+  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
@@ -183,8 +188,13 @@ block 0 (v0: i32, v1: i32) {
 }
 "#;
 
+/// [`SEP_CALLER`] with its spawn record: the module's entry 0 in its declared window.
+fn sep_caller() -> String {
+    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::v1(0)))
+}
+
 const SEP_SERVER_TWO_WORKERS: &str = r#"
-memory 12
+memory 15
 type 0 func (i64, i64) -> (i64)
 type 1 func () -> (i64)
 type 2 interface { add: 0, finish: 1 }
@@ -220,7 +230,7 @@ block 1 (vtotal: i64) {
   vt = i64.const 100000000
   vn = call.cap 4294967295 10 (i64) -> (i64) vz (vt)
   vtot = i64.add vtotal vn
-  vfa = i64.const 8
+  vfa = i64.const 17408
   vf = i64.load vfa
   vzero = i64.const 0
   vdone = i64.ne vf vzero
@@ -233,7 +243,7 @@ block 2 (vres: i64) {
 
 func () -> (i64) {
 block 0 () {
-  vfa = i64.const 8
+  vfa = i64.const 17408
   vone = i64.const 1
   i64.store vfa vone
   vz = i64.const 0
@@ -244,7 +254,7 @@ block 0 () {
 
 #[test]
 fn two_svc_wait_consumers_serve_a_live_caller_across_every_interleaving() {
-    let a = module(SEP_CALLER);
+    let a = module(&sep_caller());
     let b = module(SEP_SERVER_TWO_WORKERS);
     // Race coverage: the park orderings (0, 1, or 2 workers parked when each enqueue lands)
     // are scheduler-dependent, so run the scenario repeatedly — every interleaving must
@@ -253,11 +263,12 @@ fn two_svc_wait_consumers_serve_a_live_caller_across_every_interleaving() {
         let mut host = Host::new();
         let hi = host.grant_instantiator(0, 1u64 << 17);
         let hm = host.grant_module(&b);
+        let hb = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = u64::MAX;
         let r = run_with_host(
             &a,
             0,
-            &[Value::I32(hi), Value::I32(hm)],
+            &[Value::I32(hi), Value::I32(hm), Value::I32(hb)],
             &mut fuel,
             &mut host,
         );
