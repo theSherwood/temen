@@ -1,13 +1,16 @@
-//! Oracle harness for **time-travel checkpointing** (DEBUGGING.md W1): `seek(t)` re-executes from
-//! clock 0, so `step_back` is O(t²). Checkpoints let a `seek`/`step_back` restart from the nearest
-//! snapshot (`clock ≤ t`) instead — bounding the replay to the checkpoint stride.
+//! Oracle harness for **time-travel checkpointing** (DEBUGGING.md W1) on the tree-walk `Inspector`:
+//! `seek(t)` re-executes from clock 0, so `step_back` is O(t²). Checkpoints let a `seek`/`step_back`
+//! restart from the nearest snapshot (`clock ≤ t`) instead — bounding the replay to the checkpoint
+//! stride.
+//!
+//! The forward and backward warm≡cold sweeps are the `ShadowStack` cell of the one harness every
+//! continuation shares (`crates/temen-dap/tests/dap_checkpoints.rs`, #1460). What stays here is the
+//! `Inspector`'s own surface: `step_back` one op at a time, and the refusal a scheduled run reports.
 //!
 //! Correctness gate: a **warm** Inspector (its checkpoint ladder populated by a prior deep seek, so
 //! `seek` *restores* from a snapshot and replays only the tail) must observe **identical** state — the
 //! result, the paused location, the logical clock, and guest memory — as a **cold** Inspector (freshly
-//! attached, ladder empty, so it replays from clock 0). The cold path is the pre-existing, trusted
-//! behavior; the warm path exercises snapshot capture + restore. If restore is faithful they agree at
-//! every probed time, including across checkpoint-stride boundaries and a full backward sweep.
+//! attached, ladder empty, so it replays from clock 0).
 
 use temen_interp::{Inspector, Stop, Trap, Value};
 use temen_text::parse_module;
@@ -70,69 +73,6 @@ fn cold(src: &str, arg: i32, t: u64) -> Probe {
     let mut insp = Inspector::attach(&m, 0, &[Value::I32(arg)], 50_000_000);
     let stop = insp.seek(t);
     probe(&insp, &stop)
-}
-
-#[test]
-fn warm_seek_matches_cold_across_checkpoint_boundaries() {
-    let m = parse_module(LOOP_WITH_MEM).expect("parse");
-    let mut warm = Inspector::attach(&m, 0, &[Value::I32(3000)], 50_000_000);
-
-    // A deep seek lays down the checkpoint ladder (the run is far longer than the stride).
-    let end = warm.seek(u64::MAX);
-    assert!(
-        matches!(end, Stop::Finished(_)),
-        "the loop terminates: {end:?}"
-    );
-    assert!(
-        warm.checkpoint_count() > 1,
-        "a multi-thousand-op run must lay down several checkpoints (got {}) — else this harness is \
-         vacuous",
-        warm.checkpoint_count()
-    );
-
-    // Probe times that bracket the stride (1024): below the first checkpoint, just across it, deep in
-    // the middle, and right at the end. Each warm seek restores from the nearest checkpoint ≤ t.
-    for &t in &[
-        0u64,
-        1,
-        1023,
-        1024,
-        1025,
-        2050,
-        4096,
-        7000,
-        100,
-        3,
-        u64::MAX,
-    ] {
-        let stop = warm.seek(t);
-        let got = probe(&warm, &stop);
-        let want = cold(LOOP_WITH_MEM, 3000, t);
-        assert_eq!(got, want, "warm seek({t}) diverged from cold replay-from-0");
-    }
-}
-
-#[test]
-fn backward_sweep_matches_cold() {
-    let m = parse_module(LOOP_WITH_MEM).expect("parse");
-    let mut warm = Inspector::attach(&m, 0, &[Value::I32(2500)], 50_000_000);
-    let end = warm.seek(u64::MAX);
-    let end_clock = match end {
-        Stop::Finished(_) => warm.clock(),
-        other => panic!("expected finish, got {other:?}"),
-    };
-    assert!(warm.checkpoint_count() > 1, "ladder must be populated");
-
-    // Walk backward in strides from the end; each step_back-style jump restores from a checkpoint and
-    // must match a cold replay-from-0 to the same time.
-    let mut t = end_clock;
-    while t > 0 {
-        let stop = warm.seek(t);
-        let got = probe(&warm, &stop);
-        let want = cold(LOOP_WITH_MEM, 2500, t);
-        assert_eq!(got, want, "backward seek({t}) diverged from cold");
-        t = t.saturating_sub(317); // an odd stride so probes land off the checkpoint grid
-    }
 }
 
 #[test]
@@ -206,4 +146,16 @@ block 3 (v6: i32, v7: i32) {
         };
         assert_eq!(got, want, "scalar warm seek({t}) diverged from cold");
     }
+}
+
+/// A scheduled (multithreaded) `Inspector` seeks by global turn and takes no checkpoints: its ladder
+/// is refused from the start, and says so (#1460).
+#[test]
+fn a_scheduled_inspector_names_its_refusal() {
+    let m = parse_module(LOOP_WITH_MEM).expect("parse");
+    let insp = Inspector::attach_scheduled(&m, 0, &[Value::I32(10)], 50_000_000, Vec::new());
+    assert_eq!(
+        insp.checkpoint_refusal(),
+        Some(temen_interp::moment::Refusal::Thread)
+    );
 }
