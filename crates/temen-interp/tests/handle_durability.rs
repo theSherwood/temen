@@ -377,13 +377,15 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
         b.restore_durable_named(&named)
             .expect("the registrar serves it");
         b.restore_durable_handles(&handles);
-        let child = b.spawn_granted_child(h, 1 << 16);
+        let budget = b.grant_budget(-1, 1 << 20, -1);
+        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, budget, -1);
         assert_eq!(
             child.is_some(),
             forkable,
             "a restored capability re-grants into a child iff the registrar returned a factory"
         );
-        if let Some((mut ch, _inst, _as, granted)) = child {
+        if let Some((mut ch, _inst, _as)) = child {
+            let granted = ch.resolve_cap_name("display").expect("granted by name");
             assert_eq!(
                 ch.cap_dispatch_slots(cap_id::HOST_PROC, 0, granted, &[], None),
                 Ok(vec![7]),

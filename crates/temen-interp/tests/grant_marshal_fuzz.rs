@@ -1,8 +1,9 @@
-//! **Generative fuzz of the §14 op-13 grant-marshaling bounce** (#1025 slice 3a.2) — the confinement
-//! hinge (INVARIANTS §2: the marshaling that carries authority across the emitted `env.instantiate_module`
-//! bounce is "suspect by default"). It drives [`Host::spawn_named_child_from_window`] — which reads
-//! `grants_n × 16-byte` records `{name_off, name_len, handle, flags}` out of a confined window slice and
-//! re-grants each named handle from the parent powerbox — with adversarial windows, pointers, and counts.
+//! **Generative fuzz of the §14 grant-list marshal** (#1025 slice 3a.2) — the confinement hinge
+//! (INVARIANTS §2: the marshaling that carries authority into a child is "suspect by default"). A spawn
+//! reads `grants_n × 16-byte` records `{name_off, name_len, handle, flags}` out of the parent's window
+//! ([`read_grant_records`], every spawn's one reader) and builds the child by re-granting each named
+//! handle from the parent powerbox ([`Host::spawn_detached_child`], the native tiers' builder). This
+//! drives that pair with adversarial windows, pointers, and counts.
 //!
 //! Two properties, both fail-closed:
 //!   1. **Memory safety.** Over fully arbitrary `(window bytes, grants_ptr, grants_n)` the parse never
@@ -12,11 +13,8 @@
 //!      every record is in-window, its name is UTF-8, *and* its handle is one the parent can actually
 //!      re-grant. A forged handle (one the parent never granted) is refused — `can_regrant` holds — and a
 //!      wholly-valid list is never falsely refused.
-//!
-//! The window carve / no-widening property is `check_child_carve`'s (tested in `nested_grant_marshal_op13`
-//! + the escape tests); this file fuzzes the record parse + the authority gate that `spawn_named_child_from_window` owns.
 
-use temen_interp::{ForkedProc, GrantMarshalError, Host, HostProc};
+use temen_interp::{read_grant_records, read_slice, ForkedProc, Host, HostProc, Trap};
 
 const CHILD_SIZE: u64 = 1 << 12;
 
@@ -56,6 +54,18 @@ fn parent_host() -> (Host, i32) {
     });
     let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless);
     (host, h)
+}
+
+/// What a spawn does with a grant list: parse it out of `window`, then build a child holding it, its
+/// window paid from a budget granted after the one re-grantable cap (so no record names it). `Ok(true)`
+/// is a built child; `Ok(false)` refuses the whole spawn over a handle the parent may not re-grant; a
+/// record or name outside the window is `Err(MemoryFault)`, a non-UTF-8 name `Err(CapFault)`.
+fn marshal(host: &mut Host, window: &[u8], grants_ptr: u64, grants_n: u64) -> Result<bool, Trap> {
+    let grants = read_grant_records(grants_ptr, grants_n, |o, l| read_slice(window, o, l))?;
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    Ok(host
+        .spawn_detached_child(&grants, CHILD_SIZE, budget, -1)
+        .is_some())
 }
 
 /// Re-parse the window with the *same* record layout the function uses, to independently decide whether the
@@ -113,11 +123,10 @@ fn fuzz_grant_marshal_memory_safety_and_determinism() {
 
         let (mut host1, _) = parent_host();
         let (mut host2, _) = parent_host();
-        let a = host1.spawn_named_child_from_window(&window, grants_ptr, grants_n, CHILD_SIZE);
-        let b = host2.spawn_named_child_from_window(&window, grants_ptr, grants_n, CHILD_SIZE);
+        let a = marshal(&mut host1, &window, grants_ptr, grants_n);
+        let b = marshal(&mut host2, &window, grants_ptr, grants_n);
         assert_eq!(
-            a.is_ok(),
-            b.is_ok(),
+            a, b,
             "marshal is deterministic (seed {seed}, ptr {grants_ptr}, n {grants_n})"
         );
     }
@@ -179,21 +188,16 @@ fn fuzz_grant_marshal_authority_oracle() {
         }
 
         let expect = should_succeed(&window, 0, n, grantable);
-        let got = host.spawn_named_child_from_window(&window, 0, n, CHILD_SIZE);
+        let got = marshal(&mut host, &window, 0, n);
         assert_eq!(
-            got.is_ok(),
+            got == Ok(true),
             expect,
-            "authority oracle mismatch (seed {seed}, n {n}): got {:?}, expected ok={expect}",
-            got.as_ref().map(|_| ()).map_err(|e| *e)
+            "authority oracle mismatch (seed {seed}, n {n}): got {got:?}, expected ok={expect}"
         );
         // A refusal must be one of the fail-closed kinds — never a silent partial child.
-        if let Err(e) = got {
-            assert!(matches!(
-                e,
-                GrantMarshalError::OutOfWindow
-                    | GrantMarshalError::BadName
-                    | GrantMarshalError::NotRegrantable
-            ));
-        }
+        assert!(
+            matches!(got, Ok(_) | Err(Trap::MemoryFault | Trap::CapFault)),
+            "seed {seed}: {got:?}"
+        );
     }
 }

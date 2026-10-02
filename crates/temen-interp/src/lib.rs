@@ -36455,35 +36455,18 @@ block 0 (vsp: i64, v0: i64) {
         }
     }
 
-    /// Domain **scoping**: a §14 `instantiate` live child (own powerbox, same scheduler) traps —
-    /// only ITS domain dies; the run continues and the owner observes the death as a value:
-    /// `poll` (iface 6 op 9) reports status 2 (trapped, non-propagating — the I37 supervision
-    /// idiom), which the root returns. The owner's world must NOT be torn down.
+    /// Domain **scoping**: a live child (own powerbox, same scheduler) traps — only ITS domain
+    /// dies; the run continues and the owner observes the death as a value: `poll` (iface 6 op 9)
+    /// reports status 2 (trapped, non-propagating — the I37 supervision idiom), which the root
+    /// returns. The owner's world must NOT be torn down. The root spawns the child detached (op 17)
+    /// through the v1 record the test lays at 17536, paying for it from its budget.
     const CHILD_TRAP_POLLED: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0. #1094: the record + names sit above
-  ; the unconditional NULL guard (base 17536 = 16384 + 1152), since [0, 16384) is now unmapped.
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vbud: i32) {
+  vb = i64.const 17564
+  i32.store vb vbud
+  vrec = i64.const 17536
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrec)
   br 1(v0, v5)
 }
 block 1 (v6: i32, v7: i32) {
@@ -36513,11 +36496,19 @@ block 0 (v0: i64) {
 
     #[test]
     fn threaded_live_child_trap_kills_only_its_domain() {
-        let m = parse_module(CHILD_TRAP_POLLED).unwrap();
+        let mut m = parse_module(CHILD_TRAP_POLLED).unwrap();
+        m.data.push(temen_ir::Data {
+            offset: 17536,
+            readonly: false,
+            bytes: temen_ir::SpawnRec::v1(1).encode(),
+        });
         let mut host = Host::new();
+        host.set_self_module(&Arc::new(m.clone()));
         let inst = host.grant_instantiator(0, 128 << 10);
+        let budget = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = 10_000_000u64;
-        let r = run_with_host(&m, 0, &[Value::I32(inst)], &mut fuel, &mut host);
+        let args = [Value::I32(inst), Value::I32(budget)];
+        let r = run_with_host(&m, 0, &args, &mut fuel, &mut host);
         assert_eq!(
             r,
             Ok(vec![Value::I64(2)]),
