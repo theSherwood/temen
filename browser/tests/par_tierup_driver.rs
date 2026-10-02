@@ -375,7 +375,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
                             .collect();
                         temen_par_deliver_jit_invoke(v, slots.as_ptr(), slots.len());
                     }
-                    Err(_) => temen_par_deliver_jit_invoke_trap(v),
+                    Err(_) => temen_par_deliver_jit_invoke_trap(v, 0), // this guest never traps
                 }
             }
             ev => panic!(

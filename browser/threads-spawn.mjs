@@ -15,6 +15,8 @@
 import { readFileSync } from 'node:fs';
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
 import { engineImports } from './engine-imports.mjs';
+// #1822: the code emitted frames last passed to `env.trap`, handed to the trap deliver.
+let lastTrap = 0;
 
 const WASM = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const GUEST = process.argv[3] ?? 'corpus/threads.temenc';
@@ -68,7 +70,7 @@ async function worker() {
     const emod = await WebAssembly.instantiate(await WebAssembly.compile(bytes), {
       env: {
         memory,
-        trap: () => {}, // Temen fault; the following `unreachable` throws, caught below as a vCPU trap
+        trap: (c) => { lastTrap = c; }, // Temen fault; the following `unreachable` throws, caught below as a vCPU trap
         call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
       },
     });
@@ -86,7 +88,7 @@ async function worker() {
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
-        trap: () => {},
+        trap: (c) => { lastTrap = c; },
         call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
       },
     });
@@ -183,13 +185,14 @@ async function worker() {
         emitted.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(v));
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count tier-ups (non-vacuity)
       try {
+        lastTrap = 0;
         const ret = emitted['f' + tfunc](win, envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
         const rptr = Number(ex.temen_par_alloc(Math.max(1, rets.length) * 8));
         for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = BigInt(rets[i]);
         ex.temen_par_deliver_tierup(v, rptr, rets.length);
       } catch {
-        ex.temen_par_deliver_tierup_trap(v);
+        ex.temen_par_deliver_tierup_trap(v, lastTrap);
       }
       continue;
     }
@@ -203,6 +206,7 @@ async function worker() {
       jitUnit.fuel.value = 1n << 61n; // ample fuel (emitted `fuel` global)
       if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // reuse the counter (non-vacuity)
       try {
+        lastTrap = 0;
         const ret = jitUnit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
         const rn = Number(ex.temen_par_jit_result_types_len(v));
@@ -211,7 +215,7 @@ async function worker() {
         for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = jitRes(rets[i], rtypes[i]);
         ex.temen_par_deliver_jit_invoke(v, rptr, rets.length);
       } catch {
-        ex.temen_par_deliver_jit_invoke_trap(v);
+        ex.temen_par_deliver_jit_invoke_trap(v, lastTrap);
       }
       continue;
     }

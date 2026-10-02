@@ -11,6 +11,7 @@
 // A trap with `trapDeclines: false` returns its status, name and fault address; by default it throws.
 // Under JSPI a leaf is sliced at its own safepoints (step 4): a leaf that never ends stops at a budget
 // checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
+// A fault in a leaf's emitted code reports the trap its `env.trap` named (#1822), as the interpreter's.
 //
 // Usage:  node browser-coop-embedder-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -73,6 +74,11 @@ const check = (host, r, suspends) => {
     if (sl.status !== null || sl.slices !== 20 || sl.out !== 'hi\n' || sl.counts.leaves !== 1) {
       fail(`${host}: onSlice false stops an endless leaf at a checkpoint: status ${sl.status}, `
         + `${sl.slices} slices, out ${JSON.stringify(sl.out)}, ${sl.counts.leaves} leaves`);
+    }
+    const fl = r.faultsLeaf;
+    if (fl.status !== 3 || fl.trap !== 'MemoryFault' || fl.out !== 'before\n' || fl.counts.leaves !== 1) {
+      fail(`${host}: a fault in a leaf is its trap, not Unreachable (#1822): status ${fl.status}, `
+        + `trap ${fl.trap}, out ${JSON.stringify(fl.out)}, ${fl.counts.leaves} leaves`);
     }
   }
   const f = r.faults;

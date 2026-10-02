@@ -25,9 +25,9 @@ use temen_browser::{
     temen_coop_table_log2, temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value,
     temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
     temen_onramp_set_grant_instantiator, temen_run_value, temen_status, temen_stdout_len,
-    temen_stdout_ptr, temen_warm_close, temen_warm_coop_open, temen_warm_coop_prepare,
-    temen_warm_eval, temen_warm_open, temen_wasmjit_spill_sp_off, COOP_RUN_DONE,
-    COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
+    temen_stdout_ptr, temen_trap_len, temen_trap_ptr, temen_warm_close, temen_warm_coop_open,
+    temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, temen_wasmjit_spill_sp_off,
+    COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
     STATUS_UNSUPPORTED,
 };
 use temen_browser::{
@@ -143,7 +143,7 @@ export 0 func "_start" 0
 /// `f{func}(win, env, ...argv)`, copy the window back, and return the i64 results (or `None` on a wasm
 /// trap — delivered as a trap to the paused task). The pure leaf never bounces, so `env.call_interp`
 /// is a trap-stub here.
-fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
+fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     // SAFETY: the paused task is parked inside the TIERUP event; the session stash (wasm, argv,
     // window) is stable until the deliver call, and this thread is the only accessor (FFI_LOCK).
     let wasm = unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) };
@@ -244,17 +244,16 @@ fn service_coop_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
     unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&buf);
 
     match ran {
-        Ok(()) => Some(
-            results
-                .iter()
-                .map(|v| match v {
-                    Val::I64(x) => *x,
-                    Val::I32(x) => *x as i64,
-                    _ => panic!("non-integer result"),
-                })
-                .collect(),
-        ),
-        Err(_) => None,
+        Ok(()) => Ok(results
+            .iter()
+            .map(|v| match v {
+                Val::I64(x) => *x,
+                Val::I32(x) => *x as i64,
+                _ => panic!("non-integer result"),
+            })
+            .collect()),
+        // #1822: the code the emitted frames passed to `env.trap` (0 for a native wasm trap).
+        Err(_) => Err(*store.data()),
     }
 }
 
@@ -365,7 +364,7 @@ fn run_emitted_coop(
     argv: &[i64],
     mapped: i64,
     n_results: usize,
-) -> Option<Vec<i64>> {
+) -> Result<Vec<i64>, i32> {
     // #816: the pending task's window, per event (see `service_coop_on_wasmi`).
     let win_len = temen_coop_tierup_win_len();
     let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
@@ -427,22 +426,21 @@ fn run_emitted_coop(
     // SAFETY: exclusive mirror of the parked window.
     unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&buf);
     match ran {
-        Ok(()) => Some(
-            results
-                .iter()
-                .map(|v| match v {
-                    Val::I64(x) => *x,
-                    Val::I32(x) => *x as i64,
-                    _ => panic!("non-integer result"),
-                })
-                .collect(),
-        ),
-        Err(_) => None,
+        Ok(()) => Ok(results
+            .iter()
+            .map(|v| match v {
+                Val::I64(x) => *x,
+                Val::I32(x) => *x as i64,
+                _ => panic!("non-integer result"),
+            })
+            .collect()),
+        // #1822: the code the emitted frames passed to `env.trap` (0 for a native wasm trap).
+        Err(_) => Err(*store.data()),
     }
 }
 
 /// Service one cooperative JIT_INVOKE on wasmi: run the invoked unit's `f0`. All-i64 in this harness.
-fn service_coop_jit_on_wasmi(n_results: usize) -> Option<Vec<i64>> {
+fn service_coop_jit_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     // SAFETY: the JIT_INVOKE operand stash is stable until deliver; only accessor (FFI_LOCK).
     let wasm =
         unsafe { std::slice::from_raw_parts(temen_coop_jit_wasm_ptr(), temen_coop_jit_wasm_len()) };
@@ -499,8 +497,8 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
                 );
                 let n = temen_coop_jit_result_types_len();
                 match service_coop_jit_on_wasmi(n) {
-                    Some(res) => temen_coop_deliver_jit(res.as_ptr(), res.len()),
-                    None => temen_coop_deliver_jit_trap(),
+                    Ok(res) => temen_coop_deliver_jit(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_jit_trap(code),
                 }
             }
             COOP_RUN_TIERUP => panic!("unexpected TIERUP from the leafless vm_jit_* guest"),
@@ -573,8 +571,8 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
                 assert!(tierups < 50, "runaway tier-ups");
                 assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
                 match service_coop_on_wasmi(n_results) {
-                    Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                    None => temen_coop_deliver_trap(),
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
                 }
             }
             COOP_RUN_DONE => break,
@@ -661,8 +659,8 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
                     assert!(tierups < 50, "runaway tier-ups");
                     assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) can tier up");
                     match service_coop_on_wasmi(n_results) {
-                        Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                        None => temen_coop_deliver_trap(),
+                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                        Err(code) => temen_coop_deliver_trap(code),
                     }
                 }
                 COOP_RUN_DONE => break,
@@ -753,6 +751,9 @@ struct DriverData {
     /// #1954: the scratch of the leaf call that parked (`temen_coop_call_interp` returned `2`), whose
     /// results [`COOP_RUN_RESUME`] brings.
     parked_args: Option<i32>,
+    /// #1822: the code the running emitted frames last passed to `env.trap`, handed to the trap
+    /// deliver as the JS driver's `lastTrap` is (reset at each event's entry, in `prime`).
+    last_trap: i32,
 }
 
 /// #1954: the host error a parked leaf call unwinds wasmi with — resumable, as JSPI suspends the
@@ -908,7 +909,9 @@ fn instantiate_in(mut ctx: impl AsContextMut<Data = DriverData>, wasm: &[u8]) ->
         .define("env", "__indirect_function_table", table)
         .unwrap();
     linker
-        .func_wrap("env", "trap", |_c: Caller<'_, DriverData>, _code: i32| {})
+        .func_wrap("env", "trap", |mut c: Caller<'_, DriverData>, code: i32| {
+            c.data_mut().last_trap = code;
+        })
         .unwrap();
     linker
         .func_wrap("env", "call_interp", call_interp_host)
@@ -1069,6 +1072,7 @@ impl CoopB2Driver {
 
     /// Sync window + globals into the shared instances before running an emitted entry.
     fn prime(&mut self, mapped: i64) {
+        self.store.data_mut().last_trap = 0;
         // #1312: read the window's base and length per event — a previous event's `vm_map` may have
         // grown (and relocated) it — and widen the mirror to whatever it is now.
         let (win_ptr, win_len) = live_win();
@@ -1156,7 +1160,7 @@ impl CoopB2Driver {
                     .collect();
                 temen_coop_deliver(slots.as_ptr(), slots.len());
             }
-            Err(_) => temen_coop_deliver_trap(),
+            Err(_) => temen_coop_deliver_trap(self.store.data().last_trap),
         }
     }
 
@@ -1221,7 +1225,7 @@ impl CoopB2Driver {
                     .collect();
                 temen_coop_deliver_jit(slots.as_ptr(), slots.len());
             }
-            Err(_) => temen_coop_deliver_jit_trap(),
+            Err(_) => temen_coop_deliver_jit_trap(self.store.data().last_trap),
         }
     }
 
@@ -3550,8 +3554,8 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
                 assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
                 spans.push((temen_coop_tierup_win_len(), temen_coop_mapped()));
                 match service_coop_on_wasmi(n_results) {
-                    Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                    None => temen_coop_deliver_trap(),
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
                 }
             }
             COOP_RUN_DONE => break,
@@ -3686,10 +3690,10 @@ fn coop_tierup_child_paged_traps_over_carve() {
                 assert!(tierups < 50, "runaway tier-ups");
                 assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
                 // The child's leaf runs paged over its carve; loading the unmapped page must trap,
-                // so `service_coop_on_wasmi` returns `None` (the emitted `MemoryFault`).
+                // so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
                 match service_coop_on_wasmi(n_results) {
-                    Some(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                    None => temen_coop_deliver_trap(),
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
                 }
             }
             COOP_RUN_DONE | COOP_RUN_TRAP => break,
@@ -3710,6 +3714,15 @@ fn coop_tierup_child_paged_traps_over_carve() {
         temen_coop_value(),
         want.value,
         "value parity with the oracle on the trapping run"
+    );
+    // #1822: and it is the oracle's trap — the emitted leaf's `env.trap(MEMORY_FAULT)` code reaches
+    // the guest, where it used to be delivered as `Unreachable`.
+    // SAFETY: the end-of-run trap-name slot, read before anything else runs.
+    let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
+    assert_eq!(
+        std::str::from_utf8(trap).unwrap(),
+        want.trap.as_ref().map_or("", |t| t.name()),
+        "trap-kind parity with the oracle on the trapping run"
     );
     temen_coop_close();
 }
@@ -4776,7 +4789,7 @@ impl CoopB2Driver {
             }
             _ => {
                 self.writeback();
-                temen_coop_deliver_trap();
+                temen_coop_deliver_trap(self.store.data().last_trap);
                 None
             }
         }
