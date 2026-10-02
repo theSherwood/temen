@@ -2313,6 +2313,7 @@ fn drive_arc(
     // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
     // re-unwind mid-thaw and `durable_load_dstate` reads the thaw — the real snapshot-restore path
     // leaks the same `UNWINDING`. A freeze leaves the thaw word `NORMAL`, so this never fires on it.
+    // Only that leftover `UNWINDING` is cleared: a thaw armed for its own freeze keeps `ARMED` (#2044).
     // A durable **thaw** re-enters `drive` to *continue* an already-charged run (the root re-enters
     // under REWINDING), so the top-level-entry fuel charge below must not fire again on it.
     let is_thaw = durable
@@ -2321,7 +2322,7 @@ fn drive_arc(
             .is_some_and(|m| m.durable_thaw_state(0) == STATE_REWINDING);
     if durable {
         if let Some(m) = mem.as_mut() {
-            if m.durable_thaw_state(0) == STATE_REWINDING {
+            if m.durable_thaw_state(0) == STATE_REWINDING && m.durable_state() == STATE_UNWINDING {
                 m.durable_set_state(STATE_NORMAL);
             }
         }
@@ -2895,16 +2896,17 @@ fn seed_domain(
                         trap_fault: None,
                     },
                 );
-                if parent == id {
-                    while root.threads.len() <= fd.slot {
-                        root.threads.push(None);
-                    }
-                    root.threads[fd.slot] = Some(cid);
-                } else if let Some(p) = children.get_mut(&parent) {
+                let spawner = if parent == id {
+                    Some(&mut *root)
+                } else {
+                    children.get_mut(&parent).map(|p| &mut **p)
+                };
+                if let Some(p) = spawner {
                     while p.threads.len() <= fd.slot {
                         p.threads.push(None);
                     }
                     p.threads[fd.slot] = Some(cid);
+                    p.delivered_detached.push((fd.slot, cid));
                 }
             }
         }
@@ -8836,6 +8838,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             !v.nested_children.iter().any(|c| c.slot == *slot)
                                 && v.threads.get(*slot).and_then(|t| *t).is_some()
                         })
+                        // #2044 — and each a thaw delivered as completed, still unjoined.
+                        .chain(
+                            v.delivered_detached
+                                .iter()
+                                .filter(|&&(slot, cid)| v.threads.get(slot) == Some(&Some(cid)))
+                                .map(|&(slot, _)| slot),
+                        )
                         .collect();
                     let mut refuse = false;
                     for slot in detached {
@@ -11960,6 +11969,11 @@ struct VCpu {
     /// (a nested child is reached through its carve, a `thread.spawn` sibling shares our window).
     /// Beside the bell, what the spawn knew that a thaw needs to mint the child again (#1361 step 4).
     child_freeze: BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
+    /// #2044 — the completed detached children a thaw delivered at this vCPU's join slots, as `(slot,
+    /// task)`: the task whose posted result the slot's `join` takes. Nothing was re-created for them,
+    /// so they are in no `child_hosts`; a freeze before the `join` reads them here and records each as
+    /// completed again, while the slot still names that task.
+    delivered_detached: Vec<(usize, TaskId)>,
     /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
     /// innermost first. A worker may run it only while every bounded cap in the chain has room
     /// ([`lane_enter`]); it holds those lanes exactly while it is on a worker and releases them the
@@ -12118,6 +12132,7 @@ impl VCpu {
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
+            delivered_detached: Vec::new(),
             lane_chain: Vec::new(),
             child_lane: BTreeMap::new(),
             serve_run: None,
@@ -12199,6 +12214,7 @@ impl VCpu {
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
+            delivered_detached: Vec::new(),
             lane_chain: Vec::new(),
             child_lane: BTreeMap::new(),
             serve_run: None,
@@ -12302,6 +12318,7 @@ impl VCpu {
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
+            delivered_detached: Vec::new(),
             lane_chain: Vec::new(),
             child_lane: BTreeMap::new(),
             serve_run: None,
@@ -13165,6 +13182,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         unit_ref_cache,
         window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
         live: _,         // #2001: handed back when the vCPU is dropped
+        delivered_detached: _, // #2044: read by the freeze scan, at the dispatch boundary
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -33235,24 +33253,24 @@ impl Mem {
     }
 
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
-    /// stage 1): the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`) takes precedence; else
-    /// context `ctx`'s per-context **thaw** word (`REWINDING`/`NORMAL`). Mirror of [`Self::durable_store_dstate`].
+    /// stage 1): context `ctx`'s per-context **thaw** word while it is `REWINDING` — a rewind is the
+    /// context's own — else the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`/`NORMAL`),
+    /// the run's. So a thawed run armed for a second freeze rewinds first, its arm intact (#2044).
+    /// Mirror of [`Self::durable_store_dstate`].
     fn durable_load_dstate(&self, ctx: usize) -> i32 {
-        let g = self.durable_state();
-        if g != STATE_NORMAL {
-            g
-        } else {
-            self.durable_thaw_state(ctx)
+        match self.durable_thaw_state(ctx) {
+            STATE_REWINDING => STATE_REWINDING,
+            _ => self.durable_state(),
         }
     }
 
     /// Store a vCPU's unified durable phase, routing `REWINDING` to context `ctx`'s own **thaw** word and
     /// the freeze phases (`UNWINDING`/`ARMED`/`NORMAL`) to the global **freeze** word — so a rewinding
     /// vCPU flipping its own word to `NORMAL` can't disturb a sibling still `REWINDING` (the relocation
-    /// the JIT needs for concurrent rewinds; the interp swaps it per dispatch, slice 3.2.1).
+    /// the JIT needs for concurrent rewinds; the interp swaps it per dispatch, slice 3.2.1). A
+    /// rewinding vCPU leaves the freeze word as the run has it: an arm, or a freeze another vCPU began.
     fn durable_store_dstate(&mut self, ctx: usize, dstate: i32) {
         if dstate == STATE_REWINDING {
-            self.durable_set_state(STATE_NORMAL);
             self.durable_set_thaw_state(ctx, STATE_REWINDING);
         } else {
             self.durable_set_state(dstate);
@@ -33638,34 +33656,29 @@ impl Mem {
     /// Bytes first so a `Ro`/grown page has its contents before the protection is applied. The fresh
     /// window has no regions, so this reproduces the guest-visible state exactly.
     fn restore_layout(&mut self, layout: &MemLayout) {
-        // Bulk fast path, the mirror of the capture above (and of `seed`): no §13 region ⇒ no page is
-        // `Backed`, so the image writes straight through to `back` in one pass. Same root-only offset
-        // convention as `layout_snapshot`.
-        if !self.has_regions.load(Ordering::Relaxed) {
-            self.back.write_from(0, &layout.bytes);
-        } else {
-            for (i, &b) in layout.bytes.iter().enumerate() {
-                self.set_byte(i as u64, b);
-            }
-        }
-        // Install the captured map, *replacing* whatever this window carries. The guard is only the
-        // fast-path one: a window with no explicit protections restoring an image that has none stays
-        // off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries the map
-        // is assigned outright — restoring into a **live** window (a reactor rewinding to an earlier
-        // moment) must drop the pages the guest has `map`-grown since, or they would survive as
-        // addressable memory the moment never had. A fresh window (the checkpoint ladder's target) has
-        // an empty map, so this is unchanged there.
+        // Install the captured map first, *replacing* whatever this window carries. The guard is only
+        // the fast-path one: a window with no explicit protections restoring an image that has none
+        // stays off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries
+        // the map is assigned outright — restoring into a **live** window (a reactor rewinding to an
+        // earlier moment) must drop the pages the guest has `map`-grown since, or they would survive
+        // as addressable memory the moment never had. A fresh window (the checkpoint ladder's target)
+        // has an empty map, so this is unchanged there. The layout may be in another page unit (a §12
+        // artifact's fixed 4 KiB, or a 16 KiB native capture); `rebased_to` is identity when they
+        // already agree. A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which
+        // installs its entry with the region it names.
         if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
             let mut space = self.space_write(); // marks prot_dirty, matching the captured window
-                                                // The layout may be in another page unit (a §12 artifact's fixed 4 KiB, or a 16 KiB native
-                                                // capture); `rebased_to` is identity when they already agree.
-                                                // A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which installs
-                                                // its entry with the region it names.
             space.prot = layout.map.rebased_to(self.page);
             space
                 .prot
                 .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
         }
+        // Then the image, straight into `back` in one pass (the mirror of the capture above and of
+        // `seed`). No page is `Backed` now (an alias dirties the map, so the map above replaced it),
+        // so every byte is the window's own: a region the live window aliased since the moment was
+        // taken keeps its bytes out of the restore (#2059). Same root-only offset convention as
+        // `layout_snapshot`.
+        self.back.write_from(0, &layout.bytes);
     }
 
     /// Capture just this window's page-protection map (window-relative page ⇒ state) for checkpointing a
