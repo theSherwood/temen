@@ -159,8 +159,10 @@ fn a_detached_child_attests_window_unexposed_where_a_nested_one_attests_exposed(
 
 /// The budget's quota is the attenuation: with exactly one window's worth (4096 bytes), the
 /// first detached spawn succeeds and the second refuses probeably (`-EINVAL`, nothing
-/// charged) — a numeric quota, host-enforced at mint. Composite: first_failed*10 +
-/// second_failed = 0*10 + 1 = 1.
+/// charged) — a numeric quota, host-enforced at mint. The first child is [`DETACHED_SERVER`],
+/// parked in `svc.wait` until the parent calls it after the second mint, so it holds its window
+/// across that mint: a child that returned at once could end on another worker and hand its window
+/// back first (#2077). Composite: first_failed*10 + second_failed = 0*10 + 1 = 1.
 const QUOTA_EXHAUSTS: &str = r#"
 memory 17
 
@@ -174,6 +176,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vq = i64.const 0
   vfst = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
   vsnd = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vex = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vfst, vex)
+  va = i64.const 40
+  vb = i64.const 2
+  vsum = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
   vj = call.cap 6 1 (i32) -> (i64) v0 (vfst)
   vzero = i32.const 0
   vf1 = i32.lt_s vfst vzero
@@ -190,7 +197,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 #[test]
 fn the_minter_quota_bounds_detached_mints() {
     let a = module(QUOTA_EXHAUSTS);
-    let b = module(ATTEST_MOD);
+    let b = module(DETACHED_SERVER);
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
@@ -532,7 +539,9 @@ fn a_durable_domain_refuses_a_detached_spawn_until_the_capture_lands() {
 
 /// [`SPAWN_ONLY_PARENT`] that then reads what is left of `Budget.mem` while its child is still live,
 /// returning `(slot, remaining)`. The charge has to be observed from inside: the child's window goes
-/// back to the budget when the child ends (INVARIANTS #3, 2026-09-29), which the run's teardown does.
+/// back to the budget when the child ends (INVARIANTS #3, 2026-09-29). The child is
+/// [`DETACHED_SERVER`], parked in `svc.wait` until the parent calls it after the read, so it is live
+/// at the read (#2077); the parent then joins it.
 const SPAWN_THEN_READ_PARENT: &str = r#"memory 17
 func (i32, i32, i32) -> (i64, i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -546,6 +555,12 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vr = i64.extend_i32_s vs
   fld = i64.const 1
   vleft = call.cap 14 1 (i64) -> (i64) v2 (fld)
+  vex = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vex)
+  va = i64.const 40
+  vb = i64.const 2
+  vsum = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vs)
   return vr, vleft
   }
 }
@@ -557,7 +572,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 #[test]
 fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
     let a = module(SPAWN_THEN_READ_PARENT);
-    let b = module(ATTEST_MOD);
+    let b = module(DETACHED_SERVER);
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
@@ -578,6 +593,6 @@ fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
     );
     assert!(
         host.budget_mem_take(hw, 1 << 12),
-        "the child ended with the run, so its window went back to Budget.mem"
+        "the child ended (the parent called it, then joined it), so its window went back to Budget.mem"
     );
 }

@@ -1190,14 +1190,14 @@ fn refreeze_root() -> String {
 /// [`NEST_TOTAL`] — reloaded at the rewound `join`, not lost to a `ThreadFault`.
 #[test]
 fn a_delivered_completed_child_rides_a_second_freeze_on_every_engine() {
-    refreezes_every_engine(QUICK_NEST, Ok(NEST_TOTAL));
+    refreezes_every_engine(QUICK_NEST, (Ok(NEST_TOTAL), ""));
 }
 
 /// #2044 — **the same for a child that trapped**: its trap rides both freezes as its `join` outcome,
 /// and every engine's last thaw re-raises it from the root's rewound `join`.
 #[test]
 fn a_delivered_trapped_child_rides_a_second_freeze_on_every_engine() {
-    refreezes_every_engine(TRAP_NEST, Err(temen_ir::trap_code::UNREACHABLE));
+    refreezes_every_engine(TRAP_NEST, (Err(temen_ir::trap_code::UNREACHABLE), ""));
 }
 
 /// Freeze [`refreeze_root`] over `child` (which ends at once) on each engine at its first fiber
@@ -1219,8 +1219,10 @@ fn refreezes_every_engine(child: &str, answer: Answer) {
         let (mut host, args) = nest_powerbox(&child, 0, 1);
         let win = init_durable_window(1 << PARENT_LOG2, ARENA);
         match nest_run(e, &root, &args, &win, &mut host, None) {
-            Some((r, _)) if r == answer => runs.push(e),
-            Some((r, _)) => wrong.push(format!("uninterrupted on {e:?}: {r:?}")),
+            Some((r, out, _)) if (r, out.as_str()) == answer => runs.push(e),
+            Some((r, out, _)) => {
+                wrong.push(format!("uninterrupted on {e:?}: {r:?}, writing {out:?}"))
+            }
             None => {} // a target without the JIT's child executor
         }
     }
@@ -1228,7 +1230,7 @@ fn refreezes_every_engine(child: &str, answer: Answer) {
         let (mut fhost, args) = nest_powerbox(&child, 0, 1);
         let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
         arm_freeze_after(&mut win, 1);
-        let (r, fsnap) = nest_run(first, &root, &args, &win, &mut fhost, None).expect("runs");
+        let (r, _, fsnap) = nest_run(first, &root, &args, &win, &mut fhost, None).expect("runs");
         if (r, fhost.frozen_detached().len()) != (Ok(0), 1) {
             wrong.push(format!(
                 "first freeze on {first:?}: {r:?}, carrying {} completed",
@@ -1240,7 +1242,8 @@ fn refreezes_every_engine(child: &str, answer: Answer) {
         for &second in &runs {
             let (mut shost, mut swin) = nest_restore(&art, &root, &child);
             arm_freeze_after(&mut swin, 1);
-            let Some((r, ssnap)) = nest_run(second, &root, &args, &swin, &mut shost, None) else {
+            let Some((r, _, ssnap)) = nest_run(second, &root, &args, &swin, &mut shost, None)
+            else {
                 wrong.push(format!("{first:?} → second freeze on {second:?}: refused"));
                 continue;
             };
