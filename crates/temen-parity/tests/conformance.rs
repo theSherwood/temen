@@ -117,9 +117,10 @@ fn skip_set_is_small_and_reasoned() {
         .collect();
     // Fibers/threads/futex/setjmp/gc (target-conditional) + the cap/import/export host-wired ops +
     // the `process, serve & fork` sub-ops (scheduler/host-wired, exercised by the fork/serve
-    // harnesses).
+    // harnesses). #2068 added `poll`/`detach`/`kill`/`instantiate_detached`, exercised on every
+    // driver by `spawn_every_driver.rs` and on the JIT by `detached_child_jit.rs`.
     assert!(
-        skipped.len() <= 33,
+        skipped.len() <= 37,
         "conf_skip set grew to {} — audit these before raising the bound:\n{:?}",
         skipped.len(),
         skipped,

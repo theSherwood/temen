@@ -320,6 +320,15 @@ fn unorchestrated(event: &str) -> ! {
     panic!("the Vcpu harness does not orchestrate {event}; extend `drivers::drive` to cover it")
 }
 
+/// The drivers that schedule a spawned child themselves. The [`Driver::Vcpu`]'s host runs its
+/// children, so it declines a module that `poll`s, `detach`es or `kill`s one (temen#2068).
+pub const SCHEDULING: [Driver; 4] = [
+    Driver::Oracle,
+    Driver::Coop,
+    Driver::Parallel,
+    Driver::Debug,
+];
+
 /// Run `m` on every driver and assert each one gives `want` — result and streams. Every driver must
 /// run the module (none may decline), so a case cannot pass by falling back. A failure lists every
 /// driver that disagreed, not just the first.
@@ -329,7 +338,18 @@ pub fn agree_on_every_driver(
     setup: &dyn Fn() -> (Host, Vec<Value>),
     want: &Ran,
 ) {
-    let wrong: Vec<String> = ALL
+    agree_on(&ALL, what, m, setup, want);
+}
+
+/// [`agree_on_every_driver`] over `drivers` only.
+pub fn agree_on(
+    drivers: &[Driver],
+    what: &str,
+    m: &Module,
+    setup: &dyn Fn() -> (Host, Vec<Value>),
+    want: &Ran,
+) {
+    let wrong: Vec<String> = drivers
         .iter()
         .filter_map(|&d| match run_on(d, m, setup) {
             Some(got) if &got == want => None,
