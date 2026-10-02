@@ -15269,6 +15269,53 @@ fn lower_overflow_intrinsic(
     Ok(true)
 }
 
+/// Lower `llvm.experimental.cttz.elts.iM.vNi1(mask, is_zero_poison)` — the number of trailing false
+/// lanes of a `<N x i1>` mask, i.e. the index of its first true lane, or `N` when no lane is true (#1993:
+/// clang 22's early-exit vectorizer uses it to find which lane of the vector step left the loop). The
+/// mask is held lane-wise, so it is a chain of selects from the last lane down: `N`, then `k` wherever
+/// lane `k` is set. `N` for an all-false mask is also a valid answer where `is_zero_poison` makes that
+/// case poison. `None` if `c` is not this intrinsic.
+fn lower_cttz_elts(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    types: &Types,
+) -> Result<Option<ValIdx>, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(None);
+    };
+    let Some(rest) = name.strip_prefix("llvm.experimental.cttz.elts.") else {
+        return Ok(None);
+    };
+    let mask_op = &c.arguments[0].0;
+    let Some(n) = i1_vector_lanes(mask_op.get_type(types).as_ref()) else {
+        return unsup("cttz.elts of a non-mask vector");
+    };
+    let mask = mask_operand(ctx, mask_op, n)?;
+    // The result width is the name's first suffix (`i64` in `….i64.v2i1`).
+    let wide = match rest.split('.').next() {
+        Some("i64") => true,
+        Some("i32") => false,
+        _ => return unsup(format!("cttz.elts result type in {name}")),
+    };
+    let konst = |ctx: &mut BlockCtx, k: usize| {
+        if wide {
+            ctx.const_i64(k as i64)
+        } else {
+            ctx.push(Inst::ConstI32(k as i32))
+        }
+    };
+    let mut r = konst(ctx, n);
+    for k in (0..n).rev() {
+        let kv = konst(ctx, k);
+        r = ctx.push(Inst::Select {
+            cond: mask[k],
+            a: kv,
+            b: r,
+        });
+    }
+    Ok(Some(r))
+}
+
 /// Lower `llvm.vector.reduce.{add,mul,and,or,xor,smax,smin,umax,umin}.v4i32` — the horizontal reduction
 /// `-O2` auto-vectorization emits to close a reduction loop (the `i32x4` accumulator → a scalar). No
 /// Temen reduce op, so it is unrolled: extract the 4 lanes and fold them with the scalar op (`add`/`mul`/
@@ -18936,6 +18983,11 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if lower_mask(ctx, instr, types)? {
         return Ok(());
     }
+    if let Instruction::GetElementPtr(g) = instr {
+        if lower_vector_gep(ctx, g, types)? {
+            return Ok(());
+        }
+    }
 
     // A `landingpad` binds the `{ptr,i32}` exception aggregate from the reserved EH slots: field 0
     // the in-flight exception object pointer (`cur_exn`), field 1 the type selector (`cur_sel`) the
@@ -19250,6 +19302,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `llvm.vector.reduce.*` (the horizontal reduce auto-vectorization emits) → an unrolled
         // lane fold to a scalar.
         if let Some(idx) = lower_vector_reduce(ctx, c, types)? {
+            if let Some(dest) = &c.dest {
+                if let Some(&vid) = ctx.s.name2id.get(dest) {
+                    ctx.idx_of.insert(vid, idx);
+                }
+            }
+            return Ok(());
+        }
+        // `llvm.experimental.cttz.elts` (the lane an early-exit vectorized loop exited on) → the
+        // index of the mask's first true lane.
+        if let Some(idx) = lower_cttz_elts(ctx, c, types)? {
             if let Some(dest) = &c.dest {
                 if let Some(&vid) = ctx.s.name2id.get(dest) {
                     ctx.idx_of.insert(vid, idx);
@@ -21067,6 +21129,34 @@ fn mask_operand(ctx: &mut BlockCtx, op: &Operand, n: usize) -> Result<Vec<ValIdx
     }
 }
 
+/// #1993 — a `getelementptr` over a **pointer vector** (`getelementptr i8, <2 x ptr> %bases, i64 16`:
+/// clang 22's early-exit vectorizer forms each lane's `base + SPAN` this way). Each lane is an `i64`
+/// window offset, so the scalar offset walk runs once per lane and the lanes repack into the result
+/// vector. Vector *indices* are not handled. `Ok(false)` if the base is not a vector.
+fn lower_vector_gep(
+    ctx: &mut BlockCtx,
+    g: &crate::ll::ast::GetElementPtr,
+    types: &Types,
+) -> Result<bool, Error> {
+    let base_ty = g.address.get_type(types);
+    if !matches!(base_ty.as_ref(), Type::VectorType { .. }) {
+        return Ok(false);
+    }
+    if g.indices
+        .iter()
+        .any(|i| matches!(i.get_type(types).as_ref(), Type::VectorType { .. }))
+    {
+        return unsup("getelementptr with vector indices");
+    }
+    let lanes = vec_explode(ctx, &g.address, types, false)?;
+    let mut out = Vec::with_capacity(lanes.len());
+    for b in lanes {
+        out.push(gep_from(ctx, b, g, types)?);
+    }
+    vec_implode(ctx, &g.dest, &out, base_ty.as_ref(), types)?;
+    Ok(true)
+}
+
 /// Lower the **`<N x i1>` boolean-mask** instructions a vectorized program produces. temen-ir has no
 /// first-class `<N x i1>` type, so a mask is held lane-wise (`mask_lanes`: `N` scalar `0`/`1`s) and
 /// every producer/consumer is scalarized: vector `icmp`/`fcmp` → per-lane scalar compare; `select`
@@ -21122,8 +21212,22 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
         I::Select(x) if i1_vector_lanes(x.condition.get_type(types).as_ref()).is_some() => {
             let n = i1_vector_lanes(x.condition.get_type(types).as_ref()).unwrap();
             let mask = mask_operand(ctx, &x.condition, n)?;
-            let a = vec_explode(ctx, &x.true_value, types, false)?;
-            let b = vec_explode(ctx, &x.false_value, types, false)?;
+            // A select **of masks** (#1993: clang 22's early-exit vectorizer writes a lane-wise
+            // `a && b` as `select <N x i1> a, <N x i1> b, zeroinitializer`) picks between mask lanes,
+            // and its result is a mask again.
+            let res_ty = x.true_value.get_type(types);
+            let of_masks = i1_vector_lanes(res_ty.as_ref()).is_some();
+            let (a, b) = if of_masks {
+                (
+                    mask_operand(ctx, &x.true_value, n)?,
+                    mask_operand(ctx, &x.false_value, n)?,
+                )
+            } else {
+                (
+                    vec_explode(ctx, &x.true_value, types, false)?,
+                    vec_explode(ctx, &x.false_value, types, false)?,
+                )
+            };
             let mut out = Vec::with_capacity(n);
             for k in 0..n {
                 out.push(ctx.push(Inst::Select {
@@ -21132,8 +21236,11 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
                     b: b[k],
                 }));
             }
-            let res_ty = x.true_value.get_type(types);
-            vec_implode(ctx, &x.dest, &out, res_ty.as_ref(), types)?;
+            if of_masks {
+                bind_mask(ctx, &x.dest, out);
+            } else {
+                vec_implode(ctx, &x.dest, &out, res_ty.as_ref(), types)?;
+            }
             Ok(true)
         }
         // `extractelement <N x i1> mask, k` → lane `k` (a clean `0`/`1`).
@@ -21736,7 +21843,19 @@ fn translate_gep(
     g: &crate::ll::ast::GetElementPtr,
     types: &Types,
 ) -> Result<ValIdx, Error> {
-    let mut addr = ctx.operand(&g.address)?;
+    let base = ctx.operand(&g.address)?;
+    gep_from(ctx, base, g, types)
+}
+
+/// [`translate_gep`]'s offset walk from an explicit `base` address — also one lane of a pointer
+/// vector's GEP ([`lower_vector_gep`]).
+fn gep_from(
+    ctx: &mut BlockCtx,
+    base: ValIdx,
+    g: &crate::ll::ast::GetElementPtr,
+    types: &Types,
+) -> Result<ValIdx, Error> {
+    let mut addr = base;
     let mut cur = g.source_element_type.clone();
     let mut const_off: i64 = 0;
     for (k, idx) in g.indices.iter().enumerate() {
