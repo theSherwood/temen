@@ -268,6 +268,122 @@ fn scheduled_window_write_survives_seek() {
     );
 }
 
+/// A guest that resolves its `"instantiator"` and `"budget"`, spawns a detached copy of itself (an
+/// op-17 v1 record, `module = -1`) and returns what the copy returns. The copy, func 1, adds 1 to a
+/// word of its own window 3000 times and returns it.
+const SELF_SPAWN: &str = r#"memory 17
+data 17472 "instantiator"
+data 17488 "budget"
+func () -> (i64) {
+block 0 () {
+  p1 = i64.const 17472
+  l1 = i64.const 12
+  vi = self.resolve p1 l1
+  p2 = i64.const 17488
+  l2 = i64.const 6
+  vbud = self.resolve p2 l2
+  vz = i64.const 0
+  r0 = i64.const 4294967297
+  a0 = i64.const 17536
+  i64.store a0 r0
+  a1 = i64.const 17544
+  i64.store a1 vz
+  r2 = i64.const -4294967296
+  a2 = i64.const 17552
+  i64.store a2 r2
+  vb64 = i64.extend_i32_u vbud
+  v32 = i64.const 32
+  vbs = i64.shl vb64 v32
+  vself = i64.const 4294967295
+  r3 = i64.or vbs vself
+  a3 = i64.const 17560
+  i64.store a3 r3
+  a4 = i64.const 17568
+  i64.store a4 vz
+  a5 = i64.const 17576
+  i64.store a5 vz
+  a6 = i64.const 17584
+  i64.store a6 vz
+  a7 = i64.const 17592
+  i64.store a7 vz
+  a8 = i64.const 17600
+  i64.store a8 vz
+  a9 = i64.const 17608
+  i64.store a9 vself
+  a10 = i64.const 17616
+  i64.store a10 vz
+  vh = call.cap 6 17 (i64) -> (i32) vi (a0)
+  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vn: i64) {
+  va = i64.const 20000
+  vx = i64.load va
+  vone = i64.const 1
+  vx2 = i64.add vx vone
+  i64.store va vx2
+  vn2 = i64.add vn vone
+  vlim = i64.const 3000
+  vmore = i64.ne vn2 vlim
+  br_if vmore 1(vn2) 2()
+}
+block 2 () {
+  vb = i64.const 20000
+  vr = i64.load vb
+  return vr
+  }
+}
+"#;
+
+/// #2072 — **a window write while a detached child is stopped lands in the child's window, and the
+/// recorded write replays there**: break at the head of the child's loop, add a million to its count,
+/// and it finishes a million higher, before and after a `seek(0)` re-drive. The write is recorded
+/// with the focused task; recording it as the root's window replayed it there, and the re-drive
+/// counted to 3000.
+#[test]
+fn a_window_write_to_a_stopped_child_survives_seek() {
+    let m = parse_module(SELF_SPAWN).expect("parses");
+    let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, true, Vec::new(), false, None, None)
+        .expect("bytecode subset");
+    let bp = IrPc {
+        module: 0,
+        func: 1,
+        block: 1,
+        inst: 0,
+    };
+    Debuggee::set_breakpoint(&mut b, bp);
+    for _ in 0..100 {
+        let Stop::Break { .. } = Debuggee::run_until_stop(&mut b) else {
+            panic!("expected the child's loop-head breakpoint");
+        };
+    }
+    let count = u64::from_le_bytes(
+        Debuggee::read_window(&b, 20000, 8)
+            .expect("readable")
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(count, 99, "the child's count, read in its window");
+    assert!(
+        Debuggee::write_window(&mut b, 20000, &(count + 1_000_000).to_le_bytes()),
+        "the write lands"
+    );
+    Debuggee::clear_breakpoint(&mut b, bp);
+    assert_eq!(finish(&mut b), vec![Value::I64(1_003_000)], "the live run");
+    let _ = Debuggee::seek(&mut b, 0);
+    assert_eq!(
+        finish(&mut b),
+        vec![Value::I64(1_003_000)],
+        "seek(0) + rerun re-applies the write in the child's window"
+    );
+}
+
 /// stackTrace → scopes → the top frame's `variablesReference` + the named var's current value.
 fn top_scope_var(s: &mut DapServer, seq: i64, name: &str) -> (i64, String) {
     let out = s.handle(&req(

@@ -1733,11 +1733,16 @@ impl FreshWindow {
 /// its detached progeny (#1361 step 4, #1440, #1501). The tree-walker's freeze captures the child and
 /// `Vcpu` leaves the capture to its embedder, but the in-process drivers' freeze cannot, so there a
 /// durable domain's detached spawn refuses (#1893).
+///
+/// `own`: the spawning domain's unit in the run's source — what its registered self module compiled
+/// to — for a driver that tracks it (the debugger, #2076). A child of the spawner's own program runs
+/// that unit; `None` compiles the program again, as any granted module is.
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     freezes_detached: bool,
+    own: Option<(u32, std::sync::Arc<Compiled>)>,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
     // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
     // other value fails closed, checked first as the tree-walker's op-15 arm does.
@@ -1756,8 +1761,19 @@ fn admit_detached_child(
             g.durable,
         )
     };
-    let compiled = compile_module(&cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?;
-    let sig = compiled.sigs.get(s.entry as usize);
+    // A child of the spawner's own program runs the spawning domain's unit, `own`, when the driver
+    // names it, as a same-module confined child does (#1726): no second compile, and the child's
+    // code keeps the identity the debugger keys breakpoints and §6 debug info on (#2076).
+    let program = match own {
+        Some((m, p)) if host.is_self_module(s.module) => ChildProgram::Spawner(m, p),
+        _ => {
+            ChildProgram::Granted(compile_module(&cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?)
+        }
+    };
+    let sig = match &program {
+        ChildProgram::Spawner(_, p) => p.sigs.get(s.entry as usize),
+        ChildProgram::Granted(c) => c.sigs.get(s.entry as usize),
+    };
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
@@ -1840,7 +1856,7 @@ fn admit_detached_child(
     let child = AdmittedChild {
         mem: None,
         host: child_host,
-        program: ChildProgram::Granted(compiled),
+        program,
         args,
         fuel,
         lease: Some((s.budget, child_size)),
@@ -1860,8 +1876,9 @@ fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
+    own: Option<(u32, std::sync::Arc<Compiled>)>,
 ) -> Result<Option<AdmittedChild>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, s, false)? else {
+    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, own)? else {
         return Ok(None);
     };
     child.mem = Some(window.build(None, &mut child.host)?);
@@ -4837,12 +4854,14 @@ impl<'p> Vcpu<'p> {
                             self.mem.as_ref(),
                             spawn,
                             true,
+                            None,
                         ),
                         None => admit_detached_child(
                             &mut self.host,
                             self.mem.as_ref(),
                             spawn,
                             true,
+                            None,
                         ),
                     };
                     match admitted {
@@ -4998,10 +5017,14 @@ impl<'p> Vcpu<'p> {
         }
         let spawn = DetachedSpawn::of(&sr);
         let admitted = match self.shared_host {
-            Some(m) => {
-                admit_detached_child(&mut m.lock_unpoisoned(), self.mem.as_ref(), spawn, true)
-            }
-            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true),
+            Some(m) => admit_detached_child(
+                &mut m.lock_unpoisoned(),
+                self.mem.as_ref(),
+                spawn,
+                true,
+                None,
+            ),
+            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, None),
         }?;
         let Some((child, window)) = admitted else {
             return Ok(None);
@@ -5772,7 +5795,7 @@ fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> bool {
 /// #1866 — a detached child's env carries its own window image and powerbox instead, or nothing of
 /// either once it is `spent` ([`env_spent`]). `None` when a live one's powerbox holds a binding that
 /// is not a plain value ([`Host::child_powerbox`]).
-fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Option<EnvSnapshot> {
+fn env_snapshot(e: &DbgEnv, spent: bool) -> Option<EnvSnapshot> {
     let detached = match e.place {
         EnvPlace::Carve => None,
         EnvPlace::Detached { spawner } => Some(DetachedEnv {
@@ -5796,7 +5819,7 @@ fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Option<EnvSnapshot> {
             .mem
             .as_ref()
             .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
-        module,
+        module: e.program as usize,
         host: e.host.replay_substate(),
         fuel: e.fuel.can_burn(),
         prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
@@ -5829,6 +5852,7 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
         mem,
         host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
+        program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: es.fibers.clone(),
         place: EnvPlace::Carve,
@@ -5855,6 +5879,7 @@ fn rebuild_detached_env(
             mem: None,
             host,
             table,
+            program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
             fibers: Vec::new(),
             place,
@@ -5875,6 +5900,7 @@ fn rebuild_detached_env(
         mem: Some(mem),
         host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
+        program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: es.fibers.clone(),
         place,
@@ -6101,7 +6127,7 @@ pub fn build_pagestate_table(info: &MemMapInfo, backed: u64) -> (Vec<u8>, u64) {
 
 /// Decode + report the op the active continuation is about to execute to `sink` (module-0 ops
 /// only, like the watchpoint scan; coroutine-child ops over their own confined windows are out of
-/// scope). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
+/// scope, and the callers skip a task in a child's window, #2076). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
 /// and address semantics are the instrumentation pass's, pinned by the `access_sink_diff`
 /// differential.
 fn emit_access(
@@ -6144,7 +6170,9 @@ fn emit_access(
 /// backward can undo it instead of replaying to it. Mirrors [`emit_access`]'s decode — module-0 ops
 /// only — and takes its spans from [`watch_accesses`](super::watch_accesses), the same per-op analysis
 /// the watchpoint check runs, so bulk `mem.copy`/`mem.fill` and v128 stores are covered on the one
-/// definition and no store path is touched. Inert while the journal is disarmed.
+/// definition and no store path is touched. Inert while the journal is disarmed, and for `mem: None`:
+/// a caller passes the root window only for a task that writes it, since a child of the root's own
+/// program runs module 0 in its own window (#2076), which each anchor carries whole (#2058).
 fn journal_op(
     journal: &mut super::journal::Journal,
     vm: &Vm,
@@ -6242,13 +6270,7 @@ fn journal_state(
     let Some(extra) = extra_envs
         .iter()
         .enumerate()
-        .map(|(k, e)| {
-            let module = tasks
-                .iter()
-                .find(|t| t.env == Some(k))
-                .map_or(0, |t| t.vt.active.module);
-            env_snapshot(e, module, env_spent(tasks, extra_envs, k))
-        })
+        .map(|(k, e)| env_snapshot(e, env_spent(tasks, extra_envs, k)))
         .collect::<Option<Vec<_>>>()
     else {
         return;
@@ -6573,10 +6595,12 @@ enum WriteTarget {
 /// A **debugger write scheduled at a clock/turn** (INTERACTIVE_EMBEDDING.md slice 8): re-applied
 /// whenever execution passes that clock on **any** path — a live resume and a seek replay reach
 /// identical states, which is what keeps the history slider truthful after an edit. `task` names
-/// the focused vCPU a `Var` write resolves in on the scheduled engine (ignored single-vCPU).
+/// the vCPU focused when the write was made: the write lands in that task's window, and a `Var`
+/// write resolves in its frame (#2072).
 #[derive(Clone, Debug)]
 pub enum ScheduledWrite {
     Window {
+        task: usize,
         addr: u64,
         bytes: Vec<u8>,
     },
@@ -6610,14 +6634,43 @@ fn journaled_write(
     m.write_bytes(addr, bytes).is_some()
 }
 
-/// Coerce + store `value` into the typed regs slot / window target. Best-effort like the live
-/// write: an unresolvable or float target is skipped.
+/// Write a debugger edit into the window of a task in `env`, the one a read of that task sees
+/// ([`ScheduledDebugRun::task_mem`]): the root's (`None`), journaled, or a child env's (#2072). A
+/// child's edit is not journaled, since the journal's pre-images cover the root window only. Each
+/// anchor carries a live detached child's whole window (#2058), so an undo restores it from there and
+/// the replay re-applies the edit at its turn. (A carve's bytes are the root's, which the journal
+/// records for no child — #2064, retiring with the carve.)
+fn write_task_window(
+    journal: &mut super::journal::Journal,
+    turn: u64,
+    mem: &mut Option<Mem>,
+    envs: &mut [DbgEnv],
+    env: Option<usize>,
+    addr: u64,
+    bytes: &[u8],
+) -> bool {
+    match env {
+        None => mem
+            .as_mut()
+            .is_some_and(|m| journaled_write(journal, turn, m, addr, bytes)),
+        Some(k) => envs[k]
+            .mem
+            .as_mut()
+            .is_some_and(|m| m.write_bytes(addr, bytes).is_some()),
+    }
+}
+
+/// Coerce + store `value` into the typed regs slot / window target of a task in `env`. Best-effort
+/// like the live write: an unresolvable or float target is skipped.
+#[allow(clippy::too_many_arguments)]
 fn apply_target(
     target: Option<WriteTarget>,
     value: i64,
     width: usize,
     vm_regs: &mut [Reg],
     mem: &mut Option<Mem>,
+    envs: &mut [DbgEnv],
+    env: Option<usize>,
     journal: &mut super::journal::Journal,
     turn: u64,
 ) {
@@ -6634,17 +6687,23 @@ fn apply_target(
         }
         Some(WriteTarget::Win { addr }) => {
             let w = width.clamp(1, 8);
-            if let Some(m) = mem.as_mut() {
-                journaled_write(journal, turn, m, addr, &value.to_le_bytes()[..w]);
-            }
+            write_task_window(
+                journal,
+                turn,
+                mem,
+                envs,
+                env,
+                addr,
+                &value.to_le_bytes()[..w],
+            );
         }
         None => {}
     }
 }
 
-/// Apply every scheduled write due at `turn` to the run's pieces (a `Var` write resolves in its
-/// recorded `task`'s frame); `cursor` advances past applied and stale entries (entries below `turn`
-/// are inside a restored checkpoint already).
+/// Apply every scheduled write due at `turn` to the run's pieces: each lands in its recorded `task`'s
+/// window, and a `Var` write resolves in that task's frame; `cursor` advances past applied and stale
+/// entries (entries below `turn` are inside a restored checkpoint already).
 #[allow(clippy::too_many_arguments)]
 fn apply_due_writes(
     writes: &[(u64, ScheduledWrite)],
@@ -6653,6 +6712,7 @@ fn apply_due_writes(
     tasks: &mut [DbgTask],
     source: &ModuleSource,
     mem: &mut Option<Mem>,
+    envs: &mut [DbgEnv],
     debug: Option<&DebugInfo>,
     fn_block_base: &[Vec<u32>],
     fn_block_types: &[Vec<Vec<ValType>>],
@@ -6663,9 +6723,9 @@ fn apply_due_writes(
     }
     while *cursor < writes.len() && writes[*cursor].0 == turn {
         match &writes[*cursor].1 {
-            ScheduledWrite::Window { addr, bytes } => {
-                if let Some(m) = mem.as_mut() {
-                    journaled_write(journal, turn, m, *addr, bytes);
+            ScheduledWrite::Window { task, addr, bytes } => {
+                if let Some(t) = tasks.get(*task) {
+                    write_task_window(journal, turn, mem, envs, t.env, *addr, bytes);
                 }
             }
             ScheduledWrite::Var {
@@ -6680,7 +6740,10 @@ fn apply_due_writes(
                         let target = FrameReader {
                             vm: &t.vt.active,
                             source,
-                            mem: &*mem,
+                            mem: match t.env {
+                                None => &*mem,
+                                Some(k) => &envs[k].mem,
+                            },
                             debug,
                             fn_block_base,
                             fn_block_types,
@@ -6694,6 +6757,8 @@ fn apply_due_writes(
                             *width,
                             &mut t.vt.active.regs,
                             mem,
+                            envs,
+                            t.env,
                             journal,
                             turn,
                         );
@@ -7058,6 +7123,9 @@ struct DbgEnv {
     mem: Option<Mem>,
     host: Host,
     table: SharedSlots,
+    /// The unit of the run's source the domain runs (the root's is module 0): a child of its own
+    /// program runs it too (#2076), and a checkpoint rebuilds the env's table over it.
+    program: u32,
     /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
     fuel: Fuel,
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
@@ -7178,9 +7246,10 @@ pub type ScheduledSnapshot = super::moment::Moment;
 struct EnvSnapshot {
     win_base: u64,
     size_log2: u8,
-    /// The child's module in the shared source (`0` = same-module `instantiate`; `>= 1` = a
-    /// **separate-module** `instantiate_module` child, whose pushed unit is captured in the run
-    /// snapshot's `extra_units`). Its natural dispatch table is rebuilt over this index.
+    /// The unit the child's domain runs ([`DbgEnv::program`]): `0` for a child of the root's own
+    /// program (a same-module `instantiate`, or a detached child of it, #2076); `>= 1` for a
+    /// **separate** module's, whose pushed unit is captured in the run snapshot's `extra_units`. Its
+    /// natural dispatch table is rebuilt over this index.
     module: usize,
     host: super::HostReplaySubstate,
     fuel: u64,
@@ -7937,6 +8006,7 @@ fn dbg_start_child(
         mem,
         host,
         table,
+        program: module,
         // The debugger runs every task on a fixed allowance: a detached child gets what its chain
         // lets it burn at the spawn, where an executor's child draws from the chain as it goes
         // (#1944 slice 3).
@@ -7974,6 +8044,9 @@ fn dbg_instantiate_detached(
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
+    // The spawner's own unit, which a child of its own program runs (#2076).
+    let program = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
+    let own = source.get(program as usize).map(|p| (program, p));
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
         None => (shared_mem.as_ref(), host),
@@ -7982,7 +8055,7 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, spawn)? else {
+    let Some(child) = admit_detached_in_process(owner, pm, spawn, own)? else {
         tasks[ti]
             .vt
             .active
@@ -8778,6 +8851,7 @@ impl ScheduledDebugRun {
         let Self {
             source,
             mem,
+            extra_envs,
             tasks,
             turn,
             fn_block_base,
@@ -8795,6 +8869,7 @@ impl ScheduledDebugRun {
             tasks,
             source,
             mem,
+            extra_envs,
             debug.as_ref(),
             fn_block_base,
             fn_block_types,
@@ -8802,8 +8877,8 @@ impl ScheduledDebugRun {
         );
     }
 
-    /// The focused task index (the one a `write_var` resolves in) — the backend records it on a
-    /// scheduled `Var` write so replays resolve in the same task.
+    /// The focused task index (the one a `write_window` lands in and a `write_var` resolves in) — the
+    /// backend records it on a scheduled write so replays land in the same task's window (#2072).
     pub fn focus_task(&self) -> usize {
         self.focus
     }
@@ -9008,17 +9083,15 @@ impl ScheduledDebugRun {
             if !tasks[ti].at_bp {
                 let hit = {
                     let cur_vm = tasks[ti].vt.debug_active();
-                    let cur_mem: &Option<Mem> = match tasks[ti].env {
-                        None => &*mem,
-                        Some(k) => &extra_envs[k].mem,
-                    };
                     match cur_vm.cur_ir_pc(source) {
                         Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
                         // A window-range watch (cross-thread) stops *before* the access; a value
                         // watch (#1229) stops when a watched SSA-held variable's value changed.
-                        Some(pc) => watch_stop_before(
+                        // Both name the root's window, which a task in a child's window does not
+                        // run in, though a child of the root's own program runs module 0 (#2076).
+                        Some(pc) if tasks[ti].env.is_none() => watch_stop_before(
                             cur_vm,
-                            cur_mem,
+                            &*mem,
                             funcs,
                             fn_block_base,
                             watchpoints,
@@ -9026,7 +9099,7 @@ impl ScheduledDebugRun {
                             pc,
                         )
                         .map(|w| (pc, Some(w))),
-                        None => None,
+                        _ => None,
                     }
                 };
                 if let Some((pc, watch)) = hit {
@@ -9081,12 +9154,14 @@ impl ScheduledDebugRun {
                 tasks,
                 source,
                 mem,
+                extra_envs,
                 debug.as_ref(),
                 fn_block_base,
                 fn_block_types,
                 journal,
             );
-            if let Some(sink) = access_sink.as_mut() {
+            // The sink observes the root's window only (#2076), as the journal below does.
+            if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
                 let cur_vm = tasks[ti].vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
@@ -9099,7 +9174,7 @@ impl ScheduledDebugRun {
                 funcs,
                 fn_block_base,
                 *turn,
-                mem,
+                if tasks[ti].env.is_none() { mem } else { &None },
             );
             journal_state(
                 journal,
@@ -9301,12 +9376,13 @@ impl ScheduledDebugRun {
             tasks,
             source,
             mem,
+            extra_envs,
             debug.as_ref(),
             fn_block_base,
             fn_block_types,
             journal,
         );
-        if let Some(sink) = access_sink.as_mut() {
+        if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
             let cur_vm = tasks[ti].vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
         }
@@ -9319,7 +9395,7 @@ impl ScheduledDebugRun {
             funcs,
             fn_block_base,
             *turn,
-            mem,
+            if tasks[ti].env.is_none() { mem } else { &None },
         );
         journal_state(
             journal,
@@ -9572,20 +9648,11 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             fibers: self.fibers.clone(),
-            // Each child env's module = the module its owning task runs (`0` = same-module `instantiate`;
-            // `>= 1` = a separate-module `instantiate_module` child), so its table rebuilds correctly.
             extra_envs: self
                 .extra_envs
                 .iter()
                 .enumerate()
-                .map(|(k, e)| {
-                    let module = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.env == Some(k))
-                        .map_or(0, |t| t.vt.active.module);
-                    env_snapshot(e, module, env_spent(&self.tasks, &self.extra_envs, k))
-                })
+                .map(|(k, e)| env_snapshot(e, env_spent(&self.tasks, &self.extra_envs, k)))
                 .collect::<Option<_>>()?,
             extra_units: self.source.extra_units(),
             budgets: self.host.budget_tree(),
@@ -9834,13 +9901,20 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// **Write bytes into the shared guest window** (slice 8, the DAP `writeMemory` backend). `false`
-    /// if the range is unmapped or the module has no memory.
+    /// **Write bytes into the focused thread's guest window** (slice 8, the DAP `writeMemory`
+    /// backend): the window [`read_window`](Self::read_window) reads, a child's own when a child is
+    /// focused (#2072). `false` if the range is unmapped or the module has no memory.
     pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
-        let turn = self.turn;
-        self.mem
-            .as_mut()
-            .is_some_and(|m| journaled_write(&mut self.journal, turn, m, addr, bytes))
+        let env = self.tasks[self.focus].env;
+        write_task_window(
+            &mut self.journal,
+            self.turn,
+            &mut self.mem,
+            &mut self.extra_envs,
+            env,
+            addr,
+            bytes,
+        )
     }
 
     /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's
@@ -15304,7 +15378,7 @@ impl CoopSched {
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
                     let admitted = task_host(host, extra_envs, tasks[ti].env)
-                        .with(|h| admit_detached_in_process(h, pm, spawn));
+                        .with(|h| admit_detached_in_process(h, pm, spawn, None));
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
@@ -17789,8 +17863,12 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // powerbox) on this driver, then `run_vcpu_parallel` over the child's `Mem` exactly as a
             // confined child, its result published to the parent's `reg` for `join`.
             Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
-                let admitted =
-                    admit_detached_in_process(&mut host.lock_unpoisoned(), mem.as_ref(), spawn);
+                let admitted = admit_detached_in_process(
+                    &mut host.lock_unpoisoned(),
+                    mem.as_ref(),
+                    spawn,
+                    None,
+                );
                 let child = match admitted {
                     Ok(Some(c)) => c,
                     Ok(None) => {
