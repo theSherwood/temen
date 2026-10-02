@@ -635,3 +635,149 @@ fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
         "and of the interpreter's"
     );
 }
+
+/// #2051 — a bytecode **reactor** (the browser save-state's engine): func 0 `(AddressSpace)` mints a
+/// region, maps it at 128 KiB and again at 192 KiB, stores `1111` through the first, and returns the
+/// handle; func 1 `(region)` maps a region it is handed at 128 KiB; func 2 (`tick`) stores `3333`
+/// through the first mapping and returns `first + 2·second` read back through the second — `1111 +
+/// 2·3333` only while both mappings alias one region holding the bytes stored before.
+const REACTOR_SRC: &str = "memory 18
+func (i32) -> (i32) {
+block 0 (vas: i32) {
+  vlen = i64.const 65536
+  vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vr = i32.wrap_i64 vrh
+  va = i64.const 131072
+  vb = i64.const 196608
+  vz = i64.const 0
+  vprot = i64.const 3
+  vm1 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (va, vz, vlen, vprot)
+  vm2 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (vb, vz, vlen, vprot)
+  vp = i64.const 131080
+  vone = i64.const 1111
+  i64.store vp vone
+  return vr
+  }
+}
+func (i32) -> (i64) {
+block 0 (vr: i32) {
+  va = i64.const 131072
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (va, vz, vlen, vprot)
+  return vm
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vp = i64.const 131096
+  vt = i64.const 3333
+  i64.store vp vt
+  vq = i64.const 196616
+  vx = i64.load vq
+  vw = i64.const 196632
+  vy = i64.load vw
+  vy2 = i64.add vy vy
+  vs = i64.add vx vy2
+  return vs
+  }
+}
+";
+const REACTOR_WANT: i64 = 1111 + 2 * 3333;
+
+/// `func(args)` on a live reactor.
+fn tick(
+    r: &mut temen_interp::bytecode::Reactor,
+    host: &mut Host,
+    func: u32,
+    args: &[Value],
+) -> Value {
+    let mut fuel = 1_000_000u64;
+    let out = r.call(func, args, &mut fuel, host).expect("reactor call");
+    out[0]
+}
+
+/// **#2051 — a bytecode reactor's save-state carries the region its window aliases.** The reactor's
+/// live window is no holder of its own, so the region rides the freeze its frame boundary takes; the
+/// artifact carries its bytes once; the thawed reactor's window re-aliases the rebuilt region at both
+/// offsets, reads the bytes stored before the freeze, and shares what it stores after; a thawed
+/// reactor re-freezes byte-identical. A moment, which carries no region bytes, still refuses.
+#[test]
+fn a_bytecode_reactor_save_state_carries_its_region() {
+    use temen_interp::{bytecode::Reactor, moment::ReactorMoment};
+    let m = temen_text::parse_module(REACTOR_SRC).expect("parse");
+    let mut host = Host::new();
+    let asp = host.grant_address_space(0, WINDOW as u64);
+    let mut r = Reactor::open(&m).expect("open");
+    tick(&mut r, &mut host, 0, &[Value::I32(asp)]);
+    assert_eq!(
+        tick(&mut r, &mut host, 2, &[]),
+        Value::I64(REACTOR_WANT),
+        "live"
+    );
+
+    let layout = r.window_layout().expect("a window");
+    assert!(
+        layout.aliases_regions(),
+        "the mapped pages are captured as the region"
+    );
+    assert!(
+        ReactorMoment::capture(layout.clone(), &host).is_none(),
+        "a moment cannot carry the region's bytes"
+    );
+    let reserved = r.window_reserved_log2().expect("a window");
+    let artifact = freeze_layout(&m, &layout, reserved, &host).expect("rides");
+
+    let thawed = || {
+        let mut thost = Host::new();
+        let (rlayout, _) =
+            temen_snapshot::restore_layout(&artifact, &m, &mut thost).expect("restores");
+        let mut r2 = Reactor::open(&m).expect("open");
+        assert!(r2.restore_window(&rlayout, &thost), "re-aliases");
+        (r2, thost)
+    };
+    let (r2, thost) = thawed();
+    assert_eq!(
+        freeze_layout(&m, &r2.window_layout().expect("a window"), reserved, &thost)
+            .expect("re-freeze"),
+        artifact,
+        "canonical re-freeze byte-identical"
+    );
+    let (mut r2, mut thost) = thawed();
+    assert_eq!(
+        tick(&mut r2, &mut thost, 2, &[]),
+        Value::I64(REACTOR_WANT),
+        "both offsets alias the rebuilt region, which holds the bytes from before the freeze"
+    );
+}
+
+/// **#2051 — a live reactor's window does not hide a holder outside the cut.** A region the embedder
+/// also keeps still declines a reactor's freeze, naming the region.
+#[test]
+fn a_bytecode_reactor_region_the_embedder_holds_declines() {
+    use temen_interp::bytecode::Reactor;
+    let m = temen_text::parse_module(REACTOR_SRC).expect("parse");
+    let mut host = Host::new();
+    let (rh, kept) = region_kept_outside(&mut host);
+    let mut r = Reactor::open(&m).expect("open");
+    assert_eq!(
+        tick(&mut r, &mut host, 1, &[Value::I32(rh)]),
+        Value::I64(0),
+        "mapped"
+    );
+    let layout = r.window_layout().expect("a window");
+    let reserved = r.window_reserved_log2().expect("a window");
+    let refused = freeze_layout(&m, &layout, reserved, &host);
+    assert!(
+        matches!(
+            refused,
+            Err(FreezeError::RegionNotCaptured(RegionNotCaptured {
+                why: RegionRefusal::HolderOutsideCut,
+                ..
+            }))
+        ),
+        "the embedder still holds it: {refused:?}"
+    );
+    drop(kept);
+}

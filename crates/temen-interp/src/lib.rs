@@ -17,7 +17,7 @@ pub mod moment;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use temen_ir::{
@@ -20705,9 +20705,9 @@ pub struct DurableRegion {
 /// #2025 — the §13 regions a freeze's cut names, one per backing, in the order the cut first names
 /// them. `cut` is every domain of the cut, parents before children: its host and the region ids its
 /// handles and window pages name. R4's holder rule is cut-wide: every reference to a named backing
-/// must be a region entry of a host in `cut`. The run's windows are gone by the time a freeze
-/// serializes, so any other reference is a holder the cut does not carry — a domain outside it, or
-/// the embedder — and the region declines. So does a backing written from outside the VM.
+/// must be a region entry of a host in `cut`. A window holds none of its own (an interpreter
+/// window keeps a `Weak`, a JIT window maps the backing's OS handle), so any other reference is a
+/// holder the cut does not carry — a domain outside it, or the embedder — and the region declines. So does a backing written from outside the VM.
 pub fn capture_cut_regions(
     cut: &[(&Host, BTreeSet<u32>)],
 ) -> Result<Vec<DurableRegion>, RegionNotCaptured> {
@@ -31606,6 +31606,15 @@ impl MemLayout {
         )
     }
 
+    /// Whether a page of this layout aliases a §13 region (#2025): its bytes are the region's, which
+    /// the layout does not carry.
+    pub fn aliases_regions(&self) -> bool {
+        self.map
+            .prot
+            .values()
+            .any(|p| matches!(p, PageProt::Backed { .. }))
+    }
+
     /// A bare image under the region default — no page deviating from it: what a fresh run is seeded
     /// with.
     pub fn image(bytes: Vec<u8>) -> MemLayout {
@@ -31741,9 +31750,12 @@ struct AddrSpace {
     /// (`Unmapped`), and grown/re-committed tail (`Rw`) pages — anywhere in `[0, reserved)`.
     prot: BTreeMap<u64, PageProt>,
     /// §13 `SharedRegion` backings this window has aliased in, keyed by region id (the bytes a
-    /// [`PageProt::Backed`] page redirects to). A clone of the `Host`'s `Arc`, so two windows — or
-    /// two offsets in one window — that map the same region share the *same* bytes.
-    regions: BTreeMap<u32, RegionBacking>,
+    /// [`PageProt::Backed`] page redirects to). A `Weak` of the `Host`'s `Arc`, so two windows — or
+    /// two offsets in one window — that map the same region share the *same* bytes, and the host is
+    /// the region's only owner: a live window is no holder of its own, so a freeze at a reactor's
+    /// frame boundary counts holders as a freeze after a run does (#2051). A page whose region is
+    /// gone reads zero and drops its stores, as one naming no region always has.
+    regions: BTreeMap<u32, Weak<dyn SharedBacking>>,
 }
 
 impl Mem {
@@ -32781,7 +32793,7 @@ impl Mem {
                 let ident = space
                     .regions
                     .get(region)
-                    .map(|b| Arc::as_ptr(b) as *const u8 as u64)
+                    .map(|b| Weak::as_ptr(b) as *const u8 as u64)
                     .unwrap_or(*region as u64);
                 return FutexKey::Region(ident, region_off + rel % self.page);
             }
@@ -33212,6 +33224,7 @@ impl Mem {
             return space
                 .regions
                 .get(region)
+                .and_then(Weak::upgrade)
                 .map_or(0, |r| r.read_byte(*region_off + idx as u64));
         }
         self.back.byte(off)
@@ -33255,7 +33268,7 @@ impl Mem {
             .get(&(off.wrapping_sub(self.window.base()) / self.page))
         {
             // §13 aliased page: write through to the shared region backing.
-            if let Some(r) = space.regions.get(region) {
+            if let Some(r) = space.regions.get(region).and_then(Weak::upgrade) {
                 r.write_byte(*region_off + idx as u64, b);
             }
             return;
@@ -33450,8 +33463,8 @@ impl Mem {
         // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
         // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
         // PER BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy
-        // rather than millions of calls; `layout_snapshot_safe` excludes the region case anyway, so the
-        // per-byte arm is the unreachable-in-practice mirror of `byte`'s own slow path. Offset `0`, not
+        // rather than millions of calls; the per-byte arm is a window that aliased a region, which
+        // only a reactor's §12 save-state captures (#2051), reading through it. Offset `0`, not
         // `window.base()`, exactly as the per-byte arm's `self.byte(i)` indexes: this capture is
         // root-only (see the doc above), where the two agree.
         let bytes = if !self.has_regions.load(Ordering::Relaxed) {
@@ -33575,7 +33588,7 @@ impl Mem {
                 continue;
             }
             let n = (self.page as usize).min(snap - start);
-            if let Some(r) = space.regions.get(region) {
+            if let Some(r) = space.regions.get(region).and_then(Weak::upgrade) {
                 for k in 0..n {
                     out[start + k] = r.read_byte(*region_off + k as u64);
                 }
@@ -33805,7 +33818,7 @@ impl GuestMem for Mem {
         self.has_regions.store(true, Ordering::Relaxed);
         {
             let mut space = self.space_write();
-            space.regions.insert(region, backing);
+            space.regions.insert(region, Arc::downgrade(&backing));
             for (i, &page) in pages.iter().enumerate() {
                 space.prot.insert(
                     page,
@@ -35459,7 +35472,8 @@ mod prot_tests {
 
     // ---- §13 SharedRegion: host-backed memory aliased into the window ----
 
-    /// A §13 `SharedRegion` backing of `pages` whole host pages, zero-filled.
+    /// A §13 `SharedRegion` backing of `pages` whole host pages, zero-filled. A test keeps it alive
+    /// while the window aliases it, as the host does (a window holds only a `Weak`, #2051).
     fn region(pages: u64) -> RegionBacking {
         Arc::new(VecBacking(Mutex::new(vec![0u8; (pages * page()) as usize])))
     }
@@ -35475,7 +35489,10 @@ mod prot_tests {
             m.map_region(a, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
             0
         );
-        assert_eq!(m.map_region(b, 0, page(), PROT_READ | PROT_WRITE, 0, r), 0);
+        assert_eq!(
+            m.map_region(b, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
+            0
+        );
         let v = Value::I64(0x0123_4567_89ab_cdefu64 as i64);
         assert!(m.store(a, 0, StoreOp::I64, v).is_ok());
         assert_eq!(m.load(b, 0, LoadOp::I64), Ok(v), "A→B alias");
@@ -35497,7 +35514,14 @@ mod prot_tests {
         );
         // a second mapping of *region page 1* at window page 2.
         assert_eq!(
-            m.map_region(2 * page(), page(), page(), PROT_READ | PROT_WRITE, 0, r),
+            m.map_region(
+                2 * page(),
+                page(),
+                page(),
+                PROT_READ | PROT_WRITE,
+                0,
+                r.clone()
+            ),
             0
         );
         let v = Value::I64(0xdead_beef);
@@ -35514,7 +35538,7 @@ mod prot_tests {
             m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
             0
         );
-        assert_eq!(m.map_region(page(), 0, page(), PROT_READ, 0, r), 0); // RO alias of same region
+        assert_eq!(m.map_region(page(), 0, page(), PROT_READ, 0, r.clone()), 0); // RO alias of same region
         let v = Value::I64(0x5151_5151);
         assert!(m.store(0, 0, StoreOp::I64, v).is_ok());
         assert_eq!(

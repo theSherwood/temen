@@ -1276,7 +1276,12 @@ artifact are the interpreter's; a JIT thaw starts the window private and, once t
 and before the guest runs, re-aliases each `Backed` run onto the rebuilt region through the same
 `SharedRegion.map` path as the op-15 pre-map (`Host::apply_premap`), on a root's window and on a
 re-launched child's. A JIT thaw needs an OS-backed region factory (`temen_run::new_shared_region`),
-as a live JIT run does to map a region at all.
+as a live JIT run does to map a region at all. A bytecode reactor's save-state (#2051) carries them
+the same way: its window is still live at the frame boundary it freezes on, but an interpreter window
+holds only a `Weak` of each region it maps (the host is the one owner), so the holder rule counts it
+as it counts a finished run's; `Reactor::restore_window` re-aliases the thawed layout's `Backed`
+runs through the host. A reactor *moment* still refuses an aliased window: it carries no region
+bytes, so a rewind would show the region as it is at the restore, not as it was.
 
 *Optimization (not v1):* diff against the post-instantiation image (`Module::data`
 segments) instead of storing all committed pages. Correctness doesn't need it.

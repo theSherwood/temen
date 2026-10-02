@@ -108,7 +108,7 @@ fn a_dense_page_map_restores_into_the_reactor_window_in_its_own_page_unit() {
         "from_dense ⇄ dense_prots is exact"
     );
 
-    assert!(r.restore_window(&layout));
+    assert!(r.restore_window(&layout, &Host::new()));
     let back = r.window_layout().expect("capturable");
     assert_eq!(
         back.dense_prots(),

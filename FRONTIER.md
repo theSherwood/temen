@@ -51,7 +51,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *durability* 🔶 — a pipe the tree minted rides the cut (#1680); an embedder-fed pipe, or one with an end outside the cut, is the boundary, not yet carried
 
 **`SharedRegion`**
-- *durability* 🔶 — a region the cut wholly holds rides with its aliases, across detached children and on the native JIT too (#2025); one held outside the cut or host-file-backed is the boundary
+- *durability* 🔶 — a region the cut wholly holds rides with its aliases, across detached children, on the native JIT and in a bytecode reactor's save-state too (#2025, #2051); one held outside the cut or host-file-backed is the boundary
 - *debugger* 🔶 — map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by name in the bytecode lowering
 
 **`AddressSpace`**

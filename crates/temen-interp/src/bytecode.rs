@@ -3484,10 +3484,11 @@ impl Reactor {
         window_layout_of(self.mem.as_ref())
     }
 
-    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window. `false` for a
-    /// memory-less module (nothing to restore into).
-    pub fn restore_window(&mut self, layout: &MemLayout) -> bool {
-        restore_window_of(self.mem.as_mut(), layout)
+    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window, its §13 pages
+    /// aliased back onto the regions `host` holds (see [`restore_window_of`]). `false` for a
+    /// memory-less module (nothing to restore into), or a page naming no region of `host`.
+    pub fn restore_window(&mut self, layout: &MemLayout, host: &Host) -> bool {
+        restore_window_of(self.mem.as_mut(), layout, host)
     }
 
     /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
@@ -3496,14 +3497,13 @@ impl Reactor {
     }
 }
 
-/// Capture a reactor's window, or `None` when there is nothing faithfully capturable: a memory-less
-/// module, or a window that has aliased a §13 `SharedRegion` — an image cannot reproduce a live alias
-/// into shared backing, so the capture **refuses** rather than handing back a fiction that would
-/// restore as detached bytes (INVARIANTS #9c; the same `layout_snapshot_safe` gate the checkpoint
-/// ladder uses).
+/// Capture a reactor's window, or `None` for a memory-less module. A page that aliases a §13
+/// `SharedRegion` is captured as the region it names (#2051): a §12 save-state carries the region and
+/// re-aliases it, and a moment, which cannot, refuses such a layout ([`ReactorMoment::capture`]).
+///
+/// [`ReactorMoment::capture`]: crate::moment::Moment::capture
 fn window_layout_of(mem: Option<&Mem>) -> Option<MemLayout> {
-    let m = mem?;
-    m.layout_snapshot_safe().then(|| m.layout_snapshot())
+    Some(mem?.layout_snapshot())
 }
 
 /// A reactor window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
@@ -3514,12 +3514,15 @@ fn window_reserved_log2_of(mem: Option<&Mem>) -> Option<u8> {
     Some(reserved.trailing_zeros() as u8)
 }
 
-/// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]).
-fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout) -> bool {
+/// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]), each §13
+/// page aliased back onto the region of `host` it names — the thaw of a save-state, whose restore
+/// rebuilt the regions on `host` (#2051). `false` with no window, or for a page naming no region of
+/// `host`.
+fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout, host: &Host) -> bool {
     match mem {
         Some(m) => {
             m.restore_layout(layout);
-            true
+            host.realias_regions(m, &layout.dense_prots())
         }
         None => false,
     }
@@ -3689,10 +3692,11 @@ impl VcpuReactor {
     }
 
     /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window — the window
-    /// this reactor keeps across frames, so the next `frame` runs over the restored state. `false` for
-    /// a memory-less module (nothing to restore into).
-    pub fn restore_window(&mut self, layout: &MemLayout) -> bool {
-        restore_window_of(self.mem.as_mut(), layout)
+    /// this reactor keeps across frames, so the next `frame` runs over the restored state — its §13
+    /// pages aliased back onto the regions `host` holds. `false` for a memory-less module (nothing to
+    /// restore into), or a page naming no region of `host`.
+    pub fn restore_window(&mut self, layout: &MemLayout, host: &Host) -> bool {
+        restore_window_of(self.mem.as_mut(), layout, host)
     }
 
     /// This window's reservation as a log2 — see [`window_reserved_log2_of`].

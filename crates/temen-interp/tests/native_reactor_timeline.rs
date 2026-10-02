@@ -150,13 +150,10 @@ impl MomentReactor for NativeReactor {
             .push_back(((kind as i64) << 32) | (payload as i64 & 0xffff_ffff));
     }
     fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment::capture(
-            self.inst.window_layout()?,
-            &self.host,
-        ))
+        ReactorMoment::capture(self.inst.window_layout()?, &self.host)
     }
     fn restore(&mut self, m: &ReactorMoment) -> bool {
-        if !self.inst.restore_window(&m.layout()) {
+        if !self.inst.restore_window(&m.layout(), &self.host) {
             return false;
         }
         m.restore_host(&mut self.host);
