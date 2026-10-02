@@ -5457,7 +5457,7 @@ impl OnrampReactor {
             .map_err(|_| STATUS_UNSUPPORTED)?;
 
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
-        if !inst.restore_window(&layout) {
+        if !inst.restore_window(&layout, &host) {
             return Err(STATUS_UNSUPPORTED);
         }
         Ok(OnrampReactor {
@@ -5516,10 +5516,10 @@ impl OnrampReactor {
     /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
     /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
     pub fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment::capture(
+        ReactorMoment::capture(
             self.inst.window_layout()?,
             &self.host,
-        ))
+        )
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -5530,7 +5530,7 @@ impl OnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if !self.inst.restore_window(&moment.layout()) {
+        if !self.inst.restore_window(&moment.layout(), &self.host) {
             return false;
         }
         moment.restore_host(&mut self.host);
@@ -5703,10 +5703,10 @@ impl SharedOnrampReactor {
     /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
     /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
     pub fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment::capture(
+        ReactorMoment::capture(
             self.reactor.window_layout()?,
             &self.host.lock().unwrap(),
-        ))
+        )
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -5717,10 +5717,11 @@ impl SharedOnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if !self.reactor.restore_window(&moment.layout()) {
+        let mut host = self.host.lock().unwrap();
+        if !self.reactor.restore_window(&moment.layout(), &host) {
             return false;
         }
-        moment.restore_host(&mut self.host.lock().unwrap());
+        moment.restore_host(&mut host);
         true
     }
 }
@@ -6002,10 +6003,10 @@ impl JitOnrampReactor {
     /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
     /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
     pub fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment::capture(
+        ReactorMoment::capture(
             region_layout(&self.back)?,
             &self.host,
-        ))
+        )
     }
 
     /// Freeze this reactor into a §12 save-state artifact — the emitted tier's twin of
