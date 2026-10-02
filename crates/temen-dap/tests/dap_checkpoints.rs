@@ -802,3 +802,142 @@ fn scheduled_checkpoint_warm_seek_matches_cold_with_a_host_capability() {
     let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
     assert_eq!(warm_back, cold_back, "warm backward sweep ≡ cold");
 }
+
+/// #2026 — a guest that **creates, maps and writes a §13 region** mid-run. Phase one bumps a window
+/// counter at 16384 `n` times; then it mints a 64 KiB region through its `memory` capability (the
+/// handle arrives as the first argument), stores the handle at 16392, and maps the region at 128 KiB.
+/// Phase two adds 3 to a counter at 131080 — in the region — `n` times. Last it mints a second
+/// region, stores that handle at 16400, and returns the region counter.
+///
+/// So a checkpoint taken in phase two must carry the region's bytes, the handle naming it and the
+/// window's alias; and the second mint, re-run after a restore, must land on the handle a from-0 run
+/// gives it, which it does only if the restored table holds the first one where the run did.
+const REGION_LOOP: &str = "\
+memory 18
+func (i32, i64) -> (i64) {
+block 0 (vas: i32, vn: i64) {
+  br 1(vas, vn, vn)
+}
+block 1 (va1: i32, vn1: i64, vi1: i64) {
+  vz1 = i64.eqz vi1
+  br_if vz1 3(va1, vn1) 2(va1, vn1, vi1)
+}
+block 2 (va2: i32, vn2: i64, vi2: i64) {
+  vaddr2 = i64.const 16384
+  vc2 = i64.load vaddr2
+  vone2 = i64.const 1
+  vs2 = i64.add vc2 vone2
+  i64.store vaddr2 vs2
+  vm2 = i64.const -1
+  vnext2 = i64.add vi2 vm2
+  br 1(va2, vn2, vnext2)
+}
+block 3 (va3: i32, vn3: i64) {
+  vlen3 = i64.const 65536
+  vrh3 = call.cap 5 5 (i64) -> (i64) va3 (vlen3)
+  vh3 = i64.const 16392
+  i64.store vh3 vrh3
+  vr3 = i32.wrap_i64 vrh3
+  voff3 = i64.const 131072
+  vroff3 = i64.const 0
+  vprot3 = i64.const 3
+  vm3 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr3 (voff3, vroff3, vlen3, vprot3)
+  br 4(va3, vn3)
+}
+block 4 (va4: i32, vi4: i64) {
+  vz4 = i64.eqz vi4
+  br_if vz4 6(va4) 5(va4, vi4)
+}
+block 5 (va5: i32, vi5: i64) {
+  vaddr5 = i64.const 131080
+  vc5 = i64.load vaddr5
+  vthree5 = i64.const 3
+  vs5 = i64.add vc5 vthree5
+  i64.store vaddr5 vs5
+  vm5 = i64.const -1
+  vnext5 = i64.add vi5 vm5
+  br 4(va5, vnext5)
+}
+block 6 (va6: i32) {
+  vlen6 = i64.const 65536
+  vrh6 = call.cap 5 5 (i64) -> (i64) va6 (vlen6)
+  vh6 = i64.const 16400
+  i64.store vh6 vrh6
+  vaddr6 = i64.const 131080
+  vr6 = i64.load vaddr6
+  return vr6
+  }
+}";
+
+/// The `memory` capability's handle in the on-ramp powerbox: the fourth grant of the §3e prefix
+/// (slot 3, first generation).
+const MEMORY_HANDLE: i32 = (1 << 8) | 3;
+
+/// The clock, the stack, and every value [`REGION_LOOP`] keeps: the window counter, both region
+/// handles, and the region counter read through the alias.
+fn obs_region(b: &mut BytecodeBackend, t: u64) -> (u64, String, Vec<u8>) {
+    let (clock, stack, _) = obs(b, t);
+    let mut mem = b.read_window(16384, 24).unwrap_or_default();
+    mem.extend(b.read_window(131080, 8).unwrap_or_default());
+    (clock, stack, mem)
+}
+
+#[test]
+fn bytecode_checkpoint_warm_seek_matches_cold_with_a_region() {
+    let m = parse_module(REGION_LOOP).expect("parses");
+    let args = [Value::I32(MEMORY_HANDLE), Value::I64(400)];
+    let mk = || {
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            true, // the on-ramp powerbox: its `memory` capability mints the regions
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .expect("the bytecode engine accepts the region loop")
+    };
+
+    let end = 8100; // past the end: the run finishes at turn 8024
+    let probes: Vec<u64> = (0..=end).step_by(131).chain([end]).collect();
+    let cold: Vec<_> = probes
+        .iter()
+        .map(|&t| {
+            let mut b = mk();
+            obs_region(&mut b, t)
+        })
+        .collect();
+    // The run really maps the region and writes through it, and really mints the second one.
+    let last = &cold.last().expect("probes").2;
+    assert_eq!(
+        &last[24..],
+        &1200i64.to_le_bytes(),
+        "400 bumps of 3, through the alias"
+    );
+    assert_ne!(&last[8..16], &[0; 8], "the first region's handle");
+    assert_ne!(&last[16..24], &[0; 8], "the second region's handle");
+
+    let mut warm = mk();
+    warm.seek(end);
+    assert!(
+        warm.checkpoint_count() > 4,
+        "checkpoints are laid down past the mint and the map — before #2026 the ladder dropped \
+         itself the moment the guest minted a region",
+    );
+
+    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs_region(&mut warm, t)).collect();
+    assert_eq!(
+        warm_fwd, cold,
+        "warm (checkpoint-restored) seek ≡ cold (replay-from-0) at every forward probe",
+    );
+    let warm_back: Vec<_> = probes
+        .iter()
+        .rev()
+        .map(|&t| obs_region(&mut warm, t))
+        .collect();
+    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
+    assert_eq!(warm_back, cold_back, "warm backward sweep ≡ cold");
+}

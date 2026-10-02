@@ -6229,7 +6229,8 @@ fn journal_op(
 /// invertible in place: a host using the §3.6 serve queue or holding a capability with opaque declared
 /// state (`Host::journal_invertible`), a task stepping inside a §22 invoke (its transient `Vm` is not
 /// captured, the same exclusion `checkpointable` makes), an event-parked fiber (a non-deterministic
-/// wall-clock deadline), or a live detached child whose powerbox is not plain values (`env_snapshot`).
+/// wall-clock deadline), a live detached child whose powerbox is not plain values (`env_snapshot`), or
+/// a child holding a §13 region (its writes through its own aliases are not journaled, #2026).
 /// Those runs still time-travel by checkpoint-plus-replay, exactly as today.
 #[allow(clippy::too_many_arguments)]
 fn journal_state(
@@ -6239,6 +6240,7 @@ fn journal_state(
     fibers: &[FiberState],
     source: &ModuleSource,
     host: &Host,
+    mem: Option<&Mem>,
     clock: u64,
     turn: u64,
     policy: &super::journal::JournalPolicy,
@@ -6255,6 +6257,7 @@ fn journal_state(
         return;
     }
     let invertible = host.journal_invertible()
+        && extra_envs.iter().all(|e| e.host.region_count() == 0)
         && tasks.iter().all(|t| t.vt.active_invoke.is_none())
         && !fibers.iter().any(|f| {
             matches!(
@@ -6323,7 +6326,23 @@ fn journal_state(
             .filter_map(|e| e.detached.as_ref()?.live.as_ref())
             .map(|l| (l.image.bytes.len() / std::mem::size_of::<super::Reg>()) as u64)
             .sum::<u64>();
-    journal.record_state(turn, cont, host.journal_cursor(), turn + stride.max(slots));
+    journal.record_state(
+        turn,
+        cont,
+        host.journal_cursor(),
+        region_mark(host, mem),
+        turn + stride.max(slots),
+    );
+}
+
+/// #2026 — what an undo cannot take back of the run's §13 regions, compared rather than restored (as
+/// [`HostCursor::jit_mark`](crate::HostCursor) is): how many regions the root holds — a mint adds a
+/// backing and a handle — and its window's [`alias_version`](Mem::alias_version) — a `map` or
+/// `unmap` moves an alias, which the window pre-images do not record. A write through an alias needs
+/// neither: its pre-image is read and put back through the alias, on the region's bytes, in the turn
+/// order every task's writes are journaled in.
+fn region_mark(host: &Host, mem: Option<&Mem>) -> (usize, u64) {
+    (host.region_count(), mem.map_or(0, Mem::alias_version))
 }
 
 /// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
@@ -8711,13 +8730,14 @@ impl ScheduledDebugRun {
         // Undo only goes backward. A turn past the run's own position is not history, and the
         // nearest-at-or-before anchor lookup would otherwise happily answer with the last boundary.
         // Nor across a `Jit` compile (#2015): the unit and its handle stay, and the replay would
-        // compile again under a different handle.
+        // compile again under a different handle. Nor across a region mint or a moved alias (#2026,
+        // `region_mark`).
         turn < self.turn
             && self.journal.can_undo_to(turn)
-            && self
-                .journal
-                .state_at(turn)
-                .is_some_and(|st| st.cursor.jit_mark == self.host.jit_compile_mark())
+            && self.journal.state_at(turn).is_some_and(|st| {
+                st.cursor.jit_mark == self.host.jit_compile_mark()
+                    && st.region_mark == region_mark(&self.host, self.mem.as_ref())
+            })
     }
 
     /// Undo back to `turn`, putting the run where it stood **before** that turn's op ran: the window
@@ -9183,6 +9203,7 @@ impl ScheduledDebugRun {
                 fibers,
                 source,
                 host,
+                mem.as_ref(),
                 *clock,
                 *turn,
                 journal_policy,
@@ -9404,6 +9425,7 @@ impl ScheduledDebugRun {
             fibers,
             source,
             host,
+            mem.as_ref(),
             *clock,
             *turn,
             journal_policy,
@@ -9566,11 +9588,12 @@ impl ScheduledDebugRun {
     /// ever arise alongside an `instantiate` sibling (the bytecode engine rejects `coroutine + thread`).
     /// Both coroutines and children may be **demand**/self-page-mapping: each child's own page map is
     /// captured (`child_checkpointable`: `layout_snapshot_safe`, no §13 regions, within the parent's
-    /// prefix) and its bytes ride in the shared snapshot. Still excluded (→ replay-from-turn-0): a
-    /// region-aliased child, or one carved beyond the parent's captured prefix.
+    /// prefix) and its bytes ride in the shared snapshot. The root's §13 regions ride the moment
+    /// ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its window's aliases in its
+    /// page map. Still excluded (→ replay-from-turn-0): a child holding or aliasing a region, or one
+    /// carved beyond the parent's captured prefix.
     fn checkpointable(&self) -> bool {
         self.host.checkpoint_safe()
-            && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
             // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
             && self.tasks.iter().all(|t| t.vt.active_invoke.is_none())
             && !self
@@ -9590,16 +9613,19 @@ impl ScheduledDebugRun {
             // child's window is its own (#1866): its image rides its env's snapshot, so only a §13
             // region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
             // values, which the capture itself checks (`env_snapshot`).
+            // A child's host is rebuilt without regions, so one holding a region is out too.
             && self.extra_envs.iter().enumerate().all(|(k, e)| match e.place {
                 EnvPlace::Carve => {
                     e.host.checkpoint_safe()
                         && !e.host.has_jit_table()
+                        && e.host.region_count() == 0
                         && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
                 }
                 EnvPlace::Detached { .. } => {
                     env_spent(&self.tasks, &self.extra_envs, k)
                         || (e.host.checkpoint_safe()
                             && !e.host.has_jit_table()
+                            && e.host.region_count() == 0
                             && e.mem.as_ref().is_some_and(|m| m.layout_snapshot_safe()))
                 }
             })
@@ -9607,19 +9633,20 @@ impl ScheduledDebugRun {
 
     /// Snapshot the scheduled continuation at the current [`turn`](ScheduledDebugRun::op_turn) for the
     /// backend's checkpoint ladder — `None` outside the [`checkpointable`](ScheduledDebugRun::checkpointable)
-    /// subset. Captures each task's active `Vm` + join table + state, the shared window bytes, the host
-    /// replay substate, and both scheduler clocks; the transient `stopped`/`focus`/`last_watch` are
-    /// *not* captured — [`locate`](ScheduledDebugRun::locate) rederives them from the task states.
+    /// subset, or when a region the root holds cannot ride. Captures each task's active `Vm` + join
+    /// table + state, the shared window bytes, the host replay substate and regions, and both scheduler
+    /// clocks; the transient `stopped`/`focus`/`last_watch` are *not* captured —
+    /// [`locate`](ScheduledDebugRun::locate) rederives them from the task states.
     pub fn snapshot(&self) -> Option<ScheduledSnapshot> {
         if !self.checkpointable() {
             return None;
         }
         let continuation = self.build_continuation()?;
-        Some(super::moment::Moment::new(
+        super::moment::Moment::checkpoint(
             self.mem.as_ref().map(|m| m.layout_snapshot()),
             &self.host,
             super::moment::Continuation::Bytecode(continuation),
-        ))
+        )
     }
 
     /// The continuation half of a capture: every task's `Vm` + join table + state, the run-shared fiber
@@ -9672,11 +9699,16 @@ impl ScheduledDebugRun {
             .continuation()
             .as_bytecode()
             .expect("a scheduled seek ladder holds only Bytecode moments");
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
-            m.restore_layout(&layout);
-        }
         self.install_continuation(c, true);
         snap.restore_host(&mut self.host);
+        // Last: the window's §13 pages re-alias onto the regions the host half just rebuilt (#2026).
+        if let Some(layout) = snap.mem() {
+            let aliased = restore_window_of(self.mem.as_mut(), &layout, &self.host);
+            debug_assert!(
+                aliased,
+                "a checkpoint's aliases name the regions it carries"
+            );
+        }
         self.turn = turn;
         self.clock = c.clock;
         self.locate(); // stepping-ready: the stop state rederives from the restored task states

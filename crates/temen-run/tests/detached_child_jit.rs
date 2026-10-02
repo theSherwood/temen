@@ -1093,3 +1093,101 @@ fn a_childs_thread_joining_a_grandchild_gives_back_the_childs_lane_on_the_jit() 
     assert_eq!(interp, Ok(vec![Value::I64(105)]), "interpreter");
     assert_eq!(jit, JitOutcome::Returned(vec![105]), "the JIT");
 }
+
+/// A child that spins forever.
+const CHILD_SPINS: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  br 1()
+  }
+}
+"#;
+
+/// A child parked forever on a word of its own window nobody notifies.
+const CHILD_PARKS: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  va = i64.const 40000
+  ve = i32.const 0
+  vt = i64.const -1
+  vs = i32.atomic.wait va ve vt
+  br 1()
+  }
+}
+"#;
+
+/// A child whose thread is parked forever while its main joins the thread.
+const CHILD_THREAD_PARKS: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vr = thread.join vt
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+}
+block 1 () {
+  va = i64.const 40000
+  ve = i32.const 0
+  vt = i64.const -1
+  vs = i32.atomic.wait va ve vt
+  br 1()
+  }
+}
+"#;
+
+/// #2074 — `kill` (op 12) ends a detached child however it is occupied, on the JIT as on the
+/// interpreter: spinning, parked on a word of its own window, or with its thread parked while its main
+/// joins it. The parent sleeps 50 ms so the child is spinning or parked first, kills it, and `wait`s:
+/// each answers `THREAD_FAULT`. A kill that only flags a parked child leaves the `wait` hanging (or, on
+/// the interpreter with nothing else alive, ends the run as a deadlock), so neither stands in for it.
+#[test]
+fn kill_ends_a_detached_child_spinning_or_parked() {
+    let p = module(&parent_then(
+        "vsa = i64.const 20000\n  \
+         vse = i32.const 0\n  \
+         vst = i64.const 50000000\n  \
+         vsl = i32.atomic.wait vsa vse vst\n  \
+         vk = call.cap 6 12 (i32) -> (i32) v0 (vh)\n  \
+         vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
+         return vr",
+    ));
+    let fault = temen_ir::trap_code::THREAD_FAULT;
+    let children = [
+        ("spinning", CHILD_SPINS),
+        ("parked", CHILD_PARKS),
+        ("thread parked", CHILD_THREAD_PARKS),
+    ];
+    for (name, child) in children {
+        let (p, c) = (p.clone(), module(child));
+        assert_eq!(
+            within_a_minute(&format!("interpreter, {name}"), move || interp_result(
+                &p,
+                host(&c, 1 << 20)
+            )),
+            Ok(vec![Value::I64(fault)]),
+            "interpreter, {name}"
+        );
+    }
+    for (name, child) in children {
+        let (p, c) = (p.clone(), module(child));
+        assert_eq!(
+            within_a_minute(&format!("the JIT, {name}"), move || jit_outcome(
+                &p,
+                host(&c, 1 << 20)
+            )),
+            JitOutcome::Returned(vec![fault]),
+            "the JIT, {name}"
+        );
+    }
+}
