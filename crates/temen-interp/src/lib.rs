@@ -30151,8 +30151,13 @@ impl Host {
     /// ([`bytecode::child_entry_ok`]); its declared memory must fit `window_mapped`, the caller's
     /// **backed prefix** (the image-replace runs where the caller did, and pages past the backed prefix
     /// have no backing); and every inherited grant must be regrantable. Then the fresh powerbox is
-    /// built ([`Self::spawn_named_child`]) and the process state carried into it
+    /// built ([`Self::spawn_child_powerbox`]) and the process state carried into it
     /// ([`Self::exec_carry`]).
+    ///
+    /// The new image attests what the caller did (PROCESS.md §6): an exec replaces the image, not
+    /// the domain, so the placement and the ancestors' rights over it are the caller's. A
+    /// `posix_spawn` builds here in a fork copy of its caller's powerbox ([`Self::spawn_powerbox`]),
+    /// so its process attests what a fork twin does.
     ///
     /// The new image's starter caps span `window_reserved`, the caller's **whole window** — its
     /// reservation, the confinement bound its `GuestMem` reports ([`GuestMem::window_size`]). The
@@ -30198,7 +30203,7 @@ impl Host {
         }
         let child_size = 1u64 << win_log2;
         let (mut host, ci, ca) = self
-            .spawn_named_child(grants, window_reserved)
+            .spawn_child_powerbox(grants, window_reserved, self.attestation)
             .ok_or(EINVAL)?;
         // #1944 slice 3 — an exec replaces the image, not the domain: the new image's use is charged
         // to the node the old one's was, as a process keeps its cgroup across `execve`, so a child
