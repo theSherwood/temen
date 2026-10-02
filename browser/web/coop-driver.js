@@ -94,7 +94,10 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 //   The run's window is readable meanwhile through `temen_coop_read`.
 // - `trapDeclines` (default `true`): a trapped run throws ("declined to the interpreter"), for a host
 //   that then re-runs the program interpreted. `false` returns the trap status (3) instead, with the
-//   trap's name and fault address in the `temen_trap_*`/`temen_fault_addr` slots.
+//   trap's name and fault address in the `temen_trap_*`/`temen_fault_addr` slots. That is exact for a
+//   trap on the interpreter, but a trap in emitted code (`counts.leaves > 0`) is not named there: it
+//   reads as `Unreachable`, with no address. A host that shows the trap re-runs such a run
+//   interpreted to name it, as c_interpret does (replaying the cap answers the first run got).
 //
 // The driver closes the session before it returns; the run's value is `temen_run_value`, its files
 // `temen_coop_fs_image`.

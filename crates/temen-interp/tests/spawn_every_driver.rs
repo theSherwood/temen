@@ -12,7 +12,7 @@
 #[path = "support/drivers.rs"]
 mod drivers;
 
-use drivers::{agree_on_every_driver, Ran};
+use drivers::{agree_on, agree_on_every_driver, run_on, Driver, Ran, SCHEDULING};
 use temen_interp::{cap_id, Attestation, Host, StreamRole, Trap, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
@@ -1359,4 +1359,113 @@ fn wait_answers_how_a_detached_child_ended() {
         &op15_fuel_setup(&loops, PAYLOAD / 2),
         &trapped(Trap::ThreadFault),
     );
+}
+
+// ---- #2068: poll, detach and kill (Instantiator ops 9/10/12) on the bytecode engine ----
+
+/// A detached child that spins forever.
+const CHILD_SPINS: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  br 1()
+  }
+}
+";
+
+/// The tail of a parent that `kill`s the child it just spawned, then `wait`s:
+/// `kill * 1000 + wait`.
+const KILL_WAIT: &str = "\
+  k1 = call.cap 6 12 (i32) -> (i32) vinst (vch)
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  k2 = i64.extend_i32_s k1
+  k = i64.const 1000
+  s1 = i64.mul k2 k
+  s2 = i64.add s1 w1
+  return s2
+  }
+}
+";
+
+/// The tail of a parent that `wait`s, `poll`s, then `join`s: `(wait * 1000 + poll) * 1000 + value`.
+const WAIT_POLL_JOIN: &str = "\
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  p1 = call.cap 6 9 (i32) -> (i32) vinst (vch)
+  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  p2 = i64.extend_i32_s p1
+  k = i64.const 1000
+  s1 = i64.mul w1 k
+  s2 = i64.add s1 p2
+  s3 = i64.mul s2 k
+  s4 = i64.add s3 jr
+  return s4
+  }
+}
+";
+
+/// The tail of a parent that `wait`s, then `detach`es, then `join`s the spent handle.
+const WAIT_DETACH_JOIN: &str = "\
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  d1 = call.cap 6 10 (i32) -> (i32) vinst (vch)
+  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  return jr
+  }
+}
+";
+
+/// The tail of a parent that `wait`s, then `kill`s the child that has already ended, then `join`s.
+const WAIT_KILL_JOIN: &str = "\
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  k1 = call.cap 6 12 (i32) -> (i32) vinst (vch)
+  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  return jr
+  }
+}
+";
+
+/// #2068, #2074 — `poll`, `detach` and `kill` answer as the tree-walker's do on every driver that
+/// schedules its own children:
+/// - a kill ends a child that would spin forever, and `wait` answers `THREAD_FAULT` (a kill that
+///   did nothing would run the child into its node's fuel ceiling: `OUT_OF_FUEL`);
+/// - `poll` on a child that returned answers 1, and leaves it for its `join`;
+/// - `detach` spends the handle, so a `join` after it is a `ThreadFault`;
+/// - a kill of a child that has ended does nothing: its `join` still gets its value.
+///
+/// The `Vcpu`'s host runs its children, so it declines these modules rather than diverge.
+#[test]
+fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
+    use temen_ir::trap_code;
+    let spins = module(CHILD_SPINS);
+    let loops = module(CHILD_LOOPS);
+    // The spinning child's node holds 10M fuel, so a kill that did nothing fails in seconds, not
+    // at the run's ceiling; the kill reaches it long before.
+    let cases: [(&str, &str, &Module, i64, Ran); 4] = [
+        (
+            "kill, then wait",
+            KILL_WAIT,
+            &spins,
+            10_000_000,
+            ok(trap_code::THREAD_FAULT),
+        ),
+        ("wait, poll, join", WAIT_POLL_JOIN, &loops, -1, ok(1007)),
+        (
+            "wait, detach, join",
+            WAIT_DETACH_JOIN,
+            &loops,
+            -1,
+            trapped(Trap::ThreadFault),
+        ),
+        ("wait, kill, join", WAIT_KILL_JOIN, &loops, -1, ok(7)),
+    ];
+    for (what, tail, child, fuel, want) in cases {
+        let m = module(&op15_then(false, 0, tail));
+        let setup = op15_fuel_setup(child, fuel);
+        agree_on(&SCHEDULING, what, &m, &setup, &want);
+        assert!(
+            run_on(Driver::Vcpu, &m, &setup).is_none(),
+            "{what}: the Vcpu declines"
+        );
+    }
 }

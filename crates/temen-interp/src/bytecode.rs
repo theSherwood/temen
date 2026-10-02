@@ -155,6 +155,15 @@ impl Copies {
 /// A resolved branch edge: its arg copies plus the target op index (`pc`).
 type Edge = (Copies, u32);
 
+/// Which of the child lifecycle probes an [`Op::ChildCtl`] is (PROCESS.md S3, Instantiator ops
+/// 9/10/12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildCtl {
+    Poll,
+    Detach,
+    Kill,
+}
+
 /// One resolved operation. Operands and results are **frame-window-relative slot indices** (added
 /// to the activation's `base` at run time); branch targets are op indices (`pc`) within the same
 /// function. Edge copies are `(src_slot, dst_slot)` pairs applied on a taken branch.
@@ -427,6 +436,16 @@ enum Op {
         /// The `call.cap` result slot — receives `-EINVAL` on a refused exec (a successful exec never
         /// returns to this activation).
         dst: u32,
+    },
+    /// PROCESS.md S3 — `Instantiator.poll`/`detach`/`kill` (ops 9/10/12) on child `child`: how it
+    /// stands (0 running, 1 returned, 2 trapped), drop the join claim, or end it and its subtree
+    /// (#2074). The authority check runs in the op exec; the rest needs the driver's task set
+    /// ([`Outcome::ChildCtl`]).
+    ChildCtl {
+        handle: u32,
+        child: u32,
+        dst: u32,
+        ctl: ChildCtl,
     },
     /// §3.6 (I36 slice 2) — `Instantiator.child_offer` (op 14): mint a live-callee offer over a
     /// running child's impl-export into the wirer's table. The authority check (the Instantiator
@@ -923,6 +942,31 @@ mod frame_bound_tests {
         v.stack.push((0, 0, 0, 0, 0));
         assert_eq!(v.open_frame(regs + 2), Err(Trap::StackOverflow));
         assert_eq!(v.regs.len(), regs + 1, "nothing allocated");
+        // A tail call pushes no frame, so only the register file's bound applies (#2082).
+        assert_eq!(
+            v.grow_regs(regs + 2),
+            Ok(()),
+            "a tail call at the frame bound"
+        );
+        assert_eq!(v.grow_regs(MAX_REG_SLOTS + 1), Err(Trap::StackOverflow));
+        assert_eq!(v.regs.len(), regs + 2, "nothing allocated");
+    }
+
+    /// #2082 — the register file grows geometrically but stops at its ceiling: `Vec::resize` alone
+    /// would double past it, allocating up to twice the bound.
+    #[test]
+    fn the_register_file_grows_no_further_than_its_ceiling() {
+        assert_eq!(grown_capacity(100, 150, 1000), 200, "doubles");
+        assert_eq!(
+            grown_capacity(100, 300, 1000),
+            300,
+            "or takes what the window needs"
+        );
+        assert_eq!(
+            grown_capacity(600, 700, 1000),
+            1000,
+            "but stops at the ceiling, not 1200"
+        );
     }
 }
 
@@ -1186,16 +1230,15 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                 match inst {
                     // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
                     // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec,
-                    // op 18 = wait (all executor children,
+                    // op 18 = wait, ops 9/10/12 = poll/detach/kill (all executor children,
                     // scheduler-driven — the grant-carrying spawns re-grant caps but spawn the same
-                    // kind of confined task); everything else on INSTANTIATOR is the legacy coroutine
-                    // residue. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
+                    // kind of confined task); every other INSTANTIATOR op is a deleted one (#2069). Classifying the named spawns as `has_instantiate` (not `has_coro`) is
                     // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
                     // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 13 | 14 | 15 | 17 | 18,
+                        op: 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -1734,11 +1777,16 @@ impl FreshWindow {
 /// its detached progeny (#1361 step 4, #1440, #1501). The tree-walker's freeze captures the child and
 /// `Vcpu` leaves the capture to its embedder, but the in-process drivers' freeze cannot, so there a
 /// durable domain's detached spawn refuses (#1893).
+///
+/// `own`: the spawning domain's unit in the run's source — what its registered self module compiled
+/// to — for a driver that tracks it (the debugger, #2076). A child of the spawner's own program runs
+/// that unit; `None` compiles the program again, as any granted module is.
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     freezes_detached: bool,
+    own: Option<(u32, std::sync::Arc<Compiled>)>,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
     // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
     // other value fails closed, checked first as the tree-walker's op-15 arm does.
@@ -1757,8 +1805,19 @@ fn admit_detached_child(
             g.durable,
         )
     };
-    let compiled = compile_module(&cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?;
-    let sig = compiled.sigs.get(s.entry as usize);
+    // A child of the spawner's own program runs the spawning domain's unit, `own`, when the driver
+    // names it, as a same-module confined child does (#1726): no second compile, and the child's
+    // code keeps the identity the debugger keys breakpoints and §6 debug info on (#2076).
+    let program = match own {
+        Some((m, p)) if host.is_self_module(s.module) => ChildProgram::Spawner(m, p),
+        _ => {
+            ChildProgram::Granted(compile_module(&cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?)
+        }
+    };
+    let sig = match &program {
+        ChildProgram::Spawner(_, p) => p.sigs.get(s.entry as usize),
+        ChildProgram::Granted(c) => c.sigs.get(s.entry as usize),
+    };
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
@@ -1841,7 +1900,7 @@ fn admit_detached_child(
     let child = AdmittedChild {
         mem: None,
         host: child_host,
-        program: ChildProgram::Granted(compiled),
+        program,
         args,
         fuel,
         lease: Some((s.budget, child_size)),
@@ -1861,8 +1920,9 @@ fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
+    own: Option<(u32, std::sync::Arc<Compiled>)>,
 ) -> Result<Option<AdmittedChild>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, s, false)? else {
+    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, own)? else {
         return Ok(None);
     };
     child.mem = Some(window.build(None, &mut child.host)?);
@@ -2428,6 +2488,16 @@ fn compile_inst(
                 // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
                 // child's export. The mint needs the child's live env, so the op surfaces to the
                 // driver; the compile only marshals `(child, export)`.
+                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if !args.is_empty() => Op::ChildCtl {
+                    handle: g(*handle),
+                    child: g(args[0]),
+                    dst,
+                    ctl: match op {
+                        9 => ChildCtl::Poll,
+                        10 => ChildCtl::Detach,
+                        _ => ChildCtl::Kill,
+                    },
+                },
                 (cap_id::INSTANTIATOR, 14) if args.len() >= 2 => Op::ChildOffer {
                     handle: g(*handle),
                     child: g(args[0]),
@@ -3389,6 +3459,24 @@ impl VcpuProgram {
     /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
     /// cooperative oracle uses. `0` ⇒ natural size (no install room).
     pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
+        // `poll`/`detach`/`kill` (Instantiator ops 9/10/12) act on a child's run, which this
+        // engine's host drives (`VcpuEvent::Join` hands it the token), so it has nothing to answer
+        // or end them with: decline, and the host runs the module on an engine that can (#2068).
+        let child_ctl = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: super::cap_id::INSTANTIATOR,
+                        op: 9 | 10 | 12,
+                        ..
+                    }
+                )
+            })
+        });
+        if child_ctl {
+            return None;
+        }
         let c = compile_module_for(m)?;
         let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
@@ -4624,7 +4712,10 @@ impl<'p> Vcpu<'p> {
                 // `cooperative: false`, so it never arises here); fail closed like its neighbours.
                 | Ok(VcpuStop::BlockOnFiber { .. })
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
-                | Ok(VcpuStop::Preempted) => return VcpuEvent::Trapped(Trap::ThreadFault),
+                | Ok(VcpuStop::Preempted)
+                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns:
+                // `VcpuProgram::compile` declines a module that uses them, so none arrives here.
+                | Ok(VcpuStop::ChildCtl { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
                     let froze = durable
@@ -4838,12 +4929,14 @@ impl<'p> Vcpu<'p> {
                             self.mem.as_ref(),
                             spawn,
                             true,
+                            None,
                         ),
                         None => admit_detached_child(
                             &mut self.host,
                             self.mem.as_ref(),
                             spawn,
                             true,
+                            None,
                         ),
                     };
                     match admitted {
@@ -4999,10 +5092,14 @@ impl<'p> Vcpu<'p> {
         }
         let spawn = DetachedSpawn::of(&sr);
         let admitted = match self.shared_host {
-            Some(m) => {
-                admit_detached_child(&mut m.lock_unpoisoned(), self.mem.as_ref(), spawn, true)
-            }
-            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true),
+            Some(m) => admit_detached_child(
+                &mut m.lock_unpoisoned(),
+                self.mem.as_ref(),
+                spawn,
+                true,
+                None,
+            ),
+            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, None),
         }?;
         let Some((child, window)) = admitted else {
             return Ok(None);
@@ -5805,9 +5902,9 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
 /// in the shared window snapshot (the view shares the root backing region).
 ///
 /// #1866 — a detached child's env carries its own window image and powerbox instead, or nothing of
-/// either once it is `spent` ([`env_spent`]). `None` when a live one's powerbox holds a binding that
-/// is not a plain value ([`Host::child_powerbox`]).
-fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Result<EnvSnapshot, Refusal> {
+/// either once it is `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that
+/// is not a plain value ([`Host::child_powerbox`]), or it has no window.
+fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
     let detached = match e.place {
         EnvPlace::Carve => None,
         EnvPlace::Detached { spawner } => Some(DetachedEnv {
@@ -5831,7 +5928,7 @@ fn env_snapshot(e: &DbgEnv, module: usize, spent: bool) -> Result<EnvSnapshot, R
             .mem
             .as_ref()
             .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
-        module,
+        module: e.program as usize,
         host: e.host.replay_substate(),
         fuel: e.fuel.can_burn(),
         prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
@@ -5864,6 +5961,7 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
         mem,
         host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
+        program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: es.fibers.clone(),
         place: EnvPlace::Carve,
@@ -5890,6 +5988,7 @@ fn rebuild_detached_env(
             mem: None,
             host,
             table,
+            program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
             fibers: Vec::new(),
             place,
@@ -5910,6 +6009,7 @@ fn rebuild_detached_env(
         mem: Some(mem),
         host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
+        program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: es.fibers.clone(),
         place,
@@ -6136,7 +6236,7 @@ pub fn build_pagestate_table(info: &MemMapInfo, backed: u64) -> (Vec<u8>, u64) {
 
 /// Decode + report the op the active continuation is about to execute to `sink` (module-0 ops
 /// only, like the watchpoint scan; coroutine-child ops over their own confined windows are out of
-/// scope). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
+/// scope, and the callers skip a task in a child's window, #2076). The decode is the same live-SSA lookup as [`watch_hit_before`]; the event vocabulary
 /// and address semantics are the instrumentation pass's, pinned by the `access_sink_diff`
 /// differential.
 fn emit_access(
@@ -6179,7 +6279,9 @@ fn emit_access(
 /// backward can undo it instead of replaying to it. Mirrors [`emit_access`]'s decode — module-0 ops
 /// only — and takes its spans from [`watch_accesses`](super::watch_accesses), the same per-op analysis
 /// the watchpoint check runs, so bulk `mem.copy`/`mem.fill` and v128 stores are covered on the one
-/// definition and no store path is touched. Inert while the journal is disarmed.
+/// definition and no store path is touched. Inert while the journal is disarmed, and for `mem: None`:
+/// a caller passes the root window only for a task that writes it, since a child of the root's own
+/// program runs module 0 in its own window (#2076), which each anchor carries whole (#2058).
 fn journal_op(
     journal: &mut super::journal::Journal,
     vm: &Vm,
@@ -6273,13 +6375,7 @@ fn journal_state(
     let Ok(extra) = extra_envs
         .iter()
         .enumerate()
-        .map(|(k, e)| {
-            let module = tasks
-                .iter()
-                .find(|t| t.env == Some(k))
-                .map_or(0, |t| t.vt.active.module);
-            env_snapshot(e, module, env_spent(tasks, extra_envs, k))
-        })
+        .map(|(k, e)| env_snapshot(e, env_spent(tasks, extra_envs, k)))
         .collect::<Result<Vec<_>, _>>()
     else {
         return;
@@ -6620,10 +6716,12 @@ enum WriteTarget {
 /// A **debugger write scheduled at a clock/turn** (INTERACTIVE_EMBEDDING.md slice 8): re-applied
 /// whenever execution passes that clock on **any** path — a live resume and a seek replay reach
 /// identical states, which is what keeps the history slider truthful after an edit. `task` names
-/// the focused vCPU a `Var` write resolves in on the scheduled engine (ignored single-vCPU).
+/// the vCPU focused when the write was made: the write lands in that task's window, and a `Var`
+/// write resolves in its frame (#2072).
 #[derive(Clone, Debug)]
 pub enum ScheduledWrite {
     Window {
+        task: usize,
         addr: u64,
         bytes: Vec<u8>,
     },
@@ -6657,14 +6755,43 @@ fn journaled_write(
     m.write_bytes(addr, bytes).is_some()
 }
 
-/// Coerce + store `value` into the typed regs slot / window target. Best-effort like the live
-/// write: an unresolvable or float target is skipped.
+/// Write a debugger edit into the window of a task in `env`, the one a read of that task sees
+/// ([`ScheduledDebugRun::task_mem`]): the root's (`None`), journaled, or a child env's (#2072). A
+/// child's edit is not journaled, since the journal's pre-images cover the root window only. Each
+/// anchor carries a live detached child's whole window (#2058), so an undo restores it from there and
+/// the replay re-applies the edit at its turn. (A carve's bytes are the root's, which the journal
+/// records for no child — #2064, retiring with the carve.)
+fn write_task_window(
+    journal: &mut super::journal::Journal,
+    turn: u64,
+    mem: &mut Option<Mem>,
+    envs: &mut [DbgEnv],
+    env: Option<usize>,
+    addr: u64,
+    bytes: &[u8],
+) -> bool {
+    match env {
+        None => mem
+            .as_mut()
+            .is_some_and(|m| journaled_write(journal, turn, m, addr, bytes)),
+        Some(k) => envs[k]
+            .mem
+            .as_mut()
+            .is_some_and(|m| m.write_bytes(addr, bytes).is_some()),
+    }
+}
+
+/// Coerce + store `value` into the typed regs slot / window target of a task in `env`. Best-effort
+/// like the live write: an unresolvable or float target is skipped.
+#[allow(clippy::too_many_arguments)]
 fn apply_target(
     target: Option<WriteTarget>,
     value: i64,
     width: usize,
     vm_regs: &mut [Reg],
     mem: &mut Option<Mem>,
+    envs: &mut [DbgEnv],
+    env: Option<usize>,
     journal: &mut super::journal::Journal,
     turn: u64,
 ) {
@@ -6681,17 +6808,23 @@ fn apply_target(
         }
         Some(WriteTarget::Win { addr }) => {
             let w = width.clamp(1, 8);
-            if let Some(m) = mem.as_mut() {
-                journaled_write(journal, turn, m, addr, &value.to_le_bytes()[..w]);
-            }
+            write_task_window(
+                journal,
+                turn,
+                mem,
+                envs,
+                env,
+                addr,
+                &value.to_le_bytes()[..w],
+            );
         }
         None => {}
     }
 }
 
-/// Apply every scheduled write due at `turn` to the run's pieces (a `Var` write resolves in its
-/// recorded `task`'s frame); `cursor` advances past applied and stale entries (entries below `turn`
-/// are inside a restored checkpoint already).
+/// Apply every scheduled write due at `turn` to the run's pieces: each lands in its recorded `task`'s
+/// window, and a `Var` write resolves in that task's frame; `cursor` advances past applied and stale
+/// entries (entries below `turn` are inside a restored checkpoint already).
 #[allow(clippy::too_many_arguments)]
 fn apply_due_writes(
     writes: &[(u64, ScheduledWrite)],
@@ -6700,6 +6833,7 @@ fn apply_due_writes(
     tasks: &mut [DbgTask],
     source: &ModuleSource,
     mem: &mut Option<Mem>,
+    envs: &mut [DbgEnv],
     debug: Option<&DebugInfo>,
     fn_block_base: &[Vec<u32>],
     fn_block_types: &[Vec<Vec<ValType>>],
@@ -6710,9 +6844,9 @@ fn apply_due_writes(
     }
     while *cursor < writes.len() && writes[*cursor].0 == turn {
         match &writes[*cursor].1 {
-            ScheduledWrite::Window { addr, bytes } => {
-                if let Some(m) = mem.as_mut() {
-                    journaled_write(journal, turn, m, *addr, bytes);
+            ScheduledWrite::Window { task, addr, bytes } => {
+                if let Some(t) = tasks.get(*task) {
+                    write_task_window(journal, turn, mem, envs, t.env, *addr, bytes);
                 }
             }
             ScheduledWrite::Var {
@@ -6727,7 +6861,10 @@ fn apply_due_writes(
                         let target = FrameReader {
                             vm: &t.vt.active,
                             source,
-                            mem: &*mem,
+                            mem: match t.env {
+                                None => &*mem,
+                                Some(k) => &envs[k].mem,
+                            },
                             debug,
                             fn_block_base,
                             fn_block_types,
@@ -6741,6 +6878,8 @@ fn apply_due_writes(
                             *width,
                             &mut t.vt.active.regs,
                             mem,
+                            envs,
+                            t.env,
                             journal,
                             turn,
                         );
@@ -7105,6 +7244,9 @@ struct DbgEnv {
     mem: Option<Mem>,
     host: Host,
     table: SharedSlots,
+    /// The unit of the run's source the domain runs (the root's is module 0): a child of its own
+    /// program runs it too (#2076), and a checkpoint rebuilds the env's table over it.
+    program: u32,
     /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
     fuel: Fuel,
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
@@ -7221,9 +7363,10 @@ impl ScheduledContinuation {
 struct EnvSnapshot {
     win_base: u64,
     size_log2: u8,
-    /// The child's module in the shared source (`0` = same-module `instantiate`; `>= 1` = a
-    /// **separate-module** `instantiate_module` child, whose pushed unit is captured in the run
-    /// snapshot's `extra_units`). Its natural dispatch table is rebuilt over this index.
+    /// The unit the child's domain runs ([`DbgEnv::program`]): `0` for a child of the root's own
+    /// program (a same-module `instantiate`, or a detached child of it, #2076); `>= 1` for a
+    /// **separate** module's, whose pushed unit is captured in the run snapshot's `extra_units`. Its
+    /// natural dispatch table is rebuilt over this index.
     module: usize,
     host: super::HostReplaySubstate,
     fuel: u64,
@@ -7767,6 +7910,10 @@ fn service_advance(
                 *turn += 1;
                 dbg_join(tasks, ti, handle, dst, wait);
             }
+            Outcome::ChildCtl { child, dst, ctl } => {
+                *turn += 1;
+                dbg_child_ctl(tasks, extra_envs, ti, child, dst, ctl);
+            }
             Outcome::MemoryWait {
                 base,
                 expected,
@@ -7980,6 +8127,7 @@ fn dbg_start_child(
         mem,
         host,
         table,
+        program: module,
         // The debugger runs every task on a fixed allowance: a detached child gets what its chain
         // lets it burn at the spawn, where an executor's child draws from the chain as it goes
         // (#1944 slice 3).
@@ -8017,6 +8165,9 @@ fn dbg_instantiate_detached(
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
+    // The spawner's own unit, which a child of its own program runs (#2076).
+    let program = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
+    let own = source.get(program as usize).map(|p| (program, p));
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
         None => (shared_mem.as_ref(), host),
@@ -8025,7 +8176,7 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, spawn)? else {
+    let Some(child) = admit_detached_in_process(owner, pm, spawn, own)? else {
         tasks[ti]
             .vt
             .active
@@ -8075,6 +8226,65 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32, wait: bool)
                 dst,
                 wait,
             }
+        }
+    }
+}
+
+/// PROCESS.md S3 `poll`/`detach`/`kill` under the debug engine, as the cooperative driver's arm.
+fn dbg_child_ctl(
+    tasks: &mut [DbgTask],
+    envs: &[DbgEnv],
+    ti: usize,
+    child: i32,
+    dst: u32,
+    ctl: ChildCtl,
+) {
+    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
+        Ok(s) => s,
+        Err(t) => {
+            dbg_complete(tasks, ti, Err(t));
+            return;
+        }
+    };
+    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+    let answer = match ctl {
+        ChildCtl::Poll => match &tasks[c].state {
+            DbgTaskState::Done(Ok(_)) => 1,
+            DbgTaskState::Done(Err(_)) => 2,
+            _ => 0,
+        },
+        ChildCtl::Detach => {
+            tasks[ti].threads[slot] = None;
+            0
+        }
+        ChildCtl::Kill => {
+            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env) {
+                dbg_kill_env(tasks, envs, k);
+            }
+            0
+        }
+    };
+    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
+}
+
+/// `Instantiator.kill` (#2074) under the debug engine: [`coop_kill_env`]'s rule, descending through
+/// the detached children env `k` spawned. (A carve child's env records no spawner; the carve path
+/// is being deleted, #1867.)
+fn dbg_kill_env(tasks: &mut [DbgTask], envs: &[DbgEnv], k: usize) {
+    let live: Vec<usize> = (0..tasks.len())
+        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, DbgTaskState::Done(_)))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for i in live {
+        if !matches!(tasks[i].state, DbgTaskState::Done(_)) {
+            dbg_complete(tasks, i, Err(Trap::ThreadFault));
+        }
+    }
+    for j in 0..envs.len() {
+        if matches!(envs[j].place, EnvPlace::Detached { spawner: Some(s) } if s == k) {
+            dbg_kill_env(tasks, envs, j);
         }
     }
 }
@@ -8822,6 +9032,7 @@ impl ScheduledDebugRun {
         let Self {
             source,
             mem,
+            extra_envs,
             tasks,
             turn,
             fn_block_base,
@@ -8839,6 +9050,7 @@ impl ScheduledDebugRun {
             tasks,
             source,
             mem,
+            extra_envs,
             debug.as_ref(),
             fn_block_base,
             fn_block_types,
@@ -8846,8 +9058,8 @@ impl ScheduledDebugRun {
         );
     }
 
-    /// The focused task index (the one a `write_var` resolves in) — the backend records it on a
-    /// scheduled `Var` write so replays resolve in the same task.
+    /// The focused task index (the one a `write_window` lands in and a `write_var` resolves in) — the
+    /// backend records it on a scheduled write so replays land in the same task's window (#2072).
     pub fn focus_task(&self) -> usize {
         self.focus
     }
@@ -9052,17 +9264,15 @@ impl ScheduledDebugRun {
             if !tasks[ti].at_bp {
                 let hit = {
                     let cur_vm = tasks[ti].vt.debug_active();
-                    let cur_mem: &Option<Mem> = match tasks[ti].env {
-                        None => &*mem,
-                        Some(k) => &extra_envs[k].mem,
-                    };
                     match cur_vm.cur_ir_pc(source) {
                         Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
                         // A window-range watch (cross-thread) stops *before* the access; a value
                         // watch (#1229) stops when a watched SSA-held variable's value changed.
-                        Some(pc) => watch_stop_before(
+                        // Both name the root's window, which a task in a child's window does not
+                        // run in, though a child of the root's own program runs module 0 (#2076).
+                        Some(pc) if tasks[ti].env.is_none() => watch_stop_before(
                             cur_vm,
-                            cur_mem,
+                            &*mem,
                             funcs,
                             fn_block_base,
                             watchpoints,
@@ -9070,7 +9280,7 @@ impl ScheduledDebugRun {
                             pc,
                         )
                         .map(|w| (pc, Some(w))),
-                        None => None,
+                        _ => None,
                     }
                 };
                 if let Some((pc, watch)) = hit {
@@ -9125,12 +9335,14 @@ impl ScheduledDebugRun {
                 tasks,
                 source,
                 mem,
+                extra_envs,
                 debug.as_ref(),
                 fn_block_base,
                 fn_block_types,
                 journal,
             );
-            if let Some(sink) = access_sink.as_mut() {
+            // The sink observes the root's window only (#2076), as the journal below does.
+            if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
                 let cur_vm = tasks[ti].vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
@@ -9143,7 +9355,7 @@ impl ScheduledDebugRun {
                 funcs,
                 fn_block_base,
                 *turn,
-                mem,
+                if tasks[ti].env.is_none() { mem } else { &None },
             );
             journal_state(
                 journal,
@@ -9346,12 +9558,13 @@ impl ScheduledDebugRun {
             tasks,
             source,
             mem,
+            extra_envs,
             debug.as_ref(),
             fn_block_base,
             fn_block_types,
             journal,
         );
-        if let Some(sink) = access_sink.as_mut() {
+        if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
             let cur_vm = tasks[ti].vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
         }
@@ -9364,7 +9577,7 @@ impl ScheduledDebugRun {
             funcs,
             fn_block_base,
             *turn,
-            mem,
+            if tasks[ti].env.is_none() { mem } else { &None },
         );
         journal_state(
             journal,
@@ -9618,20 +9831,11 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             fibers: self.fibers.clone(),
-            // Each child env's module = the module its owning task runs (`0` = same-module `instantiate`;
-            // `>= 1` = a separate-module `instantiate_module` child), so its table rebuilds correctly.
             extra_envs: self
                 .extra_envs
                 .iter()
                 .enumerate()
-                .map(|(k, e)| {
-                    let module = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.env == Some(k))
-                        .map_or(0, |t| t.vt.active.module);
-                    env_snapshot(e, module, env_spent(&self.tasks, &self.extra_envs, k))
-                })
+                .map(|(k, e)| env_snapshot(e, env_spent(&self.tasks, &self.extra_envs, k)))
                 .collect::<Result<_, _>>()?,
             extra_units: self.source.extra_units(),
             budgets: self.host.budget_tree(),
@@ -9885,13 +10089,20 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// **Write bytes into the shared guest window** (slice 8, the DAP `writeMemory` backend). `false`
-    /// if the range is unmapped or the module has no memory.
+    /// **Write bytes into the focused thread's guest window** (slice 8, the DAP `writeMemory`
+    /// backend): the window [`read_window`](Self::read_window) reads, a child's own when a child is
+    /// focused (#2072). `false` if the range is unmapped or the module has no memory.
     pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
-        let turn = self.turn;
-        self.mem
-            .as_mut()
-            .is_some_and(|m| journaled_write(&mut self.journal, turn, m, addr, bytes))
+        let env = self.tasks[self.focus].env;
+        write_task_window(
+            &mut self.journal,
+            self.turn,
+            &mut self.mem,
+            &mut self.extra_envs,
+            env,
+            addr,
+            bytes,
+        )
     }
 
     /// Read `len` bytes from the focused thread's guest window at `addr`: the active coroutine child's
@@ -10048,6 +10259,7 @@ fn spawn_task(
         table,
         fuel: child_fuel,
         fibers: FiberTables::default(),
+        spawner: None,
     });
     tasks.push(TaskSlot {
         vt,
@@ -10534,6 +10746,13 @@ enum Outcome {
     /// domain until a caller's enqueue re-admits it. The cursor is persisted AT the op, so the
     /// wake re-executes the whole serve drain (the tree-walker's rewound park).
     SvcWait,
+    /// PROCESS.md S3 — `poll`/`detach`/`kill` on child `child` ([`Op::ChildCtl`]); driver-side, as
+    /// it owns the task set. The answer (`poll`'s status, else 0) lands at `dst`.
+    ChildCtl {
+        child: i32,
+        dst: u32,
+        ctl: ChildCtl,
+    },
     /// §3.6 (I36 slice 2) — `child_offer`: mint a live offer over child `child`'s export
     /// `export` (driver-side — it owns the child envs); the handle (or `-EINVAL`) lands at `dst`.
     ChildOffer {
@@ -11945,6 +12164,7 @@ fn drive_nested(
             Outcome::Instantiate { .. }
             | Outcome::InstantiateDetached { .. }
             | Outcome::ChildOffer { .. }
+            | Outcome::ChildCtl { .. }
                 if run_meta.is_none() =>
             {
                 return Err(Trap::CapFault)
@@ -11980,6 +12200,12 @@ enum VcpuStop {
     },
     /// §3.6 (I36 slice 2): park this task in `svc.wait` on its own domain ([`Outcome::SvcWait`]).
     SvcWait,
+    /// PROCESS.md S3: `poll`/`detach`/`kill` on child `child` ([`Outcome::ChildCtl`]).
+    ChildCtl {
+        child: i32,
+        dst: u32,
+        ctl: ChildCtl,
+    },
     /// §3.6 (I36 slice 2): mint a live offer over child `child`'s export ([`Outcome::ChildOffer`]).
     ChildOffer {
         child: i32,
@@ -12594,6 +12820,9 @@ fn step_vcpu(
                 })
             }
             Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
+            Outcome::ChildCtl { child, dst, ctl } => {
+                return Ok(VcpuStop::ChildCtl { child, dst, ctl })
+            }
             Outcome::ChildOffer { child, export, dst } => {
                 return Ok(VcpuStop::ChildOffer { child, export, dst })
             }
@@ -12765,6 +12994,33 @@ struct ChildEnv {
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
     /// per-domain [`ParDomain`] registry, here. The root domain's is [`CoopSched::fibers`].
     fibers: FiberTables,
+    /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
+    /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
+    spawner: Option<usize>,
+}
+
+/// `Instantiator.kill` (#2074), cooperative form: end every live task of env `k` with
+/// `ThreadFault`, wherever it is parked ([`complete`] overwrites any blocked state and wakes its
+/// joiners), then the child envs it spawned, as the tree-walker's kill ends a child and its subtree.
+/// An env with nothing left alive is left as it is, its children with it: killing a child that has
+/// ended does nothing.
+fn coop_kill_env(tasks: &mut [TaskSlot], envs: &[ChildEnv], k: usize) {
+    let live: Vec<usize> = (0..tasks.len())
+        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, TaskState::Done(_)))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for i in live {
+        if !matches!(tasks[i].state, TaskState::Done(_)) {
+            complete(tasks, i, Err(Trap::ThreadFault));
+        }
+    }
+    for j in 0..envs.len() {
+        if envs[j].spawner == Some(k) {
+            coop_kill_env(tasks, envs, j);
+        }
+    }
 }
 
 /// #1727 — the powerbox a task's own handles live in: its §14 [`ChildEnv`]'s, or the domain's for the
@@ -12821,6 +13077,7 @@ fn coop_start_child(
         table,
         fuel,
         fibers: FiberTables::default(),
+        spawner: tasks[ti].env,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
@@ -14806,6 +15063,7 @@ impl CoopSched {
                             table: twin_table,
                             fuel: extra_envs[ck].fuel.for_thread(),
                             fibers: FiberTables::default(),
+                            spawner: None,
                         });
                         let twin_ti = tasks.len();
                         tasks.push(TaskSlot {
@@ -14968,6 +15226,7 @@ impl CoopSched {
                                         table: built.table,
                                         fuel: fuel.for_thread(),
                                         fibers: FiberTables::default(),
+                                        spawner: None,
                                     });
                                     tasks[ti].env = Some(eidx);
                                     built.leaf
@@ -15160,6 +15419,7 @@ impl CoopSched {
                                 table: twin_table,
                                 fuel: twin_fuel,
                                 fibers: FiberTables::default(),
+                                spawner: None,
                             });
                             debug_assert_eq!(
                                 tasks.len(),
@@ -15355,7 +15615,7 @@ impl CoopSched {
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
                     let admitted = task_host(host, extra_envs, tasks[ti].env)
-                        .with(|h| admit_detached_in_process(h, pm, spawn));
+                        .with(|h| admit_detached_in_process(h, pm, spawn, None));
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
@@ -15383,6 +15643,41 @@ impl CoopSched {
                     if let Err(t) = started {
                         complete(tasks, ti, Err(t));
                     }
+                }
+                // PROCESS.md S3 — `poll`/`detach`/`kill`, as the tree-walker's op 9/10/12 arms: a
+                // forged or spent handle is a `ThreadFault`, like `join`'s.
+                Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
+                    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
+                        Ok(s) => s,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+                    let answer = match ctl {
+                        ChildCtl::Poll => match &tasks[c].state {
+                            TaskState::Done(Ok(_)) => 1,
+                            TaskState::Done(Err(_)) => 2,
+                            _ => 0,
+                        },
+                        // The result dies with its env; its window lease is refunded once it is
+                        // done (`refund_ended_windows`); its lane went back at admission.
+                        ChildCtl::Detach => {
+                            tasks[ti].threads[slot] = None;
+                            0
+                        }
+                        // A `thread.spawn` handle shares this task's env: nothing to kill, as on
+                        // the tree-walker (no `child_kill` entry).
+                        ChildCtl::Kill => {
+                            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env)
+                            {
+                                coop_kill_env(tasks, extra_envs, k);
+                            }
+                            0
+                        }
+                    };
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
                 }
                 Ok(VcpuStop::Join { handle, dst, wait }) => {
                     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
@@ -16804,7 +17099,13 @@ mod par_futex_tests {
 struct ParDomain {
     fibers: SharedFibers,
     dead: std::sync::Mutex<Option<Trap>>,
+    /// #2074 — the §14 children this domain's vCPUs spawned, by their id in its registry: the domain
+    /// each runs in and the registry its own vCPUs join through. A kill reaches them through it.
+    kids: std::sync::Mutex<std::collections::BTreeMap<u64, ParChild>>,
 }
+
+/// A §14 child of a [`ParDomain`]: its own domain, and the registry its vCPUs join through.
+type ParChild = (std::sync::Arc<ParDomain>, std::sync::Arc<ThreadRegistry>);
 
 impl ParDomain {
     /// This domain's trap, once a member has died.
@@ -16828,6 +17129,18 @@ impl ParDomain {
             reg.woken.notify_all();
         }
         reg.wake_fork_waiters();
+    }
+
+    /// `Instantiator.kill` (#2074): end this child domain, whose vCPUs join through `reg`, and every
+    /// child domain under it, with `ThreadFault` ([`ParDomain::kill`] wakes its parked members; a
+    /// running one stops at its next safepoint). The parallel driver's child scope joins its
+    /// children before it ends, so a domain that has ended has none left alive.
+    fn kill_tree(&self, reg: &ThreadRegistry) {
+        self.kill(&Trap::ThreadFault, reg);
+        let kids: Vec<ParChild> = self.kids.lock_unpoisoned().values().cloned().collect();
+        for (d, r) in kids {
+            d.kill_tree(&r);
+        }
     }
 }
 
@@ -17322,6 +17635,37 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 let handle = threads.len() as i32;
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
+            }
+            // PROCESS.md S3 — `poll`/`detach`/`kill`, as the cooperative driver's arm.
+            Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
+                let slot = match super::resolve_thread(&threads, child) {
+                    Ok(s) => s,
+                    Err(t) => return (Err(t), mem),
+                };
+                let id = threads[slot].expect("resolve_thread checked liveness");
+                let answer = match ctl {
+                    ChildCtl::Poll => match reg.done.lock_unpoisoned().get(&id) {
+                        None => 0,
+                        Some(Ok(_)) => 1,
+                        Some(Err(_)) => 2,
+                    },
+                    // A result published later stays in `done` until the run ends, as the oracle
+                    // discards a detached child's at teardown.
+                    ChildCtl::Detach => {
+                        threads[slot] = None;
+                        reg.done.lock_unpoisoned().remove(&id);
+                        0
+                    }
+                    // A `thread.spawn` handle names no child domain: nothing to kill.
+                    ChildCtl::Kill => {
+                        let kid = domain.kids.lock_unpoisoned().get(&id).cloned();
+                        if let Some((d, r)) = kid {
+                            d.kill_tree(&r);
+                        }
+                        0
+                    }
+                };
+                vt.active.set(dst, Reg::from_i32(answer));
             }
             Ok(VcpuStop::Join { handle, dst, wait }) => {
                 let slot = match super::resolve_thread(&threads, handle) {
@@ -17830,7 +18174,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &host, &mut threads, child, spawn.entry) {
+                match par_start_child(
+                    scope,
+                    dom,
+                    reg,
+                    &host,
+                    &domain,
+                    &mut threads,
+                    child,
+                    spawn.entry,
+                ) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -17840,8 +18193,12 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // powerbox) on this driver, then `run_vcpu_parallel` over the child's `Mem` exactly as a
             // confined child, its result published to the parent's `reg` for `join`.
             Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
-                let admitted =
-                    admit_detached_in_process(&mut host.lock_unpoisoned(), mem.as_ref(), spawn);
+                let admitted = admit_detached_in_process(
+                    &mut host.lock_unpoisoned(),
+                    mem.as_ref(),
+                    spawn,
+                    None,
+                );
                 let child = match admitted {
                     Ok(Some(c)) => c,
                     Ok(None) => {
@@ -17850,7 +18207,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                match par_start_child(scope, dom, reg, &host, &mut threads, child, spawn.entry) {
+                match par_start_child(
+                    scope,
+                    dom,
+                    reg,
+                    &host,
+                    &domain,
+                    &mut threads,
+                    child,
+                    spawn.entry,
+                ) {
                     Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
                     Err(t) => return (Err(t), mem),
                 }
@@ -17864,11 +18230,14 @@ fn run_vcpu_parallel_body<'scope, 'env>(
 /// children *it* spawns) — publishing its result to this vCPU's `reg`, where `join` finds it. Returns
 /// the join handle; `Err(ThreadFault)` on the cross-thread vCPU-count bomb (the cooperative driver's
 /// `live >= MAX_VCPUS`).
+#[allow(clippy::too_many_arguments)] // the spawn's context, as `coop_start_child`'s
 fn par_start_child<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
     reg: &'env ThreadRegistry,
     parent_host: &std::sync::Arc<std::sync::Mutex<Host>>,
+    // The spawner's domain, which records the child for a kill (#2074).
+    parent_domain: &ParDomain,
     threads: &mut Vec<Option<u64>>,
     child: AdmittedChild,
     entry: i64,
@@ -17892,8 +18261,20 @@ fn par_start_child<'scope, 'env>(
     let id = reg
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let child_reg = ThreadRegistry::new();
+    let child_par = std::sync::Arc::new(ParDomain::default());
+    parent_domain.kids.lock_unpoisoned().insert(
+        id,
+        (
+            std::sync::Arc::clone(&child_par),
+            std::sync::Arc::clone(&child_reg),
+        ),
+    );
+    // A kill that reached the spawner while this child was being filed missed it: it dies too.
+    if parent_domain.dead().is_some() {
+        child_par.kill_tree(&child_reg);
+    }
     scope.spawn(move || {
-        let child_reg = ThreadRegistry::new();
         let child_host = std::sync::Arc::new(std::sync::Mutex::new(host));
         let (r, _m) = std::thread::scope(|cscope| {
             run_vcpu_parallel(
@@ -17901,7 +18282,7 @@ fn par_start_child<'scope, 'env>(
                 &child_dom,
                 &child_reg,
                 std::sync::Arc::clone(&child_host),
-                std::sync::Arc::new(ParDomain::default()),
+                child_par,
                 None,
                 vt,
                 mem,
@@ -18144,20 +18525,47 @@ struct Vm {
 /// (The tree-walker's `MAX_CALL_DEPTH` is an oracle bound, not a production one.)
 const MAX_FRAMES: usize = 1 << 17;
 
-/// #1958 — the register file's ceiling in slots (16 bytes each: 256 MiB live, at most twice that
-/// allocated as the `Vec` grows), past which a call traps `StackOverflow`. A backstop for fat frames:
-/// the depth bound alone lets a many-slot function's recursion exhaust the host first. Only a chain
-/// averaging over 128 slots a frame meets it before [`MAX_FRAMES`].
-const MAX_REG_SLOTS: usize = 1 << 24;
+/// #1958 — the register file's ceiling in slots (16 bytes each: 512 MiB), past which a call traps
+/// `StackOverflow`. A backstop for fat frames: the depth bound alone lets a many-slot function's
+/// recursion exhaust the host first. Only a chain averaging over 256 slots a frame meets it before
+/// [`MAX_FRAMES`]. [`Vm::grow_regs`] grows the file no further, so this is also the most it ever
+/// allocates.
+///
+/// It sits above what real programs reach. A function's window is a slot per IR value, so Lua's
+/// `luaV_execute` takes 115,599 slots in the `ltests` build, and `cstack.lua`'s recursive `gsub`
+/// peaks below `21 << 20` slots when Lua's own C-stack limit stops it (#2082).
+const MAX_REG_SLOTS: usize = 1 << 25;
+const _: () = assert!(MAX_REG_SLOTS > 21 << 20);
+
+/// The capacity the register file grows to for a window ending at slot `need`: geometric, so a deep
+/// recursion grows it O(log n) times, but never past `max` (#2082).
+fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
+    need.max(capacity.saturating_mul(2)).min(max)
+}
 
 impl Vm {
-    /// Open a callee window ending at slot `need` for a call that pushes a return entry: the one place
-    /// a call grows the register file, bounded by [`MAX_FRAMES`] and [`MAX_REG_SLOTS`] (#1958).
+    /// Open a callee window ending at slot `need` for a call that pushes a return entry, bounded by
+    /// [`MAX_FRAMES`] and by the register file's own bound (#1958).
     fn open_frame(&mut self, need: usize) -> Result<(), Trap> {
-        if self.stack.len() >= MAX_FRAMES || need > MAX_REG_SLOTS {
+        if self.stack.len() >= MAX_FRAMES {
+            return Err(Trap::StackOverflow);
+        }
+        self.grow_regs(need)
+    }
+
+    /// Grow the register file to end at slot `need`: the one place it grows, for a call's window
+    /// ([`Self::open_frame`]) and a tail call's, which reuses its caller's base. Past
+    /// [`MAX_REG_SLOTS`] it traps `StackOverflow` before it allocates anything (#1958); below it, it
+    /// grows no further than the bound (#2082).
+    fn grow_regs(&mut self, need: usize) -> Result<(), Trap> {
+        if need > MAX_REG_SLOTS {
             return Err(Trap::StackOverflow);
         }
         if self.regs.len() < need {
+            if need > self.regs.capacity() {
+                let cap = grown_capacity(self.regs.capacity(), need, MAX_REG_SLOTS);
+                self.regs.reserve_exact(cap - self.regs.len());
+            }
             self.regs.resize(need, Reg::default());
         }
         Ok(())
@@ -18906,10 +19314,7 @@ impl Vm {
                     if module == 0 {
                         callprof::hit(callee);
                     }
-                    let need = base + c.progs[callee].nslots as usize;
-                    if self.regs.len() < need {
-                        self.regs.resize(need, Reg::default());
-                    }
+                    self.grow_regs(base + c.progs[callee].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
                         self.scratch.push(self.regs[base + *a as usize]);
@@ -18938,10 +19343,7 @@ impl Vm {
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
-                    let need = base + tm.progs[tfunc].nslots as usize;
-                    if self.regs.len() < need {
-                        self.regs.resize(need, Reg::default());
-                    }
+                    self.grow_regs(base + tm.progs[tfunc].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
                         self.scratch.push(self.regs[base + *a as usize]);
@@ -19512,6 +19914,22 @@ impl Vm {
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
                 // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
                 // confined child (it owns the task set + the per-child environments).
+                Op::ChildCtl {
+                    handle,
+                    child,
+                    dst,
+                    ctl,
+                } => {
+                    let ih = r!(*handle).i32();
+                    host.with(|p| p.resolve_instantiator(ih))?; // authority, as `ChildOffer`
+                    let child = r!(*child).i32();
+                    let (dst, ctl) = (*dst, *ctl);
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::ChildCtl { child, dst, ctl });
+                }
                 Op::ChildOffer {
                     handle,
                     child,

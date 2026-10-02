@@ -193,11 +193,15 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
     let self_ty = temen_ir::CAP_SELF_TYPE_ID;
     let leaf = cell(Status::Declines, LEAF);
     match (type_id, op) {
-        // §14 executor children — instantiate (0) / join (1) / instantiate_module (5) /
-        // instantiate_module_named (13) / child_offer (14) / instantiate_rec (17) / wait (18): native
-        // on both interpreters (`Op::Instantiate`/`InstJoin`/`InstantiateModule`/`ChildOffer`/…) and
-        // on Cranelift (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp.
-        (capcall::INSTANTIATOR, 0 | 1 | 5 | 13 | 14 | 17 | 18) => [F, F, F, leaf],
+        // §14 executor children — instantiate (0) / join (1) / instantiate_module (5) / poll (9) /
+        // detach (10) / kill (12) / instantiate_module_named (13) / child_offer (14) /
+        // instantiate_detached (15) / instantiate_rec (17) / wait (18): native on both interpreters
+        // (`Op::Instantiate`/`InstJoin`/`ChildCtl`/`ChildOffer`/…) and on Cranelift
+        // (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp. (The bytecode
+        // engine's resumable `Vcpu`, whose host runs the children, declines 9/10/12.)
+        (capcall::INSTANTIATOR, 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18) => {
+            [F, F, F, leaf]
+        }
 
         // §3.6 service points — `svc.poll` (9) / `svc.wait` (10): both fast backends compile them to
         // the native serve-loop core *when the module is serve-qualified* (no seam that could park a

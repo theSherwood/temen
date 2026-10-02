@@ -1434,14 +1434,16 @@ impl Debuggee for BytecodeBackend {
                 .collect(),
         ))
     }
-    /// Slice 8: apply + record a window write. The engine re-applies it at this turn on every
-    /// path that passes it — live resume and seek replay alike.
+    /// Slice 8: apply + record a window write, with the focused task whose window it lands in
+    /// (#2072). The engine re-applies it at this turn on every path that passes it — live resume and
+    /// seek replay alike.
     fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
         let ok = self.run.write_window(addr, bytes);
         if ok {
             self.writes.push((
                 self.run.op_turn(),
                 ScheduledWrite::Window {
+                    task: self.run.focus_task(),
                     addr,
                     bytes: bytes.to_vec(),
                 },

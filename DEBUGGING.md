@@ -529,6 +529,19 @@ different things depending on which pair you compare:
   executor and the OS-thread parallel driver call, and `dbg_start_child` only schedules it (as for op 15).
   `spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
 
+  **A detached child of the debuggee's own program (#2076), and edits in a child (#2072).** A detached
+  child whose module is its spawner's own program (`module = -1`) runs the spawning domain's unit, as a
+  same-module confined child does (#1726). The shared admission takes that unit as a parameter, and the
+  debug scheduler passes each env's (`DbgEnv::program`; the root's is module 0). So a breakpoint in the
+  program stops such a child, and its frames read the program's §6 debug info, as a carve child's did.
+  A child of a granted module still runs a unit of its own. The production drivers pass no unit yet, so
+  there each such spawn still compiles the program again (#2076). A debugger edit lands in the focused
+  task's window, the one `read_window` reads: `write_window`, a variable in memory, and the scheduled
+  replays of both, each of which records its task (#2072). The window observers — the watch scan, the
+  access sink and the undo journal — name the root's window, so they skip a task in a child's window,
+  where they used to skip only ops off module 0. Covered by `bytecode_debug_detached.rs` and
+  `state_writes.rs`.
+
   **§14 coroutine step-into on the multi-vCPU engine (slice 16).** Coroutine step-into (14b/14c) now
   reaches the scheduled engine: `coro_step_into` is on by default for every debug-engine `VTask`, and the
   coroutine-active task is **pinned** in the scheduler (`dbg_pinned_coro` in `drive`/`tick`) — a `resume`
@@ -1786,8 +1799,14 @@ read window/locals, record/replay control, model-check/replay). It is **not** a 
 capability by default — it is a *host* capability (the embedder/debugger holds it), consistent
 with "debugger observes from outside." Nesting (§14) makes a parent a natural debugger of a
 child. (That rests on the carve child's parent-readable window, which is being retired —
-INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only by grant; no
-detached equivalent yet — tracked in #1289.)
+INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only by grant, and the
+owner decided on 2026-10-01 (#1866) which grant: **inspecting a detached child is the freeze
+grant**, since a snapshot is a read. An ancestor may inspect a child it holds
+`FreezeScope::DetachedProgeny` over and that attests `freeze_exposed`; a child nobody may freeze is
+uninspectable. No domain-held inspection surface exists: D-DBG-5 keeps the `Inspector` host-only,
+and none is built until a consumer needs one (owner, 2026-10-02, #1866), so that grant is the gate
+for the first one. The platform's debugger holds authority over every domain and reads, writes and
+checkpoints any task's window (§1).)
 
 **Dependencies.** None upstream; it is the integration point. Build the shell first so W1/W2/W3
 land verbs onto it incrementally.
@@ -2473,8 +2492,10 @@ What holds it up:
 - **A detached child's window is its own** (#2058). The pre-images cover the root window only, so
   each anchor carries a live detached child's window image and powerbox, as a checkpoint does (§1,
   #1866), and the image counts toward the anchor's stride. A child whose powerbox holds anything but
-  plain values journals no state entry. A **carve** child's writes are not journaled at all (#2064);
-  the carve's retirement (#1867) removes that case.
+  plain values journals no state entry. A child of the root's own program runs module 0 in its own
+  window (#2076), so the journal skips every op of a task outside the root's window, not only ops off
+  module 0; a debugger edit there is not journaled either (#2072). A **carve** child's writes are not
+  journaled at all (#2064); the carve's retirement (#1867) removes that case.
 
 **Floats are not a hazard here, and it is worth saying why rather than assuming it.** The IR's scalar
 float unops are `abs`/`neg`/`sqrt`, all IEEE-754 correctly rounded and therefore bit-exact; there are

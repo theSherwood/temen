@@ -13069,7 +13069,11 @@ fn lower_vm_builtin(
         // park, answering how the child ended — 0 if it returned (it stays for `__vm_join`), else its
         // trap's wire code (`temen_ir::trap_code`), the child reaped. A spawner's way to outlive a
         // child that crashed or ran out of fuel.
-        "__vm_wait" => {
+        // PROCESS.md S3 (#1706): `long __vm_poll(int inst, long child)` → `call.cap INSTANTIATOR 9`
+        // (0 running, 1 returned, 2 trapped; never parks), `__vm_detach` → op 10 (drop the join
+        // claim), `__vm_kill` → op 12 (end the child and its subtree, running or parked: #2074). A
+        // spawner's way to supervise children without inheriting their traps.
+        "__vm_wait" | "__vm_poll" | "__vm_detach" | "__vm_kill" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
             let child = ctx.operand_i64(vm_arg(c, 1)?)?;
             let sig = temen_ir::FuncType {
@@ -13079,7 +13083,12 @@ fn lower_vm_builtin(
             let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
-                op: 18,
+                op: match name {
+                    "__vm_poll" => 9,
+                    "__vm_detach" => 10,
+                    "__vm_kill" => 12,
+                    _ => 18,
+                },
                 sig,
                 handle,
                 args: vec![child],

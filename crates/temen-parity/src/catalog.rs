@@ -1128,7 +1128,11 @@ fn process(ops: &mut Vec<Op>) {
         ("instantiate", inst, 0u32),
         ("join", inst, 1),
         ("wait", inst, 18),
+        ("poll", inst, 9),
+        ("detach", inst, 10),
+        ("kill", inst, 12),
         ("instantiate_module", inst, 5),
+        ("instantiate_detached", inst, 15),
         ("child_offer", inst, 14),
         // §3.6 service points + the FORK.md self-namespace ops.
         ("svc.poll", self_ty, crate::capcall::SVC_POLL),

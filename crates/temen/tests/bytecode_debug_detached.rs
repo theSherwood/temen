@@ -5,10 +5,12 @@
 //! restore), and the run's budget tree, which the child's spawn charged. The undo journal records
 //! none of a detached child's writes, so each of its anchors carries the child's window the same way
 //! (#2058); and stdio a child's re-grant promoted into a shared cell is captured and rewound there
-//! (#2055).
+//! (#2055). A child of the debuggee's own program runs its spawner's unit, so breakpoints and §6
+//! debug info reach it (#2076), and a debugger edit while a child is focused lands in the child's
+//! window, live and on every replay (#2072).
 
-use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
-use temen_interp::{Host, StreamRole, Value};
+use temen_interp::bytecode::{SchedStop, ScheduledDebugRun, ScheduledWrite};
+use temen_interp::{Host, IrPc, StreamRole, Value, VarValue, WatchKind};
 use temen_text::parse_module;
 
 /// Root `(instantiator, module, budget, stdout) -> i64`: spawns the child (op 15, entry 0, a 64 KiB
@@ -181,7 +183,20 @@ fn finish(run: &mut ScheduledDebugRun) -> (String, String) {
 /// promoted stdout (#2055).
 #[test]
 fn a_live_detached_child_rides_every_checkpoint() {
-    let mut refr = session(ROOT, CHILD, false);
+    let (result, out) = rides_every_checkpoint(CHILD);
+    assert_eq!(
+        (result.as_str(), out.as_str()),
+        ("Err(MemoryFault)", "0123"),
+        "the uninterrupted run: the child's last load faults on the page it unmapped, and its join \
+         re-raises the fault"
+    );
+}
+
+/// Checkpoint a run of [`ROOT`] spawning `child` at every turn, restore each checkpoint into a fresh
+/// run, and check the restore lands where the uninterrupted run stood and replays forward exactly as
+/// it did. Returns the uninterrupted run's result and output.
+fn rides_every_checkpoint(child: &str) -> (String, String) {
+    let mut refr = session(ROOT, child, false);
     let mut fuel = FUEL;
     let mut want = vec![observe(&mut refr)];
     let mut snaps = vec![refr.snapshot()];
@@ -190,12 +205,6 @@ fn a_live_detached_child_rides_every_checkpoint() {
         snaps.push(refr.snapshot());
     }
     let (result, out) = finish(&mut refr);
-    assert_eq!(
-        (result.as_str(), out.as_str()),
-        ("Err(MemoryFault)", "0123"),
-        "the uninterrupted run: the child's last load faults on the page it unmapped, and its join \
-         re-raises the fault"
-    );
 
     let mut wrong = Vec::new();
     for (c, snap) in snaps.iter().enumerate() {
@@ -203,7 +212,7 @@ fn a_live_detached_child_rides_every_checkpoint() {
             wrong.push(format!("turn {c}: no checkpoint"));
             continue;
         };
-        let mut warm = session(ROOT, CHILD, false);
+        let mut warm = session(ROOT, child, false);
         warm.restore(c as u64, snap);
         let mut i = c;
         if observe(&mut warm) != want[i] {
@@ -224,6 +233,7 @@ fn a_live_detached_child_rides_every_checkpoint() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    (result, out)
 }
 
 /// The child of [`an_undo_with_a_live_detached_child_matches_a_fresh_run`]: it adds 1 to a word of
@@ -361,4 +371,376 @@ fn an_undo_truncates_output_a_child_promoted() {
         "the turns before the root's write are in the journal"
     );
     assert_eq!(finish(&mut r), want);
+}
+
+/// A root `(instantiator, budget) -> i64` that spawns a copy of itself (an op-17 v1 record, the
+/// spawner's own module) and joins it. The copy, func 1, adds 1 to a word of its own window 3000
+/// times and returns it, as [`LONG_CHILD`] does. The module's §6 debug info names that word `count`,
+/// a global, so a variable write resolves to it in whichever task is focused.
+const SELF_ROOT: &str = r#"memory 17
+func (i32, i32) -> (i64) {
+block 0 (vi: i32, vbud: i32) {
+  vz = i64.const 0
+  r0 = i64.const 4294967297
+  a0 = i64.const 17536
+  i64.store a0 r0
+  a1 = i64.const 17544
+  i64.store a1 vz
+  r2 = i64.const -4294967296
+  a2 = i64.const 17552
+  i64.store a2 r2
+  vb64 = i64.extend_i32_u vbud
+  v32 = i64.const 32
+  vbs = i64.shl vb64 v32
+  vself = i64.const 4294967295
+  r3 = i64.or vbs vself
+  a3 = i64.const 17560
+  i64.store a3 r3
+  a4 = i64.const 17568
+  i64.store a4 vz
+  a5 = i64.const 17576
+  i64.store a5 vz
+  a6 = i64.const 17584
+  i64.store a6 vz
+  a7 = i64.const 17592
+  i64.store a7 vz
+  a8 = i64.const 17600
+  i64.store a8 vz
+  a9 = i64.const 17608
+  i64.store a9 vself
+  a10 = i64.const 17616
+  i64.store a10 vz
+  vh = call.cap 6 17 (i64) -> (i32) vi (a0)
+  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vn: i64) {
+  va = i64.const 20000
+  vx = i64.load va
+  vone = i64.const 1
+  vx2 = i64.add vx vone
+  i64.store va vx2
+  vn2 = i64.add vn vone
+  vlim = i64.const 3000
+  vmore = i64.ne vn2 vlim
+  br_if vmore 1(vn2) 2()
+}
+block 2 () {
+  vb = i64.const 20000
+  vr = i64.load vb
+  return vr
+  }
+}
+
+debug.file 0 "count.c"
+debug.fname 0 "main"
+debug.fname 1 "child"
+debug.var global "count" fixed 20000 "long"
+"#;
+
+/// A run of [`SELF_ROOT`], with the journal armed or not.
+fn self_session(journal: bool) -> ScheduledDebugRun {
+    let m = std::sync::Arc::new(parse_module(SELF_ROOT).expect("parse the root"));
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let inst = host.grant_instantiator(0, 1 << 17);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let args = [inst, budget].map(Value::I32);
+    let mut run = ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("in subset");
+    run.set_journal_armed(journal);
+    run
+}
+
+/// The head of the child's loop in [`SELF_ROOT`], where each of its 3000 iterations starts.
+const LOOP_HEAD: IrPc = IrPc {
+    module: 0,
+    func: 1,
+    block: 1,
+    inst: 0,
+};
+
+/// Run `r` to the child's `n`th stop at [`LOOP_HEAD`], where the child is focused, and clear the
+/// breakpoint. Returns the turn it stopped at.
+fn stop_in_child(r: &mut ScheduledDebugRun, n: usize) -> u64 {
+    r.set_breakpoints(vec![LOOP_HEAD]);
+    let mut fuel = FUEL;
+    for _ in 0..n {
+        match r.run_until_stop(&mut fuel) {
+            SchedStop::Break { pc, .. } => assert_eq!(pc, LOOP_HEAD),
+            other => panic!("unexpected stop {other:?}"),
+        }
+    }
+    assert_eq!(r.stopped_task(), Some(1), "the child stops there");
+    r.set_breakpoints(Vec::new());
+    r.op_turn()
+}
+
+/// The word the child counts in, read from the focused task's window.
+fn count(r: &ScheduledDebugRun) -> u64 {
+    u64::from_le_bytes(r.read_window(20000, 8).unwrap().try_into().unwrap())
+}
+
+/// #2076 — a detached child of the debuggee's own program runs its spawner's unit, so a breakpoint
+/// in its code stops it, and its frames read the program's §6 debug info: a stop at each of its 3000
+/// iterations, each reading the count so far. A child that ran a second copy of the program, a unit
+/// of its own, never stopped, and its variables read as nothing.
+#[test]
+fn a_breakpoint_stops_a_child_of_its_own_program() {
+    let mut r = self_session(false);
+    r.set_breakpoints(vec![LOOP_HEAD]);
+    let mut fuel = FUEL;
+    let mut stops = 0u64;
+    let result = loop {
+        match r.run_until_stop(&mut fuel) {
+            SchedStop::Break { pc, .. } => {
+                assert_eq!((pc, r.stopped_task()), (LOOP_HEAD, Some(1)));
+                assert_eq!(
+                    r.read_var(0, "count", 8),
+                    Some(VarValue::Bytes(stops.to_le_bytes().to_vec())),
+                    "stop {stops}"
+                );
+                stops += 1;
+            }
+            SchedStop::Finished(res) => break res,
+            other => panic!("unexpected stop {other:?}"),
+        }
+    };
+    assert_eq!(
+        (stops, format!("{result:?}")),
+        (3000, "Ok([I64(3000)])".into())
+    );
+}
+
+/// #2072 — a debugger write while the child is focused lands in the child's window, the one a read
+/// there shows: a window write (`writeMemory`) and a variable write (`setVariable`) alike. The
+/// root's word at the same address is untouched, and the child counts on from the write. Writing the
+/// root's window instead left the child counting to 3000.
+#[test]
+fn a_write_to_a_focused_child_lands_in_its_window() {
+    for var in [false, true] {
+        let mut r = self_session(false);
+        stop_in_child(&mut r, 100);
+        let x = count(&r);
+        let y = x + 1_000_000;
+        let landed = if var {
+            r.write_var(0, "count", y as i64, 8)
+        } else {
+            r.write_window(20000, &y.to_le_bytes())
+        };
+        assert!(landed, "var {var}");
+        assert_eq!(
+            count(&r),
+            y,
+            "var {var}: the child's window holds the write"
+        );
+        assert!(r.select_task(0));
+        assert_eq!(count(&r), 0, "var {var}: the root's does not");
+        assert_eq!(finish(&mut r).0, "Ok([I64(1003000)])", "var {var}");
+    }
+}
+
+/// #2072 — a write recorded against the child, as the DAP backend records `writeMemory` and
+/// `setVariable`, lands in the child's window on every path that passes its turn: a fresh run, a
+/// restore from a checkpoint taken before the turn, and an undo from after it, which lands where a
+/// fresh run stands.
+#[test]
+fn a_childs_recorded_writes_replay_into_its_window() {
+    let mut r = self_session(false);
+    let turn = stop_in_child(&mut r, 100);
+    let x = count(&r);
+    let writes = [
+        (
+            ScheduledWrite::Window {
+                task: 1,
+                addr: 20000,
+                bytes: (x + 1_000_000).to_le_bytes().to_vec(),
+            },
+            "Ok([I64(1003000)])",
+        ),
+        (
+            ScheduledWrite::Var {
+                task: 1,
+                frame: 0,
+                name: "count".into(),
+                value: (x + 2_000_000) as i64,
+                width: 8,
+            },
+            "Ok([I64(2003000)])",
+        ),
+    ];
+    for (write, want) in writes {
+        let with = |journal| {
+            let mut r = self_session(journal);
+            r.set_scheduled_writes(vec![(turn, write.clone())]);
+            r
+        };
+        assert_eq!(finish(&mut with(false)).0, want, "{write:?}: a fresh run");
+
+        let mut fuel = FUEL;
+        let mut a = with(false);
+        while a.op_turn() < turn - 500 {
+            assert!(a.tick(&mut fuel));
+        }
+        let snap = a.snapshot().expect("a checkpoint");
+        let mut b = with(false);
+        b.restore(turn - 500, &snap);
+        assert_eq!(finish(&mut b).0, want, "{write:?}: a restore before it");
+
+        let mut u = with(true);
+        while u.op_turn() < turn + 2000 {
+            assert!(u.tick(&mut fuel));
+        }
+        assert!(u.undo_to(turn - 500), "the turn is in the journal");
+        let mut fresh = with(false);
+        while fresh.op_turn() < turn - 500 {
+            assert!(fresh.tick(&mut fuel));
+        }
+        assert_eq!(
+            observe(&mut u),
+            observe(&mut fresh),
+            "{write:?}: an undo lands where a fresh run stands"
+        );
+        assert_eq!(finish(&mut u).0, want, "{write:?}: an undo across it");
+    }
+}
+
+/// #2076 — the journal's pre-images are of the root's window alone. The child of [`SELF_ROOT`] runs
+/// module 0 too, but in its own window, which each anchor carries whole (#2058); recording its 3000
+/// stores against the root's window would hold pre-images of bytes nothing there wrote.
+#[test]
+fn the_journal_records_only_the_root_windows_writes() {
+    let mut ticked = self_session(true);
+    let mut fuel = FUEL;
+    while ticked.tick(&mut fuel) {}
+    let mut driven = self_session(true);
+    finish(&mut driven);
+    for r in [ticked, driven] {
+        assert_eq!(
+            r.journal_stats().appended,
+            11,
+            "the root's stores of the spawn record"
+        );
+    }
+}
+
+/// A child `(instantiator, address space) -> i64` that spawns a copy of its own program with the
+/// budget its spawn paid with, `"budget"` (an op-17 v1 record, `module = -1`), and returns what the
+/// copy returns. The copy, func 1, adds 1 to a word of its own window 20 times and returns it.
+const SPAWNING_CHILD: &str = r#"memory 16
+data 16400 "budget"
+func (i64, i64) -> (i64) {
+block 0 (vi: i64, vas: i64) {
+  vp = i64.const 16400
+  vl = i64.const 6
+  vbud = self.resolve vp vl
+  vz = i64.const 0
+  r0 = i64.const 4294967297
+  a0 = i64.const 17536
+  i64.store a0 r0
+  a1 = i64.const 17544
+  i64.store a1 vz
+  r2 = i64.const -4294967296
+  a2 = i64.const 17552
+  i64.store a2 r2
+  vb64 = i64.extend_i32_u vbud
+  v32 = i64.const 32
+  vbs = i64.shl vb64 v32
+  vself = i64.const 4294967295
+  r3 = i64.or vbs vself
+  a3 = i64.const 17560
+  i64.store a3 r3
+  a4 = i64.const 17568
+  i64.store a4 vz
+  a5 = i64.const 17576
+  i64.store a5 vz
+  a6 = i64.const 17584
+  i64.store a6 vz
+  a7 = i64.const 17592
+  i64.store a7 vz
+  a8 = i64.const 17600
+  i64.store a8 vz
+  a9 = i64.const 17608
+  i64.store a9 vself
+  a10 = i64.const 17616
+  i64.store a10 vz
+  vh = call.cap 6 17 (i64) -> (i32) vi (a0)
+  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vn: i64) {
+  va = i64.const 20000
+  vx = i64.load va
+  vone = i64.const 1
+  vx2 = i64.add vx vone
+  i64.store va vx2
+  vn2 = i64.add vn vone
+  vlim = i64.const 20
+  vmore = i64.ne vn2 vlim
+  br_if vmore 1(vn2) 2()
+}
+block 2 () {
+  vb = i64.const 20000
+  vr = i64.load vb
+  return vr
+  }
+}
+"#;
+
+/// #2076 — a child of a child's own program runs that child's unit, not the root's: the grandchild
+/// runs the child's func 1 and returns its count. And the run checkpoints at every turn, each env
+/// rebuilt under the one that spawned it — the grandchild's powerbox under the child's, the child's
+/// under the root's — with the unit it runs.
+#[test]
+fn a_child_of_a_childs_own_program_rides_every_checkpoint() {
+    assert_eq!(
+        rides_every_checkpoint(SPAWNING_CHILD),
+        ("Ok([I64(20)])".to_string(), String::new())
+    );
+}
+
+/// #2076 — the window watches and the access sink name the root's window. The child of
+/// [`SELF_ROOT`] runs module 0 too, but in its own window: a write watch on the word it counts in
+/// never stops it, and the sink sees none of its accesses, only the root's.
+#[test]
+fn window_watches_and_the_access_sink_see_the_roots_window_only() {
+    let mut r = self_session(false);
+    r.set_watchpoints(vec![(20000, 8, WatchKind::Write)]);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    r.set_access_sink(Box::new(move |_, task, _| sink.lock().unwrap().push(task)));
+    let mut fuel = FUEL;
+    let mut stops = 0;
+    let result = loop {
+        match r.run_until_stop(&mut fuel) {
+            SchedStop::Break { .. } => stops += 1,
+            SchedStop::Finished(res) => break res,
+            other => panic!("unexpected stop {other:?}"),
+        }
+    };
+    assert_eq!(
+        (stops, format!("{result:?}")),
+        (0, "Ok([I64(3000)])".into())
+    );
+    // A replay by `tick` feeds the sink the same way.
+    let mut ticked = self_session(false);
+    let sink = std::sync::Arc::clone(&seen);
+    ticked.set_access_sink(Box::new(move |_, task, _| sink.lock().unwrap().push(task)));
+    while ticked.tick(&mut fuel) {}
+    let seen = seen.lock().unwrap();
+    assert!(
+        !seen.is_empty() && seen.iter().all(|&task| task == 0),
+        "the root's accesses alone"
+    );
 }
