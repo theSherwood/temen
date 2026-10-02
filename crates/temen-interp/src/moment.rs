@@ -226,9 +226,11 @@ impl Moment {
     /// A reactor moment always carries a window image (this takes it by value); restoring one gives
     /// **rewind**, a [`Ladder`] of them a keyframe ladder, re-running forward over recorded input the
     /// frames between rungs. A moment restored into a fresh reactor is a save-state; restored twice, a
-    /// branch.
-    pub fn capture(layout: MemLayout, host: &Host) -> ReactorMoment {
-        Moment::new(Some(layout), host, Continuation::None)
+    /// branch. `None` for a window that aliases a §13 region: a moment carries no region's bytes, so a
+    /// restore would show the region as it is then, not as it was (#2051) — a §12 artifact, which
+    /// carries them, is the save-state for such a window.
+    pub fn capture(layout: MemLayout, host: &Host) -> Option<ReactorMoment> {
+        (!layout.aliases_regions()).then(|| Moment::new(Some(layout), host, Continuation::None))
     }
 
     /// The window image. A reactor moment always carries one — it is only ever built by

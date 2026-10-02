@@ -432,9 +432,6 @@ pub enum RestoreError {
     /// carried. The other half of the same seam: an artifact carries what the domain had *left*, and
     /// the thaw may narrow that, never widen it (INVARIANTS #3).
     BudgetRefused(BudgetThawRefused),
-    /// #2025 — the artifact maps a §13 region into a window restored as a [`MemLayout`] (a detached
-    /// child's, or a reactor's), which does not re-alias regions yet (#2025 step 2).
-    RegionInLayout,
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -1452,28 +1449,17 @@ pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<
 /// [`restore_with_prots`] into the one window-image form: the restored image and page map as a
 /// [`MemLayout`] ready for a reactor's `restore_window`, plus the reservation the artifact recorded.
 /// The committed prefix is `module`'s declared memory — the window a fresh instance of `module`
-/// opens with, which the geometry check inside guarantees the image covers.
+/// opens with, which the geometry check inside guarantees the image covers. A §13 page keeps the
+/// region it names, rebuilt on `host`: the reactor's `restore_window` re-aliases it (#2051).
 pub fn restore_layout(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    let (layout, reserved_log2) =
-        restore_layout_at(artifact, module, host, 0, &mut ThawCut::default())?;
-    // A reactor restores the image into a window it already holds, and has no thaw to re-alias a
-    // §13 page onto its region (#2025).
-    if layout
-        .dense_prots()
-        .iter()
-        .any(|p| matches!(p, PageProt::Backed { .. }))
-    {
-        return Err(RestoreError::RegionInLayout);
-    }
-    Ok((layout, reserved_log2))
+    restore_layout_at(artifact, module, host, 0, &mut ThawCut::default())
 }
 
-/// [`restore_layout`] at detached-nesting `depth`, `Backed` pages kept: a detached child's thaw
-/// re-aliases them.
+/// [`restore_layout`] at detached-nesting `depth`.
 fn restore_layout_at(
     artifact: &[u8],
     module: &Module,
