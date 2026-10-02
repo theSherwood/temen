@@ -315,7 +315,7 @@ static mut LAST_BUILD: Option<temen_posix::Posix> = None;
 struct Toolchain {
     driver_bytes: Vec<u8>,
     cmds_bytes: Vec<u8>,
-    driver: Module,
+    driver: Arc<Module>,
     commands: Vec<(Vec<String>, PreparedModule)>,
 }
 
@@ -347,17 +347,23 @@ fn toolchain_in<'s>(
         .is_some_and(|t| t.driver_bytes == driver && t.cmds_bytes == cmds)
     {
         let decode = |b| temen_encode::decode_module(b).map_err(|_| STATUS_DECODE_ERR);
-        let commands = blob_entries(cmds)
-            .into_iter()
+        let entries = blob_entries(cmds);
+        let commands: Vec<(Vec<String>, PreparedModule)> = entries
+            .iter()
             .map(|(paths, b)| {
-                let m = PreparedModule::new(Arc::new(decode(b)?));
+                let m = prepare(&decode(b)?);
                 Ok((paths.lines().map(String::from).collect(), m))
             })
             .collect::<Result<_, i32>>()?;
+        // nimony is one of its own commands: a driver that is one runs that command's module.
+        let module = match entries.iter().position(|(_, b)| *b == driver) {
+            Some(i) => Arc::clone(commands[i].1.module()),
+            None => Arc::new(decode(driver)?),
+        };
         *slot = Some(Toolchain {
             driver_bytes: driver.to_vec(),
             cmds_bytes: cmds.to_vec(),
-            driver: decode(driver)?,
+            driver: module,
             commands,
         });
     }
@@ -507,10 +513,18 @@ mod toolchain_tests {
             Arc::ptr_eq(again.commands[0].1.module(), &kept),
             "the same bytes keep it"
         );
+        assert!(
+            Arc::ptr_eq(&again.driver, &kept),
+            "a driver that is a command runs its module"
+        );
         let changed = toolchain_in(&mut slot, &one, &other).expect("decodes");
         assert!(
             !Arc::ptr_eq(changed.commands[0].1.module(), &kept),
             "other bytes decode afresh"
+        );
+        assert_eq!(
+            *changed.driver, *kept,
+            "a driver that is no command decodes alone"
         );
         assert_eq!(
             toolchain_in(&mut slot, b"not a module", &cmds).err(),

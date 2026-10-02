@@ -4235,6 +4235,14 @@ struct PosixRun<'a> {
     loader: bool,
 }
 
+/// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
+/// [`Host::grant_module`] would grant it: from a clone, whose vectors are exact where a decoded
+/// module's keep their growth slack. A caller that grants the same commands run after run keeps them
+/// prepared instead (a nim build's toolchain, #2087).
+fn prepare(m: &temen_ir::Module) -> PreparedModule {
+    PreparedModule::new(std::sync::Arc::new(m.clone()))
+}
+
 /// The powerbox of a POSIX process the browser runs — bash ([`bash_exec_with`], the #1122 sessions)
 /// and nimony's driver ([`nimony::nim_build`]): the on-ramp gate, the personality, the import
 /// bindings, the command registry, and the argv/env blob. `None` = not a `_start`-shaped module.
@@ -4243,13 +4251,6 @@ struct PosixRun<'a> {
 /// ops), `grant` wiring what the native `bash_probe` and the nim lane's runs do. It serves no heap
 /// (`0,0`): each program brings its own allocator, which grows into the window's reserved tail through
 /// the core's memory ops. It owns stdin (`read(0)`) and stdout/stderr.
-/// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
-/// [`Host::grant_module`] would grant it. A caller that grants the same commands run after run keeps
-/// them prepared instead (a nim build's toolchain, #2087).
-fn prepare(m: &temen_ir::Module) -> PreparedModule {
-    PreparedModule::new(std::sync::Arc::new(m.clone()))
-}
-
 fn posix_host_build(
     m: &temen_ir::Module,
     run: &PosixRun,
