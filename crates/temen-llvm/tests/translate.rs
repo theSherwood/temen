@@ -10584,6 +10584,76 @@ fn simd_ptr2_copy() {
     check_vs_native("simd_ptr2_copy", src, 2);
 }
 
+/// #1993 — clang ≥ 22 **early-exit-vectorizes** a plain linear search: the loop body becomes a vector
+/// compare whose lanes combine through a `select` of masks, the exit test is the mask's movemask
+/// (`bitcast <N x i1> to iN`), and the exit block finds the matching lane with
+/// `llvm.experimental.cttz.elts`. Two searches, run against native: the stack-range lookup that broke
+/// `pthread.h` (`<2 x ptr>` lanes: a null check and a `[base, base + SPAN)` range test) and an `int`
+/// key search (`<4 x i32>` lanes). Each also covers a miss and a bound that ends the scan before the
+/// match. With clang 22 or newer the `.ll` must hold the vectorized shape, so this cannot pass on a
+/// scalar loop.
+#[test]
+fn simd_early_exit_search() {
+    // `run` comes first: the harness runs function 0.
+    let ptr_src = "#define MAX 256\n\
+        #define SPAN 16\n\
+        static char *stacks[MAX];\n\
+        static int next_id = 1;\n\
+        int find(char *p);\n\
+        static char a[16], b[16], c[16];\n\
+        int run(int seed) {\n\
+        \x20 stacks[2] = a; stacks[5] = b; stacks[9] = c;\n\
+        \x20 next_id = 8 + seed;\n\
+        \x20 int r = find(c + seed);\n\
+        \x20 int none = find(0);\n\
+        \x20 next_id = 6;\n\
+        \x20 int capped = find(c);\n\
+        \x20 return r * 16 + none * 4 + (capped != 0);\n\
+        }\n\
+        __attribute__((noinline)) int find(char *p) {\n\
+        \x20 int n = next_id;\n\
+        \x20 for (int i = 1; i < n && i < MAX; i++) {\n\
+        \x20   char *base = stacks[i];\n\
+        \x20   if (base && p >= base && p < base + SPAN) return i;\n\
+        \x20 }\n\
+        \x20 return 0;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    let int_src = "static int keys[64];\n\
+        int find(int x, int n);\n\
+        int run(int seed) {\n\
+        \x20 for (int i = 0; i < 64; i++) keys[i] = i * 7 + seed;\n\
+        \x20 return find(seed + 7 * 37, 50) + find(3, 50) + 2 * (find(seed + 7 * 45, 40) + 1);\n\
+        }\n\
+        __attribute__((noinline)) int find(int x, int n) {\n\
+        \x20 for (int i = 0; i < n && i < 64; i++)\n\
+        \x20   if (keys[i] == x) return i;\n\
+        \x20 return -1;\n\
+        }\n\
+        int main(void) { return run(5); }\n";
+    for (name, src) in [("early_exit_ptr", ptr_src), ("early_exit_int", int_src)] {
+        let Some(ll) = compile_to_ll_vectorized(name, src) else {
+            return;
+        };
+        if clang_major().is_some_and(|m| m >= 22) {
+            let text = std::fs::read_to_string(&ll).expect("read .ll");
+            assert!(
+                text.contains("llvm.experimental.cttz.elts"),
+                "{name}: clang >= 22 should early-exit-vectorize this search"
+            );
+        }
+        check_simd_bc_vs_native(name, &ll, 5);
+    }
+}
+
+/// The major version of the `clang` on `PATH`, if it answers `--version`.
+fn clang_major() -> Option<u32> {
+    let out = Command::new("clang").arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rest = text.split("clang version ").nth(1)?;
+    rest.split('.').next()?.trim().parse().ok()
+}
+
 /// `<2 x i64>` lane multiply + add + per-lane extract (`i64x2` `VIntBin` Mul/Add, `ExtractLane`).
 /// `run(7)`: a={7,9}, b={3,5}, c=a*b+b={24,50}; c[0]+c[1]=74.
 #[test]
