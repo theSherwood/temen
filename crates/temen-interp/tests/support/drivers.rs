@@ -321,7 +321,8 @@ fn unorchestrated(event: &str) -> ! {
 }
 
 /// The drivers that schedule a spawned child themselves. The [`Driver::Vcpu`]'s host runs its
-/// children, so it declines a module that `poll`s, `detach`es or `kill`s one (temen#2068).
+/// children and has no surface to answer `poll`, `detach` or `kill` yet, so each traps there when it
+/// runs (temen#2083).
 pub const SCHEDULING: [Driver; 4] = [
     Driver::Oracle,
     Driver::Coop,

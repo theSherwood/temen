@@ -3459,24 +3459,6 @@ impl VcpuProgram {
     /// (the powerbox's [`Host::jit_table_log2`]), so guest-driven install lands at the same slots the
     /// cooperative oracle uses. `0` ⇒ natural size (no install room).
     pub fn compile_with_jit_table(m: &Module, table_log2: u8) -> Option<VcpuProgram> {
-        // `poll`/`detach`/`kill` (Instantiator ops 9/10/12) act on a child's run, which this
-        // engine's host drives (`VcpuEvent::Join` hands it the token), so it has nothing to answer
-        // or end them with: decline, and the host runs the module on an engine that can (#2068).
-        let child_ctl = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR,
-                        op: 9 | 10 | 12,
-                        ..
-                    }
-                )
-            })
-        });
-        if child_ctl {
-            return None;
-        }
         let c = compile_module_for(m)?;
         let dom = Domain::new(c, table_log2);
         Some(VcpuProgram {
@@ -4713,8 +4695,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::BlockOnFiber { .. })
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
                 | Ok(VcpuStop::Preempted)
-                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns:
-                // `VcpuProgram::compile` declines a module that uses them, so none arrives here.
+                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns and has no
+                // surface to answer yet (#2083): fail closed when one runs, like `Exec`. Compiling
+                // still admits a module that merely contains one (every JACL program links a kill).
                 | Ok(VcpuStop::ChildCtl { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {

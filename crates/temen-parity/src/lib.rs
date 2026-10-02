@@ -198,7 +198,7 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         // instantiate_detached (15) / instantiate_rec (17) / wait (18): native on both interpreters
         // (`Op::Instantiate`/`InstJoin`/`ChildCtl`/`ChildOffer`/…) and on Cranelift
         // (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp. (The bytecode
-        // engine's resumable `Vcpu`, whose host runs the children, declines 9/10/12.)
+        // engine's resumable `Vcpu`, whose host runs the children, traps when 9/10/12 run: #2083.)
         (capcall::INSTANTIATOR, 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18) => {
             [F, F, F, leaf]
         }
