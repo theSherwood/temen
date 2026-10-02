@@ -1127,6 +1127,7 @@ fn process(ops: &mut Vec<Op>) {
         // §14 executor children — the process-spawn nouns.
         ("instantiate", inst, 0u32),
         ("join", inst, 1),
+        ("wait", inst, 18),
         ("instantiate_module", inst, 5),
         ("child_offer", inst, 14),
         // §3.6 service points + the FORK.md self-namespace ops.

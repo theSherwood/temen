@@ -570,10 +570,13 @@ enum Op {
     /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
     /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
     /// the §12 thread machinery — children share one handle namespace (`threads`) with `thread.spawn`.
+    /// With `wait` it is `Instantiator.wait` (op 18): how the child ended lands at `dst` instead
+    /// ([`super::join_delivery`]).
     InstJoin {
         handle: u32,
         child: u32,
         dst: u32,
+        wait: bool,
     },
     /// §12 `memory.wait`: futex wait (`ty`-wide) on `addr` while it equals `expected`, up to
     /// `timeout` ns; the status (0/1/2) lands at `dst`. Scheduler-driven.
@@ -1181,8 +1184,8 @@ fn scan_seams(funcs: &[Func]) -> Seams {
             for inst in &b.insts {
                 match inst {
                     // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
-                    // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec
-                    // (all executor children,
+                    // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec,
+                    // op 18 = wait (all executor children,
                     // scheduler-driven — the grant-carrying spawns re-grant caps but spawn the same
                     // kind of confined task); everything else on INSTANTIATOR is the legacy coroutine
                     // residue. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
@@ -1191,7 +1194,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 13 | 14 | 15 | 17,
+                        op: 0 | 1 | 5 | 13 | 14 | 15 | 17 | 18,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -2367,10 +2370,12 @@ fn compile_inst(
                     dst,
                     grants: None,
                 },
-                (cap_id::INSTANTIATOR, 1) if !args.is_empty() => Op::InstJoin {
+                // op 18 = wait: join's park, delivering how the child ended (`join_delivery`).
+                (cap_id::INSTANTIATOR, op @ (1 | 18)) if !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
                     dst,
+                    wait: op == 18,
                 },
                 // op 5 = instantiate_module: the first arg is the granted `Module` handle; the carve
                 // args (entry/off/size_log2/quota) follow. (join, op 1, serves both kinds.)
@@ -3949,6 +3954,8 @@ pub struct Vcpu<'p> {
     /// The child whose join is in flight, whose charges go back on
     /// [`deliver_join`](Self::deliver_join).
     joining: Option<VcpuChild>,
+    /// The slot of the child a `wait` (op 18) has in flight, where a child that returned goes back.
+    join_wait: Option<usize>,
 }
 
 /// A child in a [`Vcpu`]'s table: the host's token for it, a detached child's window lease, and a
@@ -3959,6 +3966,8 @@ struct VcpuChild {
     token: u64,
     lease: Option<(i32, u64)>,
     live: LiveVcpu,
+    /// The outcome a `wait` (op 18) received for this child, which returned: its `join` takes it.
+    ended: Option<Result<Vec<Value>, Trap>>,
 }
 
 /// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
@@ -4304,6 +4313,7 @@ impl<'p> Vcpu<'p> {
             pending_lease: None,
             pending_live: LiveVcpu::none(),
             joining: None,
+            join_wait: None,
         })
     }
 
@@ -4357,6 +4367,7 @@ impl<'p> Vcpu<'p> {
             pending_lease: None,
             pending_live: LiveVcpu::none(),
             joining: None,
+            join_wait: None,
         })
     }
 
@@ -4677,13 +4688,34 @@ impl<'p> Vcpu<'p> {
                         vcpu: self.prog.take_vcpu_id(),
                     };
                 }
-                Ok(VcpuStop::Join { handle, dst }) => match self.join_child(handle) {
-                    Ok(child) => {
-                        self.pending = Some(dst);
-                        return VcpuEvent::Join { child };
+                Ok(VcpuStop::Join { handle, dst, wait }) => {
+                    let slot = match super::resolve_thread(&self.children, handle) {
+                        Ok(slot) => slot,
+                        Err(t) => return VcpuEvent::Trapped(t),
+                    };
+                    // A child a `wait` found returned keeps its outcome here for its `join`: the
+                    // host handed its token back once already, so it is delivered without one.
+                    if let Some(res) = self.children[slot].as_ref().and_then(|c| c.ended.clone()) {
+                        let (out, keep) = super::join_delivery(&res, wait);
+                        if !keep {
+                            self.joining = self.children[slot].take();
+                            self.end_join();
+                        }
+                        match out {
+                            Ok(r) => self.vt.active.set(dst, r),
+                            Err(t) => return VcpuEvent::Trapped(t),
+                        }
+                    } else {
+                        match self.join_child(handle) {
+                            Ok(child) => {
+                                self.pending = Some(dst);
+                                self.join_wait = wait.then_some(slot);
+                                return VcpuEvent::Join { child };
+                            }
+                            Err(t) => return VcpuEvent::Trapped(t),
+                        }
                     }
-                    Err(t) => return VcpuEvent::Trapped(t),
-                },
+                }
                 Ok(VcpuStop::CapPending { id, dst }) => {
                     let comps = match self.shared_host {
                         Some(m) => m.lock_unpoisoned().completions(),
@@ -4916,6 +4948,7 @@ impl<'p> Vcpu<'p> {
             token,
             lease: self.pending_lease.take(),
             live: std::mem::replace(&mut self.pending_live, LiveVcpu::none()),
+            ended: None,
         }));
         handle
     }
@@ -5004,13 +5037,20 @@ impl<'p> Vcpu<'p> {
     /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
     /// child trap propagates (the joiner traps on its next `run`).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
-        self.end_join();
-        let dst = self.pending.take().expect("deliver with no pending event");
-        match res {
-            Ok(vals) => {
-                let v = vals.first().copied().unwrap_or(Value::I64(0));
-                self.vt.active.set(dst, Reg::from_value(v));
+        let wait = self.join_wait.take();
+        let (out, keep) = super::join_delivery(&res, wait.is_some());
+        match wait {
+            // A `wait` on a child that returned: it goes back to its slot for its `join`.
+            Some(slot) if keep => {
+                let mut child = self.joining.take().expect("a join in flight");
+                child.ended = Some(res);
+                self.children[slot] = Some(child);
             }
+            _ => self.end_join(),
+        }
+        let dst = self.pending.take().expect("deliver with no pending event");
+        match out {
+            Ok(r) => self.vt.active.set(dst, r),
             Err(t) => self.trap = Some(t),
         }
     }
@@ -6927,11 +6967,13 @@ pub enum SchedBreak {
 #[derive(Clone)]
 enum DbgTaskState {
     Runnable,
-    /// Parked on `thread.join` of task `child` (handle `slot`); its result lands at `dst` on wake.
+    /// Parked on `thread.join` of task `child` (handle `slot`); its result lands at `dst` on wake
+    /// (with `wait`, how it ended: [`super::join_delivery`]).
     BlockedJoin {
         child: usize,
         slot: usize,
         dst: u32,
+        wait: bool,
     },
     /// Parked on `memory.wait` at address `addr` of its own window until a `memory.notify` whose
     /// futex key matches, or the logical `clock` reaches `deadline`; the status (`WAIT_WOKEN` /
@@ -7499,20 +7541,28 @@ fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>)
         tasks[done].state = DbgTaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
         for (j, t) in tasks.iter_mut().enumerate() {
-            let DbgTaskState::BlockedJoin { child, slot, dst } = t.state else {
+            let DbgTaskState::BlockedJoin {
+                child,
+                slot,
+                dst,
+                wait,
+            } = t.state
+            else {
                 continue;
             };
             if child != done {
                 continue;
             }
-            t.threads[slot] = None;
-            match &res {
-                Ok(vals) => {
-                    let v = vals.first().copied().unwrap_or(Value::I64(0));
-                    t.vt.active.set(dst, Reg::from_value(v));
+            let (out, keep) = super::join_delivery(&res, wait);
+            if !keep {
+                t.threads[slot] = None;
+            }
+            match out {
+                Ok(r) => {
+                    t.vt.active.set(dst, r);
                     t.state = DbgTaskState::Runnable;
                 }
-                Err(trap) => work.push((j, Err(*trap))),
+                Err(trap) => work.push((j, Err(trap))),
             }
         }
     }
@@ -7670,9 +7720,9 @@ fn service_advance(
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
-            Outcome::ThreadJoin { handle, dst } => {
+            Outcome::ThreadJoin { handle, dst, wait } => {
                 *turn += 1;
-                dbg_join(tasks, ti, handle, dst);
+                dbg_join(tasks, ti, handle, dst, wait);
             }
             Outcome::MemoryWait {
                 base,
@@ -7955,7 +8005,7 @@ fn dbg_instantiate_detached(
 }
 
 /// `thread.join`: deliver a finished child's result now, else park the joiner. Mirrors `drive`'s `Join`.
-fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
+fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32, wait: bool) {
     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
         Ok(s) => s,
         Err(t) => {
@@ -7966,17 +8016,23 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
     let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
     match &tasks[child].state {
         DbgTaskState::Done(res) => {
-            let res = res.clone();
-            tasks[ti].threads[slot] = None;
-            match res {
-                Ok(vals) => {
-                    let v = vals.first().copied().unwrap_or(Value::I64(0));
-                    tasks[ti].vt.active.set(dst, Reg::from_value(v));
-                }
+            let (out, keep) = super::join_delivery(res, wait);
+            if !keep {
+                tasks[ti].threads[slot] = None;
+            }
+            match out {
+                Ok(r) => tasks[ti].vt.active.set(dst, r),
                 Err(t) => dbg_complete(tasks, ti, Err(t)),
             }
         }
-        _ => tasks[ti].state = DbgTaskState::BlockedJoin { child, slot, dst },
+        _ => {
+            tasks[ti].state = DbgTaskState::BlockedJoin {
+                child,
+                slot,
+                dst,
+                wait,
+            }
+        }
     }
 }
 
@@ -10407,10 +10463,12 @@ enum Outcome {
         dst: u32,
         module: usize,
     },
-    /// `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst`.
+    /// `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst` — or,
+    /// with `wait` (`Instantiator.wait`, op 18), how it ended ([`super::join_delivery`]).
     ThreadJoin {
         handle: i32,
         dst: u32,
+        wait: bool,
     },
     /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
     /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
@@ -11959,6 +12017,7 @@ enum VcpuStop {
     Join {
         handle: i32,
         dst: u32,
+        wait: bool,
     },
     /// §14 confined child (ops 0, 5, 13, 17): the driver (which owns the task set / extra
     /// environments) admits it with [`admit_confined_child`] and registers it as a joinable thread.
@@ -12467,7 +12526,9 @@ fn step_vcpu(
                     module: module as u32,
                 })
             }
-            Outcome::ThreadJoin { handle, dst } => return Ok(VcpuStop::Join { handle, dst }),
+            Outcome::ThreadJoin { handle, dst, wait } => {
+                return Ok(VcpuStop::Join { handle, dst, wait })
+            }
             // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
             // qualification veto keeps them out of fiber contexts, so no registry state is live.
             Outcome::LiveCall {
@@ -12778,11 +12839,13 @@ fn refund_ended_windows(tasks: &mut [TaskSlot], host: &mut Host, envs: &[ChildEn
 
 enum TaskState {
     Runnable,
-    /// Parked on `thread.join` of task `child`; deliver its result to `dst` and wake.
+    /// Parked on `thread.join` of task `child`; deliver its result to `dst` and wake (with `wait`,
+    /// how it ended: [`super::join_delivery`]).
     BlockedJoin {
         child: usize,
         slot: usize,
         dst: u32,
+        wait: bool,
     },
     /// Parked on `memory.wait` at futex `key` until notified or `deadline` (logical clock). The key is
     /// **backing-identity canonical** ([`super::FutexKey`]): two confined `instantiate` children that
@@ -15270,7 +15333,7 @@ impl CoopSched {
                         complete(tasks, ti, Err(t));
                     }
                 }
-                Ok(VcpuStop::Join { handle, dst }) => {
+                Ok(VcpuStop::Join { handle, dst, wait }) => {
                     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
                         Ok(s) => s,
                         Err(t) => {
@@ -15282,18 +15345,22 @@ impl CoopSched {
                     match &tasks[child].state {
                         TaskState::Done(res) => {
                             // The child already finished: deliver now (a child trap propagates here).
-                            let res = res.clone();
-                            tasks[ti].threads[slot] = None;
-                            match res {
-                                Ok(vals) => {
-                                    let v = vals.first().copied().unwrap_or(Value::I64(0));
-                                    tasks[ti].vt.active.set(dst, Reg::from_value(v));
-                                }
+                            let (out, keep) = super::join_delivery(res, wait);
+                            if !keep {
+                                tasks[ti].threads[slot] = None;
+                            }
+                            match out {
+                                Ok(r) => tasks[ti].vt.active.set(dst, r),
                                 Err(t) => complete(tasks, ti, Err(t)),
                             }
                         }
                         _ => {
-                            tasks[ti].state = TaskState::BlockedJoin { child, slot, dst };
+                            tasks[ti].state = TaskState::BlockedJoin {
+                                child,
+                                slot,
+                                dst,
+                                wait,
+                            };
                         }
                     }
                 }
@@ -16811,17 +16878,22 @@ impl ThreadRegistry {
         self.woken.notify_all();
     }
 
-    /// Block until vCPU `id` has published, then take (consume) its result — the parallel analogue of
-    /// the cooperative `BlockedJoin` wakeup. A child trap is returned to propagate to the joiner.
-    /// A joiner whose own `domain` dies while it waits completes with the domain's trap.
-    fn join(&self, id: u64, domain: &ParDomain) -> Result<Vec<Value>, Trap> {
+    /// Block until vCPU `id` has published, then deliver its result by [`super::join_delivery`] —
+    /// consumed unless a `wait` leaves it for a `join` — the parallel analogue of the cooperative
+    /// `BlockedJoin` wakeup. A child trap is returned to propagate to the joiner. A joiner whose own
+    /// `domain` dies while it waits completes with the domain's trap.
+    fn join(&self, id: u64, domain: &ParDomain, wait: bool) -> (Result<Reg, Trap>, bool) {
         let mut g = self.done.lock().unwrap();
         loop {
-            if let Some(r) = g.remove(&id) {
-                return r;
+            if let Some(r) = g.get(&id) {
+                let (out, keep) = super::join_delivery(r, wait);
+                if !keep {
+                    g.remove(&id);
+                }
+                return (out, keep);
             }
             if let Some(t) = domain.dead() {
-                return Err(t);
+                return (Err(t), false);
             }
             g = self.woken.wait(g).unwrap();
         }
@@ -17200,18 +17272,19 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
             }
-            Ok(VcpuStop::Join { handle, dst }) => {
-                // Single join: the handle is now spent.
-                let id = match super::take_child(&mut threads, handle) {
-                    Ok(id) => id,
+            Ok(VcpuStop::Join { handle, dst, wait }) => {
+                let slot = match super::resolve_thread(&threads, handle) {
+                    Ok(s) => s,
                     Err(t) => return (Err(t), mem),
                 };
-                match reg.join(id, &domain) {
+                let id = threads[slot].expect("resolve_thread checked liveness");
+                let (out, keep) = reg.join(id, &domain, wait);
+                if !keep {
+                    threads[slot] = None; // a single join: the handle is now spent
+                }
+                match out {
                     // A joined child's first result value lands in the joiner's `dst`.
-                    Ok(vals) => {
-                        let v = vals.first().copied().unwrap_or(Value::I64(0));
-                        vt.active.set(dst, Reg::from_value(v));
-                    }
+                    Ok(r) => vt.active.set(dst, r),
                     // A child trap propagates: the joiner completes with the same trap.
                     Err(t) => return (Err(t), mem),
                 }
@@ -17807,20 +17880,28 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
         tasks[done].state = TaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
         for (j, t) in tasks.iter_mut().enumerate() {
-            let TaskState::BlockedJoin { child, slot, dst } = t.state else {
+            let TaskState::BlockedJoin {
+                child,
+                slot,
+                dst,
+                wait,
+            } = t.state
+            else {
                 continue;
             };
             if child != done {
                 continue;
             }
-            t.threads[slot] = None;
-            match &res {
-                Ok(vals) => {
-                    let v = vals.first().copied().unwrap_or(Value::I64(0));
-                    t.vt.active.set(dst, Reg::from_value(v));
+            let (out, keep) = super::join_delivery(&res, wait);
+            if !keep {
+                t.threads[slot] = None;
+            }
+            match out {
+                Ok(r) => {
+                    t.vt.active.set(dst, r);
                     t.state = TaskState::Runnable;
                 }
-                Err(trap) => work.push((j, Err(*trap))),
+                Err(trap) => work.push((j, Err(trap))),
             }
         }
     }
@@ -19371,7 +19452,11 @@ impl Vm {
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadJoin { handle, dst });
+                    return Ok(Outcome::ThreadJoin {
+                        handle,
+                        dst,
+                        wait: false,
+                    });
                 }
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
                 // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
@@ -19659,16 +19744,21 @@ impl Vm {
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
                 // (executor children live in the same `threads` handle namespace as `thread.spawn`).
-                Op::InstJoin { handle, child, dst } => {
+                Op::InstJoin {
+                    handle,
+                    child,
+                    dst,
+                    wait,
+                } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?; // authority
                     let handle = r!(*child).i32();
-                    let dst = *dst;
+                    let (dst, wait) = (*dst, *wait);
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadJoin { handle, dst });
+                    return Ok(Outcome::ThreadJoin { handle, dst, wait });
                 }
                 Op::MemoryWait {
                     ty,

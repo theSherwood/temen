@@ -13065,6 +13065,55 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // `long __vm_wait(int inst, long child)` → `call.cap INSTANTIATOR 18 inst (child)`: join's
+        // park, answering how the child ended — 0 if it returned (it stays for `__vm_join`), else its
+        // trap's wire code (`temen_ir::trap_code`), the child reaped. A spawner's way to outlive a
+        // child that crashed or ran out of fuel.
+        "__vm_wait" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let child = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 18,
+                sig,
+                handle,
+                args: vec![child],
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // `Budget` (PROCESS.md S5): `long __vm_budget_split(int budget, long fuel, long mem, long
+        // spawn)` → `call.cap BUDGET 0` mints a node under `budget` with those ceilings (`-1`:
+        // only its ancestors cap it), returning its handle or `-errno`; `long __vm_budget_read(int
+        // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain. The
+        // split is how a spawner bounds what one child may spend, by handing it the node.
+        "__vm_budget_split" | "__vm_budget_read" => {
+            let split = name == "__vm_budget_split";
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget handle
+            let n = if split { 3 } else { 1 };
+            let args = (1..=n)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64; n],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: temen_ir::cap_id::BUDGET,
+                op: if split { 0 } else { 1 },
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // §12 per-vCPU TLS register: `__vm_vcpu_tls_get()` reads the current vCPU's word (seeded to the
         // dense vCPU id, so it doubles as a vCPU id); `__vm_vcpu_tls_set(x)` overwrites it (e.g. a
         // pointer to the guest's per-CPU block, for full __thread-style TLS).

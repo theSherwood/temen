@@ -1281,3 +1281,82 @@ fn a_detached_childs_threads_are_capped_by_its_budget() {
         );
     }
 }
+
+// ---- #2053: `wait` (op 18) — how a child ended, without inheriting its trap ----
+
+/// The tail of a parent that `wait`s for its child and returns the answer.
+const WAIT: &str = "\
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  return w1
+  }
+}
+";
+
+/// The tail of a parent that `wait`s twice, then `join`s: `(first * 1000 + second) * 1000 + value`.
+const WAIT_WAIT_JOIN: &str = "\
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  w2 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  k = i64.const 1000
+  s1 = i64.mul w1 k
+  s2 = i64.add s1 w2
+  s3 = i64.mul s2 k
+  s4 = i64.add s3 jr
+  return s4
+  }
+}
+";
+
+/// The tail of a parent that `wait`s, then `join`s the same handle.
+const WAIT_JOIN: &str = "\
+  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  return jr
+  }
+}
+";
+
+/// A detached child that reaches `unreachable`.
+const CHILD_UNREACHABLE: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  unreachable
+  }
+}
+";
+
+/// #2053 — on every driver, `wait` parks until the child ends and answers how: 0 for a child that
+/// returned, which stays for its `join` (a second `wait` answers 0 again, and the `join` still gets its
+/// value); else the child's trap's wire code, and the parent runs on — a child that loops past its
+/// node's fuel ceiling answers `OUT_OF_FUEL`, one that reaches `unreachable` answers `UNREACHABLE`. A
+/// trapped child has nothing left to join: the wait reaps it, so a `join` after it is a spent handle.
+#[test]
+fn wait_answers_how_a_detached_child_ended() {
+    use temen_ir::trap_code;
+    let loops = module(CHILD_LOOPS);
+    let crashes = module(CHILD_UNREACHABLE);
+    agree_on_every_driver(
+        "wait, wait, join on a child that returned",
+        &module(&op15_then(false, 0, WAIT_WAIT_JOIN)),
+        &op15_fuel_setup(&loops, 2 * PAYLOAD),
+        &ok(7),
+    );
+    agree_on_every_driver(
+        "wait on a child past its fuel ceiling",
+        &module(&op15_then(false, 0, WAIT)),
+        &op15_fuel_setup(&loops, PAYLOAD / 2),
+        &ok(trap_code::OUT_OF_FUEL),
+    );
+    agree_on_every_driver(
+        "wait on a child that reaches unreachable",
+        &module(&op15_then(false, 0, WAIT)),
+        &op15_setup(&crashes, 1 << 20),
+        &ok(trap_code::UNREACHABLE),
+    );
+    agree_on_every_driver(
+        "join after a wait reaped a trapped child",
+        &module(&op15_then(false, 0, WAIT_JOIN)),
+        &op15_fuel_setup(&loops, PAYLOAD / 2),
+        &trapped(Trap::ThreadFault),
+    );
+}

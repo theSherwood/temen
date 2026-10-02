@@ -7038,6 +7038,8 @@ struct InstEnv {
     nursery_addr: i64,
     instantiate_thunk: i64,
     join_thunk: i64,
+    // op 18 (`wait`): join's park, answering how the child ended.
+    wait_thunk: i64,
     // PROCESS.md S3 lifecycle thunks (poll / detach / kill) — parity with the interpreter's ops 9/10/12.
     poll_thunk: i64,
     detach_thunk: i64,
@@ -7069,6 +7071,7 @@ impl InstEnv {
             nursery_addr: 0,
             instantiate_thunk: 0,
             join_thunk: 0,
+            wait_thunk: 0,
             poll_thunk: 0,
             detach_thunk: 0,
             kill_thunk: 0,
@@ -7086,6 +7089,7 @@ impl InstEnv {
             nursery_addr: (n as *const instantiator_rt::Nursery) as i64,
             instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
             join_thunk: instantiator_rt::join as *const () as i64,
+            wait_thunk: instantiator_rt::wait as *const () as i64,
             poll_thunk: instantiator_rt::poll as *const () as i64,
             detach_thunk: instantiator_rt::detach as *const () as i64,
             kill_thunk: instantiator_rt::kill as *const () as i64,
@@ -10028,8 +10032,8 @@ fn lower_instantiator(
         0 => Some((&[VI64, VI64, VI64, VI64], &[VI32])),
         // instantiate_module: a leading `Module` handle (i64 slot), then the same four
         5 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
-        // join(child) -> result
-        1 => Some((&[VI32], &[VI64])),
+        // join(child) -> result; wait(child) -> 0 | trap code
+        1 | 18 => Some((&[VI32], &[VI64])),
         // S3 lifecycle: poll / detach / kill (child) -> i32 status
         9 | 10 | 12 => Some((&[VI32], &[VI32])),
         // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn (§3d: the
@@ -10117,10 +10121,11 @@ fn lower_instantiator(
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
-        1 => {
+        1 | 18 => {
             // join(nursery, mem_base, instantiator:i32, child_handle:i32, trap_out:i64) -> result:i64.
             // The nursery owns the child table for this run; the thunk still resolves the call.cap's
-            // `Instantiator` first, as the oracle does for every op (#1729).
+            // `Instantiator` first, as the oracle does for every op (#1729). `wait` (op 18) has
+            // join's shape and answers how the child ended.
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
@@ -10129,7 +10134,11 @@ fn lower_instantiator(
             }
             tsig.returns.push(AbiParam::new(I64));
             let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
+            let thunk_addr = match op {
+                1 => lower.inst.join_thunk,
+                _ => lower.inst.wait_thunk,
+            };
+            let thunk = b.ins().iconst(I64, thunk_addr);
             let call = b
                 .ins()
                 .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
