@@ -1203,7 +1203,7 @@ fn a_delivered_trapped_child_rides_a_second_freeze_on_every_engine() {
 /// Freeze [`refreeze_root`] over `child` (which ends at once) on each engine at its first fiber
 /// safepoint, thaw each artifact on each engine armed to freeze again at the second, and thaw each
 /// of those on each engine. Both freezes must carry the child as completed, and every last thaw
-/// answers `answer`, the uninterrupted run's.
+/// answers `answer`, the uninterrupted run's; neither child writes, so nor does any run.
 fn refreezes_every_engine(child: &str, answer: Answer) {
     use Engine::*;
     let confined = |src: &str| {

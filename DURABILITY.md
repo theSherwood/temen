@@ -1286,7 +1286,16 @@ the same way: its window is still live at the frame boundary it freezes on, but 
 holds only a `Weak` of each region it maps (the host is the one owner), so the holder rule counts it
 as it counts a finished run's; `Reactor::restore_window` re-aliases the thawed layout's `Backed`
 runs through the host. A reactor *moment* still refuses an aliased window: it carries no region
-bytes, so a rewind would show the region as it is at the restore, not as it was.
+bytes, so a rewind would show the region as it is at the restore, not as it was. A **debugger
+checkpoint** carries them (#2026, `Moment::checkpoint`): the root host's regions, by the same holder
+rule over that host alone (`capture_cut_regions`; a child domain's regions are not carried, so a
+region a child holds or maps keeps the run on replay-from-0), each backing's bytes paged and shared
+across rungs like the window image, plus which backing each region id names and the live region
+handles' slots and generations. The seek's fresh host rebuilds them under the same ids and handles
+before the window re-aliases its `Backed` pages. The **undo journal** needs no region capture: a
+write through an alias is journaled on the region's bytes, in turn order across tasks. It declines
+across a region mint or a moved alias (the root's region count, and its window's page-map version
+once it has aliased a region), and while a child holds a region.
 
 *Optimization (not v1):* diff against the post-instantiation image (`Module::data`
 segments) instead of storing all committed pages. Correctness doesn't need it.

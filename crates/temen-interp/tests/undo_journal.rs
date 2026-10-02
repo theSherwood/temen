@@ -842,3 +842,159 @@ fn the_journal_reports_how_far_back_undo_reaches() {
     );
     assert_eq!(r.journal_stats().reach, None, "and the stats say so");
 }
+
+/// #2026 — a guest that **mints and maps a §13 region**, then has two threads add into one cell of
+/// it: the root adds `k` for `k = n..1`, a spawned thread adds 1 `n` times. Both stores land on the
+/// region's bytes through the window's alias, interleaved by the schedule. The region's handle is
+/// stored at 16384.
+const REGION_WRITERS: &str = "memory 18
+func (i32, i64) -> (i64) {
+block 0 (vas: i32, vn: i64) {
+  vlen = i64.const 65536
+  vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vhat = i64.const 16384
+  i64.store vhat vrh
+  vr = i32.wrap_i64 vrh
+  voff = i64.const 131072
+  vroff = i64.const 0
+  vprot = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (voff, vroff, vlen, vprot)
+  vsp = i64.const 0
+  vh = thread.spawn 1 vsp vn
+  br 1(vh, vn)
+}
+block 1 (vh1: i32, vk1: i64) {
+  vz1 = i64.eqz vk1
+  br_if vz1 3(vh1) 2(vh1, vk1)
+}
+block 2 (vh2: i32, vk2: i64) {
+  va2 = i64.const 131080
+  vc2 = i64.load va2
+  vs2 = i64.add vc2 vk2
+  i64.store va2 vs2
+  vm2 = i64.const -1
+  vn2 = i64.add vk2 vm2
+  br 1(vh2, vn2)
+}
+block 3 (vh3: i32) {
+  vj3 = thread.join vh3
+  va3 = i64.const 131080
+  vr3 = i64.load va3
+  return vr3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1(varg)
+}
+block 1 (vi: i64) {
+  vz = i64.eqz vi
+  br_if vz 2() 3(vi)
+}
+block 2 () {
+  vr = i64.const 0
+  return vr
+}
+block 3 (vi2: i64) {
+  vaddr = i64.const 131080
+  vc = i64.load vaddr
+  vone = i64.const 1
+  vs = i64.add vc vone
+  i64.store vaddr vs
+  vm1 = i64.const -1
+  vnext = i64.add vi2 vm1
+  br 1(vnext)
+  }
+}
+";
+
+const REGION_ITERS: i64 = 200;
+
+/// [`REGION_WRITERS`] on a fresh host holding only a whole-window `memory` capability to mint with.
+fn region_run() -> ScheduledDebugRun {
+    let m = temen_text::parse_module(REGION_WRITERS).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let mut host = temen_interp::Host::new();
+    let mem = host.grant_memory();
+    let args = [
+        temen_interp::Value::I32(mem),
+        temen_interp::Value::I64(REGION_ITERS),
+    ];
+    ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("in the debug subset")
+}
+
+/// The region's handle, its cell read through the alias, and the run's turn.
+fn observe_region(r: &ScheduledDebugRun) -> (Vec<u8>, Vec<u8>, u64) {
+    (
+        r.read_window(16384, 8).expect("readable"),
+        r.read_window(131072, 16).expect("readable"),
+        r.op_turn(),
+    )
+}
+
+/// **Undo across writes to a §13 region** (#2026): a store through an alias is journaled on the
+/// region's bytes, so undoing to any turn after the map leaves the region as a fresh run ticked there
+/// has it, both threads' stores undone in the order they ran. Before the map it declines: the mint
+/// added a backing and a handle, and the map an alias, that no pre-image takes back — `seek` serves
+/// those turns.
+#[test]
+fn undo_across_region_writes_matches_a_replayed_run_or_declines() {
+    let mut r = region_run();
+    r.set_journal_armed(true);
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let sum = REGION_ITERS * (REGION_ITERS + 1) / 2 + REGION_ITERS;
+    assert_eq!(
+        r.result().cloned(),
+        Some(Ok(vec![temen_interp::Value::I64(sum)])),
+        "both threads add into the region"
+    );
+    let end = r.op_turn();
+    let fresh = |t: u64| {
+        let mut f = region_run();
+        let mut fuel = FUEL;
+        while f.op_turn() < t && f.tick(&mut fuel) {}
+        observe_region(&f)
+    };
+
+    let (mut undone, mut declined) = (0, Vec::new());
+    for t in (0..end).rev() {
+        if r.undo_to(t) {
+            assert_eq!(
+                observe_region(&r),
+                fresh(t),
+                "undo_to({t}) ≡ a fresh run ticked to {t}"
+            );
+            undone += 1;
+        } else {
+            declined.push(t);
+        }
+    }
+    assert!(
+        undone > 1000,
+        "most of the run undoes, got {undone} of {end}"
+    );
+    assert!(
+        declined.contains(&0),
+        "undo declines back across the mint and the map"
+    );
+    let first_undone = (0..end)
+        .find(|t| !declined.contains(t))
+        .expect("some turn undoes");
+    assert!(
+        declined.iter().all(|&t| t < first_undone),
+        "only a prefix declines — the turns before the first anchor past the map",
+    );
+
+    // Back to the start declines and leaves the run where it stood, so it runs on to the end the
+    // first pass reached. An undo that went through would keep the region and its handle, and the
+    // re-run would mint a second one under another handle.
+    assert!(!r.undo_to(0));
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    assert_eq!(
+        observe_region(&r),
+        fresh(end),
+        "the run ends where a fresh one does"
+    );
+}

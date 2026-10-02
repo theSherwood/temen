@@ -111,6 +111,8 @@ pub(crate) struct StateEntry {
     pub(crate) coord: u64,
     pub(crate) cont: ScheduledContinuation,
     pub(crate) cursor: HostCursor,
+    /// The run's §13 region mark (`bytecode::region_mark`, #2026): compared, not restored.
+    pub(crate) region_mark: (usize, u64),
     /// The first turn the next boundary may take ([`Journal::state_due`]).
     pub(crate) next: u64,
 }
@@ -314,6 +316,7 @@ impl Journal {
         coord: u64,
         cont: ScheduledContinuation,
         cursor: HostCursor,
+        region_mark: (usize, u64),
         next: u64,
     ) {
         if !self.armed {
@@ -329,6 +332,7 @@ impl Journal {
             coord,
             cont,
             cursor,
+            region_mark,
             next,
         });
         self.recorded_states += 1;

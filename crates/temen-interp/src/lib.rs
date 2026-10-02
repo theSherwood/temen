@@ -860,6 +860,18 @@ pub(crate) struct HostCursor {
     pub(crate) jit_mark: (usize, u64),
 }
 
+/// #2026 — which backing each of a host's §13 region ids names, and the handles that name them: with
+/// the backings' bytes, which a [`moment::Moment`] holds, what a debugger checkpoint carries of a
+/// run's regions ([`Host::capture_regions`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegionTable {
+    /// Per region id, its backing's index among the captured bytes. Ids aliasing one backing share
+    /// it, so they restore as one region again.
+    backing: Vec<usize>,
+    /// Each live `SharedRegion` handle: `(slot, generation, region id)`.
+    handles: Vec<(u32, u32, u32)>,
+}
+
 /// The run-mutable host substate a time-travel checkpoint restores — see [`Host::replay_substate`].
 #[derive(Clone)]
 struct HostReplaySubstate {
@@ -1594,8 +1606,9 @@ impl Inspector {
             // The window as a `MemLayout` (bytes + page map), the one image form (#1456). Under
             // `snapshot_safe` — which `checkpointable` requires — the map holds only in-prefix `Rw`
             // commits and the NULL guard, so this captures exactly the bytes `window_snapshot` did and
-            // restores them the same way; it is the same datum in the shared form.
-            moment::Moment::new(
+            // restores them the same way; it is the same datum in the shared form. `None` when a
+            // region the host holds cannot ride (#2026).
+            moment::Moment::checkpoint(
                 root.mem.as_ref().map(|m| m.layout_snapshot()),
                 &h,
                 moment::Continuation::ShadowStack(moment::ShadowStack::new(
@@ -1603,6 +1616,11 @@ impl Inspector {
                     root.fuel.can_burn(),
                 )),
             )
+        };
+        let Some(cp) = cp else {
+            self.checkpointing = false;
+            self.checkpoints.clear();
+            return;
         };
         self.checkpoints.take(clock, cp);
     }
@@ -24895,10 +24913,16 @@ impl Host {
     /// Whether the only run-mutable state this host has accumulated is the **restorable** replay
     /// substate (I/O streams, clock, cap cursor) — i.e. no stateful host capability has left residue a
     /// checkpoint restore would silently drop. A fresh seek-host starts with all of these empty; the
-    /// guest minting a §13 region / §12 blocking / async ring / §22 JIT domain, or the embedder granting
-    /// a host-fn, populates one. While they stay empty a checkpoint restored to an earlier logical time
+    /// guest minting a §12 blocking / async ring / §22 JIT domain, or the embedder granting a host-fn,
+    /// populates one. While they stay empty a checkpoint restored to an earlier logical time
     /// reproduces the host faithfully (W1); otherwise the `Inspector` stops checkpointing and falls back
     /// to replay-from-clock-0.
+    ///
+    /// **§13 regions are the checkpoint's own to decide (#2026).** A [`Moment::checkpoint`] carries
+    /// the regions a host holds, and declines when one cannot ride
+    /// ([`capture_regions`](Host::capture_regions)), so they are not refused here.
+    ///
+    /// [`Moment::checkpoint`]: moment::Moment::checkpoint
     ///
     /// **Module grants are exempt.** [`modules`](Host::modules) is populated *only* by the embedder
     /// ([`grant_module`](Host::grant_module) / [`grant_module_durable`](Host::grant_module_durable) —
@@ -24930,8 +24954,7 @@ impl Host {
     ///   cap-state vector in [`HostReplaySubstate`] lines up. An **unnamed** host-fn is an opaque closure
     ///   with no such rule and still disqualifies the run, exactly as before (fail-closed).
     fn checkpoint_safe(&self) -> bool {
-        self.regions.is_empty()
-            && self.blockings.is_empty()
+        self.blockings.is_empty()
             && self.every_host_proc_reconstructible()
             // #2015: a unit is a `JitCode` handle and an install the restore cannot rebuild, but a
             // table that holds none matches the fresh grant a restore lands in, up to the quota the
@@ -25996,6 +26019,60 @@ impl Host {
     pub fn adopt_region(&mut self, backing: RegionBacking) -> u32 {
         self.regions.push(backing);
         self.regions.len() as u32 - 1
+    }
+
+    /// How many §13 regions this domain holds, mapped or not.
+    pub(crate) fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// #2026 — this host's regions for a debugger checkpoint: each backing's bytes once, and the
+    /// [`RegionTable`] naming them. `None` when one cannot ride, by R4's holder rule over this host
+    /// alone ([`capture_cut_regions`]): a checkpoint carries no child domain's regions, so any other
+    /// holder — a child, or the embedder — is outside it, and so is a host file the region aliases.
+    pub(crate) fn capture_regions(&self) -> Option<(Vec<Vec<u8>>, RegionTable)> {
+        let ids = (0..self.regions.len() as u32).collect();
+        let captured = capture_cut_regions(&[(self, ids)]).ok()?;
+        let backing = self
+            .regions
+            .iter()
+            .map(|b| {
+                captured
+                    .iter()
+                    .position(|r| r.key == region_key(b))
+                    .expect("every region of this host was captured")
+            })
+            .collect();
+        let handles = self
+            .table
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s.entry {
+                Some(Binding::SharedRegion(region)) => Some((slot as u32, s.generation, region)),
+                _ => None,
+            })
+            .collect();
+        let bytes = captured.into_iter().map(|r| r.bytes).collect();
+        Some((bytes, RegionTable { backing, handles }))
+    }
+
+    /// #2026 — put back a [`capture_regions`](Host::capture_regions) on the host a seek rebuilt:
+    /// `backings` (one per captured backing, rebuilt from its bytes) under the same region ids, and
+    /// each handle that named one at the same slot and generation, so the guest's handle values and
+    /// the window's aliases (re-mapped after this) resolve as they did. The rebuilt host holds only
+    /// its launch grants, so this replaces its regions outright.
+    pub(crate) fn restore_regions(&mut self, backings: &[RegionBacking], table: &RegionTable) {
+        self.regions = table
+            .backing
+            .iter()
+            .map(|&i| Arc::clone(&backings[i]))
+            .collect();
+        for &(slot, generation, region) in &table.handles {
+            let s = &mut self.table[slot as usize];
+            s.generation = generation;
+            s.type_id = cap_id::SHARED_REGION;
+            s.entry = Some(Binding::SharedRegion(region));
+        }
     }
 
     /// #1680 — the tree-minted pipes this domain's live ends name, with those its nested children
@@ -32174,6 +32251,16 @@ impl Mem {
         self.map_version.load(Ordering::Acquire)
     }
 
+    /// #2026 — the page-map version once this window has aliased a §13 region, `0` before: what an
+    /// undo compares to decline across a `map`/`unmap` that moved an alias, which the journal's
+    /// pre-images do not record.
+    pub(crate) fn alias_version(&self) -> u64 {
+        match self.has_regions.load(Ordering::Relaxed) {
+            true => self.map_version(),
+            false => 0,
+        }
+    }
+
     /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): it shares the **same**
     /// everything — the `Arc<Region>` bytes *and* the `Arc<RwLock<AddrSpace>>` address space — so a
     /// `map`/`unmap`/`protect` (or §13 alias) by any vCPU is immediately visible to the others.
@@ -32708,11 +32795,15 @@ impl Mem {
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
     /// it through the same `confine_checked` a guest load uses, so a read past the reserved window
     /// faults instead of escaping; uncommitted in-window pages read as zero (demand-zeroed backing).
+    /// A page aliasing a §13 region reads the region's bytes, as the guest's own load does (#2026).
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
         if len == 0 {
             return Ok(Vec::new());
         }
         let abs = self.confine_checked(addr, 0, len as u32)?;
+        if self.has_regions.load(Ordering::Relaxed) {
+            return Ok(self.read_abs(abs, len));
+        }
         let mut out = vec![0u8; len];
         self.back.read_into(abs, &mut out);
         Ok(out)
@@ -33602,16 +33693,6 @@ impl Mem {
         self.snapshot(self.window.mapped())
     }
 
-    /// Whether the live memory state round-trips through a [`layout_snapshot`](Mem::layout_snapshot) /
-    /// [`restore_layout`](Mem::restore_layout) pair — the precondition for time-travel checkpointing a
-    /// **page-mapping** window (W1). Weaker than [`snapshot_safe`](Mem::snapshot_safe): because the
-    /// page-protection map is captured *alongside* the bytes, this admits `protect`ed (`Ro`), `unmap`ped,
-    /// and grown reserved-tail (`Rw`) pages — a window that manages its own layout via `map`/`unmap`/
-    /// `protect`. The one disqualifier is §13 region aliasing: a `Backed` page's bytes live in a shared
-    /// cross-domain `SharedRegion`, not this window's own backing, so a bytes-plus-protmap capture cannot
-    /// reproduce it (and reinstating a cross-domain alias on restore is out of scope). `has_regions` is
-    /// the monotonic "ever aliased a region" flag, set at the same choke as the `Backed` insert, so its
-    /// clear state proves no `Backed` page exists.
     /// Read-only **memory-map introspection** (INTERACTIVE_EMBEDDING.md slice 5, W6 tooling):
     /// `(page_size, mapped, reserved, pages)`, where `pages` lists every page with an explicit
     /// state as `(page_base_offset, kind)` — kind `0` = read-only (`protect`ed), `1` = read-write
@@ -33641,6 +33722,17 @@ impl Mem {
         )
     }
 
+    /// Whether the live memory state round-trips through a [`layout_snapshot`](Mem::layout_snapshot) /
+    /// [`restore_layout`](Mem::restore_layout) pair — the precondition for time-travel checkpointing a
+    /// **page-mapping** window (W1). Weaker than [`snapshot_safe`](Mem::snapshot_safe): because the
+    /// page-protection map is captured *alongside* the bytes, this admits `protect`ed (`Ro`), `unmap`ped,
+    /// and grown reserved-tail (`Rw`) pages — a window that manages its own layout via `map`/`unmap`/
+    /// `protect`. The one disqualifier is §13 region aliasing: a `Backed` page's bytes live in a shared
+    /// `SharedRegion`, not this window's own backing, so a bytes-plus-protmap capture cannot reproduce
+    /// it. `has_regions` is the monotonic "ever aliased a region" flag, set at the same choke as the
+    /// `Backed` insert, so its clear state proves no `Backed` page exists. The **root** window no longer
+    /// needs this: a debugger checkpoint carries the root host's regions and re-aliases the window onto
+    /// them (#2026), so it gates the child windows, whose hosts are rebuilt without regions.
     fn layout_snapshot_safe(&self) -> bool {
         !self.has_regions.load(Ordering::Relaxed)
     }
@@ -33694,9 +33786,10 @@ impl Mem {
 
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
     /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
-    /// [`restore_layout`](Mem::restore_layout). Precondition: [`layout_snapshot_safe`](Mem::layout_snapshot_safe)
-    /// (no §13 regions). The byte range runs to the high-water mark — the mapped prefix, extended to
-    /// cover any grown reserved-tail page present in the map — so a `map`-grown heap is captured;
+    /// [`restore_layout`](Mem::restore_layout). A page aliasing a §13 region is captured as the
+    /// region it names, its bytes the region's to carry. The byte range runs to the high-water mark —
+    /// the mapped prefix, extended to cover any grown reserved-tail page present in the map — so a
+    /// `map`-grown heap is captured;
     /// uncommitted/unmapped pages inside it read zero (the demand-zeroed backing, and `map`/`unmap`
     /// zero on commit), matching a fresh window. Only for the **root** window (`base == 0`); nested
     /// children ride in the root capture.
@@ -33707,8 +33800,9 @@ impl Mem {
         // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
         // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
         // PER BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy
-        // rather than millions of calls; the per-byte arm is a window that aliased a region, which
-        // only a reactor's §12 save-state captures (#2051), reading through it. Offset `0`, not
+        // rather than millions of calls; the per-byte arm is a window that aliased a region, which a
+        // reactor's §12 save-state (#2051) and a debugger checkpoint (#2026) capture, reading through
+        // it. Offset `0`, not
         // `window.base()`, exactly as the per-byte arm's `self.byte(i)` indexes: this capture is
         // root-only (see the doc above), where the two agree.
         let bytes = if !self.has_regions.load(Ordering::Relaxed) {
