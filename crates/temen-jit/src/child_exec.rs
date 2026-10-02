@@ -364,6 +364,9 @@ struct Entry {
     /// #1469 — the task's own domain, reachable while a worker holds the task: a poisoned task's
     /// parked vCPUs must be woken to observe it.
     dom: Option<Arc<Domain>>,
+    /// #2074 — the task's instance (its trap cell in field 0), reachable while a worker holds the
+    /// task, for [`ChildExec::kill`].
+    vm: Arc<VmCtx>,
 }
 
 struct ExecState {
@@ -421,8 +424,9 @@ impl ChildExec {
         (self.dom != 0).then(|| unsafe { &*(self.dom as *const Domain) })
     }
 
-    /// File a task and make it runnable. Its `done` cell is filled when it finishes.
-    pub(crate) fn spawn(self: &Arc<Self>, mut task: ChildTask) {
+    /// File a task and make it runnable. Its `done` cell is filled when it finishes. Returns its id,
+    /// which [`Self::kill`] takes.
+    pub(crate) fn spawn(self: &Arc<Self>, mut task: ChildTask) -> u64 {
         // #1469 — a child compiled with thread ops gets its own domain over its window (the thread
         // thunks find it through `os_thread_rt::CURRENT_DOMAIN`, set for each residency below).
         // So does a durable child (#1937): a wait ends on a freeze of its domain's window, and a
@@ -499,6 +503,7 @@ impl ChildExec {
             .unwrap_or(g.tasks.len() + 1);
         let stop = task.copy_back.is_some().then(|| Arc::clone(&task.vm));
         let dom = task.dom.clone();
+        let vm = Arc::clone(&task.vm);
         g.tasks.insert(
             id,
             Entry {
@@ -509,11 +514,46 @@ impl ChildExec {
                 woken: false,
                 stop,
                 dom,
+                vm,
             },
         );
         g.runnable.push_back(id);
         self.ensure_worker(&mut g, widest);
         self.cv.notify_one();
+        id
+    }
+
+    /// `Instantiator.kill` (#2074): end task `id` with `ThreadFault`, running or parked. Its trap
+    /// cell stops its running vCPUs at their next entry or back-edge poll (`emit_domain_poll`), and a
+    /// parked task (or a parked vCPU of its own) is woken to observe it, as a teardown's poison is.
+    /// A task that has finished is gone from the table, and nothing happens.
+    pub(crate) fn kill(&self, id: u64) {
+        let mut g = lock(&self.state);
+        let Some(e) = g.tasks.get_mut(&id) else {
+            return;
+        };
+        // Never clobber a trap the child already recorded.
+        let _ = e.vm.trap.compare_exchange(
+            0,
+            TrapKind::ThreadFault as i64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        if let Some(d) = &e.dom {
+            d.wake_own_parked();
+        }
+        // A running task may be on its way to a park: latch the wake, as `wake_parked` does.
+        e.woken = true;
+        if std::mem::take(&mut e.parked) {
+            e.deadline = None;
+            if std::mem::take(&mut e.counted) {
+                if let Some(d) = self.domain() {
+                    d.task_unparked();
+                }
+            }
+            g.runnable.push_back(id);
+        }
+        self.cv.notify_all();
     }
 
     fn ensure_worker(self: &Arc<Self>, g: &mut ExecState, want: usize) {

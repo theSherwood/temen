@@ -7743,13 +7743,26 @@ fn twin_finished_locked(
     woke | wake_posix_reap_any_locked(s, parent)
 }
 
+/// PROCESS.md S3 `kill` (#2074): end a §14 child, under the scheduler lock. Its kill flag stops its
+/// **running** members at their next per-op poll (teardown is non-preemptive); tearing its domain
+/// down reaps its **parked** ones, wherever they wait, which wakes the parent's `join`/`wait`. Each
+/// reaped member kills its own children the same way ([`reap`]), so a whole subtree ends. `host` is
+/// the child's powerbox, absent for a nested child, which shares its spawner's domain and is reached
+/// only through its flag.
+fn kill_child_locked(s: &mut Sched, flag: &AtomicBool, host: Option<&Arc<Mutex<Host>>>) {
+    flag.store(true, Ordering::Relaxed);
+    if let Some(h) = host {
+        let key = h.lock_unpoisoned().domain_id() as usize;
+        teardown_domain(s, key, &Trap::ThreadFault, h);
+    }
+}
+
 /// Kill one vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24):
 /// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` re-raises
 /// (I37 supervision mechanics) — keeping `mem`/`fuel` residue (the root's is read back by
 /// [`drive_arc`] when a sibling's trap ended the run), wake any cross-domain joiner, free its
-/// durable shadow context, and set its own §14 children's kill flags (ownership anchors *their*
-/// lifetime too — the owner's death propagates as the existing S3 kill, observed at the child's
-/// per-op poll). Returns the dispatch tickets the vCPU had admitted but not replied
+/// durable shadow context, and kill its own §14 children (ownership anchors *their* lifetime too —
+/// the owner's death propagates as the S3 kill, [`kill_child_locked`]). Returns the dispatch tickets the vCPU had admitted but not replied
 /// (`handler_parks` / `serve_run`) so the caller can errno-wake their cross-domain callers (D37).
 fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     let tickets: Vec<u64> = v
@@ -7758,8 +7771,8 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         .map(|&(_, t)| t)
         .chain(v.serve_run.as_ref().map(|r| r.ticket))
         .collect();
-    for flag in v.child_kill.values() {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    for (slot, flag) in &v.child_kill {
+        kill_child_locked(s, flag, v.child_hosts.get(slot));
     }
     // CALLS.md 4b.3 — a reaped caller that was mid-animation holds a provider instance checked out
     // (`busy = true`, its world on this vCPU). Reopen admission on each so a *reused* `Host` never
@@ -9058,8 +9071,22 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     trap_fiber,
                     trap_fault,
                 };
+                // #2074 — a killed vCPU that stopped at its own poll (it was running, so no teardown
+                // reaped it) takes its §14 children with it, as a reaped one does ([`reap`]).
+                let killed = v.kill.as_ref().is_some_and(|k| k.load(Ordering::Relaxed));
+                let orphans = if killed {
+                    (
+                        std::mem::take(&mut v.child_kill),
+                        std::mem::take(&mut v.child_hosts),
+                    )
+                } else {
+                    Default::default()
+                };
                 drop(v);
                 let mut s = sched.lock();
+                for (slot, flag) in &orphans.0 {
+                    kill_child_locked(&mut s, flag, orphans.1.get(slot));
+                }
                 // #1584 — a freeze is now in flight: the worker loop drains the parks that will not
                 // otherwise observe it (see `freeze_in_flight`).
                 s.froze |= froze;
@@ -9829,6 +9856,22 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.lock().results.contains_key(&id),
             SchedRef::Det(d) => d.lock().results.contains_key(&id),
+        }
+    }
+    /// `Instantiator.kill` (#2074): [`kill_child_locked`] on this run's scheduler.
+    fn kill_child(&self, flag: &AtomicBool, host: Option<&Arc<Mutex<Host>>>) {
+        match self {
+            SchedRef::Real(s) => {
+                kill_child_locked(&mut s.lock(), flag, host);
+                s.work.notify_all();
+            }
+            SchedRef::Det(d) => {
+                flag.store(true, Ordering::Relaxed);
+                if let Some(h) = host {
+                    let key = h.lock_unpoisoned().domain_id() as usize;
+                    det_teardown_domain(&mut d.lock(), key, &Trap::ThreadFault);
+                }
+            }
         }
     }
 }
@@ -15132,20 +15175,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             credit_child_lane(child_lane, host, slot); // D66
                             frames[top].vals.push(Reg::from_i32(0));
                         }
-                        // kill(child) -> 0 | -ESRCH (PROCESS.md S3): set the child's subtree kill flag;
-                        // the child (and its `thread.spawn` descendants, which share the flag) traps at
-                        // its next per-op poll (`ThreadFault` → `poll` reports 2). Idempotent; killing an
-                        // already-finished child (no live flag) is a harmless success. The parent must
-                        // then `poll`/`detach` rather than `join` (a `join` would propagate the child's
-                        // trap to the parent). Reliably stops a **running** child; a child parked on a
-                        // futex/join observes the kill when it next wakes (prompt parked-wake is a
-                        // follow-up). A forged/joined handle is a `ThreadFault`.
+                        // kill(child) -> 0 (PROCESS.md S3, #2074): end the child and everything under
+                        // it, running or parked, with `ThreadFault` (`poll` → 2, `wait` → its code).
+                        // Idempotent; killing an already-finished child is a harmless success. The
+                        // parent then `wait`s or `poll`s (a `join` re-raises the trap). A forged or
+                        // joined handle is a `ThreadFault`.
                         12 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             if let Some(flag) = child_kill.get(&slot) {
-                                flag.store(true, Ordering::Relaxed);
+                                sched.kill_child(flag, child_hosts.get(&slot));
                             }
                             frames[top].vals.push(Reg::from_i32(0));
                         }
