@@ -602,10 +602,13 @@ fn coop_tierup_child_env_tasks_tier_up() {
         "cooperative tier-up run with a detached child diverged from the pure-interp oracle"
     );
     // #816 env routing: all three eligible calls surface — the root's, the detached child entry's
-    // (spawn-arm inheritance), and the child-env worker's (thread-arm inheritance).
+    // (spawn-arm inheritance), and the child-env worker's (thread-arm inheritance). #2102: off unix a
+    // detached window has no flat backing, so only the root's does there.
+    let want_tierups = if cfg!(unix) { 3 } else { 1 };
     assert_eq!(
-        tierups, 3,
-        "root + child entry + child worker must all tier up (#816), got {tierups}"
+        tierups, want_tierups,
+        "root + child entry + child worker must all tier up where a detached window is flat \
+         (#816, #2102), got {tierups}"
     );
 }
 
