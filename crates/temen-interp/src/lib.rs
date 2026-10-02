@@ -21607,6 +21607,26 @@ type HostFnVtable = Arc<(Vec<String>, Vec<FuncType>)>;
 /// attach-time coverage walk.
 type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
 
+/// #1866 — a detached child's powerbox as the scheduled debugger's checkpoint carries it, in memory:
+/// its handle table by the freeze's own durable capture, and what its spawn decided beside it — its
+/// names, import bindings, program, attestation, budget node and lane. Only a table of plain values
+/// is carried (streams, the exit and clock, address spaces, instantiators, freeze authority,
+/// budgets), so a rebuild needs no thaw seam; any other binding keeps the run out of the
+/// checkpointable subset, and a seek replays from an earlier checkpoint ([`Host::child_powerbox`]).
+#[derive(Clone)]
+pub(crate) struct ChildPowerbox {
+    handles: Vec<DurableHandle>,
+    names: Vec<(String, i32)>,
+    import_bindings: Vec<BoundImport>,
+    import_remaps: Vec<Option<Arc<[u32]>>>,
+    import_reqs: Vec<Option<ImportReq>>,
+    self_module: Option<Arc<Module>>,
+    attestation: Attestation,
+    durable: bool,
+    own_budget: u32,
+    lane_cap: i64,
+}
+
 /// §3.5 coverage walk: for every required `(name, sig)`, find the same-named,
 /// signature-equal provider op; extra provider ops are ignored. Name-less providers (legacy
 /// wires) fall back to exact positional matching. Returns the consumer→provider op remap, or
@@ -24836,10 +24856,15 @@ impl Host {
     /// append-only) and each capability's opaque declared state — is excluded by
     /// [`journal_invertible`](Host::journal_invertible) instead of being restored wrongly.
     pub(crate) fn journal_cursor(&self) -> HostCursor {
+        // #2055: a stream promoted into a shared cell (a child re-granted it) writes there.
+        let len = |cell: &Option<Arc<Mutex<Vec<u8>>>>, own: &Vec<u8>| {
+            cell.as_ref()
+                .map_or(own.len(), |c| c.lock_unpoisoned().len())
+        };
         HostCursor {
             stdin_pos: self.stdin_pos,
-            stdout_len: self.stdout.len(),
-            stderr_len: self.stderr.len(),
+            stdout_len: len(&self.out_sink, &self.stdout),
+            stderr_len: len(&self.err_sink, &self.stderr),
             clock_ns: self.clock_ns,
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
@@ -24862,8 +24887,15 @@ impl Host {
     /// journal by construction rather than by separate bookkeeping.
     pub(crate) fn restore_journal_cursor(&mut self, c: &HostCursor) {
         self.stdin_pos = c.stdin_pos;
-        self.stdout.truncate(c.stdout_len);
-        self.stderr.truncate(c.stderr_len);
+        // #2055: truncate where the bytes went — the shared cell, once promoted.
+        match &self.out_sink {
+            Some(cell) => cell.lock_unpoisoned().truncate(c.stdout_len),
+            None => self.stdout.truncate(c.stdout_len),
+        }
+        match &self.err_sink {
+            Some(cell) => cell.lock_unpoisoned().truncate(c.stderr_len),
+            None => self.stderr.truncate(c.stderr_len),
+        }
         self.clock_ns = c.clock_ns;
         self.cap_consumed = c.cap_consumed;
         if let Some(slot) = self.cap_replay.as_mut() {
@@ -24930,10 +24962,12 @@ impl Host {
     /// clones (`stdout`/`stderr` and the debug-run serve queue are typically tiny).
     fn replay_substate(&self) -> HostReplaySubstate {
         let (svc_queue, svc_results, svc_next_ticket) = self.svc_state();
+        // #2055: each stream as it stands, wherever it lives — its own field, or the shared cell
+        // a child's re-grant promoted it into.
         HostReplaySubstate {
-            stdin_pos: self.stdin_pos,
-            stdout: self.stdout.clone(),
-            stderr: self.stderr.clone(),
+            stdin_pos: self.stdin_copy().1,
+            stdout: self.stdout_bytes(),
+            stderr: self.stderr_bytes(),
             clock_ns: self.clock_ns,
             cap_cursor: self.cap_consumed,
             cap_record: self.cap_record.clone().unwrap_or_default(),
@@ -24955,9 +24989,20 @@ impl Host {
     /// cap-replay cursor and reinstates the I/O streams + clock, so a replay resumed from the
     /// checkpoint's logical time draws the same subsequent inputs and accumulates onto the same output.
     fn restore_replay_substate(&mut self, s: &HostReplaySubstate) {
-        self.stdin_pos = s.stdin_pos;
-        self.stdout = s.stdout.clone();
-        self.stderr = s.stderr.clone();
+        // #2055: back where reads and writes now go, which a restored child's inherited stdio may
+        // already have promoted into a shared cell.
+        match &self.in_shared {
+            Some(cell) => cell.lock_unpoisoned().pos = s.stdin_pos,
+            None => self.stdin_pos = s.stdin_pos,
+        }
+        match &self.out_sink {
+            Some(cell) => *cell.lock_unpoisoned() = s.stdout.clone(),
+            None => self.stdout = s.stdout.clone(),
+        }
+        match &self.err_sink {
+            Some(cell) => *cell.lock_unpoisoned() = s.stderr.clone(),
+            None => self.stderr = s.stderr.clone(),
+        }
         self.clock_ns = s.clock_ns;
         self.cap_consumed = s.cap_cursor;
         if let Some(slot) = self.cap_replay.as_mut() {
@@ -29377,6 +29422,67 @@ impl Host {
                 *sink = Some(idx);
             }
         }
+    }
+
+    /// #1866 — this (detached child's) powerbox as a [`ChildPowerbox`], or `None` when its table holds
+    /// a binding that is not a plain value.
+    pub(crate) fn child_powerbox(&self) -> Option<ChildPowerbox> {
+        let handles = self.capture_durable_handles().ok()?;
+        let plain = handles.iter().all(|h| {
+            matches!(
+                h.binding,
+                DurableBinding::Stream { .. }
+                    | DurableBinding::Exit
+                    | DurableBinding::Clock
+                    | DurableBinding::AddressSpace { .. }
+                    | DurableBinding::Instantiator { .. }
+                    | DurableBinding::FreezeAuthority(_)
+                    | DurableBinding::Budget { .. }
+            )
+        });
+        plain.then(|| ChildPowerbox {
+            handles,
+            names: self.cap_names.clone(),
+            import_bindings: self.import_bindings.clone(),
+            import_remaps: self.import_remaps.clone(),
+            import_reqs: self.import_reqs.clone(),
+            self_module: self.self_module.clone(),
+            attestation: self.attestation,
+            durable: self.durable,
+            own_budget: self.own_budget,
+            lane_cap: self.lane_cap,
+        })
+    }
+
+    /// #1866 — rebuild a child's [`ChildPowerbox`] under this, its spawner's, powerbox: its handles
+    /// re-pinned as a thaw re-pins them, its node in this run's budget tree, and the stdio it inherited
+    /// aliased to this host's, as the spawn aliased it ([`Host::alias_inherited_stdio`]).
+    pub(crate) fn rebuild_child_powerbox(&mut self, pb: &ChildPowerbox) -> Host {
+        let mut child = Host::new();
+        child.durable = pb.durable;
+        child.attestation = pb.attestation;
+        child.budgets = Arc::clone(&self.budgets);
+        child.own_budget = pb.own_budget;
+        child.lane_cap = pb.lane_cap;
+        child.restore_durable_handles(&pb.handles);
+        child.cap_names = pb.names.clone();
+        child.import_bindings = pb.import_bindings.clone();
+        child.import_remaps = pb.import_remaps.clone();
+        child.import_reqs = pb.import_reqs.clone();
+        child.set_self_module_opt(pb.self_module.clone());
+        self.alias_inherited_stdio(&mut child);
+        child
+    }
+
+    /// #1866 — every node of this run's budget tree, with its ceilings and charges. Every domain of the
+    /// run shares the tree, so one copy puts them all back ([`Host::set_budget_tree`]).
+    pub(crate) fn budget_tree(&self) -> Vec<BudgetNode> {
+        self.budgets.0.lock_unpoisoned().clone()
+    }
+
+    /// #1866 — put this run's budget tree back as [`Host::budget_tree`] captured it.
+    pub(crate) fn set_budget_tree(&self, nodes: &[BudgetNode]) {
+        *self.budgets.0.lock_unpoisoned() = nodes.to_vec();
     }
 
     /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding
