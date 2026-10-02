@@ -9438,8 +9438,9 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
 
 /// Emit the domain-teardown poll ([`Lower::domain_poll`]) — at loop back-edges and at the entry of
 /// a function that tail-calls: if this vCPU's trap cell is non-zero —
-/// set by a sibling's trap, the root's completion, or a parent tearing down a §14 child — return
-/// straight up the stack, as a call's trap-propagation guard does. The cell is only read, so the
+/// set by a sibling's trap, the root's completion, or a parent tearing down a §14 child — or its stop
+/// word is (a parent's `kill` or teardown, #2088), return straight up the stack, as a call's
+/// trap-propagation guard does. The cell is only read, so the
 /// value that ended the domain is the one reported. The load is atomic for the reason
 /// [`emit_epoch_check`]'s is: another thread writes the cell, and a plain load could be hoisted out
 /// of the loop it bounds. A no-op when `domain_poll` is off.
@@ -9451,11 +9452,19 @@ fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
     }
     let trap_out = b.use_var(lower.vmctx_var);
     let tc = b.ins().atomic_load(I64, atomic_flags(), trap_out);
+    // #2088 — and the stop word (`VmCtx::stop`), which a `call.cap` never resets as it does the trap
+    // cell, so a kill that landed during one is still seen here.
+    let stop_word = b.ins().iadd_imm(trap_out, vmctx::STOP as i64);
+    let st = b.ins().atomic_load(I64, atomic_flags(), stop_word);
+    let any = b.ins().bor(tc, st);
     let stop = b.create_block();
     let cont = b.create_block();
     b.set_cold_block(stop); // taken once per vCPU lifetime: keep it off the loop's fall-through path
-    b.ins().brif(tc, stop, &[], cont, &[]);
+    b.ins().brif(any, stop, &[], cont, &[]);
     b.switch_to_block(stop);
+    // A trap already recorded wins; else the stop becomes the trap the return reports.
+    let code = b.ins().select(tc, tc, st);
+    b.ins().atomic_store(atomic_flags(), code, trap_out);
     emit_trap_return(b, lower);
     b.switch_to_block(cont);
     // `stop`/`cont` are sealed by the caller's `seal_all_blocks`.

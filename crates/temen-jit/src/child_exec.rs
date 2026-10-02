@@ -532,13 +532,16 @@ impl ChildExec {
         let Some(e) = g.tasks.get_mut(&id) else {
             return;
         };
-        // Never clobber a trap the child already recorded.
-        let _ = e.vm.trap.compare_exchange(
-            0,
-            TrapKind::ThreadFault as i64,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        // The stop word ends it at its next poll, whatever its host calls do to the trap cell
+        // (#2088); the trap cell ends the waits a parked vCPU of it re-checks. Never clobber a trap
+        // the child already recorded.
+        let code = TrapKind::ThreadFault as i64;
+        let _ =
+            e.vm.stop
+                .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+        let _ =
+            e.vm.trap
+                .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
         if let Some(d) = &e.dom {
             d.wake_own_parked();
         }
@@ -1070,8 +1073,9 @@ impl ChildExec {
                     }
                     true
                 } else if let Some(stop) = e.stop.as_ref().filter(|_| end_domain) {
-                    // Never clobber a trap the child already recorded.
-                    let _ = stop.trap.compare_exchange(
+                    // The stop word, which a `call.cap` does not reset (#2088). Never clobber a
+                    // stop already set.
+                    let _ = stop.stop.compare_exchange(
                         0,
                         crate::DOMAIN_DONE_CODE as i64,
                         Ordering::Relaxed,

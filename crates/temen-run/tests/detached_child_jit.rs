@@ -1191,3 +1191,70 @@ fn kill_ends_a_detached_child_spinning_or_parked() {
         );
     }
 }
+
+/// A child that reads its attestation (a host call) and then spins.
+const CHILD_CALLS_THEN_SPINS: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vat = call.cap 4294967295 4 () -> (i64) vz ()
+  br 1()
+}
+block 1 () {
+  br 1()
+  }
+}
+"#;
+
+/// A child that makes a host call on every iteration of a loop that never ends.
+const CHILD_SPINS_CALLING: &str = r#"memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  vz = i32.const 0
+  vat = call.cap 4294967295 4 () -> (i64) vz ()
+  br 1()
+  }
+}
+"#;
+
+/// #2088 — a kill on the JIT survives the child's host calls: each successful `call.cap` resets the
+/// trap cell, which used to erase a kill that landed during (or before) one, so the child ran on and
+/// its parent's `wait` hung. The parent kills each child as soon as it is spawned; both answer
+/// `THREAD_FAULT`, as on the interpreter.
+#[test]
+fn a_kill_survives_the_childs_host_calls_on_the_jit() {
+    let p = module(&parent_then(
+        "vk = call.cap 6 12 (i32) -> (i32) v0 (vh)\n  \
+         vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
+         return vr",
+    ));
+    let fault = temen_ir::trap_code::THREAD_FAULT;
+    for (name, child) in [
+        ("a host call, then a spin", CHILD_CALLS_THEN_SPINS),
+        ("a host call every iteration", CHILD_SPINS_CALLING),
+    ] {
+        let (pi, ci) = (p.clone(), module(child));
+        assert_eq!(
+            within_a_minute(&format!("interpreter, {name}"), move || interp_result(
+                &pi,
+                host(&ci, 1 << 20)
+            )),
+            Ok(vec![Value::I64(fault)]),
+            "interpreter, {name}"
+        );
+        for round in 0..20 {
+            let (pj, cj) = (p.clone(), module(child));
+            assert_eq!(
+                within_a_minute(&format!("the JIT, {name}"), move || jit_outcome(
+                    &pj,
+                    host(&cj, 1 << 20)
+                )),
+                JitOutcome::Returned(vec![fault]),
+                "the JIT, {name}, round {round}"
+            );
+        }
+    }
+}

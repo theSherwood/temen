@@ -55,6 +55,11 @@ pub struct VmCtx {
     /// The §12 thread domain (`os_thread_rt::Domain`) the instance's `thread.*`, futex and blocking
     /// `cont.resume` sites run on: its own, or for a §14 child its parent's. Null when it has none.
     pub sched: *const c_void,
+    /// #2088 — the **stop word**: a trap code a parent's `kill` or teardown sets to end this instance's
+    /// running vCPUs. Their entry and back-edge poll (`emit_domain_poll`) moves it into the trap cell
+    /// and unwinds. It is apart from the trap cell because a successful `call.cap` resets that cell to
+    /// `0`, which would erase a stop that landed during the call.
+    pub stop: AtomicI64,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -96,6 +101,7 @@ impl VmCtx {
             sig_ctx: a.sig_ctx,
             embedder: a.embedder,
             sched: a.sched,
+            stop: AtomicI64::new(0),
         }
     }
 
@@ -117,7 +123,8 @@ impl VmCtx {
 // SAFETY: every pointer field is the address of a host-owned object that outlives each run entering
 // through this context (the caller's contract at every entry), and compiled code only *reads* them; the
 // one field written concurrently — the trap cell, by sibling vCPUs of one instance — is atomic. So one
-// context may be shared by the threads of one instance (its spawned vCPUs, a §14 task's worker).
+// context may be shared by the threads of one instance (its spawned vCPUs, a §14 task's worker). The
+// stop word is atomic too: a parent's thread writes it while the instance runs.
 unsafe impl Send for VmCtx {}
 unsafe impl Sync for VmCtx {}
 
@@ -129,6 +136,7 @@ pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
 pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32;
 pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
 pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
+pub(crate) const STOP: i32 = core::mem::offset_of!(VmCtx, stop) as i32;
 
 // The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.
 const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);
