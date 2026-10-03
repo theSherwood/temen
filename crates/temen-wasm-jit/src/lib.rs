@@ -53,19 +53,22 @@
 //!
 //! ## Control flow
 //!
-//! v1 is the **block dispatcher**: SSA values live in wasm locals (one per block-scoped value —
-//! block params first, then each instruction's results, mirroring the verifier's numbering); a
-//! `loop` re-dispatches on a `$next` local via `br_table` over one wasm `block` per Temen block.
-//! Branch arguments are pushed onto the operand stack *then* popped into the target's param locals
-//! (reverse order), so a self-branch that permutes its own params can't read an already-overwritten
-//! local. A relooper for reducible CFGs is a planned upgrade, not a correctness need — and measured
-//! low-ROI so far: it made no V8 difference on Lua's giant reducible function (BROWSER.md), and the
-//! per-dispatch fuel cost it also carried is now removed by the fuel global. It would only pay on
-//! *multi-block-per-trip* loops, where re-dispatching each block both costs and defeats the fuel
-//! global's register allocation (the `branchy` row in BROWSER.md § "Fuel in a global").
+//! SSA values live in wasm locals (one per block-scoped value — block params first, then each
+//! instruction's results, mirroring the verifier's numbering). A function's blocks **nest as
+//! structured control flow** when its CFG is reducible (`Structure`: a `loop` per loop header, a
+//! `block` per dominator-tree child, each edge one `br`). Otherwise, and in split functions, they run
+//! under the **block dispatcher**: a `loop` re-dispatches on a `$next` local via `br_table` over one
+//! wasm `block` per Temen block. The two differ only in how an edge reaches its target
+//! (`FnCtx::transfer`). Branch arguments are pushed onto the operand stack *then* popped into the
+//! target's param locals (reverse order), so a self-branch that permutes its own params can't read an
+//! already-overwritten local; an argument already in its param's local is not moved.
 //!
-//! Proven by `tests/differential.rs`: every kernel runs on the bytecode engine (the oracle) and on
-//! the emitted wasm under `wasmi`, comparing results **and trap kinds**.
+//! Structured control flow made nim's tools 1.5× faster in Chromium (#2099). It made no difference to
+//! Lua's one giant interpreter loop (BROWSER.md); a program of many functions with multi-block loops
+//! is what re-dispatching each block slows.
+//!
+//! Proven by `tests/differential.rs`: every kernel runs on the interpreter (the oracle) and on the
+//! emitted wasm under `wasmi`, in both lowerings, comparing results **and trap kinds**.
 
 #![forbid(unsafe_code)]
 
@@ -4540,6 +4543,218 @@ fn import_name(out: &mut Vec<u8>, module: &str, name: &str) {
     out.extend_from_slice(name.as_bytes());
 }
 
+/// Where a function's labels sit when its blocks nest as **structured** wasm control flow (#2099)
+/// rather than running under the `$next` dispatcher: what [`FnCtx::transfer`] branches to. Built by
+/// [`Structure::of`].
+struct Structure {
+    /// `rpo[b]` — block `b`'s reverse-postorder number from the entry. An edge whose target does not
+    /// come later in this order retreats, to a loop header.
+    rpo: Vec<u32>,
+    /// `loop_at[b]` — the level of the `loop` that a retreating edge to `b` branches to.
+    loop_at: Vec<u32>,
+    /// `follow_at[b]` — the level of the `block` that `b`'s code follows, which every other edge to
+    /// `b` branches out of.
+    follow_at: Vec<u32>,
+}
+
+/// One step of a function's layout ([`Structure::of`], [`Layout::dispatcher`]). A label's level is
+/// the number of labels open once it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Layout {
+    Loop,
+    Block,
+    /// The dispatcher's `br_table` over `$next`: block `k` runs after the end of the `k`-th
+    /// innermost label.
+    Dispatch,
+    /// Block `k`'s code. It never falls through: its terminator branches, returns or traps.
+    Code(u32),
+    End,
+}
+
+impl Layout {
+    /// The `$next` dispatcher over `n` blocks: `loop { block .. block { br_table $next } code_0 ..
+    /// code_{n-1} }`, every edge setting `$next` and branching back to the loop (level 1).
+    fn dispatcher(n: usize) -> Vec<Layout> {
+        let mut layout = vec![Layout::Loop];
+        layout.extend((0..n).map(|_| Layout::Block));
+        layout.push(Layout::Dispatch);
+        for k in 0..n as u32 {
+            layout.extend([Layout::End, Layout::Code(k)]);
+        }
+        layout.push(Layout::End);
+        layout
+    }
+}
+
+impl Structure {
+    /// Nest `f`'s blocks along its dominator tree, after Ramsey's "Beyond Relooper" (ICFP 2022). A
+    /// loop header opens a `loop`, which every retreating edge to it branches to. Each child of a
+    /// block in the dominator tree gets a `block` around the parent's code, the child's code placed
+    /// after that block's `end`: every other edge to the child branches out of the block. The
+    /// children nest so that a later one's `block` encloses an earlier one's code, since forward
+    /// edges go later in reverse postorder.
+    ///
+    /// `None` if `f` is irreducible (an edge retreats to a block that does not dominate its source),
+    /// or has a block the entry cannot reach: the dispatcher runs it instead, so both lowerings emit
+    /// every block (and refuse the same functions).
+    fn of(f: &Func) -> Option<(Structure, Vec<Layout>)> {
+        let n = f.blocks.len();
+        let succ: Vec<Vec<u32>> = f
+            .blocks
+            .iter()
+            .map(|b| b.term.edges().iter().map(|e| e.0).collect())
+            .collect();
+
+        // Depth-first from the entry; `order` ends in reverse postorder.
+        let mut order: Vec<u32> = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        seen[0] = true;
+        let mut stack = vec![(0u32, 0usize)];
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            match succ[b as usize].get(i) {
+                Some(&s) => {
+                    top.1 += 1;
+                    if !seen[s as usize] {
+                        seen[s as usize] = true;
+                        stack.push((s, 0));
+                    }
+                }
+                None => {
+                    order.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        if order.len() < n {
+            return None;
+        }
+        order.reverse();
+        let mut rpo = vec![0; n];
+        for (i, &b) in order.iter().enumerate() {
+            rpo[b as usize] = i as u32;
+        }
+
+        // From here blocks are named by their reverse-postorder numbers.
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (i, &b) in order.iter().enumerate() {
+            for &s in &succ[b as usize] {
+                preds[rpo[s as usize] as usize].push(i as u32);
+            }
+        }
+        // Immediate dominators (Cooper, Harvey & Kennedy, "A Simple, Fast Dominance Algorithm"). A
+        // dominator comes earlier in reverse postorder, so walking the later of two fingers up the
+        // tree meets their nearest common dominator.
+        let mut idom = vec![u32::MAX; n];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in 1..n {
+                let mut d = u32::MAX;
+                for &p in &preds[i] {
+                    if idom[p as usize] == u32::MAX {
+                        continue;
+                    }
+                    if d == u32::MAX {
+                        d = p;
+                        continue;
+                    }
+                    let mut a = p;
+                    while a != d {
+                        while a > d {
+                            a = idom[a as usize];
+                        }
+                        while d > a {
+                            d = idom[d as usize];
+                        }
+                    }
+                }
+                if idom[i] != d {
+                    idom[i] = d;
+                    changed = true;
+                }
+            }
+        }
+
+        // Loop headers. Reducible iff every retreating edge goes to a dominator of its source.
+        let mut header = vec![false; n];
+        for (i, &b) in order.iter().enumerate() {
+            for &s in &succ[b as usize] {
+                let t = rpo[s as usize];
+                if t <= i as u32 {
+                    let mut d = i as u32;
+                    while d > t {
+                        d = idom[d as usize];
+                    }
+                    if d != t {
+                        return None;
+                    }
+                    header[t as usize] = true;
+                }
+            }
+        }
+        let mut kids: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for i in 1..n {
+            kids[idom[i] as usize].push(i as u32);
+        }
+
+        // Lay the tree out depth-first. A block's children open their `block`s latest-first around
+        // its code; then each child, earliest first, closes its `block` and lays out its subtree.
+        enum Walk {
+            Visit(u32),
+            End,
+        }
+        let mut layout = Vec::with_capacity(3 * n);
+        let mut loop_at = vec![0; n];
+        let mut follow_at = vec![0; n];
+        let mut level = 0;
+        let mut walk = vec![Walk::Visit(0)];
+        while let Some(w) = walk.pop() {
+            let Walk::Visit(x) = w else {
+                level -= 1;
+                layout.push(Layout::End);
+                continue;
+            };
+            if header[x as usize] {
+                level += 1;
+                loop_at[order[x as usize] as usize] = level;
+                layout.push(Layout::Loop);
+                walk.push(Walk::End);
+            }
+            for &c in kids[x as usize].iter().rev() {
+                level += 1;
+                follow_at[order[c as usize] as usize] = level;
+                layout.push(Layout::Block);
+                walk.extend([Walk::Visit(c), Walk::End]);
+            }
+            layout.push(Layout::Code(order[x as usize]));
+        }
+        let structure = Structure {
+            rpo,
+            loop_at,
+            follow_at,
+        };
+        Some((structure, layout))
+    }
+}
+
+thread_local! {
+    /// [`with_dispatcher_only`]'s switch.
+    static DISPATCHER_ONLY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Run `f` with every function this thread emits under the `$next` dispatcher, structured or not.
+/// The dispatcher is the fallback for irreducible control flow and for split functions, so the
+/// differential holds it against the oracle on every kernel too (INVARIANTS.md #15).
+#[doc(hidden)]
+pub fn with_dispatcher_only<R>(f: impl FnOnce() -> R) -> R {
+    DISPATCHER_ONLY.set(true);
+    let r = f();
+    DISPATCHER_ONLY.set(false);
+    r
+}
+
 /// Per-function emission state: the (block, value) → wasm-local map plus the scratch locals.
 struct FnCtx {
     /// `local_of[block][value]` — wasm local index of each block-scoped SSA value.
@@ -4559,8 +4774,8 @@ struct FnCtx {
     /// #1627 spill mode: the `i32` local holding the spill cursor a call site pushed from, which
     /// [`emit_spill_pop`] writes back after the call. `None` outside spill mode.
     spill_l: Option<u32>,
-    /// Open label count inside the body; the dispatcher `loop` is the first label opened, so a
-    /// branch back to it from depth `d` is `br (d - 1)`.
+    /// Open label count inside the body: a branch from depth `d` to the label at level `l` is
+    /// `br (d - l)`.
     depth: u32,
     /// Wasm global index of the live-`mapped` window size (#717). `emit_confine`/`emit_span_check`
     /// read it via `global.get` instead of a baked `1 << size_log2`, so a `vm_map`-grown window no
@@ -4573,18 +4788,35 @@ struct FnCtx {
     /// the interpreter's `check_prot` would. `None` (every other entry) emits byte-identical code
     /// to before #750 — the fail-closed default pays nothing.
     page_check: Option<(u8, u32)>,
-    /// The **experimental NULL-page guard** ([`compile_module_tierup_nullguard`], a measurement
-    /// mode): `Some(guard)` ⇒ every confined access additionally traps when its first byte lands
-    /// below `guard` — matching an interpreter whose page map seeds `[0, guard)` `Unmapped`. Never
-    /// elided (an in-window proof is an upper bound; it says nothing about the low pages). `None`
-    /// everywhere else — byte-identical output.
+    /// The **NULL-page guard** (#964/#1094): `Some(guard)` ⇒ every confined access additionally
+    /// traps when its first byte lands below `guard` — matching an interpreter whose page map seeds
+    /// `[0, guard)` `Unmapped`. Never elided (an in-window proof is an upper bound; it says nothing
+    /// about the low pages). `None` under the page check, which already traps on those `Unmapped`
+    /// pages (#2105), and where the window is smaller than the guard.
     null_guard: Option<u64>,
+    /// `Some` when this function's blocks nest as structured control flow; `None` runs them under
+    /// the `$next` dispatcher.
+    structure: Option<Structure>,
 }
 
 impl FnCtx {
-    fn br_dispatch(&self, code: &mut Vec<u8>) {
+    /// Branch from block `from` to block `target`, whose params the edge has set.
+    fn transfer(&self, code: &mut Vec<u8>, from: usize, target: u32) {
+        let t = target as usize;
+        let level = match &self.structure {
+            None => {
+                code.push(OP_I32_CONST);
+                sleb32(code, target as i32);
+                code.push(OP_LOCAL_SET);
+                uleb(code, self.next_l as u64);
+                1 // the dispatcher loop
+            }
+            Some(s) if s.rpo[t] <= s.rpo[from] => s.loop_at[t],
+            Some(s) => s.follow_at[t],
+        };
+        debug_assert!(level > 0, "block {target}'s label is not open");
         code.push(OP_BR);
-        uleb(code, (self.depth - 1) as u64);
+        uleb(code, (self.depth - level) as u64);
     }
 }
 
@@ -4608,7 +4840,7 @@ fn emit_func(
     // Allocate locals with a **per-type pool reused across blocks**, then $next/$ea/$fuel/$atomic.
     //
     // Values are block-scoped (SSA numbering resets per block; all cross-block dataflow goes through
-    // block params), and the dispatcher runs exactly one block at a time — so when block B executes,
+    // block params), and control is in exactly one block at a time — so when block B executes,
     // every other block's value locals are dead. Their slots can therefore be shared: a type needs
     // only `max over blocks of (that type's value count in the block)` locals, not the sum. This is
     // what keeps a huge function (QuickJS's ~1800-block `JS_CallInternal`) under wasm engines'
@@ -4718,7 +4950,8 @@ fn emit_func(
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         // The pagestate global (paged mode only) sits immediately after `mapped`.
         page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
-        null_guard,
+        null_guard: null_guard.filter(|_| paged.is_none()),
+        structure: None,
     };
 
     let mut code = Vec::new();
@@ -4734,7 +4967,7 @@ fn emit_func(
     }
 
     // Fuel unification (INVARIANTS.md #9): charge one fuel for the **function-entry** safepoint,
-    // once, before the dispatcher loop — the oracle's per-entry charge (top-level entry and each
+    // once, before the blocks — the oracle's per-entry charge (top-level entry and each
     // `call`/`call.dyn`/`return_call` into an emitted function, whose body runs this on entry).
     // The rest of the budget is charged at taken back-edges inside `emit_edge`; forward branches and
     // `return` are free. This matches the oracle safepoint-for-safepoint (not the old coarser
@@ -4742,50 +4975,70 @@ fn emit_func(
     // point for any budget, not merely "both eventually trap".
     emit_fuel_check(&mut cx, &mut code);
 
-    // The dispatcher: loop { block .. block { br_table $next } code_0 .. code_{N-1} }.
-    code.push(OP_LOOP);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
+    // The blocks nest as structured control flow where they can; the dispatcher runs the rest.
     let n = f.blocks.len();
-    for _ in 0..n {
-        code.push(OP_BLOCK);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
+    let structured = if DISPATCHER_ONLY.get() {
+        None
+    } else {
+        Structure::of(f)
+    };
+    let layout = match structured {
+        Some((structure, layout)) => {
+            cx.structure = Some(structure);
+            layout
+        }
+        None => Layout::dispatcher(n),
+    };
+    for step in layout {
+        match step {
+            Layout::Loop | Layout::Block => {
+                code.push(if step == Layout::Loop {
+                    OP_LOOP
+                } else {
+                    OP_BLOCK
+                });
+                code.push(BLOCKTYPE_VOID);
+                cx.depth += 1;
+            }
+            Layout::Dispatch => {
+                code.push(OP_LOCAL_GET);
+                uleb(&mut code, cx.next_l as u64);
+                code.push(OP_BR_TABLE);
+                uleb(&mut code, n as u64); // n labels + default
+                for k in 0..n {
+                    uleb(&mut code, k as u64); // depth k exits block k → lands at code_k
+                }
+                uleb(&mut code, (n - 1) as u64); // default: unreachable by construction
+            }
+            Layout::Code(k) => {
+                let k = k as usize;
+                emit_block_body(
+                    m,
+                    f,
+                    &mut cx,
+                    &mut code,
+                    k,
+                    &f.blocks[k],
+                    &per_block_types[k],
+                    mapped,
+                    wasm_of,
+                    interp_leaf,
+                    types,
+                    table_size,
+                    nested_caps,
+                    cross_module,
+                    None, // monolithic emit: no block-group split
+                    gc_reach,
+                )?;
+            }
+            Layout::End => {
+                code.push(OP_END);
+                cx.depth -= 1;
+            }
+        }
     }
-    code.push(OP_LOCAL_GET);
-    uleb(&mut code, cx.next_l as u64);
-    code.push(OP_BR_TABLE);
-    uleb(&mut code, n as u64); // n labels + default
-    for k in 0..n {
-        uleb(&mut code, k as u64); // depth k exits block k → lands at code_k
-    }
-    uleb(&mut code, (n - 1) as u64); // default: unreachable by construction; any valid label
-
-    for (k, b) in f.blocks.iter().enumerate() {
-        code.push(OP_END); // close block k; code_k follows
-        cx.depth -= 1;
-        emit_block_body(
-            m,
-            f,
-            &mut cx,
-            &mut code,
-            k,
-            b,
-            &per_block_types[k],
-            mapped,
-            wasm_of,
-            interp_leaf,
-            types,
-            table_size,
-            nested_caps,
-            cross_module,
-            None, // monolithic emit: no block-group split
-            gc_reach,
-        )?;
-    }
-    code.push(OP_END); // close the loop
-    cx.depth -= 1;
-    code.push(OP_UNREACHABLE); // every path returned / trapped / re-dispatched
+    debug_assert_eq!(cx.depth, 0);
+    code.push(OP_UNREACHABLE); // every path returned / trapped / branched
     code.push(OP_END); // function body end
 
     // Prepend the locals vector (grouped runs of one type).
@@ -4933,7 +5186,8 @@ fn emit_split_group(
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
-        null_guard,
+        null_guard: null_guard.filter(|_| paged.is_none()),
+        structure: None,
     };
 
     let mut code = Vec::new();
@@ -5080,6 +5334,7 @@ fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         page_check: None,
         null_guard: None,
+        structure: None,
     };
     let mut code = Vec::new();
     emit_fuel_check(&mut cx, &mut code); // the single function-entry safepoint
@@ -6068,9 +6323,8 @@ fn emit_xgroup_edge(
     );
 }
 
-/// Whether `target` leaves `from_block`'s group. Emits the inter-group edge when so and returns `true`
-/// (the caller must **not** add the `$next`/`br_dispatch` — the `return_call` already left the frame);
-/// otherwise emits the ordinary same-group [`emit_edge`] and returns `false`.
+/// An edge that leaves `from_block`'s group (split functions only) is an inter-group `return_call`
+/// ([`emit_xgroup_edge`]); any other is an ordinary [`emit_edge`].
 fn emit_edge_maybe_xgroup(
     f: &Func,
     cx: &mut FnCtx,
@@ -6079,15 +6333,13 @@ fn emit_edge_maybe_xgroup(
     from_block: usize,
     target: u32,
     args: &[temen_ir::ValIdx],
-) -> bool {
-    if let Some(sp) = split {
-        if sp.block_group[target as usize] != sp.block_group[from_block] {
-            emit_xgroup_edge(f, cx, code, sp, from_block, target, args);
-            return true;
+) {
+    match split {
+        Some(sp) if sp.block_group[target as usize] != sp.block_group[from_block] => {
+            emit_xgroup_edge(f, cx, code, sp, from_block, target, args)
         }
+        _ => emit_edge(cx, code, from_block, target, args),
     }
-    emit_edge(cx, code, from_block, target, args);
-    false
 }
 
 fn emit_edge(
@@ -6105,18 +6357,23 @@ fn emit_edge(
     if (target as usize) <= from_block {
         emit_fuel_check(cx, code);
     }
-    for a in args {
+    // A parallel move into the target's params. An arg already in its param's slot (a value passed
+    // straight through, under the pooled slots) stays put: no other param shares that slot.
+    let moves: Vec<(u32, u32)> = args
+        .iter()
+        .zip(&cx.local_of[target as usize])
+        .map(|(a, &dst)| (cx.local_of[from_block][*a as usize], dst))
+        .filter(|(src, dst)| src != dst)
+        .collect();
+    for (src, _) in &moves {
         code.push(OP_LOCAL_GET);
-        uleb(code, cx.local_of[from_block][*a as usize] as u64);
+        uleb(code, *src as u64);
     }
-    for i in (0..args.len()).rev() {
+    for (_, dst) in moves.iter().rev() {
         code.push(OP_LOCAL_SET);
-        uleb(code, cx.local_of[target as usize][i] as u64);
+        uleb(code, *dst as u64);
     }
-    code.push(OP_I32_CONST);
-    sleb32(code, target as i32);
-    code.push(OP_LOCAL_SET);
-    uleb(code, cx.next_l as u64);
+    cx.transfer(code, from_block, target);
 }
 
 /// #1627 — `last[v]` is the index of the last instruction of `b` that reads value `v`
@@ -7153,11 +7410,7 @@ fn emit_block_body(
 
     match &b.term {
         Terminator::Br { target, args } => {
-            // Inter-group (split) targets leave via `return_call` (no `$next`/dispatch); same-group
-            // targets set `$next` and branch to the dispatch loop as before.
-            if !emit_edge_maybe_xgroup(f, cx, code, split, k, *target, args) {
-                cx.br_dispatch(code);
-            }
+            emit_edge_maybe_xgroup(f, cx, code, split, k, *target, args);
         }
         Terminator::BrIf {
             cond,
@@ -7170,23 +7423,33 @@ fn emit_block_body(
             code.push(OP_IF);
             code.push(BLOCKTYPE_VOID);
             cx.depth += 1;
-            // An inter-group arm ends in `return_call` (leaves the frame); a same-group arm sets `$next`
-            // and falls through to the shared `br_dispatch` after `end` (unreachable if both arms left).
+            // Each arm leaves: a branch, or an inter-group `return_call`.
             emit_edge_maybe_xgroup(f, cx, code, split, k, *then_blk, then_args);
             code.push(OP_ELSE);
             emit_edge_maybe_xgroup(f, cx, code, split, k, *else_blk, else_args);
             code.push(OP_END);
             cx.depth -= 1;
-            cx.br_dispatch(code);
+            code.push(OP_UNREACHABLE);
         }
         Terminator::BrTable {
             idx,
             targets,
             default,
         } => {
-            // One landing block per edge (targets then default); each edge assigns its own args.
-            let arms: Vec<&temen_ir::Edge> =
-                targets.iter().chain(core::iter::once(default)).collect();
+            // One landing block per distinct edge, which assigns its args: a switch's cases mostly
+            // share a few (QuickJS's interpreter loop: 1837 cases, 300 distinct edges).
+            let mut arms: Vec<&temen_ir::Edge> = Vec::new();
+            let mut arm_of = std::collections::HashMap::new();
+            let labels: Vec<usize> = targets
+                .iter()
+                .chain(core::iter::once(default))
+                .map(|e| {
+                    *arm_of.entry(e).or_insert_with(|| {
+                        arms.push(e);
+                        arms.len() - 1
+                    })
+                })
+                .collect();
             for _ in &arms {
                 code.push(OP_BLOCK);
                 code.push(BLOCKTYPE_VOID);
@@ -7195,18 +7458,14 @@ fn emit_block_body(
             get(code, cx, *idx);
             code.push(OP_BR_TABLE);
             uleb(code, targets.len() as u64);
-            for j in 0..targets.len() {
-                uleb(code, j as u64);
+            for l in labels {
+                uleb(code, l as u64); // the last is the default
             }
-            uleb(code, targets.len() as u64); // default = the outermost landing block
-            for (j, (target, args)) in arms.iter().enumerate() {
+            for (target, args) in arms {
                 code.push(OP_END);
                 cx.depth -= 1;
-                if !emit_edge_maybe_xgroup(f, cx, code, split, k, *target, args) {
-                    cx.br_dispatch(code);
-                }
-                // The br/return_call above leaves this position unreachable; the next `end` follows.
-                let _ = j;
+                // The branch or `return_call` leaves this position unreachable; the next `end` follows.
+                emit_edge_maybe_xgroup(f, cx, code, split, k, *target, args);
             }
         }
         Terminator::Return(vals) => {
@@ -7383,5 +7642,104 @@ mod emit_cap_tests {
         let mut sub = vec![true];
         cap_oversized(&m, &mut sub);
         assert_eq!(sub, vec![true], "0 restores the default");
+    }
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+
+    /// The layout `Structure::of` gives the first function of `src`; `None` if it is irreducible.
+    fn layout(src: &str) -> Option<Vec<Layout>> {
+        let m = temen_text::parse_module(src).expect("parse");
+        Structure::of(&m.funcs[0]).map(|(_, layout)| layout)
+    }
+
+    use Layout::{Block, Code, End, Loop};
+
+    #[test]
+    fn a_diamond_nests_its_arms_and_their_join_under_the_entry() {
+        let src = "func (i32) -> (i32) {
+            block 0 (v0: i32) { br_if v0 1(v0) 2(v0) }
+            block 1 (v1: i32) { br 3(v1) }
+            block 2 (v2: i32) { br 3(v2) }
+            block 3 (v3: i32) { return v3 }
+        }";
+        // Reverse postorder is 0, 2, 1, 3: the join's `block` is outermost, the arms' inside it.
+        let want = [
+            Block,
+            Block,
+            Block,
+            Code(0),
+            End,
+            Code(2),
+            End,
+            Code(1),
+            End,
+            Code(3),
+        ];
+        assert_eq!(layout(src).unwrap(), want);
+    }
+
+    #[test]
+    fn a_loop_header_opens_a_loop_around_the_blocks_it_dominates() {
+        let src = "func (i32) -> (i32) {
+            block 0 (v0: i32) { br 1(v0) }
+            block 1 (v1: i32) { br_if v1 2(v1) 3(v1) }
+            block 2 (v2: i32) { br 1(v2) }
+            block 3 (v3: i32) { return v3 }
+        }";
+        let want = [
+            Block,
+            Code(0),
+            End,
+            Loop,
+            Block,
+            Block,
+            Code(1),
+            End,
+            Code(3),
+            End,
+            Code(2),
+            End,
+        ];
+        assert_eq!(layout(src).unwrap(), want);
+    }
+
+    #[test]
+    fn a_loop_with_two_entries_is_irreducible() {
+        let src = "func (i32) -> (i32) {
+            block 0 (v0: i32) { br_if v0 1(v0) 2(v0) }
+            block 1 (v1: i32) { br_if v1 2(v1) 3(v1) }
+            block 2 (v2: i32) { br_if v2 1(v2) 3(v2) }
+            block 3 (v3: i32) { return v3 }
+        }";
+        assert_eq!(layout(src), None);
+    }
+
+    #[test]
+    fn a_block_the_entry_cannot_reach_keeps_the_dispatcher() {
+        let src = "func (i32) -> (i32) {
+            block 0 (v0: i32) { br 2(v0) }
+            block 1 (v1: i32) { br 2(v1) }
+            block 2 (v2: i32) { return v2 }
+        }";
+        assert_eq!(layout(src), None);
+    }
+
+    #[test]
+    fn the_dispatcher_lays_every_block_under_one_loop() {
+        let want = [
+            Loop,
+            Block,
+            Block,
+            Layout::Dispatch,
+            End,
+            Code(0),
+            End,
+            Code(1),
+            End,
+        ];
+        assert_eq!(Layout::dispatcher(2), want);
     }
 }

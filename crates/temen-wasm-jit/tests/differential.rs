@@ -5,7 +5,7 @@
 //! `temen-bytecode-wasm` bench row's cross-check.
 
 use temen_interp::{Trap, Value};
-use temen_wasm_jit::{compile_module, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
+use temen_wasm_jit::{compile_module, with_dispatcher_only, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 /// Where the guest window starts in the harness's linear memory (page 1 — page 0 holds the env
@@ -163,21 +163,39 @@ fn wasm_run(m: &temen_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Out
 
 /// Parse + verify a kernel, then differential-run it over `args` (each as the single i64 param
 /// unless the kernel takes none). Plenty of fuel by default; `fuel` overrides for the fuel test.
+/// Both control-flow lowerings run: structured, and the dispatcher that irreducible control flow
+/// and split functions fall back to.
 fn diff(name: &str, src: &str, sweep: &[i64], fuel: u64) {
-    let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("{name}: {e}"));
-    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
-    let wasm = compile_module(&m).unwrap_or_else(|e| panic!("{name}: emit: {e}"));
+    let m = parse(name, src);
+    let lowerings = [
+        ("structured", compile_module(&m)),
+        ("dispatcher", with_dispatcher_only(|| compile_module(&m))),
+    ];
     let arity = m.funcs[0].params.len();
     let sweeps: Vec<Vec<Value>> = if arity == 0 {
         vec![vec![]]
     } else {
         sweep.iter().map(|a| vec![Value::I64(*a)]).collect()
     };
-    for args in &sweeps {
-        let want = oracle(&m, args, fuel);
-        let got = wasm_run(&m, &wasm, args, fuel);
-        assert_eq!(want, got, "{name}: MISCOMPILE for args {args:?}");
+    for (lowering, wasm) in &lowerings {
+        let wasm = wasm
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{name}: emit ({lowering}): {e}"));
+        for args in &sweeps {
+            let want = oracle(&m, args, fuel);
+            let got = wasm_run(&m, wasm, args, fuel);
+            assert_eq!(
+                want, got,
+                "{name}: MISCOMPILE ({lowering}) for args {args:?}"
+            );
+        }
     }
+}
+
+fn parse(name: &str, src: &str) -> temen_ir::Module {
+    let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("{name}: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
+    m
 }
 
 const ARGS: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000, i64::MIN, i64::MAX];
@@ -834,6 +852,206 @@ block 3 (v14: i64) {
 #[test]
 fn swap_params() {
     diff("swap_params", SWAP, &[0, 1, 2, 3, 10, 50, 90], FUEL);
+}
+
+/// Two loops nested, the inner one leaving both ways: `continue` the outer loop from inside the
+/// inner one, and `break` out of both to the exit, which the outer loop's own exit joins.
+const NESTED_LOOPS: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 31
+  v2 = i64.and v0 v1
+  v3 = i64.const 0
+  br 1(v2, v3, v3)
+}
+block 1 (v4: i64, v5: i64, v6: i64) {
+  v7 = i64.lt_s v5 v4
+  v8 = i64.const 0
+  br_if v7 2(v4, v5, v8, v6) 6(v6)
+}
+block 2 (v9: i64, v10: i64, v11: i64, v12: i64) {
+  v13 = i64.lt_s v11 v10
+  br_if v13 3(v9, v10, v11, v12) 5(v9, v10, v12)
+}
+block 3 (v14: i64, v15: i64, v16: i64, v17: i64) {
+  v18 = i64.mul v15 v16
+  v19 = i64.const 7
+  v20 = i64.rem_u v18 v19
+  v21 = i64.const 3
+  v22 = i64.eq v20 v21
+  v23 = i64.const 1
+  v24 = i64.add v15 v23
+  br_if v22 1(v14, v24, v17) 4(v14, v15, v16, v17)
+}
+block 4 (v25: i64, v26: i64, v27: i64, v28: i64) {
+  v29 = i64.const 13
+  v30 = i64.eq v27 v29
+  v31 = i64.xor v26 v27
+  v32 = i64.add v28 v31
+  v33 = i64.const 1
+  v34 = i64.add v27 v33
+  br_if v30 6(v28) 2(v25, v26, v34, v32)
+}
+block 5 (v35: i64, v36: i64, v37: i64) {
+  v38 = i64.const 3
+  v39 = i64.mul v37 v38
+  v40 = i64.add v39 v36
+  v41 = i64.const 1
+  v42 = i64.add v36 v41
+  br 1(v35, v42, v40)
+}
+block 6 (v43: i64) {
+  return v43
+  }
+}
+"#;
+
+#[test]
+fn nested_loops() {
+    diff(
+        "nested_loops",
+        NESTED_LOOPS,
+        &[0, 1, 2, 5, 13, 14, 20, 31, -1],
+        FUEL,
+    );
+}
+
+/// A state machine: a loop whose header `br_table`s over the state, every arm retreating to it.
+const STATE_MACHINE: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 255
+  v2 = i64.and v0 v1
+  v3 = i64.const 0
+  br 1(v2, v3, v3)
+}
+block 1 (v4: i64, v5: i64, v6: i64) {
+  v7 = i64.const 0
+  v8 = i64.eq v4 v7
+  br_if v8 6(v6) 2(v4, v5, v6)
+}
+block 2 (v9: i64, v10: i64, v11: i64) {
+  v12 = i32.wrap_i64 v10
+  br_table v12 [3(v9, v11), 4(v9, v11), 5(v9, v11)] 5(v9, v11)
+}
+block 3 (v13: i64, v14: i64) {
+  v15 = i64.const 1
+  v16 = i64.sub v13 v15
+  v17 = i64.add v14 v15
+  br 1(v16, v15, v17)
+}
+block 4 (v18: i64, v19: i64) {
+  v20 = i64.const 1
+  v21 = i64.sub v18 v20
+  v22 = i64.const 2
+  v23 = i64.mul v19 v22
+  br 1(v21, v22, v23)
+}
+block 5 (v24: i64, v25: i64) {
+  v26 = i64.const 1
+  v27 = i64.sub v24 v26
+  v28 = i64.xor v25 v24
+  v29 = i64.const 0
+  br 1(v27, v29, v28)
+}
+block 6 (v30: i64) {
+  return v30
+  }
+}
+"#;
+
+#[test]
+fn state_machine() {
+    diff(
+        "state_machine",
+        STATE_MACHINE,
+        &[0, 1, 2, 3, 7, 100, 255, -1],
+        FUEL,
+    );
+}
+
+/// Irreducible: a loop of two blocks, each of which the entry can enter first. No nesting of
+/// `block`s and `loop`s expresses it, so it runs under the dispatcher.
+const IRREDUCIBLE: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 63
+  v2 = i64.and v0 v1
+  v3 = i64.const 64
+  v4 = i64.and v0 v3
+  v5 = i64.const 0
+  v6 = i64.ne v4 v5
+  br_if v6 2(v2, v5) 1(v2, v5)
+}
+block 1 (v7: i64, v8: i64) {
+  v9 = i64.const 0
+  v10 = i64.eq v7 v9
+  v11 = i64.const 1
+  v12 = i64.sub v7 v11
+  v13 = i64.const 3
+  v14 = i64.mul v8 v13
+  v15 = i64.add v14 v11
+  br_if v10 3(v8) 2(v12, v15)
+}
+block 2 (v16: i64, v17: i64) {
+  v18 = i64.const 0
+  v19 = i64.eq v16 v18
+  v20 = i64.const 1
+  v21 = i64.sub v16 v20
+  v22 = i64.const 5
+  v23 = i64.add v17 v22
+  br_if v19 3(v17) 1(v21, v23)
+}
+block 3 (v24: i64) {
+  return v24
+  }
+}
+"#;
+
+#[test]
+fn irreducible() {
+    diff(
+        "irreducible",
+        IRREDUCIBLE,
+        &[0, 1, 2, 7, 63, 64, 65, 127, -1, i64::MIN],
+        FUEL,
+    );
+}
+
+/// A block the entry cannot reach, branching into the live code: the function keeps the dispatcher.
+const DEAD_BLOCK: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 2(v0)
+}
+block 1 (v1: i64) {
+  br 2(v1)
+}
+block 2 (v2: i64) {
+  v3 = i64.const 1
+  v4 = i64.add v2 v3
+  return v4
+  }
+}
+"#;
+
+#[test]
+fn dead_block() {
+    diff("dead_block", DEAD_BLOCK, ARGS, FUEL);
+}
+
+/// Irreducible control flow, or a block the entry cannot reach, emits the dispatcher whichever
+/// lowering is asked for; control flow that nests emits differently.
+#[test]
+fn the_dispatcher_runs_what_does_not_nest() {
+    let dispatches = |name, src| {
+        let m = parse(name, src);
+        let dispatched = with_dispatcher_only(|| compile_module(&m)).unwrap();
+        compile_module(&m).unwrap() == dispatched
+    };
+    assert!(dispatches("irreducible", IRREDUCIBLE));
+    assert!(dispatches("dead_block", DEAD_BLOCK));
+    assert!(!dispatches("nested_loops", NESTED_LOOPS));
 }
 
 /// Guest `unreachable` → the same trap kind on both engines.
