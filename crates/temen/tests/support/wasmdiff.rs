@@ -210,11 +210,13 @@ pub fn run_differential_wasm(m: &Module, args: &[Value]) {
         return;
     }
     // Emit; the tier refusing a module (out-of-integer-subset op) is a skip, not a divergence —
-    // exactly as the Cranelift path skips `JitError::Unsupported`.
-    let wasm = match temen_wasm_jit::compile_module(m) {
-        Ok(w) => w,
-        Err(_) => return,
+    // exactly as the Cranelift path skips `JitError::Unsupported`. Both control-flow lowerings run:
+    // structured, and the dispatcher that irreducible control flow and split functions fall back to.
+    let Ok(structured) = temen_wasm_jit::compile_module(m) else {
+        return;
     };
+    let dispatched = temen_wasm_jit::with_dispatcher_only(|| temen_wasm_jit::compile_module(m))
+        .expect("the dispatcher emits what the structured lowering does");
 
     // Escape-oracle seed over the window, so a divergent or under-masked load/store shows up as a
     // final-memory mismatch (zero-init could hide a bad read that returns 0). Only for float-free
@@ -235,9 +237,24 @@ pub fn run_differential_wasm(m: &Module, args: &[Value]) {
     let mut fuel = FUEL;
     let mut host = Host::new();
     let (interp, imem) = run_capture_reserved_with_host(m, 0, args, &mut fuel, &init, 0, &mut host);
+    for wasm in [&structured, &dispatched] {
+        agree(
+            m,
+            &interp,
+            &imem,
+            wasm_run(m, wasm, args, &init),
+            mem_oracle,
+        );
+    }
+}
 
-    let (wasm_out, wmem) = wasm_run(m, &wasm, args, &init);
-
+fn agree(
+    m: &Module,
+    interp: &Result<Vec<Value>, Trap>,
+    imem: &[u8],
+    (wasm_out, wmem): (WasmOutcome, Vec<u8>),
+    mem_oracle: bool,
+) {
     match (interp, wasm_out) {
         (Ok(want), WasmOutcome::Vals(got)) => {
             assert_eq!(want.len(), got.len(), "result arity\n{m:#?}");
@@ -268,7 +285,7 @@ pub fn run_differential_wasm(m: &Module, args: &[Value]) {
         // wasm can return where the eager interpreter trapped; an *unmodeled* interp trap is likewise
         // not held against it. A non-droppable modeled trap must never let the wasm return a value.
         (Err(trap), WasmOutcome::Vals(_)) => assert!(
-            droppable(&trap) || !modeled(&trap),
+            droppable(trap) || !modeled(trap),
             "interp trapped {trap:?} but wasm-JIT returned\n{m:#?}"
         ),
         (Ok(_), WasmOutcome::Trapped) => {
