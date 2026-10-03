@@ -12,7 +12,11 @@
 //!    module: i32 (-1 = self), budget: i32 (reserved 0), quota: i64, grants_ptr: u64,
 //!    grants_n: u64 }`
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::{run_capture_reserved_with_host, Host, StreamRole, Value};
+use temen_ir::SpawnRec;
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -1682,14 +1686,6 @@ fn a_joined_detached_childs_window_returns_to_its_budget() {
 /// spawns func 2 from its own `"budget"` — the node that paid for it — and returns `join + 20`, or the
 /// refusal's `-errno`. Func 2 returns 3. The root exits with its child's result plus 100.
 fn three_generations(child_ceiling: i64) -> String {
-    let rec = |at: u64, entry: u32| -> String {
-        let esc: String = temen_ir::SpawnRec::v1(entry)
-            .encode()
-            .iter()
-            .map(|b| format!("\\x{b:02x}"))
-            .collect();
-        format!("data {at} \"{esc}\"\n")
-    };
     format!(
         "memory 17
 data 16384 \"vm\"
@@ -1751,8 +1747,8 @@ block 0 (va: i64) {{
   }}
 }}
 ",
-        r1 = rec(17408, 1),
-        r2 = rec(17504, 2),
+        r1 = rec::segment(17408, &SpawnRec::v1(1)),
+        r2 = rec::segment(17504, &SpawnRec::v1(2)),
     )
 }
 
@@ -1763,6 +1759,93 @@ fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
     let src = three_generations(1 << 18);
     for b in BACKENDS {
         assert_eq!(run_detached(b, &src).expect("run"), 123, "{b:?}");
+    }
+}
+
+/// #1909, INVARIANTS #3 R2 — a detached child's growth past its declared window spends the budget
+/// that paid for the window, on every tier. The root pays for func 1 from a node capped at the child's
+/// 64 KiB window plus 64 KiB; the child grows 64 KiB (it fits), asks for 64 KiB more (`-ENOMEM`), gives
+/// the first back (refunded at once), grows the second (it fits again), and returns a bit per answer.
+/// The root exits `child * 10 + 1` when its node's room is the whole ceiling again after the join: the
+/// child's end handed back the growth it still held.
+fn growth_program() -> String {
+    format!(
+        "memory 16
+data 17920 \"vm\"
+data 17928 \"budget\"
+{rec}import 0 \"exit\" (i32) -> ()
+
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 17920
+  vl = i64.const 2
+  vinst = self.resolve vp vl
+  bp = i64.const 17928
+  bl = i64.const 6
+  vbud = self.resolve bp bl
+  f = i64.const -1
+  m = i64.const 131072
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vbud (f, m, f)
+  rb = i64.const 17436
+  i32.store rb vsub
+  rp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  one = i64.const 1
+  vroom = call.cap 14 1 (i64) -> (i64) vsub (one)
+  vfull = i64.eq vroom m
+  vfw = i64.extend_i32_u vfull
+  ten = i64.const 10
+  vhi = i64.mul vr ten
+  vsum = i64.add vhi vfw
+  vc = i32.wrap_i64 vsum
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+func 1 (i64, i64) -> (i64) {{
+block 0 (vinst: i64, vas64: i64) {{
+  vas = i32.wrap_i64 vas64
+  a1 = i64.const 65536
+  a2 = i64.const 131072
+  n = i64.const 65536
+  rw = i64.const 3
+  z = i64.const 0
+  enomem = i64.const -12
+  r1 = call.cap 5 0 (i64, i64, i64) -> (i64) vas (a1, n, rw)
+  r2 = call.cap 5 0 (i64, i64, i64) -> (i64) vas (a2, n, rw)
+  r3 = call.cap 5 1 (i64, i64) -> (i64) vas (a1, n)
+  r4 = call.cap 5 0 (i64, i64, i64) -> (i64) vas (a2, n, rw)
+  b1 = i64.eq r1 z
+  b2 = i64.eq r2 enomem
+  b3 = i64.eq r3 z
+  b4 = i64.eq r4 z
+  w1 = i64.extend_i32_u b1
+  w2 = i64.extend_i32_u b2
+  w3 = i64.extend_i32_u b3
+  w4 = i64.extend_i32_u b4
+  two = i64.const 2
+  four = i64.const 4
+  eight = i64.const 8
+  x2 = i64.mul w2 two
+  x3 = i64.mul w3 four
+  x4 = i64.mul w4 eight
+  s1 = i64.add w1 x2
+  s2 = i64.add s1 x3
+  s3 = i64.add s2 x4
+  return s3
+  }}
+}}
+",
+        rec = rec::segment(17408, &SpawnRec::v1(1)),
+    )
+}
+
+#[test]
+fn a_detached_childs_growth_spends_its_budget_on_every_tier() {
+    let src = growth_program();
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 151, "{b:?}");
     }
 }
 

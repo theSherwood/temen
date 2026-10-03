@@ -444,7 +444,8 @@ block 0 (v0: i64) {
 
 /// #1286 — a detached window **grows**: its starter `AddressSpace` spans the reservation (a root's
 /// shape), not the declared size, so a `vm_map` past 64 KiB is admitted and the grown page is usable.
-/// (Bounding the grant to the declared window refused the map and the store then faulted.)
+/// (Bounding the grant to the declared window refused the map and the store then faulted.) The budget
+/// that pays for the window pays for its growth too (#1909), so it holds both.
 #[test]
 fn a_detached_child_grows_past_its_declared_window() {
     let a = module(ARGV_PARENT);
@@ -452,7 +453,7 @@ fn a_detached_child_grows_past_its_declared_window() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(-1, (1 << 16) as i64, -1);
+    let hw = host.grant_budget(-1, (1 << 16) + (1 << 14), -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,

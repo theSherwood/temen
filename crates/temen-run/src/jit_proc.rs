@@ -392,8 +392,10 @@ impl Tree {
             // with the thread's closure, unrun, so the parent releases the pipe ends it inherited:
             // the twin's table is the parent's, copied an instant ago, so releasing the parent's
             // set once releases exactly the twin's copies (and zeroes no pipe the parent holds).
+            // Likewise the growth its window copy was charged (#1909).
             Err(_) => {
                 let _ = host.release_pipe_ends();
+                host.undo_fork_growth();
                 let crash = Err(Trap::ThreadFault);
                 for hook in hooks {
                     hook(temen_interp::reap_status(&crash));
@@ -762,11 +764,13 @@ fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
     (start, img.host)
 }
 
-/// A process is done with its last image: disarm its powerbox, and release the pipe ends it holds
+/// A process is done with its last image: disarm its powerbox, hand back what its window grew
+/// ([`Host::release_growth`], #1909), and release the pipe ends it holds
 /// ([`Host::release_pipe_ends`]) — ringing the tree when that left a pipe with no writers or no
 /// readers, whose blocked readers wake to EOF and writers to `-EPIPE`.
 fn retire(tree: &Tree, host: &mut Host) {
     host.disarm_caller_requests();
+    host.release_growth();
     let (eof, epipe) = host.release_pipe_ends();
     if !eof.is_empty() || !epipe.is_empty() {
         tree.ring();

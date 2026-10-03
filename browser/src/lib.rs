@@ -11370,7 +11370,10 @@ pub extern "C" fn temen_op13jit_child_mem_id() -> i32 {
 pub extern "C" fn temen_op13jit_deliver() -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the driver + run.
     let value = unsafe { RUN_VALUE };
-    unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = None };
+    // The child's run ends here: what its window grew goes back to the budget that paid for it (#1909).
+    if let Some(mut run) = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).take() } {
+        run.host.release_growth();
+    }
     let Some(d) = (unsafe { (*core::ptr::addr_of_mut!(OP13_JIT)).as_mut() }) else {
         return OP13JIT_TRAP;
     };

@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**357 exports** in 36 families — 307 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
+**358 exports** in 36 families — 308 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -24,7 +24,7 @@
 | `link` | 10 | 6 | 0 |
 | `mem` | 3 | 0 | 0 |
 | `module` | 3 | 0 | 0 |
-| `nim` | 4 | 4 | 0 |
+| `nim` | 5 | 5 | 0 |
 | `onramp` | 66 | 55 | 0 |
 | `op13jit` | 9 | 9 | 0 |
 | `par` | 74 | 74 | 2 |
@@ -244,6 +244,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_nim_file_ptr`
 - `temen_nim_module_suffix`
 - `temen_nim_open`
+- `temen_nim_remove`
 
 ### `onramp`
 

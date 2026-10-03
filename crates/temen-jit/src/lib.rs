@@ -960,9 +960,15 @@ pub type LaneGiver = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, lane: i64
 /// #1587, #1877 — settle what a [`BudgetMemTaker`] admitted: the window's `bytes` and the child's
 /// first vCPU go back to `budget` on the parent, at the child's end or when its spawn fails *after*
 /// the take. The OS-thread spawn is the one refusal on the detached path that happens after the
-/// commit, so without this a guest that trips it leaks its allowance per attempt.
-pub type BudgetMemGiver =
-    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64);
+/// commit, so without this a guest that trips it leaks its allowance per attempt. At the child's end
+/// `child` is its powerbox (a [`GrantChild::ctx`]), and what its window grew goes back too (#1909);
+/// null for a child that never ran.
+pub type BudgetMemGiver = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    child: *mut core::ffi::c_void,
+    budget: i32,
+    bytes: u64,
+);
 
 /// Op-15 **pre-map admission** (the parent side of `instantiate_detached`'s optional `(region,
 /// child_off)`): may the parent's `SharedRegion` `region` be aliased whole into a child window of
