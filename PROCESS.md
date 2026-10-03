@@ -571,6 +571,16 @@ generous ceiling up front replaces most top-ups, and `transfer` raises a child's
 needed. The Genode-style quota transfer this replaced (the parent's remaining falling by exactly
 what the child's rose, a shortfall cascading up the ancestry) is retired with R2's old wording.
 
+**Growing the window spends the same budget (#1909).** A detached window's growth past its declared
+size is charged as its pages commit: a `map`, or a `protect` that leaves pages readable or writable,
+in the reserved tail charges the domain's own node (the budget that paid for its window) and every
+ancestor, all or nothing. Past a ceiling the op is `-ENOMEM` and changes no page. A page given back
+(unmapped, or aliased to a region) is refunded at once; a page protected to nothing keeps its
+contents, so it stays charged. What the window still holds goes back when the domain ends or an exec
+replaces its image. A fork twin pays for the growth its copy holds (its copy of the declared window is
+not charged yet, #2106); a freeze keeps the charge, and the thaw takes it over. A run's root grows
+unmetered, as its window was minted by its embedder.
+
 ### Faults — the security trap is terminal; the memory fault is a capability event
 
 > **The pager's data path is a byte transfer (#1862, 2026-09-29):** the pager is called with the

@@ -1930,7 +1930,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             launch,
             ..
         } = td;
-        let Some(mut r) = host.prepare_detached_relaunch(&launch, child) else {
+        let Some(mut r) = host.prepare_detached_relaunch(&launch, child, window.page_map()) else {
             return Err(temen_jit::JitError::Unsupported(
                 "durable JIT thaw: a detached child's imports no longer bind",
             ));
@@ -2907,7 +2907,7 @@ locked_parent_hook!(
 locked_parent_hook!(
     budget_mem_give_locked,
     budget_mem_give,
-    (budget: i32, bytes: u64) -> ()
+    (child: *mut c_void, budget: i32, bytes: u64) -> ()
 );
 locked_parent_hook!(lane_give_locked, lane_give, (lane: i64) -> ());
 locked_parent_hook!(
@@ -3886,11 +3886,25 @@ pub unsafe extern "C" fn lane_give(ctx: *mut c_void, lane: i64) {
 
 /// #1587, #1877 — the settling of what [`budget_mem_take`] admitted ([`temen_jit::BudgetMemGiver`]):
 /// at the child's end, or for a spawn that failed after the take, its window's `bytes` and its first
-/// vCPU go back to `budget` on the parent `Host` ([`Host::release_detached`]).
+/// vCPU go back to `budget` on the parent `Host` ([`Host::release_detached`]). At the child's end what
+/// its window grew goes back too, from its own powerbox `child` ([`Host::release_growth`], #1909).
 ///
 /// # Safety
-/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
-pub unsafe extern "C" fn budget_mem_give(ctx: *mut c_void, budget: i32, bytes: u64) {
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host); `child` is null or a live
+/// [`temen_jit::GrantChild::ctx`].
+pub unsafe extern "C" fn budget_mem_give(
+    ctx: *mut c_void,
+    child: *mut c_void,
+    budget: i32,
+    bytes: u64,
+) {
+    if !child.is_null() {
+        let child = &*(child as *const Mutex<Host>);
+        child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_growth();
+    }
     let parent = &mut *(ctx as *mut Host);
     parent.release_detached(budget, bytes);
 }
@@ -4151,18 +4165,22 @@ impl MprotectWindow {
     }
 
     /// Update one page's software state from cap `prot` bits, mirroring `temen_interp::set_prot`:
-    /// a read-write page is left absent in the prefix, explicit `Rw` in the reserved tail.
-    fn set_prot(&mut self, page: u64, prot: i32) {
+    /// a read-write page is left absent in the prefix, explicit `Rw` in the reserved tail, and an
+    /// unmapped tail page absent unless it `keeps` the contents the window held there (#1909).
+    fn set_prot(&mut self, page: u64, prot: i32, keeps: bool) {
         const PROT_READ: i32 = 1;
         const PROT_WRITE: i32 = 2;
+        let tail = page * self.page >= self.mapped;
         if prot & PROT_WRITE != 0 {
-            if page * self.page < self.mapped {
-                self.prot_clear(page);
-            } else {
+            if tail {
                 self.prot_set(page, PageState::Rw);
+            } else {
+                self.prot_clear(page);
             }
         } else if prot & PROT_READ != 0 {
             self.prot_set(page, PageState::Ro);
+        } else if tail && !(keeps && self.prot_get(page).is_some_and(|p| held_tail(&p))) {
+            self.prot_clear(page);
         } else {
             self.prot_set(page, PageState::Unmapped);
         }
@@ -4337,6 +4355,13 @@ impl MprotectWindow {
 }
 
 #[cfg(any(unix, windows))]
+/// #1909 — whether a reserved-tail page in this state is the window's own memory, which its budget
+/// pays for: `temen_interp`'s rule over the JIT's page states (an unmapped tail page is absent, so a
+/// tail `Unmapped` page kept its contents).
+fn held_tail(p: &PageState) -> bool {
+    matches!(p, PageState::Rw | PageState::Ro | PageState::Unmapped)
+}
+
 impl GuestMem for MprotectWindow {
     /// The reserved mask domain — what the interpreter's `Mem` answers (`window.reserved()`), and the
     /// bound an `execve`'s window check reads. #1768: without it the JIT's window reported the trait
@@ -4379,7 +4404,7 @@ impl GuestMem for MprotectWindow {
         // SAFETY: the page range is RW and within the reserved mapping (validated).
         unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
         for page in pages {
-            self.set_prot(page, prot);
+            self.set_prot(page, prot, false);
         }
         self.hw_apply(start, plen, prot);
         0
@@ -4416,7 +4441,7 @@ impl GuestMem for MprotectWindow {
                         return EINVAL;
                     }
                     for p in first..=last {
-                        self.prot_set(p, PageState::Unmapped);
+                        self.set_prot(p, 0, false);
                     }
                     run = None;
                 }
@@ -4431,9 +4456,18 @@ impl GuestMem for MprotectWindow {
         self.hw_release_hint(start, plen);
         self.hw_apply(start, plen, 0 /* none */);
         for page in pages {
-            self.prot_set(page, PageState::Unmapped);
+            self.set_prot(page, 0, false);
         }
         0
+    }
+    fn tail_bytes(&self, offset: u64, len: u64) -> temen_interp::TailBytes {
+        let Ok(pages) = self.prot_pages(offset, len) else {
+            return temen_interp::TailBytes::default();
+        };
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        temen_interp::window_tail_bytes(&map, pages, self.mapped, self.page, held_tail, |p| {
+            matches!(p, PageState::Backed { .. })
+        })
     }
     /// §3e op 2 `protect`: change protection without touching backing (the D40 RO mechanism). The
     /// page is committed first (a no-op on already-committed pages; on windows it makes a never-mapped
@@ -4459,8 +4493,8 @@ impl GuestMem for MprotectWindow {
                         writable: prot & 2 != 0,
                     },
                 ),
-                Some(PageState::Backed { .. }) => self.prot_set(page, PageState::Unmapped),
-                _ => self.set_prot(page, prot),
+                Some(PageState::Backed { .. }) => self.set_prot(page, 0, false),
+                _ => self.set_prot(page, prot, true),
             }
         }
         self.hw_apply(start, plen, prot);
@@ -6037,12 +6071,12 @@ pub fn conductor(caps: &[&str], argv: &[&str]) -> temen_ir::Module {
 }
 
 /// Grant [`conductor`]'s first three args on `host`: an `Instantiator`, `child` as a `Module`, and a
-/// `Budget` holding exactly `child`'s declared window.
+/// `Budget` unbounded on its own level, which pays for `child`'s window and for what `child` grows
+/// past it (#1909): a phase grows as freely as it would at the root.
 pub fn grant_conductor(host: &mut Host, child: &temen_ir::Module) -> (i32, i32, i32) {
-    let log2 = child.memory.as_ref().map_or(0, |m| m.size_log2);
     let inst = host.grant_instantiator(0, 1u64 << CONDUCTOR_LOG2);
     let modh = host.grant_module(child);
-    let budget = host.grant_budget(-1, 1i64 << log2, -1);
+    let budget = host.grant_budget(-1, -1, -1);
     (inst, modh, budget)
 }
 
@@ -7008,9 +7042,9 @@ impl HostCap {
     /// (`Instantiator.instantiate_detached`, op 15) whose fresh platform windows no ancestor below
     /// the platform can read (the child attests `window_exposed = false` — the distrust-spawner trust
     /// anchor). Embedder-granted like `exec`/`fs`; each mint charges the child's window size to
-    /// `mem`. Its fuel and spawn are unbounded on its own level (#1944 slice 3): the run's fuel limit
-    /// above it caps the children it funds, and each child it funds is one `spawn` of it while it
-    /// lives.
+    /// `mem`, and what the child grows past it (#1909). Its fuel and spawn are unbounded on its own
+    /// level (#1944 slice 3): the run's fuel limit above it caps the children it funds, and each
+    /// child it funds is one `spawn` of it while it lives.
     pub fn detached_budget(mem: u64) -> HostCap {
         HostCap {
             type_id: cap_id::BUDGET,

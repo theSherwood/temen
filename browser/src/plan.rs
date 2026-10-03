@@ -90,11 +90,6 @@ impl Plan {
         }
     }
 
-    /// What the root's budget must hold to mint every node's window.
-    pub fn window_bytes(&self) -> u64 {
-        self.nodes.iter().map(|n| 1u64 << n.window_log2).sum()
-    }
-
     /// The root guest's Temen IR text. Its params are `(inst, module_0 … module_{n-1}, budget, cap_0 …)`
     /// — the order [`root_args`](Self::root_args) builds. `Err` names what does not fit or resolve.
     pub fn root_src(&self) -> Result<String, String> {
@@ -282,12 +277,16 @@ impl Plan {
     /// per node (`modules`, in node order) and the budget every node's window is minted from — and
     /// return its args in the order [`root_src`](Self::root_src)'s params declare: `inst`, the modules,
     /// the budget, then `caps` (already granted on `host`, one handle per [`Plan::caps`] name).
+    ///
+    /// The budget is unbounded on its own level: it pays for each node's window and for what the node
+    /// grows past it (#1909), so a node grows as freely as it would at the root, bounded by its own
+    /// memory, not by its declared size.
     pub fn root_args(&self, host: &mut Host, modules: &[&Module], caps: &[i32]) -> Vec<Value> {
         debug_assert_eq!(modules.len(), self.nodes.len());
         debug_assert_eq!(caps.len(), self.caps.len());
         let inst = host.grant_instantiator(0, 1u64 << ROOT_WINDOW_LOG2);
         let mods: Vec<i32> = modules.iter().map(|m| host.grant_module(m)).collect();
-        let budget = host.grant_budget(-1, self.window_bytes() as i64, -1);
+        let budget = host.grant_budget(-1, -1, -1);
         std::iter::once(inst)
             .chain(mods)
             .chain(std::iter::once(budget))

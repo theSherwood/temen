@@ -175,10 +175,12 @@ fn a_detached_child_on_the_jit_matches_the_interpreter() {
     let p = module(&parent(true));
     let c = module(CHILD);
     let want = ARGV_WORD + 1; // argv landed; attest = 1 (tier 1, window_exposed = false)
-    assert_eq!(run_interp(&p, &c, 1 << 16), want, "interpreter oracle");
+                              // The budget holds the child's window and the 16 KiB it grows (#1909: growth spends it too).
+    let quota = (1 << 16) + (1 << 14);
+    assert_eq!(run_interp(&p, &c, quota), want, "interpreter oracle");
     let before = temen_jit::child_compiles();
     assert_eq!(
-        run_jit(&p, &c, 1 << 16),
+        run_jit(&p, &c, quota),
         want,
         "the JIT-hosted detached child"
     );

@@ -422,24 +422,27 @@ unsafe fn granted_teardown(
         // #1971 — a child a freeze captured keeps its window charged: the artifact carries the
         // charge, and the thaw's relaunch files the lease again.
         let window = if captured { None } else { window };
-        // SAFETY: the powerbox is freed exactly once, here, by the task that owned it; the givers
-        // were loaded from `rt`, registered with the parent host `parent_ctx` names.
+        // SAFETY: the powerbox is freed exactly once, here, by the task that owned it, after the
+        // window settles against it; the givers were loaded from `rt`, registered with the parent
+        // host `parent_ctx` names.
         unsafe {
+            give_back(parent_ctx.0, ctx.0, lane_give, mem_give, lane, window);
             release(ctx.0);
-            give_back(parent_ctx.0, lane_give, mem_give, lane, window);
         }
     })
 }
 
-/// Hand a detached child's lane, window bytes and first vCPU back to its parent: at the child's end
-/// ([`granted_teardown`]), or when its spawn goes no further after the admission took them
-/// ([`undo_admission`]).
+/// Hand a detached child's lane, window bytes and first vCPU back to its parent, and what its window
+/// grew (#1909): at the child's end ([`granted_teardown`]), or when its spawn goes no further after
+/// the admission took them ([`undo_admission`], with no `child`: it never ran).
 ///
 /// # Safety
 /// `lane_give` / `mem_give` are 0 or the embedder's registered [`crate::LaneGiver`] /
-/// [`crate::BudgetMemGiver`], and `parent_ctx` is the parent host they were registered with.
+/// [`crate::BudgetMemGiver`], `parent_ctx` is the parent host they were registered with, and `child`
+/// is null or the child's live powerbox.
 unsafe fn give_back(
     parent_ctx: *mut core::ffi::c_void,
+    child: *mut core::ffi::c_void,
     lane_give: usize,
     mem_give: usize,
     lane: i64,
@@ -451,7 +454,7 @@ unsafe fn give_back(
     }
     if let (Some((budget, bytes)), true) = (window, mem_give != 0) {
         let give: crate::BudgetMemGiver = core::mem::transmute(mem_give);
-        give(parent_ctx, budget, bytes);
+        give(parent_ctx, child, budget, bytes);
     }
 }
 
@@ -463,6 +466,7 @@ unsafe fn give_back(
 unsafe fn undo_admission(rt: &Nursery, budget: i32, bytes: u64, lane: i64) {
     give_back(
         rt.grant_ctx(),
+        core::ptr::null_mut(),
         rt.grant_lane_give.load(Ordering::Acquire),
         rt.grant_budget_mem_give.load(Ordering::Acquire),
         lane,
