@@ -4788,11 +4788,11 @@ struct FnCtx {
     /// the interpreter's `check_prot` would. `None` (every other entry) emits byte-identical code
     /// to before #750 — the fail-closed default pays nothing.
     page_check: Option<(u8, u32)>,
-    /// The **experimental NULL-page guard** ([`compile_module_tierup_nullguard`], a measurement
-    /// mode): `Some(guard)` ⇒ every confined access additionally traps when its first byte lands
-    /// below `guard` — matching an interpreter whose page map seeds `[0, guard)` `Unmapped`. Never
-    /// elided (an in-window proof is an upper bound; it says nothing about the low pages). `None`
-    /// everywhere else — byte-identical output.
+    /// The **NULL-page guard** (#964/#1094): `Some(guard)` ⇒ every confined access additionally
+    /// traps when its first byte lands below `guard` — matching an interpreter whose page map seeds
+    /// `[0, guard)` `Unmapped`. Never elided (an in-window proof is an upper bound; it says nothing
+    /// about the low pages). `None` under the page check, which already traps on those `Unmapped`
+    /// pages (#2105), and where the window is smaller than the guard.
     null_guard: Option<u64>,
     /// `Some` when this function's blocks nest as structured control flow; `None` runs them under
     /// the `$next` dispatcher.
@@ -4950,7 +4950,7 @@ fn emit_func(
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         // The pagestate global (paged mode only) sits immediately after `mapped`.
         page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
-        null_guard,
+        null_guard: null_guard.filter(|_| paged.is_none()),
         structure: None,
     };
 
@@ -5186,7 +5186,7 @@ fn emit_split_group(
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
-        null_guard,
+        null_guard: null_guard.filter(|_| paged.is_none()),
         structure: None,
     };
 

@@ -612,6 +612,32 @@ fn unsynced_table_diverges() {
     );
 }
 
+/// #2105: under the page check the NULL guard is the table's. Its pages are `Unmapped` in the page
+/// map the driver builds the table from, so the paged emit carries no guard compare of its own. A
+/// NULL load and a NULL store trap on both tiers through the synced table; a defaults-only table,
+/// which leaves the guard out, admits the load, since nothing else stands behind the table.
+#[test]
+fn the_null_guard_is_the_page_tables() {
+    let (off, len) = last_page(UNMAP_LOAD);
+    for guest in [UNMAP_LOAD, UNMAP_STORE] {
+        let (want, _) = run_guest(guest, off, len, 8, Mode::Interp);
+        assert_eq!(
+            want,
+            Outcome::Trap(TrapKind::MemoryFault),
+            "the oracle seeds the guard"
+        );
+        let (got, tierups) = run_guest(guest, off, len, 8, Mode::PagedSynced);
+        assert_eq!(tierups, 1, "the leaf must actually tier up");
+        assert_eq!(want, got, "paged tier diverged on a NULL access");
+    }
+    let (got, _) = run_guest(UNMAP_LOAD, off, len, 8, Mode::PagedUnsynced);
+    assert_eq!(
+        got,
+        Outcome::Vals(vec![0]),
+        "a table without the guard admits a NULL load: no compare stands behind the table"
+    );
+}
+
 #[test]
 fn unpaged_output_carries_no_pagestate() {
     // Lands-dark pin: the default (unpaged) entry emits no page-check machinery — no `"pagestate"`
