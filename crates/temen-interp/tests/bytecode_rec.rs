@@ -16,7 +16,11 @@
 //!   `-EINVAL`, exactly the Cranelift thunk's — pinned divergent, to flip when child vCPU
 //!   quotas land here.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use temen_interp::{bytecode, run_with_host, Host, Trap, Value};
+use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
 use temen_ir::errno::EINVAL;
@@ -61,35 +65,17 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// `REC_SPAWN`'s shape plus an **impl export** (a pager-capable module): op 17 present + impl
-/// exports ⇒ the whole module must decline to the tree-walk oracle (the record's pager field is
-/// runtime data, so admission is by module shape — `compile_module_for`).
+/// A record spawn (the v1 record [`rec_with_impl_export`] appends at 17536) plus an **impl export**
+/// (a pager-capable module): op 17 present + impl exports ⇒ the whole module must decline to the
+/// tree-walk oracle (the record's pager field is runtime data, so admission is by module shape —
+/// `compile_module_for`).
 const REC_WITH_IMPL_EXPORT: &str = r#"memory 17
 type 0 func (i64) -> (i64)
 type 1 interface { page: 0 }
 export 0 interface "pager" 1 { page: 1 }
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  qv0 = i64.const 4294967296
-  qv1 = i64.const 65536
-  qv2 = i64.const -4294967284
-  qv3 = i64.const 4294967295
-  qv4 = i64.const 0
   qa0 = i64.const 17536
-  i64.store qa0 qv0
-  qa1 = i64.const 17544
-  i64.store qa1 qv1
-  qa2 = i64.const 17552
-  i64.store qa2 qv2
-  qa3 = i64.const 17560
-  i64.store qa3 qv3
-  qa4 = i64.const 17568
-  i64.store qa4 qv4
-  qa5 = i64.const 17576
-  i64.store qa5 qv4
-  qa6 = i64.const 17584
-  i64.store qa6 qv4
   vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
   return vr
@@ -102,6 +88,51 @@ block 0 (v0: i64) {
   }
 }
 "#;
+
+/// [`REC_WITH_IMPL_EXPORT`] with its record: func 1 in its declared window.
+fn rec_with_impl_export() -> String {
+    format!(
+        "{REC_WITH_IMPL_EXPORT}{}",
+        rec::segment(17536, &SpawnRec::v1(1))
+    )
+}
+
+/// A detached-record parent (`(i32 inst, i64 budget) -> (i64)`): the budget handle arrives at run
+/// time and is stored into the v1 record appended at 17536 (func 1, its declared window). Spawn,
+/// join, return the child's 42 — or the spawn's refusal.
+fn budget_rec_v1_src() -> String {
+    format!(
+        "memory 17
+func (i32, i64) -> (i64) {{
+block 0 (v0: i32, v1: i64) {{
+  qb = i32.wrap_i64 v1
+  qba = i64.const 17564
+  i32.store qba qb
+  qa0 = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
+  vz = i32.const 0
+  vneg = i32.lt_s vch vz
+  br_if vneg 1(vch) 2(v0, vch)
+}}
+block 1 (ve: i32) {{
+  vr = i64.extend_i32_s ve
+  return vr
+}}
+block 2 (vi2: i32, vch2: i32) {{
+  vr = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vr = i64.const 42
+  return vr
+  }}
+}}
+{rec}",
+        rec = rec::segment(17536, &SpawnRec::v1(1))
+    )
+}
 
 /// Budget-record parent (`(i32 inst, i64 budget) -> (i64)`): the budget handle arrives at run
 /// time, so f24 is packed with `or(module=-1, budget<<32)`; quota stays 0 (mixing is a
@@ -201,7 +232,7 @@ fn record_spawn_is_native_and_matches_the_oracle() {
 /// demand paging), on both the orchestration entry and the cooperative runner.
 #[test]
 fn pager_capable_record_module_declines_to_the_oracle() {
-    let m = parse_module(REC_WITH_IMPL_EXPORT).expect("parse");
+    let m = parse_module(&rec_with_impl_export()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     assert!(
         bytecode::VcpuProgram::compile(&m).is_none(),
@@ -269,11 +300,11 @@ fn budget_mem_refusal_is_einval_on_both_engines() {
     assert_eq!(r_bc, r_tw, "mem refusal: bytecode != tree-walker");
 }
 
-/// A dangling budget handle fails the spawn closed (`CapFault`) on both engines — the exec arm's
-/// peek is the bytecode twin of the tree-walker's parse-time peek.
+/// A dangling budget handle fails the detached spawn closed (`CapFault`) on both engines, natively —
+/// the bytecode exec arm's check is the twin of the tree-walker's record-parse check.
 #[test]
 fn dangling_budget_handle_capfaults_on_both_engines() {
-    let src = budget_rec_src(12, 65536);
+    let src = budget_rec_v1_src();
     let mut h_tw = Host::new();
     let i_tw = h_tw.grant_instantiator(0, 1 << 17);
     let r_tw = tw(&src, &[Value::I32(i_tw), Value::I64(99)], &mut h_tw);
@@ -281,17 +312,7 @@ fn dangling_budget_handle_capfaults_on_both_engines() {
 
     let mut h_bc = Host::new();
     let i_bc = h_bc.grant_instantiator(0, 1 << 17);
-    let m = parse_module(&src).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let mut fuel = 10_000_000u64;
-    let r_bc = bytecode::compile_and_run_with_host(
-        &m,
-        0,
-        &[Value::I32(i_bc), Value::I64(99)],
-        &mut fuel,
-        &mut h_bc,
-    )
-    .expect("native");
+    let r_bc = bc(&src, &[Value::I32(i_bc), Value::I64(99)], &mut h_bc);
     assert_eq!(r_bc, r_tw, "dangling budget: bytecode != tree-walker");
 }
 

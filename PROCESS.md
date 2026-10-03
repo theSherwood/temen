@@ -650,6 +650,11 @@ self.attest() -> { isolation_tier,                      (§2: 0 / 1 / 3)
   always freeze it — every nested durable child today); a **detached** child owns its window,
   so an ancestor freezes it only if granted, and may thus be platform-durable **and**
   ancestor-confidential at once.
+- **An image-replace keeps the domain's report** (owner, 2026-10-02, #1867). An `execve`
+  replaces the image, not the domain: its placement and its ancestors' rights are the
+  caller's, so the new image attests what the caller did. A `posix_spawn`ed process is built
+  in a fork copy of its caller's powerbox, so it attests what a fork twin does: the caller's
+  report.
 - **Attest covers computation, not provisioning.** Every capability a domain holds came
   through its (possibly hostile) creator, so "fetch my secret over my secure channel" is
   MITM-able regardless of a clean report — the classic TEE lesson. v1 deliberately claims

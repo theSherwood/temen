@@ -74,6 +74,7 @@ fn authority_covers_sub_ranges_not_just_the_exact_range() {
 #[test]
 fn a_host_with_no_grant_holds_no_authority() {
     let h = Host::new();
+    assert!(!h.holds_freeze_authority(FreezeScope::DetachedProgeny));
     assert!(!h.holds_freeze_authority(FreezeScope::Carve {
         base: 0,
         size: u64::MAX

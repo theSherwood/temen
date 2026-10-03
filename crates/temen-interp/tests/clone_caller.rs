@@ -9,8 +9,29 @@
 //!   duplicated powerbox), deliver `reply_orig` to the original and `reply_twin` to the twin. Both
 //!   resume past the same fork `call.cap` — return-twice, one live run.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{run_with_host, Host, StreamRole, Value};
+use temen_ir::SpawnRec;
+
+/// The server's spawn record: S (func 1) at 17536, its window the module's own.
+fn server() -> String {
+    rec::segment(17536, &SpawnRec::v1(1))
+}
+
+/// `src` with its spawn records: the server S (func 1) at 17536, and the caller C (func 4) at 17664,
+/// granted `"svc"` and `"o"` by the list at 16640. Both are detached, paid from the root's last
+/// argument, a `Budget`.
+fn forking(src: &str) -> String {
+    let c = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 2,
+        ..SpawnRec::v1(4)
+    };
+    format!("{src}{}{}", server(), rec::segment(17664, &c))
+}
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(text).expect("parse");
@@ -93,29 +114,12 @@ memory 17
 type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "svc" 1 { op: 2 }
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vbud: i32) {
+  q0b = i64.const 17564
+  i32.store q0b vbud
+  q0p = i64.const 17536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q0p)
   vexp = i64.const 0
   vh = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vexp)
   varg = i64.const 7
@@ -198,12 +202,20 @@ fn clone_caller_outside_a_handler_is_probeable_einval() {
 
 #[test]
 fn clone_caller_injects_the_callers_reply_out_of_band() {
-    let m = module(SRC);
+    let m = module(&format!("{SRC}{}", server()));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let mut fuel = 20_000_000u64;
-    let r = run_with_host(&m, 0, &[Value::I32(ih)], &mut fuel, &mut host).expect("run");
+    let r = run_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(hb)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
     // The root observes the value `clone_caller` INJECTED (999), not the handler's own return (5) —
     // proving the servicer supplied the caller's reply out-of-band and the auto-reply was suppressed.
     assert_eq!(
@@ -249,31 +261,12 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  ; spawn via record (op 17): entry=1 off=131072 sl=12 quota=0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 131072
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
-  vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  q1b = i64.const 17564
+  i32.store q1b vbud
+  q1p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
@@ -292,29 +285,10 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; spawn via record (op 17): entry=4 off=135168 sl=12 quota=0
-  q2v0 = i64.const 17179869184
-  q2v1 = i64.const 135168
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2v5 = i64.const 16640
-  q2v6 = i64.const 2
-  q2a0 = i64.const 17664
-  i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
-  i64.store q2a5 q2v5
-  q2a6 = i64.const 17712
-  i64.store q2a6 q2v6
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+  q2b = i64.const 17692
+  i32.store q2b vbud
+  q2p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
@@ -347,16 +321,10 @@ block 0 (vpid: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
@@ -381,7 +349,7 @@ block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
   br_if visechild 1(vhsvc, vho) 4(vr, vho)
   }
 block 4 (vr: i64, vho: i32) {
-  vp16 = i64.const 16
+  vp16 = i64.const 17408
   i64.store vp16 vr
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
@@ -392,17 +360,18 @@ block 4 (vr: i64, vho: i32) {
 
 #[test]
 fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
-    let m = module(SRC_TWIN);
+    let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout(); // promote stdout to a shared sink the twin inherits
     let out_h = host.grant_stream(StreamRole::Out);
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -438,17 +407,18 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 /// window (`Mem::fork_private`) + duplicated powerbox (`Host::fork_powerbox`); the parent `wait`s
 /// the twin (`reap`) so its stdout write is observed deterministically before teardown.
 fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
-    let m = module(SRC_TWIN);
+    let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -462,17 +432,18 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     let (oracle_r, oracle_bytes) = run_src_twin_oracle();
 
     // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
-    let m = module(SRC_TWIN);
+    let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let mut fuel = 40_000_000u64;
     let bc_r = temen_interp::bytecode::compile_and_run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -524,31 +495,12 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  ; spawn via record (op 17): entry=1 off=131072 sl=12 quota=0
-  q3v0 = i64.const 4294967296
-  q3v1 = i64.const 131072
-  q3v2 = i64.const -4294967284
-  q3v3 = i64.const 4294967295
-  q3v4 = i64.const 0
-  q3a0 = i64.const 17728
-  i64.store q3a0 q3v0
-  q3a1 = i64.const 17736
-  i64.store q3a1 q3v1
-  q3a2 = i64.const 17744
-  i64.store q3a2 q3v2
-  q3a3 = i64.const 17752
-  i64.store q3a3 q3v3
-  q3a4 = i64.const 17760
-  i64.store q3a4 q3v4
-  q3a5 = i64.const 17768
-  i64.store q3a5 q3v4
-  q3a6 = i64.const 17776
-  i64.store q3a6 q3v4
-  vs = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  q3b = i64.const 17564
+  i32.store q3b vbud
+  q3p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q3p)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
@@ -567,29 +519,10 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; spawn via record (op 17): entry=4 off=135168 sl=12 quota=0
-  q4v0 = i64.const 17179869184
-  q4v1 = i64.const 135168
-  q4v2 = i64.const -4294967284
-  q4v3 = i64.const 4294967295
-  q4v4 = i64.const 0
-  q4v5 = i64.const 16640
-  q4v6 = i64.const 2
-  q4a0 = i64.const 17792
-  i64.store q4a0 q4v0
-  q4a1 = i64.const 17800
-  i64.store q4a1 q4v1
-  q4a2 = i64.const 17808
-  i64.store q4a2 q4v2
-  q4a3 = i64.const 17816
-  i64.store q4a3 q4v3
-  q4a4 = i64.const 17824
-  i64.store q4a4 q4v4
-  q4a5 = i64.const 17832
-  i64.store q4a5 q4v5
-  q4a6 = i64.const 17840
-  i64.store q4a6 q4v6
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q4a0)
+  q4b = i64.const 17692
+  i32.store q4b vbud
+  q4p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q4p)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
@@ -621,16 +554,10 @@ block 0 (vpid: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
   br 1(vhsvc, vho)
@@ -643,7 +570,7 @@ block 1 (vhsvc: i32, vho: i32) {
   br_if vforkfail 1(vhsvc, vho) 2(vpid, vhsvc, vho)
   }
 block 2 (vpid: i64, vhsvc: i32, vho: i32) {
-  vp16 = i64.const 16
+  vp16 = i64.const 17408
   i64.store vp16 vpid
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
@@ -668,17 +595,18 @@ block 5 (vpid: i64) {
 
 #[test]
 fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
-    let m = module(SRC_FORK_PID);
+    let m = module(&forking(SRC_FORK_PID));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -728,31 +656,12 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  ; spawn via record (op 17): entry=1 off=131072 sl=12 quota=0
-  q5v0 = i64.const 4294967296
-  q5v1 = i64.const 131072
-  q5v2 = i64.const -4294967284
-  q5v3 = i64.const 4294967295
-  q5v4 = i64.const 0
-  q5a0 = i64.const 17856
-  i64.store q5a0 q5v0
-  q5a1 = i64.const 17864
-  i64.store q5a1 q5v1
-  q5a2 = i64.const 17872
-  i64.store q5a2 q5v2
-  q5a3 = i64.const 17880
-  i64.store q5a3 q5v3
-  q5a4 = i64.const 17888
-  i64.store q5a4 q5v4
-  q5a5 = i64.const 17896
-  i64.store q5a5 q5v4
-  q5a6 = i64.const 17904
-  i64.store q5a6 q5v4
-  vs = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  q5b = i64.const 17564
+  i32.store q5b vbud
+  q5p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q5p)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
@@ -771,29 +680,10 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; spawn via record (op 17): entry=4 off=135168 sl=12 quota=0
-  q6v0 = i64.const 17179869184
-  q6v1 = i64.const 135168
-  q6v2 = i64.const -4294967284
-  q6v3 = i64.const 4294967295
-  q6v4 = i64.const 0
-  q6v5 = i64.const 16640
-  q6v6 = i64.const 2
-  q6a0 = i64.const 17920
-  i64.store q6a0 q6v0
-  q6a1 = i64.const 17928
-  i64.store q6a1 q6v1
-  q6a2 = i64.const 17936
-  i64.store q6a2 q6v2
-  q6a3 = i64.const 17944
-  i64.store q6a3 q6v3
-  q6a4 = i64.const 17952
-  i64.store q6a4 q6v4
-  q6a5 = i64.const 17960
-  i64.store q6a5 q6v5
-  q6a6 = i64.const 17968
-  i64.store q6a6 q6v6
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q6a0)
+  q6b = i64.const 17692
+  i32.store q6b vbud
+  q6p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
@@ -825,16 +715,10 @@ block 0 (vpid: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
   br 1()
   }
 block 1 () {
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
   vc0 = i64.const 0
@@ -849,7 +733,7 @@ block 2 (vpid: i64) {
   br_if vparent 3(vpid) 5()
   }
 block 3 (vpid: i64) {
-  vp0b = i64.const 0
+  vp0b = i64.const 16684
   vl3b = i64.const 3
   vhsvc2 = self.resolve vp0b vl3b
   vstatus = call.cap 268435456 1 (i64) -> (i64) vhsvc2 (vpid)
@@ -858,10 +742,10 @@ block 3 (vpid: i64) {
   br_if vwaitfail 3(vpid) 4(vstatus)
   }
 block 4 (vstatus: i64) {
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
-  vp16 = i64.const 16
+  vp16 = i64.const 17408
   i64.store vp16 vstatus
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
@@ -876,17 +760,18 @@ block 5 () {
 
 #[test]
 fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
-    let m = module(SRC_FORK_WAIT);
+    let m = module(&forking(SRC_FORK_WAIT));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let mut fuel = 60_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -924,30 +809,12 @@ type 2 func (i64, i64) -> (i64)
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  q5v0 = i64.const 4294967296
-  q5v1 = i64.const 131072
-  q5v2 = i64.const -4294967284
-  q5v3 = i64.const 4294967295
-  q5v4 = i64.const 0
-  q5a0 = i64.const 17856
-  i64.store q5a0 q5v0
-  q5a1 = i64.const 17864
-  i64.store q5a1 q5v1
-  q5a2 = i64.const 17872
-  i64.store q5a2 q5v2
-  q5a3 = i64.const 17880
-  i64.store q5a3 q5v3
-  q5a4 = i64.const 17888
-  i64.store q5a4 q5v4
-  q5a5 = i64.const 17896
-  i64.store q5a5 q5v4
-  q5a6 = i64.const 17904
-  i64.store q5a6 q5v4
-  vs = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
+  q5b = i64.const 17564
+  i32.store q5b vbud
+  q5p = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (q5p)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
   va0 = i64.const 16640
@@ -966,28 +833,10 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  q6v0 = i64.const 17179869184
-  q6v1 = i64.const 135168
-  q6v2 = i64.const -4294967284
-  q6v3 = i64.const 4294967295
-  q6v4 = i64.const 0
-  q6v5 = i64.const 16640
-  q6v6 = i64.const 2
-  q6a0 = i64.const 17920
-  i64.store q6a0 q6v0
-  q6a1 = i64.const 17928
-  i64.store q6a1 q6v1
-  q6a2 = i64.const 17936
-  i64.store q6a2 q6v2
-  q6a3 = i64.const 17944
-  i64.store q6a3 q6v3
-  q6a4 = i64.const 17952
-  i64.store q6a4 q6v4
-  q6a5 = i64.const 17960
-  i64.store q6a5 q6v5
-  q6a6 = i64.const 17968
-  i64.store q6a6 q6v6
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q6a0)
+  q6b = i64.const 17692
+  i32.store q6b vbud
+  q6p = i64.const 17664
+  vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
@@ -1019,16 +868,10 @@ block 0 (vpid: i64, vflags: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
-  voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
   br 1()
   }
 block 1 () {
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vhsvc = self.resolve vp0 vl3
   vc0 = i64.const 0
@@ -1043,7 +886,7 @@ block 2 (vpid: i64) {
   br_if vparent 3(vpid) 5()
   }
 block 3 (vpid: i64) {
-  vp0b = i64.const 0
+  vp0b = i64.const 16684
   vl3b = i64.const 3
   vhsvc2 = self.resolve vp0b vl3b
   vnohang = i64.const 1
@@ -1053,17 +896,17 @@ block 3 (vpid: i64) {
   br_if vraced 3(vpid) 4(vstatus)
   }
 block 4 (vstatus: i64) {
-  vp8 = i64.const 8
+  vp8 = i64.const 16694
   vl1 = i64.const 1
   vho = self.resolve vp8 vl1
-  vp16 = i64.const 16
+  vp16 = i64.const 17408
   i64.store vp16 vstatus
   vlen = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
   return vstatus
   }
 block 5 () {
-  vfa = i64.const 24
+  vfa = i64.const 17344
   vval = i32.const 7
   i32.store vfa vval
   vexp = i32.const 7
@@ -1077,17 +920,18 @@ block 5 () {
 
 #[test]
 fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
-    let m = module(SRC_FORK_WAITPID);
+    let m = module(&forking(SRC_FORK_WAITPID));
     let mut host = Host::new();
     host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let mut fuel = 60_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -1123,7 +967,7 @@ fn a_second_wait_on_a_twin_already_waited_gets_echild() {
   br 4(vpid, vth)
   }
 block 4 (vpid: i64, vth: i32) {
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vh = self.resolve vp0 vl3
   vstatus = call.cap 268435456 1 (i64) -> (i64) vh (vpid)
@@ -1137,7 +981,7 @@ block 5 (vstatus: i64, vth: i32) {
   return vsum
   }
 block 6 () {
-  vwa = i64.const 64
+  vwa = i64.const 17344
   vwe = i32.const 0
   vwt = i64.const 200000000
   vww = i32.atomic.wait vwa vwe vwt
@@ -1150,7 +994,7 @@ block 0 (vsp: i64, vpid: i64) {
   br 1(vpid)
   }
 block 1 (vpid: i64) {
-  vp0 = i64.const 0
+  vp0 = i64.const 16684
   vl3 = i64.const 3
   vh = self.resolve vp0 vl3
   vs = call.cap 268435456 1 (i64) -> (i64) vh (vpid)
@@ -1169,16 +1013,17 @@ block 2 (vs: i64) {
     );
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let m = module(&src);
+        let m = module(&forking(&src));
         let mut host = Host::new();
         host.set_self_module(&m);
         let ih = host.grant_instantiator(0, 1u64 << 18);
+        let hb = host.grant_budget(-1, 8 << 20, -1);
         let out_h = host.grant_stream(StreamRole::Out);
         let mut fuel = 60_000_000u64;
         let _ = tx.send(run_with_host(
             &m,
             0,
-            &[Value::I32(ih), Value::I32(out_h)],
+            &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
             &mut fuel,
             &mut host,
         ));

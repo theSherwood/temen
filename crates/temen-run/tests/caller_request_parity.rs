@@ -83,6 +83,32 @@ block 0 (v0: i64) {\n\
   }\n\
 }\n";
 
+/// #1867 — a command that reports its `self.attest` folded into a status byte: `10 *` its exposure
+/// bits (`window_exposed | freeze_exposed << 1`) `+` its tier.
+const ATTEST_COMMAND: &str = "memory 17\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  va = self.attest\n\
+  vr = i64.extend_i32_u va\n\
+  v8 = i64.const 8\n\
+  vbits = i64.shr_u vr v8\n\
+  v10 = i64.const 10\n\
+  vhi = i64.mul vbits v10\n\
+  v255 = i64.const 255\n\
+  vtier = i64.and vr v255\n\
+  vs = i64.add vhi vtier\n\
+  return vs\n\
+  }\n\
+}\n";
+
+/// The report the embedder gives the caller in the attestation rows: a separate process its
+/// embedder may snapshot. [`ATTEST_COMMAND`] folds it to `23`.
+const CALLER_ATTESTATION: temen_interp::Attestation = temen_interp::Attestation {
+    tier: 3,
+    window_exposed: false,
+    freeze_exposed: true,
+};
+
 /// A command that reads its stdin (fd 0) to EOF through the personality, re-issuing a core pipe
 /// end's tag on the end itself as a libc shim does, and returns `70 +` the bytes it read (`200` on
 /// an error). A spawned child whose stdin is a pipe ends only if it sees EOF there, and it sees EOF
@@ -237,12 +263,18 @@ enum Body {
     /// Leave `90` at 96 KiB, then `execve("/bin/c", NULL, NULL)` into [`FRESH_COMMAND`]: the new
     /// image's window is fresh, so the command returns `7`, not `97`.
     ExecStartsFresh,
+    /// #1867 — [`Body::Exec`] by a caller attesting [`CALLER_ATTESTATION`], into [`ATTEST_COMMAND`]:
+    /// the new image returns its own report.
+    ExecAttests,
     /// `pspawn` of `/bin/c` with no file actions, then `wait4` it: `exit` with its `WEXITSTATUS`,
     /// or with the spawn's errno, negated.
     SpawnReap,
     /// [`Body::SpawnReap`] with argv `["x", "x", "x"]`, into [`ARGC_COMMAND`]: the spawned image
     /// reads the argv the spawn passed, so the child returns `3`.
     SpawnArgv,
+    /// #1867 — [`Body::SpawnReap`] by a caller attesting [`CALLER_ATTESTATION`], into
+    /// [`ATTEST_COMMAND`]: the parent exits with the child's report.
+    SpawnAttests,
     /// A pipe the guest mints and adopts as two fds, then `pspawn` of [`STDIN_COMMAND`] with the
     /// file actions `dup2(read end, 0)`, `close(read end)`, `close(write end)`. The parent writes
     /// `"x"`, closes its write end, reaps the child and exits with its status: `71`, the one byte
@@ -665,7 +697,7 @@ fn guest(form: Form, body: Body) -> String {
             form.call(0, "vp, vz, vz"),
             form.call(1, "vc"),
         ),
-        Body::Exec => format!(
+        Body::Exec | Body::ExecAttests => format!(
             "{head}func () -> () {{\n\
              block 0 () {{\n\
              \x20 vdummy = i32.const 0\n\
@@ -713,7 +745,9 @@ fn guest(form: Form, body: Body) -> String {
             form.call(3, "vkid, vst, vz2, vz2"),
             form.call(1, "vcode"),
         ),
-        Body::SpawnReap | Body::SpawnArgv => spawn_guest(form, body == Body::SpawnArgv),
+        Body::SpawnReap | Body::SpawnArgv | Body::SpawnAttests => {
+            spawn_guest(form, body == Body::SpawnArgv)
+        }
         Body::SpawnStdinEof => spawn_stdin_guest(form),
         Body::SpawnOutput => spawn_output_guest(form, false),
         Body::SpawnOutputThreaded => spawn_output_guest(form, true),
@@ -952,6 +986,7 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         Body::ExecDeliversArgv => ARGC_COMMAND,
         Body::ExecStartsFresh => FRESH_COMMAND,
         Body::SpawnArgv => ARGC_COMMAND,
+        Body::ExecAttests | Body::SpawnAttests => ATTEST_COMMAND,
         Body::SpawnStdinEof => STDIN_COMMAND,
         Body::SpawnOutput | Body::SpawnOutputThreaded => WRITE_COMMAND,
         _ => COMMAND,
@@ -1032,6 +1067,9 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         }
         if matches!(cmd, Cmd::Built | Cmd::Corrupt) {
             temen_run::grant_module_loader(host);
+        }
+        if matches!(body, Body::ExecAttests | Body::SpawnAttests) {
+            host.set_attestation(CALLER_ATTESTATION);
         }
     };
     inst.run_with_caps_and_host(backend, &RunConfig::default(), &[], Some(&mut setup))
@@ -1122,6 +1160,18 @@ fn an_execd_image_starts_in_a_fresh_window_on_every_route() {
     );
 }
 
+/// #1867 — an exec replaces the image, not the domain, so the new image attests what its caller did
+/// (PROCESS.md §6). It used to attest a nested child's report, `13`: an exposed window, the carve's,
+/// that it never ran in, and no ancestor that may snapshot it.
+#[test]
+fn an_execd_image_attests_what_its_caller_did_on_every_route() {
+    assert_parity(
+        Body::ExecAttests,
+        Cmd::Registered,
+        Outcome::Returned(vec![Value::I64(23)]),
+    );
+}
+
 /// `posix_spawn` starts a process running the command and returns its pid, which the parent reaps:
 /// the command's status on every route. What a spawn cannot start is an errno with nothing created,
 /// when the personality can tell (nothing at the path, a file that is not a program); an image the
@@ -1146,6 +1196,13 @@ fn a_spawned_process_runs_and_its_parent_reaps_it_on_every_route() {
 #[test]
 fn a_spawned_process_reads_the_argv_it_was_given_on_every_route() {
     assert_parity(Body::SpawnArgv, Cmd::Registered, Outcome::Exited(3));
+}
+
+/// #1867 — a spawned process's image is built in a fork copy of its caller's powerbox, so it attests
+/// what a fork twin does: its caller's report. It used to attest a nested child's, `13`.
+#[test]
+fn a_spawned_process_attests_what_its_caller_did_on_every_route() {
+    assert_parity(Body::SpawnAttests, Cmd::Registered, Outcome::Exited(23));
 }
 
 /// A spawn's file actions make the child's stdin the pipe, and its copy of the write end is gone:

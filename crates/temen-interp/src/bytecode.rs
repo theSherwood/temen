@@ -10191,6 +10191,7 @@ fn spawn_task(
         fuel: child_fuel,
         fibers: FiberTables::default(),
         spawner: None,
+        program: vt.active.module as u32,
     });
     tasks.push(TaskSlot {
         vt,
@@ -10432,8 +10433,8 @@ fn image_pages(host: &Host, m: &Module) -> bool {
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
 /// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
 /// window). Resolves + compiles the command, admits it (entry sig, command window `<=` the
-/// caller's), builds the command powerbox (`spawn_named_child` + [`Host::exec_carry`] — the same
-/// personality carry the tree-walker uses), materializes the command image into a fresh window of
+/// caller's), builds the command powerbox ([`Host::exec_image`] — the same build and personality
+/// carry the tree-walker uses), materializes the command image into a fresh window of
 /// the caller's geometry ([`Mem::exec_window`]; flat for a leaf image the host emitted), and pushes
 /// the compiled command as a new domain unit. Returns the rebuilt process ([`ExecBuilt`]) for the
 /// caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
@@ -12930,6 +12931,9 @@ struct ChildEnv {
     /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
     /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
     spawner: Option<usize>,
+    /// The unit of the run's [`ModuleSource`] this env's domain runs — its own program, which a
+    /// detached spawn of it reuses (#2078). The root domain's is unit 0.
+    program: u32,
 }
 
 /// `Instantiator.kill` (#2074), cooperative form: end every live task of env `k` with
@@ -13011,6 +13015,7 @@ fn coop_start_child(
         fuel,
         fibers: FiberTables::default(),
         spawner: tasks[ti].env,
+        program: module,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
@@ -14990,6 +14995,7 @@ impl CoopSched {
                         // the caller's env fuel.
                         let twin_table = extra_envs[ck].table.fork();
                         let twin_eidx = extra_envs.len();
+                        let program = extra_envs[ck].program;
                         extra_envs.push(ChildEnv {
                             mem: twin_mem,
                             host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
@@ -14997,6 +15003,7 @@ impl CoopSched {
                             fuel: extra_envs[ck].fuel.for_thread(),
                             fibers: FiberTables::default(),
                             spawner: None,
+                            program,
                         });
                         let twin_ti = tasks.len();
                         tasks.push(TaskSlot {
@@ -15160,6 +15167,7 @@ impl CoopSched {
                                         fuel: fuel.for_thread(),
                                         fibers: FiberTables::default(),
                                         spawner: None,
+                                        program: tasks[ti].vt.active.module as u32,
                                     });
                                     tasks[ti].env = Some(eidx);
                                     built.leaf
@@ -15194,6 +15202,7 @@ impl CoopSched {
                                         std::sync::Arc::new(std::sync::Mutex::new(built.host));
                                     extra_envs[k].table = built.table;
                                     extra_envs[k].mem = Some(built.mem);
+                                    extra_envs[k].program = tasks[ti].vt.active.module as u32;
                                     built.leaf
                                 }
                             }
@@ -15346,6 +15355,7 @@ impl CoopSched {
                                 None => dom.table.fork(),
                             };
                             let twin_eidx = extra_envs.len();
+                            let program = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
                             extra_envs.push(ChildEnv {
                                 mem: twin_mem,
                                 host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
@@ -15353,6 +15363,7 @@ impl CoopSched {
                                 fuel: twin_fuel,
                                 fibers: FiberTables::default(),
                                 spawner: None,
+                                program,
                             });
                             debug_assert_eq!(
                                 tasks.len(),
@@ -15547,8 +15558,13 @@ impl CoopSched {
                         None => mem.as_ref(),
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
+                    // #2078 — a child of the spawning domain's own program runs that domain's unit,
+                    // as a same-module confined child does: no second compile. The domain's unit,
+                    // not the spawning frame's: a §22 unit the domain installed is not its program.
+                    let unit = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
+                    let own = dom.source.get(unit as usize).map(|p| (unit, p));
                     let admitted = task_host(host, extra_envs, tasks[ti].env)
-                        .with(|h| admit_detached_in_process(h, pm, spawn, None));
+                        .with(|h| admit_detached_in_process(h, pm, spawn, own));
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
@@ -15563,6 +15579,17 @@ impl CoopSched {
                             continue;
                         }
                     };
+                    // #816 env-routed tier-up, as for a confined child: a child running the root's
+                    // unit inherits the run's bitmap when the driver can address its own window
+                    // flatly; any other window stays interpreted.
+                    let tierup = match (&child.program, eligible.as_ref()) {
+                        (ChildProgram::Spawner(0, _), Some(e))
+                            if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
+                        {
+                            Some((std::sync::Arc::clone(e), *page_checked))
+                        }
+                        _ => None,
+                    };
                     let started = coop_start_child(
                         tasks,
                         extra_envs,
@@ -15571,7 +15598,7 @@ impl CoopSched {
                         child,
                         spawn.entry,
                         dst,
-                        None,
+                        tierup,
                     );
                     if let Err(t) = started {
                         complete(tasks, ti, Err(t));

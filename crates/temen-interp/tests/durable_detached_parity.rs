@@ -20,6 +20,9 @@
 //! freeze captures the child; without that authority it refuses. This test asserts *agreement*, and
 //! separately asserts what they agree on.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 
@@ -265,8 +268,7 @@ fn a_durable_domain_never_admits_an_uninstrumented_module_detached() {
 }
 
 /// The grandchild probe: a separate, **un-instrumented** module the detached child is handed by
-/// name and tries to instantiate nested inside itself. `memory 15` — it carves as the top half of
-/// the child's 64 KiB window.
+/// name and tries to spawn detached itself. `memory 15`: its own 32 KiB window.
 const LEAF: &str = r#"memory 15
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -276,44 +278,52 @@ block 0 (v0: i64) {
 "#;
 
 /// The detached child for the inheritance probe. Entry `(i64) -> (i64)`: `v0` is its own starter
-/// `Instantiator` handle, as the op-15 arm passes it. It resolves the named grant `"m"` (LEAF),
-/// tries to instantiate it as a nested grandchild (op 5: carve `[32 KiB, 64 KiB)` of its own
-/// window, entry 0), and returns the grandchild's joined result (≥ 0) — or the spawn's `-EINVAL`
-/// if the child's **own** durability refused the un-instrumented module (§4, the nested arm's
-/// `mod_durable_ok`). So the value that comes back through the parent's join is a direct
-/// observation of the bit the child inherited.
-const PROBE_CHILD: &str = r#"memory 16
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+/// `Instantiator` handle, as the op-15 arm passes it. It resolves the named grant `"m"` (LEAF) and
+/// its own `"budget"`, writes both into its v1 record at 24576 (entry 0), tries to spawn LEAF as a
+/// detached grandchild (op 17), and returns the grandchild's joined result (≥ 0) — or the spawn's
+/// `-EINVAL` if the child's **own** durability refused the un-instrumented module (§4, the detached
+/// admission's durability check). So the value that comes back through the parent's join is a
+/// direct observation of the bit the child inherited.
+fn probe_child() -> String {
+    format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   vinst = i32.wrap_i64 v0
   vnp = i64.const 20480
-  vname = i64.const 109
-  i64.store vnp vname
   vl = i64.const 1
   vmh = self.resolve vnp vl
-  vm64 = i64.extend_i32_s vmh
-  ve = i64.const 0
-  voff = i64.const 32768
-  vlog = i64.const 15
-  vq = i64.const 0
-  vs = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (vm64, ve, voff, vlog, vq)
+  vbp = i64.const 20488
+  vbl = i64.const 6
+  vbh = self.resolve vbp vbl
+  vrm = i64.const 24600
+  i32.store vrm vmh
+  vrb = i64.const 24604
+  i32.store vrb vbh
+  vrec = i64.const 24576
+  vs = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   z = i32.const 0
   vneg = i32.lt_s vs z
   br_if vneg 1(vs) 2(vinst, vs)
-  }
-block 1 (ve1: i32) {
+  }}
+block 1 (ve1: i32) {{
   vr = i64.extend_i32_s ve1
   return vr
-  }
-block 2 (vi2: i32, vs2: i32) {
+  }}
+block 2 (vi2: i32, vs2: i32) {{
   vj = call.cap 6 1 (i32) -> (i64) vi2 (vs2)
   return vj
-  }
+  }}
+}}
+data 20480 "m"
+data 20488 "budget"
+{}"#,
+        rec::segment(24576, &temen_ir::SpawnRec::v1(0))
+    )
 }
-"#;
 
 /// The parent for the inheritance probe: lays one op-11-format grant record at 16384 —
-/// `{name_off=16400, name_len=1, handle=v3, flags=0}` with `"m"` at 16400 — spawns `PROBE_CHILD`
+/// `{name_off=16400, name_len=1, handle=v3, flags=0}` with `"m"` at 16400 — spawns [`probe_child`]
 /// detached (op 15: budget `v2`, module `v1`, grants `(16384, 1)`, entry 0, `memory 16`, no quota),
 /// and returns the child's joined answer, or the spawn's own `-EINVAL` if op 15 refused.
 /// Args: `(instantiator, child module, budget, leaf module)`.
@@ -361,7 +371,7 @@ block 2 (vi2: i32, vs2: i32) {
 /// grandchild was admitted.
 fn probe(durable: bool) -> i64 {
     let parent = module(PROBE_PARENT);
-    let child = module(PROBE_CHILD);
+    let child = module(&probe_child());
     let leaf = module(LEAF);
     let mut host = Host::new();
     host.set_durable(durable);

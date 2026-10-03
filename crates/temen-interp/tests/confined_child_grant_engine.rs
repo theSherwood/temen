@@ -1,42 +1,44 @@
-//! **#1011 slice 3a — production wiring: a §14 op-13 grant list runs on the resumable engine.** A
-//! guest issues `instantiate_module_named` (op 13) with a grant list, and the **resumable `Vcpu`
-//! engine** admits it through the one admission every driver uses (`admit_confined_child`),
-//! re-granting the named cap out of the *parent's own powerbox* into the child's. The driver only
-//! starts the admitted child over its carve (`take_child` + `PendingChild::start`) — the exact seam a
-//! JIT-tier nim phase child (a shared `fs`) uses. Window confinement (§2) is untouched: the grant is
+//! **#1011 slice 3a — production wiring: a spawn's grant list runs on the resumable engine.** A
+//! guest spawns a separate module through a v1 record (op 17) carrying a grant list, and the
+//! **resumable `Vcpu` engine** admits it through the one admission every driver uses
+//! (`admit_detached_child`), re-granting the named cap out of the *parent's own powerbox* into the
+//! child's. The driver only starts the admitted child over a fresh window (`take_child` +
+//! `PendingChild::start`) — the seam a JIT-tier nim phase child (a shared `fs`) uses. The grant is
 //! authority (§3), a cross-tier `call.cap`, not a window access.
+
+#[path = "support/rec.rs"]
+mod rec;
 
 use std::sync::{Arc, Mutex};
 use temen_interp::{bytecode, ForkedProc, Host, HostProc, Region, Trap, Value};
+use temen_ir::SpawnRec;
 
-// The granted child (a *separate* module): its `Instantiator` arrives as `v0` (unused); it seeds the
-// name `"fs"` (`0x7366` little-endian = 'f','s') into its own window, resolves it to a handle, and
-// calls the granted `HOST_PROC` counter (type 13, op 0) — a post-increment `1`. Identical child to
-// `confined_child_grant.rs`.
+// The granted child (a *separate* module): its `Instantiator` arrives as `v0` (unused); it resolves
+// the name `"fs"` (a data segment) to a handle and calls the granted `HOST_PROC` counter (type 13,
+// op 0) — a post-increment `1`.
 const CHILD: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vname = i64.const 29542
-  vzero = i64.const 16384
-  i64.store vzero vname
-  vp0 = i64.const 16384
+  vp0 = i64.const 17408
   vl2 = i64.const 2
   vh = self.resolve vp0 vl2
   vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
   return vr
   }
 }
+data 17408 "fs"
 "#;
 
 // The parent (module 0). Entry args: `v0` = Instantiator, `v1` = the granted child `Module` handle,
-// `v2` = the `"fs"` cap handle in the parent's powerbox. It seeds the name `"fs"` at window offset 18432
-// (above the #1094 NULL guard), builds one 16-byte grant record at offset 17408 (`{name_off:u32=18432,
-// name_len:u32=2, handle:i32=v2, flags:u32=0}`), then issues `instantiate_module_named` (op 13) —
-// module `v1`, grant list at `(17408, 1)`, entry 0, carve `off=65536 size_log2=16 quota=0` — and joins the child (op 1), returning
-// its result. A correct run returns the granted counter's `1`.
+// `v2` = the `"fs"` cap handle in the parent's powerbox, `v3` = the `Budget` the child's window is
+// paid from. It seeds the name `"fs"` at window offset 18432, builds one 16-byte grant record at
+// offset 17408 (`{name_off:u32=18432, name_len:u32=2, handle:i32=v2, flags:u32=0}`), writes the
+// module and budget into its v1 record at 17536 (grant list `(17408, 1)`, entry 0), spawns the
+// child (op 17) and joins it (op 1), returning its result. A correct run returns the granted
+// counter's `1`.
 const PARENT: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vname = i64.const 29542
   vnoff = i64.const 18432
   i64.store vnoff vname
@@ -46,19 +48,26 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vfsh = i64.extend_i32_u v2
   vrec1off = i64.const 17416
   i64.store vrec1off vfsh
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vsl = i64.const 16
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vmod = i64.const 17560
+  i32.store vmod v1
+  vbud = i64.const 17564
+  i32.store vbud v3
+  vrec = i64.const 17536
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrec)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }
 }
 "#;
+
+fn parent() -> String {
+    let spawn = SpawnRec {
+        grants_ptr: 17408,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
+    format!("{PARENT}{}", rec::segment(17536, &spawn))
+}
 
 fn module(text: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(text).expect("parse");
@@ -90,38 +99,29 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless)
 }
 
-/// A raw window base that crosses no thread here, but keeps derived provenance (offset into the one live
-/// allocation). Sound: only ever offset into the allocation below and handed to `Region::shared`.
-#[derive(Clone, Copy)]
-struct WinPtr(*mut u8);
+/// A fresh reservation of `size` bytes: the root's window, and each child's own, as every driver
+/// gives a detached child. The engine seeds it.
+fn window(size: u64) -> Arc<Region> {
+    Arc::new(Region::new(size, temen_interp::host_page_size()))
+}
 
-/// Drive one vCPU of the run to completion, servicing §14 instantiate events. On an `Instantiate` the
+/// Drive one vCPU of the run to completion, servicing its spawns. On an `InstantiateDetached` the
 /// driver starts the child the engine admitted (its powerbox already built, the grant included) over
-/// the carve. A leaf child runs synchronously (recursively drivable), its result delivered at the join.
-fn drive(
-    prog: &bytecode::VcpuProgram,
-    base: WinPtr,
-    mut vcpu: bytecode::Vcpu<'_>,
-) -> Result<Vec<Value>, Trap> {
+/// a fresh window. A leaf child runs synchronously (recursively drivable), its result delivered at
+/// the join.
+fn drive(prog: &bytecode::VcpuProgram, mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap> {
     let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
-            } => {
-                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
-                // child here); the child's region aliases that sub-window — the §14 shared data plane.
-                let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
-                // SAFETY: as above — `2^size_log2` valid bytes at the validated carve.
-                let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
+            bytecode::VcpuEvent::InstantiateDetached { .. } => {
                 let child = vcpu
                     .take_child()
-                    .expect("an Instantiate carries its admitted child")
-                    .start(prog, back, None)
-                    .expect("confined child builds");
-                let r = drive(prog, child_base, child);
+                    .expect("an InstantiateDetached carries its admitted child")
+                    .start(prog, window(1u64 << temen_ir::DEFAULT_RESERVED_LOG2), None)
+                    .expect("the child builds");
+                let r = drive(prog, child);
                 let token = children.len() as u64;
                 children.push(r);
                 vcpu.deliver_child(token);
@@ -129,14 +129,14 @@ fn drive(
             bytecode::VcpuEvent::Join { child } => {
                 vcpu.deliver_join(children[child as usize].clone());
             }
-            _ => panic!("unexpected event in the op-13 grant kernel"),
+            _ => panic!("unexpected event in the grant kernel"),
         }
     }
 }
 
 #[test]
-fn op13_grant_list_regrants_through_the_resumable_engine() {
-    let parent = module(PARENT);
+fn a_grant_list_regrants_through_the_resumable_engine() {
+    let parent = module(&parent());
     let child = module(CHILD);
     let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
 
@@ -145,39 +145,32 @@ fn op13_grant_list_regrants_through_the_resumable_engine() {
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(&child);
     let fsh = grant_fs(&mut host, &counter);
-
-    // A 2^17 backing (fits the child's 2^16 carve at offset 65536).
-    let size = 1usize << 17;
-    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-    // SAFETY: non-zero layout; `size` valid 8-aligned bytes owned here until freed below.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null());
-    // SAFETY: `base` addresses `size` valid bytes, exclusively this run's, freed only after the vCPUs.
-    let back = Arc::new(unsafe { Region::shared(base, size as u64) });
+    let budget = host.grant_budget(-1, 1 << 20, -1);
 
     let root = bytecode::Vcpu::new_root_with_powerbox(
         &prog,
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(fsh)],
-        Arc::clone(&back),
+        &[
+            Value::I32(inst),
+            Value::I32(modh),
+            Value::I32(fsh),
+            Value::I32(budget),
+        ],
+        window(1 << 17),
         &[],
         host,
     )
     .expect("root vcpu");
-    let r = drive(&prog, WinPtr(base), root);
-
-    drop(back);
-    // SAFETY: same layout; every vCPU and region view is dropped, so no borrow outlives this.
-    unsafe { std::alloc::dealloc(base, layout) };
+    let r = drive(&prog, root);
 
     assert_eq!(
         r,
         Ok(vec![Value::I64(1)]),
-        "the granted child resolved 'fs' by name (re-granted through the engine's op-13 arm) and called it (counter -> 1)"
+        "the granted child resolved 'fs' by name (re-granted through the engine's spawn arm) and called it (counter -> 1)"
     );
     assert_eq!(
         *counter.lock().unwrap(),
         1,
-        "the re-granted handler ran once inside the confined child, over the shared parent state"
+        "the re-granted handler ran once inside the child, over the shared parent state"
     );
 }

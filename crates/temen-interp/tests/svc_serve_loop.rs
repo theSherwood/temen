@@ -6,8 +6,12 @@
 //! window and powerbox as `main` — what `main` writes, handlers read, and vice versa. There
 //! is no second state: the passive instance's two-world split is what §3.6 dissolves.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{run_with_host, Host, Value, CAP_SELF_SVC_POLL, SVC_QUEUE_CAP};
+use temen_ir::SpawnRec;
 
 /// The serving domain. Offer "counter" op 0 = func 1 `bump(x) -> old + x`, where `old` is the
 /// LIVE value at mem[16384] (above the #1094 NULL guard) — the handler both reads and writes
@@ -231,7 +235,9 @@ block 0 (va: i64, vb: i64) {
 
 /// §3.6 slice 4 — the **slot route**: the same round-trip as the direct form, but the caller
 /// attaches the live-callee cap into a rebindable import slot and calls `call.import 0` — the
-/// discovery-then-attach pattern over a live domain. Same enqueue/park/reply machinery.
+/// discovery-then-attach pattern over a live domain. Same enqueue/park/reply machinery. The
+/// serving child is func 1, spawned detached by the record [`slot_caller`] appends at 17600 and
+/// paid from the `Budget` `v1`.
 const SLOT_CALLER: &str = r#"
 memory 17
 type 0 func (i64, i64) -> (i64)
@@ -239,29 +245,12 @@ type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 import 0 "svc.add" (i64, i64) -> (i64) rebindable
 
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 65536
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vrb = i64.const 17628
+  i32.store vrb v1
+  vrp = i64.const 17600
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   vst = import.attach 0 v7
@@ -292,10 +281,15 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
+/// [`SLOT_CALLER`] with its spawn record.
+fn slot_caller() -> String {
+    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::v1(1)))
+}
+
 #[test]
 fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
     let m = Arc::new({
-        let m = temen_text::parse_module(SLOT_CALLER).expect("parse");
+        let m = temen_text::parse_module(&slot_caller()).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         m
     });
@@ -310,8 +304,10 @@ fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
         rebindable: true,
     }]);
     let h = host.grant_instantiator(0, 1u64 << 17);
+    let b = host.grant_budget(-1, 1 << 20, -1);
     let mut fuel = 5_000_000u64;
-    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    let r =
+        run_with_host(&m, 0, &[Value::I32(h), Value::I32(b)], &mut fuel, &mut host).expect("run");
     assert_eq!(
         r,
         vec![Value::I64(142)],
@@ -323,7 +319,7 @@ fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
 /// proves parse; this pins print→parse stability and the desugared identity.
 #[test]
 fn svc_sugar_round_trips_and_desugars_to_the_reserved_dispatch() {
-    let m = temen_text::parse_module(SLOT_CALLER).expect("parse");
+    let m = temen_text::parse_module(&slot_caller()).expect("parse");
     let printed = temen_text::print_module(&m);
     assert!(
         printed.contains("svc.wait v"),
@@ -428,18 +424,19 @@ fn a_separate_module_child_serves_its_own_offers() {
 /// A `child_offer` naming an export the child's module doesn't have refuses with a probeable
 /// `-EINVAL` — resolved against the CHILD's module (which has export 0 only), never the
 /// wirer's. The child here polls-and-returns (nothing to serve), so the parent's `join`
-/// completes the run cleanly after the refused wire.
+/// completes the run cleanly after the refused wire. The child runs module `v1`, spawned detached
+/// by the record [`separate_module_bad_export`] appends at 17408 and paid from the `Budget` `v2`.
 const SEPARATE_MODULE_BAD_EXPORT: &str = r#"
 memory 17
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vlog = i64.const 12
-  vq = i64.const 0
-  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17432
+  i32.store vrm v1
+  vrb = i64.const 17436
+  i32.store vrb v2
+  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 9
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -474,20 +471,29 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
+/// [`SEPARATE_MODULE_BAD_EXPORT`] with its spawn record: the module's entry 0 in its declared window.
+fn separate_module_bad_export() -> String {
+    format!(
+        "{SEPARATE_MODULE_BAD_EXPORT}{}",
+        rec::segment(17408, &SpawnRec::v1(0))
+    )
+}
+
 #[test]
 fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
-    let a = temen_text::parse_module(SEPARATE_MODULE_BAD_EXPORT).expect("parse");
+    let a = temen_text::parse_module(&separate_module_bad_export()).expect("parse");
     temen_verify::verify_module(&a).expect("verify");
     let b = temen_text::parse_module(SEPARATE_MODULE_POLL_SERVER).expect("parse server");
     temen_verify::verify_module(&b).expect("verify server");
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
+    let hb = host.grant_budget(-1, 1 << 20, -1);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
         0,
-        &[Value::I32(hi), Value::I32(hm)],
+        &[Value::I32(hi), Value::I32(hm), Value::I32(hb)],
         &mut fuel,
         &mut host,
     )
@@ -500,13 +506,14 @@ fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
 }
 
 /// §3.6 — **sibling-as-service**: the parent spawns serving child A, takes a live offer over
-/// it (`child_offer`), and re-grants that cap into child B at spawn (`instantiate_named`,
-/// op 11 — the grant record's handle field is stored at runtime). B discovers it by
+/// it (`child_offer`), and re-grants that cap into child B at spawn (the grant list at 16640, its
+/// handle field stored at runtime). B discovers it by
 /// `self.resolve("adder")` in its OWN powerbox (the re-grant interned the shape there —
 /// B's first guest intern, `GUEST_IMPL_BASE`) and calls through it: the call enqueues on A,
 /// parks B's vCPU, A's `svc.wait` serves `add(40, 2)`, and the reply wakes B — two siblings
 /// coordinating through a live peer their parent introduced, no shared memory, no parent
-/// relay. Composite: join(A=1)*100 + join(B=42) = 142.
+/// relay. Composite: join(A=1)*100 + join(B=42) = 142. Both are spawned detached by the records
+/// [`sibling_as_service`] appends at 17664 and 17760, paid from the `Budget` `v1`.
 const SIBLING_AS_SERVICE: &str = r#"
 memory 17
 type 0 func (i64, i64) -> (i64)
@@ -514,31 +521,12 @@ type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 3 }
 data 16584 "adder"
 
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q2v0 = i64.const 4294967296
-  q2v1 = i64.const 65536
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2a0 = i64.const 17664
-  i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
-  i64.store q2a5 q2v4
-  q2a6 = i64.const 17712
-  i64.store q2a6 q2v4
-  vA = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vrba = i64.const 17692
+  i32.store vrba v1
+  vrpa = i64.const 17664
+  vA = call.cap 6 17 (i64) -> (i32) v0 (vrpa)
   vz = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vA, vz)
   va1 = i64.const 16640
@@ -549,29 +537,10 @@ block 0 (v0: i32) {
   i32.store va2 vv2
   va3 = i64.const 16648
   i32.store va3 vcap
-  ; spawn via record (op 17): entry=2 off=69632 sl=12 quota=0
-  q3v0 = i64.const 8589934592
-  q3v1 = i64.const 69632
-  q3v2 = i64.const -4294967284
-  q3v3 = i64.const 4294967295
-  q3v4 = i64.const 0
-  q3v5 = i64.const 16640
-  q3v6 = i64.const 1
-  q3a0 = i64.const 17728
-  i64.store q3a0 q3v0
-  q3a1 = i64.const 17736
-  i64.store q3a1 q3v1
-  q3a2 = i64.const 17744
-  i64.store q3a2 q3v2
-  q3a3 = i64.const 17752
-  i64.store q3a3 q3v3
-  q3a4 = i64.const 17760
-  i64.store q3a4 q3v4
-  q3a5 = i64.const 17768
-  i64.store q3a5 q3v5
-  q3a6 = i64.const 17776
-  i64.store q3a6 q3v6
-  vB = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
+  vrbb = i64.const 17788
+  i32.store vrbb v1
+  vrpb = i64.const 17760
+  vB = call.cap 6 17 (i64) -> (i32) v0 (vrpb)
   vjB = call.cap 6 1 (i32) -> (i64) v0 (vB)
   vjA = call.cap 6 1 (i32) -> (i64) v0 (vA)
   vk = i64.const 100
@@ -591,10 +560,7 @@ block 0 (v0: i64) {
 
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  vnm = i64.const 491327349857
-  vza = i64.const 0
-  i64.store vza vnm
-  vp = i64.const 0
+  vp = i64.const 16584
   vl = i64.const 5
   vh = self.resolve vp vl
   va = i64.const 40
@@ -612,18 +578,35 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
+/// [`SIBLING_AS_SERVICE`] with its spawn records: A is func 1, and B is func 2 granted the list at
+/// 16640.
+fn sibling_as_service() -> String {
+    let b = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::v1(2)
+    };
+    format!(
+        "{SIBLING_AS_SERVICE}{}{}",
+        rec::segment(17664, &SpawnRec::v1(1)),
+        rec::segment(17760, &b)
+    )
+}
+
 #[test]
 fn a_sibling_calls_a_sibling_through_a_regranted_live_offer() {
     let m = Arc::new({
-        let m = temen_text::parse_module(SIBLING_AS_SERVICE).expect("parse");
+        let m = temen_text::parse_module(&sibling_as_service()).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         m
     });
     let mut host = Host::new();
     host.set_self_module(&m);
     let h = host.grant_instantiator(0, 1u64 << 17);
+    let b = host.grant_budget(-1, 1 << 20, -1);
     let mut fuel = 5_000_000u64;
-    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    let r =
+        run_with_host(&m, 0, &[Value::I32(h), Value::I32(b)], &mut fuel, &mut host).expect("run");
     assert_eq!(
         r,
         vec![Value::I64(142)],

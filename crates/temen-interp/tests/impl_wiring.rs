@@ -79,6 +79,13 @@ fn offer_funcs() -> Arc<[Func]> {
     .into()
 }
 
+/// #1867 — a detached child of `parent` holding `grants` by name, its window paid from a budget
+/// granted for it: the child a spawn builds once the carve is gone.
+fn spawn_child(parent: &mut Host, grants: &[(String, i32)]) -> Option<(Host, i32, i32)> {
+    let budget = parent.grant_budget(-1, 1 << 20, -1);
+    parent.spawn_detached_child(grants, 1 << 16, budget, -1)
+}
+
 #[test]
 fn intern_keys_on_names_and_shape_and_allocates_from_the_base() {
     let mut h = Host::new();
@@ -369,8 +376,7 @@ fn an_offer_regrants_into_a_child_one_hop_deeper() {
     let handle = parent
         .wire_offer_func(&funcs, &Arc::from(Vec::new()), &[1])
         .expect("offer");
-    let (mut child, _cinst, _cas) = parent
-        .spawn_named_child(&[("adder".into(), handle)], 1 << 16)
+    let (mut child, _cinst, _cas) = spawn_child(&mut parent, &[("adder".into(), handle)])
         .expect("offer handles are re-grantable");
     let ch = child.resolve_cap_name("adder").expect("named in the child");
     let entry = child.resolve_offer(ch).expect("adopted entry");
@@ -392,8 +398,7 @@ fn child_manifest_binds_named_offers_and_withholds_fail_closed() {
         .wire_offer_func(&funcs, &Arc::from(Vec::new()), &[1, 0])
         .expect("offer");
     let spawn = |parent: &mut Host| {
-        parent
-            .spawn_named_child(&[("add".into(), handle)], 1 << 16)
+        spawn_child(parent, &[("add".into(), handle)])
             .expect("spawn")
             .0
     };
@@ -471,9 +476,11 @@ fn child_manifest_binds_stderr_by_name_only() {
     let out = parent.grant_stream(StreamRole::Out);
     let err = parent.grant_stream(StreamRole::Err);
 
-    let (mut child, _, _) = parent
-        .spawn_named_child(&[("stdout".into(), out), ("stderr".into(), err)], 1 << 16)
-        .expect("spawn");
+    let (mut child, _, _) = spawn_child(
+        &mut parent,
+        &[("stdout".into(), out), ("stderr".into(), err)],
+    )
+    .expect("spawn");
     let (imps, tys) = manifest(&["stream_write", "stderr"]);
     child.bind_child_manifest(&imps, &tys).expect("both bind");
     let stdout_h = child.resolve_cap_name("stdout").expect("stdout granted");
@@ -490,9 +497,7 @@ fn child_manifest_binds_stderr_by_name_only() {
         "stderr → stderr"
     );
 
-    let (mut child, _, _) = parent
-        .spawn_named_child(&[("stdout".into(), out)], 1 << 16)
-        .expect("spawn");
+    let (mut child, _, _) = spawn_child(&mut parent, &[("stdout".into(), out)]).expect("spawn");
     let (imps, tys) = manifest(&["stderr"]);
     assert_eq!(
         child.bind_child_manifest(&imps, &tys),
@@ -522,9 +527,7 @@ fn provenance_reports_platform_vs_ancestor_terminated() {
         "ancestor-terminated at the wiring domain"
     );
 
-    let (mut child, _, _) = parent
-        .spawn_named_child(&[("adder".into(), offer)], 1 << 16)
-        .expect("spawn");
+    let (mut child, _, _) = spawn_child(&mut parent, &[("adder".into(), offer)]).expect("spawn");
     let ch = child.resolve_cap_name("adder").expect("named");
     assert_eq!(
         prov(&mut child, ch),
@@ -635,9 +638,7 @@ fn a_regranted_instanced_offer_shares_one_service_instance() {
         Ok(vec![1])
     );
 
-    let (mut child, _, _) = parent
-        .spawn_named_child(&[("counter".into(), offer)], 1 << 16)
-        .expect("spawn");
+    let (mut child, _, _) = spawn_child(&mut parent, &[("counter".into(), offer)]).expect("spawn");
     let ch = child.resolve_cap_name("counter").expect("named");
     let ctid = child.resolve_offer(ch).unwrap().type_id;
     assert_eq!(
@@ -931,9 +932,7 @@ fn grouped_import_coverage_binds_a_subset_with_a_remap() {
     let mut parent = Host::new();
     parent.set_self_module(&pm);
     let h = parent.reify_export(0).expect("reify own offer");
-    let (mut child, _ci, _ca) = parent
-        .spawn_named_child(&[("svc".into(), h)], 1 << 16)
-        .expect("spawn");
+    let (mut child, _ci, _ca) = spawn_child(&mut parent, &[("svc".into(), h)]).expect("spawn");
 
     let cm = temen_text::parse_module(
         "type 0 func (i64) -> (i64)\n\
@@ -1042,9 +1041,7 @@ fn grouped_attach_runs_the_coverage_walk_and_refreshes_the_remap() {
     let mut parent = Host::new();
     parent.set_self_module(&pm);
     let h = parent.reify_export(0).expect("reify");
-    let (mut child, _ci, _ca) = parent
-        .spawn_named_child(&[("later".into(), h)], 1 << 16)
-        .expect("spawn");
+    let (mut child, _ci, _ca) = spawn_child(&mut parent, &[("later".into(), h)]).expect("spawn");
 
     // The consumer requires only `dbl`, rebindable, under a name nothing matches at spawn.
     let cm = temen_text::parse_module(
