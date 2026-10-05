@@ -310,7 +310,7 @@ frontier's own repair, never parked. Until it is gone:
   (#1867); the version word is that migration's scaffolding. The window is always the child module's
   declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
   module it did not build need not know its size — any other value must equal it. A query for the
-  size is #1908; growth past it is charged to no budget yet (#1909).
+  size is #1908; growth past it spends the same budget as the pages commit (#1909, ruling R2).
 - **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
   `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
   spawn-time args payload; results ride the join and the region.

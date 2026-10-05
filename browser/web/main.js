@@ -369,7 +369,8 @@ block 0 (v0: i64) {
     const codegen = await run(guest, { ...opt, instCodegen: true });
     const growGuest = await fetchBytes('/corpus/threads_inst_detached_one.temenc');
     const growUnit = await fetchBytes('/corpus/threads_inst_unit_grow.temenc');
-    const growOpt = { unit: growUnit, winSize: 1 << 20, minter: 65536 };
+    // The budget pays for the child's 64 KiB window and the 64 KiB it grows (#1909).
+    const growOpt = { unit: growUnit, winSize: 1 << 20, minter: 2 * 65536 };
     const growInterp = await run(growGuest, { ...growOpt, inst: true });
     const growCodegen = await run(growGuest, { ...growOpt, instCodegen: true });
     const ms = (performance.now() - t0).toFixed(0);

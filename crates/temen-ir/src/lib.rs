@@ -288,7 +288,9 @@ pub enum PageState {
     Rw,
     /// Committed read-only.
     Ro,
-    /// Inaccessible — an `unmap` (zeroed) or a `protect(none)` (contents kept).
+    /// Inaccessible — an `unmap` (zeroed) or a `protect(none)` (contents kept). In the reserved tail
+    /// only the latter: an unmapped tail page is absent, so a tail `Unmapped` page is memory the
+    /// window still holds, which its budget pays for (#1909).
     Unmapped,
     /// A §13 `SharedRegion` alias: the page *is* the bytes at `off` in the host's region `region`,
     /// so it cannot be copied into a private duplicate (a fork refuses the window, as the

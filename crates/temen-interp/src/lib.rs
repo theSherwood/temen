@@ -1098,6 +1098,9 @@ impl GuestMem for RecordingMem<'_> {
     fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         self.inner.protect(offset, len, prot)
     }
+    fn tail_bytes(&self, offset: u64, len: u64) -> TailBytes {
+        self.inner.tail_bytes(offset, len)
+    }
     fn map_region(
         &mut self,
         win_off: u64,
@@ -3094,7 +3097,7 @@ fn relaunch_detached(
         host,
     } = grants
         .lock_unpoisoned()
-        .prepare_detached_relaunch(&launch, host)?;
+        .prepare_detached_relaunch(&launch, host, window.page_map())?;
     // #1971 — the lease op 15 filed at the spawn, filed again: the child's window goes back to the
     // budget that paid for it when the child ends, on the spawner's handle, as an unfrozen child's does.
     let lease = spawner
@@ -7790,7 +7793,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     };
     let id = v.id;
     // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
-    // back to the budget that paid for them (lock order sched → host).
+    // back to the budget that paid for them (lock order sched → host), and what it grew (#1909).
+    // Every vCPU of the dying domain passes here; the first hands the growth back.
+    v.host.lock_unpoisoned().release_growth();
     if let Some((cell, budget, bytes)) = v.window_lease.take() {
         cell.lock_unpoisoned().release_detached(budget, bytes);
     }
@@ -9030,7 +9035,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (pipe_eofs, pipe_epipes) = if froze || v.spawn_residue.is_some() {
                     (Vec::new(), Vec::new())
                 } else {
-                    v.host.lock_unpoisoned().release_pipe_ends()
+                    let mut h = v.host.lock_unpoisoned();
+                    // #1909 — and its window goes, with what it grew.
+                    h.release_growth();
+                    h.release_pipe_ends()
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
@@ -19664,6 +19672,62 @@ impl SharedBacking for VecBacking {
     }
 }
 
+/// #1909 — what a window holds in the reserved tail of a page range: the part past its declared size,
+/// which a window grows into.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct TailBytes {
+    /// The range's bytes past the declared window.
+    pub tail: u64,
+    /// Of those, the bytes the window holds committed as its own memory: what its budget pays for.
+    pub held: u64,
+    /// Of those, the bytes aliased to a §13 region: the region's memory, not the window's.
+    pub aliased: u64,
+}
+
+/// #1909 — which reserved-tail pages of its range a page op can leave committed as the window's own
+/// memory ([`Host::page_op`] charges that much first).
+#[derive(Clone, Copy)]
+enum Commits {
+    /// None new: an `unmap`, a region alias, a `map` or `protect` to no access.
+    Nothing,
+    /// Every page: a `map` makes each the window's own, an aliased one included.
+    Every,
+    /// Every page but an alias, which a `protect` leaves the region's.
+    Own,
+}
+
+/// #1909 — whether a reserved-tail page in this state is the window's own memory, which its budget
+/// pays for: committed, or protected to nothing and keeping its contents (an unmapped tail page is
+/// absent, [`Mem::set_prot`]); not a §13 alias, whose bytes are the region's.
+fn held_tail(p: &PageProt) -> bool {
+    matches!(p, PageProt::Rw | PageProt::Ro | PageProt::Unmapped)
+}
+
+/// #1909 — [`GuestMem::tail_bytes`] over a window's page map: of `pages`, the bytes past `mapped`
+/// (the declared window; the reserved tail starts there), by whether `held` or `aliased` says the
+/// window holds a page as its own memory or as a region's. A tail page is absent from the map until
+/// something commits it, so only the map's entries in the range are visited, however large the range.
+pub fn window_tail_bytes<S>(
+    map: &BTreeMap<u64, S>,
+    pages: core::ops::RangeInclusive<u64>,
+    mapped: u64,
+    page: u64,
+    held: impl Fn(&S) -> bool,
+    aliased: impl Fn(&S) -> bool,
+) -> TailBytes {
+    let (first, last) = (mapped.div_ceil(page).max(*pages.start()), *pages.end());
+    if first > last {
+        return TailBytes::default();
+    }
+    let count =
+        |f: &dyn Fn(&S) -> bool| map.range(first..=last).filter(|(_, s)| f(s)).count() as u64;
+    TailBytes {
+        tail: (last - first + 1) * page,
+        held: count(&held) * page,
+        aliased: count(&aliased) * page,
+    }
+}
+
 /// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
 /// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
 /// single host dispatch ([`Host::cap_dispatch`]) serves both backends. **All offsets/pointers are
@@ -19695,6 +19759,13 @@ pub trait GuestMem {
     }
     fn protect(&mut self, _offset: u64, _len: u64, _prot: i32) -> i64 {
         0
+    }
+
+    /// #1909 — what the window holds in the reserved tail of the pages covering
+    /// `[offset, offset+len)` ([`window_tail_bytes`]). Nothing for a range `map` would refuse, and for
+    /// a window that cannot grow (the default).
+    fn tail_bytes(&self, _offset: u64, _len: u64) -> TailBytes {
+        TailBytes::default()
     }
 
     /// `SharedRegion` op 0 `map` (§13): alias `backing`'s `[region_off, region_off+len)` pages into
@@ -21723,6 +21794,7 @@ pub(crate) struct ChildPowerbox {
     attestation: Attestation,
     durable: bool,
     own_budget: u32,
+    grown: Option<u64>,
     lane_cap: i64,
 }
 
@@ -22725,6 +22797,11 @@ pub struct Host {
     /// so an activation's fuel limit bounds the whole tree; a detached child's is the budget that paid
     /// for it ([`Host::give_child_budget`]); a fork twin shares its spawner's.
     own_budget: u32,
+    /// #1909, INVARIANTS #3 R2 — what this domain's window holds committed past its declared size,
+    /// charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the window
+    /// goes ([`Host::release_growth`]). `None` for a window no budget paid for (a run's root), whose
+    /// growth is unmetered.
+    grown: Option<u64>,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -23519,6 +23596,7 @@ impl Host {
             realias: Vec::new(),
             budgets: Arc::default(),
             own_budget: BudgetTree::RUN_NODE,
+            grown: None,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
@@ -23623,7 +23701,26 @@ impl Host {
     /// Stream / Exit / Clock / Memory / SharedRegion / Budget) plus live offers, a self-module, an
     /// attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding a
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
+    ///
+    /// #1909 — the twin's window is a copy of this one, its grown tail included, so the twin pays for
+    /// that growth: it is charged to the node the twin shares with this domain and every ancestor,
+    /// all or nothing — a level without the room refuses the fork, as a full `spawn` ceiling does.
+    /// (The copy of the declared window is not charged yet: #2106.)
     fn fork_powerbox(&self, twin_pid: u64) -> Option<Host> {
+        let mut twin = self.powerbox_copy(twin_pid)?;
+        if let Some(g @ 1..) = self.grown {
+            if !self.budgets.charge(self.own_budget, BUDGET_MEM, g) {
+                return None;
+            }
+            twin.grown = Some(g);
+        }
+        Some(twin)
+    }
+
+    /// [`Self::fork_powerbox`]'s powerbox duplicate, before the window it rides with is known: a fork
+    /// copies this domain's window, a spawn ([`Self::spawn_powerbox`]) builds a fresh one. Either way
+    /// the copy's growth is metered when this domain's is (#1909), with nothing held yet.
+    fn powerbox_copy(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
@@ -23814,6 +23911,7 @@ impl Host {
         // nodes and both charge the same chains, as a forked process stays in its cgroup.
         twin.budgets = Arc::clone(&self.budgets);
         twin.own_budget = self.own_budget;
+        twin.grown = self.grown.map(|_| 0);
         twin.quota = self.quota;
         // Structural intern / import binding tables ride along (same program surface).
         twin.iface_intern = self.iface_intern.clone();
@@ -24737,11 +24835,13 @@ impl Host {
     /// its restored powerbox what the spawner decided — durability, its lane cap, its program
     /// as self module, its grant names, the stdio it inherited (#2054), and its import bindings
     /// (leniently for a same-module child, #1234). `None` if the grant is gone, it declares no memory,
-    /// or its imports no longer bind.
+    /// or its imports no longer bind. `window` is its restored window's page map: what it had grown
+    /// past its declared size stays charged, as the artifact carries it (#1909).
     pub fn prepare_detached_relaunch(
         &mut self,
         launch: &DetachedLaunch,
         mut host: Host,
+        window: &PageMap,
     ) -> Option<DetachedRelaunch> {
         self.alias_inherited_stdio(&mut host);
         let (_, g) = self.grant_by_digest(&launch.digest)?;
@@ -24753,12 +24853,14 @@ impl Host {
             host.register_cap_name(name, *h);
         }
         // #1944 slice 3 — the child's own node is the budget that paid for it, which it holds as its
-        // `"budget"` (#1944 slice 2): its vCPUs draw their fuel from it again.
+        // `"budget"` (#1944 slice 2): its vCPUs draw their fuel from it again, and #1909 its window's
+        // growth is metered against it again, from what the window holds.
         if let Some(node) = host
             .resolve_cap_name("budget")
             .and_then(|h| host.budget_node(h))
         {
             host.own_budget = node;
+            host.grown = Some(window.grown_bytes());
         }
         let bound = if launch.same_module {
             host.bind_same_module_manifest(&g.imports, &g.types)
@@ -26620,9 +26722,75 @@ impl Host {
         if let Some(node) = self.budget_node(budget) {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
+            // #1909 — the budget that paid for the window pays for its growth too.
+            child.grown = Some(0);
             if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
                 child.cap_names.insert(0, ("budget".to_string(), h));
             }
+        }
+    }
+
+    /// #1909, INVARIANTS #3 R2 — run `op`, a page op over `[off, off+len)` of `mem`, metering what it
+    /// grows of the window past its declared size: growing a detached window spends `Budget.mem` from
+    /// this domain's own node and every ancestor, as minting it did. `commits` says which tail pages
+    /// the op can leave committed as the window's own; that worst case is charged first, all or
+    /// nothing: `-ENOMEM`, with no page changed, when a level lacks the room. After the op the charge
+    /// is settled to what the window actually holds there, so a page already held costs nothing and a
+    /// page given back (unmapped, or aliased to a region) is refunded; one protected to nothing keeps
+    /// its contents, and its charge. A window no budget paid for grows unmetered.
+    fn page_op(
+        &mut self,
+        mem: &mut dyn GuestMem,
+        off: u64,
+        len: u64,
+        commits: Commits,
+        op: impl FnOnce(&Host, &mut dyn GuestMem) -> i64,
+    ) -> i64 {
+        let Some(grown) = self.grown else {
+            return op(self, mem);
+        };
+        let before = mem.tail_bytes(off, len);
+        let held = before.held;
+        let worst = match commits {
+            Commits::Nothing => 0,
+            Commits::Every => before.tail - held,
+            Commits::Own => before.tail - held - before.aliased,
+        };
+        if worst > 0 && !self.budgets.charge(self.own_budget, BUDGET_MEM, worst) {
+            return ENOMEM;
+        }
+        let r = op(self, mem);
+        let after = mem.tail_bytes(off, len).held;
+        let now = (grown + after).saturating_sub(held);
+        debug_assert!(
+            now <= grown + worst,
+            "a page op held more than it was charged"
+        );
+        let back = (grown + worst).saturating_sub(now);
+        if back > 0 {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, back);
+        }
+        self.grown = Some(now);
+        r
+    }
+
+    /// #1909 — undo [`Self::fork_powerbox`]'s growth charge for a twin whose powerbox was dropped
+    /// unrun: the twin's charge was this domain's growth, taken an instant ago on the node they share.
+    pub fn undo_fork_growth(&self) {
+        if let Some(g @ 1..) = self.grown {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, g);
+        }
+    }
+
+    /// #1909 — this domain's window is gone (the domain ended, or an exec replaced its image): what it
+    /// grew past its declared size goes back to its node and every ancestor, as the window's own bytes
+    /// go back with its lease (INVARIANTS #3: ending a use refunds every level). Never on a freeze: a
+    /// captured window stays charged, and the thaw takes the charge over
+    /// ([`Host::prepare_detached_relaunch`]).
+    pub fn release_growth(&mut self) {
+        if let Some(g @ 1..) = self.grown {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, g);
+            self.grown = Some(0);
         }
     }
 
@@ -28174,7 +28342,7 @@ impl Host {
     /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
     /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
     /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), and `"budget"`
-    /// (one `win` of `Budget.mem`).
+    /// (one `win` of `Budget.mem`, which pays for a child's growth as well as its window, #1909).
     pub fn grant_detached_spawn_caps(&mut self, win: u64, by_module_handle: bool) {
         let Some(m) = self.self_module.clone() else {
             return;
@@ -29632,6 +29800,7 @@ impl Host {
             attestation: self.attestation,
             durable: self.durable,
             own_budget: self.own_budget,
+            grown: self.grown,
             lane_cap: self.lane_cap,
         })
     }
@@ -29645,6 +29814,8 @@ impl Host {
         child.attestation = pb.attestation;
         child.budgets = Arc::clone(&self.budgets);
         child.own_budget = pb.own_budget;
+        // #1909 — the growth the checkpoint's window held, which the restored tree still charges.
+        child.grown = pb.grown;
         child.lane_cap = pb.lane_cap;
         child.restore_durable_handles(&pb.handles);
         child.cap_names = pb.names.clone();
@@ -29854,7 +30025,7 @@ impl Host {
     /// process's window is a fresh one. `None` when the powerbox cannot be duplicated.
     pub fn spawn_powerbox(&mut self, pid: u64, plan: SpawnPlan) -> Option<Host> {
         let pages = self.cap_pages.take();
-        let twin = self.fork_powerbox(pid);
+        let twin = self.powerbox_copy(pid);
         self.cap_pages = pages;
         let twin = twin?;
         if let Some((_, source)) = twin.signal_poll() {
@@ -30189,6 +30360,9 @@ impl Host {
         // cannot exec its way out of the budget that caps it.
         host.budgets = Arc::clone(&self.budgets);
         host.own_budget = self.own_budget;
+        // #1909 — the image starts in a fresh window, with nothing grown yet, metered as the old one
+        // was.
+        host.grown = self.grown.map(|_| 0);
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
@@ -30203,6 +30377,8 @@ impl Host {
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
         // counts never dip through this.
         let zeroed_pipes = self.release_pipe_ends();
+        // #1909 — and the old window goes with it: what it grew is handed back.
+        self.release_growth();
         Ok(ExecImage {
             zeroed_pipes,
             host,
@@ -31060,21 +31236,27 @@ impl Host {
                 let Some(mem) = mem else {
                     return Ok(vec![EINVAL]);
                 };
+                // #1909 — neither op commits a page of the window's own, but either may give one
+                // back: an alias replaces it, and an `unmap` reaches any page of the window.
                 Ok(vec![match op {
                     0 => {
                         let win_off = *args.first().unwrap_or(&0) as u64;
                         let region_off = *args.get(1).unwrap_or(&0) as u64;
                         let len = *args.get(2).unwrap_or(&0) as u64;
                         let prot = *args.get(3).unwrap_or(&0) as i32;
-                        self.region_map(mem, win_off, region_off, len, prot, region, backing)
+                        self.page_op(mem, win_off, len, Commits::Nothing, |h, m| {
+                            h.region_map(m, win_off, region_off, len, prot, region, backing)
+                        })
                     }
                     1 => {
                         let win_off = *args.first().unwrap_or(&0) as u64;
                         let len = *args.get(1).unwrap_or(&0) as u64;
-                        if let Some(hook) = &self.region_hook {
-                            hook(win_off, len, None);
-                        }
-                        mem.unmap(win_off, len)
+                        self.page_op(mem, win_off, len, Commits::Nothing, |h, m| {
+                            if let Some(hook) = &h.region_hook {
+                                hook(win_off, len, None);
+                            }
+                            m.unmap(win_off, len)
+                        })
                     }
                     2 => backing.size() as i64,
                     3 => mem.region_page_size(),
@@ -31229,6 +31411,11 @@ impl Host {
                 if off.checked_add(len).is_none_or(|end| end > size) {
                     return Ok(vec![EINVAL]);
                 }
+                // #1909 — a `map` or `protect` that leaves pages readable or writable can commit
+                // them, so it may grow the window ([`Host::page_op`] meters it).
+                let at = base + off;
+                let access = prot & (PROT_READ | PROT_WRITE) != 0;
+                let commits = |c| if access { c } else { Commits::Nothing };
                 Ok(vec![match op {
                     0 => {
                         // The growth cap (§3e slice 5): at the limit, map fails probeably — the
@@ -31239,20 +31426,25 @@ impl Host {
                                 return Ok(vec![ENOMEM]);
                             }
                         }
-                        let r = mem.map(base + off, len, prot);
+                        let every = commits(Commits::Every);
+                        let r = self.page_op(mem, at, len, every, |_, m| m.map(at, len, prot));
                         if r >= 0 && self.mem_map_limit.is_some() {
                             self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_add(len);
                         }
                         r
                     }
                     1 => {
-                        let r = mem.unmap(base + off, len);
+                        let r =
+                            self.page_op(mem, at, len, Commits::Nothing, |_, m| m.unmap(at, len));
                         if r >= 0 && self.mem_map_limit.is_some() {
                             self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_sub(len);
                         }
                         r
                     }
-                    2 => mem.protect(base + off, len, prot),
+                    2 => {
+                        let own = commits(Commits::Own);
+                        self.page_op(mem, at, len, own, |_, m| m.protect(at, len, prot))
+                    }
                     _ => EINVAL,
                 }])
             }
@@ -31757,6 +31949,16 @@ pub struct PageMap {
 }
 
 impl PageMap {
+    /// #1909 — the bytes the window holds committed past its declared size `[0, mapped)`, in this
+    /// host's pages (as a window restored from the map counts them, [`GuestMem::tail_bytes`]): the
+    /// growth its domain's budget pays for.
+    pub fn grown_bytes(&self) -> u64 {
+        let page = host_page_size();
+        let first = self.mapped.div_ceil(page);
+        let pages = self.rebased_to(page);
+        pages.range(first..).filter(|(_, p)| held_tail(p)).count() as u64 * page
+    }
+
     /// A map with no deviations from the region default and no carried prefix — what a driver starts a
     /// session with, and what a flat window hands back.
     ///
@@ -31980,7 +32182,8 @@ enum PageProt {
     Rw,
     /// `protect`ed read-only: reads succeed, a store faults (the D40 const-segment mechanism).
     Ro,
-    /// `unmap`ped: any access faults.
+    /// `unmap`ped, or `protect`ed to nothing (its contents kept): any access faults. In the reserved
+    /// tail only the latter, as an unmapped tail page is absent ([`Mem::set_prot`]).
     Unmapped,
     /// §13 aliased page: its bytes live at `region_off` in the `SharedRegion` `region`
     /// ([`Mem::regions`]), not in an anonymous [`Mem::pages`] entry. `writable` mirrors the map
@@ -33317,18 +33520,24 @@ impl Mem {
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
     /// read-only, neither ⇒ unmapped. A read-write page in the initial prefix is left *absent*
     /// (its default); in the reserved tail it needs an explicit [`PageProt::Rw`] entry, since
-    /// *absent* there means unmapped.
-    /// Apply a `map`/`protect` protection to one page in the given prot map (the caller holds the
-    /// address-space write lock). Uses `self`'s immutable `window`/`page` only.
-    fn set_prot(&self, prot: &mut BTreeMap<u64, PageProt>, page: u64, flags: i32) {
+    /// *absent* there means unmapped. So an unmapped tail page is absent too, unless it `keeps` the
+    /// contents the window held there (a `protect` to nothing, which a later `protect` reveals): a
+    /// tail [`PageProt::Unmapped`] page is one the window still holds, which its budget pays for
+    /// (#1909, [`GuestMem::tail_bytes`]).
+    /// Apply a `map`/`protect`/`unmap` protection to one page in the given prot map (the caller holds
+    /// the address-space write lock). Uses `self`'s immutable `window`/`page` only.
+    fn set_prot(&self, prot: &mut BTreeMap<u64, PageProt>, page: u64, flags: i32, keeps: bool) {
+        let tail = page * self.page >= self.window.mapped();
         if flags & PROT_WRITE != 0 {
-            if page * self.page < self.window.mapped() {
-                prot.remove(&page); // read+write is the prefix default (no entry)
-            } else {
+            if tail {
                 prot.insert(page, PageProt::Rw); // explicit commit in the reserved tail
+            } else {
+                prot.remove(&page); // read+write is the prefix default (no entry)
             }
         } else if flags & PROT_READ != 0 {
             prot.insert(page, PageProt::Ro);
+        } else if tail && !(keeps && matches!(prot.get(&page), Some(p) if held_tail(p))) {
+            prot.remove(&page);
         } else {
             prot.insert(page, PageProt::Unmapped);
         }
@@ -34122,7 +34331,7 @@ impl GuestMem for Mem {
         {
             let mut space = self.space_write();
             for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, prot);
+                self.set_prot(&mut space.prot, page, prot, false);
             }
         }
         for page in pages {
@@ -34141,7 +34350,7 @@ impl GuestMem for Mem {
         {
             let mut space = self.space_write();
             for page in pages.clone() {
-                space.prot.insert(page, PageProt::Unmapped);
+                self.set_prot(&mut space.prot, page, 0, false);
             }
         }
         for page in pages {
@@ -34149,6 +34358,21 @@ impl GuestMem for Mem {
                 .zero(self.window.base() + page * self.page, self.page);
         }
         0
+    }
+
+    fn tail_bytes(&self, offset: u64, len: u64) -> TailBytes {
+        let Ok(pages) = self.prot_pages(offset, len) else {
+            return TailBytes::default();
+        };
+        let space = self.space_read();
+        window_tail_bytes(
+            &space.prot,
+            pages,
+            self.window.mapped(),
+            self.page,
+            held_tail,
+            |p| matches!(p, PageProt::Backed { .. }),
+        )
     }
 
     /// §3e op 2 `protect`: change the protection of mapped pages without touching their backing
@@ -34167,7 +34391,7 @@ impl GuestMem for Mem {
             }) = space.prot.get(&page).copied()
             {
                 if prot & (PROT_READ | PROT_WRITE) == 0 {
-                    space.prot.insert(page, PageProt::Unmapped);
+                    self.set_prot(&mut space.prot, page, 0, false); // the region's, not kept
                 } else {
                     space.prot.insert(
                         page,
@@ -34179,7 +34403,7 @@ impl GuestMem for Mem {
                     );
                 }
             } else {
-                self.set_prot(&mut space.prot, page, prot);
+                self.set_prot(&mut space.prot, page, prot, true);
             }
         }
         0
@@ -34768,6 +34992,116 @@ mod region_minter_tests {
         let region =
             host.grant_host_proc_region(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
         assert!(plain >= 0 && region >= 0 && plain != region);
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    //! #1909 — a detached window's growth past its declared size is charged to the budget that paid
+    //! for the window, wherever the window goes: a fork twin's copy pays for its own, and an exec's
+    //! fresh window hands the replaced one's back.
+    use super::*;
+
+    const GROWTH: u64 = 1 << 16;
+
+    /// A detached child paid from a node capped at `ceiling`, which has grown its 64 KiB window by
+    /// [`GROWTH`] at 64 KiB: `(parent, node, child, its window, its AddressSpace)`.
+    fn grown_child(ceiling: i64) -> (Host, u32, Host, Mem, i32) {
+        let mut parent = Host::new();
+        let budget = parent.grant_budget(-1, ceiling, -1);
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        let (_, space) = child.grant_starter_caps(1 << 20);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let args = [1 << 16, GROWTH as i64, (PROT_READ | PROT_WRITE) as i64];
+        let r = child.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 0, space, &args, Some(&mut mem));
+        assert_eq!(r, Ok(vec![0]), "the growth fits the ceiling");
+        (parent, node, child, mem, space)
+    }
+
+    fn used(host: &Host, node: u32) -> i64 {
+        host.budgets.used(node, BUDGET_MEM)
+    }
+
+    #[test]
+    fn a_fork_twin_pays_for_the_growth_its_window_copies() {
+        let (parent, node, child, ..) = grown_child(2 * GROWTH as i64);
+        assert_eq!(used(&parent, node), GROWTH as i64);
+        let mut twin = child.fork_powerbox(7).expect("the copy's growth fits");
+        assert_eq!(
+            used(&parent, node),
+            2 * GROWTH as i64,
+            "the twin's copy is charged"
+        );
+        assert!(
+            child.fork_powerbox(8).is_none(),
+            "no room for another copy: the fork is refused"
+        );
+        assert_eq!(
+            used(&parent, node),
+            2 * GROWTH as i64,
+            "and charges nothing"
+        );
+        let copy = child.powerbox_copy(9).expect("a spawn's copy");
+        assert_eq!(
+            copy.grown,
+            Some(0),
+            "a spawned process starts in a fresh window"
+        );
+        twin.release_growth();
+        assert_eq!(
+            used(&parent, node),
+            GROWTH as i64,
+            "the twin's end hands its copy back"
+        );
+    }
+
+    #[test]
+    fn an_exec_hands_back_the_growth_of_the_image_it_replaces() {
+        let (parent, node, mut child, ..) = grown_child(2 * GROWTH as i64);
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mh = child.grant_module(&cmd);
+        let command = child.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let image = child
+            .exec_image(&command, &[], 0, 0, 1 << 16, 1 << 20)
+            .expect("admits");
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the replaced window's growth is back"
+        );
+        assert_eq!(
+            image.host.grown,
+            Some(0),
+            "the new image is metered, holding none"
+        );
+    }
+
+    /// A `protect` to nothing keeps a page the window holds (a later `protect` reveals its
+    /// contents), so the page stays charged; over a page the window never held it holds nothing new.
+    #[test]
+    fn a_protect_to_nothing_holds_only_what_the_window_held() {
+        let (parent, node, mut child, mut mem, space) = grown_child(2 * GROWTH as i64);
+        let mut none = |at: u64| {
+            let args = [at as i64, GROWTH as i64, 0];
+            child.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 2, space, &args, Some(&mut mem))
+        };
+        assert_eq!(none(1 << 17), Ok(vec![0]));
+        assert_eq!(
+            used(&parent, node),
+            GROWTH as i64,
+            "an untouched page: nothing new held"
+        );
+        assert_eq!(none(1 << 16), Ok(vec![0]));
+        assert_eq!(
+            used(&parent, node),
+            GROWTH as i64,
+            "the grown page kept its contents: still charged"
+        );
     }
 }
 

@@ -4543,10 +4543,37 @@ impl<'p> Vcpu<'p> {
     /// cooperative scheduler ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`])
     /// flattens them.
     pub fn run(&mut self) -> VcpuEvent {
-        let durable = match self.shared_host {
+        let ev = self.run_to_event();
+        // #1909 — a §14 child's main vCPU ending ends its domain: what its window grew goes back to
+        // the budget that paid for it, as the tree-walker's domain finish hands it back. Not when it
+        // unwound for a freeze: a frozen child stays charged.
+        let ended = match ev {
+            VcpuEvent::Trapped(_) => true,
+            VcpuEvent::Done(_) => {
+                !(self.durable()
+                    && self.mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING))
+            }
+            _ => false,
+        };
+        if ended && self.own_dom.is_some() {
+            match self.shared_host {
+                Some(m) => m.lock_unpoisoned().release_growth(),
+                None => self.host.release_growth(),
+            }
+        }
+        ev
+    }
+
+    fn durable(&self) -> bool {
+        match self.shared_host {
             Some(m) => m.lock_unpoisoned().is_durable(),
             None => self.host.is_durable(),
-        };
+        }
+    }
+
+    /// [`Vcpu::run`]'s loop, up to the next event.
+    fn run_to_event(&mut self) -> VcpuEvent {
+        let durable = self.durable();
         // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
         // punts on its host. A cheap flag store per resume.
         match self.shared_host {
@@ -7157,7 +7184,9 @@ struct DbgTask {
 /// over module 0 (no installed §22 units), and `fuel` a sub-allocated quota. Plain `Host` (the debug
 /// scheduler is single-threaded and the §3.6 live-call/serve machinery is not yet driven here).
 /// [`refund_ended_windows`] on the debugger's scheduler: a finished detached child's window goes back
-/// to the budget that paid for it, in the spawner's own powerbox.
+/// to the budget that paid for it, in the spawner's own powerbox, and what the window grew with it
+/// (#1909), from the child's own. The debugger's child envs see no other end (it declines fork, spawn
+/// and exec), and it never replaces their powerboxes, so the child's is still here.
 fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [DbgEnv]) {
     for t in tasks.iter_mut() {
         if matches!(t.state, DbgTaskState::Done(_)) {
@@ -7165,6 +7194,9 @@ fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [
                 match env {
                     None => host.release_detached(budget, bytes),
                     Some(k) => envs[k].host.release_detached(budget, bytes),
+                }
+                if let Some(k) = t.env {
+                    envs[k].host.release_growth();
                 }
             }
         }
@@ -14081,7 +14113,7 @@ impl CoopSched {
             // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its env done, cleanly
             // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
             // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
-            // parked producer to `-EPIPE`.
+            // parked producer to `-EPIPE`. What its window grew goes back with them (#1909).
             let mut live = vec![false; extra_envs.len()];
             let mut seen = vec![false; extra_envs.len()];
             for t in tasks.iter() {
@@ -14093,7 +14125,10 @@ impl CoopSched {
             let mut finished: Vec<usize> = Vec::new();
             for k in 0..extra_envs.len() {
                 if seen[k] && !live[k] && released_envs.insert(k) {
-                    extra_envs[k].host.lock_unpoisoned().release_pipe_ends();
+                    let mut h = extra_envs[k].host.lock_unpoisoned();
+                    h.release_growth();
+                    h.release_pipe_ends();
+                    drop(h);
                     finished.push(k);
                 }
             }
@@ -17360,7 +17395,8 @@ fn start_process<'scope, 'env>(
         let (r, _m) = run_vcpu_parallel(scope, dom, reg, host, domain, tbl, vt, mem, fuel);
         let status = super::reap_status(&r);
         let hooks = {
-            let g = hooks_host.lock_unpoisoned();
+            let mut g = hooks_host.lock_unpoisoned();
+            g.release_growth(); // #1909
             g.release_pipe_ends();
             g.exit_hooks.clone()
         };
@@ -18256,8 +18292,13 @@ fn par_start_child<'scope, 'env>(
                 fuel,
             )
         });
-        // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends.
-        child_host.lock_unpoisoned().release_pipe_ends();
+        // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends, and (#1909) what
+        // its window grew.
+        {
+            let mut h = child_host.lock_unpoisoned();
+            h.release_growth();
+            h.release_pipe_ends();
+        }
         // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
         // the result is published, so a joiner sees the refund.
         if let Some((parent, budget, bytes)) = lease {

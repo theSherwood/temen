@@ -109,7 +109,10 @@ block 0 () {
   }
 }
 `;
-const CHILD_LOG2 = 16, MINTER_QUOTA = 3 * (1 << CHILD_LOG2);
+// The budget pays for three children: each one's window and the 16 KiB it grows (#1909). The fourth
+// spawn, made before any join, finds less than a window left, however far the three have grown.
+const CHILD_LOG2 = 16, CHILD_GROWTH = 16384;
+const MINTER_QUOTA = 3 * ((1 << CHILD_LOG2) + CHILD_GROWTH);
 // #1865: the root spawns its OWN func 1 (→ 7) through an op-17 v1 record (`module = -1`) and joins
 // it, with a granted unit whose func 1 (→ 9) is emitted. Only a child that runs the granted unit may
 // run its emit, so with `instCodegen` this child stays interpreted: 7, no emitted children.
