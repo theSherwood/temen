@@ -761,9 +761,9 @@ suspension boundaries.
   `Vcpu` (same window, same `own_dom`, same shared `Mutex<Host>`) that would otherwise have called
   the JITted function.
 - **Emitter**: pure-Rust TEMEN-IR→wasm-bytes in the cdylib (no heavy deps; it must itself build for
-  wasm32). Control flow v1 = the `loop + br_table` block dispatcher with SSA values in locals
-  (simple, handles any CFG); a relooper/stackifier for reducible CFGs later recovers straight-line
-  speed. Guest access = `win_base + (addr & mask)` inline. Traps: wasm traps surface as catchable
+  wasm32). Control flow = structured `block`/`loop` nesting for reducible CFGs (#2099), with the
+  `loop + br_table` block dispatcher (handles any CFG) for irreducible ones and split functions; SSA
+  values in locals. Guest access = `win_base + (addr & mask)` inline. Traps: wasm traps surface as catchable
   `RuntimeError` at the JS boundary; TEMEN-specific faults become explicit checks.
 - **Linking**: JS compiles the emitted bytes (`new WebAssembly.Module` — sync compile is fine on
   Workers, where every vCPU already runs), instantiates against the same imported shared memory,
@@ -1240,6 +1240,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    verified (differential-clean; Lua is 100% reducible, so `luaV_execute` *was* structured) and made
    **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
    shape is irrelevant to V8 here; the cost is the giant function itself. So the relooper was reverted.
+   *(Revisited in #2099: the result holds for one giant interpreter loop, not for programs of many
+   functions. A stackifier over the dominator tree made nimony's `hexer d` 1.5× faster in Chromium —
+   1.33–1.39 s vs 1.92–2.24 s warm — and is now the emitter's lowering for reducible CFGs, the
+   dispatcher its fallback.)*
    (The per-demo wasm-JIT toggle for the module demos has since landed anyway — `play.js`, proven by
    `browser-play-editor-test.mjs` — with the caveat above still true: light scripts run net *slower*
    under the JIT, since the emit/setup overhead isn't repaid.)
