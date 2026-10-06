@@ -525,14 +525,16 @@ unsafe fn cap_thunk_impl(
     // CALLS.md 5c.1b — the caller side of the JIT parked transport (§10.2 arm 5): a `call.cap`
     // whose handle resolves to a minted live-impl enqueues on the callee child's shared cell and
     // **thread-blocks** on the reply, instead of falling to the generic dispatch (whose LiveImpl
-    // arm answers `-EINVAL`). The `host` borrow above is dead on this path; `live_impl_call`
-    // re-derives from `ctx` in its own short scope before any callee lock is taken.
-    if let Some(r) = live_impl_call(ctx as *mut Host, type_id, op, handle, arg_slots, trap_out) {
-        if *trap_out == 0 {
-            if n_results != 0 {
-                *results = r;
-            }
-            *trap_out = 0;
+    // arm answers `-EINVAL`). The `host` borrow above is dead on this path; the target is
+    // re-derived from `ctx` in its own short scope before any callee lock is taken.
+    let target = {
+        let h = &*(ctx as *mut Host);
+        h.live_impl_of(handle, type_id).map(|t| (t, h.handoff()))
+    };
+    if let Some(((callee, export), fast)) = target {
+        let r = live_impl_call(&callee, export, fast, op, arg_slots, trap_out);
+        if *trap_out == 0 && n_results != 0 {
+            *results = r;
         }
         return;
     }
@@ -751,16 +753,21 @@ pub unsafe extern "C" fn cap_thunk_locked(
     // A parked op runs again from the top: its dispatch re-takes the lock (#1826).
     loop {
         let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-        // CALLS.md 5c.1b — a **locked-domain caller** (itself a granted child) does not take the
-        // parked transport yet: the delegate below holds this domain's own guard, so blocking on a
-        // sibling's reply while a sibling blocks on ours would deadlock (A holds A waiting B; B
-        // blocked on A's lock). Refuse probeably (`-EINVAL`, the pre-5c.1 answer) — the child-caller
-        // tier is a recorded 5c residue; the root caller (unlocked thunk) covers the transport.
-        if guard.live_impl_of(handle, type_id).is_some() {
-            if n_results != 0 {
-                *results = EINVAL;
+        // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
+        // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
+        // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
+        if let Some((callee, export)) = guard.live_impl_of(handle, type_id) {
+            let fast = guard.handoff();
+            drop(guard);
+            let arg_slots = if n_args == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(args, n_args as usize)
+            };
+            let r = live_impl_call(&callee, export, fast, op, arg_slots, trap_out);
+            if *trap_out == 0 && n_results != 0 {
+                *results = r;
             }
-            *trap_out = 0;
             return;
         }
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
@@ -3511,9 +3518,8 @@ unsafe fn serve_locked_child(
 /// CALLS.md 5c.3 / §10.4 — the per-thread **crossing-depth bound**: inline handoff crossings are
 /// real native frames on the claiming thread, so re-entrant chains must bound and **decline to
 /// the parked transport** at the rim (fail-closed toward the slower correct transport, never a
-/// wrong answer). Structurally the depth cannot exceed 1 today — a granted child (locked-domain
-/// caller) refuses live-impl calls before its guard-holding delegate — but the bound is the
-/// §10.4 contract for when that tier unlocks.
+/// wrong answer): a handler run inline can itself call through an offer, from a locked domain
+/// too (#2139).
 const CROSSING_DEPTH_MAX: u32 = 64;
 thread_local! {
     static CROSSING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -3529,20 +3535,19 @@ fn crossing_depth_ok() -> bool {
 /// backpressure, the interp's exact answer); a callee cell with no Condvar (not a shared JIT
 /// child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
 /// exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
-/// unwind via the trap cell. Returns `Some(reply)` when this WAS a live-impl call (the caller
-/// pushes it and returns), `None` to fall through to the generic dispatch.
+/// unwind via the trap cell. `callee`/`export` are the live-impl the handle resolved to and `fast`
+/// the caller's handoff knob, each read by the caller from its own powerbox before the call (a
+/// locked caller with its domain guard released first, #2139); the reply is what the caller pushes.
 unsafe fn live_impl_call(
-    host_ptr: *mut Host,
-    type_id: u32,
+    callee: &Mutex<Host>,
+    export: u32,
+    fast: bool,
     op: u32,
-    handle: i32,
     args: &[i64],
     trap_out: *mut i64,
-) -> Option<i64> {
+) -> i64 {
     const CAP_REVOKED: i64 = -9;
-    let (callee, export) = (*host_ptr).live_impl_of(handle, type_id)?;
-    let fast = (*host_ptr).handoff();
-    // The parent-host borrow above is dead; only the callee cell is locked from here on.
+    // Only the callee cell is locked from here on: the caller holds no lock of its own.
     let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     // CALLS.md 5c.2 — the thunk fast path (§10.2 arm 4): the callee's serve loop is parked at an
     // empty-queue `svc.wait` (activation published) and unclaimed — claim it (atomic with the
@@ -3587,13 +3592,13 @@ unsafe fn live_impl_call(
                         if let Some(cv) = g2.svc_cv() {
                             cv.notify_all();
                         }
-                        return Some(CAP_REVOKED);
+                        return CAP_REVOKED;
                     }
                     g2.release_handoff(1);
                     if let Some(cv) = g2.svc_cv() {
                         cv.notify_all();
                     }
-                    return Some(res.first().copied().unwrap_or(0));
+                    return res.first().copied().unwrap_or(0);
                 }
                 _ => {
                     // Unknown handler / arity mismatch: decline to the parked transport (the
@@ -3604,30 +3609,30 @@ unsafe fn live_impl_call(
         }
     }
     let Some(ticket) = guard.svc_enqueue(export, op, args.to_vec()) else {
-        return Some(EAGAIN); // full queue / unservable op: probeable backpressure
+        return EAGAIN; // full queue / unservable op: probeable backpressure
     };
     let Some(cv) = guard.svc_cv() else {
         // Not a shared JIT-child cell (e.g. an interp-tier callee reached from a JIT run):
         // this transport cannot wake, so keep the pre-5c.1 probeable answer. The dispatch
         // was enqueued but never served; drop it to keep the queue honest.
         let _ = guard.svc_result(ticket);
-        return Some(EINVAL);
+        return EINVAL;
     };
     let epoch = guard.epoch_cell();
     loop {
         if let Some(r) = guard.svc_result(ticket) {
-            return Some(r);
+            return r;
         }
         if guard.child_serve_ctx() == 0 {
             // The child exited (release cleared the ctx) with our dispatch unserved — the
             // dead-callee edge, probeable, never a hang (D37 death-is-revocation).
-            return Some(CAP_REVOKED);
+            return CAP_REVOKED;
         }
         if blocked_wait_interrupted(epoch, trap_out) {
             if *trap_out == 0 {
                 *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
             }
-            return Some(0); // value unused: the trap cell unwinds the caller
+            return 0; // value unused: the trap cell unwinds the caller
         }
         let (g, _) = cv
             .wait_timeout(guard, std::time::Duration::from_millis(20))
@@ -4124,9 +4129,9 @@ impl MprotectWindow {
     ///   this tier could not mirror it without protecting past the carve — so a small child stays
     ///   usable on both tiers.
     ///
-    /// Assigning the constant *unconditionally* here is what broke `jit_instantiate_granted`: a
-    /// granted child's carve is smaller than the guard, the interpreter left it unguarded, and this
-    /// tier refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
+    /// Assigning the constant *unconditionally* here once broke the granted-child test: a granted
+    /// child's carve is smaller than the guard, the interpreter left it unguarded, and this tier
+    /// refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
     pub fn set_null_guard(&mut self, guard: u64) {
         if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.mapped {
             return;
