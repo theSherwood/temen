@@ -6107,15 +6107,15 @@ fn client_gone_locked(s: &mut Sched, service: usize) {
 }
 
 /// #1217 — the service domains a finishing vCPU was a client of, whose `svc.wait` its end
-/// releases: its §2.2 pager, and — for a §14 child's entry vCPU (`nested_child`: the child
-/// domain's end, not a thread of it finishing) — the provider of every live offer its powerbox
-/// still holds ([`Binding::LiveImpl`], the re-granted `child_offer` shape). Instanced offers
-/// (CALLS.md 4x, animated on the caller's own vCPU) never park a provider on this client, so they
-/// are not listed. Locks the host cells briefly, never nested; call it before taking the
-/// scheduler lock.
+/// releases: its §2.2 pager, and — for a §14 child's entry vCPU, carve (`nested_child`) or detached
+/// (the one vCPU with a `freeze_bell`): the child domain's end, not a thread of it finishing — the
+/// provider of every live offer its powerbox still holds ([`Binding::LiveImpl`], the re-granted
+/// `child_offer` shape). Instanced offers (CALLS.md 4x, animated on the caller's own vCPU) never
+/// park a provider on this client, so they are not listed. Locks the host cells briefly, never
+/// nested; call it before taking the scheduler lock.
 fn client_gone_targets(v: &VCpu) -> Vec<usize> {
     let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
-    if v.nested_child {
+    if v.nested_child || v.freeze_bell.is_some() {
         let hg = v.host.lock_unpoisoned();
         cells.extend(hg.table.iter().filter_map(|slot| match slot.entry {
             Some(Binding::LiveImpl(i)) => {

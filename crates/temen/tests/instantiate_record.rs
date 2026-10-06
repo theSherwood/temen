@@ -142,11 +142,6 @@ block 0 (v0: i64) {
 /// `123`, where a parent-window address (64 KiB higher) would make it `124`. The runtime copies the page around it into the child. It never writes
 /// the child's memory, so the same pager serves a child it cannot address.
 fn record_pager_program() -> String {
-    record_pager_program_at(16384)
-}
-
-/// [`record_pager_program`] with the child's faulting address chosen by the caller.
-fn record_pager_program_at(fault: u64) -> String {
     let f0 = (1u64 << 32) as i64; // version 0, entry 1
     let f16 = 16i64; // size_log2 16, pager export 0
     let f24 = 0xFFFF_FFFFi64; // module -1, budget 0
@@ -188,7 +183,7 @@ block 0 () {{
 
 func 1 (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  vaddr = i64.const {fault}
+  vaddr = i64.const 16384
   vb = i32.load8_u vaddr
   vbw = i64.extend_i32_u vb
   return vbw
@@ -212,7 +207,6 @@ block 0 (vaddr: i64) {{
         f0 = f0,
         f16 = f16,
         f24 = f24,
-        fault = fault,
         stores = store_record(17408),
     )
 }
@@ -240,18 +234,6 @@ fn run(backend: Backend, src: &str) -> Result<i32, String> {
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
-/// [`run`] on its own thread with a deadline: the #1217 pins guard against a *hang* (a pager
-/// parked forever), so a regression must fail the test, not stall the binary until CI's timeout.
-fn run_bounded(backend: Backend, src: &str) -> Result<i32, String> {
-    let src = src.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(run(backend, &src));
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("{backend:?}: the run hung (pager parked with a dead client?)"))
-}
-
 /// The record spelling of a plain op-0 spawn produces the identical result.
 #[test]
 fn record_spawn_matches_legacy_plain_spawn() {
@@ -273,62 +255,24 @@ fn record_spawn_carries_the_pager_binding() {
     }
 }
 
-/// #1206: a pager-bound child's fault **below its NULL guard** is fatal on every backend — never the
-/// recoverable kind the pager services (the reserved region cannot be mapped). The parent is parked
-/// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
-/// no-progress answer) so its `join` surfaces the trap — the run traps instead of hanging.
-#[test]
-fn pager_child_guard_fault_is_fatal() {
-    let src = record_pager_program_at(0);
-    for b in BACKENDS {
-        assert!(
-            run_bounded(b, &src).is_err(),
-            "{b:?}: a NULL fault in a paged child is fatal"
-        );
-    }
-}
-
-/// #1217: a demand child that **never faults** — it returns `5` without touching its window — must
-/// not strand the pager parked in `svc.wait`. The wait returns `0` once the child is gone; the
-/// `join` delivers `5`; the run exits `0 * 1000 + 5`.
-#[test]
-fn pager_child_that_never_faults_releases_the_parked_pager() {
-    let src = record_pager_program_at(0).replace("vb = i32.load8_u vaddr", "vb = i32.const 5");
-    for b in BACKENDS {
-        assert_eq!(run_bounded(b, &src).expect("run"), 5, "{b:?}");
-    }
-}
-
-/// #1217, the other order: the child is already gone (joined) when the parent reaches `svc.wait`,
-/// so nothing could ever wake it — the wait returns `0` immediately rather than parking.
-#[test]
-fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
-    let src = record_pager_program_at(0)
-        .replace("vb = i32.load8_u vaddr", "vb = i32.const 5")
-        .replace(
-            "  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n",
-            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vs = svc.wait vz\n",
-        );
-    assert!(
-        src.contains("(vch)\n  vs = svc.wait"),
-        "the swap must apply"
-    );
-    for b in BACKENDS {
-        assert_eq!(run_bounded(b, &src).expect("run"), 5, "{b:?}");
-    }
-}
-
 /// #1217, the granted-offer shape: the root spawns a **server** child (func 1: one `svc.wait`,
 /// returning its count), mints a `child_offer` over its export, and spawns a **guest** child
 /// (func 3, `guest`) with that offer re-granted by name as `"fork"`; then `join`s the server and
-/// exits its count. The guest's 4-KiB carve is below the guard size, so it stages the name at 0.
+/// exits its count. Both children are detached, paid from the root's `"budget"`; the `"fork"` name is
+/// a data segment, so the guest finds it in its own window too.
 fn granted_client_program(guest: &str) -> String {
+    let guest_rec = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::v1(3)
+    };
     format!(
         "\
-memory 18
+memory 17
 data 16384 \"vm\"
+data 16400 \"budget\"
 data 16684 \"fork\"
-type 0 func (i64) -> (i64)
+{server_rec}{guest_rec}type 0 func (i64) -> (i64)
 type 1 interface {{ op: 0 }}
 export 0 interface \"fork\" 1 {{ op: 2 }}
 import 0 \"exit\" (i32) -> ()
@@ -337,15 +281,12 @@ block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
   v0 = self.resolve vp vl
-  vf0 = i64.const 4294967296
-  vf8 = i64.const 65536
-  vf16 = i64.const -4294967284
-  vf24 = i64.const 4294967295
-  vf32 = i64.const 0
-  vf40 = i64.const 0
-  vf48 = i64.const 0
-{server_rec}
-  vsp = i64.const 17536
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vsb = i64.const 17436
+  i32.store vsb vb
+  vsp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
   vz0 = i64.const 0
   voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -357,12 +298,9 @@ block 0 () {{
   i32.store va1 vfour
   va2 = i64.const 16648
   i32.store va2 voff
-  vg0 = i64.const 12884901888
-  vg8 = i64.const 131072
-  vg40 = i64.const 16640
-  vg48 = i64.const 1
-{guest_rec}
-  vgp = i64.const 17600
+  vgb = i64.const 17532
+  i32.store vgb vb
+  vgp = i64.const 17504
   vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
   vjs = call.cap 6 1 (i32) -> (i64) v0 (vs)
   vc = i32.wrap_i64 vjs
@@ -389,14 +327,8 @@ block 0 (v0: i64) {{
   }}
 }}
 ",
-        server_rec = store_record(17536),
-        guest_rec = store_record(17600)
-            .replace("vra", "vgra")
-            .replace("vf0", "vg0")
-            .replace("vf8", "vg8")
-            .replace("vf40", "vg40")
-            .replace("vf48", "vg48"),
-        guest = guest,
+        server_rec = rec::segment(17408, &SpawnRec::v1(1)),
+        guest_rec = rec::segment(17504, &guest_rec),
     )
 }
 
@@ -405,16 +337,15 @@ block 0 (v0: i64) {{
 #[test]
 fn granted_client_that_calls_once_is_served() {
     let src = granted_client_program(
-        "  vfn = i64.const 1802661734
-  vz8 = i64.const 0
-  i64.store vz8 vfn
+        "  vnp = i64.const 16684
   vl4 = i64.const 4
-  vfork = self.resolve vz8 vl4
+  vfork = self.resolve vnp vl4
+  vz8 = i64.const 0
   vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
   return vr",
     );
     for b in BACKENDS {
-        assert_eq!(run_bounded(b, &src).expect("run"), 1, "{b:?}");
+        assert_eq!(run_detached(b, &src).expect("run"), 1, "{b:?}");
     }
 }
 
@@ -424,7 +355,7 @@ fn granted_client_that_calls_once_is_served() {
 fn granted_client_that_dies_before_calling_releases_the_server() {
     let src = granted_client_program("  unreachable");
     for b in BACKENDS {
-        assert_eq!(run_bounded(b, &src).expect("run"), 0, "{b:?}");
+        assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
     }
 }
 
@@ -449,7 +380,7 @@ fn joined_daemon_whose_client_is_gone_deadlocks_to_threadfault() {
         "the daemon rewrite must apply"
     );
     for b in BACKENDS {
-        let e = run_bounded(b, &src).expect_err("the join-deadlock must trap, not hang");
+        let e = run_detached(b, &src).expect_err("the join-deadlock must trap, not hang");
         assert!(
             e.contains("ThreadFault"),
             "{b:?}: the all-parked join-deadlock traps ThreadFault, got: {e}"
@@ -1321,12 +1252,16 @@ fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
 /// for the flag (plus a settle for the resumer to file its park), and only then spawns the client,
 /// which returns at once. After joining the client the root releases the fiber, the thread
 /// returns, and the serve loop reaches `svc.wait` with its only client long gone: it must return
-/// `0`, so the root exits `0`.
+/// `0`, so the root exits `0`. The flag (byte 0) and the fiber's go-cell (byte 8) are in a
+/// `SharedRegion` the root mints and maps at 65536, and pre-maps into the server's window at the
+/// same offset.
 #[test]
 fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
-    // The server is a 4-KiB carve at root offset 65536; the flag (2048) and the fiber's go-cell
-    // (2056) are server-window offsets, i.e. root addresses 67584 and 67592.
     let src = granted_client_program("  vz9 = i64.const 0\n  return vz9")
+        .replace(
+            "data 16400 \"budget\"\n",
+            "data 16400 \"budget\"\ndata 16416 \"as\"\n",
+        )
         .replace(
             "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
             "block 0 (v0: i64) {
@@ -1339,13 +1274,32 @@ fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
   }",
         )
         .replace(
+            "  vsp = i64.const 17408\n",
+            "  vap = i64.const 16416
+  val = i64.const 2
+  vas = self.resolve vap val
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vmap = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vreg = i64.const 17480
+  i32.store vreg vrh
+  vcoff = i64.const 17488
+  i64.store vcoff vwo
+  vsp = i64.const 17408
+",
+        )
+        .replace(
             "  vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)\n",
             "  vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
-  vfl = i64.const 67584
+  vfl = i64.const 65536
   vfe = i32.const 0
   vinf = i64.const -1
   vfw = i32.atomic.wait vfl vfe vinf
-  vdead = i64.const 67600
+  vdead = i64.const 65552
   vms = i64.const 50000000
   vsettle = i32.atomic.wait vdead vfe vms
 ",
@@ -1354,7 +1308,7 @@ fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
             "  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)\n",
             "  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
   vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
-  vgo = i64.const 67592
+  vgo = i64.const 65544
   vgone = i32.const 1
   i32.store vgo vgone
   vgw = atomic.notify vgo vgone
@@ -1371,11 +1325,11 @@ block 0 (vsp: i64, varg: i64) {
 }
 func 5 (i64, i64) -> (i64) {
 block 0 (vsp: i64, varg: i64) {
-  vflag = i64.const 2048
+  vflag = i64.const 65536
   vone = i32.const 1
   i32.store vflag vone
   vw = atomic.notify vflag vone
-  vgo = i64.const 2056
+  vgo = i64.const 65544
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vgo vexp vto
@@ -1385,68 +1339,15 @@ block 0 (vsp: i64, varg: i64) {
 }
 ";
     assert!(
-        src.contains("thread.spawn 4") && src.contains("vsettle") && src.contains("vjg"),
+        src.contains("data 16416 \"as\"")
+            && src.contains("thread.spawn 4")
+            && src.contains("vcoff")
+            && src.contains("vsettle")
+            && src.contains("vjg"),
         "the rewrites must apply"
     );
     for b in BACKENDS {
-        assert_eq!(run_bounded(b, &src).expect("run"), 0, "{b:?}");
-    }
-}
-
-/// #1815: a demand child's page fault must **wake** a pager parked at `svc.wait` when the fault is
-/// not served by direct handoff. The fault arm enqueued the request and parked the child on the
-/// reply ticket, but only the handoff path ever reached the pager — with handoff off (or a handoff
-/// that found no serve loop to take) the parked pager slept through the request and the run
-/// deadlocked. The fault is the same request a `call.cap` makes, so it takes the same
-/// enqueue + `svc_wake` + park. Pinned handoff-off; handoff-on is `record_spawn_carries_the_pager_binding`.
-#[test]
-fn a_page_fault_wakes_a_parked_pager_without_handoff() {
-    let m = parse_module(&record_pager_program()).expect("parse");
-    verify_module(&m).expect("verify");
-    for b in BACKENDS {
-        let m = m.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let registry = Imports::new().provide("exit", HostCap::exit());
-            let inst = instantiate_with_imports(m, registry).expect("instantiate");
-            let cfg = RunConfig {
-                handoff: false,
-                ..RunConfig::default()
-            };
-            let r = inst.run_with_caps(
-                b,
-                &cfg,
-                &[(
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                )],
-            );
-            let _ = tx.send(r.map(|r| r.outcome).map_err(|e| e.to_string()));
-        });
-        let r = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("{b:?}: the run hung"));
-        assert!(
-            matches!(r, Ok(Outcome::Exited(1123))),
-            "{b:?}: the pager serves the fault: {r:?}"
-        );
-    }
-}
-
-/// #1862: a pager reply names a source the pager's window can't supply — here 1 MiB past a buffer
-/// it did fill, beyond its 128 KiB window. The
-/// fault is unserviceable, so the child dies as a pagerless fault would (detect-and-kill), and the
-/// parent's `join` raises it: the run traps instead of the child reading unsupplied bytes.
-#[test]
-fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
-    let src = record_pager_program().replace(
-        "  return vsrc\n",
-        "  vpast = i64.const 1048576\n  vbad = i64.add vsrc vpast\n  return vbad\n",
-    );
-    assert!(src.contains("return vbad"), "the rewrite must apply");
-    for b in BACKENDS {
-        let e = run_bounded(b, &src).expect_err("an unsuppliable page is fatal");
-        assert!(e.contains("MemoryFault"), "{b:?}: {e}");
+        assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
     }
 }
 
@@ -1529,31 +1430,43 @@ block 0 (v0: i64) {{
     )
 }
 
-/// Run with the Instantiator plus a detached-window budget (`"budget"`, 1 MiB of `Budget.mem`).
+/// Run with the Instantiator (`"vm"`), an AddressSpace (`"as"`) and a detached-window budget
+/// (`"budget"`, 1 MiB of `Budget.mem`).
 fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
-    run_detached_with(backend, src, 1 << 20)
+    run_detached_with(backend, src, 1 << 20, RunConfig::default())
 }
 
-/// [`run_detached`] with a `mem`-byte budget.
-fn run_detached_with(backend: Backend, src: &str, mem: u64) -> Result<i32, String> {
+/// [`run_detached`] with a `mem`-byte budget, under `cfg`. The run gets its own thread and a
+/// deadline: the #1217 pins guard against a *hang* (a pager parked for a child that is gone), so a
+/// regression must fail the test, not stall the binary until CI's timeout.
+fn run_detached_with(backend: Backend, src: &str, mem: u64, cfg: RunConfig) -> Result<i32, String> {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
-    let registry = Imports::new().provide("exit", HostCap::exit());
-    let inst = instantiate_with_imports(m, registry).expect("instantiate");
-    let r = inst
-        .run_with_caps(
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let registry = Imports::new().provide("exit", HostCap::exit());
+        let inst = instantiate_with_imports(m, registry).expect("instantiate");
+        let r = inst.run_with_caps(
             backend,
-            &RunConfig::default(),
+            &cfg,
             &[
                 (
                     "vm",
                     HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
                 ),
                 ("budget", HostCap::detached_budget(mem)),
+                (
+                    "as",
+                    HostCap::custom(5, 0, |h, win| h.grant_address_space(0, win)),
+                ),
             ],
-        )
-        .map_err(|e| e.to_string())?;
-    match r.outcome {
+        );
+        let _ = tx.send(r.map(|r| r.outcome).map_err(|e| e.to_string()));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|e| panic!("{backend:?}: the run did not finish: {e}"))?;
+    match outcome {
         Outcome::Exited(code) => Ok(code),
         other => Err(format!("unexpected outcome {other:?}")),
     }
@@ -1615,13 +1528,12 @@ fn a_v1_record_with_an_offset_fails_closed() {
     }
 }
 
-/// #1862 + #1863: a **detached** demand child — a window the pager cannot address — is served by a
-/// pager that fills its own buffer and replies with its address. The v1 record names impl export 0 as
-/// the pager; the child's first touch (at 20000) faults into a `page(addr)` the root serves from
-/// `svc.wait`; the pager gets `addr` in the child's coordinates, stores 77 at `addr + 40000` in its own
-/// window, and replies with that address. The child reads 77; the root exits `77 + 1 serve * 1000`.
-#[test]
-fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
+/// A root that serves its own detached demand child: the v1 record names impl export 0 as the pager,
+/// and the root waits in `svc.wait` before it joins the child, then exits `byte + serves * 1000`. The
+/// child (func 1) returns the byte at `fault`, its first touch of that page. The pager (func 2) gets
+/// the fault address in the child's coordinates, stores 77 at `addr + 40000` in its own window, and
+/// replies with that address (#1862).
+fn detached_pager_program_at(fault: u64) -> String {
     let src = detached_record_program()
         .replace(
             "import 0 \"exit\" (i32) -> ()\n",
@@ -1635,7 +1547,7 @@ fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
         )
         .replace(
             &format!("  va = i64.const {}\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  vk = i64.const 100\n  vr = i64.add vbw vk\n  return vr\n", temen_ir::module_args_base()),
-            "  va = i64.const 20000\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
+            &format!("  va = i64.const {fault}\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n"),
         )
         + "
 func 2 (i64) -> (i64) {
@@ -1652,11 +1564,107 @@ block 0 (vaddr: i64) {
         src.contains("interface \"pager\"")
             && src.contains("vr16 = i64.const 17\n")
             && src.contains("svc.wait")
-            && src.contains("i64.const 20000"),
+            && src.contains(&format!("va = i64.const {fault}\n")),
+        "the rewrites must apply"
+    );
+    src
+}
+
+/// #1862 + #1863: a **detached** demand child — a window the pager cannot address — is served by a
+/// pager that fills its own buffer and replies with its address. The child's first touch (at 20000)
+/// faults into a `page(addr)` the root serves from `svc.wait`; the child reads 77; the root exits
+/// `77 + 1 serve * 1000`.
+#[test]
+fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
+    let src = detached_pager_program_at(20000);
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+    }
+}
+
+/// #1815: a demand child's page fault must **wake** a pager parked at `svc.wait` when the fault is
+/// not served by direct handoff. The fault arm enqueued the request and parked the child on the
+/// reply ticket, but only the handoff path ever reached the pager — with handoff off (or a handoff
+/// that found no serve loop to take) the parked pager slept through the request and the run
+/// deadlocked. The fault is the same request a `call.cap` makes, so it takes the same
+/// enqueue + `svc_wake` + park. Pinned handoff-off; handoff-on is the test above.
+#[test]
+fn a_page_fault_wakes_a_parked_pager_without_handoff() {
+    let src = detached_pager_program_at(20000);
+    let cfg = || RunConfig {
+        handoff: false,
+        ..RunConfig::default()
+    };
+    for b in BACKENDS {
+        assert_eq!(
+            run_detached_with(b, &src, 1 << 20, cfg()).expect("run"),
+            1077,
+            "{b:?}: the pager serves the fault"
+        );
+    }
+}
+
+/// #1206: a pager-bound child's fault **below its NULL guard** is fatal on every backend — never the
+/// recoverable kind the pager services (the reserved region cannot be mapped). The parent is parked
+/// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
+/// no-progress answer) so its `join` surfaces the trap — the run traps instead of hanging.
+#[test]
+fn pager_child_guard_fault_is_fatal() {
+    let src = detached_pager_program_at(0);
+    for b in BACKENDS {
+        assert!(
+            run_detached(b, &src).is_err(),
+            "{b:?}: a NULL fault in a paged child is fatal"
+        );
+    }
+}
+
+/// #1217: a demand child that **never faults** — it returns `5` without touching its window — must
+/// not strand the pager parked in `svc.wait`. The wait returns `0` once the child is gone; the
+/// `join` delivers `5`; the run exits `0 * 1000 + 5`.
+#[test]
+fn pager_child_that_never_faults_releases_the_parked_pager() {
+    let src =
+        detached_pager_program_at(0).replace("  vb = i32.load8_u va\n", "  vb = i32.const 5\n");
+    assert!(src.contains("vb = i32.const 5\n"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 5, "{b:?}");
+    }
+}
+
+/// #1217, the other order: the child is already gone (joined) when the parent reaches `svc.wait`,
+/// so nothing could ever wake it — the wait returns `0` immediately rather than parking.
+#[test]
+fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
+    let src = detached_pager_program_at(0)
+        .replace("  vb = i32.load8_u va\n", "  vb = i32.const 5\n")
+        .replace(
+            "  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n",
+            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vs = svc.wait vz\n",
+        );
+    assert!(
+        src.contains("vb = i32.const 5\n") && src.contains("(vch)\n  vs = svc.wait"),
         "the rewrites must apply"
     );
     for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+        assert_eq!(run_detached(b, &src).expect("run"), 5, "{b:?}");
+    }
+}
+
+/// #1862: a pager reply names a source the pager's window can't supply — here 1 MiB past a buffer
+/// it did fill, beyond its 128 KiB window. The fault is unserviceable, so the child dies as a
+/// pagerless fault would (detect-and-kill), and the parent's `join` raises it: the run traps instead
+/// of the child reading unsupplied bytes.
+#[test]
+fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
+    let src = detached_pager_program_at(20000).replace(
+        "  return vsrc\n",
+        "  vpast = i64.const 1048576\n  vbad = i64.add vsrc vpast\n  return vbad\n",
+    );
+    assert!(src.contains("return vbad"), "the rewrite must apply");
+    for b in BACKENDS {
+        let e = run_detached(b, &src).expect_err("an unsuppliable page is fatal");
+        assert!(e.contains("MemoryFault"), "{b:?}: {e}");
     }
 }
 
@@ -1674,7 +1682,7 @@ fn a_joined_detached_childs_window_returns_to_its_budget() {
     assert!(src.contains("vch2"), "the rewrite must apply");
     for b in BACKENDS {
         assert_eq!(
-            run_detached_with(b, &src, 1 << 17).expect("run"),
+            run_detached_with(b, &src, 1 << 17, RunConfig::default()).expect("run"),
             284,
             "{b:?}: the second child fits the window the first gave back"
         );
