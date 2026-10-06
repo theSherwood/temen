@@ -698,7 +698,7 @@ in session discussion; collected here so the next slice has a home to be picked 
   Worker setup were a stale view: V8 can miss a grow notice for a Worker still deserializing the
   shared memory it was handed, so its instance keeps the old length, and its first atomic or bulk
   access to the missed pages traps (a trap inside dlmalloc's lock hangs every other thread). Every
-  threads-engine instantiation now adopts the memory first (`adoptMemory` in `web/engine-mem.js`, a
+  threads-engine instantiation now adopts the memory first (`adoptMemory` in `web/foreign-mem.js`, a
   `grow(0)`). `browser-test.mjs` pins it with Workers handed a memory that is growing, and no longer
   retries the index page.
 - [x] **wasm-JIT tier** — compile Temen IR to wasm at the explicit compile points and run hot compute
