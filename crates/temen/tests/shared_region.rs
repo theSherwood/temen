@@ -100,6 +100,70 @@ fn shared_region_without_second_mapping_is_not_aliased() {
     );
 }
 
+/// #2109: a host call's buffer copies go through the alias, on both interpreters. The bytecode
+/// engine copies a host call's buffers in one go while no region is mapped; once one is, each byte
+/// must resolve through the page map, as on the tree-walker. The guest maps the region at two window
+/// offsets and stores `MARKER` through the first. It writes those 8 bytes into a pipe from the
+/// second mapping (the host reads the guest's buffer), reads them back into the second mapping 8
+/// bytes further on (the host fills the guest's buffer), and loads that word through the first
+/// mapping: `MARKER` only if both copies resolved the alias.
+#[test]
+fn host_buffer_copies_go_through_the_alias_on_both_interpreters() {
+    let src = format!(
+        "memory 18\n\
+         func (i32, i32, i32) -> (i64) {{\n\
+         block 0 (vr: i32, vw: i32, vrd: i32) {{\n\
+         \x20 vg = call.cap 4 3 () -> (i64) vr ()\n\
+         \x20 v0 = i64.const 0\n\
+         \x20 vp = i32.const 3\n\
+         \x20 va = i64.const 65536\n\
+         \x20 vb = i64.add va vg\n\
+         \x20 vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (va, v0, vg, vp)\n\
+         \x20 vm2 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (vb, v0, vg, vp)\n\
+         \x20 vmark = i64.const {MARKER}\n\
+         \x20 i64.store va vmark\n\
+         \x20 v8 = i64.const 8\n\
+         \x20 vwn = call.cap 0 1 (i64, i64) -> (i64) vw (vb, v8)\n\
+         \x20 vb8 = i64.add vb v8\n\
+         \x20 vrn = call.cap 0 0 (i64, i64) -> (i64) vrd (vb8, v8)\n\
+         \x20 va8 = i64.add va v8\n\
+         \x20 vx = i64.load va8\n\
+         \x20 return vx\n\
+           }}\n\
+         }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    for bytecode in [false, true] {
+        let mut host = Host::new();
+        let region = host.grant_shared_region(1 << 16);
+        let (w, r) = host.grant_pipe();
+        let args = [Value::I32(region), Value::I32(w), Value::I32(r)];
+        let mut fuel = 1_000_000u64;
+        let (res, _snap) = if bytecode {
+            temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                &m,
+                0,
+                &args,
+                &mut fuel,
+                &[],
+                0,
+                &mut host,
+            )
+            .expect("in the bytecode engine's subset")
+        } else {
+            run_capture_reserved_with_host(&m, 0, &args, &mut fuel, &[], 0, &mut host)
+        };
+        assert_eq!(
+            res.expect("run ok"),
+            vec![Value::I64(MARKER)],
+            "bytecode={bytecode}: the pipe's write must read the region through the second mapping, \
+             and its read must fill the region through it"
+        );
+    }
+}
+
 /// The **magic ring buffer** (§13's headline use of multi-offset aliasing), differentially on both
 /// backends: map the region at two *adjacent* window offsets `[0, g)` and `[g, 2g)` (both aliasing
 /// region `[0, g)`), then issue a single 8-byte store at `g - 4` — **straddling the seam**. Its low

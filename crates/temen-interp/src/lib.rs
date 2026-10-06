@@ -33603,28 +33603,29 @@ impl Mem {
             .all(|page| matches!(self.page_access(&space.prot, page), Some(w) if w || !write))
     }
 
-    /// Borrow-validate and read a `(ptr, len)` capability buffer (§7): every page of
-    /// `[ptr, ptr+len)` must be committed. Returns the bytes, or `None` (→ `-EFAULT`).
-    /// Confinement holds regardless; this explicit check is the recoverable guest-bug
-    /// path, not a safety boundary.
-    fn read_bytes_impl(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
-        if !self.range_committed(ptr, len, false) {
-            return None;
-        }
-        // `ptr` is guest-relative; `byte` indexes the (possibly parent-shared) backing absolutely.
-        let base = self.window.base();
-        Some((0..len).map(|k| self.byte(base + ptr + k)).collect())
+    /// Borrow-validate a `(ptr, len)` capability buffer (§7): every page of `[ptr, ptr+len)` must be
+    /// committed, and writable to `write` it. Returns where the buffer starts in the (possibly
+    /// parent-shared) backing, which is indexed absolutely, or `None` (→ `-EFAULT`). Confinement
+    /// holds regardless; this explicit check is the recoverable guest-bug path, not a safety boundary.
+    fn buffer(&self, ptr: u64, len: u64, write: bool) -> Option<u64> {
+        self.range_committed(ptr, len, write)
+            .then(|| self.window.base() + ptr)
     }
 
-    /// Borrow-validate and write a `(ptr, len)` capability buffer (§7): every page must be
-    /// committed and writable. `None` → `-EFAULT`.
+    /// Read a capability buffer ([`Mem::buffer`]) one relaxed atomic byte at a time, which stays
+    /// defined under the tree-walker's concurrent vCPUs. The bytecode engine copies in one go
+    /// ([`SoleMem`]).
+    fn read_bytes_impl(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let at = self.buffer(ptr, len, false)?;
+        Some((0..len).map(|k| self.byte(at + k)).collect())
+    }
+
+    /// Write a capability buffer ([`Mem::buffer`]) one relaxed atomic byte at a time; the mirror of
+    /// [`Mem::read_bytes_impl`].
     fn write_bytes_impl(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
-        if !self.range_committed(ptr, data.len() as u64, true) {
-            return None;
-        }
-        let base = self.window.base();
+        let at = self.buffer(ptr, data.len() as u64, true)?;
         for (k, b) in data.iter().enumerate() {
-            self.set_byte(base + ptr + k as u64, *b);
+            self.set_byte(at + k as u64, *b);
         }
         Some(())
     }
@@ -33840,7 +33841,8 @@ impl Mem {
 
     /// Write `bytes` at the backing-absolute `off`, as [`Self::set_byte`] would byte by byte: in one
     /// copy when no §13 region is mapped, since then no page is `Backed` and every byte writes
-    /// through to `back` (the [`Self::seed`] fast path).
+    /// through to `back`. The copy is not atomic, so the caller must be the window's only accessor:
+    /// a window being seeded or given an image, or the bytecode engine ([`SoleMem`]).
     fn write_run(&self, off: u64, bytes: &[u8]) {
         if !self.has_regions.load(Ordering::Relaxed) {
             self.back.write_from(off, bytes);
@@ -33849,6 +33851,17 @@ impl Mem {
         for (k, &b) in bytes.iter().enumerate() {
             self.set_byte(off + k as u64, b);
         }
+    }
+
+    /// Read `len` bytes at the backing-absolute `off`, as [`Self::byte`] would byte by byte; the
+    /// mirror of [`Self::write_run`], under the same only-accessor contract.
+    fn read_run(&self, off: u64, len: u64) -> Vec<u8> {
+        if !self.has_regions.load(Ordering::Relaxed) {
+            let mut out = vec![0; len as usize];
+            self.back.read_into(off, &mut out);
+            return out;
+        }
+        (0..len).map(|k| self.byte(off + k)).collect()
     }
 
     /// Materialize a module's data segments over the window whose image starts at the
@@ -33891,18 +33904,10 @@ impl Mem {
     /// (`ScheduledDebugRun::seed_mem`) rather than growing a second seeding path.
     pub(crate) fn seed(&mut self, init: &[u8]) {
         let n = (init.len() as u64).min(self.window.mapped()) as usize;
-        // Bulk fast path: with no §13 region mapped, no page is `Backed`, so the whole prefix writes
-        // straight through to `back` — one `memcpy` (flat) or a single-lock page-wise copy (`Paged`),
-        // instead of a lock + `BTreeMap` entry PER BYTE. `fork_private` (the hot 2 MB seed) always
-        // hits this — it refuses a fork over any region. The per-byte arm stays for the (currently
-        // unused) region-mapped case, matching `set_byte`'s slow path exactly.
-        if !self.has_regions.load(Ordering::Relaxed) {
-            self.back.write_from(0, &init[..n]);
-        } else {
-            for (i, &b) in init[..n].iter().enumerate() {
-                self.set_byte(i as u64, b);
-            }
-        }
+        // One `memcpy` (flat) or a single-lock page-wise copy (`Paged`) instead of a lock + `BTreeMap`
+        // entry per byte. `fork_private` (the hot 2 MB seed) always takes it: it refuses a fork over
+        // any region.
+        self.write_run(0, &init[..n]);
     }
 
     /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent). Reads are
@@ -33912,18 +33917,8 @@ impl Mem {
     /// (`base == 0`) this is identical to the old `byte(i)`. Fixes `fork_private` of a nested guest:
     /// the twin now inherits the carve's high-offset globals, not zeros (FORK.md §8.6).
     fn snapshot(&self, n: u64) -> Vec<u8> {
-        let n = n.min(self.window.mapped());
-        let base = self.window.base();
-        // Bulk fast path (mirror of `seed`): no §13 region ⇒ read the prefix straight from `back` in
-        // one pass (`memcpy` flat, single-lock page walk `Paged`) instead of a lock PER BYTE. The
-        // per-run window capture and `fork_private`'s `window_snapshot` both flow through here.
-        if !self.has_regions.load(Ordering::Relaxed) {
-            let mut out = vec![0u8; n as usize];
-            self.back.read_into(base, &mut out);
-            out
-        } else {
-            (0..n).map(|i| self.byte(base + i)).collect()
-        }
+        // The per-run window capture and `fork_private`'s `window_snapshot` both flow through here.
+        self.read_run(self.window.base(), n.min(self.window.mapped()))
     }
 
     /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)
@@ -34463,6 +34458,62 @@ impl GuestMem for Mem {
     /// so the two backends agree.
     fn page_size(&self) -> i64 {
         self.page as i64
+    }
+}
+
+/// The bytecode engine's view of its [`Mem`], which it hands to every host call (#2109). The call's
+/// guest buffers move in one copy ([`Mem::read_run`]/[`Mem::write_run`]) instead of one relaxed
+/// atomic per byte, which the `+atomics` browser build turns into a sequentially consistent
+/// `i32.atomic.store8` for every byte written. That is the contract the engine's loads, stores and
+/// `memory.copy` already rely on ([`Mem::load_scalar`], [`Mem::mem_copy_fast`]): nothing else
+/// touches the window while the engine runs. In its parallel driver the contract is that the guest
+/// does not race, so a host copy races only a guest that races on its own syscall buffer. The
+/// tree-walker hands host calls the `Mem` itself, whose copies stay per-byte atomics;
+/// `bytecode_diff` holds the two engines against each other. Every other op forwards unchanged.
+struct SoleMem<'a>(&'a mut Mem);
+
+impl GuestMem for SoleMem<'_> {
+    fn window_size(&self) -> u64 {
+        self.0.window_size()
+    }
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let at = self.0.buffer(ptr, len, false)?;
+        Some(self.0.read_run(at, len))
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let at = self.0.buffer(ptr, data.len() as u64, true)?;
+        self.0.write_run(at, data);
+        Some(())
+    }
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.0.map(offset, len, prot)
+    }
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        self.0.unmap(offset, len)
+    }
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        self.0.protect(offset, len, prot)
+    }
+    fn tail_bytes(&self, offset: u64, len: u64) -> TailBytes {
+        self.0.tail_bytes(offset, len)
+    }
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        self.0
+            .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn page_size(&self) -> i64 {
+        self.0.page_size()
+    }
+    fn region_page_size(&self) -> i64 {
+        self.0.region_page_size()
     }
 }
 

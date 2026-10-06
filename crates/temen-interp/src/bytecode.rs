@@ -11642,9 +11642,8 @@ fn gc_write(
     for w in roots.into_iter().take(cap) {
         bytes.extend_from_slice(&w.to_le_bytes());
     }
-    mem.as_mut()
-        .ok_or(Trap::Malformed)?
-        .write_bytes_impl(buf, &bytes)
+    super::SoleMem(mem.as_mut().ok_or(Trap::Malformed)?)
+        .write_bytes(buf, &bytes)
         .ok_or(Trap::MemoryFault)?;
     Ok(total)
 }
@@ -19409,7 +19408,8 @@ impl Vm {
                     // serves it only where its reads and writes can park), so it is serviced here.
                     if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == super::CAP_SELF_PIPE {
                         let fds = argv.first().copied().unwrap_or(0) as u64;
-                        let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                        let mut sole = mem.as_mut().map(super::SoleMem);
+                        let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
                         let r = host.with(|p| p.mint_pipe(fds, gm));
                         if !results.is_empty() {
                             self.regs[base + *dst as usize] = Reg::from_i64(r);
@@ -19490,7 +19490,9 @@ impl Vm {
                         pc += 1;
                         continue;
                     }
-                    let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
+                    // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
+                    let mut sole = mem.as_mut().map(super::SoleMem);
+                    let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut pending_id = None;
                     // #1173 — take this dispatch's PER-OP park/interrupt flags in the SAME lock scope
                     // as the dispatch that sets them. They live on the shared `Host`, and on the
