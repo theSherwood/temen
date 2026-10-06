@@ -14322,7 +14322,11 @@ fn lower_inline_asm(
     let t = String::from_utf8_lossy(&decoded);
     let t = t.trim();
     // Barriers + the PAUSE hint: no architectural effect for this guest → drop. Always `void`.
-    if t.is_empty() || t == "lock; addl $$0,0(%rsp)" || t == "rep; nop" || t == "pause" {
+    // A template that is only assembler comments (`# {}`, the value barrier `zeroize` and
+    // constant-time crypto put on a pointer) executes nothing either: its operands are inputs
+    // whose use only kept the optimizer's hands off them, and that optimizer has already run.
+    let comment = t.lines().all(|l| l.trim_start().starts_with('#'));
+    if t.is_empty() || comment || t == "lock; addl $$0,0(%rsp)" || t == "rep; nop" || t == "pause" {
         if c.dest.is_some() {
             return unsup(format!("inline-asm barrier with a result: {t:?}"));
         }
@@ -18265,6 +18269,23 @@ fn lower_narrow_atomic_cas(
     Ok((old32, masked_exp32))
 }
 
+/// #2138 — the pieces a 65..=128-bit integer's high part of `w` bits (above its low i64) moves through
+/// memory in: `(bit offset within it, width)`, widest first. `None` unless `w` is a whole number
+/// of bytes — what SROA folds an odd-sized struct tail into (`load i96` from `SocketAddr`, #775;
+/// `i104` across a Noise handshake's state).
+fn hi_pieces(w: u32) -> Option<Vec<(u32, u32)>> {
+    if w == 0 || w > 64 || !w.is_multiple_of(8) {
+        return None;
+    }
+    let (mut at, mut out) = (0, Vec::new());
+    while at < w {
+        let p = [64, 32, 16, 8].into_iter().find(|&p| p <= w - at)?;
+        out.push((at, p));
+        at += p;
+    }
+    Some(out)
+}
+
 /// I14 tier 3 — read an i128 operand as its `(lo, hi)` i64 parts. A local i128 is an `agg` pair
 /// `[lo, hi]` (built by `lower_i128`, `load i128`, …); a constant i128 below 2⁶⁴ materializes as
 /// `(value, 0)`. A cross-block i128 (no `agg` entry here) or a wide/negative i128 constant fails
@@ -18276,7 +18297,11 @@ fn i128_parts(ctx: &mut BlockCtx, op: &Operand) -> Result<(ValIdx, ValIdx), Erro
         }
     }
     if let Operand::ConstantOperand(c) = op {
-        if let Constant::Int { bits: 128, value } = c.as_ref() {
+        if let Constant::Int {
+            bits: 65..=128,
+            value,
+        } = c.as_ref()
+        {
             // Split the full 128-bit constant into its low/high `i64` limbs. Hardcoding `hi = 0` here
             // (the old code) silently dropped the high 64 bits of any constant ≥ 2⁶⁴ — a miscompile:
             // e.g. libbf's `udiv1norm` folds `2^126` as an i128 subtrahend, and a zero high limb turned
@@ -19142,10 +19167,16 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `agg` pair). The generic path below would `ctx.operand` the i128 value as a scalar and fail
         // ("value … not available in block"). clang emits this from a 16-byte copy or a `? :` /
         // accumulator on a 128-bit quantity — e.g. Postgres numeric `int2_accum`'s `sumX2`.
-        if matches!(
-            st.value.get_type(types).as_ref(),
-            Type::IntegerType { bits: 128 }
-        ) {
+        // Any 65..=128-bit width stores the same way, its high part in the pieces `load` reads
+        // it back from (`hi_pieces`).
+        let wide = match st.value.get_type(types).as_ref() {
+            Type::IntegerType { bits } if (65..=128).contains(bits) => Some(*bits),
+            _ => None,
+        };
+        if let Some(bits) = wide {
+            let Some(pieces) = hi_pieces(bits - 64) else {
+                return unsup(format!("store i{} (hi remainder {} bits)", bits, bits - 64));
+            };
             let addr = ctx.operand(&st.address)?;
             let (lo, hi) = i128_parts(ctx, &st.value)?;
             ctx.push_effect(Inst::Store {
@@ -19154,14 +19185,32 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 value: lo,
                 offset: 0,
             });
-            let c8 = ctx.const_i64(8);
-            let hi_addr = ctx.add_i64(addr, c8);
-            ctx.push_effect(Inst::Store {
-                op: temen_ir::StoreOp::I64,
-                addr: hi_addr,
-                value: hi,
-                offset: 0,
-            });
+            for (at, p) in pieces {
+                let op = match p {
+                    64 => temen_ir::StoreOp::I64,
+                    32 => temen_ir::StoreOp::I64_32,
+                    16 => temen_ir::StoreOp::I64_16,
+                    _ => temen_ir::StoreOp::I64_8,
+                };
+                let mut v = hi;
+                if at > 0 {
+                    let sh = ctx.const_i64(i64::from(at));
+                    v = ctx.push(Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::ShrU,
+                        a: hi,
+                        b: sh,
+                    });
+                }
+                let off = ctx.const_i64(8 + i64::from(at / 8));
+                let piece_addr = ctx.add_i64(addr, off);
+                ctx.push_effect(Inst::Store {
+                    op,
+                    addr: piece_addr,
+                    value: v,
+                    offset: 0,
+                });
+            }
             return Ok(());
         }
         let addr = ctx.operand(&st.address)?;
@@ -19625,12 +19674,8 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
     if let I::Load(l) = instr {
         if let Type::IntegerType { bits } = l.loaded_ty.as_ref() {
             if (65..=128).contains(bits) {
-                let hi_op = match bits - 64 {
-                    64 => temen_ir::LoadOp::I64,
-                    32 => temen_ir::LoadOp::I64_32U,
-                    16 => temen_ir::LoadOp::I64_16U,
-                    8 => temen_ir::LoadOp::I64_8U,
-                    w => return unsup(format!("load i{} (hi remainder {w} bits)", bits)),
+                let Some(pieces) = hi_pieces(bits - 64) else {
+                    return unsup(format!("load i{} (hi remainder {} bits)", bits, bits - 64));
                 };
                 let addr = ctx.operand(&l.address)?;
                 let lo = ctx.push(Inst::Load {
@@ -19638,13 +19683,43 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     addr,
                     offset: 0,
                 });
-                let c8 = ctx.const_i64(8);
-                let hi_addr = ctx.add_i64(addr, c8);
-                let hi = ctx.push(Inst::Load {
-                    op: hi_op,
-                    addr: hi_addr,
-                    offset: 0,
-                });
+                // The high part, zero-extended piece by piece: each piece loaded zero-extending
+                // and shifted to its place.
+                let mut hi = None;
+                for (at, p) in pieces {
+                    let op = match p {
+                        64 => temen_ir::LoadOp::I64,
+                        32 => temen_ir::LoadOp::I64_32U,
+                        16 => temen_ir::LoadOp::I64_16U,
+                        _ => temen_ir::LoadOp::I64_8U,
+                    };
+                    let off = ctx.const_i64(8 + i64::from(at / 8));
+                    let piece_addr = ctx.add_i64(addr, off);
+                    let mut v = ctx.push(Inst::Load {
+                        op,
+                        addr: piece_addr,
+                        offset: 0,
+                    });
+                    if at > 0 {
+                        let sh = ctx.const_i64(i64::from(at));
+                        v = ctx.push(Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Shl,
+                            a: v,
+                            b: sh,
+                        });
+                    }
+                    hi = Some(match hi {
+                        None => v,
+                        Some(h) => ctx.push(Inst::IntBin {
+                            ty: IntTy::I64,
+                            op: BinOp::Or,
+                            a: h,
+                            b: v,
+                        }),
+                    });
+                }
+                let hi = hi.expect("a whole byte or more");
                 if let Some(&vid) = ctx.s.name2id.get(&l.dest) {
                     ctx.agg.insert(vid, vec![lo, hi]);
                 }
@@ -19653,10 +19728,20 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
     }
     if let I::ICmp(x) = instr {
-        if matches!(
-            x.operand0.get_type(types).as_ref(),
-            Type::IntegerType { bits: 128 }
-        ) {
+        let wide = match x.operand0.get_type(types).as_ref() {
+            Type::IntegerType { bits } if (65..=128).contains(bits) => Some(*bits),
+            _ => None,
+        };
+        if let Some(bits) = wide {
+            // Narrower than 128, the pair is zero-extended: equality and the unsigned orders
+            // compare it exactly, but its sign bit is not bit 127, so a signed order fails closed.
+            let signed = matches!(
+                x.predicate,
+                IntPredicate::SLT | IntPredicate::SLE | IntPredicate::SGT | IntPredicate::SGE
+            );
+            if bits != 128 && signed {
+                return unsup(format!("signed icmp on i{bits}"));
+            }
             let (alo, ahi) = i128_parts(ctx, &x.operand0)?;
             let (blo, bhi) = i128_parts(ctx, &x.operand1)?;
             let r = i128_icmp(ctx, x.predicate, alo, ahi, blo, bhi);
