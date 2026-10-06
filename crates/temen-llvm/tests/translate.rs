@@ -14619,3 +14619,62 @@ define i64 @run() {
         other => panic!("expected Unsupported for a signed i104 icmp, got {other:?}"),
     }
 }
+
+/// #2146: a scalar funnel shift by a runtime amount, at `i64` and `i32`, matches LLVM's
+/// semantics: the amount taken modulo the width, and an amount of 0 (or the width) giving the
+/// unshifted operand. The amount reaches the shifting function as a parameter, so it is not a
+/// constant there.
+#[test]
+fn funnel_shift_by_a_runtime_amount() {
+    fn fsh(w: u32, left: bool, a: u64, b: u64, s: u64) -> u64 {
+        let mask = if w == 64 { u64::MAX } else { (1 << w) - 1 };
+        let (a, b, s) = (a & mask, b & mask, (s % w as u64) as u32);
+        let r = match (s, left) {
+            (0, true) => a,
+            (0, false) => b,
+            (s, true) => (a << s) | (b >> (w - s)),
+            (s, false) => (a << (w - s)) | (b >> s),
+        };
+        r & mask
+    }
+    let (a, b) = (0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210u64);
+    let amounts = [0u64, 1, 13, 31, 32, 33, 63, 64, 65, 200];
+    let mut body = String::new();
+    let mut want = 0u64;
+    let mut acc = String::from("0");
+    for (i, &s) in amounts.iter().enumerate() {
+        for (w, left) in [(64, true), (64, false), (32, true), (32, false)] {
+            let f = format!("{}{w}", if left { "l" } else { "r" });
+            let v = format!("%v{i}{f}");
+            if w == 64 {
+                body += &format!(
+                    "  {v} = call i64 @{f}(i64 {a}, i64 {b}, i64 {s})\n",
+                    a = a as i64,
+                    b = b as i64
+                );
+            } else {
+                body += &format!(
+                    "  {v}n = call i32 @{f}(i32 {a}, i32 {b}, i32 {s})\n  {v} = zext i32 {v}n to i64\n",
+                    a = a as u32 as i32,
+                    b = b as u32 as i32,
+                );
+            }
+            let m = format!("%m{i}{f}");
+            body += &format!("  {m} = mul i64 {acc}, 31\n  %a{i}{f} = xor i64 {m}, {v}\n");
+            acc = format!("%a{i}{f}");
+            want = want.wrapping_mul(31) ^ fsh(w, left, a, b, s);
+        }
+    }
+    let mut src = String::new();
+    for (w, op) in [(64, "fshl"), (64, "fshr"), (32, "fshl"), (32, "fshr")] {
+        let f = format!("{}{w}", &op[3..]);
+        src += &format!(
+            "define i{w} @{f}(i{w} %a, i{w} %b, i{w} %s) {{\n  %r = call i{w} @llvm.{op}.i{w}(i{w} %a, i{w} %b, i{w} %s)\n  ret i{w} %r\n}}\n"
+        );
+    }
+    src += &format!("define i64 @run() {{\n{body}  ret i64 {acc}\n}}\n");
+    for (w, op) in [(64, "fshl"), (64, "fshr"), (32, "fshl"), (32, "fshr")] {
+        src += &format!("declare i{w} @llvm.{op}.i{w}(i{w}, i{w}, i{w})\n");
+    }
+    assert_eq!(run_ll_i64("fsh_runtime", &src), want as i64);
+}

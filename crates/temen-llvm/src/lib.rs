@@ -14830,7 +14830,8 @@ fn lower_int_intrinsic(
         // no-shift operand) — both shift counts are then in `1..w`, no shift-by-`w` edge case — and the
         // result is masked back to `w` (a narrow value lives in a wider container). Found via Embench
         // `aha-mont64`'s `modul64` (`fshl.i64(hi, lo, 1)`) and `picojpeg` (`fshl.i16`). A non-constant
-        // amount (needs a width-edge-safe `select`) or a `33..63` width stays fail-closed.
+        // amount lowers at `i32`/`i64` with a width-edge `select` (#2146); a non-constant amount at a
+        // narrow width, or a `33..63` width, stays fail-closed.
         "llvm.fshl" | "llvm.fshr" => {
             let is_fshl = base == "llvm.fshl";
             let w = src_bits(args[0], types)?;
@@ -14846,9 +14847,50 @@ fn lower_int_intrinsic(
                     ));
                 }
                 let Some(c) = const_int(args[2]) else {
-                    return unsup(format!(
-                        "general funnel shift `{name}` (non-constant amount)"
-                    ));
+                    // #2146: a runtime amount at a full width (the container's), as the vector
+                    // path does per lane: `s = amt mod w`, both shifts, and a `select` on `s == 0`
+                    // for the width edge (the other shift is then by `w`, which temen-ir masks to
+                    // nothing; the select discards it). `ed25519-dalek`'s scalar multiplication
+                    // emits `fshr.i64` so. A narrow width would need its container masked too.
+                    if w != 32 && w != 64 {
+                        return unsup(format!(
+                            "general funnel shift `{name}` (non-constant amount, narrow i{w})"
+                        ));
+                    }
+                    let a = ctx.operand(args[0])?;
+                    let b = ctx.operand(args[1])?;
+                    let amt = ctx.operand(args[2])?;
+                    let kk = |ctx: &mut BlockCtx, n: i64| {
+                        if ty == IntTy::I64 {
+                            ctx.push(Inst::ConstI64(n))
+                        } else {
+                            ctx.push(Inst::ConstI32(n as i32))
+                        }
+                    };
+                    let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                        ctx.push(Inst::IntBin { ty, op, a, b })
+                    };
+                    let wmask = kk(ctx, w as i64 - 1);
+                    let s = bin(ctx, BinOp::And, amt, wmask);
+                    let wc = kk(ctx, w as i64);
+                    let comp = bin(ctx, BinOp::Sub, wc, s);
+                    let (lsh, rsh) = if is_fshl { (s, comp) } else { (comp, s) };
+                    let hi = bin(ctx, BinOp::Shl, a, lsh);
+                    let lo = bin(ctx, BinOp::ShrU, b, rsh);
+                    let comb = bin(ctx, BinOp::Or, hi, lo);
+                    let zero = kk(ctx, 0);
+                    let is_zero = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::Eq,
+                        a: s,
+                        b: zero,
+                    });
+                    let edge = if is_fshl { a } else { b };
+                    return Ok(Some(ctx.push(Inst::Select {
+                        cond: is_zero,
+                        a: edge,
+                        b: comb,
+                    })));
                 };
                 let s = (c % w as u64) as i64;
                 let a = ctx.operand(args[0])?;
