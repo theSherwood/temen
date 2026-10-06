@@ -28467,7 +28467,9 @@ impl Host {
     /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
     /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
     /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), and `"budget"`
-    /// (one `win` of `Budget.mem`, which pays for a child's growth as well as its window, #1909).
+    /// (one `win` of `Budget.mem`, which pays for a child's growth as well as its window, #1909). The
+    /// one-window ceiling is a grant tighter than the root's, which a guest sizes its child from
+    /// (owner, 2026-10-06, #2113).
     pub fn grant_detached_spawn_caps(&mut self, win: u64, by_module_handle: bool) {
         let Some(m) = self.self_module.clone() else {
             return;

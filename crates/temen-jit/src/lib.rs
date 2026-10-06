@@ -5654,6 +5654,12 @@ impl CompiledModule {
         self.live_fault_range.is_some()
     }
 
+    /// #2113 — the fuel cell this module's code charges, as [`Self::compile`] was handed it: what a
+    /// recompaction compiles the fresh module against, so the fresh code meters as the old did.
+    pub fn fuel_cell(&self) -> Option<*mut FuelCell> {
+        (!self.instance.fuel.is_null()).then_some(self.instance.fuel)
+    }
+
     /// The stable type id `ty` was interned under, or `None` if no unit this module compiled
     /// has mentioned it (as a function signature or a call-site type). Ids are append-only —
     /// once returned, an id never remaps — and id-equality coincides with structural equality

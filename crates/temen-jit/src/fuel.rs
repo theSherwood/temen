@@ -75,6 +75,19 @@ impl FuelCell {
         })
     }
 
+    /// #2113 — point a cell that compiled code keeps across runs (a compile-once program's) at the
+    /// chain its next run draws from: what the last draw left goes back to its chain first. `None`
+    /// detaches it, so code run before the next re-arm traps `OutOfFuel`. Only between runs: no
+    /// code may be charging the cell.
+    pub fn rearm(&mut self, src: Option<Arc<dyn BudgetNode>>) {
+        let slot = self.src.get_mut().unwrap_or_else(|e| e.into_inner());
+        let left = std::mem::take(&mut self.left);
+        if let Some(s) = slot.take() {
+            s.give_back(left);
+        }
+        *slot = src;
+    }
+
     /// What this cell's vCPUs can still burn: `left` plus the chain's room, `u64::MAX` unmetered.
     pub fn can_burn(&self) -> u64 {
         let left = unsafe { core::ptr::read_volatile(&self.left) };
