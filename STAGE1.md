@@ -334,7 +334,7 @@ anyway (the JIT is 1:1 OS-thread; a single-worker interp run has no thread to
 run the child ahead of the parent). The **portable idiom** is to loop `poll`
 (yielding the worker between probes) until non-zero; the **terminal** value is
 identical across backends — `1` returning, `2` trapping. That is now pinned by
-`crates/temen/tests/lifecycle_poll_convergence.rs` (interp vs JIT, both cases).
+`crates/temen/tests/lifecycle.rs` (interp vs JIT, both cases).
 See ISSUES.md I43. The `$?` = 128 + signal crash-status mapping is a shell/guest
 convention (not a substrate contract) and remains guest-personality work.
 
