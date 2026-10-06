@@ -215,6 +215,16 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   audited `unsafe`) instead of the scalar loop — same single-threaded-cooperative contract as
   `read_word`/`write_word`. The tree-walker keeps the scalar `mem_copy`/`mem_fill` as the
   independent oracle; the `temen-mem` Mapped/Shared-vs-Paged differential fuzzers cover the new ops.
+- **[done] Host-call buffer copies (#2109).** A host call that fills or drains a guest buffer (a
+  `read`, a `write`) copied it through `Mem`'s `GuestMem` impl one relaxed atomic byte at a time,
+  on both engines. The bytecode engine now hands host calls a `SoleMem` view of its `Mem`, which
+  copies with one `Region::read_into`/`write_from` (`Mem::read_run`/`write_run`; per byte through
+  the page map only once a §13 region is aliased), under the same single-threaded-cooperative
+  contract as `read_word`/`write_word`. The tree-walker keeps the per-byte copies. It matters most
+  in the `+atomics` browser build, where each relaxed byte store is a sequentially consistent
+  `i32.atomic.store8`. nimony's tools read their `.nif` inputs whole (the guest libc's `mmap` of a
+  file is an anonymous map and one `read`): in Chromium, `hexer d`'s 88 `mmap` calls went from
+  ~270 ms to ~40 ms per run, and a warm run from ~1.37 s to ~1.19 s.
 - **Success:** memory kernel drops toward the software floor; escape_oracle + shared_region +
   address_space still byte-identical.
 
