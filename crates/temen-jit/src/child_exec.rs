@@ -1072,14 +1072,14 @@ impl ChildExec {
                     }
                     true
                 } else if end_domain && !spared {
-                    // The stop word, which a `call.cap` does not reset (#2088). Never clobber a
-                    // stop already set.
-                    let _ = e.vm.stop.compare_exchange(
-                        0,
-                        crate::DOMAIN_DONE_CODE as i64,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
+                    // As `kill` ends a task: the stop word ends it at its next poll, whatever its
+                    // host calls do to the trap cell (#2088), and the trap cell ends a host-side
+                    // wait it re-checks (a serve loop's park). Never clobber either already set.
+                    let done = crate::DOMAIN_DONE_CODE as i64;
+                    for cell in [&e.vm.stop, &e.vm.trap] {
+                        let _ =
+                            cell.compare_exchange(0, done, Ordering::Relaxed, Ordering::Relaxed);
+                    }
                     true
                 } else {
                     false
