@@ -850,6 +850,9 @@ pub(crate) struct HostCursor {
     pub(crate) cap_consumed: usize,
     pub(crate) cap_record_len: usize,
     pub(crate) mem_mapped_bytes: u64,
+    /// #2113 — the host's half of its window's accounting ([`Host::grown`], [`Host::own_window`],
+    /// [`Host::main_vcpu`]): the tree an undo puts back holds the charges, these what they are for.
+    pub(crate) held: (u64, u64, bool),
     /// The `Jit` tables' [`compile_mark`](Host::jit_compile_mark) — not restored but compared: a
     /// `compile` adds a unit and a `JitCode` handle, which a cursor cannot take back, so an undo across
     /// one declines (#2015).
@@ -896,6 +899,9 @@ struct HostReplaySubstate {
     /// The memory growth-cap accounting at the checkpoint (slice 5) — without it, a restore
     /// would zero the count and the limit would go lenient after a seek.
     mem_mapped_bytes: u64,
+    /// #2113 — the host's half of its window's accounting, as [`HostCursor::held`]: the checkpoint's
+    /// tree holds the charges.
+    held: (u64, u64, bool),
     /// #1455 — each host capability's **own** declared state, positional over `host_procs`
     /// ([`Host::capture_cap_states`]). A checkpoint restores into a run whose powerbox was rebuilt from
     /// scratch, so a capability carrying guest-observable state of its own (an `fs` server's per-`open`
@@ -3229,7 +3235,12 @@ fn drive_over_cell(
     handoff: bool,
     jit_reapply: Vec<JitReapply>,
 ) -> TracedRun {
-    let mut root_fuel = Fuel::drawn(host_shared.lock_unpoisoned().begin_activation(*fuel));
+    let window = RootWindow::of(mem.as_ref());
+    let mut root_fuel = Fuel::drawn(
+        host_shared
+            .lock_unpoisoned()
+            .begin_activation(*fuel, window),
+    );
     if charge_entry {
         if let Err(t) = root_fuel.burn() {
             drop(root_fuel);
@@ -3849,7 +3860,7 @@ pub fn run_scheduled(
         s.live += 1;
         let dt = Arc::new(DomainTable::new(&funcs, 0)); // DPOR: no Jit install, natural table
         let mut host = Host::new();
-        let fuel = Fuel::drawn(host.begin_activation(fuel)); // #1944 slice 3
+        let fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref()))); // #1944 slice 3
         let mut root = Box::new(VCpu::new(
             funcs,
             types,
@@ -4638,7 +4649,7 @@ fn run_one_schedule(
         s.live += 1;
         let dt = Arc::new(DomainTable::new(funcs, 0)); // DPOR: no Jit install, natural table
         let mut host = Host::new();
-        let fuel = Fuel::drawn(host.begin_activation(fuel)); // #1944 slice 3
+        let fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref()))); // #1944 slice 3
         let mut root = VCpu::new(
             Arc::clone(funcs),
             Arc::clone(types),
@@ -20113,6 +20124,33 @@ pub const DEFAULT_CHANNEL: u64 = 64 << 30;
 /// #2113 — the root's `spawn` grant when its embedder names none: [`MAX_VCPUS`] live vCPUs.
 pub const DEFAULT_SPAWN: u64 = MAX_VCPUS as u64;
 
+/// #2113 — the window a run's root opens an activation over ([`Host::begin_activation`]), as the
+/// run's own node pays for it: `declared` bytes, and `grown` past them that it holds committed as its
+/// own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootWindow {
+    pub declared: u64,
+    pub grown: u64,
+}
+
+impl RootWindow {
+    /// A fresh run of `m`: its declared memory, nothing grown yet.
+    pub fn fresh(m: &Module) -> RootWindow {
+        RootWindow {
+            declared: m.memory.map_or(0, |mc| 1 << mc.size_log2),
+            grown: 0,
+        }
+    }
+
+    /// What `mem` holds: nothing for a run with no window.
+    pub(crate) fn of(mem: Option<&Mem>) -> RootWindow {
+        mem.map_or(RootWindow::default(), |m| RootWindow {
+            declared: m.window.mapped(),
+            grown: m.tail_bytes(0, m.window.reserved()).held,
+        })
+    }
+}
+
 impl Default for BudgetTree {
     /// A run's tree, holding its root node ([`BudgetTree::RUN_NODE`]): the run's own, holding the
     /// default grant ([`DEFAULT_MEM`], [`DEFAULT_CHANNEL`], [`DEFAULT_SPAWN`]) until its embedder sets
@@ -21854,7 +21892,7 @@ pub(crate) struct ChildPowerbox {
     attestation: Attestation,
     durable: bool,
     own_budget: u32,
-    grown: Option<u64>,
+    grown: u64,
     lane_cap: i64,
 }
 
@@ -22857,17 +22895,20 @@ pub struct Host {
     /// so an activation's fuel limit bounds the whole tree; a detached child's is the budget that paid
     /// for it ([`Host::give_child_budget`]); a fork twin shares its spawner's.
     own_budget: u32,
-    /// #1909, INVARIANTS #3 R2 — what this domain's window holds committed past its declared size,
-    /// charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the window
-    /// goes ([`Host::release_memory`]). `None` for a window no budget paid for (a run's root), whose
-    /// growth is unmetered.
-    grown: Option<u64>,
+    /// #1909, #2113, INVARIANTS #3 R2 — what this domain's window holds committed past its declared
+    /// size, charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the
+    /// window goes ([`Host::release_memory`]).
+    grown: u64,
     /// #2106 — the declared window this domain pays for itself, charged to `own_budget` and every
-    /// ancestor when the domain is made and handed back with its growth: a fork twin's copy of its
-    /// parent's window, a spawned process's fresh one ([`Host::process_powerbox`]). `0` for a detached
-    /// child, whose window its admission lease pays for, and for an unmetered root. An exec keeps it,
-    /// as the image's window is the caller's size.
+    /// ancestor and handed back with its growth: a run's root's, from when an activation opens
+    /// ([`Host::begin_activation`], #2113), a fork twin's copy of its parent's window, a spawned
+    /// process's fresh one ([`Host::process_powerbox`]). `0` for a detached child, whose window its
+    /// admission lease pays for. An exec keeps it, as the image's window is the caller's size.
     own_window: u64,
+    /// #2113 — whether `own_budget` holds the one `spawn` of a run's root main vCPU, charged when an
+    /// activation opens ([`Host::begin_activation`]) and handed back with the window. A detached
+    /// child's first vCPU rides its admission lease instead.
+    main_vcpu: bool,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -23658,8 +23699,9 @@ impl Host {
             realias: Vec::new(),
             budgets: Arc::default(),
             own_budget: BudgetTree::RUN_NODE,
-            grown: None,
+            grown: 0,
             own_window: 0,
+            main_vcpu: false,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
@@ -23768,7 +23810,7 @@ impl Host {
     /// tail past them, so the twin pays for both ([`Self::process_powerbox`]): a level without the
     /// room refuses the fork, as a full `spawn` ceiling does.
     fn fork_powerbox(&self, twin_pid: u64, window: u64) -> Option<Host> {
-        self.process_powerbox(twin_pid, window, self.grown.unwrap_or(0))
+        self.process_powerbox(twin_pid, window, self.grown)
     }
 
     /// #2106, INVARIANTS #3 R2 — [`Self::powerbox_copy`] for a new process whose window starts with
@@ -23776,31 +23818,24 @@ impl Host {
     /// pays for it: charged to the node it shares with this domain and every ancestor, all or nothing,
     /// before any fork factory runs, so a refusal registers no process. It goes back when the process
     /// ends ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or
-    /// the powerbox cannot be duplicated. A process of an unmetered domain (a run's root) is
-    /// unmetered too.
+    /// the powerbox cannot be duplicated.
     fn process_powerbox(&self, pid: u64, window: u64, grown: u64) -> Option<Host> {
-        let charge = self.grown.map(|_| window + grown);
-        if let Some(c) = charge {
-            if !self.budgets.charge(self.own_budget, BUDGET_MEM, c) {
-                return None;
-            }
+        let charge = window + grown;
+        if !self.budgets.charge(self.own_budget, BUDGET_MEM, charge) {
+            return None;
         }
         let Some(mut twin) = self.powerbox_copy(pid) else {
-            if let Some(c) = charge {
-                self.budgets.refund(self.own_budget, BUDGET_MEM, c);
-            }
+            self.budgets.refund(self.own_budget, BUDGET_MEM, charge);
             return None;
         };
-        if charge.is_some() {
-            twin.own_window = window;
-            twin.grown = Some(grown);
-        }
+        twin.own_window = window;
+        twin.grown = grown;
         Some(twin)
     }
 
     /// [`Self::process_powerbox`]'s powerbox duplicate, before the window it rides with is known: a
     /// fork copies this domain's window, a spawn ([`Self::spawn_powerbox`]) builds a fresh one. Either
-    /// way the copy is metered when this domain is (#1909), with nothing held yet.
+    /// way the copy holds nothing yet (#1909).
     fn powerbox_copy(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
@@ -23992,7 +24027,6 @@ impl Host {
         // nodes and both charge the same chains, as a forked process stays in its cgroup.
         twin.budgets = Arc::clone(&self.budgets);
         twin.own_budget = self.own_budget;
-        twin.grown = self.grown.map(|_| 0);
         // Structural intern / import binding tables ride along (same program surface).
         twin.iface_intern = self.iface_intern.clone();
         twin.import_remaps = self.import_remaps.clone();
@@ -24940,7 +24974,7 @@ impl Host {
             .and_then(|h| host.budget_node(h))
         {
             host.own_budget = node;
-            host.grown = Some(window.grown_bytes());
+            host.grown = window.grown_bytes();
         }
         let bound = if launch.same_module {
             host.bind_same_module_manifest(&g.imports, &g.types)
@@ -25180,6 +25214,7 @@ impl Host {
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
             mem_mapped_bytes: self.mem_mapped_bytes,
+            held: (self.grown, self.own_window, self.main_vcpu),
             jit_mark: self.jit_compile_mark(),
         }
     }
@@ -25216,6 +25251,7 @@ impl Host {
             rec.truncate(c.cap_record_len);
         }
         self.mem_mapped_bytes = c.mem_mapped_bytes;
+        (self.grown, self.own_window, self.main_vcpu) = c.held;
     }
 
     /// Whether this host's run-mutable state is invertible by a [`HostCursor`] alone — the journal's
@@ -25287,6 +25323,7 @@ impl Host {
             svc_next_ticket,
             cap_states: self.capture_cap_states(),
             mem_mapped_bytes: self.mem_mapped_bytes,
+            held: (self.grown, self.own_window, self.main_vcpu),
             jit_quota: self
                 .jit_tables
                 .iter()
@@ -25329,6 +25366,7 @@ impl Host {
             s.svc_next_ticket,
         );
         self.mem_mapped_bytes = s.mem_mapped_bytes;
+        (self.grown, self.own_window, self.main_vcpu) = s.held;
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
         // as a fresh powerbox minted them. Under a replaying tape too: a replay re-runs such a
@@ -26811,8 +26849,6 @@ impl Host {
         if let Some(node) = self.budget_node(budget) {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
-            // #1909 — the budget that paid for the window pays for its growth too.
-            child.grown = Some(0);
             if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
                 child.cap_names.insert(0, ("budget".to_string(), h));
             }
@@ -26826,7 +26862,8 @@ impl Host {
     /// nothing: `-ENOMEM`, with no page changed, when a level lacks the room. After the op the charge
     /// is settled to what the window actually holds there, so a page already held costs nothing and a
     /// page given back (unmapped, or aliased to a region) is refunded; one protected to nothing keeps
-    /// its contents, and its charge. A window no budget paid for grows unmetered.
+    /// its contents, and its charge. A run's root's window is metered against the run's own node, its
+    /// embedder's grant (#2113).
     fn page_op(
         &mut self,
         mem: &mut dyn GuestMem,
@@ -26835,9 +26872,7 @@ impl Host {
         commits: Commits,
         op: impl FnOnce(&Host, &mut dyn GuestMem) -> i64,
     ) -> i64 {
-        let Some(grown) = self.grown else {
-            return op(self, mem);
-        };
+        let grown = self.grown;
         let before = mem.tail_bytes(off, len);
         let held = before.held;
         let worst = match commits {
@@ -26859,7 +26894,7 @@ impl Host {
         if back > 0 {
             self.budgets.refund(self.own_budget, BUDGET_MEM, back);
         }
-        self.grown = Some(now);
+        self.grown = now;
         r
     }
 
@@ -26867,28 +26902,44 @@ impl Host {
     /// image): what its window held goes back to its node and every ancestor — what it grew past its
     /// declared size, and the declared window itself when the domain paid for it
     /// ([`Self::own_window`]), as a detached child's goes back with its lease (INVARIANTS #3: ending
-    /// a use refunds every level). And it lets go of the regions it holds: one no other domain holds
-    /// goes, and its charge with it ([`ChargedRegion`]). Never on a freeze: a captured window stays
-    /// charged, and the thaw takes the charge over ([`Host::prepare_detached_relaunch`]). A window no
-    /// budget paid for (a run's root) is its embedder's, regions and all: the embedder reads it after
-    /// the run, and a reactor's next call finds its regions where they were (#2113 meters the root).
+    /// a use refunds every level). A run's root's main vCPU goes back with its window (#2113). And it
+    /// lets go of the regions it holds: one no other domain holds goes, and its charge with it
+    /// ([`ChargedRegion`]). Never on a freeze: a captured window stays charged, and the thaw takes the
+    /// charge over ([`Host::prepare_detached_relaunch`]). A domain on the run's own node (a run's
+    /// root, and its processes) keeps its regions for the embedder: it reads them after the run, and
+    /// a reactor's next call finds them where they were.
     pub fn release_memory(&mut self) {
-        if let Some(g) = self.grown {
-            let held = g + std::mem::take(&mut self.own_window);
-            if held > 0 {
-                self.budgets.refund(self.own_budget, BUDGET_MEM, held);
-            }
-            self.grown = Some(0);
+        let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
+        if held > 0 {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, held);
+        }
+        if std::mem::take(&mut self.main_vcpu) {
+            self.budgets.refund(self.own_budget, BUDGET_SPAWN, 1);
+        }
+        if self.own_budget != BudgetTree::RUN_NODE {
             self.regions.clear();
         }
     }
 
-    /// #1944 slice 3 — open an activation of this domain with `fuel` to burn: its own node's fuel room
-    /// becomes `fuel` (unbounded when `fuel` does not fit a ceiling — `u64::MAX` by convention),
-    /// whatever earlier activations burned, so a reactor call or a thaw starts with the limit its
-    /// embedder passes. Returns the node its vCPUs draw from.
-    pub fn begin_activation(&mut self, fuel: u64) -> NodeRef {
+    /// #1944 slice 3, #2113 — open an activation of the run this domain roots, over `window`, with
+    /// `fuel` to burn: its own node's fuel room becomes `fuel` (unbounded when `fuel` does not fit a
+    /// ceiling — `u64::MAX` by convention), whatever earlier activations burned, so a reactor call or
+    /// a thaw starts with the limit its embedder passes. The root's window and its main vCPU are its
+    /// own node's, as a child's are its budget's: charged past any ceiling, since they are what its
+    /// embedder chose to run, so a grant they exceed leaves the run room for nothing more. What an
+    /// earlier activation's window held goes back first. Returns the node its vCPUs draw from.
+    pub fn begin_activation(&mut self, fuel: u64, window: RootWindow) -> NodeRef {
         self.budgets.set_fuel_room(self.own_budget, fuel);
+        let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
+        if held > 0 {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, held);
+        }
+        self.budgets
+            .force_charge(self.own_budget, BUDGET_MEM, window.declared + window.grown);
+        (self.own_window, self.grown) = (window.declared, window.grown);
+        if !std::mem::replace(&mut self.main_vcpu, true) {
+            self.budgets.force_charge(self.own_budget, BUDGET_SPAWN, 1);
+        }
         self.own_node()
     }
 
@@ -30483,9 +30534,6 @@ impl Host {
         // cannot exec its way out of the budget that caps it.
         host.budgets = Arc::clone(&self.budgets);
         host.own_budget = self.own_budget;
-        // #1909 — the image starts in a fresh window, with nothing grown yet, metered as the old one
-        // was.
-        host.grown = self.grown.map(|_| 0);
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
@@ -30496,8 +30544,9 @@ impl Host {
         )
         .map_err(|()| EINVAL)?;
         // #2106 — committed: the window is the caller's size, so a declared window the domain paid
-        // for itself stays paid for.
+        // for itself stays paid for, as a root's main vCPU stays charged (#2113).
         host.own_window = std::mem::take(&mut self.own_window);
+        host.main_vcpu = std::mem::take(&mut self.main_vcpu);
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
@@ -35196,7 +35245,8 @@ mod growth_tests {
     //! #1909, #2106 — the memory a window holds is charged to the budget that paid for it, wherever
     //! the window goes: a detached window's growth past its declared size, a fork twin's copy of its
     //! parent's window, a spawned process's fresh one. An exec's fresh window hands back the growth of
-    //! the one it replaces and keeps paying for its declared size.
+    //! the one it replaces and keeps paying for its declared size. #2113 — a run's root pays its own
+    //! node, the embedder's grant, as a child pays its budget.
     use super::*;
 
     const GROWTH: u64 = 1 << 16;
@@ -35270,7 +35320,7 @@ mod growth_tests {
         let mut process = child
             .spawn_powerbox(7, SpawnPlan(Box::new(())), WINDOW)
             .expect("the window fits");
-        assert_eq!(process.grown, Some(0), "it starts with nothing grown");
+        assert_eq!(process.grown, 0, "it starts with nothing grown");
         assert_eq!(
             used(&parent, node),
             (WINDOW + GROWTH) as i64,
@@ -35307,11 +35357,7 @@ mod growth_tests {
             0,
             "the replaced window's growth is back"
         );
-        assert_eq!(
-            image.host.grown,
-            Some(0),
-            "the new image is metered, holding none"
-        );
+        assert_eq!(image.host.grown, 0, "the new image holds none");
     }
 
     #[test]
@@ -35355,6 +35401,76 @@ mod growth_tests {
             used(&parent, node),
             GROWTH as i64,
             "the grown page kept its contents: still charged"
+        );
+    }
+
+    /// A run's root granted `mem` bytes, its activation open over [`WINDOW`]: `(root, its window, its
+    /// AddressSpace)`.
+    fn root(mem: i64) -> (Host, Mem, i32) {
+        let mut root = Host::new();
+        root.set_grant(mem, -1, -1);
+        let (_, space) = root.grant_starter_caps(1 << 20);
+        let mem = Mem::with_reservation(20, 16, None);
+        let window = RootWindow::of(Some(&mem));
+        assert_eq!(window.declared, WINDOW);
+        let _ = root.begin_activation(u64::MAX, window);
+        (root, mem, space)
+    }
+
+    /// #2113 — an activation charges the root's window and its main vCPU to the run's own node, past
+    /// any ceiling; a second settles to the window it runs over, and the root's end hands both back.
+    #[test]
+    fn a_roots_activation_charges_its_window_and_main_vcpu() {
+        let (mut root, ..) = root(1);
+        let run = BudgetTree::RUN_NODE;
+        assert_eq!(used(&root, run), WINDOW as i64, "past the 1-byte grant");
+        assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 1, "its main vCPU");
+        let wider = RootWindow {
+            declared: 2 * WINDOW,
+            grown: GROWTH,
+        };
+        let _ = root.begin_activation(u64::MAX, wider);
+        assert_eq!(
+            used(&root, run),
+            (2 * WINDOW + GROWTH) as i64,
+            "the next activation's window, in place of the last"
+        );
+        assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 1, "still one");
+        root.release_memory();
+        assert_eq!(used(&root, run), 0, "the root's end hands its window back");
+        assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 0, "and its vCPU");
+    }
+
+    /// #2113 — the root's growth spends its grant: past it, `map` is `-ENOMEM`.
+    #[test]
+    fn a_roots_growth_spends_its_grant() {
+        let (mut root, mut mem, space) = root((WINDOW + GROWTH) as i64);
+        let mut grow = |at: u64| {
+            let args = [at as i64, GROWTH as i64, (PROT_READ | PROT_WRITE) as i64];
+            root.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 0, space, &args, Some(&mut mem))
+        };
+        assert_eq!(grow(WINDOW), Ok(vec![0]), "the growth fits the grant");
+        assert_eq!(grow(WINDOW + GROWTH), Ok(vec![ENOMEM]), "past it");
+        assert_eq!(used(&root, BudgetTree::RUN_NODE), (WINDOW + GROWTH) as i64);
+    }
+
+    /// #2113 — a root's fork twin pays for its copy from the root's grant, as a child's twin pays
+    /// from its budget, and its end hands it back.
+    #[test]
+    fn a_roots_fork_twin_pays_from_the_roots_grant() {
+        let (root, ..) = root(2 * WINDOW as i64);
+        let mut twin = root.fork_powerbox(2, WINDOW).expect("the copy fits");
+        let run = BudgetTree::RUN_NODE;
+        assert_eq!(used(&root, run), 2 * WINDOW as i64, "the twin's copy");
+        assert!(
+            root.fork_powerbox(3, WINDOW).is_none(),
+            "no room for another"
+        );
+        twin.release_memory();
+        assert_eq!(
+            used(&root, run),
+            WINDOW as i64,
+            "the twin's end hands it back"
         );
     }
 }

@@ -244,7 +244,7 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
 fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() {
     let mut h = Host::new();
     assert_eq!(h.own_node().draw(), None, "no activation yet: unbounded");
-    let mut fuel = Fuel::drawn(h.begin_activation(10));
+    let mut fuel = Fuel::drawn(h.begin_activation(10, RootWindow::default()));
     for _ in 0..4 {
         fuel.burn().expect("room left");
     }
@@ -254,14 +254,14 @@ fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() 
         6,
         "read back once the vCPU handed back its rest"
     );
-    let src = h.begin_activation(10);
+    let src = h.begin_activation(10, RootWindow::default());
     assert_eq!(
         h.fuel_left(),
         10,
         "a new activation starts with its own limit"
     );
     assert_eq!(src.draw(), Some(5));
-    let _ = h.begin_activation(u64::MAX);
+    let _ = h.begin_activation(u64::MAX, RootWindow::default());
     assert_eq!(h.fuel_left(), u64::MAX, "u64::MAX: unbounded");
     let mut fuel = Fuel::drawn(h.own_node());
     fuel.burn().expect("unmetered");
@@ -278,7 +278,7 @@ fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() 
 fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
     let mut h = Host::new();
     let b = h.grant_budget(-1, -1, -1);
-    let mut root = Fuel::drawn(h.begin_activation(10));
+    let mut root = Fuel::drawn(h.begin_activation(10, RootWindow::default()));
     root.burn().expect("room left"); // draws 5 of the activation's 10
     assert_eq!(
         fuel_room(&mut h, b),

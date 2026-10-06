@@ -892,7 +892,7 @@ fn demo_jit_threads_runs() {
     all(windows, target_arch = "x86_64")
 ))]
 #[test]
-fn quota_contains_a_powerbox_thread_bomb() {
+fn the_spawn_grant_contains_a_powerbox_thread_bomb() {
     // A powerbox entry (paramless exported `_start`) that just spawns a vCPU and returns.
     let src = "memory 16\n\
         export 0 func \"_start\" 0\n\
@@ -911,9 +911,9 @@ fn quota_contains_a_powerbox_thread_bomb() {
         }\n";
     let m = load(src);
 
-    // No `spawn` past the root's own vCPU: the spawn detect-and-kills (Err).
+    // `spawn` for the root's own vCPU and no more: the spawn detect-and-kills (Err).
     let tight = Limits {
-        spawn: Some(0),
+        spawn: Some(1),
         ..Limits::default()
     };
     let r = run_powerbox_cfg(&m, b"", &[], &[], tight);

@@ -380,7 +380,8 @@ fn print_usage() {
          \n                 streams live (a REPL guest is live); the default on a terminal\n\
          \n  env: TEMEN_DEADLINE_MS (kill a runaway guest after N ms),\n\
          \n       TEMEN_FUEL / TEMEN_MEM / TEMEN_CHANNEL / TEMEN_SPAWN (the run's grant: fuel,\n\
-         \n       bytes of memory and of pipe buffers, live vCPUs; each unset is the default).\n\
+         \n       bytes of memory and of pipe buffers, live vCPUs with the root's own; each unset\n\
+         \n       is the default).\n\
          \n\
          \nlink (D-LINK): statically link units into one runnable module.\n\
          \n  temen-run --link <unit.temt|.temeno|.temen>... [-o OUT.temen | --emit-text]\n\

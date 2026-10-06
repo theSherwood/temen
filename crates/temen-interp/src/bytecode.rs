@@ -52,8 +52,8 @@ use temen_ir::{
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
-    LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue,
-    WindowSpec, DEFAULT_RESERVED_LOG2,
+    LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow, Trap, Value,
+    VarValue, WindowSpec, DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -2889,7 +2889,7 @@ pub fn compile_and_run_with_host_traced(
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     // #1944 slice 3 — an activation of `host`: the root draws its fuel from the host's own node.
-    let mut vfuel = Fuel::drawn(host.begin_activation(*fuel));
+    let mut vfuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
     let r = loop {
         match vm.resume(
             &dom.source,
@@ -3310,7 +3310,7 @@ impl SharedProgram {
             mm
         });
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel));
+        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         Ok(CoopRun {
             dom,
@@ -3999,6 +3999,10 @@ pub struct Vcpu<'p> {
     pending_lease: Option<(i32, u64)>,
     /// #2001 — the just-spawned thread's `spawn` on this vCPU's domain node, filed with its child.
     pending_live: LiveVcpu,
+    /// #2113 — a root's window, which it opens its run's activation over at its first
+    /// [`run`](Self::run): its powerbox's own node pays for it and the root's main vCPU
+    /// ([`Host::begin_activation`]). `None` for a child, and once opened.
+    opens: Option<RootWindow>,
     /// The child whose join is in flight, whose charges go back on
     /// [`deliver_join`](Self::deliver_join).
     joining: Option<VcpuChild>,
@@ -4282,6 +4286,7 @@ impl<'p> Vcpu<'p> {
         Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
 
+    /// A root vCPU over `mem`, which it opens its activation over at its first [`run`](Self::run).
     fn with_mem(
         prog: &'p VcpuProgram,
         func: u32,
@@ -4289,7 +4294,8 @@ impl<'p> Vcpu<'p> {
         mem: Option<Mem>,
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
-        Vcpu::with_mem_in(prog, 0, func, args, mem, host)
+        let opens = Some(RootWindow::of(mem.as_ref()));
+        Vcpu::with_mem_in(prog, 0, func, args, mem, host).map(|v| Vcpu { opens, ..v })
     }
 
     fn with_mem_in(
@@ -4337,6 +4343,7 @@ impl<'p> Vcpu<'p> {
             children: Vec::new(),
             pending_lease: None,
             pending_live: LiveVcpu::none(),
+            opens: None,
             joining: None,
             join_wait: None,
         })
@@ -4391,6 +4398,7 @@ impl<'p> Vcpu<'p> {
             children: Vec::new(),
             pending_lease: None,
             pending_live: LiveVcpu::none(),
+            opens: None,
             joining: None,
             join_wait: None,
         })
@@ -4543,6 +4551,13 @@ impl<'p> Vcpu<'p> {
     /// cooperative scheduler ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`])
     /// flattens them.
     pub fn run(&mut self) -> VcpuEvent {
+        if let Some(window) = self.opens.take() {
+            // Unmetered fuel: this engine's vCPUs burn a fixed allowance.
+            match self.shared_host {
+                Some(m) => m.lock_unpoisoned().begin_activation(u64::MAX, window),
+                None => self.host.begin_activation(u64::MAX, window),
+            };
+        }
         let ev = self.run_to_event();
         // #1909 — a §14 child's main vCPU ending ends its domain: what its window grew goes back to
         // the budget that paid for it, as the tree-walker's domain finish hands it back. Not when it
@@ -8798,6 +8813,10 @@ impl ScheduledDebugRun {
         let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
         let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
         let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
+        // #2113 — the run's window and main vCPU, charged to the powerbox's own node. The debugger
+        // lends its fuel per resume.
+        let mut host = host;
+        let _ = host.begin_activation(u64::MAX, RootWindow::of(mem.as_ref()));
         Some(ScheduledDebugRun {
             source,
             table,
@@ -13656,7 +13675,7 @@ fn drive(
 ) -> Result<Vec<Value>, Trap> {
     // #1944 slice 3 — an activation of `host`: the root and its threads draw from the host's own
     // node, and `fuel` reads back the room left once every task has handed back what it did not burn.
-    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel));
+    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
     let r = (|| {
         // The native driver never enables tier-up (no eligibility bitmap), so `pump` runs the whole
         // schedule and returns `Done`; a `TierUp` yield is impossible here.
@@ -16618,7 +16637,7 @@ impl CoopRun {
             .and_then(|t| t.leaf.as_ref())
             .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel));
+        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         sched.root_leaf = root_leaf;
         Ok(CoopRun {
@@ -16650,7 +16669,7 @@ impl CoopRun {
             .and_then(|t| t.leaf.as_ref())
             .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel));
+        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
         let mut sched =
             match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup) {
                 Ok(s) => s,
@@ -17802,7 +17821,7 @@ fn drive_parallel(
     };
     // #1944 slice 3 — an activation of `host`: every vCPU thread draws from the host's own node, and
     // `fuel` reads back the room left once each has handed back what it did not burn.
-    let root_fuel = Fuel::drawn(host.begin_activation(*fuel));
+    let root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
     let reg = ThreadRegistry::new();
     // Share the caller's powerbox across every vCPU thread, then hand it back (so the caller reads its
     // stdout / final state). `Arc` (not a scope-borrowed `&Mutex`) because a personality fork twin

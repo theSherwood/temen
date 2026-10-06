@@ -2458,6 +2458,11 @@ child's grants is exactly the party positioned to observe their use.
   readout, so a parent can also act: tighten a quota, revoke a `SharedRegion`,
   cut a fuel budget, or kill the child (the §5 detect-and-kill path, available to
   a parent over its own children via the lifecycle capability).
+- **The root is the embedder's child (#2113).** The embedder grants a run the
+  ceilings of the run's own budget node (`temen_run::Limits`: fuel, `mem`,
+  `channel`, `spawn`; large defaults when it names none), and the root is charged
+  to that node as a child is to its budget: its window and main vCPU, then all it
+  makes. No code can use more than the grant above it (INVARIANTS #3).
 
 ### Per-resource readouts (all read off structures the parent already owns)
 vCPU/core-time + scheduling stats vs quota; resident/mapped memory vs window +

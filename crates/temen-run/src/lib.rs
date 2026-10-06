@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
-    GuestMem, Host, HostProc, RegionBacking, StreamRole, Trap,
+    GuestMem, Host, HostProc, RegionBacking, RootWindow, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -1705,6 +1705,17 @@ pub fn jit_cap_run(
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
+    // #1944 slice 3, #2113 — an activation of the run `host` roots, as `jit_run`'s: the default fuel,
+    // and its window (with what `init` grew) and main vCPU charged to its node.
+    let window = RootWindow {
+        grown: init.page_map().grown_bytes(),
+        ..RootWindow::fresh(m)
+    };
+    let node = host.begin_activation(temen_interp::DEFAULT_FUEL, window);
+    let mut root_fuel = temen_jit::FuelCell::metering(Arc::new(HostNode(node)));
+    let fuel = root_fuel
+        .as_deref_mut()
+        .map(|c| c as *mut temen_jit::FuelCell);
     let restore = jit_restore_prots(m, host, init);
     // #2025 — an `init` that names §13 pages has them aliased back onto their regions.
     let realias = host.has_premap();
@@ -1739,8 +1750,8 @@ pub fn jit_cap_run(
             None,                         // sub
             Some(module_resolver_locked), // §14 module children resolve their `Module` grant
             None,                         // interrupt
-            None,                         // fuel
-            None,                         // fast_resolver
+            fuel,
+            None, // fast_resolver
             node,
             table_reserve_log2,
         )?;
@@ -1800,8 +1811,8 @@ pub fn jit_cap_run(
         None,                  // sub
         Some(module_resolver), // §14 module children resolve their `Module` grant
         None,                  // interrupt
-        None,                  // fuel
-        None,                  // fast_resolver
+        fuel,
+        None, // fast_resolver
         run_node(host),
         table_reserve_log2,
     )?;
@@ -2557,10 +2568,13 @@ impl JitSession {
     /// serialize through the session's `Mutex<Host>`).
     pub fn run_prompt(&mut self, args: &[i64]) -> Result<JitOutcome, temen_jit::JitError> {
         let cm_ptr: *mut CompiledModule = &mut self.cm;
-        self.host
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_jit_native_ctx(cm_ptr as usize);
+        {
+            let mut h = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            // #2113 — each prompt is an activation over a fresh window: the session's node pays for
+            // it and its main vCPU. Its code meters no fuel.
+            h.begin_activation(u64::MAX, RootWindow::fresh(&self.base));
+            h.set_jit_native_ctx(cm_ptr as usize);
+        }
         // SAFETY: `cm_ptr` is the only pointer used for this run and the one the thunk's handlers
         // re-enter through (registered above); the run's vCPU threads serialize their `call.cap`s
         // through the session's `Mutex<Host>`; `self.cm` is not moved during the call (we hold
@@ -5454,6 +5468,9 @@ impl PowerboxProgram {
         *self.host = Host::new();
         self.host.stdin = stdin.to_vec();
         self.inst.grant_caps(&mut self.host, self.win);
+        // #2113 — the run's window and main vCPU, charged to its node. The cached code meters no fuel.
+        self.host
+            .begin_activation(u64::MAX, RootWindow::fresh(&self.inst.module));
         // No argv/env buffer: the cached path serves the plain compute powerbox (stdin in, stdout
         // out), exactly like `run_powerbox`, which passes no args. `run_raw` seeds nothing extra.
         // SAFETY: `self.host` is the same boxed allocation whose address was baked as `cm`'s ctx at
@@ -6390,17 +6407,19 @@ pub enum Backend {
 #[derive(Clone, Debug, Default)]
 pub struct Limits {
     /// The fuel the root is granted for an activation, which every vCPU of the run (a child's
-    /// included) draws from, on every backend (#1944 slice 3). The JIT's code carries fuel checks
-    /// unless this is no limit.
+    /// included) draws from, on every backend (#1944 slice 3); `None` is the default grant's
+    /// ([`temen_interp::DEFAULT_FUEL`]). The JIT's code carries fuel checks unless it is `u64::MAX`,
+    /// no limit.
     pub fuel: Option<u64>,
     /// Wall-clock deadline for the JIT's detect-and-kill watchdog (§5); ignored by the interpreters.
     pub deadline: Option<std::time::Duration>,
-    /// The root's `mem`: what its window grows, its fibers' stacks, the regions it mints and its
-    /// children's windows, together.
+    /// The root's `mem`: its window and what it grows, its fibers' stacks, the regions it mints, and
+    /// its processes' and children's windows, together.
     pub mem: Option<u64>,
     /// The root's `channel`: its pipes' worst-case FIFOs and its children's.
     pub channel: Option<u64>,
-    /// The root's `spawn`: the run's live vCPUs (threads, fork twins, spawned processes, children).
+    /// The root's `spawn`: the run's live vCPUs, its own main vCPU first (threads, fork twins,
+    /// spawned processes, children).
     pub spawn: Option<u64>,
 }
 
@@ -6535,10 +6554,11 @@ fn jit_run(
     process: bool,
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // #1944 slice 3, #2113 — `Limits.fuel` is the root budget's fuel ceiling on the JIT too (#1705),
-    // the default grant's when it names none: the root's cell draws from the host's own node.
+    // the default grant's when it names none: the root's cell draws from the host's own node, which
+    // pays for its window and main vCPU as an interpreter's does.
     limits.grant(host);
-    let mut root_fuel =
-        temen_jit::FuelCell::metering(Arc::new(HostNode(host.begin_activation(limits.fuel()))));
+    let node = host.begin_activation(limits.fuel(), RootWindow::fresh(m));
+    let mut root_fuel = temen_jit::FuelCell::metering(Arc::new(HostNode(node)));
     let fuel = root_fuel
         .as_deref_mut()
         .map(|c| c as *mut temen_jit::FuelCell);
