@@ -14500,9 +14500,19 @@ fn lower_int_intrinsic(
                 i128_icmp(ctx, ltp, pa[0], pa[1], pb[0], pb[1]),
             )
         } else {
+            let bits = src_bits(args[0], types)?;
             let opnd_ty = int_ty(val_type(opnd_ty.as_ref())?)?;
-            let a = ctx.operand(args[0])?;
-            let b = ctx.operand(args[1])?;
+            let mut a = ctx.operand(args[0])?;
+            let mut b = ctx.operand(args[1])?;
+            // #2146: a narrow operand sits zero-extended in its container (§3b), so a signed
+            // order sign-extends it first, as a signed `icmp` does; else `scmp.i8(-3, 0)` reads
+            // 253 and answers 1 (`curve25519-dalek`'s NAF digits, a negative one taken as
+            // positive).
+            if signed && bits != 32 && bits != 64 {
+                let to = if bits < 32 { 32 } else { 64 };
+                a = emit_ext(ctx, a, bits, to, true);
+                b = emit_ext(ctx, b, bits, to, true);
+            }
             let (gtop, ltop) = if signed {
                 (CmpOp::GtS, CmpOp::LtS)
             } else {
@@ -18598,6 +18608,18 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     use Instruction as I;
     let is_i128 = |o: &Operand| int_bits(o.get_type(types).as_ref()) == Some(128);
     match instr {
+        // `llvm.bswap.i128` (SHA-512's 128-bit length counter, #2146): each half byte-swapped,
+        // and the halves exchanged.
+        I::Call(c) if callee_name(c).as_deref() == Some("llvm.bswap.i128") => {
+            let (Some(dest), Some((arg, _))) = (&c.dest, c.arguments.first()) else {
+                return unsup("llvm.bswap.i128 without a value or a result");
+            };
+            let (lo, hi) = i128_parts(ctx, arg)?;
+            let new_lo = emit_bswap(ctx, hi, IntTy::I64, 8);
+            let new_hi = emit_bswap(ctx, lo, IntTy::I64, 8);
+            set_i128(ctx, dest, new_lo, new_hi);
+            Ok(true)
+        }
         // zext iN X to i128: N ≤ 64 → (zext(X, N→64), 0); N in 65..=127 → the identity on the value's
         // `(lo, hi)` pair (its only producers — the wide `load` path — zero-extend the hi half, so the
         // pair is already canonical i128).

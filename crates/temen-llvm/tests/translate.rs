@@ -14678,3 +14678,64 @@ fn funnel_shift_by_a_runtime_amount() {
     }
     assert_eq!(run_ll_i64("fsh_runtime", &src), want as i64);
 }
+
+/// #2146: `llvm.bswap.i128` reverses all sixteen bytes: each half byte-swapped, and the halves
+/// exchanged (SHA-512's 128-bit length counter).
+#[test]
+fn i128_bswap() {
+    let (hi, lo) = (0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210u64);
+    let src = format!(
+        r#"
+define i64 @run() {{
+  %h = zext i64 {hi} to i128
+  %l = zext i64 {lo} to i128
+  %hs = shl i128 %h, 64
+  %x = or i128 %hs, %l
+  %r = call i128 @llvm.bswap.i128(i128 %x)
+  %rlo = trunc i128 %r to i64
+  %rh = lshr i128 %r, 64
+  %rhi = trunc i128 %rh to i64
+  %m = mul i64 %rhi, 3
+  %s = add i64 %rlo, %m
+  ret i64 %s
+}}
+declare i128 @llvm.bswap.i128(i128)
+"#,
+        hi = hi as i64,
+        lo = lo as i64,
+    );
+    let r = ((hi as u128) << 64 | lo as u128).swap_bytes();
+    let want = (r as u64).wrapping_add(((r >> 64) as u64).wrapping_mul(3));
+    assert_eq!(run_ll_i64("i128_bswap", &src), want as i64);
+}
+
+/// #2146: a signed three-way compare of a narrow integer orders it as signed: `-3` is below `0`
+/// as an `i8` and `-300` below `7` as an `i16`, though each sits zero-extended in its container;
+/// the unsigned compare of the same `i8` still reads `253`.
+#[test]
+fn narrow_scmp_is_signed() {
+    let src = r#"
+define i64 @run() {
+  %p = alloca i16, align 2
+  store i8 -3, ptr %p, align 1
+  %x = load i8, ptr %p, align 1
+  %s = call i8 @llvm.scmp.i8.i8(i8 %x, i8 0)
+  %u = call i8 @llvm.ucmp.i8.i8(i8 %x, i8 0)
+  store i16 -300, ptr %p, align 2
+  %y = load i16, ptr %p, align 2
+  %w = call i8 @llvm.scmp.i8.i16(i16 %y, i16 7)
+  %s64 = sext i8 %s to i64
+  %u64 = sext i8 %u to i64
+  %w64 = sext i8 %w to i64
+  %u10 = mul i64 %u64, 10
+  %w100 = mul i64 %w64, 100
+  %r1 = add i64 %s64, %u10
+  %r = add i64 %r1, %w100
+  ret i64 %r
+}
+declare i8 @llvm.scmp.i8.i8(i8, i8)
+declare i8 @llvm.ucmp.i8.i8(i8, i8)
+declare i8 @llvm.scmp.i8.i16(i16, i16)
+"#;
+    assert_eq!(run_ll_i64("narrow_scmp", src), -1 + 10 - 100);
+}
