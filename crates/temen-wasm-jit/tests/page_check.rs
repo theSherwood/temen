@@ -52,6 +52,24 @@ block 0 (v0: i64) {
 }
 "#;
 
+/// As [`UNMAP_LOAD`], but the leaf loads at `probe + 20000`: an offset past the 16 KiB NULL guard, so
+/// a `probe` that wraps that sum past `2^64` lands on an ordinary `Rw` page, not in the guard.
+const UNMAP_LOAD_FAR: &str = r#"memory 17
+func (i32, i64, i64, i64) -> (i64) {
+block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  v1 = call 1 (vprobe)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0 offset=20000
+  return vl
+  }
+}
+"#;
+
 /// Guest `(as, off, len, probe)`: `unmap` `[off, off+len)`, then call the **store** leaf at `probe`
 /// (an 8-byte store — the straddle probe places its last byte on the unmapped page).
 const UNMAP_STORE: &str = r#"memory 17
@@ -256,7 +274,10 @@ fn run_emitted(
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
     let mut store: Store<i32> = Store::new(&engine, 0);
     let table_base = WIN_BASE as usize + win_size;
-    let need = table_base + table.len();
+    // The bytes past the table read `Rw`, so a check that indexes past it admits rather than meeting
+    // the zero (`Unmapped`) of fresh memory: an off-by-one in the bound shows up as a divergence.
+    const PAST_TABLE: usize = 64;
+    let need = table_base + table.len() + PAST_TABLE;
     let pages = (need as u32).div_ceil(1 << 16) + 1;
     let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
     memory
@@ -266,6 +287,9 @@ fn run_emitted(
     let live = unsafe { std::slice::from_raw_parts(base, win_size) };
     memory.write(&mut store, WIN_BASE as usize, live).unwrap();
     memory.write(&mut store, table_base, table).unwrap();
+    memory
+        .write(&mut store, table_base + table.len(), &[1u8; PAST_TABLE])
+        .unwrap();
 
     let mut linker: Linker<i32> = Linker::new(&engine);
     linker.define("env", "memory", memory).unwrap();
@@ -636,6 +660,78 @@ fn the_null_guard_is_the_page_tables() {
         Outcome::Vals(vec![0]),
         "a table without the guard admits a NULL load: no compare stands behind the table"
     );
+}
+
+/// Both tiers agree on `guest(off, len, probe)`, and the oracle gives `want`.
+fn agree(guest: &str, off: u64, len: u64, probe: i64, want: Outcome) {
+    let (oracle, _) = run_guest(guest, off, len, probe, Mode::Interp);
+    assert_eq!(oracle, want, "oracle sanity at probe {probe:#x}");
+    let (got, tierups) = run_guest(guest, off, len, probe, Mode::PagedSynced);
+    assert_eq!(tierups, 1, "the leaf must actually tier up");
+    assert_eq!(got, want, "paged tier diverged at probe {probe:#x}");
+}
+
+/// #2117: the paged check consults the last byte's page first and the first byte's only when the
+/// access crosses into it. An 8-byte load whose *first* bytes are on an unmapped page and whose last
+/// are on the `Rw` page after it is that second consultation; the opposite straddle is
+/// [`straddling_store_traps_at_the_page_edge`].
+#[test]
+fn a_straddle_starting_on_an_unmapped_page_traps() {
+    let page = probe_page_size(&build(UNMAP_LOAD));
+    let win = 1u64 << WIN_LOG2;
+    let (off, len) = (win - 2 * page, page); // the second-to-last page; the last stays Rw
+    let fault = Outcome::Trap(TrapKind::MemoryFault);
+    agree(UNMAP_LOAD, off, len, (off + page - 4) as i64, fault.clone());
+    agree(UNMAP_LOAD, off, len, (off - 4) as i64, fault); // the other way across
+    agree(
+        UNMAP_LOAD,
+        off,
+        len,
+        (off + page) as i64,
+        Outcome::Vals(vec![0]),
+    ); // just past it
+}
+
+/// #2117: the bound is the page-state table's coverage, which the driver writes to `"mapped"`, and
+/// one compare of the access's last byte against it is the whole bounds check. The window's last 8
+/// bytes load on both tiers; an access reaching one byte past the window faults on both.
+#[test]
+fn the_window_end_bounds_the_check() {
+    let page = probe_page_size(&build(UNMAP_LOAD));
+    let win = 1u64 << WIN_LOG2;
+    let (off, len) = (32768, page); // a page well clear of the window's end
+    agree(
+        UNMAP_LOAD,
+        off,
+        len,
+        (win - 8) as i64,
+        Outcome::Vals(vec![0]),
+    );
+    for probe in [win - 7, win - 1, win, win + page] {
+        agree(
+            UNMAP_LOAD,
+            off,
+            len,
+            probe as i64,
+            Outcome::Trap(TrapKind::MemoryFault),
+        );
+    }
+}
+
+/// #2117: an access whose address wraps past `2^64` faults on both tiers. With a small offset the
+/// wrapped last byte lands in the NULL guard, whose pages the table holds `Unmapped`; with an offset
+/// past the guard it lands on an ordinary page, and only the explicit overflow compare stops it.
+#[test]
+fn wrapping_addresses_trap_on_both_tiers() {
+    let (off, len) = last_page(UNMAP_LOAD);
+    let fault = Outcome::Trap(TrapKind::MemoryFault);
+    for probe in [-1i64, -4, -7, -8, -16] {
+        agree(UNMAP_LOAD, off, len, probe, fault.clone());
+    }
+    // `probe + 20000` wraps to 19000: `Rw`, inside the window, past the guard.
+    agree(UNMAP_LOAD_FAR, off, len, -1000, fault.clone());
+    agree(UNMAP_LOAD_FAR, off, len, -20000, fault); // wraps to exactly 0
+    agree(UNMAP_LOAD_FAR, off, len, 0, Outcome::Vals(vec![0])); // the control: 20000 itself
 }
 
 #[test]
