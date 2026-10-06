@@ -25,7 +25,7 @@
 
 use std::alloc::Layout;
 
-use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value};
+use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value, DEFAULT_FUEL};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
@@ -58,7 +58,7 @@ pub extern "C" fn run_roundtrip() -> i64 {
     let Ok(m2) = temen_encode::decode_module(&bytes) else {
         return i64::MIN;
     };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     match bytecode::compile_and_run(&m2, 0, &[Value::I64(1)], &mut fuel) {
         Some(Ok(vals)) => match vals.first() {
             Some(Value::I64(x)) => *x,
@@ -103,7 +103,7 @@ pub extern "C" fn run_guest(n: i64) -> i64 {
     let Ok(m) = temen_text::parse_module(ALU) else {
         return i64::MIN;
     };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     match bytecode::compile_and_run(&m, 0, &[Value::I64(n)], &mut fuel) {
         Some(Ok(vals)) => match vals.first() {
             Some(Value::I64(x)) => *x,
@@ -196,7 +196,7 @@ pub extern "C" fn run_threads() -> i64 {
     let Ok(m) = temen_text::parse_module(THREADS) else {
         return i64::MIN;
     };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     match bytecode::compile_and_run(&m, 0, &[], &mut fuel) {
         Some(Ok(vals)) => match vals.first() {
             Some(Value::I64(x)) => *x,
@@ -485,7 +485,7 @@ fn run_at(ptr: *const u8, len: usize, args: &[Value]) -> i64 {
             return 0;
         }
     };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let mut host = temen_interp::Host::new(); // deny-all powerbox (compute-only)
     match bytecode::compile_and_run_with_host(&m, 0, args, &mut fuel, &mut host) {
         None => {
@@ -608,7 +608,7 @@ pub extern "C" fn temen_run_bench(
             }
         })
         .collect();
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let mut host = Host::new(); // deny-all powerbox (compute-only)
     match bytecode::compile_and_run_with_host(&m, func, &args, &mut fuel, &mut host) {
         None => {
@@ -671,7 +671,7 @@ pub extern "C" fn temen_run_shared(
         std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: &[Value] = if arity >= 1 { &[Value::I64(arg)] } else { &[] };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     match bytecode::compile_and_run_capture_over(&m, 0, args, &mut fuel, &[], back) {
         Some((Ok(vals), _)) => match vals.first() {
             Some(Value::I64(x)) => *x,
@@ -3064,7 +3064,7 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
             host.register_cap_name(name, *handle);
         }
     }
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
             None => (STATUS_UNSUPPORTED, 0, 0),
@@ -3924,7 +3924,7 @@ fn onramp_run(
         Some((root, args)) => (root, args.as_slice(), Vec::new()),
         None => (m, &[][..], onramp_env_init(env)),
     };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
     // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
     // just like a static `call.cap (JIT, op)`, and multiplexes the guest's scheduler cooperatively
@@ -4014,7 +4014,7 @@ pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     if !temen_posix::bind(m, &mut host, px_h) {
         return unsupported();
     }
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
             None => (STATUS_UNSUPPORTED, 0, 0),
@@ -4137,7 +4137,7 @@ fn bash_run_over_compiled(
     let Some((mut host, posix, init_mem)) = posix_host_build(m, &run) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let (status, value, exit_code) = match bytecode::run_capture_reserved_over_compiled_with_host(
         m,
         compiled,
@@ -4578,7 +4578,7 @@ pub fn onramp_fs_exec(
         Err(status) => return unsupported(status),
     };
     host.stdin = stdin.to_vec();
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
         m,
         0,
@@ -5403,7 +5403,7 @@ impl OnrampReactor {
         // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
         // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
         // then persists for every `tick`.
-        let mut fuel = u64::MAX;
+        let mut fuel = DEFAULT_FUEL;
         match inst.call(0, &[], &mut fuel, &mut host) {
             Ok(_) => {}
             Err(_) => return Err(STATUS_TRAP),
@@ -5498,7 +5498,7 @@ impl OnrampReactor {
     pub fn frame(&mut self) -> (i32, Vec<u8>) {
         let stdout_before = self.host.stdout.len();
         let args = [Value::I64(self.entry_sp as i64)];
-        let mut fuel = u64::MAX;
+        let mut fuel = DEFAULT_FUEL;
         let status = match self.inst.call(self.tick, &args, &mut fuel, &mut self.host) {
             Ok(_) => STATUS_OK,
             Err(Trap::Exit(_)) => STATUS_EXIT,
@@ -5888,7 +5888,7 @@ impl JitOnrampReactor {
         // against the powerbox. The window then persists in `back` for every frame.
         match start {
             JitStart::Entry => {
-                let mut fuel = u64::MAX;
+                let mut fuel = DEFAULT_FUEL;
                 match program.run_over(0, &[], &mut fuel, back.clone(), &mut host, true) {
                     Ok(_) => {}
                     Err(_) => return Err(STATUS_TRAP),
@@ -5977,7 +5977,7 @@ impl JitOnrampReactor {
     /// persistent host (so a `display.present` populates the frame cell, `keyboard.poll` drains input).
     /// `Err(Trap::Exit)` is the guest's `Exit`; any other `Err` is a trap.
     pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
-        let mut fuel = u64::MAX;
+        let mut fuel = DEFAULT_FUEL;
         // Use the once-compiled `program` (no per-call recompile — the frame's dominant cost otherwise).
         self.program.run_over(
             func,
@@ -6791,7 +6791,7 @@ impl JitOnrampRun {
     /// the powerbox (so `write`/`read`/`exit` resolve). A `Trap::Exit(code)` is stashed (the guest called
     /// `exit`) so `f0` unwinds and the run reports `STATUS_EXIT` with that code.
     pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
-        let mut fuel = u64::MAX;
+        let mut fuel = DEFAULT_FUEL;
         let r = if self.grow {
             // #1153 single-shot on-ramp: run the bounce over the PERSISTED page map (so a prior `vm_map`
             // grow's committed pages survive the fresh-`Mem`-per-bounce shape), and re-capture the grown
@@ -6958,7 +6958,7 @@ pub struct CapOutcome {
 /// bytes of memory after the run. Shared verbatim by the wasm [`temen_run_capture`] export and the
 /// native `gencorpus` ground truth, so the differential compares identical logic.
 pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     match bytecode::compile_and_run_capture(m, 0, &[Value::I64(arg)], &mut fuel, init) {
         None => CapOutcome {
             status: STATUS_UNSUPPORTED,
@@ -7461,7 +7461,7 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     }
     let mut host = Host::new();
     let _ = grant_onramp_caps(&mut host, &m, None, None);
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     // The reservation is clamped to the backing (#816): a `map` past `win` fails with `-EINVAL`
     // instead of minting pages whose writes the backing silently drops.
     let (ran, pages, _) = prog.run_over_grown(
@@ -7558,7 +7558,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
         host.set_stdout_tee(t);
     }
     let _ = grant_onramp_caps(&mut host, &s.module, None, None);
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
     // the bytes), so a `vm_map`-grown warm heap is addressable again — and its `protect`ed rodata
     // write-protected again (#816). Every eval starts from the SAME captured map — an eval's own
@@ -8019,7 +8019,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     let run = match wc.prog.coop_run_over_grown(
         s.eval_fn,
         &[Value::I64(s.entry_sp as i64)],
-        u64::MAX,
+        DEFAULT_FUEL,
         host,
         Some(tierup),
         s.back.clone(),
@@ -8363,7 +8363,7 @@ pub extern "C" fn temen_bash_session(
     if !ahead.is_empty() {
         posix.feed_terminal(&ahead);
     }
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     let code = match bytecode::run_capture_reserved_over_compiled_with_host(
         m,
         compiled,
@@ -8531,7 +8531,7 @@ pub extern "C" fn temen_bash_coop_open(
         compiled,
         0,
         &[],
-        u64::MAX,
+        DEFAULT_FUEL,
         host,
         None,
         &init_mem,

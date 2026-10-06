@@ -2309,7 +2309,8 @@ fn leave_residue(host: &mut Host, r: temen_jit::DurableResidue) {
 ///
 /// `base`/`entry`/`reserved_log2`/`table_reserve_log2` must be the **same** inputs the old module
 /// was compiled with (the caller owns them — the same ones it passed to [`jit_cap_run`] /
-/// [`CompiledModule::compile`]); the fresh module shares the parent's baked environment exactly.
+/// [`CompiledModule::compile`]); the fresh module shares the parent's baked environment exactly,
+/// its fuel cell included ([`CompiledModule::fuel_cell`]), which must then outlive both.
 pub fn recompact_jit(
     base: &Module,
     entry: u32,
@@ -2336,7 +2337,7 @@ pub fn recompact_jit(
         None, // sub
         None, // resolve_module
         None, // interrupt
-        None, // fuel
+        old.fuel_cell(),
         None, // fast_resolver
         run_node(host),
         table_reserve_log2,
@@ -2503,6 +2504,9 @@ pub struct JitSession {
     /// The session-owned powerbox, boxed so its address is stable (baked as the `call.cap` ctx) and
     /// behind a `Mutex` so a multi-threaded guest's concurrent `call.cap`s serialize.
     host: Box<Mutex<Host>>,
+    /// #2113 — the fuel cell the session's code charges, boxed so its address is stable (baked at
+    /// construction and at every recompaction): each prompt re-arms it from the session's node.
+    fuel: Box<temen_jit::FuelCell>,
     /// The carried guest window (low `SNAP` bytes), seeding each prompt and updated from its result.
     window: Vec<u8>,
     /// How many times this session has auto-compacted (observability / tests).
@@ -2533,6 +2537,7 @@ impl JitSession {
         let node = run_node(&host);
         let host = Box::new(Mutex::new(host));
         let ctx = &*host as *const Mutex<Host> as *mut c_void;
+        let mut fuel = temen_jit::FuelCell::fixed(0);
         let cm = CompiledModule::compile(
             base,
             entry,
@@ -2542,7 +2547,7 @@ impl JitSession {
             None, // sub
             None, // resolve_module
             None, // interrupt
-            None, // fuel
+            Some(&mut *fuel as *mut _),
             None, // fast_resolver
             node,
             table_reserve_log2,
@@ -2556,6 +2561,7 @@ impl JitSession {
             watermark,
             cm,
             host,
+            fuel,
             window: vec![0u8; SESSION_SNAP],
             compactions: 0,
         })
@@ -2571,8 +2577,10 @@ impl JitSession {
         {
             let mut h = self.host.lock().unwrap_or_else(|e| e.into_inner());
             // #2113 — each prompt is an activation over a fresh window: the session's node pays for
-            // it and its main vCPU. Its code meters no fuel.
-            h.begin_activation(u64::MAX, RootWindow::fresh(&self.base));
+            // it and its main vCPU, and its code draws the default fuel from it.
+            let node =
+                h.begin_activation(temen_interp::DEFAULT_FUEL, RootWindow::fresh(&self.base));
+            self.fuel.rearm(Some(Arc::new(HostNode(node))));
             h.set_jit_native_ctx(cm_ptr as usize);
         }
         // SAFETY: `cm_ptr` is the only pointer used for this run and the one the thunk's handlers
@@ -2586,6 +2594,7 @@ impl JitSession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(0);
+        self.fuel.rearm(None); // what the prompt drew and did not burn goes back to its node
         let (out, mem) = r?;
         self.window = mem;
         if self.watermark != 0 && self.cm.extra_byte_count() >= self.watermark {
@@ -2614,7 +2623,7 @@ impl JitSession {
             None, // sub
             None, // resolve_module
             None, // interrupt
-            None, // fuel
+            Some(&mut *self.fuel as *mut _),
             None, // fast_resolver
             node,
             self.table_reserve_log2,
@@ -5431,6 +5440,9 @@ pub struct PowerboxProgram {
     /// The module compiled once against `&*host`. Boxed so its address (registered as the native
     /// re-entry ctx each run) is stable across moves of the `PowerboxProgram`.
     cm: Box<CompiledModule>,
+    /// #2113 — the fuel cell `cm`'s code charges, boxed so its baked address is stable: each run
+    /// re-arms it from the run's own node.
+    fuel: Box<temen_jit::FuelCell>,
 }
 
 impl PowerboxProgram {
@@ -5478,6 +5490,7 @@ impl PowerboxProgram {
         let mut host = Box::new(Host::new());
         let cc = CapCtx::Raw(&mut *host as *mut Host);
         inst.grant_caps(&mut host, win);
+        let mut fuel = temen_jit::FuelCell::fixed(0);
         let mut cm = Box::new(
             CompiledModule::compile(
                 &inst.module,
@@ -5490,7 +5503,7 @@ impl PowerboxProgram {
                 // powerbox host — the ctx is that host's box (`cc.ptr()`), as `cap_thunk`'s.
                 Some(module_resolver),
                 None, // interrupt (no §5 watchdog in the cached path; see `run`)
-                None, // fuel
+                Some(&mut *fuel as *mut _),
                 Some(fast_cap_resolver),
                 // #2113 — what its fibers charge. `run` replaces the host's contents each call, but this
                 // node's tree lives as long as the code, and holds the default grant.
@@ -5515,6 +5528,7 @@ impl PowerboxProgram {
             win,
             host,
             cm,
+            fuel,
         })
     }
 
@@ -5528,15 +5542,20 @@ impl PowerboxProgram {
         *self.host = Host::new();
         self.host.stdin = stdin.to_vec();
         self.inst.grant_caps(&mut self.host, self.win);
-        // #2113 — the run's window and main vCPU, charged to its node. The cached code meters no fuel.
-        self.host
-            .begin_activation(u64::MAX, RootWindow::fresh(&self.inst.module));
+        // #2113 — the run's window and main vCPU, charged to its node, and the default fuel its code
+        // draws from it, as `run_powerbox`'s.
+        let node = self.host.begin_activation(
+            temen_interp::DEFAULT_FUEL,
+            RootWindow::fresh(&self.inst.module),
+        );
+        self.fuel.rearm(Some(Arc::new(HostNode(node))));
         // No argv/env buffer: the cached path serves the plain compute powerbox (stdin in, stdout
         // out), exactly like `run_powerbox`, which passes no args. `run_raw` seeds nothing extra.
         // SAFETY: `self.host` is the same boxed allocation whose address was baked as `cm`'s ctx at
         // compile time; `self.cm` is not moved during the call (we hold `&mut self`). No watchdog is
         // armed, matching `run_powerbox` (as opposed to `run_powerbox_cfg` with a deadline).
         let jr = unsafe { powerbox_run_prebuilt(&mut self.cm, &mut self.host, &[], None) };
+        self.fuel.rearm(None); // what the run drew and did not burn goes back to its node
         let jr = jr.map_err(|e| format!("JIT run failed: {e:?}"))?;
         // Fold a guest trap into an `Err` with its backtrace + trapping fiber, exactly as `jit_run`.
         if let JitOutcome::Trapped(kind) = jr.outcome {

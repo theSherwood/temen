@@ -53,7 +53,7 @@ use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
     LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow, Trap, Value,
-    VarValue, WindowSpec, DEFAULT_RESERVED_LOG2,
+    VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -3916,6 +3916,17 @@ enum PendingJit {
     },
 }
 
+/// #2113 — how a host-built [`Vcpu`] starts its fuel at its first [`run`](Vcpu::run), from the
+/// powerbox it runs under (the shared one when it has one): a root opens its run's activation over its
+/// window, so that powerbox's own node pays for the window and the main vCPU and grants the default
+/// fuel the root draws ([`Host::begin_activation`]); a thread draws from the same node, as the other
+/// drivers' threads draw from their run's.
+#[derive(Clone, Copy)]
+enum Opens {
+    Root(RootWindow),
+    Thread,
+}
+
 /// One **resumable** vCPU over a shared window. The host calls [`run`](Vcpu::run) to advance it until a
 /// [`VcpuEvent`], services the event, delivers the result (`deliver_*`), and runs again — so the same
 /// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope (as
@@ -3999,10 +4010,9 @@ pub struct Vcpu<'p> {
     pending_lease: Option<(i32, u64)>,
     /// #2001 — the just-spawned thread's `spawn` on this vCPU's domain node, filed with its child.
     pending_live: LiveVcpu,
-    /// #2113 — a root's window, which it opens its run's activation over at its first
-    /// [`run`](Self::run): its powerbox's own node pays for it and the root's main vCPU
-    /// ([`Host::begin_activation`]). `None` for a child, and once opened.
-    opens: Option<RootWindow>,
+    /// #2113 — how a host-built vCPU starts its fuel at its first [`run`](Self::run). `None` for a
+    /// §14 child, which arrives with its fuel, and once started.
+    opens: Option<Opens>,
     /// The child whose join is in flight, whose charges go back on
     /// [`deliver_join`](Self::deliver_join).
     joining: Option<VcpuChild>,
@@ -4283,7 +4293,8 @@ impl<'p> Vcpu<'p> {
                 ..WindowSpec::default()
             })
         });
-        Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
+        let opens = Some(Opens::Thread);
+        Vcpu::with_mem_in(prog, module, func, args, mem, Host::new()).map(|v| Vcpu { opens, ..v })
     }
 
     /// A root vCPU over `mem`, which it opens its activation over at its first [`run`](Self::run).
@@ -4294,7 +4305,7 @@ impl<'p> Vcpu<'p> {
         mem: Option<Mem>,
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
-        let opens = Some(RootWindow::of(mem.as_ref()));
+        let opens = Some(Opens::Root(RootWindow::of(mem.as_ref())));
         Vcpu::with_mem_in(prog, 0, func, args, mem, host).map(|v| Vcpu { opens, ..v })
     }
 
@@ -4323,8 +4334,9 @@ impl<'p> Vcpu<'p> {
             fiber_sp: Vec::new(),
             fiber_meta: Vec::new(),
             mem,
-            // Unmetered, as a host-built vCPU has always been; a detached child's comes from its
-            // own budget node instead ([`PendingChild::start`], #1944 slice 3).
+            // A host-built root or thread draws from its powerbox's node from its first `run`
+            // ([`Opens`], #2113); a §14 child arrives with its own budget node's
+            // ([`PendingChild::start`], #1944 slice 3).
             fuel: Fuel::fixed(u64::MAX),
             host,
             shared_host: None,
@@ -4551,12 +4563,23 @@ impl<'p> Vcpu<'p> {
     /// cooperative scheduler ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`])
     /// flattens them.
     pub fn run(&mut self) -> VcpuEvent {
-        if let Some(window) = self.opens.take() {
-            // Unmetered fuel: this engine's vCPUs burn a fixed allowance.
-            match self.shared_host {
-                Some(m) => m.lock_unpoisoned().begin_activation(u64::MAX, window),
-                None => self.host.begin_activation(u64::MAX, window),
+        if let Some(opens) = self.opens.take() {
+            let mem = self.mem.as_ref();
+            let start = |h: &mut Host| match opens {
+                // Fuel unification: a fresh run's entry costs one fuel, as on every driver.
+                Opens::Root(window) => (h.begin_activation(DEFAULT_FUEL, window), !thaws(h, mem)),
+                Opens::Thread => (h.own_node(), false),
             };
+            let (node, entry) = match self.shared_host {
+                Some(m) => start(&mut m.lock_unpoisoned()),
+                None => start(&mut self.host),
+            };
+            self.fuel = Fuel::drawn(node);
+            if entry {
+                if let Err(t) = self.fuel.burn() {
+                    self.trap = Some(t);
+                }
+            }
         }
         let ev = self.run_to_event();
         // #1909 — a §14 child's main vCPU ending ends its domain: what its window grew goes back to
@@ -14016,11 +14039,7 @@ impl CoopSched {
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
         // Gated exactly as the tree-walker's `drive` (`super::drive_arc`): a durable **thaw** re-enters to
         // continue an already-charged run (the root re-enters under `REWINDING`), so it must not re-charge.
-        let is_thaw = host.is_durable()
-            && mem
-                .as_ref()
-                .is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING);
-        if !is_thaw {
+        if !thaws(host, mem.as_ref()) {
             fuel.burn()?;
         }
         let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
@@ -17813,6 +17832,13 @@ fn wire_parallel_doors(
 /// Returns the root's result and its (now-quiescent) `Mem` for capture. Scope: the pure-threads subset
 /// (`thread.spawn`/`join` + atomics); other multi-vCPU events fail closed (see
 /// [`compile_and_run_capture_over_parallel`]).
+/// Whether a run's entry is a durable **thaw** continuing an already-charged run (its root re-enters
+/// under `REWINDING`), which takes no entry charge: the gate the tree-walker's `drive` applies to its
+/// own.
+fn thaws(host: &Host, mem: Option<&Mem>) -> bool {
+    host.is_durable() && mem.is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING)
+}
+
 fn drive_parallel(
     dom: Domain,
     entry: FuncIdx,
@@ -17827,7 +17853,16 @@ fn drive_parallel(
     };
     // #1944 slice 3 — an activation of `host`: every vCPU thread draws from the host's own node, and
     // `fuel` reads back the room left once each has handed back what it did not burn.
-    let root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    // Fuel unification: entering the top-level entry costs one fuel, as `CoopSched::new` and the
+    // tree-walker charge it (#2113 found this driver skipping it).
+    if !thaws(host, mem.as_ref()) {
+        if let Err(t) = root_fuel.burn() {
+            drop(root_fuel);
+            *fuel = host.fuel_left();
+            return (Err(t), mem);
+        }
+    }
     let reg = ThreadRegistry::new();
     // Share the caller's powerbox across every vCPU thread, then hand it back (so the caller reads its
     // stdout / final state). `Arc` (not a scope-borrowed `&Mutex`) because a personality fork twin

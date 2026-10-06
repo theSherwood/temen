@@ -54,7 +54,8 @@ impl Ran {
     }
 }
 
-const FUEL: u64 = 50_000_000;
+/// The fuel each driver but `Vcpu` is handed; a `Vcpu` root opens its run with [`temen_interp::DEFAULT_FUEL`].
+pub const FUEL: u64 = 50_000_000;
 
 /// Run `m`'s function 0 on `driver`. `setup` builds a fresh powerbox and the entry's arguments (it
 /// is called once per run, so handles are minted in the same order on every driver). `None` means

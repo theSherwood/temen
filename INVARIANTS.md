@@ -83,7 +83,12 @@ to every level, and a vCPU that ends or freezes refunds the unburned rest of its
 burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
 one on op 15 or a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
 (`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
-budgets below it, since what is left of it differs by engine (each draws on its own schedule). The
+budgets below it, since what is left of it differs by engine (each draws on its own schedule). Every
+host grants it, the default fuel when it names none: the CLI, the C API, the browser, and the JIT's
+compile-once programs, which re-arm their fuel cell for each run (#2113). *Node 0's other dimensions
+(owner, 2026-10-06):* once #1867 deletes the carve, a guest sees node 0's `mem`, `channel` and
+`spawn` too; until then showing them would bound every budget's `spawn`, which the carve's
+budget-funded spawns refuse. The
 carve ops (0/5/13, v0 records) keep a fixed allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
 ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
 vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
@@ -115,10 +120,9 @@ exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
-its grant the embedder's. The gaps are tracked, not exceptions: the root's fuel where its host meters
-none (the browser, and the JIT's compile-once `PowerboxProgram` and `JitSession`, #2113), the carve
-(#1867), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused after its
-admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
+its grant the embedder's. The gaps are tracked, not exceptions: the carve (#1867), a `Vcpu` child its
+parent never joins (#2119), the pipe ends a spawn refused after its admission re-granted (#2120), and
+the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

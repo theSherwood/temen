@@ -27,7 +27,7 @@
 //! and, from inside a capability call, the two window accessors. The page supplies one import:
 //! `temen_host.js_cap_call(slot, op, args_ptr, n_args, mem) -> i64` — the whole JS side of the seam.
 
-use temen_interp::{bytecode, cap_id, BoundImport, GuestMem, Host, Trap, Value};
+use temen_interp::{bytecode, cap_id, BoundImport, GuestMem, Host, Trap, Value, DEFAULT_FUEL};
 
 use crate::{
     stash, STATUS_BAD_RESULT, STATUS_DECODE_ERR, STATUS_EXIT, STATUS_OK, STATUS_TRAP,
@@ -186,7 +186,7 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
     // A JS-powerbox guest's entry is paramless: capabilities arrive through the manifest, never as
     // positional handle arguments.
     let entry = m.resolve_export("_start").unwrap_or(0);
-    let mut fuel = u64::MAX;
+    let mut fuel = DEFAULT_FUEL;
     match bytecode::compile_and_run_with_host(&m, entry, &[], &mut fuel, &mut host) {
         None => {
             set(STATUS_UNSUPPORTED);

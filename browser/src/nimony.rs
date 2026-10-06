@@ -93,7 +93,7 @@ pub fn nim_open(
         driver,
         0,
         &[],
-        u64::MAX,
+        temen_interp::DEFAULT_FUEL,
         host,
         tierup,
         &init_mem,
