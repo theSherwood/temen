@@ -19,7 +19,7 @@
 use core::cell::Cell;
 use core::ffi::c_void;
 use temen_ir::{Func, TypeEntry, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, JitOutcome, Quota, TrapKind};
+use temen_jit::{CompiledModule, JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -97,7 +97,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("compile parent");

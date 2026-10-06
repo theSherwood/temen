@@ -104,6 +104,87 @@ block 0 () {
     );
 }
 
+/// #2113 — **a seek keeps the grant's accounting**: the limit is the root's `mem` grant, charged on
+/// the budget tree, and a seek's restore puts back both the tree and what the window holds against
+/// it. The guest maps block A, spins past several checkpoints, unmaps A and maps block B, which fits
+/// only because the unmap handed A's bytes back. Seeking into the spin and running on gives the same
+/// answer as the run straight through: a restore that lost the window's half of the accounting would
+/// refund nothing at the unmap, and B would be `-ENOMEM`.
+#[test]
+fn a_seek_keeps_what_the_window_holds_against_the_limit() {
+    const SRC: &str = r#"memory 16
+import 0 "vm_map" (i64, i64, i64) -> (i64)
+import 1 "vm_unmap" (i64, i64) -> (i64)
+
+func () -> (i64) {
+block 0 () {
+  a = i64.const 65536
+  n = i64.const 65536
+  rw = i64.const 3
+  r1 = call.import 0 (a, n, rw)
+  z = i64.const 0
+  br 1(z, r1)
+}
+block 1 (vi: i64, vr1: i64) {
+  k = i64.const 3000
+  c = i64.lt_u vi k
+  one = i64.const 1
+  vn = i64.add vi one
+  br_if c 1(vn, vr1) 2(vr1)
+}
+block 2 (wr1: i64) {
+  a2 = i64.const 65536
+  n2 = i64.const 65536
+  r2 = call.import 1 (a2, n2)
+  b2 = i64.const 131072
+  rw2 = i64.const 3
+  r3 = call.import 0 (b2, n2, rw2)
+  z2 = i64.const 0
+  e1 = i64.eq wr1 z2
+  e2 = i64.eq r2 z2
+  e3 = i64.eq r3 z2
+  w1 = i64.extend_i32_u e1
+  w2 = i64.extend_i32_u e2
+  w3 = i64.extend_i32_u e3
+  two = i64.const 2
+  four = i64.const 4
+  x2 = i64.mul w2 two
+  x3 = i64.mul w3 four
+  s1 = i64.add w1 x2
+  s = i64.add s1 x3
+  return s
+  }
+}
+"#;
+    let m = parse_module(SRC).expect("parses");
+    let mut b = BytecodeBackend::new(
+        m,
+        0,
+        &[],
+        u64::MAX,
+        true,
+        Vec::new(),
+        false,
+        Some(65536),
+        None,
+    )
+    .expect("subset");
+    let finish = |b: &mut BytecodeBackend| match Debuggee::run_until_stop(b) {
+        Stop::Finished(Ok(vals)) => vals.first().copied(),
+        other => panic!("the guest should finish: {other:?}"),
+    };
+    assert_eq!(finish(&mut b), Some(Value::I64(7)), "straight through");
+    let end = b.clock();
+    for t in [end / 2, end - 20] {
+        b.seek(t);
+        assert_eq!(
+            finish(&mut b),
+            Some(Value::I64(7)),
+            "from a seek to {t} of {end}"
+        );
+    }
+}
+
 /// **The memory-map JSON**: geometry (mapped/reserved/page size), the grown tail pages as `rw`
 /// entries after the guest's `vm_map`, the stack constants — and it fails cleanly on the
 /// tree-walker.

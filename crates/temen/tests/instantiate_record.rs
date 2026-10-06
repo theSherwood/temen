@@ -1106,10 +1106,10 @@ fn budget_record_funds_the_child_on_every_tier() {
     );
 }
 
-/// §3c.2's **narrowed** gap, pinned: a budget with a bounded `spawn` ceiling (child-quota
-/// threading the JIT tier doesn't have yet) stays a probeable `-EINVAL` on the native lane
-/// while the interpreter honors it — budget intact either way. Bounded-zero fuel is the same
-/// class. When child-quota threading lands, flip this to 42 like its sibling above.
+/// §3c.2's **narrowed** gap, pinned: a budget with a bounded `spawn` ceiling stays a probeable
+/// `-EINVAL` on the native lane while the interpreter funds the carve child — budget intact either
+/// way. Bounded-zero fuel is the same class. The gap goes with the carve (#1867): a detached child
+/// is charged its budget's `spawn` on every engine.
 #[test]
 fn spawn_bounded_budget_record_is_the_narrowed_jit_gap() {
     let run_b = |backend: Backend| -> i32 {

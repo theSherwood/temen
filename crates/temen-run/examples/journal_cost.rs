@@ -181,8 +181,9 @@ fn build(g: &Guest, module: &temen_ir::Module) -> Option<ScheduledDebugRun> {
         limits: Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         args: g.args.iter().map(|s| s.as_bytes().to_vec()).collect(),
         ..RunConfig::default()

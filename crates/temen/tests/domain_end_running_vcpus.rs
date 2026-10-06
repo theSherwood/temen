@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::sync::mpsc;
 use std::time::Duration;
 use temen_interp::{Host, Trap, Value};
-use temen_jit::{JitOutcome, Quota, TrapKind};
+use temen_jit::{JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -98,10 +98,7 @@ fn cranelift(src: &str) -> Option<JitOutcome> {
             temen_run::cap_thunk,
             &mut host as *mut Host as *mut c_void,
             no_resolver,
-            Quota {
-                max_fibers: 1 << 16,
-                max_vcpus: 8,
-            },
+            None,
         )
         .expect("jit compile");
         let _ = tx.send(out);

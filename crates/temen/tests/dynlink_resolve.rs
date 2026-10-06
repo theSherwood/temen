@@ -12,7 +12,7 @@
 
 use temen_encode::{decode_module, encode_module};
 use temen_ir::{Inst, Resolved, ResolvedCap, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
 use temen_run::{encode_symbol_table, jit_blob_validator, jit_resolve_and_validate};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -31,7 +31,7 @@ fn compile_host(src: &str) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("compile host program")

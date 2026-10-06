@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use temen_ir::DEFAULT_RESERVED_LOG2;
-use temen_jit::{CompiledModule, Quota, VarMachineLoc, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, VarMachineLoc, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
 /// A pure-compute function with a hand-written §6 debug section: source lines 2, 3, 4 map onto its
@@ -47,7 +47,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compiles")

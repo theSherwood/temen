@@ -86,15 +86,8 @@ fn guarded_layout_runs_end_to_end() {
 
     let args: [&[u8]; 4] = [b"prog", b"alpha", b"be", b"c"];
     let env: [&[u8]; 1] = [b"GUEST_HOME=/warm"];
-    let b = run_powerbox_cfg(
-        &guarded,
-        b"",
-        &args,
-        &env,
-        None,
-        temen_run::Quota::default(),
-    )
-    .expect("guarded runs");
+    let b = run_powerbox_cfg(&guarded, b"", &args, &env, temen_run::Limits::default())
+        .expect("guarded runs");
     assert_eq!(
         String::from_utf8_lossy(&b.stdout),
         "argc=4 sum=8 acc=672 home=/warm\n"

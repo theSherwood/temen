@@ -9,7 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 /// A domain's node in the embedder's budget chain (temen-run's, over a `temen_interp` budget node):
-/// where a [`FuelCell`] draws its next chunk, and what a domain's vCPUs are charged to (#2001).
+/// where a [`FuelCell`] draws its next chunk, and what a domain's vCPUs (#2001) and fibers (#2112)
+/// are charged to.
 pub trait BudgetNode: Send + Sync {
     /// Up to a chunk of fuel from the chain, charged to every level: `None` when every level is
     /// unbounded (nothing to meter), `Some(0)` when the chain is spent.
@@ -24,6 +25,14 @@ pub trait BudgetNode: Send + Sync {
     fn force_vcpu(&self);
     /// Hand back a vCPU's charge when it ends.
     fn vcpu_ended(&self);
+    /// #2112 — charge one live fiber, [`temen_ir::FIBER_STACK`] of `mem`, to every level, all or
+    /// nothing: `false` when a level's `mem` is full.
+    fn charge_fiber(&self) -> bool;
+    /// [`Self::charge_fiber`] past any ceiling: a fiber a thaw re-creates, which lived before the
+    /// freeze.
+    fn force_fiber(&self);
+    /// Hand back a fiber's charge when it ends.
+    fn fiber_ended(&self);
 }
 
 /// A domain's counted-fuel cell. `repr(C)`: compiled code reads `left` at word 0 and calls `refill`

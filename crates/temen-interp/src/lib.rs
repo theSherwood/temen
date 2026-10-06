@@ -849,7 +849,9 @@ pub(crate) struct HostCursor {
     pub(crate) clock_ns: i64,
     pub(crate) cap_consumed: usize,
     pub(crate) cap_record_len: usize,
-    pub(crate) mem_mapped_bytes: u64,
+    /// #2113 — the host's half of its window's accounting ([`Host::grown`], [`Host::own_window`],
+    /// [`Host::main_vcpu`]): the tree an undo puts back holds the charges, these what they are for.
+    pub(crate) held: (u64, u64, bool),
     /// The `Jit` tables' [`compile_mark`](Host::jit_compile_mark) — not restored but compared: a
     /// `compile` adds a unit and a `JitCode` handle, which a cursor cannot take back, so an undo across
     /// one declines (#2015).
@@ -893,9 +895,9 @@ struct HostReplaySubstate {
     svc_queue: Vec<SvcDispatch>,
     svc_results: Vec<(u64, i64)>,
     svc_next_ticket: u64,
-    /// The memory growth-cap accounting at the checkpoint (slice 5) — without it, a restore
-    /// would zero the count and the limit would go lenient after a seek.
-    mem_mapped_bytes: u64,
+    /// #2113 — the host's half of its window's accounting, as [`HostCursor::held`]: the checkpoint's
+    /// tree holds the charges.
+    held: (u64, u64, bool),
     /// #1455 — each host capability's **own** declared state, positional over `host_procs`
     /// ([`Host::capture_cap_states`]). A checkpoint restores into a run whose powerbox was rebuilt from
     /// scratch, so a capability carrying guest-observable state of its own (an `fs` server's per-`open`
@@ -1216,8 +1218,7 @@ impl Inspector {
                 ..WindowSpec::default()
             })
         });
-        let quota = Quota::default();
-        let sched = Arc::new(Scheduler::new(quota.max_vcpus, MAX_WORKERS));
+        let sched = Arc::new(Scheduler::new(MAX_VCPUS, MAX_WORKERS));
         let dt = Arc::new(DomainTable::new(&funcs, 0));
         // A debugged run burns a fixed allowance, so a checkpoint's counter is the whole of its fuel
         // state and a seek replays it exactly (#1944 slice 3).
@@ -1232,7 +1233,6 @@ impl Inspector {
             0,
             0,
             SchedRef::Real(sched),
-            quota,
             dt,
         );
         let mut d = DebugCtx::new(shared);
@@ -1393,7 +1393,6 @@ impl Inspector {
                 0,
                 id,
                 SchedRef::Det(Arc::clone(&det)),
-                Quota::default(),
                 dt,
             );
             root.memop = true; // one visible op per turn — the granularity steps/breakpoints align to
@@ -2290,9 +2289,6 @@ fn drive_arc(
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
-    // §15: the domain's spawn quota (already clamped to the hard ceilings by `set_quota`) sizes the
-    // executor's live-vCPU cap and each vCPU's fiber cap. Default = the ceilings (unchanged behavior).
-    let quota = host.quota();
     // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
     // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
     let jit_table_log2 = host.jit_table_log2();
@@ -2382,7 +2378,6 @@ fn drive_arc(
         mem,
         Arc::clone(&host_shared),
         workers,
-        quota,
         jit_table_log2,
         offer_table_demand,
         durable,
@@ -2422,7 +2417,7 @@ fn drive_arc_shared(
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
-    let (quota, jit_table_log2, offer_table_demand, durable, handoff, jit_reapply) = {
+    let (jit_table_log2, offer_table_demand, durable, handoff, jit_reapply) = {
         let h = cell.lock_unpoisoned();
         // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
         // onto the sub-run's fresh dispatch table, exactly as the by-value wrapper does.
@@ -2435,7 +2430,6 @@ fn drive_arc_shared(
             })
             .collect();
         (
-            h.quota(),
             h.jit_table_log2(),
             h.offer_table_demand(),
             h.is_durable(),
@@ -2457,7 +2451,6 @@ fn drive_arc_shared(
         mem,
         Arc::clone(cell),
         workers,
-        quota,
         jit_table_log2,
         offer_table_demand,
         false,
@@ -2513,7 +2506,6 @@ fn seed_domain(
     types: &Arc<[temen_ir::TypeEntry]>,
     dt: &Arc<DomainTable>,
     host_shared: &Arc<Mutex<Host>>,
-    quota: Quota,
     residue: ThawResidue,
 ) {
     let id = root.id;
@@ -2571,8 +2563,16 @@ fn seed_domain(
             let got = if ff.is_free() {
                 root.registry.seed_free(ff.generation)
             } else {
-                root.registry
-                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation, ff.consumed)
+                // #2112 — the fiber handed its charge back as the freeze flattened it.
+                let charge = root.host.lock_unpoisoned().fiber_recharge();
+                root.registry.seed_frozen(
+                    ff.func,
+                    ff.sp,
+                    ff.shadow_sp,
+                    ff.generation,
+                    ff.consumed,
+                    charge,
+                )
             };
             debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
             debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
@@ -2637,7 +2637,6 @@ fn seed_domain(
                     funcs,
                     types,
                     dt,
-                    quota,
                     ff,
                 );
             }
@@ -2828,7 +2827,6 @@ fn seed_domain(
                 cdepth,
                 cid,
                 SchedRef::Real(Arc::clone(sched)),
-                quota,
                 cdt,
             ));
             child.durable = true;
@@ -2875,7 +2873,6 @@ fn seed_domain(
                 funcs,
                 types,
                 dt,
-                quota,
                 ff,
             );
         }
@@ -2934,7 +2931,7 @@ fn seed_domain(
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
             let edge = (spawner.id, td.slot);
-            if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td, quota) {
+            if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td) {
                 // A detached child is a callee like a nested one (#1901).
                 child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
                 s.runnable.push_back(child);
@@ -2994,7 +2991,6 @@ fn seed_thread(
     funcs: &Arc<[Func]>,
     types: &Arc<[temen_ir::TypeEntry]>,
     dt: &Arc<DomainTable>,
-    quota: Quota,
     ff: FrozenVCpu,
 ) {
     let Some(&parent) = live_ids.get(&(ff.parent_task as TaskId)) else {
@@ -3046,7 +3042,6 @@ fn seed_thread(
         0,
         cid,
         SchedRef::Real(Arc::clone(sched)),
-        quota,
         Arc::clone(dt),
     ));
     child.registry = Arc::clone(&p.registry);
@@ -3077,7 +3072,6 @@ fn relaunch_detached(
     spawner: &mut VCpu,
     grants: &Arc<Mutex<Host>>,
     td: ThawedDetached,
-    quota: Quota,
 ) -> Option<Box<VCpu>> {
     let ThawedDetached {
         slot,
@@ -3140,9 +3134,6 @@ fn relaunch_detached(
         &funcs,
         child_host.lock_unpoisoned().jit_table_log2(),
     ));
-    // A detached child's quota is its spawner's, as at the spawn; its fuel, vCPUs and channel memory
-    // are its budget chain's, which the restore carried (#1944 slice 3).
-    let child_quota = quota;
     // #1944 slice 3 — the child draws from the budget that paid for it, which its restored node chain
     // still charges; what it had drawn and not burned went back at the freeze.
     let child_fuel = Fuel::drawn(child_host.lock_unpoisoned().own_node());
@@ -3159,7 +3150,6 @@ fn relaunch_detached(
         spawner.depth + 1,
         cid,
         SchedRef::Real(Arc::clone(sched)),
-        child_quota,
         Arc::clone(&cdt),
     ));
     child.memop = spawner.memop;
@@ -3178,7 +3168,6 @@ fn relaunch_detached(
         &types,
         &cdt,
         &child_host,
-        child_quota,
         residue,
     );
     // The spawner's side of the edge, at the recorded slot.
@@ -3235,7 +3224,6 @@ fn drive_over_cell(
     mem: &mut Option<Mem>,
     host_shared: Arc<Mutex<Host>>,
     workers: usize,
-    quota: Quota,
     jit_table_log2: u8,
     offer_table_demand: usize,
     durable: bool,
@@ -3243,7 +3231,12 @@ fn drive_over_cell(
     handoff: bool,
     jit_reapply: Vec<JitReapply>,
 ) -> TracedRun {
-    let mut root_fuel = Fuel::drawn(host_shared.lock_unpoisoned().begin_activation(*fuel));
+    let window = RootWindow::of(mem.as_ref());
+    let mut root_fuel = Fuel::drawn(
+        host_shared
+            .lock_unpoisoned()
+            .begin_activation(*fuel, window),
+    );
     if charge_entry {
         if let Err(t) = root_fuel.burn() {
             drop(root_fuel);
@@ -3253,7 +3246,7 @@ fn drive_over_cell(
     }
     // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
     let sched = {
-        let mut s = Scheduler::new(quota.max_vcpus, workers);
+        let mut s = Scheduler::new(MAX_VCPUS, workers);
         s.handoff = handoff;
         Arc::new(s)
     };
@@ -3393,7 +3386,6 @@ fn drive_over_cell(
             0,
             id,
             SchedRef::Real(Arc::clone(&sched)),
-            quota,
             Arc::clone(&dt),
         ));
         root.durable = durable;
@@ -3411,7 +3403,6 @@ fn drive_over_cell(
             &types,
             &dt,
             &host_shared,
-            quota,
             thaw,
         );
         let (registry, arena) = (Arc::clone(&root.registry), root.arena());
@@ -3865,7 +3856,7 @@ pub fn run_scheduled(
         s.live += 1;
         let dt = Arc::new(DomainTable::new(&funcs, 0)); // DPOR: no Jit install, natural table
         let mut host = Host::new();
-        let fuel = Fuel::drawn(host.begin_activation(fuel)); // #1944 slice 3
+        let fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref()))); // #1944 slice 3
         let mut root = Box::new(VCpu::new(
             funcs,
             types,
@@ -3877,7 +3868,6 @@ pub fn run_scheduled(
             0,
             id,
             SchedRef::Det(Arc::clone(&det)),
-            Quota::default(), // deterministic oracle path: the fixed anti-bomb ceilings
             dt,
         ));
         s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
@@ -4655,7 +4645,7 @@ fn run_one_schedule(
         s.live += 1;
         let dt = Arc::new(DomainTable::new(funcs, 0)); // DPOR: no Jit install, natural table
         let mut host = Host::new();
-        let fuel = Fuel::drawn(host.begin_activation(fuel)); // #1944 slice 3
+        let fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref()))); // #1944 slice 3
         let mut root = VCpu::new(
             Arc::clone(funcs),
             Arc::clone(types),
@@ -4667,7 +4657,6 @@ fn run_one_schedule(
             0,
             id,
             SchedRef::Det(Arc::clone(&det)),
-            Quota::default(), // exhaustive model-checker path: the fixed anti-bomb ceilings
             dt,
         );
         root.memop = true;
@@ -5080,10 +5069,9 @@ fn dispatch_indirect(
 
 /// Maximum number of fibers a single run may create (§12). Bounds the fiber table so a
 /// fiber-bomb yields a clean [`Trap::FiberFault`] instead of unbounded host allocation —
-/// the reference-oracle analogue of the quota that charges out-of-band stacks to the
-/// guest, so a fiber-bomb OOMs *itself*, never the host. `1 << 24` (~16.7M): the hard ceiling equals
-/// the fiber-handle index width ([`FIBER_GEN_SHIFT`]); the per-run spawn quota (`TEMEN_MAX_FIBERS`,
-/// clamped to this) is the tunable anti-bomb policy.
+/// so a fiber-bomb exhausts *itself*, never the host. `1 << 24` (~16.7M): the hard ceiling equals the
+/// fiber-handle index width ([`FIBER_GEN_SHIFT`]). Below it, the policy is the domain's `mem`: each
+/// live fiber is [`temen_ir::FIBER_STACK`] of it (#2112), up to what the embedder granted the run (#2113).
 const MAX_FIBERS: usize = 1 << 24;
 
 /// Maximum number of **concurrently live** vCPUs (`thread.spawn`) across a run (§12). With the M:N
@@ -5092,12 +5080,6 @@ const MAX_FIBERS: usize = 1 << 24;
 /// [`Trap::ThreadFault`]. A spawned-and-joined loop creates unboundedly many vCPUs over its lifetime;
 /// only simultaneous liveness is bounded.
 const MAX_VCPUS: usize = 1 << 16;
-
-// §15 **spawn quota** — the single shared type lives in `temen-ir` (re-exported here and as
-// `temen_jit::Quota`), so a powerbox embedder sets it once and it binds all three backends identically,
-// with no facade conversion (Followup F6). The local `MAX_FIBERS`/`MAX_VCPUS` consts above mirror its
-// hard ceilings (also used here for fiber/vCPU table sizing); `Quota::clamped` enforces them.
-pub use temen_ir::Quota;
 
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
@@ -5487,7 +5469,6 @@ impl ExecReq {
         depth: u32,
         id: TaskId,
         sched: SchedRef,
-        quota: Quota,
     ) -> VCpu {
         // The image gets its own function table: an exec replaces the whole image, and the caller's
         // table is sized for the CALLER's functions — an image with more of them trapped on its
@@ -5509,7 +5490,6 @@ impl ExecReq {
             depth,
             id,
             sched,
-            quota,
             dt,
         )
     }
@@ -7261,7 +7241,6 @@ impl Scheduler {
                                 v.depth,
                                 pid,
                                 v.sched.clone(),
-                                v.quota,
                             );
                             child.live = live;
                             s.live += 1;
@@ -9676,12 +9655,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // the address space, and the caller's window is released with it.
                 let caller = v.mem.take();
                 let fuel = std::mem::replace(&mut v.fuel, Fuel::fixed(0));
-                let (depth, id, sched_ref, quota) = (v.depth, v.id, v.sched.clone(), v.quota);
+                let (depth, id, sched_ref) = (v.depth, v.id, v.sched.clone());
                 // #2001 — the process's budget charges carry over: its `spawn`, and a detached
                 // child's window lease (the fresh window has the caller's geometry).
                 let live = std::mem::replace(&mut v.live, LiveVcpu::none());
                 let lease = v.window_lease.take();
-                *v = req.into_vcpu(caller.as_ref(), fuel, depth, id, sched_ref, quota);
+                *v = req.into_vcpu(caller.as_ref(), fuel, depth, id, sched_ref);
                 v.live = live;
                 v.window_lease = lease;
                 // #802 interactive — RE-wire the door over the rebuilt vCPU's host (fresh
@@ -11226,6 +11205,10 @@ struct RegState {
     /// fiber's re-executed `suspend` (its `Yield` rewind arm) instead of re-parking. `Some` only between
     /// that claim and that suspend. Grows with `fibers` (same index).
     pending: Vec<Option<i64>>,
+    /// #2112 — per slot: the fiber's charge on the node of the domain whose `cont.new` made it,
+    /// handed back when the fiber returns ([`Self::finish`]) or the registry goes. Grows with
+    /// `fibers` (same index).
+    charges: Vec<LiveFiber>,
     /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
     /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
@@ -11248,6 +11231,7 @@ impl FiberRegistry {
                 gens: Vec::new(),
                 consumed: Vec::new(),
                 pending: Vec::new(),
+                charges: Vec::new(),
                 free: BinaryHeap::new(),
                 vcpu_mask: 0,
             }),
@@ -11322,30 +11306,31 @@ impl FiberRegistry {
         self.lock().vcpu_mask |= mask;
     }
 
-    /// `cont.new`: allocate a slot — the guest handle — under the §15 quota, which is **per run** now
-    /// that the table is run-shared (DESIGN.md §23 (per-run quota)). The `+ 1` counts the off-table root
-    /// computation. **Recycling (step 3):** the lowest freed slot is reused (its already-bumped
+    /// `cont.new`: allocate a slot — the guest handle — under [`MAX_FIBERS`], which is **per run** now
+    /// that the table is run-shared (DESIGN.md §23). The `+ 1` counts the off-table root computation. **Recycling (step 3):** the lowest freed slot is reused (its already-bumped
     /// generation kept, so a stale handle to its former occupant fails `claim`); only when none is free
     /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
-    /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
+    /// lifetime total — and the ceiling / durable-reserve checks (on the grow path / the allocated
     /// context) likewise bound concurrency rather than lifetime.
+    /// `charge` is the fiber's [`LiveFiber`], held while the slot is its; a refusal drops it, which
+    /// hands it back.
     fn create(
         &self,
         func: i32,
         sp: i64,
-        max_fibers: usize,
         durable: bool,
         arena: ShadowArena,
+        charge: LiveFiber,
     ) -> Result<i64, Trap> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
-        // Growing (no free slot ⇒ every existing slot is live) must honor the concurrency quota.
-        if reuse.is_none() && t.fibers.len() + 1 >= max_fibers {
+        // Growing (no free slot ⇒ every existing slot is live) must honor the table's hard bound.
+        if reuse.is_none() && t.fibers.len() + 1 >= MAX_FIBERS {
             return Err(Trap::FiberFault);
         }
         let slot = reuse.unwrap_or(t.fibers.len());
         // A durable fiber needs a distinct shadow region; refuse if the reserve has no room (a
-        // clean `FiberFault`, like exhausting the quota — never an overflow into another
+        // clean `FiberFault`, like reaching the ceiling — never an overflow into another
         // context's region). The fiber's context index is `slot + 1` (the root is context 0). The
         // fiber pool grows up from 1 and the spawned-vCPU pool grows down from `MAX_SHADOW_CTX`
         // (slice 3.2.2), so this fiber must stay strictly below the lowest live vCPU context (which,
@@ -11366,6 +11351,7 @@ impl FiberRegistry {
             t.shadow[slot] = arena.frame_base(slot + 1); // reused region: empty stack at its frame base
             t.consumed[slot] = false;
             t.pending[slot] = None;
+            t.charges[slot] = charge;
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, sp });
@@ -11373,6 +11359,7 @@ impl FiberRegistry {
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
             t.consumed.push(false);
             t.pending.push(None);
+            t.charges.push(charge);
             0
         };
         Ok(fiber_handle(slot, generation))
@@ -11529,6 +11516,7 @@ impl FiberRegistry {
         debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
         t.fibers[slot] = RegFiber::Done;
         t.gens[slot] = t.gens[slot].wrapping_add(1);
+        t.charges[slot] = LiveFiber::none(); // #2112: its charge goes back
         t.free.push(Reverse(slot));
     }
 
@@ -11597,6 +11585,7 @@ impl FiberRegistry {
         t.gens.push(generation);
         t.consumed.push(false);
         t.pending.push(None);
+        t.charges.push(LiveFiber::none());
         t.free.push(Reverse(slot));
         slot
     }
@@ -11647,7 +11636,8 @@ impl FiberRegistry {
     /// Thaw seeding (slice 3.1.5): re-create a frozen fiber at the next slot as `Pending` (so a
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
-    /// dense handle namespace; returns the slot, which must equal the recorded one.
+    /// dense handle namespace; returns the slot, which must equal the recorded one. `charge` is the
+    /// fiber's, taken again (#2112): the freeze handed it back.
     fn seed_frozen(
         &self,
         func: i32,
@@ -11655,6 +11645,7 @@ impl FiberRegistry {
         shadow_sp: u64,
         generation: u64,
         consumed: bool,
+        charge: LiveFiber,
     ) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
@@ -11663,6 +11654,7 @@ impl FiberRegistry {
         t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
         t.consumed.push(consumed); // #1538: a consumed park delivers at its rewound suspend
         t.pending.push(None);
+        t.charges.push(charge);
         slot
     }
 
@@ -11964,8 +11956,6 @@ struct VCpu {
     /// point; `None` if the turn ran no visible op). Read back by the DPOR driver ([`explore_all`]) to
     /// build the schedule trace; unused by the real pool / seeded explorer.
     acc: Option<MemAccess>,
-    /// §15 spawn quota (fiber/vCPU ceilings) — inherited by every vCPU of the run from the root.
-    quota: Quota,
     /// The domain's **shared, live** dispatch table (slots + installed units), shared by every vCPU
     /// of the domain via `Arc` so a guest-driven `install` is visible across `thread.spawn` children
     /// and `Jit.invoke` children (DESIGN.md §22). Reads are lock-free atomic loads (see
@@ -12137,7 +12127,6 @@ impl VCpu {
         depth: u32,
         id: TaskId,
         sched: SchedRef,
-        quota: Quota,
         dt: Arc<DomainTable>,
     ) -> VCpu {
         VCpu {
@@ -12187,7 +12176,6 @@ impl VCpu {
             sched,
             memop: false,
             acc: None,
-            quota,
             dt,
             units: Vec::new(),
             invoked: None,
@@ -12269,7 +12257,6 @@ impl VCpu {
             sched: self.sched.clone(),
             memop: false,
             acc: None,
-            quota: self.quota,
             dt: Arc::new(self.dt.fork()), // #1297: its own table, seeded with the parent's installs
             units: Vec::new(),
             invoked: None,
@@ -12315,7 +12302,6 @@ impl VCpu {
         fuel: Fuel,
         depth: u32,
         sched: SchedRef,
-        quota: Quota,
     ) -> VCpu {
         // Unit-own funcref (DESIGN.md §22): if the unit takes its OWN functions' addresses,
         // auto-install them into `dt` (function-granular) so `ref.func i` resolves to the unit's own
@@ -12373,7 +12359,6 @@ impl VCpu {
             sched,
             memop: false,
             acc: None,
-            quota,
             dt,
             units: Vec::new(),
             invoked: Some(unit),
@@ -13198,11 +13183,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
 
     let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program), immutable for the run
     let types = Arc::clone(&v.types); // module 0 type section (#922)
-    let spawn_quota = v.quota; // §15 fiber/vCPU ceilings (distinct from the Instantiator's i64 fuel quota)
-                               // `dt` is the **shared** domain table (atomic slots + the writer-locked installed
-                               // units); reads off it are lock-free. `units` here is this vCPU's **local clone** of
-                               // the installed-units prefix, refreshed lazily on a miss (`resolve_module`) so neither
-                               // a running unit frame nor the `Jit.install` arm needs the shared lock on the hot loop.
+
+    // `dt` is the **shared** domain table (atomic slots + the writer-locked installed units); reads
+    // off it are lock-free. `units` here is this vCPU's **local clone** of the installed-units prefix,
+    // refreshed lazily on a miss (`resolve_module`) so neither a running unit frame nor the
+    // `Jit.install` arm needs the shared lock on the hot loop.
     let VCpu {
         types: _,      // module 0 type section — already cloned above (#922)
         invoked_types, // the invoked unit's type section (module INVOKE_MODULE), if any
@@ -13243,7 +13228,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         tls,
         memop,
         acc,
-        quota: _,
         setjmp_points,
         dt,
         units,
@@ -13724,7 +13708,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // Allocate the handler fiber slot; exhaustion is backpressure —
                                     // undo the checkout, answer -EAGAIN (never a trap).
                                     let handle_ =
-                                        match registry.create(0, 0, spawn_quota.max_fibers, false, arena) {
+                                        // A fiber the runtime makes for a dispatch is mechanism,
+                                        // charged to nothing (#2112).
+                                        match registry.create(
+                                            0,
+                                            0,
+                                            false,
+                                            arena,
+                                            LiveFiber::none(),
+                                        ) {
                                             Ok(h_) => h_,
                                             Err(_) => {
                                                 // 7.1 threaded: no checkout to undo (see above).
@@ -14340,7 +14332,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         std::mem::replace(fuel, Fuel::fixed(0)),
                         depth + frames.len() as u32 + 1,
                         sched.clone(),
-                        spawn_quota,
                     );
                     child.memop = memop;
                     // #1660: the unit runs over this window's heap, so a collection inside it must
@@ -14977,14 +14968,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Some(_) => fuel.can_burn(),
                                         None => fuel.carve_allowance(quota),
                                     });
-                                    let spawn_quota = match rec_b.as_ref() {
-                                        Some(b) if b.spawn >= 0 => temen_ir::Quota {
-                                            max_vcpus: (b.spawn.max(1) as usize)
-                                                .min(spawn_quota.max_vcpus),
-                                            max_fibers: spawn_quota.max_fibers,
-                                        },
-                                        _ => spawn_quota,
-                                    };
                                     // A same-module child runs the **spawning frame's** module — the
                                     // one `entry` was validated against above (`cfs`), so an installed
                                     // §22 unit's child runs the unit's function, not module 0's
@@ -15070,7 +15053,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             depth + 1,
                                             id,
                                             csched,
-                                            spawn_quota, // a nested child inherits the domain's spawn quota
                                             cdt,
                                         );
                                         child.memop = memop;
@@ -15554,7 +15536,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             depth + 1,
                                             id,
                                             csched,
-                                            spawn_quota,
                                             cdt,
                                         );
                                         child.memop = memop;
@@ -15859,16 +15840,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             .map(|(s_, ty)| Reg::from_value(slot_to_val(*ty, *s_)))
                             .collect();
                         // The handler's fiber slot — an ordinary registry fiber (recycled on
-                        // finish), so the §15 quota bounds concurrent parked handlers too.
-                        // Exhaustion is backpressure to the dispatch, not a trap.
-                        let handle =
-                            match registry.create(0, 0, spawn_quota.max_fibers, durable, arena) {
-                                Ok(h_) => h_,
-                                Err(_) => {
-                                    sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
-                                    continue;
-                                }
-                            };
+                        // finish), so [`MAX_FIBERS`] bounds concurrent parked handlers too.
+                        // Exhaustion is backpressure to the dispatch, not a trap. A fiber the
+                        // runtime makes for a dispatch is mechanism, charged to nothing (#2112).
+                        let handle = match registry.create(0, 0, durable, arena, LiveFiber::none())
+                        {
+                            Ok(h_) => h_,
+                            Err(_) => {
+                                sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
+                                continue;
+                            }
+                        };
                         // Claim it straight into `Running` (discarding the placeholder
                         // `Start`): handler first-frames are built here — their signatures
                         // are the impl_export's own, not the `(sp, arg)` fiber launch shape.
@@ -16987,15 +16969,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::ContNew { func, sp } => {
                     let funcref = get_i32(&frames[top].vals, *func)?;
                     let stack_base = get_i64(&frames[top].vals, *sp)?;
+                    // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
+                    let charge = host
+                        .lock_unpoisoned()
+                        .fiber_charge()
+                        .ok_or(Trap::FiberFault)?;
                     // `durable` runs assign the new fiber a distinct shadow region (and refuse if
                     // the reserve is full); a non-durable run ignores the region bookkeeping.
-                    let handle = registry.create(
-                        funcref,
-                        stack_base,
-                        spawn_quota.max_fibers,
-                        durable,
-                        arena,
-                    )?;
+                    let handle = registry.create(funcref, stack_base, durable, arena, charge)?;
                     frames[top].vals.push(Reg::from_i64(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
@@ -17444,7 +17425,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             0,
                             id,
                             csched,
-                            spawn_quota, // spawned vCPU inherits the domain's spawn quota
                             cdt,
                         );
                         // Start the child in the spawning frame's module (an installed §22 unit's own
@@ -20130,13 +20110,56 @@ struct BudgetTree(Mutex<Vec<BudgetNode>>);
 /// only one safepoint in this many walks the chain.
 pub const FUEL_CHUNK: u64 = 1 << 16;
 
+/// #2113 — the fuel a run's root is granted for an activation when its embedder names none (owner,
+/// 2026-10-06: "just put large bounds on everything"). One value on every engine.
+pub const DEFAULT_FUEL: u64 = 1 << 40;
+/// #2113 — the root's `mem` grant when its embedder names none: 64 GiB.
+pub const DEFAULT_MEM: u64 = 64 << 30;
+/// #2113 — the root's `channel` grant when its embedder names none: 64 GiB.
+pub const DEFAULT_CHANNEL: u64 = 64 << 30;
+/// #2113 — the root's `spawn` grant when its embedder names none: [`MAX_VCPUS`] live vCPUs.
+pub const DEFAULT_SPAWN: u64 = MAX_VCPUS as u64;
+
+/// #2113 — the window a run's root opens an activation over ([`Host::begin_activation`]), as the
+/// run's own node pays for it: `declared` bytes, and `grown` past them that it holds committed as its
+/// own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootWindow {
+    pub declared: u64,
+    pub grown: u64,
+}
+
+impl RootWindow {
+    /// A fresh run of `m`: its declared memory, nothing grown yet.
+    pub fn fresh(m: &Module) -> RootWindow {
+        RootWindow {
+            declared: m.memory.map_or(0, |mc| 1 << mc.size_log2),
+            grown: 0,
+        }
+    }
+
+    /// What `mem` holds: nothing for a run with no window.
+    pub(crate) fn of(mem: Option<&Mem>) -> RootWindow {
+        mem.map_or(RootWindow::default(), |m| RootWindow {
+            declared: m.window.mapped(),
+            grown: m.tail_bytes(0, m.window.reserved()).held,
+        })
+    }
+}
+
 impl Default for BudgetTree {
-    /// A run's tree, holding its root node ([`BudgetTree::RUN_NODE`]): the run's own, every ceiling
-    /// unbounded until an activation sets its fuel ([`Host::begin_activation`]).
+    /// A run's tree, holding its root node ([`BudgetTree::RUN_NODE`]): the run's own, holding the
+    /// default grant ([`DEFAULT_MEM`], [`DEFAULT_CHANNEL`], [`DEFAULT_SPAWN`]) until its embedder sets
+    /// its own ([`Host::set_grant`]). Its fuel is granted per activation ([`Host::begin_activation`]);
+    /// its lane is unbounded.
     fn default() -> BudgetTree {
+        let mut ceiling = [-1; BUDGET_DIMS];
+        ceiling[BUDGET_MEM] = DEFAULT_MEM as i64;
+        ceiling[BUDGET_SPAWN] = DEFAULT_SPAWN as i64;
+        ceiling[BUDGET_CHANNEL] = DEFAULT_CHANNEL as i64;
         BudgetTree(Mutex::new(vec![BudgetNode {
             parent: None,
-            ceiling: [-1; BUDGET_DIMS],
+            ceiling,
             used: [0; BUDGET_DIMS],
         }]))
     }
@@ -20455,36 +20478,50 @@ impl NodeRef {
     pub fn vcpu_ended(&self) {
         self.tree.refund(self.node, BUDGET_SPAWN, 1);
     }
+
+    /// #2112 — charge one live fiber, [`temen_ir::FIBER_STACK`] of `mem`, to the chain, all or
+    /// nothing: `false` when a level's `mem` is full. The Cranelift JIT, which keeps its own fibers,
+    /// pairs it with [`Self::fiber_ended`]; the interpreters hold a [`LiveFiber`] instead.
+    pub fn charge_fiber(&self) -> bool {
+        self.tree
+            .charge(self.node, BUDGET_MEM, temen_ir::FIBER_STACK)
+    }
+
+    /// [`Self::charge_fiber`] past any ceiling: a fiber a thaw re-creates, which lived before the
+    /// freeze.
+    pub fn force_fiber(&self) {
+        self.tree
+            .force_charge(self.node, BUDGET_MEM, temen_ir::FIBER_STACK);
+    }
+
+    /// Hand back a fiber's charge when it ends.
+    pub fn fiber_ended(&self) {
+        self.tree
+            .refund(self.node, BUDGET_MEM, temen_ir::FIBER_STACK);
+    }
 }
 
-/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node: one `spawn`, taken when the vCPU
-/// is made and handed back when this is dropped, so a node's `spawn` counts the live vCPUs of its
-/// subtree (the cgroups `pids.max` model).
-///
-/// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
-/// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
-/// either the run's own, which no guest reads, or a detached child's, whose admission charged the
-/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]).
-pub struct LiveVcpu(Option<NodeRef>);
+/// #2001, #2112 — what a live vCPU or fiber holds of its domain's node: `N` of dimension `D`, charged to
+/// the node and every ancestor when it is made and handed back when this is dropped.
+pub struct Held<const D: usize, const N: u64>(Option<NodeRef>);
 
-impl LiveVcpu {
-    /// Charge one vCPU to `node` and every ancestor: `None`, with nothing charged, when a level's
-    /// `spawn` is full. The guard is built only once the charge took: a refused one dropped would hand
-    /// back a `spawn` never charged.
-    pub(crate) fn charge(node: NodeRef) -> Option<LiveVcpu> {
-        node.charge_vcpu().then(|| LiveVcpu(Some(node)))
+impl<const D: usize, const N: u64> Held<D, N> {
+    /// Charge `node` and every ancestor: `None`, with nothing charged, when a level is full. The guard
+    /// is built only once the charge took: a refused one dropped would hand back what was never
+    /// charged. Public for an embedder that keeps its own vCPUs (the Cranelift JIT's processes).
+    pub fn charge(node: NodeRef) -> Option<Self> {
+        node.tree.charge(node.node, D, N).then(|| Held(Some(node)))
     }
 
-    /// Charge one vCPU past any ceiling ([`NodeRef::force_vcpu`]).
-    pub(crate) fn force(node: NodeRef) -> LiveVcpu {
-        node.force_vcpu();
-        LiveVcpu(Some(node))
+    /// Charge `node` past any ceiling: what a thaw re-creates, which lived before the freeze.
+    pub(crate) fn force(node: NodeRef) -> Self {
+        node.tree.force_charge(node.node, D, N);
+        Held(Some(node))
     }
 
-    /// A vCPU that holds no charge: a run's root, a detached child's first (its window's lease holds
-    /// it), or a carve child's, which the carve path leaves uncharged until #1867 deletes it.
-    pub(crate) fn none() -> LiveVcpu {
-        LiveVcpu(None)
+    /// One that holds no charge.
+    pub(crate) fn none() -> Self {
+        Held(None)
     }
 
     /// Whether this holds a charge.
@@ -20493,13 +20530,27 @@ impl LiveVcpu {
     }
 }
 
-impl Drop for LiveVcpu {
+impl<const D: usize, const N: u64> Drop for Held<D, N> {
     fn drop(&mut self) {
         if let Some(n) = &self.0 {
-            n.vcpu_ended();
+            n.tree.refund(n.node, D, N);
         }
     }
 }
+
+/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node: one `spawn`, so a node's `spawn`
+/// counts the live vCPUs of its subtree (the cgroups `pids.max` model).
+///
+/// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
+/// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
+/// either the run's own, which no guest reads, or a detached child's, whose admission charged the
+/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]). A carve
+/// child's holds none either, until #1867 deletes the carve path.
+pub type LiveVcpu = Held<BUDGET_SPAWN, 1>;
+
+/// #2112 — a live fiber's charge on its domain's node: [`temen_ir::FIBER_STACK`] of `mem`, taken when
+/// `cont.new` makes it ([`Host::fiber_charge`]) and handed back when it returns or its registry goes.
+pub type LiveFiber = Held<BUDGET_MEM, { temen_ir::FIBER_STACK }>;
 
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
@@ -21837,7 +21888,7 @@ pub(crate) struct ChildPowerbox {
     attestation: Attestation,
     durable: bool,
     own_budget: u32,
-    grown: Option<u64>,
+    grown: u64,
     lane_cap: i64,
 }
 
@@ -22766,16 +22817,6 @@ pub struct Host {
     /// hands over a delivery); the eval-loop park site takes it ([`Self::take_sig_interrupt`]) and, when
     /// set, returns `-EINTR` rather than rewinding+parking.
     sig_interrupt: bool,
-    /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
-    /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
-    /// `map`, whole-window or carved) may hold through this Host — a map past it fails probeably
-    /// (`-ENOMEM`, invariant 5), so a guest allocator returns NULL. Policy lives here at the cap,
-    /// never in `Mem`/the TCB. `None` (default) = unbounded, zero-cost.
-    mem_map_limit: Option<u64>,
-    /// Bytes currently mapped through `AddressSpace` `map` while a limit is set (map adds, unmap
-    /// subtracts). Rebuilt naturally by a from-0 replay (a live, untaped cap); carried
-    /// by [`HostReplaySubstate`] so a checkpoint restore keeps the accounting.
-    mem_mapped_bytes: u64,
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -22840,17 +22881,20 @@ pub struct Host {
     /// so an activation's fuel limit bounds the whole tree; a detached child's is the budget that paid
     /// for it ([`Host::give_child_budget`]); a fork twin shares its spawner's.
     own_budget: u32,
-    /// #1909, INVARIANTS #3 R2 — what this domain's window holds committed past its declared size,
-    /// charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the window
-    /// goes ([`Host::release_memory`]). `None` for a window no budget paid for (a run's root), whose
-    /// growth is unmetered.
-    grown: Option<u64>,
+    /// #1909, #2113, INVARIANTS #3 R2 — what this domain's window holds committed past its declared
+    /// size, charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the
+    /// window goes ([`Host::release_memory`]).
+    grown: u64,
     /// #2106 — the declared window this domain pays for itself, charged to `own_budget` and every
-    /// ancestor when the domain is made and handed back with its growth: a fork twin's copy of its
-    /// parent's window, a spawned process's fresh one ([`Host::process_powerbox`]). `0` for a detached
-    /// child, whose window its admission lease pays for, and for an unmetered root. An exec keeps it,
-    /// as the image's window is the caller's size.
+    /// ancestor and handed back with its growth: a run's root's, from when an activation opens
+    /// ([`Host::begin_activation`], #2113), a fork twin's copy of its parent's window, a spawned
+    /// process's fresh one ([`Host::process_powerbox`]). `0` for a detached child, whose window its
+    /// admission lease pays for. An exec keeps it, as the image's window is the caller's size.
     own_window: u64,
+    /// #2113 — whether `own_budget` holds the one `spawn` of a run's root main vCPU, charged when an
+    /// activation opens ([`Host::begin_activation`]) and handed back with the window. A detached
+    /// child's first vCPU rides its admission lease instead.
+    main_vcpu: bool,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -23115,10 +23159,6 @@ pub struct Host {
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears;
     /// filed under [`UNCLAIMED_BASE`] while seeded for a window not built yet ([`Host::reset_cap_pages`]).
     cap_pages: Option<(usize, CapPageMap)>,
-    /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
-    /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
-    /// size the executor's live-vCPU cap and each vCPU's fiber cap.
-    quota: Quota,
     /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
@@ -23627,8 +23667,6 @@ impl Host {
             pipe_write_parked: None,
             pipe_wake_writers: None,
             sig_interrupt: false,
-            mem_map_limit: None,
-            mem_mapped_bytes: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),
             out_sink: None,
@@ -23645,8 +23683,9 @@ impl Host {
             realias: Vec::new(),
             budgets: Arc::default(),
             own_budget: BudgetTree::RUN_NODE,
-            grown: None,
+            grown: 0,
             own_window: 0,
+            main_vcpu: false,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
@@ -23696,7 +23735,6 @@ impl Host {
             external_wake: None,
             exec_replace: None,
             cap_pages: None,
-            quota: Quota::default(),
             jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
@@ -23756,7 +23794,7 @@ impl Host {
     /// tail past them, so the twin pays for both ([`Self::process_powerbox`]): a level without the
     /// room refuses the fork, as a full `spawn` ceiling does.
     fn fork_powerbox(&self, twin_pid: u64, window: u64) -> Option<Host> {
-        self.process_powerbox(twin_pid, window, self.grown.unwrap_or(0))
+        self.process_powerbox(twin_pid, window, self.grown)
     }
 
     /// #2106, INVARIANTS #3 R2 — [`Self::powerbox_copy`] for a new process whose window starts with
@@ -23764,31 +23802,24 @@ impl Host {
     /// pays for it: charged to the node it shares with this domain and every ancestor, all or nothing,
     /// before any fork factory runs, so a refusal registers no process. It goes back when the process
     /// ends ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or
-    /// the powerbox cannot be duplicated. A process of an unmetered domain (a run's root) is
-    /// unmetered too.
+    /// the powerbox cannot be duplicated.
     fn process_powerbox(&self, pid: u64, window: u64, grown: u64) -> Option<Host> {
-        let charge = self.grown.map(|_| window + grown);
-        if let Some(c) = charge {
-            if !self.budgets.charge(self.own_budget, BUDGET_MEM, c) {
-                return None;
-            }
+        let charge = window + grown;
+        if !self.budgets.charge(self.own_budget, BUDGET_MEM, charge) {
+            return None;
         }
         let Some(mut twin) = self.powerbox_copy(pid) else {
-            if let Some(c) = charge {
-                self.budgets.refund(self.own_budget, BUDGET_MEM, c);
-            }
+            self.budgets.refund(self.own_budget, BUDGET_MEM, charge);
             return None;
         };
-        if charge.is_some() {
-            twin.own_window = window;
-            twin.grown = Some(grown);
-        }
+        twin.own_window = window;
+        twin.grown = grown;
         Some(twin)
     }
 
     /// [`Self::process_powerbox`]'s powerbox duplicate, before the window it rides with is known: a
     /// fork copies this domain's window, a spawn ([`Self::spawn_powerbox`]) builds a fresh one. Either
-    /// way the copy is metered when this domain is (#1909), with nothing held yet.
+    /// way the copy holds nothing yet (#1909).
     fn powerbox_copy(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
@@ -23980,8 +24011,6 @@ impl Host {
         // nodes and both charge the same chains, as a forked process stays in its cgroup.
         twin.budgets = Arc::clone(&self.budgets);
         twin.own_budget = self.own_budget;
-        twin.grown = self.grown.map(|_| 0);
-        twin.quota = self.quota;
         // Structural intern / import binding tables ride along (same program surface).
         twin.iface_intern = self.iface_intern.clone();
         twin.import_remaps = self.import_remaps.clone();
@@ -23995,8 +24024,6 @@ impl Host {
         // Copied I/O scalars (POSIX fork copies the stdin buffer/offset; a shared fd is the sink case).
         (twin.stdin, twin.stdin_pos) = self.stdin_copy();
         twin.stdin_block = self.stdin_block;
-        twin.mem_map_limit = self.mem_map_limit;
-        twin.mem_mapped_bytes = self.mem_mapped_bytes;
         twin.clock_ns = self.clock_ns;
         twin.jit_table_log2 = self.jit_table_log2;
         twin.jit_hosts_fibers = self.jit_hosts_fibers;
@@ -24520,13 +24547,6 @@ impl Host {
         self.stdin.extend_from_slice(bytes);
     }
 
-    /// Set (or clear) the **memory growth cap** — see [`Host::mem_map_limit`]. With a
-    /// limit, a `vm_map` whose committed total would exceed it returns `-ENOMEM` (probeable; a
-    /// guest `malloc` over `vm_map` returns NULL), and `vm_unmap` returns its bytes to the budget.
-    pub fn set_mem_map_limit(&mut self, limit: Option<u64>) {
-        self.mem_map_limit = limit;
-    }
-
     /// Take the transient "the last stdin read parked" flag (the `CapCall` arm uses it to yield
     /// [`Outcome::StdinPark`]). Crate-internal: the bytecode engine lives in a sibling module.
     pub fn take_stdin_parked(&mut self) -> bool {
@@ -24929,7 +24949,7 @@ impl Host {
             .and_then(|h| host.budget_node(h))
         {
             host.own_budget = node;
-            host.grown = Some(window.grown_bytes());
+            host.grown = window.grown_bytes();
         }
         let bound = if launch.same_module {
             host.bind_same_module_manifest(&g.imports, &g.types)
@@ -25168,7 +25188,7 @@ impl Host {
             clock_ns: self.clock_ns,
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
-            mem_mapped_bytes: self.mem_mapped_bytes,
+            held: (self.grown, self.own_window, self.main_vcpu),
             jit_mark: self.jit_compile_mark(),
         }
     }
@@ -25204,7 +25224,7 @@ impl Host {
         if let Some(rec) = self.cap_record.as_mut() {
             rec.truncate(c.cap_record_len);
         }
-        self.mem_mapped_bytes = c.mem_mapped_bytes;
+        (self.grown, self.own_window, self.main_vcpu) = c.held;
     }
 
     /// Whether this host's run-mutable state is invertible by a [`HostCursor`] alone — the journal's
@@ -25275,7 +25295,7 @@ impl Host {
             svc_results,
             svc_next_ticket,
             cap_states: self.capture_cap_states(),
-            mem_mapped_bytes: self.mem_mapped_bytes,
+            held: (self.grown, self.own_window, self.main_vcpu),
             jit_quota: self
                 .jit_tables
                 .iter()
@@ -25317,7 +25337,7 @@ impl Host {
             s.svc_results.clone(),
             s.svc_next_ticket,
         );
-        self.mem_mapped_bytes = s.mem_mapped_bytes;
+        (self.grown, self.own_window, self.main_vcpu) = s.held;
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
         // as a fresh powerbox minted them. Under a replaying tape too: a replay re-runs such a
@@ -25333,18 +25353,6 @@ impl Host {
     /// Whether this domain holds a `Jit` table at all, unit or none.
     pub(crate) fn has_jit_table(&self) -> bool {
         !self.jit_tables.is_empty()
-    }
-
-    /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
-    /// anti-bomb ceiling ([`MAX_FIBERS`]/[`MAX_VCPUS`]) — a quota can only *tighten* — and to ≥ 1. The
-    /// quota is read at run start ([`run_with_host`]→`drive`); a guest exceeding it traps cleanly
-    /// (`FiberFault`/`ThreadFault`). The JIT enforces the same quota via `temen_jit` (see `temen-run`).
-    pub fn set_quota(&mut self, quota: Quota) {
-        self.quota = quota.clamped();
-    }
-    /// This domain's spawn quota (the clamped value in effect).
-    pub fn quota(&self) -> Quota {
-        self.quota
     }
 
     /// CALLS.md 4d — enable **direct handoff** for a run rooted at this domain (see [`Host::handoff`]).
@@ -26665,6 +26673,19 @@ impl Host {
         self.grant(cap_id::STREAM, Binding::Stream { role, sink: None })
     }
 
+    /// #2113 — the embedder's grant to the run this domain roots: its own node's `mem`, `channel` and
+    /// `spawn` ceilings (`-1` = unbounded), which bound everything charged under it — the domain's
+    /// windows, fibers, regions, pipes and vCPUs, and its children's. A run's root holds the default
+    /// grant until this is called ([`DEFAULT_MEM`]); its fuel is granted per activation
+    /// ([`Self::begin_activation`]).
+    pub fn set_grant(&mut self, mem: i64, channel: i64, spawn: i64) {
+        self.budgets.set_ceiling(self.own_budget, BUDGET_MEM, mem);
+        self.budgets
+            .set_ceiling(self.own_budget, BUDGET_CHANNEL, channel);
+        self.budgets
+            .set_ceiling(self.own_budget, BUDGET_SPAWN, spawn);
+    }
+
     /// #989 — set this domain's own node's channel-memory ceiling (bytes); `-1` = unbounded. The carve
     /// spawn paths call it on a carve child's `Host`, whose node heads a tree of its own, with the
     /// funding record's `Budget.channel` (until #1867 deletes the carve). A detached child needs none:
@@ -26799,8 +26820,6 @@ impl Host {
         if let Some(node) = self.budget_node(budget) {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
-            // #1909 — the budget that paid for the window pays for its growth too.
-            child.grown = Some(0);
             if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
                 child.cap_names.insert(0, ("budget".to_string(), h));
             }
@@ -26814,7 +26833,8 @@ impl Host {
     /// nothing: `-ENOMEM`, with no page changed, when a level lacks the room. After the op the charge
     /// is settled to what the window actually holds there, so a page already held costs nothing and a
     /// page given back (unmapped, or aliased to a region) is refunded; one protected to nothing keeps
-    /// its contents, and its charge. A window no budget paid for grows unmetered.
+    /// its contents, and its charge. A run's root's window is metered against the run's own node, its
+    /// embedder's grant (#2113).
     fn page_op(
         &mut self,
         mem: &mut dyn GuestMem,
@@ -26823,9 +26843,7 @@ impl Host {
         commits: Commits,
         op: impl FnOnce(&Host, &mut dyn GuestMem) -> i64,
     ) -> i64 {
-        let Some(grown) = self.grown else {
-            return op(self, mem);
-        };
+        let grown = self.grown;
         let before = mem.tail_bytes(off, len);
         let held = before.held;
         let worst = match commits {
@@ -26847,7 +26865,7 @@ impl Host {
         if back > 0 {
             self.budgets.refund(self.own_budget, BUDGET_MEM, back);
         }
-        self.grown = Some(now);
+        self.grown = now;
         r
     }
 
@@ -26855,28 +26873,44 @@ impl Host {
     /// image): what its window held goes back to its node and every ancestor — what it grew past its
     /// declared size, and the declared window itself when the domain paid for it
     /// ([`Self::own_window`]), as a detached child's goes back with its lease (INVARIANTS #3: ending
-    /// a use refunds every level). And it lets go of the regions it holds: one no other domain holds
-    /// goes, and its charge with it ([`ChargedRegion`]). Never on a freeze: a captured window stays
-    /// charged, and the thaw takes the charge over ([`Host::prepare_detached_relaunch`]). A window no
-    /// budget paid for (a run's root) is its embedder's, regions and all: the embedder reads it after
-    /// the run, and a reactor's next call finds its regions where they were (#2113 meters the root).
+    /// a use refunds every level). A run's root's main vCPU goes back with its window (#2113). And it
+    /// lets go of the regions it holds: one no other domain holds goes, and its charge with it
+    /// ([`ChargedRegion`]). Never on a freeze: a captured window stays charged, and the thaw takes the
+    /// charge over ([`Host::prepare_detached_relaunch`]). A domain on the run's own node (a run's
+    /// root, and its processes) keeps its regions for the embedder: it reads them after the run, and
+    /// a reactor's next call finds them where they were.
     pub fn release_memory(&mut self) {
-        if let Some(g) = self.grown {
-            let held = g + std::mem::take(&mut self.own_window);
-            if held > 0 {
-                self.budgets.refund(self.own_budget, BUDGET_MEM, held);
-            }
-            self.grown = Some(0);
+        let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
+        if held > 0 {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, held);
+        }
+        if std::mem::take(&mut self.main_vcpu) {
+            self.budgets.refund(self.own_budget, BUDGET_SPAWN, 1);
+        }
+        if self.own_budget != BudgetTree::RUN_NODE {
             self.regions.clear();
         }
     }
 
-    /// #1944 slice 3 — open an activation of this domain with `fuel` to burn: its own node's fuel room
-    /// becomes `fuel` (unbounded when `fuel` does not fit a ceiling — `u64::MAX` by convention),
-    /// whatever earlier activations burned, so a reactor call or a thaw starts with the limit its
-    /// embedder passes. Returns the node its vCPUs draw from.
-    pub fn begin_activation(&mut self, fuel: u64) -> NodeRef {
+    /// #1944 slice 3, #2113 — open an activation of the run this domain roots, over `window`, with
+    /// `fuel` to burn: its own node's fuel room becomes `fuel` (unbounded when `fuel` does not fit a
+    /// ceiling — `u64::MAX` by convention), whatever earlier activations burned, so a reactor call or
+    /// a thaw starts with the limit its embedder passes. The root's window and its main vCPU are its
+    /// own node's, as a child's are its budget's: charged past any ceiling, since they are what its
+    /// embedder chose to run, so a grant they exceed leaves the run room for nothing more. What an
+    /// earlier activation's window held goes back first. Returns the node its vCPUs draw from.
+    pub fn begin_activation(&mut self, fuel: u64, window: RootWindow) -> NodeRef {
         self.budgets.set_fuel_room(self.own_budget, fuel);
+        let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
+        if held > 0 {
+            self.budgets.refund(self.own_budget, BUDGET_MEM, held);
+        }
+        self.budgets
+            .force_charge(self.own_budget, BUDGET_MEM, window.declared + window.grown);
+        (self.own_window, self.grown) = (window.declared, window.grown);
+        if !std::mem::replace(&mut self.main_vcpu, true) {
+            self.budgets.force_charge(self.own_budget, BUDGET_SPAWN, 1);
+        }
         self.own_node()
     }
 
@@ -26886,6 +26920,20 @@ impl Host {
             tree: Arc::clone(&self.budgets),
             node: self.own_budget,
         }
+    }
+
+    /// #2112 — the charge for a fiber this domain's `cont.new` makes: [`temen_ir::FIBER_STACK`] of
+    /// `mem` on its node and every ancestor, all or nothing. `None` past a ceiling, where `cont.new`
+    /// traps `FiberFault`. A run's root charges the run's own node, which no guest reads, as its
+    /// threads do, until #2113 meters the root.
+    pub(crate) fn fiber_charge(&self) -> Option<LiveFiber> {
+        LiveFiber::charge(self.own_node())
+    }
+
+    /// #2112 — [`Self::fiber_charge`] past any ceiling: a fiber a thaw re-creates, which lived before
+    /// the freeze and handed its charge back as the freeze flattened it.
+    pub(crate) fn fiber_recharge(&self) -> LiveFiber {
+        LiveFiber::force(self.own_node())
     }
 
     /// #1944 slice 3 — the fuel room left on this domain's own chain: what an activation reads back
@@ -29097,7 +29145,7 @@ impl Host {
     /// Tighten (or widen) every granted `Jit` domain's compile quota — the §15-style resource
     /// bound on guest-driven compilation (units and cumulative submitted-blob bytes; enforced
     /// in the shared [`Host::jit_compile`] gate, so a quota'd `compile` fails `-ENOMEM`
-    /// identically on both backends). Set before the run, like [`Host::set_quota`].
+    /// identically on both backends). Set before the run, like [`Host::set_grant`].
     pub fn set_jit_quota(&mut self, max_units: u32, max_blob_bytes: u64) {
         for d in &mut self.jit_tables {
             d.units_left = max_units;
@@ -30457,9 +30505,6 @@ impl Host {
         // cannot exec its way out of the budget that caps it.
         host.budgets = Arc::clone(&self.budgets);
         host.own_budget = self.own_budget;
-        // #1909 — the image starts in a fresh window, with nothing grown yet, metered as the old one
-        // was.
-        host.grown = self.grown.map(|_| 0);
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
@@ -30470,8 +30515,9 @@ impl Host {
         )
         .map_err(|()| EINVAL)?;
         // #2106 — committed: the window is the caller's size, so a declared window the domain paid
-        // for itself stays paid for.
+        // for itself stays paid for, as a root's main vCPU stays charged (#2113).
         host.own_window = std::mem::take(&mut self.own_window);
+        host.main_vcpu = std::mem::take(&mut self.main_vcpu);
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
@@ -31531,29 +31577,10 @@ impl Host {
                 let commits = |c| if access { c } else { Commits::Nothing };
                 Ok(vec![match op {
                     0 => {
-                        // The growth cap (§3e slice 5): at the limit, map fails probeably — the
-                        // OOM-teaching knob. Accounting only runs with a limit set; it meters
-                        // every AddressSpace `map` on this Host, whole-window or carved.
-                        if let Some(limit) = self.mem_map_limit {
-                            if self.mem_mapped_bytes.saturating_add(len) > limit {
-                                return Ok(vec![ENOMEM]);
-                            }
-                        }
                         let every = commits(Commits::Every);
-                        let r = self.page_op(mem, at, len, every, |_, m| m.map(at, len, prot));
-                        if r >= 0 && self.mem_map_limit.is_some() {
-                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_add(len);
-                        }
-                        r
+                        self.page_op(mem, at, len, every, |_, m| m.map(at, len, prot))
                     }
-                    1 => {
-                        let r =
-                            self.page_op(mem, at, len, Commits::Nothing, |_, m| m.unmap(at, len));
-                        if r >= 0 && self.mem_map_limit.is_some() {
-                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_sub(len);
-                        }
-                        r
-                    }
+                    1 => self.page_op(mem, at, len, Commits::Nothing, |_, m| m.unmap(at, len)),
                     2 => {
                         let own = commits(Commits::Own);
                         self.page_op(mem, at, len, own, |_, m| m.protect(at, len, prot))
@@ -35170,7 +35197,8 @@ mod growth_tests {
     //! #1909, #2106 — the memory a window holds is charged to the budget that paid for it, wherever
     //! the window goes: a detached window's growth past its declared size, a fork twin's copy of its
     //! parent's window, a spawned process's fresh one. An exec's fresh window hands back the growth of
-    //! the one it replaces and keeps paying for its declared size.
+    //! the one it replaces and keeps paying for its declared size. #2113 — a run's root pays its own
+    //! node, the embedder's grant, as a child pays its budget.
     use super::*;
 
     const GROWTH: u64 = 1 << 16;
@@ -35244,7 +35272,7 @@ mod growth_tests {
         let mut process = child
             .spawn_powerbox(7, SpawnPlan(Box::new(())), WINDOW)
             .expect("the window fits");
-        assert_eq!(process.grown, Some(0), "it starts with nothing grown");
+        assert_eq!(process.grown, 0, "it starts with nothing grown");
         assert_eq!(
             used(&parent, node),
             (WINDOW + GROWTH) as i64,
@@ -35281,11 +35309,7 @@ mod growth_tests {
             0,
             "the replaced window's growth is back"
         );
-        assert_eq!(
-            image.host.grown,
-            Some(0),
-            "the new image is metered, holding none"
-        );
+        assert_eq!(image.host.grown, 0, "the new image holds none");
     }
 
     #[test]
@@ -35329,6 +35353,76 @@ mod growth_tests {
             used(&parent, node),
             GROWTH as i64,
             "the grown page kept its contents: still charged"
+        );
+    }
+
+    /// A run's root granted `mem` bytes, its activation open over [`WINDOW`]: `(root, its window, its
+    /// AddressSpace)`.
+    fn root(mem: i64) -> (Host, Mem, i32) {
+        let mut root = Host::new();
+        root.set_grant(mem, -1, -1);
+        let (_, space) = root.grant_starter_caps(1 << 20);
+        let mem = Mem::with_reservation(20, 16, None);
+        let window = RootWindow::of(Some(&mem));
+        assert_eq!(window.declared, WINDOW);
+        let _ = root.begin_activation(u64::MAX, window);
+        (root, mem, space)
+    }
+
+    /// #2113 — an activation charges the root's window and its main vCPU to the run's own node, past
+    /// any ceiling; a second settles to the window it runs over, and the root's end hands both back.
+    #[test]
+    fn a_roots_activation_charges_its_window_and_main_vcpu() {
+        let (mut root, ..) = root(1);
+        let run = BudgetTree::RUN_NODE;
+        assert_eq!(used(&root, run), WINDOW as i64, "past the 1-byte grant");
+        assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 1, "its main vCPU");
+        let wider = RootWindow {
+            declared: 2 * WINDOW,
+            grown: GROWTH,
+        };
+        let _ = root.begin_activation(u64::MAX, wider);
+        assert_eq!(
+            used(&root, run),
+            (2 * WINDOW + GROWTH) as i64,
+            "the next activation's window, in place of the last"
+        );
+        assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 1, "still one");
+        root.release_memory();
+        assert_eq!(used(&root, run), 0, "the root's end hands its window back");
+        assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 0, "and its vCPU");
+    }
+
+    /// #2113 — the root's growth spends its grant: past it, `map` is `-ENOMEM`.
+    #[test]
+    fn a_roots_growth_spends_its_grant() {
+        let (mut root, mut mem, space) = root((WINDOW + GROWTH) as i64);
+        let mut grow = |at: u64| {
+            let args = [at as i64, GROWTH as i64, (PROT_READ | PROT_WRITE) as i64];
+            root.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 0, space, &args, Some(&mut mem))
+        };
+        assert_eq!(grow(WINDOW), Ok(vec![0]), "the growth fits the grant");
+        assert_eq!(grow(WINDOW + GROWTH), Ok(vec![ENOMEM]), "past it");
+        assert_eq!(used(&root, BudgetTree::RUN_NODE), (WINDOW + GROWTH) as i64);
+    }
+
+    /// #2113 — a root's fork twin pays for its copy from the root's grant, as a child's twin pays
+    /// from its budget, and its end hands it back.
+    #[test]
+    fn a_roots_fork_twin_pays_from_the_roots_grant() {
+        let (root, ..) = root(2 * WINDOW as i64);
+        let mut twin = root.fork_powerbox(2, WINDOW).expect("the copy fits");
+        let run = BudgetTree::RUN_NODE;
+        assert_eq!(used(&root, run), 2 * WINDOW as i64, "the twin's copy");
+        assert!(
+            root.fork_powerbox(3, WINDOW).is_none(),
+            "no room for another"
+        );
+        twin.release_memory();
+        assert_eq!(
+            used(&root, run),
+            WINDOW as i64,
+            "the twin's end hands it back"
         );
     }
 }
@@ -35443,6 +35537,95 @@ mod live_vcpu_tests {
         );
         drop(held);
         assert_eq!(parent.budgets.used(node, BUDGET_SPAWN), 0);
+    }
+}
+
+#[cfg(test)]
+mod fiber_charge_tests {
+    //! #2112 — a live fiber is `FIBER_STACK` of its domain's `mem`: charged when it is made, handed
+    //! back when it returns or its registry goes, and taken again for a fiber a thaw re-creates. The
+    //! every-engine behaviour is `temen`'s `tests/fiber_budget.rs`; these pin the registry's own
+    //! bookkeeping.
+    use super::*;
+
+    const FIBER: i64 = temen_ir::FIBER_STACK as i64;
+
+    /// A detached child paid from a node whose `mem` ceiling is `ceiling`: `(parent, node, child)`.
+    fn child(ceiling: i64) -> (Host, u32, Host) {
+        let mut parent = Host::new();
+        let budget = parent.grant_budget(-1, ceiling, -1);
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        (parent, node, child)
+    }
+
+    fn used(host: &Host, node: u32) -> i64 {
+        host.budgets.used(node, BUDGET_MEM)
+    }
+
+    fn create(reg: &FiberRegistry, charge: LiveFiber) -> Result<i64, Trap> {
+        reg.create(0, 0, false, ShadowArena::EMPTY, charge)
+    }
+
+    #[test]
+    fn a_fiber_spends_mem_until_it_returns_or_its_registry_goes() {
+        let (parent, node, child) = child(2 * FIBER);
+        let reg = FiberRegistry::new();
+        let a = create(&reg, child.fiber_charge().expect("room")).expect("slot");
+        let _b = create(&reg, child.fiber_charge().expect("room")).expect("slot");
+        assert_eq!(used(&parent, node), 2 * FIBER);
+        assert!(
+            child.fiber_charge().is_none(),
+            "a third is past the ceiling, and charges nothing"
+        );
+        assert_eq!(used(&parent, node), 2 * FIBER);
+        let (slot, _) = reg.claim(a).expect("claim");
+        reg.finish(slot);
+        assert_eq!(
+            used(&parent, node),
+            FIBER,
+            "a returned fiber hands its charge back"
+        );
+        drop(reg);
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "and the registry, the one left unfinished"
+        );
+    }
+
+    #[test]
+    fn a_thaw_charges_the_fibers_it_recreates_again() {
+        let (parent, node, child) = child(FIBER);
+        let reg = FiberRegistry::new();
+        reg.seed_frozen(0, 0, 0, 0, false, child.fiber_recharge());
+        reg.seed_free(1);
+        assert_eq!(
+            used(&parent, node),
+            FIBER,
+            "a frozen fiber, not a free slot"
+        );
+        reg.seed_frozen(0, 0, 0, 0, false, child.fiber_recharge());
+        assert_eq!(
+            used(&parent, node),
+            2 * FIBER,
+            "past the ceiling: the fiber lived before the freeze"
+        );
+        drop(reg);
+        assert_eq!(used(&parent, node), 0);
+    }
+
+    /// Until #2113 meters the root, a root's fibers charge the run's own node, which has no ceiling
+    /// and which no guest reads.
+    #[test]
+    fn a_roots_fibers_charge_the_runs_own_node() {
+        let root = Host::new();
+        let reg = FiberRegistry::new();
+        create(&reg, root.fiber_charge().expect("no ceiling")).expect("slot");
+        assert_eq!(used(&root, root.own_budget), FIBER);
+        drop(reg);
+        assert_eq!(used(&root, root.own_budget), 0);
     }
 }
 

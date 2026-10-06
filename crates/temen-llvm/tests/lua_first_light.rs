@@ -23,8 +23,9 @@ fn run(backend: Backend) -> Outcome {
         limits: Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,

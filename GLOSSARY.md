@@ -190,7 +190,7 @@ The system is four ideas wearing many names:
   keeps serving after `main` returns for as long as its handles are held. Makes
   blocking guest ops (interposed stdin `read`) and service-on-service layering
   expressible. Re-entry (A→B→A) is just a fresh handler fiber; call cycles are
-  recursion, bounded by fuel + the fiber quota — they fault, never hang. Isolated
+  recursion, bounded by fuel + the domain's `mem` (a fiber is `FIBER_STACK` of it) — they fault, never hang. Isolated
   service state, when wanted, is explicit: spawn a child.
 - **admission** — (DESIGN.md §12a) letting one inbound call mint a handler fiber in a
   provider's world. Gated per provider *domain*: `single` (default) serializes handlers

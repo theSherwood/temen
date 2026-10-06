@@ -13,7 +13,7 @@
 //! commute) loses no interleaving.
 
 use temen_interp::{explore_all, explore_all_bruteforce, run, run_scheduled, run_with_host};
-use temen_interp::{Host, Quota, Trap, Value};
+use temen_interp::{Host, Trap, Value};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -195,12 +195,11 @@ fn foreign_vcpu_claim_succeeds_without_a_race() {
     assert_outcomes(NO_RACE, &[Ok(42)]);
 }
 
-/// **The fiber quota is per-run now** (the registry is run-shared; DESIGN.md §23 (per-run quota)): with
-/// `max_fibers = 2` (the root computation + one creation), the root's `cont.new` fills the run's
-/// budget, so a *spawned vCPU's* `cont.new` trips it — under the old per-vCPU tables the child's
-/// fresh table would have admitted it (this is the non-vacuous pin of the semantic change).
+/// **The fiber bound is per-run** (the registry is run-shared; DESIGN.md §23): with a `mem` grant of
+/// one fiber (#2112, #2113), the root's `cont.new` fills it, so a *spawned vCPU's* `cont.new` trips it
+/// — per-vCPU tables would each have admitted one (this is the non-vacuous pin of the semantic change).
 #[test]
-fn fiber_quota_spans_vcpus() {
+fn fiber_bound_spans_vcpus() {
     let src = r#"
 func () -> (i64) {
 block 0 () {
@@ -226,24 +225,21 @@ block 0 (vsp: i64, varg: i64) {
 }
 "#;
     let m = module(src);
-    let run_quota = |max_fibers: usize| -> Result<Vec<Value>, Trap> {
+    let run_granted = |fibers: i64| -> Result<Vec<Value>, Trap> {
         let mut host = Host::new();
-        host.set_quota(Quota {
-            max_fibers,
-            max_vcpus: 1 << 16,
-        });
+        host.set_grant(fibers * temen_ir::FIBER_STACK as i64, -1, -1);
         let mut fuel = 10_000_000u64;
         run_with_host(&m, 0, &[], &mut fuel, &mut host)
     };
     assert_eq!(
-        run_quota(2),
+        run_granted(1),
         Err(Trap::FiberFault),
-        "the child's cont.new must trip the run-wide quota the root already filled"
+        "the child's cont.new must trip the run-wide grant the root already filled"
     );
     assert_eq!(
-        run_quota(3),
+        run_granted(2),
         Ok(vec![Value::I64(1)]),
-        "one more slot admits it — and the child's handle (1) continues the run's numbering"
+        "room for one more admits it — and the child's handle (1) continues the run's numbering"
     );
 }
 

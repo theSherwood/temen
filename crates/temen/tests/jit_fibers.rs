@@ -286,7 +286,7 @@ fn fiber_uses_data_stack_and_memory() {
 #[test]
 fn fiber_backtrace_walks_a_suspended_fibers_guest_stack() {
     use temen_ir::DEFAULT_RESERVED_LOG2;
-    use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+    use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
 
     // `func 1` (entry) calls `func 2` (helper) at fib.c:5; the helper `suspend`s at fib.c:9.
     let src = r#"
@@ -332,7 +332,7 @@ debug.loc 2 0 0 0 9 3
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("compile");

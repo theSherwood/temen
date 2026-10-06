@@ -1,6 +1,6 @@
 //! **Phase 3 — uniform run config across backends.** The same powerbox program runs on the
 //! tree-walker, the bytecode engine, and the JIT through one `RunConfig`, and the resource limits
-//! (fuel, spawn quota, window size) apply uniformly where each backend supports them. Proves the
+//! (fuel, the root's grant, window size) apply uniformly where each backend supports them. Proves the
 //! "pick a backend, set the knobs, run" interface from `temen_run::Instance::run` / `run_diff`.
 //!
 //! Gated `#![cfg(unix)]` like the other JIT differential suites.

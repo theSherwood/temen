@@ -27,7 +27,7 @@
 //!
 //! Pids follow the interpreters' (#799: a twin's pid *is* its task id): the root is `1`, twins count
 //! from `2` in fork order, a refused powerbox burns its number (#1648), and a fork past the run's
-//! vCPU quota answers `-EAGAIN`. When the root's image chain finishes, the run ends with it (DESIGN.md
+//! `spawn` grant or [`temen_ir::MAX_VCPUS`] answers `-EAGAIN`. When the root's image chain finishes, the run ends with it (DESIGN.md
 //! §12 domain lifetime): every running twin is stopped at its next safepoint through the tree's
 //! kill-path cell and joined, as the oracle's teardown stops running siblings.
 //!
@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use temen_interp::{
-    ExecCmd, GuestMem, Host, ParkEvent, ParkTransients, SpawnPlan, Trap, TwinTrap, Value,
+    ExecCmd, GuestMem, Host, LiveVcpu, ParkEvent, ParkTransients, SpawnPlan, Trap, TwinTrap, Value,
 };
 use temen_ir::durable_abi::{ShadowArena, STATE_OFF, STATE_UNWINDING};
 use temen_ir::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
@@ -179,7 +179,6 @@ pub(crate) struct Tree {
     interrupt: Arc<AtomicU64>,
     /// Whether the run armed a deadline (then every image polls the cell, the root's included).
     deadline: bool,
-    quota: temen_jit::Quota,
     /// #1944 slice 3 — the root budget's fuel cell when `Limits.fuel` bounds the run (`0`: un-metered).
     /// Every image of the tree charges it: a process shares its forker's budget node, as a fork twin
     /// does on the interpreters.
@@ -191,7 +190,8 @@ pub(crate) struct Tree {
 struct TreeState {
     /// The next twin pid (from 2; a refused powerbox burns one).
     next_pid: u64,
-    /// Live processes, the root included — held to the run's vCPU quota, the oracle's task cap.
+    /// Live processes, the root included — held to [`temen_ir::MAX_VCPUS`], the oracle's task cap.
+    /// Each process but the root is also one `spawn` of its forker's budget node (#2001, #2113).
     live: usize,
     /// Every twin's thread, joined at teardown.
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -202,7 +202,6 @@ struct TreeState {
 impl Tree {
     fn new(
         interrupt: Option<&Arc<AtomicU64>>,
-        quota: temen_jit::Quota,
         fuel: Option<*mut temen_jit::FuelCell>,
     ) -> Arc<Tree> {
         Arc::new(Tree {
@@ -219,7 +218,6 @@ impl Tree {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             deadline: interrupt.is_some(),
-            quota,
             fuel: fuel.map_or(0, |c| c as usize),
             code: Mutex::new(HashMap::new()),
         })
@@ -346,14 +344,20 @@ impl Tree {
     /// **Fork** the process frozen at `point` over `host` (FORK.md §9.5, the JIT's arm of the
     /// oracle's `fork_vcpu`): mint the twin's pid, copy the window, duplicate the powerbox, and start
     /// the twin running `image` — returning the parent's reply: the twin's pid, or `-EAGAIN` for a
-    /// refusal that duplicated nothing (the quota is full; the window aliases shared memory; a
+    /// refusal that duplicated nothing (no `spawn` is left; the window aliases shared memory; a
     /// capability the core cannot duplicate). Holds the tree lock throughout, as the oracle holds its
     /// scheduler lock, so concurrent forks mint pids in one order.
     fn fork(self: &Arc<Self>, host: &mut Host, point: &ForkPoint<'_>, image: &Arc<Image>) -> i64 {
         let mut st = self.lock();
-        if st.live >= self.quota.max_vcpus || self.torn_down.load(Ordering::SeqCst) {
+        if st.live >= temen_ir::MAX_VCPUS || self.torn_down.load(Ordering::SeqCst) {
             return EAGAIN;
         }
+        // #2001, #2113 — the twin is one `spawn` of the node it shares with its parent while it
+        // lives, as the oracle's `fork_vcpu` charges it: a full ceiling refuses the fork. A refusal
+        // below drops the charge, handing it back.
+        let Some(live) = LiveVcpu::charge(host.own_node()) else {
+            return EAGAIN;
+        };
         let pid = st.next_pid;
         let pages = host
             .cap_window_pages(point.window_base())
@@ -384,7 +388,7 @@ impl Tree {
             .spawn(move || {
                 let host = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(host) = host {
-                    tree.run_proc(pid, host, start);
+                    tree.run_proc(pid, host, start, live);
                 }
             });
         match spawned {
@@ -430,9 +434,14 @@ impl Tree {
         (mapped, reserved): (u64, u64),
     ) -> i64 {
         let mut st = self.lock();
-        if st.live >= self.quota.max_vcpus || self.torn_down.load(Ordering::SeqCst) {
+        if st.live >= temen_ir::MAX_VCPUS || self.torn_down.load(Ordering::SeqCst) {
             return EAGAIN;
         }
+        // #2001, #2113 — the process is one `spawn` of the caller's node while it lives, as the
+        // oracle's `spawn_vcpu` charges it. A process that dies at birth hands it back.
+        let Some(live) = LiveVcpu::charge(host.own_node()) else {
+            return EAGAIN;
+        };
         let pid = st.next_pid;
         // #1648 — from here a factory may register a process under this pid: burn it.
         st.next_pid = pid + 1;
@@ -460,7 +469,7 @@ impl Tree {
             .spawn(move || {
                 let host = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(host) = host {
-                    tree.run_proc(pid, host, start);
+                    tree.run_proc(pid, host, start, live);
                 }
             });
         match spawned {
@@ -493,7 +502,7 @@ impl Tree {
     /// image, or a spawned process starting a new one), then retire it — the exit hooks its
     /// personalities rode in on first (so a parent's re-run `waitpid` finds it a zombie), then the
     /// ring that wakes that parent.
-    fn run_proc(self: Arc<Self>, pid: u64, mut host: Host, start: Start<'static>) {
+    fn run_proc(self: Arc<Self>, pid: u64, mut host: Host, start: Start<'static>, live: LiveVcpu) {
         // SAFETY: this thread owns `host` for the whole process.
         let (r, results, final_host) = unsafe { run_process(&self, pid, &mut host, start, None) };
         let result = interp_result(&r, &results);
@@ -503,8 +512,9 @@ impl Tree {
         {
             let mut st = self.lock();
             st.live -= 1;
-            // A twin the run's end stopped did not crash: the oracle reaps it with the run, recording
-            // nothing, and so does the tree.
+            drop(live); // its `spawn` goes back with its slot
+                        // A twin the run's end stopped did not crash: the oracle reaps it with the run, recording
+                        // nothing, and so does the tree.
             let stopped = self.torn_down.load(Ordering::SeqCst);
             if let Err(trap) = result {
                 if !matches!(trap, Trap::Exit(_)) && !stopped {
@@ -825,7 +835,7 @@ unsafe fn compile(
         .as_ref()
         .map_or((m, entry), |(im, at)| (im, *at));
     let fuel = (tree.fuel != 0).then_some(tree.fuel as *mut temen_jit::FuelCell);
-    let cm = compile_image(cc, code, at, interrupt, tree.quota, jit, fuel)?;
+    let cm = compile_image(cc, code, at, interrupt, jit, fuel)?;
     let image = (!jit).then(|| cm.share()).flatten().map(|code| {
         Arc::new(Image {
             code,
@@ -896,7 +906,6 @@ pub(crate) unsafe fn compile_image(
     module: &Module,
     entry: FuncIdx,
     interrupt: Option<*const AtomicU64>,
-    quota: temen_jit::Quota,
     jit: bool,
     fuel: Option<*mut temen_jit::FuelCell>,
 ) -> Result<CompiledModule, temen_jit::JitError> {
@@ -919,15 +928,15 @@ pub(crate) unsafe fn compile_image(
         interrupt,
         fuel, // the root budget's cell when `Limits.fuel` bounds the run (`jit_run`)
         fast,
-        quota,
+        cc.with_host(|h| crate::run_node(h)), // #2113 — what its vCPUs, fibers and processes charge
         CLI_JIT_TABLE_LOG2,
     )?;
     let (fibers, threads) = cc.with_host(|h| (h.jit_hosts_fibers(), h.jit_hosts_threads()));
     if jit && fibers {
-        cm.enable_fiber_hosting(quota)?;
+        cm.enable_fiber_hosting()?;
     }
     if jit && threads && cc.is_locked() {
-        cm.enable_thread_hosting(quota)?;
+        cm.enable_thread_hosting()?;
     }
     Ok(cm)
 }
@@ -1259,12 +1268,11 @@ pub(crate) unsafe fn run_root(
     slots: &[i64],
     host: &mut Host,
     interrupt: Option<&Arc<AtomicU64>>,
-    quota: temen_jit::Quota,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
     fuel: Option<*mut temen_jit::FuelCell>,
 ) -> (Result<JitRun, temen_jit::JitError>, Vec<ValType>) {
-    let tree = Tree::new(interrupt, quota, fuel);
+    let tree = Tree::new(interrupt, fuel);
     let start = Start::Fresh {
         program: Program::Embedder(m),
         entry: func,

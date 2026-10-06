@@ -17,7 +17,7 @@
 //! What this does **not** do (the JIT frontier, tracked on #1600): preempt. A task that never parks
 //! holds its lane until it returns; the interpreter's quantum round-robin has no JIT twin. And a
 //! domain's *own* `thread.spawn` vCPUs — a child task's included (#1469) — stay 1:1 OS threads,
-//! counted by `max_vcpus`; they are not tasks.
+//! counted against `MAX_VCPUS` and their domain's `Budget.spawn`; they are not tasks.
 //!
 //! **Env-swap rules** (the D66 checklist R1–R5): each resume is its own `run_guarded_range` bracket
 //! over the *task's* fault range (R1); the per-thread state the child reads through TLS — its fiber
@@ -182,7 +182,8 @@ impl ChildTask {
         // per-domain registry. A child compiled without `cont.*` gets an unused one-slot table; the
         // runtime still carries the `yielders` / `active_slots` bookkeeping that
         // `fiber_event_park` and `current_fiber_slot` read. A durable child's table knows its shadow
-        // arena, where its `thread.spawn` vCPUs reserve their contexts (#2010).
+        // arena, where its `thread.spawn` vCPUs reserve their contexts (#2010), and a detached
+        // child's its node, which its fibers are charged to (#2112).
         let shadow = done
             .durable
             .as_ref()
@@ -190,15 +191,16 @@ impl ChildTask {
         let mut rt = match (code.fiber_cfg, code.call_tramp) {
             (Some((type_id, mask)), Some(t)) => {
                 let table = Arc::new(SharedFiberTable::new(
-                    temen_ir::Quota::default().max_fibers,
+                    temen_ir::MAX_FIBERS,
                     shadow,
+                    node.clone(),
                 ));
                 let mut rt = Box::new(FiberRuntime::new(table, type_id, mask));
                 rt.set_call_tramp(t);
                 rt
             }
             _ => {
-                let table = Arc::new(SharedFiberTable::new(1, shadow));
+                let table = Arc::new(SharedFiberTable::new(1, shadow, None));
                 Box::new(FiberRuntime::new(table, 0, code.fn_table_mask))
             }
         };
@@ -986,6 +988,9 @@ impl ChildExec {
                 }
             }
         }
+        // #2112 — the child's domain has ended: its fibers' charges go back before its parent can
+        // learn of the end, as its window's do in `teardown`.
+        task.rt.table().release_charges();
         if let Some(c) = task.copy_back.take() {
             c(task.window.rw_mut());
         }

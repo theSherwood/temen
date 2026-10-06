@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use temen_interp::{bytecode, source_loc, Inspector, IrPc, Stop, Trap, Value, VarValue};
 use temen_ir::{Module, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
 /// The stop pc of a bytecode-engine (`ScheduledDebugRun`) stop, `None` once finished — for the
@@ -71,7 +71,7 @@ fn compile_jit(m: &Module) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compiles")

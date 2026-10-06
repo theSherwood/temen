@@ -25,7 +25,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use temen_ir::{Module, ValType, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
 use temen_peval::{
     optimize_module, specialize, specialize_with_config, SpecArg, SpecConfig, SpecError,
 };
@@ -195,7 +195,7 @@ fn jit_compile(m: &Module, entry: u32) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compile")

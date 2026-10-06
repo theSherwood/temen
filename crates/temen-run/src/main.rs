@@ -30,8 +30,8 @@ use std::{env, fs, process};
 
 use temen_ir::Module;
 use temen_run::{
-    is_named_powerbox_entry, run_kernel, run_powerbox_with_host, specialize_module, Outcome, Quota,
-    SpecArg, SpecializeOpts, Value,
+    is_named_powerbox_entry, run_kernel, run_powerbox_with_host, specialize_module, Limits,
+    Outcome, SpecArg, SpecializeOpts, Value,
 };
 use temen_verify::verify_module;
 
@@ -196,19 +196,16 @@ fn try_main() -> Result<(), String> {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .map(std::time::Duration::from_millis);
-        // §15 spawn quota (CLI policy): `TEMEN_MAX_FIBERS`/`TEMEN_MAX_VCPUS` cap fiber/vCPU spawning so a
-        // spawn-bomb is detect-and-killed; unset ⇒ the default anti-bomb ceilings.
-        let env_usize = |k: &str, dflt: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(dflt)
-        };
-        let dq = Quota::default();
-        let quota = Quota {
-            max_fibers: env_usize("TEMEN_MAX_FIBERS", dq.max_fibers),
-            max_vcpus: env_usize("TEMEN_MAX_VCPUS", dq.max_vcpus),
+        // #2113 — the root's grant (CLI policy): `TEMEN_FUEL`, `TEMEN_MEM`, `TEMEN_CHANNEL` and
+        // `TEMEN_SPAWN` bound the run, a fiber or thread bomb included; each unset is the default
+        // grant.
+        let env_u64 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
+        let limits = Limits {
+            fuel: env_u64("TEMEN_FUEL"),
+            deadline,
+            mem: env_u64("TEMEN_MEM"),
+            channel: env_u64("TEMEN_CHANNEL"),
+            spawn: env_u64("TEMEN_SPAWN"),
         };
         // The guest's `argv`: when the user passes `-- <args>`, the input file name is `argv[0]`
         // and the post-`--` tokens follow. When *no* `--` args are given, pass an empty vector so the
@@ -240,7 +237,7 @@ fn try_main() -> Result<(), String> {
         };
         let host_setup: Option<&mut dyn FnMut(&mut temen_interp::Host)> =
             interactive.then_some(&mut live_stdio);
-        let run = run_powerbox_with_host(&module, &stdin, &argv, &[], deadline, quota, host_setup)?;
+        let run = run_powerbox_with_host(&module, &stdin, &argv, &[], limits, host_setup)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();
@@ -382,7 +379,9 @@ fn print_usage() {
          \n  --interactive  the guest reads the real stdin a line at a time and its stdout\n\
          \n                 streams live (a REPL guest is live); the default on a terminal\n\
          \n  env: TEMEN_DEADLINE_MS (kill a runaway guest after N ms),\n\
-         \n       TEMEN_MAX_FIBERS / TEMEN_MAX_VCPUS (§15 spawn quotas — kill a fiber/thread bomb).\n\
+         \n       TEMEN_FUEL / TEMEN_MEM / TEMEN_CHANNEL / TEMEN_SPAWN (the run's grant: fuel,\n\
+         \n       bytes of memory and of pipe buffers, live vCPUs with the root's own; each unset\n\
+         \n       is the default).\n\
          \n\
          \nlink (D-LINK): statically link units into one runnable module.\n\
          \n  temen-run --link <unit.temt|.temeno|.temen>... [-o OUT.temen | --emit-text]\n\

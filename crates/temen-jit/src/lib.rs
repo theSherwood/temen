@@ -748,12 +748,6 @@ pub type FastCapResolver = unsafe extern "C" fn(
     n_res: u32,
 ) -> *const core::ffi::c_void;
 
-// §15 **spawn quota** — the single shared type lives in `temen-ir` (re-exported here and as
-// `temen_interp::Quota`), so a powerbox embedder sets it once and it binds all three backends
-// identically, with no facade conversion (Followup F6). `max_vcpus` bounds the run's *concurrently
-// live* vCPUs, the root among them, as on the interpreters: a spawn-join loop never trips it.
-pub use temen_ir::Quota;
-
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
 /// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
 /// host's table is append-only and the host outlives the run — the same lifetime contract as the
@@ -1247,8 +1241,8 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
         None, // interrupt
         None, // fuel
         None, // fast_resolver
-        Quota::default(),
-        0, // natural (non-B2-reserved) function-table size
+        None, // node
+        0,    // natural (non-B2-reserved) function-table size
     )
 }
 
@@ -1287,7 +1281,7 @@ pub fn compile_and_run_with_host_fast(
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     fast_resolver: FastCapResolver,
-    quota: Quota,
+    node: Option<std::sync::Arc<dyn BudgetNode>>,
 ) -> Result<JitOutcome, JitError> {
     Ok(run_inner(
         m,
@@ -1297,7 +1291,7 @@ pub fn compile_and_run_with_host_fast(
         cap_ctx,
         RunOpts {
             fast_resolver: Some(fast_resolver),
-            quota,
+            node,
             ..RunOpts::default()
         },
     )?
@@ -1388,7 +1382,7 @@ pub fn compile_and_run_with_host_interruptible_fast(
     cap_ctx: *mut core::ffi::c_void,
     interrupt: *const AtomicU64,
     fast_resolver: FastCapResolver,
-    quota: Quota,
+    node: Option<std::sync::Arc<dyn BudgetNode>>,
 ) -> Result<JitOutcome, JitError> {
     Ok(run_inner(
         m,
@@ -1399,7 +1393,7 @@ pub fn compile_and_run_with_host_interruptible_fast(
         RunOpts {
             interrupt: Some(interrupt),
             fast_resolver: Some(fast_resolver),
-            quota,
+            node,
             ..RunOpts::default()
         },
     )?
@@ -1659,8 +1653,8 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
         None, // no interrupt
         None, // no fuel budget
         None, // no fast cap resolver
-        Quota::default(),
-        0, // one-shot path: natural table size
+        None, // no budget node
+        0,    // one-shot path: natural table size
     )?;
     cm.restore_prots = init_prots.to_vec();
     cm.run(args, Some(init_mem), Some(SNAP_CAP))
@@ -2177,7 +2171,7 @@ pub fn compile_and_run_durable(
             None, // interrupt
             None, // fuel
             None, // fast_resolver
-            Quota::default(),
+            None, // node
             0,
         )?;
         cm.restore_prots = run.init_prots;
@@ -2231,8 +2225,9 @@ struct RunOpts<'a> {
     fuel: Option<*mut FuelCell>,
     /// §9/D45 devirtualized fast cap resolver.
     fast_resolver: Option<FastCapResolver>,
-    /// §15 spawn quota.
-    quota: Quota,
+    /// #2113 — the run's own budget node: what its vCPUs, fibers and processes are charged to
+    /// (`None`: charged to nothing, a host-less run's).
+    node: Option<std::sync::Arc<dyn BudgetNode>>,
     /// #932 — the async-signal delivery arm (host `armed` flag + take/return thunks + ctx) baked into
     /// safepoints; `None` ⇒ no signal check emitted.
     signal: Option<SignalArm>,
@@ -2251,7 +2246,7 @@ impl Default for RunOpts<'_> {
             interrupt: None,
             fuel: None,
             fast_resolver: None,
-            quota: Quota::default(),
+            node: None,
             signal: None,
         }
     }
@@ -2275,7 +2270,7 @@ fn run_inner(
         interrupt,
         fuel,
         fast_resolver,
-        quota,
+        node,
         signal,
     } = opts;
     // The historical one-shot lifecycle, now compile → run over the long-lived split
@@ -2294,7 +2289,7 @@ fn run_inner(
         interrupt,
         fuel,
         fast_resolver,
-        quota,
+        node,
         0,      // one-shot path: natural table size (no B2 reservation)
         signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
     )?;
@@ -2932,9 +2927,13 @@ pub struct CompiledModule {
     #[cfg(fiber_rt)]
     fiber_cfg: Option<(u32, u64)>,
     /// The **domain-shared fiber table** (D57 3b-ii) the root's `fiber_rt` and every spawned
-    /// vCPU's runtime are built over — one handle namespace + one §15 fiber quota per domain.
+    /// vCPU's runtime are built over — one handle namespace + one fiber ceiling per domain.
     #[cfg(fiber_rt)]
     fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>>,
+    /// #2113 — the run's own budget node ([`Self::compile`]'s `node`), which the fiber table and
+    /// thread domain the hosting enablers stand up later charge too.
+    #[cfg(fiber_rt)]
+    node: Option<std::sync::Arc<dyn BudgetNode>>,
     /// Machine-address → source map for finalized code (W5 JIT/DWARF Stage 1), sorted by `lo`.
     /// Empty unless the module carried `-g` debug info. Host-side tooling, off the runtime path.
     src_ranges: Vec<SrcRange>,
@@ -3198,7 +3197,7 @@ impl CompiledModule {
         interrupt: Option<*const AtomicU64>,
         fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
-        quota: Quota,
+        node: Option<std::sync::Arc<dyn BudgetNode>>,
         table_reserve_log2: u8,
     ) -> Result<CompiledModule, JitError> {
         // #932 — the stable public signature: no async signal delivery armed (the common case). The
@@ -3215,7 +3214,7 @@ impl CompiledModule {
             interrupt,
             fuel,
             fast_resolver,
-            quota,
+            node,
             table_reserve_log2,
             None,
         )
@@ -3236,7 +3235,7 @@ impl CompiledModule {
         interrupt: Option<*const AtomicU64>,
         fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
-        quota: Quota,
+        node: Option<std::sync::Arc<dyn BudgetNode>>,
         table_reserve_log2: u8,
         signal: Option<SignalArm>,
     ) -> Result<CompiledModule, JitError> {
@@ -3406,7 +3405,7 @@ impl CompiledModule {
         let fiber_mask = (table_len as u64) - 1;
         // Fibers + threads compose via a per-vCPU fiber runtime (execution context), published through a
         // thread-local, all over **one domain-shared fiber table** (D57 3b-ii: a unified handle
-        // namespace + a per-domain §15 quota, matching the interpreter's run-shared registry). This is
+        // namespace + a per-domain fiber ceiling, matching the interpreter's run-shared registry). This is
         // the *root* vCPU's runtime (the one running `main` on the caller's thread); each spawned vCPU
         // builds its own over the same table from `fiber_cfg` (`os_thread_rt`). Created whenever the
         // module uses `cont.*` **or** `thread.spawn` — a threaded module needs the table for the
@@ -3417,8 +3416,9 @@ impl CompiledModule {
         let fiber_table: Option<std::sync::Arc<fiber_rt::SharedFiberTable>> =
             if uses_fibers || uses_threads {
                 Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
-                    quota.max_fibers,
+                    temen_ir::MAX_FIBERS,
                     shadow,
+                    node.clone(),
                 )))
             } else {
                 None
@@ -3475,7 +3475,7 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         let domain: Option<Box<os_thread_rt::Domain>> =
             if uses_threads || uses_fibers || module_uses_instantiator(m) {
-                Some(Box::new(os_thread_rt::Domain::new(quota.max_vcpus)))
+                Some(Box::new(os_thread_rt::Domain::new(node.clone())))
             } else {
                 None
             };
@@ -3928,7 +3928,7 @@ impl CompiledModule {
             })
             .collect();
         #[cfg(not(fiber_rt))]
-        let _ = &quota;
+        let _ = &node;
         #[cfg(fiber_rt)]
         let needs_runtime = uses_fibers
             || m.funcs.iter().any(temen_ir::Func::uses_threads)
@@ -4014,6 +4014,8 @@ impl CompiledModule {
             },
             #[cfg(fiber_rt)]
             fiber_table,
+            #[cfg(fiber_rt)]
+            node,
             src_ranges,
             src_files,
             func_names,
@@ -4231,6 +4233,8 @@ impl CompiledModule {
             fiber_cfg: self.fiber_cfg,
             #[cfg(fiber_rt)]
             fiber_table: None,
+            #[cfg(fiber_rt)]
+            node: None,
             src_ranges: self.src_ranges.clone(),
             src_files: self.src_files.clone(),
             func_names: self.func_names.clone(),
@@ -5368,11 +5372,10 @@ impl CompiledModule {
     /// **Idempotent** and behavior-preserving: a no-op if fibers are already hosted (the parent used
     /// `cont.*`/`gc.roots`), reusing an existing table/trampoline a thread-only parent already built.
     #[cfg(fiber_rt)]
-    pub fn enable_fiber_hosting(&mut self, quota: Quota) -> Result<(), JitError> {
+    pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
         if !self.fiber.is_null() {
             return Ok(()); // already hosting fibers (parent used cont.*/gc.roots at compile time)
         }
-        let quota = quota.clamped();
         // Append the fiber-entry signature to the per-domain type registry (idempotent; an id never
         // remaps — DESIGN.md §22). A later `define_extra` interning the same signature gets this id,
         // so id-equality stays ≡ structural equality. Consulted only here, guest not yet running.
@@ -5381,13 +5384,14 @@ impl CompiledModule {
         // `[0, table_len)`; padding slots trap on the type check) and equals `compile`'s funcs-based
         // mask for a domain with no reserved install table (the fiber-hosting consumer).
         let fiber_mask = self.fn_table_mask;
-        // Domain-shared handle namespace + §15 quota — reuse the one a thread-only parent built.
+        // Domain-shared handle namespace — reuse the one a thread-only parent built.
         let table = match &self.fiber_table {
             Some(t) => std::sync::Arc::clone(t),
             None => {
                 let t = std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
-                    quota.max_fibers,
+                    temen_ir::MAX_FIBERS,
                     self.shadow,
+                    self.node.clone(),
                 ));
                 self.fiber_table = Some(std::sync::Arc::clone(&t));
                 t
@@ -5442,7 +5446,7 @@ impl CompiledModule {
     /// Fiber hosting on a target without stack-switch support: a no-op — fibers stay unsupported, so
     /// a fiber-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
     #[cfg(not(fiber_rt))]
-    pub fn enable_fiber_hosting(&mut self, _quota: Quota) -> Result<(), JitError> {
+    pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
         Ok(())
     }
 
@@ -5470,11 +5474,10 @@ impl CompiledModule {
     /// host (matching a normally-compiled fiber-free threaded module), already `Some` if fibers are
     /// also hosted, so the two `enable_*` calls compose in either order.
     #[cfg(fiber_rt)]
-    pub fn enable_thread_hosting(&mut self, quota: Quota) -> Result<(), JitError> {
+    pub fn enable_thread_hosting(&mut self) -> Result<(), JitError> {
         if !self.thread.is_null() {
             return Ok(()); // already hosting threads (parent used thread.*, or a nesting Domain exists)
         }
-        let quota = quota.clamped();
         // The domain-shared fiber table (D57 3b-ii): every spawned vCPU builds its `FiberRuntime` /
         // durable vCPU-context over it. `compile` creates it for *any* threaded module (even a
         // fiber-free one — the durable-context allocator needs it), so create it here too. Reuse an
@@ -5483,8 +5486,9 @@ impl CompiledModule {
         // is all that's needed here.
         if self.fiber_table.is_none() {
             self.fiber_table = Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
-                quota.max_fibers,
+                temen_ir::MAX_FIBERS,
                 self.shadow,
+                self.node.clone(),
             )));
         }
         // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). Spawned
@@ -5516,7 +5520,7 @@ impl CompiledModule {
         // Stand up the executor `Domain` the unit's `thread.*` sites load from this instance's context.
         // Its per-run `Env` (window / fn-table / trap cell / this trampoline) is supplied later by the
         // run entry's `set_env`; the address is stable now, which is all the context needs.
-        let domain = Box::new(os_thread_rt::Domain::new(quota.max_vcpus));
+        let domain = Box::new(os_thread_rt::Domain::new(self.node.clone()));
         self.instance.sched = &*domain as *const os_thread_rt::Domain as *const core::ffi::c_void;
         self.thread = ThreadEnv {
             spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
@@ -5535,7 +5539,7 @@ impl CompiledModule {
     /// Thread hosting on a target without the fiber/thread runtime: a no-op — threads stay unsupported,
     /// so a thread-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
     #[cfg(not(fiber_rt))]
-    pub fn enable_thread_hosting(&mut self, _quota: Quota) -> Result<(), JitError> {
+    pub fn enable_thread_hosting(&mut self) -> Result<(), JitError> {
         Ok(())
     }
 
@@ -6591,6 +6595,7 @@ fn compile_child_windowed(
         call_tramp,
         fiber_cfg,
         fiber_table: None,
+        node: None,
         src_ranges: Vec::new(),
         src_files: Vec::new(),
         func_names: std::collections::HashMap::new(),

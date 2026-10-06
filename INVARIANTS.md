@@ -83,9 +83,8 @@ to every level, and a vCPU that ends or freezes refunds the unburned rest of its
 burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
 one on op 15 or a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
 (`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
-budgets below it, since what is left of it differs by engine (their default limits differ, and each
-draws on its own schedule). The carve ops (0/5/13, v0 records) keep a fixed
-allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
+budgets below it, since what is left of it differs by engine (each draws on its own schedule). The
+carve ops (0/5/13, v0 records) keep a fixed allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
 ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
 vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
 with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
@@ -95,26 +94,36 @@ as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posi
 windows, charged to `mem` of that node, the twin's with the growth it copies, before the process
 exists, and handed back when it ends; an exec keeps the charge (#2106, #2110). A thaw re-charges the
 threads it re-creates. On the resumable `Vcpu` engine a
-thread's charge goes back at its join, where that engine learns it ended. A run's root is its
-embedder's and is charged to nothing, and the Cranelift JIT charges nothing to the run's own node,
-which no guest reads (#2113 tracks both). A pipe's worst-case FIFO is charged to the
+thread's charge goes back at its join, where that engine learns it ended. The run's own node holds
+the embedder's grant (#2113): `Limits` sets its `mem`, `channel` and `spawn` ceilings
+(`Host::set_grant`), and a run whose embedder names none holds large defaults. The root is charged to
+it as a child is to its budget, on every engine: its window and main vCPU when an activation opens
+(`Host::begin_activation`), past any ceiling, since they are what the embedder chose to run, and
+everything it makes after, its growth and its processes' windows included. A carve child (ops 0/5/13, v0
+records) charges no node: `MAX_VCPUS` alone bounds its vCPUs and `MAX_FIBERS` its fibers until #1867
+deletes the carve. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
 region a guest mints is charged there too, its bytes, until no domain holds it; a domain a budget paid
-for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111). A freeze carries no node's `channel` use: the thaw re-charges each
-pipe and region it rebuilds to the thawing root. An
-exec keeps its domain's node, so a child cannot exec its way out of its budget.
+for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111). A
+fiber `cont.new` makes is `FIBER_STACK` (256 KiB) of its domain's `mem` while it lives: charged to
+the domain's node and every ancestor, `FiberFault` past a ceiling, and handed back when the fiber
+returns or its domain ends. A freeze hands it back as it flattens the fiber, and the thaw re-charges
+each fiber it re-creates, as threads (#2112). A fiber the runtime makes to serve a dispatch is
+mechanism, charged to nothing. A freeze carries no node's `channel` use: the thaw re-charges each
+pipe and region it rebuilds to the thawing root. An exec keeps its domain's node, so a child cannot
+exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
-its grant the embedder's. The gaps are tracked, not exceptions: the root's own use and `Limits`
-(#2113), fibers (#2112), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused
-after its admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel
-(#1997).
+its grant the embedder's. The gaps are tracked, not exceptions: the root's fuel where its host meters
+none (the browser, and the JIT's compile-once `PowerboxProgram` and `JitSession`, #2113), the carve
+(#1867), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused after its
+admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,
 and it moves down the graph like every other. Until D66 no runtime represented it per domain —
-`max_vcpus` bounds task *count* (parked tasks included), host parallelism was a global worker count,
+`max_vcpus` bounded task *count* (parked tasks included), host parallelism was a global worker count,
 and on the JIT a §14 detached child was one OS thread, so a parent held whatever the OS allowed. Now a
 domain holds a **lane cap**, checked when a worker picks one of its tasks and released on
 park/yield/finish. A parent grants a child a lane ≤ its own cap, with Σ granted lanes ≤ the parent's

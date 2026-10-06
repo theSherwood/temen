@@ -28,8 +28,8 @@ use temen_interp::MemEvent;
 
 use crate::json::Json;
 use temen_interp::{
-    CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason, Trap, Value, VarValue,
-    WatchId, WatchKind,
+    CapTape, FrameInfo, Host, Inspector, IrPc, RootWindow, SourceLoc, Stop, StopReason, Trap,
+    Value, VarValue, WatchId, WatchKind, DEFAULT_CHANNEL, DEFAULT_SPAWN,
 };
 use temen_ir::{FuncIdx, Module};
 
@@ -115,8 +115,9 @@ fn grant_io_powerbox(
 /// engine's subset. `block_stdin` (W4) arms the blocking-stdin park on the powerbox host: a thread's
 /// `read` on an exhausted buffer parks it (`SchedStop::StdinPark`) instead of returning EOF, re-armed
 /// on every `seek` rebuild so a read past the replay frontier parks again. `mem_limit` (slice 5) is
-/// the Memory-capability growth cap — a `vm_map` past it returns -ENOMEM, so a guest malloc observes
-/// NULL (the OOM-teaching knob) — likewise re-armed on every rebuild.
+/// the memory the root may hold past its declared window — its `mem` grant past the window (#2113):
+/// a `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching knob) —
+/// likewise set on every rebuild.
 #[allow(clippy::too_many_arguments)]
 fn build_run(
     module: &Module,
@@ -135,7 +136,14 @@ fn build_run(
     let mut run = if powerbox {
         let mut host = Host::new();
         grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
-        host.set_mem_map_limit(mem_limit);
+        if let Some(limit) = mem_limit {
+            let mem = RootWindow::fresh(module).declared.saturating_add(limit);
+            host.set_grant(
+                i64::try_from(mem).unwrap_or(-1),
+                DEFAULT_CHANNEL as i64,
+                DEFAULT_SPAWN as i64,
+            );
+        }
         if block_stdin {
             host.set_stdin_blocking(true);
         }
@@ -480,8 +488,9 @@ pub struct BytecodeBackend {
     /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF (powerbox
     /// sessions).
     block_stdin: bool,
-    /// Slice 5: the session's Memory-capability growth cap ([`Host::set_mem_map_limit`]) — set on
-    /// the powerbox at build and on every seek rebuild. `None` = unbounded.
+    /// Slice 5: the memory the session's root may hold past its declared window, its `mem` grant
+    /// ([`Host::set_grant`], #2113) — set on the powerbox at build and on every seek rebuild.
+    /// `None` = the default grant.
     mem_limit: Option<u64>,
     /// Slice 6: whether the scheduler trace tape is armed — re-armed on every seek rebuild so the
     /// replay refills the tape deterministically.

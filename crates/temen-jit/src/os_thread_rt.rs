@@ -334,7 +334,7 @@ pub unsafe fn wake_host_parks(trap_out: *mut i64, key: u64) {
 pub(crate) struct Domain {
     env: Mutex<Option<Env>>,
     /// The **domain-shared fiber table** (D57 3b-ii) every spawned vCPU's `FiberRuntime` is built
-    /// over — one handle namespace + one §15 fiber quota for the whole domain (the root vCPU's
+    /// over — one handle namespace + one fiber ceiling for the whole domain (the root vCPU's
     /// runtime shares the same `Arc`, held by the `CompiledModule`). `None` for fiber-free modules.
     /// `std::sync::Arc`/`Mutex<Option<…>>` like `env` (set once on the setup thread, read at spawns).
     fiber_table: Mutex<Option<std::sync::Arc<SharedFiberTable>>>,
@@ -375,10 +375,6 @@ pub(crate) struct Domain {
     next_task: Mutex<u64>,
     futex: Mutex<HashMap<FutexKey, FutexEntry>>,
     futex_cv: Condvar,
-    /// §15 spawn quota: max **concurrently-live** vCPUs (incl. the root) this domain may have, clamped
-    /// to [`MAX_VCPUS`]. Exceeding it is a clean `ThreadFault`. Bounds `Threads::live` (concurrent),
-    /// matching the interpreter's `s.live` — a spawn-join loop is fine (a finished vCPU frees its slot).
-    max_vcpus: usize,
     /// §5 W3 Stage 3: a trap-time backtrace capture handed up by a **spawned** vCPU when it trapped.
     /// The per-thread capture lives in `trap_shim.c`'s thread-local (filled by the SIGSEGV/SIGBUS
     /// handler or the explicit-trap helper) and would be lost when the worker thread ends, so the
@@ -427,8 +423,8 @@ pub(crate) struct Domain {
     /// the run under one scheduler: one live cap, one futex, one deadlock count.
     hub: usize,
     /// #2001 — the budget node this domain's spawned vCPUs are charged to, one `spawn` each while
-    /// it lives: a detached child's own. `None` for a run's own domain, whose vCPUs would charge the
-    /// run's node, which no guest reads, and for a carve child's (#1867).
+    /// it lives: a run's own (the embedder's grant, #2113) or a detached child's. `None` for a carve
+    /// child's (#1867) and for shared code's ([`Self::fresh`]), which spawns nothing.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 }
 
@@ -445,7 +441,7 @@ struct DTable {
 struct Threads {
     /// §15 **concurrently-live** vCPUs — the root (1) plus every spawned vCPU that hasn't finished.
     /// Incremented under this lock at a successful `thread.spawn`, decremented when a spawned vCPU's
-    /// computation ends ([`run_child`]). The §15 quota bounds *this* (concurrent liveness, like the
+    /// computation ends ([`run_child`]). [`MAX_VCPUS`] bounds *this* (concurrent liveness, like the
     /// interpreter's `s.live`), **not** `cells.len()` (the cumulative handle table that never shrinks —
     /// symmetric with the interpreter's per-vCPU `threads` Vec). Starts at 1 (the root) via
     /// [`Domain::new`]; `Default` is 0 only for the unused loom path.
@@ -674,18 +670,20 @@ pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
 }
 
 impl Domain {
-    /// A new domain with this one's §15 vCPU quota and nothing else: what another instance of the
-    /// same code runs on (#1825).
+    /// A new domain with nothing of this one's: what another instance of the same code runs on
+    /// (#1825). Shared code makes no thread or fiber, so it charges no node.
     pub(crate) fn fresh(&self) -> Domain {
-        Domain::new(self.max_vcpus)
+        Domain::new(None)
     }
 
-    pub(crate) fn new(max_vcpus: usize) -> Domain {
+    /// A run's own domain: its vCPUs (and a §14 child task's, through [`Self::new_child`]) are charged
+    /// to `node` (#2001, #2113), and [`MAX_VCPUS`] bounds the run's live vCPUs.
+    pub(crate) fn new(node: Option<std::sync::Arc<dyn crate::BudgetNode>>) -> Domain {
         Domain {
             env: Mutex::new(None),
             fiber_table: Mutex::new(None),
-            // `live` starts at 1: the root vCPU (the main thread running the entry) counts toward the
-            // §15 quota, like the interpreter's `s.live`.
+            // `live` starts at 1: the root vCPU (the main thread running the entry) counts toward
+            // [`MAX_VCPUS`], like the interpreter's `s.live`.
             threads: Mutex::new(Threads {
                 live: 1,
                 ..Threads::default()
@@ -699,7 +697,6 @@ impl Domain {
             next_task: Mutex::new(1), // root is task 0; first spawn is 1
             futex: Mutex::new(HashMap::new()),
             futex_cv: Condvar::new(),
-            max_vcpus: max_vcpus.clamp(1, MAX_VCPUS),
             trap_capture: Mutex::new(None),
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
@@ -710,7 +707,7 @@ impl Domain {
             lane_cv: Condvar::new(),
             lane_chain: Mutex::new(Vec::new()),
             hub: 0,
-            node: None,
+            node,
         }
     }
 
@@ -723,11 +720,10 @@ impl Domain {
         lane_chain: Vec<(usize, i64)>,
         node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     ) -> Domain {
-        let mut d = Domain::new(hub.max_vcpus);
+        let mut d = Domain::new(node);
         d.threads = Mutex::new(Threads::default());
         d.lane_chain = Mutex::new(lane_chain);
         d.hub = hub as *const Domain as usize;
-        d.node = node;
         d
     }
 
@@ -822,8 +818,8 @@ impl Domain {
     /// parked child would push `parked` past `live` and fail a *parent* vCPU's infinite wait closed.
     /// Called on the spawning thread before `instantiate` returns (so a subsequent wait already counts
     /// the child); paired with [`Self::child_finished`] on the child's own thread.
-    /// Reserve a §15 live-vCPU slot for a §14 child, or refuse. `false` ⇒ the domain is at
-    /// [`Domain::max_vcpus`] and the caller must not spawn.
+    /// Reserve a §15 live-vCPU slot for a §14 child, or refuse. `false` ⇒ the run is at
+    /// [`MAX_VCPUS`] and the caller must not spawn.
     ///
     /// #1586 — this used to be an unconditional `live += 1`, so every §14 child (nested, named, or
     /// detached) *incremented the very counter the ceiling is built on and skipped the check*. Only
@@ -838,7 +834,7 @@ impl Domain {
     /// oracle's behaviour, arriving on this backend.
     pub(crate) fn try_child_start(&self) -> bool {
         let mut t = lock(&self.threads);
-        if t.live >= self.max_vcpus {
+        if t.live >= MAX_VCPUS {
             return false;
         }
         t.live += 1;
@@ -1666,7 +1662,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         // bounded by the run-wide count, as the oracle's one scheduler bounds every vCPU of the run
         // (its own `live` is then only this domain's share, for its teardown).
         let at_ceiling = if std::ptr::eq(hub, dom) {
-            t.live >= dom.max_vcpus
+            t.live >= MAX_VCPUS
         } else {
             !hub.try_child_start()
         };
@@ -1774,7 +1770,7 @@ unsafe fn defer_spawn(
     {
         let mut t = lock(&dom.threads);
         // #2001 — and its domain's budget node, as `thread_spawn` charges it.
-        if t.live >= dom.max_vcpus || !dom.charge_vcpu() {
+        if t.live >= MAX_VCPUS || !dom.charge_vcpu() {
             table.free_vcpu_context(ctx);
             store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
             return -1;
@@ -3076,6 +3072,22 @@ fn futex_notify(
     woken
 }
 
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    /// #1586 — a §14 child takes one of the run's live-vCPU slots, and is refused once none is left:
+    /// [`MAX_VCPUS`] is the whole bound on a carve child, which charges no budget node (#1867).
+    #[test]
+    fn a_child_is_refused_at_the_vcpu_ceiling() {
+        let dom = Domain::new(None);
+        lock(&dom.threads).live = MAX_VCPUS - 1;
+        assert!(dom.try_child_start(), "the last slot");
+        assert!(!dom.try_child_start(), "past the ceiling");
+        assert_eq!(dom.live_vcpus(), MAX_VCPUS, "a refusal takes no slot");
+    }
+}
+
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
@@ -3357,7 +3369,7 @@ mod loom_tests {
     #[test]
     fn loom_a_lane_released_mid_scan_never_reorders_the_queue() {
         loom::model(|| {
-            let dom = Arc::new(Domain::new(MAX_VCPUS));
+            let dom = Arc::new(Domain::new(None));
             let parent: &[(usize, i64)] = &[(1, 1)];
             let (a, b): (&[(usize, i64)], &[(usize, i64)]) =
                 (&[(1, 1), (2, -1)], &[(1, 1), (3, -1)]);
@@ -3387,7 +3399,7 @@ mod loom_tests {
     fn loom_quiesce_barrier_never_hangs_with_per_context_sp() {
         loom::model(|| {
             const N: usize = 2;
-            let dom = Arc::new(Domain::new(MAX_VCPUS));
+            let dom = Arc::new(Domain::new(None));
             dom.arm_quiesce(N);
             // §12.8 4A.5: per-context SP words — each worker owns its own slot (no shared scratch).
             let sps: Vec<Arc<AtomicU64>> = (0..N).map(|_| Arc::new(AtomicU64::new(0))).collect();

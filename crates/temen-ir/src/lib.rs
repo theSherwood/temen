@@ -401,7 +401,7 @@ pub mod durable_abi {
     /// ([`ShadowArena::stride`]): 4 KiB. A deep call chain needs a wider one (#1872).
     pub const DEFAULT_SHADOW_STRIDE: u64 = 1 << 12;
     /// The most shadow contexts a declared arena may hold (`(end - base) / stride`): one
-    /// machine word of allocator occupancy bits, and far above any fiber quota in the tree. The
+    /// machine word of allocator occupancy bits, and far above any fiber count a test makes. The
     /// verifier holds a declared arena to it; a producer that *places* an arena (the LLVM on-ramp's
     /// `--shadow-arena`, #1534) sizes against the same number rather than a copy of it.
     pub const MAX_SHADOW_CONTEXTS: usize = 64;
@@ -3980,14 +3980,21 @@ pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
 pub const POWERBOX_HEAP_RESERVE: u64 = 8 << 20;
 /// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
 /// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
-/// [`Quota`] can only *tighten* below this, never raise it. `1 << 24` (~16.7M) — the ceiling equals the
-/// cross-backend fiber-handle index width (`FIBER_GEN_SHIFT`), raised from `1 << 16` once the arena
-/// stack backend removed the `vm.max_map_count` VMA wall that used to bind concurrency lower.
+/// domain's `Budget.mem` bounds its live fibers below this ([`FIBER_STACK`] each, #2112). `1 << 24`
+/// (~16.7M) — the ceiling equals the cross-backend fiber-handle index width (`FIBER_GEN_SHIFT`), raised
+/// from `1 << 16` once the arena stack backend removed the `vm.max_map_count` VMA wall that used to
+/// bind concurrency lower.
 pub const MAX_FIBERS: usize = 1 << 24;
+
+/// #2112 — what a live fiber holds of its domain's `Budget.mem`: the JIT's fiber stack, 256 KiB. Every
+/// engine charges it for each fiber `cont.new` makes, whatever the fiber's real footprint there (an
+/// interpreter's continuation is smaller), so a budget reads the same on every engine.
+pub const FIBER_STACK: u64 = 1 << 18;
 
 /// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
 /// `ThreadFault` past it. Every engine bounds the run's *concurrently live* vCPUs, the root among
-/// them, so a spawn-join loop never trips it.
+/// them, so a spawn-join loop never trips it. A domain's `Budget.spawn` bounds its live vCPUs below
+/// this (#2001, #2113).
 pub const MAX_VCPUS: usize = 1 << 16;
 
 /// D66 — the **lane arithmetic** every scheduler's dispatch calls (INVARIANTS #3 ruling 2026-09-21):
@@ -4038,45 +4045,6 @@ pub mod lanes {
                     running.remove(&d);
                 }
             }
-        }
-    }
-}
-
-/// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
-/// (`thread.spawn`) a run may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb
-/// ceilings. The **single** quota type shared by both runtimes (re-exported as `temen_interp::Quota` and
-/// `temen_jit::Quota`), so a powerbox embedder sets it once and it binds the tree-walker, bytecode
-/// engine, and JIT identically (no facade conversion). The embedder sets it on the `Host`
-/// (`Host::set_quota`, which [`Quota::clamped`]s it); a guest that exceeds it traps cleanly
-/// (`FiberFault`/`ThreadFault`) — DoS *containment* policy (§15/D48), not just the host-OOM backstop.
-/// [`Default`] is the hard ceilings, so an unconfigured run is unchanged.
-///
-/// `max_vcpus` counts the run's concurrently live vCPUs on every backend ([`MAX_VCPUS`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Quota {
-    /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);
-    /// clamped to [`MAX_FIBERS`]. Per-run, not per-vCPU (the fiber table is the run-shared registry).
-    pub max_fibers: usize,
-    /// Max vCPUs a run may create (`thread.spawn`); clamped to [`MAX_VCPUS`].
-    pub max_vcpus: usize,
-}
-
-impl Default for Quota {
-    fn default() -> Quota {
-        Quota {
-            max_fibers: MAX_FIBERS,
-            max_vcpus: MAX_VCPUS,
-        }
-    }
-}
-
-impl Quota {
-    /// Clamp each limit to its hard anti-bomb ceiling (a quota can only *tighten*, never raise the
-    /// ceiling), and to ≥ 1 (the root vCPU/computation always exists).
-    pub fn clamped(self) -> Quota {
-        Quota {
-            max_fibers: self.max_fibers.clamp(1, MAX_FIBERS),
-            max_vcpus: self.max_vcpus.clamp(1, MAX_VCPUS),
         }
     }
 }
