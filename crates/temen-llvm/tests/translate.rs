@@ -14533,3 +14533,89 @@ fn demo_bash_readline_transcript_matches_native() {
         "readline bash -i (coop session): the terminal transcript differs from native readline"
     );
 }
+
+/// An inline-asm template that is only an assembler comment — `zeroize`'s value barrier,
+/// `asm!("# {}", in(reg) ptr)`, which constant-time crypto puts on a pointer — executes nothing,
+/// and drops like the other barriers; the value it was "observing" is untouched.
+#[test]
+fn inline_asm_comment_only_is_a_barrier() {
+    let src = r##"
+define i64 @run() {
+  %a = alloca i64, align 8
+  store i64 41, ptr %a, align 8
+  call void asm sideeffect "# $0", "r,~{memory}"(ptr %a)
+  %v = load i64, ptr %a, align 8
+  %r = add i64 %v, 1
+  ret i64 %r
+}
+"##;
+    assert_eq!(run_ll_i64("asm comment barrier", src), 42);
+}
+
+/// A wide integer whose high part is not 8, 16, 32 or 64 bits — `i104`, what SROA folds a 13-byte
+/// comparison or struct tail into — loads, stores and compares: stored, copied and loaded back it
+/// keeps its 13 bytes and writes no more (bytes 13..16 of the copy keep their 0xff), and equality
+/// and the unsigned orders against a wide constant hold.
+#[test]
+fn i104_load_store_icmp() {
+    // b"over the link", little-endian; its top byte is b'k' = 107.
+    let c = "8511584187930874794490777138799";
+    let src = format!(
+        r#"
+define i64 @run() {{
+  %a = alloca [16 x i8], align 8
+  %b = alloca [16 x i8], align 8
+  store i128 -1, ptr %b, align 8
+  store i104 {c}, ptr %a, align 8
+  %x = load i104, ptr %a, align 8
+  store i104 %x, ptr %b, align 8
+  %y = load i104, ptr %b, align 8
+  %eq = icmp eq i104 %y, {c}
+  %lt = icmp ult i104 %y, 8511584187930874794490777138800
+  %ne = icmp ne i104 %y, 8511584187930874794490777138798
+  %p12 = getelementptr i8, ptr %b, i64 12
+  %top = load i8, ptr %p12, align 1
+  %p13 = getelementptr i8, ptr %b, i64 13
+  %past = load i8, ptr %p13, align 1
+  %e = zext i1 %eq to i64
+  %l = zext i1 %lt to i64
+  %n = zext i1 %ne to i64
+  %t = zext i8 %top to i64
+  %q = zext i8 %past to i64
+  %l1 = shl i64 %l, 1
+  %n2 = shl i64 %n, 2
+  %t3 = shl i64 %t, 3
+  %q11 = shl i64 %q, 11
+  %r1 = or i64 %e, %l1
+  %r2 = or i64 %r1, %n2
+  %r3 = or i64 %r2, %t3
+  %r = or i64 %r3, %q11
+  ret i64 %r
+}}
+"#
+    );
+    assert_eq!(
+        run_ll_i64("i104", &src),
+        1 | 1 << 1 | 1 << 2 | 107 << 3 | 0xff << 11
+    );
+}
+
+/// The sign bit of an `i104` is not bit 127 of its zero-extended pair, so a signed order on it
+/// fails closed rather than comparing the wrong bit.
+#[test]
+fn i104_signed_icmp_is_fail_closed() {
+    let src = r#"
+define i64 @run() {
+  %a = alloca [16 x i8], align 8
+  store i104 1, ptr %a, align 8
+  %x = load i104, ptr %a, align 8
+  %c = icmp slt i104 %x, 2
+  %r = zext i1 %c to i64
+  ret i64 %r
+}
+"#;
+    match temen_llvm::translate_ll_str(src) {
+        Err(temen_llvm::Error::Unsupported(_)) => {}
+        other => panic!("expected Unsupported for a signed i104 icmp, got {other:?}"),
+    }
+}
