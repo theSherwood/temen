@@ -7,10 +7,13 @@
 //! pairs a root that finishes with a sibling that never would — a `thread.spawn` thread or a §14
 //! child — and asks both engines for the root's answer.
 
-use std::ffi::c_void;
-use std::sync::mpsc;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
-use temen_interp::{Host, Trap, Value};
+use temen_interp::{Host, MemLayout, Trap, Value};
+use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -45,14 +48,16 @@ block 0 (v0: i64) {
 /// The root spawns a `thread.spawn` spinner, then runs `tail`.
 fn thread_guest(tail: &str) -> String {
     format!(
-        "memory 17\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vh = thread.spawn 1 v0 v0\n{tail}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  br 1(v0)\n}}{SPIN}"
+        "memory 17\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vh = thread.spawn 1 v0 v0\n{tail}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  br 1(v0)\n}}{SPIN}"
     )
 }
 
-/// The root spawns a §14 child (op 0, a 128 KiB carve) that spins, then runs `tail`.
+/// The root spawns a §14 child that spins, detached and paid from its `Budget` (a v1 record at
+/// 17408), then runs `tail`.
 fn child_guest(tail: &str) -> String {
     format!(
-        "memory 19\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vi = i32.wrap_i64 v0\n  ve = i64.const 1\n  vo = i64.const 131072\n  vs = i64.const 17\n  vq = i64.const 0\n  vc = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vi (ve, vo, vs, vq)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  br 1(v0)\n}}{SPIN}"
+        "memory 19\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  br 1(v0)\n}}{SPIN}{}",
+        rec::segment(17408, &SpawnRec::v1(1))
     )
 }
 
@@ -65,22 +70,22 @@ fn module(src: &str) -> temen_ir::Module {
     m
 }
 
-/// The root's argument: an `Instantiator` over the whole window (unused by the thread guests).
-fn host() -> (Host, i64) {
+/// The root's arguments: an `Instantiator` over the whole window and the `Budget` that pays for a
+/// child (both unused by the thread guests). The host knows the root's module, which a child spawned
+/// detached from it runs.
+fn host(m: &temen_ir::Module) -> (Host, [i64; 2]) {
     let mut host = Host::new();
+    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 1 << 19);
-    (host, ih as i64)
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    (host, [ih, budget].map(i64::from))
 }
 
 fn oracle(src: &str) -> Result<Vec<Value>, Trap> {
     let m = module(src);
-    let (mut host, ih) = host();
+    let (mut host, args) = host(&m);
     let mut fuel = 10_000_000u64;
-    temen_interp::run_with_host(&m, 0, &[Value::I64(ih)], &mut fuel, &mut host)
-}
-
-unsafe extern "C" fn no_resolver(_t: u32, _o: u32, _na: u32, _nr: u32) -> *const c_void {
-    core::ptr::null()
+    temen_interp::run_with_host(&m, 0, &args.map(Value::I64), &mut fuel, &mut host)
 }
 
 /// The JIT's answer, or `None` if the run is still going after `DEADLINE` — a hang. The run is on
@@ -90,17 +95,19 @@ fn cranelift(src: &str) -> Option<JitOutcome> {
     let m = module(src);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut host, ih) = host();
-        let out = temen_jit::compile_and_run_with_host_fast(
+        let (mut host, args) = host(&m);
+        let out = temen_run::jit_cap_run(
             &m,
             0,
-            &[ih],
-            temen_run::cap_thunk,
-            &mut host as *mut Host as *mut c_void,
-            no_resolver,
+            &args,
+            &MemLayout::image(Vec::new()),
+            DEFAULT_RESERVED_LOG2,
+            0,
+            &mut host,
             None,
         )
-        .expect("jit compile");
+        .expect("jit run")
+        .0;
         let _ = tx.send(out);
     });
     rx.recv_timeout(DEADLINE).ok()
@@ -132,7 +139,7 @@ fn a_root_trap_ends_a_running_thread() {
 #[test]
 fn a_root_return_ends_a_thread_in_a_tail_call_cycle() {
     let src = format!(
-        "memory 17\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vh = thread.spawn 1 v0 v0\n{RETURN_5}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  r = call 2 (v0)\n  return r\n  }}\n}}{TAIL_LOOP}"
+        "memory 17\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vh = thread.spawn 1 v0 v0\n{RETURN_5}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  r = call 2 (v0)\n  return r\n  }}\n}}{TAIL_LOOP}"
     );
     assert_eq!(oracle(&src), Ok(vec![Value::I64(5)]), "oracle");
     let jit = cranelift(&src).expect("cranelift hung on the tail-calling thread");

@@ -1,9 +1,9 @@
 //! PROCESS.md S3/S1c — §14 child lifecycle ops `poll` (9) / `detach` (10) / `kill` (12) on the **JIT**.
 //!
-//! A non-durable JIT child now runs on its **own OS thread** (S1c async children), so `poll` reports
-//! the live state: `0` (running) while its thread is still executing, then `1` (returned) / `2`
-//! (trapped) once it finishes; `kill`/`detach` of a child are harmless successes returning `0`. (The
-//! child's thread is joined at run teardown either way.)
+//! A JIT child spawned detached runs as a **task** on the run's child executor (D66), concurrently
+//! with its parent, so `poll` reports the live state: `0` (running) while it is still executing, then
+//! `1` (returned) / `2` (trapped) once it finishes; `kill`/`detach` of a finished child are harmless
+//! successes returning `0`. Each guest spawns its child through a v1 record paid from a `Budget`.
 //!
 //! - `kill_detach_match_interp` is a **cross-backend differential**: `instantiate` → `kill` → `detach`
 //!   returns `0` on both engines (no futex/loop, so it stays on the nesting compile path — a program
@@ -12,21 +12,36 @@
 //!   value (`1`, returned) — exercising the running→done transition the OS-thread child now goes
 //!   through; poll's interp semantics live in `lifecycle_poll_detach.rs`.
 
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
-use temen_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
+use std::sync::Arc;
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
+use temen_ir::{Module, SpawnRec};
+use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-fn run_interp(src: &str) -> Result<Vec<Value>, temen_interp::Trap> {
-    let m = parse_module(src).expect("parse");
+/// `src` with its spawn record (func 1, at 20480), and a host for it: the guest's two args, an
+/// `Instantiator` and the `Budget` that pays for the child its own module spawns.
+fn setup(src: &str) -> (Module, Host, [i32; 2]) {
+    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1(1)));
+    let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut h = Host::new();
+    h.set_self_module(&Arc::new(m.clone()));
     let ih = h.grant_instantiator(0, 128 << 10);
+    let bh = h.grant_budget(-1, 1 << 20, -1);
+    (m, h, [ih, bh])
+}
+
+fn run_interp(src: &str) -> Result<Vec<Value>, temen_interp::Trap> {
+    let (m, mut h, args) = setup(src);
     let mut fuel = 50_000_000u64;
     run_capture_reserved_with_host(
         &m,
         0,
-        &[Value::I32(ih)],
+        &args.map(Value::I32),
         &mut fuel,
         &[0u8; 128 << 10],
         0,
@@ -36,18 +51,16 @@ fn run_interp(src: &str) -> Result<Vec<Value>, temen_interp::Trap> {
 }
 
 fn run_jit(src: &str) -> JitOutcome {
-    let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    let mut h = Host::new();
-    let jh = h.grant_instantiator(0, 128 << 10);
-    compile_and_run_capture_reserved_with_host(
+    let (m, mut h, args) = setup(src);
+    temen_run::jit_cap_run(
         &m,
         0,
-        &[jh as i64],
-        &[0u8; 128 << 10],
+        &args.map(i64::from),
+        &MemLayout::image(vec![0u8; 128 << 10]),
         0,
-        temen_run::cap_thunk,
-        &mut h as *mut Host as *mut core::ffi::c_void,
+        0,
+        &mut h,
+        None,
     )
     .expect("jit")
     .0
@@ -58,29 +71,12 @@ fn run_jit(src: &str) -> JitOutcome {
 /// the result is backend-stable: `0` on the interpreter (kill flags the child, detach drops the claim)
 /// and `0` on the JIT (the child already ran synchronously).
 const KILL_DETACH: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
-  q0v0 = i64.const 4294967296\n\
-  q0v1 = i64.const 0\n\
-  q0v2 = i64.const -4294967284\n\
-  q0v3 = i64.const 4294967295\n\
-  q0a0 = i64.const 20480\n\
-  i64.store q0a0 q0v0\n\
-  q0off = i64.const 16384\n\
-  q0a1 = i64.const 20488\n\
-  i64.store q0a1 q0off\n\
-  q0a2 = i64.const 20496\n\
-  i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 20504\n\
-  i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 20512\n\
-  i64.store q0a4 q0v1\n\
-  q0a5 = i64.const 20520\n\
-  i64.store q0a5 q0v1\n\
-  q0a6 = i64.const 20528\n\
-  i64.store q0a6 q0v1\n\
-  vch = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
+func (i32, i32) -> (i64) {\n\
+block 0 (v0: i32, vb: i32) {\n\
+  vrb = i64.const 20508\n\
+  i32.store vrb vb\n\
+  vrp = i64.const 20480\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n\
   vk = call.cap 6 12 (i32) -> (i32) v0 (vch)\n\
   vd = call.cap 6 10 (i32) -> (i32) v0 (vch)\n\
   vten = i32.const 10\n\
@@ -102,29 +98,12 @@ block 0 (vci: i64) {\n\
 /// thread completes, `poll` reports `1` (returned) and the loop exits. Deterministic (the child always
 /// finishes) and exercises the running→done transition of an OS-thread child.
 const POLL_DONE: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
-  q1v0 = i64.const 4294967296\n\
-  q1v1 = i64.const 0\n\
-  q1v2 = i64.const -4294967284\n\
-  q1v3 = i64.const 4294967295\n\
-  q1a0 = i64.const 20480\n\
-  i64.store q1a0 q1v0\n\
-  q1off = i64.const 16384\n\
-  q1a1 = i64.const 20488\n\
-  i64.store q1a1 q1off\n\
-  q1a2 = i64.const 20496\n\
-  i64.store q1a2 q1v2\n\
-  q1a3 = i64.const 20504\n\
-  i64.store q1a3 q1v3\n\
-  q1a4 = i64.const 20512\n\
-  i64.store q1a4 q1v1\n\
-  q1a5 = i64.const 20520\n\
-  i64.store q1a5 q1v1\n\
-  q1a6 = i64.const 20528\n\
-  i64.store q1a6 q1v1\n\
-  vch = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
+func (i32, i32) -> (i64) {\n\
+block 0 (v0: i32, vb: i32) {\n\
+  vrb = i64.const 20508\n\
+  i32.store vrb vb\n\
+  vrp = i64.const 20480\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n\
   br 1(v0, vch)\n\
 }\n\
 block 1 (bv0: i32, bvch: i32) {\n\
@@ -175,29 +154,12 @@ fn jit_poll_reports_child_done() {
 /// at the first poll → `1*10 + 1 = 11`. So `== 1` is a deterministic witness that the child executed
 /// concurrently with the parent — the whole point of async children (the substrate for a pipeline).
 const POLL_RUNNING: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0\n\
-  q2v0 = i64.const 4294967296\n\
-  q2v1 = i64.const 0\n\
-  q2v2 = i64.const -4294967284\n\
-  q2v3 = i64.const 4294967295\n\
-  q2a0 = i64.const 20480\n\
-  i64.store q2a0 q2v0\n\
-  q2off = i64.const 16384\n\
-  q2a1 = i64.const 20488\n\
-  i64.store q2a1 q2off\n\
-  q2a2 = i64.const 20496\n\
-  i64.store q2a2 q2v2\n\
-  q2a3 = i64.const 20504\n\
-  i64.store q2a3 q2v3\n\
-  q2a4 = i64.const 20512\n\
-  i64.store q2a4 q2v1\n\
-  q2a5 = i64.const 20520\n\
-  i64.store q2a5 q2v1\n\
-  q2a6 = i64.const 20528\n\
-  i64.store q2a6 q2v1\n\
-  vch = call.cap 6 17 (i64) -> (i32) v0 (q2a0)\n\
+func (i32, i32) -> (i64) {\n\
+block 0 (v0: i32, vb: i32) {\n\
+  vrb = i64.const 20508\n\
+  i32.store vrb vb\n\
+  vrp = i64.const 20480\n\
+  vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n\
   vfirst = call.cap 6 9 (i32) -> (i32) v0 (vch)\n\
   br 1(v0, vch, vfirst)\n\
 }\n\

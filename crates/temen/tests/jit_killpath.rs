@@ -10,12 +10,17 @@
 //! a deterministic fuel budget, the JIT on a wall-clock watchdog (the realistic host mechanism), so
 //! they stop at different points — but both must stop, and both must report OutOfFuel.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use temen_interp::{run, Host, Trap, Value};
+use temen_interp::{run, Trap, Value};
+use temen_ir::SpawnRec;
 use temen_jit::{compile_and_run, compile_and_run_with_host_interruptible, JitOutcome, TrapKind};
+use temen_run::Limits;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -190,38 +195,31 @@ fn jit_unarmed_path_is_unchanged() {
     assert_eq!(jit, JitOutcome::Returned(vec![0]));
 }
 
-/// A §14 parent that instantiates func 1 as a nested child (64 KiB carve at offset 0) and `join`s it.
-/// The child **spins forever**, so a host kill must reach *into the child* — the child polls the
-/// **parent's** interrupt cell (it is compiled with the same baked address), trips `OutOfFuel`,
-/// `join` propagates it, and the parent unwinds. Without the child polling that cell, the synchronous
-/// `instantiate` never returns and the whole run hangs.
+/// A §14 parent (a powerbox `_start`) that spawns func 1 detached through a v1 record at 17408, paid
+/// from its `"budget"`, and `join`s it. The child **spins forever**, so the run's kill must reach
+/// *into the child*: the host's deadline watchdog sets the run's interrupt cell, the parent's parked
+/// `join` traps `OutOfFuel`, and the run's teardown ends the running child with it. Without that, the
+/// run waits on the child and hangs.
 const PARENT_WITH_RUNAWAY_CHILD: &str = "\
 memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 0
-  q0off = i64.const 65536
-  q0v2 = i64.const -4294967280
-  q0v3 = i64.const 4294967295
-  q0a0 = i64.const 16384
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 16392
-  i64.store q0a1 q0off
-  q0a2 = i64.const 16400
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 16408
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 16416
-  i64.store q0a4 q0v1
-  q0a5 = i64.const 16424
-  i64.store q0a5 q0v1
-  q0a6 = i64.const 16432
-  i64.store q0a6 q0v1
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  return v6
+export 0 func \"_start\" 0
+data 16640 \"instantiator\"
+data 16656 \"budget\"
+func () -> (i32) {
+block 0 () {
+  vip = i64.const 16640
+  vil = i64.const 12
+  vi = self.resolve vip vil
+  vbp = i64.const 16656
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vrb = i64.const 17436
+  i32.store vrb vb
+  vrp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  v6 = call.cap 6 1 (i32) -> (i64) vi (v5)
+  v7 = i32.wrap_i64 v6
+  return v7
   }
 }
 func (i64) -> (i64) {
@@ -240,35 +238,29 @@ block 1 (v1: i64) {
 fn jit_killpath_stops_runaway_child() {
     let _serial = serial();
     if !temen_jit::fiber_supported() {
-        return; // no JIT nesting runtime here — an instantiate is an inert CapFault, not a child run
+        return; // no JIT nesting runtime here — a spawn is an inert CapFault, not a child run
     }
-    let m = parse_module(PARENT_WITH_RUNAWAY_CHILD).expect("parse");
+    let src = format!(
+        "{PARENT_WITH_RUNAWAY_CHILD}{}",
+        rec::segment(17408, &SpawnRec::v1(1))
+    );
+    let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
-
-    let win = 1u64 << 17;
-    let mut host = Host::new();
-    let inst = host.grant_instantiator(0, win); // the parent's nesting authority over the window
-
-    let interrupt = Arc::new(AtomicU64::new(0));
-    let wd = interrupt.clone();
-    let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        wd.store(1, Ordering::SeqCst);
+    let limits = Limits {
+        deadline: Some(Duration::from_millis(100)),
+        ..Limits::default()
+    };
+    // The run is on its own thread so a hang fails this test instead of stalling the suite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(temen_run::run_powerbox_cfg(&m, b"", &[], &[], limits));
     });
-    let outcome = compile_and_run_with_host_interruptible(
-        &m,
-        0,
-        &[inst as i64],
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut core::ffi::c_void,
-        Arc::as_ptr(&interrupt),
-    )
-    .expect("jit compiles");
-    watchdog.join().unwrap();
-
-    assert_eq!(
-        outcome,
-        JitOutcome::Trapped(TrapKind::OutOfFuel),
-        "a runaway nested JIT child must be killed (and not hang the parent's instantiate)"
+    let err = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the run hung on its runaway child")
+        .expect_err("a runaway detached JIT child must be killed, not returned");
+    assert!(
+        err.contains("OutOfFuel"),
+        "expected an OutOfFuel detect-and-kill, got: {err}"
     );
 }

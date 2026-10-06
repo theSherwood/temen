@@ -1102,17 +1102,16 @@ impl Nursery {
         children[slot] = Child::finished(result, trap);
     }
 
-    /// S1c — join every async child OS thread. Called at run **teardown**, before the parent window is
-    /// freed, so no child thread outlives the memory it copies to/from. A well-behaved child has already
-    /// finished (a `join`/`detach` waited on it, or it ran to completion and the run is ending); a still-
-    /// running **detached** child blocks here exactly as a detached `thread.spawn` vCPU does at
-    /// `Domain::join_all` — the run's contract is that every vCPU/child is joined before the window dies.
+    /// S1c — join every child task. Called at run **teardown**, before the parent window is freed, so
+    /// no child outlives the memory it copies to/from. A child still running ends with the run, as the
+    /// oracle ends a child domain (DESIGN §23, D66): unless the run froze, its stop word ends it at its
+    /// next poll, and the join waits for that.
     ///
     /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
     /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
     pub(crate) fn join_children(&self, froze: bool) -> Vec<crate::DetachedHarvest> {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
-        // unless this is a freeze the carve children end with the domain; then the workers are joined.
+        // unless this is a freeze every running task ends with the run; then the workers are joined.
         // It is the whole run's, so every descendant's task has ended too (#1956).
         self.child_exec.shutdown_and_join(!froze);
         let harvest = if froze {

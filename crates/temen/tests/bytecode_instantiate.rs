@@ -10,21 +10,35 @@
 //! (didn't fall back). The host grants the `Instantiator` capability (iface 6); the handle reaches
 //! the guest as func 0's argument. `instantiate` is `call.cap 6 0`, `join` is `call.cap 6 1`.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
+use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, Value};
+use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 
-/// Run `src`'s entry on both engines with an `Instantiator` granted over `[0, 1<<win_log2)`, and
-/// assert the results are identical and equal to `want`.
+/// A host for `m` with an `Instantiator` over the low 128 KiB and a `"budget"` that a detached spawn
+/// of `m`'s own code pays from.
+fn host(m: &Module) -> (Host, i32) {
+    let mut h = Host::new();
+    h.set_self_module(&Arc::new(m.clone()));
+    let budget = h.grant_budget(-1, 1 << 20, -1);
+    h.register_cap_name("budget", budget);
+    let inst = h.grant_instantiator(0, 128 << 10);
+    (h, inst)
+}
+
+/// Run `src`'s entry on both engines with an `Instantiator` granted over `[0, 128 KiB)`, and assert
+/// the results are identical and equal to `want`.
 fn check(src: &str, want: Result<Vec<Value>, ()>) {
     let m = parse_module(src).expect("parse");
 
-    let mut h_tw = Host::new();
-    let inst_tw = h_tw.grant_instantiator(0, 128 << 10);
+    let (mut h_tw, inst_tw) = host(&m);
     let mut f_tw = 5_000_000u64;
     let tw = run_with_host(&m, 0, &[Value::I32(inst_tw)], &mut f_tw, &mut h_tw);
 
-    let mut h_bc = Host::new();
-    let inst_bc = h_bc.grant_instantiator(0, 128 << 10);
+    let (mut h_bc, inst_bc) = host(&m);
     let mut f_bc = 5_000_000u64;
     let bc =
         bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(inst_bc)], &mut f_bc, &mut h_bc)
@@ -174,32 +188,20 @@ fn nesting_composes_to_depth_two() {
 }
 
 /// A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
-/// `AddressSpace` (iface 5, op 1 = `unmap`) to decommit the second 16 KiB of its **own** 64 KiB
-/// window (the first 16 KiB is its NULL guard, #1206 — a page op there is refused as at the root) — a
-/// confined sub-window page op — and returns the unmap result (0). The parent returns it.
+/// `AddressSpace` (iface 5, op 1 = `unmap`) to decommit the second 16 KiB of its **own** window (the
+/// first 16 KiB is its NULL guard, #1206 — a page op there is refused as at the root) and returns the
+/// unmap result (0). The parent spawns it detached through a v1 record at 17728, paid from the
+/// `"budget"` it resolves, and returns what it returns.
 const ADDRESS_SPACE: &str = r#"memory 18
+data 16640 "budget"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0
-  q3v0 = i64.const 4294967296
-  q3v1 = i64.const 65536
-  q3v2 = i64.const -4294967280
-  q3v3 = i64.const 4294967295
-  q3v4 = i64.const 0
+  vnp = i64.const 16640
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  q3b = i64.const 17756
+  i32.store q3b vb
   q3a0 = i64.const 17728
-  i64.store q3a0 q3v0
-  q3a1 = i64.const 17736
-  i64.store q3a1 q3v1
-  q3a2 = i64.const 17744
-  i64.store q3a2 q3v2
-  q3a3 = i64.const 17752
-  i64.store q3a3 q3v3
-  q3a4 = i64.const 17760
-  i64.store q3a4 q3v4
-  q3a5 = i64.const 17768
-  i64.store q3a5 q3v4
-  q3a6 = i64.const 17776
-  i64.store q3a6 q3v4
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
@@ -218,7 +220,8 @@ block 0 (v0: i64, v1: i64) {
 
 #[test]
 fn two_arg_child_manages_its_own_pages() {
-    check(ADDRESS_SPACE, Ok(vec![Value::I64(0)]));
+    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1(1)));
+    check(&src, Ok(vec![Value::I64(0)]));
 }
 
 /// An out-of-range carve (a 4 KiB child at offset 128 KiB doesn't fit the 128 KiB holder) returns

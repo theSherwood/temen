@@ -7,8 +7,11 @@
 //! `CapFault` there. Cranelift passed only the child handle to these thunks, so it joined, polled,
 //! detached, killed and minted through any handle at all.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::{bytecode, Host, MemLayout, Trap, Value};
-use temen_ir::DEFAULT_RESERVED_LOG2;
+use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::jit_cap_run;
 use temen_text::parse_module;
@@ -17,8 +20,8 @@ use temen_verify::verify_module;
 /// A handle the guest was never granted.
 const FORGED: i32 = 9999;
 
-/// Spawn func 1 into a 4 KiB carve at 64 KiB through the real `Instantiator`, then apply `op` to the
-/// live child through `FORGED`.
+/// Spawn func 1 detached through the real `Instantiator`, paid from the root's `Budget` (a v1 record
+/// at 17408), then apply `op` to the live child through `FORGED`.
 fn guest(op: u32) -> temen_ir::Module {
     let call = match op {
         1 => "  vr = call.cap 6 1 (i32) -> (i64) vf (vh)".to_string(),
@@ -27,13 +30,12 @@ fn guest(op: u32) -> temen_ir::Module {
     };
     let src = format!(
         r#"memory 17
-func (i32) -> (i64) {{
-block 0 (vi: i32) {{
-  ve = i64.const 1
-  voff = i64.const 65536
-  vsl = i64.const 12
-  vq = i64.const 0
-  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vi (ve, voff, vsl, vq)
+func (i32, i32) -> (i64) {{
+block 0 (vi: i32, vb: i32) {{
+  vab = i64.const 17436
+  i32.store vab vb
+  vp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vi (vp)
   vf = i32.const {FORGED}
 {call}
   return vr
@@ -45,38 +47,41 @@ block 0 (v0: i64) {{
   return v
   }}
 }}
-"#
+{rec}"#,
+        rec = rec::segment(17408, &SpawnRec::v1(1))
     );
     let m = parse_module(&src).expect("parse guest");
     verify_module(&m).expect("verify guest");
     m
 }
 
-fn host() -> (Host, i32) {
+/// The entry's arguments: the `Instantiator` and the `Budget` that pays for the child.
+fn host() -> (Host, [i32; 2]) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 128 << 10);
-    (host, inst)
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    (host, [inst, budget])
 }
 
 fn oracle(m: &temen_ir::Module) -> Result<Vec<Value>, Trap> {
-    let (mut host, inst) = host();
+    let (mut host, args) = host();
     let mut fuel = 10_000_000u64;
-    temen_interp::run_with_host(m, 0, &[Value::I32(inst)], &mut fuel, &mut host)
+    temen_interp::run_with_host(m, 0, &args.map(Value::I32), &mut fuel, &mut host)
 }
 
 /// `None` when the bytecode engine declines the module (it has no lowering for ops 9/10/12).
 fn bytecode_engine(m: &temen_ir::Module) -> Option<Result<Vec<Value>, Trap>> {
-    let (mut host, inst) = host();
+    let (mut host, args) = host();
     let mut fuel = 10_000_000u64;
-    bytecode::compile_and_run_with_host(m, 0, &[Value::I32(inst)], &mut fuel, &mut host)
+    bytecode::compile_and_run_with_host(m, 0, &args.map(Value::I32), &mut fuel, &mut host)
 }
 
 fn cranelift(m: &temen_ir::Module) -> JitOutcome {
-    let (mut host, inst) = host();
+    let (mut host, args) = host();
     jit_cap_run(
         m,
         0,
-        &[inst as i64],
+        &args.map(i64::from),
         &MemLayout::image(Vec::new()),
         DEFAULT_RESERVED_LOG2,
         0,

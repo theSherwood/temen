@@ -358,16 +358,11 @@ struct Entry {
     deadline: Option<Instant>,
     /// A wake arrived (possibly while the task was still running toward its park).
     woken: bool,
-    /// A **carve** child's trap cell, for a teardown that ends the parent's domain: the parent's
-    /// completion ends its nested children, running ones included (DESIGN §12 domain teardown),
-    /// and a running task is reachable only through this — its `task` is on a worker. `None` for a
-    /// detached child, which a parent's completion does not end.
-    stop: Option<Arc<VmCtx>>,
     /// #1469 — the task's own domain, reachable while a worker holds the task: a poisoned task's
     /// parked vCPUs must be woken to observe it.
     dom: Option<Arc<Domain>>,
     /// #2074 — the task's instance (its trap cell in field 0), reachable while a worker holds the
-    /// task, for [`ChildExec::kill`].
+    /// task, for [`ChildExec::kill`] and the run's teardown.
     vm: Arc<VmCtx>,
 }
 
@@ -503,7 +498,6 @@ impl ChildExec {
             .map(|&(_, cap)| cap as usize)
             .min()
             .unwrap_or(g.tasks.len() + 1);
-        let stop = task.copy_back.is_some().then(|| Arc::clone(&task.vm));
         let dom = task.dom.clone();
         let vm = Arc::clone(&task.vm);
         g.tasks.insert(
@@ -514,7 +508,6 @@ impl ChildExec {
                 deadline: None,
                 counted: false,
                 woken: false,
-                stop,
                 dom,
                 vm,
             },
@@ -1053,10 +1046,11 @@ impl ChildExec {
     /// hung the join, and unwinds through its trailing guard instead — the interpreter's teardown
     /// sweep. A task that parks after this began is poisoned too (`worker_loop`).
     ///
-    /// `end_domain` — the parent's domain is ending (not freezing): its **carve** children end with
-    /// it, running or not yet started, as the oracle ends them. Their cell gets the completion
-    /// sentinel, which their entry and back-edge polls observe (`emit_domain_poll`). A
-    /// freeze skips this, so a child the freeze reaches still unwinds under its own freeze word.
+    /// `end_domain` — the run is ending (not freezing): every task ends with it, running or not yet
+    /// started, carve or detached, as the oracle ends a child domain with the run (DESIGN §23, D66).
+    /// Its stop word gets the completion sentinel, which its entry and back-edge polls observe
+    /// (`emit_domain_poll`). A freeze skips this, so a child the freeze reaches still unwinds under
+    /// its own freeze word.
     /// For the same reason a **durable** child under a word the freeze rang
     /// (`Nursery::ring_detached`) is never poisoned, here or when it parks later, and unwinds and
     /// rides, where a poisoned one would end in a trap and leave no image: its futex wait is woken
@@ -1077,15 +1071,15 @@ impl ChildExec {
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
                     }
                     true
-                } else if let Some(stop) = e.stop.as_ref().filter(|_| end_domain) {
-                    // The stop word, which a `call.cap` does not reset (#2088). Never clobber a
-                    // stop already set.
-                    let _ = stop.stop.compare_exchange(
-                        0,
-                        crate::DOMAIN_DONE_CODE as i64,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
+                } else if end_domain && !spared {
+                    // As `kill` ends a task: the stop word ends it at its next poll, whatever its
+                    // host calls do to the trap cell (#2088), and the trap cell ends a host-side
+                    // wait it re-checks (a serve loop's park). Never clobber either already set.
+                    let done = crate::DOMAIN_DONE_CODE as i64;
+                    for cell in [&e.vm.stop, &e.vm.trap] {
+                        let _ =
+                            cell.compare_exchange(0, done, Ordering::Relaxed, Ordering::Relaxed);
+                    }
                     true
                 } else {
                     false

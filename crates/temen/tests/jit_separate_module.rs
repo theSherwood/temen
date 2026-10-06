@@ -8,8 +8,12 @@
 //! supply of those segments for demand children, validation (`-EINVAL` / `CapFault`), and the final
 //! parent window bytes.
 
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
-use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Trap, Value};
+use temen_ir::SpawnRec;
+use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -37,7 +41,8 @@ block 0 (v0: i64) {
 }
 
 /// Run `parent_src` on both backends with identical grants: an `Instantiator` over the whole 128 KiB
-/// window and a `Module` capability for `child_src` (their handles passed as the entry's two args).
+/// window and a `Module` capability for `child_src` (their handles passed as the entry's two args),
+/// and a `"budget"` a detached spawn pays from.
 fn both(parent_src: &str) -> BothOut {
     both_with(parent_src, child_src())
 }
@@ -51,13 +56,16 @@ fn both_with(parent_src: &str, child_src: &str) -> BothOut {
     let init: Vec<u8> = (0..(128u64 << 10))
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();
+    let grant = |h: &mut Host| {
+        let budget = h.grant_budget(-1, 1 << 20, -1);
+        h.register_cap_name("budget", budget);
+        (h.grant_instantiator(0, 128 << 10), h.grant_module(&child))
+    };
 
     let mut hi = Host::new();
-    let ii = hi.grant_instantiator(0, 128 << 10);
-    let mi = hi.grant_module(&child);
+    let (ii, mi) = grant(&mut hi);
     let mut hj = Host::new();
-    let ij = hj.grant_instantiator(0, 128 << 10);
-    let mj = hj.grant_module(&child);
+    let (ij, mj) = grant(&mut hj);
     assert_eq!((ii, mi), (ij, mj), "grants must encode identically");
 
     let mut fuel = 5_000_000u64;
@@ -70,19 +78,18 @@ fn both_with(parent_src: &str, child_src: &str) -> BothOut {
         0,
         &mut hi,
     );
-    let (jo, jmem) = compile_and_run_capture_reserved_with_host_ex(
+    let (jo, jmem) = temen_run::jit_cap_run(
         &parent,
         0,
         &[ij as i64, mj as i64],
-        &init,
+        &MemLayout::image(init),
         0,
-        temen_run::cap_thunk,
-        &mut hj as *mut Host as *mut core::ffi::c_void,
-        Some(temen_run::module_resolver),
+        0,
+        &mut hj,
         None,
     )
     .expect("jit");
-    (ir, imem, jo, jmem)
+    (ir, imem, jo, jmem.bytes().to_vec())
 }
 
 /// A child ("plugin") with two exported entries — `"alpha"` (func 0) → `byte+1000`, `"beta"` (func 1)
@@ -116,75 +123,43 @@ block 0 (v0: i64) {
 "
 }
 
-/// Like [`both`], but grants [`named_child_src`] (the two-export child) so a parent can resolve a child
-/// entry by name on both backends.
-fn both_named(parent_src: &str) -> BothOut {
-    let parent = parse_module(parent_src).expect("parse parent");
-    verify_module(&parent).expect("verify parent");
-    let child = parse_module(named_child_src()).expect("parse child");
-    verify_module(&child).expect("verify child");
-    let init: Vec<u8> = (0..(128u64 << 10))
-        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
-        .collect();
-
-    let mut hi = Host::new();
-    let ii = hi.grant_instantiator(0, 128 << 10);
-    let mi = hi.grant_module(&child);
-    let mut hj = Host::new();
-    let ij = hj.grant_instantiator(0, 128 << 10);
-    let mj = hj.grant_module(&child);
-    assert_eq!((ii, mi), (ij, mj), "grants must encode identically");
-
-    let mut fuel = 5_000_000u64;
-    let (ir, imem) = run_capture_reserved_with_host(
-        &parent,
-        0,
-        &[Value::I32(ii), Value::I32(mi)],
-        &mut fuel,
-        &init,
-        0,
-        &mut hi,
-    );
-    let (jo, jmem) = compile_and_run_capture_reserved_with_host_ex(
-        &parent,
-        0,
-        &[ij as i64, mj as i64],
-        &init,
-        0,
-        temen_run::cap_thunk,
-        &mut hj as *mut Host as *mut core::ffi::c_void,
-        Some(temen_run::module_resolver),
-        None,
-    )
-    .expect("jit");
-    (ir, imem, jo, jmem)
-}
-
 #[test]
 fn jit_module_child_by_export_name_matches_interp() {
     if !temen_jit::fiber_supported() {
         return; // no JIT nesting runtime on this target
     }
     // The parent resolves "beta" (func 1) via Module op 0 — routed through `cap_thunk` →
-    // `cap_dispatch_slots` on the JIT, same as the interpreter — then instantiate_module's it → join.
-    let parent = "memory 17
+    // `cap_dispatch_slots` on the JIT, same as the interpreter — writes it into the entry of a v1
+    // record with the module and its `"budget"`, and spawns the child detached → join.
+    let parent = format!(
+        "memory 17
 data 16584 \"beta\"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+data 16640 \"budget\"
+func (i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32) {{
   v2 = i64.const 16584
   v3 = i64.const 4
   v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
-  v5 = i64.extend_i32_s v1
-  v6 = i64.const 0
-  v7 = i64.const 65536
-  v8 = i64.const 16
-  v9 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v5, v4, v7, v8, v6)
+  ve = i32.wrap_i64 v4
+  rea = i64.const 17412
+  i32.store rea ve
+  rma = i64.const 17432
+  i32.store rma v1
+  vnp = i64.const 16640
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  rba = i64.const 17436
+  i32.store rba vb
+  rp = i64.const 17408
+  v9 = call.cap 6 17 (i64) -> (i32) v0 (rp)
   v10 = call.cap 6 1 (i32) -> (i64) v0 (v9)
   return v10
-  }
-}
-";
-    let (ir, imem, jo, jmem) = both_named(parent);
+  }}
+}}
+{}",
+        rec::segment(17408, &SpawnRec::v1(0))
+    );
+    let (ir, imem, jo, jmem) = both_with(&parent, named_child_src());
     let ival = ir.expect("interp ran ok").pop().expect("one result");
     assert_eq!(ival, Value::I64(86 + 2000), "interp name-addressed child");
     assert!(
@@ -253,20 +228,29 @@ fn jit_powerbox_entry_child_matches_interp() {
     if !temen_jit::fiber_supported() {
         return; // no JIT nesting runtime on this target
     }
-    // instantiate_module(module, entry 0, off 64 KiB, size 2^16, fuel 0) → join → child's result.
-    let parent = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+    // Spawn the module's entry 0 detached, through a v1 record paid from its `"budget"` → join →
+    // the child's result.
+    let parent = format!(
+        "memory 17
+data 16640 \"budget\"
+func (i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32) {{
+  rma = i64.const 17432
+  i32.store rma v1
+  vnp = i64.const 16640
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  rba = i64.const 17436
+  i32.store rba vb
+  rp = i64.const 17408
+  v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
   v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
   return v7
-  }
-}
-";
+  }}
+}}
+{}",
+        rec::segment(17408, &SpawnRec::v1(0))
+    );
     let status = "memory 16
 export 0 func \"_start\" 0
 func () -> (i32) {
@@ -285,7 +269,7 @@ block 0 () {
 }
 ";
     for (child, want) in [(status, -7i64), (nothing, 0)] {
-        let (ir, imem, jo, jmem) = both_with(parent, child);
+        let (ir, imem, jo, jmem) = both_with(&parent, child);
         assert_eq!(ir, Ok(vec![Value::I64(want)]), "interp, child:\n{child}");
         assert!(
             matches!(jo, JitOutcome::Returned(ref s) if s == &[want]),

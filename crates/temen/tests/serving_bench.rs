@@ -24,23 +24,27 @@
 //! so this file doubles as an N-round serial-serve correctness pin — the existing svc parity tests
 //! only serve a single request.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::time::Instant;
 
+use temen_ir::{cap_id, SpawnRec};
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 
 /// A caller `_start` that spawns a serving child (func 1), mints a live offer over its `adder`
 /// export (op 14), then calls `add(i, 1)` through the offer `n` times — parking on each call until
 /// the child serves it — accumulating the replies, joins the child, and exits with the low 32 bits
-/// of the sum. (CALLS.md 5c.1c: the spawn is op 11 with an empty grant list — a plain op-0
-/// child is destitute by design on the JIT, and a serving child needs the shared granted
-/// powerbox the parked transport rides; interp/bytecode semantics unchanged.) The child serves exactly `n` requests in a `svc.wait` loop, then returns. The sum is
+/// of the sum. The spawn is detached, through a v1 record paid from the caller's `"budget"`. The
+/// child serves exactly `n` requests in a `svc.wait` loop, then returns. The sum is
 /// `Σ_{i=0}^{n-1} (i + 1) = n(n+1)/2` (wrapped to i32 at exit) — deterministic across backends.
 fn serving_program(n: u64) -> String {
     format!(
         "\
 memory 17
 data 16384 \"vm\"
+data 16400 \"budget\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface {{ add: 0 }}
 export 0 interface \"adder\" 1 {{ add: 2 }}
@@ -51,26 +55,12 @@ block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  q0b = i64.const 17564
+  i32.store q0b vb
   q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
   vch = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   vexp = i64.const 0
   voffer = call.cap 6 14 (i32, i64) -> (i32) vh (vch, vexp)
@@ -119,7 +109,8 @@ block 0 (va: i64, vb: i64) {{
   return vs
   }}
 }}
-"
+{rec}",
+        rec = rec::segment(17536, &SpawnRec::v1(1))
     )
 }
 
@@ -141,10 +132,16 @@ fn run(backend: Backend, src: &str) -> i32 {
         .run_with_caps(
             backend,
             &RunConfig::default(),
-            &[(
-                "vm",
-                HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-            )],
+            &[
+                (
+                    "vm",
+                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                ),
+                (
+                    "budget",
+                    HostCap::custom(cap_id::BUDGET, 0, |h, _| h.grant_budget(-1, 1 << 20, -1)),
+                ),
+            ],
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
     match r.outcome {
