@@ -7170,7 +7170,7 @@ struct DbgTask {
     /// (so a loop-body breakpoint re-fires each iteration).
     at_bp: bool,
     /// A detached child's window lease `(spawner env, budget, bytes)` — [`TaskSlot::lease`]'s
-    /// counterpart, returned by [`dbg_refund_ended_windows`] once this task is `Done`.
+    /// counterpart, returned by [`dbg_refund_ended_windows`] once this task is `Done`, or the run is.
     lease: Option<(Option<usize>, i32, u64)>,
     /// #2001 — [`TaskSlot::live`]'s counterpart: a thread's `spawn`, handed back when it completes.
     live: LiveVcpu,
@@ -7186,10 +7186,16 @@ struct DbgTask {
 /// [`refund_ended_windows`] on the debugger's scheduler: a finished detached child's window goes back
 /// to the budget that paid for it, in the spawner's own powerbox, and what the window grew with it
 /// (#1909), from the child's own. The debugger's child envs see no other end (it declines fork, spawn
-/// and exec), and it never replaces their powerboxes, so the child's is still here.
-fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [DbgEnv]) {
+/// and exec), and it never replaces their powerboxes, so the child's is still here. `run_ended`: the
+/// run is over, which ends every child still live too, as the oracle's teardown reaps it (#2006).
+fn dbg_refund_ended_windows(
+    tasks: &mut [DbgTask],
+    host: &mut Host,
+    envs: &mut [DbgEnv],
+    run_ended: bool,
+) {
     for t in tasks.iter_mut() {
-        if matches!(t.state, DbgTaskState::Done(_)) {
+        if run_ended || matches!(t.state, DbgTaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
                 match env {
                     None => host.release_detached(budget, bytes),
@@ -8021,7 +8027,7 @@ fn dbg_instantiate_confined(
 ) -> Result<(), Trap> {
     // The spawning task's window and fuel, and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner, pfuel) = match tasks[ti].env {
-        None => (shared_mem.as_ref(), host, shared_fuel),
+        None => (shared_mem.as_ref(), &mut *host, shared_fuel),
         Some(k) => {
             let e = &mut extra_envs[k];
             (e.mem.as_ref(), &mut e.host, &e.fuel)
@@ -8046,6 +8052,7 @@ fn dbg_instantiate_confined(
         tasks,
         ti,
         extra_envs,
+        host,
         source,
         child,
         spawn.entry,
@@ -8056,39 +8063,58 @@ fn dbg_instantiate_confined(
 
 /// Schedule an admitted §14/§5 child as a debug task over its own [`DbgEnv`], registered as a child
 /// handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it), and land the handle in `dst`.
-/// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`).
+/// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`). A child refused here hands
+/// its window lease back to its spawner's powerbox, the root's `host` or an env's, so a spawn refused
+/// after its admission charges nothing ([`coop_start_child`], #2006).
 #[allow(clippy::too_many_arguments)]
 fn dbg_start_child(
     tasks: &mut Vec<DbgTask>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
+    host: &mut Host,
     source: &ModuleSource,
     child: AdmittedChild,
     entry: i64,
     dst: u32,
     place: EnvPlace,
 ) -> Result<(), Trap> {
-    let live = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
-        .count();
-    if live >= super::MAX_VCPUS {
-        return Err(Trap::ThreadFault); // instantiate bomb
-    }
+    let spawner = tasks[ti].env;
     let AdmittedChild {
         mem,
-        host,
+        host: child_host,
         program,
         args,
         fuel,
         lease,
     } = child;
-    let (module, prog) = program.land(source)?;
-    let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
+    let live = tasks
+        .iter()
+        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
+        .count();
+    let built = if live >= super::MAX_VCPUS {
+        Err(Trap::ThreadFault) // instantiate bomb
+    } else {
+        program.land(source).and_then(|(module, prog)| {
+            let (vt, table) = child_task(module, &prog, entry, &args, child_host.jit_table_log2())?;
+            Ok((module, vt, table))
+        })
+    };
+    let (module, vt, table) = match built {
+        Ok(b) => b,
+        Err(t) => {
+            if let Some((budget, bytes)) = lease {
+                match spawner {
+                    None => host.release_detached(budget, bytes),
+                    Some(k) => extra_envs[k].host.release_detached(budget, bytes),
+                }
+            }
+            return Err(t);
+        }
+    };
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
         mem,
-        host,
+        host: child_host,
         table,
         program: module,
         // The debugger runs every task on a fixed allowance: a detached child gets what its chain
@@ -8105,7 +8131,7 @@ fn dbg_start_child(
         env: Some(eidx),
         state: DbgTaskState::Runnable,
         at_bp: false,
-        lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
+        lease: lease.map(|(budget, bytes)| (spawner, budget, bytes)),
         live: LiveVcpu::none(),
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -8133,7 +8159,7 @@ fn dbg_instantiate_detached(
     let own = source.get(program as usize).map(|p| (program, p));
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
-        None => (shared_mem.as_ref(), host),
+        None => (shared_mem.as_ref(), &mut *host),
         Some(k) => {
             let e = &mut extra_envs[k];
             (e.mem.as_ref(), &mut e.host)
@@ -8153,6 +8179,7 @@ fn dbg_instantiate_detached(
         tasks,
         ti,
         extra_envs,
+        host,
         source,
         child,
         spawn.entry,
@@ -9158,9 +9185,15 @@ impl ScheduledDebugRun {
         host.completions().allow_host_completed();
         loop {
             if let DbgTaskState::Done(res) = &tasks[0].state {
-                return SchedStop::Finished(res.clone());
+                let res = res.clone();
+                // #2006 — the run is over, and every child still live ends with it, as the oracle's
+                // teardown reaps it (not a run that froze: the cut carries them).
+                if !(host.is_durable() && is_unwinding(mem)) {
+                    dbg_refund_ended_windows(tasks, host, extra_envs, true);
+                }
+                return SchedStop::Finished(res);
             }
-            dbg_refund_ended_windows(tasks, host, extra_envs);
+            dbg_refund_ended_windows(tasks, host, extra_envs, false);
             // A task mid-coroutine is pinned (atomic resume); otherwise prefer the stepping thread while
             // it is runnable (so a step stays on it and a step-over runs its own call), else the
             // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
@@ -10154,6 +10187,10 @@ fn spawn_task(
 ) -> (i64, Option<CoopStep>) {
     let child_ti = tasks.len();
     let pid = child_ti as u64 + 1;
+    // The run's live cap first, as the oracle's `spawn_vcpu` checks it (#2006).
+    if live_tasks(tasks) >= super::MAX_VCPUS {
+        return (super::EAGAIN, None);
+    }
     // #2001 — the process is one `spawn` of the node it shares with its spawner while it lives: a full
     // ceiling refuses it as the live cap does.
     let node = task_host(host, extra_envs, tasks[ti].env).with(|h| h.own_node());
@@ -13007,14 +13044,26 @@ fn task_host<'a>(host: &'a mut Host, envs: &'a [ChildEnv], env: Option<usize>) -
     }
 }
 
+/// The run's live vCPUs: every task not yet done, the root among them — what the `MAX_VCPUS`
+/// anti-bomb gate counts, as the oracle's scheduler counts `live`.
+fn live_tasks(tasks: &[TaskSlot]) -> usize {
+    tasks
+        .iter()
+        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+        .count()
+}
+
 /// Schedule an admitted §14/§5 child as a task of the cooperative executor over its own environment,
 /// registered as a child handle of task `ti`, and land the handle in `dst`. `tierup` is the run's
 /// eligibility bitmap and page-check flag, for a child that inherits them (see the confined arm).
-/// `Err(ThreadFault)` on the vCPU-count bomb; the caller completes `ti` with it.
+/// `Err(ThreadFault)` on the vCPU-count bomb; the caller completes `ti` with it. A child refused here
+/// hands its window lease back to its spawner's powerbox in `host`, so a spawn refused after its
+/// admission charges nothing (#1975, #2006), as the oracle's undo does.
 #[allow(clippy::too_many_arguments)]
 fn coop_start_child(
     tasks: &mut Vec<TaskSlot>,
     extra_envs: &mut Vec<ChildEnv>,
+    host: &mut Host,
     ti: usize,
     source: &ModuleSource,
     child: AdmittedChild,
@@ -13022,23 +13071,32 @@ fn coop_start_child(
     dst: u32,
     tierup: Option<(std::sync::Arc<[bool]>, bool)>,
 ) -> Result<(), Trap> {
-    let live = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, TaskState::Done(_)))
-        .count();
-    if live >= super::MAX_VCPUS {
-        return Err(Trap::ThreadFault); // instantiate bomb
-    }
+    let spawner = tasks[ti].env;
     let AdmittedChild {
         mem,
-        host,
+        host: child_host,
         program,
         args,
         fuel,
         lease,
     } = child;
-    let (module, prog) = program.land(source)?;
-    let (mut vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
+    let built = if live_tasks(tasks) >= super::MAX_VCPUS {
+        Err(Trap::ThreadFault) // instantiate bomb
+    } else {
+        program.land(source).and_then(|(module, prog)| {
+            let (vt, table) = child_task(module, &prog, entry, &args, child_host.jit_table_log2())?;
+            Ok((module, vt, table))
+        })
+    };
+    let (module, mut vt, table) = match built {
+        Ok(b) => b,
+        Err(t) => {
+            if let Some((budget, bytes)) = lease {
+                task_host(host, extra_envs, spawner).with(|h| h.release_detached(budget, bytes));
+            }
+            return Err(t);
+        }
+    };
     if let Some((eligible, page_checked)) = tierup {
         vt.active.jit_eligible = Some(eligible);
         vt.active.jit_page_checked = page_checked;
@@ -13046,11 +13104,11 @@ fn coop_start_child(
     let eidx = extra_envs.len();
     extra_envs.push(ChildEnv {
         mem,
-        host: std::sync::Arc::new(std::sync::Mutex::new(host)),
+        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
         table,
         fuel,
         fibers: FiberTables::default(),
-        spawner: tasks[ti].env,
+        spawner,
         program: module,
     });
     let cidx = tasks.len();
@@ -13060,7 +13118,7 @@ fn coop_start_child(
         env: Some(eidx),
         state: TaskState::Runnable,
         suspended: None,
-        lease: lease.map(|(budget, bytes)| (tasks[ti].env, budget, bytes)),
+        lease: lease.map(|(budget, bytes)| (spawner, budget, bytes)),
         live: LiveVcpu::none(),
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -13084,7 +13142,7 @@ struct TaskSlot {
     /// the park clears.
     suspended: Option<Box<Suspended>>,
     /// A detached child's window lease `(spawner env, budget, bytes)`, on the child's root task:
-    /// once the task is `Done` the scheduler returns the bytes to the spawner's budget
+    /// once the task is `Done`, or the run is, the scheduler returns the bytes to the spawner's budget
     /// ([`refund_ended_windows`]).
     lease: Option<(Option<usize>, i32, u64)>,
     /// #2001 — the task's `spawn` on its domain's node, handed back when it completes
@@ -13108,13 +13166,25 @@ impl TaskSlot {
 /// Return the window bytes of every detached child whose root task has ended to the budget that paid
 /// for them, in the spawner's own powerbox — `Budget.mem` accounts live windows (INVARIANTS #3,
 /// 2026-09-29). Run at the top of every scheduling round, so the refund lands before any task runs
-/// again.
-fn refund_ended_windows(tasks: &mut [TaskSlot], host: &mut Host, envs: &[ChildEnv]) {
+/// again. `run_ended`: the run is over, which ends every child still live too, as the oracle's
+/// teardown reaps it ([`CoopSched::pump`]): its window goes back, and what each child domain's window
+/// holds ([`Host::release_memory`], #2006).
+fn refund_ended_windows(
+    tasks: &mut [TaskSlot],
+    host: &mut Host,
+    envs: &[ChildEnv],
+    run_ended: bool,
+) {
     for t in tasks.iter_mut() {
-        if matches!(t.state, TaskState::Done(_)) {
+        if run_ended || matches!(t.state, TaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
                 task_host(host, envs, env).with(|h| h.release_detached(budget, bytes));
             }
+        }
+    }
+    if run_ended {
+        for e in envs {
+            e.host.lock_unpoisoned().release_memory();
         }
     }
 }
@@ -13964,7 +14034,33 @@ impl CoopSched {
     /// tier-up never fires, so this runs the whole schedule and returns `Done` — behaviourally the
     /// inline loop `drive` used to run. Each iteration services one runnable vCPU via `step_vcpu` and
     /// settles wakes/teardown; a run-fatal trap is `Err(trap)`.
+    ///
+    /// A run that ends (its root finished, or a trap ended it) ends every domain still live in it, as
+    /// the oracle's teardown reaps them (`teardown_run`): each detached child hands its window back
+    /// to the budget that paid for it, and each child domain what its window holds (#2006). Not a run
+    /// that froze: the cut carries them.
     fn pump(
+        &mut self,
+        dom: &Domain,
+        mem: &mut Option<Mem>,
+        host: &mut Host,
+        fuel: &mut Fuel,
+        budget: u64,
+    ) -> Result<CoopStep, Trap> {
+        let step = self.pump_to_pause(dom, mem, host, fuel, budget);
+        let ended = match &step {
+            Ok(CoopStep::Done(_)) => !(host.is_durable() && is_unwinding(mem)),
+            Ok(_) => false,
+            Err(_) => true,
+        };
+        if ended {
+            refund_ended_windows(&mut self.tasks, host, &self.extra_envs, true);
+        }
+        step
+    }
+
+    /// [`Self::pump`]'s schedule, up to its next pause.
+    fn pump_to_pause(
         &mut self,
         dom: &Domain,
         mem: &mut Option<Mem>,
@@ -14269,7 +14365,7 @@ impl CoopSched {
             for ci in pipe_wakes {
                 tasks[ci].state = TaskState::Runnable;
             }
-            refund_ended_windows(tasks, host, extra_envs);
+            refund_ended_windows(tasks, host, extra_envs, false);
             // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
             // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
             // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
@@ -14987,7 +15083,8 @@ impl CoopSched {
                         // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
                         // here and that push, so the fork factories learn it up front (#863 slice 2).
                         let twin_pid = tasks.len() as u64;
-                        let forked = if bare {
+                        // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
+                        let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
                             caller_env.and_then(|ck| {
                                 let twin_mem = match &extra_envs[ck].mem {
                                     Some(m) => Some(m.fork_private()?),
@@ -15309,9 +15406,11 @@ impl CoopSched {
                     // The twin shares the caller's budget node (`fork_powerbox`), so it draws from it
                     // as a thread would (#1944 slice 3).
                     // #2001 — the twin is one `spawn` of the node it shares with its parent while it
-                    // lives: a full ceiling refuses the fork, as the live cap does.
+                    // lives: a full ceiling refuses the fork, as the live cap does, which is checked
+                    // first, as the oracle's `fork_vcpu` checks it (#2006).
                     let node = task_host(host, extra_envs, tasks[ti].env).with(|h| h.own_node());
-                    let forked: Option<(Fuel, Option<Mem>, Host, LiveVcpu)> = if bare {
+                    let room = bare && live_tasks(tasks) < super::MAX_VCPUS;
+                    let forked: Option<(Fuel, Option<Mem>, Host, LiveVcpu)> = if room {
                         (|| {
                             let live = LiveVcpu::charge(node)?;
                             match tasks[ti].env {
@@ -15460,11 +15559,7 @@ impl CoopSched {
                         complete(tasks, ti, Err(Trap::Malformed));
                         continue;
                     }
-                    let live = tasks
-                        .iter()
-                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
-                        .count();
-                    if live >= super::MAX_VCPUS {
+                    if live_tasks(tasks) >= super::MAX_VCPUS {
                         complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                         continue;
                     }
@@ -15577,6 +15672,7 @@ impl CoopSched {
                     let started = coop_start_child(
                         tasks,
                         extra_envs,
+                        host,
                         ti,
                         &dom.source,
                         child,
@@ -15637,6 +15733,7 @@ impl CoopSched {
                     let started = coop_start_child(
                         tasks,
                         extra_envs,
+                        host,
                         ti,
                         &dom.source,
                         child,
@@ -17100,6 +17197,153 @@ mod par_futex_tests {
     }
 }
 
+/// #2006 — a detached child its driver refuses at the run's live-vCPU cap, after the admission charged
+/// its window and first vCPU, hands both back: a spawn refused after its admission charges nothing
+/// (#1975), on every driver that schedules the child itself. A guest cannot reach the cap cheaply
+/// (`MAX_VCPUS` live vCPUs, an OS thread each on the parallel driver), so each driver's scheduling
+/// step is called directly with its live count full.
+#[cfg(test)]
+mod live_cap_tests {
+    use super::*;
+
+    const WINDOW: u64 = 1 << 16;
+
+    fn unit() -> Compiled {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        compile_module(&m.funcs, &m.types, None).expect("compile")
+    }
+
+    /// A powerbox whose budget an admission has charged for one child, and that child.
+    fn admitted() -> (Host, AdmittedChild) {
+        let mut host = Host::new();
+        let budget = host.grant_budget(-1, -1, -1);
+        host.admit_detached_spawn(budget, WINDOW).expect("admitted");
+        let child = AdmittedChild {
+            mem: None,
+            host: Host::new(),
+            program: ChildProgram::Spawner(0, std::sync::Arc::new(unit())),
+            args: Vec::new(),
+            fuel: Fuel::fixed(0),
+            lease: Some((budget, WINDOW)),
+        };
+        assert_eq!(held(&host), (WINDOW as i64, 1), "the admission's charge");
+        (host, child)
+    }
+
+    /// The `mem` and `spawn` the granted budget holds.
+    fn held(host: &Host) -> (i64, i64) {
+        let node = host
+            .capture_durable_budgets()
+            .into_iter()
+            .find(|n| n.parent.is_none())
+            .expect("the granted budget");
+        (node.used.mem, node.used.spawn)
+    }
+
+    fn vtask() -> VTask {
+        VTask::new(&unit(), 0, &[]).expect("task")
+    }
+
+    #[test]
+    fn the_cooperative_driver_hands_a_refused_childs_window_back() {
+        let (mut host, child) = admitted();
+        let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
+            .map(|_| TaskSlot {
+                vt: vtask(),
+                threads: Vec::new(),
+                env: None,
+                state: TaskState::Runnable,
+                suspended: None,
+                lease: None,
+                live: LiveVcpu::none(),
+            })
+            .collect();
+        let source = ModuleSource::new(unit());
+        let r = coop_start_child(
+            &mut tasks,
+            &mut Vec::new(),
+            &mut host,
+            0,
+            &source,
+            child,
+            0,
+            0,
+            None,
+        );
+        assert_eq!(r, Err(Trap::ThreadFault));
+        assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
+        assert_eq!(held(&host), (0, 0), "nothing stays charged");
+    }
+
+    #[test]
+    fn the_debug_scheduler_hands_a_refused_childs_window_back() {
+        let (mut host, child) = admitted();
+        let mut tasks: Vec<DbgTask> = (0..crate::MAX_VCPUS)
+            .map(|_| DbgTask {
+                vt: vtask(),
+                threads: Vec::new(),
+                env: None,
+                state: DbgTaskState::Runnable,
+                at_bp: false,
+                lease: None,
+                live: LiveVcpu::none(),
+            })
+            .collect();
+        let source = ModuleSource::new(unit());
+        let place = EnvPlace::Detached { spawner: None };
+        let r = dbg_start_child(
+            &mut tasks,
+            0,
+            &mut Vec::new(),
+            &mut host,
+            &source,
+            child,
+            0,
+            0,
+            place,
+        );
+        assert_eq!(r, Err(Trap::ThreadFault));
+        assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
+        assert_eq!(held(&host), (0, 0), "nothing stays charged");
+    }
+
+    #[test]
+    fn the_parallel_driver_hands_a_refused_childs_window_back() {
+        let (host, child) = admitted();
+        let host = std::sync::Arc::new(std::sync::Mutex::new(host));
+        let dom = Domain::new(unit(), 0);
+        let reg = ThreadRegistry::new();
+        reg.live
+            .store(crate::MAX_VCPUS, std::sync::atomic::Ordering::Relaxed);
+        let mut threads = Vec::new();
+        let r = std::thread::scope(|scope| {
+            par_start_child(
+                scope,
+                &dom,
+                &reg,
+                &host,
+                &ParDomain::default(),
+                &mut threads,
+                child,
+                0,
+            )
+        });
+        assert_eq!(r, Err(Trap::ThreadFault));
+        assert!(threads.is_empty(), "nothing was started");
+        assert_eq!(
+            reg.live.load(std::sync::atomic::Ordering::Relaxed),
+            crate::MAX_VCPUS,
+            "the refusal took no live slot"
+        );
+        assert_eq!(
+            held(&host.lock_unpoisoned()),
+            (0, 0),
+            "nothing stays charged"
+        );
+    }
+}
+
 /// One **domain** of the parallel driver (DESIGN.md §12): the root and its `thread.spawn` threads,
 /// or a §14 confined child or fork twin and its threads — the world that shares one window and
 /// powerbox. It holds the domain's fiber registry (#1761) and its death: a member's trap is
@@ -17160,13 +17404,15 @@ impl ParDomain {
 /// parallel driver runs each vCPU on its **own OS thread**, so a joiner blocks here on a `Condvar`
 /// until the child it named publishes its result. One `id` namespace across the whole run (handed out
 /// by `next_id`); a child's result (value-or-trap) is delivered to the lowest-index waiter via the
-/// `done` map. `live` mirrors the cooperative `MAX_VCPUS` anti-bomb gate across threads. `futex` serves
-/// the guest's `memory.wait`/`notify` across threads.
+/// `done` map. `futex` serves the guest's `memory.wait`/`notify` across threads.
 struct ThreadRegistry {
     done: std::sync::Mutex<std::collections::HashMap<u64, Result<Vec<Value>, Trap>>>,
     woken: std::sync::Condvar,
     next_id: std::sync::atomic::AtomicU64,
-    live: std::sync::atomic::AtomicUsize,
+    /// The run's live vCPUs, the root among them, shared by every domain's registry: what the
+    /// `MAX_VCPUS` anti-bomb gate counts, as the cooperative driver counts its tasks (#2006). Taken by
+    /// [`Self::try_start`], given back by [`Self::end`].
+    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     futex: Futex,
     /// #748 — the personality **fork-twin table** for the parallel driver's `ForkSelf`/`ReapWait`
     /// arms: `(exited pids, generation)`. Exited pids are permanent (never removed — pids are
@@ -17187,12 +17433,23 @@ struct ThreadRegistry {
 }
 
 impl ThreadRegistry {
+    /// A run's root registry: its live count starts at one, the root vCPU.
     fn new() -> std::sync::Arc<ThreadRegistry> {
+        Self::counting(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)))
+    }
+
+    /// A child domain's registry: its own join table, futex and fork table, counted in the run's live
+    /// vCPUs.
+    fn child(&self) -> std::sync::Arc<ThreadRegistry> {
+        Self::counting(std::sync::Arc::clone(&self.live))
+    }
+
+    fn counting(live: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> std::sync::Arc<Self> {
         std::sync::Arc::new_cyclic(|me| ThreadRegistry {
             done: std::sync::Mutex::new(std::collections::HashMap::new()),
             woken: std::sync::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(0),
-            live: std::sync::atomic::AtomicUsize::new(0),
+            live,
             futex: Futex::default(),
             fork_exits: std::sync::Mutex::new((std::collections::HashSet::new(), 0)),
             fork_woken: std::sync::Condvar::new(),
@@ -17246,10 +17503,26 @@ impl ThreadRegistry {
         }
     }
 
+    /// Take one of the run's live-vCPU slots for a vCPU about to be made, the cooperative
+    /// `live >= MAX_VCPUS` gate across threads: `false`, with nothing taken, when the run is full.
+    fn try_start(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.live.fetch_add(1, Relaxed) < super::MAX_VCPUS {
+            return true;
+        }
+        self.live.fetch_sub(1, Relaxed);
+        false
+    }
+
+    /// Give back a slot [`Self::try_start`] took: its vCPU ended, or was never made.
+    fn end(&self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// A spawned vCPU finished: publish its result and wake any joiner parked on it.
     fn publish(&self, id: u64, res: Result<Vec<Value>, Trap>) {
         self.done.lock().unwrap().insert(id, res);
-        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.end();
         self.woken.notify_all();
     }
 
@@ -17413,7 +17686,7 @@ fn start_process<'scope, 'env>(
             h(status);
         }
         drop(live); // #2001: its `spawn` goes back before a reaper can see it ended
-        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        reg.end();
         reg.publish_fork_exit(pid);
     });
 }
@@ -17598,28 +17871,24 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 let Some(live) = LiveVcpu::charge(node) else {
                     return (Err(Trap::ThreadFault), mem);
                 };
-                // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`).
-                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                    > super::MAX_VCPUS
-                {
-                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let mut child_vt =
+                    match VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)]) {
+                        Ok(v) => v,
+                        Err(t) => return (Err(t), mem),
+                    };
+                // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`), taken
+                // once nothing can fail before the thread holds it (#2006).
+                if !reg.try_start() {
                     return (Err(Trap::ThreadFault), mem);
                 }
                 let id = reg
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let child_vt =
-                    match VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)]) {
-                        Ok(mut v) => {
-                            v.active.module = module as usize;
-                            v.active.home = module as usize;
-                            // §12 seed the child's `vcpu.tls` to its dense id (root = 0; ids start
-                            // at 0 for the first child) — the cooperative `Spawn` arm's seeding.
-                            v.active.tls = id as i64 + 1;
-                            v
-                        }
-                        Err(t) => return (Err(t), mem),
-                    };
+                child_vt.active.module = module as usize;
+                child_vt.active.home = module as usize;
+                // §12 seed the child's `vcpu.tls` to its dense id (root = 0; ids start at 0 for the
+                // first child) — the cooperative `Spawn` arm's seeding.
+                child_vt.active.tls = id as i64 + 1;
                 // The child runs over its own `Mem` view of the **same** shared backing (real atomics)
                 // and SHARES this vCPU's powerbox cell (a thread, not a process — cf. `ForkSelf`).
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
@@ -17707,12 +17976,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     && vt.active_id == ROOT_FIBER
                     && vt.chain.is_empty();
                 // Cross-thread anti-bomb gate (the `Spawn` arm's), released on any refusal.
-                let admitted = bare
-                    && reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        < super::MAX_VCPUS;
-                if bare && !admitted {
-                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                let admitted = bare && reg.try_start();
                 let forked: Option<(Option<Mem>, Host, i64, LiveVcpu)> = if admitted {
                     let twin_pid = reg
                         .next_fork_pid
@@ -17731,7 +17995,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         Some((tm, th, twin_pid, live))
                     })();
                     if built.is_none() {
-                        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        reg.end();
                     }
                     built
                 } else {
@@ -17792,13 +18056,11 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     vt.active.set(dst, Reg::from_i64(super::EINVAL));
                     continue;
                 }
-                let admitted =
-                    reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < super::MAX_VCPUS;
                 // #2001 — the process is one `spawn` of the node it shares with its spawner while
                 // it lives: a full ceiling refuses it as the live cap does.
                 let node = host.lock_unpoisoned().own_node();
-                let twin = if admitted {
-                    LiveVcpu::charge(node).and_then(|live| {
+                let twin = if reg.try_start() {
+                    let twin = LiveVcpu::charge(node).and_then(|live| {
                         let pid = reg
                             .next_fork_pid
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -17807,13 +18069,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             .lock_unpoisoned()
                             .spawn_powerbox(pid as u64, plan, window);
                         twin.map(|t| (pid, t, live))
-                    })
+                    });
+                    if twin.is_none() {
+                        reg.end();
+                    }
+                    twin
                 } else {
                     None
                 };
                 match twin {
                     None => {
-                        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         vt.active.set(dst, Reg::from_i64(super::EAGAIN));
                     }
                     Some((pid, mut twin, live)) => {
@@ -17852,7 +18117,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                             Err(_) => {
                                 let _ = twin.spawn_failed(super::SPAWN_EXEC_FAILED);
                                 drop(live);
-                                reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                reg.end();
                                 reg.publish_fork_exit(pid);
                             }
                         }
@@ -18245,7 +18510,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
 /// the shared source), attenuated powerbox, window, fuel and thread registry (for the threads and
 /// children *it* spawns) — publishing its result to this vCPU's `reg`, where `join` finds it. Returns
 /// the join handle; `Err(ThreadFault)` on the cross-thread vCPU-count bomb (the cooperative driver's
-/// `live >= MAX_VCPUS`).
+/// `live >= MAX_VCPUS`). A child refused here hands its window lease back to `parent_host`, so a spawn
+/// refused after its admission charges nothing ([`coop_start_child`], #2006).
 #[allow(clippy::too_many_arguments)] // the spawn's context, as `coop_start_child`'s
 fn par_start_child<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -18258,10 +18524,6 @@ fn par_start_child<'scope, 'env>(
     child: AdmittedChild,
     entry: i64,
 ) -> Result<i32, Trap> {
-    if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 > super::MAX_VCPUS {
-        reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        return Err(Trap::ThreadFault);
-    }
     let AdmittedChild {
         mem,
         host,
@@ -18270,14 +18532,34 @@ fn par_start_child<'scope, 'env>(
         fuel,
         lease,
     } = child;
-    let (module, prog) = program.land(&dom.source)?;
-    let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
+    let built = if reg.try_start() {
+        let built = program.land(&dom.source).and_then(|(module, prog)| {
+            child_task(module, &prog, entry, &args, host.jit_table_log2())
+        });
+        if built.is_err() {
+            reg.end();
+        }
+        built
+    } else {
+        Err(Trap::ThreadFault) // instantiate bomb
+    };
+    let (vt, table) = match built {
+        Ok(b) => b,
+        Err(t) => {
+            if let Some((budget, bytes)) = lease {
+                parent_host
+                    .lock_unpoisoned()
+                    .release_detached(budget, bytes);
+            }
+            return Err(t);
+        }
+    };
     let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), table);
     let lease = lease.map(|(budget, bytes)| (std::sync::Arc::clone(parent_host), budget, bytes));
     let id = reg
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let child_reg = ThreadRegistry::new();
+    let child_reg = reg.child();
     let child_par = std::sync::Arc::new(ParDomain::default());
     parent_domain.kids.lock_unpoisoned().insert(
         id,

@@ -342,11 +342,10 @@ block 0 (vpid: i64) {
 const WINDOW: i64 = 1 << 19;
 
 /// Run [`BUDGET_SRC`] with its server and guest paid from a budget whose `mem` ceiling is `ceiling`,
-/// on the tree-walker or the bytecode engine (both serve `clone_caller`): the manager's result and the
-/// rooms the guest's copies wrote. They read the room while the run is live: on the bytecode engine a
-/// detached child still live at the run's end (the fork server) keeps its window charged after it
-/// (#2006).
-fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>) {
+/// on the tree-walker or the bytecode engine (both serve `clone_caller`): the manager's result, the
+/// rooms the guest's copies wrote while the run was live, and the `mem` the budget still holds once
+/// the run is over. The fork server is still live at the run's end, and ends with it (#2006).
+fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>, i64) {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
@@ -379,14 +378,21 @@ fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>) {
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    (r, wrote)
+    let held = host
+        .capture_durable_budgets()
+        .into_iter()
+        .find(|n| n.parent.is_none())
+        .expect("the granted budget")
+        .used
+        .mem;
+    (r, wrote, held)
 }
 
 #[test]
 fn a_fork_twin_pays_for_its_copy_of_the_window_while_it_lives() {
     let ceiling = 8 * WINDOW;
     for bytecode in [false, true] {
-        let (r, wrote) = run_budgeted(ceiling, bytecode);
+        let (r, wrote, held) = run_budgeted(ceiling, bytecode);
         assert_eq!(
             wrote,
             vec![ceiling - 3 * WINDOW, ceiling - 2 * WINDOW],
@@ -398,6 +404,10 @@ fn a_fork_twin_pays_for_its_copy_of_the_window_while_it_lives() {
             vec![Value::I64(ceiling - 2 * WINDOW)],
             "bytecode={bytecode}"
         );
+        assert_eq!(
+            held, 0,
+            "bytecode={bytecode}: the run's end hands every window back"
+        );
     }
 }
 
@@ -405,7 +415,7 @@ fn a_fork_twin_pays_for_its_copy_of_the_window_while_it_lives() {
 fn a_fork_with_no_room_for_the_twins_window_is_refused() {
     let ceiling = 3 * WINDOW - 1;
     for bytecode in [false, true] {
-        let (r, wrote) = run_budgeted(ceiling, bytecode);
+        let (r, wrote, held) = run_budgeted(ceiling, bytecode);
         assert_eq!(
             r,
             vec![Value::I64(temen_ir::errno::EAGAIN)],
@@ -416,6 +426,10 @@ fn a_fork_with_no_room_for_the_twins_window_is_refused() {
             wrote,
             vec![ceiling - 2 * WINDOW],
             "bytecode={bytecode}: the refusals charged nothing"
+        );
+        assert_eq!(
+            held, 0,
+            "bytecode={bytecode}: the run's end hands every window back"
         );
     }
 }
