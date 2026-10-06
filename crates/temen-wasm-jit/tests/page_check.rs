@@ -23,7 +23,7 @@ use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_wasm_jit::{
     compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged,
-    TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
+    ENV_FAULT_OFF, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -225,7 +225,7 @@ enum TrapKind {
 }
 
 /// How the run is driven.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     /// Pure interpreter — the oracle.
     Interp,
@@ -342,11 +342,20 @@ fn run_emitted(
                 })
                 .collect(),
         ),
-        Err(_) => Outcome::Trap(match *store.data() {
-            TRAP_OUT_OF_FUEL => TrapKind::OutOfFuel,
-            TRAP_MEMORY_FAULT => TrapKind::MemoryFault,
-            _ => TrapKind::Other,
-        }),
+        Err(_) => {
+            // #2126: the fault address the emitted guard left in the env cell (`-1`: none).
+            let mut slot = [0u8; 8];
+            memory
+                .read(&store, ENV_PTR as usize + ENV_FAULT_OFF, &mut slot)
+                .unwrap();
+            let addr = i64::from_le_bytes(slot);
+            LAST_FAULT.set((addr >= 0).then_some(addr as u64));
+            Outcome::Trap(match *store.data() {
+                TRAP_OUT_OF_FUEL => TrapKind::OutOfFuel,
+                TRAP_MEMORY_FAULT => TrapKind::MemoryFault,
+                _ => TrapKind::Other,
+            })
+        }
     };
     // SAFETY: see fn doc.
     let backs = unsafe { std::slice::from_raw_parts_mut(base, win_size) };
@@ -375,6 +384,12 @@ fn probe_page_size(m: &temen_ir::Module) -> u64 {
     // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the buffer.
     unsafe { std::alloc::dealloc(base, layout) };
     page
+}
+
+thread_local! {
+    /// #2126 — the faulting address the emitted guard of this thread's last [`run_emitted`] that
+    /// trapped left in the env cell.
+    static LAST_FAULT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Drive `guest(as, off, len, probe)` in `mode`, servicing tier-ups on emitted wasm with the
@@ -1056,4 +1071,54 @@ fn aligned_atomic_load_traps_on_unmapped_page() {
         want, got,
         "paged tier diverged on an in-prefix aligned atomic load"
     );
+}
+
+/// #2126 — a `MemoryFault` in page-checked emitted code reports the same faulting address as the
+/// oracle: the access's first byte, for an unmapped load, a store to an `Ro` page, and a store whose
+/// last byte straddles onto an unmapped page (the page that faults is not the one the address names).
+#[test]
+fn paged_faults_report_the_oracles_address() {
+    for (src, delta) in [(UNMAP_LOAD, 16i64), (PROTECT_STORE, 16), (UNMAP_STORE, -4)] {
+        let (off, len) = last_page(src);
+        let probe = off as i64 + delta;
+        let fault = |mode| {
+            LAST_FAULT.set(None);
+            let (out, _) = run_guest(src, off, len, probe, mode);
+            assert_eq!(
+                out,
+                Outcome::Trap(TrapKind::MemoryFault),
+                "{mode:?} at {probe:#x}"
+            );
+            LAST_FAULT.get()
+        };
+        let want = oracle_fault(src, off, len, probe);
+        assert_eq!(want, Some(probe as u64), "oracle sanity at {probe:#x}");
+        assert_eq!(
+            fault(Mode::PagedSynced),
+            want,
+            "paged fault address at {probe:#x}"
+        );
+    }
+}
+
+/// The oracle's faulting address for `guest(as, off, len, probe)`: the interpreter run as a coop
+/// session, whose end records it (`last_capture_fault_addr`), as an embedder reads it.
+fn oracle_fault(guest_src: &str, off: u64, len: u64, probe: i64) -> Option<u64> {
+    let m = build(guest_src);
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    let args = [
+        Value::I32(asl),
+        Value::I64(off as i64),
+        Value::I64(len as i64),
+        Value::I64(probe),
+    ];
+    let mut run = bytecode::CoopRun::new(&m, 0, &args, FUEL, host, None)
+        .expect("in the bytecode subset")
+        .expect("builds");
+    assert!(matches!(
+        run.run(),
+        bytecode::CoopEvent::Trapped(Trap::MemoryFault)
+    ));
+    temen_interp::last_capture_fault_addr()
 }

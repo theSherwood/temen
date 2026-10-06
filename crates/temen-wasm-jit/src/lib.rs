@@ -1814,9 +1814,15 @@ pub const ENV_SPILL_SP_OFF: usize = GROUP_SCRATCH_OFF as usize + GROUP_SCRATCH_S
 /// #1627 — the spill region's end (`i32`, exclusive). A push that would cross it traps
 /// [`TRAP_SPILL_OVERFLOW`] instead of writing.
 pub const ENV_SPILL_END_OFF: usize = ENV_SPILL_SP_OFF + 4;
+/// #2126 — the **faulting address** of a `MemoryFault` raised by emitted code (`i64`, 8-aligned): the
+/// function's fault block stores it here just before `env.trap(TRAP_MEMORY_FAULT)`
+/// ([`emit_fault_block_close`]), so a host can report a segfault's address the way the interpreter
+/// oracle does (`last_capture_fault_addr`). `-1` when the oracle records none for that fault (a
+/// misaligned atomic). Read only after such a trap.
+pub const ENV_FAULT_OFF: usize = ENV_SPILL_END_OFF + 4;
 /// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier call scratch
-/// + the group-edge scratch + the spill cursor pair.
-pub const ENV_CELL_BYTES: usize = ENV_SPILL_END_OFF + 4;
+/// + the group-edge scratch + the spill cursor pair + the fault address.
+pub const ENV_CELL_BYTES: usize = ENV_FAULT_OFF + 8;
 
 /// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
 /// Exports `f{i}` per Temen function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
@@ -6010,6 +6016,16 @@ fn emit_unpaged_confine(
     align: bool,
     elide: bool,
 ) {
+    // eff = addr + offset (wrapping) — set before the bound check, so a fault there reports it
+    // (#2126). Past the check it is exact: `addr <= mapped - k`, and a proof (`elide`) fails on any
+    // overflow.
+    code.push(OP_LOCAL_GET);
+    uleb(code, addr_local as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, offset as i64);
+    code.push(0x7c); // i64.add → eff
+    code.push(OP_LOCAL_SET);
+    uleb(code, cx.ea_l as u64);
     if !elide {
         // Trap unless `addr + offset + width <= mapped`, with no overflow (`Window::checked`): with
         // `k = offset + width`, trap iff `mapped < k` or `addr > mapped - k`. The bound is the
@@ -6041,15 +6057,6 @@ fn emit_unpaged_confine(
         }
         emit_trap_if(cx, code);
     }
-    // eff = addr + offset — exact, not wrapped: past the check `addr <= mapped - k`, and a proof
-    // (`elide`) fails on any overflow.
-    code.push(OP_LOCAL_GET);
-    uleb(code, addr_local as u64);
-    code.push(OP_I64_CONST);
-    sleb64(code, offset as i64);
-    code.push(0x7c); // i64.add → eff
-    code.push(OP_LOCAL_SET);
-    uleb(code, cx.ea_l as u64);
     if align {
         emit_align_trap(cx, code, width);
     }
@@ -6102,14 +6109,8 @@ fn emit_paged_confine(
     write: bool,
     page_log2: u8,
 ) {
-    // An end past 2^64 is past every window: never admitted.
-    let k = offset.checked_add(width);
-    if k.is_none() {
-        code.push(OP_I32_CONST);
-        sleb32(code, 1);
-        emit_trap_if(cx, code);
-    }
-    // eff = addr + offset — the access's first byte.
+    // eff = addr + offset — the access's first byte, and the address every check below reports
+    // (#2126).
     code.push(OP_LOCAL_GET);
     uleb(code, addr_local as u64);
     if offset != 0 {
@@ -6119,6 +6120,13 @@ fn emit_paged_confine(
     }
     code.push(OP_LOCAL_SET);
     uleb(code, cx.ea_l as u64);
+    // An end past 2^64 is past every window: never admitted.
+    let k = offset.checked_add(width);
+    if k.is_none() {
+        code.push(OP_I32_CONST);
+        sleb32(code, 1);
+        emit_trap_if(cx, code);
+    }
     if align {
         emit_align_trap(cx, code, width);
     }
@@ -6231,16 +6239,30 @@ fn emit_fault_block_open(cx: &FnCtx, code: &mut Vec<u8>) {
 
 /// Close [`emit_fault_block_open`]'s block and trap `MemoryFault` after it. The body inside ends
 /// in `unreachable`, so only a check's branch reaches this point.
+///
+/// #2126 — the trap first records the faulting address in the env cell ([`ENV_FAULT_OFF`]): every
+/// check leaves it in `ea_l` before it branches — an access's first byte `addr + offset` (wrapping),
+/// a span's base, or `-1` for a misaligned atomic — the address the oracle records for the same
+/// fault (`Mem::peek_fault_rel`). The checks themselves stay a `br_if` each.
 fn emit_fault_block_close(cx: &FnCtx, code: &mut Vec<u8>) {
     debug_assert_eq!(cx.depth, 0);
     if cx.touches_mem {
         code.push(OP_END);
+        code.push(OP_LOCAL_GET);
+        uleb(code, 1); // env
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.ea_l as u64);
+        code.push(0x37); // i64.store
+        uleb(code, 3); // align 8
+        uleb(code, ENV_FAULT_OFF as u64);
         emit_trap(code, TRAP_MEMORY_FAULT);
     }
 }
 
 /// Trap `MemoryFault` when the effective address (`ea_l`) is not a multiple of `width` (a power of
 /// two) — the natural-alignment requirement §12 atomics carry (the interpreter's `check_align`).
+/// The oracle records no address for it, so the arm sets `ea_l` to `-1` before it branches to the
+/// fault block (#2126); only atomics carry this check.
 fn emit_align_trap(cx: &mut FnCtx, code: &mut Vec<u8>, width: u64) {
     code.push(OP_LOCAL_GET);
     uleb(code, cx.ea_l as u64);
@@ -6250,7 +6272,18 @@ fn emit_align_trap(cx: &mut FnCtx, code: &mut Vec<u8>, width: u64) {
     code.push(OP_I64_CONST);
     sleb64(code, 0);
     code.push(0x52); // i64.ne → misaligned?
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    code.push(OP_I64_CONST);
+    sleb64(code, -1);
+    code.push(OP_LOCAL_SET);
+    uleb(code, cx.ea_l as u64);
+    code.push(OP_I32_CONST);
+    sleb32(code, 1);
     emit_trap_if(cx, code);
+    code.push(OP_END);
+    cx.depth -= 1;
 }
 
 /// The NULL-guard extent to **emit** for `m`: [`temen_ir::module_null_guard`] (unconditional, #1094),
@@ -6286,6 +6319,15 @@ fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     emit_trap_if(cx, code);
 }
 
+/// #2126 — a span's checks report its base, as the oracle's `confine_span` / `check_prot_span` do:
+/// put it where the fault block reads the address ([`emit_fault_block_close`]).
+fn emit_span_fault_addr(cx: &FnCtx, code: &mut Vec<u8>, base_local: u32) {
+    code.push(OP_LOCAL_GET);
+    uleb(code, base_local as u64);
+    code.push(OP_LOCAL_SET);
+    uleb(code, cx.ea_l as u64);
+}
+
 /// Open `if len != 0 {` for a bulk op — the caller emits the confined op inside and closes with a
 /// matching `OP_END` (`cx.depth -= 1`). A zero-length bulk op is a no-op that must never fault (see
 /// the lowering comment), so the entire span-check + `memory.fill`/`.copy` lives under this guard.
@@ -6318,6 +6360,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
         cx.touches_mem,
         "`touches_memory` misses a bulk-memory instruction"
     );
+    emit_span_fault_addr(cx, code, base_local);
     // trap if base > live_mapped  (#717: the `mapped` global's live window size, via `mapped_l`)
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
@@ -6377,6 +6420,7 @@ fn emit_span_page_check(
         return;
     };
     let (page_l, last_l) = (cx.span_page_l, cx.span_last_page_l);
+    emit_span_fault_addr(cx, code, base_local);
     // page_l = (base & MASK) >> page_log2  — the span's first window-relative page.
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
