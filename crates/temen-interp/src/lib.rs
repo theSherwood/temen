@@ -19528,6 +19528,13 @@ pub trait SharedBacking: Send + Sync {
     /// Write one region-relative byte (out of range ⇒ ignored). Interior-mutable: a region is shared
     /// (`Arc`), so writes go through `&self`.
     fn write_byte(&self, off: u64, b: u8);
+    /// #2127 — one naturally aligned `width`-byte (1, 2, 4 or 8) atomic access at region-relative
+    /// `off`: `f` maps the current value to the one to store (`None` stores nothing), and the old
+    /// value (zero-extended) is returned. Atomic, and sequentially consistent with every other
+    /// `atomic` on the region (§12): it is how the interpreter's atomics reach an aliased page, so
+    /// it must never be built from `read_byte`/`write_byte`. Out of range ⇒ 0, nothing stored.
+    /// `f` may run more than once (a hardware compare-exchange retry); it must be pure.
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64;
     /// An OS shared-memory handle a flat-window backend can `mmap` for real aliasing; `None` for the
     /// pure-Rust reference backing (the interpreter models aliasing in software instead). Unix
     /// (`memfd`/`shm`); the Windows analogue is [`os_section`](SharedBacking::os_section).
@@ -19672,6 +19679,27 @@ impl SharedBacking for VecBacking {
             *s = b;
         }
     }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        // One lock for the whole word: every `atomic` on the region is serialized, so each is
+        // atomic and all are totally ordered (#2127).
+        let mut buf = self.buf();
+        let Some(word) = (off as usize)
+            .checked_add(width as usize)
+            .and_then(|end| buf.get_mut(off as usize..end))
+        else {
+            return 0;
+        };
+        let old = word
+            .iter()
+            .rev()
+            .fold(0u64, |v, &b| (v << 8) | u64::from(b));
+        if let Some(new) = f(old) {
+            for (k, b) in word.iter_mut().enumerate() {
+                *b = (new >> (8 * k)) as u8;
+            }
+        }
+        old
+    }
 }
 
 /// #2111 — a region the run's domains made (a guest's `create_region`, or a thaw's rebuild): its
@@ -19694,6 +19722,9 @@ impl SharedBacking for ChargedRegion {
     }
     fn write_byte(&self, off: u64, b: u8) {
         self.backing.write_byte(off, b)
+    }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        self.backing.atomic(off, width, f)
     }
     fn os_fd(&self) -> Option<i32> {
         self.backing.os_fd()
@@ -33449,18 +33480,34 @@ impl Mem {
         }
     }
 
-    /// Whether `base`'s page is a §13 aliased (`Backed`) page. A naturally-aligned ≤8-byte atomic
-    /// lies wholly within one host page, so the single page of `base` decides. Aliased pages keep the
-    /// value-correct `read_le`/`write_le` path (their bytes live in an `Rc` region, not `back`);
-    /// anonymous pages get `back`'s real hardware atomics (§12).
-    fn is_backed(&self, base: u64) -> bool {
-        self.has_regions.load(Ordering::Relaxed)
-            && matches!(
-                self.space_read()
-                    .prot
-                    .get(&(base.wrapping_sub(self.window.base()) / self.page)),
-                Some(PageProt::Backed { .. })
-            )
+    /// #2127 — an atomic of `width` bytes at confined `base` on a §13 aliased page, done as one
+    /// [`SharedBacking::atomic`] on the region (so it is atomic and SC against every other vCPU and
+    /// window aliasing it); `None` if `base`'s page is not aliased, for `back`'s real hardware
+    /// atomics (§12). A naturally aligned ≤ 8-byte atomic lies within one host page, so `base`'s
+    /// page decides. A dropped region reads 0 and
+    /// takes no store, as [`byte`](Self::byte) does.
+    fn backed_atomic(
+        &self,
+        base: u64,
+        width: u32,
+        f: &mut dyn FnMut(u64) -> Option<u64>,
+    ) -> Option<u64> {
+        if !self.has_regions.load(Ordering::Relaxed) {
+            return None;
+        }
+        let space = self.space_read();
+        let Some(PageProt::Backed {
+            region, region_off, ..
+        }) = space
+            .prot
+            .get(&(base.wrapping_sub(self.window.base()) / self.page))
+        else {
+            return None;
+        };
+        let at = *region_off + base % self.page;
+        let r = space.regions.get(region).and_then(Weak::upgrade);
+        drop(space);
+        Some(r.map_or(0, |r| r.atomic(at, width, f)))
     }
 
     /// Validate a `<ty>.atomic.wait` address: confine it, require natural alignment, and require the
@@ -33475,13 +33522,12 @@ impl Mem {
     }
 
     /// The current `width`-byte value at confined `base` (no checks; `prepare_wait` ran them). Used
-    /// for the futex compare under the parking lock — real atomic for anonymous pages, value-correct
-    /// for §13 aliases.
+    /// for the futex compare under the parking lock — a real atomic, on an anonymous page or a §13
+    /// alias (#2127).
     fn atomic_value(&self, base: u64, width: u32) -> u64 {
-        if self.is_backed(base) {
-            self.read_le(base, width)
-        } else {
-            self.back.atomic_load(base, width)
+        match self.backed_atomic(base, width, &mut |_| None) {
+            Some(v) => v,
+            None => self.back.atomic_load(base, width),
         }
     }
 
@@ -33533,10 +33579,9 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, false)?;
-        let raw = if self.is_backed(base) {
-            self.read_le(base, width)
-        } else {
-            self.back.atomic_load(base, width)
+        let raw = match self.backed_atomic(base, width, &mut |_| None) {
+            Some(raw) => raw,
+            None => self.back.atomic_load(base, width),
         };
         Ok(atomic_decode(ty, raw))
     }
@@ -33546,10 +33591,12 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
-        if self.is_backed(base) {
-            self.write_le(base, width, store_bits(v));
-        } else {
-            self.back.atomic_store(base, width, store_bits(v));
+        let bits = store_bits(v);
+        if self
+            .backed_atomic(base, width, &mut |_| Some(bits))
+            .is_none()
+        {
+            self.back.atomic_store(base, width, bits);
         }
         self.writes += 1;
         Ok(())
@@ -33568,12 +33615,11 @@ impl Mem {
         let base = self.confine_checked(addr, offset, width)?;
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
-        let old = if self.is_backed(base) {
-            let old = self.read_le(base, width);
-            self.write_le(base, width, atomic_rmw_apply(ty, op, old, store_bits(v)));
-            old
-        } else {
-            self.back.atomic_rmw(base, width, rmw_op(op), store_bits(v))
+        let bits = store_bits(v);
+        let apply = &mut |old| Some(atomic_rmw_apply(ty, op, old, bits));
+        let old = match self.backed_atomic(base, width, apply) {
+            Some(old) => old,
+            None => self.back.atomic_rmw(base, width, rmw_op(op), bits),
         };
         self.writes += 1;
         Ok(atomic_decode(ty, old))
@@ -33593,15 +33639,14 @@ impl Mem {
         self.check_align(base, width)?;
         self.check_prot(base, width, true)?;
         let want = store_bits(expected) & width_mask(width);
-        let old = if self.is_backed(base) {
-            let old = self.read_le(base, width); // already the low `width` bytes, zero-extended
-            if old == want {
-                self.write_le(base, width, store_bits(replacement));
-            }
-            old
-        } else {
-            self.back
-                .atomic_cmpxchg(base, width, store_bits(expected), store_bits(replacement))
+        let rep = store_bits(replacement);
+        // The old value comes back as the low `width` bytes, zero-extended, like `want`.
+        let swap = &mut |old| (old == want).then_some(rep);
+        let old = match self.backed_atomic(base, width, swap) {
+            Some(old) => old,
+            None => self
+                .back
+                .atomic_cmpxchg(base, width, store_bits(expected), rep),
         };
         // Count a write only when the compare succeeded (a failed cmpxchg leaves memory unchanged —
         // the distinction the spin detector needs to tell a spinning retry from a real acquire).
@@ -36537,6 +36582,68 @@ mod prot_tests {
         let w = Value::I64(0x7777);
         assert!(m.store(b + 16, 0, StoreOp::I64, w).is_ok());
         assert_eq!(m.load(a + 16, 0, LoadOp::I64), Ok(w), "B→A alias");
+    }
+
+    /// #2127 — an atomic on a §13 aliased page is one atomic access to the region, as on the
+    /// bytecode engine and the JIT: two windows aliasing one region, each on its own thread,
+    /// fetch-add the same word and lose no update. Byte-wise RMWs lost most of them.
+    #[test]
+    fn shared_region_rmw_is_atomic_across_windows() {
+        const N: i64 = 20_000;
+        let r = region(1);
+        let add = |r: RegionBacking| {
+            std::thread::spawn(move || {
+                let mut m = mem64k();
+                assert_eq!(m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r), 0);
+                for _ in 0..N {
+                    m.atomic_rmw(8, 0, IntTy::I64, AtomicRmwOp::Add, Value::I64(1))
+                        .expect("in range");
+                }
+            })
+        };
+        let (a, b) = (add(r.clone()), add(r.clone()));
+        a.join().expect("thread a");
+        b.join().expect("thread b");
+        let mut m = mem64k();
+        assert_eq!(
+            m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
+            0
+        );
+        assert_eq!(m.atomic_load(8, 0, IntTy::I64), Ok(Value::I64(2 * N)));
+    }
+
+    /// #2127 — a 64-bit atomic load on an aliased page never sees half of a concurrent atomic
+    /// store: a writer alternates 0 and all ones, and a reader on another window sees only those.
+    #[test]
+    fn shared_region_load_never_tears() {
+        const N: usize = 20_000;
+        let r = region(1);
+        let w = {
+            let r = r.clone();
+            std::thread::spawn(move || {
+                let mut m = mem64k();
+                assert_eq!(m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r), 0);
+                for i in 0..N {
+                    let v = if i % 2 == 0 { -1 } else { 0 };
+                    m.atomic_store(0, 0, IntTy::I64, Value::I64(v))
+                        .expect("in range");
+                }
+            })
+        };
+        let mut m = mem64k();
+        assert_eq!(
+            m.map_region(0, 0, page(), PROT_READ | PROT_WRITE, 0, r.clone()),
+            0
+        );
+        let mut torn = 0;
+        for _ in 0..N {
+            match m.atomic_load(0, 0, IntTy::I64) {
+                Ok(Value::I64(0 | -1)) => {}
+                _ => torn += 1,
+            }
+        }
+        w.join().expect("writer");
+        assert_eq!(torn, 0, "loads saw half of a store");
     }
 
     #[test]

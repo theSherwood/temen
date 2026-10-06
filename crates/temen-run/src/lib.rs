@@ -4718,6 +4718,45 @@ fn create_region_fd(cap: usize) -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(fd)
 }
 
+/// #2127 — [`SharedBacking::atomic`] over a host mapping of `[0, len)` at `ptr`: a real hardware
+/// atomic on the same memory the JIT's guests alias, so the interpreter's atomics on the region are
+/// atomic and SC against theirs as well as against each other. An access out of range, misaligned,
+/// or of another width than 1, 2, 4 or 8 returns 0 and stores nothing.
+///
+/// # Safety
+///
+/// `ptr` must map `[0, len)` readable and writable for the call, and be aligned to 8 (a page).
+unsafe fn mapped_atomic(
+    ptr: *mut u8,
+    len: usize,
+    off: u64,
+    width: u32,
+    f: &mut dyn FnMut(u64) -> Option<u64>,
+) -> u64 {
+    use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::SeqCst};
+    let (off, w) = (off as usize, width as usize);
+    if !matches!(w, 1 | 2 | 4 | 8) || off % w != 0 || off.checked_add(w).is_none_or(|e| e > len) {
+        return 0;
+    }
+    // SAFETY: `off + w ≤ len`, inside the mapping (the caller's contract).
+    let p = unsafe { ptr.add(off) };
+    macro_rules! rmw {
+        ($a:ty, $t:ty) => {{
+            // SAFETY: `p` is in the mapping and aligned to `w` (an aligned `off` from an aligned
+            // `ptr`); an atomic view of shared memory is how every engine accesses it.
+            let a = unsafe { <$a>::from_ptr(p.cast::<$t>()) };
+            let r = a.fetch_update(SeqCst, SeqCst, |v| f(u64::from(v)).map(|n| n as $t));
+            u64::from(r.unwrap_or_else(|v| v))
+        }};
+    }
+    match w {
+        1 => rmw!(AtomicU8, u8),
+        2 => rmw!(AtomicU16, u16),
+        4 => rmw!(AtomicU32, u32),
+        _ => rmw!(AtomicU64, u64),
+    }
+}
+
 /// A §13 `SharedRegion` backing over a real OS shared-memory object (`memfd`/`shm`), whose `os_fd` a
 /// window `mmap`s `MAP_SHARED` for true hardware aliasing. The fd is also mapped once into the host
 /// process so `read_byte`/`write_byte` work (e.g. if an interpreter `Mem` uses this backing); in the
@@ -4787,6 +4826,10 @@ impl SharedBacking for ShmBacking {
             // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
             unsafe { *self.ptr.add(off as usize) = b }
         }
+    }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
+        unsafe { mapped_atomic(self.ptr, self.len, off, width, f) }
     }
     fn os_fd(&self) -> Option<i32> {
         use std::os::fd::AsRawFd;
@@ -4899,6 +4942,10 @@ impl SharedBacking for FileBacking {
             unsafe { *self.ptr.add(off as usize) = b }
         }
     }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
+        unsafe { mapped_atomic(self.ptr, self.len, off, width, f) }
+    }
     fn os_fd(&self) -> Option<i32> {
         use std::os::fd::AsRawFd;
         Some(self.file.as_raw_fd())
@@ -5006,6 +5053,10 @@ impl SharedBacking for WinShmBacking {
             // SAFETY: off < len ≤ cap; `ptr` maps `[0, cap)` RW for `self`'s lifetime.
             unsafe { *self.ptr.add(off as usize) = b }
         }
+    }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        // SAFETY: `ptr` maps `[0, cap)` RW for `self`'s lifetime, page-aligned, and `len ≤ cap`.
+        unsafe { mapped_atomic(self.ptr, self.len, off, width, f) }
     }
     fn os_section(&self) -> Option<isize> {
         Some(self.section as isize)
