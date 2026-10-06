@@ -297,6 +297,22 @@ impl SharedBacking for TestBacking {
             *x = b;
         }
     }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        let mut buf = self.0.lock().unwrap();
+        let Some(word) = buf.get_mut(off as usize..off as usize + width as usize) else {
+            return 0;
+        };
+        let old = word
+            .iter()
+            .rev()
+            .fold(0u64, |v, &b| (v << 8) | u64::from(b));
+        if let Some(new) = f(old) {
+            for (k, b) in word.iter_mut().enumerate() {
+                *b = (new >> (8 * k)) as u8;
+            }
+        }
+        old
+    }
     fn outside_writers(&self) -> bool {
         self.1
     }
