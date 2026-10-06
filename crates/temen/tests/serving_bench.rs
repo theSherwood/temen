@@ -29,7 +29,7 @@ mod rec;
 
 use std::time::Instant;
 
-use temen_ir::{cap_id, SpawnRec};
+use temen_ir::SpawnRec;
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 
@@ -137,10 +137,7 @@ fn run(backend: Backend, src: &str) -> i32 {
                     "vm",
                     HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
                 ),
-                (
-                    "budget",
-                    HostCap::custom(cap_id::BUDGET, 0, |h, _| h.grant_budget(-1, 1 << 20, -1)),
-                ),
+                ("budget", HostCap::detached_budget(1 << 20)),
             ],
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
