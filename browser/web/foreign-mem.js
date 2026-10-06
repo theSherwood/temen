@@ -12,7 +12,23 @@
 // Widths 4/8; `off` naturally aligned. A registry is per agent (page or Worker): a Memory registered
 // here is addressable by the engine instance(s) of THIS agent.
 
-import { adoptMemory } from './engine-mem.js';
+/**
+ * Adopt a shared memory this agent was handed — a Worker's copy of the engine memory, or of a detached
+ * child's — by making its length current. Call it once, before instantiating over the memory or viewing
+ * its `buffer`. Returns the memory. It lives here, not in `engine-mem.js`, because every Worker loads
+ * this module anyway: one more import in a Worker's module graph costs each Worker birth a fetch.
+ *
+ * V8 tells every agent sharing a memory when it grows, but an agent still deserializing the memory when
+ * another thread grows it can miss the notice (#1996). Its `buffer`, and every instance it then builds
+ * over the memory, keep the old length until the next grow. Loads and stores into the missed pages
+ * still work, but atomics, `memory.fill`/`copy` and `memory.size` check the stale length and trap, and a
+ * view over the stale `buffer` ends early. `grow(0)` makes V8 re-read the length for this agent and its
+ * instances on the spot.
+ */
+export function adoptMemory(memory) {
+  memory.grow(0);
+  return memory;
+}
 
 const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0 within it }
 

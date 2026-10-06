@@ -1,4 +1,4 @@
-import { adoptMemory } from './web/engine-mem.js';
+import { adoptMemory } from './web/foreign-mem.js';
 
 // The import object every instantiation of the **engine** wasm (`temen_browser.wasm`) must supply.
 // Besides the optional shared `memory` (the threads build imports it; the plain build owns its own),
