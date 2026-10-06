@@ -1849,6 +1849,77 @@ fn a_detached_childs_growth_spends_its_budget_on_every_tier() {
     }
 }
 
+/// #2111 — a region a detached child mints spends the `channel` of the budget that paid for its
+/// window, on every tier. The root pays for func 1 from a node whose `channel` ceiling is one 64 KiB
+/// region; the child mints one (it fits) and asks for a second (`-ENOMEM`), returning a bit per answer.
+/// The root exits `child * 10 + 1` when its node's `channel` room is the whole ceiling again after the
+/// join: the child's end let go of the region it still held.
+fn region_program() -> String {
+    format!(
+        "memory 16
+data 17920 \"vm\"
+data 17928 \"budget\"
+{rec}import 0 \"exit\" (i32) -> ()
+
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 17920
+  vl = i64.const 2
+  vinst = self.resolve vp vl
+  bp = i64.const 17928
+  bl = i64.const 6
+  vbud = self.resolve bp bl
+  f = i64.const -1
+  c = i64.const 65536
+  vsub = call.cap 14 0 (i64, i64, i64, i64) -> (i32) vbud (f, f, f, c)
+  rb = i64.const 17436
+  i32.store rb vsub
+  rp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  three = i64.const 3
+  vroom = call.cap 14 1 (i64) -> (i64) vsub (three)
+  vfull = i64.eq vroom c
+  vfw = i64.extend_i32_u vfull
+  ten = i64.const 10
+  vhi = i64.mul vr ten
+  vsum = i64.add vhi vfw
+  vc = i32.wrap_i64 vsum
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+func 1 (i64, i64) -> (i64) {{
+block 0 (vinst: i64, vas64: i64) {{
+  vas = i32.wrap_i64 vas64
+  n = i64.const 65536
+  z = i64.const 0
+  enomem = i64.const -12
+  r1 = call.cap 5 5 (i64) -> (i64) vas (n)
+  r2 = call.cap 5 5 (i64) -> (i64) vas (n)
+  b1 = i64.ge_s r1 z
+  b2 = i64.eq r2 enomem
+  w1 = i64.extend_i32_u b1
+  w2 = i64.extend_i32_u b2
+  two = i64.const 2
+  x2 = i64.mul w2 two
+  s = i64.add w1 x2
+  return s
+  }}
+}}
+",
+        rec = rec::segment(17408, &SpawnRec::v1(1)),
+    )
+}
+
+#[test]
+fn a_detached_childs_region_spends_its_budget_on_every_tier() {
+    let src = region_program();
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 31, "{b:?}");
+    }
+}
+
 /// #1944 (the owner's A/B/C example): a child's ceiling caps its whole subtree even while its parent
 /// has room. The child's 128 KiB ceiling holds its own window, so its child's spawn is refused
 /// (`-22 + 100`), under a root budget of 1 MiB.

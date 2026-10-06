@@ -2021,6 +2021,11 @@ impl TwinWindow {
     pub fn base(&self) -> usize {
         self.window.base() as usize
     }
+
+    /// The duplicate's backed prefix: the declared window the twin pays for (#2106).
+    pub fn mapped(&self) -> u64 {
+        self.window.mapped() as u64
+    }
 }
 
 impl ForkPoint<'_> {

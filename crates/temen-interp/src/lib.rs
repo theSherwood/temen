@@ -7188,7 +7188,7 @@ impl Scheduler {
         // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
         let twin_host = {
             let hg = v.host.lock_unpoisoned();
-            match hg.fork_powerbox(twin_id) {
+            match hg.fork_powerbox(twin_id, v.mem.as_ref().map_or(0, Mem::mapped_size)) {
                 Some(h) => Arc::new(Mutex::new(h)),
                 None => {
                     drop(hg);
@@ -7246,7 +7246,8 @@ impl Scheduler {
             let pid = s.next_task;
             // #1648 — from here a factory may register a process under this pid: burn it.
             s.next_task += 1;
-            let twin = v.host.lock_unpoisoned().spawn_powerbox(pid, plan);
+            let window = v.mem.as_ref().map_or(0, Mem::mapped_size);
+            let twin = v.host.lock_unpoisoned().spawn_powerbox(pid, plan, window);
             match twin.map(|t| Arc::new(Mutex::new(t))) {
                 None => EAGAIN,
                 Some(twin) => {
@@ -7794,8 +7795,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     let id = v.id;
     // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
     // back to the budget that paid for them (lock order sched → host), and what it grew (#1909).
-    // Every vCPU of the dying domain passes here; the first hands the growth back.
-    v.host.lock_unpoisoned().release_growth();
+    // Every vCPU of the dying domain passes here; the first hands it back, with the window of a
+    // process that paid for its own (#2106).
+    v.host.lock_unpoisoned().release_memory();
     if let Some((cell, budget, bytes)) = v.window_lease.take() {
         cell.lock_unpoisoned().release_detached(budget, bytes);
     }
@@ -9036,8 +9038,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     (Vec::new(), Vec::new())
                 } else {
                     let mut h = v.host.lock_unpoisoned();
-                    // #1909 — and its window goes, with what it grew.
-                    h.release_growth();
+                    // #1909, #2106 — and its window goes, with what it held.
+                    h.release_memory();
                     h.release_pipe_ends()
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
@@ -19672,6 +19674,46 @@ impl SharedBacking for VecBacking {
     }
 }
 
+/// #2111 — a region the run's domains made (a guest's `create_region`, or a thaw's rebuild): its
+/// backing, charged `bytes` of `channel` to `node` and every ancestor for as long as it lives. The
+/// charge rides the shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go
+/// of it last refunds the node that paid. A domain lets go of its regions when it ends
+/// ([`Host::release_memory`]), so the refund lands at the same point on every engine.
+struct ChargedRegion {
+    backing: RegionBacking,
+    node: NodeRef,
+    bytes: u64,
+}
+
+impl SharedBacking for ChargedRegion {
+    fn size(&self) -> u64 {
+        self.backing.size()
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        self.backing.read_byte(off)
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        self.backing.write_byte(off, b)
+    }
+    fn os_fd(&self) -> Option<i32> {
+        self.backing.os_fd()
+    }
+    fn os_section(&self) -> Option<isize> {
+        self.backing.os_section()
+    }
+    fn outside_writers(&self) -> bool {
+        self.backing.outside_writers()
+    }
+}
+
+impl Drop for ChargedRegion {
+    fn drop(&mut self) {
+        self.node
+            .tree
+            .refund(self.node.node, BUDGET_CHANNEL, self.bytes);
+    }
+}
+
 /// #1909 — what a window holds in the reserved tail of a page range: the part past its declared size,
 /// which a window grows into.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -22799,9 +22841,15 @@ pub struct Host {
     own_budget: u32,
     /// #1909, INVARIANTS #3 R2 — what this domain's window holds committed past its declared size,
     /// charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the window
-    /// goes ([`Host::release_growth`]). `None` for a window no budget paid for (a run's root), whose
+    /// goes ([`Host::release_memory`]). `None` for a window no budget paid for (a run's root), whose
     /// growth is unmetered.
     grown: Option<u64>,
+    /// #2106 — the declared window this domain pays for itself, charged to `own_budget` and every
+    /// ancestor when the domain is made and handed back with its growth: a fork twin's copy of its
+    /// parent's window, a spawned process's fresh one ([`Host::process_powerbox`]). `0` for a detached
+    /// child, whose window its admission lease pays for, and for an unmetered root. An exec keeps it,
+    /// as the image's window is the caller's size.
+    own_window: u64,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -23597,6 +23645,7 @@ impl Host {
             budgets: Arc::default(),
             own_budget: BudgetTree::RUN_NODE,
             grown: None,
+            own_window: 0,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
@@ -23702,24 +23751,43 @@ impl Host {
     /// attestation, and the shared sinks. Copy-vs-share is decided per backing, not silently: adding a
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
     ///
-    /// #1909 — the twin's window is a copy of this one, its grown tail included, so the twin pays for
-    /// that growth: it is charged to the node the twin shares with this domain and every ancestor,
-    /// all or nothing — a level without the room refuses the fork, as a full `spawn` ceiling does.
-    /// (The copy of the declared window is not charged yet: #2106.)
-    fn fork_powerbox(&self, twin_pid: u64) -> Option<Host> {
-        let mut twin = self.powerbox_copy(twin_pid)?;
-        if let Some(g @ 1..) = self.grown {
-            if !self.budgets.charge(self.own_budget, BUDGET_MEM, g) {
+    /// #1909, #2106 — the twin's window is a copy of this one, `window` declared bytes and the grown
+    /// tail past them, so the twin pays for both ([`Self::process_powerbox`]): a level without the
+    /// room refuses the fork, as a full `spawn` ceiling does.
+    fn fork_powerbox(&self, twin_pid: u64, window: u64) -> Option<Host> {
+        self.process_powerbox(twin_pid, window, self.grown.unwrap_or(0))
+    }
+
+    /// #2106, INVARIANTS #3 R2 — [`Self::powerbox_copy`] for a new process whose window starts with
+    /// `window` declared bytes and `grown` past them. A new window spends `Budget.mem`, so the process
+    /// pays for it: charged to the node it shares with this domain and every ancestor, all or nothing,
+    /// before any fork factory runs, so a refusal registers no process. It goes back when the process
+    /// ends ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or
+    /// the powerbox cannot be duplicated. A process of an unmetered domain (a run's root) is
+    /// unmetered too.
+    fn process_powerbox(&self, pid: u64, window: u64, grown: u64) -> Option<Host> {
+        let charge = self.grown.map(|_| window + grown);
+        if let Some(c) = charge {
+            if !self.budgets.charge(self.own_budget, BUDGET_MEM, c) {
                 return None;
             }
-            twin.grown = Some(g);
+        }
+        let Some(mut twin) = self.powerbox_copy(pid) else {
+            if let Some(c) = charge {
+                self.budgets.refund(self.own_budget, BUDGET_MEM, c);
+            }
+            return None;
+        };
+        if charge.is_some() {
+            twin.own_window = window;
+            twin.grown = Some(grown);
         }
         Some(twin)
     }
 
-    /// [`Self::fork_powerbox`]'s powerbox duplicate, before the window it rides with is known: a fork
-    /// copies this domain's window, a spawn ([`Self::spawn_powerbox`]) builds a fresh one. Either way
-    /// the copy's growth is metered when this domain's is (#1909), with nothing held yet.
+    /// [`Self::process_powerbox`]'s powerbox duplicate, before the window it rides with is known: a
+    /// fork copies this domain's window, a spawn ([`Self::spawn_powerbox`]) builds a fresh one. Either
+    /// way the copy is metered when this domain is (#1909), with nothing held yet.
     fn powerbox_copy(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
         // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
@@ -26115,7 +26183,9 @@ impl Host {
     }
 
     /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: the
-    /// embedder's factory, as a guest mint uses, else the heap.
+    /// embedder's factory, as a guest mint uses, else the heap. #2111 — charged to this domain's
+    /// node whatever its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a
+    /// freeze carries no node's `channel` use.
     pub fn rebuild_region(&self, bytes: &[u8]) -> RegionBacking {
         let backing = match self.region_factory {
             Some(f) => f(bytes.len()),
@@ -26124,7 +26194,13 @@ impl Host {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        backing
+        self.budgets
+            .force_charge(self.own_budget, BUDGET_CHANNEL, bytes.len() as u64);
+        Arc::new(ChargedRegion {
+            backing,
+            node: self.own_node(),
+            bytes: bytes.len() as u64,
+        })
     }
 
     /// #2025 — hold a rebuilt region under a new id, for the thaw to re-pin the handles and window
@@ -26774,23 +26850,23 @@ impl Host {
         r
     }
 
-    /// #1909 — undo [`Self::fork_powerbox`]'s growth charge for a twin whose powerbox was dropped
-    /// unrun: the twin's charge was this domain's growth, taken an instant ago on the node they share.
-    pub fn undo_fork_growth(&self) {
-        if let Some(g @ 1..) = self.grown {
-            self.budgets.refund(self.own_budget, BUDGET_MEM, g);
-        }
-    }
-
-    /// #1909 — this domain's window is gone (the domain ended, or an exec replaced its image): what it
-    /// grew past its declared size goes back to its node and every ancestor, as the window's own bytes
-    /// go back with its lease (INVARIANTS #3: ending a use refunds every level). Never on a freeze: a
-    /// captured window stays charged, and the thaw takes the charge over
-    /// ([`Host::prepare_detached_relaunch`]).
-    pub fn release_growth(&mut self) {
-        if let Some(g @ 1..) = self.grown {
-            self.budgets.refund(self.own_budget, BUDGET_MEM, g);
+    /// #1909, #2106, #2111 — this domain is done with its memory (it ended, or an exec replaced its
+    /// image): what its window held goes back to its node and every ancestor — what it grew past its
+    /// declared size, and the declared window itself when the domain paid for it
+    /// ([`Self::own_window`]), as a detached child's goes back with its lease (INVARIANTS #3: ending
+    /// a use refunds every level). And it lets go of the regions it holds: one no other domain holds
+    /// goes, and its charge with it ([`ChargedRegion`]). Never on a freeze: a captured window stays
+    /// charged, and the thaw takes the charge over ([`Host::prepare_detached_relaunch`]). A window no
+    /// budget paid for (a run's root) is its embedder's, regions and all: the embedder reads it after
+    /// the run, and a reactor's next call finds its regions where they were (#2113 meters the root).
+    pub fn release_memory(&mut self) {
+        if let Some(g) = self.grown {
+            let held = g + std::mem::take(&mut self.own_window);
+            if held > 0 {
+                self.budgets.refund(self.own_budget, BUDGET_MEM, held);
+            }
             self.grown = Some(0);
+            self.regions.clear();
         }
     }
 
@@ -30014,9 +30090,14 @@ impl Host {
     /// of refusing the fork as in-flight run state. It *is* window state on the JIT — which pages the
     /// guest committed or protected — and the twin gets a private copy of the window, so it gets a copy
     /// of the map, filed under its own window's base (`twin_base`). The parent's map is untouched.
-    pub fn fork_powerbox_jit(&mut self, twin_pid: u64, twin_base: usize) -> Option<Host> {
+    pub fn fork_powerbox_jit(
+        &mut self,
+        twin_pid: u64,
+        twin_base: usize,
+        window: u64,
+    ) -> Option<Host> {
         let pages = self.cap_pages.take();
-        let twin = self.fork_powerbox(twin_pid);
+        let twin = self.fork_powerbox(twin_pid, window);
         let copy = pages
             .as_ref()
             .map(|(_, m)| m.lock_unpoisoned().clone())
@@ -30032,10 +30113,12 @@ impl Host {
     /// register the process), with the spawn's staged state committed to it
     /// ([`SignalSource::spawn_commit`]); an engine then builds the process's image in it as an exec
     /// builds one ([`Self::exec_image`]). A JIT window's page map stays with the caller: the new
-    /// process's window is a fresh one. `None` when the powerbox cannot be duplicated.
-    pub fn spawn_powerbox(&mut self, pid: u64, plan: SpawnPlan) -> Option<Host> {
+    /// process's window is a fresh one, of the caller's `window` declared bytes, which the process
+    /// pays for (#2106, [`Self::process_powerbox`]). `None` when the powerbox cannot be duplicated or
+    /// a level of the shared node lacks the room for the window.
+    pub fn spawn_powerbox(&mut self, pid: u64, plan: SpawnPlan, window: u64) -> Option<Host> {
         let pages = self.cap_pages.take();
-        let twin = self.powerbox_copy(pid);
+        let twin = self.process_powerbox(pid, window, 0);
         self.cap_pages = pages;
         let twin = twin?;
         if let Some((_, source)) = twin.signal_poll() {
@@ -30045,10 +30128,13 @@ impl Host {
     }
 
     /// A spawned process whose image could not be built in its powerbox (this, from
-    /// [`Self::spawn_powerbox`]): it exits with `status` as it is born. Its pipe ends are released,
-    /// returning the pipes that left with no writers or no readers for the engine to wake, and its
-    /// exit hooks fire, so its personality retires it to a zombie its parent reaps.
+    /// [`Self::spawn_powerbox`]), or a new process the OS gave no thread: it exits with `status` as
+    /// it is born. The window it was charged for goes back ([`Self::release_memory`]) and its pipe
+    /// ends are released, returning the pipes that left with no writers or no readers for the
+    /// engine to wake, and its exit hooks fire, so its personality retires it to a zombie its parent
+    /// reaps.
     pub fn spawn_failed(&mut self, status: i64) -> (Vec<u32>, Vec<u32>) {
+        self.release_memory();
         let zeroed = self.release_pipe_ends();
         for hook in &self.exit_hooks {
             hook(status);
@@ -30382,13 +30468,16 @@ impl Host {
             &mut starters,
         )
         .map_err(|()| EINVAL)?;
+        // #2106 — committed: the window is the caller's size, so a declared window the domain paid
+        // for itself stays paid for.
+        host.own_window = std::mem::take(&mut self.own_window);
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
         // counts never dip through this.
         let zeroed_pipes = self.release_pipe_ends();
         // #1909 — and the old window goes with it: what it grew is handed back.
-        self.release_growth();
+        self.release_memory();
         Ok(ExecImage {
             zeroed_pipes,
             host,
@@ -31386,17 +31475,30 @@ impl Host {
                     // a fresh zero-filled shareable region and gets its handle, to `map` into its own
                     // window and/or `grant` into a child domain (SharedRegion op 4). Backing comes
                     // from the embedder's factory (OS shared memory under the JIT) or the reference
-                    // `VecBacking`. Capped per-region (anti-bomb); real quota metering is §15 — DoS
-                    // is contained, not prevented (D48).
+                    // `VecBacking`. #2111 — its bytes spend `channel` of this domain's node and every
+                    // ancestor, as a pipe's FIFO does, all or nothing: `-ENOMEM` when a level lacks
+                    // the room. The per-region cap stays as the anti-bomb bound on one mint.
                     let len = *args.first().unwrap_or(&0);
                     if len <= 0 || len > MAX_MINTED_REGION {
                         return Ok(vec![EINVAL]);
+                    }
+                    if !self
+                        .budgets
+                        .charge(self.own_budget, BUDGET_CHANNEL, len as u64)
+                    {
+                        return Ok(vec![ENOMEM]);
                     }
                     let backing = match self.region_factory {
                         Some(f) => f(len as usize),
                         None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
                     };
-                    // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit #1).
+                    let backing: RegionBacking = Arc::new(ChargedRegion {
+                        backing,
+                        node: self.own_node(),
+                        bytes: len as u64,
+                    });
+                    // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit
+                    // #1); the region goes with the refusal, and its charge with it.
                     return Ok(vec![self
                         .try_grant_shared_region_backed(backing)
                         .map_or(EMFILE, |h| h as i64)]);
@@ -32801,6 +32903,12 @@ impl Mem {
     /// emitted `"mapped"` global so the bound check never under-admits a table-admitted page.
     pub(crate) fn reserved_size(&self) -> u64 {
         self.window.reserved()
+    }
+
+    /// The window's backed prefix — the declared window a new process pays for when it copies this
+    /// one or is spawned with its geometry (#2106, [`Host::process_powerbox`]).
+    pub(crate) fn mapped_size(&self) -> u64 {
+        self.window.mapped()
     }
 
     /// Re-establish a **restored explicit page-state map** (#816 warm-snapshot restore): re-insert
@@ -35058,15 +35166,19 @@ mod region_minter_tests {
 
 #[cfg(test)]
 mod growth_tests {
-    //! #1909 — a detached window's growth past its declared size is charged to the budget that paid
-    //! for the window, wherever the window goes: a fork twin's copy pays for its own, and an exec's
-    //! fresh window hands the replaced one's back.
+    //! #1909, #2106 — the memory a window holds is charged to the budget that paid for it, wherever
+    //! the window goes: a detached window's growth past its declared size, a fork twin's copy of its
+    //! parent's window, a spawned process's fresh one. An exec's fresh window hands back the growth of
+    //! the one it replaces and keeps paying for its declared size.
     use super::*;
 
     const GROWTH: u64 = 1 << 16;
+    /// [`grown_child`]'s declared window.
+    const WINDOW: u64 = 1 << 16;
 
-    /// A detached child paid from a node capped at `ceiling`, which has grown its 64 KiB window by
-    /// [`GROWTH`] at 64 KiB: `(parent, node, child, its window, its AddressSpace)`.
+    /// A detached child paid from a node capped at `ceiling`, which has grown its [`WINDOW`] by
+    /// [`GROWTH`] at 64 KiB: `(parent, node, child, its window, its AddressSpace)`. Its declared
+    /// window is not charged here: an admission's lease pays for that.
     fn grown_child(ceiling: i64) -> (Host, u32, Host, Mem, i32) {
         let mut parent = Host::new();
         let budget = parent.grant_budget(-1, ceiling, -1);
@@ -35075,7 +35187,11 @@ mod growth_tests {
         parent.give_child_budget(budget, &mut child);
         let (_, space) = child.grant_starter_caps(1 << 20);
         let mut mem = Mem::with_reservation(20, 16, None);
-        let args = [1 << 16, GROWTH as i64, (PROT_READ | PROT_WRITE) as i64];
+        let args = [
+            WINDOW as i64,
+            GROWTH as i64,
+            (PROT_READ | PROT_WRITE) as i64,
+        ];
         let r = child.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 0, space, &args, Some(&mut mem));
         assert_eq!(r, Ok(vec![0]), "the growth fits the ceiling");
         (parent, node, child, mem, space)
@@ -35085,32 +35201,35 @@ mod growth_tests {
         host.budgets.used(node, BUDGET_MEM)
     }
 
+    fn command(host: &mut Host) -> ExecModule {
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mh = host.grant_module(&cmd);
+        host.exec_module(ExecCmd::Granted(mh)).expect("resolves")
+    }
+
     #[test]
-    fn a_fork_twin_pays_for_the_growth_its_window_copies() {
-        let (parent, node, child, ..) = grown_child(2 * GROWTH as i64);
+    fn a_fork_twin_pays_for_its_window_and_the_growth_it_copies() {
+        let (parent, node, child, ..) = grown_child((WINDOW + 2 * GROWTH) as i64);
         assert_eq!(used(&parent, node), GROWTH as i64);
-        let mut twin = child.fork_powerbox(7).expect("the copy's growth fits");
+        let mut twin = child.fork_powerbox(7, WINDOW).expect("the copy fits");
         assert_eq!(
             used(&parent, node),
-            2 * GROWTH as i64,
-            "the twin's copy is charged"
+            (WINDOW + 2 * GROWTH) as i64,
+            "the twin's copy is charged: its declared window and its growth"
         );
         assert!(
-            child.fork_powerbox(8).is_none(),
+            child.fork_powerbox(8, WINDOW).is_none(),
             "no room for another copy: the fork is refused"
         );
         assert_eq!(
             used(&parent, node),
-            2 * GROWTH as i64,
+            (WINDOW + 2 * GROWTH) as i64,
             "and charges nothing"
         );
-        let copy = child.powerbox_copy(9).expect("a spawn's copy");
-        assert_eq!(
-            copy.grown,
-            Some(0),
-            "a spawned process starts in a fresh window"
-        );
-        twin.release_growth();
+        twin.release_memory();
         assert_eq!(
             used(&parent, node),
             GROWTH as i64,
@@ -35119,16 +35238,42 @@ mod growth_tests {
     }
 
     #[test]
+    fn a_spawned_process_pays_for_its_fresh_window() {
+        let (parent, node, mut child, ..) = grown_child((WINDOW + GROWTH) as i64);
+        let mut process = child
+            .spawn_powerbox(7, SpawnPlan(Box::new(())), WINDOW)
+            .expect("the window fits");
+        assert_eq!(process.grown, Some(0), "it starts with nothing grown");
+        assert_eq!(
+            used(&parent, node),
+            (WINDOW + GROWTH) as i64,
+            "its window is charged"
+        );
+        assert!(
+            child
+                .spawn_powerbox(8, SpawnPlan(Box::new(())), WINDOW)
+                .is_none(),
+            "no room for another window: the spawn is refused"
+        );
+        assert_eq!(
+            used(&parent, node),
+            (WINDOW + GROWTH) as i64,
+            "and charges nothing"
+        );
+        process.spawn_failed(SPAWN_EXEC_FAILED);
+        assert_eq!(
+            used(&parent, node),
+            GROWTH as i64,
+            "a process that dies at birth hands its window back"
+        );
+    }
+
+    #[test]
     fn an_exec_hands_back_the_growth_of_the_image_it_replaces() {
         let (parent, node, mut child, ..) = grown_child(2 * GROWTH as i64);
-        let cmd = temen_text::parse_module(
-            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
-        )
-        .expect("parse");
-        let mh = child.grant_module(&cmd);
-        let command = child.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let command = command(&mut child);
         let image = child
-            .exec_image(&command, &[], 0, 0, 1 << 16, 1 << 20)
+            .exec_image(&command, &[], 0, 0, WINDOW, 1 << 20)
             .expect("admits");
         assert_eq!(
             used(&parent, node),
@@ -35139,6 +35284,27 @@ mod growth_tests {
             image.host.grown,
             Some(0),
             "the new image is metered, holding none"
+        );
+    }
+
+    #[test]
+    fn an_exec_keeps_paying_for_the_window_a_process_paid_for() {
+        let (parent, node, child, ..) = grown_child((WINDOW + 2 * GROWTH) as i64);
+        let mut twin = child.fork_powerbox(7, WINDOW).expect("the copy fits");
+        let command = command(&mut twin);
+        let mut image = twin
+            .exec_image(&command, &[], 0, 0, WINDOW, 1 << 20)
+            .expect("admits");
+        assert_eq!(
+            used(&parent, node),
+            (WINDOW + GROWTH) as i64,
+            "the copy's growth is back, and its window is the image's"
+        );
+        image.host.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            GROWTH as i64,
+            "the image's end hands the window back"
         );
     }
 
@@ -35167,6 +35333,84 @@ mod growth_tests {
 }
 
 #[cfg(test)]
+mod region_charge_tests {
+    //! #2111 — a guest-minted region spends `channel` of its minter's node and every ancestor until
+    //! no domain holds it.
+    use super::*;
+
+    const REGION: u64 = 1 << 16;
+
+    /// A detached child paid from a node whose `channel` ceiling is `ceiling`: `(parent, node, child,
+    /// its AddressSpace)`.
+    fn child(ceiling: i64) -> (Host, u32, Host, i32) {
+        let mut parent = Host::new();
+        let budget = parent.grant_budget_channel(-1, -1, -1, ceiling);
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        let (_, space) = child.grant_starter_caps(1 << 20);
+        (parent, node, child, space)
+    }
+
+    fn mint(host: &mut Host, space: i32, len: u64) -> i64 {
+        let r = host.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 5, space, &[len as i64], None);
+        r.expect("create_region")[0]
+    }
+
+    fn used(host: &Host, node: u32) -> i64 {
+        host.budgets.used(node, BUDGET_CHANNEL)
+    }
+
+    #[test]
+    fn a_minted_region_spends_channel_until_its_minter_ends() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        assert!(mint(&mut child, space, REGION) >= 0, "the region fits");
+        assert_eq!(used(&parent, node), REGION as i64);
+        assert_eq!(
+            mint(&mut child, space, 1),
+            ENOMEM,
+            "no room for another byte: the mint is refused"
+        );
+        assert_eq!(used(&parent, node), REGION as i64, "and charges nothing");
+        child.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the minter's end hands the region back"
+        );
+    }
+
+    #[test]
+    fn a_region_stays_charged_while_another_domain_holds_it() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        assert!(mint(&mut child, space, REGION) >= 0);
+        let mut twin = child.fork_powerbox(7, 0).expect("a simple domain forks");
+        child.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            REGION as i64,
+            "the twin still holds it"
+        );
+        twin.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the last holder's end hands it back"
+        );
+    }
+
+    #[test]
+    fn a_thaw_charges_a_region_it_rebuilds_to_the_rebuilding_domain() {
+        let (parent, node, mut child, _) = child(-1);
+        let id = child.adopt_region(child.rebuild_region(&[7; 64]));
+        assert_eq!(child.regions[id as usize].read_byte(63), 7);
+        assert_eq!(used(&parent, node), 64);
+        child.release_memory();
+        assert_eq!(used(&parent, node), 0);
+    }
+}
+
+#[cfg(test)]
 mod fork_powerbox_tests {
     //! FORK.md PR 1 increment 3 — `Host::fork_powerbox`, the twin's powerbox. It copies the domain's
     //! **handle namespace** (so the twin holds equivalent handles at the same values) over the **same
@@ -35179,7 +35423,7 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         let h_inst = host.grant_instantiator(0, 1u64 << 16);
         let h_out = host.grant_stream(StreamRole::Out);
-        let twin = host.fork_powerbox(7).expect("a simple domain forks");
+        let twin = host.fork_powerbox(7, 0).expect("a simple domain forks");
         // A distinct domain identity — the twin is its own domain.
         assert_ne!(
             twin.domain_id(),
@@ -35393,7 +35637,7 @@ mod fork_powerbox_tests {
 
         // fork carries it whole: the handle resolves AND its validator backing rode along.
         let mut twin = host
-            .fork_powerbox(7)
+            .fork_powerbox(7, 0)
             .expect("forks with a live module loader");
         assert!(
             twin.resolve(lh, cap_id::MODULE_LOADER).is_ok(),
@@ -35492,7 +35736,7 @@ mod fork_powerbox_tests {
         let hr = host
             .try_grant_shared_region_backed(backing)
             .expect("region grant");
-        let twin = host.fork_powerbox(7).expect("forks");
+        let twin = host.fork_powerbox(7, 0).expect("forks");
         let (hid, tid) = match (
             host.resolve(hr, cap_id::SHARED_REGION),
             twin.resolve(hr, cap_id::SHARED_REGION),
@@ -35519,7 +35763,7 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
         assert!(
-            host.fork_powerbox(7).is_none(),
+            host.fork_powerbox(7, 0).is_none(),
             "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
         );
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
@@ -35531,7 +35775,7 @@ mod fork_powerbox_tests {
             CapState::Stateless,
         );
         assert!(
-            host.fork_powerbox(7).is_none(),
+            host.fork_powerbox(7, 0).is_none(),
             "one factory-less host_proc fails the whole fork closed even beside a forkable one"
         );
     }
@@ -35560,7 +35804,9 @@ mod fork_powerbox_tests {
             Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
             CapState::Stateless,
         );
-        let twin = host.fork_powerbox(7).expect("a forkable host_proc forks");
+        let twin = host
+            .fork_powerbox(7, 0)
+            .expect("a forkable host_proc forks");
         // Same handle value resolves in the twin, through the factory-minted fresh closure.
         let mut twin = twin;
         assert_eq!(
@@ -35575,7 +35821,7 @@ mod fork_powerbox_tests {
         );
         // The factory rode along: the twin itself remains forkable (fork-of-fork / nesting).
         assert!(
-            twin.fork_powerbox(7).is_some(),
+            twin.fork_powerbox(7, 0).is_some(),
             "a forked domain is still forkable — nested guests can fork"
         );
     }
@@ -35596,7 +35842,7 @@ mod fork_powerbox_tests {
             }),
             captured(1),
         );
-        let twin = parent.fork_powerbox(7).expect("forkable");
+        let twin = parent.fork_powerbox(7, 0).expect("forkable");
         assert_eq!(parent.capture_cap_states(), vec![Some(vec![1])]);
         assert_eq!(twin.capture_cap_states(), vec![Some(vec![9])]);
     }
@@ -35641,7 +35887,7 @@ mod fork_powerbox_tests {
             "the child's re-granted proc shares the parent's state (inherited libc / fd table)"
         );
         assert!(
-            child.fork_powerbox(7).is_some(),
+            child.fork_powerbox(7, 0).is_some(),
             "the child's inherited libc is itself forkable — the guest can then fork"
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.
@@ -36973,7 +37219,7 @@ mod channel_budget_tests {
         assert_eq!(parent.channel_used(), PIPE_CAP as i64);
 
         // Fork: the twin shares the backing (counts bumped to 2/2) and its parent's node.
-        let twin = parent.fork_powerbox(42).expect("fork");
+        let twin = parent.fork_powerbox(42, 0).expect("fork");
         assert_eq!(
             twin.channel_used(),
             PIPE_CAP as i64,
@@ -37215,7 +37461,7 @@ mod signal_door_claim_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         // Three entries, one personality: the shape #1645 leaves behind plus two plain host caps.
         let h = host_with(&[false, true, false], &calls);
-        let twin = h.fork_powerbox(7).expect("one claimant forks");
+        let twin = h.fork_powerbox(7, 0).expect("one claimant forks");
         assert!(
             twin.sig_source.is_some(),
             "the twin takes the single claimed door"
@@ -37227,7 +37473,7 @@ mod signal_door_claim_tests {
     fn no_claimant_forks_and_the_twin_shares_its_parents_source() {
         let calls = Arc::new(AtomicUsize::new(0));
         let h = host_with(&[false, false], &calls);
-        let twin = h.fork_powerbox(7).expect("no claimant forks");
+        let twin = h.fork_powerbox(7, 0).expect("no claimant forks");
         assert!(
             twin.sig_source.is_none(),
             "no door claimed: the twin falls back to sharing the parent's (none installed here)"
@@ -37242,7 +37488,7 @@ mod signal_door_claim_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let h = host_with(&[true, true, false], &calls);
         assert!(
-            h.fork_powerbox(7).is_none(),
+            h.fork_powerbox(7, 0).is_none(),
             "two providers claiming the domain's door must fail the fork closed"
         );
         let first = calls.load(Ordering::SeqCst);
@@ -37251,7 +37497,7 @@ mod signal_door_claim_tests {
             "it bails on the second claim — the third entry is never minted"
         );
         assert!(
-            h.fork_powerbox(8).is_none(),
+            h.fork_powerbox(8, 0).is_none(),
             "the refusal is permanent: the powerbox cannot be forked faithfully"
         );
         assert_eq!(

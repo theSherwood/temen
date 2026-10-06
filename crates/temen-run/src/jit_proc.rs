@@ -367,38 +367,39 @@ impl Tree {
         // #1648 — past here a fork factory may have registered a process under this pid: never
         // reuse it, whatever happens next.
         st.next_pid = pid + 1;
-        let Some(twin_host) = host.fork_powerbox_jit(pid, window.base()) else {
+        let Some(twin_host) = host.fork_powerbox_jit(pid, window.base(), window.mapped()) else {
             return EAGAIN;
         };
-        let hooks = twin_host.exit_hooks();
         let tree = Arc::clone(self);
         let start = Start::Twin {
             image: Arc::clone(image),
             window,
             args: point.args().to_vec(),
         };
+        let twin = Arc::new(Mutex::new(Some(twin_host)));
+        let cell = Arc::clone(&twin);
         let spawned = std::thread::Builder::new()
             .name(format!("temen-jit-pid{pid}"))
             .stack_size(PROC_STACK)
-            .spawn(move || tree.run_proc(pid, twin_host, start));
+            .spawn(move || {
+                let host = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(host) = host {
+                    tree.run_proc(pid, host, start);
+                }
+            });
         match spawned {
             Ok(t) => {
                 st.live += 1;
                 st.threads.push(t);
             }
             // The OS would not give the twin a thread, after its personalities registered it: it
-            // dies at birth, as a crash — retired through its exit hooks and reaped by its parent
-            // like any twin that trapped, never a table entry no one can reap. Its powerbox went
-            // with the thread's closure, unrun, so the parent releases the pipe ends it inherited:
-            // the twin's table is the parent's, copied an instant ago, so releasing the parent's
-            // set once releases exactly the twin's copies (and zeroes no pipe the parent holds).
-            // Likewise the growth its window copy was charged (#1909).
+            // dies at birth, as a crash — retired through its exit hooks, with its window's charge
+            // and its pipe ends released, and reaped by its parent like any twin that trapped, never
+            // a table entry no one can reap.
             Err(_) => {
-                let _ = host.release_pipe_ends();
-                host.undo_fork_growth();
-                let crash = Err(Trap::ThreadFault);
-                for hook in hooks {
-                    hook(temen_interp::reap_status(&crash));
+                let host = twin.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(mut host) = host {
+                    host.spawn_failed(temen_interp::reap_status(&Err(Trap::ThreadFault)));
                 }
                 st.traps.push(TwinTrap {
                     task: pid,
@@ -435,7 +436,7 @@ impl Tree {
         let pid = st.next_pid;
         // #1648 — from here a factory may register a process under this pid: burn it.
         st.next_pid = pid + 1;
-        let Some(mut twin) = host.spawn_powerbox(pid, plan) else {
+        let Some(mut twin) = host.spawn_powerbox(pid, plan, mapped) else {
             return EAGAIN;
         };
         let built = twin
@@ -764,13 +765,13 @@ fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
     (start, img.host)
 }
 
-/// A process is done with its last image: disarm its powerbox, hand back what its window grew
-/// ([`Host::release_growth`], #1909), and release the pipe ends it holds
+/// A process is done with its last image: disarm its powerbox, hand back what its window held
+/// ([`Host::release_memory`], #1909, #2106), and release the pipe ends it holds
 /// ([`Host::release_pipe_ends`]) — ringing the tree when that left a pipe with no writers or no
 /// readers, whose blocked readers wake to EOF and writers to `-EPIPE`.
 fn retire(tree: &Tree, host: &mut Host) {
     host.disarm_caller_requests();
-    host.release_growth();
+    host.release_memory();
     let (eof, epipe) = host.release_pipe_ends();
     if !eof.is_empty() || !epipe.is_empty() {
         tree.ring();
