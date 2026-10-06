@@ -88,5 +88,22 @@ export function engineMemory(wasmBytes, { initial = ENGINE_INITIAL_PAGES, maxPag
   return { memory: new WebAssembly.Memory({ initial, maximum, shared: true }), maxPages: maximum };
 }
 
+/**
+ * Adopt a shared memory this agent was handed — a Worker's copy of the engine memory, or of a detached
+ * child's — by making its length current. Call it once, before instantiating over the memory or viewing
+ * its `buffer`. Returns the memory.
+ *
+ * V8 tells every agent sharing a memory when it grows, but an agent still deserializing the memory when
+ * another thread grows it can miss the notice (#1996). Its `buffer`, and every instance it then builds
+ * over the memory, keep the old length until the next grow. Loads and stores into the missed pages
+ * still work, but atomics, `memory.fill`/`copy` and `memory.size` check the stale length and trap, and a
+ * view over the stale `buffer` ends early. `grow(0)` makes V8 re-read the length for this agent and its
+ * instances on the spot.
+ */
+export function adoptMemory(memory) {
+  memory.grow(0);
+  return memory;
+}
+
 /** Bytes a page count addresses — for a host reporting or budgeting against the ceiling. */
 export const pagesToBytes = (pages) => pages * 2 ** PAGE_BITS;

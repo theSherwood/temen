@@ -694,11 +694,13 @@ in session discussion; collected here so the next slice has a home to be picked 
   (tracked under **Status** #3); the browser path stays wasm32 until then. When it lands: unify
   wasm64 with the threads build (`+atomics` + memory64 in one target) so the browser gets the native
   `u64` address path — re-run the corpus differential and the Chromium lane on it.
-- [ ] **Chromium first-run timeout flake (watch item).** `browser-test.mjs` has twice hit a one-off
-  timeout on the first run after a cold wasm build (~1 in 8 locally; once with a
-  `memory access out of bounds` pageerror), never reproducing on re-run and never on Node. Diagnose
-  (suspect: a stale view or an init race visible only under a cold Worker spin-up) or, failing
-  that, make the CI lane retry once so a known flake doesn't red a PR.
+- [x] **Chromium index-page flake (#1996).** The `memory access out of bounds` traps and hangs in
+  Worker setup were a stale view: V8 can miss a grow notice for a Worker still deserializing the
+  shared memory it was handed, so its instance keeps the old length, and its first atomic or bulk
+  access to the missed pages traps (a trap inside dlmalloc's lock hangs every other thread). Every
+  threads-engine instantiation now adopts the memory first (`adoptMemory` in `web/engine-mem.js`, a
+  `grow(0)`). `browser-test.mjs` pins it with Workers handed a memory that is growing, and no longer
+  retries the index page.
 - [x] **wasm-JIT tier** — compile Temen IR to wasm at the explicit compile points and run hot compute
   near-natively in the browser. Was the largest remaining browser project; **landed through all
   eight slices** of the plan below (§ "wasm-JIT tier"): emitter core, browser linking, mixed
