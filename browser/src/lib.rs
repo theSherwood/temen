@@ -11990,6 +11990,13 @@ pub extern "C" fn temen_wasmjit_env_bytes() -> usize {
     temen_wasm_jit::ENV_CELL_BYTES
 }
 
+/// #2126: byte offset of the env cell's fault address (`i64`), which an emitted `MemoryFault` guard
+/// writes before it traps ([`temen_coop_deliver_fault_addr`]).
+#[no_mangle]
+pub extern "C" fn temen_wasmjit_fault_off() -> usize {
+    temen_wasm_jit::ENV_FAULT_OFF
+}
+
 /// #1627: byte offset of the env cell's spill cursor (`i32`); the region's end follows at `+ 4`.
 #[no_mangle]
 pub extern "C" fn temen_wasmjit_spill_sp_off() -> usize {
@@ -13495,6 +13502,9 @@ struct CoopTierupRun {
     jit_wasm_by_handle: Option<std::sync::Arc<[u8]>>,
     /// A bounce callback's staged trap (see [`temen_coop_call_interp`] / [`temen_coop_deliver_trap`]).
     pending_bounce_trap: Option<Trap>,
+    /// #2126: the faulting address of a `MemoryFault` in emitted code, as its guard recorded it
+    /// ([`temen_coop_deliver_fault_addr`]); the run's end reports it when the oracle recorded none.
+    jit_fault: Option<u64>,
     /// The guest's top-level result, staged at DONE.
     value: i64,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
@@ -13674,6 +13684,7 @@ impl CoopTierupRun {
             shim_wasm: Vec::new(),
             jit_wasm_by_handle: None,
             pending_bounce_trap: None,
+            jit_fault: None,
             value: 0,
             frame: std::sync::Arc::new(std::sync::Mutex::new(None)),
             paged: false,
@@ -14337,9 +14348,9 @@ fn coop_pump(budget: Option<u64>) -> i32 {
         // Which trap ended the run, and where a memory fault faulted — as the one-shot run reports.
         LAST_TRAP = trap.as_ref().map_or("", Trap::name);
         FAULT_ADDR = match trap {
-            Some(Trap::MemoryFault) => {
-                temen_interp::last_capture_fault_addr().map_or(-1, |a| a as i64)
-            }
+            Some(Trap::MemoryFault) => temen_interp::last_capture_fault_addr()
+                .or(s.jit_fault)
+                .map_or(-1, |a| a as i64),
             _ => -1,
         };
         stash(&mut *core::ptr::addr_of_mut!(FS_IMAGE), fs);
@@ -14768,6 +14779,21 @@ pub extern "C" fn temen_coop_deliver_jit(rptr: *const i64, n: usize) {
 /// Deliver a trap from the emitted unit for the pending JIT_INVOKE (a bounce callback's staged trap in
 /// preference, so a callback's `exit` ends the run as `STATUS_EXIT` exactly as interpreted; otherwise
 /// `code` names it — see [`emitted_trap`]).
+/// #2126 — the faulting address of the `MemoryFault` emitted code is about to deliver (its guard
+/// stores it in the env cell at [`temen_wasmjit_fault_off`]; `-1` there means none). The driver calls
+/// this before [`temen_coop_deliver_trap`] / [`temen_coop_deliver_jit_trap`], so the run reports a
+/// segfault's address as the interpreter does (`temen_fault_addr`). The first fault recorded wins,
+/// as in the scheduler.
+#[no_mangle]
+pub extern "C" fn temen_coop_deliver_fault_addr(addr: i64) {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        if addr >= 0 && s.jit_fault.is_none() {
+            s.jit_fault = Some(addr as u64);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn temen_coop_deliver_jit_trap(code: i32) {
     // SAFETY: single-threaded wasm; exclusive access to the session.

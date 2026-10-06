@@ -78,6 +78,26 @@ block 0 () {
 export 0 func "_start" 0
 `;
 
+// #2126 — a guest that writes "before\n" and then divides by a zero it loads, a trap the wasm engine
+// raises itself (no `env.trap`) in emitted code.
+const DIVIDES = `memory 16
+import 0 "write" (i64, i64) -> (i64)
+data 34816 "before\\n"
+func () -> (i64) {
+block 0 () {
+  vsl = i64.const 34816
+  vlen = i64.const 7
+  vw = call.import 0 (vsl, vlen)
+  vza = i64.const 34824
+  vz = i64.load vza
+  vn = i64.const 42
+  vq = i64.div_s vn vz
+  return vq
+  }
+}
+export 0 func "_start" 0
+`;
+
 // A guest that writes "tick\n" 50 times, spinning 2000 back-edges between writes, and returns 50.
 const TICKS = `memory 16
 import 0 "write" (i64, i64) -> (i64)
@@ -192,12 +212,17 @@ export async function runCases({ ex, memory, drive, suspends }) {
     results.ticksLeaf = await run();
     // #1822: a fault in the leaf's emitted code reaches the guest as the trap its `env.trap` named.
     if (open(FAULTS, [], leafMode) !== 0) throw new Error('open faults leaf');
-    results.faultsLeaf = { ...(await run({ trapDeclines: false })), trap: trapName() };
+    results.faultsLeaf = { ...(await run({ trapDeclines: false })), trap: trapName(), addr: ex.temen_fault_addr() };
+    // #2126: a trap the engine raises itself is named from its message, as the interpreter names it.
+    if (open(DIVIDES, [], leafMode) !== 0) throw new Error('open divides leaf');
+    results.dividesLeaf = { ...(await run({ trapDeclines: false })), trap: trapName() };
   }
   if (open(TICKS, [], COOP_NO_REGIONS) !== 0) throw new Error('open ticks');
   results.ticks = await run();
   if (open(FAULTS, [], COOP_NO_REGIONS) !== 0) throw new Error('open faults');
   results.faults = { ...(await run({ trapDeclines: false })), trap: trapName(), addr: ex.temen_fault_addr() };
+  if (open(DIVIDES, [], COOP_NO_REGIONS) !== 0) throw new Error('open divides');
+  results.divides = { ...(await run({ trapDeclines: false })), trap: trapName() };
   if (open(FAULTS, [], COOP_NO_REGIONS) !== 0) throw new Error('open faults again');
   results.faultsDecline = await run().then(() => 'returned', (e) => String(e.message));
   return results;

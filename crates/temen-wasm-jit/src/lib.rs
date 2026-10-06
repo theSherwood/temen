@@ -1812,9 +1812,14 @@ pub const ENV_SPILL_SP_OFF: usize = GROUP_SCRATCH_OFF as usize + GROUP_SCRATCH_S
 /// #1627 — the spill region's end (`i32`, exclusive). A push that would cross it traps
 /// [`TRAP_SPILL_OVERFLOW`] instead of writing.
 pub const ENV_SPILL_END_OFF: usize = ENV_SPILL_SP_OFF + 4;
+/// #2126 — the **faulting address** of a `MemoryFault` raised by emitted code (`i64`, 8-aligned): the
+/// guard stores it here just before `env.trap(TRAP_MEMORY_FAULT)`, so a host can report a segfault's
+/// address the way the interpreter oracle does (`last_capture_fault_addr`). `-1` when the oracle
+/// records none for that fault (a misaligned atomic). Read only after such a trap.
+pub const ENV_FAULT_OFF: usize = ENV_SPILL_END_OFF + 4;
 /// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier call scratch
-/// + the group-edge scratch + the spill cursor pair.
-pub const ENV_CELL_BYTES: usize = ENV_SPILL_END_OFF + 4;
+/// + the group-edge scratch + the spill cursor pair + the fault address.
+pub const ENV_CELL_BYTES: usize = ENV_FAULT_OFF + 8;
 
 /// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
 /// Exports `f{i}` per Temen function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
@@ -5827,6 +5832,43 @@ fn emit_fuel_check(cx: &mut FnCtx, code: &mut Vec<u8>) {
 
 /// `call env.trap(code); unreachable` — the host records the Temen trap kind, the `unreachable`
 /// aborts execution.
+/// The address a `MemoryFault` guard reports ([`emit_fault`]): the one the oracle records for the
+/// same fault (`Mem::peek_fault_rel`) — an access's `addr + offset` (wrapping), a span's base — or
+/// none.
+enum FaultAt {
+    None,
+    Local(u32),
+    LocalPlus(u32, u64),
+}
+
+/// Trap `MemoryFault` with its faulting address recorded in the env cell ([`ENV_FAULT_OFF`]) first.
+/// Only the trap arm grows; the guard's admitted path is unchanged.
+fn emit_fault(code: &mut Vec<u8>, at: FaultAt) {
+    code.push(OP_LOCAL_GET);
+    uleb(code, 1); // env
+    match at {
+        FaultAt::None => {
+            code.push(OP_I64_CONST);
+            sleb64(code, -1);
+        }
+        FaultAt::Local(l) => {
+            code.push(OP_LOCAL_GET);
+            uleb(code, l as u64);
+        }
+        FaultAt::LocalPlus(l, off) => {
+            code.push(OP_LOCAL_GET);
+            uleb(code, l as u64);
+            code.push(OP_I64_CONST);
+            sleb64(code, off as i64);
+            code.push(0x7c); // i64.add (wrapping, as the oracle's report)
+        }
+    }
+    code.push(0x37); // i64.store
+    uleb(code, 3); // align 8
+    uleb(code, ENV_FAULT_OFF as u64);
+    emit_trap(code, TRAP_MEMORY_FAULT);
+}
+
 fn emit_trap(code: &mut Vec<u8>, trap_code: i32) {
     code.push(OP_I32_CONST);
     sleb32(code, trap_code);
@@ -5918,11 +5960,11 @@ fn emit_confine_maybe_aligned(
                 code.push(OP_IF);
                 code.push(BLOCKTYPE_VOID);
                 cx.depth += 1;
-                emit_trap(code, TRAP_MEMORY_FAULT);
+                emit_fault(code, FaultAt::LocalPlus(addr_local, offset));
                 code.push(OP_END);
                 cx.depth -= 1;
             }
-            None => emit_trap(code, TRAP_MEMORY_FAULT),
+            None => emit_fault(code, FaultAt::LocalPlus(addr_local, offset)),
         }
     }
     // eff = addr + offset — exact, not wrapped: past the check `addr <= mapped - k`, and a proof
@@ -5947,7 +5989,8 @@ fn emit_confine_maybe_aligned(
         code.push(OP_IF);
         code.push(BLOCKTYPE_VOID);
         cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
+        // The oracle's `check_align` records no address.
+        emit_fault(code, FaultAt::None);
         code.push(OP_END);
         cx.depth -= 1;
     }
@@ -6018,7 +6061,7 @@ fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bo
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
+    emit_fault(code, FaultAt::Local(cx.ea_l));
     code.push(OP_END);
     cx.depth -= 1;
 }
@@ -6055,7 +6098,7 @@ fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
+    emit_fault(code, FaultAt::Local(cx.ea_l));
     code.push(OP_END);
     cx.depth -= 1;
 }
@@ -6097,7 +6140,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
+    emit_fault(code, FaultAt::Local(base_local));
     code.push(OP_END);
     cx.depth -= 1;
     // trap if len > live_mapped - base
@@ -6112,7 +6155,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
+    emit_fault(code, FaultAt::Local(base_local));
     code.push(OP_END);
     cx.depth -= 1;
     // #1004: NULL-guard low bound for a marked module — trap if the span dips into the reserved
@@ -6134,7 +6177,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
         code.push(OP_IF);
         code.push(BLOCKTYPE_VOID);
         cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
+        emit_fault(code, FaultAt::Local(base_local));
         code.push(OP_END);
         cx.depth -= 1;
     }
@@ -6226,7 +6269,7 @@ fn emit_span_page_check(
     code.push(OP_IF);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
+    emit_fault(code, FaultAt::Local(base_local));
     code.push(OP_END);
     cx.depth -= 1;
     // page_l += 1; continue the loop.

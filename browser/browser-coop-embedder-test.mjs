@@ -80,10 +80,20 @@ const check = (host, r, suspends) => {
       fail(`${host}: a fault in a leaf is its trap, not Unreachable (#1822): status ${fl.status}, `
         + `trap ${fl.trap}, out ${JSON.stringify(fl.out)}, ${fl.counts.leaves} leaves`);
     }
+    // #2126: the leaf's guard recorded the faulting address, the one the interpreted run reports.
+    if (fl.addr !== 8n) fail(`${host}: a fault in a leaf reports its address (#2126): addr ${fl.addr}`);
+    const dl = r.dividesLeaf;
+    if (dl.status !== 3 || dl.trap !== 'DivByZero' || dl.out !== 'before\n' || dl.counts.leaves !== 1) {
+      fail(`${host}: a native trap in a leaf is named from its message (#2126): status ${dl.status}, `
+        + `trap ${dl.trap}, out ${JSON.stringify(dl.out)}, ${dl.counts.leaves} leaves`);
+    }
   }
   const f = r.faults;
   if (f.status !== 3 || f.trap !== 'MemoryFault' || f.addr !== 8n || f.out !== 'before\n') {
     fail(`${host}: a reported trap: status ${f.status}, trap ${f.trap}, addr ${f.addr}, out ${JSON.stringify(f.out)}`);
+  }
+  if (r.divides.status !== 3 || r.divides.trap !== 'DivByZero') {
+    fail(`${host}: an interpreted divide by zero: status ${r.divides.status}, trap ${r.divides.trap}`);
   }
   if (!/declined to the interpreter/.test(r.faultsDecline)) {
     fail(`${host}: a trap declines by default: ${r.faultsDecline}`);
