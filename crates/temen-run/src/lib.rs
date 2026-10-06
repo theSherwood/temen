@@ -4745,8 +4745,17 @@ unsafe fn mapped_atomic(
             // SAFETY: `p` is in the mapping and aligned to `w` (an aligned `off` from an aligned
             // `ptr`); an atomic view of shared memory is how every engine accesses it.
             let a = unsafe { <$a>::from_ptr(p.cast::<$t>()) };
-            let r = a.fetch_update(SeqCst, SeqCst, |v| f(u64::from(v)).map(|n| n as $t));
-            u64::from(r.unwrap_or_else(|v| v))
+            // A compare-exchange loop: `f` may run more than once, as its contract allows.
+            let mut v = a.load(SeqCst);
+            loop {
+                let Some(n) = f(u64::from(v)) else {
+                    break u64::from(v);
+                };
+                match a.compare_exchange_weak(v, n as $t, SeqCst, SeqCst) {
+                    Ok(old) => break u64::from(old),
+                    Err(now) => v = now,
+                }
+            }
         }};
     }
     match w {
