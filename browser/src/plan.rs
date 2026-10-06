@@ -407,12 +407,9 @@ pub(crate) fn drive_op13<'p>(
             // window — this inline (interpreter) path has no emitted-unit servicer (that is the staged
             // `JIT_RUN` path's bounce), correct and slower. The unit resolves on the child's host.
             bytecode::VcpuEvent::JitInstall { handle, code } => {
-                let (funcs, types) = match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
-                {
-                    Ok((f, t, _wasm, _id)) => (Ok(f), t),
-                    Err(t) => (Err(t), std::sync::Arc::from(Vec::new())),
-                };
-                let _ = vcpu.deliver_jit_install(funcs, types);
+                let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
+                    .map(|(f, t, _wasm, id)| (f, t, id));
+                let _ = vcpu.deliver_jit_install(unit);
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
                 let authorized = vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());

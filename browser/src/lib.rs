@@ -1325,35 +1325,6 @@ fn par_pb() -> Option<&'static ParPowerbox> {
     unsafe { p.as_ref() }
 }
 
-/// Resolve a code-handle's unit funcs under authority `handle` against the powerbox (the `install` /
-/// `invoke` service): a forged / cross-domain / wrong-type handle is an inert `CapFault` → trap.
-#[allow(clippy::type_complexity)]
-fn par_resolve_unit(
-    pb: &ParPowerbox,
-    handle: i32,
-    code: i32,
-) -> Result<
-    (
-        std::sync::Arc<[temen_ir::Func]>,
-        std::sync::Arc<[temen_ir::TypeEntry]>,
-        (u32, u32),
-    ),
-    Trap,
-> {
-    let domain = pb.host.resolve_jit_domain(handle)?;
-    let (cd, cu) = pb.host.resolve_jit_code(code)?;
-    if cd != domain {
-        return Err(Trap::CapFault);
-    }
-    // FuncType interning (#922): the unit's type section rides alongside its funcs so the
-    // interpreter's `deliver_jit_*` can resolve the interned call sig indices.
-    let funcs = pb.host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
-    let types = pb.host.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
-    // #1339: the `(domain, unit)` identity rides back too — the slot mirror keys on it, never on the
-    // guest-revocable code handle.
-    Ok((funcs, types, (cd, cu)))
-}
-
 // ---- §14 instantiate across Workers (THREADS.md 4c-domain §14-D2) -------------------------------
 // The §14 root powerbox lives **in the root vCPU** (unlike the §22 JIT powerbox, which the vCPU asks
 // the host to resolve against): §14 resolves its `Instantiator` authority in-Vm during `resume`, so
@@ -1857,14 +1828,8 @@ fn par_resolve_unit_rt(
     ),
     Trap,
 > {
-    let domain = h.resolve_jit_domain(handle)?;
-    let (cd, cu) = h.resolve_jit_code(code)?;
-    if cd != domain {
-        return Err(Trap::CapFault);
-    }
     // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
-    let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
-    let types = h.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
+    let (funcs, types, (cd, cu)) = h.resolve_jit_unit(handle, code)?;
     // #1339: `(cd, cu)` rides back for the slot mirror (the handle is revocable, the index is not).
     Ok((funcs, types, h.jit_unit_wasm_or_emit(cd, cu), (cd, cu))) // #1301: a thawed unit re-emits here
 }
@@ -2596,19 +2561,15 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 // handle so each Worker can mirror the shared `Domain` into its own `WebAssembly.Table`
                 // (§22 Model B2 cross-Worker — funcrefs can't cross Workers).
                 let resolved = if let Some(pb) = par_pb() {
-                    par_resolve_unit(pb, handle, code)
+                    pb.host.resolve_jit_unit(handle, code)
                 } else if let Some(cfg) = par_jit_rt() {
                     let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
                     par_resolve_unit_rt(&mut g, handle, code).map(|(f, t, _, id)| (f, t, id))
                 } else {
                     return PAR_TRAP;
                 };
-                // #922: split the resolved `(funcs, types)` — a trap delivers empty types (unused).
-                let (funcs, types, unit_id) = match resolved {
-                    Ok((f, t, id)) => (Ok(f), t, Some(id)),
-                    Err(t) => (Err(t), std::sync::Arc::from(Vec::new()), None),
-                };
-                if let Some(slot) = v.inner.deliver_jit_install(funcs, types) {
+                let unit_id = resolved.as_ref().ok().map(|&(_, _, id)| id);
+                if let Some(slot) = v.inner.deliver_jit_install(resolved) {
                     // #1339: mirror the unit identity, not the (revocable) code handle.
                     if let Some(id) = unit_id {
                         par_jit_slot_record(slot, id);
@@ -2707,7 +2668,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                 && rtypes.is_some()
                                 && mapped.is_some();
                             if codegen {
-                                match par_resolve_unit(pb, handle, code) {
+                                match pb.host.resolve_jit_unit(handle, code) {
                                     Ok(_) => {
                                         v.jit_argv = argv.into_vec();
                                         v.jit_code = code;
@@ -2722,7 +2683,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                 }
                             } else {
                                 // #922: split the resolved `(funcs, types)` for delivery.
-                                match par_resolve_unit(pb, handle, code) {
+                                match pb.host.resolve_jit_unit(handle, code) {
                                     Ok((funcs, types, _)) => {
                                         v.inner.deliver_jit_invoke(Ok(funcs), types)
                                     }

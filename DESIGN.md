@@ -3172,19 +3172,27 @@ module 0 — fixed to the spawning frame's module). All tiers now claim this sup
   nested-caps emit; the JS drivers service them (the PR #587/#590 bounce pattern). Pinned by the
   browser harness's `instthreads` item and `nested_vm.rs::threaded_unit_matches_oracle`.
 
-**The `Instantiator` in a submitted unit (#1726, #1578).** Same split as threads, same reason.
+**The `Instantiator` in a submitted unit (#1726, #2143, #1578).** Same split as threads, same reason.
 *Installed*, a unit's `instantiate` is an ordinary module-aware spawn: a same-module child runs the
 **spawning frame's** module — the unit's function, not module 0's of the same index — on every engine
 (the tree-walker builds the child from the frame's module; the bytecode drivers share one
 `spawner_module`; Cranelift bakes the unit's program into its spawn sites as `self_prog`, and a module
-with an install table stands up the nursery an installed unit spawns through). *Invoked*, the whole
+with an install table stands up the nursery an installed unit spawns through). A detached spawn
+follows the same rule: from a unit's frame, `module = -1` names the unit's own program as a module —
+its functions over the table's memory, with no data, no shadow arena and no durable attestation
+(`Host::resolve_spawn_module`, the one rule every engine asks). The child runs that program as its
+own, so its `-1` names it in turn, and a durable domain refuses the spawn, as it refuses its root
+program's `-1`. Each engine reports the unit the spawning frame runs, as its `(table, unit)` on the
+spawning domain's host: the tree-walker's and the bytecode drivers' dispatch tables record it per
+installed module, and Cranelift carries it on `self_prog` into the host callbacks. *Invoked*, the whole
 `Instantiator` is unavailable: a child would outlive the synchronous call over code nothing keeps (an
 invoked unit is never installed), and its handle would name the transient invoke vCPU's child, which
 nobody can join — so every `Instantiator` op `CapFault`s inside a `Jit.invoke` (the tree-walker when
 the op runs; the nested bytecode drive by name; the native tier before it trampolines, through the same
 `invoke_refuses` gate as threads — coarser by the one case of an op on a path that never runs). Pinned
-by `crates/temen/tests/unit_instantiator.rs` (three engines, both routes) and the frontier matrix's
-code-origin column, which drives both routes.
+by `crates/temen/tests/unit_instantiator.rs` (the oracle, the four bytecode drivers and Cranelift; both
+routes, and a unit's child spawning in turn) and the frontier matrix's code-origin column, which drives
+both routes.
 
 **Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
 (module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the

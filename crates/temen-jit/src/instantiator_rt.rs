@@ -36,6 +36,10 @@ type ChildCodeKey = (usize, usize, u32, u8);
 pub(crate) struct UnitProg {
     pub(crate) funcs: std::sync::Arc<[Func]>,
     pub(crate) types: std::sync::Arc<[TypeEntry]>,
+    /// The unit's `(table, unit)` on its host ([`crate::unit_ref`]), which the host callbacks resolve
+    /// a detached self-spawn from the unit against (#2143); [`crate::NO_UNIT`] for a unit no host
+    /// names.
+    pub(crate) unit: i64,
 }
 
 /// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
@@ -1465,17 +1469,20 @@ impl Nursery {
             let (funcs, types) = self.self_program(self_prog);
             return Some((funcs, types, None, &[], self.shadow));
         }
-        self.resolve_granted(module, trap_out)
+        self.resolve_granted(module, crate::NO_UNIT, trap_out)
     }
 
     /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) — including
-    /// `SELF_MODULE` (`-1`), which the host resolves to the running module *with* its data segments
-    /// and declared memory. A detached child needs those (its window is fresh), where a carve child
-    /// of `-1` runs over the parent's bytes and takes only [`Self::self_program`] (#1863).
+    /// `SELF_MODULE` (`-1`), which the host resolves to the spawning code's program *with* its data
+    /// segments and declared memory: the running module's, or from an installed unit's code (`unit`,
+    /// [`crate::unit_ref`]) the unit's (#2143). A detached child needs those (its window is fresh),
+    /// where a carve child of `-1` runs over the parent's bytes and takes only
+    /// [`Self::self_program`] (#1863).
     #[allow(clippy::type_complexity)]
     unsafe fn resolve_granted(
         &self,
         module: i64,
+        unit: i64,
         trap_out: *mut i64,
     ) -> Option<(
         &[Func],
@@ -1489,7 +1496,7 @@ impl Nursery {
             return None;
         };
         let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
-        if resolver(self.cap_ctx, module as i32, &mut rm) == 0 || rm.n_funcs == 0 {
+        if resolver(self.cap_ctx, module as i32, unit, &mut rm) == 0 || rm.n_funcs == 0 {
             *trap_out = TrapKind::CapFault as i64;
             return None;
         }
@@ -1508,17 +1515,15 @@ impl Nursery {
         Some((funcs, types, Some(rm.memory_log2), data, rm.shadow))
     }
 
-    /// #1501 — whether a `Module` grant is attested **freezable** (instrumented): the other half of what
-    /// a durable domain may spawn. A self child runs this domain's own (durable) program.
-    unsafe fn child_module_durable(&self, module: i64) -> bool {
-        if module < 0 {
-            return true;
-        }
+    /// #1501 — whether the module a detached spawn names is attested **freezable** (instrumented): the
+    /// other half of what a durable domain may spawn. `-1` asks the host too, which attests neither the
+    /// running module's grant nor a unit's, so a durable domain refuses it, as on the oracle.
+    unsafe fn child_module_durable(&self, module: i64, unit: i64) -> bool {
         let Some(resolver) = self.resolve_module else {
             return false;
         };
         let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
-        resolver(self.cap_ctx, module as i32, &mut rm) != 0 && rm.durable
+        resolver(self.cap_ctx, module as i32, unit, &mut rm) != 0 && rm.durable
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk, returning its
@@ -1958,7 +1963,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 && grants_n > 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.grant_ctx(), gc.ctx, -1) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, -1, crate::NO_UNIT) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             return EINVAL as i32;
@@ -2360,7 +2365,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         // §3.3 withhold: a `required` import with nothing to bind fails the spawn closed —
         // probeable `-EINVAL`, before compiling or running any child code (the interpreter's
         // inline spawn takes the same early exit).
-        if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, module, crate::NO_UNIT) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             return EINVAL as i32;
@@ -2604,11 +2609,12 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 ///
 /// # Safety
 /// As [`instantiate_module_named`]: `rt`/`mem_base`/`mem_size`/`trap_out` are the baked nursery, live
-/// parent window base, **reserved** span, and run trap cell, valid for the call.
+/// parent window base, **reserved** span, and run trap cell, valid for the call; a nonzero
+/// `self_prog` is a live [`UnitProg`] ([`Nursery::self_program`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_detached(
     rt: *const Nursery,
-    _self_prog: i64,
+    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -2658,8 +2664,19 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     if rt.resolve(mem_base, handle, trap_out).is_none() {
         return 0;
     }
+    // The installed unit the spawning code is, if any: from it, `module = -1` names the unit's own
+    // program (#2143). One no host names cannot spawn that program.
+    let unit = if self_prog == 0 {
+        crate::NO_UNIT
+    } else {
+        (*(self_prog as *const UnitProg)).unit
+    };
+    if module < 0 && self_prog != 0 && unit == crate::NO_UNIT {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_granted(module, trap_out)
+        rt.resolve_granted(module, unit, trap_out)
     else {
         return 0;
     };
@@ -2700,7 +2717,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     };
     let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
     let durable_ok = !durable
-        || (rt.child_module_durable(module)
+        || (rt.child_module_durable(module, unit)
             && child_shadow != temen_ir::durable_abi::ShadowArena::EMPTY);
     if !ok_entry
         || child_size == 0
@@ -2773,7 +2790,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, module, unit) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             undo_admission(rt, budget as i32, child_size, lane);

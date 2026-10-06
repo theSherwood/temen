@@ -79,7 +79,7 @@ impl Repl {
 
         let defs = self
             .cm
-            .define_extra(&funcs, &types)
+            .define_extra(&funcs, &types, None)
             .expect("compile the definition");
         let slot = self
             .cm

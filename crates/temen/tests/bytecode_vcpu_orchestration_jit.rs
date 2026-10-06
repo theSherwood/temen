@@ -219,32 +219,10 @@ impl Orch {
             g = self.cv.wait(g).unwrap();
         }
     }
-    /// Resolve a code-handle's unit funcs under authority `handle` (the install/invoke service):
-    /// a forged / cross-domain / wrong-type handle is an inert `CapFault` → trap.
-    fn resolve_unit(&self, handle: i32, code: i32) -> Result<Arc<[temen_ir::Func]>, Trap> {
-        let g = self.pb.lock().unwrap();
-        let domain = g.resolve_jit_domain(handle)?;
-        let (cd, cu) = g.resolve_jit_code(code)?;
-        if cd != domain {
-            return Err(Trap::CapFault);
-        }
-        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
-    }
-    /// #922: the resolved unit's type section (empty on any resolution failure — the funcs
-    /// resolution above surfaces the trap, so this only feeds the interned-sig lookup).
-    fn resolve_unit_types(&self, handle: i32, code: i32) -> Arc<[temen_ir::TypeEntry]> {
-        let g = self.pb.lock().unwrap();
-        let Ok(domain) = g.resolve_jit_domain(handle) else {
-            return Arc::from(Vec::new());
-        };
-        let Ok((cd, cu)) = g.resolve_jit_code(code) else {
-            return Arc::from(Vec::new());
-        };
-        if cd != domain {
-            return Arc::from(Vec::new());
-        }
-        g.jit_unit_types(cd, cu)
-            .unwrap_or_else(|| Arc::from(Vec::new()))
+    /// Resolve a code-handle's unit under authority `handle` (the install/invoke service): a forged /
+    /// cross-domain / wrong-type handle is an inert `CapFault` → trap.
+    fn resolve_unit(&self, handle: i32, code: i32) -> Result<temen_interp::ResolvedJitUnit, Trap> {
+        self.pb.lock().unwrap().resolve_jit_unit(handle, code)
     }
     /// Authority check for `uninstall`: a forged/wrong-type domain handle traps.
     fn check_authority(&self, handle: i32) -> Result<(), Trap> {
@@ -298,10 +276,7 @@ fn drive<'s, 'e>(
                 vcpu.deliver_join(orch.join(child));
             }
             bytecode::VcpuEvent::JitInstall { handle, code } => {
-                vcpu.deliver_jit_install(
-                    orch.resolve_unit(handle, code),
-                    orch.resolve_unit_types(handle, code),
-                );
+                vcpu.deliver_jit_install(orch.resolve_unit(handle, code));
             }
             bytecode::VcpuEvent::JitUninstall { handle, slot: _ } => {
                 vcpu.deliver_jit_uninstall(orch.check_authority(handle));
@@ -314,10 +289,11 @@ fn drive<'s, 'e>(
                 results: _,
                 mapped: _, // interpreted delivery below — the codegen sync value is unused
             } => {
-                vcpu.deliver_jit_invoke(
-                    orch.resolve_unit(handle, code),
-                    orch.resolve_unit_types(handle, code),
-                );
+                let unit = orch.resolve_unit(handle, code);
+                let types = unit
+                    .as_ref()
+                    .map_or_else(|_| Arc::from(Vec::new()), |(_, t, _)| Arc::clone(t));
+                vcpu.deliver_jit_invoke(unit.map(|(f, _, _)| f), types);
             }
             // These kernels use only spawn/join + JIT; wait/notify/§14 never arise here.
             bytecode::VcpuEvent::Wait { .. }

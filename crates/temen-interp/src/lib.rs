@@ -2272,9 +2272,10 @@ fn drive(
 
 /// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
 /// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
-/// One B2-installed unit to re-apply onto a sub-run's fresh dispatch table: `(slot, funcs, types)`
-/// — the unit's own type section (#922) rides alongside its funcs so its interned call sigs resolve.
-type JitReapply = (u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
+/// One B2-installed unit to re-apply onto a sub-run's fresh dispatch table: `(slot, funcs, types,
+/// (table, unit))` — the unit's own type section (#922) rides alongside its funcs so its interned call
+/// sigs resolve, and its id so a spawn from it names its program (#2143).
+type JitReapply = (u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>, (u32, u32));
 
 fn drive_arc(
     funcs: Arc<[Func]>,
@@ -2303,14 +2304,7 @@ fn drive_arc(
     // table below can re-apply it. Empty for a fresh run (nothing installed), so it is a pure no-op
     // there; on a thaw it re-installs each captured unit at its slot, so a `call.dyn` through an
     // installed slot resolves after freeze/thaw. Install order is preserved (dense module ids).
-    let jit_reapply: Vec<JitReapply> = host
-        .jit_all_installs()
-        .into_iter()
-        .filter_map(|(d, slot, unit)| {
-            host.jit_unit_funcs(d, unit)
-                .and_then(|f| host.jit_unit_types(d, unit).map(|t| (slot, f, t)))
-        })
-        .collect();
+    let jit_reapply = host.jit_reapply();
     // §12.8 concurrent-thaw stage 1: a thaw restores the frozen window with the global **freeze** word
     // still `UNWINDING` (the artifact froze there), while the per-context **thaw** word now carries the
     // `REWINDING` phase. Clear the leftover freeze word to `NORMAL` up front, so the loop polls don't
@@ -2421,14 +2415,7 @@ fn drive_arc_shared(
         let h = cell.lock_unpoisoned();
         // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
         // onto the sub-run's fresh dispatch table, exactly as the by-value wrapper does.
-        let reapply: Vec<JitReapply> = h
-            .jit_all_installs()
-            .into_iter()
-            .filter_map(|(d, slot, unit)| {
-                h.jit_unit_funcs(d, unit)
-                    .and_then(|f| h.jit_unit_types(d, unit).map(|t| (slot, f, t)))
-            })
-            .collect();
+        let reapply = h.jit_reapply();
         (
             h.jit_table_log2(),
             h.offer_table_demand(),
@@ -3372,8 +3359,8 @@ fn drive_over_cell(
         // occupancy onto the fresh table, in install order, so a thawed `call.dyn` resolves. A
         // no-op for a fresh run (`jit_reapply` empty). `jit_table_log2` was restored from the
         // artifact on thaw, so the padding these slots land in exists.
-        for (slot, unit_funcs, unit_types) in &jit_reapply {
-            dt.install_at(*slot, Arc::clone(unit_funcs), Arc::clone(unit_types));
+        for (slot, unit_funcs, unit_types, id) in &jit_reapply {
+            dt.install_at(*slot, Arc::clone(unit_funcs), Arc::clone(unit_types), *id);
         }
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -4776,6 +4763,11 @@ struct DomainTable {
     /// `unit_types[i]` is the type section of the unit installed as module `i + 1`, so a call
     /// variant executed in that unit resolves its interned signature.
     unit_types: Mutex<Vec<Arc<[temen_ir::TypeEntry]>>>,
+    /// Which host unit each installed module is, in lockstep with `units`: its `(table, unit)`
+    /// ([`Host::resolve_jit_code`]), or `None` for funcs no `Jit` table holds (an offer's handler
+    /// unit). A frame of the module reports it when it spawns, so its `module = -1` names the unit's
+    /// program ([`Host::resolve_spawn_module`], #2143).
+    unit_ids: Mutex<Vec<Option<(u32, u32)>>>,
 }
 
 impl DomainTable {
@@ -4801,6 +4793,7 @@ impl DomainTable {
             slots,
             units: Mutex::new(Vec::new()),
             unit_types: Mutex::new(Vec::new()),
+            unit_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -4823,6 +4816,7 @@ impl DomainTable {
                 .collect(),
             units: Mutex::new(self.units.lock_unpoisoned().clone()),
             unit_types: Mutex::new(self.unit_types.lock_unpoisoned().clone()),
+            unit_ids: Mutex::new(self.unit_ids.lock_unpoisoned().clone()),
         }
     }
 
@@ -4835,7 +4829,12 @@ impl DomainTable {
     /// padding slot, returning the slot. `None` if every reserved slot is full. Writers serialize
     /// under the `units` lock (rare — only inside a synchronous `call.cap`, the guest suspended); the
     /// slot store is `Release` so the pushed unit is visible to any reader that observes the slot.
-    fn install(&self, unit: Arc<[Func]>, unit_types: Arc<[temen_ir::TypeEntry]>) -> Option<u32> {
+    fn install(
+        &self,
+        unit: Arc<[Func]>,
+        unit_types: Arc<[temen_ir::TypeEntry]>,
+        id: (u32, u32),
+    ) -> Option<u32> {
         let mut units = self.units.lock_unpoisoned();
         let slot = self
             .slots
@@ -4843,6 +4842,7 @@ impl DomainTable {
             .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == TABLE_EMPTY)?;
         units.push(unit);
         self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
+        self.unit_ids.lock_unpoisoned().push(Some(id)); // lockstep (#2143)
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
         Some(slot as u32)
@@ -4855,7 +4855,13 @@ impl DomainTable {
     /// dense and each slot maps to its own re-applied unit. Out-of-range / real-function slots are a
     /// no-op (a forged captured slot can only mis-dispatch within the guest's own table — never
     /// escape — but stay defensive). Not on the concurrent hot path (run setup, before any vCPU).
-    fn install_at(&self, slot: u32, unit: Arc<[Func]>, unit_types: Arc<[temen_ir::TypeEntry]>) {
+    fn install_at(
+        &self,
+        slot: u32,
+        unit: Arc<[Func]>,
+        unit_types: Arc<[temen_ir::TypeEntry]>,
+        id: (u32, u32),
+    ) {
         let s = slot as usize;
         if s >= self.slots.len() {
             return;
@@ -4863,6 +4869,7 @@ impl DomainTable {
         let mut units = self.units.lock_unpoisoned();
         units.push(unit);
         self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
+        self.unit_ids.lock_unpoisoned().push(Some(id)); // lockstep (#2143)
         let module = units.len() as u32; // module k ≡ units[k-1]
         self.slots[s].store(pack_slot(module, 0), Ordering::Release);
     }
@@ -4878,6 +4885,7 @@ impl DomainTable {
         &self,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
+        id: Option<(u32, u32)>,
     ) -> Option<Vec<u32>> {
         let n = unit.len();
         let mut units = self.units.lock_unpoisoned();
@@ -4914,6 +4922,7 @@ impl DomainTable {
         }
         units.push(unit);
         self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
+        self.unit_ids.lock_unpoisoned().push(id); // lockstep (#2143)
         let module = units.len() as u32; // module k ≡ units[k-1]
         for (func, &slot) in free.iter().enumerate() {
             self.slots[slot].store(pack_slot(module, func as u32), Ordering::Release);
@@ -4946,6 +4955,13 @@ impl DomainTable {
 
     fn units_snapshot(&self) -> Vec<Arc<[Func]>> {
         self.units.lock_unpoisoned().clone()
+    }
+
+    /// The host unit module `m` is (`unit_ids`): `None` for the primary program, the transient
+    /// invoked unit, and an installed module no `Jit` table holds.
+    fn unit_id(&self, m: u32) -> Option<(u32, u32)> {
+        let i = m.checked_sub(1)? as usize;
+        self.unit_ids.lock_unpoisoned().get(i).copied().flatten()
     }
 }
 
@@ -12296,6 +12312,7 @@ impl VCpu {
         dt: Arc<DomainTable>,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
+        unit_id: (u32, u32),
         args: &[Value],
         mem: Option<Mem>,
         host: Arc<Mutex<Host>>,
@@ -12308,7 +12325,7 @@ impl VCpu {
         // func i — the interpreter mirror of the JIT's `define_extra` auto-install. `None` (no
         // `ref.func`, or too few reserved slots) leaves `ref.func` unremapped, exactly like the JIT.
         let invoked_ref_slots = if unit_uses_ref_func(&unit) {
-            dt.install_unit_funcs(unit.clone(), unit_types.clone())
+            dt.install_unit_funcs(unit.clone(), unit_types.clone(), Some(unit_id))
         } else {
             None
         };
@@ -13671,7 +13688,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             {
                                                 Some((_, s_)) => s_.clone(),
                                                 None => {
-                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone());
+                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone(), None);
                                                     unit_ref_cache.push((key_, s_.clone()));
                                                     s_
                                                 }
@@ -14221,25 +14238,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 ($h:expr, $args:expr) => {{
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let (domain, cu, unit_funcs, unit_types) = {
-                        let hg = host.lock_unpoisoned();
-                        let domain = hg.resolve_jit_domain($h)?;
-                        let (cd, cu) = hg.resolve_jit_code(ch)?;
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        (
-                            domain,
-                            cu,
-                            hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?,
-                            hg.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?, // (#922)
-                        )
-                    };
+                    let (unit_funcs, unit_types, (domain, cu)) =
+                        host.lock_unpoisoned().resolve_jit_unit($h, ch)?;
                     // Append the unit to the **shared** domain table (module id = its 1-based
                     // index) and fill the next empty slot — visible at once to every vCPU of the
                     // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
                     // so the first install lands at the same index the JIT's `install` returns.
-                    let res = match dt.install(unit_funcs, unit_types.clone()) {
+                    let res = match dt.install(unit_funcs, unit_types.clone(), (domain, cu)) {
                         Some(slot) => {
                             // Record the occupancy on the domain so it survives the run (the table is
                             // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
@@ -14280,20 +14285,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // handle-as-arg — e.g. the Instantiator's module ops), so read it as a slot.
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
-                    let (unit_funcs, unit_types) = {
-                        let hg = host.lock_unpoisoned();
-                        let domain = hg.resolve_jit_domain($h)?;
-                        let (cd, cu) = hg.resolve_jit_code(ch)?;
-                        // A code handle is only valid on the domain that compiled it.
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        // FuncType interning (#922): the unit's funcs + its type section.
-                        (
-                            hg.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?,
-                            hg.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?,
-                        )
-                    };
+                    // A code handle is only valid on the domain that compiled it.
+                    let (unit_funcs, unit_types, unit_id) =
+                        host.lock_unpoisoned().resolve_jit_unit($h, ch)?;
                     let entry = unit_funcs.first().ok_or(Trap::CapFault)?;
                     // Strict arity: the call.cap's declared signature must match the unit entry's
                     // (minus the code-handle arg) — fail-closed, identically on the JIT path.
@@ -14326,6 +14320,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Arc::clone(dt),
                         unit_funcs,
                         unit_types, // the invoked unit's type section (#922)
+                        unit_id,
                         &child_args,
                         child_mem,
                         Arc::clone(host),
@@ -15306,10 +15301,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 _ => None,
                             };
                             // The module grant (a forged module handle is a CapFault, as ops
-                            // 5/13); the child runs it as its own program + self module.
+                            // 5/13); the child runs it as its own program + self module. `-1` is
+                            // the spawning frame's program: an installed unit's own, from a frame
+                            // of one (#2143).
                             let cm = {
                                 let hg = host.lock_unpoisoned();
-                                let g = hg.resolve_module(mh)?;
+                                let g =
+                                    hg.resolve_spawn_module(mh, dt.unit_id(frames[top].module))?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
                                     shadow: g.shadow,
@@ -23463,6 +23461,9 @@ pub type JitDurableTaintFn = fn(&[Func], &[temen_ir::TypeEntry]) -> Vec<FuncType
 /// the same path (#1346). Zero cost when unset — every non-browser run leaves it `None`.
 pub type JitWasmEmitter = fn(&[u8]) -> Option<Vec<u8>>;
 
+/// A unit [`Host::resolve_jit_unit`] resolved: its funcs, its type section and its `(table, unit)`.
+pub type ResolvedJitUnit = (Arc<[Func]>, Arc<[temen_ir::TypeEntry]>, (u32, u32));
+
 /// A successful [`Host::jit_compile`]: the minted `CompiledCode` handle and the `(domain,
 /// unit)` indices the JIT embedder needs to compile the unit natively and register its
 /// trampoline ([`Host::set_jit_unit_native`]).
@@ -23492,6 +23493,12 @@ struct JitUnit {
     /// interpreter. The bytes are opaque here: the core stores and returns them, never decoding or
     /// executing them.
     wasm: Option<Arc<[u8]>>,
+    /// What a detached self-spawn from this unit runs (#2143): the grant `module = -1` names in a
+    /// frame of the unit ([`Host::resolve_spawn_module`]), its program as a module
+    /// ([`jit_unit_module`]). Built at the first such spawn, because a grant hashes the module. Never
+    /// durable: the module declares no shadow arena, so a durable domain refuses the spawn, as it
+    /// refuses its root program's `-1`.
+    grant: std::sync::OnceLock<ModuleGrant>,
 }
 
 /// Where a [`JitTableState`]'s memory-match precondition comes from.
@@ -23651,15 +23658,13 @@ pub fn module_digest(m: &Module) -> [u8; 32] {
     temen_encode::digest256(&temen_encode::encode_module(&canon))
 }
 
-/// Encode a compiled §22 unit's already-instrumented+verified funcs as a canonical module image
-/// for the snapshot (DURABILITY.md §12.5 Slice 2). Only `funcs` + the domain's declared `memory`
-/// ride — the resolved funcs are self-contained (`call.dyn`/`call.cap` carry inline
-/// signatures, imports are already linked away), so no type/import/export section is needed, and
-/// `decode_module` + `verify_module` reconstruct them losslessly on thaw. Debug info is dropped
-/// (untrusted, backend-ignored). `encode_module` is canonical, so `decode`→`encode` round-trips
-/// byte-identically, which is what keeps the §12.6 re-serialize invariant a plain `==`.
-fn encode_jit_unit(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Option<u8>) -> Vec<u8> {
-    let m = Module {
+/// A compiled §22 unit's program as a module: its already-instrumented+verified funcs and type
+/// section, with the domain's declared `memory` — what its snapshot encodes ([`encode_jit_unit`]) and
+/// what a detached self-spawn from it runs (#2143). The resolved funcs are self-contained
+/// (`call.dyn`/`call.cap` carry inline signatures, imports are already linked away), so no
+/// import/export section is needed. Debug info is dropped (untrusted, backend-ignored).
+fn jit_unit_module(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Option<u8>) -> Module {
+    Module {
         funcs: funcs.to_vec(),
         // FuncType interning (#922): the unit's type section must ride `unit_ir` so a restore's
         // `decode_module` + `verify_module` can resolve the interned call type indices.
@@ -23669,8 +23674,15 @@ fn encode_jit_unit(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Opti
             shadow: None,
         }),
         ..Module::default()
-    };
-    temen_encode::encode_module(&m)
+    }
+}
+
+/// Encode a unit's module ([`jit_unit_module`]) as a canonical image for the snapshot (DURABILITY.md
+/// §12.5 Slice 2): `decode_module` + `verify_module` reconstruct it losslessly on thaw, and
+/// `encode_module` is canonical, so `decode`→`encode` round-trips byte-identically, which is what
+/// keeps the §12.6 re-serialize invariant a plain `==`.
+fn encode_jit_unit(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Option<u8>) -> Vec<u8> {
+    temen_encode::encode_module(&jit_unit_module(funcs, types, mem_log2))
 }
 
 impl Default for Host {
@@ -23928,6 +23940,7 @@ impl Host {
                         install_code: 0,
                         install_type_id: u.install_type_id,
                         wasm: u.wasm.clone(),
+                        grant: u.grant.clone(),
                     })
                     .collect(),
                 native_ctx: 0,
@@ -24998,12 +25011,14 @@ impl Host {
         })
     }
 
-    /// The `Module` a grant handle names — `SELF_MODULE` for this domain's own program — if live.
-    pub fn module_arc(&self, handle: i32) -> Option<Arc<Module>> {
-        if handle == SELF_MODULE {
-            return self.self_module.clone();
+    /// The `Module` a spawn's module operand names, if live: a granted module, or for
+    /// [`SELF_MODULE`] the spawning frame's program — this domain's own, or the installed unit `unit`
+    /// ([`Self::resolve_spawn_module`]).
+    pub fn spawn_module(&self, handle: i32, unit: Option<(u32, u32)>) -> Option<Arc<Module>> {
+        if handle == SELF_MODULE && unit.is_none() {
+            return self.self_module.clone(); // without building its grant (`Host::self_grant`)
         }
-        self.resolve_module(handle)
+        self.resolve_spawn_module(handle, unit)
             .ok()
             .map(|g| Arc::clone(&g.module))
     }
@@ -26647,6 +26662,7 @@ impl Host {
                     install_code: 0,
                     install_type_id: u.install_type_id,
                     wasm: None,
+                    grant: std::sync::OnceLock::new(),
                 });
             }
             rebuilt.push(JitTableState {
@@ -28638,19 +28654,44 @@ impl Host {
         }
     }
 
+    /// What a spawn's module operand names: the grant `handle` resolves to, where [`SELF_MODULE`]
+    /// names the **spawning frame's** program — the running module, or the installed §22 unit the
+    /// frame runs, `unit` (`(table, unit)`, as [`Self::resolve_jit_code`] names it). DESIGN.md §22: a
+    /// same-module child runs the spawning frame's module, so from a unit's frame `-1` is the unit's
+    /// own program (#2143). The one rule every engine's detached spawn asks.
+    fn resolve_spawn_module(
+        &self,
+        handle: i32,
+        unit: Option<(u32, u32)>,
+    ) -> Result<&ModuleGrant, Trap> {
+        let Some((t, u)) = unit.filter(|_| handle == SELF_MODULE) else {
+            return self.resolve_module(handle);
+        };
+        let d = self.jit_tables.get(t as usize).ok_or(Trap::CapFault)?;
+        let ju = d.units.get(u as usize).ok_or(Trap::CapFault)?;
+        Ok(ju.grant.get_or_init(|| {
+            let m = jit_unit_module(&ju.funcs, &ju.types, self.jit_mem_log2(d));
+            ModuleGrant::of(Arc::new(m), false)
+        }))
+    }
+
     /// Resolve a §14 `Module` handle to **raw views** of its grant — the bridge the JIT's nesting
     /// runtime uses (via `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`).
     /// `None` for a forged/closed/wrong-type handle. The returned pointers borrow [`Host::modules`]
-    /// (append-only), so they stay valid for as long as this `Host` lives — which outlives the run,
+    /// (append-only), or a unit's own grant, which lives as long as the unit (`JitUnit::grant`), so
+    /// they stay valid for as long as this `Host` lives — which outlives the run,
     /// the same lifetime contract as the `call.cap` ctx itself. `memory_log2` is `-1` when the
     /// module declares no memory. Host-side callers only; never reachable from a guest `call.cap`
     /// (the generic dispatch on a `Module` handle is an inert `CapFault`), so no host address ever
     /// leaks into a guest-readable value.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// `handle` is a spawn's module operand, `unit` the installed unit the spawning frame runs, if
+    /// any ([`Self::resolve_spawn_module`]).
     #[allow(clippy::type_complexity)]
     pub fn resolve_module_parts(
         &self,
         handle: i32,
+        unit: Option<(u32, u32)>,
     ) -> Option<(
         *const Func,
         usize,
@@ -28662,7 +28703,7 @@ impl Host {
         ShadowArena,
         bool,
     )> {
-        let g = self.resolve_module(handle).ok()?;
+        let g = self.resolve_spawn_module(handle, unit).ok()?;
         Some((
             g.funcs.as_ptr(),
             g.funcs.len(),
@@ -29095,15 +29136,22 @@ impl Host {
             .map_or(Vec::new(), |d| d.installed.clone())
     }
 
-    /// Every domain's install occupancy flattened to `(domain, slot, unit)` in domain-then-install
-    /// order — what the run entry re-applies to a freshly-built dispatch table so a restored install
-    /// survives a freeze/thaw (DURABILITY.md §12.5 install-durability). Empty for a fresh run (no
-    /// installs recorded), so re-apply is a no-op there.
-    fn jit_all_installs(&self) -> Vec<(u32, u32, u32)> {
+    /// Every domain's install occupancy, in domain-then-install order, as a freshly-built dispatch
+    /// table re-applies it ([`DomainTable::install_at`]) so a restored install survives a
+    /// freeze/thaw (DURABILITY.md §12.5 install-durability): each slot with its unit's funcs, types
+    /// and `(table, unit)`. Empty for a fresh run (no installs recorded), so re-apply is a no-op there.
+    fn jit_reapply(&self) -> Vec<JitReapply> {
         let mut out = Vec::new();
-        for (domain, d) in self.jit_tables.iter().enumerate() {
-            for &(slot, unit) in &d.installed {
-                out.push((domain as u32, slot, unit));
+        for (d, t) in self.jit_tables.iter().enumerate() {
+            for &(slot, unit) in &t.installed {
+                if let Some(u) = t.units.get(unit as usize) {
+                    out.push((
+                        slot,
+                        Arc::clone(&u.funcs),
+                        Arc::clone(&u.types),
+                        (d as u32, unit),
+                    ));
+                }
             }
         }
         out
@@ -29328,6 +29376,7 @@ impl Host {
             install_code: 0,
             install_type_id: 0,
             wasm: None,
+            grant: std::sync::OnceLock::new(),
         });
         // #1529 (see above): the unit installed and it spawns detached, so grant the set now —
         // each name once (`grant_detached_spawn_caps` skips a name already registered). Three conditions keep it
@@ -29413,6 +29462,21 @@ impl Host {
             Binding::JitCode { domain, unit } => Ok((domain, unit)),
             _ => Err(Trap::CapFault),
         }
+    }
+
+    /// Resolve a `Jit.install`/`invoke` `(jit, code)` pair: authority (a forged handle is a
+    /// `CapFault`) and the cross-table check (a code handle from another table is one too), to the
+    /// unit's funcs, its type section (#922) and its `(table, unit)`. What every engine installs or
+    /// invokes, and what a [`bytecode::Vcpu`]'s embedder delivers for a `JitInstall`.
+    pub fn resolve_jit_unit(&self, jit: i32, code: i32) -> Result<ResolvedJitUnit, Trap> {
+        let table = self.resolve_jit_domain(jit)?;
+        let (t, u) = self.resolve_jit_code(code)?;
+        if t != table {
+            return Err(Trap::CapFault);
+        }
+        let funcs = self.jit_unit_funcs(t, u).ok_or(Trap::CapFault)?;
+        let types = self.jit_unit_types(t, u).ok_or(Trap::CapFault)?;
+        Ok((funcs, types, (t, u)))
     }
 
     /// The validated functions of a compiled unit (its entry is `funcs[0]`).
@@ -35684,6 +35748,62 @@ mod fiber_charge_tests {
 }
 
 #[cfg(test)]
+mod spawn_module_tests {
+    use super::*;
+
+    fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<Arc<[Func]>, i64> {
+        let m = temen_encode::decode_module(bytes).map_err(|_| EINVAL)?;
+        temen_verify::verify_module(&m).map_err(|_| EINVAL)?;
+        Ok(m.funcs.into())
+    }
+
+    /// #2143 — from an installed unit's frame, `-1` names the unit's program as a module: its
+    /// functions over the table's memory, with no data, no shadow arena and no durable attestation, so
+    /// a durable domain refuses the spawn. Without a unit it is still the running module, and a unit
+    /// the host does not hold is a forgery.
+    #[test]
+    fn a_units_own_module_is_its_program() {
+        let program = temen_text::parse_module(
+            "memory 16\ndata 16400 \"x\"\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n",
+        )
+        .expect("parse program");
+        let unit = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse unit");
+        let mut host = Host::new();
+        host.set_self_module(&Arc::new(program));
+        host.set_jit_validator(validator);
+        let jit = host.grant_jit(Some(16));
+        let c = host
+            .jit_compile(jit, &temen_encode::encode_module(&unit))
+            .expect("no trap")
+            .expect("compiled");
+
+        let g = host
+            .resolve_spawn_module(SELF_MODULE, Some((c.domain, c.unit)))
+            .expect("the unit's module");
+        assert_eq!(&*g.funcs, &unit.funcs[..]);
+        assert_eq!(g.memory_log2, Some(16));
+        assert!(g.data.is_empty() && g.shadow.is_none() && !g.durable);
+
+        let own = host
+            .resolve_spawn_module(SELF_MODULE, None)
+            .expect("the running module");
+        assert_eq!(
+            own.data.len(),
+            1,
+            "without a unit, `-1` is the running module"
+        );
+
+        assert!(matches!(
+            host.resolve_spawn_module(SELF_MODULE, Some((c.domain, c.unit + 1))),
+            Err(Trap::CapFault)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod fork_powerbox_tests {
     //! FORK.md PR 1 increment 3 — `Host::fork_powerbox`, the twin's powerbox. It copies the domain's
     //! **handle namespace** (so the twin holds equivalent handles at the same values) over the **same
@@ -37093,7 +37213,9 @@ mod domain_table_tests {
         // A second view — a worker thread / invoke child sharing the same live table.
         let worker = Arc::clone(&dt);
 
-        let slot = dt.install(unit(2), Arc::from(Vec::new())).expect("install"); // a (i32,i32)->(i32) unit
+        let slot = dt
+            .install(unit(2), Arc::from(Vec::new()), (0, 0))
+            .expect("install"); // a (i32,i32)->(i32) unit
         assert_eq!(
             slot, 1,
             "first padding slot is just past the 1 module function"
@@ -37122,7 +37244,9 @@ mod domain_table_tests {
     fn uninstall_clears_and_guards() {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2)); // 4 slots, 1 real func
-        let slot = dt.install(unit(1), Arc::from(Vec::new())).expect("install") as usize;
+        let slot = dt
+            .install(unit(1), Arc::from(Vec::new()), (0, 0))
+            .expect("install") as usize;
         assert_eq!(slot, 1);
         assert!(!dt.uninstall(0, 1), "slot 0 is the real function");
         assert!(!dt.uninstall(99, 1), "out of range");
@@ -37144,7 +37268,8 @@ mod domain_table_tests {
     fn resolve_module_routes_program_invoke_and_installed() {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2));
-        dt.install(unit(2), Arc::from(Vec::new())).expect("install"); // module 1
+        dt.install(unit(2), Arc::from(Vec::new()), (0, 0))
+            .expect("install"); // module 1
         let invoked = Some(unit(3));
         let mut local: Vec<Arc<[Func]>> = Vec::new();
 

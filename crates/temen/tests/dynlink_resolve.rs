@@ -90,7 +90,7 @@ fn host_assisted_resolve_links_a_serialized_plugin_by_name() {
     // Compile the resolved unit at runtime against the host's live table, then call it: it dispatches
     // through the shared table to the host's F — F(10,3) = 23.
     let ptrs = cm
-        .define_extra(&funcs, &types)
+        .define_extra(&funcs, &types, None)
         .expect("define_extra (compile the plugin)");
     let (out, _) =
         unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[10, 3], None) }.expect("run plugin");

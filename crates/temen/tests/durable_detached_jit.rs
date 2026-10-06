@@ -90,6 +90,70 @@ fn returned(o: JitOutcome) -> Vec<i64> {
     }
 }
 
+/// Spawns its own program (`module = -1`) detached at func 1, and returns what the spawn answered.
+const SELF_SPAWN: &str = "memory 17 shadow 16448 65536
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vb = i64.extend_i32_u v1
+  vself = i64.const -1
+  vz = i64.const 0
+  ve = i64.const 1
+  vlog = i64.const 17
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vself, vz, vz, ve, vlog, vz)
+  vr = i64.extend_i32_s vc
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v = i64.const 7
+  return v
+  }
+}
+";
+
+/// A durable domain spawns detached only a module the host attested freezable (#1501), and `-1`'s
+/// grant is not attested: the spawn refuses `-EINVAL` on the oracle and on the JIT alike. The JIT used
+/// to admit it, taking `-1` for the domain's own durable program.
+#[test]
+fn a_durable_domain_refuses_its_own_program_detached() {
+    let m = instrument(SELF_SPAWN);
+    let powerbox = || {
+        let mut host = Host::new();
+        host.set_durable(true);
+        host.set_self_module(&std::sync::Arc::new(m.clone()));
+        let inst = host.grant_instantiator(0, 1 << 17);
+        let budget = host.grant_budget(-1, 1 << 20, -1);
+        host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+        (host, [inst, budget])
+    };
+    let win = init_durable_window(1 << 17, ARENA);
+
+    let (mut host, h) = powerbox();
+    let args = h.map(Value::I32);
+    let mut fuel = 5_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(&m, 0, &args, &mut fuel, &win, 17, &mut host);
+    assert_eq!(r, Ok(vec![Value::I64(-22)]), "oracle");
+
+    let (mut host, h) = powerbox();
+    let slots = h.map(i64::from);
+    let jit = temen_run::jit_cap_run(
+        &m,
+        0,
+        &slots,
+        &MemLayout::image(win.to_vec()),
+        17,
+        0,
+        &mut host,
+        None,
+    );
+    match jit {
+        Ok((o, _)) => assert_eq!(returned(o), vec![-22], "jit"),
+        Err(JitError::Unsupported(_)) => {} // a target without the child executor
+        Err(e) => panic!("JIT run failed: {e:?}"),
+    }
+}
+
 #[test]
 fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     let parent = instrument(PARENT);
