@@ -2733,7 +2733,7 @@ fn seed_domain(
                 // A nested durable child is same-module (§4), so its arena is this one's.
                 m.nested_view(m.window.base() + abs_carve, fnr.size_log2, m.shadow_arena())
             });
-            let mut ch = Host::new();
+            let mut ch = host_shared.lock_unpoisoned().child_host();
             ch.set_durable(true);
             // #1289 R1 / O14: re-stamp the child's §6 attestation, which the thaw otherwise
             // defaults (`window_exposed = false` — a lie: the parent reads this child's carve).
@@ -14755,7 +14755,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // `AddressSpace` (so it can manage its own pages). These are its entry
                                 // arguments. (Pass-through of the parent's *other* handles is a
                                 // follow-up.)
-                                let mut ch = Host::new();
+                                let mut ch = host.lock_unpoisoned().child_host();
                                 // §4: *a durable domain may only spawn durable children* — the
                                 // subtree freezes as a unit, so the child's own spawns/fibers must
                                 // reserve shadow state like the parent's (and its own nested
@@ -15423,7 +15423,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if pager_for_child.is_some() {
                                     fm.demand_page();
                                 }
-                                let mut ch = Host::new();
+                                let mut ch = host.lock_unpoisoned().child_host();
                                 // §4: *a durable domain may only spawn durable children* — the
                                 // detached child inherits the bit exactly as a nested one does (the
                                 // nested arm above), so its own spawns/fibers reserve shadow state
@@ -24812,7 +24812,7 @@ impl Host {
     /// answers for the whole tree: a child's authority was only ever an attenuation of its spawner's,
     /// so what it gets back is decided in the same place (INVARIANTS #3).
     pub fn detached_thaw_host(&mut self) -> Host {
-        let mut child = Host::new();
+        let mut child = self.child_host();
         child.set_durable(true);
         child.modules = self.modules.iter().filter(|g| g.durable).cloned().collect();
         self.lend_jit_admission(&mut child);
@@ -29372,6 +29372,16 @@ impl Host {
         self.regions.push(backing);
         self.try_grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
+    /// A fresh host for a domain this one spawns (#1978): it mints `SharedRegion`s with this host's
+    /// [`Host::set_region_factory`], as the embedder installed it once for the whole run. Without it
+    /// a detached child's own `region_create` minted a [`VecBacking`], which has no OS handle, so the
+    /// JIT's `map` of it failed with `-EINVAL` while a region its parent granted mapped. Every place
+    /// that builds a child's host starts from this, so no spawn path can drop the factory again.
+    pub(crate) fn child_host(&self) -> Host {
+        let mut child = Host::new();
+        child.region_factory = self.region_factory;
+        child
+    }
 
     /// Install the backing factory for **guest-minted** regions (`AddressSpace.create_region`,
     /// §13/§14). A flat-window embedder passes an OS-shared-memory factory (e.g.
@@ -29500,7 +29510,7 @@ impl Host {
         if !self.can_regrant(grant_handle) {
             return None;
         }
-        let mut ch = Host::new();
+        let mut ch = self.child_host();
         // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
         ch.set_self_module_opt(self.self_module.clone());
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
@@ -29809,7 +29819,7 @@ impl Host {
     /// re-pinned as a thaw re-pins them, its node in this run's budget tree, and the stdio it inherited
     /// aliased to this host's, as the spawn aliased it ([`Host::alias_inherited_stdio`]).
     pub(crate) fn rebuild_child_powerbox(&mut self, pb: &ChildPowerbox) -> Host {
-        let mut child = Host::new();
+        let mut child = self.child_host();
         child.durable = pb.durable;
         child.attestation = pb.attestation;
         child.budgets = Arc::clone(&self.budgets);
@@ -29901,7 +29911,7 @@ impl Host {
         if !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
             return None;
         }
-        let mut ch = Host::new();
+        let mut ch = self.child_host();
         ch.parent_domain = Some(self.domain_id); // D66 — the lane chain's next link
                                                  // §3.6/5c.0: a named-grant child runs the holder's own program, so its **self module** —
                                                  // what `offer_shape` and its serve loop resolve against — is the holder's. The interp's

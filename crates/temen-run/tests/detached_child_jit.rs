@@ -1260,3 +1260,81 @@ fn a_kill_survives_the_childs_host_calls_on_the_jit() {
         }
     }
 }
+
+/// #1978 — a detached child that mints a 64 KiB `SharedRegion` through its own `AddressSpace`
+/// (resolved by name), maps it at 65536 of its window, stores 41 through the mapping and loads it
+/// back: it returns the map's status plus the word (41 when both work).
+const MINTING_CHILD: &str = r#"memory 17
+data 20000 "addrspace"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnp = i64.const 20000
+  vnl = i64.const 9
+  vas = self.resolve vnp vnl
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vin = i64.const 41
+  vz = i64.const 0
+  vok = i64.eq vm vz
+  br_if vok 1() 2(vm)
+}
+block 1 () {
+  vat = i64.const 65536
+  vword = i64.const 41
+  i64.store vat vword
+  vback = i64.load vat
+  return vback
+}
+block 2 (verr: i64) {
+  return verr
+  }
+}
+"#;
+
+/// `v0` Instantiator, `v1` the [`MINTING_CHILD`] module, `v2` the `Budget`: spawn it detached with a
+/// window of `2^17`, join it, and return its result.
+const MINTING_PARENT: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 17
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vj
+  }
+}
+"#;
+
+/// #1978 — a detached child maps a region it minted itself on the JIT, as on the interpreter. Its
+/// host inherits the embedder's OS shared-memory region factory (`Host::child_host`); before, it
+/// minted a software `VecBacking` the JIT cannot `mmap`, and the map answered `-EINVAL`.
+#[test]
+fn a_detached_child_maps_a_region_it_minted_on_the_jit_as_on_the_interpreter() {
+    let parent = module(MINTING_PARENT);
+    let child = module(MINTING_CHILD);
+    let minting_host = || {
+        let (mut host, h) = host(&child, 1 << 20);
+        host.set_region_factory(temen_run::new_shared_region);
+        (host, h)
+    };
+    let interp = match interp_result(&parent, minting_host())
+        .expect("interp run")
+        .first()
+    {
+        Some(Value::I64(x)) => *x,
+        other => panic!("unexpected interp result {other:?}"),
+    };
+    assert_eq!(interp, 41, "the oracle maps the child's own region");
+    let jit = match jit_outcome(&parent, minting_host()) {
+        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
+        ref o => panic!("jit ended abnormally: {o:?}"),
+    };
+    assert_eq!(jit, interp, "the JIT matches the oracle (was -22, #1978)");
+}
