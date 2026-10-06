@@ -2571,8 +2571,16 @@ fn seed_domain(
             let got = if ff.is_free() {
                 root.registry.seed_free(ff.generation)
             } else {
-                root.registry
-                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation, ff.consumed)
+                // #2112 — the fiber handed its charge back as the freeze flattened it.
+                let charge = root.host.lock_unpoisoned().fiber_recharge();
+                root.registry.seed_frozen(
+                    ff.func,
+                    ff.sp,
+                    ff.shadow_sp,
+                    ff.generation,
+                    ff.consumed,
+                    charge,
+                )
             };
             debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
             debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
@@ -11226,6 +11234,10 @@ struct RegState {
     /// fiber's re-executed `suspend` (its `Yield` rewind arm) instead of re-parking. `Some` only between
     /// that claim and that suspend. Grows with `fibers` (same index).
     pending: Vec<Option<i64>>,
+    /// #2112 — per slot: the fiber's charge on the node of the domain whose `cont.new` made it,
+    /// handed back when the fiber returns ([`Self::finish`]) or the registry goes. Grows with
+    /// `fibers` (same index).
+    charges: Vec<LiveFiber>,
     /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
     /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
@@ -11248,6 +11260,7 @@ impl FiberRegistry {
                 gens: Vec::new(),
                 consumed: Vec::new(),
                 pending: Vec::new(),
+                charges: Vec::new(),
                 free: BinaryHeap::new(),
                 vcpu_mask: 0,
             }),
@@ -11329,6 +11342,8 @@ impl FiberRegistry {
     /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
     /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
     /// context) likewise bound concurrency rather than lifetime.
+    /// `charge` is the fiber's [`LiveFiber`], held while the slot is its; a refusal drops it, which
+    /// hands it back.
     fn create(
         &self,
         func: i32,
@@ -11336,6 +11351,7 @@ impl FiberRegistry {
         max_fibers: usize,
         durable: bool,
         arena: ShadowArena,
+        charge: LiveFiber,
     ) -> Result<i64, Trap> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
@@ -11366,6 +11382,7 @@ impl FiberRegistry {
             t.shadow[slot] = arena.frame_base(slot + 1); // reused region: empty stack at its frame base
             t.consumed[slot] = false;
             t.pending[slot] = None;
+            t.charges[slot] = charge;
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, sp });
@@ -11373,6 +11390,7 @@ impl FiberRegistry {
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
             t.consumed.push(false);
             t.pending.push(None);
+            t.charges.push(charge);
             0
         };
         Ok(fiber_handle(slot, generation))
@@ -11529,6 +11547,7 @@ impl FiberRegistry {
         debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
         t.fibers[slot] = RegFiber::Done;
         t.gens[slot] = t.gens[slot].wrapping_add(1);
+        t.charges[slot] = LiveFiber::none(); // #2112: its charge goes back
         t.free.push(Reverse(slot));
     }
 
@@ -11597,6 +11616,7 @@ impl FiberRegistry {
         t.gens.push(generation);
         t.consumed.push(false);
         t.pending.push(None);
+        t.charges.push(LiveFiber::none());
         t.free.push(Reverse(slot));
         slot
     }
@@ -11647,7 +11667,8 @@ impl FiberRegistry {
     /// Thaw seeding (slice 3.1.5): re-create a frozen fiber at the next slot as `Pending` (so a
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
-    /// dense handle namespace; returns the slot, which must equal the recorded one.
+    /// dense handle namespace; returns the slot, which must equal the recorded one. `charge` is the
+    /// fiber's, taken again (#2112): the freeze handed it back.
     fn seed_frozen(
         &self,
         func: i32,
@@ -11655,6 +11676,7 @@ impl FiberRegistry {
         shadow_sp: u64,
         generation: u64,
         consumed: bool,
+        charge: LiveFiber,
     ) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
@@ -11663,6 +11685,7 @@ impl FiberRegistry {
         t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
         t.consumed.push(consumed); // #1538: a consumed park delivers at its rewound suspend
         t.pending.push(None);
+        t.charges.push(charge);
         slot
     }
 
@@ -13724,7 +13747,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // Allocate the handler fiber slot; exhaustion is backpressure —
                                     // undo the checkout, answer -EAGAIN (never a trap).
                                     let handle_ =
-                                        match registry.create(0, 0, spawn_quota.max_fibers, false, arena) {
+                                        // A fiber the runtime makes for a dispatch is mechanism,
+                                        // charged to nothing (#2112).
+                                        match registry.create(
+                                            0,
+                                            0,
+                                            spawn_quota.max_fibers,
+                                            false,
+                                            arena,
+                                            LiveFiber::none(),
+                                        ) {
                                             Ok(h_) => h_,
                                             Err(_) => {
                                                 // 7.1 threaded: no checkout to undo (see above).
@@ -15860,15 +15892,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             .collect();
                         // The handler's fiber slot — an ordinary registry fiber (recycled on
                         // finish), so the §15 quota bounds concurrent parked handlers too.
-                        // Exhaustion is backpressure to the dispatch, not a trap.
-                        let handle =
-                            match registry.create(0, 0, spawn_quota.max_fibers, durable, arena) {
-                                Ok(h_) => h_,
-                                Err(_) => {
-                                    sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
-                                    continue;
-                                }
-                            };
+                        // Exhaustion is backpressure to the dispatch, not a trap. A fiber the
+                        // runtime makes for a dispatch is mechanism, charged to nothing (#2112).
+                        let handle = match registry.create(
+                            0,
+                            0,
+                            spawn_quota.max_fibers,
+                            durable,
+                            arena,
+                            LiveFiber::none(),
+                        ) {
+                            Ok(h_) => h_,
+                            Err(_) => {
+                                sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
+                                continue;
+                            }
+                        };
                         // Claim it straight into `Running` (discarding the placeholder
                         // `Start`): handler first-frames are built here — their signatures
                         // are the impl_export's own, not the `(sp, arg)` fiber launch shape.
@@ -16987,6 +17026,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::ContNew { func, sp } => {
                     let funcref = get_i32(&frames[top].vals, *func)?;
                     let stack_base = get_i64(&frames[top].vals, *sp)?;
+                    // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
+                    let charge = host
+                        .lock_unpoisoned()
+                        .fiber_charge()
+                        .ok_or(Trap::FiberFault)?;
                     // `durable` runs assign the new fiber a distinct shadow region (and refuse if
                     // the reserve is full); a non-durable run ignores the region bookkeeping.
                     let handle = registry.create(
@@ -16995,6 +17039,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         spawn_quota.max_fibers,
                         durable,
                         arena,
+                        charge,
                     )?;
                     frames[top].vals.push(Reg::from_i64(handle));
                 }
@@ -20455,36 +20500,50 @@ impl NodeRef {
     pub fn vcpu_ended(&self) {
         self.tree.refund(self.node, BUDGET_SPAWN, 1);
     }
+
+    /// #2112 — charge one live fiber, [`temen_ir::FIBER_STACK`] of `mem`, to the chain, all or
+    /// nothing: `false` when a level's `mem` is full. The Cranelift JIT, which keeps its own fibers,
+    /// pairs it with [`Self::fiber_ended`]; the interpreters hold a [`LiveFiber`] instead.
+    pub fn charge_fiber(&self) -> bool {
+        self.tree
+            .charge(self.node, BUDGET_MEM, temen_ir::FIBER_STACK)
+    }
+
+    /// [`Self::charge_fiber`] past any ceiling: a fiber a thaw re-creates, which lived before the
+    /// freeze.
+    pub fn force_fiber(&self) {
+        self.tree
+            .force_charge(self.node, BUDGET_MEM, temen_ir::FIBER_STACK);
+    }
+
+    /// Hand back a fiber's charge when it ends.
+    pub fn fiber_ended(&self) {
+        self.tree
+            .refund(self.node, BUDGET_MEM, temen_ir::FIBER_STACK);
+    }
 }
 
-/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node: one `spawn`, taken when the vCPU
-/// is made and handed back when this is dropped, so a node's `spawn` counts the live vCPUs of its
-/// subtree (the cgroups `pids.max` model).
-///
-/// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
-/// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
-/// either the run's own, which no guest reads, or a detached child's, whose admission charged the
-/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]).
-pub struct LiveVcpu(Option<NodeRef>);
+/// #2001, #2112 — what a live vCPU or fiber holds of its domain's node: `N` of dimension `D`, charged to
+/// the node and every ancestor when it is made and handed back when this is dropped.
+pub struct Held<const D: usize, const N: u64>(Option<NodeRef>);
 
-impl LiveVcpu {
-    /// Charge one vCPU to `node` and every ancestor: `None`, with nothing charged, when a level's
-    /// `spawn` is full. The guard is built only once the charge took: a refused one dropped would hand
-    /// back a `spawn` never charged.
-    pub(crate) fn charge(node: NodeRef) -> Option<LiveVcpu> {
-        node.charge_vcpu().then(|| LiveVcpu(Some(node)))
+impl<const D: usize, const N: u64> Held<D, N> {
+    /// Charge `node` and every ancestor: `None`, with nothing charged, when a level is full. The guard
+    /// is built only once the charge took: a refused one dropped would hand back what was never
+    /// charged.
+    pub(crate) fn charge(node: NodeRef) -> Option<Self> {
+        node.tree.charge(node.node, D, N).then(|| Held(Some(node)))
     }
 
-    /// Charge one vCPU past any ceiling ([`NodeRef::force_vcpu`]).
-    pub(crate) fn force(node: NodeRef) -> LiveVcpu {
-        node.force_vcpu();
-        LiveVcpu(Some(node))
+    /// Charge `node` past any ceiling: what a thaw re-creates, which lived before the freeze.
+    pub(crate) fn force(node: NodeRef) -> Self {
+        node.tree.force_charge(node.node, D, N);
+        Held(Some(node))
     }
 
-    /// A vCPU that holds no charge: a run's root, a detached child's first (its window's lease holds
-    /// it), or a carve child's, which the carve path leaves uncharged until #1867 deletes it.
-    pub(crate) fn none() -> LiveVcpu {
-        LiveVcpu(None)
+    /// One that holds no charge.
+    pub(crate) fn none() -> Self {
+        Held(None)
     }
 
     /// Whether this holds a charge.
@@ -20493,13 +20552,27 @@ impl LiveVcpu {
     }
 }
 
-impl Drop for LiveVcpu {
+impl<const D: usize, const N: u64> Drop for Held<D, N> {
     fn drop(&mut self) {
         if let Some(n) = &self.0 {
-            n.vcpu_ended();
+            n.tree.refund(n.node, D, N);
         }
     }
 }
+
+/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node: one `spawn`, so a node's `spawn`
+/// counts the live vCPUs of its subtree (the cgroups `pids.max` model).
+///
+/// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
+/// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
+/// either the run's own, which no guest reads, or a detached child's, whose admission charged the
+/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]). A carve
+/// child's holds none either, until #1867 deletes the carve path.
+pub type LiveVcpu = Held<BUDGET_SPAWN, 1>;
+
+/// #2112 — a live fiber's charge on its domain's node: [`temen_ir::FIBER_STACK`] of `mem`, taken when
+/// `cont.new` makes it ([`Host::fiber_charge`]) and handed back when it returns or its registry goes.
+pub type LiveFiber = Held<BUDGET_MEM, { temen_ir::FIBER_STACK }>;
 
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
@@ -26886,6 +26959,20 @@ impl Host {
             tree: Arc::clone(&self.budgets),
             node: self.own_budget,
         }
+    }
+
+    /// #2112 — the charge for a fiber this domain's `cont.new` makes: [`temen_ir::FIBER_STACK`] of
+    /// `mem` on its node and every ancestor, all or nothing. `None` past a ceiling, where `cont.new`
+    /// traps `FiberFault`. A run's root charges the run's own node, which no guest reads, as its
+    /// threads do, until #2113 meters the root.
+    pub(crate) fn fiber_charge(&self) -> Option<LiveFiber> {
+        LiveFiber::charge(self.own_node())
+    }
+
+    /// #2112 — [`Self::fiber_charge`] past any ceiling: a fiber a thaw re-creates, which lived before
+    /// the freeze and handed its charge back as the freeze flattened it.
+    pub(crate) fn fiber_recharge(&self) -> LiveFiber {
+        LiveFiber::force(self.own_node())
     }
 
     /// #1944 slice 3 — the fuel room left on this domain's own chain: what an activation reads back
@@ -35443,6 +35530,95 @@ mod live_vcpu_tests {
         );
         drop(held);
         assert_eq!(parent.budgets.used(node, BUDGET_SPAWN), 0);
+    }
+}
+
+#[cfg(test)]
+mod fiber_charge_tests {
+    //! #2112 — a live fiber is `FIBER_STACK` of its domain's `mem`: charged when it is made, handed
+    //! back when it returns or its registry goes, and taken again for a fiber a thaw re-creates. The
+    //! every-engine behaviour is `temen`'s `tests/fiber_budget.rs`; these pin the registry's own
+    //! bookkeeping.
+    use super::*;
+
+    const FIBER: i64 = temen_ir::FIBER_STACK as i64;
+
+    /// A detached child paid from a node whose `mem` ceiling is `ceiling`: `(parent, node, child)`.
+    fn child(ceiling: i64) -> (Host, u32, Host) {
+        let mut parent = Host::new();
+        let budget = parent.grant_budget(-1, ceiling, -1);
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        (parent, node, child)
+    }
+
+    fn used(host: &Host, node: u32) -> i64 {
+        host.budgets.used(node, BUDGET_MEM)
+    }
+
+    fn create(reg: &FiberRegistry, charge: LiveFiber) -> Result<i64, Trap> {
+        reg.create(0, 0, MAX_FIBERS, false, ShadowArena::EMPTY, charge)
+    }
+
+    #[test]
+    fn a_fiber_spends_mem_until_it_returns_or_its_registry_goes() {
+        let (parent, node, child) = child(2 * FIBER);
+        let reg = FiberRegistry::new();
+        let a = create(&reg, child.fiber_charge().expect("room")).expect("slot");
+        let _b = create(&reg, child.fiber_charge().expect("room")).expect("slot");
+        assert_eq!(used(&parent, node), 2 * FIBER);
+        assert!(
+            child.fiber_charge().is_none(),
+            "a third is past the ceiling, and charges nothing"
+        );
+        assert_eq!(used(&parent, node), 2 * FIBER);
+        let (slot, _) = reg.claim(a).expect("claim");
+        reg.finish(slot);
+        assert_eq!(
+            used(&parent, node),
+            FIBER,
+            "a returned fiber hands its charge back"
+        );
+        drop(reg);
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "and the registry, the one left unfinished"
+        );
+    }
+
+    #[test]
+    fn a_thaw_charges_the_fibers_it_recreates_again() {
+        let (parent, node, child) = child(FIBER);
+        let reg = FiberRegistry::new();
+        reg.seed_frozen(0, 0, 0, 0, false, child.fiber_recharge());
+        reg.seed_free(1);
+        assert_eq!(
+            used(&parent, node),
+            FIBER,
+            "a frozen fiber, not a free slot"
+        );
+        reg.seed_frozen(0, 0, 0, 0, false, child.fiber_recharge());
+        assert_eq!(
+            used(&parent, node),
+            2 * FIBER,
+            "past the ceiling: the fiber lived before the freeze"
+        );
+        drop(reg);
+        assert_eq!(used(&parent, node), 0);
+    }
+
+    /// Until #2113 meters the root, a root's fibers charge the run's own node, which has no ceiling
+    /// and which no guest reads.
+    #[test]
+    fn a_roots_fibers_charge_the_runs_own_node() {
+        let root = Host::new();
+        let reg = FiberRegistry::new();
+        create(&reg, root.fiber_charge().expect("no ceiling")).expect("slot");
+        assert_eq!(used(&root, root.own_budget), FIBER);
+        drop(reg);
+        assert_eq!(used(&root, root.own_budget), 0);
     }
 }
 

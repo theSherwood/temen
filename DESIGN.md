@@ -1751,8 +1751,10 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   (~ns, no syscall, no flush). **Free and uncapped, but quota-metered:** the data
   stack is guest memory; the control stack is out-of-band yet its pages are
   **charged against the guest's memory quota** (§15). So a fiber-bomb OOMs *itself*
-  (sandbox-safe) — it cannot exhaust *host* memory via out-of-band stacks. The unit
-  of *concurrency*. (`setjmp`/`longjmp` and C++ EH lower onto this switch — §3d.)
+  (sandbox-safe) — it cannot exhaust *host* memory via out-of-band stacks. (#2112:
+  each live fiber is a fixed `FIBER_STACK`, 256 KiB, of its domain's `Budget.mem` on
+  every engine; INVARIANTS #3.) The unit of *concurrency*. (`setjmp`/`longjmp` and
+  C++ EH lower onto this switch — §3d.)
 - **vCPU** — a capability to run on a physical core, granted with a quota from the
   domain's core-set (§9). Each is an OS thread the host scheduler runs. **Capped**
   — real cores, so resource metering + Spectre core-isolation apply. The unit of

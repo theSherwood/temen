@@ -100,16 +100,20 @@ embedder's and is charged to nothing, and the Cranelift JIT charges nothing to t
 which no guest reads (#2113 tracks both). A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
 region a guest mints is charged there too, its bytes, until no domain holds it; a domain a budget paid
-for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111). A freeze carries no node's `channel` use: the thaw re-charges each
-pipe and region it rebuilds to the thawing root. An
-exec keeps its domain's node, so a child cannot exec its way out of its budget.
+for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111). A
+fiber `cont.new` makes is `FIBER_STACK` (256 KiB) of its domain's `mem` while it lives: charged to
+the domain's node and every ancestor, `FiberFault` past a ceiling, and handed back when the fiber
+returns or its domain ends. A freeze hands it back as it flattens the fiber, and the thaw re-charges
+each fiber it re-creates, as threads (#2112). A fiber the runtime makes to serve a dispatch is
+mechanism, charged to nothing. A freeze carries no node's `channel` use: the thaw re-charges each
+pipe and region it rebuilds to the thawing root. An exec keeps its domain's node, so a child cannot
+exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
 its grant the embedder's. The gaps are tracked, not exceptions: the root's own use and `Limits`
-(#2113), fibers (#2112), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused
-after its admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel
-(#1997).
+(#2113), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused after its
+admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

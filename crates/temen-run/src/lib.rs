@@ -3047,7 +3047,8 @@ unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
 }
 
 /// #1944 slice 3 — a budget node as the JIT sees it: a [`temen_jit::FuelCell`] draws from it and
-/// hands back what it did not burn, and a domain charges its threads to it (#2001).
+/// hands back what it did not burn, and a domain charges its threads (#2001) and fibers (#2112) to
+/// it.
 struct HostNode(temen_interp::NodeRef);
 
 impl temen_jit::BudgetNode for HostNode {
@@ -3068,6 +3069,15 @@ impl temen_jit::BudgetNode for HostNode {
     }
     fn vcpu_ended(&self) {
         self.0.vcpu_ended()
+    }
+    fn charge_fiber(&self) -> bool {
+        self.0.charge_fiber()
+    }
+    fn force_fiber(&self) {
+        self.0.force_fiber()
+    }
+    fn fiber_ended(&self) {
+        self.0.fiber_ended()
     }
 }
 

@@ -118,7 +118,7 @@ const MAX_FIBERS: usize = 1 << 24;
 /// the host's address space — on Windows the reservation is **eager-committed**, so the per-fiber cost
 /// is real RAM, not lazy VA (ISSUES.md I1). A reservation that the OS still refuses surfaces as a
 /// `FiberFault`, never an abort, via the fallible `temen_fiber::Fiber::new`.
-const FIBER_STACK: usize = 1 << 18;
+const FIBER_STACK: usize = temen_ir::FIBER_STACK as usize;
 
 // ---- Durable per-fiber shadow-stack layout (DURABILITY.md §12.8, D-fiber-cont option A) ----
 //
@@ -383,6 +383,47 @@ struct TableState {
     /// **up** from context 1; a child's bit is freed when it finishes, so the bound is *peak
     /// concurrent* vCPUs. Only touched on a durable run (state ≠ NORMAL ⇒ single-worker).
     vcpu_mask: u64,
+    /// #2112 — per slot: its fiber's charge on the domain's node, handed back when the fiber returns
+    /// ([`SharedFiberTable::free_slot`]) or its domain ends ([`SharedFiberTable::release_charges`]).
+    /// Grows with `slots` (same index), as the interpreter registry's charges do.
+    charges: Vec<FiberCharge>,
+}
+
+/// #2112 — what a live fiber holds of its domain's `mem`: [`temen_ir::FIBER_STACK`] on the domain's
+/// node and every ancestor, handed back when this is dropped. Holds nothing in a domain with no node
+/// (a run's own, until #2113 meters the root).
+struct FiberCharge(Option<Arc<dyn crate::BudgetNode>>);
+
+impl FiberCharge {
+    /// Charge `node`'s chain, all or nothing: `None`, with nothing charged, when a level's `mem` is
+    /// full.
+    fn charge(node: &Option<Arc<dyn crate::BudgetNode>>) -> Option<FiberCharge> {
+        match node {
+            Some(n) => n.charge_fiber().then(|| FiberCharge(Some(Arc::clone(n)))),
+            None => Some(FiberCharge(None)),
+        }
+    }
+
+    /// [`Self::charge`] past any ceiling: a fiber a thaw re-creates, which lived before the freeze.
+    fn force(node: &Option<Arc<dyn crate::BudgetNode>>) -> FiberCharge {
+        if let Some(n) = node {
+            n.force_fiber();
+        }
+        FiberCharge(node.clone())
+    }
+
+    /// One that holds no charge: a free slot's.
+    fn none() -> FiberCharge {
+        FiberCharge(None)
+    }
+}
+
+impl Drop for FiberCharge {
+    fn drop(&mut self) {
+        if let Some(n) = &self.0 {
+            n.fiber_ended();
+        }
+    }
 }
 
 pub(crate) struct SharedFiberTable {
@@ -395,19 +436,28 @@ pub(crate) struct SharedFiberTable {
     /// The module-declared shadow arena (INVARIANTS.md #16) — where this domain's per-context
     /// shadow regions sit; every placement question in this runtime is answered from it.
     pub(crate) shadow: ShadowArena,
+    /// #2112 — the budget node this domain's fibers are charged to: a detached child's own. `None`
+    /// for a run's own domain, as for its threads (#2113), and for a carve child's (#1867).
+    node: Option<Arc<dyn crate::BudgetNode>>,
 }
 
 impl SharedFiberTable {
-    pub(crate) fn new(max_fibers: usize, shadow: ShadowArena) -> SharedFiberTable {
+    pub(crate) fn new(
+        max_fibers: usize,
+        shadow: ShadowArena,
+        node: Option<Arc<dyn crate::BudgetNode>>,
+    ) -> SharedFiberTable {
         SharedFiberTable {
             state: Mutex::new(TableState {
                 slots: Vec::new(),
                 free: BinaryHeap::new(),
                 vcpu_mask: 0,
+                charges: Vec::new(),
             }),
             max_fibers: max_fibers.clamp(1, MAX_FIBERS),
             next_owner: AtomicU64::new(0),
             shadow,
+            node,
         }
     }
 
@@ -463,8 +513,9 @@ impl SharedFiberTable {
     /// generation. **Recycling (step 3):** the lowest freed slot is reused — its `Ownership` replaced
     /// at the kept (bumped) generation, so a stale handle to its former occupant still fails
     /// `claim_gen` — and only when none is free does the table grow. `None` if a racing allocation
-    /// filled the domain quota since [`Self::has_room`].
-    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64) -> Option<i64> {
+    /// filled the domain quota since [`Self::has_room`]. `charge` is the fiber's
+    /// ([`Self::fiber_charge`]), held while the slot is its; a refusal drops it, handing it back.
+    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64, charge: FiberCharge) -> Option<i64> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         if reuse.is_none() && t.slots.len() + 1 >= self.max_fibers {
@@ -494,16 +545,37 @@ impl SharedFiberTable {
         if reuse.is_some() {
             t.free.pop();
             t.slots[slot] = new_slot;
+            t.charges[slot] = charge;
         } else {
             t.slots.push(new_slot);
+            t.charges.push(charge);
         }
         Some(fiber_handle(slot, generation))
     }
 
     /// Return a finished slot to the free list (recycling step 3); its generation was bumped by
-    /// [`Ownership::finish`], so a later `cont.new` may reuse it ABA-safely.
+    /// [`Ownership::finish`], so a later `cont.new` may reuse it ABA-safely. Its fiber's charge goes
+    /// back (#2112).
     fn free_slot(&self, slot: usize) {
-        self.lock().free.push(Reverse(slot));
+        let mut t = self.lock();
+        t.free.push(Reverse(slot));
+        t.charges[slot] = FiberCharge::none();
+    }
+
+    /// #2112 — the charge for a fiber this domain's `cont.new` makes: [`temen_ir::FIBER_STACK`] of
+    /// `mem` on its node and every ancestor, all or nothing. `None` past a ceiling, where `cont.new`
+    /// traps `FiberFault`.
+    fn fiber_charge(&self) -> Option<FiberCharge> {
+        FiberCharge::charge(&self.node)
+    }
+
+    /// #2112 — this table's domain has ended: each fiber still live hands its charge back now, not
+    /// when the last reference to the table goes, so whoever learns of the end (a joining parent)
+    /// finds the budget whole. Its slots stay as they are.
+    pub(crate) fn release_charges(&self) {
+        for c in self.lock().charges.iter_mut() {
+            *c = FiberCharge::none();
+        }
     }
 }
 
@@ -623,6 +695,10 @@ impl SharedFiberTable {
             consumed: AtomicBool::new(consumed), // #1538: delivers at its rewound suspend
             pending: Mutex::new(None),
         }));
+        // #2112 — the fiber handed its charge back as the freeze flattened it, or as its domain
+        // ended.
+        let charge = FiberCharge::force(&self.node);
+        t.charges.push(charge);
         slot
     }
 
@@ -644,6 +720,7 @@ impl SharedFiberTable {
             pending: Mutex::new(None),
             park_on: Mutex::new(ParkOn::Event),
         }));
+        t.charges.push(FiberCharge::none());
         t.free.push(Reverse(slot));
         slot
     }
@@ -989,7 +1066,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
         fault(trap_out);
         return -1;
     }
-    let (mask, type_id, call_tramp) = {
+    let (mask, type_id, call_tramp, charge) = {
         let rt = &*rt;
         // Quota pre-check **before** the stack mmap, so a fiber-bomb is a clean `FiberFault` that
         // never exhausts the OS map limit. (`create` re-checks under the table lock — a racing
@@ -998,11 +1075,18 @@ pub(crate) unsafe extern "C" fn fiber_new(
             fault(trap_out);
             return -1;
         }
+        // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives, charged before
+        // its stack is mapped, as the quota is checked. A failure below drops it, handing it back.
+        let Some(charge) = rt.table.fiber_charge() else {
+            fault(trap_out);
+            return -1;
+        };
         (
             rt.fn_table_mask,
             rt.fiber_type_id,
             rt.call_tramp
                 .expect("call-trampoline set before any fiber runs"),
+            charge,
         )
     };
 
@@ -1026,7 +1110,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
     };
 
     let rt = &*rt;
-    match rt.table.create(Box::new(fiber), funcref, sp as i64) {
+    match rt.table.create(Box::new(fiber), funcref, sp as i64, charge) {
         Some(handle) => handle,
         None => {
             fault(trap_out); // a sibling vCPU filled the domain quota since the pre-check
@@ -1906,7 +1990,7 @@ mod vcpu_ctx_tests {
     // free-then-reuse (recycling) and a thaw-seed — the JIT mirror of the interp registry's `vcpu_mask`.
     #[test]
     fn reserve_is_top_down_and_recycles() {
-        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA);
+        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA, None);
         // Spawned vCPUs grow down from the highest fitting context.
         let top = top_ctx();
         assert_eq!(t.reserve_vcpu_context(), Some(top));
@@ -1927,7 +2011,7 @@ mod vcpu_ctx_tests {
     // post-thaw spawn reuses the freed gap while still avoiding the re-attached siblings (no collision).
     #[test]
     fn thaw_seed_with_gaps_reuses_the_recycled_context() {
-        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA);
+        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA, None);
         let top = top_ctx();
         let (hi, mid, lo) = (top, top - 1, top - 2);
         // Re-attach two live children at `hi` and `lo`; `mid` is the recycled gap between them.
@@ -1947,7 +2031,7 @@ mod vcpu_ctx_tests {
 
     #[test]
     fn reserve_exhausts_cleanly() {
-        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA);
+        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA, None);
         // A fresh table has no fibers, so every non-root context up to the arena's ceiling is free.
         let fitting = TEST_ARENA.ctx_ceiling();
         for _ in 0..fitting {
@@ -1975,7 +2059,7 @@ mod flatten_claim_tests {
     /// resume of the same handle still faults.
     #[test]
     fn a_flattening_resume_that_loses_its_claim_skips_the_fiber() {
-        let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY));
+        let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
         let slot = table.seed_free(1);
         let snapshot = fiber_handle(slot, 0);
         let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));

@@ -52,8 +52,8 @@ use temen_ir::{
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
-    LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue, WindowSpec,
-    DEFAULT_RESERVED_LOG2,
+    LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, Trap, Value, VarValue,
+    WindowSpec, DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -3933,7 +3933,7 @@ pub struct Vcpu<'p> {
     vt: VTask,
     fibers: Vec<FiberState>,
     fiber_sp: Vec<u64>,
-    fiber_meta: Vec<(i32, i64)>,
+    fiber_meta: Vec<FiberMeta>,
     mem: Option<Mem>,
     fuel: Fuel,
     host: Host,
@@ -3963,7 +3963,7 @@ pub struct Vcpu<'p> {
     /// ([`bounce_call`](Vcpu::bounce_call)) shares this registry, so a fiber parked by one callback
     /// is resumable by a later one — the same one-registry-per-invoke scope the interpreted
     /// `run_invoke` has by construction. Cleared when the invoke resolves (`deliver_jit_invoke_*`).
-    invoke_fibers: Vec<FiberState>,
+    invoke_fibers: FiberTables,
     /// The entry's initial arguments as the constructor built them — a §14 confined child's starter
     /// cap handles (`[Instantiator, AddressSpace?]`, widened to `i64`), so a host that runs the
     /// child's entry on emitted wasm (the browser's codegen path) passes exactly the handles the
@@ -4327,7 +4327,7 @@ impl<'p> Vcpu<'p> {
             prog,
             pending: None,
             pending_jit: None,
-            invoke_fibers: Vec::new(),
+            invoke_fibers: FiberTables::default(),
             entry_args: Vec::new(),
             trap: None,
             jit_eligible: None,
@@ -4381,7 +4381,7 @@ impl<'p> Vcpu<'p> {
             prog,
             pending: None,
             pending_jit: None,
-            invoke_fibers: Vec::new(),
+            invoke_fibers: FiberTables::default(),
             entry_args: args,
             trap: None,
             jit_eligible: None,
@@ -4559,6 +4559,11 @@ impl<'p> Vcpu<'p> {
             match self.shared_host {
                 Some(m) => m.lock_unpoisoned().release_memory(),
                 None => self.host.release_memory(),
+            }
+            // #2112 — and what its fibers hold, now rather than when its embedder drops this vCPU:
+            // a child's fibers are its own (never a shared registry).
+            for m in &mut self.fiber_meta {
+                m.charge = LiveFiber::none();
             }
         }
         ev
@@ -5278,7 +5283,7 @@ impl<'p> Vcpu<'p> {
     /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
     /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
     pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
-        self.invoke_fibers.clear(); // the emitted invoke resolved — its bounce registry dies with it
+        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
             panic!("deliver_jit_invoke_vals with no pending invoke");
         };
@@ -5366,11 +5371,11 @@ impl<'p> Vcpu<'p> {
                 &mut self.fuel,
                 &mut self.mem,
                 &mut cell,
-                // Invoke fibers are transient: no shadow-SP / freeze tables to keep aligned.
+                // Invoke fibers live as long as the invoke, across its bounces.
                 &mut FiberCell::Excl {
-                    fibers: &mut self.invoke_fibers,
-                    sp: &mut Vec::new(),
-                    meta: &mut Vec::new(),
+                    fibers: &mut self.invoke_fibers.fibers,
+                    sp: &mut self.invoke_fibers.sp,
+                    meta: &mut self.invoke_fibers.meta,
                 },
                 None,
                 None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
@@ -5425,7 +5430,7 @@ impl<'p> Vcpu<'p> {
     /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
     /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
     pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
-        self.invoke_fibers.clear(); // the emitted invoke resolved — its bounce registry dies with it
+        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         self.pending_jit = None;
         self.trap = Some(trap);
     }
@@ -5890,7 +5895,7 @@ fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
         host: e.host.replay_substate(),
         fuel: e.fuel.can_burn(),
         prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
-        fibers: e.fibers.clone(),
+        fibers: e.fibers.fibers.clone(),
         detached,
     })
 }
@@ -5917,11 +5922,11 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
     let table_log2 = host.jit_table_log2(); // #1296: the child's reserved install slots
     DbgEnv {
         mem,
-        host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
         program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
-        fibers: es.fibers.clone(),
+        fibers: FiberTables::restored(es.fibers.clone(), &host),
+        host,
         place: EnvPlace::Carve,
     }
 }
@@ -5948,7 +5953,7 @@ fn rebuild_detached_env(
             table,
             program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
-            fibers: Vec::new(),
+            fibers: FiberTables::default(),
             place,
         };
     };
@@ -5965,11 +5970,11 @@ fn rebuild_detached_env(
     let table_log2 = host.jit_table_log2();
     DbgEnv {
         mem: Some(mem),
-        host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
         program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
-        fibers: es.fibers.clone(),
+        fibers: FiberTables::restored(es.fibers.clone(), &host),
+        host,
         place,
     }
 }
@@ -6435,7 +6440,7 @@ enum FiberStep {
 /// another — D57 migration) and rebuilt deterministically on a reverse `seek` replay.
 fn debug_advance_fiber(
     vt: &mut VTask,
-    fibers: &mut Vec<FiberState>,
+    fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
     fuel: &mut Fuel,
@@ -6453,6 +6458,12 @@ fn debug_advance_fiber(
     if vt.active_invoke.is_some() {
         return step_active_invoke(vt, source, table, fuel, mem, host);
     }
+    // This engine never freezes, so a fiber's shadow-SP is never read; its `meta` holds its charge.
+    let FiberTables {
+        fibers,
+        sp: fiber_sp,
+        meta,
+    } = fibers;
     match vt
         .active
         .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
@@ -6464,6 +6475,9 @@ fn debug_advance_fiber(
             // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
             Some((rid, resumer, rdst)) => {
                 fibers[vt.active_id] = FiberState::Done;
+                if let Some(m) = meta.get_mut(vt.active_id) {
+                    m.charge = LiveFiber::none(); // #2112: its charge goes back
+                }
                 let retval = vals.first().copied().unwrap_or(Value::I64(0));
                 // `vcpu.tls` is the vCPU's word: it follows execution (as in `step_vcpu`).
                 let tls = vt.active.tls;
@@ -6476,6 +6490,10 @@ fn debug_advance_fiber(
             }
         },
         Ok(Outcome::ContNew { funcref, sp, dst }) => {
+            // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
+            let Some(charge) = host.fiber_charge() else {
+                return FiberStep::Trapped(Trap::FiberFault);
+            };
             if fibers.len() + 1 >= super::MAX_FIBERS {
                 return FiberStep::Trapped(Trap::FiberFault);
             }
@@ -6484,6 +6502,12 @@ fn debug_advance_fiber(
                 funcref,
                 sp,
                 consumed: false,
+            });
+            fiber_sp.push(0);
+            meta.push(FiberMeta {
+                func: funcref,
+                sp,
+                charge,
             });
             vt.active.set(dst, Reg::from_i32(h));
             FiberStep::Stepped
@@ -7207,6 +7231,16 @@ fn dbg_refund_ended_windows(
             }
         }
     }
+    // #2112 — a child domain with no task left running has ended, whatever its root did first: its
+    // fibers' registry goes, and what they hold with it, as the oracle's goes with the domain.
+    for (k, e) in envs.iter_mut().enumerate() {
+        let running = tasks
+            .iter()
+            .any(|t| t.env == Some(k) && !matches!(t.state, DbgTaskState::Done(_)));
+        if run_ended || !running {
+            e.fibers = FiberTables::default();
+        }
+    }
 }
 
 struct DbgEnv {
@@ -7220,7 +7254,7 @@ struct DbgEnv {
     fuel: Fuel,
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
     /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
-    fibers: Vec<FiberState>,
+    fibers: FiberTables,
     /// Where its window lives, which decides what a checkpoint carries of it (#1866).
     place: EnvPlace,
 }
@@ -7398,7 +7432,7 @@ pub struct ScheduledDebugRun {
     /// The root domain's §12 fiber registry (one handle namespace across its vCPUs; a fiber created on
     /// one can be resumed on another — D57). Each §14 child has its own ([`DbgEnv::fibers`]). Rebuilt
     /// deterministically on a reverse `seek` replay.
-    fibers: Vec<FiberState>,
+    fibers: FiberTables,
     fn_block_base: Vec<Vec<u32>>,
     fn_block_types: Vec<Vec<Vec<ValType>>>,
     debug: Option<DebugInfo>,
@@ -7780,7 +7814,7 @@ fn dbg_advance_task(
     tasks: &mut [DbgTask],
     ti: usize,
     extra_envs: &mut [DbgEnv],
-    fibers: &mut Vec<FiberState>,
+    fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
     fuel: &mut Fuel,
@@ -7826,7 +7860,7 @@ fn service_advance(
     tasks: &mut Vec<DbgTask>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
-    fibers: &mut Vec<FiberState>,
+    fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
     fuel: &mut Fuel,
@@ -7991,8 +8025,8 @@ fn service_advance(
             } => {
                 *turn += 1;
                 let reg = match tasks[ti].env {
-                    None => &*fibers,
-                    Some(k) => &extra_envs[k].fibers,
+                    None => &fibers.fibers,
+                    Some(k) => &extra_envs[k].fibers.fibers,
                 };
                 let roots = gc_scan(&tasks[ti].vt, reg, source, lo, hi, mask);
                 let m: &mut Option<Mem> = match tasks[ti].env {
@@ -8121,7 +8155,7 @@ fn dbg_start_child(
         // lets it burn at the spawn, where an executor's child draws from the chain as it goes
         // (#1944 slice 3).
         fuel: Fuel::fixed(fuel.can_burn()),
-        fibers: Vec::new(),
+        fibers: FiberTables::default(),
         place,
     });
     let cidx = tasks.len();
@@ -8779,7 +8813,7 @@ impl ScheduledDebugRun {
                 live: LiveVcpu::none(),
             }],
             extra_envs: Vec::new(),
-            fibers: Vec::new(),
+            fibers: FiberTables::default(),
             fn_block_base,
             fn_block_types,
             debug: m.debug_info.clone(),
@@ -9357,7 +9391,7 @@ impl ScheduledDebugRun {
                 journal,
                 tasks,
                 extra_envs,
-                fibers,
+                &fibers.fibers,
                 source,
                 host,
                 mem.as_ref(),
@@ -9579,7 +9613,7 @@ impl ScheduledDebugRun {
             journal,
             tasks,
             extra_envs,
-            fibers,
+            &fibers.fibers,
             source,
             host,
             mem.as_ref(),
@@ -9757,8 +9791,9 @@ impl ScheduledDebugRun {
         }
         if any_event_parked(
             self.fibers
+                .fibers
                 .iter()
-                .chain(self.extra_envs.iter().flat_map(|e| e.fibers.iter())),
+                .chain(self.extra_envs.iter().flat_map(|e| e.fibers.fibers.iter())),
         ) {
             return Err(Refusal::Fiber);
         }
@@ -9826,7 +9861,7 @@ impl ScheduledDebugRun {
                     live: t.live.held(),
                 })
                 .collect(),
-            fibers: self.fibers.clone(),
+            fibers: self.fibers.fibers.clone(),
             extra_envs: self
                 .extra_envs
                 .iter()
@@ -9876,7 +9911,8 @@ impl ScheduledDebugRun {
     /// rewinds in place rather than re-executing, so it installs task states **verbatim** — a run that
     /// was parked at that turn must come back parked, not silently runnable.
     fn install_continuation(&mut self, c: &ScheduledContinuation, readmit_parks: bool) {
-        self.fibers = c.fibers.clone();
+        // #2112 — each live fiber is charged again, as each live thread is below.
+        self.fibers = FiberTables::restored(c.fibers.clone(), &self.host);
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
         self.source.reset_extra(&c.extra_units);
@@ -11050,12 +11086,47 @@ enum FiberState {
 }
 
 /// The §12 fiber registry's three parallel tables — the slots, each fiber's durable shadow-SP
-/// (§12.8) and its freeze re-entry metadata — as one unit, so a shared registry locks them together.
+/// (§12.8) and its [`FiberMeta`] — as one unit, so a shared registry locks them together.
 #[derive(Default)]
 struct FiberTables {
     fibers: Vec<FiberState>,
     sp: Vec<u64>,
-    meta: Vec<(i32, i64)>,
+    meta: Vec<FiberMeta>,
+}
+
+impl FiberTables {
+    /// #2112 — the debugger's registry rebuilt from `fibers`, a checkpoint's copy of its slots: each
+    /// fiber not yet done takes its charge on `host`'s node again, past any ceiling, as a thaw's
+    /// re-created fiber does. The restore then puts back the budget tree as the checkpoint saw it,
+    /// which held these charges.
+    fn restored(fibers: Vec<FiberState>, host: &Host) -> FiberTables {
+        let meta = fibers
+            .iter()
+            .map(|f| FiberMeta {
+                func: 0,
+                sp: 0,
+                charge: match f {
+                    FiberState::Done => LiveFiber::none(),
+                    _ => host.fiber_recharge(),
+                },
+            })
+            .collect();
+        FiberTables {
+            sp: vec![0; fibers.len()],
+            meta,
+            fibers,
+        }
+    }
+}
+
+/// What a registry keeps of a fiber beside its state: its freeze re-entry metadata (DURABILITY.md
+/// §12.8) — its **resolved** entry function index and data-stack base, so the freeze driver can emit
+/// a `FrozenFiber` for it after it parks — and #2112 its charge on the node of the domain whose
+/// `cont.new` made it, handed back when it returns or the registry goes.
+struct FiberMeta {
+    func: i32,
+    sp: i64,
+    charge: LiveFiber,
 }
 
 /// A **run-shared** §12 fiber registry for vCPUs on separate OS threads or Web Workers (#1761): one
@@ -11082,7 +11153,7 @@ enum FiberCell<'a> {
     Excl {
         fibers: &'a mut Vec<FiberState>,
         sp: &'a mut Vec<u64>,
-        meta: &'a mut Vec<(i32, i64)>,
+        meta: &'a mut Vec<FiberMeta>,
     },
     Shared(&'a SharedFibers),
 }
@@ -11092,7 +11163,7 @@ impl FiberCell<'_> {
     #[inline]
     fn with<R>(
         &mut self,
-        f: impl FnOnce(&mut Vec<FiberState>, &mut Vec<u64>, &mut Vec<(i32, i64)>) -> R,
+        f: impl FnOnce(&mut Vec<FiberState>, &mut Vec<u64>, &mut Vec<FiberMeta>) -> R,
     ) -> R {
         match self {
             FiberCell::Excl { fibers, sp, meta } => f(fibers, sp, meta),
@@ -11387,7 +11458,7 @@ fn shadow_switch(
 fn freeze_drive(
     fibers: &mut Vec<FiberState>,
     fiber_sp: &mut Vec<u64>,
-    fiber_meta: &mut Vec<(i32, i64)>,
+    fiber_meta: &mut Vec<FiberMeta>,
     dom: &Domain,
     ctx: &mut RunCtx,
     budget: u64,
@@ -11474,7 +11545,7 @@ fn freeze_drive(
                 continue;
             }
         };
-        let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
+        let (func, sp) = fiber_meta.get(slot).map_or((0, 0), |m| (m.func, m.sp));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
             m.durable_set_sp(arena.region_base(slot + 1), arena.frame_base(slot + 1));
@@ -11829,7 +11900,12 @@ fn drive_nested(
                 None => return Ok(vals),
                 // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` back.
                 Some((rid, resumer, rdst)) => {
-                    fibers.with(|f, _, _| f[active_id] = FiberState::Done);
+                    fibers.with(|f, _, meta| {
+                        f[active_id] = FiberState::Done;
+                        if let Some(m) = meta.get_mut(active_id) {
+                            m.charge = LiveFiber::none(); // #2112: its charge goes back
+                        }
+                    });
                     let retval = vals.first().copied().unwrap_or(Value::I64(0));
                     // `vcpu.tls` is the vCPU's word: it follows execution (as in `step_vcpu`).
                     let tls = active.tls;
@@ -11892,14 +11968,14 @@ fn drive_nested(
                 return Ok(Vec::new());
             }
             Outcome::ContNew { funcref, sp, dst } => {
-                // Run-registry mode (#880): keep the parallel arrays index-aligned with the run's
-                // (`step_vcpu`'s ContNew arm, minus the durable shadow bookkeeping — see the
-                // `run_meta` doc above).
-                let run_level = run_meta.is_some();
+                // The registry's parallel arrays stay index-aligned (`step_vcpu`'s ContNew arm,
+                // minus the durable shadow bookkeeping — see the `run_meta` doc above).
                 let arena = mem
                     .as_ref()
                     .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
                 let func_idx = (funcref as u32 as usize & source.primary().table_mask) as i32;
+                // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
+                let charge = host.with(|h| h.fiber_charge()).ok_or(Trap::FiberFault)?;
                 let h = fibers
                     .with(|f, fsp, meta| {
                         if f.len() + 1 >= super::MAX_FIBERS {
@@ -11911,10 +11987,12 @@ fn drive_nested(
                             sp,
                             consumed: false,
                         });
-                        if run_level {
-                            fsp.push(arena.frame_base(h + 1));
-                            meta.push((func_idx, sp));
-                        }
+                        fsp.push(arena.frame_base(h + 1));
+                        meta.push(FiberMeta {
+                            func: func_idx,
+                            sp,
+                            charge,
+                        });
                         Some(h as i32)
                     })
                     .ok_or(Trap::FiberFault)?;
@@ -12477,13 +12555,15 @@ fn step_vcpu(
                     let frozen = fibers.with(|f, sp, meta| {
                         let frozen = frozen && sp[id] > base;
                         f[id] = if frozen {
-                            let (funcref, sp) = meta[id];
                             FiberState::Pending {
-                                funcref,
-                                sp,
+                                funcref: meta[id].func,
+                                sp: meta[id].sp,
                                 consumed: false,
                             }
                         } else {
+                            if let Some(m) = meta.get_mut(id) {
+                                m.charge = LiveFiber::none(); // #2112: its charge goes back
+                            }
                             FiberState::Done
                         };
                         frozen
@@ -12517,6 +12597,11 @@ fn step_vcpu(
                 // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
                 // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
                 let func_idx = (funcref as u32 as usize & dom.source.primary().table_mask) as i32;
+                // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
+                let charge = ctx
+                    .host
+                    .with(|h| h.fiber_charge())
+                    .ok_or(Trap::FiberFault)?;
                 let h = fibers
                     .with(|f, fsp, meta| {
                         if f.len() + 1 >= super::MAX_FIBERS {
@@ -12529,7 +12614,11 @@ fn step_vcpu(
                             consumed: false,
                         });
                         fsp.push(arena.frame_base(h + 1));
-                        meta.push((func_idx, sp));
+                        meta.push(FiberMeta {
+                            func: func_idx,
+                            sp,
+                            charge,
+                        });
                         Some(h as i32)
                     })
                     .ok_or(Trap::FiberFault)?;
@@ -13168,11 +13257,11 @@ impl TaskSlot {
 /// 2026-09-29). Run at the top of every scheduling round, so the refund lands before any task runs
 /// again. `run_ended`: the run is over, which ends every child still live too, as the oracle's
 /// teardown reaps it ([`CoopSched::pump`]): its window goes back, and what each child domain's window
-/// holds ([`Host::release_memory`], #2006).
+/// and fibers hold ([`Host::release_memory`], #2006, #2112).
 fn refund_ended_windows(
     tasks: &mut [TaskSlot],
     host: &mut Host,
-    envs: &[ChildEnv],
+    envs: &mut [ChildEnv],
     run_ended: bool,
 ) {
     for t in tasks.iter_mut() {
@@ -13185,6 +13274,7 @@ fn refund_ended_windows(
     if run_ended {
         for e in envs {
             e.host.lock_unpoisoned().release_memory();
+            e.fibers = FiberTables::default();
         }
     }
 }
@@ -13764,7 +13854,7 @@ struct CoopSched {
     fiber_sp: Vec<u64>,
     /// Freeze residue (DURABILITY.md §12.8): each fiber's `(resolved entry func index, data-stack
     /// base)` — what a [`super::FrozenFiber`] needs after the fiber parks. Parallel to `fibers`.
-    fiber_meta: Vec<(i32, i64)>,
+    fiber_meta: Vec<FiberMeta>,
     /// §12 teardown: child envs already torn down by a member's trap/exit (D37 death-is-revocation).
     dead_envs: std::collections::BTreeSet<usize>,
     /// FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned).
@@ -13824,7 +13914,7 @@ struct CoopSched {
     /// so an invoke's fibers die with it, exactly as the interpreted `run_invoke`'s loop-local registry
     /// does. A tier-up region's bounces use the run-level `fibers` instead (a parked fiber persists for
     /// the run to resume). Empty except during an outstanding invoke; always empty on the native `drive`.
-    invoke_fibers: Vec<FiberState>,
+    invoke_fibers: FiberTables,
     /// #1122 route (a) — when set, an all-parked, externally-wakeable settle yields
     /// [`CoopStep::Idle`] to the driver instead of blocking on the #1122 doorbell (see
     /// [`CoopRun::set_suspend_on_idle`]). Off on the native `drive` and the blocking browser session.
@@ -13936,7 +14026,7 @@ impl CoopSched {
         // Freeze residue (DURABILITY.md §12.8): each fiber's `(resolved entry func index, data-stack base)`
         // — what a [`super::FrozenFiber`] needs after the fiber parks (when its `Pending` `funcref`/`sp` are
         // gone). Parallel to `fibers`. Inert on a non-durable run.
-        let mut fiber_meta: Vec<(i32, i64)> = Vec::new();
+        let mut fiber_meta: Vec<FiberMeta> = Vec::new();
         // Thaw seeding (DURABILITY.md §12.8 slice 3.1.5): a `REWINDING` run re-creates the fibers a freeze
         // flattened *before* the root re-enters, so the root's re-issued `cont.resume` names the same dense
         // handles (0, 1, …) and each fiber's saved shadow-SP is back in `fiber_sp` for the swap to re-point
@@ -13965,7 +14055,16 @@ impl CoopSched {
                     }
                 });
                 fiber_sp.push(ff.shadow_sp);
-                fiber_meta.push((ff.func, ff.sp));
+                // #2112 — a live fiber handed its charge back as the freeze flattened it.
+                fiber_meta.push(FiberMeta {
+                    func: ff.func,
+                    sp: ff.sp,
+                    charge: if ff.is_free() {
+                        LiveFiber::none()
+                    } else {
+                        host.fiber_recharge()
+                    },
+                });
             }
         }
         let clock: u64 = 0;
@@ -14019,7 +14118,7 @@ impl CoopSched {
             slot_units: vec![None; 1usize << host.jit_table_log2()],
             table_gen: 0,
             // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
-            invoke_fibers: Vec::new(),
+            invoke_fibers: FiberTables::default(),
             suspend_on_idle: false,
             slice_left: None,
             freeze_on_quiesce: host.is_durable()
@@ -14054,7 +14153,7 @@ impl CoopSched {
             Err(_) => true,
         };
         if ended {
-            refund_ended_windows(&mut self.tasks, host, &self.extra_envs, true);
+            refund_ended_windows(&mut self.tasks, host, &mut self.extra_envs, true);
         }
         step
     }
@@ -16224,7 +16323,7 @@ impl CoopSched {
     /// the invoking task's frame via `pending_jit`). A short reply traps the task.
     fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
         // #926 slice 2g: the emitted invoke resolved — its bounce registry dies with it (Vcpu parity).
-        self.invoke_fibers.clear();
+        self.invoke_fibers = FiberTables::default();
         let (ti, dst, results) = self
             .pending_jit
             .take()
@@ -16245,7 +16344,7 @@ impl CoopSched {
     /// [`deliver_tierup_trap`](Self::deliver_tierup_trap)).
     fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
         // #926 slice 2g: the emitted invoke resolved (trapped) — its bounce registry dies with it.
-        self.invoke_fibers.clear();
+        self.invoke_fibers = FiberTables::default();
         let (ti, _dst, _results) = self
             .pending_jit
             .take()
@@ -16881,16 +16980,15 @@ impl CoopRun {
                 Some((_, TierUpDst::Entry { parks: true }, _))
             );
         let mut parked = None;
-        // The registry `coop_bounce` threads into `drive_nested`: invoke-confined (`invoke_fibers`, no
-        // shadow-SP/freeze halves — invoke fibers are transient) during an emitted `Jit.invoke`, else the
-        // run-level registry with its parallel arrays. One of the two `match` arms below moves it.
-        let (mut scratch_sp, mut scratch_meta) = (Vec::new(), Vec::new());
+        // The registry `coop_bounce` threads into `drive_nested`: invoke-confined (`invoke_fibers`,
+        // which lives as long as the invoke, across its bounces) during an emitted `Jit.invoke`, else
+        // the run-level registry. One of the two `match` arms below moves it.
         let (mut bounce_fibers, bounce_meta): (FiberCell, Option<BounceRunCtx<'_>>) = if in_invoke {
             (
                 FiberCell::Excl {
-                    fibers: invoke_fibers,
-                    sp: &mut scratch_sp,
-                    meta: &mut scratch_meta,
+                    fibers: &mut invoke_fibers.fibers,
+                    sp: &mut invoke_fibers.sp,
+                    meta: &mut invoke_fibers.meta,
                 },
                 None,
             )
@@ -17211,6 +17309,85 @@ mod par_futex_tests {
 /// (#1975), on every driver that schedules the child itself. A guest cannot reach the cap cheaply
 /// (`MAX_VCPUS` live vCPUs, an OS thread each on the parallel driver), so each driver's scheduling
 /// step is called directly with its live count full.
+/// #2112 — the debug scheduler ends a child domain when its last task ends, not when its root does,
+/// as the oracle ends a domain with its last vCPU: a thread still running may resume the fibers its
+/// root left, so they stay, and stay charged, until it ends too.
+#[cfg(test)]
+mod dbg_domain_end_tests {
+    use super::*;
+
+    fn task(state: DbgTaskState) -> DbgTask {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
+        DbgTask {
+            vt: VTask::new(&unit, 0, &[]).expect("task"),
+            threads: Vec::new(),
+            env: Some(0),
+            state,
+            at_bp: false,
+            lease: None,
+            live: LiveVcpu::none(),
+        }
+    }
+
+    /// A detached child whose root has returned, its window's lease with it, while its thread runs.
+    #[test]
+    fn a_childs_fibers_stay_while_a_thread_runs_and_go_with_its_last_task() {
+        const WINDOW: u64 = 1 << 16;
+        let mut parent = Host::new();
+        let budget = parent.grant_budget(-1, -1, -1);
+        parent
+            .admit_detached_spawn(budget, WINDOW)
+            .expect("admitted");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        let mut fibers = FiberTables::default();
+        fibers.fibers.push(FiberState::Pending {
+            funcref: 0,
+            sp: 0,
+            consumed: false,
+        });
+        fibers.sp.push(0);
+        fibers.meta.push(FiberMeta {
+            func: 0,
+            sp: 0,
+            charge: child.fiber_charge().expect("room"),
+        });
+        let mut envs = vec![DbgEnv {
+            mem: None,
+            host: child,
+            table: build_table_for(1, 0, 0),
+            program: 0,
+            fuel: Fuel::fixed(0),
+            fibers,
+            place: EnvPlace::Detached { spawner: None },
+        }];
+        let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
+        let done = || DbgTaskState::Done(Ok(Vec::new()));
+        let mut tasks = vec![task(done()), task(DbgTaskState::Runnable)];
+        tasks[0].lease = Some((None, budget, WINDOW));
+        dbg_refund_ended_windows(&mut tasks, &mut parent, &mut envs, false);
+        assert_eq!(
+            envs[0].fibers.fibers.len(),
+            1,
+            "a thread runs on: the fiber stays"
+        );
+        assert_eq!(
+            held(&parent),
+            temen_ir::FIBER_STACK as i64,
+            "the window went back, the fiber's charge stays"
+        );
+        tasks[1].state = done();
+        dbg_refund_ended_windows(&mut tasks, &mut parent, &mut envs, false);
+        assert!(
+            envs[0].fibers.fibers.is_empty(),
+            "its last task ended, and the domain with it"
+        );
+        assert_eq!(held(&parent), 0, "its fiber's charge went back");
+    }
+}
+
 #[cfg(test)]
 mod live_cap_tests {
     use super::*;
@@ -18589,7 +18766,7 @@ fn par_start_child<'scope, 'env>(
                 &child_dom,
                 &child_reg,
                 std::sync::Arc::clone(&child_host),
-                child_par,
+                std::sync::Arc::clone(&child_par),
                 None,
                 vt,
                 mem,
@@ -18597,12 +18774,13 @@ fn par_start_child<'scope, 'env>(
             )
         });
         // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends, and (#1909) what
-        // its window held.
+        // its window held, and (#2112) its fibers, whose registry the spawner's domain keeps for a kill.
         {
             let mut h = child_host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
         }
+        *child_par.fibers.0.lock_unpoisoned() = FiberTables::default();
         // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
         // the result is published, so a joiner sees the refund.
         if let Some((parent, budget, bytes)) = lease {

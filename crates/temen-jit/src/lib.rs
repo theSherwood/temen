@@ -3419,6 +3419,7 @@ impl CompiledModule {
                 Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
                     quota.max_fibers,
                     shadow,
+                    None,
                 )))
             } else {
                 None
@@ -5388,6 +5389,7 @@ impl CompiledModule {
                 let t = std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
                     quota.max_fibers,
                     self.shadow,
+                    None,
                 ));
                 self.fiber_table = Some(std::sync::Arc::clone(&t));
                 t
@@ -5485,6 +5487,7 @@ impl CompiledModule {
             self.fiber_table = Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
                 quota.max_fibers,
                 self.shadow,
+                None,
             )));
         }
         // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). Spawned

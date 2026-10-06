@@ -3985,6 +3985,11 @@ pub const POWERBOX_HEAP_RESERVE: u64 = 8 << 20;
 /// stack backend removed the `vm.max_map_count` VMA wall that used to bind concurrency lower.
 pub const MAX_FIBERS: usize = 1 << 24;
 
+/// #2112 — what a live fiber holds of its domain's `Budget.mem`: the JIT's fiber stack, 256 KiB. Every
+/// engine charges it for each fiber `cont.new` makes, whatever the fiber's real footprint there (an
+/// interpreter's continuation is smaller), so a budget reads the same on every engine.
+pub const FIBER_STACK: u64 = 1 << 18;
+
 /// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
 /// `ThreadFault` past it. Every engine bounds the run's *concurrently live* vCPUs, the root among
 /// them, so a spawn-join loop never trips it.

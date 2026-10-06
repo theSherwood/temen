@@ -869,7 +869,7 @@ fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &temen_ir::Module) ->
 
 /// Each of `runs`' thaws of `art` that does not answer `answer`, described: what the thaw returns
 /// and writes. `runs` are the engines that run the tree at all: one of them refusing the thaw is
-/// wrong too.
+/// wrong too, and so is a thaw that ends with its budget still holding a charge (#2112).
 fn nest_thaws(
     art: &[u8],
     froze: Engine,
@@ -883,7 +883,21 @@ fn nest_thaws(
     for &thaws in runs {
         let (mut host, win) = nest_restore(art, root, nest);
         match nest_run(thaws, root, args, &win, &mut host, None) {
-            Some((r, out, _)) if (r, out.as_str()) == answer => {}
+            Some((r, out, _)) if (r, out.as_str()) == answer => {
+                // #2112 — what the thaw re-charged went back as the tree ended: a cut that carried a
+                // charge the thaw takes again would leave it held.
+                let held: Vec<_> = host
+                    .capture_durable_budgets()
+                    .iter()
+                    .map(|n| (n.used.mem, n.used.spawn))
+                    .filter(|&u| u != (0, 0))
+                    .collect();
+                if !held.is_empty() {
+                    wrong.push(format!(
+                        "frozen on {froze:?}, thawed on {thaws:?}: the budget still holds {held:?}"
+                    ));
+                }
+            }
             Some((r, out, _)) => wrong.push(format!(
                 "frozen on {froze:?}, thawed on {thaws:?}: {r:?}, writing {out:?}"
             )),
