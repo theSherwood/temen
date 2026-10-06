@@ -1241,9 +1241,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    **no difference** in an A/B: Lua's 5M-loop ran 16.9 s (relooper) vs 16.8 s (dispatcher). Control-flow
    shape is irrelevant to V8 here; the cost is the giant function itself. So the relooper was reverted.
    *(Revisited in #2099: the result holds for one giant interpreter loop, not for programs of many
-   functions. A stackifier over the dominator tree made nimony's `hexer d` 1.5× faster in Chromium —
-   1.33–1.39 s vs 1.92–2.24 s warm — and is now the emitter's lowering for reducible CFGs, the
-   dispatcher its fallback.)*
+   functions. A stackifier over the dominator tree made nimony's `hexer d` 1.7× faster in Chromium —
+   2.65–3.02 s vs 4.72–5.67 s warm, with #2105 from the same PR — and is now the emitter's lowering
+   for reducible CFGs, the dispatcher its fallback.)*
    (The per-demo wasm-JIT toggle for the module demos has since landed anyway — `play.js`, proven by
    `browser-play-editor-test.mjs` — with the caveat above still true: light scripts run net *slower*
    under the JIT, since the emit/setup overhead isn't repaid.)
