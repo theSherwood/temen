@@ -14,12 +14,14 @@
 //!
 //! This test plays the relocating host directly: the `env.call_interp` stub moves the whole window
 //! to a second base, republishes it, and returns. The emitted leaf's post-bounce store must land at
-//! the new base and **not** at the old one — the assertion that fails without the reload.
+//! the new base and **not** at the old one — the assertion that fails without the reload. It runs the
+//! bounce twice over: through a direct `call`, and through `call.dyn`, whose table slot holds the
+//! driver's bounce shim (#2118: the indirect call once skipped the reload).
 
 use temen_wasm_jit::compile_module_tierup_b2;
 use wasmi::{
-    Caller, Engine, FuncRef, Global, Linker, Memory, MemoryType, Module as WModule, Store, Table,
-    TableType, Val,
+    Caller, Engine, Func, FuncRef, Global, Linker, Memory, MemoryType, Module as WModule, Store,
+    Table, TableType, Val,
 };
 
 /// The window's first home in the mirrored linear memory, and the second one it moves to. Far apart
@@ -98,7 +100,26 @@ struct Bounce {
 
 #[test]
 fn an_emitted_frame_follows_the_window_across_a_relocating_bounce() {
-    let m = temen_text::parse_module(SRC).expect("parse");
+    follows_a_relocating_bounce(SRC);
+}
+
+/// The same bounce reached through `call.dyn`: slot 2 of the shared table holds func 2's cross-tier
+/// trampoline, which bounces exactly as the direct `call 2` does. An indirect call is a call that can
+/// run guest code like any other, so the caller must reload its window after it too.
+#[test]
+fn an_emitted_frame_follows_the_window_across_a_relocating_indirect_bounce() {
+    let src = SRC.replace(
+        "  vh = call 2 (v0)\n",
+        "  vslot = i32.const 2\n  vh = call.dyn (i64) -> (i64) vslot (v0)\n",
+    );
+    assert_ne!(src, SRC, "the leaf's bounce now goes through the table");
+    follows_a_relocating_bounce(&src);
+}
+
+/// Run the emitted leaf (func 1) over a window at `OLD_WIN` whose bounce moves it to `NEW_WIN`, and
+/// check every access after the bounce went through the new base.
+fn follows_a_relocating_bounce(src: &str) {
+    let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     // The **B2** emit — the shape the cooperative driver runs (`coop_emit_for`): a shared reserved
     // dispatch table and the #888 widened cross-tier set, so an in-subset leaf that calls a
@@ -143,28 +164,12 @@ fn an_emitted_frame_follows_the_window_across_a_relocating_bounce() {
             "call_interp",
             |mut c: Caller<'_, Bounce>, target: i32, args_ptr: i32| {
                 assert_eq!(target, 2, "only the cap-bearing helper bounces");
-                let mem = c.data().mem.expect("memory registered before the run");
-                let win_global = c
-                    .data()
-                    .win_global
-                    .expect("the emitted module exports the live-win global");
-                let seen = match win_global.get(&c) {
-                    Val::I32(v) => v,
-                    other => panic!("`win` must be an i32 global, got {other:?}"),
-                };
-                // Relocate: copy the whole window to its new home, leaving the old bytes in place so
-                // a stale-base store is *visible* rather than silently landing in the same buffer.
-                let mut buf = vec![0u8; WIN_LEN];
-                mem.read(&c, seen as usize, &mut buf).unwrap();
-                mem.write(&mut c, NEW_WIN as usize, &buf).unwrap();
-                win_global.set(&mut c, Val::I32(NEW_WIN as i32)).unwrap();
+                relocate(&mut c);
                 // The helper's i64 result rides back in the cross-tier scratch (slot 0). The
                 // emitted code passes `args_ptr` already offset to the scratch, so slot 0 is at 0.
+                let mem = c.data().mem.expect("memory registered before the run");
                 mem.write(&mut c, args_ptr as usize, &BOUNCE_K.to_le_bytes())
                     .unwrap();
-                let d = c.data_mut();
-                d.win_at_bounce = seen;
-                d.calls += 1;
             },
         )
         .unwrap();
@@ -178,6 +183,24 @@ fn an_emitted_frame_follows_the_window_across_a_relocating_bounce() {
         .get_global(&store, "win")
         .expect("the emitted module exports the live-win global");
     store.data_mut().win_global = Some(win_global);
+    // Fill the shared table the way the cooperative driver does (`syncTable`): slot `i` holds the
+    // instance's `f{i}` export, or for an interpreter-resident function the driver's shim, which bounces
+    // into the engine exactly like `env.call_interp` (here: the same relocation, returning the result).
+    let shim = Func::wrap(
+        &mut store,
+        |mut c: Caller<'_, Bounce>, _win: i32, _env: i32, _a: i64| -> i64 {
+            relocate(&mut c);
+            BOUNCE_K
+        },
+    );
+    for slot in 0..m.funcs.len() {
+        let f = instance
+            .get_func(&store, &format!("f{slot}"))
+            .unwrap_or(shim);
+        table
+            .set(&mut store, slot as u64, Val::FuncRef(FuncRef::new(f)))
+            .unwrap();
+    }
     let f1 = instance.get_func(&store, "f1").expect("f1 exported");
     let mut results = [Val::I64(0)];
     f1.call(
@@ -236,4 +259,26 @@ fn an_emitted_frame_follows_the_window_across_a_relocating_bounce() {
         VAL_BEFORE + VAL_AFTER + BOUNCE_K,
         "the leaf reads both stores back through the relocated window"
     );
+}
+
+/// What a relocating host does in a bounce: copy the whole window to its new home and republish the
+/// base. The old bytes stay in place, so a store through the stale base is *visible* rather than
+/// silently landing in the same buffer.
+fn relocate(c: &mut Caller<'_, Bounce>) {
+    let mem = c.data().mem.expect("memory registered before the run");
+    let win_global = c
+        .data()
+        .win_global
+        .expect("the emitted module exports the live-win global");
+    let seen = match win_global.get(&*c) {
+        Val::I32(v) => v,
+        other => panic!("`win` must be an i32 global, got {other:?}"),
+    };
+    let mut buf = vec![0u8; WIN_LEN];
+    mem.read(&*c, seen as usize, &mut buf).unwrap();
+    mem.write(&mut *c, NEW_WIN as usize, &buf).unwrap();
+    win_global.set(&mut *c, Val::I32(NEW_WIN as i32)).unwrap();
+    let d = c.data_mut();
+    d.win_at_bounce = seen;
+    d.calls += 1;
 }

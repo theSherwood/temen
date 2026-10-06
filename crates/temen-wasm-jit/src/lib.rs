@@ -138,8 +138,9 @@ const FUEL_DEFAULT: i64 = 1 << 61;
 
 /// The wasm global index of the **live window `mapped` size** (#717 / issue: wasm-JIT confines against
 /// the compile-time `mapped`). The emitted bounds check (`emit_confine`/`emit_span_check`) reads this
-/// global via `global.get` instead of a baked `1 << size_log2`, so an access into memory the guest grew
-/// at runtime via `vm_map` no longer spuriously faults on the JIT where the interpreter admits it. The
+/// global instead of a baked `1 << size_log2`, so an access into memory the guest grew at runtime via
+/// `vm_map` no longer spuriously faults on the JIT where the interpreter admits it. A function reads it
+/// into a local at entry and after every call (`emit_mem_state_load`, #2117): only then can it change. The
 /// global self-initializes to the emit-time `1 << size_log2`, so a host that never grows the window sees
 /// behavior **identical** to the old constant; a growing host writes the live size through the exported
 /// `"mapped"` global (kept in sync by the `vm_map` cross-tier handler). It sits *after* the fuel global
@@ -162,7 +163,7 @@ const MAPPED_GLOBAL_IDX: u32 = 1;
 const WIN_GLOBAL_IDX: u32 = 2;
 
 /// The wasm global index of the #750 page-state table base (paged modules only) — after `fuel`,
-/// `mapped` and `win`.
+/// `mapped` and `win`. Read into a local with `mapped` (`emit_mem_state_load`, #2117).
 const PAGESTATE_GLOBAL_IDX: u32 = 3;
 
 // ---- wasm binary encoding primitives -------------------------------------------------------------
@@ -216,6 +217,7 @@ const OP_IF: u8 = 0x04;
 const OP_ELSE: u8 = 0x05;
 const OP_END: u8 = 0x0b;
 const OP_BR: u8 = 0x0c;
+const OP_BR_IF: u8 = 0x0d;
 const OP_BR_TABLE: u8 = 0x0e;
 const OP_RETURN: u8 = 0x0f;
 const OP_CALL: u8 = 0x10;
@@ -4771,28 +4773,37 @@ struct FnCtx {
     /// i64 locals otherwise (TurboFan drops them).
     span_page_l: u32,
     span_last_page_l: u32,
+    /// #2117: the i64 local holding the live window size (the `"mapped"` global, #717) and the i32
+    /// local holding the page-state table's base (the `"pagestate"` global, paged only). A function
+    /// that touches memory loads them at entry and after every call ([`emit_mem_state_load`]): the
+    /// host writes those globals only while a call is out, so reading the locals is reading the
+    /// globals, without a global load at every access.
+    mapped_l: u32,
+    table_l: u32,
+    /// #2117: i64 scratch for the paged check — the access's last byte, then its page.
+    lp_l: u32,
+    /// Whether this function accesses memory, i.e. whether its checks read `mapped_l`/`table_l`
+    /// ([`touches_memory`]).
+    touches_mem: bool,
     /// #1627 spill mode: the `i32` local holding the spill cursor a call site pushed from, which
     /// [`emit_spill_pop`] writes back after the call. `None` outside spill mode.
     spill_l: Option<u32>,
     /// Open label count inside the body: a branch from depth `d` to the label at level `l` is
     /// `br (d - l)`.
     depth: u32,
-    /// Wasm global index of the live-`mapped` window size (#717). `emit_confine`/`emit_span_check`
-    /// read it via `global.get` instead of a baked `1 << size_log2`, so a `vm_map`-grown window no
-    /// longer spuriously faults a legitimate access on the JIT. See [`MAPPED_GLOBAL_IDX`].
-    mapped_global_idx: u32,
-    /// The **gated software page-check** (#750): `Some((page_log2, pagestate_global_idx))` iff this
-    /// module was compiled by the opt-in paged entry ([`compile_module_tierup_paged`]). Every
-    /// confined access then also consults the host-maintained byte-per-page state table (base in
-    /// the exported `"pagestate"` i32 global; `0 = Unmapped`, `1 = Rw`, `2 = Ro`) and traps where
-    /// the interpreter's `check_prot` would. `None` (every other entry) emits byte-identical code
-    /// to before #750 — the fail-closed default pays nothing.
-    page_check: Option<(u8, u32)>,
-    /// The **NULL-page guard** (#964/#1094): `Some(guard)` ⇒ every confined access additionally
-    /// traps when its first byte lands below `guard` — matching an interpreter whose page map seeds
-    /// `[0, guard)` `Unmapped`. Never elided (an in-window proof is an upper bound; it says nothing
-    /// about the low pages). `None` under the page check, which already traps on those `Unmapped`
-    /// pages (#2105), and where the window is smaller than the guard.
+    /// The **gated software page-check** (#750): `Some(page_log2)` iff this module was compiled by
+    /// the opt-in paged entry ([`compile_module_tierup_paged`]). Every confined access then also
+    /// consults the host-maintained byte-per-page state table (base in the exported `"pagestate"`
+    /// i32 global; `0 = Unmapped`, `1 = Rw`, `2 = Ro`) and traps where the interpreter's `check_prot`
+    /// would ([`emit_paged_confine`]). `None` (every other entry) emits no page check — the
+    /// fail-closed default pays nothing.
+    page_check: Option<u8>,
+    /// The **NULL-page guard** (#964/#1094) extent: `[0, guard)` is seeded `Unmapped` in the
+    /// interpreter's page map and refused to the page ops, so no access below it is ever admitted.
+    /// Unpaged, every confined access compares its first byte against it ([`emit_null_guard`]); never
+    /// elided (an in-window proof is an upper bound, it says nothing about the low pages). Paged, the
+    /// table already holds those pages `Unmapped` (#2105), and the guard is what traps a wrapped
+    /// address ([`emit_paged_confine`]). `None` where the window is smaller than the guard.
     null_guard: Option<u64>,
     /// `Some` when this function's blocks nest as structured control flow; `None` runs them under
     /// the `$next` dispatcher.
@@ -4931,6 +4942,12 @@ fn emit_func(
     local_types.push(ValType::I64);
     let span_last_page_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I64);
+    let mapped_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+    let table_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I32);
+    let lp_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
     // #1627: the spill cursor saved across one call ([`emit_spill_push`]) — spill mode only.
     let spill_l = (!gc_reach.is_empty()).then(|| {
         local_types.push(ValType::I32);
@@ -4945,12 +4962,14 @@ fn emit_func(
         atomic_addr_l,
         span_page_l,
         span_last_page_l,
+        mapped_l,
+        table_l,
+        lp_l,
+        touches_mem: touches_memory(f),
         spill_l,
         depth: 0,
-        mapped_global_idx: MAPPED_GLOBAL_IDX,
-        // The pagestate global (paged mode only) sits immediately after `mapped`.
-        page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
-        null_guard: null_guard.filter(|_| paged.is_none()),
+        page_check: paged,
+        null_guard,
         structure: None,
     };
 
@@ -4958,6 +4977,7 @@ fn emit_func(
     // #1312: publish this frame's window base before anything reads or writes memory, so the global
     // every call site reloads from names *this* frame's window (see `emit_win_publish`).
     emit_win_publish(&mut code);
+    emit_mem_state_load(&cx, &mut code);
     // Copy the Temen params into the entry block's param locals ($next defaults to 0 = entry).
     for (i, _) in f.params.iter().enumerate() {
         code.push(OP_LOCAL_GET);
@@ -4974,6 +4994,7 @@ fn emit_func(
     // once-per-dispatch-iteration debit), so the emitted wasm traps `OutOfFuel` at the *identical*
     // point for any budget, not merely "both eventually trap".
     emit_fuel_check(&mut cx, &mut code);
+    emit_fault_block_open(&cx, &mut code);
 
     // The blocks nest as structured control flow where they can; the dispatcher runs the rest.
     let n = f.blocks.len();
@@ -5037,8 +5058,8 @@ fn emit_func(
             }
         }
     }
-    debug_assert_eq!(cx.depth, 0);
     code.push(OP_UNREACHABLE); // every path returned / trapped / branched
+    emit_fault_block_close(&cx, &mut code);
     code.push(OP_END); // function body end
 
     // Prepend the locals vector (grouped runs of one type).
@@ -5168,6 +5189,12 @@ fn emit_split_group(
     local_types.push(ValType::I64);
     let span_last_page_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I64);
+    let mapped_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
+    let table_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I32);
+    let lp_l = n_params + local_types.len() as u32;
+    local_types.push(ValType::I64);
     // #1627: the spill cursor saved across one call ([`emit_spill_push`]) — spill mode only.
     let spill_l = (!gc_reach.is_empty()).then(|| {
         local_types.push(ValType::I32);
@@ -5182,11 +5209,14 @@ fn emit_split_group(
         atomic_addr_l,
         span_page_l,
         span_last_page_l,
+        mapped_l,
+        table_l,
+        lp_l,
+        touches_mem: touches_memory(f),
         spill_l,
         depth: 0,
-        mapped_global_idx: MAPPED_GLOBAL_IDX,
-        page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
-        null_guard: null_guard.filter(|_| paged.is_none()),
+        page_check: paged,
+        null_guard,
         structure: None,
     };
 
@@ -5194,6 +5224,7 @@ fn emit_split_group(
     // #1312: publish this frame's window base first — a group function is entered both from the
     // wrapper and by inter-group `return_call`, and either way local 0 is the window to run over.
     emit_win_publish(&mut code);
+    emit_mem_state_load(&cx, &mut code);
     // ---- entry dispatch: pick the entry block from `entry` (param 2), load its params from scratch,
     // set `$next`, then fall into the main loop. `$sel` encloses the whole nest so each arm brs out of
     // selection into the loop below. Structure mirrors the block-dispatcher (innermost `end` first).
@@ -5249,6 +5280,7 @@ fn emit_split_group(
         arm_of[gb] = p as u64;
     }
     cx.depth = 0;
+    emit_fault_block_open(&cx, &mut code);
     code.push(OP_LOOP);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
@@ -5293,6 +5325,7 @@ fn emit_split_group(
     code.push(OP_END); // close the loop
     cx.depth -= 1;
     code.push(OP_UNREACHABLE);
+    emit_fault_block_close(&cx, &mut code);
     code.push(OP_END); // function body end
 
     // Prepend the locals vector (grouped runs of one type).
@@ -5329,9 +5362,12 @@ fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec
         atomic_addr_l: 0,
         span_page_l: 0,
         span_last_page_l: 0,
+        mapped_l: 0,
+        table_l: 0,
+        lp_l: 0,
+        touches_mem: false,
         spill_l: None,
         depth: 0,
-        mapped_global_idx: MAPPED_GLOBAL_IDX,
         page_check: None,
         null_guard: None,
         structure: None,
@@ -5758,7 +5794,7 @@ pub fn compile_split_fn(
 /// * a host with a **fixed** window never writes the global and still sees it correct (each entry
 ///   restores it), so this is behavior-neutral for every existing driver; and
 /// * a callee entered with a different window (the per-event `win` of a §14 confined child) publishes
-///   *its* window, and the caller restores its own on return via [`emit_win_reload`].
+///   *its* window, and the caller restores its own on return via [`emit_after_call`].
 fn emit_win_publish(code: &mut Vec<u8>) {
     code.push(OP_LOCAL_GET);
     uleb(code, 0); // win
@@ -5766,16 +5802,66 @@ fn emit_win_publish(code: &mut Vec<u8>) {
     uleb(code, WIN_GLOBAL_IDX as u64);
 }
 
-/// #1312 — **reload** `win` (local 0) from [`WIN_GLOBAL_IDX`] after a call that can run guest code.
-/// The callee (or a cross-tier bounce inside it) may have `vm_map`-grown the window, and a growing
-/// backing may relocate, in which case the host publishes the fresh base into the global before
-/// returning. Two instructions, and only after calls — the address computations themselves consume
-/// local 0 immediately, so nothing else can hold a stale base.
-fn emit_win_reload(code: &mut Vec<u8>) {
+/// What to re-read after a call that can run guest code. The callee (or a cross-tier bounce inside
+/// it) may have `vm_map`-grown the window, and the host publishes what changed into the globals
+/// before returning:
+/// * `win` (local 0), from [`WIN_GLOBAL_IDX`] (#1312): a growing backing may relocate;
+/// * the live window size and the page-state table's base, into the locals the access checks read
+///   ([`emit_mem_state_load`], #2117).
+///
+/// Only after calls — the host writes the globals only while a call is out, so between calls the
+/// locals and the globals agree.
+fn emit_after_call(cx: &FnCtx, code: &mut Vec<u8>) {
     code.push(0x23); // global.get
     uleb(code, WIN_GLOBAL_IDX as u64);
     code.push(OP_LOCAL_SET);
     uleb(code, 0); // win
+    emit_mem_state_load(cx, code);
+}
+
+/// #2117 — load the live window size ([`MAPPED_GLOBAL_IDX`]) and, under the page check, the
+/// page-state table's base ([`PAGESTATE_GLOBAL_IDX`]) into the locals every access check reads
+/// ([`FnCtx::mapped_l`], [`FnCtx::table_l`]). At function entry and after every call; nothing for a
+/// function that never touches memory.
+fn emit_mem_state_load(cx: &FnCtx, code: &mut Vec<u8>) {
+    if !cx.touches_mem {
+        return;
+    }
+    code.push(0x23); // global.get
+    uleb(code, MAPPED_GLOBAL_IDX as u64);
+    code.push(OP_LOCAL_SET);
+    uleb(code, cx.mapped_l as u64);
+    if cx.page_check.is_some() {
+        code.push(0x23); // global.get
+        uleb(code, PAGESTATE_GLOBAL_IDX as u64);
+        code.push(OP_LOCAL_SET);
+        uleb(code, cx.table_l as u64);
+    }
+}
+
+/// Whether any instruction of `f` reads or writes the window through a confined access, i.e. whether
+/// its checks read [`FnCtx::mapped_l`]/[`FnCtx::table_l`]. The access lowerings `debug_assert` it, so
+/// a lowering that confines an instruction kind missing here fails in tests rather than reading an
+/// unloaded local (which would trap every access: `mapped_l` reads 0).
+fn touches_memory(f: &Func) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::Load { .. }
+                    | Inst::Store { .. }
+                    | Inst::AtomicLoad { .. }
+                    | Inst::AtomicStore { .. }
+                    | Inst::AtomicRmw { .. }
+                    | Inst::AtomicCmpxchg { .. }
+                    | Inst::MemCopy { .. }
+                    | Inst::MemMove { .. }
+                    | Inst::MemFill { .. }
+                    | Inst::V128Load { .. }
+                    | Inst::V128Store { .. }
+            )
+        })
+    })
 }
 
 /// Debit one fuel unit from the fuel counter global and trap `TRAP_OUT_OF_FUEL` when it goes negative
@@ -5812,6 +5898,11 @@ fn emit_fuel_check(cx: &mut FnCtx, code: &mut Vec<u8>) {
     sleb32(code, TRAP_OUT_OF_FUEL);
     code.push(OP_CALL);
     uleb(code, 0); // func 0 = the env.trap import
+
+    // #2117: the host had a turn, so the access checks re-read the live size and table it may have
+    // republished. Not `win`: no guest code of this process ran (a leaf has no threads), and the split
+    // wrapper never published its own `win`, so the global could name another frame's window.
+    emit_mem_state_load(cx, code);
     code.push(0x23); // global.get
     uleb(code, FUEL_GLOBAL_IDX as u64);
     code.push(OP_I64_CONST);
@@ -5881,6 +5972,9 @@ fn emit_confine(
 /// says (#717). A live size that drops below it (a host denying a window one bound no longer
 /// describes) does not stop an elided access: what changed is page state inside the backed window,
 /// which only the paged check carries.
+///
+/// Under the page check the lowering is [`emit_paged_confine`], which takes no `elide`: its bound is
+/// one compare, and the page state it guards is dynamic.
 #[allow(clippy::too_many_arguments)]
 fn emit_confine_maybe_aligned(
     cx: &mut FnCtx,
@@ -5892,38 +5986,60 @@ fn emit_confine_maybe_aligned(
     elide: bool,
     write: bool,
 ) {
+    debug_assert!(
+        cx.touches_mem,
+        "`touches_memory` misses a confined instruction"
+    );
+    match cx.page_check {
+        Some(page_log2) => {
+            emit_paged_confine(cx, code, addr_local, offset, width, align, write, page_log2)
+        }
+        // Unpaged, every in-window byte is readable and writable.
+        None => emit_unpaged_confine(cx, code, addr_local, offset, width, align, elide),
+    }
+}
+
+/// The unpaged lowering of [`emit_confine_maybe_aligned`]: the live-size bound (unless `elide`), the
+/// alignment trap, the NULL-guard compare, then the confined address.
+fn emit_unpaged_confine(
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    addr_local: u32,
+    offset: u64,
+    width: u64,
+    align: bool,
+    elide: bool,
+) {
     if !elide {
         // Trap unless `addr + offset + width <= mapped`, with no overflow (`Window::checked`): with
         // `k = offset + width`, trap iff `mapped < k` or `addr > mapped - k`. The bound is the
         // **live** window size (#717: the `mapped` global, which the host re-syncs as the window
-        // grows), and no value the host writes there can wrap `mapped - k` into admitting more than
-        // the window — `mapped < k` is its own trap, not a subtraction that wraps (#1919). An access
-        // whose `offset + width` overflows is never admitted.
+        // grows, read through `mapped_l`), and no value the host writes there can wrap `mapped - k`
+        // into admitting more than the window — `mapped < k` is its own trap, not a subtraction that
+        // wraps (#1919). An access whose `offset + width` overflows is never admitted.
         match offset.checked_add(width) {
             Some(k) => {
-                code.push(0x23); // global.get
-                uleb(code, cx.mapped_global_idx as u64);
+                code.push(OP_LOCAL_GET);
+                uleb(code, cx.mapped_l as u64);
                 code.push(OP_I64_CONST);
                 sleb64(code, k as i64);
                 code.push(0x54); // i64.lt_u: mapped < k ?
                 code.push(OP_LOCAL_GET);
                 uleb(code, addr_local as u64);
-                code.push(0x23); // global.get
-                uleb(code, cx.mapped_global_idx as u64);
+                code.push(OP_LOCAL_GET);
+                uleb(code, cx.mapped_l as u64);
                 code.push(OP_I64_CONST);
                 sleb64(code, k as i64);
                 code.push(0x7d); // i64.sub → mapped - k (read only when mapped >= k)
                 code.push(0x56); // i64.gt_u: addr > mapped - k ?
                 code.push(0x72); // i32.or
-                code.push(OP_IF);
-                code.push(BLOCKTYPE_VOID);
-                cx.depth += 1;
-                emit_trap(code, TRAP_MEMORY_FAULT);
-                code.push(OP_END);
-                cx.depth -= 1;
             }
-            None => emit_trap(code, TRAP_MEMORY_FAULT),
+            None => {
+                code.push(OP_I32_CONST);
+                sleb32(code, 1);
+            }
         }
+        emit_trap_if(cx, code);
     }
     // eff = addr + offset — exact, not wrapped: past the check `addr <= mapped - k`, and a proof
     // (`elide`) fails on any overflow.
@@ -5935,35 +6051,16 @@ fn emit_confine_maybe_aligned(
     code.push(OP_LOCAL_SET);
     uleb(code, cx.ea_l as u64);
     if align {
-        // `eff & (width - 1) != 0` ⇒ misaligned ⇒ trap (matches `check_align`).
-        code.push(OP_LOCAL_GET);
-        uleb(code, cx.ea_l as u64);
-        code.push(OP_I64_CONST);
-        sleb64(code, (width - 1) as i64);
-        code.push(0x83); // i64.and
-        code.push(OP_I64_CONST);
-        sleb64(code, 0);
-        code.push(0x52); // i64.ne → misaligned?
-        code.push(OP_IF);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
-        code.push(OP_END);
-        cx.depth -= 1;
+        emit_align_trap(cx, code, width);
     }
-    // #750 (paged modules only): the software page-check — first and, when the access can straddle
-    // a page boundary, last touched page, exactly the pages the oracle's `check_prot` walks. An
-    // `align`ed access never straddles (the align trap above already fired for a misaligned
-    // address, and a `width`-aligned access of power-of-two `width` ≤ page size lies in one page),
-    // so only unaligned multi-byte accesses consult the second page. NEVER elided: `elide` proves
-    // the access in-window, but page *state* is dynamic, so an in-window proof says nothing about
-    // mapped/RW (#750's honest-limits note). No-op when unpaged.
-    emit_page_check_one(cx, code, 0, write);
-    if width > 1 && !align {
-        emit_page_check_one(cx, code, width - 1, write);
-    }
-    // NULL-page guard (experimental measurement mode) — like the page check, never elided.
-    emit_null_guard(cx, code);
+    emit_null_guard(cx, code); // never elided
+    emit_confined_addr(cx, code);
+}
+
+/// Leave the confined 32-bit linear-memory address of the access on the stack: `win + (eff & MASK)`.
+/// The `& MASK` clamp is unconditional (INVARIANTS #2) — a no-op past any check, and what keeps even
+/// an access a wrong proof or a wrong table admitted inside the window.
+fn emit_confined_addr(cx: &FnCtx, code: &mut Vec<u8>) {
     code.push(OP_LOCAL_GET);
     uleb(code, cx.ea_l as u64);
     code.push(OP_I64_CONST);
@@ -5975,52 +6072,185 @@ fn emit_confine_maybe_aligned(
     code.push(0x6a); // i32.add → the confined linear-memory address
 }
 
-/// One page-state consultation of the #750 software page-check: the state byte of the page holding
-/// `(ea_l + delta) & MASK` is loaded from the host-maintained table (base in the `"pagestate"`
-/// global) and mismatches trap through the existing [`TRAP_MEMORY_FAULT`] seam — a read of an
-/// `Unmapped` page, or a write to anything but `Rw`. Emitted only for paged modules
-/// ([`FnCtx::page_check`]); the trap decision happens strictly **inside** `[0, mapped)` — the
-/// bounds check came first — so a wrong table is a trap-parity divergence (INVARIANTS #9), never an
-/// escape (#2).
-fn emit_page_check_one(cx: &mut FnCtx, code: &mut Vec<u8>, delta: u64, write: bool) {
-    let Some((page_log2, ps_gidx)) = cx.page_check else {
-        return;
-    };
+/// #2117 — the paged lowering of [`emit_confine_maybe_aligned`]: one exact check per access, then the
+/// confined address ([`emit_confined_addr`]). It traps `MemoryFault` exactly where the interpreter's
+/// `confine_checked` + `check_prot` do (INVARIANTS #9).
+///
+/// The driver writes the page-state table's **coverage** to `"mapped"` ([`build_pagestate_table`]'s
+/// contract): the table holds one state byte per page of `[0, mapped)`, and `mapped` is a whole
+/// number of pages. So for the access's last byte `last = addr + offset + width - 1`, `last < mapped`
+/// is both the interpreter's bound `addr + offset + width <= mapped` and the bound that keeps every
+/// page index below inside the table. The last byte's page is consulted first; the first byte's only
+/// when the access crosses into it (an `align`ed access, of power-of-two `width` ≤ a page, never
+/// does). Never elided: page state is dynamic, and the bound is one compare.
+///
+/// **Wrapping.** `addr + offset`, or `last`, may wrap past `2^64`, which the interpreter faults. A
+/// wrapped `last` is below `offset + width`, and the NULL guard's pages are `Unmapped` in every table
+/// (seeded so, and refused to the page ops), so when `offset + width` fits under the guard the
+/// last-page consultation traps the access — before the first-page one could index past the table.
+/// Otherwise (no guard, or a large `offset`) an explicit `last < addr` compare traps it.
+///
+/// [`build_pagestate_table`]: ../temen_interp/bytecode/fn.build_pagestate_table.html
+#[allow(clippy::too_many_arguments)]
+fn emit_paged_confine(
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    addr_local: u32,
+    offset: u64,
+    width: u64,
+    align: bool,
+    write: bool,
+    page_log2: u8,
+) {
+    // An end past 2^64 is past every window: never admitted.
+    let k = offset.checked_add(width);
+    if k.is_none() {
+        code.push(OP_I32_CONST);
+        sleb32(code, 1);
+        emit_trap_if(cx, code);
+    }
+    // eff = addr + offset — the access's first byte.
+    code.push(OP_LOCAL_GET);
+    uleb(code, addr_local as u64);
+    if offset != 0 {
+        code.push(OP_I64_CONST);
+        sleb64(code, offset as i64);
+        code.push(0x7c); // i64.add
+    }
+    code.push(OP_LOCAL_SET);
+    uleb(code, cx.ea_l as u64);
+    if align {
+        emit_align_trap(cx, code, width);
+    }
+    // lp = last = eff + (width - 1); trap unless last < mapped.
     code.push(OP_LOCAL_GET);
     uleb(code, cx.ea_l as u64);
-    if delta != 0 {
+    if width > 1 {
         code.push(OP_I64_CONST);
-        sleb64(code, delta as i64);
-        code.push(0x7c); // i64.add → the access's last byte
+        sleb64(code, (width - 1) as i64);
+        code.push(0x7c); // i64.add
     }
-    code.push(OP_I64_CONST);
-    sleb64(code, MASK as i64);
-    code.push(0x83); // i64.and — same clamp domain as the access itself
+    code.push(OP_LOCAL_TEE);
+    uleb(code, cx.lp_l as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.mapped_l as u64);
+    code.push(0x5a); // i64.ge_u → last at or past the table's end?
+    emit_trap_if(cx, code);
+    let guard_traps_wrap = matches!((cx.null_guard, k), (Some(g), Some(k)) if k <= g);
+    if !guard_traps_wrap {
+        // last < addr ⇔ addr + offset + width - 1 wrapped.
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.lp_l as u64);
+        code.push(OP_LOCAL_GET);
+        uleb(code, addr_local as u64);
+        code.push(0x54); // i64.lt_u
+        emit_trap_if(cx, code);
+    }
+    let crosses = width > 1 && !align;
+    // The last byte's page.
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.lp_l as u64);
     code.push(OP_I64_CONST);
     sleb64(code, page_log2 as i64);
-    code.push(0x88); // i64.shr_u → window-relative page index
+    code.push(0x88); // i64.shr_u
+    if crosses {
+        code.push(OP_LOCAL_TEE);
+        uleb(code, cx.lp_l as u64); // lp = the last byte's page
+    }
+    emit_page_state_check(cx, code, write);
+    if crosses {
+        // The first byte's page, when it is another one.
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.ea_l as u64);
+        code.push(OP_I64_CONST);
+        sleb64(code, page_log2 as i64);
+        code.push(0x88); // i64.shr_u
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.lp_l as u64);
+        code.push(0x52); // i64.ne
+        code.push(OP_IF);
+        code.push(BLOCKTYPE_VOID);
+        cx.depth += 1;
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.ea_l as u64);
+        code.push(OP_I64_CONST);
+        sleb64(code, page_log2 as i64);
+        code.push(0x88); // i64.shr_u
+        emit_page_state_check(cx, code, write);
+        code.push(OP_END);
+        cx.depth -= 1;
+    }
+    emit_confined_addr(cx, code);
+}
+
+/// Consume an i64 page index and trap `MemoryFault` unless that page admits the access: a load any
+/// committed page (`Rw`/`Ro`; only `Unmapped` = 0 traps), a store only an `Rw` (1) page. The index is
+/// within the table: [`emit_paged_confine`] bounded it first.
+fn emit_page_state_check(cx: &mut FnCtx, code: &mut Vec<u8>, write: bool) {
     code.push(0xa7); // i32.wrap_i64
-    code.push(0x23); // global.get pagestate (table base in linear memory)
-    uleb(code, ps_gidx as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.table_l as u64);
     code.push(0x6a); // i32.add
     code.push(0x2d); // i32.load8_u → the page's state byte
     uleb(code, 0); // align
     uleb(code, 0); // offset
     if write {
-        // A store is admitted only on an `Rw` (1) page.
         code.push(OP_I32_CONST);
         sleb64(code, 1);
         code.push(0x47); // i32.ne
     } else {
-        // A load is admitted on anything committed (`Rw`/`Ro`) — only `Unmapped` (0) traps.
         code.push(0x45); // i32.eqz
     }
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
+}
+
+/// Consume an i32 condition and trap `MemoryFault` when it is non-zero: branch out to the function's
+/// fault block ([`emit_fault_block_open`]), which encloses every label `cx.depth` counts.
+fn emit_trap_if(cx: &FnCtx, code: &mut Vec<u8>) {
+    debug_assert!(
+        cx.touches_mem,
+        "a memory check in a function with no fault block"
+    );
+    code.push(OP_BR_IF);
+    uleb(code, cx.depth as u64);
+}
+
+/// #2134 — open the **fault block** of a function that touches memory. Every confinement check in
+/// the body traps by branching out of it ([`emit_trap_if`]) to the one `env.trap(MemoryFault)` after
+/// it ([`emit_fault_block_close`]), so a check is a `br_if` rather than an `if` arm around a call of
+/// its own. Those calls never ran unless the guest faulted, but V8 compiled each one: dropping them
+/// made nimony's `hexer d` 28% faster in Chromium. Opened where `cx.depth` is 0 and never counted in
+/// it, so from depth `d` the block is label `d`.
+fn emit_fault_block_open(cx: &FnCtx, code: &mut Vec<u8>) {
+    debug_assert_eq!(cx.depth, 0);
+    if cx.touches_mem {
+        code.push(OP_BLOCK);
+        code.push(BLOCKTYPE_VOID);
+    }
+}
+
+/// Close [`emit_fault_block_open`]'s block and trap `MemoryFault` after it. The body inside ends
+/// in `unreachable`, so only a check's branch reaches this point.
+fn emit_fault_block_close(cx: &FnCtx, code: &mut Vec<u8>) {
+    debug_assert_eq!(cx.depth, 0);
+    if cx.touches_mem {
+        code.push(OP_END);
+        emit_trap(code, TRAP_MEMORY_FAULT);
+    }
+}
+
+/// Trap `MemoryFault` when the effective address (`ea_l`) is not a multiple of `width` (a power of
+/// two) — the natural-alignment requirement §12 atomics carry (the interpreter's `check_align`).
+fn emit_align_trap(cx: &mut FnCtx, code: &mut Vec<u8>, width: u64) {
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.ea_l as u64);
+    code.push(OP_I64_CONST);
+    sleb64(code, (width - 1) as i64);
+    code.push(0x83); // i64.and
+    code.push(OP_I64_CONST);
+    sleb64(code, 0);
+    code.push(0x52); // i64.ne → misaligned?
+    emit_trap_if(cx, code);
 }
 
 /// The NULL-guard extent to **emit** for `m`: [`temen_ir::module_null_guard`] (unconditional, #1094),
@@ -6038,10 +6268,11 @@ fn emit_null_guard_extent(m: &temen_ir::Module) -> Option<u64> {
 /// mode): trap when the access's first byte lands below `guard`. A *bottom* guard needs no
 /// last-byte consultation — an access starting at or above `guard` cannot reach down into
 /// `[0, guard)` — so this is one compare + never-taken branch, the cheap lowering the NULL-trap
-/// design weighs against full paged mode. Masked into the same clamp domain as the access itself
-/// (matching [`emit_page_check_one`]'s defensive style). No-op when unguarded.
+/// design weighs against full paged mode. Masked into the same clamp domain as the access itself.
+/// No-op when unguarded, and under the page check, whose table holds the guard's pages `Unmapped`
+/// (#2105).
 fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
-    let Some(guard) = cx.null_guard else {
+    let (Some(guard), None) = (cx.null_guard, cx.page_check) else {
         return;
     };
     code.push(OP_LOCAL_GET);
@@ -6052,12 +6283,7 @@ fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     code.push(OP_I64_CONST);
     sleb64(code, guard as i64);
     code.push(0x54); // i64.lt_u → first byte below the guard?
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
 }
 
 /// Open `if len != 0 {` for a bulk op — the caller emits the confined op inside and closes with a
@@ -6088,41 +6314,36 @@ fn emit_bulk_guard_open(cx: &mut FnCtx, code: &mut Vec<u8>, len_local: u32) {
 /// Emits nothing to the operand stack; call [`emit_win_addr`] afterwards for each span's confined
 /// address.
 fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_local: u32) {
-    // trap if base > live_mapped  (#717: live window size from the `mapped` global, not a constant)
+    debug_assert!(
+        cx.touches_mem,
+        "`touches_memory` misses a bulk-memory instruction"
+    );
+    // trap if base > live_mapped  (#717: the `mapped` global's live window size, via `mapped_l`)
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
-    code.push(0x23); // global.get
-    uleb(code, cx.mapped_global_idx as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.mapped_l as u64);
     code.push(0x56); // i64.gt_u
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
     // trap if len > live_mapped - base
     code.push(OP_LOCAL_GET);
     uleb(code, len_local as u64);
-    code.push(0x23); // global.get
-    uleb(code, cx.mapped_global_idx as u64);
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.mapped_l as u64);
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
     code.push(0x7d); // i64.sub → live_mapped - base (base <= live_mapped here)
     code.push(0x56); // i64.gt_u: len > live_mapped - base
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
     // #1004: NULL-guard low bound for a marked module — trap if the span dips into the reserved
     // `[0, guard)` region. Called inside `if len != 0`, so `len >= 1` and `base` is the span's
     // lowest byte: `base >= guard` proves every byte is at or above the guard (a *bottom* region
     // needs no last-byte check, #750's note). This is the span analogue of the scalar
     // [`emit_null_guard`] — with it, bulk-memory functions of a marked module emit (they no longer
     // leave the subset in `analyze` / the tier-up fixpoint), trapping exactly where the
-    // interpreter's `check_prot_span` faults on the `Unmapped` guard pages.
-    if let Some(guard) = cx.null_guard {
+    // interpreter's `check_prot_span` faults on the `Unmapped` guard pages. Paged, the per-page walk
+    // does it: the table holds the guard's pages `Unmapped` (#2105).
+    if let (Some(guard), None) = (cx.null_guard, cx.page_check) {
         code.push(OP_LOCAL_GET);
         uleb(code, base_local as u64);
         code.push(OP_I64_CONST);
@@ -6131,16 +6352,11 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
         code.push(OP_I64_CONST);
         sleb64(code, guard as i64);
         code.push(0x54); // i64.lt_u → base below the guard?
-        code.push(OP_IF);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
-        code.push(OP_END);
-        cx.depth -= 1;
+        emit_trap_if(cx, code);
     }
 }
 
-/// #1081 — the **paged bulk-memory per-page walk**: the span analogue of [`emit_page_check_one`]. For a
+/// #1081 — the **paged bulk-memory per-page walk**: the span analogue of [`emit_paged_confine`]. For a
 /// span `[base, base+len)` that has already passed [`emit_span_check`] (so it lies within `[0, mapped)`
 /// and every page has a live `"pagestate"` entry), walk each window-relative page it touches and trap
 /// `MemoryFault` where the interpreter's [`check_prot_span`](../temen_interp) would: an `Unmapped` page
@@ -6157,7 +6373,7 @@ fn emit_span_page_check(
     len_local: u32,
     write: bool,
 ) {
-    let Some((page_log2, ps_gidx)) = cx.page_check else {
+    let Some(page_log2) = cx.page_check else {
         return;
     };
     let (page_l, last_l) = (cx.span_page_l, cx.span_last_page_l);
@@ -6204,9 +6420,9 @@ fn emit_span_page_check(
     code.push(0x56); // i64.gt_u
     code.push(0x0d); // br_if
     uleb(code, 1);
-    // state = pagestate[page_l]  (table base in the pagestate global; window-relative page index).
-    code.push(0x23); // global.get pagestate
-    uleb(code, ps_gidx as u64);
+    // state = pagestate[page_l]  (the table base, via `table_l`; window-relative page index).
+    code.push(OP_LOCAL_GET);
+    uleb(code, cx.table_l as u64);
     code.push(OP_LOCAL_GET);
     uleb(code, page_l as u64);
     code.push(0xa7); // i32.wrap_i64
@@ -6223,12 +6439,7 @@ fn emit_span_page_check(
         // A load is admitted on anything committed (`Rw`/`Ro`) — only `Unmapped` (0) traps.
         code.push(0x45); // i32.eqz
     }
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
     // page_l += 1; continue the loop.
     code.push(OP_LOCAL_GET);
     uleb(code, page_l as u64);
@@ -6859,14 +7070,14 @@ fn emit_block_body(
                 get(code, cx, *arg);
                 code.push(OP_CALL);
                 uleb(code, THREAD_SPAWN_IMPORT_IDX as u64);
-                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
+                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::ThreadJoin { handle } if nested_caps => {
                 get(code, cx, *handle);
                 code.push(OP_CALL);
                 uleb(code, THREAD_JOIN_IMPORT_IDX as u64);
-                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
+                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::MemoryWait {
@@ -6887,7 +7098,7 @@ fn emit_block_body(
                 sleb32(code, matches!(ty, IntTy::I64) as i32);
                 code.push(OP_CALL);
                 uleb(code, MEM_WAIT_IMPORT_IDX as u64);
-                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
+                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::MemoryNotify { addr, count } if nested_caps => {
@@ -6897,7 +7108,7 @@ fn emit_block_body(
                 get(code, cx, *count);
                 code.push(OP_CALL);
                 uleb(code, MEM_NOTIFY_IMPORT_IDX as u64);
-                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
+                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             // §14 VM-in-VM bounce (opt-in `nested_caps`): a `call.cap` to INSTANTIATOR
@@ -6963,7 +7174,7 @@ fn emit_block_body(
                 }
                 // #1312: every arm above bounced to the host, which may have grown (and so
                 // relocated) the window; reload before the results are popped and used.
-                emit_win_reload(code);
+                emit_after_call(cx, code);
                 for i in (0..n_results).rev() {
                     code.push(OP_LOCAL_SET);
                     uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -6987,8 +7198,8 @@ fn emit_block_body(
                         }
                         code.push(OP_CALL);
                         uleb(code, widx as u64);
-                        emit_win_reload(code); // #1312: the callee may have grown the window
-                                               // Results pushed in order; pop into destination locals in reverse.
+                        emit_after_call(cx, code); // #1312: the callee may have grown the window
+                                                   // Results pushed in order; pop into destination locals in reverse.
                         for i in (0..n_results).rev() {
                             code.push(OP_LOCAL_SET);
                             uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -7020,6 +7231,7 @@ fn emit_block_body(
                         code.push(0x11); // call_indirect
                         uleb(code, indirect_type_index(types, &ft)? as u64);
                         uleb(code, 0); // table index 0
+                        emit_after_call(cx, code); // #2118: the sibling's callee may have grown the window
                         for i in (0..n_results).rev() {
                             code.push(OP_LOCAL_SET);
                             uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -7059,7 +7271,7 @@ fn emit_block_body(
                         uleb(code, 1); // func 1 = env.call_interp
                                        // #1312: the bounce runs interpreted guest code that may `vm_map`-grow the
                                        // window, relocating its backing — reload before the results are read back.
-                        emit_win_reload(code);
+                        emit_after_call(cx, code);
                         // Load results back from the scratch slots (narrow to i32 where needed).
                         for i in 0..n_results {
                             code.push(OP_LOCAL_GET);
@@ -7113,6 +7325,9 @@ fn emit_block_body(
                 code.push(0x11); // call.dyn
                 uleb(code, indirect_type_index(types, ft)? as u64);
                 uleb(code, 0); // table index 0
+                               // #2118: a slot can hold a bounce shim, or an emitted function that bounces, either of
+                               // which may have grown (and so relocated) the window.
+                emit_after_call(cx, code);
                 for i in (0..n_results).rev() {
                     code.push(OP_LOCAL_SET);
                     uleb(code, cx.local_of[k][next_val + i] as u64);
