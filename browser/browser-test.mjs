@@ -45,11 +45,10 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 let failed = false;
 try {
   const page = await browser.newPage();
-  // Keep the pageerror texts (not just print them): I22 is a rare flake where a worker vCPU's
-  // `temen_par_run` takes an uncaught host wasm trap (`memory access out of bounds`, or `unreachable`
-  // from a panic=abort engine panic). The rejection never reaches the page, so the item hangs
-  // `pending` and the wait below times out — with no clue which check tripped. On timeout we dump
-  // both the still-`pending` items and these captured messages so the next recurrence self-identifies.
+  // Keep the pageerror texts (not just print them): a worker vCPU whose setup traps reports `fail`
+  // (worker.js's backstop), but a trap that still escapes never reaches the page's run promise, so its
+  // item would sit `pending` until the wait below times out. On timeout we dump both the still-`pending`
+  // items and these captured messages, so a recurrence names its cause.
   const pageErrors = [];
   page.on('console', (m) => console.log(`  [page] ${m.text()}`));
   page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
@@ -58,69 +57,44 @@ try {
   const WORK_IDS = ['powerbox', 'threads', 'jit', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
 
-  // I22 mitigation: the index page exercises the rare shared-memory codegen-stash race (a worker vCPU
-  // traps → its item fails, or on an older engine the page hangs). Root cause is a double-free on the
-  // shared `temen_par_enable_*` stashes (ISSUES.md I22) — not yet fixed in the engine, but it passes on a
-  // plain reload every time it's been observed. So retry the whole index page up to 3× (reloading
-  // between) instead of forcing a manual CI re-run. Each retry is logged LOUDLY so the flake stays
-  // visible (per AGENTS.md "log flakiness early"); a real regression fails all 3 attempts and stays red.
-  const INDEX_ATTEMPTS = 3;
-  let pageOk = false;
-  let isolated, powerbox, threads, jit, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads;
-  for (let attempt = 1; attempt <= INDEX_ATTEMPTS; attempt++) {
-    if (attempt > 1) {
-      console.log(`  [I22 retry] index-page attempt ${attempt}/${INDEX_ATTEMPTS} — reloading (a prior attempt hit the rare codegen-race trap; it clears on reload)`);
-      pageErrors.length = 0;
-      await page.reload({ waitUntil: 'load' });
-    }
-    // Wait until every work item leaves 'pending' (or time out). With the worker.js liveness backstop a
-    // trapped vCPU now marks its item 'fail' fast rather than hanging, so a timeout should be rare — but
-    // if one happens, dump which items are still pending + the captured pageerror(s) for diagnosis.
-    try {
-      await page.waitForFunction(
-        (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
-        WORK_IDS, { timeout: 30_000 },
-      );
-    } catch {
-      const statuses = await page.evaluate(
-        (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
-        WORK_IDS,
-      );
-      const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
-      console.log(`  [timeout] attempt ${attempt}: items still pending: ${stuck.join(', ') || '(none)'}`);
-      console.log(`  [timeout] attempt ${attempt}: uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
-    }
-
-    isolated = await read('isolated');
-    powerbox = await read('powerbox');
-    threads = await read('threads');
-    jit = await read('jit');
-    capio = await read('capio');
-    wasmjit = await read('wasmjit');
-    tierup = await read('tierup');
-    jitcodegen = await read('jitcodegen');
-    instcodegen = await read('instcodegen');
-    instnested = await read('instnested');
-    instpaged = await read('instpaged');
-    jitruntime = await read('jitruntime');
-    jitb2 = await read('jitb2');
-    instthreads = await read('instthreads');
-
-    pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
-      threads.status === 'pass' && jit.status === 'pass' &&
-      capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
-      jitcodegen.status === 'pass' && instcodegen.status === 'pass' &&
-      instnested.status === 'pass' && instpaged.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
-      instthreads.status === 'pass';
-    if (pageOk) {
-      if (attempt > 1) console.log(`  [I22 retry] index page passed on attempt ${attempt} (self-healed the flake)`);
-      break;
-    }
-    if (attempt < INDEX_ATTEMPTS) {
-      const bad = WORK_IDS.filter((id, i) => [powerbox, threads, jit, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads][i].status !== 'pass');
-      console.log(`  [I22 retry] attempt ${attempt}: index page not green (failing: ${bad.join(', ') || 'isolated'}) — retrying`);
-    }
+  // One load, no retry: the page's old flake (#1996, a Worker handed the engine memory with a stale
+  // length) is fixed at its cause, so an item that fails here is a real failure.
+  try {
+    await page.waitForFunction(
+      (ids) => ids.every((id) => document.getElementById(id).dataset.status !== 'pending'),
+      WORK_IDS, { timeout: 30_000 },
+    );
+  } catch {
+    const statuses = await page.evaluate(
+      (ids) => ids.map((id) => ({ id, status: document.getElementById(id)?.dataset.status ?? 'missing' })),
+      WORK_IDS,
+    );
+    const stuck = statuses.filter((s) => s.status === 'pending').map((s) => s.id);
+    console.log(`  [timeout] items still pending: ${stuck.join(', ') || '(none)'}`);
+    console.log(`  [timeout] uncaught pageerror(s): ${pageErrors.length ? pageErrors.join(' | ') : '(none captured)'}`);
   }
+
+  const isolated = await read('isolated');
+  const powerbox = await read('powerbox');
+  const threads = await read('threads');
+  const jit = await read('jit');
+  const capio = await read('capio');
+  const wasmjit = await read('wasmjit');
+  const tierup = await read('tierup');
+  const jitcodegen = await read('jitcodegen');
+  const instcodegen = await read('instcodegen');
+  const instnested = await read('instnested');
+  const instpaged = await read('instpaged');
+  const jitruntime = await read('jitruntime');
+  const jitb2 = await read('jitb2');
+  const instthreads = await read('instthreads');
+
+  const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
+    threads.status === 'pass' && jit.status === 'pass' &&
+    capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
+    jitcodegen.status === 'pass' && instcodegen.status === 'pass' &&
+    instnested.status === 'pass' && instpaged.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
+    instthreads.status === 'pass';
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
@@ -136,6 +110,61 @@ try {
   console.log(`  ${jitruntime.text}`);
   console.log(`  ${jitb2.text}`);
   console.log(`  ${instthreads.text}\n`);
+
+  // #1996 pin: a Worker handed a shared memory while another thread grows it must see that grow. V8 can
+  // miss the grow notice for an agent still deserializing the memory and leave it a stale length, under
+  // which atomics and bulk copies into the missed pages trap; every threads-engine instantiation adopts
+  // the memory through `foreignImports` (`adoptMemory`) to make it current. A grower Worker grows a memory
+  // a page at a time while new Workers are handed it; each reads how far it had grown, adopts it as an
+  // engine instantiation does, and reports whether its view reaches that far.
+  const BIRTHS = 150;
+  const births = await page.evaluate(async (n) => {
+    const memory = new WebAssembly.Memory({ initial: 256, maximum: 8192, shared: true });
+    const cell = new Int32Array(new SharedArrayBuffer(8)); // [0] pages grown so far, [1] stop
+    const script = (code) => URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+    const grower = new Worker(script(`onmessage = ({ data: { memory, cell } }) => {
+      postMessage(0);
+      for (let pages = memory.grow(1) + 1; !Atomics.load(cell, 1) && pages < 8192; pages = memory.grow(1) + 1) {
+        Atomics.store(cell, 0, pages);
+        for (const t = performance.now() + 0.3; performance.now() < t;);
+      }
+    };`));
+    const child = script(`import { foreignImports } from '${location.origin}/web/foreign-mem.js';
+      onmessage = ({ data: { memory, cell } }) => {
+        const grown = Atomics.load(cell, 0) * 65536;
+        foreignImports(memory);
+        postMessage(memory.buffer.byteLength >= grown);
+      };`);
+    await new Promise((r) => { grower.onmessage = r; grower.postMessage({ memory, cell }); });
+    let started = 0, done = 0, short = 0;
+    const birth = async () => {
+      while (started < n) {
+        started++;
+        const w = new Worker(child, { type: 'module' });
+        const ok = await new Promise((resolve, reject) => {
+          w.onmessage = (e) => resolve(e.data);
+          w.onerror = (e) => reject(new Error(`a born Worker failed: ${e.message}`));
+          w.postMessage({ memory, cell });
+        });
+        w.terminate();
+        done++;
+        if (!ok) short++;
+      }
+    };
+    try {
+      await Promise.race([
+        Promise.all(Array.from({ length: 6 }, birth)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`births timed out after ${done} of ${n}`)), 60_000)),
+      ]);
+    } finally {
+      Atomics.store(cell, 1, 1);
+      grower.terminate();
+    }
+    return { done, short };
+  }, BIRTHS);
+  const birthsOk = births.done === BIRTHS && births.short === 0;
+  console.log(`  memory adoption: ${births.done} Workers handed a growing memory, ${births.short} with a ` +
+    `stale length ${birthsOk ? 'PASS' : 'FAIL'}\n`);
 
   // --- the playground (play.html): Temen text typed into the page, parsed in-browser, run across ----
   // Workers. Drives the page like a human: pick an example / type source, click Run, read the
@@ -369,7 +398,7 @@ try {
     console.log('  play/postgres: SKIP (artifacts not staged — run `node build-pg-assets.mjs`)');
   }
 
-  const ok = pageOk && checks.every(Boolean);
+  const ok = pageOk && birthsOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: Temen runs in a real browser — powerbox + genuine multi-Worker ` +
     `parallelism (incl. §22 guest-JIT on a shared Domain, §14 detached children on their ` +

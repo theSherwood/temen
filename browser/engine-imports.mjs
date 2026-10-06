@@ -1,3 +1,5 @@
+import { adoptMemory } from './web/engine-mem.js';
+
 // The import object every instantiation of the **engine** wasm (`temen_browser.wasm`) must supply.
 // Besides the optional shared `memory` (the threads build imports it; the plain build owns its own),
 // the wasm32 build imports `temen_host.webgpu_op` — the `webgpu` capability's host seam (a guest ships a
@@ -32,6 +34,7 @@ export function engineImports(memory) {
       },
     },
   };
-  if (memory) imports.env = { memory };
+  // A Worker handed the memory adopts it before instantiating over it (`adoptMemory`, #1996).
+  if (memory) imports.env = { memory: adoptMemory(memory) };
   return imports;
 }

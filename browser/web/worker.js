@@ -34,14 +34,15 @@ self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
     jitB2, jitRuntime, tierupPaged, childMem, ticket } = e.data;
-  // I22 liveness backstop. The `temen_par_run` loop below already catches host traps, but the SETUP +
+  // Liveness backstop. The `temen_par_run` loop below already catches host traps, but not the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
-  // _inst_codegen, temen_par_child*) are the ones a rare shared-memory race actually trips (a double-free
-  // in the shared codegen stash → `memory access out of bounds` or a panic=abort `unreachable`). An
-  // uncaught trap there rejects this async onmessage, and a Worker's unhandled rejection does NOT fire
-  // `Worker.onerror` on the page — so a child that dies here never fills its completion slot and the
-  // root's join `Atomics.wait` hangs the whole page (the 30s-timeout flake). Wrap the entire body so
-  // ANY trap becomes a clean vCPU trap: wake any joiner, and report `fail` with the captured panic site.
+  // _inst_codegen, temen_par_child*), where the shared-memory races have bitten: a double-free in the
+  // shared codegen stash (I22, since fixed by `CodegenGuard`) and a Worker handed this memory with a
+  // stale length (#1996, fixed by `foreignImports` adopting it). An uncaught trap there rejects this
+  // async onmessage, and a Worker's unhandled rejection does NOT fire `Worker.onerror` on the page, so a
+  // child that dies here never fills its completion slot and the root's join `Atomics.wait` hangs the
+  // whole page. Wrap the entire body so ANY trap becomes a clean vCPU trap: wake any joiner, and report
+  // `fail` with the captured panic site.
   let ex;
   try {
   // The engine imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). A Worker vCPU has

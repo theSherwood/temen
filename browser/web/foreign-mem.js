@@ -12,6 +12,8 @@
 // Widths 4/8; `off` naturally aligned. A registry is per agent (page or Worker): a Memory registered
 // here is addressable by the engine instance(s) of THIS agent.
 
+import { adoptMemory } from './engine-mem.js';
+
 const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0 within it }
 
 /**
@@ -21,7 +23,7 @@ const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region o
  * host's (DETACHED_JIT.md §3.1).
  */
 export function registerForeign(memory, base = 0) {
-  mems.push({ m: memory, base });
+  mems.push({ m: adoptMemory(memory), base }); // a detached child's memory, shared by its threads' Workers
   return mems.length - 1;
 }
 
@@ -32,6 +34,9 @@ export function foreignMemory(id) {
 
 /** The `temen_host` import entries for an engine instance whose linear memory is `engineMemory`. */
 export function foreignImports(engineMemory) {
+  // Every threads-engine instantiation comes through here, so this is where an agent handed the engine
+  // memory adopts it: before the views below and the instance built over these imports (#1996).
+  adoptMemory(engineMemory);
   // Views are cached and NEVER refreshed through `.buffer` on the hot path: measured in Chromium, the
   // `WebAssembly.Memory.buffer` getter costs ~90 ns, more than the whole wasm↔JS call. A view over
   // SHARED memory is never detached by a grow — it just stays short — so "does this access fit in the

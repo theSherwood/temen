@@ -877,9 +877,10 @@ fn par_jit_paged() -> bool {
 //
 // The emit runs while the lock is held, so under `panic = "abort"` a compile panic would leave the
 // lock stuck and the run's other Workers spinning — but (i) the emitters are pure and only ever see
-// fixed corpus/constant modules that compile cleanly, and (ii) the I22 retry reloads the page with a
-// *fresh* `WebAssembly.Memory`, which re-initialises `CODEGEN_LOCK` to `false`, so even that case
-// self-heals. (The pre-fix double-free is what actually produced the panics; this removes it.)
+// fixed corpus/constant modules that compile cleanly, and (ii) the panicking Worker reports `fail`
+// (worker.js's setup backstop), so its run fails and its spinning Workers are terminated instead of
+// hanging (the lock stays held for the rest of that engine's life). (The pre-fix double-free is what
+// actually produced the panics; this removes it.)
 static PAR_RUN_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static CODEGEN_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
