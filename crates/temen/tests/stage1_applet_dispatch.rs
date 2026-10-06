@@ -6,41 +6,51 @@
 //! spawn the matching entry, thread its exit code into `$?`.
 //!
 //! The name→entry lookup itself is trivial personality glue (a map) and lives above this; here the
-//! entry index is chosen per case, exactly as the shell will compute it. BusyBox-multicall shape
-//! (`instantiate_named`, op 11 + `join`, op 1), differential interp==JIT.
+//! entry index is chosen per case, exactly as the shell will compute it. BusyBox-multicall shape (a
+//! detached v1 record spawn with one named grant, + `join`), differential interp==JIT.
 //!
 //! Gated `#![cfg(unix)]` like the other JIT differential suites (temen-jit's guard page is unix-only).
 #![cfg(unix)]
 
-#[path = "support/grant_hooks.rs"]
-mod grant_hooks_mod;
-use grant_hooks_mod::grant_hooks;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
-use temen_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap, Value};
-use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
+use std::sync::Arc;
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Trap, Value};
+use temen_ir::{module_args_base, Module, SpawnRec};
+use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
 const WIN: usize = 128 << 10;
-const CARVE: u64 = 64 << 10;
+/// Where the parent stores the applet's argv before the spawn, in its own window.
+const TOKEN_AT: u64 = 16700;
 
 /// One module: parent (func 0) plus three applets — func 1 `true` (→0), func 2 `false` (→1), func 3
-/// `echo` (resolve `stdout`, write 3 seeded bytes, →3). The parent seeds `token` into the applet's
-/// carve, lays a `stdout` grant record, spawns applet `entry`, joins, and returns its status.
-fn src(entry: u64, token: &[u8; 3]) -> String {
-    let f0 = (entry << 32) as i64;
+/// `echo` (resolve `stdout`, write its 3 argv bytes, →3). The parent stores `token`, lays a `stdout`
+/// grant record, spawns applet `entry` detached through a v1 record paid from its `Budget` that
+/// carries the token as the args payload (it lands at the applet's `module_args_base`), joins, and
+/// returns its status.
+fn src(entry: u32, token: &[u8; 3]) -> String {
     let seed: String = token
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let addr = CARVE + 16384 + i as u64;
+            let addr = TOKEN_AT + i as u64;
             format!("  q{i} = i64.const {addr}\n  c{i} = i32.const {b}\n  i32.store8 q{i} c{i}\n")
         })
         .collect();
+    let spawn = SpawnRec {
+        grants_ptr: 16384,
+        grants_n: 1,
+        args: (TOKEN_AT, token.len() as u64),
+        ..SpawnRec::v1(entry)
+    };
+    let args = module_args_base();
     format!(
         r#"memory 17
-func (i32, i32) -> (i64) {{
-block 0 (vinst: i32, vout: i32) {{
+{rec}func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vout: i32, vbud: i32) {{
   a0 = i64.const 16384
   n100 = i32.const 16484
   i32.store a0 n100
@@ -69,28 +79,9 @@ block 0 (vinst: i32, vout: i32) {{
   i32.store8 p104 cu
   p105 = i64.const 16489
   i32.store8 p105 ct
-{seed}  ; spawn via record (op 17): off=CARVE sl=16 quota=0, one named grant record at 16384
-  rrv0 = i64.const {f0}
-  rrv1 = i64.const {CARVE}
-  rrv2 = i64.const -4294967280
-  rrv3 = i64.const 4294967295
-  rrvz = i64.const 0
-  rrgp = i64.const 16384
-  rrv1n = i64.const 1
+{seed}  rrb = i64.const 17564
+  i32.store rrb vbud
   rra0 = i64.const 17536
-  i64.store rra0 rrv0
-  rra1 = i64.const 17544
-  i64.store rra1 rrv1
-  rra2 = i64.const 17552
-  i64.store rra2 rrv2
-  rra3 = i64.const 17560
-  i64.store rra3 rrv3
-  rra4 = i64.const 17568
-  i64.store rra4 rrvz
-  rra5 = i64.const 17576
-  i64.store rra5 rrgp
-  rra6 = i64.const 17584
-  i64.store rra6 rrv1n
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
   r = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return r
@@ -129,27 +120,37 @@ block 0 (vci: i64) {{
   i32.store8 a205 ct
   len6 = i64.const 6
   hout = self.resolve a200 len6
-  a0 = i64.const 16384
+  a0 = i64.const {args}
   len3 = i64.const 3
   w = call.cap 0 1 (i64, i64) -> (i64) hout (a0, len3)
   return w
   }}
 }}
-"#
+"#,
+        rec = rec::segment(17536, &spawn),
     )
 }
 
-fn run_interp(entry: u64, token: &[u8; 3]) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+/// The module for `entry`, and a host for it with the parent's three args: an `Instantiator`, the
+/// `stdout` it grants the applet, and the `Budget` that pays for the applet's window.
+fn setup(entry: u32, token: &[u8; 3]) -> (Module, Host, [i32; 3]) {
     let m = parse_module(&src(entry, token)).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
+    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, WIN as u64);
     let oh = host.grant_stream(StreamRole::Out);
+    let bh = host.grant_budget(-1, 1 << 20, -1);
+    (m, host, [ih, oh, bh])
+}
+
+fn run_interp(entry: u32, token: &[u8; 3]) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let (m, mut host, args) = setup(entry, token);
     let mut fuel = 5_000_000u64;
     let (res, _snap) = run_capture_reserved_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(oh)],
+        &args.map(Value::I32),
         &mut fuel,
         &[0u8; WIN],
         0,
@@ -158,22 +159,17 @@ fn run_interp(entry: u64, token: &[u8; 3]) -> (Result<Vec<Value>, Trap>, Vec<u8>
     (res, host.stdout_bytes())
 }
 
-fn run_jit(entry: u64, token: &[u8; 3]) -> (JitOutcome, Vec<u8>) {
-    let m = parse_module(&src(entry, token)).expect("parse");
-    verify_module(&m).expect("verify");
-    let mut host = Host::new();
-    let ih = host.grant_instantiator(0, WIN as u64);
-    let oh = host.grant_stream(StreamRole::Out);
-    let (jo, _jmem) = compile_and_run_capture_reserved_with_host_ex(
+fn run_jit(entry: u32, token: &[u8; 3]) -> (JitOutcome, Vec<u8>) {
+    let (m, mut host, args) = setup(entry, token);
+    let (jo, _) = temen_run::jit_cap_run(
         &m,
         0,
-        &[ih as i64, oh as i64],
-        &[0u8; WIN],
+        &args.map(i64::from),
+        &MemLayout::image(vec![0u8; WIN]),
         0,
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut core::ffi::c_void,
+        0,
+        &mut host,
         None,
-        Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit");
     (jo, host.stdout_bytes())
@@ -185,7 +181,7 @@ fn run_jit(entry: u64, token: &[u8; 3]) -> (JitOutcome, Vec<u8>) {
 #[test]
 fn dispatch_selects_applet_and_threads_its_status() {
     // (entry, expected status, expected stdout)
-    let cases: &[(u64, i64, &[u8])] = &[(1, 0, b""), (2, 1, b""), (3, 3, b"hey")];
+    let cases: &[(u32, i64, &[u8])] = &[(1, 0, b""), (2, 1, b""), (3, 3, b"hey")];
     for &(entry, status, out) in cases {
         let token = b"hey";
         let (ir, iout) = run_interp(entry, token);

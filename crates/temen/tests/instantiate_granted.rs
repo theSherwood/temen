@@ -29,7 +29,8 @@ use temen_verify::verify_module;
 /// the name `"g"` (name at 20480, grant record at 20488), then `join` and return the child's result.
 ///
 /// func 1 (child, `(Instantiator, AddressSpace)`): write the three bytes `"hi\n"` into its own
-/// window above its NULL guard, resolve `"g"` by name, `Stream.write` them through it, then return 7.
+/// window above its NULL guard, resolve `"g"` by name, `Stream.write` them through it, then return
+/// `100 * g + 7` — so the join also carries the handle the child was given.
 const SRC: &str = "memory 17\n\
 func (i32, i32, i32) -> (i64) {\n\
 block 0 (vinst: i32, vstream: i32, vbud: i32) {\n\
@@ -73,8 +74,12 @@ block 0 (vcinst: i64, vcas: i64) {\n\
   vsh = self.resolve vnp vnl\n\
   vlen = i64.const 3\n\
   vw = call.cap 0 1 (i64, i64) -> (i64) vsh (v0, vlen)\n\
+  vsh64 = i64.extend_i32_s vsh\n\
+  vhun = i64.const 100\n\
+  vhs = i64.mul vsh64 vhun\n\
   v7 = i64.const 7\n\
-  return v7\n\
+  vr = i64.add vhs v7\n\
+  return vr\n\
   }\n\
 }\n";
 
@@ -142,16 +147,20 @@ fn run_jit(stream_grant: bool) -> (JitOutcome, Vec<u8>) {
 fn granted_child_writes_stdout_on_both() {
     let (ir, iout) = run_interp(true);
     let (jo, jout) = run_jit(true);
-    // Interpreter reference: the child ran, wrote through the re-granted stdout, joined with 7.
-    assert_eq!(ir, Ok(vec![Value::I64(7)]), "interp: child ran and joined");
+    // Interpreter reference: the child ran, wrote through the re-granted stdout, and joined.
+    let joined = match ir.as_deref() {
+        Ok([Value::I64(r)]) if r % 100 == 7 => *r,
+        other => panic!("interp: child ran and joined, got {other:?}"),
+    };
     assert_eq!(
         iout, b"hi\n",
         "interp: child output through re-granted stdout"
     );
-    // JIT parity: same return value, same bytes into the same (shared) sink.
+    // JIT parity: the same result — the child's `"g"` is the same handle, since the JIT builds the
+    // child's powerbox in the oracle's order — and the same bytes into the same (shared) sink.
     assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[7]),
-        "jit: granted child must join with 7, got {jo:?}"
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[joined]),
+        "jit: granted child must join with {joined}, as the interpreter, got {jo:?}"
     );
     assert_eq!(jout, iout, "jit: granted child's stdout must match interp");
 }

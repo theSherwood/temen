@@ -6107,15 +6107,15 @@ fn client_gone_locked(s: &mut Sched, service: usize) {
 }
 
 /// #1217 — the service domains a finishing vCPU was a client of, whose `svc.wait` its end
-/// releases: its §2.2 pager, and — for a §14 child's entry vCPU (`nested_child`: the child
-/// domain's end, not a thread of it finishing) — the provider of every live offer its powerbox
-/// still holds ([`Binding::LiveImpl`], the re-granted `child_offer` shape). Instanced offers
-/// (CALLS.md 4x, animated on the caller's own vCPU) never park a provider on this client, so they
-/// are not listed. Locks the host cells briefly, never nested; call it before taking the
-/// scheduler lock.
+/// releases: its §2.2 pager, and — for a §14 child's entry vCPU, carve (`nested_child`) or detached
+/// (the one vCPU with a `freeze_bell`): the child domain's end, not a thread of it finishing — the
+/// provider of every live offer its powerbox still holds ([`Binding::LiveImpl`], the re-granted
+/// `child_offer` shape). Instanced offers (CALLS.md 4x, animated on the caller's own vCPU) never
+/// park a provider on this client, so they are not listed. Locks the host cells briefly, never
+/// nested; call it before taking the scheduler lock.
 fn client_gone_targets(v: &VCpu) -> Vec<usize> {
     let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
-    if v.nested_child {
+    if v.nested_child || v.freeze_bell.is_some() {
         let hg = v.host.lock_unpoisoned();
         cells.extend(hg.table.iter().filter_map(|slot| match slot.entry {
             Some(Binding::LiveImpl(i)) => {
@@ -30023,7 +30023,7 @@ impl Host {
     ) -> Option<(Host, i32, i32)> {
         // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
         let attestation = self.child_attestation(false, None);
-        self.spawn_child_powerbox(grants, child_size, attestation)
+        self.spawn_child_powerbox(grants, child_size, attestation, None)
     }
 
     /// PROCESS.md §5 / #1287 — the **detached** twin of [`Self::spawn_named_child`]: the same by-name
@@ -30051,18 +30051,22 @@ impl Host {
         // budget it charged, as the tree-walker's arm does. The JIT's thunk carries both from its
         // admission hook to this build itself, so nothing waits on this host between the two for
         // another vCPU's spawn to take (#1972).
-        let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
+        let (mut ch, cinst, cas) =
+            self.spawn_child_powerbox(grants, reservation, attestation, Some(budget))?;
         ch.set_durable(durable);
         ch.set_lane_cap(lane);
-        self.give_child_budget(budget, &mut ch);
         Some((ch, cinst, cas))
     }
 
+    /// The child powerbox: its starter caps, then `budget` as its own `"budget"` (a detached child,
+    /// [`Self::give_child_budget`]), then each of `grants` under its name — the order the
+    /// tree-walker's detached arm grants them in, so a child's handles are the same on every engine.
     fn spawn_child_powerbox(
         &mut self,
         grants: &[(String, i32)],
         child_size: u64,
         attestation: Attestation,
+        budget: Option<i32>,
     ) -> Option<(Host, i32, i32)> {
         // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
         // anything (a partially-built child would leak a promoted sink / installed pipe).
@@ -30078,6 +30082,9 @@ impl Host {
         ch.set_self_module_opt(self.self_module.clone());
         ch.set_attestation(attestation);
         let (cinst, cas) = ch.grant_starter_caps(child_size);
+        if let Some(budget) = budget {
+            self.give_child_budget(budget, &mut ch);
+        }
         for (name, handle) in grants {
             // Pre-checked above, so this cannot fail; each cap (coordinate-free or pipe end) is
             // re-granted into the child under its name.
@@ -30531,7 +30538,7 @@ impl Host {
         }
         let child_size = 1u64 << win_log2;
         let (mut host, ci, ca) = self
-            .spawn_child_powerbox(grants, window_reserved, self.attestation)
+            .spawn_child_powerbox(grants, window_reserved, self.attestation, None)
             .ok_or(EINVAL)?;
         // #1944 slice 3 — an exec replaces the image, not the domain: the new image's use is charged
         // to the node the old one's was, as a process keeps its cgroup across `execve`, so a child

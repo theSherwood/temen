@@ -17,16 +17,16 @@
 //!
 //! **§3d note (2026-08-06):** these parents stay on the scalar spawn ops **deliberately**: an
 //! R9-instrumented guest is pure SSA + `call.cap` (`transform_module` refuses any guest memory
-//! op — `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window.
-//! The record migration (CONSOLIDATION.md §3d) therefore gates the op-0/5 arm deletion on the
-//! §12.7 relocation work that lifts that restriction — do not migrate this file until then.
+//! op — `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window. A
+//! test that leaves the carve (#1867) spawns through op 15's scalar form instead, as
+//! `durable_detached_jit.rs` does.
 
 use std::sync::Arc;
 use temen_durable::{
     arm_freeze_after, arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state,
     transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, Trap, Value};
 use temen_ir::{Func, Module};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -329,20 +329,21 @@ block 0 () {
 
 // ---- Freeze × §14 children (the fail-closed half of "STW quiesces the subtree as a unit") ----
 
-/// Durable parent: instantiate + join a same-module child, then drive a fiber that suspends once
-/// (the armed freeze trigger ticks on `cont.resume`, so `arm = 2` lands the freeze at the second
-/// resume — after the join, with the fiber parked: the covered residue shape). Returns child
-/// result + fiber result = 777 + 55 = 832.
-const PARENT_JOIN_THEN_FIBER: &str = "memory 18 shadow 16448 65536
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 131072
-  v3 = i64.const 17
-  v4 = i64.const 0
-  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+/// Durable parent that spawns its granted child **detached** (op 15's scalar form: budget, module,
+/// no grants, entry 0, `size_log2` 17, no quota) and joins it, then drives a fiber that suspends
+/// once (the armed freeze trigger ticks on `cont.resume`, so `arm = 2` lands the freeze at the second
+/// resume — after the join, with the fiber parked: the covered residue shape). Returns child result
+/// + fiber result = 4321 + 55 = 4376.
+const PARENT_DETACHED_JOIN_THEN_FIBER: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 17
+  v5 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  v7 = ref.func 2
+  v7 = ref.func 1
   v8 = i64.const 4096
   v9 = cont.new v7 v8
   v10 = i64.const 0
@@ -354,12 +355,6 @@ block 0 (v0: i32) {
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.const 777
-  return v2
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (v0: i64, v1: i64) {
   v2 = i64.const 5
   v3 = suspend v2
   v4 = i64.const 55
@@ -367,6 +362,23 @@ block 0 (v0: i64, v1: i64) {
   }
 }
 ";
+
+/// A durable powerbox for [`PARENT_DETACHED_JOIN_THEN_FIBER`]: the `Instantiator`, [`child`]'s
+/// durable module grant, a `Budget` for its window, and the freeze authority over detached progeny
+/// a durable domain needs to spawn detached at all — with their handles as the parent's entry args.
+/// Every call grants in the same order, so a thawing host's handles are the frozen ones.
+fn detached_powerbox() -> (Host, [Value; 3]) {
+    let mut host = Host::new();
+    host.set_durable(true);
+    let inst = host.grant_instantiator(0, WINDOW as u64);
+    let modh = host.grant_durable_module(&child());
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    (
+        host,
+        [Value::I32(inst), Value::I32(modh), Value::I32(budget)],
+    )
+}
 
 /// §4 subtree freeze (the covered shape): a freeze landing while a same-module §14 child is
 /// **live** no longer refuses — the child is driven to unwind into its own carve (the subtree STW
@@ -612,43 +624,32 @@ fn thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module() {
 /// valid artifact, and the thaw **reloads** the child's join result (reload-not-reissue — the
 /// child is never re-run) and reproduces the uninterrupted total.
 #[test]
-fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
-    let parent = instrument(PARENT_JOIN_THEN_FIBER);
+fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
+    let parent = instrument(PARENT_DETACHED_JOIN_THEN_FIBER);
 
     // Control: uninterrupted total.
-    let mut host = Host::new();
-    host.set_durable(true);
-    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let (mut host, args) = detached_powerbox();
     let mut fuel = 5_000_000u64;
     let (base, _) = run_capture_reserved_with_host(
         &parent,
         0,
-        &[Value::I32(ih)],
+        &args,
         &mut fuel,
         &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
-    assert_eq!(base, Ok(vec![Value::I64(777 + 55)]), "uninterrupted total");
+    assert_eq!(base, Ok(vec![Value::I64(4321 + 55)]), "uninterrupted total");
 
     // Armed freeze: tick 1 at the first resume (runs; the fiber parks), tick 2 at the second —
     // the freeze lands with the child already joined (its result checkpointed in the parent's
     // shadow frame) and the fiber parked (rides as Section-2 residue).
-    let mut fhost = Host::new();
-    fhost.set_durable(true);
-    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let (mut fhost, fargs) = detached_powerbox();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, 2);
     let mut fuel = 5_000_000u64;
-    let (fr, fsnap) = run_capture_reserved_with_host(
-        &parent,
-        0,
-        &[Value::I32(fih)],
-        &mut fuel,
-        &win,
-        SIZE_LOG2,
-        &mut fhost,
-    );
+    let (fr, fsnap) =
+        run_capture_reserved_with_host(&parent, 0, &fargs, &mut fuel, &win, SIZE_LOG2, &mut fhost);
     assert!(
         fr.is_ok(),
         "freeze-after-join returns a placeholder: {fr:?}"
@@ -658,28 +659,23 @@ fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
         STATE_UNWINDING,
         "the armed freeze landed (joined child does not refuse it)"
     );
+    assert!(
+        fhost.captured_detached().is_empty(),
+        "a joined child is not captured"
+    );
 
-    // Thaw: the parent rewinds, reloading the instantiate handle and the join result from its
-    // shadow frame — the child never re-runs — and completes to the uninterrupted total.
+    // Thaw: the parent rewinds, reloading the spawn handle and the join result from its shadow
+    // frame — the child never re-runs — and completes to the uninterrupted total.
     let mut twin = fsnap.clone();
     begin_thaw(&mut twin, TEST_ARENA, 0);
-    let mut thost = Host::new();
-    thost.set_durable(true);
+    let (mut thost, targs) = detached_powerbox();
     thost.set_frozen_fibers(fhost.frozen_fibers().to_vec());
-    let tih = thost.grant_instantiator(0, WINDOW as u64);
     let mut fuel = 5_000_000u64;
-    let (tr, tsnap) = run_capture_reserved_with_host(
-        &parent,
-        0,
-        &[Value::I32(tih)],
-        &mut fuel,
-        &twin,
-        SIZE_LOG2,
-        &mut thost,
-    );
+    let (tr, tsnap) =
+        run_capture_reserved_with_host(&parent, 0, &targs, &mut fuel, &twin, SIZE_LOG2, &mut thost);
     assert_eq!(
         tr,
-        Ok(vec![Value::I64(777 + 55)]),
+        Ok(vec![Value::I64(4321 + 55)]),
         "thaw reproduces the total — the §14 join result reloaded, the child never re-ran"
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
@@ -692,15 +688,13 @@ fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
 /// `None`, so an embedder always lands on the enforced path.)
 #[test]
 fn bytecode_durable_capture_declines_a_nesting_module() {
-    let parent = instrument(PARENT_SELF);
-    let mut host = Host::new();
-    host.set_durable(true);
-    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let parent = instrument(PARENT_DETACHED_JOIN_THEN_FIBER);
+    let (mut host, args) = detached_powerbox();
     let mut fuel = 5_000_000u64;
     let r = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
         &parent,
         0,
-        &[Value::I32(ih)],
+        &args,
         &mut fuel,
         &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
