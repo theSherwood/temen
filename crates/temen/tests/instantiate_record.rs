@@ -133,7 +133,7 @@ block 0 (v0: i64) {
 ";
 
 /// The §2.2 pager shape spelled as a record: pager export 0, one 64 KiB stride, handler
-/// supplies 123 — the record twin of `paging_offer.rs`'s single-fault vertical (exit 1123). The child
+/// supplies 123 — the carve twin of `a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it` (exit 1123). The child
 /// faults at 16 KiB: its carve reserves the NULL guard below that like any window (#1206), and a guard
 /// fault is fatal, never the recoverable kind a pager services.
 /// The pager (func 2) follows the #1862 contract: it gets the child's fault address **in the child's

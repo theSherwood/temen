@@ -3,21 +3,21 @@
 //!   cargo test -p temen --release --test paging_bench -- --ignored --nocapture
 //!
 //! **What it measures and why.** The fault-service round-trip on the unified offer transport —
-//! a demand process child (`Instantiator` op 16) touches an unsupplied page, the fault becomes a
-//! `page(addr)` call on the parent's pager export (direct handoff runs the handler inline on the
-//! child's thread), the handler stores the page's bytes, the substrate supplies the page, and the
-//! rewound access re-executes — timed per-fault across the backends. Until §2.3 this file raced
-//! the offer lane against the bespoke coroutine ops (`spawn_demand_coroutine` + resume-loop
-//! paging) they replaced; the collapse deleted those ops, so the offer lane now holds the
-//! absolute pin, with the deletion-time record below as the reference point.
+//! a detached demand child (a v1 record naming the parent's pager export) touches an unsupplied
+//! page, the fault becomes a `page(addr)` call on the parent's pager export (direct handoff runs the
+//! handler inline on the child's thread), the handler stores the page's bytes, the substrate supplies
+//! the page, and the rewound access re-executes — timed per-fault across the backends. Until §2.3
+//! this file raced the offer lane against the bespoke coroutine ops (`spawn_demand_coroutine` +
+//! resume-loop paging) they replaced; the collapse deleted those ops, so the offer lane now holds
+//! the absolute pin, with the deletion-time record below as the reference point.
 //!
 //! Shape notes: each child touches `P` pages at a 64 KiB stride, so the fault count is exactly
 //! `P` on any host page size ≤ 64 KiB (supply maps only the host page containing the fault, and
 //! the next touch is a stride away) — the checksum is host-independent. The parent respawns `S`
-//! children over the same carve; a fresh demand child re-faults every page, so total round-trips
+//! children, each into a fresh window; a fresh demand child faults every page, so total round-trips
 //! are `S·P` with spawn cost amortized 1/P per fault. As in `serving_bench`, all backends must
 //! agree on the checksum *before* timing (never benchmark a miscompile), so this file doubles as
-//! a CI pin for N sequential fault-service rounds — `paging_offer.rs` only faults once or twice.
+//! the CI pin for N sequential fault-service rounds.
 //!
 //! Deletion-time record (the §2.3 evidence, measured on the last commit carrying both lanes,
 //! after the §2.2b dispatch fast lane): bespoke TreeWalk 1430 ns / Bytecode 1828 ns / Jit
@@ -27,14 +27,18 @@
 //! concurrent child; the priced-but-not-queued parked-provider cache (~300-450 ns floor)
 //! remains the lever if it ever matters.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::time::Instant;
 
+use temen_ir::SpawnRec;
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 
-/// Child carve: a 2^23 window at offset 2^23 inside a 2^24 parent — 128 strides of 64 KiB.
-const CARVE_OFF: u64 = 1 << 23;
-const CARVE_LOG2: u64 = 23;
+/// Where the pager stages a page in its own window: this far above the fault address, past the
+/// 128 strides of 64 KiB the child touches and inside the parent's 2^24 window.
+const BUFFER_OFF: u64 = 1 << 23;
 /// The byte the pager supplies at each fault address; the child sums what it reads.
 const PAGE_BYTE: i64 = 7;
 /// Per-fault marker the parent folds into the checksum, so a silently skipped fault (a page that
@@ -42,18 +46,21 @@ const PAGE_BYTE: i64 = 7;
 const FAULT_MARK: i64 = 1000;
 
 /// CONSOLIDATION.md §2.2 — the **offer-transport twin**: the same S x P shape, driven the
-/// collapsed way. The parent spawns a **demand process child** (`Instantiator` op 16) over the
-/// same carve, naming its own impl export 0 as the pager; the child walks the same strides
-/// concurrently, each first touch faulting into a `page(addr)` call the parent serves from
-/// `svc.wait` (direct handoff runs the handler inline on the child's thread); the parent counts
-/// serves (`FAULT_MARK` each), joins the child (its stride sum), and repeats. The checksum is
-/// identical to the bespoke lane's by construction: the comparison this file exists for.
+/// collapsed way. The parent spawns its own func 1 as a **detached demand child**, through a v1
+/// record paid from its `"budget"` that names its own impl export 0 as the pager; the child walks
+/// the strides of its own window concurrently, each first touch faulting into a `page(addr)` call
+/// the parent serves from `svc.wait` (direct handoff runs the handler inline on the child's thread);
+/// the parent counts serves (`FAULT_MARK` each), joins the child (its stride sum), and repeats. The
+/// handler gets the fault address in the child's coordinates, stores the page's byte `BUFFER_OFF`
+/// above it in its own window, and replies with that address (#1862). The checksum is identical to
+/// the bespoke lane's by construction: the comparison this file exists for.
 fn offer_paging_program(s: u64, p: u64) -> String {
     format!(
         "\
 memory 24
 data 16384 \"vm\"
-type 0 func (i64) -> (i64)
+data 16400 \"budget\"
+{rec}type 0 func (i64) -> (i64)
 type 1 interface {{ page: 0 }}
 export 0 interface \"pager\" 1 {{ page: 2 }}
 import 0 \"exit\" (i32) -> ()
@@ -63,31 +70,17 @@ block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vrb = i64.const 17564
+  i32.store vrb vb
   vs0 = i64.const 0
   vacc0 = i64.const 0
   br 1(vh, vs0, vacc0)
 }}
 block 1 (vh1: i32, vs: i64, vacc: i64) {{
-  ; spawn a demand child via record (op 17): pager = impl export 0 (f16 hi), entry 1
-  rrv0 = i64.const 4294967296
-  rrv1 = i64.const {off}
-  rrv2 = i64.const {sl}
-  rrv3 = i64.const 4294967295
-  rrvz = i64.const 0
   rra0 = i64.const 17536
-  i64.store rra0 rrv0
-  rra1 = i64.const 17544
-  i64.store rra1 rrv1
-  rra2 = i64.const 17552
-  i64.store rra2 rrv2
-  rra3 = i64.const 17560
-  i64.store rra3 rrv3
-  rra4 = i64.const 17568
-  i64.store rra4 rrvz
-  rra5 = i64.const 17576
-  i64.store rra5 rrvz
-  rra6 = i64.const 17584
-  i64.store rra6 rrvz
   vch = call.cap 6 17 (i64) -> (i32) vh1 (rra0)
   vsrv0 = i64.const 0
   br 2(vh1, vs, vacc, vch, vsrv0)
@@ -146,16 +139,22 @@ block 2 (vaf: i64) {{
 
 func 2 (i64) -> (i64) {{
 block 0 (vaddr: i64) {{
-  vcarve = i64.const {off}
-  vsrc = i64.add vaddr vcarve
+  vbuf = i64.const {off}
+  vsrc = i64.add vaddr vbuf
   vb = i32.const {byte}
   i32.store8 vsrc vb
   return vsrc
   }}
 }}
 ",
-        off = CARVE_OFF,
-        sl = CARVE_LOG2,
+        rec = rec::segment(
+            17536,
+            &SpawnRec {
+                pager: 0,
+                ..SpawnRec::v1(1)
+            }
+        ),
+        off = BUFFER_OFF,
         byte = PAGE_BYTE,
         mark = FAULT_MARK,
         s = s,
@@ -181,10 +180,14 @@ fn run(backend: Backend, src: &str) -> i32 {
         .run_with_caps(
             backend,
             &RunConfig::default(),
-            &[(
-                "vm",
-                HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-            )],
+            &[
+                (
+                    "vm",
+                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                ),
+                // One live child at a time, each a 2^24 window.
+                ("budget", HostCap::detached_budget(1 << 25)),
+            ],
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
     match r.outcome {
@@ -206,7 +209,7 @@ fn demand_fault_rounds_agree_across_backends() {
         assert_eq!(
             run(b, &offer),
             want,
-            "{b:?}: offer (op 16 pager) {s}x{p} fault-service rounds"
+            "{b:?}: offer (record pager) {s}x{p} fault-service rounds"
         );
     }
 }
@@ -246,7 +249,7 @@ fn fault_service_latency() {
 
 /// The **fourth backend** — the wasm-JIT tier (`temen-wasm-jit`) — pinned so it is never silently
 /// forgotten in this comparison. Today the pager parent sits outside the emitter's nested
-/// subset (`svc.wait` serve loops and op 16 have no bounce arms), so the tier **fails closed**
+/// subset (`svc.wait` serve loops have no bounce arms), so the tier **fails closed**
 /// and the entry folds to the bytecode interpreter: the wasm-JIT row of the fault-service table
 /// *is* the Bytecode row. This test asserts exactly that state.
 /// When the emitter grows the arms, the assert flips — replace it with a real timed lane
