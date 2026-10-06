@@ -7797,7 +7797,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // back to the budget that paid for them (lock order sched → host), and what it grew (#1909).
     // Every vCPU of the dying domain passes here; the first hands it back, with the window of a
     // process that paid for its own (#2106).
-    v.host.lock_unpoisoned().release_window();
+    v.host.lock_unpoisoned().release_memory();
     if let Some((cell, budget, bytes)) = v.window_lease.take() {
         cell.lock_unpoisoned().release_detached(budget, bytes);
     }
@@ -9039,7 +9039,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else {
                     let mut h = v.host.lock_unpoisoned();
                     // #1909, #2106 — and its window goes, with what it held.
-                    h.release_window();
+                    h.release_memory();
                     h.release_pipe_ends()
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
@@ -19674,6 +19674,46 @@ impl SharedBacking for VecBacking {
     }
 }
 
+/// #2111 — a region the run's domains made (a guest's `create_region`, or a thaw's rebuild): its
+/// backing, charged `bytes` of `channel` to `node` and every ancestor for as long as it lives. The
+/// charge rides the shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go
+/// of it last refunds the node that paid. A domain lets go of its regions when it ends
+/// ([`Host::release_memory`]), so the refund lands at the same point on every engine.
+struct ChargedRegion {
+    backing: RegionBacking,
+    node: NodeRef,
+    bytes: u64,
+}
+
+impl SharedBacking for ChargedRegion {
+    fn size(&self) -> u64 {
+        self.backing.size()
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        self.backing.read_byte(off)
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        self.backing.write_byte(off, b)
+    }
+    fn os_fd(&self) -> Option<i32> {
+        self.backing.os_fd()
+    }
+    fn os_section(&self) -> Option<isize> {
+        self.backing.os_section()
+    }
+    fn outside_writers(&self) -> bool {
+        self.backing.outside_writers()
+    }
+}
+
+impl Drop for ChargedRegion {
+    fn drop(&mut self) {
+        self.node
+            .tree
+            .refund(self.node.node, BUDGET_CHANNEL, self.bytes);
+    }
+}
+
 /// #1909 — what a window holds in the reserved tail of a page range: the part past its declared size,
 /// which a window grows into.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -22801,7 +22841,7 @@ pub struct Host {
     own_budget: u32,
     /// #1909, INVARIANTS #3 R2 — what this domain's window holds committed past its declared size,
     /// charged to `own_budget` and every ancestor ([`Host::page_op`]) and handed back when the window
-    /// goes ([`Host::release_window`]). `None` for a window no budget paid for (a run's root), whose
+    /// goes ([`Host::release_memory`]). `None` for a window no budget paid for (a run's root), whose
     /// growth is unmetered.
     grown: Option<u64>,
     /// #2106 — the declared window this domain pays for itself, charged to `own_budget` and every
@@ -23722,7 +23762,7 @@ impl Host {
     /// `window` declared bytes and `grown` past them. A new window spends `Budget.mem`, so the process
     /// pays for it: charged to the node it shares with this domain and every ancestor, all or nothing,
     /// before any fork factory runs, so a refusal registers no process. It goes back when the process
-    /// ends ([`Self::release_window`]). `None`, with nothing charged, when a level lacks the room or
+    /// ends ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or
     /// the powerbox cannot be duplicated. A process of an unmetered domain (a run's root) is
     /// unmetered too.
     fn process_powerbox(&self, pid: u64, window: u64, grown: u64) -> Option<Host> {
@@ -26143,7 +26183,9 @@ impl Host {
     }
 
     /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: the
-    /// embedder's factory, as a guest mint uses, else the heap.
+    /// embedder's factory, as a guest mint uses, else the heap. #2111 — charged to this domain's
+    /// node whatever its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a
+    /// freeze carries no node's `channel` use.
     pub fn rebuild_region(&self, bytes: &[u8]) -> RegionBacking {
         let backing = match self.region_factory {
             Some(f) => f(bytes.len()),
@@ -26152,7 +26194,13 @@ impl Host {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        backing
+        self.budgets
+            .force_charge(self.own_budget, BUDGET_CHANNEL, bytes.len() as u64);
+        Arc::new(ChargedRegion {
+            backing,
+            node: self.own_node(),
+            bytes: bytes.len() as u64,
+        })
     }
 
     /// #2025 — hold a rebuilt region under a new id, for the thaw to re-pin the handles and window
@@ -26802,19 +26850,23 @@ impl Host {
         r
     }
 
-    /// #1909, #2106 — this domain's window is gone (the domain ended, or an exec replaced its image):
-    /// what it held goes back to its node and every ancestor — what it grew past its declared size,
-    /// and the declared window itself when the domain paid for it ([`Self::own_window`]), as a
-    /// detached child's goes back with its lease (INVARIANTS #3: ending a use refunds every level).
-    /// Never on a freeze: a captured window stays charged, and the thaw takes the charge over
-    /// ([`Host::prepare_detached_relaunch`]).
-    pub fn release_window(&mut self) {
+    /// #1909, #2106, #2111 — this domain is done with its memory (it ended, or an exec replaced its
+    /// image): what its window held goes back to its node and every ancestor — what it grew past its
+    /// declared size, and the declared window itself when the domain paid for it
+    /// ([`Self::own_window`]), as a detached child's goes back with its lease (INVARIANTS #3: ending
+    /// a use refunds every level). And it lets go of the regions it holds: one no other domain holds
+    /// goes, and its charge with it ([`ChargedRegion`]). Never on a freeze: a captured window stays
+    /// charged, and the thaw takes the charge over ([`Host::prepare_detached_relaunch`]). A window no
+    /// budget paid for (a run's root) is its embedder's, regions and all: the embedder reads it after
+    /// the run, and a reactor's next call finds its regions where they were (#2113 meters the root).
+    pub fn release_memory(&mut self) {
         if let Some(g) = self.grown {
             let held = g + std::mem::take(&mut self.own_window);
             if held > 0 {
                 self.budgets.refund(self.own_budget, BUDGET_MEM, held);
             }
             self.grown = Some(0);
+            self.regions.clear();
         }
     }
 
@@ -30067,12 +30119,12 @@ impl Host {
 
     /// A spawned process whose image could not be built in its powerbox (this, from
     /// [`Self::spawn_powerbox`]), or a new process the OS gave no thread: it exits with `status` as
-    /// it is born. The window it was charged for goes back ([`Self::release_window`]) and its pipe
+    /// it is born. The window it was charged for goes back ([`Self::release_memory`]) and its pipe
     /// ends are released, returning the pipes that left with no writers or no readers for the
     /// engine to wake, and its exit hooks fire, so its personality retires it to a zombie its parent
     /// reaps.
     pub fn spawn_failed(&mut self, status: i64) -> (Vec<u32>, Vec<u32>) {
-        self.release_window();
+        self.release_memory();
         let zeroed = self.release_pipe_ends();
         for hook in &self.exit_hooks {
             hook(status);
@@ -30395,10 +30447,8 @@ impl Host {
         host.budgets = Arc::clone(&self.budgets);
         host.own_budget = self.own_budget;
         // #1909 — the image starts in a fresh window, with nothing grown yet, metered as the old one
-        // was. #2106 — the window is the caller's size, so a declared window the domain paid for
-        // itself stays paid for.
+        // was.
         host.grown = self.grown.map(|_| 0);
-        host.own_window = std::mem::take(&mut self.own_window);
         let mut starters = [ci, ca];
         self.exec_carry(
             &mut host,
@@ -30408,13 +30458,16 @@ impl Host {
             &mut starters,
         )
         .map_err(|()| EINVAL)?;
+        // #2106 — committed: the window is the caller's size, so a declared window the domain paid
+        // for itself stays paid for.
+        host.own_window = std::mem::take(&mut self.own_window);
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
         // counts never dip through this.
         let zeroed_pipes = self.release_pipe_ends();
         // #1909 — and the old window goes with it: what it grew is handed back.
-        self.release_window();
+        self.release_memory();
         Ok(ExecImage {
             zeroed_pipes,
             host,
@@ -31412,17 +31465,30 @@ impl Host {
                     // a fresh zero-filled shareable region and gets its handle, to `map` into its own
                     // window and/or `grant` into a child domain (SharedRegion op 4). Backing comes
                     // from the embedder's factory (OS shared memory under the JIT) or the reference
-                    // `VecBacking`. Capped per-region (anti-bomb); real quota metering is §15 — DoS
-                    // is contained, not prevented (D48).
+                    // `VecBacking`. #2111 — its bytes spend `channel` of this domain's node and every
+                    // ancestor, as a pipe's FIFO does, all or nothing: `-ENOMEM` when a level lacks
+                    // the room. The per-region cap stays as the anti-bomb bound on one mint.
                     let len = *args.first().unwrap_or(&0);
                     if len <= 0 || len > MAX_MINTED_REGION {
                         return Ok(vec![EINVAL]);
+                    }
+                    if !self
+                        .budgets
+                        .charge(self.own_budget, BUDGET_CHANNEL, len as u64)
+                    {
+                        return Ok(vec![ENOMEM]);
                     }
                     let backing = match self.region_factory {
                         Some(f) => f(len as usize),
                         None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
                     };
-                    // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit #1).
+                    let backing: RegionBacking = Arc::new(ChargedRegion {
+                        backing,
+                        node: self.own_node(),
+                        bytes: len as u64,
+                    });
+                    // Guest-minting: a full handle table yields -EMFILE, never a panic (§3c / audit
+                    // #1); the region goes with the refusal, and its charge with it.
                     return Ok(vec![self
                         .try_grant_shared_region_backed(backing)
                         .map_or(EMFILE, |h| h as i64)]);
@@ -35102,7 +35168,7 @@ mod growth_tests {
             (WINDOW + 2 * GROWTH) as i64,
             "and charges nothing"
         );
-        twin.release_window();
+        twin.release_memory();
         assert_eq!(
             used(&parent, node),
             GROWTH as i64,
@@ -35173,7 +35239,7 @@ mod growth_tests {
             (WINDOW + GROWTH) as i64,
             "the copy's growth is back, and its window is the image's"
         );
-        image.host.release_window();
+        image.host.release_memory();
         assert_eq!(
             used(&parent, node),
             GROWTH as i64,
@@ -35202,6 +35268,84 @@ mod growth_tests {
             GROWTH as i64,
             "the grown page kept its contents: still charged"
         );
+    }
+}
+
+#[cfg(test)]
+mod region_charge_tests {
+    //! #2111 — a guest-minted region spends `channel` of its minter's node and every ancestor until
+    //! no domain holds it.
+    use super::*;
+
+    const REGION: u64 = 1 << 16;
+
+    /// A detached child paid from a node whose `channel` ceiling is `ceiling`: `(parent, node, child,
+    /// its AddressSpace)`.
+    fn child(ceiling: i64) -> (Host, u32, Host, i32) {
+        let mut parent = Host::new();
+        let budget = parent.grant_budget_channel(-1, -1, -1, ceiling);
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        let (_, space) = child.grant_starter_caps(1 << 20);
+        (parent, node, child, space)
+    }
+
+    fn mint(host: &mut Host, space: i32, len: u64) -> i64 {
+        let r = host.cap_dispatch_slots(cap_id::ADDRESS_SPACE, 5, space, &[len as i64], None);
+        r.expect("create_region")[0]
+    }
+
+    fn used(host: &Host, node: u32) -> i64 {
+        host.budgets.used(node, BUDGET_CHANNEL)
+    }
+
+    #[test]
+    fn a_minted_region_spends_channel_until_its_minter_ends() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        assert!(mint(&mut child, space, REGION) >= 0, "the region fits");
+        assert_eq!(used(&parent, node), REGION as i64);
+        assert_eq!(
+            mint(&mut child, space, 1),
+            ENOMEM,
+            "no room for another byte: the mint is refused"
+        );
+        assert_eq!(used(&parent, node), REGION as i64, "and charges nothing");
+        child.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the minter's end hands the region back"
+        );
+    }
+
+    #[test]
+    fn a_region_stays_charged_while_another_domain_holds_it() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        assert!(mint(&mut child, space, REGION) >= 0);
+        let mut twin = child.fork_powerbox(7, 0).expect("a simple domain forks");
+        child.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            REGION as i64,
+            "the twin still holds it"
+        );
+        twin.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the last holder's end hands it back"
+        );
+    }
+
+    #[test]
+    fn a_thaw_charges_a_region_it_rebuilds_to_the_rebuilding_domain() {
+        let (parent, node, mut child, _) = child(-1);
+        let id = child.adopt_region(child.rebuild_region(&[7; 64]));
+        assert_eq!(child.regions[id as usize].read_byte(63), 7);
+        assert_eq!(used(&parent, node), 64);
+        child.release_memory();
+        assert_eq!(used(&parent, node), 0);
     }
 }
 

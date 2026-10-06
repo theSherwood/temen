@@ -97,9 +97,18 @@ exists, and handed back when it ends; an exec keeps the charge (#2106, #2110). A
 threads it re-creates. On the resumable `Vcpu` engine a
 thread's charge goes back at its join, where that engine learns it ended. A run's root is its
 embedder's and is charged to nothing, and the Cranelift JIT charges nothing to the run's own node,
-which no guest reads. A pipe's worst-case FIFO is charged to the
-`channel` of the node of the domain that minted it, and every ancestor, until its last end closes. An
+which no guest reads (#2113 tracks both). A pipe's worst-case FIFO is charged to the
+`channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
+region a guest mints is charged there too, its bytes, until no domain holds it; a domain a budget paid
+for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111). A freeze carries no node's `channel` use: the thaw re-charges each
+pipe and region it rebuilds to the thawing root. An
 exec keeps its domain's node, so a child cannot exec its way out of its budget.
+
+*No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
+from above, so no code can use more than it was granted, and the root is a domain like any other,
+its grant the embedder's. The gaps are tracked, not exceptions: the root's own use and `Limits`
+(#2113), fibers (#2112), the bytecode drivers' lease and live-cap leaks (#2006), and the wasm-JIT's
+emitted `thread.spawn` (#2007) and fuel (#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

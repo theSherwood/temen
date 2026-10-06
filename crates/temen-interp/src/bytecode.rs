@@ -4557,8 +4557,8 @@ impl<'p> Vcpu<'p> {
         };
         if ended && self.own_dom.is_some() {
             match self.shared_host {
-                Some(m) => m.lock_unpoisoned().release_window(),
-                None => self.host.release_window(),
+                Some(m) => m.lock_unpoisoned().release_memory(),
+                None => self.host.release_memory(),
             }
         }
         ev
@@ -7196,7 +7196,7 @@ fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [
                     Some(k) => envs[k].host.release_detached(budget, bytes),
                 }
                 if let Some(k) = t.env {
-                    envs[k].host.release_window();
+                    envs[k].host.release_memory();
                 }
             }
         }
@@ -14131,7 +14131,7 @@ impl CoopSched {
             for k in 0..extra_envs.len() {
                 if seen[k] && !live[k] && released_envs.insert(k) {
                     let mut h = extra_envs[k].host.lock_unpoisoned();
-                    h.release_window();
+                    h.release_memory();
                     h.release_pipe_ends();
                     drop(h);
                     finished.push(k);
@@ -17406,7 +17406,7 @@ fn start_process<'scope, 'env>(
         let status = super::reap_status(&r);
         let hooks = {
             let mut g = hooks_host.lock_unpoisoned();
-            g.release_window(); // #1909, #2106
+            g.release_memory(); // #1909, #2106
             g.release_pipe_ends();
             g.exit_hooks.clone()
         };
@@ -18310,7 +18310,7 @@ fn par_start_child<'scope, 'env>(
         // its window held.
         {
             let mut h = child_host.lock_unpoisoned();
-            h.release_window();
+            h.release_memory();
             h.release_pipe_ends();
         }
         // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before

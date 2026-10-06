@@ -365,7 +365,8 @@ pub extern "C" fn run_fork() -> i64 {
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
-    let budget = host.grant_budget(-1, 2 << 18, -1); // the server's and the guest's windows
+    // The server's and the guest's windows, and the twin's copy of the guest's (#2106).
+    let budget = host.grant_budget(-1, 3 << 18, -1);
     let mut fuel = 40_000_000u64;
     let r = match bytecode::compile_and_run_with_host(
         &m,
@@ -11372,7 +11373,7 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
     let value = unsafe { RUN_VALUE };
     // The child's run ends here: what its window grew goes back to the budget that paid for it (#1909).
     if let Some(mut run) = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).take() } {
-        run.host.release_window();
+        run.host.release_memory();
     }
     let Some(d) = (unsafe { (*core::ptr::addr_of_mut!(OP13_JIT)).as_mut() }) else {
         return OP13JIT_TRAP;

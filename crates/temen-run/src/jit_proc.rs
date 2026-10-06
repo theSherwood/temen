@@ -766,12 +766,12 @@ fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
 }
 
 /// A process is done with its last image: disarm its powerbox, hand back what its window held
-/// ([`Host::release_window`], #1909, #2106), and release the pipe ends it holds
+/// ([`Host::release_memory`], #1909, #2106), and release the pipe ends it holds
 /// ([`Host::release_pipe_ends`]) — ringing the tree when that left a pipe with no writers or no
 /// readers, whose blocked readers wake to EOF and writers to `-EPIPE`.
 fn retire(tree: &Tree, host: &mut Host) {
     host.disarm_caller_requests();
-    host.release_window();
+    host.release_memory();
     let (eof, epipe) = host.release_pipe_ends();
     if !eof.is_empty() || !epipe.is_empty() {
         tree.ring();
