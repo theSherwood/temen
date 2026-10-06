@@ -69,7 +69,7 @@ fn jit_compile(m: &Module) -> temen_jit::CompiledModule {
         None,
         None, // fuel
         None,
-        temen_jit::Quota::default(),
+        None,
         0,
     )
     .expect("jit compile")

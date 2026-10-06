@@ -13,7 +13,7 @@
 //!   so a process that could sleep could not fork.)
 
 use core::ffi::c_void;
-use temen_jit::{CompiledModule, JitError, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitError, JitOutcome, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
 /// A `call.cap` whose answer is the powerbox's own: the thunk returns the `i64` its ctx points at.
@@ -66,7 +66,7 @@ fn compile(
         None,
         None,
         None,
-        Quota::default(),
+        None,
         table_log2,
     )
     .expect("compile")

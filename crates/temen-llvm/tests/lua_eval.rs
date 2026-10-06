@@ -40,8 +40,9 @@ fn stdout_of(backend: Backend) -> Vec<u8> {
         limits: Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: SCRIPT.as_bytes().to_vec(), // the guest reads its program off stdin
         memory_size_log2: None,

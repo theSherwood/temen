@@ -18,7 +18,7 @@ A non-C frontend (e.g. JACL's codegen) that emits TEMEN-IR and links it itself s
   resolved by **name** (not by fixed position), like wasm's `(module, name)` import matching.
 - **Arbitrary host capabilities** — a host can expose any interface with any semantics, reached by
   the guest through the object-capability handle model.
-- **Uniform run config across backends** — the consumer sets fuel/deadline, vCPU/fiber quota, and
+- **Uniform run config across backends** — the consumer sets fuel/deadline, the root's grant, and
   memory once, and it binds the tree-walker, the bytecode engine, and the JIT identically.
 - **C bindings** — the whole surface (instantiate, bind imports, call exports, set limits, grant
   capabilities) usable from C, since many consumers will be more comfortable there.
@@ -122,8 +122,8 @@ impl Instance {
 }
 ```
 
-`Quota` is currently two structurally-identical types (`temen_interp::Quota`, `temen_jit::Quota`) —
-unify into one (in `temen-ir` or `temen-interp`) consumed by both backends.
+`Quota` was two structurally-identical types (`temen_interp::Quota`, `temen_jit::Quota`) — unified
+into one (F6), then retired for the root's grant on the budget tree (#2113).
 
 ---
 
@@ -168,11 +168,10 @@ unify into one (in `temen-ir` or `temen-interp`) consumed by both backends.
       ≤8-with-heap / ≤32-without cap; not needed until a frontend wants >8 named caps *and* a heap.
 
 ### Phase 3 — uniform run config across backends — done
-- [x] `Limits` is the single unified quota knob the consumer sets (`max_fibers`/`max_vcpus` =
-      "CPUs available", `fuel`, `deadline`); the facade converts to `temen_interp::Quota` /
-      `temen_jit::Quota` internally, so the two structurally-identical backend `Quota` types stay an
-      impl detail the embedder never touches. (Deduping them into one shared type would churn both
-      escape-TCB-adjacent crates for no consumer-visible gain — left as optional cleanup.)
+- [x] `Limits` is the single knob the consumer sets: `fuel`, `deadline`, and the root's grant
+      (`mem`, `channel`, `spawn`), the ceilings of the run's own budget node on every backend
+      (#2113). It replaced the `max_fibers`/`max_vcpus` quota: the hard ceilings
+      (`MAX_FIBERS`/`MAX_VCPUS`) stay, and the grant bounds a run below them.
 - [x] `Limits` + `RunConfig` (fuel = the root budget's fuel ceiling on every backend since #1944
       slice 3, its default per backend — 2^34 on the interpreters, none on the JIT; deadline = the
       JIT's §5 watchdog, ignored by the interpreters; `memory_size_log2` overrides the window).
@@ -424,9 +423,9 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   do. The shim wraps the live `GuestMem` borrow for the duration of one call only. Test:
   `abi_tests::host_fn_reads_and_writes_guest_memory_via_c_abi` (`upcase` reads+uppercases+writes the
   window, streamed back out, on all three backends); `temen.h` + `examples/hello.c` updated.
-- **F6 — unify `Quota`.** *Landed.* The §15 spawn quota is one type in `temen-ir`, re-exported as
-  `temen_interp::Quota` / `temen_jit::Quota`; the field-by-field facade conversion is gone (see the §F1
-  notes / `jit_run`). Values + clamping unchanged (both ceilings `1<<16`).
+- **F6 — unify `Quota`.** *Landed, then retired (#2113).* The §15 spawn quota became one type in
+  `temen-ir`; #2113 replaced it with the root's grant on the budget tree (`Limits.mem`/`spawn`), so a
+  run's fibers and vCPUs are charged like any domain's.
 - **F7 — runtime name→handle directory.** *Landed.* A guest can resolve a capability **by name to its
   handle at runtime** — dlopen-style discovery, the dynamic counterpart to load-time name binding — via
   a first-class IR instruction **`self.resolve <name_ptr> <name_len> -> i32`** (a clean

@@ -44,7 +44,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Exhaustive DPOR model checker (all interleavings) | **Built** | `temen-interp` `explore_all` (+ `_bruteforce` oracle) |
 | Interp↔JIT differential testing of concurrency | **Built** | `jit_fuzz.rs`, `concurrent_fuzz.rs`, `fiber_fuzz.rs` |
 | SSA promotion (the inspectability-tension source) | **Built** | §3d, frontend promote pass |
-| Fuel/quota metering *properties* | **Built** | `Host::set_quota`/`quota`, §15 |
+| Fuel/grant metering *properties* | **Built** | `Host::set_grant`, the budget tree, §15 |
 | `call.cap` I/O record log (`CapTape`) — input caps `Clock` + stdin `read` + **any host-fn** (slots **and** buffer writes); replayed for faithful `seek` | **Built — W1 slices 2, 5** | `temen-interp` `Host::record_caps` / `CapTape` / `RecordingMem` |
 | Schedule record log (`SchedTape`) — capture a live interleaving as a replayable plan; seeded schedule fuzzing | **Built — W1 slice 4** (interp; SC ⇒ schedule *is* memory order) | `temen-interp` `Inspector::sched_tape` / `attach_scheduled_seeded` |
 | W7 model-check → replayable witness (find a failing interleaving, reproduce it) | **Built — slice 1** | `temen-interp` `find_schedule` / `replay_schedule` / `Witness` |
@@ -1789,7 +1789,7 @@ watchpoints composing, `debug_witness_stepping.rs`; see §4.)
 **Cross-cutting shell.** Goal: the host-side capability object every other workstream's surface
 hangs off — shaped like §15 `Monitor`, observe-only, never widening guest authority.
 
-**Current substrate.** The §15 metering *properties* exist (`Host::set_quota`/`quota`, fuel),
+**Current substrate.** The §15 metering *properties* exist (`Host::set_grant`, the budget tree, fuel),
 but no `Monitor`/`Inspector` *type*. The `Host` already exposes a rich `grant_*` surface and an
 async-notify hook — the right place to anchor an observer.
 

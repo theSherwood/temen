@@ -90,8 +90,10 @@ fn peval_specialize_runs_in_sandbox_and_matches_host() {
         b"",
         &[],
         &[],
-        Some(std::time::Duration::from_secs(120)),
-        temen_run::Quota::default(),
+        temen_run::Limits {
+            deadline: Some(std::time::Duration::from_secs(120)),
+            ..temen_run::Limits::default()
+        },
     )
     .expect("run the in-sandbox specializer");
 

@@ -61,7 +61,7 @@ fn jit_compile(m: &Module) -> (temen_jit::CompiledModule, usize) {
         None, // interrupt
         None, // fuel
         None, // fast_resolver
-        temen_jit::Quota::default(),
+        None,
         0,
     )
     .expect("jit compile");

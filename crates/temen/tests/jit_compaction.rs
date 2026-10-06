@@ -24,7 +24,7 @@
 use temen_encode::encode_module;
 use temen_interp::Host;
 use temen_ir::{Func, Module, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, TrapKind, INERT_CAP_THUNK};
 use temen_run::{grant_jit, recompact_jit, JitSession};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -45,7 +45,7 @@ fn compile_reserved(m: &Module, table_log2: u8) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         table_log2,
     )
     .expect("compile")
@@ -319,7 +319,7 @@ fn run_repl(table_log2: u8, n: usize, compact_every: Option<usize>) -> (Vec<i64>
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         table_log2,
     )
     .expect("compile shell");
@@ -418,7 +418,7 @@ fn recompaction_carries_live_invoke_only_unit() {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         table_log2,
     )
     .expect("compile shell");

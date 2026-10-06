@@ -153,7 +153,7 @@ fn time_engines(m: &Module, has_cap: bool) -> (f64, f64, f64, f64) {
             temen_run::cap_thunk,
             ctx,
             temen_run::fast_cap_resolver,
-            temen_jit::Quota::default(),
+            None,
         );
         black_box(&r);
     });

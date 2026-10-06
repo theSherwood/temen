@@ -122,8 +122,9 @@ typedef struct {
   int32_t fuel_set;
   uint64_t deadline_ms; /* JIT detect-and-kill deadline (if deadline_set); ignored by interps */
   int32_t deadline_set;
-  size_t max_fibers; /* §15 spawn quota (0 = default) */
-  size_t max_vcpus;  /* §15 vCPU cap / "CPUs available" (0 = default) */
+  uint64_t mem;     /* the run's grant of memory bytes: windows, fiber stacks, regions (0 = default) */
+  uint64_t channel; /* the run's grant of pipe-buffer bytes (0 = default) */
+  uint64_t spawn;   /* the run's grant of live vCPUs (0 = default) */
   const uint8_t *stdin_bytes; /* guest stdin (NULL/0 = empty) */
   size_t stdin_len;
   uint8_t memory_size_log2; /* window override (if memory_set) */

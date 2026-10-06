@@ -65,8 +65,9 @@ fn asset_translates_real_hexer_leng_byte_identical_to_native() {
             limits: Limits {
                 fuel: None,
                 deadline: None,
-                max_fibers: 0,
-                max_vcpus: 0,
+                mem: None,
+                channel: None,
+                spawn: None,
             },
             stdin: leng,
             memory_size_log2: None,

@@ -21,7 +21,7 @@
 
 use temen_interp::{run, Value};
 use temen_ir::{FuncType, ValType, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, TrapKind, INERT_CAP_THUNK};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -40,7 +40,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("compile")
@@ -402,7 +402,7 @@ fn install_makes_unit_call_indirectable() {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         4,
     )
     .expect("compile");

@@ -42,8 +42,10 @@ fn peval_guest_specializes_interpreter_and_jits_in_sandbox() {
         b"",
         &argv,
         &[],
-        Some(std::time::Duration::from_secs(180)),
-        Default::default(),
+        temen_run::Limits {
+            deadline: Some(std::time::Duration::from_secs(180)),
+            ..Default::default()
+        },
     )
     .expect("run the peval-futamura guest");
 

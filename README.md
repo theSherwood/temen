@@ -137,8 +137,8 @@ Roughly where things stand:
   `wait`/`notify` futex, and a C `<pthread.h>` built over them — no built-in
   scheduler (guests build their own M:N runtimes).
 - **Nesting (VM-in-VM)** on both backends, cross-domain shared regions, a
-  host-enforced **fuel/epoch kill-path** for runaway guests, and spawn quotas for
-  DoS containment.
+  host-enforced **fuel/epoch kill-path** for runaway guests, and a budget tree (fuel,
+  memory, vCPUs, channel memory) for DoS containment.
 - A **guest-driven JIT** capability (a guest builds IR at runtime, the host verifies
   and Cranelift-compiles it into the guest's own domain).
 - Tooling: durable domains (freeze/thaw + snapshot codec), a DAP debug server,

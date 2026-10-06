@@ -581,7 +581,7 @@ pub unsafe extern "C" fn temen_instance_with_mem_hooks(
 // ----------------------------------------------------------------------------
 
 /// Run configuration. A `NULL` pointer means all defaults. `*_set` flags select whether the paired
-/// field is applied (else the default is used); `max_fibers`/`max_vcpus` of `0` also mean "default".
+/// field is applied (else the default is used); a `mem`/`channel`/`spawn` of `0` also means "default".
 #[repr(C)]
 pub struct TemenRunConfig {
     /// The run's fuel limit on every backend (applied iff `fuel_set`): the root budget's fuel ceiling
@@ -591,9 +591,11 @@ pub struct TemenRunConfig {
     /// JIT detect-and-kill deadline in milliseconds (applied iff `deadline_set`). Ignored by interps.
     pub deadline_ms: u64,
     pub deadline_set: i32,
-    /// §15 spawn quota (`0` ⇒ default).
-    pub max_fibers: usize,
-    pub max_vcpus: usize,
+    /// #2113 — the run's root grant (`0` ⇒ the default grant): its bytes of memory (windows, fiber
+    /// stacks, regions), its bytes of pipe buffers, and its live vCPUs. Past `INT64_MAX`: no limit.
+    pub mem: u64,
+    pub channel: u64,
+    pub spawn: u64,
     /// Guest stdin bytes (`NULL`/`0` ⇒ empty).
     pub stdin: *const u8,
     pub stdin_len: usize,
@@ -610,7 +612,6 @@ unsafe fn run_config(c: *const TemenRunConfig) -> RunConfig {
     let Some(c) = c.as_ref() else {
         return RunConfig::default();
     };
-    let d = Limits::default();
     let stdin = if c.stdin.is_null() || c.stdin_len == 0 {
         Vec::new()
     } else {
@@ -620,16 +621,9 @@ unsafe fn run_config(c: *const TemenRunConfig) -> RunConfig {
         limits: Limits {
             fuel: (c.fuel_set != 0).then_some(c.fuel),
             deadline: (c.deadline_set != 0).then(|| Duration::from_millis(c.deadline_ms)),
-            max_fibers: if c.max_fibers != 0 {
-                c.max_fibers
-            } else {
-                d.max_fibers
-            },
-            max_vcpus: if c.max_vcpus != 0 {
-                c.max_vcpus
-            } else {
-                d.max_vcpus
-            },
+            mem: (c.mem != 0).then_some(c.mem),
+            channel: (c.channel != 0).then_some(c.channel),
+            spawn: (c.spawn != 0).then_some(c.spawn),
         },
         stdin,
         memory_size_log2: (c.memory_set != 0).then_some(c.memory_size_log2),

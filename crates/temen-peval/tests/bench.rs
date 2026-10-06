@@ -25,7 +25,7 @@ use temen_ir::{
 /// guard, so the interpreter programs (which used to live at address 0) and their scratch/heap
 /// regions must sit one guard up. Program `base + pc` decoding and const-overlays key off this.
 const PROG_BASE: u64 = POWERBOX_NULL_GUARD;
-use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
 use temen_peval::{
     optimize_module, specialize, specialize_with, specialize_with_config, SpecArg, SpecConfig,
 };
@@ -2004,7 +2004,7 @@ fn jit_compile(m: &Module) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compile")

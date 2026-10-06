@@ -16,7 +16,7 @@ use temen_ir::{
     BinOp, Block, ConvOp, Func, FuncType, Inst, IntTy, Module, Terminator, TypeEntry, ValType,
     DEFAULT_RESERVED_LOG2,
 };
-use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
 use temen_peval::{specialize_with_config, SpecArg, SpecConfig};
 use temen_verify::verify_module;
 
@@ -182,7 +182,7 @@ fn jit_compile(m: &Module) -> CompiledModule {
         None,
         None,
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compile")

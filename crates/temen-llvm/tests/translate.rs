@@ -1650,15 +1650,8 @@ fn check_powerbox_vs_native_args(name: &str, src: &str, args: &[&str], env: &[&s
     temen_verify::verify_module(&module).expect("verify translated IR");
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
     let envv: Vec<&[u8]> = env.iter().map(|s| s.as_bytes()).collect();
-    let run = temen_run::run_powerbox_cfg(
-        &module,
-        b"",
-        &argv,
-        &envv,
-        None,
-        temen_run::Quota::default(),
-    )
-    .expect("powerbox run (args)");
+    let run = temen_run::run_powerbox_cfg(&module, b"", &argv, &envv, temen_run::Limits::default())
+        .expect("powerbox run (args)");
 
     assert_eq!(
         run.stdout, native.stdout,
@@ -3905,8 +3898,9 @@ fn demo_lmdb_mmap_cap_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4083,8 +4077,9 @@ fn demo_lmdb_crash_recovery() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4262,8 +4257,9 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4402,8 +4398,9 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4534,8 +4531,9 @@ fn demo_sqlite_fs_cap_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4671,8 +4669,9 @@ fn demo_pg_oscap_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4760,8 +4759,9 @@ fn trap_error_surfaces_guest_output() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -4986,8 +4986,9 @@ fn demo_pg_stdio_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -5073,8 +5074,9 @@ fn demo_pg_stream_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -5161,8 +5163,9 @@ fn demo_pg_fprintf_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
@@ -5264,8 +5267,9 @@ fn demo_pg_sscanf_vs_native() {
         limits: temen_run::Limits {
             fuel: None,
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: stdin_bytes.to_vec(),
         memory_size_log2: None,
@@ -5475,8 +5479,10 @@ fn check_guest_concurrency_demo(name: &str, rel: &str, expect: &[u8]) {
         b"",
         &[],
         &[],
-        Some(std::time::Duration::from_secs(60)),
-        temen_run::Quota::default(),
+        temen_run::Limits {
+            deadline: Some(std::time::Duration::from_secs(60)),
+            ..temen_run::Limits::default()
+        },
     )
     .expect("powerbox run");
     assert_eq!(
@@ -8086,8 +8092,10 @@ fn vm_jit_threads_demo() {
         b"",
         &[],
         &[],
-        Some(std::time::Duration::from_secs(60)),
-        temen_run::Quota::default(),
+        temen_run::Limits {
+            deadline: Some(std::time::Duration::from_secs(60)),
+            ..temen_run::Limits::default()
+        },
     )
     .expect("powerbox run");
     assert_eq!(

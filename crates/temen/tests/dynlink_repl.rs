@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use temen_encode::{decode_module, encode_module};
 use temen_ir::{Resolved, DEFAULT_RESERVED_LOG2};
-use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
 use temen_run::jit_resolve_and_validate;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -50,7 +50,7 @@ impl Repl {
             None,
             None, // fuel
             None,
-            Quota::default(),
+            None,
             4,
         )
         .expect("compile the REPL host module");

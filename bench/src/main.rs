@@ -1002,7 +1002,7 @@ fn temen_call_host(m: &temen_ir::Module, entry: u32, lead: &[i64], n: i64) -> i6
             bench_thunk,
             std::ptr::null_mut(),
             bench_fast_resolver,
-            temen_jit::Quota::default(),
+            None,
         )
     } else {
         compile_and_run_with_host(m, entry, &args, bench_thunk, std::ptr::null_mut())

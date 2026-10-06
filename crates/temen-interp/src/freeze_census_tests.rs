@@ -172,7 +172,6 @@ fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
         0,
         id,
         f.sched.clone(),
-        Quota::default(),
         dt,
     ))
 }

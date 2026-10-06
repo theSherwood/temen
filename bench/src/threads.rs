@@ -60,7 +60,7 @@ fn parallel_wat(nworkers: u32, steps: u32) -> String {
 /// Time the parallel `run` on Temen (compiled once; `thread.spawn` = native OS threads). Returns
 /// `(result, best_of_reps)`.
 fn run_temen(wasm: &[u8], reps: usize) -> (i64, Duration) {
-    use temen_jit::{CompiledModule, JitOutcome, Quota, INERT_CAP_THUNK};
+    use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
     let t = temen_wasm::transpile(wasm).expect("temen transpile");
     let run_idx = t
         .exports
@@ -79,7 +79,7 @@ fn run_temen(wasm: &[u8], reps: usize) -> (i64, Duration) {
         None,
         None,
         None, // fast_resolver
-        Quota::default(),
+        None,
         0,
     )
     .expect("temen jit compile");

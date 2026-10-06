@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use temen_ir::Module;
 use temen_run::{
-    is_named_powerbox_entry, run_kernel, run_powerbox, run_powerbox_cfg, Outcome, Quota, Value,
+    is_named_powerbox_entry, run_kernel, run_powerbox, run_powerbox_cfg, Limits, Outcome, Value,
 };
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -522,8 +522,10 @@ fn deadline_kills_runaway_powerbox_guest() {
         b"",
         &[],
         &[],
-        Some(Duration::from_millis(100)),
-        Quota::default(),
+        Limits {
+            deadline: Some(Duration::from_millis(100)),
+            ..Limits::default()
+        },
     )
     .expect_err("a runaway guest must be killed, not returned");
     assert!(
@@ -553,7 +555,7 @@ fn trap_kill_message_carries_a_source_backtrace() {
          debug.fname 0 \"divide\"\n\
          debug.loc 0 0 2 0 7 5\n",
     );
-    let err = run_powerbox_cfg(&m, b"", &[], &[], None, Quota::default())
+    let err = run_powerbox_cfg(&m, b"", &[], &[], Limits::default())
         .expect_err("div-by-zero must be killed");
     assert!(err.contains("DivByZero"), "names the trap kind: {err}");
     assert!(
@@ -585,7 +587,7 @@ fn memfault_kill_message_carries_a_source_backtrace() {
          debug.fname 0 \"store_oob\"\n\
          debug.loc 0 0 2 0 9 5\n",
     );
-    let err = run_powerbox_cfg(&m, b"", &[], &[], None, Quota::default())
+    let err = run_powerbox_cfg(&m, b"", &[], &[], Limits::default())
         .expect_err("the overrun must be detect-and-killed");
     assert!(err.contains("MemoryFault"), "names the trap kind: {err}");
     assert!(
@@ -620,8 +622,10 @@ fn deadline_does_not_delay_fast_guest() {
         b"",
         &[],
         &[],
-        Some(Duration::from_secs(30)),
-        Quota::default(),
+        Limits {
+            deadline: Some(Duration::from_secs(30)),
+            ..Limits::default()
+        },
     )
     .expect("run");
     let elapsed = t0.elapsed();
@@ -878,10 +882,10 @@ fn demo_jit_threads_runs() {
     );
 }
 
-/// §15 the embedder-facing spawn quota (`run_powerbox_cfg`) is enforced
-/// end-to-end on the JIT: a powerbox guest that spawns a vCPU is **detect-and-killed** under a
-/// `max_vcpus = 1` quota (the root fills it), and runs under the default. Gated to the targets where
-/// the JIT thread runtime exists (elsewhere `thread.spawn` is `Unsupported`, a different `Err`).
+/// #2113 — the embedder's `spawn` grant (`run_powerbox_cfg`) is enforced end-to-end on the JIT: a
+/// powerbox guest that spawns a vCPU is **detect-and-killed** under a grant with no room for it, and
+/// runs under the default. Gated to the targets where the JIT thread runtime exists (elsewhere
+/// `thread.spawn` is `Unsupported`, a different `Err`).
 #[cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -907,22 +911,22 @@ fn quota_contains_a_powerbox_thread_bomb() {
         }\n";
     let m = load(src);
 
-    // max_vcpus = 1 ⇒ the root alone fills the quota; the spawn detect-and-kills (Err).
-    let tight = Quota {
-        max_fibers: 1 << 16,
-        max_vcpus: 1,
+    // No `spawn` past the root's own vCPU: the spawn detect-and-kills (Err).
+    let tight = Limits {
+        spawn: Some(0),
+        ..Limits::default()
     };
-    let r = run_powerbox_cfg(&m, b"", &[], &[], None, tight);
+    let r = run_powerbox_cfg(&m, b"", &[], &[], tight);
     assert!(
         r.is_err(),
-        "a spawn over the quota must detect-and-kill, got {r:?}"
+        "a spawn past the grant must detect-and-kill, got {r:?}"
     );
 
-    // The default quota admits the spawn+join.
-    let r = run_powerbox_cfg(&m, b"", &[], &[], None, Quota::default());
+    // The default grant admits the spawn+join.
+    let r = run_powerbox_cfg(&m, b"", &[], &[], Limits::default());
     assert!(
         r.is_ok(),
-        "the default quota must run the program, got {r:?}"
+        "the default grant must run the program, got {r:?}"
     );
 }
 

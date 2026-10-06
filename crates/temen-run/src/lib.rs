@@ -39,9 +39,8 @@ use temen_interp::SharedBacking;
 use temen_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOSPC};
 use temen_ir::{FuncIdx, FuncType, Module, Resolved, ValType};
 
-// Re-export the value type + the §15 spawn quota so embedders (and the CLI) need not also depend on
-// `temen-interp`.
-pub use temen_interp::{Quota, Value};
+// Re-export the value type so embedders (and the CLI) need not also depend on `temen-interp`.
+pub use temen_interp::Value;
 // Re-export the mem-hook instrumentation stats so [`Instance::mem_hook_stats`] consumers need not
 // also depend on `temen-opt`.
 pub use temen_opt::instrument::MemHookStats;
@@ -1728,6 +1727,7 @@ pub fn jit_cap_run(
     // later without changing guest software. Thread-hosting forces the serialized path (a hosted
     // unit's spawned vCPUs are the concurrent callers, even when the top-level module is sequential).
     if hosts_threads || m.funcs.iter().any(|f| f.uses_concurrency()) {
+        let node = run_node(host); // the node goes with the host into its lock
         let host_mutex = Mutex::new(std::mem::take(host));
         let cc = CapCtx::Locked(&host_mutex as *const Mutex<Host>);
         let mut cm = CompiledModule::compile(
@@ -1741,7 +1741,7 @@ pub fn jit_cap_run(
             None,                         // interrupt
             None,                         // fuel
             None,                         // fast_resolver
-            temen_jit::Quota::default(),
+            node,
             table_reserve_log2,
         )?;
         // The granted §14 spawns (named, separate-module, detached) — the hooks the CLI path installs
@@ -1757,10 +1757,10 @@ pub fn jit_cap_run(
         cm.set_restore_prots(restore);
         cm.set_freeze_controller(freeze);
         if hosts_fibers {
-            cm.enable_fiber_hosting(temen_jit::Quota::default())?;
+            cm.enable_fiber_hosting()?;
         }
         if hosts_threads {
-            cm.enable_thread_hosting(temen_jit::Quota::default())?;
+            cm.enable_thread_hosting()?;
         }
         host_mutex
             .lock()
@@ -1802,7 +1802,7 @@ pub fn jit_cap_run(
         None,                  // interrupt
         None,                  // fuel
         None,                  // fast_resolver
-        temen_jit::Quota::default(),
+        run_node(host),
         table_reserve_log2,
     )?;
     // The granted §14 spawns, as in the locked branch above.
@@ -1817,7 +1817,7 @@ pub fn jit_cap_run(
     cm.set_restore_prots(restore);
     cm.set_freeze_controller(freeze);
     if hosts_fibers {
-        cm.enable_fiber_hosting(temen_jit::Quota::default())?;
+        cm.enable_fiber_hosting()?;
     }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
@@ -2327,7 +2327,7 @@ pub fn recompact_jit(
         None, // interrupt
         None, // fuel
         None, // fast_resolver
-        temen_jit::Quota::default(),
+        run_node(host),
         table_reserve_log2,
     )?;
     recompact_into(&mut fresh, host, domain, old)?;
@@ -2519,6 +2519,7 @@ impl JitSession {
         watermark: usize,
         host: Host,
     ) -> Result<JitSession, temen_jit::JitError> {
+        let node = run_node(&host);
         let host = Box::new(Mutex::new(host));
         let ctx = &*host as *const Mutex<Host> as *mut c_void;
         let cm = CompiledModule::compile(
@@ -2532,7 +2533,7 @@ impl JitSession {
             None, // interrupt
             None, // fuel
             None, // fast_resolver
-            temen_jit::Quota::default(),
+            node,
             table_reserve_log2,
         )?;
         Ok(JitSession {
@@ -2589,6 +2590,7 @@ impl JitSession {
             "JitSession::compact is quiescent-only: no prompt may be in flight"
         );
         let ctx = &*self.host as *const Mutex<Host> as *mut c_void;
+        let node = run_node(&self.host.lock().unwrap_or_else(|e| e.into_inner()));
         let mut fresh = CompiledModule::compile(
             &self.base,
             self.entry,
@@ -2600,7 +2602,7 @@ impl JitSession {
             None, // interrupt
             None, // fuel
             None, // fast_resolver
-            temen_jit::Quota::default(),
+            node,
             self.table_reserve_log2,
         )?;
         {
@@ -5224,11 +5226,11 @@ unsafe fn powerbox_run_prebuilt(
 /// `stdout`, a readable `stdin` seeded from `stdin`, and `Exit` — the three handles the
 /// frontend's `_start` expects, granted in declared order. Returns the outcome and captured
 /// output. `Err` if the (already-verified) module fails to JIT-compile, or if the guest
-/// **traps** (detect-and-kill, §5) — the guest can never corrupt the host. Unbounded execution
-/// (no §5 kill-path); use [`run_powerbox_cfg`] to bound a possibly-runaway guest (deadline/quota) or
+/// **traps** (detect-and-kill, §5) — the guest can never corrupt the host. The run holds the
+/// default grant ([`Limits::default`]); use [`run_powerbox_cfg`] to set its grant or a deadline, or
 /// to hand it an argv/env.
 pub fn run_powerbox(module: &Module, stdin: &[u8]) -> Result<Run, String> {
-    run_powerbox_cfg(module, stdin, &[], &[], None, Quota::default())
+    run_powerbox_cfg(module, stdin, &[], &[], Limits::default())
 }
 
 /// Build the §3e powerbox **args buffer** from `args` (the `argv` vector — `args[0]` is the program
@@ -5261,21 +5263,19 @@ fn build_args_blob(args: &[&[u8]], env: &[&[u8]]) -> Result<Vec<u8>, String> {
 /// program leaves the buffer unread; `args[0]` is conventionally the program name, `env` entries are
 /// `KEY=VALUE`, see [`build_args_blob`] for the bounded layout), the §5 kill-path `deadline` (a
 /// watchdog thread stops a runaway guest that long after it starts — surfacing as an `Err`, not a
-/// hang — waking early the moment the run finishes; `None` ⇒ unbounded), and the §15 spawn `quota`
-/// (cap fibers/vCPUs below the anti-bomb ceilings; [`Quota::default`] = the ceilings). The `temen-run`
-/// CLI reads `TEMEN_DEADLINE_MS` / `TEMEN_MAX_FIBERS` / `TEMEN_MAX_VCPUS` and forwards its post-`--`
-/// arguments through here; an embedder supplies its own policy (reading process env is the CLI's job,
-/// not the library's). `run_powerbox(m, stdin)` is exactly `run_powerbox_cfg(m, stdin, &[], &[], None,
-/// Quota::default())`.
+/// hang — waking early the moment the run finishes; `None` ⇒ unbounded) and the root's grant (#2113),
+/// both in `limits`. The `temen-run` CLI reads them from `TEMEN_DEADLINE_MS`, `TEMEN_FUEL`,
+/// `TEMEN_MEM`, `TEMEN_CHANNEL` and `TEMEN_SPAWN`, and forwards its post-`--` arguments through here;
+/// an embedder supplies its own policy (reading process env is the CLI's job, not the library's).
+/// `run_powerbox(m, stdin)` is exactly `run_powerbox_cfg(m, stdin, &[], &[], Limits::default())`.
 pub fn run_powerbox_cfg(
     module: &Module,
     stdin: &[u8],
     args: &[&[u8]],
     env: &[&[u8]],
-    deadline: Option<std::time::Duration>,
-    quota: Quota,
+    limits: Limits,
 ) -> Result<Run, String> {
-    run_powerbox_with_host(module, stdin, args, env, deadline, quota, None)
+    run_powerbox_with_host(module, stdin, args, env, limits, None)
 }
 
 /// [`run_powerbox_cfg`] plus a **host setup hook** ([`Instance::run_with_caps_and_host`]): the CLI's
@@ -5286,8 +5286,7 @@ pub fn run_powerbox_with_host(
     stdin: &[u8],
     args: &[&[u8]],
     env: &[&[u8]],
-    deadline: Option<std::time::Duration>,
-    quota: Quota,
+    limits: Limits,
     host_setup: Option<&mut dyn FnMut(&mut Host)>,
 ) -> Result<Run, String> {
     // Escape gate (fail-closed, §2a): the single chokepoint both public powerbox entry points funnel
@@ -5315,12 +5314,7 @@ pub fn run_powerbox_with_host(
         hooks: None,
     };
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline,
-            max_fibers: quota.max_fibers,
-            max_vcpus: quota.max_vcpus,
-        },
+        limits,
         stdin: stdin.to_vec(),
         memory_size_log2: None,
         args: args.iter().map(|s| s.to_vec()).collect(),
@@ -5410,7 +5404,6 @@ impl PowerboxProgram {
         let mut host = Box::new(Host::new());
         let cc = CapCtx::Raw(&mut *host as *mut Host);
         inst.grant_caps(&mut host, win);
-        let quota = temen_jit::Quota::default();
         let mut cm = Box::new(
             CompiledModule::compile(
                 &inst.module,
@@ -5425,7 +5418,9 @@ impl PowerboxProgram {
                 None, // interrupt (no §5 watchdog in the cached path; see `run`)
                 None, // fuel
                 Some(fast_cap_resolver),
-                quota,
+                // #2113 — what its fibers charge. `run` replaces the host's contents each call, but this
+                // node's tree lives as long as the code, and holds the default grant.
+                run_node(&host),
                 CLI_JIT_TABLE_LOG2,
             )
             .map_err(|e| format!("JIT compile failed: {e:?}"))?,
@@ -5436,7 +5431,7 @@ impl PowerboxProgram {
         // hosting is *not* enabled: that is the locked (concurrent) arm's job, and `uses_concurrency`
         // modules — the only ones that could reach it — are refused above.
         if host.jit_hosts_fibers() {
-            cm.enable_fiber_hosting(quota)
+            cm.enable_fiber_hosting()
                 .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
         }
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
@@ -5458,7 +5453,6 @@ impl PowerboxProgram {
         // deterministic order (so the handle values the guest sees match what it saw when compiled).
         *self.host = Host::new();
         self.host.stdin = stdin.to_vec();
-        self.host.set_quota(Quota::default());
         self.inst.grant_caps(&mut self.host, self.win);
         // No argv/env buffer: the cached path serves the plain compute powerbox (stdin in, stdout
         // out), exactly like `run_powerbox`, which passes no args. `run_raw` seeds nothing extra.
@@ -6375,11 +6369,6 @@ fn outcome_from_jit(results: &[ValType], jit: JitOutcome) -> Result<Outcome, Str
     }
 }
 
-/// The interpreters' fuel limit when [`Limits::fuel`] is `None` — generous, but finite so a
-/// non-terminating guest under the tree-walker can't hang the host. The JIT's default is no limit: a
-/// runaway guest is better bounded there by a `deadline`, which costs its code no fuel checks.
-const DEFAULT_FUEL: u64 = 1 << 34;
-
 /// Which execution backend a run targets. All three honour the same [`RunConfig`] where they support
 /// it; the differential oracle ([`Instance::run_diff`]) cross-checks `TreeWalk` against `Jit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6392,47 +6381,52 @@ pub enum Backend {
     Jit,
 }
 
-/// Resource limits applied **uniformly across backends, where each supports them** — the consumer
-/// sets these once regardless of backend. Two knobs are inherently backend-specific (and documented as
-/// such): `fuel` is the interpreters' per-op budget (the JIT has no cheap per-op counter), and
-/// `deadline` arms the JIT's §5 watchdog (the interpreters bound themselves with `fuel`). The spawn
-/// quota (`max_fibers` / `max_vcpus`) and the window size (via [`RunConfig::memory_size_log2`]) bind
-/// all three.
-#[derive(Clone, Debug)]
+/// The run's resource limits, applied **uniformly across backends**: the consumer sets these once
+/// regardless of backend. All but `deadline` are the run's root grant (#2113): its own budget node's
+/// ceilings, which bound everything the run does, its children included, as a spawn's budget bounds a
+/// child. `None` is the default grant ([`temen_interp::DEFAULT_FUEL`], [`temen_interp::DEFAULT_MEM`],
+/// …), one value on every backend; a value past `i64::MAX` is no limit. The window size is
+/// [`RunConfig::memory_size_log2`].
+#[derive(Clone, Debug, Default)]
 pub struct Limits {
-    /// The run's fuel limit: the root budget's fuel ceiling, which every vCPU of the run (a child's
-    /// included) draws from, on every backend (#1944 slice 3). `None` is each backend's default:
-    /// [`DEFAULT_FUEL`] on `TreeWalk`/`Bytecode`, no limit on the JIT (whose code then carries no fuel
-    /// checks). A limit past `i64::MAX` is no limit.
+    /// The fuel the root is granted for an activation, which every vCPU of the run (a child's
+    /// included) draws from, on every backend (#1944 slice 3). The JIT's code carries fuel checks
+    /// unless this is no limit.
     pub fuel: Option<u64>,
     /// Wall-clock deadline for the JIT's detect-and-kill watchdog (§5); ignored by the interpreters.
     pub deadline: Option<std::time::Duration>,
-    /// §15 spawn quota — max fibers (`cont.new`) a run may create.
-    pub max_fibers: usize,
-    /// §15 spawn quota — max concurrently-live vCPUs (`thread.spawn`); the "CPUs available" cap.
-    pub max_vcpus: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Limits {
-        let q = Quota::default();
-        Limits {
-            fuel: None,
-            deadline: None,
-            max_fibers: q.max_fibers,
-            max_vcpus: q.max_vcpus,
-        }
-    }
+    /// The root's `mem`: what its window grows, its fibers' stacks, the regions it mints and its
+    /// children's windows, together.
+    pub mem: Option<u64>,
+    /// The root's `channel`: its pipes' worst-case FIFOs and its children's.
+    pub channel: Option<u64>,
+    /// The root's `spawn`: the run's live vCPUs (threads, fork twins, spawned processes, children).
+    pub spawn: Option<u64>,
 }
 
 impl Limits {
-    /// The §15 spawn quota these limits imply (the interpreter form; the JIT form has identical fields).
-    fn quota(&self) -> Quota {
-        Quota {
-            max_fibers: self.max_fibers,
-            max_vcpus: self.max_vcpus,
-        }
+    /// The fuel these limits grant an activation.
+    fn fuel(&self) -> u64 {
+        self.fuel.unwrap_or(temen_interp::DEFAULT_FUEL)
     }
+
+    /// #2113 — set the root's grant on `host`: its own node's `mem`, `channel` and `spawn` ceilings.
+    fn grant(&self, host: &mut Host) {
+        let ceiling =
+            |v: Option<u64>, default: u64| i64::try_from(v.unwrap_or(default)).unwrap_or(-1);
+        host.set_grant(
+            ceiling(self.mem, temen_interp::DEFAULT_MEM),
+            ceiling(self.channel, temen_interp::DEFAULT_CHANNEL),
+            ceiling(self.spawn, temen_interp::DEFAULT_SPAWN),
+        );
+    }
+}
+
+/// #2113 — `host`'s own budget node as the JIT charges it: what the run's vCPUs, fibers and processes
+/// are charged to, as on the interpreters. The `node` an embedder passes to
+/// [`temen_jit::CompiledModule::compile`] for a run over `host`.
+pub fn run_node(host: &Host) -> Option<Arc<dyn temen_jit::BudgetNode>> {
+    Some(Arc::new(HostNode(host.own_node())))
 }
 
 /// How to run a powerbox entry: the resource [`Limits`], the guest's stdin, and an optional override of
@@ -6520,8 +6514,8 @@ fn with_deadline<T>(
     }
 }
 
-/// The single JIT compile→run path: run `func` on the JIT under `limits` (quota + optional deadline
-/// watchdog), seeded with `init_mem` and (when `snapshot_cap` is `Some`) returning the low-window
+/// The single JIT compile→run path: run `func` on the JIT under `limits` (the root's grant + optional
+/// deadline watchdog), seeded with `init_mem` and (when `snapshot_cap` is `Some`) returning the low-window
 /// snapshot, folding a guest trap into an `Err` (with the §5 W3 backtrace + trapping fiber). A
 /// concurrent guest serializes the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the
 /// unlocked fast path ([`jit_proc::with_cap_ctx`]). Run as a `process`, either is the root of a
@@ -6540,14 +6534,11 @@ fn jit_run(
     snapshot_cap: Option<usize>,
     process: bool,
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
-    // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
-    let quota = limits.quota();
-    // #1944 slice 3 — `Limits.fuel` is the root budget's fuel ceiling on the JIT too (#1705): a
-    // bounded one arms the root, whose cell draws from the host's own node. `None` (the JIT's default)
-    // or an unbounded limit leaves the run un-metered: its deadline stops a runaway.
-    let mut root_fuel = limits
-        .fuel
-        .and_then(|n| temen_jit::FuelCell::metering(Arc::new(HostNode(host.begin_activation(n)))));
+    // #1944 slice 3, #2113 — `Limits.fuel` is the root budget's fuel ceiling on the JIT too (#1705),
+    // the default grant's when it names none: the root's cell draws from the host's own node.
+    limits.grant(host);
+    let mut root_fuel =
+        temen_jit::FuelCell::metering(Arc::new(HostNode(host.begin_activation(limits.fuel()))));
     let fuel = root_fuel
         .as_deref_mut()
         .map(|c| c as *mut temen_jit::FuelCell);
@@ -6562,7 +6553,6 @@ fn jit_run(
                     slots,
                     host,
                     interrupt,
-                    quota,
                     init_mem,
                     snapshot_cap,
                     fuel,
@@ -6578,7 +6568,7 @@ fn jit_run(
             let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
             let r = unsafe {
                 jit_proc::with_cap_ctx(host, jit_proc::concurrent(m), |cc| {
-                    jit_proc::compile_image(cc, m, func, ip, quota, jit, fuel)
+                    jit_proc::compile_image(cc, m, func, ip, jit, fuel)
                         .and_then(|cm| jit_proc::run_image(cc, cm, ip, None, start))
                 })
             };
@@ -7675,7 +7665,7 @@ impl Instance {
     /// stash slot, no ABI change, no authority unless the embedder injects it.
     /// #1122 route (a) — open a **cooperative suspend/resume session** on the bytecode engine: the
     /// same host build as [`run_with_caps`](Self::run_with_caps) (powerbox, `extra_caps` by name,
-    /// stdin/quota/handoff), but the run is returned as a [`CoopSession`] the caller pumps. Whenever
+    /// stdin/grant/handoff), but the run is returned as a [`CoopSession`] the caller pumps. Whenever
     /// every task is parked on something only the embedder can satisfy (a terminal read), `pump`
     /// returns [`SessionStep::Idle`] instead of blocking a thread on the doorbell; the caller feeds
     /// the terminal (`Posix::feed_terminal`) and pumps again. No second thread, no doorbell, the
@@ -7693,14 +7683,14 @@ impl Instance {
         let init_mem = config.init_mem()?;
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
-        host.set_quota(config.limits.quota());
+        config.limits.grant(&mut host);
         host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
             let handle = (cap.grant)(&mut host, win);
             host.register_cap_name(name, handle);
         }
-        let fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+        let fuel = config.limits.fuel();
         let mut run = temen_interp::bytecode::CoopRun::new_reserved(
             m,
             0,
@@ -7747,7 +7737,7 @@ impl Instance {
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
-        host.set_quota(config.limits.quota());
+        config.limits.grant(&mut host);
         host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
@@ -7772,7 +7762,7 @@ impl Instance {
         let mut trap_bt: Vec<temen_interp::IrPc> = Vec::new();
         let folded = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
-                let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+                let mut fuel = config.limits.fuel();
                 let (r, bt) = run_interp_traced(
                     backend,
                     m,
@@ -7812,7 +7802,7 @@ impl Instance {
 
     /// Build a **debug run** of the powerbox entry, over the same granted `Host` that
     /// [`run_with_caps`](Instance::run_with_caps) would build — same capability set, same names, same
-    /// quota and handoff, and the same argv/env blob seeded at `module_args_base`.
+    /// grant and handoff, and the same argv/env blob seeded at `module_args_base`.
     ///
     /// This is what makes the debug engine usable on a *real* guest rather than on hand-written test
     /// modules. #1455 lifted `Host::admits_checkpoint`'s refusal of cap-using guests (it reads
@@ -7835,7 +7825,7 @@ impl Instance {
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
-        host.set_quota(config.limits.quota());
+        config.limits.grant(&mut host);
         host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
@@ -7877,7 +7867,7 @@ impl Instance {
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
-        host.set_quota(config.limits.quota());
+        config.limits.grant(&mut host);
         host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
         for (name, cap) in extra_caps {
@@ -7899,7 +7889,7 @@ impl Instance {
         // SAFETY: `base` is `size` valid page-aligned bytes, exclusively this window's until freed.
         let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, size as u64) });
 
-        let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+        let mut fuel = config.limits.fuel();
         let cap = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
             m,
             0,
@@ -7945,14 +7935,14 @@ impl Instance {
         let mut hj = Host::new();
         hi.stdin = config.stdin.clone();
         hj.stdin = config.stdin.clone();
-        hi.set_quota(config.limits.quota());
-        hj.set_quota(config.limits.quota());
+        config.limits.grant(&mut hi);
+        config.limits.grant(&mut hj);
         hi.set_handoff(config.handoff);
         hj.set_handoff(config.handoff);
         self.grant_caps(&mut hi, win);
         self.grant_caps(&mut hj, win);
 
-        let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+        let mut fuel = config.limits.fuel();
         let interp = run_interp(
             Backend::TreeWalk,
             m,
@@ -8229,7 +8219,7 @@ fn run_capture_on(
         backend
     };
     let treewalk = |host: &mut Host| {
-        let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
+        let mut fuel = limits.fuel();
         run_capture_reserved_with_host(
             m,
             fidx,
@@ -8246,7 +8236,7 @@ fn run_capture_on(
             Ok((outcome_from_interp(r)?, snap))
         }
         Backend::Bytecode => {
-            let mut fuel = limits.fuel.unwrap_or(DEFAULT_FUEL);
+            let mut fuel = limits.fuel();
             match temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
                 m,
                 fidx,
@@ -8424,7 +8414,7 @@ impl Instance {
 
         let mut host = Host::new();
         host.stdin = config.stdin.clone();
-        host.set_quota(config.limits.quota());
+        config.limits.grant(&mut host);
         host.set_handoff(config.handoff);
         self.grant_caps(&mut host, win);
 

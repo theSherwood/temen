@@ -490,8 +490,7 @@ fn nim_reads_its_argv_and_env_under_the_powerbox() {
             b"/in.nim".as_slice(),
         ],
         &[b"TEMEN_ARGV_PROBE=seen".as_slice()],
-        None,
-        temen_run::Quota::default(),
+        temen_run::Limits::default(),
     )
     .unwrap_or_else(|e| panic!("run_powerbox_cfg: {e}"));
     // `paramCount()` is `argc - 1` (nim excludes `argv[0]`), and `paramStr(0)` is the program name.

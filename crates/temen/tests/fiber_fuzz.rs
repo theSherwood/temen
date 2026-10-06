@@ -17,7 +17,7 @@
 //! generated fiber programs run on *both* backends and must agree, hardening the `temen-fiber` native
 //! stack-switch the JIT lowers fibers to — the exact asm a future migratable-fiber resume reuses
 //! unchanged (DESIGN.md §23). It runs an **acyclic** generator (bounded call + fiber-spawn depth)
-//! over a low fiber quota and only hands the JIT programs the interpreter proved terminate, so it is
+//! under a low fiber grant and only hands the JIT programs the interpreter proved terminate, so it is
 //! hang-/bomb-proof by construction while exercising thousands of real resume chains.
 
 use temen_encode::{decode_module, encode_module};
@@ -331,19 +331,18 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
     use temen_interp::{run_with_host, Host, Value};
     use temen_jit::{CompiledModule, JitError, JitOutcome, INERT_CAP_THUNK};
 
-    // A **low, symmetric fiber quota** on both backends. Interp fibers are cheap heap `Vec<Frame>`s,
-    // but each JIT fiber `mmap`s a guard-paged native stack, so a program that creates thousands is
-    // `Ok` on the interp yet exhausts the OS map limit on the JIT. `fiber_new` checks the quota
-    // *before* allocating the stack, so a bomb is a clean `FiberFault` on both — and an interp run
-    // that *completes* under it created ≤ `MAX_FIBERS_Q` fibers, bounding the JIT to that many stacks.
-    const MAX_FIBERS_Q: usize = 64;
-    let interp_quota = temen_interp::Quota {
-        max_fibers: MAX_FIBERS_Q,
-        ..Default::default()
-    };
-    let jit_quota = temen_jit::Quota {
-        max_fibers: MAX_FIBERS_Q,
-        ..Default::default()
+    // A **low, symmetric fiber bound** on both backends: the root's `mem` grant (#2113) holds
+    // `MAX_FIBERS_Q` live fibers, `FIBER_STACK` each (#2112). Interp fibers are cheap heap
+    // `Vec<Frame>`s, but each JIT fiber `mmap`s a guard-paged native stack, so a program that creates
+    // thousands is `Ok` on the interp yet exhausts the OS map limit on the JIT. `fiber_new` charges
+    // the fiber *before* allocating its stack, so a bomb is a clean `FiberFault` on both — and an
+    // interp run that *completes* under it held ≤ `MAX_FIBERS_Q` fibers at once, bounding the JIT to
+    // that many stacks.
+    const MAX_FIBERS_Q: i64 = 64;
+    let granted = || {
+        let mut host = Host::new();
+        host.set_grant(MAX_FIBERS_Q * temen_ir::FIBER_STACK as i64, -1, -1);
+        host
     };
 
     // Windows commits every page against the system commit limit (no overcommit), and the JIT's
@@ -360,8 +359,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
         // interp run short (it bails `OutOfFuel`) while completing every bounded one.
         let args = [Value::I64(4096), Value::I64(1)];
         let mut fuel = 20_000u64;
-        let mut host = Host::new();
-        host.set_quota(interp_quota);
+        let mut host = granted();
         let interp = run_with_host(&m, 0, &args, &mut fuel, &mut host);
 
         // Only the JIT-safe (interp-terminating, fiber-bounded) programs are run on the JIT — see the
@@ -370,7 +368,8 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             continue;
         };
 
-        // The lower-level compile entry (vs `compile_and_run`) lets us pass the matching fiber quota.
+        // The lower-level compile entry (vs `compile_and_run`) lets us pass the matching grant.
+        let jhost = granted();
         let mut cm = match CompiledModule::compile(
             &m,
             0,
@@ -382,7 +381,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             None,
             None, // fuel
             None,
-            jit_quota,
+            temen_run::run_node(&jhost),
             0,
         ) {
             Ok(cm) => cm,

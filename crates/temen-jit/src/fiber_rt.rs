@@ -12,7 +12,7 @@
 //! **Storage is domain-shared and fibers are MIGRATABLE (D57 steps 3b-ii + 3c).** The fiber table is
 //! one [`SharedFiberTable`] per compiled module, shared by every vCPU of the domain — the same
 //! unified handle namespace as the interpreter's run-shared registry (handles are `0, 1, …`
-//! domain-wide; the §15 fiber quota is per-domain). Each slot carries the loom-verified single-owner
+//! domain-wide; the fiber bound is per-domain). Each slot carries the loom-verified single-owner
 //! [`Ownership`] word (`fiber_registry`), and **any vCPU may resume any resumable fiber**: a
 //! `cont.resume` *claims* the slot (`OWNED`-fresh or `RUNNABLE`-suspended → `RUNNING`,
 //! [`Ownership::claim`] — exactly one racing claimant wins, a loser gets a clean `FiberFault`), a
@@ -107,11 +107,11 @@ extern "C" {
     fn temen_set_current_fiber(handle: i64) -> i64;
 }
 
-/// Max concurrently-allocated fibers per run (matches the interpreter's `MAX_FIBERS`): an anti-bomb
-/// ceiling so a fiber-bomb traps (`FiberFault`) instead of exhausting host memory. `1 << 24` (~16.7M):
-/// the ceiling equals the fiber-handle index width ([`FIBER_GEN_SHIFT`]) now the arena removed the
-/// `vm.max_map_count` VMA wall; the per-run spawn quota (clamped to this) is the tunable policy.
-const MAX_FIBERS: usize = 1 << 24;
+/// Max concurrently-allocated fibers per run ([`temen_ir::MAX_FIBERS`]): an anti-bomb ceiling so a
+/// fiber-bomb traps (`FiberFault`) instead of exhausting host memory. `1 << 24` (~16.7M): the ceiling
+/// equals the fiber-handle index width ([`FIBER_GEN_SHIFT`]) now the arena removed the
+/// `vm.max_map_count` VMA wall; a domain's `Budget.mem` is the tunable policy (#2112).
+const MAX_FIBERS: usize = temen_ir::MAX_FIBERS;
 
 /// Per-fiber control-stack size (the out-of-band native stack, guard-paged by `temen-fiber`). 256 KiB:
 /// large enough for deep guest call chains, but small enough that many concurrent fibers stay within
@@ -367,7 +367,7 @@ pub(crate) enum ParkOn {
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
 /// and every `thread.spawn`ed vCPU — the unified handle namespace (slot index = the guest handle,
-/// exactly the interpreter registry's numbering) and the per-domain §15 fiber quota. Slots are not
+/// exactly the interpreter registry's numbering) and the per-domain fiber bound. Slots are not
 /// recycled yet (matching the interp registry; recycling + generation-carrying handles are a later
 /// slice on both backends together — `finish` already bumps the slot generation under the hood).
 /// The fiber table's locked state: the slots, plus the freed-slot **min-heap** (recycling step 3).
@@ -428,16 +428,17 @@ impl Drop for FiberCharge {
 
 pub(crate) struct SharedFiberTable {
     state: Mutex<TableState>,
-    /// §15 quota: max fibers (incl. the implicit root computation) for the **whole domain**,
-    /// clamped to [`MAX_FIBERS`] — per-run like the interpreter's, not per-vCPU.
+    /// The most fibers (incl. the implicit root computation) the **whole domain** may hold, clamped to
+    /// [`MAX_FIBERS`]: that ceiling, or 1 for a child compiled without `cont.*`. Its `Budget.mem`
+    /// bounds them below it ([`Self::fiber_charge`]).
     max_fibers: usize,
     /// Owner-token allocator: each vCPU's `FiberRuntime` takes a unique token at construction.
     next_owner: AtomicU64,
     /// The module-declared shadow arena (INVARIANTS.md #16) — where this domain's per-context
     /// shadow regions sit; every placement question in this runtime is answered from it.
     pub(crate) shadow: ShadowArena,
-    /// #2112 — the budget node this domain's fibers are charged to: a detached child's own. `None`
-    /// for a run's own domain, as for its threads (#2113), and for a carve child's (#1867).
+    /// #2112 — the budget node this domain's fibers are charged to: a run's own (the embedder's
+    /// grant, #2113) or a detached child's. `None` for a carve child's (#1867).
     node: Option<Arc<dyn crate::BudgetNode>>,
 }
 
@@ -501,7 +502,7 @@ impl SharedFiberTable {
         self.lock().vcpu_mask = mask;
     }
 
-    /// Quota pre-check (no allocation yet): would one more fiber exceed the domain budget? Checked
+    /// Ceiling pre-check (no allocation yet): would one more fiber pass [`MAX_FIBERS`]? Checked
     /// *before* the fiber's stack is mmap'd so a fiber-bomb is a clean `FiberFault` that never
     /// touches the OS map limit. A free slot is always room (recycling reuses, doesn't grow).
     fn has_room(&self) -> bool {
@@ -581,9 +582,9 @@ impl SharedFiberTable {
 
 impl FiberSlot {
     /// D66 — a **platform-owned** slot: the fiber a child-domain task runs on. Lives in no guest
-    /// table (it is not a `cont.new` handle, spends no §15 fiber quota, and is never resolvable by
-    /// a guest), but is an ordinary `FiberSlot` otherwise, so the single-owner claim, `running_on`,
-    /// and `event_park` work unchanged — which is what lets the futex thunk's "inside a fiber ⇒
+    /// table (it is not a `cont.new` handle, spends no `mem` and no fiber slot, and is never
+    /// resolvable by a guest), but is an ordinary `FiberSlot` otherwise, so the single-owner claim,
+    /// `running_on`, and `event_park` work unchanged — which is what lets the futex thunk's "inside a fiber ⇒
     /// park the fiber" branch serve a child task with no second park mechanism (INVARIANTS #15).
     /// A durable child's shadow region is seeded per residency by the executor (#1361 step 4).
     pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
@@ -1046,7 +1047,7 @@ pub(crate) unsafe fn make_task_fiber(
 
 /// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(sp, arg)`.
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
-/// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** §15 quota).
+/// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
 ///
 /// # Safety
 /// `fn_table_base`/`trap_out` are the threaded context; `fuel_addr` is this compile's counted-fuel
@@ -1068,7 +1069,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
     }
     let (mask, type_id, call_tramp, charge) = {
         let rt = &*rt;
-        // Quota pre-check **before** the stack mmap, so a fiber-bomb is a clean `FiberFault` that
+        // Ceiling pre-check **before** the stack mmap, so a fiber-bomb is a clean `FiberFault` that
         // never exhausts the OS map limit. (`create` re-checks under the table lock — a racing
         // sibling vCPU may fill the last slot — at the cost of one transient stack allocation.)
         if !rt.table.has_room() {
@@ -1076,7 +1077,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
             return -1;
         }
         // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives, charged before
-        // its stack is mapped, as the quota is checked. A failure below drops it, handing it back.
+        // its stack is mapped, as the ceiling is checked. A failure below drops it, handing it back.
         let Some(charge) = rt.table.fiber_charge() else {
             fault(trap_out);
             return -1;

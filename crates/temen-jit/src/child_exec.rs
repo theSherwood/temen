@@ -17,7 +17,7 @@
 //! What this does **not** do (the JIT frontier, tracked on #1600): preempt. A task that never parks
 //! holds its lane until it returns; the interpreter's quantum round-robin has no JIT twin. And a
 //! domain's *own* `thread.spawn` vCPUs — a child task's included (#1469) — stay 1:1 OS threads,
-//! counted by `max_vcpus`; they are not tasks.
+//! counted against `MAX_VCPUS` and their domain's `Budget.spawn`; they are not tasks.
 //!
 //! **Env-swap rules** (the D66 checklist R1–R5): each resume is its own `run_guarded_range` bracket
 //! over the *task's* fault range (R1); the per-thread state the child reads through TLS — its fiber
@@ -191,7 +191,7 @@ impl ChildTask {
         let mut rt = match (code.fiber_cfg, code.call_tramp) {
             (Some((type_id, mask)), Some(t)) => {
                 let table = Arc::new(SharedFiberTable::new(
-                    temen_ir::Quota::default().max_fibers,
+                    temen_ir::MAX_FIBERS,
                     shadow,
                     node.clone(),
                 ));

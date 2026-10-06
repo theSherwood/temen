@@ -316,10 +316,10 @@ fn dangling_budget_handle_capfaults_on_both_engines() {
     assert_eq!(r_bc, r_tw, "dangling budget: bytecode != tree-walker");
 }
 
-/// **The narrowed gap, pinned divergent** (flip when child vCPU quotas land on this tier): a
-/// budget with a *bounded spawn ceiling* funds on the tree-walker (which tightens the child's
-/// `Quota.max_vcpus`) but refuses `-EINVAL` on the bytecode engine — exactly the Cranelift
-/// thunk's narrowed gap (`instantiate_record.rs::spawn_bounded_budget_record_is_the_narrowed_jit_gap`).
+/// **The narrowed gap, pinned divergent** (it goes with the carve, #1867): a budget with a
+/// *bounded spawn ceiling* funds a carve child on the tree-walker (which charges the child's vCPUs
+/// to no node) but refuses `-EINVAL` on the bytecode engine — exactly the Cranelift thunk's
+/// narrowed gap (`instantiate_record.rs::spawn_bounded_budget_record_is_the_narrowed_jit_gap`).
 #[test]
 fn bounded_spawn_budget_is_the_narrowed_bytecode_gap() {
     let src = budget_rec_src(12, 65536);
@@ -348,6 +348,6 @@ fn bounded_spawn_budget_is_the_narrowed_bytecode_gap() {
     assert_eq!(
         r_bc,
         Ok(vec![Value::I64(EINVAL)]),
-        "bytecode narrowed gap — flip this to 42 when vCPU quotas land on this tier"
+        "bytecode narrowed gap — it goes with the carve (#1867)"
     );
 }

@@ -13,7 +13,7 @@
 
 use temen_interp::{func_name, run_traced, source_loc, IrPc};
 use temen_ir::DEFAULT_RESERVED_LOG2;
-use temen_jit::{CompiledModule, JitOutcome, Quota, TrapKind, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, JitOutcome, TrapKind, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
 /// Root spawns worker `func1(sp, arg)` and joins it; the worker divides by zero. The join propagates
@@ -55,7 +55,7 @@ fn compile(src: &str) -> CompiledModule {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compiles")

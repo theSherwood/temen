@@ -3401,8 +3401,9 @@ happens-before edge that makes resuming a native stack *another thread* saved so
 **What stays per-thread:** the resume chain (a worker's current native/eval call stack) and
 the JIT `yielders` stack — migration only ever moves a *suspended* fiber (on no chain). A
 fiber anywhere in a resume chain is `RUNNING`, so a re-entrant resume loses the claim and
-faults (this replaced the per-thread `chain` checks on both backends). **Quota (§15):**
-`max_fibers` is per-run/domain (the shared table's slot count) on both backends.
+faults (this replaced the per-thread `chain` checks on both backends). **Bound (§15):**
+`MAX_FIBERS` is per-run/domain (the shared table's slot count) on both backends, and each live fiber
+is `FIBER_STACK` of its domain's `mem` (#2112).
 **Compatibility:** a guest that never resumes a foreign fiber sees identical behavior;
 migration is opt-in by the guest's scheduler choosing where to resume a handle.
 
@@ -3470,7 +3471,7 @@ vCPU-shaped, and on the JIT a vCPU is one OS thread — so a parent with N detac
 host threads, bounded only by the OS (#1586, #1587; the §15 ceiling itself was bypassed on every §14
 path until #1590). That is INVARIANTS #3 in the direction the owner named: *a parent must not consume
 resources beyond what it was given*, and "granted 2 threads" was not a quantity the runtime could even
-represent per domain — `max_vcpus` bounds task *count* (parked tasks included), and host parallelism
+represent per domain — `max_vcpus` bounded task *count* (parked tasks included), and host parallelism
 was `MAX_WORKERS`, global.
 
 **The decision (owner rulings, 2026-09-21).**
@@ -3484,7 +3485,7 @@ was `MAX_WORKERS`, global.
    D22's double-scheduler objection is real *for those*. D56 is unchanged for them.
 3. **Parallelism is a granted resource, bounded at dispatch.** A domain holds a **lane cap**: how
    many tasks of its subtree may be *running* at once. Checked when a worker picks a task, released
-   on park/yield/finish. Distinct from the task-count bound (`max_vcpus`), which stays.
+   on park/yield/finish. Distinct from the task-count bound (the budget's `spawn`), which stays.
 4. **Ceiling with per-child lanes.** A grants B a lane of 2: B's subtree runs ≤ 2 at once; A's own
    tasks may fill any lane A holds. Σ of a parent's granted lanes ≤ its own cap, enforced at grant
    time; a task counts against its own lane and every enclosing one (the nested-`cpu.max` shape).

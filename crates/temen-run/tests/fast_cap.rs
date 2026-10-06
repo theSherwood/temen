@@ -5,7 +5,7 @@
 //! that a forged handle still faults.
 
 use temen_interp::{run_with_host, Host, Value};
-use temen_jit::{compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome, Quota};
+use temen_jit::{compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome};
 use temen_run::{cap_thunk, fast_cap_resolver};
 
 // `(i32 clk) -> i64`: call `Clock.now()` (0-arg, so the fast resolver `(CLOCK,0,0,1)` engages) twice
@@ -60,7 +60,7 @@ fn clock_fast_path_matches_generic_and_interp() {
         cap_thunk,
         ctx,
         fast_cap_resolver,
-        Quota::default(),
+        None,
     )
     .expect("jit fast");
     assert_eq!(fast, JitOutcome::Returned(vec![1]), "jit fast clock delta");
@@ -75,15 +75,8 @@ fn clock_fast_path_faults_on_forged_handle() {
     let _real = host.grant_clock();
     let forged = 0x7fff_fffe; // not a valid (slot, generation) for a CLOCK binding
     let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
-    let r = compile_and_run_with_host_fast(
-        &m,
-        0,
-        &[forged],
-        cap_thunk,
-        ctx,
-        fast_cap_resolver,
-        Quota::default(),
-    );
+    let r =
+        compile_and_run_with_host_fast(&m, 0, &[forged], cap_thunk, ctx, fast_cap_resolver, None);
     // A CapFault surfaces as a trap (Err) or a Trapped outcome — either way, not a clean return.
     let faulted = !matches!(r, Ok(JitOutcome::Returned(_)));
     assert!(

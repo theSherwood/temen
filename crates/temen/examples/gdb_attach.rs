@@ -20,7 +20,7 @@
 //! `bt` frame reads `compute (...) at compute.c:3`, not the synthesized `fn0`.
 
 use temen_ir::DEFAULT_RESERVED_LOG2;
-use temen_jit::{CompiledModule, Quota, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
 // Same fixture as the CI test: three computing ops mapped to source lines 2, 3, 4 of "compute.c".
@@ -60,7 +60,7 @@ fn main() {
         None,
         None, // fuel
         None,
-        Quota::default(),
+        None,
         0,
     )
     .expect("jit compiles");

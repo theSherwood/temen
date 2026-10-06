@@ -31,8 +31,9 @@ fn run(bc: &str, backend: Backend) -> temen_run::Run {
         limits: Limits {
             fuel: Some(u64::MAX), // no limit on any backend
             deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
+            mem: None,
+            channel: None,
+            spawn: None,
         },
         stdin: vec![],
         memory_size_log2: None,
