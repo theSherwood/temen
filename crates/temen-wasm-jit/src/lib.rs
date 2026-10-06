@@ -7020,6 +7020,7 @@ fn emit_block_body(
                         code.push(0x11); // call_indirect
                         uleb(code, indirect_type_index(types, &ft)? as u64);
                         uleb(code, 0); // table index 0
+                        emit_win_reload(code); // #2118: the sibling's callee may have grown the window
                         for i in (0..n_results).rev() {
                             code.push(OP_LOCAL_SET);
                             uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -7113,6 +7114,9 @@ fn emit_block_body(
                 code.push(0x11); // call.dyn
                 uleb(code, indirect_type_index(types, ft)? as u64);
                 uleb(code, 0); // table index 0
+                               // #2118: a slot can hold a bounce shim, or an emitted function that bounces, either of
+                               // which may have grown (and so relocated) the window.
+                emit_win_reload(code);
                 for i in (0..n_results).rev() {
                     code.push(OP_LOCAL_SET);
                     uleb(code, cx.local_of[k][next_val + i] as u64);
