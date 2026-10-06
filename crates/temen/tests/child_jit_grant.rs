@@ -14,20 +14,20 @@
 //! module and installs into the child's own dispatch table; the four outcomes must match the
 //! interpreter's byte-for-byte.
 
-#[path = "support/grant_hooks.rs"]
-mod grant_hooks_mod;
-use grant_hooks_mod::grant_hooks;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
+use std::sync::Arc;
 use temen_encode::encode_module;
-use temen_interp::{bytecode, run_with_host, Host, Trap, Value};
-use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
+use temen_interp::{bytecode, run_with_host, Host, MemLayout, Trap, Value};
+use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
+use temen_jit::JitOutcome;
 use temen_run::grant_jit;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// The child's carve inside the `memory 17` parent, and where the unit blob sits in the child's window
-/// (above the NULL guard + the grant scratch), i.e. parent offset `CARVE + BLOB_OFF`.
-const CARVE: usize = 65536;
+/// Where the unit blob sits, a data segment above the NULL guard and the grant scratch: the child
+/// runs the parent's module, so its own window holds the blob there too.
 const BLOB_OFF: usize = 20480;
 
 /// The unit the child compiles, declaring the module's memory (`memory 17`): `(a, b) -> a + b`, or for
@@ -43,31 +43,26 @@ fn blob(zero_arg: bool) -> Vec<u8> {
     encode_module(&m)
 }
 
-/// func 0 (parent, `(Instantiator, Jit)`): one grant record at 16384 naming the `Jit` handle `"jit"`
-/// (name bytes at 16484), spawn the child into the carve at 64 KiB through the op-17 record (56 bytes
-/// at 17536: version 0, entry 1, off 64 KiB, size_log2 16, no pager, self module, no budget, quota 0,
-/// grant list `(16384, grants_n)`), join, return its result.
-/// func 1 (child, `(Instantiator)`): resolve `"jit"` by name (written into its own window), compile
-/// the blob at `BLOB_OFF` `times` times (the last compile's code handle is what it invokes), invoke
-/// `(3, 4)`, return the sum. `times == 2` is the quota probe: it returns the **second compile's**
+/// func 0 (parent, `(Instantiator, Jit, Budget)`): one grant record at 16384 naming the `Jit` handle
+/// `"jit"` (the name a data segment at 16484 holds), spawn the child detached through a v1 record at
+/// 17536 (entry 1, the parent's module, paid from the `Budget`, grant list `(16384, grants_n)`),
+/// join, return its result.
+/// func 1 (child, `(Instantiator)`): resolve `"jit"` by name (the same data in its own window),
+/// compile the blob at `BLOB_OFF` `times` times (the last compile's code handle is what it invokes),
+/// invoke `(3, 4)`, return the sum. `times == 2` is the quota probe: it returns the **second compile's**
 /// result instead (`-ENOMEM` when the child's table has one unit). Modes 5/6: the child `install`s
 /// its unit and returns the slot; in mode 5 the parent `call.dyn`s that slot (in its own table), in
 /// mode 6 it returns the slot as is.
 fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let blob_len = blob.len();
-    // The parent stages the blob into the (future) carve as little-endian i64 stores.
-    let mut stores = String::new();
-    for (i, chunk) in blob.chunks(8).enumerate() {
-        let mut w = [0u8; 8];
-        w[..chunk.len()].copy_from_slice(chunk);
-        stores.push_str(&format!(
-            "  bp{i} = i64.const {}\n  bw{i} = i64.const {}\n  i64.store bp{i} bw{i}\n",
-            CARVE + BLOB_OFF + i * 8,
-            i64::from_le_bytes(w),
-        ));
-    }
+    let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let spawn = SpawnRec {
+        grants_ptr: 16384,
+        grants_n: u64::from(grants_n),
+        ..SpawnRec::v1(1)
+    };
     let child_pre = format!(
-        "  len3 = i64.const 3\n  hj = self.resolve n0 len3\n  vb = i64.const {}\n  vl = i64.const {}\n  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n",
+        "  n0 = i64.const 16484\n  len3 = i64.const 3\n  hj = self.resolve n0 len3\n  vb = i64.const {}\n  vl = i64.const {}\n  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n",
         BLOB_OFF, blob_len
     );
     let child_tail = match mode {
@@ -84,8 +79,8 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     };
     format!(
         r#"memory 17
-func (i32, i32) -> (i64) {{
-block 0 (vinst: i32, vjit: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vjit: i32, vbud: i32) {{
   a0 = i64.const 16384
   n100 = i32.const 16484
   i32.store a0 n100
@@ -97,83 +92,47 @@ block 0 (vinst: i32, vjit: i32) {{
   a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
-  cj = i32.const 106
-  ci = i32.const 105
-  ct = i32.const 116
-  p100 = i64.const 16484
-  i32.store8 p100 cj
-  p101 = i64.const 16485
-  i32.store8 p101 ci
-  p102 = i64.const 16486
-  i32.store8 p102 ct
-{stores}  q0v0 = i64.const 4294967296
-  q0v1 = i64.const {carve}
-  q0v2 = i64.const -4294967280
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0v5 = i64.const 16384
-  q0v6 = i64.const {grants_n}
+  qb = i64.const 17564
+  i32.store qb vbud
   q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v5
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v6
   vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
   r = call.cap 6 1 (i32) -> (i64) vinst (vch)
 {parent_tail}  }}
 }}
 func (i64) -> (i64) {{
 block 0 (vci: i64) {{
-  cj = i32.const 106
-  ci = i32.const 105
-  ct = i32.const 116
-  n0 = i64.const 16384
-  i32.store8 n0 cj
-  n1 = i64.const 16385
-  i32.store8 n1 ci
-  n2 = i64.const 16386
-  i32.store8 n2 ct
 {child_pre}{child_tail}  }}
 }}
-"#,
-        grants_n = grants_n,
-        carve = CARVE,
-        stores = stores,
-        child_pre = child_pre,
-        parent_tail = parent_tail,
-        child_tail = child_tail,
+data 16484 "jit"
+data {BLOB_OFF} "{blob_data}"
+{rec}"#,
+        rec = rec::segment(17536, &spawn),
     )
+}
+
+/// The parent's host for one run: an `Instantiator`, a `Jit` table (16 install slots for the install
+/// probe) with a `units` compile quota, and a `Budget` that pays for the child. The host knows the
+/// parent's module, which the child runs.
+fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, [i32; 3]) {
+    let mut host = Host::new();
+    host.set_self_module(&Arc::new(m.clone()));
+    let ih = host.grant_instantiator(0, 128 << 10);
+    let jh = grant_jit(&mut host, m, if mode >= 5 { 4 } else { 0 });
+    host.set_jit_quota(units, 1 << 20);
+    let bh = host.grant_budget(-1, 1 << 20, -1);
+    (host, [ih, jh, bh])
 }
 
 /// Run on the tree-walker and on the bytecode engine with the same host setup (a root `Jit` grant of
 /// `units` units); return both outcomes for the caller's assertions.
-/// The parent's host for one run: an `Instantiator` over the low 128 KiB and a `Jit` table (16
-/// install slots for the install probe) with a `units` compile quota.
-fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, i32, i32) {
-    let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
-    let jh = grant_jit(&mut host, m, if mode >= 5 { 4 } else { 0 });
-    host.set_jit_quota(units, 1 << 20);
-    (host, ih, jh)
-}
-
 fn run_both(grants_n: u32, mode: u32, units: u32) -> [Result<Vec<Value>, Trap>; 2] {
     let b = blob(mode >= 5);
     let m = parse_module(&src(grants_n, &b, mode)).expect("parse");
     verify_module(&m).expect("verify");
     let mut out = Vec::new();
     for engine in 0..2 {
-        let (mut host, ih, jh) = setup(&m, mode, units);
-        let args = [Value::I32(ih), Value::I32(jh)];
+        let (mut host, handles) = setup(&m, mode, units);
+        let args = handles.map(Value::I32);
         let mut fuel = 5_000_000u64;
         let r = if engine == 0 {
             run_with_host(&m, 0, &args, &mut fuel, &mut host)
@@ -192,25 +151,24 @@ fn run_both(grants_n: u32, mode: u32, units: u32) -> [Result<Vec<Value>, Trap>; 
 }
 
 /// The same program on the native JIT, with temen-run's production child hooks (the child is built
-/// host-side by `grant_named_child_build`, which reports the `Jit` grant's table reservation).
+/// host-side by the detached builder, which reports the `Jit` grant's table reservation).
 fn run_jit(grants_n: u32, mode: u32, units: u32) -> JitOutcome {
     let b = blob(mode >= 5);
     let m = parse_module(&src(grants_n, &b, mode)).expect("parse");
     verify_module(&m).expect("verify");
-    let (mut host, ih, jh) = setup(&m, mode, units);
-    let (jo, _mem) = compile_and_run_capture_reserved_with_host_ex(
+    let (mut host, handles) = setup(&m, mode, units);
+    temen_run::jit_cap_run(
         &m,
         0,
-        &[ih as i64, jh as i64],
-        &[0u8; 128 << 10],
+        &handles.map(i64::from),
+        &MemLayout::image(Vec::new()),
+        DEFAULT_RESERVED_LOG2,
         0,
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut core::ffi::c_void,
+        &mut host,
         None,
-        Some(grant_hooks(&mut host as *mut Host)),
     )
-    .expect("jit");
-    jo
+    .expect("jit")
+    .0
 }
 
 /// Interp `Ok([I64(x)])` ≡ JIT `Returned([x])`; any interp trap ≡ any JIT trap (the kind is not part

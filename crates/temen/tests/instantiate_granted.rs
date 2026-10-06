@@ -3,26 +3,36 @@
 //! it can do I/O. This is the load-bearing "children can hold capabilities" primitive the process
 //! substrate needs (a shell hands its child stdout/stderr/stdin).
 //!
-//! §3d: the spelling is the op-17 **record** with a one-entry named-grant list (the old positional
-//! op 8 is deleted): the parent lays the name + 16-byte grant record in its window, the child
-//! resolves the cap **by name** (`self.resolve`) instead of receiving a third entry arg. A
-//! forged / non-copyable handle (an index-carrying or window-coordinate cap) still fails the whole
-//! spawn closed (`CapFault`) at the record's grant-list validation.
+//! §3d: the spelling is the op-17 **record** with a one-entry named-grant list: the parent lays the
+//! name + 16-byte grant record in its window, the child resolves the cap **by name**
+//! (`self.resolve`) instead of receiving a third entry arg. A forged / non-copyable handle (an
+//! index-carrying or window-coordinate cap) still fails the whole spawn closed (`CapFault`) at the
+//! record's grant-list validation.
+//!
+//! The interpreter and the JIT run the same program. The JIT keeps the `Host` opaque, so the child
+//! powerbox is built host-side by temen-run's production grant hooks, which `jit_cap_run` installs —
+//! so both backends hand the child an identical set of handles and share the parent's stdout sink
+//! (stdio inheritance).
 
-use temen_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap, Value};
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
+use std::sync::Arc;
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Trap, Value};
+use temen_ir::{Module, SpawnRec};
+use temen_jit::{JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// func 0 (parent, `(Instantiator, grant_handle)`): spawn the child (func 1) via the record in a
-/// 4 KiB carve at offset 0, re-granting the parent's `grant_handle` under the name `"g"` (name at
-/// 4096, grant record at 4104, spawn record at 4160 — all above the carve), then `join` and return
-/// the child's result.
+/// func 0 (parent, `(Instantiator, grant_handle, Budget)`): spawn the child (func 1) detached through
+/// the v1 record at 20544, paid from the `Budget` and re-granting the parent's `grant_handle` under
+/// the name `"g"` (name at 20480, grant record at 20488), then `join` and return the child's result.
 ///
 /// func 1 (child, `(Instantiator, AddressSpace)`): write the three bytes `"hi\n"` into its own
-/// window, resolve `"g"` by name, `Stream.write(0, 3)` through it, then return 7.
+/// window above its NULL guard, resolve `"g"` by name, `Stream.write` them through it, then return 7.
 const SRC: &str = "memory 17\n\
-func (i32, i32) -> (i64) {\n\
-block 0 (vinst: i32, vstream: i32) {\n\
+func (i32, i32, i32) -> (i64) {\n\
+block 0 (vinst: i32, vstream: i32, vbud: i32) {\n\
   vg = i32.const 103\n\
   vnp1 = i64.const 20480\n\
   i32.store8 vnp1 vg\n\
@@ -37,27 +47,9 @@ block 0 (vinst: i32, vstream: i32) {\n\
   vgr3 = i64.const 20500\n\
   vz32 = i32.const 0\n\
   i32.store vgr3 vz32\n\
-  rrv0 = i64.const 4294967296\n\
-  rrvz = i64.const 0\n\
-  rroff = i64.const 65536\n\
-  rrv2 = i64.const -4294967284\n\
-  rrv3 = i64.const 4294967295\n\
-  rrgp = i64.const 20488\n\
-  rrgn = i64.const 1\n\
+  rrb = i64.const 20572\n\
+  i32.store rrb vbud\n\
   rra0 = i64.const 20544\n\
-  i64.store rra0 rrv0\n\
-  rra1 = i64.const 20552\n\
-  i64.store rra1 rroff\n\
-  rra2 = i64.const 20560\n\
-  i64.store rra2 rrv2\n\
-  rra3 = i64.const 20568\n\
-  i64.store rra3 rrv3\n\
-  rra4 = i64.const 20576\n\
-  i64.store rra4 rrvz\n\
-  rra5 = i64.const 20584\n\
-  i64.store rra5 rrgp\n\
-  rra6 = i64.const 20592\n\
-  i64.store rra6 rrgn\n\
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
   vres = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
   return vres\n\
@@ -65,72 +57,116 @@ block 0 (vinst: i32, vstream: i32) {\n\
 }\n\
 func (i64, i64) -> (i64) {\n\
 block 0 (vcinst: i64, vcas: i64) {\n\
-  v0 = i64.const 0\n\
+  v0 = i64.const 16640\n\
   vhb = i32.const 104\n\
   i32.store8 v0 vhb\n\
-  v1 = i64.const 1\n\
+  v1 = i64.const 16641\n\
   vib = i32.const 105\n\
   i32.store8 v1 vib\n\
-  v2 = i64.const 2\n\
+  v2 = i64.const 16642\n\
   vnb = i32.const 10\n\
   i32.store8 v2 vnb\n\
   vg = i32.const 103\n\
-  vnp = i64.const 512\n\
+  vnp = i64.const 16700\n\
   i32.store8 vnp vg\n\
   vnl = i64.const 1\n\
   vsh = self.resolve vnp vnl\n\
-  vptr = i64.const 0\n\
   vlen = i64.const 3\n\
-  vw = call.cap 0 1 (i64, i64) -> (i64) vsh (vptr, vlen)\n\
+  vw = call.cap 0 1 (i64, i64) -> (i64) vsh (v0, vlen)\n\
   v7 = i64.const 7\n\
   return v7\n\
   }\n\
 }\n";
 
-fn run(inst_first: bool) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
-    let m = parse_module(SRC).expect("parse");
+/// [`SRC`] with its spawn record.
+fn module() -> Module {
+    let spawn = SpawnRec {
+        grants_ptr: 20488,
+        grants_n: 1,
+        ..SpawnRec::v1(1)
+    };
+    let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");
+    m
+}
+
+/// A host for `m` and the parent's three args. `stream_grant` picks the second: the re-grantable
+/// `Stream` (happy path) or the non-copyable `Instantiator` (negative path), to prove it is refused.
+fn host(m: &Module, stream_grant: bool) -> (Host, [i32; 3]) {
     let mut host = Host::new();
+    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 128 << 10);
     let sh = host.grant_stream(StreamRole::Out);
-    // The parent entry is `(Instantiator, grant_handle)`. The happy path passes the Stream as the
-    // grant; the negative path passes the Instantiator itself (a window-coordinate cap → not
-    // copyable) to prove it is refused.
-    let grant = if inst_first { ih } else { sh };
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let grant = if stream_grant { sh } else { ih };
+    (host, [ih, grant, budget])
+}
+
+/// Run [`SRC`] on the interpreter: the parent's result and the effective stdout bytes (the child's
+/// output, shared into the parent's sink).
+fn run_interp(stream_grant: bool) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
+    let m = module();
+    let (mut host, args) = host(&m, stream_grant);
     let mut fuel = 5_000_000u64;
     let (res, _snap) = run_capture_reserved_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(grant)],
+        &args.map(Value::I32),
         &mut fuel,
         &[0u8; 128 << 10],
         0,
         &mut host,
     );
-    // The child's stdout was shared into the parent host's sink (stdio inheritance), so read the
-    // effective bytes, not the now-promoted local `stdout` Vec.
     (res, host.stdout_bytes())
 }
 
-#[test]
-fn child_writes_stdout_through_inherited_stream() {
-    let (res, out) = run(false); // grant the Stream
-    assert_eq!(res, Ok(vec![Value::I64(7)]), "child ran and joined");
-    assert_eq!(
-        out, b"hi\n",
-        "the child produced output through the re-granted stdout Stream"
-    );
+/// Run [`SRC`] on the JIT. Same shape as [`run_interp`].
+fn run_jit(stream_grant: bool) -> (JitOutcome, Vec<u8>) {
+    let m = module();
+    let (mut host, args) = host(&m, stream_grant);
+    let (jo, _) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &args.map(i64::from),
+        &MemLayout::image(vec![0u8; 128 << 10]),
+        0,
+        0,
+        &mut host,
+        None,
+    )
+    .expect("jit");
+    (jo, host.stdout_bytes())
 }
 
 #[test]
-fn non_copyable_grant_is_capfault() {
-    // Passing the Instantiator handle as the grant: a window-coordinate cap is not re-grantable, so
-    // `resolve_copyable` refuses it and the `instantiate_granted` call.cap is a `CapFault`.
-    let (res, out) = run(true);
+fn granted_child_writes_stdout_on_both() {
+    let (ir, iout) = run_interp(true);
+    let (jo, jout) = run_jit(true);
+    // Interpreter reference: the child ran, wrote through the re-granted stdout, joined with 7.
+    assert_eq!(ir, Ok(vec![Value::I64(7)]), "interp: child ran and joined");
     assert_eq!(
-        res,
-        Err(Trap::CapFault),
-        "a non-copyable grant must fault, not silently succeed"
+        iout, b"hi\n",
+        "interp: child output through re-granted stdout"
     );
-    assert!(out.is_empty(), "nothing should have been written");
+    // JIT parity: same return value, same bytes into the same (shared) sink.
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[7]),
+        "jit: granted child must join with 7, got {jo:?}"
+    );
+    assert_eq!(jout, iout, "jit: granted child's stdout must match interp");
+}
+
+#[test]
+fn non_copyable_grant_capfaults_on_both() {
+    // Granting the Instantiator handle (a window-coordinate cap) is refused by the spawn's grant-list
+    // validation, so the spawn is a `CapFault` on both backends — never a silent success.
+    let (ir, iout) = run_interp(false);
+    let (jo, jout) = run_jit(false);
+    assert_eq!(ir, Err(Trap::CapFault), "interp: non-copyable grant faults");
+    assert!(
+        matches!(jo, JitOutcome::Trapped(TrapKind::CapFault)),
+        "jit: non-copyable grant must fault, got {jo:?}"
+    );
+    assert!(iout.is_empty(), "interp: nothing written");
+    assert!(jout.is_empty(), "jit: nothing written");
 }

@@ -8,38 +8,45 @@
 //! native reader used to pre-size its list on the untrusted count, so on Cranelift the same guest
 //! aborted the host process on the allocation instead.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::{bytecode, Host, MemLayout, StreamRole, Trap, Value};
-use temen_ir::DEFAULT_RESERVED_LOG2;
+use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::jit_cap_run;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// `instantiate_module_named` (op 13) of [`CHILD`] over `grants_n` records at `grants_ptr`, into a
-/// 128 KiB carve at 128 KiB. Records 0 and 1 at 16640 (clear of the guarded low pages) are written to
-/// grant the stream under an empty name, so a list there is well formed.
+/// Spawns [`CHILD`] detached over `grants_n` records at `grants_ptr`, through a v1 record at 17408
+/// paid from the root's `Budget`. Records 0 and 1 at 16640 (clear of the guarded low pages) are
+/// written to grant the stream under an empty name, so a list there is well formed.
 fn guest(grants_ptr: i64, grants_n: i64) -> temen_ir::Module {
+    let spawn = SpawnRec {
+        grants_ptr: grants_ptr as u64,
+        grants_n: grants_n as u64,
+        ..SpawnRec::v1(0)
+    };
     let src = format!(
         r#"memory 19
-func (i32, i32, i32) -> (i64) {{
-block 0 (vi: i32, vm: i32, vs: i32) {{
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vm: i32, vs: i32, vb: i32) {{
   h0 = i64.const 16648
   i32.store h0 vs
   h1 = i64.const 16664
   i32.store h1 vs
-  mh = i64.extend_i32_u vm
-  gp = i64.const {grants_ptr}
-  gn = i64.const {grants_n}
-  ent = i64.const 0
-  off = i64.const 131072
-  sl = i64.const 17
-  qz = i64.const 0
-  ch = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (mh, gp, gn, ent, off, sl, qz)
+  am = i64.const 17432
+  i32.store am vm
+  ab = i64.const 17436
+  i32.store ab vb
+  rp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vi (rp)
   r = i64.extend_i32_s ch
   return r
   }}
 }}
-"#
+{rec}"#,
+        rec = rec::segment(17408, &spawn)
     );
     let m = parse_module(&src).expect("parse guest");
     verify_module(&m).expect("verify guest");
@@ -56,15 +63,17 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The entry's three arguments: the `Instantiator`, the child `Module`, and a copyable stream to grant.
-fn host() -> (Host, [i32; 3]) {
+/// The entry's four arguments: the `Instantiator`, the child `Module`, a copyable stream to grant, and
+/// the `Budget` that pays for the child.
+fn host() -> (Host, [i32; 4]) {
     let child = parse_module(CHILD).expect("parse child");
     verify_module(&child).expect("verify child");
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 1 << 19);
     let module = host.grant_module(&child);
     let out = host.grant_stream(StreamRole::Out);
-    (host, [inst, module, out])
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    (host, [inst, module, out, budget])
 }
 
 fn oracle(m: &temen_ir::Module) -> Result<Vec<Value>, Trap> {

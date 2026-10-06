@@ -10,8 +10,13 @@
 //! Same `SHARED_MEM` fixture as `bytecode_instantiate.rs`, driven through the scheduled debug engine
 //! directly (`ScheduledDebugRun::new_with_host`) rather than the DAP routing.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
+use std::sync::Arc;
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{bytecode, run_with_host, Host, IrPc, Value};
+use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
 // Parent (func 0) instantiates the child (func 1) in a 4 KiB window at 64 KiB, joins it, then reads
@@ -288,6 +293,68 @@ block 0 (v0: i64) {
 }
 "#;
 
+// #1867 — the chain detached: the root `(instantiator, budget) -> i64` spawns the child (func 1)
+// through a v1 record at 17408, paid from its budget. The child resolves its own `"budget"` and
+// spawns the grandchild (func 2) through the record at 17536, paid from it. Each window is its own,
+// so the grandchild writes its marker 200 above its NULL guard, at 16640. Each joins the next; the
+// grandchild returns 77, propagated up.
+const DETACHED_DEPTH_TWO: &str = r#"memory 17
+data 16700 "budget"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32) {
+  rb = i64.const 17436
+  i32.store rb vb
+  rp = i64.const 17408
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (rp)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.wrap_i64 v0
+  v2 = i64.const 20480
+  v3 = i32.const 171
+  i32.store8 v2 v3
+  np = i64.const 16700
+  nl = i64.const 6
+  hb = self.resolve np nl
+  cb = i64.const 17564
+  i32.store cb hb
+  cp = i64.const 17536
+  v8 = call.cap 6 17 (i64) -> (i32) v1 (cp)
+  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
+  return v9
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 16640
+  v2 = i32.const 200
+  i32.store8 v1 v2
+  v3 = i64.const 77
+  return v3
+  }
+}
+"#;
+
+/// A `ScheduledDebugRun` on [`DETACHED_DEPTH_TWO`] with its two spawn records, whose host knows the
+/// module the child and the grandchild run.
+fn detached_depth_two_session() -> ScheduledDebugRun {
+    let src = format!(
+        "{DETACHED_DEPTH_TWO}{}{}",
+        rec::segment(17408, &SpawnRec::v1(1)),
+        rec::segment(17536, &SpawnRec::v1(2))
+    );
+    let m = parse_module(&src).expect("parse");
+    let mut host = Host::new();
+    host.set_self_module(&Arc::new(m.clone()));
+    let inst = host.grant_instantiator(0, 128 << 10);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(inst), Value::I32(budget)], host)
+        .expect("scheduled debug engine drives a detached depth-2 chain")
+}
+
 fn depth_two_session() -> ScheduledDebugRun {
     let m = parse_module(DEPTH_TWO).expect("parse");
     let mut host = Host::new();
@@ -325,12 +392,11 @@ fn depth_two_instantiate_matches_the_oracle() {
     assert_eq!(tw, bc, "bytecode ≡ tree-walker");
 }
 
-/// A breakpoint in the **grandchild** fires on its own distinct vCPU (task 2), and `read_window` reads
-/// the grandchild's confined window (its marker 200), not the child's (171) or the shared window's (0)
-/// — three distinct confined windows nested two deep.
+/// A breakpoint in the **grandchild** fires on its own distinct vCPU, and `read_window` reads the
+/// grandchild's own window (its marker 200), not the child's or the root's — three windows, two deep.
 #[test]
 fn breakpoint_in_a_grandchild_fires() {
-    let mut r = depth_two_session();
+    let mut r = detached_depth_two_session();
     // The grandchild (func 2) is `const 0` (inst 0), `const 200` (inst 1), `store8` (inst 2), … — so
     // stop at inst 3, just after the store, when its marker is in its window.
     let after_store = IrPc {
@@ -350,9 +416,9 @@ fn breakpoint_in_a_grandchild_fires() {
     assert!(r.select_task(gc));
     assert_eq!(r.frame_pc(0), Some(after_store));
     assert_eq!(
-        r.read_window(0, 1).unwrap(),
+        r.read_window(16640, 1).unwrap(),
         vec![200u8],
-        "reads the grandchild's own confined window (marker 200)"
+        "reads the grandchild's own window (marker 200)"
     );
     assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(77)]));
 }

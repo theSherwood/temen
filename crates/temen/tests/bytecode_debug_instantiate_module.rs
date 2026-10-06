@@ -10,8 +10,12 @@
 //! Same `PARENT`/`CHILD_SRC` fixture as `bytecode_separate_module.rs`, driven through the scheduled debug
 //! engine directly (`ScheduledDebugRun::new_with_host`).
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{bytecode, run_with_host, Host, IrPc, Value};
+use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
 // The granted "plugin" module: a 64 KiB window with a data segment "VM" at offset 16 KiB + 100 (above
@@ -51,6 +55,23 @@ block 0 (v0: i32, v1: i32) {
 }
 "#;
 
+// #1867 — the same spawn, detached: parent `(instantiator, module, budget) -> i64` spawns the granted
+// module through a v1 record at 17408 paid from the budget, joins it, and returns its value (1086).
+const DETACHED_PARENT: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vm = i64.const 17432
+  i32.store vm v1
+  vb = i64.const 17436
+  i32.store vb v2
+  vr = i64.const 17408
+  v6 = call.cap 6 17 (i64) -> (i32) v0 (vr)
+  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  return v7
+  }
+}
+"#;
+
 const WANT: i64 = 1086;
 
 /// A powerbox with a granted `Instantiator` (over the whole window) + a `Module` grant for `CHILD_SRC`.
@@ -68,6 +89,17 @@ fn module_session() -> ScheduledDebugRun {
     let (host, inst, mh) = powerbox();
     ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(inst), Value::I32(mh)], host)
         .expect("scheduled debug engine must drive §14 instantiate_module")
+}
+
+/// A `ScheduledDebugRun` on [`DETACHED_PARENT`], with a `Budget` for the child's window.
+fn detached_session() -> ScheduledDebugRun {
+    let src = format!("{DETACHED_PARENT}{}", rec::segment(17408, &SpawnRec::v1(0)));
+    let m = parse_module(&src).expect("parse");
+    let (mut host, inst, mh) = powerbox();
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let args = [inst, mh, budget].map(Value::I32);
+    ScheduledDebugRun::new_with_host(&m, 0, &args, host)
+        .expect("scheduled debug engine must drive a detached module child")
 }
 
 fn drive_to_end(run: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value>, ()> {
@@ -141,11 +173,11 @@ fn instantiate_module_debug_run_matches_the_oracle() {
     assert_eq!(tw, bc, "bytecode ≡ tree-walker");
 }
 
-/// A breakpoint in the **granted module's** body fires on a distinct thread — the separate-module child
-/// is its own scheduled vCPU running its own pushed module index.
+/// A breakpoint in the **granted module's** body fires on a distinct thread — the separate-module child,
+/// spawned detached, is its own scheduled vCPU running its own pushed module index.
 #[test]
 fn breakpoint_in_a_module_child_fires() {
-    let mut r = module_session();
+    let mut r = detached_session();
     r.set_breakpoints(vec![child_module_first_op()]);
     let mut fuel = 5_000_000u64;
     match r.run_until_stop(&mut fuel) {

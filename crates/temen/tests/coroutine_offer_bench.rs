@@ -6,7 +6,8 @@
 //! Until §2.3 this file raced the offer lane against the bespoke coroutine ops (Instantiator
 //! ops 2/3 + `Yielder`) it replaced; the collapse deleted those ops, so the offer lane is now the
 //! only transport and this pin holds the absolute per-round shape: the parent spawns a serving
-//! child (op 11), mints a live offer over its `adder` export (op 14), and calls `add(i, 1)`
+//! child detached (a v1 record paid from its `"budget"`), mints a live offer over its `adder`
+//! export (op 14), and calls `add(i, 1)`
 //! through it n times, the child replying from a `svc.wait` loop — checksum
 //! `Σ_{i=0}^{n-1}(i+1) = n(n+1)/2`. Known asymmetry, same as `serving_bench` documents: the
 //! op-14 mint + parking live call does not `serve_qualifies` on `Backend::Jit`, so that lane
@@ -20,8 +21,12 @@
 //! `RunConfig::handoff` (2.1b) — it measured the queued transport. A parked-provider cache
 //! (~300-450 ns floor) remains the priced-but-not-queued option if ~740 ns ever matters.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::time::Instant;
 
+use temen_ir::{cap_id, SpawnRec};
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 
@@ -33,6 +38,7 @@ fn offer_program(n: u64) -> String {
         "\
 memory 17
 data 16384 \"vm\"
+data 16400 \"budget\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface {{ add: 0 }}
 export 0 interface \"adder\" 1 {{ add: 2 }}
@@ -43,26 +49,12 @@ block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  q0b = i64.const 17564
+  i32.store q0b vb
   q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
   vch = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   vexp = i64.const 0
   voffer = call.cap 6 14 (i32, i64) -> (i32) vh (vch, vexp)
@@ -111,7 +103,8 @@ block 0 (va: i64, vb: i64) {{
   return vs
   }}
 }}
-"
+{rec}",
+        rec = rec::segment(17536, &SpawnRec::v1(1))
     )
 }
 
@@ -133,10 +126,16 @@ fn run(backend: Backend, src: &str) -> i32 {
         .run_with_caps(
             backend,
             &RunConfig::default(),
-            &[(
-                "vm",
-                HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-            )],
+            &[
+                (
+                    "vm",
+                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                ),
+                (
+                    "budget",
+                    HostCap::custom(cap_id::BUDGET, 0, |h, _| h.grant_budget(-1, 1 << 20, -1)),
+                ),
+            ],
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
     match r.outcome {
