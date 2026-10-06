@@ -3986,8 +3986,8 @@ pub const POWERBOX_HEAP_RESERVE: u64 = 8 << 20;
 pub const MAX_FIBERS: usize = 1 << 24;
 
 /// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
-/// `ThreadFault` past it. The interpreter bounds *concurrently-live* vCPUs; the JIT's table is
-/// cumulative, so there it bounds *total* spawns (stricter, but containment holds either way).
+/// `ThreadFault` past it. Every engine bounds the run's *concurrently live* vCPUs, the root among
+/// them, so a spawn-join loop never trips it.
 pub const MAX_VCPUS: usize = 1 << 16;
 
 /// D66 — the **lane arithmetic** every scheduler's dispatch calls (INVARIANTS #3 ruling 2026-09-21):
@@ -4051,9 +4051,7 @@ pub mod lanes {
 /// (`FiberFault`/`ThreadFault`) — DoS *containment* policy (§15/D48), not just the host-OOM backstop.
 /// [`Default`] is the hard ceilings, so an unconfigured run is unchanged.
 ///
-/// `max_vcpus` semantics differ slightly by backend (documented at the ceilings): the interpreter
-/// counts concurrent liveness, the JIT counts cumulative spawns. The *type* is one; the runtimes apply
-/// it per their model.
+/// `max_vcpus` counts the run's concurrently live vCPUs on every backend ([`MAX_VCPUS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quota {
     /// Max fibers a **run** (domain) may create (`cont.new`, counting the root computation as 1);

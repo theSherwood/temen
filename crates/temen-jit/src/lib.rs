@@ -750,9 +750,8 @@ pub type FastCapResolver = unsafe extern "C" fn(
 
 // §15 **spawn quota** — the single shared type lives in `temen-ir` (re-exported here and as
 // `temen_interp::Quota`), so a powerbox embedder sets it once and it binds all three backends
-// identically, with no facade conversion (Followup F6). NB the JIT's vCPU table is **cumulative** (a
-// joined slot isn't freed), so here `max_vcpus` bounds *total* spawns over the run — stricter than the
-// interpreter's concurrent-liveness cap, but containment holds either way.
+// identically, with no facade conversion (Followup F6). `max_vcpus` bounds the run's *concurrently
+// live* vCPUs, the root among them, as on the interpreters: a spawn-join loop never trips it.
 pub use temen_ir::Quota;
 
 /// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module

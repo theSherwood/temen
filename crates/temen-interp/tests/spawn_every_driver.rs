@@ -14,7 +14,7 @@ mod drivers;
 #[path = "support/rec.rs"]
 mod rec;
 
-use drivers::{agree_on, agree_on_every_driver, run_on, Driver, Ran, SCHEDULING};
+use drivers::{agree_on, agree_on_every_driver, run_on, run_on_then, Driver, Ran, SCHEDULING};
 use temen_interp::{cap_id, Attestation, Host, StreamRole, Trap, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
@@ -1490,4 +1490,53 @@ fn a_kill_that_never_runs_does_not_stop_a_module_on_any_driver() {
     let loops = module(CHILD_LOOPS);
     let m = module(&op15_then(false, 0, JOIN_THEN_DEAD_KILL));
     agree_on_every_driver("dead kill", &m, &op15_fuel_setup(&loops, -1), &ok(7));
+}
+
+/// A detached child parked on a 1 ms timed wait, which returns its wait status.
+const CHILD_WAITS: &str = "memory 15
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 24576
+  vz = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait va vz vto
+  vr = i64.extend_i32_s vst
+  return vr
+  }
+}
+";
+
+/// A parent that returns its child's handle without joining it.
+const NO_JOIN: &str = "\
+  vr = i64.extend_i32_s vch
+  return vr
+  }
+}
+";
+
+/// The `mem` and `spawn` the budget a setup granted still holds.
+fn budget_held(h: &Host) -> (i64, i64) {
+    let node = h
+        .capture_durable_budgets()
+        .into_iter()
+        .find(|n| n.parent.is_none())
+        .expect("the granted budget");
+    (node.used.mem, node.used.spawn)
+}
+
+/// #2006 — a detached child still live when its run ends ends with it, as the oracle's teardown reaps
+/// it: its window and first vCPU go back to the budget that paid for them. The parent returns without
+/// joining a child parked on a timed wait; once the run is over, the budget holds nothing. (The
+/// `Vcpu`'s host runs its children, and the engine hands a child's charge back only at its join:
+/// #2119.)
+#[test]
+fn a_child_live_at_the_runs_end_hands_its_window_back() {
+    let m = module(&op15_then(false, 0, NO_JOIN));
+    let child = module(CHILD_WAITS);
+    let setup = op15_setup(&child, 1 << 15);
+    for d in SCHEDULING {
+        let (ran, held) = run_on_then(d, &m, &setup, &budget_held).expect("runs");
+        assert_eq!(ran, ok(0), "{d:?}");
+        assert_eq!(held, (0, 0), "{d:?}: the run's end left the child charged");
+    }
 }

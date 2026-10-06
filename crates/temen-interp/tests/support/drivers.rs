@@ -60,16 +60,28 @@ const FUEL: u64 = 50_000_000;
 /// is called once per run, so handles are minted in the same order on every driver). `None` means
 /// the driver declined the module — it does not compile on that engine, or the debug tier fell back.
 pub fn run_on(driver: Driver, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)) -> Option<Ran> {
+    run_on_then(driver, m, setup, &|_| ()).map(|(ran, ())| ran)
+}
+
+/// [`run_on`], and what `after` reads from the root powerbox once the run is over (a budget's use,
+/// say).
+pub fn run_on_then<R>(
+    driver: Driver,
+    m: &Module,
+    setup: &dyn Fn() -> (Host, Vec<Value>),
+    after: &dyn Fn(&Host) -> R,
+) -> Option<(Ran, R)> {
     let (mut host, args) = setup();
+    let done = |r, host: &Host| Some((Ran::of(r, host), after(host)));
     let mut fuel = FUEL;
     match driver {
         Driver::Oracle => {
             let r = run_with_host(m, 0, &args, &mut fuel, &mut host);
-            Some(Ran::of(r, &host))
+            done(r, &host)
         }
         Driver::Coop => {
             let r = bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host)?;
-            Some(Ran::of(r, &host))
+            done(r, &host)
         }
         Driver::Parallel => {
             let (back, base, layout) = window(m);
@@ -86,7 +98,7 @@ pub fn run_on(driver: Driver, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)
             // SAFETY: the layout `window` allocated; the run joined every vCPU and dropped every view.
             unsafe { std::alloc::dealloc(base, layout) };
             let (r, _image) = r?;
-            Some(Ran::of(r, &host))
+            done(r, &host)
         }
         Driver::Debug => {
             let mut d = ScheduledDebugRun::new_with_host(m, 0, &args, host)?;
@@ -98,7 +110,7 @@ pub fn run_on(driver: Driver, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)
                     other => panic!("the debug scheduler stopped early: {other:?}"),
                 }
             };
-            Some(Ran::of(r, d.host()))
+            done(r, d.host())
         }
         Driver::Vcpu => {
             let prog = bytecode::VcpuProgram::compile(m)?;
@@ -125,7 +137,7 @@ pub fn run_on(driver: Driver, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)
             // SAFETY: as for `Parallel` — every vCPU thread joined inside the scope above.
             unsafe { std::alloc::dealloc(base, layout) };
             let host = shared.into_inner().unwrap_or_else(|e| e.into_inner());
-            Some(Ran::of(r, &host))
+            done(r, &host)
         }
     }
 }
