@@ -10,7 +10,8 @@
 //!   non-zero; the **terminal** value it reaches is the same on both engines.
 //! - `detach(child) -> 0` drops the parent's join claim without waiting: the child keeps running
 //!   until it ends, or the run does (a child domain ends with the run, DESIGN §23).
-//! - `kill` and `detach` of a finished child are harmless successes returning `0`.
+//! - `kill(child)` ends a running child at its next poll, and `poll` then reports it trapped (`2`);
+//!   `kill` and `detach` of a finished child are harmless successes returning `0`.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -23,7 +24,9 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// `src` with its spawn record (func 1, at 20480), and a host for it: the guest's two args, an
-/// `Instantiator` and the `Budget` that pays for the child its own module spawns.
+/// `Instantiator` and the `Budget` that pays for the child its own module spawns. The host also holds
+/// a 64 KiB `SharedRegion` the guest can resolve as `"region"`, over an OS shared-memory object so the
+/// JIT can alias it into a child's window.
 fn setup(src: &str) -> (Module, Host, [i32; 2]) {
     let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1(1)));
     let m = parse_module(&src).expect("parse");
@@ -32,6 +35,8 @@ fn setup(src: &str) -> (Module, Host, [i32; 2]) {
     h.set_self_module(&Arc::new(m.clone()));
     let ih = h.grant_instantiator(0, 128 << 10);
     let bh = h.grant_budget(-1, 1 << 20, -1);
+    let region = h.grant_shared_region_backed(temen_run::new_shared_region(64 << 10));
+    h.register_cap_name("region", region);
     (m, h, [ih, bh])
 }
 
@@ -196,6 +201,89 @@ fn poll_running_is_zero_and_detach_does_not_block() {
     assert!(
         matches!(jo, JitOutcome::Returned(ref s) if s == &[0]),
         "jit: running, detached, the run ended; got {jo:?}"
+    );
+}
+
+/// `kill` ends a running child: race-free and discriminating, not a fuel-exhaustion false positive.
+/// The parent maps the `"region"` at 65536 and pre-maps it into the child's window at the same offset
+/// (record offsets 72 and 80). The child spins until the go-byte at region byte 0 is set, then would
+/// return `7`. The parent `kill`s it, *then* sets the go-byte, then polls (yielding) until the child is
+/// no longer running, and returns the final status. The kill flag is set before the go-byte and checked
+/// at every back-edge, so a working kill ends the child before it can see the byte: `poll` reports `2`.
+/// A kill that did nothing would let it return `7`, and `poll` would report `1`: the test fails fast.
+const KILL_RUNNING: &str = "memory 17
+data 16384 \"region\"
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32) {
+  rn = i64.const 16384
+  rl = i64.const 6
+  vrg = self.resolve rn rl
+  vgo = i64.const 65536
+  vro = i64.const 0
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrg (vgo, vro, vlen, vprot)
+  vrr = i64.const 20552
+  i32.store vrr vrg
+  vro2 = i64.const 20560
+  i64.store vro2 vgo
+  vrb = i64.const 20508
+  i32.store vrb vb
+  vrp = i64.const 20480
+  vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vk = call.cap 6 12 (i32) -> (i32) v0 (vch)
+  vone = i32.const 1
+  i32.store8 vgo vone
+  br 1(v0, vch)
+}
+block 1 (v0a: i32, vcha: i32) {
+  vp = call.cap 6 9 (i32) -> (i32) v0a (vcha)
+  vz32 = i32.const 0
+  vne = i32.ne vp vz32
+  br_if vne 3(v0a, vcha, vp) 2(v0a, vcha)
+}
+block 2 (v0b: i32, vchb: i32) {
+  vyield = i64.const 24576
+  vexp = i32.const 0
+  vto = i64.const 100000
+  vy = i32.atomic.wait vyield vexp vto
+  br 1(v0b, vchb)
+}
+block 3 (v0c: i32, vchc: i32, vpf: i32) {
+  vd = call.cap 6 10 (i32) -> (i32) v0c (vchc)
+  vpf64 = i64.extend_i32_u vpf
+  return vpf64
+  }
+}
+func (i64) -> (i64) {
+block 0 (vci: i64) {
+  br 1()
+}
+block 1 () {
+  vgo = i64.const 65536
+  vb = i32.load8_u vgo
+  vone = i32.const 1
+  veq = i32.eq vb vone
+  br_if veq 2() 1()
+}
+block 2 () {
+  v7 = i64.const 7
+  return v7
+  }
+}
+";
+
+#[test]
+fn kill_ends_a_running_child_before_it_can_return() {
+    assert_eq!(
+        run_interp(KILL_RUNNING),
+        Ok(vec![Value::I64(2)]),
+        "interp: killed, never returned"
+    );
+    let jo = run_jit(KILL_RUNNING);
+    assert!(
+        matches!(jo, JitOutcome::Returned(ref s) if s == &[2]),
+        "jit: killed, never returned; got {jo:?}"
     );
 }
 
