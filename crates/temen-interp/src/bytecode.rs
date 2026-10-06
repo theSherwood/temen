@@ -10572,9 +10572,15 @@ enum Parks {
 /// of protection, takes its window past what one bound describes ([`Mem::scalar_extent`]), and an
 /// image that runs whole on the emitted tier cannot decline there: it checks every access against
 /// the page state instead ([`LeafStart::paged`]).
+///
+/// An image whose window **starts** past one bound is the same case: a `readonly` data segment maps
+/// its pages `Ro` at instantiation (a C program's string literals, chibicc's rodata). Without this, a
+/// program with read-only data that never touched its page state — no `malloc`, no `printf` — was
+/// emitted unpaged, found no bound to run under, and ran interpreted (#2130).
 fn image_pages(host: &Host, m: &Module) -> bool {
     let pages = |type_id, op| type_id == temen_ir::cap_id::ADDRESS_SPACE && op <= 2;
-    host.import_bindings.iter().any(|b| pages(b.type_id, b.op))
+    m.data.iter().any(|d| d.readonly && !d.bytes.is_empty())
+        || host.import_bindings.iter().any(|b| pages(b.type_id, b.op))
         || m.funcs
             .iter()
             .flat_map(|f| &f.blocks)

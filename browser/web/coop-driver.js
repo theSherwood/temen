@@ -202,9 +202,34 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     : callInterp;
   // #1822 — the code the running emitted frames last passed to `env.trap` before aborting (a memory
   // fault, spent fuel, a spill overflow), handed to the trap deliver so the guest sees that trap. Each
-  // event's entry resets it (`armEnv`); `0` — no `env.trap` — is a native wasm trap, which has no kind.
+  // event's entry resets it (`armEnv`); `0` — no `env.trap` — is a native wasm trap (`nativeTrap`).
   let lastTrap = 0;
   const recordTrap = (code) => { lastTrap = code; };
+  // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
+  // wording is the engine's, not the spec's, so only messages that say exactly one of the
+  // interpreter's traps are named; any other stays unnamed (`0`), as before. ("integer overflow" is
+  // not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
+  // interpreter calls `BadConversion`.)
+  const NATIVE_TRAPS = [
+    [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
+    [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
+    [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
+  ];
+  const nativeTrap = (e) => {
+    if (!(e instanceof WebAssembly.RuntimeError)) return 0;
+    const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
+    return hit ? hit[1] : 0;
+  };
+  // The trap emitted frames ended with (`e`, what they threw): their `env.trap` code, else the native
+  // trap's. A memory fault's guard left its faulting address in the env cell (#2126), which the run
+  // reports as the interpreter would.
+  const trapOf = (e) => {
+    const code = lastTrap || nativeTrap(e);
+    if (code === 8 /* MEMORY_FAULT */) {
+      ex.temen_coop_deliver_fault_addr(new DataView(memory.buffer).getBigInt64(envCell + faultOff, true));
+    }
+    return code;
+  };
   // #1954 — a sliced leaf's budget checkpoint under JSPI. Its emitted code calls `env.trap(OUT_OF_FUEL)`
   // when its fuel counter runs out and aborts only if the counter is still negative afterwards; this
   // import suspends the leaf's frames there, hands over what its calls printed, gives the embedder
@@ -292,6 +317,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const spillBytes = ex.temen_coop_spill_bytes();
   const spillBase = spillBytes ? Number(ex.temen_coop_spill_ptr()) : 0;
   const spillOff = ex.temen_wasmjit_spill_sp_off();
+  const faultOff = ex.temen_wasmjit_fault_off();
   const armEnv = () => {
     lastTrap = 0;
     const dv = new DataView(memory.buffer);
@@ -467,7 +493,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     const stops = new Promise((r) => { stopLeaf = r; });
     const run = go();
     const end = await Promise.race([
-      run.then((ret) => ({ ret }), () => ({ trapped: true })),
+      run.then((ret) => ({ ret }), (e) => ({ trapped: e })),
       parks.then(() => ({ parks: true })),
       stops.then(() => ({ stopped: true })),
     ]);
@@ -477,8 +503,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     if (end.parks) {
       suspended.set(task, { run, ...parking });
       parking = null;
-    } else if (end.trapped) {
-      ex.temen_coop_deliver_trap(lastTrap);
+    } else if ('trapped' in end) {
+      ex.temen_coop_deliver_trap(trapOf(end.trapped));
     } else {
       deliver(end.ret);
     }
@@ -581,8 +607,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
           for (let i = 0; i < rets.length; i++) i64()[(rptr >> 3) + i] = tierupJitRes(rets[i], rtypes[i]);
           ex.temen_coop_deliver_jit(rptr, rets.length);
           ex.temen_dealloc(rptr, rlen);
-        } catch {
-          ex.temen_coop_deliver_jit_trap(lastTrap);
+        } catch (e) {
+          ex.temen_coop_deliver_jit_trap(trapOf(e));
         }
         continue;
       }
@@ -624,8 +650,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       }
       try {
         deliver(program['f' + func](eventWin(), envCell, ...args));
-      } catch {
-        ex.temen_coop_deliver_trap(lastTrap);
+      } catch (e) {
+        ex.temen_coop_deliver_trap(trapOf(e));
       }
     }
   } finally {

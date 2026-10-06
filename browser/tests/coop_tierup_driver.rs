@@ -4970,6 +4970,60 @@ fn coop_root_leaf_parks_on_declared_caps_and_matches_interpreted() {
     temen_coop_close();
 }
 
+/// **A root with read-only data runs whole as a leaf, though it never touches its page state**
+/// (#2130). A `readonly` segment maps its pages `Ro` at instantiation, so the window starts past what
+/// one bound describes: the leaf must be emitted page-checked, or it has no bound to run under and
+/// the run stays interpreted, as a C program with string literals and no `printf` did. The guest
+/// sums the bytes of its read-only segment and makes no host call; it tiers up once, and its value is
+/// the interpreted run's.
+#[test]
+fn coop_root_leaf_with_readonly_data_runs_whole() {
+    let _g = ffi_guard();
+    let src = r#"memory 16
+data ro 34816 "abcdefgh"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz, vz)
+}
+block 1 (vi: i64, vs: i64) {
+  vb = i64.const 34816
+  va = i64.add vb vi
+  vx = i64.load8_u va
+  vs2 = i64.add vs vx
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vn = i64.const 8
+  vgo = i64.ne vi2 vn
+  br_if vgo 1(vi2, vs2) 2(vs2)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let mut answer = |cap: &str, _: &[i64]| -> i64 { panic!("no caps: {cap}") };
+    let (interpreted, _) =
+        drive_declared(&bytes, &[], COOP_NO_REGIONS, None, &mut answer).expect("opens");
+    assert_eq!((interpreted.value, interpreted.tierups), (804, 0)); // b'a' + … + b'h'
+    for budget in [None, Some(1)] {
+        let (leaf, _) = drive_declared(
+            &bytes,
+            &[],
+            COOP_LEAF_SUSPENDS | COOP_NO_REGIONS,
+            budget,
+            &mut answer,
+        )
+        .expect("opens");
+        assert_eq!(leaf.value, interpreted.value, "budget {budget:?}");
+        assert_eq!(leaf.tierups, 1, "budget {budget:?}: the root ran whole as a leaf");
+    }
+}
+
 /// A chibicc C program that asks the embedder through two declared caps: `ping` for each of 300
 /// values (printing as it goes) and `show` for a window read — c_interpret's graphics shape
 /// (`fb_present` names its pixels by address).

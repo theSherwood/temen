@@ -12,7 +12,7 @@
 //! check this mode's lowering is weighed against.
 
 use temen_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, Value};
-use temen_wasm_jit::{compile_module_tierup_nullguard, TRAP_MEMORY_FAULT};
+use temen_wasm_jit::{compile_module_tierup_nullguard, ENV_FAULT_OFF, TRAP_MEMORY_FAULT};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_LOG2: u8 = 17; // 128 KiB window = 8 guard-sized (16 KiB) pages
@@ -52,15 +52,52 @@ block 0 () {
 }
 "#;
 
+/// #2126 — the faulting-address probes, beside f0's plain load: f1 a load at `probe + 40` (the
+/// offset is part of the address), f2 a 64-byte `mem.fill` at the probe (a span reports its base),
+/// f3 an atomic load (a misaligned one reports no address).
+const FAULTS: &str = r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0
+  return vl
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0 offset=40
+  return vl
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.const 0
+  v2 = i64.const 64
+  mem.fill v0 v1 v2
+  return v0
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.atomic.load v0
+  return v1
+  }
+}
+"#;
+
 fn build() -> temen_ir::Module {
-    let m = temen_text::parse_module(SRC).expect("parse");
+    parse(SRC)
+}
+
+fn parse(src: &str) -> temen_ir::Module {
+    let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     m
 }
 
 /// Run the emitted `f{func}` under wasmi with the live-`mapped` global set to the window size.
-/// `Ok(v)` on a clean return, `Err(trap_code)` on an emitted trap.
-fn run_emitted(wasm: &[u8], func: u32, argv: &[i64]) -> Result<i64, i32> {
+/// `Ok(v)` on a clean return, `Err((trap_code, fault address))` on an emitted trap — the address
+/// as the guard left it in the env cell (`-1` for none; stale unless the trap is a `MemoryFault`).
+fn run_emitted(wasm: &[u8], func: u32, argv: &[i64]) -> Result<i64, (i32, i64)> {
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm validates");
     let mut store: Store<i32> = Store::new(&engine, 0);
@@ -106,14 +143,20 @@ fn run_emitted(wasm: &[u8], func: u32, argv: &[i64]) -> Result<i64, i32> {
             Val::I64(x) => Ok(x),
             _ => panic!("result type"),
         },
-        Err(_) => Err(*store.data()),
+        Err(_) => {
+            let mut slot = [0u8; 8];
+            memory
+                .read(&store, ENV_PTR as usize + ENV_FAULT_OFF, &mut slot)
+                .unwrap();
+            Err((*store.data(), i64::from_le_bytes(slot)))
+        }
     }
 }
 
 /// The oracle: the same probe on the interpreter over a page map seeding `[0, GUARD)` `Unmapped`
 /// (everything else `Rw`) — the interp half of the trap-on-NULL design, available today through the
-/// durable prot-seeding seam. `Ok(v)` / `Err(())` on a trap.
-fn run_oracle(m: &temen_ir::Module, func: u32, argv: &[i64]) -> Result<i64, ()> {
+/// durable prot-seeding seam. `Ok(v)` / `Err(fault address)` on a trap.
+fn run_oracle(m: &temen_ir::Module, func: u32, argv: &[i64]) -> Result<i64, Option<u64>> {
     let npages = (WIN_SIZE / 4096) as usize; // CapturedProt granularity (DURABLE_SNAPSHOT_PAGE)
     let mut prots = vec![CapturedProt::Rw; npages];
     for slot in prots.iter_mut().take((GUARD / 4096) as usize) {
@@ -138,7 +181,7 @@ fn run_oracle(m: &temen_ir::Module, func: u32, argv: &[i64]) -> Result<i64, ()> 
             Some(Value::I64(x)) => Ok(*x),
             _ => panic!("oracle result"),
         },
-        Err(_) => Err(()),
+        Err(_) => Err(temen_interp::last_capture_fault_addr()),
     }
 }
 
@@ -169,7 +212,7 @@ fn guard_traps_match_the_seeded_interpreter() {
                 "tier divergence at f{func}({probe}): emitted {e:?} vs interp {o:?}"
             );
             assert_eq!(e.is_err(), expect_trap, "f{func}({probe})");
-            if let Err(code) = e {
+            if let Err((code, _)) = e {
                 assert_eq!(code, TRAP_MEMORY_FAULT, "f{func}({probe}) trap kind");
             }
         }
@@ -187,7 +230,7 @@ fn guard_is_never_elided() {
     let o = run_oracle(&m, 2, &[]);
     assert!(e.is_err(), "constant addr 8 must trap under the guard");
     assert!(o.is_err(), "oracle traps the same access");
-    assert_eq!(e.unwrap_err(), TRAP_MEMORY_FAULT);
+    assert_eq!(e.unwrap_err().0, TRAP_MEMORY_FAULT);
 }
 
 /// #1094: the guard is **unconditional**, so the plain tier-up entry now derives it from
@@ -212,7 +255,7 @@ fn plain_emit_carries_the_unconditional_guard() {
     );
     assert_eq!(e1, e2);
     assert_eq!(
-        run_emitted(&plain, 0, &[8]),
+        run_emitted(&plain, 0, &[8]).map_err(|(code, _)| code),
         Err(TRAP_MEMORY_FAULT),
         "plain emit traps a NULL load"
     );
@@ -277,7 +320,7 @@ block 0 (vdst: i64, vsrc: i64, vlen: i64) {
             "fill divergence at ({base}, {len}): emitted {e:?} vs interp {o:?}"
         );
         assert_eq!(e.is_err(), expect_trap, "fill({base}, {len})");
-        if let Err(code) = e {
+        if let Err((code, _)) = e {
             assert_eq!(code, TRAP_MEMORY_FAULT, "fill({base}, {len}) trap kind");
         }
     }
@@ -292,5 +335,44 @@ block 0 (vdst: i64, vsrc: i64, vlen: i64) {
             "copy(src) divergence at ({base}, {len}): emitted {e:?} vs interp {o:?}"
         );
         assert_eq!(e.is_err(), expect_trap, "copy src span ({base}, {len})");
+    }
+}
+
+/// #2126 — a `MemoryFault` in emitted code reports the **same faulting address** the oracle records,
+/// so an embedder can name a segfault's address without re-running the program on the interpreter.
+/// Every guard kind: the NULL guard (an access's first byte, even when it straddles out of the
+/// guard), the window bound (`addr + offset`, the offset included), a bulk span (its base, wherever
+/// in the span it faults), and a misaligned atomic (no address, as the oracle's `check_align`).
+#[test]
+fn emitted_faults_report_the_oracles_address() {
+    let m = parse(FAULTS);
+    let (wasm, emitted) = compile_module_tierup_nullguard(&m, false, GUARD).expect("emits");
+    assert_eq!(emitted, vec![true; 4], "every probe emits");
+    let w = WIN_SIZE as i64;
+    let probes: [(u32, i64); 11] = [
+        (0, 0),
+        (0, 8),
+        (0, GUARD as i64 - 1), // straddles out of the guard: its first byte faults
+        (0, w - 4),            // runs off the end of the window
+        (0, w + 4096),
+        (0, 1 << 40),          // wild
+        (1, w - 44),           // in-window only without the offset
+        (1, 16),               // under the guard: the address is `16 + 40`
+        (2, 64),               // a span starting under the guard
+        (2, w - 32),           // a span running off the end
+        (3, GUARD as i64 + 4), // misaligned
+    ];
+    for (func, probe) in probes {
+        let e = run_emitted(&wasm, func, &[probe]);
+        let o = run_oracle(&m, func, &[probe]);
+        let (Err((code, addr)), Err(want)) = (e, o) else {
+            panic!("f{func}({probe:#x}) must trap on both tiers: emitted {e:?} vs interp {o:?}");
+        };
+        assert_eq!(code, TRAP_MEMORY_FAULT, "f{func}({probe:#x}) trap kind");
+        assert_eq!(
+            (addr >= 0).then_some(addr as u64),
+            want,
+            "f{func}({probe:#x}): emitted fault address vs the oracle's"
+        );
     }
 }

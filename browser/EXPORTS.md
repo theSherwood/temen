@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**358 exports** in 36 families — 308 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
+**360 exports** in 36 families — 310 referenced from JS, 50 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,7 +11,7 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
-| `coop` | 58 | 48 | 0 |
+| `coop` | 59 | 49 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 5 | 5 | 1 |
@@ -41,7 +41,7 @@
 | `stdout` | 2 | 2 | 0 |
 | `trap` | 2 | 2 | 0 |
 | `warm` | 16 | 16 | 0 |
-| `wasmjit` | 9 | 9 | 0 |
+| `wasmjit` | 10 | 10 | 0 |
 
 ## Exports by family
 
@@ -105,6 +105,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_close`
 - `temen_coop_deliver`
 - `temen_coop_deliver_cap`
+- `temen_coop_deliver_fault_addr`
 - `temen_coop_deliver_jit`
 - `temen_coop_deliver_jit_trap`
 - `temen_coop_deliver_trap`
@@ -508,6 +509,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_wasmjit_compile_b2`
 - `temen_wasmjit_compile_full`
 - `temen_wasmjit_env_bytes`
+- `temen_wasmjit_fault_off`
 - `temen_wasmjit_init_window`
 - `temen_wasmjit_len`
 - `temen_wasmjit_ptr`
