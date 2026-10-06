@@ -217,6 +217,7 @@ const OP_IF: u8 = 0x04;
 const OP_ELSE: u8 = 0x05;
 const OP_END: u8 = 0x0b;
 const OP_BR: u8 = 0x0c;
+const OP_BR_IF: u8 = 0x0d;
 const OP_BR_TABLE: u8 = 0x0e;
 const OP_RETURN: u8 = 0x0f;
 const OP_CALL: u8 = 0x10;
@@ -4993,6 +4994,7 @@ fn emit_func(
     // once-per-dispatch-iteration debit), so the emitted wasm traps `OutOfFuel` at the *identical*
     // point for any budget, not merely "both eventually trap".
     emit_fuel_check(&mut cx, &mut code);
+    emit_fault_block_open(&cx, &mut code);
 
     // The blocks nest as structured control flow where they can; the dispatcher runs the rest.
     let n = f.blocks.len();
@@ -5056,8 +5058,8 @@ fn emit_func(
             }
         }
     }
-    debug_assert_eq!(cx.depth, 0);
     code.push(OP_UNREACHABLE); // every path returned / trapped / branched
+    emit_fault_block_close(&cx, &mut code);
     code.push(OP_END); // function body end
 
     // Prepend the locals vector (grouped runs of one type).
@@ -5278,6 +5280,7 @@ fn emit_split_group(
         arm_of[gb] = p as u64;
     }
     cx.depth = 0;
+    emit_fault_block_open(&cx, &mut code);
     code.push(OP_LOOP);
     code.push(BLOCKTYPE_VOID);
     cx.depth += 1;
@@ -5322,6 +5325,7 @@ fn emit_split_group(
     code.push(OP_END); // close the loop
     cx.depth -= 1;
     code.push(OP_UNREACHABLE);
+    emit_fault_block_close(&cx, &mut code);
     code.push(OP_END); // function body end
 
     // Prepend the locals vector (grouped runs of one type).
@@ -6029,15 +6033,13 @@ fn emit_unpaged_confine(
                 code.push(0x7d); // i64.sub → mapped - k (read only when mapped >= k)
                 code.push(0x56); // i64.gt_u: addr > mapped - k ?
                 code.push(0x72); // i32.or
-                code.push(OP_IF);
-                code.push(BLOCKTYPE_VOID);
-                cx.depth += 1;
-                emit_trap(code, TRAP_MEMORY_FAULT);
-                code.push(OP_END);
-                cx.depth -= 1;
             }
-            None => emit_trap(code, TRAP_MEMORY_FAULT),
+            None => {
+                code.push(OP_I32_CONST);
+                sleb32(code, 1);
+            }
         }
+        emit_trap_if(cx, code);
     }
     // eff = addr + offset — exact, not wrapped: past the check `addr <= mapped - k`, and a proof
     // (`elide`) fails on any overflow.
@@ -6100,10 +6102,12 @@ fn emit_paged_confine(
     write: bool,
     page_log2: u8,
 ) {
-    // An end past 2^64 is past every window: never admitted (the code after it is dead).
+    // An end past 2^64 is past every window: never admitted.
     let k = offset.checked_add(width);
     if k.is_none() {
-        emit_trap(code, TRAP_MEMORY_FAULT);
+        code.push(OP_I32_CONST);
+        sleb32(code, 1);
+        emit_trap_if(cx, code);
     }
     // eff = addr + offset — the access's first byte.
     code.push(OP_LOCAL_GET);
@@ -6200,14 +6204,39 @@ fn emit_page_state_check(cx: &mut FnCtx, code: &mut Vec<u8>, write: bool) {
     emit_trap_if(cx, code);
 }
 
-/// Consume an i32 condition and trap `MemoryFault` when it is non-zero.
-fn emit_trap_if(cx: &mut FnCtx, code: &mut Vec<u8>) {
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+/// Consume an i32 condition and trap `MemoryFault` when it is non-zero: branch out to the function's
+/// fault block ([`emit_fault_block_open`]), which encloses every label `cx.depth` counts.
+fn emit_trap_if(cx: &FnCtx, code: &mut Vec<u8>) {
+    debug_assert!(
+        cx.touches_mem,
+        "a memory check in a function with no fault block"
+    );
+    code.push(OP_BR_IF);
+    uleb(code, cx.depth as u64);
+}
+
+/// #2134 — open the **fault block** of a function that touches memory. Every confinement check in
+/// the body traps by branching out of it ([`emit_trap_if`]) to the one `env.trap(MemoryFault)` after
+/// it ([`emit_fault_block_close`]), so a check is a `br_if` rather than an `if` arm around a call of
+/// its own. Those calls never ran unless the guest faulted, but V8 compiled each one: dropping them
+/// made nimony's `hexer d` 28% faster in Chromium. Opened where `cx.depth` is 0 and never counted in
+/// it, so from depth `d` the block is label `d`.
+fn emit_fault_block_open(cx: &FnCtx, code: &mut Vec<u8>) {
+    debug_assert_eq!(cx.depth, 0);
+    if cx.touches_mem {
+        code.push(OP_BLOCK);
+        code.push(BLOCKTYPE_VOID);
+    }
+}
+
+/// Close [`emit_fault_block_open`]'s block and trap `MemoryFault` after it. The body inside ends
+/// in `unreachable`, so only a check's branch reaches this point.
+fn emit_fault_block_close(cx: &FnCtx, code: &mut Vec<u8>) {
+    debug_assert_eq!(cx.depth, 0);
+    if cx.touches_mem {
+        code.push(OP_END);
+        emit_trap(code, TRAP_MEMORY_FAULT);
+    }
 }
 
 /// Trap `MemoryFault` when the effective address (`ea_l`) is not a multiple of `width` (a power of
@@ -6254,12 +6283,7 @@ fn emit_null_guard(cx: &mut FnCtx, code: &mut Vec<u8>) {
     code.push(OP_I64_CONST);
     sleb64(code, guard as i64);
     code.push(0x54); // i64.lt_u → first byte below the guard?
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
 }
 
 /// Open `if len != 0 {` for a bulk op — the caller emits the confined op inside and closes with a
@@ -6300,12 +6324,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
     code.push(OP_LOCAL_GET);
     uleb(code, cx.mapped_l as u64);
     code.push(0x56); // i64.gt_u
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
     // trap if len > live_mapped - base
     code.push(OP_LOCAL_GET);
     uleb(code, len_local as u64);
@@ -6315,12 +6334,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
     uleb(code, base_local as u64);
     code.push(0x7d); // i64.sub → live_mapped - base (base <= live_mapped here)
     code.push(0x56); // i64.gt_u: len > live_mapped - base
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
     // #1004: NULL-guard low bound for a marked module — trap if the span dips into the reserved
     // `[0, guard)` region. Called inside `if len != 0`, so `len >= 1` and `base` is the span's
     // lowest byte: `base >= guard` proves every byte is at or above the guard (a *bottom* region
@@ -6338,12 +6352,7 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
         code.push(OP_I64_CONST);
         sleb64(code, guard as i64);
         code.push(0x54); // i64.lt_u → base below the guard?
-        code.push(OP_IF);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
-        emit_trap(code, TRAP_MEMORY_FAULT);
-        code.push(OP_END);
-        cx.depth -= 1;
+        emit_trap_if(cx, code);
     }
 }
 
@@ -6430,12 +6439,7 @@ fn emit_span_page_check(
         // A load is admitted on anything committed (`Rw`/`Ro`) — only `Unmapped` (0) traps.
         code.push(0x45); // i32.eqz
     }
-    code.push(OP_IF);
-    code.push(BLOCKTYPE_VOID);
-    cx.depth += 1;
-    emit_trap(code, TRAP_MEMORY_FAULT);
-    code.push(OP_END);
-    cx.depth -= 1;
+    emit_trap_if(cx, code);
     // page_l += 1; continue the loop.
     code.push(OP_LOCAL_GET);
     uleb(code, page_l as u64);

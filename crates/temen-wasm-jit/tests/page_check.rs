@@ -735,6 +735,43 @@ fn wrapping_addresses_trap_on_both_tiers() {
 }
 
 #[test]
+fn every_check_in_a_function_shares_one_memory_fault_trap() {
+    // #2134: a check branches to the function's fault block instead of carrying its own
+    // `env.trap(MemoryFault)` call, so the function makes that call once, however many it checks.
+    let m = build(
+        r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.load v0
+  vb = i64.load v0 offset=12
+  vc = i64.add va vb
+  i64.store v0 vc
+  return vc
+  }
+}
+"#,
+    );
+    // i32.const MemoryFault; call env.trap; unreachable
+    let trap_call = [0x41, TRAP_MEMORY_FAULT as u8, 0x10, 0x00, 0x00];
+    for (mode, wasm) in [
+        ("unpaged", compile_module_tierup(&m, false).expect("emit").0),
+        (
+            "paged",
+            compile_module_tierup_paged(&m, false, 12).expect("emit").0,
+        ),
+    ] {
+        let calls = wasm
+            .windows(trap_call.len())
+            .filter(|w| *w == trap_call)
+            .count();
+        assert_eq!(
+            calls, 1,
+            "{mode}: the checks share one MemoryFault trap call"
+        );
+    }
+}
+
+#[test]
 fn unpaged_output_carries_no_pagestate() {
     // Lands-dark pin: the default (unpaged) entry emits no page-check machinery — no `"pagestate"`
     // export — and a page-op module still emits nothing there (the existing page_ops.rs contract),
