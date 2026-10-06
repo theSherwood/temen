@@ -223,8 +223,8 @@ See "Completed work". Got alu to ~5× of origin; exhausted the cheap, in-place w
   contract as `read_word`/`write_word`. The tree-walker keeps the per-byte copies. It matters most
   in the `+atomics` browser build, where each relaxed byte store is a sequentially consistent
   `i32.atomic.store8`. nimony's tools read their `.nif` inputs whole (the guest libc's `mmap` of a
-  file is an anonymous map and one `read`): in Chromium, `hexer d`'s 88 `mmap` calls went from
-  ~270 ms to ~40 ms per run, and a warm run from ~1.37 s to ~1.19 s.
+  file is an anonymous map and one `read`): in Chromium, a warm `hexer d` went from 2.89 s to
+  2.54 s (medians).
 - **Success:** memory kernel drops toward the software floor; escape_oracle + shared_region +
   address_space still byte-identical.
 
