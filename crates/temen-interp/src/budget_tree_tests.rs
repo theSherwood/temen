@@ -154,7 +154,7 @@ fn a_fork_twin_charges_its_parents_nodes() {
     let mut h = Host::new();
     let a = h.grant_budget(-1, MIB, -1);
     let mut twin = h
-        .fork_powerbox(1)
+        .fork_powerbox(1, 0)
         .expect("a plain budget-holding domain forks");
     assert!(twin.budget_mem_take(a, (MIB / 4) as u64));
     assert_eq!(

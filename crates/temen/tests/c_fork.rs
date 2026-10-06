@@ -345,6 +345,13 @@ fn a_compiled_c_program_runs_fork_exec_wait_end_to_end() {
         status, 42,
         "the reaped status is the exec'd command's exit code"
     );
+    // #2106 — the twin paid the guest's budget for its copy of the window, and the exec'd image kept
+    // paying for it; every window the run made is gone, so the whole ceiling is room again.
+    assert_eq!(
+        host.cap_dispatch_slots(temen_interp::cap_id::BUDGET, 1, budget, &[1], None),
+        Ok(vec![64 << 20]),
+        "every window's charge went back"
+    );
 }
 
 /// FORK.md §8.6 — **`waitpid(-1)`: reap *any* child.** The shell's `wait`-for-any-child loop, in

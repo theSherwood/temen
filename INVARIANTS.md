@@ -91,7 +91,10 @@ vCPU is charged with its window at the admission, so a spawn-0 budget funds no c
 with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
 process) is one `spawn` of the domain's node from when it is made until it ends, refused past a ceiling
 as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posix_spawn` return
-`-EAGAIN`) (#2001). A thaw re-charges the threads it re-creates. On the resumable `Vcpu` engine a
+`-EAGAIN`) (#2001). A fork twin's copy of its parent's window and a spawned process's window are new
+windows, charged to `mem` of that node, the twin's with the growth it copies, before the process
+exists, and handed back when it ends; an exec keeps the charge (#2106, #2110). A thaw re-charges the
+threads it re-creates. On the resumable `Vcpu` engine a
 thread's charge goes back at its join, where that engine learns it ended. A run's root is its
 embedder's and is charged to nothing, and the Cranelift JIT charges nothing to the run's own node,
 which no guest reads. A pipe's worst-case FIFO is charged to the

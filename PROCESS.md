@@ -577,9 +577,15 @@ in the reserved tail charges the domain's own node (the budget that paid for its
 ancestor, all or nothing. Past a ceiling the op is `-ENOMEM` and changes no page. A page given back
 (unmapped, or aliased to a region) is refunded at once; a page protected to nothing keeps its
 contents, so it stays charged. What the window still holds goes back when the domain ends or an exec
-replaces its image. A fork twin pays for the growth its copy holds (its copy of the declared window is
-not charged yet, #2106); a freeze keeps the charge, and the thaw takes it over. A run's root grows
-unmetered, as its window was minted by its embedder.
+replaces its image. A freeze keeps the charge, and the thaw takes it over. A run's root grows
+unmetered, as its window was minted by its embedder (#2113 meters it).
+
+**A process's window spends it too (#2106, #2110).** A fork twin's copy of its parent's window and a
+spawned process's fresh window are new windows. Each is charged to the node the process shares with
+its parent, the twin's with the growth its copy holds, before the process exists: a level without the
+room refuses the `fork` or `posix_spawn` with `-EAGAIN`, and no personality has registered it. The
+charge goes back when the process ends; an exec keeps it, as the image's window is the caller's
+size. A process of an unmetered root is unmetered too.
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 

@@ -3887,7 +3887,7 @@ pub unsafe extern "C" fn lane_give(ctx: *mut c_void, lane: i64) {
 /// #1587, #1877 — the settling of what [`budget_mem_take`] admitted ([`temen_jit::BudgetMemGiver`]):
 /// at the child's end, or for a spawn that failed after the take, its window's `bytes` and its first
 /// vCPU go back to `budget` on the parent `Host` ([`Host::release_detached`]). At the child's end what
-/// its window grew goes back too, from its own powerbox `child` ([`Host::release_growth`], #1909).
+/// its window grew goes back too, from its own powerbox `child` ([`Host::release_window`], #1909).
 ///
 /// # Safety
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host); `child` is null or a live
@@ -3903,7 +3903,7 @@ pub unsafe extern "C" fn budget_mem_give(
         child
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release_growth();
+            .release_window();
     }
     let parent = &mut *(ctx as *mut Host);
     parent.release_detached(budget, bytes);

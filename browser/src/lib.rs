@@ -11372,7 +11372,7 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
     let value = unsafe { RUN_VALUE };
     // The child's run ends here: what its window grew goes back to the budget that paid for it (#1909).
     if let Some(mut run) = unsafe { (*core::ptr::addr_of_mut!(JIT_RUN)).take() } {
-        run.host.release_growth();
+        run.host.release_window();
     }
     let Some(d) = (unsafe { (*core::ptr::addr_of_mut!(OP13_JIT)).as_mut() }) else {
         return OP13JIT_TRAP;

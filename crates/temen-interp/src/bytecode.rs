@@ -4557,8 +4557,8 @@ impl<'p> Vcpu<'p> {
         };
         if ended && self.own_dom.is_some() {
             match self.shared_host {
-                Some(m) => m.lock_unpoisoned().release_growth(),
-                None => self.host.release_growth(),
+                Some(m) => m.lock_unpoisoned().release_window(),
+                None => self.host.release_window(),
             }
         }
         ev
@@ -7196,7 +7196,7 @@ fn dbg_refund_ended_windows(tasks: &mut [DbgTask], host: &mut Host, envs: &mut [
                     Some(k) => envs[k].host.release_detached(budget, bytes),
                 }
                 if let Some(k) = t.env {
-                    envs[k].host.release_growth();
+                    envs[k].host.release_window();
                 }
             }
         }
@@ -10160,17 +10160,22 @@ fn spawn_task(
     let Some(live) = LiveVcpu::charge(node) else {
         return (super::EAGAIN, None);
     };
+    let window = match tasks[ti].env {
+        Some(k) => extra_envs[k].mem.as_ref(),
+        None => mem.as_ref(),
+    }
+    .map_or(0, Mem::mapped_size);
     // The process shares its spawner's budget node (`spawn_powerbox`), so it draws from it as a thread
-    // would (#1944 slice 3).
+    // would (#1944 slice 3), and pays it for its window (#2106).
     let (twin, child_fuel) = match tasks[ti].env {
         Some(k) => (
             extra_envs[k]
                 .host
                 .lock_unpoisoned()
-                .spawn_powerbox(pid, plan),
+                .spawn_powerbox(pid, plan, window),
             extra_envs[k].fuel.for_thread(),
         ),
-        None => (host.spawn_powerbox(pid, plan), fuel.for_thread()),
+        None => (host.spawn_powerbox(pid, plan, window), fuel.for_thread()),
     };
     let Some(mut twin) = twin else {
         return (super::EAGAIN, None);
@@ -14126,7 +14131,7 @@ impl CoopSched {
             for k in 0..extra_envs.len() {
                 if seen[k] && !live[k] && released_envs.insert(k) {
                     let mut h = extra_envs[k].host.lock_unpoisoned();
-                    h.release_growth();
+                    h.release_window();
                     h.release_pipe_ends();
                     drop(h);
                     finished.push(k);
@@ -14993,7 +14998,9 @@ impl CoopSched {
                                 // #2001 — the twin is one `spawn` of the node it shares with its
                                 // parent while it lives: a full ceiling refuses the fork.
                                 let live = LiveVcpu::charge(parent.own_node())?;
-                                let twin_host = parent.fork_powerbox(twin_pid)?;
+                                let window =
+                                    extra_envs[ck].mem.as_ref().map_or(0, Mem::mapped_size);
+                                let twin_host = parent.fork_powerbox(twin_pid, window)?;
                                 Some((ck, twin_mem, twin_host, live))
                             })
                         } else {
@@ -15314,10 +15321,12 @@ impl CoopSched {
                                         Some(m) => Some(m.fork_private()?),
                                         None => None,
                                     };
+                                    let window =
+                                        extra_envs[k].mem.as_ref().map_or(0, Mem::mapped_size);
                                     let th = extra_envs[k]
                                         .host
                                         .lock_unpoisoned()
-                                        .fork_powerbox(twin_pid)?;
+                                        .fork_powerbox(twin_pid, window)?;
                                     Some((extra_envs[k].fuel.for_thread(), tm, th, live))
                                 }
                                 None => {
@@ -15325,7 +15334,8 @@ impl CoopSched {
                                         Some(m) => Some(m.fork_private()?),
                                         None => None,
                                     };
-                                    let th = host.fork_powerbox(twin_pid)?;
+                                    let window = mem.as_ref().map_or(0, Mem::mapped_size);
+                                    let th = host.fork_powerbox(twin_pid, window)?;
                                     Some((fuel.for_thread(), tm, th, live))
                                 }
                             }
@@ -17396,7 +17406,7 @@ fn start_process<'scope, 'env>(
         let status = super::reap_status(&r);
         let hooks = {
             let mut g = hooks_host.lock_unpoisoned();
-            g.release_growth(); // #1909
+            g.release_window(); // #1909, #2106
             g.release_pipe_ends();
             g.exit_hooks.clone()
         };
@@ -17717,7 +17727,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         // #2001 — the twin is one `spawn` of the node it shares with its parent
                         // while it lives: a full ceiling refuses the fork.
                         let live = LiveVcpu::charge(parent.own_node())?;
-                        let th = parent.fork_powerbox(twin_pid as u64)?;
+                        let window = mem.as_ref().map_or(0, Mem::mapped_size);
+                        let th = parent.fork_powerbox(twin_pid as u64, window)?;
                         Some((tm, th, twin_pid, live))
                     })();
                     if built.is_none() {
@@ -17792,7 +17803,10 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         let pid = reg
                             .next_fork_pid
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let twin = host.lock_unpoisoned().spawn_powerbox(pid as u64, plan);
+                        let window = mem.as_ref().map_or(0, Mem::mapped_size);
+                        let twin = host
+                            .lock_unpoisoned()
+                            .spawn_powerbox(pid as u64, plan, window);
                         twin.map(|t| (pid, t, live))
                     })
                 } else {
@@ -18293,10 +18307,10 @@ fn par_start_child<'scope, 'env>(
             )
         });
         // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends, and (#1909) what
-        // its window grew.
+        // its window held.
         {
             let mut h = child_host.lock_unpoisoned();
-            h.release_growth();
+            h.release_window();
             h.release_pipe_ends();
         }
         // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
