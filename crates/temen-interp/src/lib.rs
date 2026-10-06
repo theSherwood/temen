@@ -20469,9 +20469,10 @@ pub struct LiveVcpu(Option<NodeRef>);
 
 impl LiveVcpu {
     /// Charge one vCPU to `node` and every ancestor: `None`, with nothing charged, when a level's
-    /// `spawn` is full.
+    /// `spawn` is full. The guard is built only once the charge took: a refused one dropped would hand
+    /// back a `spawn` never charged.
     pub(crate) fn charge(node: NodeRef) -> Option<LiveVcpu> {
-        node.charge_vcpu().then_some(LiveVcpu(Some(node)))
+        node.charge_vcpu().then(|| LiveVcpu(Some(node)))
     }
 
     /// Charge one vCPU past any ceiling ([`NodeRef::force_vcpu`]).
@@ -35407,6 +35408,41 @@ mod region_charge_tests {
         assert_eq!(used(&parent, node), 64);
         child.release_memory();
         assert_eq!(used(&parent, node), 0);
+    }
+}
+
+#[cfg(test)]
+mod live_vcpu_tests {
+    //! #2001 — a live vCPU is one `spawn` of its domain's node while it lives.
+    use super::*;
+
+    /// A refused charge charges nothing and refunds nothing. Building the guard before knowing the
+    /// charge took hands back a `spawn` that was never charged as the guard drops: at a full ceiling
+    /// each refused `thread.spawn`, fork or `posix_spawn` then lowered the count by one, so refused and
+    /// accepted spawns in turn held vCPUs past the ceiling.
+    #[test]
+    fn a_refused_vcpu_charge_refunds_nothing() {
+        let mut parent = Host::new();
+        let budget = parent.grant_budget(-1, -1, 1);
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        parent.give_child_budget(budget, &mut child);
+        let held = LiveVcpu::charge(child.own_node()).expect("room for one");
+        assert!(
+            LiveVcpu::charge(child.own_node()).is_none(),
+            "the ceiling is full"
+        );
+        assert_eq!(
+            parent.budgets.used(node, BUDGET_SPAWN),
+            1,
+            "the refusal refunded nothing"
+        );
+        assert!(
+            LiveVcpu::charge(child.own_node()).is_none(),
+            "still full: the live vCPU holds the only spawn"
+        );
+        drop(held);
+        assert_eq!(parent.budgets.used(node, BUDGET_SPAWN), 0);
     }
 }
 

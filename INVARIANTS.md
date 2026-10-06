@@ -107,8 +107,9 @@ exec keeps its domain's node, so a child cannot exec its way out of its budget.
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
 its grant the embedder's. The gaps are tracked, not exceptions: the root's own use and `Limits`
-(#2113), fibers (#2112), the bytecode drivers' lease and live-cap leaks (#2006), and the wasm-JIT's
-emitted `thread.spawn` (#2007) and fuel (#1997).
+(#2113), fibers (#2112), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused
+after its admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel
+(#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_wasm_jit::{
     compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged,
-    TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
+    ENV_FAULT_OFF, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -47,6 +47,24 @@ block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vl = i64.load v0
+  return vl
+  }
+}
+"#;
+
+/// As [`UNMAP_LOAD`], but the leaf loads at `probe + 20000`: an offset past the 16 KiB NULL guard, so
+/// a `probe` that wraps that sum past `2^64` lands on an ordinary `Rw` page, not in the guard.
+const UNMAP_LOAD_FAR: &str = r#"memory 17
+func (i32, i64, i64, i64) -> (i64) {
+block 0 (vas: i32, voff: i64, vlen: i64, vprobe: i64) {
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  v1 = call 1 (vprobe)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0 offset=20000
   return vl
   }
 }
@@ -207,7 +225,7 @@ enum TrapKind {
 }
 
 /// How the run is driven.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     /// Pure interpreter — the oracle.
     Interp,
@@ -256,7 +274,10 @@ fn run_emitted(
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
     let mut store: Store<i32> = Store::new(&engine, 0);
     let table_base = WIN_BASE as usize + win_size;
-    let need = table_base + table.len();
+    // The bytes past the table read `Rw`, so a check that indexes past it admits rather than meeting
+    // the zero (`Unmapped`) of fresh memory: an off-by-one in the bound shows up as a divergence.
+    const PAST_TABLE: usize = 64;
+    let need = table_base + table.len() + PAST_TABLE;
     let pages = (need as u32).div_ceil(1 << 16) + 1;
     let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
     memory
@@ -266,6 +287,9 @@ fn run_emitted(
     let live = unsafe { std::slice::from_raw_parts(base, win_size) };
     memory.write(&mut store, WIN_BASE as usize, live).unwrap();
     memory.write(&mut store, table_base, table).unwrap();
+    memory
+        .write(&mut store, table_base + table.len(), &[1u8; PAST_TABLE])
+        .unwrap();
 
     let mut linker: Linker<i32> = Linker::new(&engine);
     linker.define("env", "memory", memory).unwrap();
@@ -318,11 +342,20 @@ fn run_emitted(
                 })
                 .collect(),
         ),
-        Err(_) => Outcome::Trap(match *store.data() {
-            TRAP_OUT_OF_FUEL => TrapKind::OutOfFuel,
-            TRAP_MEMORY_FAULT => TrapKind::MemoryFault,
-            _ => TrapKind::Other,
-        }),
+        Err(_) => {
+            // #2126: the fault address the emitted guard left in the env cell (`-1`: none).
+            let mut slot = [0u8; 8];
+            memory
+                .read(&store, ENV_PTR as usize + ENV_FAULT_OFF, &mut slot)
+                .unwrap();
+            let addr = i64::from_le_bytes(slot);
+            LAST_FAULT.set((addr >= 0).then_some(addr as u64));
+            Outcome::Trap(match *store.data() {
+                TRAP_OUT_OF_FUEL => TrapKind::OutOfFuel,
+                TRAP_MEMORY_FAULT => TrapKind::MemoryFault,
+                _ => TrapKind::Other,
+            })
+        }
     };
     // SAFETY: see fn doc.
     let backs = unsafe { std::slice::from_raw_parts_mut(base, win_size) };
@@ -351,6 +384,12 @@ fn probe_page_size(m: &temen_ir::Module) -> u64 {
     // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the buffer.
     unsafe { std::alloc::dealloc(base, layout) };
     page
+}
+
+thread_local! {
+    /// #2126 — the faulting address the emitted guard of this thread's last [`run_emitted`] that
+    /// trapped left in the env cell.
+    static LAST_FAULT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Drive `guest(as, off, len, probe)` in `mode`, servicing tier-ups on emitted wasm with the
@@ -638,6 +677,115 @@ fn the_null_guard_is_the_page_tables() {
     );
 }
 
+/// Both tiers agree on `guest(off, len, probe)`, and the oracle gives `want`.
+fn agree(guest: &str, off: u64, len: u64, probe: i64, want: Outcome) {
+    let (oracle, _) = run_guest(guest, off, len, probe, Mode::Interp);
+    assert_eq!(oracle, want, "oracle sanity at probe {probe:#x}");
+    let (got, tierups) = run_guest(guest, off, len, probe, Mode::PagedSynced);
+    assert_eq!(tierups, 1, "the leaf must actually tier up");
+    assert_eq!(got, want, "paged tier diverged at probe {probe:#x}");
+}
+
+/// #2117: the paged check consults the last byte's page first and the first byte's only when the
+/// access crosses into it. An 8-byte load whose *first* bytes are on an unmapped page and whose last
+/// are on the `Rw` page after it is that second consultation; the opposite straddle is
+/// [`straddling_store_traps_at_the_page_edge`].
+#[test]
+fn a_straddle_starting_on_an_unmapped_page_traps() {
+    let page = probe_page_size(&build(UNMAP_LOAD));
+    let win = 1u64 << WIN_LOG2;
+    let (off, len) = (win - 2 * page, page); // the second-to-last page; the last stays Rw
+    let fault = Outcome::Trap(TrapKind::MemoryFault);
+    agree(UNMAP_LOAD, off, len, (off + page - 4) as i64, fault.clone());
+    agree(UNMAP_LOAD, off, len, (off - 4) as i64, fault); // the other way across
+    agree(
+        UNMAP_LOAD,
+        off,
+        len,
+        (off + page) as i64,
+        Outcome::Vals(vec![0]),
+    ); // just past it
+}
+
+/// #2117: the bound is the page-state table's coverage, which the driver writes to `"mapped"`, and
+/// one compare of the access's last byte against it is the whole bounds check. The window's last 8
+/// bytes load on both tiers; an access reaching one byte past the window faults on both.
+#[test]
+fn the_window_end_bounds_the_check() {
+    let page = probe_page_size(&build(UNMAP_LOAD));
+    let win = 1u64 << WIN_LOG2;
+    let (off, len) = (32768, page); // a page well clear of the window's end
+    agree(
+        UNMAP_LOAD,
+        off,
+        len,
+        (win - 8) as i64,
+        Outcome::Vals(vec![0]),
+    );
+    for probe in [win - 7, win - 1, win, win + page] {
+        agree(
+            UNMAP_LOAD,
+            off,
+            len,
+            probe as i64,
+            Outcome::Trap(TrapKind::MemoryFault),
+        );
+    }
+}
+
+/// #2117: an access whose address wraps past `2^64` faults on both tiers. With a small offset the
+/// wrapped last byte lands in the NULL guard, whose pages the table holds `Unmapped`; with an offset
+/// past the guard it lands on an ordinary page, and only the explicit overflow compare stops it.
+#[test]
+fn wrapping_addresses_trap_on_both_tiers() {
+    let (off, len) = last_page(UNMAP_LOAD);
+    let fault = Outcome::Trap(TrapKind::MemoryFault);
+    for probe in [-1i64, -4, -7, -8, -16] {
+        agree(UNMAP_LOAD, off, len, probe, fault.clone());
+    }
+    // `probe + 20000` wraps to 19000: `Rw`, inside the window, past the guard.
+    agree(UNMAP_LOAD_FAR, off, len, -1000, fault.clone());
+    agree(UNMAP_LOAD_FAR, off, len, -20000, fault); // wraps to exactly 0
+    agree(UNMAP_LOAD_FAR, off, len, 0, Outcome::Vals(vec![0])); // the control: 20000 itself
+}
+
+#[test]
+fn every_check_in_a_function_shares_one_memory_fault_trap() {
+    // #2134: a check branches to the function's fault block instead of carrying its own
+    // `env.trap(MemoryFault)` call, so the function makes that call once, however many it checks.
+    let m = build(
+        r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.load v0
+  vb = i64.load v0 offset=12
+  vc = i64.add va vb
+  i64.store v0 vc
+  return vc
+  }
+}
+"#,
+    );
+    // i32.const MemoryFault; call env.trap; unreachable
+    let trap_call = [0x41, TRAP_MEMORY_FAULT as u8, 0x10, 0x00, 0x00];
+    for (mode, wasm) in [
+        ("unpaged", compile_module_tierup(&m, false).expect("emit").0),
+        (
+            "paged",
+            compile_module_tierup_paged(&m, false, 12).expect("emit").0,
+        ),
+    ] {
+        let calls = wasm
+            .windows(trap_call.len())
+            .filter(|w| *w == trap_call)
+            .count();
+        assert_eq!(
+            calls, 1,
+            "{mode}: the checks share one MemoryFault trap call"
+        );
+    }
+}
+
 #[test]
 fn unpaged_output_carries_no_pagestate() {
     // Lands-dark pin: the default (unpaged) entry emits no page-check machinery — no `"pagestate"`
@@ -923,4 +1071,54 @@ fn aligned_atomic_load_traps_on_unmapped_page() {
         want, got,
         "paged tier diverged on an in-prefix aligned atomic load"
     );
+}
+
+/// #2126 — a `MemoryFault` in page-checked emitted code reports the same faulting address as the
+/// oracle: the access's first byte, for an unmapped load, a store to an `Ro` page, and a store whose
+/// last byte straddles onto an unmapped page (the page that faults is not the one the address names).
+#[test]
+fn paged_faults_report_the_oracles_address() {
+    for (src, delta) in [(UNMAP_LOAD, 16i64), (PROTECT_STORE, 16), (UNMAP_STORE, -4)] {
+        let (off, len) = last_page(src);
+        let probe = off as i64 + delta;
+        let fault = |mode| {
+            LAST_FAULT.set(None);
+            let (out, _) = run_guest(src, off, len, probe, mode);
+            assert_eq!(
+                out,
+                Outcome::Trap(TrapKind::MemoryFault),
+                "{mode:?} at {probe:#x}"
+            );
+            LAST_FAULT.get()
+        };
+        let want = oracle_fault(src, off, len, probe);
+        assert_eq!(want, Some(probe as u64), "oracle sanity at {probe:#x}");
+        assert_eq!(
+            fault(Mode::PagedSynced),
+            want,
+            "paged fault address at {probe:#x}"
+        );
+    }
+}
+
+/// The oracle's faulting address for `guest(as, off, len, probe)`: the interpreter run as a coop
+/// session, whose end records it (`last_capture_fault_addr`), as an embedder reads it.
+fn oracle_fault(guest_src: &str, off: u64, len: u64, probe: i64) -> Option<u64> {
+    let m = build(guest_src);
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    let args = [
+        Value::I32(asl),
+        Value::I64(off as i64),
+        Value::I64(len as i64),
+        Value::I64(probe),
+    ];
+    let mut run = bytecode::CoopRun::new(&m, 0, &args, FUEL, host, None)
+        .expect("in the bytecode subset")
+        .expect("builds");
+    assert!(matches!(
+        run.run(),
+        bytecode::CoopEvent::Trapped(Trap::MemoryFault)
+    ));
+    temen_interp::last_capture_fault_addr()
 }
