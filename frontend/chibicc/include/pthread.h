@@ -89,9 +89,6 @@ static int __pthread_next_id = 1;
 static int __pthread_self_id(void) {
   char here;
   int n = __vm_atomic_load32(&__pthread_next_id);
-  // A handful of entries: no use vectorizing. clang 22 early-exit-vectorizes it into `<2 x ptr>`
-  // compares, which the LLVM on-ramp doesn't translate yet (#1993).
-#pragma clang loop vectorize(disable)
   for (int i = 1; i < n && i < __PTHREAD_MAX_IDS; i++) {
     char *base = __pthread_stacks[i];
     if (base && &here >= base && &here < base + __PTHREAD_STACK)
