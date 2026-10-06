@@ -115,8 +115,9 @@ exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
-its grant the embedder's. The gaps are tracked, not exceptions: what a guest reads of the run's own
-node (#2113), the carve (#1867), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused after its
+its grant the embedder's. The gaps are tracked, not exceptions: the root's fuel where its host meters
+none (the browser, and the JIT's compile-once `PowerboxProgram` and `JitSession`, #2113), the carve
+(#1867), a `Vcpu` child its parent never joins (#2119), the pipe ends a spawn refused after its
 admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes

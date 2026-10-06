@@ -849,7 +849,6 @@ pub(crate) struct HostCursor {
     pub(crate) clock_ns: i64,
     pub(crate) cap_consumed: usize,
     pub(crate) cap_record_len: usize,
-    pub(crate) mem_mapped_bytes: u64,
     /// #2113 — the host's half of its window's accounting ([`Host::grown`], [`Host::own_window`],
     /// [`Host::main_vcpu`]): the tree an undo puts back holds the charges, these what they are for.
     pub(crate) held: (u64, u64, bool),
@@ -896,9 +895,6 @@ struct HostReplaySubstate {
     svc_queue: Vec<SvcDispatch>,
     svc_results: Vec<(u64, i64)>,
     svc_next_ticket: u64,
-    /// The memory growth-cap accounting at the checkpoint (slice 5) — without it, a restore
-    /// would zero the count and the limit would go lenient after a seek.
-    mem_mapped_bytes: u64,
     /// #2113 — the host's half of its window's accounting, as [`HostCursor::held`]: the checkpoint's
     /// tree holds the charges.
     held: (u64, u64, bool),
@@ -22821,16 +22817,6 @@ pub struct Host {
     /// hands over a delivery); the eval-loop park site takes it ([`Self::take_sig_interrupt`]) and, when
     /// set, returns `-EINTR` rather than rewinding+parking.
     sig_interrupt: bool,
-    /// The **memory growth cap** (INTERACTIVE_EMBEDDING.md slice 5, the OOM-teaching
-    /// knob): `Some(limit)` bounds the total currently-committed bytes `vm_map` (an `AddressSpace`
-    /// `map`, whole-window or carved) may hold through this Host — a map past it fails probeably
-    /// (`-ENOMEM`, invariant 5), so a guest allocator returns NULL. Policy lives here at the cap,
-    /// never in `Mem`/the TCB. `None` (default) = unbounded, zero-cost.
-    mem_map_limit: Option<u64>,
-    /// Bytes currently mapped through `AddressSpace` `map` while a limit is set (map adds, unmap
-    /// subtracts). Rebuilt naturally by a from-0 replay (a live, untaped cap); carried
-    /// by [`HostReplaySubstate`] so a checkpoint restore keeps the accounting.
-    mem_mapped_bytes: u64,
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -23681,8 +23667,6 @@ impl Host {
             pipe_write_parked: None,
             pipe_wake_writers: None,
             sig_interrupt: false,
-            mem_map_limit: None,
-            mem_mapped_bytes: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),
             out_sink: None,
@@ -24040,8 +24024,6 @@ impl Host {
         // Copied I/O scalars (POSIX fork copies the stdin buffer/offset; a shared fd is the sink case).
         (twin.stdin, twin.stdin_pos) = self.stdin_copy();
         twin.stdin_block = self.stdin_block;
-        twin.mem_map_limit = self.mem_map_limit;
-        twin.mem_mapped_bytes = self.mem_mapped_bytes;
         twin.clock_ns = self.clock_ns;
         twin.jit_table_log2 = self.jit_table_log2;
         twin.jit_hosts_fibers = self.jit_hosts_fibers;
@@ -24563,13 +24545,6 @@ impl Host {
     /// consumed prefix is not reclaimed — fine for the interactive session's modest per-query input.
     pub fn push_stdin(&mut self, bytes: &[u8]) {
         self.stdin.extend_from_slice(bytes);
-    }
-
-    /// Set (or clear) the **memory growth cap** — see [`Host::mem_map_limit`]. With a
-    /// limit, a `vm_map` whose committed total would exceed it returns `-ENOMEM` (probeable; a
-    /// guest `malloc` over `vm_map` returns NULL), and `vm_unmap` returns its bytes to the budget.
-    pub fn set_mem_map_limit(&mut self, limit: Option<u64>) {
-        self.mem_map_limit = limit;
     }
 
     /// Take the transient "the last stdin read parked" flag (the `CapCall` arm uses it to yield
@@ -25213,7 +25188,6 @@ impl Host {
             clock_ns: self.clock_ns,
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
-            mem_mapped_bytes: self.mem_mapped_bytes,
             held: (self.grown, self.own_window, self.main_vcpu),
             jit_mark: self.jit_compile_mark(),
         }
@@ -25250,7 +25224,6 @@ impl Host {
         if let Some(rec) = self.cap_record.as_mut() {
             rec.truncate(c.cap_record_len);
         }
-        self.mem_mapped_bytes = c.mem_mapped_bytes;
         (self.grown, self.own_window, self.main_vcpu) = c.held;
     }
 
@@ -25322,7 +25295,6 @@ impl Host {
             svc_results,
             svc_next_ticket,
             cap_states: self.capture_cap_states(),
-            mem_mapped_bytes: self.mem_mapped_bytes,
             held: (self.grown, self.own_window, self.main_vcpu),
             jit_quota: self
                 .jit_tables
@@ -25365,7 +25337,6 @@ impl Host {
             s.svc_results.clone(),
             s.svc_next_ticket,
         );
-        self.mem_mapped_bytes = s.mem_mapped_bytes;
         (self.grown, self.own_window, self.main_vcpu) = s.held;
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
@@ -31606,29 +31577,10 @@ impl Host {
                 let commits = |c| if access { c } else { Commits::Nothing };
                 Ok(vec![match op {
                     0 => {
-                        // The growth cap (§3e slice 5): at the limit, map fails probeably — the
-                        // OOM-teaching knob. Accounting only runs with a limit set; it meters
-                        // every AddressSpace `map` on this Host, whole-window or carved.
-                        if let Some(limit) = self.mem_map_limit {
-                            if self.mem_mapped_bytes.saturating_add(len) > limit {
-                                return Ok(vec![ENOMEM]);
-                            }
-                        }
                         let every = commits(Commits::Every);
-                        let r = self.page_op(mem, at, len, every, |_, m| m.map(at, len, prot));
-                        if r >= 0 && self.mem_map_limit.is_some() {
-                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_add(len);
-                        }
-                        r
+                        self.page_op(mem, at, len, every, |_, m| m.map(at, len, prot))
                     }
-                    1 => {
-                        let r =
-                            self.page_op(mem, at, len, Commits::Nothing, |_, m| m.unmap(at, len));
-                        if r >= 0 && self.mem_map_limit.is_some() {
-                            self.mem_mapped_bytes = self.mem_mapped_bytes.saturating_sub(len);
-                        }
-                        r
-                    }
+                    1 => self.page_op(mem, at, len, Commits::Nothing, |_, m| m.unmap(at, len)),
                     2 => {
                         let own = commits(Commits::Own);
                         self.page_op(mem, at, len, own, |_, m| m.protect(at, len, prot))

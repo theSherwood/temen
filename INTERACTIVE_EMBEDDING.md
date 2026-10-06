@@ -507,7 +507,10 @@ frontend-coverage check, not a view remap. A third, the **seek-cost risk**, has 
 >    (`set_mem_map_limit` / `memoryLimit` launch arg): a `vm_map` past the limit returns
 >    `-ENOMEM` probeably (invariant 5 — guest `malloc` observes NULL), `vm_unmap` returns bytes
 >    to the budget, and the accounting rides `HostReplaySubstate` so checkpoint restores keep it.
->    Gated by `crates/temen-dap/tests/memory_map.rs`. Original spec: the window memory-map JSON
+>    Gated by `crates/temen-dap/tests/memory_map.rs`. *Since #2113 the cap is the root's `mem`
+>    grant* (`Host::set_grant`, its declared window plus `memoryLimit`): one limit, charged on the
+>    budget tree with everything else the root makes — its growth, its fibers, its children — and
+>    carried through a checkpoint with the tree. `set_mem_map_limit` and its count are gone. Original spec: the window memory-map JSON
 >    (data segments, heap extent, data-stack region, cap-mapped regions) and a
 >    **Memory-capability growth cap** so guest `malloc` over `vm_map` returns NULL at the limit. Integration (verified): the map JSON
 >    derives from `AddrSpace.prot`/`.regions` + the window geometry (`Mem.window`
