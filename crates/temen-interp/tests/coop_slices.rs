@@ -91,3 +91,38 @@ fn a_slice_pumped_run_ends_as_the_one_shot_run_does() {
         }
     }
 }
+
+/// A load at the address it is given, in a 128 KiB window: a probe under the NULL guard faults
+/// there.
+const LOAD_AT: &str = r#"
+memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0
+  return vl
+  }
+}
+"#;
+
+/// The faulting address a session that faults at `addr` reports, read the way an embedder reads it.
+fn fault_of(addr: i64) -> Option<u64> {
+    let m = parse_module(LOAD_AT).expect("parse");
+    let mut r = CoopRun::new(&m, 0, &[Value::I64(addr)], u64::MAX, Host::new(), None)
+        .expect("in the bytecode subset")
+        .expect("builds");
+    assert!(matches!(
+        r.run_for(1 << 20),
+        CoopEvent::Trapped(temen_interp::Trap::MemoryFault)
+    ));
+    temen_interp::last_capture_fault_addr()
+}
+
+/// Each session reports its **own** faulting address. The slot is per run, but only one of the
+/// session constructors cleared it, and a fault keeps the first address recorded, so a second
+/// session's segfault named the first one's address (c_interpret's Release run showed a NULL
+/// dereference at the address of the stack overflow before it).
+#[test]
+fn a_session_reports_its_own_fault_address_not_the_last_sessions() {
+    assert_eq!(fault_of(8), Some(8));
+    assert_eq!(fault_of(16), Some(16));
+}

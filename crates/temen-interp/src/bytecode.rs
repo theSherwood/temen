@@ -16283,6 +16283,14 @@ pub struct CoopRun {
     sched: CoopSched,
 }
 
+/// A session starts with no faulting address recorded: the slot is per run, and the scheduler keeps
+/// the first fault it records, so a leftover from the previous session would stand in for this one's
+/// (and a fault that records none, such as one in emitted code, would report it). Both of
+/// [`CoopRun`]'s constructor tails call this.
+fn clear_session_fault() {
+    super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
+}
+
 impl CoopRun {
     /// Build a run over module `m`, entering `entry(args)` with `fuel` and the granted `host` powerbox.
     /// `tierup` is the tier-up config ([`TierUpConfig`]); pass `None` for a pure-interpreter multiplex.
@@ -16320,7 +16328,6 @@ impl CoopRun {
         init_mem: &[u8],
     ) -> Option<Result<CoopRun, Trap>> {
         host.wire_park_door();
-        super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
         Self::assemble(
             m,
             entry,
@@ -16407,6 +16414,7 @@ impl CoopRun {
             return Err(Trap::Malformed);
         }
         host.wire_park_door();
+        clear_session_fault();
         let dom = Domain::over_primary(compiled, host.jit_table_log2());
         let mut mem = Mem::root(m, reserved_log2, None, init_mem);
         let root_leaf = tierup
@@ -16439,6 +16447,7 @@ impl CoopRun {
         if entry as usize >= c.progs.len() {
             return Some(Err(Trap::Malformed));
         }
+        clear_session_fault();
         let dom = Domain::new(c, host.jit_table_log2());
         let root_leaf = tierup
             .as_ref()
