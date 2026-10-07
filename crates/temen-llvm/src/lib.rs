@@ -211,18 +211,19 @@ pub struct Translated {
     pub module: Module,
     /// The value to pass as the entry's first (`sp`) argument.
     pub entry_sp: u64,
-    /// Exported function symbols: each *defined* function's name paired with its final index in
-    /// `module.funcs` (`base + i`, accounting for a synthesized `_start` prologue). This feeds a
-    /// `temen_ir::LinkUnit.exports` so a separate program module can resolve a `call.import` of these
-    /// names through `temen_ir::link` — the separate-artifact path (compile a runtime once, link many
-    /// programs against it). Synthesized helpers (`_start`, `memset`, `malloc`, …) carry no source
-    /// name and are not exported.
+    /// Exported function symbols: each *defined* function's name (in a link unit, each one with
+    /// external linkage) paired with its final index in `module.funcs` (`base + i`, accounting for a
+    /// synthesized `_start` prologue). This feeds a `temen_ir::LinkUnit.exports` so a separate program
+    /// module can resolve a `call.import` of these names through `temen_ir::link` — the
+    /// separate-artifact path (compile a runtime once, link many programs against it). Synthesized
+    /// helpers (`_start`, `memset`, `malloc`, …) carry no source name and are not exported.
     pub exports: Vec<(String, u32)>,
     /// **Global-variable symbols**: each source global's name → its window address, byte size, and
     /// read-only flag. A `@global` reference in the IR is baked to its window address (there is no
     /// runtime symbol table), so a *caller* — e.g. `temen-peval` renaming a mutable VM-state global like
     /// an interpreter's `savedpc` — needs this map to find where a named global lives in the window.
-    /// In source declaration order (writable/BSS first, then read-only), matching the layout.
+    /// In source declaration order (writable/BSS first, then read-only), matching the layout. In a
+    /// link unit the addresses are unit-local: the linker adds wherever it places the unit's data.
     pub data_symbols: Vec<DataSymbol>,
 }
 
@@ -289,6 +290,22 @@ pub struct TranslateOptions {
     /// `>=` [`temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE`] (the default). A context's call chain
     /// must fit its region to freeze, so a guest that recurses deep declares a wider one (#1872).
     pub shadow_stride: u64,
+    /// Translate a **link unit** (#1746): a library [`temen_ir::link`] can place anywhere among other
+    /// units, from any frontend, rather than a module that only runs whole or as the first unit.
+    ///
+    /// - A reference to one of the unit's own globals is a link-form `data.self` (pointers in an
+    ///   initializer, a `data.ptr` slot), so the linker can move the unit's data.
+    /// - A call to an undefined function is a `call.sym` import, and a reference to an undefined
+    ///   global a `data.sym`: the linker binds them to the unit that defines the name.
+    /// - Only external-linkage names are exported (functions, and globals as data symbols); a C
+    ///   `static` stays private to the unit.
+    ///
+    /// A link unit is not runnable until linked. It may not define `main` (a program unit is a
+    /// follow-up), and translation fails closed on the features that still bake fixed window
+    /// addresses (thread-locals, the float-formatting scratch, the synthesized ctype and locale
+    /// tables, a durable shadow arena, a §14 child entry) and on a pointer to a `static` function
+    /// stored in static data, which no link-form relocation can name. **Off by default.**
+    pub link_unit: bool,
 }
 
 impl Default for TranslateOptions {
@@ -301,6 +318,7 @@ impl Default for TranslateOptions {
             child_entry: false,
             shadow_contexts: None,
             shadow_stride: temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE,
+            link_unit: false,
         }
     }
 }
@@ -357,6 +375,38 @@ impl StubTable {
     fn get_or_insert_extern(&mut self, name: &str) -> Option<u32> {
         let sig = self.extern_sigs.get(name)?.clone();
         Some(self.get_or_insert(name, sig))
+    }
+}
+
+/// Link-unit lowering state ([`TranslateOptions::link_unit`], #1746), shared by every function's
+/// translation.
+struct LinkCtx {
+    /// Globals the unit only declares (another unit defines them): a reference is a `data.sym`.
+    extern_data: HashSet<String>,
+    /// The function-symbol imports minted by calls to undefined functions.
+    imports: RefCell<SymImports>,
+}
+
+/// A link unit's function-symbol imports: one per distinct `(name, signature)`, as [`StubTable`]
+/// keeps one stub per shape, so every `call.sym` matches its import's declared signature. They are
+/// numbered from `base`, after the capability imports.
+struct SymImports {
+    base: u32,
+    /// `(name, type-section index of the signature)`, in import order.
+    order: Vec<(String, u32)>,
+    idx: HashMap<(String, u32), u32>,
+}
+
+impl SymImports {
+    fn import(&mut self, name: &str, sig: u32) -> u32 {
+        let key = (name.to_string(), sig);
+        if let Some(&i) = self.idx.get(&key) {
+            return i;
+        }
+        let i = self.base + self.order.len() as u32;
+        self.order.push(key.clone());
+        self.idx.insert(key, i);
+        i
     }
 }
 
@@ -759,8 +809,42 @@ fn translate_impl(
     // made this an opt-in `TranslateOptions::powerbox_layout`; an opt-in the translator cannot know
     // to set — it cannot see whether the unit will be wrapped — is the footgun, so it is the layout.)
     let globals_base = stack_page;
-    let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols, tls_layout) =
-        globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
+    // A link unit (#1746) is placed by the linker, so it may not rely on anything this translation
+    // pins to a fixed window address or runs from its own `_start`. Each is a clean refusal rather
+    // than a silent misplacement.
+    if opts.link_unit {
+        let refuse = |what: &str| unsup(format!("a link unit (#1746) cannot {what}"));
+        if has_main {
+            return refuse(
+                "define `main`: translate the program whole, or link a library without it",
+            );
+        }
+        if has_global_ctors {
+            return refuse("have static constructors: no linked `_start` runs `llvm.global_ctors`");
+        }
+        if opts.child_entry {
+            return refuse("take a §14 child entry");
+        }
+        if opts.shadow_contexts.is_some() {
+            return refuse("declare a durable shadow arena");
+        }
+        if m.global_vars.iter().any(|g| g.thread_local) {
+            return refuse("have thread-locals: their block sits at a fixed window address");
+        }
+        if need_dtoa {
+            return refuse("format floats: the float scratch sits at a fixed window address");
+        }
+    }
+    let (
+        globals,
+        mut data,
+        mut globals_end,
+        cstrs,
+        gbytes,
+        data_symbols,
+        tls_layout,
+        mut link_data,
+    ) = globals_layout(m, &name2idx, globals_base, ba, stack_page, opts.link_unit)?;
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
     // module image** when the program calls the ctype locators (`isalpha`/`isspace`/`tolower`/… lower to
     // `__ctype_b_loc`/`__ctype_tolower_loc`/`__ctype_toupper_loc`, e.g. Embench `slre`). Placed after the
@@ -770,6 +854,14 @@ fn translate_impl(
     // the program calls `localeconv` (Lua's locale-aware number parsing reads `decimal_point`). Placed
     // after the globals like the ctype tables — no `_start` needed. `Some(addr)` of the struct.
     let locale_addr = build_locale_data(m, &defined_names, &mut data, &mut globals_end, stack_page);
+    let uses_ctype =
+        ctype.b_loc.is_some() || ctype.tolower_loc.is_some() || ctype.toupper_loc.is_some();
+    if opts.link_unit && (uses_ctype || locale_addr.is_some()) {
+        return unsup(
+            "a link unit (#1746) cannot use the synthesized ctype or locale tables: their pointers \
+             are baked to fixed window addresses",
+        );
+    }
     // Page-align the data stack above the globals so it never shares a page with a *read-only*
     // global (D40 protects RO segments page-granularly — a stack write into a shared page would
     // fault). `stack_page` is the *target host's* page (16 KiB native, 64 KiB wasm), so the isolation
@@ -932,6 +1024,16 @@ fn translate_impl(
         }
         RefCell::new(StubTable::new(stub_base, extern_sigs))
     });
+    // A link unit's calls to undefined functions mint `call.sym` imports (#1746), numbered after the
+    // capability imports, which are all registered by now.
+    let link_ctx = opts.link_unit.then(|| LinkCtx {
+        extern_data: std::mem::take(&mut link_data.extern_data),
+        imports: RefCell::new(SymImports {
+            base: imports.len() as u32,
+            order: Vec::new(),
+            idx: HashMap::new(),
+        }),
+    });
 
     let mut funcs = Vec::with_capacity(defined.len() + synth as usize);
     let mut any_frame = false; // does any function use the data stack (`alloca`)?
@@ -968,6 +1070,7 @@ fn translate_impl(
             &dispatch_map,
             &taken,
             &sig_types,
+            link_ctx.as_ref(),
         )
         // Name the function in the error — a bare "value N not available" is opaque in a
         // whole-program module of thousands of functions (the Postgres bring-up).
@@ -1336,16 +1439,36 @@ fn translate_impl(
         let t = intern_sig(&sig_types, import_sig(&imp.name));
         imp.shape = temen_ir::ImportShape::Func(t);
     }
+    // A link unit's function-symbol imports follow, each declared with the signature its call sites
+    // were interned with (#1746).
+    if let Some(link) = &link_ctx {
+        for (name, sig) in link.imports.borrow().order.iter() {
+            imports.push(temen_ir::Import {
+                name: name.clone(),
+                shape: temen_ir::ImportShape::Func(*sig),
+                mode: temen_ir::ImportMode::Required,
+            });
+        }
+    }
+    // A link unit exports only external-linkage names (#1746); a whole module exports every defined
+    // function, as before.
+    let exported: Vec<(String, u32)> = defined
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !(opts.link_unit && f.local))
+        .map(|(i, f)| (f.name.clone(), base + i as u32))
+        .collect();
     let types = sig_types.into_inner();
     Ok(Translated {
         module: Module {
             types,
             impl_exports: vec![],
-            // The on-ramp bakes pointer-valued globals whole-module (all offsets known at translate
-            // time), so it emits no cross-unit data symbols — nothing to export here.
-            data_exports: vec![],
-            data_ptrs: vec![],
-            data_funcrefs: vec![],
+            // A whole module bakes pointer-valued globals (every offset is known at translate time)
+            // and has no data symbols. A link unit exports its external-linkage globals and leaves its
+            // initializer pointers for the linker to fill in (#1746).
+            data_exports: link_data.exports,
+            data_ptrs: link_data.ptrs,
+            data_funcrefs: link_data.funcrefs,
             data_funcref_slots: Vec::new(),
             tls: Vec::new(),
             funcs,
@@ -1360,12 +1483,11 @@ fn translate_impl(
             // powerbox `_start` was synthesized, export it at funcidx 0 too — the named-entry marker
             // the runtime keys off (S15 (c): a paramless `_start` is tagged by its export, not params).
             exports: {
-                let mut ex: Vec<temen_ir::Export> = defined
+                let mut ex: Vec<temen_ir::Export> = exported
                     .iter()
-                    .enumerate()
-                    .map(|(i, f)| temen_ir::Export {
-                        name: f.name.clone(),
-                        func: base + i as u32,
+                    .map(|(name, func)| temen_ir::Export {
+                        name: name.clone(),
+                        func: *func,
                     })
                     .collect();
                 if synth {
@@ -1389,13 +1511,9 @@ fn translate_impl(
             debug_info: dbg.finish(),
         },
         entry_sp,
-        // Each defined function's name → its final `module.funcs` index (`base + i`), the same
+        // Each exported function's name → its final `module.funcs` index (`base + i`), the same
         // mapping `name2idx` holds, emitted in defined order for determinism.
-        exports: defined
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.name.clone(), base + i as u32))
-            .collect(),
+        exports: exported,
         data_symbols,
     })
 }
@@ -1564,64 +1682,143 @@ fn sign_extend(v: i64, bits: Option<u32>) -> i64 {
         _ => v,
     }
 }
-fn const_eval(
+/// What a constant's value is relative to (#1746). A whole-module translation knows every address,
+/// so its constants are plain numbers; a link unit's data and functions are placed by the linker, so
+/// an address there is a base the linker fills in plus a constant offset.
+#[derive(Clone, Debug, PartialEq)]
+enum CBase {
+    /// This unit's own data: the offset is a unit-local address (`data.self`).
+    SelfData,
+    /// A global another unit defines (`data.sym`).
+    DataSym(String),
+    /// A function's funcref (`ref.func`).
+    Func(String),
+}
+
+/// A folded constant: `base + off`, or just `off` when there is no `base`.
+#[derive(Clone, Debug)]
+struct CVal {
+    base: Option<CBase>,
+    off: i64,
+}
+
+impl CVal {
+    fn num(off: i64) -> Self {
+        CVal { base: None, off }
+    }
+
+    /// The plain number; `Unsupported` for an address the linker has yet to place.
+    fn number(self) -> Result<i64, Error> {
+        match self.base {
+            None => Ok(self.off),
+            Some(_) => unsup("an address used in constant arithmetic a link unit cannot relocate"),
+        }
+    }
+}
+
+/// Fold a constant expression (§3b). Outside a link unit every address is a number as soon as it is
+/// reached, so the result is a plain value; in a link unit (`link` holds its undefined data globals,
+/// #1746) an address the linker places stays a relocation.
+fn const_reloc(
     c: &Constant,
     globals: &HashMap<String, u64>,
     funcs: &HashMap<String, u32>,
     types: &Types,
-) -> Result<i64, Error> {
+    link: Option<&HashSet<String>>,
+) -> Result<CVal, Error> {
     use Constant as K;
+    let eval = |c: &Constant| const_reloc(c, globals, funcs, types, link);
     let bin = |a: &Constant, b: &Constant| -> Result<(i64, i64), Error> {
-        Ok((
-            const_eval(a, globals, funcs, types)?,
-            const_eval(b, globals, funcs, types)?,
-        ))
+        Ok((eval(a)?.number()?, eval(b)?.number()?))
+    };
+    let reloc = |base: CBase, off: i64| CVal {
+        base: Some(base),
+        off,
     };
     match c {
-        K::Int { value, .. } => Ok(*value as i64),
-        K::Null(_) => Ok(0),
+        K::Int { value, .. } => Ok(CVal::num(*value as i64)),
+        K::Null(_) => Ok(CVal::num(0)),
         K::GlobalReference { name, .. } => {
             let n = name_str(name);
             if let Some(&a) = globals.get(&n) {
-                Ok(a as i64) // a data global's window address
+                // A data global's window address: final in a whole module, unit-local in a link unit.
+                Ok(match link {
+                    None => CVal::num(a as i64),
+                    Some(_) => reloc(CBase::SelfData, a as i64),
+                })
             } else if let Some(&f) = funcs.get(&n) {
-                Ok(f as i64) // a function's §3c funcref index
+                // A function's §3c funcref index, which the linker renumbers in a link unit.
+                Ok(match link {
+                    None => CVal::num(f as i64),
+                    Some(_) => reloc(CBase::Func(n), 0),
+                })
+            } else if link.is_some_and(|ext| ext.contains(&n)) {
+                Ok(reloc(CBase::DataSym(n), 0))
             } else {
                 unsup(format!("constexpr reference to `@{n}`"))
             }
         }
         // Pointer / same-width casts pass the value through; the byte width is the *consumer*'s job.
-        K::PtrToInt(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
-        K::IntToPtr(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
-        K::BitCast(x) => const_eval(x.operand.as_ref(), globals, funcs, types),
+        K::PtrToInt(x) => eval(x.operand.as_ref()),
+        K::IntToPtr(x) => eval(x.operand.as_ref()),
+        K::BitCast(x) => eval(x.operand.as_ref()),
         // Width casts fold to the widened/narrowed **value** (the consumer emits it at the result
         // width): `trunc` keeps the low `to` bits; `zext`/`sext` extend from the *source* width — so a
         // `zext (i32 ptrtoint(@g) to i64)` zeroes the high bits rather than passing the raw address.
         K::Trunc(x) => {
-            let v = const_eval(x.operand.as_ref(), globals, funcs, types)?;
-            Ok(mask_low(v, int_bits(x.to_type.as_ref())))
+            let v = eval(x.operand.as_ref())?.number()?;
+            Ok(CVal::num(mask_low(v, int_bits(x.to_type.as_ref()))))
         }
         K::ZExt(x) => {
-            let v = const_eval(x.operand.as_ref(), globals, funcs, types)?;
-            Ok(mask_low(v, int_bits(x.operand.get_type(types).as_ref())))
+            let v = eval(x.operand.as_ref())?.number()?;
+            Ok(CVal::num(mask_low(
+                v,
+                int_bits(x.operand.get_type(types).as_ref()),
+            )))
         }
         K::SExt(x) => {
-            let v = const_eval(x.operand.as_ref(), globals, funcs, types)?;
-            Ok(sign_extend(v, int_bits(x.operand.get_type(types).as_ref())))
+            let v = eval(x.operand.as_ref())?.number()?;
+            Ok(CVal::num(sign_extend(
+                v,
+                int_bits(x.operand.get_type(types).as_ref()),
+            )))
         }
-        K::Add(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_add(b)),
-        K::Sub(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_sub(b)),
-        K::Mul(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_mul(b)),
+        // An address plus or minus a number stays relative to its base. The difference of two
+        // addresses with the same base is a number (`&g.b - &g.a`); any other mix of bases has no
+        // link-time form.
+        K::Add(x) => {
+            let (a, b) = (eval(x.operand0.as_ref())?, eval(x.operand1.as_ref())?);
+            if a.base.is_some() && b.base.is_some() {
+                return unsup("the sum of two addresses in a constant");
+            }
+            Ok(CVal {
+                base: a.base.or(b.base),
+                off: a.off.wrapping_add(b.off),
+            })
+        }
+        K::Sub(x) => {
+            let (a, b) = (eval(x.operand0.as_ref())?, eval(x.operand1.as_ref())?);
+            match (a.base, b.base) {
+                (base, None) => Ok(CVal {
+                    base,
+                    off: a.off.wrapping_sub(b.off),
+                }),
+                (Some(x), Some(y)) if x == y => Ok(CVal::num(a.off.wrapping_sub(b.off))),
+                _ => unsup("the difference of addresses with different link-time bases"),
+            }
+        }
+        K::Mul(x) => {
+            bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| CVal::num(a.wrapping_mul(b)))
+        }
         // Bitwise + left-shift constexprs (e.g. alignment masks `and(ptrtoint(@g), -16)`). All fold
         // correctly in i64 and mask to the result width at the consumer, since `and`/`or`/`xor`/`shl`
         // commute with keeping the low N bits (unlike a right shift, below). The shift amount is masked
         // to the operand width by `wrapping_shl`.
-        K::And(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a & b),
-        K::Or(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a | b),
-        K::Xor(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a ^ b),
-        K::Shl(x) => {
-            bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| a.wrapping_shl(b as u32))
-        }
+        K::And(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| CVal::num(a & b)),
+        K::Or(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| CVal::num(a | b)),
+        K::Xor(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| CVal::num(a ^ b)),
+        K::Shl(x) => bin(x.operand0.as_ref(), x.operand1.as_ref())
+            .map(|(a, b)| CVal::num(a.wrapping_shl(b as u32))),
         // Right-shift constexprs are **width-sensitive** (the fill bit and the shift range depend on
         // `operand0`'s bit width), unlike the width-agnostic bitwise ops above. `lshr` zero-fills:
         // read `operand0` as unsigned at its width (`mask_low` clears the bits above it) then shift
@@ -1631,17 +1828,20 @@ fn const_eval(
         // in-range amounts these actually carry.
         K::LShr(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| {
             let bits = int_bits(x.operand0.get_type(types).as_ref());
-            (mask_low(a, bits) as u64).wrapping_shr(b as u32) as i64
+            CVal::num((mask_low(a, bits) as u64).wrapping_shr(b as u32) as i64)
         }),
         K::AShr(x) => bin(x.operand0.as_ref(), x.operand1.as_ref()).map(|(a, b)| {
             let bits = int_bits(x.operand0.get_type(types).as_ref());
-            sign_extend(a, bits).wrapping_shr(b as u32)
+            CVal::num(sign_extend(a, bits).wrapping_shr(b as u32))
         }),
         // An interior pointer into a constant aggregate (`&arr[k]`, `&s.f`, a string-literal tail
         // `&".."[k]`) — base address plus the type-walked constant byte offset (§3b, like `getelementptr`).
         K::GetElementPtr(g) => {
-            let base = const_eval(g.address.as_ref(), globals, funcs, types)?;
-            Ok(base.wrapping_add(const_gep_offset(g, types)?))
+            let base = eval(g.address.as_ref())?;
+            Ok(CVal {
+                base: base.base,
+                off: base.off.wrapping_add(const_gep_offset(g, types)?),
+            })
         }
         other => unsup(format!("constexpr initializer {other:?}")),
     }
@@ -1729,15 +1929,25 @@ fn const_size(c: &Constant, types: &Types) -> Result<u64, Error> {
     }
 }
 
+/// One relocation in a link unit's initializer (#1746): the byte offset of an 8-byte pointer within
+/// the serialized constant, and the address it holds (`base + addend`).
+type InitReloc = (u64, CBase, i64);
+
 /// Serialize a constant initializer to its little-endian window bytes (the §3d/x86-64 layout).
 /// Aggregates recurse structurally (arrays/structs with field padding); a scalar leaf that is a
-/// pointer or constexpr is resolved via [`const_eval`] (relocations) and emitted at its type width.
+/// pointer or constexpr is resolved via [`const_reloc`] and emitted at its type width. In a link unit
+/// (`link` is `Some`) a leaf holding an address the linker places is written as 8 zero bytes and
+/// recorded in `relocs` at its offset (`at` is this constant's offset within the whole initializer).
+#[allow(clippy::too_many_arguments)] // the recursion threads the fold's inputs plus its position (8 params)
 fn const_bytes(
     c: &Constant,
     types: &Types,
     globals: &HashMap<String, u64>,
     funcs: &HashMap<String, u32>,
     ba: &mut impl Iterator<Item = u32>,
+    link: Option<&HashSet<String>>,
+    at: u64,
+    relocs: &mut Vec<InitReloc>,
 ) -> Result<Vec<u8>, Error> {
     match c {
         Constant::Int { bits, value } if *bits <= 64 => {
@@ -1761,7 +1971,17 @@ fn const_bytes(
         Constant::Array { elements, .. } | Constant::Vector(elements) => {
             let mut out = Vec::new();
             for e in elements {
-                out.extend(const_bytes(e.as_ref(), types, globals, funcs, ba)?);
+                let off = at + out.len() as u64;
+                out.extend(const_bytes(
+                    e.as_ref(),
+                    types,
+                    globals,
+                    funcs,
+                    ba,
+                    link,
+                    off,
+                    relocs,
+                )?);
             }
             Ok(out)
         }
@@ -1774,7 +1994,16 @@ fn const_bytes(
             let (offsets, size, _) = struct_layout(&fields, *is_packed, types)?;
             let mut out = vec![0u8; size as usize];
             for (v, &off) in values.iter().zip(&offsets) {
-                let b = const_bytes(v.as_ref(), types, globals, funcs, ba)?;
+                let b = const_bytes(
+                    v.as_ref(),
+                    types,
+                    globals,
+                    funcs,
+                    ba,
+                    link,
+                    at + off,
+                    relocs,
+                )?;
                 out[off as usize..off as usize + b.len()].copy_from_slice(&b);
             }
             Ok(out)
@@ -1790,8 +2019,18 @@ fn const_bytes(
                     "constexpr initializer wider than 8 bytes ({width})"
                 ));
             }
-            let v = const_eval(other, globals, funcs, types)?;
-            Ok(v.to_le_bytes()[..width as usize].to_vec())
+            let v = const_reloc(other, globals, funcs, types, link)?;
+            match v.base {
+                None => Ok(v.off.to_le_bytes()[..width as usize].to_vec()),
+                // The linker writes a whole 8-byte address (a function's index into its low 4).
+                Some(base) if width == 8 => {
+                    relocs.push((at, base, v.off));
+                    Ok(vec![0u8; 8])
+                }
+                Some(_) => unsup(format!(
+                    "a {width}-byte address in an initializer (a link unit relocates 8-byte pointers)"
+                )),
+            }
         }
     }
 }
@@ -1809,7 +2048,21 @@ type Globals = (
     HashMap<String, Vec<u8>>,
     Vec<DataSymbol>,
     TlsLayout,
+    LinkData,
 );
+
+/// A link unit's data-side link information (#1746); empty outside a link unit.
+#[derive(Default)]
+struct LinkData {
+    /// Globals the unit only declares (another unit defines them): a reference is a `data.sym`.
+    extern_data: HashSet<String>,
+    /// The unit's external-linkage globals, exported as data symbols at their unit-local offsets.
+    exports: Vec<temen_ir::DataExport>,
+    /// Pointers stored in initializers, to this unit's data or to another unit's global.
+    ptrs: Vec<temen_ir::DataPtr>,
+    /// Function pointers stored in initializers, by the function's exported name.
+    funcrefs: Vec<temen_ir::DataFuncref>,
+}
 
 /// The per-vCPU thread-local (TLS) block layout (NIM.md §3d Tier-2). Thread-local globals are peeled
 /// out of the shared window and packed into one contiguous block addressed off the `vcpu.tls` base
@@ -1844,7 +2097,19 @@ fn globals_layout(
     base: u64,
     ba: Option<&blockaddr::BlockAddrs>,
     stack_page: u64,
+    link: bool,
 ) -> Result<Globals, Error> {
+    // A link unit lays out only the globals it defines; one it merely declares lives in the unit
+    // that defines it, reached through a `data.sym` the linker binds (#1746).
+    let mut link_data = LinkData::default();
+    if link {
+        link_data.extern_data = m
+            .global_vars
+            .iter()
+            .filter(|g| g.initializer.is_none() && !name_str(&g.name).starts_with("llvm."))
+            .map(|g| name_str(&g.name))
+            .collect();
+    }
     // Phase A: assign every global a window address (from its declared type size), so a relocation
     // in any initializer can resolve a forward/backward reference to another global in phase B.
     //
@@ -1879,6 +2144,9 @@ fn globals_layout(
             // in `_start`, the rest are dropped), so never lay them out / serialize them.
             if name_str(&g.name).starts_with("llvm.") {
                 continue;
+            }
+            if link && g.initializer.is_none() {
+                continue; // declared here, defined in another unit
             }
             // Size from the initializer's serialized length (matches phase B exactly); BSS/extern
             // globals have no initializer, so fall back to the declared type size.
@@ -1929,13 +2197,22 @@ fn globals_layout(
         if let Some(init) = &g.initializer {
             let empty: Vec<u32> = Vec::new();
             let mut feed = empty.iter().copied();
-            let bytes =
-                const_bytes(init.as_ref(), &m.types, &addr, name2idx, &mut feed).map_err(|_| {
-                    Error::Unsupported(format!(
-                        "thread-local `{}` has an initializer the TLS block layout can't resolve",
-                        name_str(&g.name)
-                    ))
-                })?;
+            let bytes = const_bytes(
+                init.as_ref(),
+                &m.types,
+                &addr,
+                name2idx,
+                &mut feed,
+                None,
+                0,
+                &mut Vec::new(),
+            )
+            .map_err(|_| {
+                Error::Unsupported(format!(
+                    "thread-local `{}` has an initializer the TLS block layout can't resolve",
+                    name_str(&g.name)
+                ))
+            })?;
             if bytes.iter().any(|&x| x != 0) {
                 tls_inits.push((this_off, bytes));
             }
@@ -1980,7 +2257,54 @@ fn globals_layout(
             .and_then(|b| b.per_global.get(&name_str(&g.name)))
             .unwrap_or(&empty);
         let mut feed = labels.iter().copied();
-        let bytes = const_bytes(init.as_ref(), &m.types, &addr, name2idx, &mut feed)?;
+        let mut relocs = Vec::new();
+        let extern_data = link.then_some(&link_data.extern_data);
+        let bytes = const_bytes(
+            init.as_ref(),
+            &m.types,
+            &addr,
+            name2idx,
+            &mut feed,
+            extern_data,
+            0,
+            &mut relocs,
+        )?;
+        // A link unit's initializer pointers become link-form slots the linker fills in (#1746).
+        for (off, target, addend) in relocs.iter().cloned() {
+            let at = at + off;
+            match target {
+                CBase::SelfData => link_data.ptrs.push(temen_ir::DataPtr {
+                    at,
+                    tls: false,
+                    target: temen_ir::DataPtrTarget::SelfOff(addend as u64),
+                }),
+                CBase::DataSym(name) => link_data.ptrs.push(temen_ir::DataPtr {
+                    at,
+                    tls: false,
+                    target: temen_ir::DataPtrTarget::Sym { name, addend },
+                }),
+                // A `data.funcref` slot names an exported function, so a pointer to a `static` one
+                // has no link-time form yet.
+                CBase::Func(name) => {
+                    let local = m.functions.iter().any(|f| f.name == name && f.local);
+                    if local || addend != 0 {
+                        return unsup(format!(
+                            "a pointer to static function `@{name}` in the initializer of `@{}` \
+                             (a link unit can relocate only a pointer to an exported function)",
+                            name_str(&g.name)
+                        ));
+                    }
+                    link_data.funcrefs.push(temen_ir::DataFuncref { at, name });
+                }
+            }
+        }
+        if link && !g.local {
+            link_data.exports.push(temen_ir::DataExport {
+                name: name_str(&g.name),
+                offset: at,
+                tls: false,
+            });
+        }
         // Record the C-string length (up to the first NUL) so `puts`/`fputs` on this literal can
         // write the right slice without a runtime strlen.
         let slen = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len()) as u64;
@@ -1992,11 +2316,29 @@ fn globals_layout(
         }
         // Emit a segment only for non-zero initialized data (the window is zero-init). A read-only
         // segment is protected (D40), so a guest write to it faults.
-        if g.is_constant || bytes.iter().any(|&x| x != 0) {
+        if g.is_constant || bytes.iter().any(|&x| x != 0) || !relocs.is_empty() {
             segs.push(temen_ir::Data {
                 offset: at,
                 readonly: g.is_constant,
                 bytes,
+            });
+        }
+    }
+    // The linker sizes a unit by its highest data segment, so a link unit whose top global is
+    // zero-initialized (and so has no segment) ends its data with a one-byte zero sentinel there
+    // (as chibicc's `--emit-object` does); otherwise the next unit's data would overlap it.
+    if link {
+        let seg_top = segs
+            .iter()
+            .map(|d| d.offset + d.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        let top = syms.iter().map(|d| d.addr + d.size).max().unwrap_or(0);
+        if top > seg_top {
+            segs.push(temen_ir::Data {
+                offset: top - 1,
+                readonly: false,
+                bytes: vec![0],
             });
         }
     }
@@ -2017,7 +2359,7 @@ fn globals_layout(
             });
         }
     }
-    Ok((addr, segs, off, cstrs, gbytes, syms, tls))
+    Ok((addr, segs, off, cstrs, gbytes, syms, tls, link_data))
 }
 
 /// The pointer-cell window addresses the synthesized glibc ctype locators return (`None` = the program
@@ -2793,6 +3135,7 @@ fn translate_func(
     dispatch_map: &HashMap<DispatchKey, u32>,
     taken: &RefCell<HashSet<u32>>,
     sig_types: &RefCell<Vec<temen_ir::TypeEntry>>,
+    link: Option<&LinkCtx>,
 ) -> Result<(Func, u64), Error> {
     // A `(...)`-defined function (`f.is_var_arg`) lowers like any other: its IR signature is
     // `(sp, fixed-params…)` — the variadic arguments are not IR parameters but are read by `va_start`
@@ -2904,6 +3247,7 @@ fn translate_func(
             dispatch_map,
             taken,
             sig_types,
+            link,
         )?);
     }
     blocks.extend(aux_blocks);
@@ -13166,7 +13510,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                 }
             });
             let (buf, n) = match literal {
-                Some((addr, len)) => (ctx.const_i64(addr as i64), ctx.const_i64(len as i64)),
+                Some((addr, len)) => (ctx.data_addr(addr), ctx.const_i64(len as i64)),
                 None => {
                     let p = ctx.operand(&c.arguments[0].0)?;
                     let strlen = ctx.helpers.strlen.ok_or_else(|| {
@@ -13589,7 +13933,7 @@ fn lower_format(
     for seg in segs {
         match seg {
             FmtSeg::Lit { off, len } => {
-                let a = ctx.const_i64((fmt_addr + off as u64) as i64);
+                let a = ctx.data_addr(fmt_addr + off as u64);
                 let n = ctx.const_i64(len as i64);
                 ctx.emit_write(a, n)?;
             }
@@ -15582,7 +15926,7 @@ fn lower_libm_call(
 /// Lower `llvm.load.relative.iN(ptr P, iN offset)` — clang's **relative lookup table** (used for a
 /// `switch` returning string/function constants): the table at `P` holds 32-bit signed offsets
 /// `&target − &P`, so the absolute target is `P + sext_i32(*(i32*)(P + offset))`. The table itself
-/// (`trunc(sub(ptrtoint …))` initializers) is serialized by [`const_eval`]. Returns the result index.
+/// (`trunc(sub(ptrtoint …))` initializers) is serialized by [`const_reloc`]. Returns the result index.
 fn lower_load_relative(
     ctx: &mut BlockCtx,
     c: &crate::ll::ast::Call,
@@ -16961,6 +17305,8 @@ struct BlockCtx<'a> {
     /// #922: the shared module type section — call sites intern their `FuncType` here (via
     /// [`BlockCtx::intern_sig`]) and store the returned index on the emitted call instruction.
     sig_types: &'a RefCell<Vec<temen_ir::TypeEntry>>,
+    /// Link-unit state (#1746); `None` for a whole-module translation.
+    link: Option<&'a LinkCtx>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
@@ -17395,6 +17741,79 @@ impl<'a> BlockCtx<'a> {
         self.push(Inst::ConstI64(v))
     }
 
+    /// The window address of this unit's own data at `addr`: a constant in a whole module; in a link
+    /// unit, a `data.self` the linker rebases onto wherever it places the unit's data (#1746).
+    fn data_addr(&mut self, addr: u64) -> ValIdx {
+        match self.link {
+            None => self.const_i64(addr as i64),
+            Some(_) => self.push(Inst::DataSelf {
+                offset: addr,
+                tls: false,
+            }),
+        }
+    }
+
+    /// Fold a constant expression operand ([`const_reloc`]), as a relocation in a link unit.
+    fn const_reloc(&self, c: &Constant) -> Result<CVal, Error> {
+        let link = self.link.map(|l| &l.extern_data);
+        const_reloc(c, self.globals, self.name2idx, self.types, link)
+    }
+
+    /// Materialize a folded constant as an `i64`, or as an `i32` when its type is `to <= 32` bits wide
+    /// (zero-extended, its in-container form). In a link unit an address is its link form, narrowed
+    /// at run time when the constant is narrower than a pointer (#1746).
+    fn const_at(&mut self, v: CVal, to: Option<u32>) -> Result<ValIdx, Error> {
+        let narrow = to.filter(|&t| t <= 32);
+        let mask = |t: u32| {
+            if t == 32 {
+                u32::MAX as u64
+            } else {
+                (1u64 << t) - 1
+            }
+        };
+        let wide = match v.base {
+            None => {
+                return Ok(match narrow {
+                    Some(t) => self.push(Inst::ConstI32((v.off as u64 & mask(t)) as i32)),
+                    None => self.const_i64(v.off),
+                })
+            }
+            Some(CBase::SelfData) => self.data_addr(v.off as u64),
+            Some(CBase::DataSym(name)) => self.push(Inst::DataSym {
+                name: name.into_bytes(),
+                addend: v.off,
+                tls: false,
+            }),
+            Some(CBase::Func(name)) => {
+                let func = match self.name2idx.get(&name) {
+                    Some(&f) if v.off == 0 => f,
+                    _ => return unsup(format!("arithmetic on the address of `@{name}`")),
+                };
+                self.taken.borrow_mut().insert(func);
+                let r = self.push(Inst::RefFunc { func });
+                self.push(Inst::Convert {
+                    op: ConvOp::ExtendI32U,
+                    a: r,
+                })
+            }
+        };
+        let Some(t) = narrow else { return Ok(wide) };
+        let low = self.push(Inst::Convert {
+            op: ConvOp::WrapI64,
+            a: wide,
+        });
+        if t == 32 {
+            return Ok(low);
+        }
+        let m = self.push(Inst::ConstI32(mask(t) as i32));
+        Ok(self.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::And,
+            a: low,
+            b: m,
+        }))
+    }
+
     /// Build a `self.*` reflection op as its canonical `call.cap CAP_SELF op N` form. The typed
     /// `Inst::CapSelf*` fronts were retired at the wire rev — the wire/IR carry only the generic
     /// `CapCall`, and the runtime CAP_SELF handler dispatches on `op`. `handle` is a freshly
@@ -17753,7 +18172,7 @@ impl<'a> BlockCtx<'a> {
                         .stubs
                         .and_then(|cell| cell.borrow_mut().get_or_insert_extern(&n));
                     if let Some(&a) = self.globals.get(&n) {
-                        Ok(self.push(Inst::ConstI64(a as i64)))
+                        Ok(self.data_addr(a))
                     } else if let Some(func) = self.name2idx.get(&n).copied().or(stub_idx) {
                         // #802 old-C indirect drift: an operand-position funcref is address-taken —
                         // record it so the static dispatchers' arm sets are complete.
@@ -17763,6 +18182,21 @@ impl<'a> BlockCtx<'a> {
                             op: ConvOp::ExtendI32U,
                             a: r,
                         }))
+                    } else if let Some(link) = self.link {
+                        // A link unit reaches a global another unit defines through the linker
+                        // (#1746). A function it does not define it can call, not take the address of.
+                        if link.extern_data.contains(&n) {
+                            Ok(self.push(Inst::DataSym {
+                                name: n.into_bytes(),
+                                addend: 0,
+                                tls: false,
+                            }))
+                        } else {
+                            unsup(format!(
+                                "the address of undefined function `@{n}`: a link unit imports calls \
+                                 to it, not its address"
+                            ))
+                        }
                     } else {
                         unsup(format!("reference to `@{n}` (undefined/external global)"))
                     }
@@ -17773,13 +18207,13 @@ impl<'a> BlockCtx<'a> {
                 // (`inttoptr`/`ptrtoint` over constants — e.g. Rust's `NonNull::dangling()` for an
                 // empty `Vec`, an `inttoptr(align)`), folds to its constant `i64` window value.
                 Constant::GetElementPtr(_) | Constant::IntToPtr(_) => {
-                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
-                    Ok(self.push(Inst::ConstI64(v)))
+                    let v = self.const_reloc(c.as_ref())?;
+                    self.const_at(v, None)
                 }
                 // A constexpr integer/pointer arithmetic or width-cast fold used as an operand:
                 // `ptrtoint(@g) + k` (an interior global pointer the threaded codegen materializes as
                 // an `add` rather than a `getelementptr`), `@a − @b` pointer differences, and the
-                // integer casts `trunc`/`zext`/`sext` over those. `const_eval` resolves the global
+                // integer casts `trunc`/`zext`/`sext` over those. `const_reloc` resolves the global
                 // relocations, literals, and cast widths; emit at the result width like `ptrtoint` so a
                 // sub-i64 value stays `i32` (feeding i64 into i32 arithmetic would be a verify
                 // `TypeMismatch`).
@@ -17795,18 +18229,9 @@ impl<'a> BlockCtx<'a> {
                 | Constant::Trunc(_)
                 | Constant::ZExt(_)
                 | Constant::SExt(_) => {
-                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
-                    match int_bits(c.get_type(self.types).as_ref()) {
-                        Some(to) if to <= 32 => {
-                            let mask = if to == 32 {
-                                u32::MAX as u64
-                            } else {
-                                (1u64 << to) - 1
-                            };
-                            Ok(self.push(Inst::ConstI32((v as u64 & mask) as i32)))
-                        }
-                        _ => Ok(self.push(Inst::ConstI64(v))),
-                    }
+                    let v = self.const_reloc(c.as_ref())?;
+                    let to = int_bits(c.get_type(self.types).as_ref());
+                    self.const_at(v, to)
                 }
                 // A constexpr `ptrtoint` folds the same way, but honors its **target width**: a
                 // `ptrtoint (ptr @g to i32)` (pointer-difference idioms over globals, e.g. ltests'
@@ -17815,19 +18240,10 @@ impl<'a> BlockCtx<'a> {
                 // instruction-level `PtrToInt` (`emit_trunc(64, to)`); ≤32-bit targets mask to the
                 // canonical zero-extended narrow form.
                 Constant::PtrToInt(u) => {
-                    let v = const_eval(c.as_ref(), self.globals, self.name2idx, self.types)?;
+                    let v = self.const_reloc(c.as_ref())?;
                     let to = int_bits(u.to_type.as_ref())
                         .ok_or_else(|| Error::Unsupported("const ptrtoint to non-int".into()))?;
-                    if to <= 32 {
-                        let mask = if to == 32 {
-                            u32::MAX as u64
-                        } else {
-                            (1u64 << to) - 1
-                        };
-                        Ok(self.push(Inst::ConstI32((v as u64 & mask) as i32)))
-                    } else {
-                        Ok(self.push(Inst::ConstI64(v)))
-                    }
+                    self.const_at(v, Some(to))
                 }
                 // A constexpr integer compare — lower to a runtime `IntCmp` over its two operand
                 // values, exactly as the instruction-level `icmp` does (a global-address operand is a
@@ -17906,6 +18322,7 @@ fn translate_block(
     dispatch_map: &HashMap<DispatchKey, u32>,
     taken: &RefCell<HashSet<u32>>,
     sig_types: &RefCell<Vec<temen_ir::TypeEntry>>,
+    link: Option<&LinkCtx>,
 ) -> Result<Block, Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
@@ -17959,6 +18376,7 @@ fn translate_block(
         dispatch_map,
         taken,
         sig_types,
+        link,
         insts: Vec::new(),
         idx_of: HashMap::new(),
         agg: HashMap::new(),
@@ -19530,23 +19948,36 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 // guest-defined libm function a float intrinsic redirects to when its shape matches.
                 // Not being in `name2idx` means every recognizer/synthesizer/capability declined it and
                 // nothing defines it: it is a genuinely undefined external. Strict default: fail closed.
-                // With `stub_unresolved_externs`: mint (or reuse) a trap stub and call it, deferring the
+                // A link unit imports it instead (#1746): a `call.sym` with this site's signature,
+                // which the linker binds to the unit that exports the name. With
+                // `stub_unresolved_externs`: mint (or reuse) a trap stub and call it, deferring the
                 // fail-closed to run time (§2a).
-                let func = match ctx.name2idx.get(&name) {
-                    Some(&idx) => idx,
-                    None => match ctx.stubs {
-                        Some(cell) => {
-                            let sig = extern_stub_sig(c, types)?;
-                            cell.borrow_mut().get_or_insert(&name, sig)
+                match (ctx.name2idx.get(&name), ctx.link, ctx.stubs) {
+                    (Some(&func), _, _) => Inst::Call { func, args },
+                    (None, Some(link), _) => {
+                        let sig = ctx.intern_sig(extern_stub_sig(c, types)?);
+                        let import = link.imports.borrow_mut().import(&name, sig);
+                        // The handle operand is unused once the linker resolves the import to a
+                        // direct call (chibicc's `--emit-object` emits the same placeholder).
+                        let handle = ctx.push(Inst::ConstI32(0));
+                        Inst::CallSym {
+                            import,
+                            sig,
+                            handle,
+                            args,
                         }
-                        None => {
-                            return Err(Error::Unsupported(format!(
-                                "call to external/undefined function `{name}`"
-                            )))
-                        }
-                    },
-                };
-                Inst::Call { func, args }
+                    }
+                    (None, None, Some(cell)) => {
+                        let sig = extern_stub_sig(c, types)?;
+                        let func = cell.borrow_mut().get_or_insert(&name, sig);
+                        Inst::Call { func, args }
+                    }
+                    (None, None, None) => {
+                        return Err(Error::Unsupported(format!(
+                            "call to external/undefined function `{name}`"
+                        )))
+                    }
+                }
             }
             None => {
                 let op = c
@@ -19580,8 +20011,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // The callee still gets `sp + frame_size` (frame strictly above ours), so this is correct
         // even if a pointer into our frame escaped — and is data-stack-constant for the common
         // leaf-frame (`frame_size == 0`) case. (Reclaiming a non-empty caller frame would need
-        // `musttail` detection, which the LLVM-C binding doesn't expose.)
-        if ctx.tail_return {
+        // `musttail` detection, which the LLVM-C binding doesn't expose.) A call to a link unit's
+        // import has no `return_call` form, so it stays a call and the block's `ret` follows it.
+        if ctx.tail_return && !matches!(inst, Inst::CallSym { .. }) {
             let term = match inst {
                 Inst::Call { func, args } => Terminator::ReturnCall { func, args },
                 Inst::CallIndirect { ty, idx, args } => {

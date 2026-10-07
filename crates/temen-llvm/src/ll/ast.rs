@@ -742,7 +742,7 @@ pub struct Parameter {
 }
 
 /// A defined function. Mirrors the `llvm_ir::Function` fields the translator reads (the rest —
-/// linkage/visibility/attributes — are not consumed by the on-ramp, so omitted).
+/// visibility/attributes — are not consumed by the on-ramp, so omitted).
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
@@ -750,6 +750,9 @@ pub struct Function {
     pub is_var_arg: bool,
     pub return_type: TypeRef,
     pub basic_blocks: Vec<BasicBlock>,
+    /// `internal`/`private` linkage (a C `static`): the name is local to this module, so a link unit
+    /// does not export it (#1746).
+    pub local: bool,
 }
 
 /// A declared-but-not-defined function (a prototype). The translator only needs its name + signature
@@ -774,6 +777,8 @@ pub struct GlobalVariable {
     /// peels this global out of the shared window and into the per-vCPU `vcpu.tls`-relative TLS block
     /// (NIM.md §3d Tier-2); every access lowers to `vcpu.tls.get() + offset`.
     pub thread_local: bool,
+    /// `internal`/`private` linkage (a C `static`, a string literal): a link unit does not export it.
+    pub local: bool,
 }
 
 /// A global alias (`@a = alias … @b`). Mirrors the consumed subset of `llvm_ir::GlobalAlias`.
