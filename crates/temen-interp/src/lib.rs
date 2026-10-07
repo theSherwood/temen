@@ -14782,34 +14782,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // Empty for every other op.
                                 let mut named_child: Vec<i32> = Vec::new();
                                 for (name, gh) in &named {
-                                    let cg = {
-                                        let mut hg = host.lock_unpoisoned();
-                                        match serve_live_export(*gh) {
-                                            // #744 (EXEC.md row 4, the mediation-consistent form) —
-                                            // a **live self-serve** grant: install into the child a
-                                            // live-callee offer whose callee is THIS (the parent's)
-                                            // running powerbox, over our own impl-export `k`. The
-                                            // child's calls enqueue on our inbound queue and park
-                                            // until our `svc.wait` serve loop replies — the parent
-                                            // serves its child's `"exec"` with its own code. Only
-                                            // the CHILD's table holds the entry (granter → grantee,
-                                            // down the grant graph); we never hold a self-referential
-                                            // Arc, so there is no cycle and nothing for us to
-                                            // mis-call. `callee_slot: None` — non-durable (freeze
-                                            // refuses), the deferred durability story.
-                                            Some(k) => hg.offer_shape(k).map(|(names, sigs)| {
-                                                ch.install_live_impl(
-                                                    Arc::clone(host),
-                                                    k,
-                                                    names.into(),
-                                                    sigs.into(),
-                                                    None,
-                                                )
-                                            }),
-                                            None => hg.regrant_into_child(*gh, &mut ch),
-                                        }
-                                    };
-                                    if let Some(cg) = cg {
+                                    if let Some(cg) = regrant_eval_grant(host, *gh, &mut ch) {
                                         ch.register_cap_name(name, cg);
                                         named_child.push(cg);
                                     }
@@ -15320,7 +15293,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     module: Arc::clone(&g.module),
                                 }
                             };
-                            // Named grants (the op-11 record format), pre-validated fail-closed.
+                            // Named grants (the op-11 record format), pre-validated fail-closed. A
+                            // v1 record may carry #744's live self-serve grant; op 15's positional
+                            // form (retiring, #2067) refuses it, as every other engine's admission
+                            // does.
                             let glist = match grants_n {
                                 0 => Vec::new(),
                                 _ => {
@@ -15332,7 +15308,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             {
                                 let hg = host.lock_unpoisoned();
-                                if !glist.iter().all(|(_, h)| hg.can_regrant(*h)) {
+                                if rec.is_some() {
+                                    authorize_eval_grants(&hg, &glist)?;
+                                } else if !glist.iter().all(|(_, h)| hg.can_regrant(*h)) {
                                     return Err(Trap::CapFault);
                                 }
                             }
@@ -15428,11 +15406,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // #1944 — the budget that paid for the window is the child's own.
                                 host.lock_unpoisoned().give_child_budget(budget, &mut ch);
                                 for (name, gh) in &glist {
-                                    let cg = {
-                                        let mut hg = host.lock_unpoisoned();
-                                        hg.regrant_into_child(*gh, &mut ch)
-                                    };
-                                    if let Some(cg) = cg {
+                                    if let Some(cg) = regrant_eval_grant(host, *gh, &mut ch) {
                                         ch.register_cap_name(name, cg);
                                     }
                                 }
@@ -22151,10 +22125,13 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// records) do not zero it — giving it meaning would misread their garbage. A negative handle is
 /// already the ABI's non-grant space (`-errno` results; `can_regrant` refuses every negative), so the
 /// tag lives where nothing valid can collide; the `10` top bits keep it clear of the small-magnitude
-/// `-errno` range (top bits `11`). Honored by the eval-loop child-spawn arms (the op-17 record and
-/// op-13); every other record reader (a detached spawn, `exec_module`, the wasm marshal, the native
-/// builders) sees a negative handle and refuses it fail-closed through the unchanged `can_regrant` —
-/// no new code there. Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
+/// `-errno` range (top bits `11`). Honored by the tree-walker's spawn arms for op 13 and the op-17
+/// record (v0 and v1); op 15's positional form, `exec_module` and every other engine's admission see
+/// a negative handle and refuse it fail-closed through `can_regrant`. Those engines meet no
+/// legitimate use: the tag names one of the spawner's own impl-exports, and a module with
+/// impl-exports that spawns through a record runs on the tree-walker (the bytecode engine declines
+/// it, the Cranelift JIT folds it); only the tree-walker serves a child's call back to its parent.
+/// Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
 /// The eval-loop spawn arms' authority check over a parsed grant list (ops 13 and 17): each handle is
@@ -22172,6 +22149,23 @@ fn authorize_eval_grants(host: &Host, list: &[(String, i32)]) -> Result<(), Trap
         }
     }
     Ok(())
+}
+
+/// Re-grant one entry of a grant list [`authorize_eval_grants`] passed into `child`: a table handle
+/// as any spawn re-grants it, or — #744 — a live self-serve grant, which installs into the child a
+/// live-callee offer whose callee is the granter's own running powerbox `host`, over its impl-export.
+/// The child's calls enqueue on the granter's inbound queue and park until its `svc.wait` serve loop
+/// replies. Only the child's table holds the entry (granter → grantee, down the grant graph), so the
+/// granter never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_slot:
+/// None` — non-durable (freeze refuses), the deferred durability story (#1681).
+fn regrant_eval_grant(host: &Arc<Mutex<Host>>, handle: i32, child: &mut Host) -> Option<i32> {
+    let mut hg = host.lock_unpoisoned();
+    match serve_live_export(handle) {
+        Some(k) => hg.offer_shape(k).map(|(names, sigs)| {
+            child.install_live_impl(Arc::clone(host), k, names.into(), sigs.into(), None)
+        }),
+        None => hg.regrant_into_child(handle, child),
+    }
 }
 
 /// #744 — decode a named-grant `handle`: `Some(export)` when it carries [`GRANT_SERVE_LIVE_TAG`] (top
