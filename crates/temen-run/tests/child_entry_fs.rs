@@ -24,93 +24,63 @@
 //! buffers, masked to their own window; the shared authority is the granted cap (§3), not any window address.
 //! The memfs cap is relative-only (it refuses absolute paths, `EACCES`), so the guests name `in.bin` /
 //! `out.bin` — the same keys the parent seeds and reads back.
+//!
+//! The parent is [`temen_run::conductor`], which spawns the child detached through a v1 record. Each
+//! test runs on the tree-walk oracle and every bytecode driver ([`drivers::ALL`]), the resumable
+//! `Vcpu` among them: a real nim phase JITs, and that is the engine that tiers up.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
-use temen_interp::{bytecode, run_with_host, ForkedProc, Host, HostProcFork, Region, Trap, Value};
+use temen_interp::{ForkedProc, Host, HostProcFork, Value};
 use temen_ir::Module;
 use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
 
-// The resumable-engine test's carve parent (its hand-written drive loop serves the carve
-// `VcpuEvent::Instantiate`; it moves to the detached event with the wasm-JIT lowering, #1865):
-// `main(inst, module, fs)` lays a one-entry grant record `{name_off:18432, name_len:2}
-// → fs` at window offset 17408, op-13 (`call.cap INSTANTIATOR(=6) 13`) spawns the child module into a
-// 64 KiB carve at `[65536, 131072)` (its declared `memory 16`, off = 1<<16), then op-1 joins it. The
-// grant name `"fs"` is a data segment at 18432; the record's second word carries the `fs` handle. The
-// grant record and cap-name buffer live in the parent window above the #1094 NULL guard (16384) — the
-// parent is guarded, so they sit at 17408/18432 (was 1024/2048).
-const PARENT: &str = r#"
-memory 17
-data 18432 "fs"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vrec0 = i64.const 8589953024
-  vrecoff = i64.const 17408
-  i64.store vrecoff vrec0
-  vsh = i64.extend_i32_u v2
-  vrec1off = i64.const 17416
-  i64.store vrec1off vsh
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vsl = i64.const 16
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }
-}
-"#;
+#[path = "../../temen-interp/tests/support/drivers.rs"]
+mod drivers;
 
-// Spawn `child` through the [`temen_run::conductor`], re-granting a forkable memfs (seeded with `seed`)
-// as `"fs"`. Returns the child's joined status and the shared `MemFsHandle` (seed it before / read it
-// after).
+/// Spawn `child` through the [`temen_run::conductor`] on `driver`, re-granting a forkable memfs
+/// (seeded with `seed`) as `"fs"`. Returns the child's joined status and the shared `MemFsHandle`
+/// (seed it before / read it after).
 fn spawn_child_over_memfs(
+    driver: drivers::Driver,
     child: &Module,
-    seed: Vec<(String, Vec<u8>)>,
+    seed: &[(String, Vec<u8>)],
 ) -> (Vec<Value>, MemFsHandle) {
     temen_verify::verify_module(child).expect("child verifies");
     let parent = temen_run::conductor(&["fs"], &[]);
-
-    // A cross-domain shared memfs: every `HostProc` the factory yields (the parent's grant and the
-    // child's re-mint) closes over one store, which this `MemFsHandle` also observes — so a file the
-    // child writes is readable here after the run, and a file seeded here is readable by the child.
-    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(seed, vec![]);
-    let factory = Arc::new(factory);
-
-    let mut host = Host::new();
-    // Grant the parent a *forkable* memfs host proc: the initial handler plus a fork factory minting a
-    // fresh handler over the same store. `regrant_into_child` needs `fork.is_some()` to carry it into a
-    // child (a factory-less host proc fails `can_regrant`, fail-closed).
-    let (init, init_state) = (*factory)();
-    let fork: HostProcFork = {
-        let factory = Arc::clone(&factory);
-        Arc::new(move |_pid| {
-            let (h, s) = (*factory)();
-            ForkedProc::shared(h, s)
-        })
+    let handle = RefCell::new(None);
+    let powerbox = || {
+        // A cross-domain shared memfs: every `HostProc` the factory yields (the parent's grant and the
+        // child's re-mint) closes over one store, which the `MemFsHandle` also observes — so a file
+        // the child writes is readable after the run, and a file seeded here is readable by the child.
+        let (factory, h) = temen_run::fs::mem_fs_shared_factory(seed.to_vec(), vec![]);
+        *handle.borrow_mut() = Some(h);
+        let factory = Arc::new(factory);
+        let mut host = Host::new();
+        // Grant the parent a *forkable* memfs host proc: the initial handler plus a fork factory
+        // minting a fresh handler over the same store. `regrant_into_child` needs `fork.is_some()` to
+        // carry it into a child (a factory-less host proc fails `can_regrant`, fail-closed).
+        let (init, init_state) = (*factory)();
+        let fork: HostProcFork = {
+            let factory = Arc::clone(&factory);
+            Arc::new(move |_pid| {
+                let (h, s) = (*factory)();
+                ForkedProc::shared(h, s)
+            })
+        };
+        let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
+        let (inst, modh, budget) = temen_run::grant_conductor(&mut host, child);
+        let args = [inst, modh, budget, fs_h].map(Value::I32).to_vec();
+        (host, args)
     };
-    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
-    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, child);
-
-    let mut fuel = 200_000_000u64;
-    let r = run_with_host(
-        &parent,
-        0,
-        &[
-            Value::I32(inst),
-            Value::I32(modh),
-            Value::I32(budget),
-            Value::I32(fs_h),
-        ],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("parent run");
-    (r, handle)
+    let ran = drivers::run_on(driver, &parent, &powerbox)
+        .unwrap_or_else(|| panic!("{driver:?} declined the conductor"));
+    let r = ran
+        .result
+        .unwrap_or_else(|t| panic!("{driver:?}: the parent trapped: {t:?}"));
+    (r, handle.into_inner().expect("the run built its powerbox"))
 }
 
 fn read_back(handle: &MemFsHandle, key: &str) -> Vec<u8> {
@@ -154,19 +124,21 @@ block 0 (vstarter: i64) {
 #[test]
 fn child_entry_writes_a_file_through_a_regranted_memfs() {
     let child = parse_module(WRITER).expect("parse writer");
-    let (r, handle) = spawn_child_over_memfs(&child, vec![]);
+    for driver in drivers::ALL {
+        let (r, handle) = spawn_child_over_memfs(driver, &child, &[]);
 
-    // The child's `write` returned 9, joined back through op-1.
-    assert!(
-        matches!(r.as_slice(), [Value::I64(9)] | [Value::I32(9)]),
-        "child wrote 9 bytes, status joined back: {r:?}"
-    );
-    assert_eq!(
-        read_back(&handle, "out.bin"),
-        b"hello.nif",
-        "the child-entry guest wrote its payload through the re-granted memfs; the parent read it \
-         back via the shared handle — the `.nif` hand-back a spawned nifler uses"
-    );
+        // The child's `write` returned 9, joined back through op-1.
+        assert!(
+            matches!(r.as_slice(), [Value::I64(9)] | [Value::I32(9)]),
+            "{driver:?}: child wrote 9 bytes, status joined back: {r:?}"
+        );
+        assert_eq!(
+            read_back(&handle, "out.bin"),
+            b"hello.nif",
+            "{driver:?}: the child-entry guest wrote its payload through the re-granted memfs; the \
+             parent read it back via the shared handle — the `.nif` hand-back a spawned nifler uses"
+        );
+    }
 }
 
 // A child-entry guest that does the full read→write of a phase: resolve `"fs"`, `open("in.bin", O_READ
@@ -208,134 +180,26 @@ block 0 (vstarter: i64) {
 fn child_entry_copies_a_parent_seeded_file_through_a_regranted_memfs() {
     let child = parse_module(COPIER).expect("parse copier");
     let input = b"hello nifler".to_vec(); // 12 bytes the parent seeds into the shared store
-    let (r, handle) = spawn_child_over_memfs(&child, vec![("in.bin".to_string(), input.clone())]);
+    let seed = [("in.bin".to_string(), input.clone())];
+    for driver in drivers::ALL {
+        let (r, handle) = spawn_child_over_memfs(driver, &child, &seed);
 
-    // The child read 12 bytes and wrote all 12 back; the count joined through op-1.
-    let n = input.len() as i64;
-    let got = match r.as_slice() {
-        [Value::I64(m)] => *m,
-        [Value::I32(m)] => *m as i64,
-        other => panic!("unexpected join result: {other:?}"),
-    };
-    assert_eq!(got, n, "child copied {n} bytes, status joined back");
-    assert_eq!(
-        read_back(&handle, "out.bin"),
-        input,
-        "the child read the parent-seeded `in.bin` and wrote it to `out.bin` through the re-granted \
-         memfs — the full read→write a spawned nifler does over its `<in>`/`<out>`"
-    );
-}
-
-// --- The same hand-off on the *resumable* (tier-up / JIT-capable) engine --------------------------
-//
-// The tests above run on `run_with_host` — the tree-walker oracle. But a real nim phase JITs, and only
-// the **resumable** engine tiers up: its admission re-grants caps into the child's powerbox and the
-// host starts the admitted child (`take_child` + `start`). `child_entry_io_resumable.rs` proved that
-// path binds a re-granted `stdout` **Stream**; this proves it also carries a **forkable memfs host
-// proc** — the fs re-grant nifler's emit rides — so the child resolves `"fs"` and writes a file the
-// parent reads back, on the engine that matters for performance. Surfaces any carve/regrant
-// divergence from the oracle now, on a text-IR child, rather than during the real-nifler integration.
-
-/// A raw window base carrying derived provenance (offset into the one live allocation).
-#[derive(Clone, Copy)]
-struct WinPtr(*mut u8);
-
-/// The resumable-engine drive loop (mirrors `child_entry_io_resumable`): on `Instantiate`, start the
-/// admitted child over its carve — its powerbox already carries the op-13 re-grant and its bound
-/// manifest — and `Join` delivers the child's result. The re-granted `"fs"` lives in that powerbox, so
-/// the child's `self.resolve "fs"` finds it.
-fn drive(
-    prog: &bytecode::VcpuProgram,
-    base: WinPtr,
-    mut vcpu: bytecode::Vcpu<'_>,
-) -> Result<Vec<Value>, Trap> {
-    let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
-    loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(v) => return Ok(v),
-            bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
-            } => {
-                // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
-                // child); the child's region aliases that sub-window — the §14 shared data plane.
-                let child_base = WinPtr(unsafe { base.0.add(carve as usize) });
-                // SAFETY: `2^size_log2` valid bytes at the validated carve.
-                let back = Arc::new(unsafe { Region::shared(child_base.0, 1u64 << size_log2) });
-                let child = vcpu
-                    .take_child()
-                    .expect("an Instantiate carries its admitted child")
-                    .start(prog, back, None)
-                    .expect("confined child builds");
-                let r = drive(prog, child_base, child);
-                let token = children.len() as u64;
-                children.push(r);
-                vcpu.deliver_child(token);
-            }
-            bytecode::VcpuEvent::Join { child } => {
-                vcpu.deliver_join(children[child as usize].clone());
-            }
-            _ => panic!("unexpected event"),
-        }
+        // The child read 12 bytes and wrote all 12 back; the count joined through op-1.
+        let n = input.len() as i64;
+        let got = match r.as_slice() {
+            [Value::I64(m)] => *m,
+            [Value::I32(m)] => *m as i64,
+            other => panic!("{driver:?}: unexpected join result: {other:?}"),
+        };
+        assert_eq!(
+            got, n,
+            "{driver:?}: child copied {n} bytes, status joined back"
+        );
+        assert_eq!(
+            read_back(&handle, "out.bin"),
+            input,
+            "{driver:?}: the child read the parent-seeded `in.bin` and wrote it to `out.bin` through \
+             the re-granted memfs — the full read→write a spawned nifler does over its `<in>`/`<out>`"
+        );
     }
-}
-
-#[test]
-fn child_entry_writes_a_file_through_a_regranted_memfs_on_the_resumable_engine() {
-    let child = parse_module(WRITER).expect("parse writer");
-    temen_verify::verify_module(&child).expect("child verifies");
-    assert_eq!(child.memory.expect("child window").size_log2, 16);
-    let parent = parse_module(PARENT).expect("parse parent");
-    temen_verify::verify_module(&parent).expect("parent verifies");
-    let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
-
-    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
-    let factory = Arc::new(factory);
-    let mut host = Host::new();
-    let (init, init_state) = (*factory)();
-    let fork: HostProcFork = {
-        let factory = Arc::clone(&factory);
-        Arc::new(move |_pid| {
-            let (h, s) = (*factory)();
-            ForkedProc::shared(h, s)
-        })
-    };
-    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
-    let win = 1u64 << 17;
-    let inst = host.grant_instantiator(0, win);
-    let modh = host.grant_module(&child);
-
-    let size = win as usize;
-    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-    // SAFETY: non-zero layout; `size` valid 8-aligned bytes owned here until freed below.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null());
-    // SAFETY: `base` addresses `size` valid bytes, exclusively this run's, freed only after the vCPUs.
-    let back = Arc::new(unsafe { Region::shared(base, win) });
-
-    let root = bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(fs_h)],
-        Arc::clone(&back),
-        &[],
-        host,
-    )
-    .expect("root vcpu");
-    let r = drive(&prog, WinPtr(base), root);
-
-    drop(back);
-    // SAFETY: same layout; every vCPU and region view is dropped, so no borrow outlives this.
-    unsafe { std::alloc::dealloc(base, layout) };
-
-    assert!(
-        matches!(&r, Ok(v) if matches!(v.as_slice(), [Value::I64(9)] | [Value::I32(9)])),
-        "child wrote 9 bytes, status joined back on the resumable engine: {r:?}"
-    );
-    assert_eq!(
-        read_back(&handle, "out.bin"),
-        b"hello.nif",
-        "the child-entry guest wrote its payload through the re-granted memfs on the resumable \
-         (tier-up) engine — the fs hand-back a JIT'd nifler rides"
-    );
 }

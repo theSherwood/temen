@@ -149,11 +149,12 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     let wasm = unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) };
     let func = temen_coop_func();
     let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
-    // #816 env-routed tier-up: the PENDING task's window (base + span) — the browser JS driver's
-    // per-event `win`. A §14 confined child's event mirrors just its carve.
-    let win_len = temen_coop_tierup_win_len();
-    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
+    // #816 env-routed tier-up: the PENDING task's window — the browser JS driver's per-event `win`.
+    // A §14 child's event mirrors just its own window. Only `[0, mapped)` is mirrored: no emitted
+    // access reaches past it, and a detached child's span is its whole native reservation.
     let mapped = temen_coop_mapped();
+    let win_len = temen_coop_tierup_win_len().min(mapped as usize);
+    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
 
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
@@ -208,7 +209,7 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     // #1151 paged leaf: the leaf's emitted accesses consult the page-state table (base in the
     // exported `"pagestate"` global). Place it just after the (serving-window) mirror and point the
     // global at it — the #750 driver contract, here for a paged tier-up over the serving vCPU's own
-    // window (root OR a §14 child's carve). No-op for a non-paged run (the global is absent).
+    // window (root OR a §14 child's). No-op for a non-paged run (the global is absent).
     if temen_coop_paged() != 0 {
         let plen = temen_coop_pagestate_len();
         // SAFETY: the pending-event page-state table is stable until the deliver call.
@@ -365,8 +366,9 @@ fn run_emitted_coop(
     mapped: i64,
     n_results: usize,
 ) -> Result<Vec<i64>, i32> {
-    // #816: the pending task's window, per event (see `service_coop_on_wasmi`).
-    let win_len = temen_coop_tierup_win_len();
+    // #816: the pending task's window, per event, mirrored up to `mapped` (see
+    // `service_coop_on_wasmi`).
+    let win_len = temen_coop_tierup_win_len().min(mapped as usize);
     let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
@@ -3429,17 +3431,43 @@ impl Drop for InstantiatorGuard {
     }
 }
 
-/// The #816 guest: `_start` resolves its (knob-granted) `"instantiator"` by name, spawns a
-/// same-module confined child (f1, 32 KiB carve at 64 KiB), joins it, calls the eligible leaf f2
-/// itself, then reads back the marker byte each leaf run stored at *its own* window's offset 16384 —
-/// the root's at absolute 16384, the child's at absolute 65536+16384=81920 (visible through the
-/// parent window, shared backing). A mis-routed per-event `win` (root base for the child's event)
-/// would land the child's marker at 16384 (clobbering nothing observable but leaving 81920 zero) and
-/// fail the sum. The marker offset must clear the #1094 unconditional NULL guard (`[0, 16 KiB)`) yet
-/// stay inside the carve — so the same offset is valid in both windows, which forces the carve above
-/// the guard (a 4 KiB carve would have no writable byte the root's guarded window also admits, so the
-/// carve is now 32 KiB, size_log2 15; the handle-stash name at 33792 clears the guard too).
-/// f2 stores marker 21 at [16384] and returns x*3 + 7. Sum = child f(5)=22 + root f(3)=16 + 21 + 21 = 80.
+/// The #816 guest: `_start` resolves its (knob-granted) `"instantiator"` and `"budget"` by name,
+/// spawns a same-module child (f1) detached through a v1 record — a window of its own — joins it,
+/// then calls the eligible leaf f2 itself. f2 stores marker 21 at offset 16384 of whichever window
+/// runs it and returns x*3 + 7. The child adds the marker it reads back in its own window to its
+/// result (f(5) = 22, + 21); the root reads its own 16384 before its leaf call (0) and after (21). A
+/// mis-routed per-event `win` (the root's base for the child's event) would land the child's marker
+/// in the root's window: the child would read 0 and the root 21 before its call, and the sum would
+/// change. The marker offset clears the #1094 NULL guard (`[0, 16 KiB)`), as do the handle-stash
+/// names (33792, 33808) and the record (34816).
+/// Sum = child 43 + root f(3)=16 + 21 - 0 = 80.
+/// The by-name `"budget"` (`grant_detached_spawn_caps`), packed into one word for `self.resolve`.
+const BUDGET_NAME: i64 = i64::from_le_bytes(*b"budget\0\0");
+
+/// The stores that resolve `"budget"` and build a v1 record at 34816 spawning f1 of the guest's own
+/// module (`-1`) detached — its declared window, no pager or pre-mapped region — paid from that
+/// budget. Leaves the record's address in `vrec`.
+fn v1_record_f1() -> String {
+    format!(
+        "  vbw = i64.const {BUDGET_NAME}
+  vba = i64.const 33808
+  i64.store vba vbw
+  vbl = i64.const 6
+  vb = self.resolve vba vbl
+  vrec = i64.const 34816
+  vrw0 = i64.const 4294967297
+  i64.store vrec vrw0
+  vrw2 = i64.const -4294967296
+  i64.store vrec vrw2 offset=16
+  vrm = i32.const -1
+  i32.store vrec vrm offset=24
+  i32.store vrec vb offset=28
+  vrw9 = i64.const 4294967295
+  i64.store vrec vrw9 offset=72
+"
+    )
+}
+
 fn coop_child_guest_text() -> String {
     let out_h = onramp_out_handle();
     let name = b"instantiator";
@@ -3460,23 +3488,18 @@ block 0 () {{
   i64.store va1 vw1
   vnl = i64.const 12
   vh = self.resolve va0 vnl
-  ve = i64.const 1
-  voff = i64.const 65536
-  vsl = i64.const 15
-  vq = i64.const 0
-  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vh (ve, voff, vsl, vq)
+{record}  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vma = i64.const 16384
+  vpre = i32.load8_u vma
+  vpree = i64.extend_i32_u vpre
   v3 = i64.const 3
   vlocal = call 2 (v3)
-  vma = i64.const 16384
   vm0 = i32.load8_u vma
   vm0e = i64.extend_i32_u vm0
-  vca = i64.const 81920
-  vm1 = i32.load8_u vca
-  vm1e = i64.extend_i32_u vm1
   vs1 = i64.add vj vlocal
   vs2 = i64.add vs1 vm0e
-  vs3 = i64.add vs2 vm1e
+  vs3 = i64.sub vs2 vpree
   vslot = i64.const {SLOT}
   i64.store vslot vs3
   vout = i32.const {out_h}
@@ -3489,7 +3512,11 @@ func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   v5 = i64.const 5
   vr = call 2 (v5)
-  return vr
+  vma = i64.const 16384
+  vm = i32.load8_u vma
+  vme = i64.extend_i32_u vm
+  vs = i64.add vr vme
+  return vs
   }}
 }}
 func (i64) -> (i64) {{
@@ -3505,12 +3532,13 @@ block 0 (vx: i64) {{
   }}
 }}
 export 0 func "_start" 0
-"#
+"#,
+        record = v1_record_f1()
     )
 }
 
 #[test]
-fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
+fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     let _g = instantiator_guard();
     let m = temen_text::parse_module(&coop_child_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
@@ -3521,7 +3549,7 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value, 80,
-        "oracle: 22 + 16 + 21 + 21 (both markers landed)"
+        "oracle: 43 + 16 + 21 - 0 (each marker landed in its own window)"
     );
 
     let opened = temen_coop_open(
@@ -3543,16 +3571,16 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
 
     let n_results = m.funcs[2].results.len();
     let mut tierups = 0u32;
-    // Per-event (win_len, mapped): the child's event serves its 32 KiB carve with its own extent;
-    // the root's serves the full run window with the root's committed extent.
-    let mut spans: Vec<(usize, i64)> = Vec::new();
+    // Per-event (window base, mapped): the child's event serves its own window with its own
+    // committed extent; the root's serves the run window with the root's.
+    let mut events: Vec<(usize, i64)> = Vec::new();
     loop {
         match temen_coop_run() {
             COOP_RUN_TIERUP => {
                 tierups += 1;
                 assert!(tierups < 50, "runaway tier-ups");
                 assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
-                spans.push((temen_coop_tierup_win_len(), temen_coop_mapped()));
+                events.push((temen_coop_tierup_win_ptr() as usize, temen_coop_mapped()));
                 match service_coop_on_wasmi(n_results) {
                     Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                     Err(code) => temen_coop_deliver_trap(code),
@@ -3564,10 +3592,22 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
     }
     // The child's event first (the root is parked on the join), then the root's own leaf call —
     // each served over ITS task's window (#1117's env routing, here over real emitted wasm).
+    let [(child_win, child_mapped), (root_win, root_mapped)] = events[..] else {
+        panic!("expected the child's event then the root's, got {events:?}");
+    };
     assert_eq!(
-        spans,
-        vec![(32768, 32768), (1 << 25, 131072)],
-        "per-event window span + mapped must be the child carve then the root window"
+        root_win,
+        temen_coop_win_ptr() as usize,
+        "the root's event serves the run window"
+    );
+    assert_ne!(
+        child_win, root_win,
+        "the child's event serves its own window, not the run window"
+    );
+    assert_eq!(
+        (child_mapped, root_mapped),
+        (131072, 131072),
+        "each event's mapped is its own window's committed extent"
     );
     assert_eq!(
         tierups, 2,
@@ -3587,17 +3627,16 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
     temen_coop_close();
 }
 
-// ---- #1151: a §14 child page-op traps in REAL emitted wasm over its carve --------------------------
+// ---- #1151: a §14 child page-op traps in REAL emitted wasm over its own window --------------------
 
-/// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator`, §14-instantiate a
-/// same-module confined child at f1 (32 KiB carve at 64 KiB), join it, return the join value. f1
-/// (child entry `(inst, as)`): `unmap` the whole usable carve `[16384, 32768)` through its granted
-/// AddressSpace, then call the eligible leaf f2. f2 (leaf): load carve-relative `[16384]` — a page the
-/// child just unmapped — so the **emitted** leaf's paged per-access check must trap `MemoryFault`
-/// over the carve, exactly as the interpreter oracle does. This is the emitted-execution twin of
-/// `temen-wasm-jit`'s `nested_paged.rs` (which drives the same trap with a hand-rolled harness),
-/// carried here through the real coop FFI over a confined child's own carve (#1151, INVARIANTS #14
-/// nesting + code-origin axes).
+/// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
+/// a same-module child at f1 detached through a v1 record, join it, return the join value. f1 (child
+/// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
+/// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
+/// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
+/// as the interpreter oracle does. This is the emitted-execution twin of `temen-wasm-jit`'s
+/// `nested_paged.rs` (which drives the same trap with a hand-rolled harness), carried here through the
+/// real coop FFI over a confined child's own window (#1151, INVARIANTS #14 nesting + code-origin axes).
 fn coop_child_paged_guest_text() -> String {
     let name = b"instantiator";
     let mut w0 = [0u8; 8];
@@ -3617,11 +3656,7 @@ block 0 () {{
   i64.store va1 vw1
   vnl = i64.const 12
   vh = self.resolve va0 vnl
-  ve = i64.const 1
-  voff = i64.const 65536
-  vsl = i64.const 15
-  vq = i64.const 0
-  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vh (ve, voff, vsl, vq)
+{record}  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   return vj
   }}
@@ -3645,19 +3680,20 @@ block 0 (vx: i64) {{
   }}
 }}
 export 0 func "_start" 0
-"#
+"#,
+        record = v1_record_f1()
     )
 }
 
 #[test]
-fn coop_tierup_child_paged_traps_over_carve() {
+fn coop_tierup_child_paged_traps_over_its_own_window() {
     let _g = instantiator_guard();
     let m = temen_text::parse_module(&coop_child_paged_guest_text()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    // Oracle: the plain bytecode path with the identical powerbox — the child unmaps its carve then
-    // loads it, so the run traps `MemoryFault`.
+    // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of its
+    // window then loads it, so the run traps `MemoryFault`.
     let want = onramp_exec_root(&m, b"");
     assert_eq!(
         want.status, STATUS_TRAP,
@@ -3689,7 +3725,7 @@ fn coop_tierup_child_paged_traps_over_carve() {
                 tierups += 1;
                 assert!(tierups < 50, "runaway tier-ups");
                 assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
-                // The child's leaf runs paged over its carve; loading the unmapped page must trap,
+                // The child's leaf runs paged over its window; loading the unmapped page must trap,
                 // so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
                 match service_coop_on_wasmi(n_results) {
                     Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
@@ -3708,7 +3744,7 @@ fn coop_tierup_child_paged_traps_over_carve() {
     assert_eq!(
         temen_status(),
         want.status,
-        "trap parity with the interpreter oracle over the child's carve"
+        "trap parity with the interpreter oracle over the child's window"
     );
     assert_eq!(
         temen_coop_value(),

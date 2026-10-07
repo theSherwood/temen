@@ -1078,8 +1078,9 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    funcref-table-free analog of `env.call_interp` — so the child vCPU spawn + join happen host-side,
    exactly as the interpreter surfaces `VcpuStop::Instantiate` to its driver; the emitted parent does
    no confinement itself (the child's window carve + attenuated powerbox stay the host's job, unchanged
-   from the interpreter path). Opt-in, so the production paths are byte-identical. Pinned by
-   `crates/temen-wasm-jit/tests/nested_vm.rs`: an emitted entry that `instantiate`s + `join`s a child
+   from the interpreter path). Opt-in, so the production paths are byte-identical. The spawn is now
+   op 17's `env.instantiate_rec` bounce (#1867 retires the op-0 carve), pinned by
+   `crates/temen-wasm-jit/tests/instantiate_rec.rs`: an emitted entry that spawns + `join`s a child
    returns exactly the child's **interpreter** result (with a non-vacuity guard that the host imports
    actually fired).
    **[landed — §14 ADDRESS_SPACE `sub`/`page_size` via the one existing transport]** An entry that

@@ -1,7 +1,7 @@
 //! **§14 op-13 grant *marshaling* across the emitted bounce** (#1025 slice 3a — the confinement core).
-//! The sibling `nested_grant_op13_e2e.rs` proved a *granted* child runs on emitted wasm, but it delivered
-//! the grant by **pre-wiring** the child host into `env.call_interp` — the op-13 bounce's `grants_ptr`/
-//! `grants_n` were ignored. This file closes that gap: the `env.instantiate_module` servicer **reads the
+//! The sibling `nested_grant_e2e.rs` proves a *granted* child runs on emitted wasm, but it delivers
+//! the grant by **pre-wiring** the child host into `env.call_interp` — the spawn's grant list is
+//! ignored. This file closes that gap: the `env.instantiate_module` servicer **reads the
 //! guest's grant records out of the parent window** and re-grants them from the parent's powerbox via
 //! [`Host::spawn_named_child_from_window`], so the child's `fs` authority arrives *through the bounce* —
 //! exactly the marshaling the native Cranelift path (`grant_named_child_build`) does, now on the wasm tier.

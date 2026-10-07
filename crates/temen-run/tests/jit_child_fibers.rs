@@ -177,8 +177,8 @@ fn a_detached_child_has_its_own_fiber_registry_on_the_jit() {
     );
 }
 
-/// A parent with no fibers of its own: runs `prelude`, spawns the child, returns its join status.
-fn spawner_src(detached: bool, prelude: &str) -> String {
+/// A parent with no fibers of its own: spawns the child, returns its join status.
+fn spawner_src(detached: bool) -> String {
     let spawn = if detached {
         "ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)"
     } else {
@@ -188,7 +188,6 @@ fn spawner_src(detached: bool, prelude: &str) -> String {
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  {prelude}
   me = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
@@ -217,7 +216,7 @@ block 0 (vs: i64) {{
 }}"
     );
     for detached in [false, true] {
-        let got = parity(&spawner_src(detached, ""), &child);
+        let got = parity(&spawner_src(detached), &child);
         assert!(
             got != Ok(7),
             "detached {detached}: the suspend did not fault"
@@ -276,7 +275,7 @@ fn a_childs_fiber_parks_on_a_timed_wait() {
     for detached in [false, true] {
         for block in [false, true] {
             assert_eq!(
-                parity(&spawner_src(detached, ""), &waiting_child(block)),
+                parity(&spawner_src(detached), &waiting_child(block)),
                 Ok(9),
                 "detached {detached}, block {block}"
             );
@@ -285,16 +284,14 @@ fn a_childs_fiber_parks_on_a_timed_wait() {
 }
 
 /// `gc.roots` from a child's fiber reaches the child **root's** frames, which live on the task's
-/// stack: the root holds `0x7ab8` (loaded from the carve, where the parent stored it, so it cannot
-/// be rematerialized) live across the resume, and the fiber holds `heap_lo` (`0x7ab0`). The child
+/// stack: the root holds `0x7ab8` (loaded from its own data segment, so it cannot be
+/// rematerialized) live across the resume, and the fiber holds `heap_lo` (`0x7ab0`). The child
 /// returns `count << 40 | buf[0] << 20 | buf[1]`.
 #[test]
 fn gc_roots_in_a_childs_fiber_scans_the_child_root() {
-    let prelude = "pp = i64.const 4214792
-  pv = i64.const 31416
-  i64.store pp pv";
     let child = format!(
         "memory {CHILD_LOG2}
+data 20488 \"\\xb8\\x7a\"
 func (i64) -> (i64) {{
 block 0 (vs: i64) {{
   pa = i64.const 20488
@@ -331,8 +328,11 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    assert_eq!(
-        parity(&spawner_src(false, prelude), &child),
-        Ok(2 << 40 | 0x7ab0 << 20 | 0x7ab8)
-    );
+    for detached in [false, true] {
+        assert_eq!(
+            parity(&spawner_src(detached), &child),
+            Ok(2 << 40 | 0x7ab0 << 20 | 0x7ab8),
+            "detached {detached}"
+        );
+    }
 }

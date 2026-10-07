@@ -1,9 +1,9 @@
 //! **§14 nested child on the *emitted* tier** (issue #1123) — the wasm-JIT twin of the native
 //! `compile_child` (`temen-llvm/tests/rust_guest_op13.rs`). Where
-//! `nested_vm.rs` services the `env.instantiate` bounce by running the child on the tree-walk
-//! interpreter, this file services it by **emitting a *separate* child module and running it as its own
-//! `wasmi` instance over a sub-window carve** — so both the parent and the confined child execute on
-//! emitted wasm, exactly as the native Cranelift path runs a nimony phase child on emitted code.
+//! `instantiate_rec.rs` services the spawn bounce by running the child on the tree-walk interpreter,
+//! this file services it by **emitting a *separate* child module and running it as its own `wasmi`
+//! instance** — so both the parent and the confined child execute on emitted wasm, exactly as the
+//! native Cranelift path runs a nimony phase child on emitted code.
 //!
 //! Three op flavors of the same mechanism:
 //!   1. `nested_child_runs_on_the_emitted_tier` — the op-0 transport (slice 1). The host resolves which
@@ -869,27 +869,21 @@ fn carve_larger_than_declared_routes_mapped_and_child_uses_its_whole_carve() {
 }
 
 #[test]
-fn escape_through_the_op13_bounce_faults_and_stays_confined() {
-    // The op-13 parent spawns `CHILD_ESCAPE` (stores at 1040, past its `memory 10`/1 KiB carve, `slog=10`
-    // ⇒ `mapped == carve == 1024`). The out-of-carve store must fault, and the fault must **propagate
-    // through the bounce** to the parent's `f0` — the existing escape test runs the child directly; this
-    // one exercises the confinement of a child driven by an emitted parent.
+fn escape_through_the_op17_bounce_faults_and_stays_confined() {
+    // The op-17 parent spawns `CHILD_ESCAPE` detached (it stores at 1040, past its `memory 10` window:
+    // `mapped == 1024`). The out-of-window store must fault, and the fault must **propagate through the
+    // bounce** to the parent's `f0` — the existing escape test runs the child directly; this one
+    // exercises the confinement of a child driven by an emitted parent.
     let params = [
         Val::I32(WIN_BASE),
         Val::I32(ENV_PTR),
         Val::I32(7),
-        Val::I32(99),
+        Val::I32(CHILD_MODULE_HANDLE),
     ];
-    let carve = WIN_BASE as i64 + CARVE_OFF;
-    let res = try_run_parent_over_child(
-        &op13_parent(CARVE_OFF, 10),
-        CHILD_ESCAPE,
-        &params,
-        &[(carve + 1040) as usize],
-    );
+    let res = try_run_parent_over_child(&parent_op17(), CHILD_ESCAPE, &params, &[]);
     assert!(
         res.is_err(),
-        "an out-of-carve child access must fault the whole run through the op-13 bounce, not proceed"
+        "an out-of-window child access must fault the whole run through the op-17 bounce, not proceed"
     );
 }
 
