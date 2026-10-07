@@ -15181,7 +15181,7 @@ impl CoopSched {
                     let result: i64 = 'fork: {
                         // The running handler's dispatch ticket names the parked caller; outside a
                         // handler there is none → `-EINVAL`, exactly as the oracle.
-                        let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
+                        let Some((ticket, _)) = tasks[ti].vt.active.serve_ticket else {
                             break 'fork super::EINVAL;
                         };
                         // The server (this task) is the callee the caller parked on. In the fork
@@ -15333,7 +15333,7 @@ impl CoopSched {
                     // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
                     // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
                     let result: i64 = 'reap: {
-                        let Some(ticket) = tasks[ti].vt.active.serve_ticket else {
+                        let Some((ticket, _)) = tasks[ti].vt.active.serve_ticket else {
                             break 'reap super::EINVAL;
                         };
                         let Some(server_env) = tasks[ti].env else {
@@ -19044,11 +19044,12 @@ struct Vm {
     /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
     /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
     jit_page_checked: bool,
-    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket — `Some`
-    /// between admitting a handler activation (whose return linkage rewinds into the `SvcPoll`
-    /// op) and the re-execution that settles its result — and the count of dispatches completed
-    /// by the current `svc.poll` activation.
-    serve_ticket: Option<u64>,
+    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket and the depth
+    /// of the serve frame that admitted it (`stack.len()` there) — `Some` between admitting a
+    /// handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
+    /// re-execution that settles its result — and the count of dispatches completed by the current
+    /// `svc.poll` activation.
+    serve_ticket: Option<(u64, usize)>,
     serve_count: i64,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
@@ -20294,7 +20295,18 @@ impl Vm {
                     // the ticket's completion cell. No cross-domain caller can be parked on the
                     // ticket in this engine yet (caller-side parking is a later I36 slice), so
                     // the reply always rides the cell — the tree-walker's unclaimed-result path.
-                    if let Some(t) = self.serve_ticket.take() {
+                    // #2160, the oracle's rule: a `svc.*` from *under* the running handler (deeper
+                    // than the serve frame) is a probeable refusal that serves nothing — the serve
+                    // loop is the domain's outermost dispatcher.
+                    if self
+                        .serve_ticket
+                        .is_some_and(|(_, depth)| self.stack.len() > depth)
+                    {
+                        self.regs[base + *dst as usize] = Reg::from_i64(super::EINVAL);
+                        pc += 1;
+                        continue;
+                    }
+                    if let Some((t, _)) = self.serve_ticket.take() {
                         let v = self.regs[base + *dst as usize].i64();
                         host.with(|p| p.svc_results.insert(t, v));
                         self.serve_count += 1;
@@ -20339,9 +20351,9 @@ impl Vm {
                         for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
                             self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
                         }
+                        self.serve_ticket = Some((d.ticket, self.stack.len()));
                         self.stack
                             .push((module, cur, base, pc, base + *dst as usize));
-                        self.serve_ticket = Some(d.ticket);
                         cur = fidx;
                         base = nb;
                         pc = 0;

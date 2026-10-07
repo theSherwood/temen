@@ -1579,6 +1579,36 @@ fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
     }
 }
 
+/// #744, the typed pager: a record's pager must be an export of exactly `{ page: (i64) -> (i64) }`,
+/// the one shape a page fault's dispatch serves. Naming any other export — here one whose op has
+/// another name, and one with a second op — fails the spawn closed on every backend.
+#[test]
+fn a_pager_that_is_not_a_page_export_refuses_the_spawn() {
+    let ok = detached_pager_program_at(20000);
+    let renamed = ok
+        .replace("interface { page: 0 }", "interface { fetch: 0 }")
+        .replace("\"pager\" 1 { page: 2 }", "\"pager\" 1 { fetch: 2 }");
+    let two_ops = ok
+        .replace("interface { page: 0 }", "interface { page: 0, peek: 0 }")
+        .replace(
+            "\"pager\" 1 { page: 2 }",
+            "\"pager\" 1 { page: 2, peek: 2 }",
+        );
+    for src in [renamed, two_ops] {
+        assert!(
+            !src.contains("interface { page: 0 }"),
+            "the rewrite must apply"
+        );
+        for b in BACKENDS {
+            let r = run_detached(b, &src);
+            assert!(
+                matches!(&r, Err(e) if e.contains("CapFault")),
+                "{b:?}: a non-pager export as the pager fails the spawn closed: {r:?}"
+            );
+        }
+    }
+}
+
 /// #1815: a demand child's page fault must **wake** a pager parked at `svc.wait` when the fault is
 /// not served by direct handoff. The fault arm enqueued the request and parked the child on the
 /// reply ticket, but only the handoff path ever reached the pager — with handoff off (or a handoff

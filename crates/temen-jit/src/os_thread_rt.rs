@@ -1374,6 +1374,7 @@ fn run_child(a: SpawnArgs) {
     set_current_domain(a.dom);
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
+    crate::vcpu_tls::set_serve_handlers(0);
     // §12.8 4A.5 stage (ii): a concurrent durable child points its durable shadow-base register at its
     // own region AND initialises that region's shadow-SP word to the empty frame base, so if a freeze
     // fires its instrumented code spills into *its* per-context region (concurrent with siblings, no
@@ -1832,6 +1833,8 @@ impl Domain {
         // restore the caller's afterward — a real OS-thread child gets its own thread-local in `run_child`.
         let prev_tls = crate::vcpu_tls::get();
         crate::vcpu_tls::seed(vcpu_id);
+        let prev_handlers = crate::vcpu_tls::serve_handlers();
+        crate::vcpu_tls::set_serve_handlers(0);
         // A child that uses `cont.*` gets its own fiber execution context over the domain-shared table
         // (D57 3b-ii), like `run_child`; publish it as the current runtime for the run.
         let mut frt = env.fiber_cfg.map(|(tid, mask)| {
@@ -1893,6 +1896,7 @@ impl Domain {
             fiber_rt::set_current(pr);
         }
         crate::vcpu_tls::seed(prev_tls); // restore the caller (root) vCPU's TLS id
+        crate::vcpu_tls::set_serve_handlers(prev_handlers);
 
         let (result, trap) = if faulted {
             // SAFETY: live trap cell.

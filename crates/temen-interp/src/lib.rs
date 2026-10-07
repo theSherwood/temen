@@ -14522,8 +14522,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let ok = hg
                                         .self_module
                                         .as_ref()
-                                        .and_then(|sm| sm.impl_exports.get(sr.pager as usize))
-                                        .is_some_and(|e| !e.ops.is_empty());
+                                        .is_some_and(|sm| sm.is_pager_export(sr.pager));
                                     if !ok {
                                         return Err(Trap::CapFault);
                                     }
@@ -14564,12 +14563,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
                                 if pager != u32::MAX {
                                     let hg = host.lock_unpoisoned();
-                                    // A missing/empty pager export fails the spawn closed (§3.3).
+                                    // A pager that is not a `{ page: (i64) -> (i64) }` export fails
+                                    // the spawn closed (§3.3, #744).
                                     let ok = hg
                                         .self_module
                                         .as_ref()
-                                        .and_then(|sm| sm.impl_exports.get(pager as usize))
-                                        .is_some_and(|e| !e.ops.is_empty());
+                                        .is_some_and(|sm| sm.is_pager_export(pager));
                                     if !ok {
                                         return Err(Trap::CapFault);
                                     }

@@ -2024,7 +2024,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
 /// - `version != 0` → `CapFault` (fail closed).
 /// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `temen-run` folds op-17 modules
 ///   **with** impl exports to the oracle, so a natively-running module has none — and the
-///   interpreter fails its pager validation (`self_module.impl_exports.get(..)`) identically.
+///   interpreter fails its pager validation (`Module::is_pager_export`) identically.
 /// - `budget != 0` → probeable `-EINVAL`: the Budget-funded spawn is an interpreter-first
 ///   feature (§3b); JIT parity is a follow-up (§3c.2), exactly like durable nesting above —
 ///   the interpreter is the reference. `budget` and `quota` are mutually exclusive either way.
