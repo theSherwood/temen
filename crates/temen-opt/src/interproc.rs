@@ -18,7 +18,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use temen_ir::{Block, Export, Func, FuncIdx, Inst, Module, Terminator, ValType};
-use temen_verify::func_value_types;
+use temen_verify::block_value_types;
 
 use crate::{each_operand, get, map_operands, map_term_operands, Known};
 
@@ -225,11 +225,25 @@ pub fn dead_func_elim(m: &Module) -> Module {
 // Budgeted direct-call inliner (OPT.md Phase 3).
 // ---------------------------------------------------------------------------------------
 
-/// Don't inline a callee bigger than this (instructions in its single block) — a code-size guard.
-const MAX_CALLEE_INSTS: usize = 24;
-/// Total instructions the inliner may splice module-wide, per invocation. Bounds code growth *and*
-/// guarantees termination even through cycles of small functions (each inline spends budget).
-const INLINE_INSN_BUDGET: usize = 4096;
+/// What [`inline_calls_with`] inlines: direct callees of at most `max_callee` instructions in all,
+/// until `budget` instructions have been spliced. Spending the budget bounds growth *and* guarantees
+/// termination even through cycles of small functions (each inline spends budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineLimits {
+    /// The largest callee inlined, in instructions across all its blocks — a code-size guard.
+    pub max_callee: usize,
+    /// Instructions the pass may splice in all.
+    pub budget: usize,
+}
+
+impl InlineLimits {
+    /// [`inline_calls`]'s limits: what a residual gets ahead of the full cleanup pipeline
+    /// ([`crate::optimize_module`]).
+    pub const OPTIMIZER: InlineLimits = InlineLimits {
+        max_callee: 24,
+        budget: 4096,
+    };
+}
 
 /// Inline one **single-block, straight-line** callee at a direct `call` site, in place. The callee's
 /// block is `Return`-terminated with no internal control flow, so its body is spliced directly into
@@ -348,7 +362,7 @@ fn callee_total_insts(callee: &Func) -> usize {
     callee.blocks.iter().map(|b| b.insts.len()).sum()
 }
 
-/// Whether `callee` is an inlining candidate for a direct call: no larger than [`MAX_CALLEE_INSTS`]
+/// Whether `callee` is an inlining candidate for a direct call: no larger than `max_callee`
 /// instructions total, every block exits only by an internal branch (`br`/`br_if`/`br_table` — targets
 /// stay inside the callee), a value `return`, or `unreachable`, and at least one block actually
 /// `return`s (so the spliced-in continuation has a predecessor). Tail-call exits
@@ -356,8 +370,8 @@ fn callee_total_insts(callee: &Func) -> usize {
 /// non-tail call is a separate transform. A single-block `return` callee takes the in-place fast path
 /// ([`inline_single_block_call`]); anything else with internal control flow takes the CFG-splicing path
 /// ([`inline_multi_block_call`]).
-fn is_inlinable(callee: &Func) -> bool {
-    if callee.blocks.is_empty() || callee_total_insts(callee) > MAX_CALLEE_INSTS {
+fn is_inlinable(callee: &Func, max_callee: usize) -> bool {
+    if callee.blocks.is_empty() || callee_total_insts(callee) > max_callee {
         return false;
     }
     let exits_ok = callee.blocks.iter().all(|b| {
@@ -460,18 +474,23 @@ fn transform_callee_term(
 /// Sound because it is the call's own control/data flow made explicit: the callee body runs between the
 /// pre- and post-call code exactly as the call did, its arguments bind to the callee's parameters, its
 /// return values flow to where the call's results were used, and each captured value reaches the
-/// continuation unchanged (one definition, threaded verbatim along every path). Returns the caller's new
-/// block list.
+/// continuation unchanged (one definition, threaded verbatim along every path). Edits the caller's
+/// `blocks` in place: block `bi` is split, and the callee's blocks and the continuation are appended.
 fn inline_multi_block_call(
-    caller: &Func,
+    blocks: &mut Vec<Block>,
     bi: usize,
     call_idx: usize,
     callee: &Func,
     fn_results: &[usize],
     types: &[temen_ir::TypeEntry],
     caller_block_types: &[ValType],
-) -> Vec<Block> {
-    let b = &caller.blocks[bi];
+) {
+    let placeholder = Block {
+        params: Vec::new(),
+        insts: Vec::new(),
+        term: Terminator::Unreachable,
+    };
+    let b = core::mem::replace(&mut blocks[bi], placeholder);
     let p = b.params.len() as u32;
 
     // First result index of each caller-block instruction, and the block's total value count.
@@ -509,17 +528,24 @@ fn inline_multi_block_call(
         .map(|&c| caller_block_types[c as usize])
         .collect();
 
-    let off = caller.blocks.len() as u32; // callee entry lands at off + 0
+    let off = blocks.len() as u32; // callee entry lands at off + 0
     let k = callee.blocks.len() as u32;
     let cont = off + k;
 
     // Pre-call block (keeps index bi): the pre-call insts, then a branch into the callee passing the
-    // call arguments followed by the captured values.
+    // call arguments followed by the captured values. The post-call insts move to the continuation.
+    let Block {
+        params,
+        insts: mut pre_insts,
+        term,
+    } = b;
+    let post_insts = pre_insts.split_off(call_idx + 1);
+    pre_insts.truncate(call_idx);
     let mut pre_args = call_args;
     pre_args.extend(cap.iter().copied());
-    let pre_block = Block {
-        params: b.params.clone(),
-        insts: b.insts[..call_idx].to_vec(),
+    blocks[bi] = Block {
+        params,
+        insts: pre_insts,
         term: Terminator::Br {
             target: off,
             args: pre_args,
@@ -527,7 +553,6 @@ fn inline_multi_block_call(
     };
 
     // Callee blocks: append the captured params to each, shift internal operands/targets, thread.
-    let mut callee_blocks: Vec<Block> = Vec::with_capacity(k as usize);
     for cb in &callee.blocks {
         let np = cb.params.len() as u32;
         let mut params = cb.params.clone();
@@ -538,7 +563,7 @@ fn inline_multi_block_call(
         }
         let cap_params: Vec<u32> = (np..np + capc).collect();
         let term = transform_callee_term(&cb.term, np, capc, off, cont, &cap_params);
-        callee_blocks.push(Block {
+        blocks.push(Block {
             params,
             insts,
             term,
@@ -555,102 +580,115 @@ fn inline_multi_block_call(
         map[c as usize] = rc + i as u32; // captured value → continuation param rc+i
     }
     let mut next_cont = rc + capc;
-    let mut cont_insts: Vec<Inst> = Vec::new();
-    for i in (call_idx + 1)..b.insts.len() {
-        let mut inst = b.insts[i].clone();
+    let mut cont_insts: Vec<Inst> = Vec::with_capacity(post_insts.len());
+    for (j, mut inst) in post_insts.into_iter().enumerate() {
+        let rcount = inst.result_count(fn_results, types) as u32;
         map_operands(&mut inst, &mut |o| map[o as usize]);
-        let rcount = b.insts[i].result_count(fn_results, types) as u32;
         for r in 0..rcount {
-            map[(result_start[i] + r) as usize] = next_cont;
+            map[(result_start[call_idx + 1 + j] + r) as usize] = next_cont;
             next_cont += 1;
         }
         cont_insts.push(inst);
     }
-    let mut cont_term = b.term.clone();
+    let mut cont_term = term;
     map_term_operands(&mut cont_term, &mut |o| map[o as usize]);
     let mut cont_params = callee.results.clone();
     cont_params.extend(cap_types.iter().copied());
-    let cont_block = Block {
+    blocks.push(Block {
         params: cont_params,
         insts: cont_insts,
         term: cont_term,
-    };
-
-    let mut blocks = caller.blocks.clone();
-    blocks[bi] = pre_block;
-    blocks.extend(callee_blocks);
-    blocks.push(cont_block);
-    blocks
+    });
 }
 
-/// **Budgeted direct-call inliner.** Repeatedly splice a small callee into a direct `call` site until
-/// no eligible site remains or the module-wide instruction budget is spent — a straight-line
-/// single-block callee in place ([`inline_single_block_call`]), a callee with internal control flow by
-/// splicing its CFG in ([`inline_multi_block_call`]). Direct self-recursion is skipped, and the budget
-/// bounds total growth (so cycles of small functions terminate). Inlining does not change any function's
-/// signature, so caller/callee indices stay valid; the now-uncalled callee is swept later by
-/// [`dead_func_elim`]. Debug info is dropped once anything is inlined (instruction positions shift).
+/// **Budgeted direct-call inliner**, with [`InlineLimits::OPTIMIZER`] (see [`inline_calls_with`]).
 pub fn inline_calls(m: &Module) -> Module {
+    inline_calls_with(m, InlineLimits::OPTIMIZER)
+}
+
+/// **Budgeted direct-call inliner.** Splice small callees into direct `call` sites in one forward
+/// pass — functions in index order, their blocks in order (including the blocks a splice appends),
+/// and each spliced body rescanned in place so its own calls inline too — until no eligible site
+/// remains or `limits.budget` is spent. A straight-line single-block callee is spliced
+/// in place ([`inline_single_block_call`]); a callee with internal control flow has its CFG spliced in
+/// ([`inline_multi_block_call`]). Direct self-recursion is skipped, and every inline spends budget, so
+/// cycles of small functions terminate.
+///
+/// The one pass inlines the sites rescanning the module from the top after each inline would, in the
+/// same order, except that it never goes back to a site it has passed. A passed site stays ineligible,
+/// since the budget only falls and a splice only grows its caller, unless the splice was of a callee
+/// with no instructions: that removes the call, so its caller shrinks and could newly fit a site
+/// already passed. Inlining does not change any function's signature, so caller/callee
+/// indices stay valid; the now-uncalled callee is swept later by [`dead_func_elim`]. Debug info
+/// survives for every function nothing was inlined into; a caller's own positions go stale, so its
+/// locations and variables are dropped ([`crate::drop_stale_debug`]).
+pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let types = &m.types;
     let has_memory = m.memory.is_some();
     let mut funcs = m.funcs.clone();
-    let mut budget = INLINE_INSN_BUDGET;
-    let mut changed = false;
+    let mut budget = limits.budget;
+    let mut touched = vec![false; funcs.len()];
 
-    loop {
-        // Find one eligible (caller, block, inst) → callee site.
-        let mut site = None;
-        'scan: for ci in 0..funcs.len() {
-            for bi in 0..funcs[ci].blocks.len() {
-                for ii in 0..funcs[ci].blocks[bi].insts.len() {
-                    if let Inst::Call { func, .. } = funcs[ci].blocks[bi].insts[ii] {
-                        let callee = func as usize;
-                        if callee == ci || callee >= funcs.len() {
-                            continue; // skip direct self-recursion / out-of-range
-                        }
-                        let csize = callee_total_insts(&funcs[callee]);
-                        if is_inlinable(&funcs[callee]) && csize <= budget {
-                            site = Some((ci, bi, ii, callee, csize));
-                            break 'scan;
-                        }
+    for ci in 0..funcs.len() {
+        // `blocks.len()` is re-read each time: a multi-block splice appends the callee's blocks and
+        // the continuation, and the pass reaches them in turn.
+        let mut bi = 0;
+        while bi < funcs[ci].blocks.len() {
+            let mut ii = 0;
+            while ii < funcs[ci].blocks[bi].insts.len() {
+                let callee = match funcs[ci].blocks[bi].insts[ii] {
+                    Inst::Call { func, .. } => func as usize,
+                    _ => {
+                        ii += 1;
+                        continue;
                     }
+                };
+                // Skip direct self-recursion, an out-of-range index, an ineligible or too-big callee.
+                let fits = callee != ci
+                    && callee < funcs.len()
+                    && is_inlinable(&funcs[callee], limits.max_callee)
+                    && callee_total_insts(&funcs[callee]) <= budget;
+                if !fits {
+                    ii += 1;
+                    continue;
+                }
+                budget -= callee_total_insts(&funcs[callee]);
+                touched[ci] = true;
+                if funcs[callee].blocks.len() == 1 {
+                    // Straight-line callee: its body now starts at `ii`, where the scan resumes.
+                    let callee_block = funcs[callee].blocks[0].clone();
+                    funcs[ci].blocks[bi] = inline_single_block_call(
+                        &funcs[ci].blocks[bi],
+                        ii,
+                        &callee_block,
+                        &fn_results,
+                        types,
+                    );
+                } else {
+                    // Callee has internal control flow: splice its CFG in, threading captured values
+                    // through. The block now ends at the call; the rest of it moved to the appended
+                    // continuation.
+                    let block_types =
+                        block_value_types(&funcs[ci].blocks[bi], &funcs, types, has_memory);
+                    let callee_fn = funcs[callee].clone();
+                    inline_multi_block_call(
+                        &mut funcs[ci].blocks,
+                        bi,
+                        ii,
+                        &callee_fn,
+                        &fn_results,
+                        types,
+                        &block_types,
+                    );
+                    break;
                 }
             }
+            bi += 1;
         }
-        let (ci, bi, ii, callee, csize) = match site {
-            Some(s) => s,
-            None => break,
-        };
-        if funcs[callee].blocks.len() == 1 {
-            // Straight-line callee: splice its body in place (no new blocks, no threading).
-            let callee_block = funcs[callee].blocks[0].clone();
-            funcs[ci].blocks[bi] = inline_single_block_call(
-                &funcs[ci].blocks[bi],
-                ii,
-                &callee_block,
-                &fn_results,
-                types,
-            );
-        } else {
-            // Callee has internal control flow: splice its CFG in, threading captured values through.
-            let block_types = func_value_types(&funcs[ci], &funcs, types, has_memory);
-            let callee_fn = funcs[callee].clone();
-            funcs[ci].blocks = inline_multi_block_call(
-                &funcs[ci],
-                bi,
-                ii,
-                &callee_fn,
-                &fn_results,
-                types,
-                &block_types[bi],
-            );
-        }
-        budget -= csize;
-        changed = true;
     }
 
-    if !changed {
+    if !touched.contains(&true) {
         return m.clone();
     }
     Module {
@@ -667,7 +705,10 @@ pub fn inline_calls(m: &Module) -> Module {
         data_exports: m.data_exports.clone(),
         impl_exports: m.impl_exports.clone(),
         types: m.types.clone(),
-        debug_info: None, // instruction positions shift once bodies are spliced
+        debug_info: m
+            .debug_info
+            .as_ref()
+            .and_then(|d| crate::drop_stale_debug(d, &touched)),
     }
 }
 

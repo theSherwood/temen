@@ -2162,6 +2162,135 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
     }
 }
 
+/// The passes a linker runs on a **whole program** before it ships it (temen-leng's link, #2147):
+/// inline direct calls to callees of at most [`LINKED_MAX_CALLEE`] instructions
+/// ([`interproc::inline_calls_with`]), then number every function's blocks in reverse postorder
+/// ([`order_blocks`]).
+///
+/// Unlike [`optimize_module`] it folds nothing and runs no cleanup. That keeps it cheap enough for
+/// every link (milliseconds per 100k instructions), and since it evaluates nothing, a host linker
+/// and an in-guest one (whose temen-opt is built without `libm-floats`) produce the same module.
+/// Nearly every callee this small is a single block, so a splice leaves no threaded value for a
+/// cleanup to prune. The budget, half the program, only bounds a pathological cycle: the size limit
+/// keeps real growth to a few percent.
+pub fn optimize_linked(m: &Module) -> Module {
+    let size: usize = m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .map(|b| b.insts.len())
+        .sum();
+    let limits = interproc::InlineLimits {
+        max_callee: LINKED_MAX_CALLEE,
+        budget: size / 2,
+    };
+    let mut out = interproc::inline_calls_with(m, limits);
+    order_blocks(&mut out);
+    out
+}
+
+/// The largest callee [`optimize_linked`] inlines. On nimony's `hexer` (#2147) callees of up to 6
+/// instructions take 46% of its calls, for 6% more code; up to 24 take 67%, for 59% more code, and
+/// left uncleaned the larger splices made it slower than inlining only up to 6.
+pub const LINKED_MAX_CALLEE: usize = 6;
+
+/// Number each function's blocks in **reverse postorder** from the entry, with the blocks the entry
+/// cannot reach last, in their original order. Branch targets and the debug positions that name a
+/// block move with them; nothing else changes.
+///
+/// INVARIANTS #9 charges fuel per taken back edge, and every engine reads a back edge off the block
+/// indices: a branch to an equal-or-earlier block. In reverse postorder that is a loop's back edge. In a producer's own order it is often an ordinary join placed before the
+/// arms that branch to it, as leng places an `if`'s, and every engine then pays a fuel check there
+/// for no loop (#2147: 63% of hexer's checks). Every engine charges the same IR, so all of them pay
+/// less, and stay in step.
+pub fn order_blocks(m: &mut Module) {
+    let maps: Vec<Option<Vec<u32>>> = m.funcs.iter_mut().map(order_func_blocks).collect();
+    if let Some(d) = &mut m.debug_info {
+        let block = |f: u32, b: u32| -> u32 {
+            let map = maps.get(f as usize).and_then(Option::as_ref);
+            map.and_then(|map| map.get(b as usize).copied())
+                .unwrap_or(b)
+        };
+        for l in &mut d.locs {
+            l.block = block(l.func, l.block);
+        }
+        for v in &mut d.vars {
+            let f = v.func;
+            match &mut v.loc {
+                temen_ir::VarLoc::SsaList(list)
+                | temen_ir::VarLoc::WindowVia { base: list, .. } => {
+                    for at in list {
+                        at.block = block(f, at.block);
+                    }
+                }
+                temen_ir::VarLoc::Window { .. }
+                | temen_ir::VarLoc::Ssa { .. }
+                | temen_ir::VarLoc::Fixed { .. }
+                | temen_ir::VarLoc::Tls { .. } => {}
+            }
+        }
+    }
+}
+
+/// [`order_blocks`] for one function. Returns each old block's new index, or `None` when the blocks
+/// are already in that order.
+fn order_func_blocks(f: &mut Func) -> Option<Vec<u32>> {
+    let n = f.blocks.len();
+    let mut order = cfg::Cfg::new(&f.blocks).rpo();
+    let mut placed = vec![false; n];
+    for &b in &order {
+        placed[b as usize] = true;
+    }
+    order.extend((0..n as u32).filter(|&b| !placed[b as usize]));
+    if order.iter().enumerate().all(|(i, &b)| i as u32 == b) {
+        return None;
+    }
+    let mut new_of = vec![0u32; n];
+    for (i, &b) in order.iter().enumerate() {
+        new_of[b as usize] = i as u32;
+    }
+    let mut old: Vec<Option<Block>> = core::mem::take(&mut f.blocks)
+        .into_iter()
+        .map(Some)
+        .collect();
+    f.blocks = order
+        .iter()
+        .map(|&b| {
+            let mut blk = old[b as usize].take().expect("each block is placed once");
+            remap_targets(&mut blk.term, &new_of);
+            blk
+        })
+        .collect();
+    Some(new_of)
+}
+
+/// `d` without the positional entries of the functions marked in `stale`, whose code changed, so their
+/// `(block, inst)` locations and variable locations no longer point at what they described. What is
+/// keyed by function index alone (names) or by no position (files, types, blobs, globals) still
+/// holds, provided the pass renumbered no function. `None` once nothing is left.
+pub(crate) fn drop_stale_debug(
+    d: &temen_ir::DebugInfo,
+    stale: &[bool],
+) -> Option<temen_ir::DebugInfo> {
+    let is_stale = |f: u32| stale.get(f as usize).copied().unwrap_or(false);
+    let kept = temen_ir::DebugInfo {
+        locs: d
+            .locs
+            .iter()
+            .filter(|l| !is_stale(l.func))
+            .cloned()
+            .collect(),
+        vars: d
+            .vars
+            .iter()
+            .filter(|v| !is_stale(v.func))
+            .cloned()
+            .collect(),
+        ..d.clone()
+    };
+    (!kept.is_vacuous()).then_some(kept)
+}
+
 /// Drop blocks unreachable from the entry (block 0) and renumber the survivors, remapping
 /// terminator targets. Every successor of a reachable block is itself reachable, so every
 /// remapped target has a valid new index.

@@ -1765,8 +1765,9 @@ fn import_sig<'a>(m: &'a Module, imp: &temen_ir::Import) -> Option<(&'a [ValType
 ///
 /// Two link passes: the first (compute shim only) surfaces the retained syscall imports — their nim
 /// names (`sysWrite.0.` …) aren't known until link — then the adapter is bound onto them and the whole
-/// thing re-linked. The units link in [`link_order`]. Re-verify the result like any linked output
-/// (the caller runs `run_powerbox`, which verifies).
+/// thing re-linked. The units link in [`link_order`], and the program ships through
+/// [`temen_opt::optimize_linked`] (its tiniest callees inlined, its blocks in reverse postorder). Re-verify
+/// the result like any linked output (the caller runs `run_powerbox`, which verifies).
 pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<Module, LengError> {
     let units = &link_order(units);
     let mut runtime = nim_powerbox_runtime(units)?;
@@ -1777,7 +1778,7 @@ pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<M
         runtime.extend(nim_libc_units(libc, units)?);
     }
     // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
-    link_whole_powerbox_manifest(units, runtime)
+    link_whole_powerbox_manifest(units, runtime).map(|m| temen_opt::optimize_linked(&m))
 }
 
 /// The order a nim program's modules link in: the `system` module first, then the rest by stem. A
@@ -2102,8 +2103,9 @@ pub fn nim_posix_runtime(
 /// program that opens files, forks and execs. It is [`nim_posix_runtime`], plus the prebuilt guest
 /// libc's units when `libc` is given (`snprintf`, `strtod`, libm, which no hand-written shim
 /// carries: without them those stay unbound manifest imports), linked by
-/// [`link_whole_powerbox_manifest`] in [`link_order`]. Every caller links through this, so a phase
-/// built on the host and a program built in-guest by the self-hosted lane are one link.
+/// [`link_whole_powerbox_manifest`] in [`link_order`], then [`temen_opt::optimize_linked`]. Every caller
+/// links through this, so a phase built on the host and a program built in-guest by the self-hosted
+/// lane are one link.
 pub fn link_nim_posix(
     units: &[WholeModule],
     personality: PersonalityVtable,
@@ -2114,7 +2116,7 @@ pub fn link_nim_posix(
     if let Some(libc) = libc {
         runtime.extend(nim_libc_units(libc, units)?);
     }
-    link_whole_powerbox_manifest(units, runtime)
+    link_whole_powerbox_manifest(units, runtime).map(|m| temen_opt::optimize_linked(&m))
 }
 
 /// **`temen-link -o:<out.temen> [--libc:<path>] <main.c.nif> <dep.c.nif>...`**, the command nimony's

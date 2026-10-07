@@ -545,21 +545,21 @@ pub fn func_value_types(
     type_section: &[temen_ir::TypeEntry],
     has_memory: bool,
 ) -> Vec<Vec<ValType>> {
-    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     f.blocks
         .iter()
-        .map(|b| block_value_types(b, funcs, &fn_results, type_section, has_memory))
+        .map(|b| block_value_types(b, funcs, type_section, has_memory))
         .collect()
 }
 
-fn block_value_types(
+/// [`func_value_types`] for one block: its params, then every instruction's result type(s). For a
+/// caller that needs one block's types, without paying for the whole function's (temen-opt's inliner
+/// types the block it splits, once per splice).
+pub fn block_value_types(
     b: &Block,
     funcs: &[Func],
-    fn_results: &[usize],
     type_section: &[temen_ir::TypeEntry],
     has_memory: bool,
 ) -> Vec<ValType> {
-    let _ = fn_results;
     let mut types: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
         // The typing-only walk shares the one [`type_inst`] dispatch with `check = false`: operand
