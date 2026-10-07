@@ -9,17 +9,14 @@
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 
-/// `_start`: resolve the granted `"vm"` Instantiator by name, spawn the serving child
-/// (func 1), mint `child_offer(child, export 0)`, call `add(40, 2)` through the live cap
-/// (parking until the child's `svc.wait` serves it), join, and exit with the reply — 42.
-// CALLS.md 5c.1c — the spawn moved op 0 → op 11 (an empty named-grant list): a **plain** child is
-// destitute by design on the JIT (no powerbox of its own), while a serving child needs the shared
-// granted powerbox the 5c transport rides. Interp/bytecode semantics are unchanged (op 11 with
-// zero grants ≡ op 0 plus a powerbox), and the Jit arm below now runs the REAL JIT backend — the
-// serve fold no longer applies to nesting modules (`module_nests`).
+/// `_start`: resolve the granted `"vm"` Instantiator and `"budget"` by name, spawn the serving child
+/// (func 1) detached through a v1 record, mint `child_offer(child, export 0)`, call `add(40, 2)`
+/// through the live cap (parking until the child's `svc.wait` serves it), join, and exit with the
+/// reply — 42.
 const SERVING_PROGRAM: &str = "\
 memory 17
 data 16384 \"vm\"
+data 16400 \"budget\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface \"adder\" 1 { add: 2 }
@@ -30,26 +27,21 @@ block 0 () {
   vp = i64.const 16384
   vl = i64.const 2
   vh = self.resolve vp vl
-  ; spawn via record (op 17) at 17536 (above the #1094 NULL guard): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  ; a v1 record at 17536 (above the #1094 NULL guard and the durable control words): entry 1, the
+  ; running module (-1), its declared window, no pager or pre-mapped region, paid from `budget`
   q0a0 = i64.const 17536
+  q0v0 = i64.const 4294967297
   i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
+  q0v2 = i64.const -4294967296
+  i64.store q0a0 q0v2 offset=16
+  q0m = i32.const -1
+  i32.store q0a0 q0m offset=24
+  i32.store q0a0 vbud offset=28
+  q0v9 = i64.const 4294967295
+  i64.store q0a0 q0v9 offset=72
   v5 = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) vh (v5, v6)
@@ -90,10 +82,13 @@ fn a_serving_domain_behaves_identically_on_all_three_backends() {
             .run_with_caps(
                 backend,
                 &RunConfig::default(),
-                &[(
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                )],
+                &[
+                    (
+                        "vm",
+                        HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+                    ),
+                    ("budget", HostCap::detached_budget(1 << 20)),
+                ],
             )
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
