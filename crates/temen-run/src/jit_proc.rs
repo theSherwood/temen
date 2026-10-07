@@ -334,11 +334,7 @@ impl Tree {
             }
             _ => compile(cc, program, entry, jit, plan, interrupt, self)?,
         };
-        Ok(Loaded {
-            cm,
-            image,
-            interrupt,
-        })
+        Ok(Loaded { cm, image })
     }
 
     /// **Fork** the process frozen at `point` over `host` (FORK.md §9.5, the JIT's arm of the
@@ -702,7 +698,7 @@ unsafe fn run_process(
                                 init_mem: init_mem.as_deref(),
                                 snapshot_cap,
                             };
-                            run_image(cc, code.cm, code.interrupt, Some(&ctx), start)
+                            run_image(cc, code.cm, Some(&ctx), start)
                         })
                 });
                 (r, results)
@@ -726,8 +722,7 @@ unsafe fn run_process(
                     window,
                     args: &args,
                 };
-                let interrupt = tree.interrupt_for(pid, true);
-                (run_image(cc, cm, interrupt, Some(&ctx), start), results)
+                (run_image(cc, cm, Some(&ctx), start), results)
             }
         };
         let unwound = matches!(
@@ -788,12 +783,11 @@ fn retire(tree: &Tree, host: &mut Host) {
     }
 }
 
-/// A process image's code ([`Tree::load`]): its own instance, the image it instantiates when the code
-/// is shared, and the kill-path cell the code polls.
+/// A process image's code ([`Tree::load`]): its own instance, and the image it instantiates when
+/// the code is shared.
 struct Loaded {
     cm: CompiledModule,
     image: Option<Arc<Image>>,
-    interrupt: Option<*const AtomicU64>,
 }
 
 /// Compile `program` at `entry` over the powerbox `cc` names — instrumented to fork when `plan` says
@@ -864,9 +858,13 @@ pub(crate) enum Entry<'a> {
 /// entry decides the shape by. Its `call.cap`s can come from more than one vCPU at once: it spawns
 /// threads or runs fibers (§12; waiting and notifying alone make no second caller, so a program
 /// that only sleeps on a futex — nim's `nanosleep` — is single-threaded, and can fork). Or it has
-/// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166).
+/// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166). Or
+/// its detached children can call it back (#744): it declares an impl-export and spawns detached
+/// (op 15 or 17), so a spawn may grant the child a live offer into the root's cell.
 pub(crate) fn locked(m: &Module) -> bool {
-    m.funcs.iter().any(|f| f.uses_fibers_or_threads()) || crate::has_service_point(m)
+    m.funcs.iter().any(|f| f.uses_fibers_or_threads())
+        || crate::has_service_point(m)
+        || (!m.impl_exports.is_empty() && crate::spawns_detached(m))
 }
 
 /// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a [`locked`]
@@ -883,9 +881,10 @@ pub(crate) unsafe fn with_cap_ctx<R>(
     if !locked {
         return f(CapCtx::Raw(host));
     }
-    let locked = Mutex::new(std::mem::take(host));
-    let r = f(CapCtx::Locked(&locked));
-    *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
+    // #744 — a cell that knows itself, so a child can be granted a live offer back into it.
+    let cell = std::mem::take(host).into_cell();
+    let r = f(CapCtx::Locked(Arc::as_ptr(&cell)));
+    *host = Host::from_cell(cell);
     r
 }
 
@@ -944,18 +943,16 @@ pub(crate) unsafe fn compile_image(
 }
 
 /// The JIT run of an image's code `cm` over the powerbox `cc` names: register the live module for the
-/// cap thunk's re-entries, arm the production §14 hooks and the §5 kill-path `interrupt` (the cell the
-/// code polls), and run it. As a `process` of a tree, the image also carries its [`ProcCtx`], rings
-/// the tree's bell from its personality's doors, and — when it can fork — the fork hook that
-/// duplicates it.
+/// cap thunk's re-entries, arm the production §14 hooks, and run it. As a `process` of a tree, the
+/// image also carries its [`ProcCtx`], rings the tree's bell from its personality's doors, and — when
+/// it can fork — the fork hook that duplicates it.
 ///
 /// # Safety
 /// `cc`'s host is the live powerbox `cm` dispatches into, touched by no one else during the run but
-/// through its lock; `interrupt` (when `Some`) is the cell `cm` polls, and outlives the call.
+/// through its lock.
 pub(crate) unsafe fn run_image(
     cc: CapCtx,
     mut cm: CompiledModule,
-    interrupt: Option<*const AtomicU64>,
     process: Option<&ProcCtx>,
     start: Entry<'_>,
 ) -> Result<JitRun, temen_jit::JitError> {
@@ -983,9 +980,8 @@ pub(crate) unsafe fn run_image(
         // §3.6 / #2166: register the module as the domain's serve context too — a serving module
         // need not hold a `Jit` grant (whose per-domain ctx the line above sets).
         host.set_serve_ctx(cm_ptr);
-        if let Some(ip) = interrupt {
-            host.set_epoch_cell(ip as usize);
-        }
+        // #2173 — the parks of the run's shared cells key into its hub.
+        host.set_park_hub(cm.park_hub());
     });
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
@@ -1003,7 +999,7 @@ pub(crate) unsafe fn run_image(
     cc.with_host(|host| {
         host.set_jit_native_ctx(0);
         host.set_serve_ctx(0);
-        host.set_epoch_cell(0);
+        host.set_park_hub(0);
     });
     r.map(|(outcome, snapshot)| JitRun {
         outcome,

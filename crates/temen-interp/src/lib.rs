@@ -6132,13 +6132,7 @@ fn client_gone_locked(s: &mut Sched, service: usize) {
 fn client_gone_targets(v: &VCpu) -> Vec<usize> {
     let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
     if v.nested_child || v.freeze_bell.is_some() {
-        let hg = v.host.lock_unpoisoned();
-        cells.extend(hg.table.iter().filter_map(|slot| match slot.entry {
-            Some(Binding::LiveImpl(i)) => {
-                hg.live_impls.get(i as usize).map(|e| Arc::clone(&e.callee))
-            }
-            _ => None,
-        }));
+        cells.extend(v.host.lock_unpoisoned().live_offer_providers());
     }
     let mut ids: Vec<usize> = cells
         .iter()
@@ -14781,7 +14775,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // Empty for every other op.
                                 let mut named_child: Vec<i32> = Vec::new();
                                 for (name, gh) in &named {
-                                    if let Some(cg) = regrant_eval_grant(host, *gh, &mut ch) {
+                                    let cg = host.lock_unpoisoned().grant_into_child(
+                                        Some(host),
+                                        *gh,
+                                        &mut ch,
+                                    );
+                                    if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
                                         named_child.push(cg);
                                     }
@@ -15293,9 +15292,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                             };
                             // Named grants (the op-11 record format), pre-validated fail-closed. A
-                            // v1 record may carry #744's live self-serve grant; op 15's positional
-                            // form (retiring, #2067) refuses it, as every other engine's admission
-                            // does.
+                            // detached spawn may carry #744's live self-serve grant, from a v1
+                            // record or op 15's positional form alike.
                             let glist = match grants_n {
                                 0 => Vec::new(),
                                 _ => {
@@ -15305,14 +15303,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     })?
                                 }
                             };
-                            {
-                                let hg = host.lock_unpoisoned();
-                                if rec.is_some() {
-                                    authorize_eval_grants(&hg, &glist)?;
-                                } else if !glist.iter().all(|(_, h)| hg.can_regrant(*h)) {
-                                    return Err(Trap::CapFault);
-                                }
-                            }
+                            authorize_eval_grants(&host.lock_unpoisoned(), &glist)?;
                             let cfs: &[Func] = &cm.funcs;
                             let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
                             let ok_entry = cfs
@@ -15405,7 +15396,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // #1944 — the budget that paid for the window is the child's own.
                                 host.lock_unpoisoned().give_child_budget(budget, &mut ch);
                                 for (name, gh) in &glist {
-                                    if let Some(cg) = regrant_eval_grant(host, *gh, &mut ch) {
+                                    let cg = host.lock_unpoisoned().grant_into_child(
+                                        Some(host),
+                                        *gh,
+                                        &mut ch,
+                                    );
+                                    if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
                                     }
                                 }
@@ -22124,46 +22120,24 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// records) do not zero it — giving it meaning would misread their garbage. A negative handle is
 /// already the ABI's non-grant space (`-errno` results; `can_regrant` refuses every negative), so the
 /// tag lives where nothing valid can collide; the `10` top bits keep it clear of the small-magnitude
-/// `-errno` range (top bits `11`). Honored by the tree-walker's spawn arms for op 13 and the op-17
-/// record (v0 and v1); op 15's positional form, `exec_module` and every other engine's admission see
-/// a negative handle and refuse it fail-closed through `can_regrant`. Those engines meet no
-/// legitimate use: the tag names one of the spawner's own impl-exports, and a module with
-/// impl-exports that spawns through a record runs on the tree-walker (the bytecode engine declines
-/// it, the Cranelift JIT folds it); only the tree-walker serves a child's call back to its parent.
-/// Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
+/// `-errno` range (top bits `11`). Honored ([`Host::can_grant`]) by the tree-walker's spawn arms for
+/// op 13, op 15 and the op-17 record (v0 and v1), and by the Cranelift JIT's detached spawns, whose
+/// spawner sits in a shared cell its child can call back through ([`Host::into_cell`]: a JIT root
+/// that can mint the grant runs locked, `temen_run::jit_proc::locked`, and so does every JIT child).
+/// `exec_module` and every other admission see a negative handle and refuse it fail-closed through
+/// `can_regrant`; the bytecode engine declines a serving module that spawns, so it meets no
+/// legitimate use there yet (#744). Non-durable (`callee_slot: None` — freeze refuses), the deferred
+/// durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
-/// The eval-loop spawn arms' authority check over a parsed grant list (ops 13 and 17): each handle is
-/// a re-grantable table handle, or — #744 — a live self-serve grant naming one of the granter's own
-/// impl-exports, which must exist. (A tagged value is negative, so `can_regrant` would refuse it as a
-/// non-grant: the fail-closed path every *other* record reader takes, unchanged.)
+/// The eval-loop spawn arms' authority check over a parsed grant list (ops 13, 15 and 17): every
+/// entry must pass [`Host::can_grant`]. The tree-walker's powerbox always sits in a cell its child
+/// can call back through.
 fn authorize_eval_grants(host: &Host, list: &[(String, i32)]) -> Result<(), Trap> {
-    for (_, handle) in list {
-        let ok = match serve_live_export(*handle) {
-            Some(k) => host.offer_shape(k).is_some(),
-            None => host.can_regrant(*handle),
-        };
-        if !ok {
-            return Err(Trap::CapFault);
-        }
-    }
-    Ok(())
-}
-
-/// Re-grant one entry of a grant list [`authorize_eval_grants`] passed into `child`: a table handle
-/// as any spawn re-grants it, or — #744 — a live self-serve grant, which installs into the child a
-/// live-callee offer whose callee is the granter's own running powerbox `host`, over its impl-export.
-/// The child's calls enqueue on the granter's inbound queue and park until its `svc.wait` serve loop
-/// replies. Only the child's table holds the entry (granter → grantee, down the grant graph), so the
-/// granter never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_slot:
-/// None` — non-durable (freeze refuses), the deferred durability story (#1681).
-fn regrant_eval_grant(host: &Arc<Mutex<Host>>, handle: i32, child: &mut Host) -> Option<i32> {
-    let mut hg = host.lock_unpoisoned();
-    match serve_live_export(handle) {
-        Some(k) => hg.offer_shape(k).map(|(names, sigs)| {
-            child.install_live_impl(Arc::clone(host), k, names.into(), sigs.into(), None)
-        }),
-        None => hg.regrant_into_child(handle, child),
+    if list.iter().all(|(_, h)| host.can_grant(*h, true)) {
+        Ok(())
+    } else {
+        Err(Trap::CapFault)
     }
 }
 
@@ -23035,21 +23009,31 @@ pub struct Host {
     /// Distinct from the per-`Jit`-domain [`Host::jit_native_ctx`], which needs a granted `Jit`
     /// capability a serving module need not hold.
     serve_ctx: usize,
-    /// CALLS.md 5c.1b — the run's **kill-path epoch cell** address (`*const AtomicU64`-compatible;
-    /// `0` ⇒ none armed), mirrored here from the JIT run so a thread **blocked inside the cap
-    /// thunk** (the parked transport's caller wait / the child serve loop's empty-queue wait) can
-    /// poll it in its bounded re-check — the same cell `emit_epoch_check` polls from compiled code
-    /// and the `instantiator_rt` join park polls natively. Set alongside the nursery at run start,
-    /// inherited by granted children at spawn (one stable host cell per run).
-    epoch_cell: usize,
-    /// CALLS.md 5c.1b — the shared-cell **wake signal** for the JIT parked transport: a `Condvar`
-    /// deliberately paired with the ONE `Mutex<Host>` cell this Host lives in (every waiter passes
-    /// that cell's guard to `wait_timeout`, so the pairing is consistent by construction). Cloned
-    /// out under the lock, waited on with the guard. Notified by `svc_enqueue` (wakes the child's
-    /// empty-queue `svc.wait`) and `svc_settle` (wakes a caller blocked on its ticket). `None` for
-    /// hosts that are not shared granted-child cells (interp domains, top-level runs) — their
-    /// transports have their own wakers.
-    svc_cv: Option<Arc<Condvar>>,
+    /// #2173 — the JIT run's **park hub** (`temen_jit::CompiledModule::park_hub`: the address of
+    /// the run's thread domain, `0` ⇒ none), mirrored here at run start and inherited by granted
+    /// children at spawn, so a waker that holds no call's trap cell — a child's powerbox release —
+    /// can ring the parks on this cell ([`Host::svc_bell`]). Cleared with the run, and at a child's
+    /// end, so a cell a straggler offer still holds never rings a run that is gone.
+    park_hub: usize,
+    /// CALLS.md 5c.1b, #2173 — the JIT parked transport's **bell** for this shared cell: a
+    /// generation bumped, under the cell's lock, by every change a wait parked on the cell may be
+    /// waiting for — an enqueue, a settle, a handoff's release, the serve context clearing, a
+    /// client's end. A waiter reads it under the lock, drops the lock, and parks on the run's one
+    /// host-call park (`temen_jit::park_host_call`, keyed on the bell's address) until it moves; the
+    /// waker bumps it and wakes that key. So the transport's waits are counted for the run's
+    /// deadlock verdict like every other park. `None` for hosts that are not a JIT run's shared
+    /// cells (interp domains, raw top-level runs): nothing rings them, and a caller reaching one is
+    /// refused. Armed by [`Host::into_cell`].
+    svc_bell: Option<Arc<AtomicU64>>,
+    /// #744 — the shared cell this host sits in ([`Host::into_cell`]): a JIT root that runs locked,
+    /// or a JIT child. A detached spawn it builds mints a live self-serve grant
+    /// (`GRANT_SERVE_LIVE_TAG`) over it, so the child's calls reach this domain's serve loop. `Weak`,
+    /// so the cell never keeps itself alive; `None` ⇒ not shared, and such a grant is refused.
+    self_cell: Option<Weak<Mutex<Host>>>,
+    /// #1217 — a one-shot token: a domain that held a live offer to this one has finished. The JIT
+    /// serve loop's next `svc.wait` that would park with nothing served answers `0` instead, so the
+    /// server reaches its `join` (the tree-walker keeps the same token in its scheduler).
+    client_gone: bool,
     /// CALLS.md 5c.2 — the child's **published serve activation** while its serve loop is parked
     /// at an empty-queue `svc.wait`: `(serve_ctx, mem_base, mem_reserved)` — everything a claiming
     /// caller needs to invoke a handler inline over the child's live window (the §10.2 arm-4
@@ -23740,8 +23724,10 @@ impl Host {
             handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_ctx: 0,
-            epoch_cell: 0,
-            svc_cv: None,
+            park_hub: 0,
+            svc_bell: None,
+            self_cell: None,
+            client_gone: false,
             serve_activation: None,
             handoff_claimed: false,
             handoff_served: 0,
@@ -27736,10 +27722,6 @@ impl Host {
             args,
             ticket,
         });
-        // CALLS.md 5c.1b — wake a child serve loop blocked on the empty queue (no-op elsewhere).
-        if let Some(cv) = &self.svc_cv {
-            cv.notify_all();
-        }
         Some(ticket)
     }
 
@@ -27837,10 +27819,6 @@ impl Host {
     /// [`Host::svc_result`]).
     pub fn svc_settle(&mut self, ticket: u64, v: i64) {
         self.svc_results.insert(ticket, v);
-        // CALLS.md 5c.1b — wake a caller thread-blocked on this ticket (no-op elsewhere).
-        if let Some(cv) = &self.svc_cv {
-            cv.notify_all();
-        }
     }
 
     /// I36 slice 3 — the handler [`FuncIdx`] a queued `(export, op)` dispatch runs, for the
@@ -27859,27 +27837,69 @@ impl Host {
         self.serve_ctx
     }
 
-    /// CALLS.md 5c.1b — arm / read the kill-path epoch cell a thunk-blocked thread polls; see
-    /// [`Host::epoch_cell`].
-    pub fn set_epoch_cell(&mut self, addr: usize) {
-        self.epoch_cell = addr;
+    /// #2173 — record / read the JIT run's park hub; see [`Host::park_hub`].
+    pub fn set_park_hub(&mut self, hub: usize) {
+        self.park_hub = hub;
     }
 
-    /// The armed epoch cell (`0` ⇒ none — an un-killable embedder run; waits still bound on the
-    /// trap cell and timeout).
-    pub fn epoch_cell(&self) -> usize {
-        self.epoch_cell
+    /// The JIT run's park hub (`0` ⇒ none).
+    pub fn park_hub(&self) -> usize {
+        self.park_hub
     }
 
-    /// CALLS.md 5c.1b — arm the shared-cell wake signal (a fresh `Condvar`) on this (child) Host;
-    /// see [`Host::svc_cv`]. Called by the granted-child builders at spawn.
-    pub fn arm_svc_cv(&mut self) {
-        self.svc_cv = Some(Arc::new(Condvar::new()));
+    /// The shared cell's bell (`None` ⇒ not a JIT run's shared cell).
+    pub fn svc_bell(&self) -> Option<&Arc<AtomicU64>> {
+        self.svc_bell.as_ref()
     }
 
-    /// The shared-cell wake signal, cloned out under the cell's lock (`None` ⇒ not a shared cell).
-    pub fn svc_cv(&self) -> Option<Arc<Condvar>> {
-        self.svc_cv.clone()
+    /// #1217 — the providers of every live offer this powerbox holds (`Binding::LiveImpl`): the
+    /// service domains this domain is a client of, whose `svc.wait` its end releases.
+    pub fn live_offer_providers(&self) -> Vec<Arc<Mutex<Host>>> {
+        self.table
+            .iter()
+            .filter_map(|slot| match slot.entry {
+                Some(Binding::LiveImpl(i)) => self
+                    .live_impls
+                    .get(i as usize)
+                    .map(|e| Arc::clone(&e.callee)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #1217 — leave this domain a client-gone token; see [`Host::client_gone`].
+    pub fn set_client_gone(&mut self) {
+        self.client_gone = true;
+    }
+
+    /// #1217 — take this domain's client-gone token, if it has one.
+    pub fn take_client_gone(&mut self) -> bool {
+        std::mem::take(&mut self.client_gone)
+    }
+
+    /// #744 — move this host into a JIT run's **shared cell**: what a JIT root that runs locked, and
+    /// every JIT child, runs over. The cell knows itself ([`Host::self_cell`]), so a child can be
+    /// granted a live offer back into it, and carries the parked transport's bell
+    /// ([`Host::svc_bell`]), so a call through such an offer can wake its serve loop.
+    /// [`Host::from_cell`] takes it back.
+    pub fn into_cell(mut self) -> Arc<Mutex<Host>> {
+        self.svc_bell = Some(Arc::new(AtomicU64::new(0)));
+        let cell = Arc::new(Mutex::new(self));
+        cell.lock_unpoisoned().self_cell = Some(Arc::downgrade(&cell));
+        cell
+    }
+
+    /// Take a host back out of the cell [`Host::into_cell`] made, once its run is over: no longer a
+    /// shared cell. A clone of the cell some straggler still holds (a child's live offer to it)
+    /// keeps an empty host.
+    pub fn from_cell(cell: Arc<Mutex<Host>>) -> Host {
+        let mut host = match Arc::try_unwrap(cell) {
+            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(cell) => std::mem::take(&mut *cell.lock_unpoisoned()),
+        };
+        host.self_cell = None;
+        host.svc_bell = None;
+        host
     }
 
     /// CALLS.md 5c.2 — publish / clear this child's parked serve activation; see
@@ -29715,6 +29735,40 @@ impl Host {
         Some((ch, cinst, cas, cg))
     }
 
+    /// The spawn's authority check for one entry of a grant list: a re-grantable table handle
+    /// ([`Self::can_regrant`]), or — #744 — a live self-serve grant ([`GRANT_SERVE_LIVE_TAG`]) naming
+    /// one of this domain's own impl-exports, honored only when its child can call back into it
+    /// (`callable`: it sits in a cell a live offer can name). The tree-walker's spawn arms and the
+    /// JIT's detached builder both ask it, so they admit the same grants.
+    fn can_grant(&self, handle: i32, callable: bool) -> bool {
+        match serve_live_export(handle) {
+            Some(k) => callable && self.offer_shape(k).is_some(),
+            None => self.can_regrant(handle),
+        }
+    }
+
+    /// Grant one entry [`Self::can_grant`] passed into `child`: a table handle as any spawn
+    /// re-grants it, or — #744 — a live self-serve grant, a live-callee offer in the child whose
+    /// callee is this domain's own running cell `cell`, over its impl-export. The child's calls
+    /// enqueue on this domain's inbound queue and park until its `svc.wait` serve loop replies. Only
+    /// the child's table holds the entry (granter → grantee, down the grant graph), so the granter
+    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_slot:
+    /// None` — non-durable (freeze refuses), the deferred durability story (#1681).
+    fn grant_into_child(
+        &mut self,
+        cell: Option<&Arc<Mutex<Host>>>,
+        handle: i32,
+        child: &mut Host,
+    ) -> Option<i32> {
+        match serve_live_export(handle) {
+            Some(k) => {
+                let (names, sigs) = self.offer_shape(k)?;
+                Some(child.install_live_impl(Arc::clone(cell?), k, names.into(), sigs.into(), None))
+            }
+            None => self.regrant_into_child(handle, child),
+        }
+    }
+
     /// Whether `handle` names a capability this host may **re-grant into a §14 child** — a coordinate-free
     /// cap ([`Self::resolve_copyable`]) or a pipe end ([`Self::resolve_pipe_end`]). Used to fail a grant
     /// closed *before* any child state is built.
@@ -30060,7 +30114,7 @@ impl Host {
     ) -> Option<(Host, i32, i32)> {
         // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
         let attestation = self.child_attestation(false, None);
-        self.spawn_child_powerbox(grants, child_size, attestation, None)
+        self.spawn_child_powerbox(grants, child_size, attestation, None, None)
     }
 
     /// PROCESS.md §5 / #1287 — the **detached** twin of [`Self::spawn_named_child`]: the same by-name
@@ -30088,8 +30142,16 @@ impl Host {
         // budget it charged, as the tree-walker's arm does. The JIT's thunk carries both from its
         // admission hook to this build itself, so nothing waits on this host between the two for
         // another vCPU's spawn to take (#1972).
-        let (mut ch, cinst, cas) =
-            self.spawn_child_powerbox(grants, reservation, attestation, Some(budget))?;
+        // #744 — a live self-serve grant calls back into this host through its own shared cell, when
+        // it sits in one (a JIT root that serves, or a JIT child); without one it is refused.
+        let cell = self.self_cell.as_ref().and_then(Weak::upgrade);
+        let (mut ch, cinst, cas) = self.spawn_child_powerbox(
+            grants,
+            reservation,
+            attestation,
+            Some(budget),
+            cell.as_ref(),
+        )?;
         ch.set_durable(durable);
         ch.set_lane_cap(lane);
         Some((ch, cinst, cas))
@@ -30098,16 +30160,22 @@ impl Host {
     /// The child powerbox: its starter caps, then `budget` as its own `"budget"` (a detached child,
     /// [`Self::give_child_budget`]), then each of `grants` under its name — the order the
     /// tree-walker's detached arm grants them in, so a child's handles are the same on every engine.
+    /// `cell` is this host's own shared cell, which a #744 live self-serve grant calls back through
+    /// (`None` refuses such a grant, as `can_regrant` refuses every negative handle).
     fn spawn_child_powerbox(
         &mut self,
         grants: &[(String, i32)],
         child_size: u64,
         attestation: Attestation,
         budget: Option<i32>,
+        cell: Option<&Arc<Mutex<Host>>>,
     ) -> Option<(Host, i32, i32)> {
         // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
         // anything (a partially-built child would leak a promoted sink / installed pipe).
-        if !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
+        if !grants
+            .iter()
+            .all(|(_, h)| self.can_grant(*h, cell.is_some()))
+        {
             return None;
         }
         let mut ch = self.child_host();
@@ -30123,9 +30191,9 @@ impl Host {
             self.give_child_budget(budget, &mut ch);
         }
         for (name, handle) in grants {
-            // Pre-checked above, so this cannot fail; each cap (coordinate-free or pipe end) is
-            // re-granted into the child under its name.
-            let cg = self.regrant_into_child(*handle, &mut ch)?;
+            // Pre-checked above, so this cannot fail: each entry is granted into the child under its
+            // name, a live self-serve grant as an offer over this host's own cell.
+            let cg = self.grant_into_child(cell, *handle, &mut ch)?;
             ch.register_cap_name(name, cg);
         }
         Some((ch, cinst, cas))
@@ -30575,7 +30643,7 @@ impl Host {
         }
         let child_size = 1u64 << win_log2;
         let (mut host, ci, ca) = self
-            .spawn_child_powerbox(grants, window_reserved, self.attestation, None)
+            .spawn_child_powerbox(grants, window_reserved, self.attestation, None, None)
             .ok_or(EINVAL)?;
         // #1944 slice 3 — an exec replaces the image, not the domain: the new image's use is charged
         // to the node the old one's was, as a process keeps its cgroup across `execve`, so a child

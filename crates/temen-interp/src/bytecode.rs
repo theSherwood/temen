@@ -1346,11 +1346,12 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 /// Lower every function (fast path — superinstruction-**fused**, Slice 5a), or `None` if any uses an
 /// op outside this slice's subset. This is what every production/runtime path calls.
 /// CONSOLIDATION.md §3d — the **module-level** admission for the record spawn (op 17): a module
-/// that could build a *pager* record (it has impl exports) declines to the tree-walk oracle, which
-/// owns demand paging; with no impl exports every pager record `CapFault`s identically on every
-/// tier, so the exec arm's fail-closed pager check is exact. This mirrors temen-run's
-/// `module_demand_spawns` fold on the Cranelift tier — one predicate per tier boundary, consulted
-/// by every `&Module` compile entry (INVARIANTS.md §9).
+/// with impl exports declines to the tree-walk oracle, which owns demand paging; with no impl
+/// exports every pager record `CapFault`s identically on every tier, so the exec arm's fail-closed
+/// pager check is exact. One predicate, consulted by every `&Module` compile entry (INVARIANTS.md
+/// §9). It is broader than temen-run's `module_demand_spawns` fold, which keys on a pager-shaped
+/// export (`Module::declares_pager`) now that the Cranelift JIT serves its own children (#744): it
+/// narrows to the same key when the cooperative driver can serve them too.
 fn compile_module_for(m: &Module) -> Option<Compiled> {
     let uses_rec = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
         b.insts.iter().any(|i| {
