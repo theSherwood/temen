@@ -19,6 +19,7 @@ version = "0.0.0"
 dependencies = [
  "temen-encode",
  "temen-ir",
+ "temen-opt",
  "temen-text",
 ]
 
@@ -31,6 +32,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "temen-opt"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
+ "temen-verify",
+]
+
+[[package]]
 name = "temen-posix-abi"
 version = "0.0.0"
 dependencies = [
@@ -39,6 +48,13 @@ dependencies = [
 
 [[package]]
 name = "temen-text"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-verify"
 version = "0.0.0"
 dependencies = [
  "temen-ir",

@@ -255,15 +255,36 @@ tracked enhancement, not a blocker.
     through the callee — appended as a pass-through parameter to every callee block and carried along
     every edge (including back edges of loops in the callee) to the continuation. This over-threads;
     the always-on dead-block-parameter cleanup prunes the params that weren't needed. Tail-call callee
-    exits are excluded (a separate transform). Module-wide instruction budget + `MAX_CALLEE_INSTS`
-    (total, across all callee blocks) size guard + direct-self-recursion skip bound growth and
-    guarantee termination. `OptConfig.inline` toggle (default on), runs first at module scope so the
+    exits are excluded (a separate transform). `InlineLimits` — a module-wide instruction budget and a
+    `max_callee` size guard (total, across all callee blocks) — plus the direct-self-recursion skip bound
+    growth and guarantee termination; `inline_calls` uses `InlineLimits::OPTIMIZER` (24 / 4096). One
+    forward pass finds every site (functions in order, blocks in order including the ones a splice
+    appends, each spliced body rescanned in place): the same sites, in the same order, as rescanning
+    from the top after each inline, since the budget only falls and a splice only grows its caller.
+    The exception is a callee of no instructions, whose splice shrinks its caller by the call; the pass
+    does not go back for a site that shrinking makes fit. A multi-block
+    splice edits the caller's block list in place and types only the block it splits; cloning and
+    retyping the whole caller per splice made it quadratic in a big function (#2147: inlining `hexer`
+    under a budget that never binds, 1.8 s → 0.09 s). Debug info survives for every function nothing
+    was inlined into.
+    `OptConfig.inline` toggle (default on), runs first at module scope so the
     per-function passes fold through the inlined bodies and DFE sweeps the now-uncalled leaf — the
     end-to-end interprocedural story. Tests in `tests/interproc.rs` (single-block leaf inlined +
     DFE-removed, live code across the call site renumbered; a multi-block `abs` callee inlined with a
     captured value threaded through the join; a callee with a **loop** threaded around its back edge;
     full-pipeline devirt→inline→DFE), all re-verified; the peval differential suite + `opt_sccp` fuzz
     target now exercise it on real residuals.
+  - [x] **Linked programs** (`temen_opt::optimize_linked`, #2147): what temen-leng's link runs on every
+    nim program it ships. It inlines callees of at most `LINKED_MAX_CALLEE` (6) instructions, then
+    numbers each function's blocks in **reverse postorder** (`order_blocks`). No folding and no
+    cleanup: it is cheap enough for every link, and a host linker and the in-guest one (built without
+    `libm-floats`) produce the same module, which the self-hosted lane's fixed point requires.
+    Fuel is charged per taken back edge (INVARIANTS #9), which every engine reads off the block
+    indices: a branch to an equal-or-earlier block. In reverse postorder that is exactly a loop's back
+    edge, while leng's own order puts an `if`'s join before its arms; on `hexer` that was 63% of its
+    fuel checks. `order_blocks` remaps the debug positions that name a block. Tests in
+    `tests/linked.rs`; the `opt_sccp` fuzz target checks it against the interpreter beside
+    `optimize_module`.
   - [x] **Constant-funcref devirtualization** (`temen_opt::interproc::devirtualize`): a
     `call.dyn`/`return_call.dyn` whose `idx` is a compile-time-constant funcref (a
     `ref.func k`, or an in-range `ConstI32 k` — a funcref is a plain `i32`, the identity table) and
@@ -424,7 +445,8 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   is the same instruction budget + total-insts size guard + self-recursion skip as the single-block
   path. (Chose uniform over-threading + cleanup over selective `crate::thread::make_available` — same
   result, simpler code.)
-- [ ] Debug-info (line map) preservation through transforms.
+- [ ] Debug-info (line map) preservation through transforms. (`order_blocks` remaps positions, and
+  the inliner keeps the positions of every function it did not change; the rest still drop them.)
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
 - [x] Interprocedural constant propagation (beyond what inlining exposes). Landed
   (`temen_opt::interproc::const_prop`, Phase 3 above) — reaches callees too big to inline, plus the

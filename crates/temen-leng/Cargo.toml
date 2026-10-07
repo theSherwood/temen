@@ -27,6 +27,9 @@ float = []
 temen-ir = { path = "../temen-ir" }
 temen-text = { path = "../temen-text" }
 temen-encode = { path = "../temen-encode" }
+# `optimize_linked`, run on every linked program (#2147). Without `libm-floats`, so the guest build
+# (temen-link) carries no libm; the passes it runs fold no float, so the host links the same module.
+temen-opt = { path = "../temen-opt", default-features = false }
 
 [dev-dependencies]
 temen-verify = { path = "../temen-verify" }
