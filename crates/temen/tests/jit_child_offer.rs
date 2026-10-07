@@ -464,3 +464,48 @@ fn a_childs_serve_nested_under_its_handler_is_refused() {
         "JIT direct handoff"
     );
 }
+
+/// #2166 — like [`JOIN_SRC`], but the handler stores to `addr` before it answers, and the parent
+/// asks how the child ended with `Instantiator.wait` (op 18) rather than joining it. The parent
+/// returns `call * 100000 + wait`.
+fn faulting_handler_src(addr: u64) -> String {
+    JOIN_SRC
+        .replace(
+            "vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)\n  vk = i64.const 100\n",
+            "vj = call.cap 6 18 (i32) -> (i64) vin2 (vch2)\n  vk = i64.const 100000\n",
+        )
+        .replace(
+            "block 0 (va: i64, vb: i64) {\n  s = i64.add va vb\n",
+            &format!(
+                "block 0 (va: i64, vb: i64) {{\n  vbad = i64.const {addr}\n  i64.store vbad va\n  s = i64.add va vb\n"
+            ),
+        )
+}
+
+/// #2166 — a serving child whose handler faults dies of it on every transport, as the oracle's does:
+/// its caller's call answers the dead-callee errno (`CAP_REVOKED`, -9) and `wait` reports the
+/// child's `MemoryFault`. Both addresses fault: the NULL guard, and the first word past the child's
+/// mapped window (inside its reservation). The JIT's child routes used to lose the first fault (the
+/// child kept running) and not recover the second at all (the process died of SIGSEGV).
+#[test]
+fn a_childs_faulting_handler_kills_the_child_on_every_transport() {
+    let want = -9 * 100_000 + temen_interp::Trap::MemoryFault.code();
+    for addr in [8u64, (128 << 10) + 8] {
+        let src = faulting_handler_src(addr);
+        assert!(
+            src.contains("call.cap 6 18") && src.contains("i64.store vbad va"),
+            "the rewrites must apply"
+        );
+        assert_eq!(run_interp_i64(&src), want, "interp, store at {addr}");
+        assert_eq!(
+            run_jit_i64_knob(&src, false),
+            want,
+            "JIT parked transport, store at {addr}"
+        );
+        assert_eq!(
+            run_jit_i64_knob(&src, true),
+            want,
+            "JIT direct handoff, store at {addr}"
+        );
+    }
+}

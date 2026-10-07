@@ -1179,7 +1179,7 @@ fn cross_thread_execute_fresh_code_agrees() {
 // ---------------------------------------------------------------------------
 // ISSUES.md I36 slice 3 — the **JIT serve loop** (formerly `jit_svc.rs`; merged here so the
 // branch adds no extra heavy-link test binary — ISSUES.md I30, the linker-OOM runner deaths):
-// `svc.poll`/`svc.wait` run natively on the JIT (the cap thunk's `serve_native` arm invoking
+// `svc.poll`/`svc.wait` run natively on the JIT (the cap thunk's serve loop invoking
 // compiled handler trampolines over the live window) instead of `module_serves` folding the
 // whole run to the tree-walk oracle. Differential: every scenario runs on the tree-walker and
 // the JIT with identical `Host` setups and must agree exactly — results, completion cells,

@@ -689,7 +689,7 @@ unsafe fn run_process(
                     cur.arm_caller_requests();
                 }
                 let threads = module.funcs.iter().any(temen_ir::Func::uses_threads);
-                let r = with_cap_ctx(cur, concurrent(module), |cc| {
+                let r = with_cap_ctx(cur, locked(module), |cc| {
                     tree.load(pid, cc, &program, entry, process)
                         .and_then(|code| {
                             let ctx = ProcCtx {
@@ -860,25 +860,27 @@ pub(crate) enum Entry<'a> {
     },
 }
 
-/// Whether `m`'s `call.cap`s can come from more than one vCPU at once: it spawns threads or runs
-/// fibers (§12). Waiting and notifying alone make no second caller: a program that only sleeps on a
-/// futex (nim's `nanosleep`) is single-threaded, and can fork.
-pub(crate) fn concurrent(m: &Module) -> bool {
-    m.funcs.iter().any(|f| f.uses_fibers_or_threads())
+/// Whether `m` runs over the **locked** powerbox ([`CapCtx::Locked`]) — the one rule every JIT
+/// entry decides the shape by. Its `call.cap`s can come from more than one vCPU at once: it spawns
+/// threads or runs fibers (§12; waiting and notifying alone make no second caller, so a program
+/// that only sleeps on a futex — nim's `nanosleep` — is single-threaded, and can fork). Or it has
+/// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166).
+pub(crate) fn locked(m: &Module) -> bool {
+    m.funcs.iter().any(|f| f.uses_fibers_or_threads()) || crate::has_service_point(m)
 }
 
-/// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a `concurrent`
-/// program's vCPUs make theirs at once, so its powerbox is locked for the span of `f` and handed
-/// back after; any other program's is the raw host.
+/// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a [`locked`]
+/// program's powerbox is locked for the span of `f` and handed back after; any other program's is
+/// the raw host.
 ///
 /// # Safety
 /// `host` is live, and touched by no one else during `f`.
 pub(crate) unsafe fn with_cap_ctx<R>(
     host: &mut Host,
-    concurrent: bool,
+    locked: bool,
     f: impl FnOnce(CapCtx) -> R,
 ) -> R {
-    if !concurrent {
+    if !locked {
         return f(CapCtx::Raw(host));
     }
     let locked = Mutex::new(std::mem::take(host));
@@ -978,9 +980,9 @@ pub(crate) unsafe fn run_image(
             host.set_wake_bell(p.tree.bell());
         }
         host.set_jit_native_ctx(cm_ptr);
-        // §3.6 / I36 slice 3: register the module for the cap thunk's native serve arm too — a
-        // serving module need not hold a `Jit` grant (whose per-domain ctx the line above sets).
-        host.set_serve_native_ctx(cm_ptr);
+        // §3.6 / #2166: register the module as the domain's serve context too — a serving module
+        // need not hold a `Jit` grant (whose per-domain ctx the line above sets).
+        host.set_serve_ctx(cm_ptr);
         if let Some(ip) = interrupt {
             host.set_epoch_cell(ip as usize);
         }
@@ -1000,7 +1002,7 @@ pub(crate) unsafe fn run_image(
     // find them.
     cc.with_host(|host| {
         host.set_jit_native_ctx(0);
-        host.set_serve_native_ctx(0);
+        host.set_serve_ctx(0);
         host.set_epoch_cell(0);
     });
     r.map(|(outcome, snapshot)| JitRun {

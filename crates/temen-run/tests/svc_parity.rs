@@ -98,3 +98,74 @@ fn a_serving_domain_behaves_identically_on_all_three_backends() {
         );
     }
 }
+
+/// #2166 — a root that serves and also spawns a thread runs over the locked powerbox on the JIT, and
+/// is served there by the same loop as any other domain. It used to reach the child serve loop,
+/// which only knew a child's registration, and its `svc.poll` answered `-EINVAL` where the other
+/// backends serve. The `Instantiator` call (never reached) keeps the module off the oracle fold,
+/// and the thread is never spawned: only the module's shape matters.
+const THREADED_SERVING_ROOT: &str = "\
+memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface \"counter\" 1 { bump: 1 }
+import 0 \"exit\" (i32) -> ()
+
+func 0 () -> () {
+block 0 () {
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vc = i32.wrap_i64 vn
+  call.import 0 (vc)
+  unreachable
+  }
+}
+
+func 1 (i64) -> (i64) {
+block 0 (vx: i64) {
+  return vx
+  }
+}
+
+func 2 () -> (i64) {
+block 0 () {
+  vsp = i64.const 32768
+  va = i64.const 0
+  vh = thread.spawn 3 vsp va
+  vz = i64.const 0
+  return vz
+  }
+}
+
+func 3 (i64, i64) -> (i64) {
+block 0 (vsp: i64, va: i64) {
+  vz = i64.const 0
+  return vz
+  }
+}
+
+func 4 (i32, i32) -> (i64) {
+block 0 (vh: i32, vc: i32) {
+  vj = call.cap 6 1 (i32) -> (i64) vh (vc)
+  return vj
+  }
+}
+";
+
+#[test]
+fn a_serving_root_with_a_thread_serves_on_all_three_backends() {
+    let m = parse_module(THREADED_SERVING_ROOT).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let registry = Imports::new().provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(m, registry).expect("instantiate");
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let r = inst
+            .run_with_caps(backend, &RunConfig::default(), &[])
+            .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+        assert_eq!(
+            r.outcome,
+            Outcome::Exited(0),
+            "{backend:?}: an empty poll serves nothing and answers 0"
+        );
+    }
+}

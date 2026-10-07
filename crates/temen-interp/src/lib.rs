@@ -23026,22 +23026,15 @@ pub struct Host {
     /// snapshot-hostile (a thaw re-allocates every powerbox); the id is recordable in a
     /// snapshot and re-linkable on thaw.
     domain_id: u64,
-    /// I36 slice 3 (JIT serve loop) — the JIT embedder's native context for **this domain's
-    /// serve loop** (its `*mut CompiledModule` as a `usize`): registered around a JIT run so
-    /// the embedder's cap thunk can invoke handler trampolines over the live window at a
-    /// `svc.poll`/`svc.wait` service point. Opaque here (only the embedder dereferences it);
-    /// `0` on interpreter runs. Distinct from the per-`Jit`-domain [`Host::jit_native_ctx`]
-    /// (which requires a granted `Jit` capability a serving module need not hold).
-    serve_native_ctx: usize,
-    /// CALLS.md 5c.1a — a **JIT granted child's** serve context: the address of the child's live
-    /// compiled module (its serve trampolines + fn table), registered at spawn and cleared by the
-    /// powerbox release hook. Distinct from [`Host::serve_native_ctx`] (a top-level run's
-    /// `*mut CompiledModule`) so the two interpretations can never be confused: this one is read
-    /// only by the locked cap thunk's child serve arm, and only while the child executes (the
-    /// module outlives every in-child `call.cap` by construction; stale reads are prevented by the
-    /// clear-on-release). `0` ⇒ none. #1296: the same address is registered as the native ctx of
-    /// every `Jit` table re-granted into the child (`set_jit_native_ctx`).
-    child_serve_ctx: usize,
+    /// I36 slice 3, CALLS.md 5c.1a, #2166 — the JIT embedder's **serve context** for this domain:
+    /// the address of the compiled module it runs (its serve trampolines + fn table), so the cap
+    /// thunk's serve loop can invoke handlers over the live window at a `svc.poll`/`svc.wait`.
+    /// Registered around a root's run, or at a granted child's spawn and cleared by its powerbox
+    /// release hook (a caller mid-wait reads the clear as the dead-callee signal). Opaque here (only
+    /// the embedder dereferences it, read-only); `0` ⇒ none (an interpreter run, or released).
+    /// Distinct from the per-`Jit`-domain [`Host::jit_native_ctx`], which needs a granted `Jit`
+    /// capability a serving module need not hold.
+    serve_ctx: usize,
     /// CALLS.md 5c.1b — the run's **kill-path epoch cell** address (`*const AtomicU64`-compatible;
     /// `0` ⇒ none armed), mirrored here from the JIT run so a thread **blocked inside the cap
     /// thunk** (the parked transport's caller wait / the child serve loop's empty-queue wait) can
@@ -23058,7 +23051,7 @@ pub struct Host {
     /// transports have their own wakers.
     svc_cv: Option<Arc<Condvar>>,
     /// CALLS.md 5c.2 — the child's **published serve activation** while its serve loop is parked
-    /// at an empty-queue `svc.wait`: `(serve_ctx, mem_base, mem_size)` — everything a claiming
+    /// at an empty-queue `svc.wait`: `(serve_ctx, mem_base, mem_reserved)` — everything a claiming
     /// caller needs to invoke a handler inline over the child's live window (the §10.2 arm-4
     /// direct handoff, JIT twin). Published/cleared only by the child's own serve loop, under the
     /// cell's lock; `None` whenever the child is running, serving, or gone.
@@ -23746,8 +23739,7 @@ impl Host {
             svc_next_ticket: 0,
             handoff: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            serve_native_ctx: 0,
-            child_serve_ctx: 0,
+            serve_ctx: 0,
             epoch_cell: 0,
             svc_cv: None,
             serve_activation: None,
@@ -27857,26 +27849,14 @@ impl Host {
         self.svc_handler_func(export, op)
     }
 
-    /// I36 slice 3 — register (or clear, `0`) the JIT embedder's serve-loop native context
-    /// (its `*mut CompiledModule` as a `usize`); see [`Host::serve_native_ctx`].
-    pub fn set_serve_native_ctx(&mut self, ctx: usize) {
-        self.serve_native_ctx = ctx;
+    /// Register (or clear, `0`) this domain's JIT serve context; see [`Host::serve_ctx`].
+    pub fn set_serve_ctx(&mut self, ctx: usize) {
+        self.serve_ctx = ctx;
     }
 
-    /// The registered serve-loop native context (`0` ⇒ interpreter run / none registered).
-    pub fn serve_native_ctx(&self) -> usize {
-        self.serve_native_ctx
-    }
-
-    /// CALLS.md 5c.1a — register / clear this (child) domain's compiled-module serve context; see
-    /// [`Host::child_serve_ctx`].
-    pub fn set_child_serve_ctx(&mut self, ctx: usize) {
-        self.child_serve_ctx = ctx;
-    }
-
-    /// The registered JIT-child serve context (`0` ⇒ none / already released).
-    pub fn child_serve_ctx(&self) -> usize {
-        self.child_serve_ctx
+    /// The registered JIT serve context (`0` ⇒ none: an interpreter run, or released).
+    pub fn serve_ctx(&self) -> usize {
+        self.serve_ctx
     }
 
     /// CALLS.md 5c.1b — arm / read the kill-path epoch cell a thunk-blocked thread polls; see
