@@ -14500,9 +14500,19 @@ fn lower_int_intrinsic(
                 i128_icmp(ctx, ltp, pa[0], pa[1], pb[0], pb[1]),
             )
         } else {
+            let bits = src_bits(args[0], types)?;
             let opnd_ty = int_ty(val_type(opnd_ty.as_ref())?)?;
-            let a = ctx.operand(args[0])?;
-            let b = ctx.operand(args[1])?;
+            let mut a = ctx.operand(args[0])?;
+            let mut b = ctx.operand(args[1])?;
+            // #2146: a narrow operand sits zero-extended in its container (§3b), so a signed
+            // order sign-extends it first, as a signed `icmp` does; else `scmp.i8(-3, 0)` reads
+            // 253 and answers 1 (`curve25519-dalek`'s NAF digits, a negative one taken as
+            // positive).
+            if signed && bits != 32 && bits != 64 {
+                let to = if bits < 32 { 32 } else { 64 };
+                a = emit_ext(ctx, a, bits, to, true);
+                b = emit_ext(ctx, b, bits, to, true);
+            }
             let (gtop, ltop) = if signed {
                 (CmpOp::GtS, CmpOp::LtS)
             } else {
@@ -14830,7 +14840,8 @@ fn lower_int_intrinsic(
         // no-shift operand) — both shift counts are then in `1..w`, no shift-by-`w` edge case — and the
         // result is masked back to `w` (a narrow value lives in a wider container). Found via Embench
         // `aha-mont64`'s `modul64` (`fshl.i64(hi, lo, 1)`) and `picojpeg` (`fshl.i16`). A non-constant
-        // amount (needs a width-edge-safe `select`) or a `33..63` width stays fail-closed.
+        // amount lowers at `i32`/`i64` with a width-edge `select` (#2146); a non-constant amount at a
+        // narrow width, or a `33..63` width, stays fail-closed.
         "llvm.fshl" | "llvm.fshr" => {
             let is_fshl = base == "llvm.fshl";
             let w = src_bits(args[0], types)?;
@@ -14846,9 +14857,50 @@ fn lower_int_intrinsic(
                     ));
                 }
                 let Some(c) = const_int(args[2]) else {
-                    return unsup(format!(
-                        "general funnel shift `{name}` (non-constant amount)"
-                    ));
+                    // #2146: a runtime amount at a full width (the container's), as the vector
+                    // path does per lane: `s = amt mod w`, both shifts, and a `select` on `s == 0`
+                    // for the width edge (the other shift is then by `w`, which temen-ir masks to
+                    // nothing; the select discards it). `ed25519-dalek`'s scalar multiplication
+                    // emits `fshr.i64` so. A narrow width would need its container masked too.
+                    if w != 32 && w != 64 {
+                        return unsup(format!(
+                            "general funnel shift `{name}` (non-constant amount, narrow i{w})"
+                        ));
+                    }
+                    let a = ctx.operand(args[0])?;
+                    let b = ctx.operand(args[1])?;
+                    let amt = ctx.operand(args[2])?;
+                    let kk = |ctx: &mut BlockCtx, n: i64| {
+                        if ty == IntTy::I64 {
+                            ctx.push(Inst::ConstI64(n))
+                        } else {
+                            ctx.push(Inst::ConstI32(n as i32))
+                        }
+                    };
+                    let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+                        ctx.push(Inst::IntBin { ty, op, a, b })
+                    };
+                    let wmask = kk(ctx, w as i64 - 1);
+                    let s = bin(ctx, BinOp::And, amt, wmask);
+                    let wc = kk(ctx, w as i64);
+                    let comp = bin(ctx, BinOp::Sub, wc, s);
+                    let (lsh, rsh) = if is_fshl { (s, comp) } else { (comp, s) };
+                    let hi = bin(ctx, BinOp::Shl, a, lsh);
+                    let lo = bin(ctx, BinOp::ShrU, b, rsh);
+                    let comb = bin(ctx, BinOp::Or, hi, lo);
+                    let zero = kk(ctx, 0);
+                    let is_zero = ctx.push(Inst::IntCmp {
+                        ty,
+                        op: CmpOp::Eq,
+                        a: s,
+                        b: zero,
+                    });
+                    let edge = if is_fshl { a } else { b };
+                    return Ok(Some(ctx.push(Inst::Select {
+                        cond: is_zero,
+                        a: edge,
+                        b: comb,
+                    })));
                 };
                 let s = (c % w as u64) as i64;
                 let a = ctx.operand(args[0])?;
@@ -18556,6 +18608,18 @@ fn lower_i128(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
     use Instruction as I;
     let is_i128 = |o: &Operand| int_bits(o.get_type(types).as_ref()) == Some(128);
     match instr {
+        // `llvm.bswap.i128` (SHA-512's 128-bit length counter, #2146): each half byte-swapped,
+        // and the halves exchanged.
+        I::Call(c) if callee_name(c).as_deref() == Some("llvm.bswap.i128") => {
+            let (Some(dest), Some((arg, _))) = (&c.dest, c.arguments.first()) else {
+                return unsup("llvm.bswap.i128 without a value or a result");
+            };
+            let (lo, hi) = i128_parts(ctx, arg)?;
+            let new_lo = emit_bswap(ctx, hi, IntTy::I64, 8);
+            let new_hi = emit_bswap(ctx, lo, IntTy::I64, 8);
+            set_i128(ctx, dest, new_lo, new_hi);
+            Ok(true)
+        }
         // zext iN X to i128: N ≤ 64 → (zext(X, N→64), 0); N in 65..=127 → the identity on the value's
         // `(lo, hi)` pair (its only producers — the wide `load` path — zero-extend the hi half, so the
         // pair is already canonical i128).

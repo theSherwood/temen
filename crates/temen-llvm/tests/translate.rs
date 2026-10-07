@@ -14619,3 +14619,123 @@ define i64 @run() {
         other => panic!("expected Unsupported for a signed i104 icmp, got {other:?}"),
     }
 }
+
+/// #2146: a scalar funnel shift by a runtime amount, at `i64` and `i32`, matches LLVM's
+/// semantics: the amount taken modulo the width, and an amount of 0 (or the width) giving the
+/// unshifted operand. The amount reaches the shifting function as a parameter, so it is not a
+/// constant there.
+#[test]
+fn funnel_shift_by_a_runtime_amount() {
+    fn fsh(w: u32, left: bool, a: u64, b: u64, s: u64) -> u64 {
+        let mask = if w == 64 { u64::MAX } else { (1 << w) - 1 };
+        let (a, b, s) = (a & mask, b & mask, (s % w as u64) as u32);
+        let r = match (s, left) {
+            (0, true) => a,
+            (0, false) => b,
+            (s, true) => (a << s) | (b >> (w - s)),
+            (s, false) => (a << (w - s)) | (b >> s),
+        };
+        r & mask
+    }
+    let (a, b) = (0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210u64);
+    let amounts = [0u64, 1, 13, 31, 32, 33, 63, 64, 65, 200];
+    let mut body = String::new();
+    let mut want = 0u64;
+    let mut acc = String::from("0");
+    for (i, &s) in amounts.iter().enumerate() {
+        for (w, left) in [(64, true), (64, false), (32, true), (32, false)] {
+            let f = format!("{}{w}", if left { "l" } else { "r" });
+            let v = format!("%v{i}{f}");
+            if w == 64 {
+                body += &format!(
+                    "  {v} = call i64 @{f}(i64 {a}, i64 {b}, i64 {s})\n",
+                    a = a as i64,
+                    b = b as i64
+                );
+            } else {
+                body += &format!(
+                    "  {v}n = call i32 @{f}(i32 {a}, i32 {b}, i32 {s})\n  {v} = zext i32 {v}n to i64\n",
+                    a = a as u32 as i32,
+                    b = b as u32 as i32,
+                );
+            }
+            let m = format!("%m{i}{f}");
+            body += &format!("  {m} = mul i64 {acc}, 31\n  %a{i}{f} = xor i64 {m}, {v}\n");
+            acc = format!("%a{i}{f}");
+            want = want.wrapping_mul(31) ^ fsh(w, left, a, b, s);
+        }
+    }
+    let mut src = String::new();
+    for (w, op) in [(64, "fshl"), (64, "fshr"), (32, "fshl"), (32, "fshr")] {
+        let f = format!("{}{w}", &op[3..]);
+        src += &format!(
+            "define i{w} @{f}(i{w} %a, i{w} %b, i{w} %s) {{\n  %r = call i{w} @llvm.{op}.i{w}(i{w} %a, i{w} %b, i{w} %s)\n  ret i{w} %r\n}}\n"
+        );
+    }
+    src += &format!("define i64 @run() {{\n{body}  ret i64 {acc}\n}}\n");
+    for (w, op) in [(64, "fshl"), (64, "fshr"), (32, "fshl"), (32, "fshr")] {
+        src += &format!("declare i{w} @llvm.{op}.i{w}(i{w}, i{w}, i{w})\n");
+    }
+    assert_eq!(run_ll_i64("fsh_runtime", &src), want as i64);
+}
+
+/// #2146: `llvm.bswap.i128` reverses all sixteen bytes: each half byte-swapped, and the halves
+/// exchanged (SHA-512's 128-bit length counter).
+#[test]
+fn i128_bswap() {
+    let (hi, lo) = (0x0123_4567_89ab_cdefu64, 0xfedc_ba98_7654_3210u64);
+    let src = format!(
+        r#"
+define i64 @run() {{
+  %h = zext i64 {hi} to i128
+  %l = zext i64 {lo} to i128
+  %hs = shl i128 %h, 64
+  %x = or i128 %hs, %l
+  %r = call i128 @llvm.bswap.i128(i128 %x)
+  %rlo = trunc i128 %r to i64
+  %rh = lshr i128 %r, 64
+  %rhi = trunc i128 %rh to i64
+  %m = mul i64 %rhi, 3
+  %s = add i64 %rlo, %m
+  ret i64 %s
+}}
+declare i128 @llvm.bswap.i128(i128)
+"#,
+        hi = hi as i64,
+        lo = lo as i64,
+    );
+    let r = ((hi as u128) << 64 | lo as u128).swap_bytes();
+    let want = (r as u64).wrapping_add(((r >> 64) as u64).wrapping_mul(3));
+    assert_eq!(run_ll_i64("i128_bswap", &src), want as i64);
+}
+
+/// #2146: a signed three-way compare of a narrow integer orders it as signed: `-3` is below `0`
+/// as an `i8` and `-300` below `7` as an `i16`, though each sits zero-extended in its container;
+/// the unsigned compare of the same `i8` still reads `253`.
+#[test]
+fn narrow_scmp_is_signed() {
+    let src = r#"
+define i64 @run() {
+  %p = alloca i16, align 2
+  store i8 -3, ptr %p, align 1
+  %x = load i8, ptr %p, align 1
+  %s = call i8 @llvm.scmp.i8.i8(i8 %x, i8 0)
+  %u = call i8 @llvm.ucmp.i8.i8(i8 %x, i8 0)
+  store i16 -300, ptr %p, align 2
+  %y = load i16, ptr %p, align 2
+  %w = call i8 @llvm.scmp.i8.i16(i16 %y, i16 7)
+  %s64 = sext i8 %s to i64
+  %u64 = sext i8 %u to i64
+  %w64 = sext i8 %w to i64
+  %u10 = mul i64 %u64, 10
+  %w100 = mul i64 %w64, 100
+  %r1 = add i64 %s64, %u10
+  %r = add i64 %r1, %w100
+  ret i64 %r
+}
+declare i8 @llvm.scmp.i8.i8(i8, i8)
+declare i8 @llvm.ucmp.i8.i8(i8, i8)
+declare i8 @llvm.scmp.i8.i16(i16, i16)
+"#;
+    assert_eq!(run_ll_i64("narrow_scmp", src), -1 + 10 - 100);
+}
