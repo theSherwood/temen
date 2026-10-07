@@ -75,7 +75,7 @@ use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use temen_ir::cap_id;
@@ -7714,6 +7714,8 @@ fn lower_block(
     // via `mask` (= size−1).
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
+    // #2147 — the bounds checks this block's loads and stores share.
+    let mut checked = CheckedBases::new(lower);
 
     for (inst_idx, inst) in blk.insts.iter().enumerate() {
         // Single-site `ubs` maintenance (#893): repair any lag a previous multi-result arm left —
@@ -8949,7 +8951,12 @@ fn lower_block(
                     "ubs/vals lockstep (mask-elision, #893)"
                 );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
+                let a = get(&vals, *addr)?;
+                let phys = if elide {
+                    mask_addr(b, lower, a, *offset, true, op.info().2)
+                } else {
+                    checked.confine(b, lower, *addr, a, *offset, op.info().2)
+                };
                 lower_load(b, *op, phys)
             }
             Inst::Store {
@@ -8965,7 +8972,12 @@ fn lower_block(
                     "ubs/vals lockstep (mask-elision, #893)"
                 );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, op.info().2, size);
-                let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, op.info().2);
+                let a = get(&vals, *addr)?;
+                let phys = if elide {
+                    mask_addr(b, lower, a, *offset, true, op.info().2)
+                } else {
+                    checked.confine(b, lower, *addr, a, *offset, op.info().2)
+                };
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
@@ -9111,6 +9123,7 @@ fn lower_block(
         };
         // Single-result instruction: record its value and a sound upper bound in lockstep.
         let u = ub_of(inst, &ubs);
+        checked.note(vals.len() as u32, inst);
         vals.push(v);
         ubs.push(u);
     }
@@ -9640,21 +9653,23 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
     // Spent? (`fuel == 0` ⇒ the next charge would underflow) → refill before charging.
     b.ins()
         .brif(fuel, cont, &[BlockArg::from(fuel)], refill_blk, &[]);
-    // #1944 slice 3 — the cell's refill (word 1) draws the next chunk from the budget chain; `0` is a
-    // spent chain (or a spent fixed allowance), which traps as a spent counter always did.
+    // #1944 slice 3 — the cell's refill (word 1) draws the next chunk from the budget chain into
+    // `left`; a `left` still `0` is a spent chain (or a spent fixed allowance), which traps as a spent
+    // counter always did. #2147 — the refill is a `PreserveAll` trampoline, so this call clobbers no
+    // register: a value live across the safepoint keeps its register, and the function need not hold
+    // it in a callee-saved one (saved and restored on every call) just because a refill might happen.
     b.switch_to_block(refill_blk);
     b.set_cold_block(refill_blk);
     let sig = {
-        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+        let mut s = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
         s.params.push(AbiParam::new(I64)); // the cell
-        s.returns.push(AbiParam::new(I64)); // the refilled `left`, or 0
         b.import_signature(s)
     };
     let refill = b
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
-    let call = b.ins().call_indirect(sig, refill, &[addr]);
-    let drawn = b.inst_results(call)[0];
+    b.ins().call_indirect(sig, refill, &[addr]);
+    let drawn = b.ins().load(I64, MemFlags::trusted(), addr, 0);
     b.ins()
         .brif(drawn, cont, &[BlockArg::from(drawn)], trap_blk, &[]);
     b.switch_to_block(trap_blk);
@@ -10488,6 +10503,164 @@ fn guard_offset_of(win_reserved: u64) -> u64 {
     }
     let page = mem::page_size() as u64;
     (win_reserved + page - 1) & !(page - 1)
+}
+
+/// How far past `reserved` an access may reach and still fault on the window's trailing guard
+/// ([`mem::trailing_guard`], DESIGN.md D67), when that guard starts exactly at `reserved`: a top-level
+/// window whose reservation is page-aligned. `0` otherwise (a §14 child's slice has parent memory past
+/// its end, and an unaligned reservation shares its last page with the window), and then
+/// [`CheckedBases`] checks every access exactly, as [`mask_addr`] does.
+fn guard_reach(lower: &Lower) -> u64 {
+    let reserved = lower.mask.wrapping_add(1);
+    let guard_at_reserved = lower.mask != 0
+        && lower.sub_base == 0
+        && reserved != 0
+        && reserved.is_multiple_of(mem::page_size() as u64)
+        && lower.guard_offset == reserved;
+    if guard_at_reserved {
+        mem::trailing_guard() as u64
+    } else {
+        0
+    }
+}
+
+/// #2147 — the bounds checks one IR block's loads and stores share. A **check point** is an access
+/// whose own address `a` is tested against the reservation alone: `a ≥ reserved` redirects the base to
+/// the guard page (`select_spectre_guard`, as [`mask_addr`] redirects), and the access's offset and
+/// width fall within [`guard_reach`]. A later access in the same CLIF block whose address adds a
+/// constant to the same **root** value — `d ≥ 0` past the check point's, with `d + offset + width`
+/// within the reach — takes the checked base plus a constant, and tests nothing.
+///
+/// Exact, not approximate. If the check point's `a < reserved`, the later address is `a + d` with no
+/// wrap (`a + d < reserved + page`), so it is the interpreter's address, and whatever of the access
+/// lies past `reserved` lies on the guard page and faults there, at that access, where the
+/// interpreter's `checked_reserved` faults it. If `a ≥ reserved`, the check point itself faulted
+/// first. Under misspeculation the check point's base is the guard page's, so every access derived
+/// from it stays on that page. A base is reused only in the CLIF block that computed it, so it always
+/// dominates its uses; a call's trap check or a safepoint starts a new block, and with it new checks.
+///
+/// A store that straddles `reserved` writes nothing before it faults only on hardware that never
+/// tears a faulting store: x86-64 guarantees it, Arm and RISC-V don't. [`mask_addr`] already relies
+/// on the same at `mapped` and at every page the guest protects (#2162). Stores share checks anyway:
+/// with a check of their own, a store's address is a different value from a load's at the same
+/// address, and Cranelift can no longer forward the stored value to the load.
+struct CheckedBases {
+    /// [`guard_reach`]: `0` checks every access exactly.
+    reach: i128,
+    /// The block's `i64.const` values, by value index.
+    consts: HashMap<u32, i64>,
+    /// A value the block computes as `root + c` by adding (or subtracting) constants, by value index.
+    roots: HashMap<u32, (u32, i128)>,
+    /// The check points still usable: one per root, the latest.
+    points: Vec<CheckPoint>,
+}
+
+struct CheckPoint {
+    root: u32,
+    /// The check point's address is `root + c`.
+    c: i128,
+    /// `mem_base + (a ≥ reserved ? guard_offset : a)`.
+    base: Value,
+    /// The CLIF block the base was computed in, the only one that may use it.
+    at: cranelift_codegen::ir::Block,
+}
+
+impl CheckedBases {
+    fn new(lower: &Lower) -> CheckedBases {
+        CheckedBases {
+            reach: i128::from(guard_reach(lower)),
+            consts: HashMap::new(),
+            roots: HashMap::new(),
+            points: Vec::new(),
+        }
+    }
+
+    /// Record what value `idx`, which `inst` defines, adds to a root.
+    fn note(&mut self, idx: u32, inst: &Inst) {
+        match *inst {
+            Inst::ConstI64(k) => {
+                self.consts.insert(idx, k);
+            }
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a,
+                b,
+            } => {
+                if let Some(&k) = self.consts.get(&b) {
+                    self.roots.insert(idx, self.root_of(a, k));
+                } else if let Some(&k) = self.consts.get(&a) {
+                    self.roots.insert(idx, self.root_of(b, k));
+                }
+            }
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a,
+                b,
+            } => {
+                if let Some(&k) = self.consts.get(&b) {
+                    self.roots.insert(idx, self.root_of(a, -i128::from(k)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `v + k` as `(root, c)`.
+    fn root_of(&self, v: u32, k: impl Into<i128>) -> (u32, i128) {
+        let (root, c) = self.roots.get(&v).copied().unwrap_or((v, 0));
+        (root, c + k.into())
+    }
+
+    /// The physical address of a non-elided `width`-byte access at IR value `idx` (`addr`) + `offset`.
+    fn confine(
+        &mut self,
+        b: &mut FunctionBuilder,
+        lower: &Lower,
+        idx: u32,
+        addr: Value,
+        offset: u64,
+        width: u32,
+    ) -> Value {
+        let reach = self.reach;
+        let span = i128::from(offset) + i128::from(width);
+        if span > reach {
+            return mask_addr(b, lower, addr, offset, false, width);
+        }
+        let (root, c) = self.root_of(idx, 0);
+        let here = b.current_block().expect("lowering inside a block");
+        if let Some(p) = self.points.iter().find(|p| p.root == root && p.at == here) {
+            let d = c - p.c;
+            if d >= 0 && d + span <= reach {
+                let base = p.base;
+                return b.ins().iadd_imm(base, (d + i128::from(offset)) as i64);
+            }
+        }
+        let reserved = b.ins().iconst(I64, lower.mask.wrapping_add(1) as i64);
+        let oob = b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, addr, reserved);
+        let guard = b.ins().iconst(I64, lower.guard_offset as i64);
+        let confined = b.ins().select_spectre_guard(oob, guard, addr);
+        let mem_base = b.use_var(lower.mem_var);
+        let base = b.ins().iadd(mem_base, confined);
+        let point = CheckPoint {
+            root,
+            c,
+            base,
+            at: here,
+        };
+        match self.points.iter_mut().find(|p| p.root == root) {
+            Some(p) => *p = point,
+            None => self.points.push(point),
+        }
+        if offset == 0 {
+            base
+        } else {
+            b.ins().iadd_imm(base, offset as i64)
+        }
+    }
 }
 
 fn mask_addr(

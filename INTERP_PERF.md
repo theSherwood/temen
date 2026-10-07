@@ -565,6 +565,13 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
    watchdog), matching the interpreter, and a `quota`-capped child exhausts at its cap — both
    differentially pinned against the oracle. (Durable *thaw* re-attach of a frozen subtree child stays
    un-metered, consistent with the freeze slice's other durable-nesting deferrals.)
+6. The refill clobbers no register (#2147). A spent cell's refill (word 1) is a trampoline in
+   Cranelift's `PreserveAll` convention around the Rust refill, compiled once per process
+   (`fuel::refill_trampoline`); the check reads `left` back after the call. As a platform call, the
+   cold refill made every value live across a safepoint sit in a callee-saved register, saved and
+   restored in the prologue of every call. On nimony's `hexer d` that was 0.25 G instructions, and
+   the trampoline took execution from 0.616 s to 0.548 s. The safepoints and what they charge are
+   unchanged.
 
 ---
 
