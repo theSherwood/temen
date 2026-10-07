@@ -858,9 +858,13 @@ pub(crate) enum Entry<'a> {
 /// entry decides the shape by. Its `call.cap`s can come from more than one vCPU at once: it spawns
 /// threads or runs fibers (§12; waiting and notifying alone make no second caller, so a program
 /// that only sleeps on a futex — nim's `nanosleep` — is single-threaded, and can fork). Or it has
-/// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166).
+/// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166). Or
+/// its detached children can call it back (#744): it declares an impl-export and spawns detached
+/// (op 15 or 17), so a spawn may grant the child a live offer into the root's cell.
 pub(crate) fn locked(m: &Module) -> bool {
-    m.funcs.iter().any(|f| f.uses_fibers_or_threads()) || crate::has_service_point(m)
+    m.funcs.iter().any(|f| f.uses_fibers_or_threads())
+        || crate::has_service_point(m)
+        || (!m.impl_exports.is_empty() && crate::spawns_detached(m))
 }
 
 /// Run `f` over `host` in the shape a program's `call.cap`s need ([`CapCtx`]): a [`locked`]
@@ -877,9 +881,10 @@ pub(crate) unsafe fn with_cap_ctx<R>(
     if !locked {
         return f(CapCtx::Raw(host));
     }
-    let locked = Mutex::new(std::mem::take(host));
-    let r = f(CapCtx::Locked(&locked));
-    *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
+    // #744 — a cell that knows itself, so a child can be granted a live offer back into it.
+    let cell = std::mem::take(host).into_cell();
+    let r = f(CapCtx::Locked(Arc::as_ptr(&cell)));
+    *host = Host::from_cell(cell);
     r
 }
 

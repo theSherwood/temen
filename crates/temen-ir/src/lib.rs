@@ -4385,8 +4385,8 @@ impl Module {
     /// CONSOLIDATION.md §2.2 — whether impl export `idx` can be a spawn record's **pager**: its
     /// interface is exactly `{ page: (i64) -> (i64) }`, the one shape a page fault's dispatch can
     /// serve (it sends op 0 the fault address and reads back where the page is). Spawn validation
-    /// checks it; the native tiers' folds are to key on it too, so that a module with no such
-    /// export provably builds no pager record (#744).
+    /// checks it, and the native tiers' folds key on [`Module::declares_pager`], so a module with no
+    /// such export provably builds no pager record (#744).
     pub fn is_pager_export(&self, idx: u32) -> bool {
         let Some(e) = self.impl_exports.get(idx as usize) else {
             return false;
@@ -4396,6 +4396,11 @@ impl Module {
             self.interface_named_ops(e.interface).as_deref(),
             Some([("page", ft)]) if ft.params == i64_ && ft.results == i64_
         )
+    }
+
+    /// Whether any impl export can be a spawn record's pager ([`Module::is_pager_export`]).
+    pub fn declares_pager(&self) -> bool {
+        (0..self.impl_exports.len() as u32).any(|i| self.is_pager_export(i))
     }
 
     /// Resolve interface entry `idx` to its **named** op list `(name, signature)`, or `None`

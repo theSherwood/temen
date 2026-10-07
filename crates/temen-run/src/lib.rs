@@ -1638,8 +1638,9 @@ pub fn jit_cap_run(
     // unit's spawned vCPUs are the concurrent callers, even when the top-level module is sequential).
     if hosts_threads || jit_proc::locked(m) {
         let node = run_node(host); // the node goes with the host into its lock
-        let host_mutex = Mutex::new(std::mem::take(host));
-        let cc = CapCtx::Locked(&host_mutex as *const Mutex<Host>);
+                                   // #744 — a shared cell that knows itself, so a child can be granted a live offer back into it.
+        let host_cell = std::mem::take(host).into_cell();
+        let cc = CapCtx::Locked(std::sync::Arc::as_ptr(&host_cell));
         let mut cm = CompiledModule::compile(
             m,
             entry,
@@ -1673,7 +1674,7 @@ pub fn jit_cap_run(
             cm.enable_thread_hosting()?;
         }
         {
-            let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hg = host_cell.lock().unwrap_or_else(|e| e.into_inner());
             hg.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
             hg.set_serve_ctx(&mut cm as *mut CompiledModule as usize);
             hg.set_park_hub(cm.park_hub());
@@ -1681,27 +1682,27 @@ pub fn jit_cap_run(
         // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3), locked twin of the single-threaded path
         // below: re-compile any restore-rebuilt units into this fresh module. A no-op for a fresh run.
         {
-            let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            // Either failing hands the embedder its powerbox back (it moved into the mutex above).
+            let mut hg = host_cell.lock().unwrap_or_else(|e| e.into_inner());
+            // Either failing hands the embedder its powerbox back (it moved into the cell above).
             let prepared = reconstruct_jit_units(&mut cm, &mut hg)
                 .and_then(|()| jit_durable_enter(&mut cm, &mut hg));
             drop(hg);
             if let Err(e) = prepared {
-                hg_restore(host, host_mutex);
+                *host = Host::from_cell(host_cell);
                 return Err(e);
             }
         }
         // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
-        // above); all of the run's vCPU threads serialize their `call.cap`s through `host_mutex`.
+        // above); all of the run's vCPU threads serialize their `call.cap`s through `host_cell`.
         let r = unsafe { CompiledModule::run_raw(&mut cm, args, Some(init_mem), Some(1 << 18)) };
         {
-            let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hg = host_cell.lock().unwrap_or_else(|e| e.into_inner());
             hg.set_jit_native_ctx(0);
             hg.set_serve_ctx(0);
             hg.set_park_hub(0);
             jit_durable_leave(&mut cm, &mut hg);
         }
-        hg_restore(host, host_mutex);
+        *host = Host::from_cell(host_cell);
         return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)));
     }
     let cc = CapCtx::Raw(host as *mut Host);
@@ -1756,11 +1757,6 @@ pub fn jit_cap_run(
     host.set_park_hub(0);
     jit_durable_leave(&mut cm, host);
     r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)))
-}
-
-/// Hand the embedder back the powerbox [`jit_cap_run`]'s serialized path moved into its mutex.
-fn hg_restore(host: &mut Host, host_mutex: Mutex<Host>) {
-    *host = host_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
 }
 
 /// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
@@ -3190,15 +3186,14 @@ pub unsafe extern "C" fn grant_child_build(
             // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
             // `grant_child_release` (child exit / nursery teardown).
             let mut child = child;
-            // CALLS.md 5c.1b, #2173 — arm the shared cell's bell and inherit the run's park hub, so
-            // the parked transport's waits on this cell are parks of the run like any other.
-            child.arm_svc_bell();
+            // CALLS.md 5c.1b, #2173 — inherit the run's park hub, so the parked transport's waits on
+            // this cell (its bell is armed with the cell, `Host::into_cell`) are parks of the run.
             child.set_park_hub(parent.park_hub());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
             let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
             let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
-            let shared = std::sync::Arc::new(Mutex::new(child));
+            let shared = child.into_cell();
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
                 ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
@@ -3953,8 +3948,7 @@ unsafe fn finish_child_build(
         Some((child, inst_handle, as_handle)) => {
             // 5c.0 — shared child powerbox, two counted refs (see `grant_child_build`).
             let mut child = child;
-            // CALLS.md 5c.1b — as `grant_child_build`: arm the bell, inherit the park hub.
-            child.arm_svc_bell();
+            // CALLS.md 5c.1b — as `grant_child_build`: inherit the park hub.
             child.set_park_hub(parent.park_hub());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
@@ -3963,7 +3957,7 @@ unsafe fn finish_child_build(
             // stamped) under the parent's.
             let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
             let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
-            let shared = std::sync::Arc::new(Mutex::new(child));
+            let shared = child.into_cell();
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
                 ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
@@ -5432,9 +5426,10 @@ impl PowerboxProgram {
         // fallback predicate plus the concurrency (locked-thunk) case.
         if jit_proc::locked(&module) || module.funcs.iter().any(|f| f.uses_concurrency()) {
             return Err(
-                "PowerboxProgram: module uses §12 concurrency (cont.*/thread.*/futex) or serves \
-                        (svc.poll/svc.wait), which run over the locked powerbox; use run_powerbox \
-                        (per-call compile)"
+                "PowerboxProgram: module uses §12 concurrency (cont.*/thread.*/futex), serves \
+                        (svc.poll/svc.wait), or can grant a detached child a live offer back into \
+                        itself, which run over the locked powerbox; use run_powerbox (per-call \
+                        compile)"
                     .into(),
             );
         }
@@ -5836,27 +5831,45 @@ fn module_nests(m: &temen_ir::Module) -> bool {
     })
 }
 
-/// CONSOLIDATION.md §2.2/§3: the module spawns a demand process child (`Instantiator` op 16 —
-/// pager-serviced faults), or uses the §3 config-record spawn (op 17) **and declares impl
-/// exports** — the record's `pager` field is runtime data, so any module that could name one of
-/// its own exports as a pager folds; an export-less module cannot build a valid pager record
-/// (the interpreter fails that validation identically), so §3c runs it natively via the
-/// `instantiate_rec` thunk. The JIT has no native arm for the fault seam itself, so pager-capable
-/// modules
-/// fold to the tree-walk oracle (the same deferral discipline as §3.6 serving) — the offer
-/// transport itself is what makes this cheap to defer: JIT callers already reach providers
-/// through the cap-thunk handoff at interp cost.
+/// CONSOLIDATION.md §2.2/§3, #744: the module could build a **pager** record — it uses the §3
+/// config-record spawn (op 17) and declares a pager-shaped export ([`Module::declares_pager`], the
+/// one predicate spawn validation checks too). The record's `pager` field is runtime data, so such a
+/// module folds: the JIT has no native arm for the fault seam (native paging is #2164), and its
+/// op-17 thunk `CapFault`s any pager. A module with no pager-shaped export cannot build a valid pager
+/// record — every engine refuses one identically — so it runs natively through the
+/// `instantiate_rec` thunk, serving its own children if it serves (#744).
 fn module_demand_spawns(m: &temen_ir::Module) -> bool {
+    m.declares_pager()
+        && m.funcs.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts.iter().any(|i| {
+                    matches!(
+                        i,
+                        temen_ir::Inst::CapCall {
+                            type_id: 6,
+                            op: 17,
+                            ..
+                        }
+                    )
+                })
+            })
+        })
+}
+
+/// Whether `m` spawns a **detached** child (`Instantiator` op 15, or the op-17 record): a spawn
+/// that may grant the child a live offer back into its spawner (#744, [`jit_proc::locked`]).
+fn spawns_detached(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| match i {
-                // §3d: op 16 died into the record; the fold key is now purely "could this
-                // module build a pager record" — op 17 + impl exports (an export-less module
-                // cannot name a pager, and its pager records CapFault identically everywhere).
-                temen_ir::Inst::CapCall {
-                    type_id: 6, op: 17, ..
-                } => !m.impl_exports.is_empty(),
-                _ => false,
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    temen_ir::Inst::CapCall {
+                        type_id: 6,
+                        op: 15 | 17,
+                        ..
+                    }
+                )
             })
         })
     })
@@ -8824,6 +8837,42 @@ block 0 (vaddr: i64) {
             folds_to_oracle(&m),
             "the one routing predicate (all three call sites) folds it off the JIT"
         );
+    }
+
+    /// #744 — a parent that serves its own children: an op-17 spawn and a `svc.wait`, with an export
+    /// that is not pager-shaped ([`Module::is_pager_export`]), so it cannot build a pager record. It
+    /// runs on the JIT, which serves its children's calls over the root's shared cell.
+    #[test]
+    fn a_self_serving_parent_runs_on_the_jit() {
+        let src = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { run: 0 }
+export 0 interface "exec" 1 { run: 1 }
+
+func 0 (i32) -> (i64) {
+block 0 (vh: i32) {
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vs = i64.add vn vj
+  return vs
+  }
+}
+
+func 1 (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        assert!(!m.declares_pager(), "an `exec` export is not a pager");
+        assert!(!module_demand_spawns(&m), "so the record cannot name one");
+        assert!(!folds_to_oracle(&m), "and the JIT runs the parent itself");
     }
 }
 

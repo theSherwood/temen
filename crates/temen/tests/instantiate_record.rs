@@ -1294,17 +1294,45 @@ block 0 (va: i64, vb: i64) {{
 /// **The #744 pin**: the child's `exec.run(40, 2)` is answered by the PARENT's own handler over the
 /// parent's live world — `join*100 + served` = `4201` — the guest-served exec backend (EXEC.md row 4)
 /// end to end: mint-at-spawn into the child only, caller parks, parent serves, reply, join. Every
-/// backend agrees: the bytecode engine and the JIT route a record-spawning module with impl-exports
-/// to the tree-walker, the one engine that serves a child's call back to its parent.
+/// backend agrees: the Cranelift JIT runs the parent itself, serving the child's call over the root's
+/// shared cell; the bytecode engine still declines it to the tree-walker.
 #[test]
 fn a_parent_serves_its_childs_exec_with_its_own_code() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false);
     for b in BACKENDS {
+        // Both transports: the child's call queued for the parent's serve loop, and (handoff on,
+        // the default) run inline on the child's thread when it finds the parent parked.
+        for handoff in [true, false] {
+            let cfg = RunConfig {
+                handoff,
+                ..RunConfig::default()
+            };
+            assert_eq!(
+                run_detached_with(b, &src, 1 << 20, cfg),
+                Ok(4_201),
+                "{b:?}, handoff {handoff}: the child's exec.run(40,2) → the parent's handler \
+                 replies 42; the parent served 1 and joined 42"
+            );
+        }
+    }
+}
+
+/// #1217 on the self-serve grant: a child that holds the parent's live offer but finishes without
+/// calling it releases the parent's `svc.wait`, which answers `0` instead of waiting on a caller that
+/// is gone; the parent then joins the child's `7` — `join*100 + served` = `700` on every backend,
+/// whichever of the child's end and the parent's wait comes first.
+#[test]
+fn a_child_that_never_calls_releases_its_parents_wait() {
+    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false).replace(
+        "  vr = call.cap 268435456 0 (i64, i64) -> (i64) vexec (va, vb)\n  return vr\n",
+        "  v7 = i64.const 7\n  return v7\n",
+    );
+    assert!(src.contains("return v7"), "the rewrite must apply");
+    for b in BACKENDS {
         assert_eq!(
             run_detached(b, &src),
-            Ok(4_201),
-            "{b:?}: the child's exec.run(40,2) → the parent's handler replies 42; the parent served \
-             1 and joined 42"
+            Ok(700),
+            "{b:?}: the wait answers 0 once the child is gone; the join gets 7"
         );
     }
 }
@@ -1324,17 +1352,17 @@ fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
     }
 }
 
-/// The tag rides the v1 record only: op 15's positional form (retiring, #2067) refuses it on every
-/// backend. The Cranelift JIT runs an op-15 parent that serves rather than folding it to the
-/// tree-walker, and its spawn refuses the tag, so a tree-walker that honored it would split them.
+/// Op 15's positional form (retiring, #2067) carries the tag too: every detached spawn follows one
+/// rule. The Cranelift JIT runs this serving parent natively over a shared cell it can be called
+/// back through; the bytecode engine declines it to the tree-walker.
 #[test]
-fn op_15_refuses_a_live_self_serve_grant() {
+fn op_15_carries_a_live_self_serve_grant_too() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, true);
     for b in BACKENDS {
-        let r = run_detached(b, &src);
-        assert!(
-            matches!(&r, Err(e) if e.contains("CapFault")),
-            "{b:?}: op 15 refuses the live self-serve grant: {r:?}"
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            4201,
+            "{b:?}: our handler answered the child's exec over op 15 too"
         );
     }
 }
