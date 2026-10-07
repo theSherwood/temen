@@ -31,7 +31,7 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: temen-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs] [--null-guard]\n\
+            "usage: temen-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs] [--link-unit] [--null-guard]\n\
              \n  Translates legalized LLVM IR (textual .ll, or .bc via llvm-dis) to an TEMEN-IR module written to <out>:\n\
              \n    text (.temt) by default, binary (.temen) when -o ends in .temen or --binary,\n\
              \n    or a binary object/link unit (.temeno, v9 object dialect). Exports ride in-band\n\
@@ -42,6 +42,11 @@ fn try_main() -> Result<(), String> {
              \n  the writable data stack (which would fault under D40).\n\
              \n  --stub-externs lowers undefined externals to trap-if-called stubs instead of\n\
              \n  failing translation (large-program bring-up, e.g. Postgres).\n\
+             \n  --link-unit (#1746) translates a library the linker can place anywhere among other\n\
+             \n  units, from any frontend: its globals are addressed relative to its own data, a call\n\
+             \n  to an undefined function or a reference to an undefined global is an import, and\n\
+             \n  only external-linkage names are exported. Not runnable until linked, so it needs a\n\
+             \n  text or .temeno output.\n\
              \n  --null-guard (#964) is a redundant no-op: the powerbox low scratch is always laid out\n\
              \n  one 16 KiB guard above zero so a host seeds [0, 16384) unmapped and NULL dereferences\n\
              \n  trap (#1094 — the one canonical layout). The flag is kept only for compatibility.\n\
@@ -61,6 +66,7 @@ fn try_main() -> Result<(), String> {
     let mut binary = false;
     let mut host_page: u64 = temen_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
+    let mut link_unit = false;
     let mut child_entry = false;
     let mut shadow_contexts: Option<u32> = None;
     let mut shadow_stride = temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
@@ -79,6 +85,8 @@ fn try_main() -> Result<(), String> {
             // Lower undefined externals to trap-if-called stubs instead of failing translation — for a
             // large-program bring-up (Postgres) where most externals are dead on the exercised path.
             "--stub-externs" => stub_externs = true,
+            // #1746: a relocatable library unit, linkable anywhere among other units.
+            "--link-unit" => link_unit = true,
             // #964 trap-on-NULL: the guarded layout (low scratch shifted one guard up). #1094: the
             // guard is unconditional now (the one canonical layout), so this flag is a redundant no-op
             // kept only for compatibility with build scripts that still pass it.
@@ -120,6 +128,10 @@ fn try_main() -> Result<(), String> {
     // whose first-class export tables are its link symbols.
     let object = Path::new(&out).extension().is_some_and(|e| e == "temeno");
     let binary = binary || Path::new(&out).extension().is_some_and(|e| e == "temen");
+    // A link unit carries link forms only the object dialect (and text) can hold.
+    if link_unit && binary && !object {
+        return Err("--link-unit writes a link unit: use a .temeno or text output".into());
+    }
 
     // Translate the input. A `.ll` extension takes the in-house **textual** reader (no `llvm-dis`,
     // version-tolerant — the direction the on-ramp is developed on); anything else is treated as
@@ -130,6 +142,7 @@ fn try_main() -> Result<(), String> {
         child_entry,
         shadow_contexts,
         shadow_stride,
+        link_unit,
     };
     let is_ll = Path::new(&input).extension().is_some_and(|e| e == "ll");
     let translated = if is_ll {

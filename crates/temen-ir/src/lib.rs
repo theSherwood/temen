@@ -4089,9 +4089,10 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
 /// ([`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`], to the window's mapped boundary) when
 /// `seed_heap`, then calls the entry with `sp` = [`powerbox_entry_sp`]. The declared memory grows
 /// (never shrinks) to cover the data stack reserve. Every existing funcidx — in code, exports,
-/// impl-export ops, and debug info — shifts up by one as `_start` becomes function 0. (Funcref
-/// *values* already flowing through data or patched constants are the caller's to fix; synthesize
-/// before any [`Resolved::Slot`]-style patching.)
+/// impl-export ops, debug info, and the data image's recorded funcref slots
+/// ([`Module::data_funcref_slots`]) — shifts up by one as `_start` becomes function 0. (A funcref
+/// value in a patched constant is the caller's to fix; synthesize before any
+/// [`Resolved::Slot`]-style patching.)
 pub fn synth_manifest_start(
     module: Module,
     entry: FuncIdx,
@@ -6104,6 +6105,23 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
         }
         for n in &mut di.func_names {
             n.func += offset;
+        }
+    }
+    // A function index the data image holds at a slot [`link`] recorded (#1830) is a funcidx too: it
+    // shifts like `ref.func`, rewritten in every segment that lays the slot's bytes down. (Inside
+    // `link` the unit's list is empty by now; its slots were written already global.)
+    let targets = data_funcref_targets(m);
+    for (&at, target) in m.data_funcref_slots.iter().zip(targets) {
+        let Some(func) = target else {
+            continue; // an unlaid slot, which the verifier rejects
+        };
+        for (b, byte) in (func + offset).to_le_bytes().into_iter().enumerate() {
+            let x = at + b as u64;
+            for d in &mut m.data {
+                if x >= d.offset && x < d.offset + d.bytes.len() as u64 {
+                    d.bytes[(x - d.offset) as usize] = byte;
+                }
+            }
         }
     }
 }
