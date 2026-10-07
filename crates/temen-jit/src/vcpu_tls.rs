@@ -13,6 +13,11 @@ thread_local! {
     /// This OS thread's (vCPU's) TLS word. Defaults to 0 (the root's seed); [`seed`] resets it at the
     /// start of every root/child run so a reused worker thread can't leak a prior run's `set`.
     static VCPU_TLS: Cell<i64> = const { Cell::new(0) };
+    /// #2160 — how many serve handlers this vCPU is running. An embedder's serve loop counts each
+    /// handler it invokes, and a serve op that finds the count nonzero is nested under a handler
+    /// (refused, as the oracle refuses it). Per vCPU like the TLS word: a §14 task carries its count
+    /// across workers, and a child run inline on another vCPU's thread starts from 0.
+    static SERVE_HANDLERS: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Seed/reset the current OS thread's TLS word. Called at the start of a root run (→ 0) and at a
@@ -30,4 +35,18 @@ pub(crate) extern "C" fn get() -> i64 {
 /// `vcpu.tls.set` thunk — set the current vCPU's TLS word.
 pub(crate) extern "C" fn set(v: i64) {
     VCPU_TLS.with(|c| c.set(v));
+}
+
+/// The current vCPU's serve-handler count (see `SERVE_HANDLERS`). `#[inline(never)]`, like its
+/// setter: a handler can park and its task resume on another worker, so every access must find the
+/// running thread's word, never one computed before the park (#1466).
+#[inline(never)]
+pub fn serve_handlers() -> u32 {
+    SERVE_HANDLERS.with(|c| c.get())
+}
+
+/// Set the current vCPU's serve-handler count.
+#[inline(never)]
+pub fn set_serve_handlers(n: u32) {
+    SERVE_HANDLERS.with(|c| c.set(n));
 }

@@ -598,6 +598,12 @@ size. A root's processes pay from the run's own node.
 > never addresses the child's memory, so it serves a child in a window it cannot see — the carve
 > dependence ("pager ⇒ nested") is gone. The fault → suspend → supply → retry-on-resume shape below
 > is unchanged.
+>
+> **The pager is typed (#744, 2026-10-07):** a record's `pager` must name an impl export of exactly
+> `{ page: (i64) -> (i64) }` (`Module::is_pager_export`), the one shape the fault's dispatch serves;
+> naming any other export fails the spawn closed. Demand paging runs on the tree-walker only: the
+> native tiers refuse a pager record and fold a module that could build one to the oracle (native
+> paging is #2164).
 
 Two different things surface as "SIGSEGV" and the design splits them:
 
@@ -606,10 +612,10 @@ Two different things surface as "SIGSEGV" and the design splits them:
   resumable would put feature pressure on the most security-sensitive lowering in the
   tree, for the benefit of a guest probing its confinement. Post-mortem observation is
   covered (trap kind + backtrace to the parent — `jit_trap_backtrace`).
-- **In-window memory-management faults (unmapped / protected page)** — already a
-  *resumable event* on both backends: a demand-paged child's fault suspends the fiber
-  with the fault address (`SUSP_FAULT`, interp + `instantiator_rt.rs`), the pager
-  supplies the page, and **resume retries the access**. Retry-on-resume is the trick:
+- **In-window memory-management faults (unmapped / protected page)** — a *resumable
+  event* (on the tree-walker; #2164 for the native tiers): a demand-paged child's fault
+  suspends it with the fault address, the pager supplies the page, and **resume retries
+  the access**. Retry-on-resume is the trick:
   precise fault handling with no per-access deoptimization metadata — the tax that
   makes in-band SIGSEGV handlers expensive in a JIT, and which Cranelift won't sell
   cheaply. The pager's side is a plain serve loop, and it never outlives its client

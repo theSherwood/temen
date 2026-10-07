@@ -104,6 +104,9 @@ pub(crate) struct ChildTask {
     chain: Vec<(usize, i64)>,
     /// Saved `vcpu.tls` register between residencies (R2: task-level, not thread-level).
     tls: i64,
+    /// Saved serve-handler count between residencies (R2), so a handler that parks resumes nested
+    /// on whichever worker picks it up ([`vcpu_tls::serve_handlers`]).
+    serve_handlers: u32,
     done: Arc<ChildDone>,
     /// A **carve** child's copy-back: runs once at finish over the task's window image, before
     /// `teardown` — the parent (superset) then sees the child's writes. `None` for a detached child
@@ -239,6 +242,7 @@ impl ChildTask {
             _code: code,
             chain,
             tls: 0,
+            serve_handlers: 0,
             done,
             copy_back,
             teardown: Some(teardown),
@@ -842,6 +846,8 @@ impl ChildExec {
         });
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(task.tls);
+        let prev_handlers = vcpu_tls::serve_handlers();
+        vcpu_tls::set_serve_handlers(task.serve_handlers);
         // #1469 — the child's thread thunks act in its own domain for this residency.
         let prev_dom = os_thread_rt::set_current_domain(
             task.dom.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
@@ -871,6 +877,8 @@ impl ChildExec {
         os_thread_rt::set_current_domain(prev_dom);
         task.tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
+        task.serve_handlers = vcpu_tls::serve_handlers();
+        vcpu_tls::set_serve_handlers(prev_handlers);
         if let Some(s) = prev_shadow {
             crate::durable_shadow::seed(s);
         }

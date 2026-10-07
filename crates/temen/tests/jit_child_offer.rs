@@ -305,6 +305,57 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
+/// #2160 — like [`JOIN_SRC`] but the handler first calls `svc.poll` itself, a serve nested under
+/// the running handler, and returns what that answered. The oracle refuses it with `-EINVAL`, so the
+/// parent sees `-22*100 + served(1)`.
+const NESTED_SRC: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+
+func (i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32) {
+  vrb = i64.const 17564
+  i32.store vrb vbud
+  vrp = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vexp = i64.const 0
+  vh = call.cap 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
+  vspin = i32.const 2000000
+  br 1(vspin, vh, vch, vinst)
+}
+block 1 (vk0: i32, vh1: i32, vch1: i32, vin1: i32) {
+  vone = i32.const 1
+  vk1 = i32.sub vk0 vone
+  br_if vk1 1(vk1, vh1, vch1, vin1) 2(vh1, vch1, vin1)
+}
+block 2 (vh2: i32, vch2: i32, vin2: i32) {
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)
+  vk = i64.const 100
+  vm = i64.mul vr vk
+  vs = i64.add vm vj
+  return vs
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vz = i32.const 0
+  vinner = call.cap 4294967295 9 () -> (i64) vz ()
+  return vinner
+  }
+}
+"#;
+
 /// Like [`JOIN_SRC`] but the handler **parks mid-serve** (a 2ms timed `atomic.wait` that times
 /// out) before returning — CALLS.md 5c.4: under handoff the *claimer's* thread blocks inside the
 /// inline invoke (the §10.2 arm-6 "thread-blocks (JIT)" flavor); under the parked transport the
@@ -390,4 +441,26 @@ fn direct_handoff_with_parking_handler_matches() {
         "JIT parked transport"
     );
     assert_eq!(run_jit_i64_knob(PARK_SRC, true), 4201, "JIT direct handoff");
+}
+
+/// #2160 — a serving child's handler that calls `svc.poll` gets `-EINVAL` on every transport: the
+/// child's own serve loop (the parked transport) and the caller's thread running the handler inline
+/// (direct handoff). Under handoff the nested poll used to wait on the claim its own thread held.
+#[test]
+fn a_childs_serve_nested_under_its_handler_is_refused() {
+    assert_eq!(
+        run_interp_i64(NESTED_SRC),
+        -2199,
+        "interp: -22*100 + served(1)"
+    );
+    assert_eq!(
+        run_jit_i64_knob(NESTED_SRC, false),
+        -2199,
+        "JIT parked transport"
+    );
+    assert_eq!(
+        run_jit_i64_knob(NESTED_SRC, true),
+        -2199,
+        "JIT direct handoff"
+    );
 }

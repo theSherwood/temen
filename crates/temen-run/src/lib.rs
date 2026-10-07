@@ -914,6 +914,7 @@ unsafe fn jit_invoke_locked(
 /// serve arm and the bytecode engine's `Op::SvcPoll`:
 /// - an arity-mismatched dispatch settles `-EINVAL` inline and serving continues (the dispatch's
 ///   fault, never the domain's);
+/// - a serve op nested under a running handler answers `-EINVAL` and serves nothing (#2160);
 /// - a handler trap (incl. `Exit`) is left in the run's trap cell — terminal for the domain
 ///   (one-world semantics);
 /// - a drained queue delivers the served count;
@@ -942,6 +943,9 @@ unsafe fn serve_native(
         }
         *trap_out = 0;
     };
+    if serve_is_nested() {
+        return put(EINVAL, trap_out);
+    }
     let cm = (*host_ptr).serve_native_ctx() as *mut CompiledModule;
     if cm.is_null() {
         // No serve context registered (an embedder entry that never set one): keep the
@@ -974,7 +978,9 @@ unsafe fn serve_native(
         // arity checked above; no `&mut Host` is live (the scoped pops/settles above ended).
         // The handler runs as the serving instance: the thunk's `trap_out` is its `VmCtx`.
         let vm = trap_out as *const temen_jit::VmCtx;
-        if CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, vm).is_err() {
+        if run_handler(|| CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, vm))
+            .is_err()
+        {
             *trap_out = TrapKind::CapFault as i64; // not in-flight — unreachable from a real run
             return;
         }
@@ -3408,8 +3414,9 @@ unsafe fn serve_locked_child(
         }
         *trap_out = 0;
     };
-    if n_args != 0 {
-        // Timed `svc.wait`: oracle-only (needs deadline machinery this tier doesn't host).
+    // A nested serve under a handler; or the timed `svc.wait`, oracle-only (it needs deadline
+    // machinery this tier doesn't host).
+    if serve_is_nested() || n_args != 0 {
         return put(EINVAL, trap_out);
     }
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -3464,17 +3471,19 @@ unsafe fn serve_locked_child(
             // including this serve — has returned); `[mem_base, +mem_size)` is this child's
             // live window, handed to this very thunk call.
             drop(guard);
-            let faulted = temen_jit::child_invoke_handler(
-                serve_ctx as *const c_void,
-                code,
-                &args,
-                &mut res,
-                mem_base,
-                mem_size,
-                // Served on the child's own thread, inside its own run: the thunk's `trap_out` is
-                // the child's `VmCtx`.
-                trap_out as *const temen_jit::VmCtx,
-            );
+            let faulted = run_handler(|| {
+                temen_jit::child_invoke_handler(
+                    serve_ctx as *const c_void,
+                    code,
+                    &args,
+                    &mut res,
+                    mem_base,
+                    mem_size,
+                    // Served on the child's own thread, inside its own run: the thunk's `trap_out`
+                    // is the child's `VmCtx`.
+                    trap_out as *const temen_jit::VmCtx,
+                )
+            });
             if faulted {
                 return; // detect-and-kill: the fault trap is already in the cell
             }
@@ -3527,6 +3536,23 @@ fn crossing_depth_ok() -> bool {
     CROSSING_DEPTH.with(|d| d.get() < CROSSING_DEPTH_MAX)
 }
 
+/// #2160 — run one serve handler's invoke counted in the running vCPU's serve-handler count
+/// ([`temen_jit::serve_handlers`]). A `svc.poll`/`svc.wait` reached under it (from the handler's
+/// code or its callees) is a nested serve ([`serve_is_nested`]), refused with a probeable `-EINVAL`
+/// as the oracle refuses it: the serve loop is the domain's outermost dispatcher. Per vCPU, not per
+/// domain: a multi-consumer domain's other vCPUs serve concurrently.
+fn run_handler<R>(invoke: impl FnOnce() -> R) -> R {
+    temen_jit::set_serve_handlers(temen_jit::serve_handlers() + 1);
+    let r = invoke();
+    temen_jit::set_serve_handlers(temen_jit::serve_handlers() - 1);
+    r
+}
+
+/// Whether a serve op on the running vCPU is nested under one of its handlers ([`run_handler`]).
+fn serve_is_nested() -> bool {
+    temen_jit::serve_handlers() != 0
+}
+
 /// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `call.cap`
 /// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then
 /// **thread-block** on the cell's Condvar until the child's serve loop settles `t` — the §10.2
@@ -3571,15 +3597,17 @@ unsafe fn live_impl_call(
                     let child_vm =
                         temen_jit::VmCtx::new(temen_jit::child_instance(sctx as *const c_void));
                     CROSSING_DEPTH.with(|d| d.set(d.get() + 1));
-                    let _faulted = temen_jit::child_invoke_handler(
-                        sctx as *const c_void,
-                        code,
-                        args,
-                        &mut res,
-                        cbase as *mut u8,
-                        csize,
-                        &child_vm,
-                    );
+                    let _faulted = run_handler(|| {
+                        temen_jit::child_invoke_handler(
+                            sctx as *const c_void,
+                            code,
+                            args,
+                            &mut res,
+                            cbase as *mut u8,
+                            csize,
+                            &child_vm,
+                        )
+                    });
                     CROSSING_DEPTH.with(|d| d.set(d.get() - 1));
                     let child_trap = child_vm.trap.load(std::sync::atomic::Ordering::Relaxed);
                     let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());

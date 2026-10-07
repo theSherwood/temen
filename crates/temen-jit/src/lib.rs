@@ -182,6 +182,7 @@ pub unsafe fn fiber_park_current() {
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
+pub use vcpu_tls::{serve_handlers, set_serve_handlers};
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
 mod vmctx;
