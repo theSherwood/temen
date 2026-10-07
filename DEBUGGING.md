@@ -530,12 +530,13 @@ different things depending on which pair you compare:
   `spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
 
   **A detached child of the debuggee's own program (#2076), and edits in a child (#2072).** A detached
-  child whose module is its spawner's own program (`module = -1`) runs the spawning domain's unit, as a
-  same-module confined child does (#1726). The shared admission takes that unit as a parameter, and the
-  debug scheduler passes each env's (`DbgEnv::program`; the root's is module 0). So a breakpoint in the
-  program stops such a child, and its frames read the program's §6 debug info, as a carve child's did.
-  A child of a granted module still runs a unit of its own. The production drivers pass no unit yet, so
-  there each such spawn still compiles the program again (#2076). A debugger edit lands in the focused
+  child whose module is its spawner's own program (`module = -1`) runs the spawning frame's module, as a
+  same-module confined child does (#1726): the program's unit, or an installed §22 unit's when the frame
+  runs one (#2143). The shared admission takes that module as a parameter, and every driver passes the
+  spawning frame's (`spawner_module`). So a breakpoint in the program stops such a child, and its frames
+  read the program's §6 debug info, as a carve child's did. A child of a granted module still runs a
+  unit of its own, and so does a spawn from emitted code (the browser's `env.instantiate_rec` bounce),
+  which compiles the program again. A debugger edit lands in the focused
   task's window, the one `read_window` reads: `write_window`, a variable in memory, and the scheduled
   replays of both, each of which records its task (#2072). The window observers — the watch scan, the
   access sink and the undo journal — name the root's window, so they skip a task in a child's window,

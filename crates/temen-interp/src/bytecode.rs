@@ -764,6 +764,11 @@ impl Compiled {
 /// source lock). Built once per domain (root / §14 child / coroutine); only the root's is installed into.
 pub struct SharedSlots {
     slots: Box<[std::sync::atomic::AtomicU64]>,
+    /// The modules this domain's `Jit.install`s put in the source, each with its unit's `(table,
+    /// unit)` on the domain's host ([`super::Host::resolve_jit_code`]). A frame of one reports it when
+    /// it spawns, so its `module = -1` names the unit's program (#2143). Per domain, not on the shared
+    /// [`Compiled`]: a child whose program is that same unit runs it as its own.
+    jit_units: std::sync::Mutex<Vec<(usize, (u32, u32))>>,
 }
 
 impl SharedSlots {
@@ -783,7 +788,10 @@ impl SharedSlots {
                 })
             })
             .collect();
-        SharedSlots { slots }
+        SharedSlots {
+            slots,
+            jit_units: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     fn len(&self) -> usize {
@@ -801,6 +809,7 @@ impl SharedSlots {
                 .iter()
                 .map(|s| AtomicU64::new(s.load(Ordering::Acquire)))
                 .collect(),
+            jit_units: std::sync::Mutex::new(self.jit_units.lock_unpoisoned().clone()),
         }
     }
 
@@ -808,6 +817,12 @@ impl SharedSlots {
     #[inline]
     fn slot(&self, i: usize) -> super::TableSlot {
         super::unpack_slot(self.slots[i].load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// The unit module `m` is, if this domain installed it (`jit_units`).
+    fn jit_unit(&self, m: usize) -> Option<(u32, u32)> {
+        let units = self.jit_units.lock_unpoisoned();
+        units.iter().find(|&&(k, _)| k == m).map(|&(_, id)| id)
     }
 }
 
@@ -1034,13 +1049,13 @@ fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
     SharedSlots::new(n_funcs, table_log2, 0)
 }
 
-/// The program a **same-module** §14 child (op 0 / op 11) runs: the **spawning frame's** module —
-/// the primary for a plain guest, the unit itself for an installed §22 unit — as `(index, program)`.
-/// Every driver validates the child's entry against, and builds the child over, this one module, so
-/// the two cannot disagree (#1726: they used to validate or build against module 0, so an installed
-/// unit's child ran the base program's function of the same index). The module-aware rule
-/// `thread.spawn` already follows (`VcpuEvent::Spawn { module }`). `None` only for a module index
-/// the source does not hold, which a running frame cannot have.
+/// The program a **same-module** §14 child (op 0 / op 11, a detached `-1`) runs: the **spawning
+/// frame's** module — the primary for a plain guest, the unit itself for an installed §22 unit — as
+/// `(index, program)`. Every driver validates the child's entry against, and builds the child over,
+/// this one module, so the two cannot disagree (#1726: they used to validate or build against module
+/// 0, so an installed unit's child ran the base program's function of the same index). The
+/// module-aware rule `thread.spawn` already follows (`VcpuEvent::Spawn { module }`). `None` only for a
+/// module index the source does not hold, which a running frame cannot have.
 fn spawner_module(source: &ModuleSource, spawner: &Vm) -> Option<(u32, std::sync::Arc<Compiled>)> {
     source
         .get(spawner.module)
@@ -1103,8 +1118,8 @@ impl Domain {
     /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
     /// `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit is not
     /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. See [`jit_install_into`].
-    fn install(&self, unit: Compiled) -> Option<usize> {
-        jit_install_into(&self.source, &self.table, unit)
+    fn install(&self, unit: Compiled, id: (u32, u32)) -> Option<usize> {
+        jit_install_into(&self.source, &self.table, unit, id)
     }
 
     /// `Jit.uninstall`: clear a filled padding slot (`≥ n_real`) back to trapping. See
@@ -1119,8 +1134,14 @@ impl Domain {
 /// fields, not a wrapped [`Domain`]). Append `unit` to the shared source and fill the first padding
 /// slot with `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit
 /// is not appended). The whole op serializes under the source lock, and the slot store is `Release`,
-/// so a reader that observes the slot also observes the pushed unit.
-fn jit_install_into(source: &ModuleSource, table: &SharedSlots, unit: Compiled) -> Option<usize> {
+/// so a reader that observes the slot also observes the pushed unit. `id` is the unit's `(table,
+/// unit)` on the installing host, which the table records ([`SharedSlots::jit_unit`]).
+fn jit_install_into(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    unit: Compiled,
+    id: (u32, u32),
+) -> Option<usize> {
     use std::sync::atomic::Ordering;
     let mut mods = source.mods.lock_unpoisoned();
     let slot = table
@@ -1128,6 +1149,10 @@ fn jit_install_into(source: &ModuleSource, table: &SharedSlots, unit: Compiled) 
         .iter()
         .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
     mods.code.push(std::sync::Arc::new(unit));
+    table
+        .jit_units
+        .lock_unpoisoned()
+        .push((mods.code.len() - 1, id));
     let module = (mods.code.len() - 1) as u32;
     table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
     Some(slot)
@@ -1780,15 +1805,18 @@ impl FreshWindow {
 /// `Vcpu` leaves the capture to its embedder, but the in-process drivers' freeze cannot, so there a
 /// durable domain's detached spawn refuses (#1893).
 ///
-/// `own`: the spawning domain's unit in the run's source — what its registered self module compiled
-/// to — for a driver that tracks it (the debugger, #2076). A child of the spawner's own program runs
-/// that unit; `None` compiles the program again, as any granted module is.
+/// `spawner`: the spawning frame's module in the run's source ([`spawner_module`]), and `unit`, the
+/// `Jit` unit that module is when the spawning domain installed it ([`SharedSlots::jit_unit`]):
+/// `module = -1` then names the unit's program (#2143). A child of the frame's module runs it, with
+/// no second compile; `None` (an emitted frame's spawn, whose code is never a unit's) compiles the
+/// child's program again, as any granted module is.
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     freezes_detached: bool,
-    own: Option<(u32, std::sync::Arc<Compiled>)>,
+    spawner: Option<(u32, std::sync::Arc<Compiled>)>,
+    unit: Option<(u32, u32)>,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
     // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
     // other value fails closed, checked first as the tree-walker's op-15 arm does.
@@ -1796,7 +1824,7 @@ fn admit_detached_child(
         return Err(Trap::CapFault);
     }
     let (cfuncs, cmem_log2, cdata, ctypes, cmodule, cshadow, cdurable) = {
-        let g = host.resolve_module(s.module)?;
+        let g = host.resolve_spawn_module(s.module, unit)?;
         (
             g.funcs.clone(),
             g.memory_log2,
@@ -1807,11 +1835,14 @@ fn admit_detached_child(
             g.durable,
         )
     };
-    // A child of the spawner's own program runs the spawning domain's unit, `own`, when the driver
-    // names it, as a same-module confined child does (#1726): no second compile, and the child's
-    // code keeps the identity the debugger keys breakpoints and §6 debug info on (#2076).
-    let program = match own {
-        Some((m, p)) if host.is_self_module(s.module) => ChildProgram::Spawner(m, p),
+    // A child of the spawning frame's own module runs it, as a same-module confined child does
+    // (#1726): no second compile, and the child's code keeps the identity the debugger keys
+    // breakpoints and §6 debug info on (#2076). `-1` always names that module; a grant of the
+    // domain's program does too when the frame runs the program rather than a unit.
+    let runs_spawner =
+        s.module == super::SELF_MODULE || (unit.is_none() && host.is_self_module(s.module));
+    let program = match spawner {
+        Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
         _ => {
             ChildProgram::Granted(compile_module(&cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?)
         }
@@ -1922,9 +1953,10 @@ fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
-    own: Option<(u32, std::sync::Arc<Compiled>)>,
+    spawner: Option<(u32, std::sync::Arc<Compiled>)>,
+    unit: Option<(u32, u32)>,
 ) -> Result<Option<AdmittedChild>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, own)? else {
+    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, spawner, unit)? else {
         return Ok(None);
     };
     child.mem = Some(window.build(None, &mut child.host)?);
@@ -4930,20 +4962,25 @@ impl<'p> Vcpu<'p> {
                 // it. `true`: this engine leaves the capture of a durable domain's detached child to
                 // its embedder's freeze.
                 Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
+                    let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+                    let spawner = spawner_module(&dom.source, &self.vt.active);
+                    let unit = dom.table.jit_unit(self.vt.active.module);
                     let admitted = match self.shared_host {
                         Some(m) => admit_detached_child(
                             &mut m.lock_unpoisoned(),
                             self.mem.as_ref(),
                             spawn,
                             true,
-                            None,
+                            spawner,
+                            unit,
                         ),
                         None => admit_detached_child(
                             &mut self.host,
                             self.mem.as_ref(),
                             spawn,
                             true,
-                            None,
+                            spawner,
+                            unit,
                         ),
                     };
                     match admitted {
@@ -5105,8 +5142,11 @@ impl<'p> Vcpu<'p> {
                 spawn,
                 true,
                 None,
+                None,
             ),
-            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, None),
+            None => {
+                admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, None, None)
+            }
         }?;
         let Some((child, window)) = admitted else {
             return Ok(None);
@@ -5160,9 +5200,9 @@ impl<'p> Vcpu<'p> {
         }
     }
 
-    /// Deliver the resolved unit funcs for a `JitInstall` (the host resolved authority + code-handle):
-    /// `Err` (forged / cross-domain / wrong-type handle) propagates as a trap; `Ok(funcs)` is compiled
-    /// and installed into the **shared** [`Domain`] (so every vCPU/Worker can `call.dyn` it), the
+    /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]): `Err` (forged /
+    /// cross-domain / wrong-type handle) propagates as a trap; `Ok` is compiled and installed into
+    /// the **shared** [`Domain`] (so every vCPU/Worker can `call.dyn` it), the
     /// slot — or `-ENOSPC` if the table is full / `Malformed` if the unit is outside engine coverage —
     /// written to the awaiting dst.
     ///
@@ -5173,14 +5213,13 @@ impl<'p> Vcpu<'p> {
     /// itself stays wasm-agnostic; the slot→code-handle→emitted-wasm mapping lives in the host.
     pub fn deliver_jit_install(
         &mut self,
-        funcs: Result<std::sync::Arc<[Func]>, Trap>,
-        types: std::sync::Arc<[temen_ir::TypeEntry]>,
+        unit: Result<super::ResolvedJitUnit, Trap>,
     ) -> Option<usize> {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
         };
-        let funcs = match funcs {
-            Ok(f) => f,
+        let (funcs, types, id) = match unit {
+            Ok(u) => u,
             Err(t) => {
                 self.trap = Some(t);
                 return None;
@@ -5193,7 +5232,7 @@ impl<'p> Vcpu<'p> {
                 .own_dom
                 .as_ref()
                 .unwrap_or(&self.prog.dom)
-                .install(unit)
+                .install(unit, id)
             {
                 Some(slot) => (slot as i64, Some(slot)),
                 None => (super::ENOSPC, None),
@@ -7985,9 +8024,9 @@ fn service_advance(
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
-                if let Err(t) =
-                    dbg_instantiate_detached(tasks, ti, extra_envs, source, mem, host, spawn, dst)
-                {
+                if let Err(t) = dbg_instantiate_detached(
+                    tasks, ti, extra_envs, source, table, mem, host, spawn, dst,
+                ) {
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
@@ -8221,14 +8260,17 @@ fn dbg_instantiate_detached(
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
+    table: &SharedSlots,
     shared_mem: &Option<Mem>,
     host: &mut Host,
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
-    // The spawner's own unit, which a child of its own program runs (#2076).
-    let program = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
-    let own = source.get(program as usize).map(|p| (program, p));
+    // The spawning frame's module, which a child of its own program runs (#2076, #2143), and the
+    // unit it is when the spawning domain installed it.
+    let spawner = spawner_module(source, &tasks[ti].vt.active);
+    let table = tasks[ti].env.map_or(table, |k| &extra_envs[k].table);
+    let unit = table.jit_unit(tasks[ti].vt.active.module);
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
         None => (shared_mem.as_ref(), &mut *host),
@@ -8237,7 +8279,7 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, spawn, own)? else {
+    let Some(child) = admit_detached_in_process(owner, pm, spawn, spawner, unit)? else {
         tasks[ti]
             .vt
             .active
@@ -8367,21 +8409,9 @@ fn dbg_jit_install(
     code: i32,
     dst: u32,
 ) -> Result<(), Trap> {
-    let (funcs, types) = host.resolve_jit_domain(h).and_then(|domain| {
-        let (cd, cu) = host.resolve_jit_code(code)?;
-        if cd != domain {
-            return Err(Trap::CapFault);
-        }
-        host.jit_unit_funcs(cd, cu)
-            .ok_or(Trap::CapFault)
-            .and_then(|f| {
-                host.jit_unit_types(cd, cu)
-                    .ok_or(Trap::CapFault)
-                    .map(|t| (f, t))
-            })
-    })?;
+    let (funcs, types, id) = host.resolve_jit_unit(h, code)?;
     let res = match compile_module(&funcs, &types, None) {
-        Some(unit) => match jit_install_into(source, table, unit) {
+        Some(unit) => match jit_install_into(source, table, unit, id) {
             Some(slot) => slot as i64,
             None => super::ENOSPC,
         },
@@ -11821,28 +11851,6 @@ fn gc_write(
 /// half of the contract ("a unit runs its own scheduler to completion"). No durability shadowing:
 /// a freeze never lands mid-invoke (snapshot paths carry no invoke state), so unlike `step_vcpu`
 /// there is no `fiber_sp`/`shadow_switch` bookkeeping. A trap propagates to the invoker.
-/// A resolved unit's `(funcs, types)` — what [`resolve_jit_unit`] hands the driver's Jit arms.
-type JitUnitBody = (
-    std::sync::Arc<[Func]>,
-    std::sync::Arc<[temen_ir::TypeEntry]>,
-);
-
-/// Resolve a `Jit.invoke`/`install` `(handle, code)` pair against `host` — authority (a forged handle
-/// is a `CapFault`) and the cross-table check (a code handle from another table is one too) — to the
-/// unit's funcs + types. The one resolution body the cooperative driver's Jit arms share, so a §14
-/// child's units resolve against the **child's** host (#1296: a child holds its own `Jit` table).
-/// Also hands back the unit's `(domain, unit)` identity — the install arms mirror it per slot (#1233).
-fn resolve_jit_unit(host: &Host, h: i32, code: i32) -> Result<(JitUnitBody, (u32, u32)), Trap> {
-    let table = host.resolve_jit_domain(h)?;
-    let (cd, cu) = host.resolve_jit_code(code)?;
-    if cd != table {
-        return Err(Trap::CapFault);
-    }
-    let funcs = host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
-    let types = host.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
-    Ok(((funcs, types), (cd, cu)))
-}
-
 #[allow(clippy::too_many_arguments)] // the nested-drive dispatch shim's inputs, as `coop_bounce`'s
 fn run_invoke(
     source: &ModuleSource,
@@ -12152,9 +12160,9 @@ fn drive_nested(
             // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
                 let _ = code; // the mirror keys on the unit identity, not the (revocable) handle
-                let ((funcs, types), unit_id) = host.with(|p| resolve_jit_unit(p, h, code))?;
+                let (funcs, types, unit_id) = host.with(|p| p.resolve_jit_unit(h, code))?;
                 let res = match compile_module(&funcs, &types, None) {
-                    Some(unit) => match jit_install_into(source, table, unit) {
+                    Some(unit) => match jit_install_into(source, table, unit, unit_id) {
                         Some(slot) => {
                             if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
                                 if let Some(e) = m.units.get_mut(slot) {
@@ -12201,7 +12209,7 @@ fn drive_nested(
                 params,
                 results,
             } => {
-                let ((funcs, types), _) = host.with(|p| resolve_jit_unit(p, h, code))?;
+                let (funcs, types, _) = host.with(|p| p.resolve_jit_unit(h, code))?;
                 let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
                 let arity_ok = unit
                     .sigs
@@ -15841,13 +15849,14 @@ impl CoopSched {
                         None => mem.as_ref(),
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    // #2078 — a child of the spawning domain's own program runs that domain's unit,
-                    // as a same-module confined child does: no second compile. The domain's unit,
-                    // not the spawning frame's: a §22 unit the domain installed is not its program.
-                    let unit = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
-                    let own = dom.source.get(unit as usize).map(|p| (unit, p));
+                    // #2078 — a child of the spawning frame's own module runs it, as a same-module
+                    // confined child does: no second compile (#2143: an installed unit's, from a
+                    // frame of one).
+                    let spawner = spawner_module(&dom.source, &tasks[ti].vt.active);
+                    let table = tasks[ti].env.map_or(&*dom.table, |k| &extra_envs[k].table);
+                    let unit = table.jit_unit(tasks[ti].vt.active.module);
                     let admitted = task_host(host, extra_envs, tasks[ti].env)
-                        .with(|h| admit_detached_in_process(h, pm, spawn, own));
+                        .with(|h| admit_detached_in_process(h, pm, spawn, spawner, unit));
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
@@ -16108,10 +16117,13 @@ impl CoopSched {
                     // fail only if it uses an op the bytecode engine doesn't lower yet — the one place a
                     // guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
                     let resolved = match tasks[ti].env {
-                        None => resolve_jit_unit(host, h, code),
-                        Some(k) => resolve_jit_unit(&extra_envs[k].host.lock_unpoisoned(), h, code),
+                        None => host.resolve_jit_unit(h, code),
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .resolve_jit_unit(h, code),
                     };
-                    let ((funcs, types), unit_id) = match resolved {
+                    let (funcs, types, unit_id) = match resolved {
                         Ok(f) => f,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
@@ -16120,8 +16132,10 @@ impl CoopSched {
                     };
                     let res = match compile_module(&funcs, &types, None) {
                         Some(unit) => match match tasks[ti].env {
-                            None => dom.install(unit),
-                            Some(k) => jit_install_into(&dom.source, &extra_envs[k].table, unit),
+                            None => dom.install(unit, unit_id),
+                            Some(k) => {
+                                jit_install_into(&dom.source, &extra_envs[k].table, unit, unit_id)
+                            }
                         } {
                             Some(slot) => {
                                 // #926 slice 2f: mirror `slot → (domain, unit)` so the browser B2
@@ -16238,11 +16252,14 @@ impl CoopSched {
                     // Resolve unit funcs (authority + cross-table) against the task's host, as for
                     // install, and compile.
                     let resolved = match tasks[ti].env {
-                        None => resolve_jit_unit(host, h, code),
-                        Some(k) => resolve_jit_unit(&extra_envs[k].host.lock_unpoisoned(), h, code),
+                        None => host.resolve_jit_unit(h, code),
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .resolve_jit_unit(h, code),
                     };
                     let (funcs, types) = match resolved {
-                        Ok((f, _)) => f,
+                        Ok((f, t, _)) => (f, t),
                         Err(t) => {
                             complete(tasks, ti, Err(t));
                             continue;
@@ -18557,27 +18574,13 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 // handle is an inert CapFault → trap), then compile + install. Compiling can fail only
                 // if the unit uses an op the engine doesn't lower yet (the one place a guest unit can
                 // outrun coverage — no tree-walker fallback mid-run).
-                let (funcs, types) = {
-                    let g = host.lock_unpoisoned();
-                    match g.resolve_jit_domain(h).and_then(|domain| {
-                        let (cd, cu) = g.resolve_jit_code(code)?;
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        g.jit_unit_funcs(cd, cu)
-                            .ok_or(Trap::CapFault)
-                            .and_then(|f| {
-                                g.jit_unit_types(cd, cu)
-                                    .ok_or(Trap::CapFault)
-                                    .map(|t| (f, t))
-                            })
-                    }) {
-                        Ok(f) => f,
-                        Err(t) => return (Err(t), mem),
-                    }
+                let resolved = host.lock_unpoisoned().resolve_jit_unit(h, code);
+                let (funcs, types, id) = match resolved {
+                    Ok(u) => u,
+                    Err(t) => return (Err(t), mem),
                 };
                 let res = match compile_module(&funcs, &types, None) {
-                    Some(unit) => match dom.install(unit) {
+                    Some(unit) => match dom.install(unit, id) {
                         Some(slot) => slot as i64,
                         None => super::ENOSPC,
                     },
@@ -18724,7 +18727,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     &mut host.lock_unpoisoned(),
                     mem.as_ref(),
                     spawn,
-                    None,
+                    spawner_module(&dom.source, &vt.active),
+                    dom.table.jit_unit(vt.active.module),
                 );
                 let child = match admitted {
                     Ok(Some(c)) => c,

@@ -109,7 +109,7 @@ fn each_instance_answers_from_its_own_powerbox_while_the_others_run() {
 fn no_instance_of_shared_code_can_extend_it() {
     let unit = parse_module("func (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n")
         .expect("parse unit");
-    let extends = |cm: &mut CompiledModule| cm.define_extra(&unit.funcs, &unit.types);
+    let extends = |cm: &mut CompiledModule| cm.define_extra(&unit.funcs, &unit.types, None);
     let mut first = compile(ASKS_ITS_POWERBOX, INERT_CAP_THUNK, core::ptr::null_mut(), 4);
     let code = first.share().expect("only code");
     let mut other = code.instance(core::ptr::null_mut());

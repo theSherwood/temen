@@ -92,7 +92,7 @@ fn recompact(base: &Module, table_log2: u8, live: &[Live]) -> CompiledModule {
     let mut fresh = compile_reserved(base, table_log2);
     for u in live {
         let defs = fresh
-            .define_extra(&u.funcs, &[])
+            .define_extra(&u.funcs, &[], None)
             .expect("re-define live unit");
         assert!(
             fresh.install_at(u.slot, defs[0].code, defs[0].type_id),
@@ -121,7 +121,7 @@ fn recompaction_reclaims_superseded_definitions() {
     let last_k = 39;
     for k in 0..=last_k {
         let funcs = unit_mul_add(k);
-        let defs = cm.define_extra(&funcs, &[]).expect("define_extra");
+        let defs = cm.define_extra(&funcs, &[], None).expect("define_extra");
         if let Some(s) = slot {
             assert!(cm.uninstall(s), "uninstall previous definition");
             assert!(
@@ -181,7 +181,7 @@ fn recompaction_preserves_slots_across_a_gap() {
     let mut slots = Vec::new();
     for k in [100, 200, 300] {
         let defs = cm
-            .define_extra(&unit_mul_add(k), &[])
+            .define_extra(&unit_mul_add(k), &[], None)
             .expect("define_extra");
         slots.push(cm.install(defs[0].code, defs[0].type_id).expect("install"));
     }
@@ -228,7 +228,7 @@ fn install_at_rejects_invalid_targets() {
     verify_module(&base).expect("verify parent");
     let mut cm = compile_reserved(&base, 4); // 16 slots, 1 real func
     let defs = cm
-        .define_extra(&unit_mul_add(7), &[])
+        .define_extra(&unit_mul_add(7), &[], None)
         .expect("define_extra");
     let (code, tid) = (defs[0].code, defs[0].type_id);
 
@@ -287,7 +287,7 @@ fn host_define(host: &mut Host, cm: &mut CompiledModule, jit_h: i32, blob: &[u8]
         .expect("validate");
     let funcs = host.jit_unit_funcs(c.domain, c.unit).expect("unit funcs");
     let types = host.jit_unit_types(c.domain, c.unit).unwrap_or_default();
-    let defs = cm.define_extra(&funcs, &types).expect("define_extra");
+    let defs = cm.define_extra(&funcs, &types, None).expect("define_extra");
     host.set_jit_unit_native(
         c.domain,
         c.unit,

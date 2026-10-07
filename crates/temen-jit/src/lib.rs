@@ -779,11 +779,32 @@ pub struct ResolvedModule {
 /// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle is an inert
 /// `CapFault`) — only the host-side nesting runtime calls this.
 ///
+/// `unit` is the installed §22 unit the spawning code runs ([`unit_ref`]), or [`NO_UNIT`]: from a
+/// unit, `handle = -1` names the unit's own program, not the domain's (#2143).
+///
 /// # Safety
 /// `ctx` is the same host pointer as the run's `cap_ctx`; `out` points at a writable
 /// [`ResolvedModule`]. The filled views must outlive the run (see [`ResolvedModule`]).
-pub type ModuleResolver =
-    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, handle: i32, out: *mut ResolvedModule) -> i32;
+pub type ModuleResolver = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    handle: i32,
+    unit: i64,
+    out: *mut ResolvedModule,
+) -> i32;
+
+/// No installed unit: the spawning code is the domain's own program (or a unit no host names).
+pub const NO_UNIT: i64 = -1;
+
+/// An installed §22 unit as the host callbacks carry it: its `(table, unit)` on the host
+/// ([`CompiledModule::define_extra`]) packed into one word, or [`NO_UNIT`].
+pub fn unit_ref(unit: Option<(u32, u32)>) -> i64 {
+    unit.map_or(NO_UNIT, |(t, u)| ((t as i64) << 32) | u as i64)
+}
+
+/// The `(table, unit)` a [`unit_ref`] word names, `None` for [`NO_UNIT`].
+pub fn unit_of(r: i64) -> Option<(u32, u32)> {
+    (r >= 0).then_some(((r >> 32) as u32, r as u32))
+}
 
 /// A §14 **granted child** powerbox built host-side (PROCESS.md S2 JIT parity): an opaque child
 /// `Host` (`ctx`) holding an `Instantiator` + `AddressSpace` over the child's own window and the
@@ -1111,11 +1132,13 @@ pub type ChildOfferMint = unsafe extern "C" fn(
 /// Bind a child module's import manifest against its built powerbox host — see
 /// [`GrantChildHooks::bind_imports`]. Returns `0` on success, nonzero when a `required` import
 /// had nothing to bind (IMPORTS.md §3.3 withhold) — the spawn then fails closed with `-EINVAL`
-/// before any child code runs, matching the interpreter's inline spawn.
+/// before any child code runs, matching the interpreter's inline spawn. `module` and `unit` name the
+/// child's program as for a [`ModuleResolver`].
 pub type ChildManifestBinder = unsafe extern "C" fn(
     parent_ctx: *mut core::ffi::c_void,
     child_ctx: *mut core::ffi::c_void,
     module: i64,
+    unit: i64,
 ) -> i32;
 
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
@@ -5133,10 +5156,15 @@ impl CompiledModule {
     /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
     /// incremental definition to single-threaded code (DESIGN.md §22 "Concurrency"), and lowering
     /// `cont.*`/`thread.*` here would need per-unit runtime wiring this slice doesn't do.
+    ///
+    /// `unit` is the unit's `(table, unit)` on its host, which the host callbacks resolve a detached
+    /// self-spawn from the unit's code against (#2143); `None` for a unit no host names, which then
+    /// cannot spawn its own program detached.
     pub fn define_extra(
         &mut self,
         funcs: &[Func],
         types: &[temen_ir::TypeEntry],
+        unit: Option<(u32, u32)>,
     ) -> Result<Vec<DefinedFn>, JitError> {
         if funcs.is_empty() {
             return Ok(Vec::new());
@@ -5229,6 +5257,7 @@ impl CompiledModule {
             let prog = Box::new(instantiator_rt::UnitProg {
                 funcs: funcs.into(),
                 types: types.into(),
+                unit: unit_ref(unit),
             });
             let self_prog = &*prog as *const instantiator_rt::UnitProg as i64;
             self._unit_progs.push(prog);
@@ -5240,7 +5269,7 @@ impl CompiledModule {
             self.inst
         };
         #[cfg(not(fiber_rt))]
-        let inst = self.inst;
+        let (inst, _) = (self.inst, unit);
         let mut ctx = module.make_context();
         for (f, id) in funcs.iter().zip(&ids) {
             build_clif(

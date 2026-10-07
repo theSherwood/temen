@@ -114,7 +114,8 @@ pub fn run_on_then<R>(
             done(r, d.host())
         }
         Driver::Vcpu => {
-            let prog = bytecode::VcpuProgram::compile(m)?;
+            // The `call.dyn` table the powerbox's `Jit` reserves, as every other driver builds it.
+            let prog = bytecode::VcpuProgram::compile_with_jit_table(m, host.jit_table_log2())?;
             let (back, base, layout) = window(m);
             let shared = Mutex::new(host);
             let orch = Orch::default();
@@ -281,16 +282,39 @@ fn drive<'s, 'e>(
                 drop(g);
                 vcpu.deliver_join(r);
             }
+            bytecode::VcpuEvent::JitInstall { handle, code } => {
+                let unit = jit_unit(win, &mut vcpu, handle, code);
+                vcpu.deliver_jit_install(unit);
+            }
+            bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
+                let unit = jit_unit(win, &mut vcpu, handle, code);
+                let types = unit
+                    .as_ref()
+                    .map_or_else(|_| Arc::from(Vec::new()), |(_, t, _)| Arc::clone(t));
+                vcpu.deliver_jit_invoke(unit.map(|(f, _, _)| f), types);
+            }
             // Named, not `_`: a new event fails to build here as in every driver (#1414).
             bytecode::VcpuEvent::TierUp { .. } => unorchestrated("TierUp"),
             bytecode::VcpuEvent::Wait { .. } => unorchestrated("Wait"),
             bytecode::VcpuEvent::Notify { .. } => unorchestrated("Notify"),
-            bytecode::VcpuEvent::JitInstall { .. } => unorchestrated("JitInstall"),
             bytecode::VcpuEvent::JitUninstall { .. } => unorchestrated("JitUninstall"),
-            bytecode::VcpuEvent::JitInvoke { .. } => unorchestrated("JitInvoke"),
             bytecode::VcpuEvent::CapPending { .. } => unorchestrated("CapPending"),
             bytecode::VcpuEvent::StdinPark => unorchestrated("StdinPark"),
         }
+    }
+}
+
+/// The `Jit` unit a `JitInstall` / `JitInvoke` names, resolved in the powerbox the vCPU's handles name:
+/// the root's shared one, or a child's own.
+fn jit_unit(
+    win: &Win<'_>,
+    vcpu: &mut bytecode::Vcpu<'_>,
+    jit: i32,
+    code: i32,
+) -> Result<temen_interp::ResolvedJitUnit, Trap> {
+    match win.host {
+        Some(h) => h.lock().unwrap().resolve_jit_unit(jit, code),
+        None => vcpu.host_mut().resolve_jit_unit(jit, code),
     }
 }
 

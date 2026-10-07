@@ -1088,7 +1088,7 @@ unsafe fn jit_native_op(
             // SAFETY: `cm` is the in-flight run's CompiledModule (jit_cap_run registered it);
             // the guest is suspended in this synchronous call.cap, so this transient re-entry
             // aliases no live reference (run_raw's contract).
-            match (*cm).define_extra(&funcs, &types) {
+            match (*cm).define_extra(&funcs, &types, Some((compiled.domain, compiled.unit))) {
                 Ok(defs) => {
                     // The unit entry (func 0): trampoline for `invoke`, natural code + type_id
                     // for B2 `install` into the call.dyn table.
@@ -1276,7 +1276,7 @@ unsafe fn jit_native_op(
                 .expect("unit was just stored");
             // SAFETY: identical contract to op 0 — `cm` is the in-flight run's CompiledModule and
             // the guest is suspended in this synchronous call.cap, so the re-entry aliases nothing.
-            match (*cm).define_extra(&funcs, &types) {
+            match (*cm).define_extra(&funcs, &types, Some((compiled.domain, compiled.unit))) {
                 Ok(defs) => {
                     let d = defs[0];
                     host.set_jit_unit_native(
@@ -2397,7 +2397,7 @@ pub fn recompact_into(
             continue; // no IR retained (cannot happen for a compiled unit) — skip defensively
         };
         let types = host.jit_unit_types(domain, unit).unwrap_or_default();
-        let defs = fresh.define_extra(&funcs, &types)?;
+        let defs = fresh.define_extra(&funcs, &types, Some((domain, unit)))?;
         let d = defs[0];
         host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         if let Some(slots) = code_to_slots.get(&(old_install_code as u64)) {
@@ -2455,7 +2455,7 @@ pub fn reconstruct_jit_units(
                 continue; // no IR retained (cannot happen for a restored unit) — skip defensively
             };
             let types = host.jit_unit_types(domain, unit).unwrap_or_default();
-            let defs = cm.define_extra(&funcs, &types)?;
+            let defs = cm.define_extra(&funcs, &types, Some((domain, unit)))?;
             let d = defs[0];
             host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         }
@@ -2789,26 +2789,10 @@ unsafe fn fast_dispatch(
 pub unsafe extern "C" fn module_resolver(
     ctx: *mut c_void,
     handle: i32,
+    unit: i64,
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
-    let host = &*(ctx as *const Host);
-    match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow, durable)) => {
-            *out = temen_jit::ResolvedModule {
-                funcs,
-                n_funcs,
-                memory_log2,
-                data,
-                n_data,
-                types,
-                n_types,
-                shadow,
-                durable,
-            };
-            1
-        }
-        None => 0,
-    }
+    resolve_module_into(&*(ctx as *const Host), handle, unit, out)
 }
 
 /// [`module_resolver`] for the **locked** cap-context shape ([`CapCtx::Locked`]): `ctx` is the
@@ -2819,12 +2803,27 @@ pub unsafe extern "C" fn module_resolver(
 pub unsafe extern "C" fn module_resolver_locked(
     ctx: *mut c_void,
     handle: i32,
+    unit: i64,
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
     let host = (*(ctx as *const Mutex<Host>))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    match host.resolve_module_parts(handle) {
+    resolve_module_into(&host, handle, unit, out)
+}
+
+/// The body of both resolvers: fill `out` with the views of the module a spawn's operand names
+/// ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
+///
+/// # Safety
+/// `out` is a writable [`temen_jit::ResolvedModule`].
+unsafe fn resolve_module_into(
+    host: &Host,
+    handle: i32,
+    unit: i64,
+    out: *mut temen_jit::ResolvedModule,
+) -> i32 {
+    match host.resolve_module_parts(handle, temen_jit::unit_of(unit)) {
         Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow, durable)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
@@ -2955,7 +2954,7 @@ locked_parent_hook!(
 locked_parent_hook!(
     child_bind_imports_locked,
     child_bind_imports,
-    (child_ctx: *mut c_void, module: i64) -> i32
+    (child_ctx: *mut c_void, module: i64, unit: i64) -> i32
 );
 locked_parent_hook!(
     child_offer_mint_locked,
@@ -3654,32 +3653,29 @@ pub unsafe extern "C" fn child_bind_imports(
     parent_ctx: *mut c_void,
     child_ctx: *mut c_void,
     module: i64,
+    unit: i64,
 ) -> i32 {
     let parent = &*(parent_ctx as *mut Host);
     // 5c.0 — the child powerbox is a shared cell now (`Arc<Mutex<Host>>` raw): lock to bind.
     let child_cell = &*(child_ctx as *const Mutex<Host>);
-    if let Some(imports) = parent.module_imports(module as i32) {
-        let types = parent
-            .module_types(module as i32)
-            .unwrap_or_else(|| Arc::from(Vec::new()));
+    // The child's program: from an installed unit's code, `-1` is the unit's (#2143).
+    if let Some(m) = parent.spawn_module(module as i32, temen_jit::unit_of(unit)) {
         // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL). A
         // **same-module** child (`module == SELF_MODULE`, #1234) binds leniently instead — its
         // manifest is the parent's whole import surface, not one written for it, so an unmet
         // `required` slot is left empty (fail-closed at use) rather than refusing the spawn.
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
         let bound = if parent.is_self_module(module as i32) {
-            child.bind_same_module_manifest(&imports, &types)
+            child.bind_same_module_manifest(&m.imports, &m.types)
         } else {
-            child.bind_child_manifest(&imports, &types)
+            child.bind_child_manifest(&m.imports, &m.types)
         };
         if bound.is_err() {
             return -22;
         }
         // The child runs this program: its own self module, as the interpreter's spawn arms stamp it
         // (serve/offer resolution; and what a freeze of a detached child names it by, #1361).
-        if let Some(m) = parent.module_arc(module as i32) {
-            child.set_self_module(&m);
-        }
+        child.set_self_module(&m);
     }
     0
 }

@@ -61,7 +61,7 @@ unsafe extern "C" fn reentry_thunk(
         // Re-entrant incremental compile: the guest is suspended on this thread; the parent's
         // code is on the stack below us while finalize_definitions mprotects the new pages.
         let ptrs = (*cm)
-            .define_extra(&tc.funcs, &tc.types)
+            .define_extra(&tc.funcs, &tc.types, None)
             .expect("define_extra mid-run");
         tc.code.set(ptrs[0].tramp);
     }
@@ -175,7 +175,7 @@ fn invoke_outside_a_run_is_rejected() {
     let extra_src = "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n";
     let (ctx, mut cm) = setup(extra_src);
     let code = cm
-        .define_extra(&ctx.funcs, &ctx.types)
+        .define_extra(&ctx.funcs, &ctx.types, None)
         .expect("define outside run")[0]
         .tramp;
     let mut results = [0i64; 1];

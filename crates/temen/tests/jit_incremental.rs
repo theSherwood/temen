@@ -97,7 +97,7 @@ fn define_extra_pure_function_matches_interp() {
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     assert_eq!(ptrs.len(), 1);
     let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[6, 7], None) }.expect("run_extra");
@@ -114,7 +114,7 @@ fn define_extra_unit_local_direct_calls() {
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     assert_eq!(ptrs.len(), 2);
     let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[5], None) }.expect("run_extra");
@@ -139,10 +139,10 @@ fn incremental_finalize_keeps_earlier_code_runnable() {
     verify_module(&unit2).expect("verify");
 
     let p1 = cm
-        .define_extra(&unit1.funcs, &unit1.types)
+        .define_extra(&unit1.funcs, &unit1.types, None)
         .expect("first define_extra");
     let p2 = cm
-        .define_extra(&unit2.funcs, &unit2.types)
+        .define_extra(&unit2.funcs, &unit2.types, None)
         .expect("second define_extra");
 
     // After the SECOND finalize: unit 1's code (finalized earlier) still runs…
@@ -179,7 +179,7 @@ fn define_extra_call_indirect_uses_parent_table_and_mask() {
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     // Slot 0 → the parent's add.
     let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[30, 12], None) }.expect("idx 0");
@@ -236,7 +236,7 @@ fn parent_call_indirect_cannot_reach_extra_code() {
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     // The new code is alive and callable — through the host trampoline only.
     let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[100], None) }.expect("run_extra");
@@ -261,7 +261,7 @@ fn define_extra_unknown_signature_traps_fail_closed() {
     let extra = parse_module(extra_src).expect("parse");
     verify_module(&extra).expect("verify");
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 1, 1, &[7], None) }.expect("run_extra");
     assert!(
@@ -289,7 +289,7 @@ fn define_extra_masking_matches_interp_memory_effects() {
     assert_eq!(want, vec![Value::I32(171)]);
 
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     let (out, final_mem) =
         unsafe { cm.run_extra(ptrs[0].tramp, 0, 1, &[], None) }.expect("run_extra");
@@ -313,7 +313,7 @@ fn define_extra_masking_matches_interp_memory_effects() {
         "interp: a store past the backed extent must fault"
     );
     let ptrs = cm
-        .define_extra(&extra.funcs, &extra.types)
+        .define_extra(&extra.funcs, &extra.types, None)
         .expect("define_extra");
     let (out, _) = unsafe { cm.run_extra(ptrs[0].tramp, 0, 1, &[], None) }.expect("run_extra");
     assert!(
@@ -347,7 +347,7 @@ fn type_ids_are_interned_append_only_across_units() {
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 1\n  v2 = i64.add v0 v1\n  return v2\n  }\n}\n";
     let unit_a = parse_module(unit_a_src).expect("parse");
     verify_module(&unit_a).expect("verify");
-    cm.define_extra(&unit_a.funcs, &unit_a.types)
+    cm.define_extra(&unit_a.funcs, &unit_a.types, None)
         .expect("unit A");
     let id = cm.interned_type_id(&novel).expect("interned by unit A");
 
@@ -356,7 +356,7 @@ fn type_ids_are_interned_append_only_across_units() {
     let unit_b = parse_module(unit_b_src).expect("parse");
     verify_module(&unit_b).expect("verify");
     let ptrs = cm
-        .define_extra(&unit_b.funcs, &unit_b.types)
+        .define_extra(&unit_b.funcs, &unit_b.types, None)
         .expect("unit B");
     assert_eq!(cm.interned_type_id(&novel), Some(id), "stable across units");
     assert_eq!(
@@ -377,7 +377,7 @@ fn type_ids_are_interned_append_only_across_units() {
 #[test]
 fn define_extra_empty_unit() {
     let mut cm = compile(ADD);
-    assert!(cm.define_extra(&[], &[]).expect("empty").is_empty());
+    assert!(cm.define_extra(&[], &[], None).expect("empty").is_empty());
 }
 
 /// B2 `install` (JIT level, DESIGN.md §22 slice #4): a `define_extra` unit installed into a
@@ -411,7 +411,7 @@ fn install_makes_unit_call_indirectable() {
     let unit = parse_module(unit_src).expect("parse");
     verify_module(&unit).expect("verify");
     let defs = cm
-        .define_extra(&unit.funcs, &unit.types)
+        .define_extra(&unit.funcs, &unit.types, None)
         .expect("define_extra");
     let slot = cm.install(defs[0].code, defs[0].type_id).expect("install");
     assert_eq!(
@@ -441,7 +441,7 @@ fn install_full_table_returns_none() {
     let mut cm = compile(ADD); // natural table, 1 func → next_pow2(1) = 1 slot, zero padding
     let unit = parse_module(ADD).expect("parse");
     let defs = cm
-        .define_extra(&unit.funcs, &unit.types)
+        .define_extra(&unit.funcs, &unit.types, None)
         .expect("define_extra");
     assert!(
         cm.install(defs[0].code, defs[0].type_id).is_none(),
@@ -476,7 +476,7 @@ fn concurrent_finalize_does_not_disturb_running_code() {
     let leaf = parse_module(leaf_src).expect("parse");
     verify_module(&leaf).expect("verify");
     let defs = cm
-        .define_extra(&leaf.funcs, &leaf.types)
+        .define_extra(&leaf.funcs, &leaf.types, None)
         .expect("define leaf");
     let tramp = defs[0].tramp as usize; // Send across the thread boundary as a plain integer
 
@@ -517,7 +517,7 @@ fn concurrent_finalize_does_not_disturb_running_code() {
         );
         let m = parse_module(&src).expect("parse");
         verify_module(&m).expect("verify");
-        cm.define_extra(&m.funcs, &m.types)
+        cm.define_extra(&m.funcs, &m.types, None)
             .expect("define_extra under concurrent execution");
     }
     stop.store(true, Ordering::Relaxed);
