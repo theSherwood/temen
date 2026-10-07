@@ -6,7 +6,9 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Attestation, FrozenDetached, Host, Value};
+use temen_interp::{
+    run_capture_reserved_with_host, Attestation, FreezeScope, FrozenDetached, Host, Value,
+};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -1386,40 +1388,31 @@ block 0 (vx: i64) {
 
 /// §13.4 slice 4d — a **supervisor holding a live cap** onto a serving child freezes (its
 /// `LiveImpl` handle captured structurally by the callee's join slot, v15) and thaws with the
-/// cap **re-linked** to the re-created child. The supervisor instantiates a same-module child
-/// server, mints a `child_offer` cap over its `echo` export, then parks in `svc.wait` holding
-/// the cap; freeze-on-quiesce captures the subtree. On thaw the runtime re-creates the child
+/// cap **re-linked** to the re-created child. The supervisor spawns a same-module child server
+/// detached, mints a `child_offer` cap over its `echo` export, then parks in `svc.wait` holding
+/// the cap; freeze-on-quiesce captures the subtree. On thaw the runtime re-launches the child
 /// and re-links the supervisor's restored `LiveImpl`; a dispatch seeded into the supervisor's
 /// own queue lets its `svc.wait` return, and it then calls `echo(7)` through the re-linked cap
-/// — reaching the re-created child (which serves it from its own re-parked accept loop) and
+/// — reaching the re-launched child (which serves it from its own re-parked accept loop) and
 /// returning 107. A broken re-link would fault or hang instead.
 const SRC_4D_SUPERVISOR: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
 type 1 interface { echo: 0 }
 export 0 interface "svc" 1 { echo: 1 }
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=2 off=131072 sl=17 quota=0
-  q0v0 = i64.const 8589934592
-  q0v1 = i64.const 131072
-  q0v2 = i64.const -4294967279
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  ; a v1 record at 17536 (op 17): entry 2 of the durable module `v1`, its declared window, no
+  ; pager or pre-mapped region, paid from the budget `v2`
   q0a0 = i64.const 17536
+  q0v0 = i64.const 8589934593
   i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
+  q0v2 = i64.const -4294967296
+  i64.store q0a0 q0v2 offset=16
+  i32.store q0a0 v1 offset=24
+  i32.store q0a0 v2 offset=28
+  q0v9 = i64.const 4294967295
+  i64.store q0a0 q0v9 offset=72
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
@@ -1462,19 +1455,18 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     let mut h = Host::new();
     h.set_durable(true);
     h.set_self_module(&inst);
-    let ih = h.grant_instantiator(0, WINDOW as u64);
+    let args = [
+        h.grant_instantiator(0, WINDOW as u64),
+        h.grant_durable_module(&inst),
+        h.grant_budget(-1, 1 << 20, -1),
+    ]
+    .map(Value::I32);
+    h.grant_freeze_authority(FreezeScope::DetachedProgeny);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_on_quiesce(&mut win);
     let mut fuel = 5_000_000u64;
-    let (r, snap) = run_capture_reserved_with_host(
-        &inst,
-        0,
-        &[Value::I32(ih)],
-        &mut fuel,
-        &win,
-        SIZE_LOG2,
-        &mut h,
-    );
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
     assert!(
         r.is_ok(),
         "the cap-holding supervisor freezes (was refused pre-4d): {r:?}"
@@ -1486,6 +1478,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     let mut rhost = Host::new();
     rhost.set_durable(true);
     rhost.set_self_module(&inst);
+    rhost.grant_durable_module(&inst); // the child's program, re-granted (D-scope)
     let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
     rhost
         .svc_enqueue(0, 0, vec![0])
@@ -1493,15 +1486,8 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     let mut twin = rwin.clone();
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 5_000_000u64;
-    let (thawed, _) = run_capture_reserved_with_host(
-        &inst,
-        0,
-        &[Value::I32(ih)],
-        &mut fuel,
-        &twin,
-        SIZE_LOG2,
-        &mut rhost,
-    );
+    let (thawed, _) =
+        run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &twin, SIZE_LOG2, &mut rhost);
     assert_eq!(
         thawed,
         Ok(vec![Value::I64(107)]),
