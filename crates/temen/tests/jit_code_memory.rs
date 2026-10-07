@@ -17,7 +17,7 @@
 #[path = "support/irgen.rs"]
 mod irgen;
 
-use irgen::{fuzz_one, Gen};
+use irgen::{detached_probe, fuzz_one, Gen};
 
 fn vm_size_kib() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -33,6 +33,14 @@ fn repeated_compiles_do_not_grow_address_space() {
         let mut g = Gen::from_seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1CE_F00D);
         fuzz_one(&mut g);
     }
+    // The differential's detached pass runs a child on a fiber, and the process's first fiber
+    // reserves temen-fiber's stack arena (1 GiB of address space, held for the process life by
+    // design) — one-time too, but no warm-up seed above reaches it.
+    let child = temen_text::parse_module(
+        "memory 16\nfunc (i64) -> (i64) {\nblock 0 (x: i64) {\n  return x\n}\n}\n",
+    )
+    .unwrap();
+    detached_probe::run_jit(&detached_probe::root(0), &child, &[]).unwrap();
     let before = vm_size_kib();
     // 50 differential iterations ≈ 150+ JIT compiles (each `fuzz_one` runs multiple passes).
     // With the leak, this grew ~4.9 GiB; with `OwnedJit` freeing on drop it is 0.
