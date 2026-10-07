@@ -1175,12 +1175,12 @@ pub fn gen_args(g: &mut Gen, params: &[ValType]) -> Vec<temen_interp::Value> {
 
 // ---- shared differential check (used by jit_fuzz.rs and the libFuzzer `diff` target) ----
 
-use temen_interp::{run_capture_reserved_with_host, run_capture_sub, Host, Trap, Value};
-use temen_jit::{
-    compile_and_run_capture_reserved_with_host_fuel, compile_and_run_capture_sub, JitError,
-    JitOutcome, TrapKind,
-};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_jit::{compile_and_run_capture_reserved_with_host_fuel, JitError, JitOutcome, TrapKind};
 use temen_verify::verify_module;
+
+#[path = "detached_probe.rs"]
+pub mod detached_probe;
 
 /// The handle value of the **first** `grant_memory` on a fresh `Host`: the encoding is
 /// `(generation << CAP_LOG2) | slot` with the generation bumped to 1 on the first grant and slot
@@ -1366,11 +1366,12 @@ pub fn run_differential(m: &Module, args: &[Value]) {
         differential_pass(m, args, &init, mem_oracle, mc.size_log2.saturating_add(8));
     }
 
-    // Pass 3 — a §14 nested sub-window: the same entry confined to a child window inside a parent,
-    // so the JIT's `+ base` masking term is fuzzed across the whole op space (not just the
-    // hand-written `escape_oracle` cases). Allocates a parent only for float-free `mem_oracle`
-    // modules, so non-memory / float seeds are unaffected.
-    differential_pass_sub(m, args, mem_oracle);
+    // Pass 3 — a §14 **detached child** (#1867 decision 3): the same entry run as a child in a window
+    // of its own, spawned by a small root, so the child compile paths and the spawn wiring are fuzzed
+    // across the whole op space (not just the hand-written `escape_oracle` cases), with the root's
+    // window as the canary. Only for float-free `mem_oracle` modules, so non-memory / float seeds are
+    // unaffected.
+    differential_pass_detached(m, args, mem_oracle);
 }
 
 /// One differential pass at a given host reservation (`reserved_log2`; `0` ⇒ fully mapped):
@@ -1424,51 +1425,119 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
     assert_outcomes_agree(m, &results, interp, &imem, jit, &jmem, mem_oracle);
 }
 
-/// One differential pass over a §14 **nested sub-window**: run the entry confined to a child window
-/// at offset `base = size` inside a `2·size` parent on both backends (no powerbox — a `call.cap`
-/// CapFaults identically), and assert they agree on the result/trap and — on a clean completion —
-/// on the **whole parent** window (the sub-window escape-oracle: the JIT's new `+ base` masking term
-/// must confine every access to `[base, base+size)`, byte-for-byte with the interpreter). Skipped
-/// unless the module is a float-free `mem_oracle` candidate, so `parent` is allocated only then.
-fn differential_pass_sub(m: &Module, args: &[Value], mem_oracle: bool) {
+/// One differential pass with the entry run as a **detached child** (#1867 decision 3). The child is
+/// `m` plus a wrapper entry that calls func 0 with `args` and returns a digest of its results and of its
+/// own final window ([`detached_probe::digest_func`]); the probe root spawns it, waits for it and joins
+/// it. The interpreter and the JIT must agree on how the child ended — the same digest for a clean run,
+/// a trap under the window passes' policy — and on the root's whole final window, which must also show
+/// that the child never touched it (the canary). Skipped unless the module is a float-free
+/// `mem_oracle` candidate whose entry takes and returns only integers.
+fn differential_pass_detached(m: &Module, args: &[Value], mem_oracle: bool) {
     let Some(mc) = m.memory.filter(|_| mem_oracle) else {
         return;
     };
-    let size = 1u64 << mc.size_log2;
-    let (base, parent) = (size, size * 2); // child sits in the upper half of the parent
-    let init: Vec<u8> = (0..parent)
+    let f0 = &m.funcs[0];
+    let int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
+    if !f0.params.iter().all(int) || !f0.results.iter().all(int) {
+        return;
+    }
+    let child = detached_child(m, args, mc.size_log2);
+    let root = detached_probe::root(m.funcs.len() as u32);
+    let init: Vec<u8> = (0..1usize << detached_probe::ROOT_LOG2)
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();
-    let results = m.funcs[0].results.clone();
-    let mut fuel = 5_000_000u64;
-    let (interp, imem) = run_capture_sub(m, 0, args, &mut fuel, &init, base, parent);
-    let slots: Vec<i64> = args.iter().copied().map(to_slot).collect();
-    let (jit, jmem) = match compile_and_run_capture_sub(m, 0, &slots, &init, base, parent) {
+    let (interp, imem) = detached_probe::run_oracle(&root, &child, &init, 5_000_000);
+    let (jit, jmem) = match detached_probe::run_jit(&root, &child, &init) {
         Ok(o) => o,
         Err(JitError::Unsupported(_)) => return,
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return, // transient host OOM, not a divergence
-        Err(e) => panic!("JIT failed to compile a verified module (sub-window): {e:?}\n{m:#?}"),
+        Err(e) => panic!("JIT failed to compile a verified module (detached): {e:?}\n{m:#?}"),
     };
-    // Confinement: every byte *outside* the child's slice must equal the seed on the interpreter
-    // (the masking reference) — a sub-window escape would perturb the parent. The JIT is then held
-    // byte-identical to the interpreter over the whole parent by `assert_outcomes_agree`.
-    if interp.is_ok() {
-        for i in (0..base).chain(base + size..parent) {
-            assert_eq!(
-                imem[i as usize],
-                init[i as usize],
-                "sub-window escape: interp touched parent byte {i} outside [{base},{})\n{m:#?}",
-                base + size
-            );
+    let interp = interp.unwrap_or_else(|t| panic!("detached pass: the root trapped {t:?}\n{m:#?}"));
+    let jit = match jit {
+        JitOutcome::Returned(v) => detached_probe::Report::of(&v),
+        other => panic!("detached pass: the root did not return on the JIT: {other:?}\n{m:#?}"),
+    };
+    assert_eq!(
+        (interp.canary, jit.canary),
+        (0, 0),
+        "detached pass: the child touched the root's window\n{m:#?}"
+    );
+    assert_eq!(
+        imem, jmem,
+        "detached pass: the roots' windows differ\n{m:#?}"
+    );
+    // A child the interpreter ran out of fuel proves nothing here: the JIT arms no fuel in this pass.
+    if interp.child == Err(Trap::OutOfFuel.code()) {
+        return;
+    }
+    // The child's outcome under the window passes' policy: its digest stands for its results and its
+    // final window, so a clean run compares as one value.
+    let child_interp = interp
+        .child
+        .map(|d| vec![Value::I64(d)])
+        .map_err(|c| Trap::from_code(c).expect("a trap code"));
+    let child_jit = match jit.child {
+        Ok(d) => JitOutcome::Returned(vec![d]),
+        Err(c) => JitOutcome::Trapped(TrapKind::from_code(c as u32).expect("a trap kind")),
+    };
+    assert_outcomes_agree(m, &[ValType::I64], child_interp, &[], child_jit, &[], false);
+}
+
+/// `m` plus two functions for the detached pass: a child entry `(i64) -> (i64)` that calls func 0
+/// with `args` and returns a digest of its results and the child's window, and the digest itself.
+fn detached_child(m: &Module, args: &[Value], size_log2: u8) -> Module {
+    let f0 = &m.funcs[0];
+    let digest = m.funcs.len() + 1;
+    let mut body = String::new();
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Value::I32(x) => body.push_str(&format!("  wa{i} = i32.const {x}\n")),
+            Value::I64(x) => body.push_str(&format!("  wa{i} = i64.const {x}\n")),
+            other => unreachable!("an integer entry takes integer args, got {other:?}"),
         }
     }
-    assert_outcomes_agree(m, &results, interp, &imem, jit, &jmem, mem_oracle);
+    let call_args: Vec<String> = (0..args.len()).map(|i| format!("wa{i}")).collect();
+    let rets: Vec<String> = (0..f0.results.len()).map(|i| format!("wr{i}")).collect();
+    let call = format!("call 0 ({})", call_args.join(", "));
+    if rets.is_empty() {
+        body.push_str(&format!("  {call}\n"));
+    } else {
+        body.push_str(&format!("  {} = {call}\n", rets.join(", ")));
+    }
+    body.push_str(&format!(
+        "  wh0 = call {digest} ()\n  wp = i64.const 1099511628211\n"
+    ));
+    for (i, t) in f0.results.iter().enumerate() {
+        let r = match t {
+            ValType::I32 => {
+                body.push_str(&format!("  we{i} = i64.extend_i32_u wr{i}\n"));
+                format!("we{i}")
+            }
+            _ => format!("wr{i}"),
+        };
+        body.push_str(&format!(
+            "  wx{i} = i64.xor wh{i} {r}\n  wh{n} = i64.mul wx{i} wp\n",
+            n = i + 1
+        ));
+    }
+    let src = format!(
+        "{}func (i64) -> (i64) {{\nblock 0 (ws: i64) {{\n{body}  return wh{}\n  }}\n}}\n{}",
+        temen_text::print_module(m),
+        f0.results.len(),
+        detached_probe::digest_func(1 << size_log2),
+    );
+    let child = temen_text::parse_module(&src)
+        .unwrap_or_else(|e| panic!("detached pass: the child does not parse: {e:?}\n{src}"));
+    verify_module(&child)
+        .unwrap_or_else(|e| panic!("detached pass: the child does not verify: {e:?}\n{src}"));
+    child
 }
 
 /// Assert the interpreter and JIT agree for one pass: result value-equal (or same-modelled trap),
-/// and — when `mem_oracle` and both completed — byte-identical final memory (`imem`/`jmem`, which
-/// is the window for a top-level pass or the whole parent for a sub-window pass). Shared by the
-/// reservation passes and the §14 sub-window pass so the agreement policy lives in one place.
+/// and — when `mem_oracle` and both completed — byte-identical final memory (`imem`/`jmem`, the
+/// window). Shared by the reservation passes and the detached pass (which compares its child's
+/// digest as the result) so the agreement policy lives in one place.
 fn assert_outcomes_agree(
     m: &Module,
     results: &[temen_ir::ValType],

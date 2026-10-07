@@ -7,11 +7,15 @@
 //! identically on both backends, with no aliasing back into the window — and that the capture
 //! path reflects guest stores.
 
-use temen_interp::{run_capture, run_capture_reserved, run_capture_sub, Value};
-use temen_jit::{
-    compile_and_run_capture, compile_and_run_capture_reserved, compile_and_run_capture_sub,
-    JitOutcome,
-};
+use temen_interp::{run_capture, run_capture_reserved, Value};
+use temen_jit::{compile_and_run_capture, compile_and_run_capture_reserved, JitOutcome};
+
+#[path = "support/detached_probe.rs"]
+mod detached_probe;
+#[path = "../../temen-interp/tests/support/drivers.rs"]
+mod drivers;
+
+use detached_probe::Report;
 
 /// True on a 4 KiB-page host. A couple of `reserved_*` cases below hardcode the mapped/tail
 /// boundary at address 4096 (`memory 12`); on a 16 KiB-page host (macOS ARM) the JIT rounds the
@@ -278,123 +282,101 @@ block 0 (v0: i64) {
     }
 }
 
-/// Run both backends with the guest confined to a §14 **nested sub-window** `[base, base+size)`
-/// of a fully-backed parent of `parent_bytes` (size = the module's declared `memory`). `init`
-/// seeds the whole parent; the two returned snapshots are the whole parent window, plus each
-/// backend's trap disposition. This is the **sub-window escape-oracle**: the lowering shifts an
-/// in-bounds child offset by `base` (matching `temen_mask::Window::sub`) and faults out-of-child
-/// accesses, so byte-comparing the whole parent proves the child stayed in its slice on both
-/// backends — the riskiest claim of §14 nesting #1.
-fn both_sub(
-    src: &str,
-    init: &[u8],
-    base: u64,
-    parent_bytes: u64,
-) -> (bool, JitOutcome, Vec<u8>, Vec<u8>) {
-    let m = temen::text::parse_module(src).expect("parse");
+/// #1867 decision 3 — a child whose access is `access`, run as a **detached child** in a window of its
+/// own (`memory 16`, base 0): the escape-oracle's placement for a spawned guest, where a carve child
+/// once sat inside its parent's window.
+fn edge_child(access: &str) -> temen_ir::Module {
+    let src = format!(
+        "memory 16
+func (i64) -> (i64) {{
+block 0 (vs: i64) {{
+{access}
+  }}
+}}
+"
+    );
+    let m = temen::text::parse_module(&src).expect("parse");
     temen::verify::verify_module(&m).expect("verify");
-    let mut fuel = 1_000_000u64;
-    let (ir, imem) = run_capture_sub(&m, 0, &[Value::I32(0)], &mut fuel, init, base, parent_bytes);
-    let (jo, jmem) =
-        compile_and_run_capture_sub(&m, 0, &[0i64], init, base, parent_bytes).expect("jit");
-    (ir.is_err(), jo, imem, jmem)
+    m
 }
 
-/// §14 nesting #1: a guest runs over a 4 KiB child window placed at offset 64 KiB inside a 128 KiB
-/// parent. Its **in-window** stores must land only inside the child's slice `[64 KiB, 64 KiB + 4 KiB)`,
-/// shifted there by `base`, identically on both backends, leaving every other parent byte exactly as
-/// seeded. The lowering computes `mem_base + base + (addr+offset)` once the bounds check proves the
-/// access in-child; this differential proves the `+ base` shift is right (and confines) on both the
-/// interpreter and the JIT. (Out-of-child faulting is [`sub_window_out_of_child_faults`].)
-#[test]
-fn sub_window_confines_child_to_its_slice() {
-    const PARENT: u64 = 128 << 10; // 128 KiB
-    const BASE: u64 = 64 << 10; // size-aligned 64 KiB offset
-    const SIZE: u64 = 4096; // memory 12 → a 4 KiB child window
-    let src = "\
-memory 12
-func (i32) -> (i32) {
-block 0 (v0: i32) {
-  v1 = i64.const 261
-  v2 = i32.const 171
-  i32.store8 v1 v2
-  v3 = i64.const 1000
-  v4 = i32.const 200
-  i32.store8 v3 v4
-  v5 = i64.const 4095
-  v6 = i32.const 99
-  i32.store8 v5 v6
-  v7 = i32.const 0
-  return v7
-  }
-}
-";
-    // Seed the whole parent with a non-zero pattern so an escaped write (or a divergent read)
-    // outside the child's slice is observable, not hidden behind zeros.
-    let init: Vec<u8> = (0..PARENT)
-        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
+/// The probe root's report for `child` on every engine: the tree-walk oracle, each bytecode driver
+/// ([`drivers::ALL`]) and the Cranelift JIT.
+fn every_engine(child: &temen_ir::Module) -> Vec<(String, Report)> {
+    let root = detached_probe::root(0);
+    let powerbox = || {
+        let (host, args) = detached_probe::powerbox(child);
+        (host, args.map(Value::I32).to_vec())
+    };
+    let mut reports: Vec<(String, Report)> = drivers::ALL
+        .into_iter()
+        .map(|d| {
+            let ran = drivers::run_on(d, &root, &powerbox)
+                .unwrap_or_else(|| panic!("{d:?} declined the probe root"));
+            let r = ran
+                .result
+                .unwrap_or_else(|t| panic!("{d:?}: the probe root trapped: {t:?}"));
+            (format!("{d:?}"), Report::of_values(&r))
+        })
         .collect();
-    let (it, jo, imem, jmem) = both_sub(src, &init, BASE, PARENT);
-    assert!(!it, "interp faulted on an in-child store");
-    assert!(matches!(jo, JitOutcome::Returned(_)), "jit: {jo:?}");
-
-    assert_eq!(imem.len(), PARENT as usize, "snapshot is the whole parent");
-    assert_eq!(
-        imem, jmem,
-        "sub-window escape-oracle: interp/JIT parents diverge"
-    );
-
-    // Every byte outside the child's slice is untouched (the seed survives) — confinement.
-    for i in 0..PARENT {
-        if !(BASE..BASE + SIZE).contains(&i) {
-            assert_eq!(
-                imem[i as usize], init[i as usize],
-                "parent byte {i} escaped"
-            );
-        }
+    let (jo, _) = detached_probe::run_jit(&root, child, &[]).expect("jit");
+    match jo {
+        JitOutcome::Returned(v) => reports.push(("Jit".into(), Report::of(&v))),
+        other => panic!("Jit: the probe root did not return: {other:?}"),
     }
-    // The three in-window stores landed at their child offsets, shifted into the slice by `base`.
-    assert_eq!(imem[(BASE + 261) as usize], 171, "store @261 misplaced");
-    assert_eq!(imem[(BASE + 1000) as usize], 200, "store @1000 misplaced");
-    assert_eq!(imem[(BASE + 4095) as usize], 99, "store @4095 misplaced");
+    reports
 }
 
-/// §14 nesting #1, the confinement half: a store past the top of the child window (`4101` in a
-/// 4 KiB child) **faults** on both backends — it is not aliased back into the slice — and every
-/// parent byte outside the slice survives untouched. Pairs with
-/// [`sub_window_confines_child_to_its_slice`] (the in-window half).
+/// A detached child stores at its window's top byte and loads it back: both land, identically on every
+/// engine, and the root's window is untouched across the child's life. Pairs with
+/// [`a_detached_child_past_its_window_faults_on_every_engine`].
 #[test]
-fn sub_window_out_of_child_faults() {
-    const PARENT: u64 = 128 << 10; // 128 KiB
-    const BASE: u64 = 64 << 10; // size-aligned 64 KiB offset
-    const SIZE: u64 = 4096; // memory 12 → a 4 KiB child window
-    let src = "\
-memory 12
-func (i32) -> (i32) {
-block 0 (v0: i32) {
-  v1 = i64.const 4101
-  v2 = i32.const 200
-  i32.store8 v1 v2
-  v3 = i32.const 0
-  return v3
-  }
-}
-";
-    let init: Vec<u8> = (0..PARENT)
-        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
-        .collect();
-    let (it, jo, imem, _jmem) = both_sub(src, &init, BASE, PARENT);
-    assert!(it, "interp did not fault on the out-of-child store");
-    assert!(
-        matches!(jo, JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault)),
-        "jit did not detect-and-kill the out-of-child store: {jo:?}"
+fn a_detached_childs_window_edge_holds_on_every_engine() {
+    let child = edge_child(
+        "  va = i64.const 65535
+  vv = i32.const 99
+  i32.store8 va vv
+  vl = i32.load8_u va
+  vr = i64.extend_i32_u vl
+  return vr",
     );
-    // Nothing outside the child's slice was touched (the faulted store wrote nothing).
-    for i in 0..PARENT {
-        if !(BASE..BASE + SIZE).contains(&i) {
+    for (engine, report) in every_engine(&child) {
+        assert_eq!(
+            report,
+            Report {
+                child: Ok(99),
+                canary: 0
+            },
+            "{engine}: the edge store and load land in the child's own window"
+        );
+    }
+}
+
+/// The confinement half: a store or a load one byte past the top of a detached child's window
+/// **faults** at the access on every engine — it is not aliased back into the window — and the root's
+/// window is untouched.
+#[test]
+fn a_detached_child_past_its_window_faults_on_every_engine() {
+    let fault = temen_interp::Trap::MemoryFault.code();
+    for access in [
+        "  va = i64.const 65536
+  vv = i32.const 200
+  i32.store8 va vv
+  vz = i64.const 0
+  return vz",
+        "  va = i64.const 65536
+  vl = i32.load8_u va
+  vr = i64.extend_i32_u vl
+  return vr",
+    ] {
+        for (engine, report) in every_engine(&edge_child(access)) {
             assert_eq!(
-                imem[i as usize], init[i as usize],
-                "parent byte {i} escaped"
+                report,
+                Report {
+                    child: Err(fault),
+                    canary: 0
+                },
+                "{engine}: an access past the child's window faults, the root untouched:\n{access}"
             );
         }
     }
