@@ -365,6 +365,15 @@ pub(crate) enum ParkOn {
     Child,
 }
 
+impl ParkOn {
+    /// #1820 — a join counts itself in `Domain::parked` through the joined vCPU's completion cell
+    /// (`Domain::join_park`), which the publisher settles before the joinee leaves `live`; the
+    /// executor must not count the task's park a second time.
+    pub(crate) fn counts_itself(&self) -> bool {
+        matches!(self, ParkOn::Thread | ParkOn::Child)
+    }
+}
+
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
 /// and every `thread.spawn`ed vCPU — the unified handle namespace (slot index = the guest handle,
 /// exactly the interpreter registry's numbering) and the per-domain fiber bound. Slots are not

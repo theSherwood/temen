@@ -265,7 +265,8 @@ pub(crate) enum HostParkReq {
 }
 
 impl HostParkReq {
-    /// The stdin park's key: past every pipe's global id (a `u32`).
+    /// The stdin park's key: past every pipe's global id (a `u32`). A shared cell's bell keys its
+    /// parks above both ([`bell_key`]).
     const STDIN: u64 = u64::MAX;
 
     /// Park; `true` when the op must run again. A freeze leaves the placeholder answer for the trailing
@@ -1675,6 +1676,7 @@ pub fn jit_cap_run(
             let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
             hg.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
             hg.set_serve_ctx(&mut cm as *mut CompiledModule as usize);
+            hg.set_park_hub(cm.park_hub());
         }
         // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3), locked twin of the single-threaded path
         // below: re-compile any restore-rebuilt units into this fresh module. A no-op for a fresh run.
@@ -1696,6 +1698,7 @@ pub fn jit_cap_run(
             let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
             hg.set_jit_native_ctx(0);
             hg.set_serve_ctx(0);
+            hg.set_park_hub(0);
             jit_durable_leave(&mut cm, &mut hg);
         }
         hg_restore(host, host_mutex);
@@ -1732,12 +1735,15 @@ pub fn jit_cap_run(
     }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
+    host.set_park_hub(cm.park_hub());
     // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3): re-compile any units a restore rebuilt into
     // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
     // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
-    reconstruct_jit_units(&mut cm, host)?;
-    if let Err(e) = jit_durable_enter(&mut cm, host) {
+    let prepared =
+        reconstruct_jit_units(&mut cm, host).and_then(|()| jit_durable_enter(&mut cm, host));
+    if let Err(e) = prepared {
         host.set_jit_native_ctx(0);
+        host.set_park_hub(0);
         return Err(e);
     }
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing — and, for a
@@ -1747,6 +1753,7 @@ pub fn jit_cap_run(
     let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18)) };
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
+    host.set_park_hub(0);
     jit_durable_leave(&mut cm, host);
     r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)))
 }
@@ -3183,10 +3190,10 @@ pub unsafe extern "C" fn grant_child_build(
             // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
             // `grant_child_release` (child exit / nursery teardown).
             let mut child = child;
-            // CALLS.md 5c.1b — arm the shared-cell wake signal (the parked transport's Condvar)
-            // and inherit the run's kill-path cell so thunk-blocked waits stay boundable.
-            child.arm_svc_cv();
-            child.set_epoch_cell(parent.epoch_cell());
+            // CALLS.md 5c.1b, #2173 — arm the shared cell's bell and inherit the run's park hub, so
+            // the parked transport's waits on this cell are parks of the run like any other.
+            child.arm_svc_bell();
+            child.set_park_hub(parent.park_hub());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
             let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
@@ -3222,14 +3229,28 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
         // CALLS.md 5c.1b — clear the serve context first (idempotent across the two releases): the
         // child's module dies with the child thread, so no reader may see the pointer after
         // either ref is released. A caller mid-wait observes ctx==0 as the dead-callee signal.
-        {
+        let providers = {
             let cell = &*(ctx as *const Mutex<Host>);
             let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+            // The child's end is the release that finds its serve context still registered.
+            let ended = g.serve_ctx() != 0;
             g.set_serve_ctx(0);
             g.set_jit_native_ctx(0); // #1296 — the child's module dies with its thread too
-            if let Some(cv) = g.svc_cv() {
-                cv.notify_all();
+            ring(&g);
+            // #2173 — and the cell rings nothing more: its run may end before its last ref goes.
+            g.set_park_hub(0);
+            if ended {
+                g.live_offer_providers()
+            } else {
+                Vec::new()
             }
+        };
+        // #1217 — the child's end releases every service domain it was a client of: a serve loop
+        // parked in `svc.wait` there answers `0` and can reach its `join` (or its next wait does).
+        for p in providers {
+            let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
+            g.set_client_gone();
+            ring(&g);
         }
         // CALLS.md 5c.0 — one counted ref of the shared child powerbox (see `grant_child_build`);
         // the `Host` drops when the last of {child-thread ref, nursery-retained ref} is released.
@@ -3268,20 +3289,63 @@ unsafe fn blocked_wait_interrupted(epoch_cell: usize, trap_out: *mut i64) -> boo
     (*(trap_out as *const AtomicI64)).load(Ordering::Relaxed) != 0
 }
 
+/// #2173 — the futex key a shared cell's parks use: its bell's address with the top bit set, clear
+/// of every pipe's `u32` global id and of [`HostParkReq::STDIN`].
+fn bell_key(bell: &Arc<std::sync::atomic::AtomicU64>) -> u64 {
+    (1 << 63) | Arc::as_ptr(bell) as u64
+}
+
+/// #2173 — ring a shared cell's bell, under its lock, after a change a wait parked on the cell may
+/// be waiting for: each such wait — its serve loop, a caller of it, its server waiting out a claimed
+/// handoff — wakes and re-checks its own state. A cell with no bell has no waits to wake.
+///
+/// # Safety
+/// `g` is the locked host of a live cell, whose park hub (if any) is its live run's.
+unsafe fn ring(g: &Host) {
+    if let Some(bell) = g.svc_bell() {
+        bell.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        temen_jit::wake_host_parks_in(g.park_hub(), bell_key(bell));
+    }
+}
+
+/// #2173 — a parked-transport wait: park on the run's one host-call park
+/// ([`temen_jit::park_host_call`]) until the cell's `bell` moves past `seen`, the value read under
+/// the cell's lock together with the state that made the wait park. So it is counted for the run's
+/// deadlock verdict as every other park is, ends on a kill or the domain's teardown, and a task's
+/// wait parks the task rather than its worker thread. With no bell nothing can ring it: it ends
+/// only on the verdict, a kill or the teardown.
+///
+/// # Safety
+/// `trap_out` is the live call's trap cell, and the caller holds no lock.
+unsafe fn park_on_bell(
+    trap_out: *mut i64,
+    bell: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    seen: u64,
+) -> temen_jit::HostPark {
+    let key = bell.map_or(1 << 63, bell_key);
+    temen_jit::park_host_call(trap_out, 0, key, || {
+        bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
+    })
+}
+
+/// A bell's current generation, `0` when there is none (nothing then rings it).
+fn bell_now(bell: Option<&Arc<std::sync::atomic::AtomicU64>>) -> u64 {
+    bell.map_or(0, |b| b.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// §3.6, CALLS.md 5c.1b, #2166 — the JIT's **one serve loop**: a domain's `svc.poll`/`svc.wait`,
 /// root or §14 child, serviced on its own thread over its locked powerbox cell (a serving root runs
 /// locked for this, [`jit_proc::locked`]). Pops and serves queued dispatches through the domain's
 /// registered serve context ([`temen_jit::handler_tramp_of`] / [`temen_jit::invoke_handler`] — the
 /// guard is **dropped** around every handler invoke, so the handler's own `call.cap`s relock freely
-/// and an enqueuing caller is never blocked out); each settle notifies the cell's Condvar (waking a
-/// thread-blocked caller).
+/// and an enqueuing caller is never blocked out); each settle rings the cell's bell, waking the
+/// caller parked on its ticket.
 ///
-/// An empty-queue `svc.wait` **block-waits** on that Condvar (the arm 5 park), bounded by 20ms
-/// re-checks of the epoch/trap cells, when the domain has one: a shared child cell, which a caller
-/// can enqueue on. Without one nothing can ever enqueue, so the wait fails closed (`ThreadFault`,
-/// the deterministic-deadlock answer; ISSUES.md I36). No serve context ⇒ the probeable `-EINVAL`;
-/// so is the timed `svc.wait` form (a timeout arg), and a **nested** serve under a handler, refused
-/// as the interp refuses it (#2160).
+/// An empty-queue `svc.wait` **parks** until the bell rings (the arm-5 park, [`park_on_bell`]),
+/// counted for the run's deadlock verdict: a wait nothing can end — no bell, or every live vCPU
+/// parked — fails closed (`ThreadFault`), the oracle's answer (#2173, ISSUES.md I36). No serve
+/// context ⇒ the probeable `-EINVAL`; so is the timed `svc.wait` form (a timeout arg), and a
+/// **nested** serve under a handler, refused as the interp refuses it (#2160).
 #[allow(clippy::too_many_arguments)]
 unsafe fn serve_locked(
     m: &Mutex<Host>,
@@ -3305,7 +3369,7 @@ unsafe fn serve_locked(
         return put(EINVAL, trap_out);
     }
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-    let (serve_ctx, cv, epoch) = (guard.serve_ctx(), guard.svc_cv(), guard.epoch_cell());
+    let (serve_ctx, bell) = (guard.serve_ctx(), guard.svc_bell().cloned());
     if serve_ctx == 0 {
         // No serve context (an embedder entry that registers none, or a child already released).
         return put(EINVAL, trap_out);
@@ -3325,15 +3389,15 @@ unsafe fn serve_locked(
         }
         if guard.handoff_claimed() {
             // A claimer is running a handler inline over this domain's window: neither pop nor
-            // exit (the window must stay alive under it) — wait for the release. Only a domain
-            // with a Condvar publishes an activation a claimer can take.
-            let cv = cv
-                .as_ref()
-                .expect("a claimed activation implies a shared cell");
-            let (g, _) = cv
-                .wait_timeout(guard, std::time::Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner());
-            guard = g;
+            // exit (the window must stay alive under it) — wait for its release, which rings the
+            // bell. A kill, the teardown or the verdict cannot end this wait early: the claimer
+            // sees the same kill and releases, so until then re-check on a short sleep.
+            let seen = bell_now(bell.as_ref());
+            drop(guard);
+            if park_on_bell(trap_out, bell.as_ref(), seen) != temen_jit::HostPark::Woken {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            guard = m.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
         while let Some((export, dop, args, ticket)) = guard.svc_pop() {
@@ -3349,6 +3413,7 @@ unsafe fn serve_locked(
             };
             if args.len() != n_params {
                 guard.svc_settle(ticket, EINVAL);
+                ring(&guard);
                 continue;
             }
             let mut res = vec![0i64; n_res];
@@ -3372,38 +3437,41 @@ unsafe fn serve_locked(
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
             guard.svc_settle(ticket, res.first().copied().unwrap_or(0));
+            ring(&guard);
             count += 1;
         }
         if !wait || count != 0 {
             break;
         }
-        // Empty queue on `svc.wait` and nothing served yet. With no Condvar nothing can enqueue:
-        // fail closed rather than park forever.
-        let Some(cv) = cv.as_ref() else {
-            drop(guard);
-            *trap_out = temen_jit::TrapKind::ThreadFault as i64;
-            return;
-        };
-        // The arm-5 park — block on the cell's Condvar (released while waiting, so enqueuers get
-        // in), bounded re-checks.
-        if blocked_wait_interrupted(epoch, trap_out) {
-            guard.set_serve_activation(None);
-            drop(guard);
-            if *trap_out == 0 {
-                *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
-            }
-            return;
+        // #1217 — a client of this domain has finished since its last wait: answer the timed form's
+        // no-progress `0`, so the server reaches its `join` instead of waiting on a caller that is
+        // gone. A server with other live clients sees a spurious `0` and waits again.
+        if guard.take_client_gone() {
+            break;
         }
-        // CALLS.md 5c.2 — publish the activation for the wait's duration: a caller finding it
+        // Empty queue on `svc.wait` and nothing served yet: the arm-5 park, until the bell rings.
+        // CALLS.md 5c.2 — publish the activation for the park's duration: a caller finding it
         // (under this same lock) may claim and serve inline over `mem_base`'s window, which stays
-        // alive exactly because this frame sits in `wait_timeout` until the release (the
-        // claimed-wait arm above). Cleared on every wake — the activation never outlives the park.
+        // alive exactly because this frame stays parked until the release (the claimed-wait arm
+        // above). Cleared on every wake — the activation never outlives the park.
+        let seen = bell_now(bell.as_ref());
         guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
-        let (g, _) = cv
-            .wait_timeout(guard, std::time::Duration::from_millis(20))
-            .unwrap_or_else(|e| e.into_inner());
-        guard = g;
+        drop(guard);
+        let parked = park_on_bell(trap_out, bell.as_ref(), seen);
+        guard = m.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_serve_activation(None);
+        // A claim taken during the park holds this domain until its release (the arm above).
+        if parked == temen_jit::HostPark::Woken || guard.handoff_claimed() {
+            continue;
+        }
+        drop(guard);
+        *trap_out = match parked {
+            temen_jit::HostPark::Deadlock => temen_jit::TrapKind::ThreadFault as i64,
+            // A kill (the trap cell still clear) or the domain's teardown (it already holds why).
+            _ if *trap_out == 0 => temen_jit::TrapKind::OutOfFuel as i64,
+            _ => *trap_out,
+        };
+        return;
     }
     guard.set_serve_activation(None);
     drop(guard);
@@ -3484,15 +3552,11 @@ unsafe fn live_impl_call(
                         // dying-callee errno — the enqueue path's exact observables.
                         g2.set_handoff_trap(child_trap);
                         g2.release_handoff(0);
-                        if let Some(cv) = g2.svc_cv() {
-                            cv.notify_all();
-                        }
+                        ring(&g2);
                         return CAP_REVOKED;
                     }
                     g2.release_handoff(1);
-                    if let Some(cv) = g2.svc_cv() {
-                        cv.notify_all();
-                    }
+                    ring(&g2);
                     return res.first().copied().unwrap_or(0);
                 }
                 _ => {
@@ -3503,17 +3567,15 @@ unsafe fn live_impl_call(
             }
         }
     }
+    let Some(bell) = guard.svc_bell().cloned() else {
+        // Not a JIT run's shared cell (e.g. an interp-tier callee reached from a JIT run): no
+        // serve loop here can ever answer, so keep the pre-5c.1 probeable answer.
+        return EINVAL;
+    };
     let Some(ticket) = guard.svc_enqueue(export, op, args.to_vec()) else {
         return EAGAIN; // full queue / unservable op: probeable backpressure
     };
-    let Some(cv) = guard.svc_cv() else {
-        // Not a shared JIT-child cell (e.g. an interp-tier callee reached from a JIT run):
-        // this transport cannot wake, so keep the pre-5c.1 probeable answer. The dispatch
-        // was enqueued but never served; drop it to keep the queue honest.
-        let _ = guard.svc_result(ticket);
-        return EINVAL;
-    };
-    let epoch = guard.epoch_cell();
+    ring(&guard); // the callee's serve loop, parked on its empty queue
     loop {
         if let Some(r) = guard.svc_result(ticket) {
             return r;
@@ -3523,16 +3585,26 @@ unsafe fn live_impl_call(
             // dead-callee edge, probeable, never a hang (D37 death-is-revocation).
             return CAP_REVOKED;
         }
-        if blocked_wait_interrupted(epoch, trap_out) {
-            if *trap_out == 0 {
-                *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
+        // The arm-5 caller park, until the callee's settle (or its end) rings its bell.
+        let seen = bell_now(Some(&bell));
+        drop(guard);
+        match park_on_bell(trap_out, Some(&bell), seen) {
+            temen_jit::HostPark::Woken => {}
+            // Nothing live can serve it: the oracle's deadlock verdict.
+            temen_jit::HostPark::Deadlock => {
+                *trap_out = temen_jit::TrapKind::ThreadFault as i64;
+                return 0;
             }
-            return 0; // value unused: the trap cell unwinds the caller
+            // A kill (the trap cell still clear) or this domain's teardown: the trap cell unwinds
+            // the caller, the value is unused.
+            _ => {
+                if *trap_out == 0 {
+                    *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
+                }
+                return 0;
+            }
         }
-        let (g, _) = cv
-            .wait_timeout(guard, std::time::Duration::from_millis(20))
-            .unwrap_or_else(|e| e.into_inner());
-        guard = g;
+        guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -3881,9 +3953,9 @@ unsafe fn finish_child_build(
         Some((child, inst_handle, as_handle)) => {
             // 5c.0 — shared child powerbox, two counted refs (see `grant_child_build`).
             let mut child = child;
-            // CALLS.md 5c.1b — as `grant_child_build`: arm the wake signal, inherit the kill cell.
-            child.arm_svc_cv();
-            child.set_epoch_cell(parent.epoch_cell());
+            // CALLS.md 5c.1b — as `grant_child_build`: arm the bell, inherit the park hub.
+            child.arm_svc_bell();
+            child.set_park_hub(parent.park_hub());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
             // D66 — the lane chain the executor gates this child's dispatch on: the child's own
@@ -6580,7 +6652,7 @@ fn jit_run(
             let r = unsafe {
                 jit_proc::with_cap_ctx(host, jit_proc::locked(m), |cc| {
                     jit_proc::compile_image(cc, m, func, ip, jit, fuel)
-                        .and_then(|cm| jit_proc::run_image(cc, cm, ip, None, start))
+                        .and_then(|cm| jit_proc::run_image(cc, cm, None, start))
                 })
             };
             (r, m.funcs[func as usize].results.clone())

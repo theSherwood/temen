@@ -332,20 +332,53 @@ block 0 (v0: i64) {{
     )
 }
 
+/// [`granted_client_program`] in both spawn spellings: the op-17 records, and op 15's positional
+/// form (retiring, #2067), which every engine runs natively today — the Cranelift JIT included, where
+/// the record spelling of a module with impl-exports still folds to the tree-walker (#744).
+fn granted_client_programs(guest: &str) -> [String; 2] {
+    let rec = granted_client_program(guest);
+    // `dst = instantiate_detached(budget, self, grants_ptr, grants_n, entry, 17, 0)`, its operands
+    // named with `x` so the two spawns' names stay distinct.
+    let op15 = |dst: &str, x: &str, entry: u32, grants_ptr: u64, grants_n: u64| {
+        format!(
+            "vb{x} = i64.extend_i32_u vb\n  vm{x} = i64.const -1\n  vgp{x} = i64.const {grants_ptr}\n  \
+             vgn{x} = i64.const {grants_n}\n  ve{x} = i64.const {entry}\n  vsl{x} = i64.const 17\n  \
+             vq{x} = i64.const 0\n  {dst} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 \
+             (vb{x}, vm{x}, vgp{x}, vgn{x}, ve{x}, vsl{x}, vq{x})"
+        )
+    };
+    let positional = rec
+        .replace(
+            "vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)",
+            &op15("vs", "s15", 1, 0, 0),
+        )
+        .replace(
+            "vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)",
+            &op15("vg", "g15", 3, 16640, 1),
+        );
+    assert_eq!(
+        positional.matches("call.cap 6 15").count(),
+        2,
+        "both spawns respelled"
+    );
+    [rec, positional]
+}
+
 /// The healthy exchange, pinning the program shape: the guest resolves `"fork"` and calls it once
 /// (the handler returns 7), the server's `svc.wait` counts 1, the root exits 1.
 #[test]
 fn granted_client_that_calls_once_is_served() {
-    let src = granted_client_program(
+    for src in granted_client_programs(
         "  vnp = i64.const 16684
   vl4 = i64.const 4
   vfork = self.resolve vnp vl4
   vz8 = i64.const 0
   vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
   return vr",
-    );
-    for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), 1, "{b:?}");
+    ) {
+        for b in BACKENDS {
+            assert_eq!(run_detached(b, &src).expect("run"), 1, "{b:?}");
+        }
     }
 }
 
@@ -353,9 +386,10 @@ fn granted_client_that_calls_once_is_served() {
 /// returns `0` (never parks forever), it returns, and the root's `join` delivers `0`.
 #[test]
 fn granted_client_that_dies_before_calling_releases_the_server() {
-    let src = granted_client_program("  unreachable");
-    for b in BACKENDS {
-        assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
+    for src in granted_client_programs("  unreachable") {
+        for b in BACKENDS {
+            assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
+        }
     }
 }
 
@@ -366,18 +400,85 @@ fn granted_client_that_dies_before_calling_releases_the_server() {
 /// join-deadlock: the root parked in `join`, the daemon parked in `svc.wait`, nothing else live
 /// and no external wake source. INVARIANTS.md #9 forbids a hang, so the run must **trap**
 /// `ThreadFault`. The cooperative bytecode driver already does; this pins the tree-walk executor
-/// (and the JIT, which declines these ops to the oracle) to the identical outcome — the #1228 fix.
+/// (#1228) and the Cranelift JIT, whose `svc.wait` park and `join` count for its deadlock verdict
+/// (#2173, #1820), to the identical outcome.
 #[test]
 fn joined_daemon_whose_client_is_gone_deadlocks_to_threadfault() {
-    let base = granted_client_program("  unreachable");
-    // Re-spell the wait-once server (func 1) as an unconditional `loop { svc.wait }` daemon.
-    let src = base.replace(
-        "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
-        "block 0 (v0: i64) {\n  br 1()\n  }\nblock 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()\n  }",
+    for base in granted_client_programs("  unreachable") {
+        // Re-spell the wait-once server (func 1) as an unconditional `loop { svc.wait }` daemon.
+        let src = base.replace(
+            "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
+            "block 0 (v0: i64) {\n  br 1()\n  }\nblock 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()\n  }",
+        );
+        assert!(
+            src.contains("block 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()"),
+            "the daemon rewrite must apply"
+        );
+        for b in BACKENDS {
+            let e = run_detached(b, &src).expect_err("the join-deadlock must trap, not hang");
+            assert!(
+                e.contains("ThreadFault"),
+                "{b:?}: the all-parked join-deadlock traps ThreadFault, got: {e}"
+            );
+        }
+    }
+}
+
+/// #2173: a call nothing will ever serve. The guest calls the server's `"fork"` offer, but the
+/// server never reaches a service point — it waits forever on a word nothing stores — while the root
+/// `join`s it. Every vCPU is parked: the caller on its reply, the server in its wait, the root in its
+/// `join`. So the run traps `ThreadFault` on every engine. The JIT's caller wait used to sit outside
+/// its deadlock count, and the run hung.
+#[test]
+fn a_call_nothing_will_serve_deadlocks_to_threadfault() {
+    let guest = "  vnp = i64.const 16684
+  vl4 = i64.const 4
+  vfork = self.resolve vnp vl4
+  vz8 = i64.const 0
+  vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
+  return vr";
+    for base in granted_client_programs(guest) {
+        let server =
+            "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }";
+        assert!(
+            base.contains(server),
+            "the server's body is the rewrite target"
+        );
+        let src = base.replace(
+            server,
+            "block 0 (v0: i64) {\n  va = i64.const 16392\n  vexp = i32.const 0\n  vinf = i64.const -1\n  \
+             vst = i32.atomic.wait va vexp vinf\n  vst64 = i64.extend_i32_u vst\n  return vst64\n  }",
+        );
+        for b in BACKENDS {
+            let e = run_detached(b, &src).expect_err("the deadlock must trap, not hang");
+            assert!(
+                e.contains("ThreadFault"),
+                "{b:?}: the all-parked deadlock traps ThreadFault, got: {e}"
+            );
+        }
+    }
+}
+
+/// #1820: a root `join`ing a detached child that waits forever on a word nothing stores is a
+/// deadlock — the root parked in its `join`, the child in its wait, nothing else live — so the run
+/// traps `ThreadFault` on every engine. The JIT's `join` used to stay out of its deadlock count, and
+/// nothing decided the verdict: the run hung.
+#[test]
+fn a_root_joining_a_child_that_waits_forever_deadlocks_to_threadfault() {
+    let base = detached_record_program();
+    let body = format!(
+        "  va = i64.const {}\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  vk = i64.const 100\n  \
+         vr = i64.add vbw vk\n  return vr\n",
+        temen_ir::module_args_base()
     );
     assert!(
-        src.contains("block 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()"),
-        "the daemon rewrite must apply"
+        base.contains(&body),
+        "the child's body is the rewrite target"
+    );
+    let src = base.replace(
+        &body,
+        "  vaddr = i64.const 16392\n  vexp = i32.const 0\n  vinf = i64.const -1\n  \
+         vst = i32.atomic.wait vaddr vexp vinf\n  vst64 = i64.extend_i32_u vst\n  return vst64\n",
     );
     for b in BACKENDS {
         let e = run_detached(b, &src).expect_err("the join-deadlock must trap, not hang");
