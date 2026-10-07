@@ -21,6 +21,9 @@
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 /// The committed in-sandbox compiler. `None` when the asset is absent, which SKIPs — the same
 /// convention as `chibicc_link_libc`.
 fn chibicc_temen() -> Option<temen_ir::Module> {
@@ -66,8 +69,8 @@ fn emit_object(
 }
 
 /// Compile `src` as a **program unit** against libc declarations only, link it against the prebuilt
-/// libc unit, and run it — the same shape the chibicc card and c_interpret use, and the one that
-/// resolves the `call.sym`s a whole-program compile would leave dangling. Returns stdout.
+/// libc and heap units, and run it — the same shape the chibicc card uses, and the one that resolves
+/// the `call.sym`s a whole-program compile would leave dangling. Returns stdout.
 fn compile_and_run(src: &str) -> String {
     let Some(chibicc) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen not built");
@@ -87,7 +90,7 @@ fn compile_and_run(src: &str) -> String {
     );
     let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
     let prog = temen_text::parse_module(&prog_ir).expect("user unit parses");
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
         "link+run status {} — stderr: {}",

@@ -12,6 +12,9 @@ use temen_browser::{
 };
 use temen_interp::Trap;
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 fn chibicc_temen() -> Option<temen_ir::Module> {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
@@ -25,7 +28,13 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     let compiled = onramp_fs_exec(
         chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"/in.c",
+        ],
         b"",
     );
     assert!(
@@ -35,7 +44,10 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
         String::from_utf8_lossy(&compiled.stderr)
     );
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
-    temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
+    pg_heap::link(
+        &[],
+        &temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}")),
+    )
 }
 
 #[test]

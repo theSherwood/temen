@@ -4618,9 +4618,10 @@ pub extern "C" fn temen_run_pg(
 }
 
 /// The built-in playground libc headers, seeded under `/include` for the C-compiler card (SELFHOST_C.md
-/// §7). They are guest C compiled *into* the user's program on `#include` — `printf`/`puts`/… format
-/// over the powerbox's ambient `write`, `malloc` is a bump allocator, `str*`/`ctype` are pure. Nothing
-/// is linked, and a header costs nothing unless the program includes it. Source: `browser/playground-include/`.
+/// §7). They are guest C — `printf`/`puts`/… format over the powerbox's ambient `write`, `str*`/`ctype`
+/// are pure — whose bodies are prebuilt into the libc unit (`web/assets/pg_libc.temeno`, #1392); the heap
+/// they declare (`malloc`/`free`/…) is the heap unit's (`web/assets/pg_heap.temeno`, #2172). A program
+/// links both. Source: `browser/playground-include/`.
 pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
     const HEADERS: &[(&str, &str)] = &[
         // The Temen capability surface for C (SharedRegion, the guest JIT, by-name handles) — the
@@ -4778,8 +4779,8 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/sys/wait.h",
             include_str!("../playground-include/sys/wait.h"),
         ),
-        // Anonymous memory mapping (`mmap`/`munmap`) over the Memory capability — the map-growing
-        // allocator `malloc` already uses (`__vm_map`); file-backed mappings are unsupported.
+        // Memory mapping (`mmap`/`munmap`): anonymous mappings come from the heap, file mappings
+        // copy through the `vm_fs` memfs.
         (
             "include/sys/mman.h",
             include_str!("../playground-include/sys/mman.h"),
@@ -4812,10 +4813,10 @@ pub const CHIBICC_DEBUG_INFO: i32 = 1;
 
 /// `flags` bit 1 on the chibicc card entries: compile a **program unit** (#1392) rather than a whole
 /// program — `--emit-object` against libc *declarations only* ([`PG_DECLS_ONLY_ARGV`]), to be linked
-/// against the prebuilt libc unit (`web/assets/pg_libc.temeno`, resident via
-/// [`temen_link_lib_open`]). The user's compile drops ~12x because it no longer carries the seeded
-/// libc's bodies; the host then runs it with [`temen_link_run_lib`] or steps it with
-/// [`temen_link_text_lib`] instead of `temen_parse`-ing the emitted text directly.
+/// against the prebuilt libc and heap units (`web/assets/pg_libc.temeno`, `pg_heap.temeno`, resident
+/// via [`temen_link_lib_open`]). The user's compile drops ~12x because it no longer carries the seeded
+/// libc's bodies; the host then runs it with [`temen_link_run_libs`] or steps it with
+/// [`temen_link_text_libs`] instead of `temen_parse`-ing the emitted text directly.
 pub const CHIBICC_PROGRAM_UNIT: i32 = 2;
 
 /// The chibicc card's argv (shared by the bytecode [`temen_run_onramp_fs`] and the JIT
@@ -4968,8 +4969,8 @@ pub fn split_multifile_source(src: &[u8]) -> Vec<(String, Vec<u8>)> {
 /// Seeds `argv = ["chibicc", "/in.c"]` and runs (`flags` selects it — [`CHIBICC_DEBUG_INFO`] for `-g`,
 /// [`CHIBICC_PROGRAM_UNIT`] for a linkable unit against libc declarations only). The emitted TEMEN-IR
 /// **text** comes back on `temen_stdout_ptr`/`_len`, ready to hand to [`temen_parse`] → a runnable
-/// module, or — for a program unit — to [`temen_link_run_lib`] / [`temen_link_text_lib`] against the
-/// resident prebuilt libc unit. The seeded headers are
+/// module, or — for a program unit — to [`temen_link_run_libs`] / [`temen_link_text_libs`] against the
+/// resident prebuilt libc and heap units. The seeded headers are
 /// guest C compiled in on `#include`, so a `printf` program prints (over the powerbox's ambient
 /// `write`) instead of trapping on an unresolved call. Sets [`temen_status`]/[`temen_exit_code`]; returns
 /// the guest's `i64` result (`0` on any non-`OK`/`EXIT`).
@@ -8684,7 +8685,7 @@ static mut LINK_LIBS: Vec<Option<LinkLib>> = Vec::new();
 /// A resident library is linked *into* the program being debugged, never debugged as one, so its
 /// module-scoped globals are implementation internals: their debug vars are dropped here (#1806).
 /// Otherwise every frame's Locals and the shared-state `globals` list would carry them beside the
-/// program's own (a playground libc's `__pg_std`, `__pg_brk`, …). The library's line table and its
+/// program's own (a playground libc's `__pg_std`, `__pg_rng`, …). The library's line table and its
 /// functions' locals stay, so a step into it still shows where it is.
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {

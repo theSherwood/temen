@@ -12,6 +12,9 @@
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 fn chibicc_temen() -> Option<temen_ir::Module> {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
@@ -317,7 +320,7 @@ int main(void) {
 
     let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
     let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
         "link+run status {} — stderr: {}",
@@ -330,10 +333,10 @@ int main(void) {
     );
 }
 
-/// **The card's shape** (#1392): the prebuilt libc unit goes *resident* once
+/// **The card's shape** (#1392, #2172): the prebuilt libc and heap units go *resident* once
 /// ([`temen_browser::temen_link_lib_open`]), and each compile then hands over only the user's small
-/// program unit — to [`temen_browser::temen_link_run_lib`] to run it, or to
-/// [`temen_browser::temen_link_text_lib`] to hand a debugger the linked program's IR text. Pins the
+/// program unit — to [`temen_browser::temen_link_run_libs`] to run it, or to
+/// [`temen_browser::temen_link_text_libs`] to hand a debugger the linked program's IR text. Pins the
 /// data-symbol half of that, too: `fprintf(stdout, …)` resolves `__pg_std` out of the *resident*
 /// library, which the resident table used to drop on the floor (it linked with no data symbols at
 /// all, so the whole seeded-libc path would have failed the moment it went through a handle).
@@ -369,10 +372,19 @@ int main(void) {
         "the libc unit goes resident (status {})",
         temen_browser::temen_status()
     );
+    let heap = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/assets/pg_heap.temeno"
+    ))
+    .expect("read pg_heap.temeno");
+    let hh = temen_browser::temen_link_lib_open(heap.as_ptr(), heap.len());
+    assert!(hh >= 0, "the heap unit goes resident");
+    let handles = [h, hh];
 
-    // (a) run it: one resident library, the program unit by handle.
-    let ret = temen_browser::temen_link_run_lib(
-        h,
+    // (a) run it: the resident libraries, the program unit by handle.
+    let ret = temen_browser::temen_link_run_libs(
+        handles.as_ptr(),
+        handles.len(),
         prog_ir.as_ptr(),
         prog_ir.len(),
         b"main".as_ptr(),
@@ -391,12 +403,18 @@ int main(void) {
         "`fprintf(stdout, …)` reached the resident libc's __pg_std"
     );
 
-    // (b) step it: the same handle, the same program unit, the linked program's IR text.
-    assert_eq!(
-        temen_browser::temen_link_text_lib(h, prog_ir.as_ptr(), prog_ir.len(), b"main".as_ptr(), 4),
-        0,
-        "link-to-text against the resident libc"
-    );
+    // (b) step it: the same handles, the same program unit, the linked program's IR text.
+    let text_libs = || {
+        temen_browser::temen_link_text_libs(
+            handles.as_ptr(),
+            handles.len(),
+            prog_ir.as_ptr(),
+            prog_ir.len(),
+            b"main".as_ptr(),
+            4,
+        )
+    };
+    assert_eq!(text_libs(), 0, "link-to-text against the resident libc");
     let text = String::from_utf8(read_out()).expect("IR text is utf8");
     assert!(
         text.contains("debug.loc"),
@@ -416,15 +434,12 @@ int main(void) {
 
     // A closed handle declines instead of linking against whatever is left in the slot.
     temen_browser::temen_link_lib_close(h);
-    assert!(
-        temen_browser::temen_link_text_lib(h, prog_ir.as_ptr(), prog_ir.len(), b"main".as_ptr(), 4)
-            < 0,
-        "a closed handle is not linkable"
-    );
+    assert!(text_libs() < 0, "a closed handle is not linkable");
+    temen_browser::temen_link_lib_close(hh);
 }
 
 /// **A resident library's globals stay out of the program's debug view** (#1806). The playground libc
-/// is linked into every lesson, and its module-scoped globals (`__pg_std`, `__pg_brk`, …) used to
+/// is linked into every lesson, and its module-scoped globals (`__pg_std`, `__pg_rng`, …) used to
 /// merge into the linked program's debug vars, so every frame's Locals listed them beside the
 /// learner's own. Opening a library resident drops them. The program's global and local, and the
 /// library's own function locals and line table (a step into `printf` still resolves), all stay.
@@ -571,7 +586,7 @@ fn every_main_spelling_links_against_the_prebuilt_libc() {
             temen_browser::PG_DECLS_ONLY_ARGV,
         );
         let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
-        let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+        let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
         assert!(
             out.status == STATUS_OK || out.status == STATUS_EXIT,
             "{label}: link+run status {} — stderr: {}",
@@ -629,7 +644,7 @@ fn a_thread_local_is_per_thread_in_a_linked_playground_program() {
         temen_browser::PG_DECLS_ONLY_ARGV,
     );
     let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
         "link+run status {} — stderr: {}",
@@ -679,7 +694,7 @@ int main(void) {
         temen_browser::PG_DECLS_ONLY_ARGV,
     );
     let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
         "link+run status {} — stderr: {}",
@@ -749,7 +764,7 @@ int main(void) {
         temen_browser::PG_DECLS_ONLY_ARGV,
     );
     let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
         "link+run status {} — stderr: {}",

@@ -12,10 +12,10 @@
 //! This needs no toolchain: it links the libc against its own stub unit and reads the merged import
 //! table directly.
 
-/// Every import the committed guest libc declares is resolved by the stub unit, aliased onto the
-/// powerbox `write` cap, or one of the core's memory ops a nim program's heap grows with (`vm_map`,
-/// `vm_page_size`), which every host binds to the program's window — so those are the only names
-/// left unbound. A stub for a memory op would capture the program's own import of it at link.
+/// Every import the committed guest libc declares is resolved by the stub unit or aliased onto the
+/// powerbox `write` cap, so `write` is the only name left unbound. The libc grows no heap of its own
+/// (its `malloc` is the playground's heap unit, #2172, stubbed here), so it imports none of the core's
+/// memory ops: a nim program's `vm_map`/`vm_page_size` are its own.
 #[test]
 fn libc_cap_edge_is_fully_served() {
     let Ok(libc) = std::fs::read("../../browser/web/assets/pg_libc.temeno") else {
@@ -30,7 +30,7 @@ fn libc_cap_edge_is_fully_served() {
     left.sort_unstable();
     assert_eq!(
         left,
-        vec!["vm_map", "vm_page_size", "write"],
+        vec!["write"],
         "the guest libc has an import the stub unit does not serve — add it to \
          LIBC_CAP_STUB_NAMES (with a body of the right shape in LIBC_CAP_STUBS), or it becomes a \
          capability every nim program declares"

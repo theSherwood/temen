@@ -4,16 +4,16 @@
 // <sys/mman.h> for the playground: memory mapping over the granted Memory capability, and over the
 // `vm_fs` memfs for a file.
 //
-// - `MAP_ANONYMOUS` hands back page-aligned, zero-filled memory from the same map-growing allocator
-//   `malloc` uses (`__vm_map` under the hood; see <stdlib.h>).
+// - `MAP_ANONYMOUS` hands back page-aligned, zero-filled memory from the heap (`calloc`; see
+//   <stdlib.h>).
 // - A file mapping gets the same fresh pages with the file's bytes copied in. `MAP_PRIVATE` stops
 //   there. `MAP_SHARED` registers the pages with the memfs (its `FS_MMAP`), which copies them back to
 //   the file on `msync`, on `munmap`, and when the file's descriptor is closed.
 //
-// There is no reclamation (like `free`), and `mprotect` is a no-op: the mapping is always readable and
-// writable within the confined window. No authority beyond the Memory and `vm_fs` capabilities; all
+// Unmapping reclaims nothing, and `mprotect` is a no-op: the mapping is always readable and writable
+// within the confined window. No authority beyond the Memory and `vm_fs` capabilities; all
 // guest C.
-#include <stdlib.h> // size_t, malloc, __vm_page_size (the map-growing page allocator)
+#include <stdlib.h> // size_t, calloc, __vm_page_size
 
 #define PROT_NONE 0x0
 #define PROT_READ 0x1
@@ -36,15 +36,14 @@
 extern long __vm_fs(long op, long a, long b, long c, long d);
 enum { __FS_MM_READ = 1, __FS_MM_SEEK = 3, __FS_MM_MMAP = 9, __FS_MM_MSYNC = 10, __FS_MM_MUNMAP = 11 };
 
-// `len` bytes of fresh, page-aligned memory: whole pages, as `mmap` promises. The page size comes
-// from the Memory capability, as `malloc` reads it. (Not `__pg_pagesize`: that is a helper inside the
-// libc bodies, which a program compiled against the prebuilt libc unit, declarations only, doesn't
-// see.)
+// `len` bytes of fresh, zero-filled, page-aligned memory: whole pages, as `mmap` promises. The page size
+// comes from the Memory capability. The heap reuses freed memory, so it is `calloc` that guarantees the
+// zeros.
 static inline char *__mmap_pages(size_t len) {
   long pg = __vm_page_size();
   if (pg <= 0) pg = 4096;
   // Over-allocate by a page so the payload can be rounded up to a page boundary.
-  char *raw = (char *)malloc(len + (size_t)pg);
+  char *raw = (char *)calloc(1, len + (size_t)pg);
   if (!raw) return 0;
   return (char *)(((long)raw + pg - 1) & ~(pg - 1));
 }

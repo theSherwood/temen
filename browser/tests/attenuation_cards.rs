@@ -8,11 +8,14 @@
 //! - the **Temen** card: parsed from its text and run as-is;
 //! - the **C** card: compiled by the committed `chibicc.temen` (the in-browser compiler — this is also
 //!   the code-coupled gate for its `__vm_instantiate_rec`/`__vm_instantiate_join` builtins) against
-//!   the seeded playground headers, `<temen/spawn.h>` included, then run. Fail-soft: SKIPs if the
-//!   asset isn't built.
+//!   the seeded playground headers, `<temen/spawn.h>` included, linked against the heap unit, then
+//!   run. Fail-soft: SKIPs if the asset isn't built.
 use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK,
 };
+
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
 
 const PLAY_JS: &str = include_str!("../web/play.js");
 
@@ -62,7 +65,13 @@ fn c_card_grants_stdout_to_one_child_only() {
     let compiled = onramp_fs_exec(
         &chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"/in.c",
+        ],
         b"",
     );
     assert!(
@@ -78,7 +87,7 @@ fn c_card_grants_stdout_to_one_child_only() {
         "{ir:.300}"
     );
     let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
-    let run = onramp_exec(&m, b"");
+    let run = onramp_exec(&pg_heap::link(&[], &m), b"");
     assert_eq!(
         run.status,
         STATUS_OK,
