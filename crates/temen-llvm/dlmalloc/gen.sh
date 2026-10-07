@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Regenerate `dlmalloc.ll` from `temen_dlmalloc.c` + the vendored `malloc.c`. Needs clang and opt.
+# Regenerate `dlmalloc.ll` from `temen_dlmalloc.c` + the vendored `malloc.c`. Needs clang and opt of the
+# LLVM major `scripts/ci/install-llvm.sh` pins (e.g. `PATH=/usr/lib/llvm-22/bin:$PATH ./gen.sh`).
 #
 # The unit keeps only the entry points the on-ramp aliases (`HEAP_API` in src/lib.rs) and what they
 # reach, and every symbol and named type it defines is renamed into the reserved `__temen_dl.`

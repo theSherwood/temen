@@ -6,8 +6,6 @@ target triple = "x86_64-pc-linux-gnu"
 %__temen_dl.malloc_params = type { i64, i64, i64, i64, i64, i32 }
 %__temen_dl.malloc_state = type { i32, i32, i64, i64, ptr, ptr, ptr, i64, i64, i64, [66 x ptr], [32 x ptr], i64, i64, i64, i32, i32, %__temen_dl.malloc_segment, ptr, i64 }
 %__temen_dl.malloc_segment = type { ptr, i64, ptr, i32 }
-%__temen_dl.malloc_chunk = type { i64, i64, ptr, ptr }
-%__temen_dl.malloc_tree_chunk = type { i64, i64, ptr, ptr, [2 x ptr], ptr, i32 }
 
 @__temen_dl.mparams = internal global %__temen_dl.malloc_params zeroinitializer, align 8
 @__temen_dl._gm_ = internal global %__temen_dl.malloc_state zeroinitializer, align 8
@@ -45,18 +43,18 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %18, label %19, label %23
 
 19:                                               ; preds = %16
-  call void @llvm.lifetime.start.p0(i64 8, ptr nonnull %3) #8
-  store i64 65536, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 2), align 8
-  store i64 4096, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 1), align 8
-  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 3), i8 -1, i64 16, i1 false)
-  store i32 2, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 5), align 8
-  store i32 2, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  store i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), align 4
+  call void @llvm.lifetime.start.p0(ptr nonnull %3) #10
+  store i64 65536, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
+  store i64 4096, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 8), align 8
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 24), i8 -1, i64 16, i1 false)
+  store i32 2, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 40), align 8
+  store i32 2, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  store i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
   %20 = ptrtoint ptr %3 to i64
   %21 = and i64 %20, -16
   %22 = xor i64 %21, 1431655768
   store volatile i64 %22, ptr @__temen_dl.mparams, align 8
-  call void @llvm.lifetime.end.p0(i64 8, ptr nonnull %3) #8
+  call void @llvm.lifetime.end.p0(ptr nonnull %3) #10
   br label %23
 
 23:                                               ; preds = %19, %16
@@ -64,23 +62,23 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %24
 
 24:                                               ; preds = %23, %1
-  %25 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
+  %25 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
   %26 = and i32 %25, 2
   %27 = icmp eq i32 %26, 0
   br i1 %27, label %38, label %28
 
 28:                                               ; preds = %24
-  %29 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %29 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %30 = icmp eq i32 %29, 0
   br i1 %30, label %38, label %31
 
 31:                                               ; preds = %37, %28
-  %32 = load volatile i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), align 4
+  %32 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
   %33 = icmp eq i32 %32, 0
   br i1 %33, label %34, label %37
 
 34:                                               ; preds = %31
-  %35 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %35 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %36 = icmp eq i32 %35, 0
   br i1 %36, label %38, label %37
 
@@ -89,15 +87,15 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
 
 38:                                               ; preds = %34, %28, %24
   %39 = icmp ult i64 %0, 233
-  br i1 %39, label %40, label %351
+  br i1 %39, label %40, label %353
 
 40:                                               ; preds = %38
-  %41 = icmp ult i64 %0, 23
+  %41 = icmp samesign ult i64 %0, 23
   %42 = add nuw nsw i64 %0, 23
   %43 = and i64 %42, 496
   %44 = select i1 %41, i64 32, i64 %43
   %45 = lshr exact i64 %44, 3
-  %46 = trunc i64 %45 to i32
+  %46 = trunc nuw nsw i64 %45 to i32
   %47 = load i32, ptr @__temen_dl._gm_, align 8
   %48 = lshr i32 %47, %46
   %49 = and i32 %48, 3
@@ -110,10 +108,10 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %54 = xor i32 %53, 1
   %55 = shl nuw nsw i32 %54, 1
   %56 = zext nneg i32 %55 to i64
-  %57 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %56
-  %58 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %57, i64 0, i32 2
+  %57 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %56
+  %58 = getelementptr inbounds nuw i8, ptr %57, i64 16
   %59 = load ptr, ptr %58, align 8
-  %60 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %59, i64 0, i32 2
+  %60 = getelementptr inbounds nuw i8, ptr %59, i64 16
   %61 = load ptr, ptr %60, align 8
   %62 = icmp eq ptr %57, %61
   br i1 %62, label %63, label %67
@@ -126,12 +124,12 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %76
 
 67:                                               ; preds = %51
-  %68 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %68 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %69 = icmp ult ptr %61, %68
   br i1 %69, label %75, label %70, !prof !7
 
 70:                                               ; preds = %67
-  %71 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %61, i64 0, i32 3
+  %71 = getelementptr inbounds nuw i8, ptr %61, i64 24
   %72 = load ptr, ptr %71, align 8
   %73 = icmp eq ptr %72, %59
   br i1 %73, label %74, label %75, !prof !8
@@ -142,26 +140,26 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %76
 
 75:                                               ; preds = %70, %67
-  call void @abort() #9
+  call void @abort() #11
   unreachable
 
 76:                                               ; preds = %74, %63
   %77 = shl nuw nsw i32 %54, 3
   %78 = zext nneg i32 %77 to i64
   %79 = or disjoint i64 %78, 3
-  %80 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %59, i64 0, i32 1
+  %80 = getelementptr inbounds nuw i8, ptr %59, i64 8
   store i64 %79, ptr %80, align 8
-  %81 = getelementptr inbounds i8, ptr %59, i64 %78
-  %82 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %81, i64 0, i32 1
+  %81 = getelementptr inbounds nuw i8, ptr %59, i64 %78
+  %82 = getelementptr inbounds nuw i8, ptr %81, i64 8
   %83 = load i64, ptr %82, align 8
   %84 = or i64 %83, 1
   store i64 %84, ptr %82, align 8
-  br label %1198
+  br label %1178
 
 85:                                               ; preds = %40
-  %86 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
+  %86 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
   %87 = icmp ugt i64 %44, %86
-  br i1 %87, label %88, label %698
+  br i1 %87, label %88, label %702
 
 88:                                               ; preds = %85
   %89 = icmp eq i32 %48, 0
@@ -173,13 +171,13 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %93 = sub i32 0, %92
   %94 = or i32 %92, %93
   %95 = and i32 %91, %94
-  %96 = call i32 @llvm.cttz.i32(i32 %95, i1 true), !range !9
+  %96 = call range(i32 2, 33) i32 @llvm.cttz.i32(i32 %95, i1 true)
   %97 = shl nuw nsw i32 %96, 1
   %98 = zext nneg i32 %97 to i64
-  %99 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %98
-  %100 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %99, i64 0, i32 2
+  %99 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %98
+  %100 = getelementptr inbounds nuw i8, ptr %99, i64 16
   %101 = load ptr, ptr %100, align 8
-  %102 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %101, i64 0, i32 2
+  %102 = getelementptr inbounds nuw i8, ptr %101, i64 16
   %103 = load ptr, ptr %102, align 8
   %104 = icmp eq ptr %99, %103
   br i1 %104, label %105, label %109
@@ -192,12 +190,12 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %118
 
 109:                                              ; preds = %90
-  %110 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %110 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %111 = icmp ult ptr %103, %110
   br i1 %111, label %117, label %112, !prof !7
 
 112:                                              ; preds = %109
-  %113 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %103, i64 0, i32 3
+  %113 = getelementptr inbounds nuw i8, ptr %103, i64 24
   %114 = load ptr, ptr %113, align 8
   %115 = icmp eq ptr %114, %101
   br i1 %115, label %116, label %117, !prof !8
@@ -208,7 +206,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %118
 
 117:                                              ; preds = %112, %109
-  call void @abort() #9
+  call void @abort() #11
   unreachable
 
 118:                                              ; preds = %116, %105
@@ -216,39 +214,39 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %120 = zext nneg i32 %119 to i64
   %121 = sub nsw i64 %120, %44
   %122 = icmp ult i64 %121, 32
-  %123 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %101, i64 0, i32 1
+  %123 = getelementptr inbounds nuw i8, ptr %101, i64 8
   br i1 %122, label %124, label %130
 
 124:                                              ; preds = %118
   %125 = or disjoint i64 %120, 3
   store i64 %125, ptr %123, align 8
-  %126 = getelementptr inbounds i8, ptr %101, i64 %120
-  %127 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %126, i64 0, i32 1
+  %126 = getelementptr inbounds nuw i8, ptr %101, i64 %120
+  %127 = getelementptr inbounds nuw i8, ptr %126, i64 8
   %128 = load i64, ptr %127, align 8
   %129 = or i64 %128, 1
   store i64 %129, ptr %127, align 8
-  br label %1198
+  br label %1178
 
 130:                                              ; preds = %118
   %131 = or disjoint i64 %44, 3
   store i64 %131, ptr %123, align 8
-  %132 = getelementptr inbounds i8, ptr %101, i64 %44
+  %132 = getelementptr inbounds nuw i8, ptr %101, i64 %44
   %133 = or disjoint i64 %121, 1
-  %134 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %132, i64 0, i32 1
+  %134 = getelementptr inbounds nuw i8, ptr %132, i64 8
   store i64 %133, ptr %134, align 8
-  %135 = getelementptr inbounds i8, ptr %101, i64 %120
+  %135 = getelementptr inbounds nuw i8, ptr %101, i64 %120
   store i64 %121, ptr %135, align 8
-  %136 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
+  %136 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
   %137 = icmp eq i64 %136, 0
   br i1 %137, label %163, label %138
 
 138:                                              ; preds = %130
-  %139 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+  %139 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
   %140 = lshr i64 %136, 3
   %141 = trunc i64 %140 to i32
   %142 = shl nuw nsw i64 %140, 1
   %143 = and i64 %142, 4294967294
-  %144 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %143
+  %144 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %143
   %145 = load i32, ptr @__temen_dl._gm_, align 8
   %146 = shl nuw i32 1, %141
   %147 = and i32 %145, %146
@@ -261,44 +259,44 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %157
 
 151:                                              ; preds = %138
-  %152 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %144, i64 0, i32 2
+  %152 = getelementptr inbounds nuw i8, ptr %144, i64 16
   %153 = load ptr, ptr %152, align 8
-  %154 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %154 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %155 = icmp ult ptr %153, %154
   br i1 %155, label %156, label %157, !prof !7
 
 156:                                              ; preds = %151
-  call void @abort() #9
+  call void @abort() #11
   unreachable
 
 157:                                              ; preds = %151, %149
   %158 = phi ptr [ %144, %149 ], [ %153, %151 ]
-  %159 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %144, i64 0, i32 2
+  %159 = getelementptr inbounds nuw i8, ptr %144, i64 16
   store ptr %139, ptr %159, align 8
-  %160 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %158, i64 0, i32 3
+  %160 = getelementptr inbounds nuw i8, ptr %158, i64 24
   store ptr %139, ptr %160, align 8
-  %161 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %139, i64 0, i32 2
+  %161 = getelementptr inbounds nuw i8, ptr %139, i64 16
   store ptr %158, ptr %161, align 8
-  %162 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %139, i64 0, i32 3
+  %162 = getelementptr inbounds nuw i8, ptr %139, i64 24
   store ptr %144, ptr %162, align 8
   br label %163
 
 163:                                              ; preds = %157, %130
-  store i64 %121, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr %132, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  br label %1198
+  store i64 %121, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr %132, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  br label %1178
 
 164:                                              ; preds = %88
-  %165 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
+  %165 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
   %166 = icmp eq i32 %165, 0
-  br i1 %166, label %698, label %167
+  br i1 %166, label %702, label %167
 
 167:                                              ; preds = %164
-  %168 = call i32 @llvm.cttz.i32(i32 %165, i1 true), !range !10
+  %168 = call range(i32 0, 33) i32 @llvm.cttz.i32(i32 %165, i1 true)
   %169 = zext nneg i32 %168 to i64
-  %170 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %169
+  %170 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %169
   %171 = load ptr, ptr %170, align 8
-  %172 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %171, i64 0, i32 1
+  %172 = getelementptr inbounds nuw i8, ptr %171, i64 8
   %173 = load i64, ptr %172, align 8
   %174 = and i64 %173, -8
   %175 = sub i64 %174, %44
@@ -308,56 +306,56 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %177 = phi i64 [ %175, %167 ], [ %194, %187 ]
   %178 = phi ptr [ %171, %167 ], [ %195, %187 ]
   %179 = phi ptr [ %171, %167 ], [ %188, %187 ]
-  %180 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %179, i64 0, i32 4
+  %180 = getelementptr inbounds nuw i8, ptr %179, i64 32
   %181 = load ptr, ptr %180, align 8
   %182 = icmp eq ptr %181, null
   br i1 %182, label %183, label %187
 
 183:                                              ; preds = %176
-  %184 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %179, i64 0, i32 4, i64 1
+  %184 = getelementptr inbounds nuw i8, ptr %179, i64 40
   %185 = load ptr, ptr %184, align 8
   %186 = icmp eq ptr %185, null
   br i1 %186, label %196, label %187
 
 187:                                              ; preds = %183, %176
   %188 = phi ptr [ %185, %183 ], [ %181, %176 ]
-  %189 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %188, i64 0, i32 1
+  %189 = getelementptr inbounds nuw i8, ptr %188, i64 8
   %190 = load i64, ptr %189, align 8
   %191 = and i64 %190, -8
   %192 = sub i64 %191, %44
   %193 = icmp ult i64 %192, %177
   %194 = call i64 @llvm.umin.i64(i64 %192, i64 %177)
   %195 = select i1 %193, ptr %188, ptr %178
-  br label %176, !llvm.loop !11
+  br label %176, !llvm.loop !9
 
 196:                                              ; preds = %183
-  %197 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %197 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %198 = icmp ult ptr %178, %197
-  br i1 %198, label %348, label %199, !prof !7
+  br i1 %198, label %350, label %199, !prof !7
 
 199:                                              ; preds = %196
-  %200 = getelementptr inbounds i8, ptr %178, i64 %44
-  %201 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 5
+  %200 = getelementptr inbounds nuw i8, ptr %178, i64 %44
+  %201 = getelementptr inbounds nuw i8, ptr %178, i64 48
   %202 = load ptr, ptr %201, align 8
-  %203 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 3
+  %203 = getelementptr inbounds nuw i8, ptr %178, i64 24
   %204 = load ptr, ptr %203, align 8
   %205 = icmp eq ptr %204, %178
   br i1 %205, label %220, label %206
 
 206:                                              ; preds = %199
-  %207 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 2
+  %207 = getelementptr inbounds nuw i8, ptr %178, i64 16
   %208 = load ptr, ptr %207, align 8
   %209 = icmp ult ptr %208, %197
   br i1 %209, label %219, label %210, !prof !7
 
 210:                                              ; preds = %206
-  %211 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %208, i64 0, i32 3
+  %211 = getelementptr inbounds nuw i8, ptr %208, i64 24
   %212 = load ptr, ptr %211, align 8
   %213 = icmp eq ptr %212, %178
   br i1 %213, label %214, label %219, !prof !8
 
 214:                                              ; preds = %210
-  %215 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %204, i64 0, i32 2
+  %215 = getelementptr inbounds nuw i8, ptr %204, i64 16
   %216 = load ptr, ptr %215, align 8
   %217 = icmp eq ptr %216, %178
   br i1 %217, label %218, label %219, !prof !8
@@ -368,36 +366,36 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %248
 
 219:                                              ; preds = %214, %210, %206
-  call void @abort() #9
+  call void @abort() #11
   unreachable
 
 220:                                              ; preds = %199
-  %221 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 4, i64 1
+  %221 = getelementptr inbounds nuw i8, ptr %178, i64 40
   %222 = load ptr, ptr %221, align 8
   %223 = icmp eq ptr %222, null
   br i1 %223, label %224, label %228
 
 224:                                              ; preds = %220
-  %225 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 4
+  %225 = getelementptr inbounds nuw i8, ptr %178, i64 32
   %226 = load ptr, ptr %225, align 8
   %227 = icmp eq ptr %226, null
   br i1 %227, label %248, label %228
 
 228:                                              ; preds = %224, %220
-  %229 = phi ptr [ %225, %224 ], [ %221, %220 ]
-  %230 = phi ptr [ %226, %224 ], [ %222, %220 ]
+  %229 = phi ptr [ %221, %220 ], [ %225, %224 ]
+  %230 = phi ptr [ %222, %220 ], [ %226, %224 ]
   br label %231
 
 231:                                              ; preds = %241, %228
   %232 = phi ptr [ %229, %228 ], [ %242, %241 ]
   %233 = phi ptr [ %230, %228 ], [ %243, %241 ]
-  %234 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %233, i64 0, i32 4, i64 1
+  %234 = getelementptr inbounds nuw i8, ptr %233, i64 40
   %235 = load ptr, ptr %234, align 8
   %236 = icmp eq ptr %235, null
   br i1 %236, label %237, label %241
 
 237:                                              ; preds = %231
-  %238 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %233, i64 0, i32 4
+  %238 = getelementptr inbounds nuw i8, ptr %233, i64 32
   %239 = load ptr, ptr %238, align 8
   %240 = icmp eq ptr %239, null
   br i1 %240, label %244, label %241
@@ -405,7 +403,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
 241:                                              ; preds = %237, %231
   %242 = phi ptr [ %234, %231 ], [ %238, %237 ]
   %243 = phi ptr [ %235, %231 ], [ %239, %237 ]
-  br label %231, !llvm.loop !12
+  br label %231, !llvm.loop !10
 
 244:                                              ; preds = %237
   %245 = icmp ult ptr %232, %197
@@ -416,19 +414,19 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %248
 
 247:                                              ; preds = %244
-  call void @abort() #9
+  call void @abort() #11
   unreachable
 
 248:                                              ; preds = %246, %224, %218
   %249 = phi ptr [ %204, %218 ], [ %233, %246 ], [ null, %224 ]
   %250 = icmp eq ptr %202, null
-  br i1 %250, label %304, label %251
+  br i1 %250, label %306, label %251
 
 251:                                              ; preds = %248
-  %252 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 6
+  %252 = getelementptr inbounds nuw i8, ptr %178, i64 56
   %253 = load i32, ptr %252, align 8
   %254 = zext i32 %253 to i64
-  %255 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %254
+  %255 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %254
   %256 = load ptr, ptr %255, align 8
   %257 = icmp eq ptr %178, %256
   br i1 %257, label %258, label %268
@@ -439,1582 +437,1622 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %259, label %262, label %260
 
 260:                                              ; preds = %258
-  %261 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  br label %279
+  %261 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  br label %281
 
 262:                                              ; preds = %258
   %263 = load i32, ptr %252, align 8
   %264 = shl nuw i32 1, %263
   %265 = xor i32 %264, -1
-  %266 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
+  %266 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
   %267 = and i32 %266, %265
-  store i32 %267, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %304
+  store i32 %267, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %306
 
 268:                                              ; preds = %251
-  %269 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %269 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %270 = icmp ult ptr %202, %269
   br i1 %270, label %278, label %271, !prof !7
 
 271:                                              ; preds = %268
-  %272 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %202, i64 0, i32 4
+  %272 = getelementptr inbounds nuw i8, ptr %202, i64 32
   %273 = load ptr, ptr %272, align 8
   %274 = icmp eq ptr %273, %178
-  %275 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %202, i64 0, i32 4, i64 1
-  %276 = select i1 %274, ptr %272, ptr %275
-  store ptr %249, ptr %276, align 8
-  %277 = icmp eq ptr %249, null
-  br i1 %277, label %304, label %279
+  br i1 %274, label %275, label %276
+
+275:                                              ; preds = %271
+  store ptr %249, ptr %272, align 8
+  br label %279
+
+276:                                              ; preds = %271
+  %277 = getelementptr inbounds nuw i8, ptr %202, i64 40
+  store ptr %249, ptr %277, align 8
+  br label %279
 
 278:                                              ; preds = %268
-  call void @abort() #9
+  call void @abort() #11
   unreachable
 
-279:                                              ; preds = %271, %260
-  %280 = phi ptr [ %261, %260 ], [ %269, %271 ]
-  %281 = icmp ult ptr %249, %280
-  br i1 %281, label %303, label %282, !prof !7
+279:                                              ; preds = %276, %275
+  %280 = icmp eq ptr %249, null
+  br i1 %280, label %306, label %281
 
-282:                                              ; preds = %279
-  %283 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %249, i64 0, i32 5
-  store ptr %202, ptr %283, align 8
-  %284 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 4
-  %285 = load ptr, ptr %284, align 8
-  %286 = icmp eq ptr %285, null
-  br i1 %286, label %293, label %287
+281:                                              ; preds = %279, %260
+  %282 = phi ptr [ %261, %260 ], [ %269, %279 ]
+  %283 = icmp ult ptr %249, %282
+  br i1 %283, label %305, label %284, !prof !7
 
-287:                                              ; preds = %282
-  %288 = icmp ult ptr %285, %280
-  br i1 %288, label %292, label %289, !prof !7
+284:                                              ; preds = %281
+  %285 = getelementptr inbounds nuw i8, ptr %249, i64 48
+  store ptr %202, ptr %285, align 8
+  %286 = getelementptr inbounds nuw i8, ptr %178, i64 32
+  %287 = load ptr, ptr %286, align 8
+  %288 = icmp eq ptr %287, null
+  br i1 %288, label %295, label %289
 
-289:                                              ; preds = %287
-  %290 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %249, i64 0, i32 4
-  store ptr %285, ptr %290, align 8
-  %291 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %285, i64 0, i32 5
-  store ptr %249, ptr %291, align 8
-  br label %293
+289:                                              ; preds = %284
+  %290 = icmp ult ptr %287, %282
+  br i1 %290, label %294, label %291, !prof !7
 
-292:                                              ; preds = %287
-  call void @abort() #9
+291:                                              ; preds = %289
+  %292 = getelementptr inbounds nuw i8, ptr %249, i64 32
+  store ptr %287, ptr %292, align 8
+  %293 = getelementptr inbounds nuw i8, ptr %287, i64 48
+  store ptr %249, ptr %293, align 8
+  br label %295
+
+294:                                              ; preds = %289
+  call void @abort() #11
   unreachable
 
-293:                                              ; preds = %289, %282
-  %294 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 4, i64 1
-  %295 = load ptr, ptr %294, align 8
-  %296 = icmp eq ptr %295, null
-  br i1 %296, label %304, label %297
+295:                                              ; preds = %291, %284
+  %296 = getelementptr inbounds nuw i8, ptr %178, i64 40
+  %297 = load ptr, ptr %296, align 8
+  %298 = icmp eq ptr %297, null
+  br i1 %298, label %306, label %299
 
-297:                                              ; preds = %293
-  %298 = icmp ult ptr %295, %280
-  br i1 %298, label %302, label %299, !prof !7
+299:                                              ; preds = %295
+  %300 = icmp ult ptr %297, %282
+  br i1 %300, label %304, label %301, !prof !7
 
-299:                                              ; preds = %297
-  %300 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %249, i64 0, i32 4, i64 1
-  store ptr %295, ptr %300, align 8
-  %301 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %295, i64 0, i32 5
-  store ptr %249, ptr %301, align 8
-  br label %304
+301:                                              ; preds = %299
+  %302 = getelementptr inbounds nuw i8, ptr %249, i64 40
+  store ptr %297, ptr %302, align 8
+  %303 = getelementptr inbounds nuw i8, ptr %297, i64 48
+  store ptr %249, ptr %303, align 8
+  br label %306
 
-302:                                              ; preds = %297
-  call void @abort() #9
+304:                                              ; preds = %299
+  call void @abort() #11
   unreachable
 
-303:                                              ; preds = %279
-  call void @abort() #9
+305:                                              ; preds = %281
+  call void @abort() #11
   unreachable
 
-304:                                              ; preds = %299, %293, %271, %262, %248
-  %305 = icmp ult i64 %177, 32
-  br i1 %305, label %306, label %314
+306:                                              ; preds = %301, %295, %279, %262, %248
+  %307 = icmp ult i64 %177, 32
+  br i1 %307, label %308, label %316
 
-306:                                              ; preds = %304
-  %307 = add nuw nsw i64 %177, %44
-  %308 = or i64 %307, 3
-  %309 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 1
-  store i64 %308, ptr %309, align 8
-  %310 = getelementptr inbounds i8, ptr %178, i64 %307
-  %311 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %310, i64 0, i32 1
-  %312 = load i64, ptr %311, align 8
-  %313 = or i64 %312, 1
-  store i64 %313, ptr %311, align 8
-  br label %349
+308:                                              ; preds = %306
+  %309 = add nuw nsw i64 %177, %44
+  %310 = or i64 %309, 3
+  %311 = getelementptr inbounds nuw i8, ptr %178, i64 8
+  store i64 %310, ptr %311, align 8
+  %312 = getelementptr inbounds nuw i8, ptr %178, i64 %309
+  %313 = getelementptr inbounds nuw i8, ptr %312, i64 8
+  %314 = load i64, ptr %313, align 8
+  %315 = or i64 %314, 1
+  store i64 %315, ptr %313, align 8
+  br label %351
 
-314:                                              ; preds = %304
-  %315 = or disjoint i64 %44, 3
-  %316 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 1
-  store i64 %315, ptr %316, align 8
-  %317 = or i64 %177, 1
-  %318 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %200, i64 0, i32 1
+316:                                              ; preds = %306
+  %317 = or disjoint i64 %44, 3
+  %318 = getelementptr inbounds nuw i8, ptr %178, i64 8
   store i64 %317, ptr %318, align 8
-  %319 = getelementptr inbounds i8, ptr %200, i64 %177
-  store i64 %177, ptr %319, align 8
-  %320 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %321 = icmp eq i64 %320, 0
-  br i1 %321, label %347, label %322
+  %319 = or i64 %177, 1
+  %320 = getelementptr inbounds nuw i8, ptr %200, i64 8
+  store i64 %319, ptr %320, align 8
+  %321 = getelementptr inbounds nuw i8, ptr %200, i64 %177
+  store i64 %177, ptr %321, align 8
+  %322 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %323 = icmp eq i64 %322, 0
+  br i1 %323, label %349, label %324
 
-322:                                              ; preds = %314
-  %323 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %324 = lshr i64 %320, 3
-  %325 = trunc i64 %324 to i32
-  %326 = shl nuw nsw i64 %324, 1
-  %327 = and i64 %326, 4294967294
-  %328 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %327
-  %329 = load i32, ptr @__temen_dl._gm_, align 8
-  %330 = shl nuw i32 1, %325
-  %331 = and i32 %329, %330
-  %332 = icmp eq i32 %331, 0
-  br i1 %332, label %333, label %335
+324:                                              ; preds = %316
+  %325 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %326 = lshr i64 %322, 3
+  %327 = trunc i64 %326 to i32
+  %328 = shl nuw nsw i64 %326, 1
+  %329 = and i64 %328, 4294967294
+  %330 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %329
+  %331 = load i32, ptr @__temen_dl._gm_, align 8
+  %332 = shl nuw i32 1, %327
+  %333 = and i32 %331, %332
+  %334 = icmp eq i32 %333, 0
+  br i1 %334, label %335, label %337
 
-333:                                              ; preds = %322
-  %334 = or i32 %329, %330
-  store i32 %334, ptr @__temen_dl._gm_, align 8
-  br label %341
+335:                                              ; preds = %324
+  %336 = or i32 %331, %332
+  store i32 %336, ptr @__temen_dl._gm_, align 8
+  br label %343
 
-335:                                              ; preds = %322
-  %336 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %328, i64 0, i32 2
-  %337 = load ptr, ptr %336, align 8
-  %338 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %339 = icmp ult ptr %337, %338
-  br i1 %339, label %340, label %341, !prof !7
+337:                                              ; preds = %324
+  %338 = getelementptr inbounds nuw i8, ptr %330, i64 16
+  %339 = load ptr, ptr %338, align 8
+  %340 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %341 = icmp ult ptr %339, %340
+  br i1 %341, label %342, label %343, !prof !7
 
-340:                                              ; preds = %335
-  call void @abort() #9
+342:                                              ; preds = %337
+  call void @abort() #11
   unreachable
 
-341:                                              ; preds = %335, %333
-  %342 = phi ptr [ %328, %333 ], [ %337, %335 ]
-  %343 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %328, i64 0, i32 2
-  store ptr %323, ptr %343, align 8
-  %344 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %342, i64 0, i32 3
-  store ptr %323, ptr %344, align 8
-  %345 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %323, i64 0, i32 2
-  store ptr %342, ptr %345, align 8
-  %346 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %323, i64 0, i32 3
-  store ptr %328, ptr %346, align 8
-  br label %347
-
-347:                                              ; preds = %341, %314
-  store i64 %177, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr %200, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+343:                                              ; preds = %337, %335
+  %344 = phi ptr [ %330, %335 ], [ %339, %337 ]
+  %345 = getelementptr inbounds nuw i8, ptr %330, i64 16
+  store ptr %325, ptr %345, align 8
+  %346 = getelementptr inbounds nuw i8, ptr %344, i64 24
+  store ptr %325, ptr %346, align 8
+  %347 = getelementptr inbounds nuw i8, ptr %325, i64 16
+  store ptr %344, ptr %347, align 8
+  %348 = getelementptr inbounds nuw i8, ptr %325, i64 24
+  store ptr %330, ptr %348, align 8
   br label %349
 
-348:                                              ; preds = %196
-  call void @abort() #9
+349:                                              ; preds = %343, %316
+  store i64 %177, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr %200, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  br label %351
+
+350:                                              ; preds = %196
+  call void @abort() #11
   unreachable
 
-349:                                              ; preds = %347, %306
-  %350 = getelementptr inbounds i8, ptr %178, i64 16
-  br label %1198
+351:                                              ; preds = %349, %308
+  %352 = getelementptr inbounds nuw i8, ptr %178, i64 16
+  br label %1178
 
-351:                                              ; preds = %38
-  %352 = icmp ugt i64 %0, -129
-  br i1 %352, label %698, label %353
+353:                                              ; preds = %38
+  %354 = icmp ugt i64 %0, -129
+  br i1 %354, label %702, label %355
 
-353:                                              ; preds = %351
-  %354 = add nuw i64 %0, 23
-  %355 = and i64 %354, -16
-  %356 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %357 = icmp eq i32 %356, 0
-  br i1 %357, label %698, label %358
+355:                                              ; preds = %353
+  %356 = add nuw i64 %0, 23
+  %357 = and i64 %356, -16
+  %358 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %359 = icmp eq i32 %358, 0
+  br i1 %359, label %702, label %360
 
-358:                                              ; preds = %353
-  %359 = sub i64 0, %355
-  %360 = lshr i64 %354, 8
-  %361 = trunc i64 %360 to i32
-  %362 = icmp eq i32 %361, 0
-  br i1 %362, label %375, label %363
+360:                                              ; preds = %355
+  %361 = sub i64 0, %357
+  %362 = lshr i64 %356, 8
+  %363 = trunc i64 %362 to i32
+  %364 = icmp eq i32 %363, 0
+  br i1 %364, label %377, label %365
 
-363:                                              ; preds = %358
-  %364 = icmp ugt i32 %361, 65535
-  br i1 %364, label %375, label %365
+365:                                              ; preds = %360
+  %366 = icmp ugt i32 %363, 65535
+  br i1 %366, label %377, label %367
 
-365:                                              ; preds = %363
-  %366 = call i32 @llvm.ctlz.i32(i32 %361, i1 true), !range !13
-  %367 = shl nuw nsw i32 %366, 1
-  %368 = sub nuw nsw i32 38, %366
-  %369 = zext nneg i32 %368 to i64
-  %370 = lshr i64 %355, %369
-  %371 = trunc i64 %370 to i32
-  %372 = and i32 %371, 1
-  %373 = or disjoint i32 %372, %367
-  %374 = xor i32 %373, 62
-  br label %375
+367:                                              ; preds = %365
+  %368 = call range(i32 16, 33) i32 @llvm.ctlz.i32(i32 %363, i1 true)
+  %369 = shl nuw nsw i32 %368, 1
+  %370 = sub nuw nsw i32 38, %368
+  %371 = zext nneg i32 %370 to i64
+  %372 = lshr i64 %357, %371
+  %373 = trunc i64 %372 to i32
+  %374 = and i32 %373, 1
+  %375 = or disjoint i32 %374, %369
+  %376 = xor i32 %375, 62
+  br label %377
 
-375:                                              ; preds = %365, %363, %358
-  %376 = phi i32 [ %374, %365 ], [ 0, %358 ], [ 31, %363 ]
-  %377 = zext nneg i32 %376 to i64
-  %378 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %377
-  %379 = load ptr, ptr %378, align 8
-  %380 = icmp eq ptr %379, null
-  br i1 %380, label %416, label %381
+377:                                              ; preds = %367, %365, %360
+  %378 = phi i32 [ %376, %367 ], [ 0, %360 ], [ 31, %365 ]
+  %379 = zext nneg i32 %378 to i64
+  %380 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %379
+  %381 = load ptr, ptr %380, align 8
+  %382 = icmp eq ptr %381, null
+  br i1 %382, label %419, label %383
 
-381:                                              ; preds = %375
-  %382 = icmp eq i32 %376, 31
-  %383 = lshr i32 %376, 1
-  %384 = add nuw nsw i32 %383, 6
-  %385 = zext nneg i32 %384 to i64
-  %386 = sub nuw nsw i64 63, %385
-  %387 = select i1 %382, i64 0, i64 %386
-  %388 = shl i64 %355, %387
-  br label %389
+383:                                              ; preds = %377
+  %384 = icmp eq i32 %378, 31
+  %385 = lshr i32 %378, 1
+  %386 = add nuw nsw i32 %385, 6
+  %387 = zext nneg i32 %386 to i64
+  %388 = sub nuw nsw i64 63, %387
+  %389 = select i1 %384, i64 0, i64 %388
+  %390 = shl i64 %357, %389
+  br label %391
 
-389:                                              ; preds = %402, %381
-  %390 = phi ptr [ null, %381 ], [ %413, %402 ]
-  %391 = phi i64 [ %388, %381 ], [ %415, %402 ]
-  %392 = phi ptr [ %379, %381 ], [ %409, %402 ]
-  %393 = phi i64 [ %359, %381 ], [ %403, %402 ]
-  %394 = phi ptr [ null, %381 ], [ %404, %402 ]
-  %395 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %392, i64 0, i32 1
-  %396 = load i64, ptr %395, align 8
-  %397 = and i64 %396, -8
-  %398 = sub i64 %397, %355
-  %399 = icmp ult i64 %398, %393
-  br i1 %399, label %400, label %402
+391:                                              ; preds = %404, %383
+  %392 = phi ptr [ null, %383 ], [ %416, %404 ]
+  %393 = phi i64 [ %390, %383 ], [ %418, %404 ]
+  %394 = phi ptr [ %381, %383 ], [ %412, %404 ]
+  %395 = phi i64 [ %361, %383 ], [ %405, %404 ]
+  %396 = phi ptr [ null, %383 ], [ %406, %404 ]
+  %397 = getelementptr inbounds nuw i8, ptr %394, i64 8
+  %398 = load i64, ptr %397, align 8
+  %399 = and i64 %398, -8
+  %400 = sub i64 %399, %357
+  %401 = icmp ult i64 %400, %395
+  br i1 %401, label %402, label %404
 
-400:                                              ; preds = %389
-  %401 = icmp eq i64 %398, 0
-  br i1 %401, label %438, label %402
+402:                                              ; preds = %391
+  %403 = icmp eq i64 %400, 0
+  br i1 %403, label %441, label %404
 
-402:                                              ; preds = %400, %389
-  %403 = phi i64 [ %398, %400 ], [ %393, %389 ]
-  %404 = phi ptr [ %392, %400 ], [ %394, %389 ]
-  %405 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %392, i64 0, i32 4, i64 1
-  %406 = load ptr, ptr %405, align 8
-  %407 = lshr i64 %391, 63
-  %408 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %392, i64 0, i32 4, i64 %407
+404:                                              ; preds = %402, %391
+  %405 = phi i64 [ %400, %402 ], [ %395, %391 ]
+  %406 = phi ptr [ %394, %402 ], [ %396, %391 ]
+  %407 = getelementptr inbounds nuw i8, ptr %394, i64 32
+  %408 = getelementptr inbounds nuw i8, ptr %394, i64 40
   %409 = load ptr, ptr %408, align 8
-  %410 = icmp eq ptr %406, null
-  %411 = icmp eq ptr %406, %409
-  %412 = or i1 %410, %411
-  %413 = select i1 %412, ptr %390, ptr %406
-  %414 = icmp eq ptr %409, null
-  %415 = shl i64 %391, 1
-  br i1 %414, label %416, label %389
+  %410 = lshr i64 %393, 63
+  %411 = getelementptr inbounds nuw ptr, ptr %407, i64 %410
+  %412 = load ptr, ptr %411, align 8
+  %413 = icmp eq ptr %409, null
+  %414 = icmp eq ptr %409, %412
+  %415 = or i1 %413, %414
+  %416 = select i1 %415, ptr %392, ptr %409
+  %417 = icmp eq ptr %412, null
+  %418 = shl i64 %393, 1
+  br i1 %417, label %419, label %391
 
-416:                                              ; preds = %402, %375
-  %417 = phi ptr [ null, %375 ], [ %413, %402 ]
-  %418 = phi i64 [ %359, %375 ], [ %403, %402 ]
-  %419 = phi ptr [ null, %375 ], [ %404, %402 ]
-  %420 = icmp eq ptr %417, null
-  %421 = icmp eq ptr %419, null
-  %422 = select i1 %420, i1 %421, i1 false
-  br i1 %422, label %423, label %434
+419:                                              ; preds = %404, %377
+  %420 = phi ptr [ null, %377 ], [ %416, %404 ]
+  %421 = phi i64 [ %361, %377 ], [ %405, %404 ]
+  %422 = phi ptr [ null, %377 ], [ %406, %404 ]
+  %423 = icmp eq ptr %420, null
+  %424 = icmp eq ptr %422, null
+  %425 = select i1 %423, i1 %424, i1 false
+  br i1 %425, label %426, label %437
 
-423:                                              ; preds = %416
-  %424 = shl i32 2, %376
-  %425 = sub i32 0, %424
-  %426 = or i32 %424, %425
-  %427 = and i32 %426, %356
-  %428 = icmp eq i32 %427, 0
-  br i1 %428, label %698, label %429
+426:                                              ; preds = %419
+  %427 = shl i32 2, %378
+  %428 = sub i32 0, %427
+  %429 = or i32 %427, %428
+  %430 = and i32 %429, %358
+  %431 = icmp eq i32 %430, 0
+  br i1 %431, label %702, label %432
 
-429:                                              ; preds = %423
-  %430 = call i32 @llvm.cttz.i32(i32 %427, i1 true), !range !14
-  %431 = zext nneg i32 %430 to i64
-  %432 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %431
-  %433 = load ptr, ptr %432, align 8
-  br label %434
+432:                                              ; preds = %426
+  %433 = call range(i32 1, 33) i32 @llvm.cttz.i32(i32 %430, i1 true)
+  %434 = zext nneg i32 %433 to i64
+  %435 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %434
+  %436 = load ptr, ptr %435, align 8
+  br label %437
 
-434:                                              ; preds = %429, %416
-  %435 = phi ptr [ %419, %416 ], [ null, %429 ]
-  %436 = phi ptr [ %417, %416 ], [ %433, %429 ]
-  %437 = icmp eq ptr %436, null
-  br i1 %437, label %462, label %438
+437:                                              ; preds = %432, %419
+  %438 = phi ptr [ %422, %419 ], [ null, %432 ]
+  %439 = phi ptr [ %420, %419 ], [ %436, %432 ]
+  %440 = icmp eq ptr %439, null
+  br i1 %440, label %465, label %441
 
-438:                                              ; preds = %434, %400
-  %439 = phi ptr [ %435, %434 ], [ %392, %400 ]
-  %440 = phi i64 [ %418, %434 ], [ 0, %400 ]
-  %441 = phi ptr [ %436, %434 ], [ %392, %400 ]
-  br label %442
+441:                                              ; preds = %437, %402
+  %442 = phi ptr [ %438, %437 ], [ %394, %402 ]
+  %443 = phi i64 [ %421, %437 ], [ 0, %402 ]
+  %444 = phi ptr [ %439, %437 ], [ %394, %402 ]
+  br label %445
 
-442:                                              ; preds = %459, %438
-  %443 = phi ptr [ %452, %459 ], [ %439, %438 ]
-  %444 = phi i64 [ %451, %459 ], [ %440, %438 ]
-  %445 = phi ptr [ %460, %459 ], [ %441, %438 ]
-  %446 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %445, i64 0, i32 1
-  %447 = load i64, ptr %446, align 8
-  %448 = and i64 %447, -8
-  %449 = sub i64 %448, %355
-  %450 = icmp ult i64 %449, %444
-  %451 = call i64 @llvm.umin.i64(i64 %449, i64 %444)
-  %452 = select i1 %450, ptr %445, ptr %443
-  %453 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %445, i64 0, i32 4
-  %454 = load ptr, ptr %453, align 8
-  %455 = icmp eq ptr %454, null
-  br i1 %455, label %456, label %459
+445:                                              ; preds = %462, %441
+  %446 = phi ptr [ %455, %462 ], [ %442, %441 ]
+  %447 = phi i64 [ %454, %462 ], [ %443, %441 ]
+  %448 = phi ptr [ %463, %462 ], [ %444, %441 ]
+  %449 = getelementptr inbounds nuw i8, ptr %448, i64 8
+  %450 = load i64, ptr %449, align 8
+  %451 = and i64 %450, -8
+  %452 = sub i64 %451, %357
+  %453 = icmp ult i64 %452, %447
+  %454 = call i64 @llvm.umin.i64(i64 %452, i64 %447)
+  %455 = select i1 %453, ptr %448, ptr %446
+  %456 = getelementptr inbounds nuw i8, ptr %448, i64 32
+  %457 = load ptr, ptr %456, align 8
+  %458 = icmp eq ptr %457, null
+  br i1 %458, label %459, label %462
 
-456:                                              ; preds = %442
-  %457 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %445, i64 0, i32 4, i64 1
-  %458 = load ptr, ptr %457, align 8
-  br label %459
+459:                                              ; preds = %445
+  %460 = getelementptr inbounds nuw i8, ptr %448, i64 40
+  %461 = load ptr, ptr %460, align 8
+  br label %462
 
-459:                                              ; preds = %456, %442
-  %460 = phi ptr [ %458, %456 ], [ %454, %442 ]
-  %461 = icmp eq ptr %460, null
-  br i1 %461, label %462, label %442, !llvm.loop !15
+462:                                              ; preds = %459, %445
+  %463 = phi ptr [ %461, %459 ], [ %457, %445 ]
+  %464 = icmp eq ptr %463, null
+  br i1 %464, label %465, label %445, !llvm.loop !11
 
-462:                                              ; preds = %459, %434
-  %463 = phi i64 [ %418, %434 ], [ %451, %459 ]
-  %464 = phi ptr [ %435, %434 ], [ %452, %459 ]
-  %465 = icmp eq ptr %464, null
-  br i1 %465, label %698, label %466
+465:                                              ; preds = %462, %437
+  %466 = phi i64 [ %421, %437 ], [ %454, %462 ]
+  %467 = phi ptr [ %438, %437 ], [ %455, %462 ]
+  %468 = icmp eq ptr %467, null
+  br i1 %468, label %702, label %469
 
-466:                                              ; preds = %462
-  %467 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %468 = sub i64 %467, %355
-  %469 = icmp ult i64 %463, %468
-  br i1 %469, label %470, label %698
+469:                                              ; preds = %465
+  %470 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %471 = sub i64 %470, %357
+  %472 = icmp ult i64 %466, %471
+  br i1 %472, label %473, label %702
 
-470:                                              ; preds = %466
-  %471 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %472 = icmp ult ptr %464, %471
-  br i1 %472, label %695, label %473, !prof !7
-
-473:                                              ; preds = %470
-  %474 = getelementptr inbounds i8, ptr %464, i64 %355
-  %475 = icmp slt i64 %355, 1
-  br i1 %475, label %695, label %476, !prof !7
+473:                                              ; preds = %469
+  %474 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %475 = icmp ult ptr %467, %474
+  br i1 %475, label %699, label %476, !prof !7
 
 476:                                              ; preds = %473
-  %477 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 5
-  %478 = load ptr, ptr %477, align 8
-  %479 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 3
-  %480 = load ptr, ptr %479, align 8
-  %481 = icmp eq ptr %480, %464
-  br i1 %481, label %496, label %482
+  %477 = getelementptr inbounds nuw i8, ptr %467, i64 %357
+  %478 = getelementptr inbounds nuw i8, ptr %467, i64 48
+  %479 = load ptr, ptr %478, align 8
+  %480 = getelementptr inbounds nuw i8, ptr %467, i64 24
+  %481 = load ptr, ptr %480, align 8
+  %482 = icmp eq ptr %481, %467
+  br i1 %482, label %497, label %483
 
-482:                                              ; preds = %476
-  %483 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 2
-  %484 = load ptr, ptr %483, align 8
-  %485 = icmp ult ptr %484, %471
-  br i1 %485, label %495, label %486, !prof !7
+483:                                              ; preds = %476
+  %484 = getelementptr inbounds nuw i8, ptr %467, i64 16
+  %485 = load ptr, ptr %484, align 8
+  %486 = icmp ult ptr %485, %474
+  br i1 %486, label %496, label %487, !prof !7
 
-486:                                              ; preds = %482
-  %487 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %484, i64 0, i32 3
-  %488 = load ptr, ptr %487, align 8
-  %489 = icmp eq ptr %488, %464
-  br i1 %489, label %490, label %495, !prof !8
+487:                                              ; preds = %483
+  %488 = getelementptr inbounds nuw i8, ptr %485, i64 24
+  %489 = load ptr, ptr %488, align 8
+  %490 = icmp eq ptr %489, %467
+  br i1 %490, label %491, label %496, !prof !8
 
-490:                                              ; preds = %486
-  %491 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %480, i64 0, i32 2
-  %492 = load ptr, ptr %491, align 8
-  %493 = icmp eq ptr %492, %464
-  br i1 %493, label %494, label %495, !prof !8
+491:                                              ; preds = %487
+  %492 = getelementptr inbounds nuw i8, ptr %481, i64 16
+  %493 = load ptr, ptr %492, align 8
+  %494 = icmp eq ptr %493, %467
+  br i1 %494, label %495, label %496, !prof !8
 
-494:                                              ; preds = %490
-  store ptr %480, ptr %487, align 8
-  store ptr %484, ptr %491, align 8
-  br label %524
+495:                                              ; preds = %491
+  store ptr %481, ptr %488, align 8
+  store ptr %485, ptr %492, align 8
+  br label %525
 
-495:                                              ; preds = %490, %486, %482
-  call void @abort() #9
+496:                                              ; preds = %491, %487, %483
+  call void @abort() #11
   unreachable
 
-496:                                              ; preds = %476
-  %497 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 4, i64 1
-  %498 = load ptr, ptr %497, align 8
-  %499 = icmp eq ptr %498, null
-  br i1 %499, label %500, label %504
+497:                                              ; preds = %476
+  %498 = getelementptr inbounds nuw i8, ptr %467, i64 40
+  %499 = load ptr, ptr %498, align 8
+  %500 = icmp eq ptr %499, null
+  br i1 %500, label %501, label %505
 
-500:                                              ; preds = %496
-  %501 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 4
-  %502 = load ptr, ptr %501, align 8
-  %503 = icmp eq ptr %502, null
-  br i1 %503, label %524, label %504
+501:                                              ; preds = %497
+  %502 = getelementptr inbounds nuw i8, ptr %467, i64 32
+  %503 = load ptr, ptr %502, align 8
+  %504 = icmp eq ptr %503, null
+  br i1 %504, label %525, label %505
 
-504:                                              ; preds = %500, %496
-  %505 = phi ptr [ %501, %500 ], [ %497, %496 ]
-  %506 = phi ptr [ %502, %500 ], [ %498, %496 ]
-  br label %507
+505:                                              ; preds = %501, %497
+  %506 = phi ptr [ %498, %497 ], [ %502, %501 ]
+  %507 = phi ptr [ %499, %497 ], [ %503, %501 ]
+  br label %508
 
-507:                                              ; preds = %517, %504
-  %508 = phi ptr [ %505, %504 ], [ %518, %517 ]
-  %509 = phi ptr [ %506, %504 ], [ %519, %517 ]
-  %510 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %509, i64 0, i32 4, i64 1
-  %511 = load ptr, ptr %510, align 8
-  %512 = icmp eq ptr %511, null
-  br i1 %512, label %513, label %517
+508:                                              ; preds = %518, %505
+  %509 = phi ptr [ %506, %505 ], [ %519, %518 ]
+  %510 = phi ptr [ %507, %505 ], [ %520, %518 ]
+  %511 = getelementptr inbounds nuw i8, ptr %510, i64 40
+  %512 = load ptr, ptr %511, align 8
+  %513 = icmp eq ptr %512, null
+  br i1 %513, label %514, label %518
 
-513:                                              ; preds = %507
-  %514 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %509, i64 0, i32 4
-  %515 = load ptr, ptr %514, align 8
-  %516 = icmp eq ptr %515, null
-  br i1 %516, label %520, label %517
+514:                                              ; preds = %508
+  %515 = getelementptr inbounds nuw i8, ptr %510, i64 32
+  %516 = load ptr, ptr %515, align 8
+  %517 = icmp eq ptr %516, null
+  br i1 %517, label %521, label %518
 
-517:                                              ; preds = %513, %507
-  %518 = phi ptr [ %510, %507 ], [ %514, %513 ]
-  %519 = phi ptr [ %511, %507 ], [ %515, %513 ]
-  br label %507, !llvm.loop !16
+518:                                              ; preds = %514, %508
+  %519 = phi ptr [ %511, %508 ], [ %515, %514 ]
+  %520 = phi ptr [ %512, %508 ], [ %516, %514 ]
+  br label %508, !llvm.loop !12
 
-520:                                              ; preds = %513
-  %521 = icmp ult ptr %508, %471
-  br i1 %521, label %523, label %522, !prof !7
+521:                                              ; preds = %514
+  %522 = icmp ult ptr %509, %474
+  br i1 %522, label %524, label %523, !prof !7
 
-522:                                              ; preds = %520
-  store ptr null, ptr %508, align 8
-  br label %524
+523:                                              ; preds = %521
+  store ptr null, ptr %509, align 8
+  br label %525
 
-523:                                              ; preds = %520
-  call void @abort() #9
+524:                                              ; preds = %521
+  call void @abort() #11
   unreachable
 
-524:                                              ; preds = %522, %500, %494
-  %525 = phi ptr [ %480, %494 ], [ %509, %522 ], [ null, %500 ]
-  %526 = icmp eq ptr %478, null
-  br i1 %526, label %580, label %527
+525:                                              ; preds = %523, %501, %495
+  %526 = phi ptr [ %481, %495 ], [ %510, %523 ], [ null, %501 ]
+  %527 = icmp eq ptr %479, null
+  br i1 %527, label %583, label %528
 
-527:                                              ; preds = %524
-  %528 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 6
-  %529 = load i32, ptr %528, align 8
-  %530 = zext i32 %529 to i64
-  %531 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %530
-  %532 = load ptr, ptr %531, align 8
-  %533 = icmp eq ptr %464, %532
-  br i1 %533, label %534, label %544
+528:                                              ; preds = %525
+  %529 = getelementptr inbounds nuw i8, ptr %467, i64 56
+  %530 = load i32, ptr %529, align 8
+  %531 = zext i32 %530 to i64
+  %532 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %531
+  %533 = load ptr, ptr %532, align 8
+  %534 = icmp eq ptr %467, %533
+  br i1 %534, label %535, label %545
 
-534:                                              ; preds = %527
-  store ptr %525, ptr %531, align 8
-  %535 = icmp eq ptr %525, null
-  br i1 %535, label %538, label %536
+535:                                              ; preds = %528
+  store ptr %526, ptr %532, align 8
+  %536 = icmp eq ptr %526, null
+  br i1 %536, label %539, label %537
 
-536:                                              ; preds = %534
-  %537 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  br label %555
+537:                                              ; preds = %535
+  %538 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  br label %558
 
-538:                                              ; preds = %534
-  %539 = load i32, ptr %528, align 8
-  %540 = shl nuw i32 1, %539
-  %541 = xor i32 %540, -1
-  %542 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %543 = and i32 %542, %541
-  store i32 %543, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %580
+539:                                              ; preds = %535
+  %540 = load i32, ptr %529, align 8
+  %541 = shl nuw i32 1, %540
+  %542 = xor i32 %541, -1
+  %543 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %544 = and i32 %543, %542
+  store i32 %544, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %583
 
-544:                                              ; preds = %527
-  %545 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %546 = icmp ult ptr %478, %545
-  br i1 %546, label %554, label %547, !prof !7
+545:                                              ; preds = %528
+  %546 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %547 = icmp ult ptr %479, %546
+  br i1 %547, label %555, label %548, !prof !7
 
-547:                                              ; preds = %544
-  %548 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %478, i64 0, i32 4
-  %549 = load ptr, ptr %548, align 8
-  %550 = icmp eq ptr %549, %464
-  %551 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %478, i64 0, i32 4, i64 1
-  %552 = select i1 %550, ptr %548, ptr %551
-  store ptr %525, ptr %552, align 8
-  %553 = icmp eq ptr %525, null
-  br i1 %553, label %580, label %555
+548:                                              ; preds = %545
+  %549 = getelementptr inbounds nuw i8, ptr %479, i64 32
+  %550 = load ptr, ptr %549, align 8
+  %551 = icmp eq ptr %550, %467
+  br i1 %551, label %552, label %553
 
-554:                                              ; preds = %544
-  call void @abort() #9
+552:                                              ; preds = %548
+  store ptr %526, ptr %549, align 8
+  br label %556
+
+553:                                              ; preds = %548
+  %554 = getelementptr inbounds nuw i8, ptr %479, i64 40
+  store ptr %526, ptr %554, align 8
+  br label %556
+
+555:                                              ; preds = %545
+  call void @abort() #11
   unreachable
 
-555:                                              ; preds = %547, %536
-  %556 = phi ptr [ %537, %536 ], [ %545, %547 ]
-  %557 = icmp ult ptr %525, %556
-  br i1 %557, label %579, label %558, !prof !7
+556:                                              ; preds = %553, %552
+  %557 = icmp eq ptr %526, null
+  br i1 %557, label %583, label %558
 
-558:                                              ; preds = %555
-  %559 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %525, i64 0, i32 5
-  store ptr %478, ptr %559, align 8
-  %560 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 4
-  %561 = load ptr, ptr %560, align 8
-  %562 = icmp eq ptr %561, null
-  br i1 %562, label %569, label %563
+558:                                              ; preds = %556, %537
+  %559 = phi ptr [ %538, %537 ], [ %546, %556 ]
+  %560 = icmp ult ptr %526, %559
+  br i1 %560, label %582, label %561, !prof !7
 
-563:                                              ; preds = %558
-  %564 = icmp ult ptr %561, %556
-  br i1 %564, label %568, label %565, !prof !7
+561:                                              ; preds = %558
+  %562 = getelementptr inbounds nuw i8, ptr %526, i64 48
+  store ptr %479, ptr %562, align 8
+  %563 = getelementptr inbounds nuw i8, ptr %467, i64 32
+  %564 = load ptr, ptr %563, align 8
+  %565 = icmp eq ptr %564, null
+  br i1 %565, label %572, label %566
 
-565:                                              ; preds = %563
-  %566 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %525, i64 0, i32 4
-  store ptr %561, ptr %566, align 8
-  %567 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %561, i64 0, i32 5
-  store ptr %525, ptr %567, align 8
-  br label %569
+566:                                              ; preds = %561
+  %567 = icmp ult ptr %564, %559
+  br i1 %567, label %571, label %568, !prof !7
 
-568:                                              ; preds = %563
-  call void @abort() #9
+568:                                              ; preds = %566
+  %569 = getelementptr inbounds nuw i8, ptr %526, i64 32
+  store ptr %564, ptr %569, align 8
+  %570 = getelementptr inbounds nuw i8, ptr %564, i64 48
+  store ptr %526, ptr %570, align 8
+  br label %572
+
+571:                                              ; preds = %566
+  call void @abort() #11
   unreachable
 
-569:                                              ; preds = %565, %558
-  %570 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 4, i64 1
-  %571 = load ptr, ptr %570, align 8
-  %572 = icmp eq ptr %571, null
-  br i1 %572, label %580, label %573
+572:                                              ; preds = %568, %561
+  %573 = getelementptr inbounds nuw i8, ptr %467, i64 40
+  %574 = load ptr, ptr %573, align 8
+  %575 = icmp eq ptr %574, null
+  br i1 %575, label %583, label %576
 
-573:                                              ; preds = %569
-  %574 = icmp ult ptr %571, %556
-  br i1 %574, label %578, label %575, !prof !7
+576:                                              ; preds = %572
+  %577 = icmp ult ptr %574, %559
+  br i1 %577, label %581, label %578, !prof !7
 
-575:                                              ; preds = %573
-  %576 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %525, i64 0, i32 4, i64 1
-  store ptr %571, ptr %576, align 8
-  %577 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %571, i64 0, i32 5
-  store ptr %525, ptr %577, align 8
-  br label %580
+578:                                              ; preds = %576
+  %579 = getelementptr inbounds nuw i8, ptr %526, i64 40
+  store ptr %574, ptr %579, align 8
+  %580 = getelementptr inbounds nuw i8, ptr %574, i64 48
+  store ptr %526, ptr %580, align 8
+  br label %583
 
-578:                                              ; preds = %573
-  call void @abort() #9
+581:                                              ; preds = %576
+  call void @abort() #11
   unreachable
 
-579:                                              ; preds = %555
-  call void @abort() #9
+582:                                              ; preds = %558
+  call void @abort() #11
   unreachable
 
-580:                                              ; preds = %575, %569, %547, %538, %524
-  %581 = icmp ult i64 %463, 32
-  br i1 %581, label %582, label %590
+583:                                              ; preds = %578, %572, %556, %539, %525
+  %584 = icmp ult i64 %466, 32
+  br i1 %584, label %585, label %593
 
-582:                                              ; preds = %580
-  %583 = add nuw i64 %463, %355
-  %584 = or i64 %583, 3
-  %585 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 1
-  store i64 %584, ptr %585, align 8
-  %586 = getelementptr inbounds i8, ptr %464, i64 %583
-  %587 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %586, i64 0, i32 1
-  %588 = load i64, ptr %587, align 8
-  %589 = or i64 %588, 1
-  store i64 %589, ptr %587, align 8
-  br label %696
+585:                                              ; preds = %583
+  %586 = add nuw i64 %466, %357
+  %587 = or i64 %586, 3
+  %588 = getelementptr inbounds nuw i8, ptr %467, i64 8
+  store i64 %587, ptr %588, align 8
+  %589 = getelementptr inbounds nuw i8, ptr %467, i64 %586
+  %590 = getelementptr inbounds nuw i8, ptr %589, i64 8
+  %591 = load i64, ptr %590, align 8
+  %592 = or i64 %591, 1
+  store i64 %592, ptr %590, align 8
+  br label %700
 
-590:                                              ; preds = %580
-  %591 = or disjoint i64 %355, 3
-  %592 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %464, i64 0, i32 1
-  store i64 %591, ptr %592, align 8
-  %593 = or i64 %463, 1
-  %594 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %474, i64 0, i32 1
-  store i64 %593, ptr %594, align 8
-  %595 = getelementptr inbounds i8, ptr %474, i64 %463
-  store i64 %463, ptr %595, align 8
-  %596 = icmp ult i64 %463, 256
-  br i1 %596, label %597, label %620
+593:                                              ; preds = %583
+  %594 = or disjoint i64 %357, 3
+  %595 = getelementptr inbounds nuw i8, ptr %467, i64 8
+  store i64 %594, ptr %595, align 8
+  %596 = or i64 %466, 1
+  %597 = getelementptr inbounds nuw i8, ptr %477, i64 8
+  store i64 %596, ptr %597, align 8
+  %598 = getelementptr inbounds nuw i8, ptr %477, i64 %466
+  store i64 %466, ptr %598, align 8
+  %599 = icmp ult i64 %466, 256
+  br i1 %599, label %600, label %623
 
-597:                                              ; preds = %590
-  %598 = lshr i64 %463, 3
-  %599 = trunc i64 %598 to i32
-  %600 = shl nuw nsw i64 %598, 1
-  %601 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %600
-  %602 = load i32, ptr @__temen_dl._gm_, align 8
-  %603 = shl nuw i32 1, %599
-  %604 = and i32 %602, %603
-  %605 = icmp eq i32 %604, 0
-  br i1 %605, label %606, label %608
+600:                                              ; preds = %593
+  %601 = lshr i64 %466, 3
+  %602 = trunc nuw nsw i64 %601 to i32
+  %603 = shl nuw nsw i64 %601, 4
+  %604 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %603
+  %605 = load i32, ptr @__temen_dl._gm_, align 8
+  %606 = shl nuw i32 1, %602
+  %607 = and i32 %605, %606
+  %608 = icmp eq i32 %607, 0
+  br i1 %608, label %609, label %611
 
-606:                                              ; preds = %597
-  %607 = or i32 %602, %603
-  store i32 %607, ptr @__temen_dl._gm_, align 8
-  br label %614
+609:                                              ; preds = %600
+  %610 = or i32 %605, %606
+  store i32 %610, ptr @__temen_dl._gm_, align 8
+  br label %617
 
-608:                                              ; preds = %597
-  %609 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %601, i64 0, i32 2
-  %610 = load ptr, ptr %609, align 8
-  %611 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %612 = icmp ult ptr %610, %611
-  br i1 %612, label %613, label %614, !prof !7
+611:                                              ; preds = %600
+  %612 = getelementptr inbounds nuw i8, ptr %604, i64 16
+  %613 = load ptr, ptr %612, align 8
+  %614 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %615 = icmp ult ptr %613, %614
+  br i1 %615, label %616, label %617, !prof !7
 
-613:                                              ; preds = %608
-  call void @abort() #9
+616:                                              ; preds = %611
+  call void @abort() #11
   unreachable
 
-614:                                              ; preds = %608, %606
-  %615 = phi ptr [ %601, %606 ], [ %610, %608 ]
-  %616 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %601, i64 0, i32 2
-  store ptr %474, ptr %616, align 8
-  %617 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %615, i64 0, i32 3
-  store ptr %474, ptr %617, align 8
-  %618 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %474, i64 0, i32 2
-  store ptr %615, ptr %618, align 8
-  %619 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %474, i64 0, i32 3
-  store ptr %601, ptr %619, align 8
-  br label %696
+617:                                              ; preds = %611, %609
+  %618 = phi ptr [ %604, %609 ], [ %613, %611 ]
+  %619 = getelementptr inbounds nuw i8, ptr %604, i64 16
+  store ptr %477, ptr %619, align 8
+  %620 = getelementptr inbounds nuw i8, ptr %618, i64 24
+  store ptr %477, ptr %620, align 8
+  %621 = getelementptr inbounds nuw i8, ptr %477, i64 16
+  store ptr %618, ptr %621, align 8
+  %622 = getelementptr inbounds nuw i8, ptr %477, i64 24
+  store ptr %604, ptr %622, align 8
+  br label %700
 
-620:                                              ; preds = %590
-  %621 = lshr i64 %463, 8
-  %622 = trunc i64 %621 to i32
-  %623 = icmp eq i32 %622, 0
-  br i1 %623, label %636, label %624
+623:                                              ; preds = %593
+  %624 = lshr i64 %466, 8
+  %625 = trunc i64 %624 to i32
+  %626 = icmp eq i32 %625, 0
+  br i1 %626, label %639, label %627
 
-624:                                              ; preds = %620
-  %625 = icmp ugt i32 %622, 65535
-  br i1 %625, label %636, label %626
+627:                                              ; preds = %623
+  %628 = icmp ugt i32 %625, 65535
+  br i1 %628, label %639, label %629
 
-626:                                              ; preds = %624
-  %627 = call i32 @llvm.ctlz.i32(i32 %622, i1 true), !range !13
-  %628 = shl nuw nsw i32 %627, 1
-  %629 = sub nuw nsw i32 38, %627
-  %630 = zext nneg i32 %629 to i64
-  %631 = lshr i64 %463, %630
-  %632 = trunc i64 %631 to i32
-  %633 = and i32 %632, 1
-  %634 = or disjoint i32 %633, %628
-  %635 = xor i32 %634, 62
-  br label %636
+629:                                              ; preds = %627
+  %630 = call range(i32 16, 33) i32 @llvm.ctlz.i32(i32 %625, i1 true)
+  %631 = shl nuw nsw i32 %630, 1
+  %632 = sub nuw nsw i32 38, %630
+  %633 = zext nneg i32 %632 to i64
+  %634 = lshr i64 %466, %633
+  %635 = trunc i64 %634 to i32
+  %636 = and i32 %635, 1
+  %637 = or disjoint i32 %636, %631
+  %638 = xor i32 %637, 62
+  br label %639
 
-636:                                              ; preds = %626, %624, %620
-  %637 = phi i32 [ %635, %626 ], [ 0, %620 ], [ 31, %624 ]
-  %638 = zext nneg i32 %637 to i64
-  %639 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %638
-  %640 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 6
-  store i32 %637, ptr %640, align 8
-  %641 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 4
-  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %641, i8 0, i64 16, i1 false)
-  %642 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %643 = shl nuw i32 1, %637
-  %644 = and i32 %642, %643
-  %645 = icmp eq i32 %644, 0
-  br i1 %645, label %646, label %651
+639:                                              ; preds = %629, %627, %623
+  %640 = phi i32 [ %638, %629 ], [ 0, %623 ], [ 31, %627 ]
+  %641 = zext nneg i32 %640 to i64
+  %642 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %641
+  %643 = getelementptr inbounds nuw i8, ptr %477, i64 56
+  store i32 %640, ptr %643, align 8
+  %644 = getelementptr inbounds nuw i8, ptr %477, i64 32
+  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %644, i8 0, i64 16, i1 false)
+  %645 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %646 = shl nuw i32 1, %640
+  %647 = and i32 %645, %646
+  %648 = icmp eq i32 %647, 0
+  br i1 %648, label %649, label %654
 
-646:                                              ; preds = %636
-  %647 = or i32 %642, %643
-  store i32 %647, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  store ptr %474, ptr %639, align 8
-  %648 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 5
-  store ptr %639, ptr %648, align 8
-  %649 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 3
-  store ptr %474, ptr %649, align 8
-  %650 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 2
-  store ptr %474, ptr %650, align 8
-  br label %696
+649:                                              ; preds = %639
+  %650 = or i32 %645, %646
+  store i32 %650, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  store ptr %477, ptr %642, align 8
+  %651 = getelementptr inbounds nuw i8, ptr %477, i64 48
+  store ptr %642, ptr %651, align 8
+  %652 = getelementptr inbounds nuw i8, ptr %477, i64 24
+  store ptr %477, ptr %652, align 8
+  %653 = getelementptr inbounds nuw i8, ptr %477, i64 16
+  store ptr %477, ptr %653, align 8
+  br label %700
 
-651:                                              ; preds = %636
-  %652 = load ptr, ptr %639, align 8
-  %653 = icmp eq i32 %637, 31
-  %654 = lshr i32 %637, 1
-  %655 = add nuw nsw i32 %654, 6
-  %656 = zext nneg i32 %655 to i64
-  %657 = sub nuw nsw i64 63, %656
-  %658 = select i1 %653, i64 0, i64 %657
-  %659 = shl i64 %463, %658
-  br label %660
+654:                                              ; preds = %639
+  %655 = load ptr, ptr %642, align 8
+  %656 = icmp eq i32 %640, 31
+  %657 = lshr i32 %640, 1
+  %658 = add nuw nsw i32 %657, 6
+  %659 = zext nneg i32 %658 to i64
+  %660 = sub nuw nsw i64 63, %659
+  %661 = select i1 %656, i64 0, i64 %660
+  %662 = shl i64 %466, %661
+  br label %663
 
-660:                                              ; preds = %667, %651
-  %661 = phi ptr [ %652, %651 ], [ %671, %667 ]
-  %662 = phi i64 [ %659, %651 ], [ %670, %667 ]
-  %663 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %661, i64 0, i32 1
-  %664 = load i64, ptr %663, align 8
-  %665 = and i64 %664, -8
-  %666 = icmp eq i64 %665, %463
-  br i1 %666, label %682, label %667
+663:                                              ; preds = %670, %654
+  %664 = phi ptr [ %655, %654 ], [ %675, %670 ]
+  %665 = phi i64 [ %662, %654 ], [ %674, %670 ]
+  %666 = getelementptr inbounds nuw i8, ptr %664, i64 8
+  %667 = load i64, ptr %666, align 8
+  %668 = and i64 %667, -8
+  %669 = icmp eq i64 %668, %466
+  br i1 %669, label %686, label %670
 
-667:                                              ; preds = %660
-  %668 = lshr i64 %662, 63
-  %669 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %661, i64 0, i32 4, i64 %668
-  %670 = shl i64 %662, 1
-  %671 = load ptr, ptr %669, align 8
-  %672 = icmp eq ptr %671, null
-  br i1 %672, label %673, label %660
+670:                                              ; preds = %663
+  %671 = getelementptr inbounds nuw i8, ptr %664, i64 32
+  %672 = lshr i64 %665, 63
+  %673 = getelementptr inbounds nuw ptr, ptr %671, i64 %672
+  %674 = shl i64 %665, 1
+  %675 = load ptr, ptr %673, align 8
+  %676 = icmp eq ptr %675, null
+  br i1 %676, label %677, label %663
 
-673:                                              ; preds = %667
-  %674 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %661, i64 0, i32 4, i64 %668
-  %675 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %676 = icmp ult ptr %674, %675
-  br i1 %676, label %681, label %677, !prof !7
+677:                                              ; preds = %670
+  %678 = getelementptr inbounds nuw ptr, ptr %671, i64 %672
+  %679 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %680 = icmp ult ptr %678, %679
+  br i1 %680, label %685, label %681, !prof !7
 
-677:                                              ; preds = %673
-  store ptr %474, ptr %674, align 8
-  %678 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 5
-  store ptr %661, ptr %678, align 8
-  %679 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 3
-  store ptr %474, ptr %679, align 8
-  %680 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 2
-  store ptr %474, ptr %680, align 8
-  br label %696
+681:                                              ; preds = %677
+  store ptr %477, ptr %678, align 8
+  %682 = getelementptr inbounds nuw i8, ptr %477, i64 48
+  store ptr %664, ptr %682, align 8
+  %683 = getelementptr inbounds nuw i8, ptr %477, i64 24
+  store ptr %477, ptr %683, align 8
+  %684 = getelementptr inbounds nuw i8, ptr %477, i64 16
+  store ptr %477, ptr %684, align 8
+  br label %700
 
-681:                                              ; preds = %673
-  call void @abort() #9
+685:                                              ; preds = %677
+  call void @abort() #11
   unreachable
 
-682:                                              ; preds = %660
-  %683 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %661, i64 0, i32 2
-  %684 = load ptr, ptr %683, align 8
-  %685 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %686 = icmp uge ptr %661, %685
-  %687 = icmp uge ptr %684, %685
-  %688 = select i1 %686, i1 %687, i1 false
-  br i1 %688, label %689, label %694, !prof !8
+686:                                              ; preds = %663
+  %687 = getelementptr inbounds nuw i8, ptr %664, i64 16
+  %688 = load ptr, ptr %687, align 8
+  %689 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %690 = icmp uge ptr %664, %689
+  %691 = icmp uge ptr %688, %689
+  %692 = select i1 %690, i1 %691, i1 false, !prof !8
+  br i1 %692, label %693, label %698, !prof !8
 
-689:                                              ; preds = %682
-  %690 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %684, i64 0, i32 3
-  store ptr %474, ptr %690, align 8
-  store ptr %474, ptr %683, align 8
-  %691 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 2
-  store ptr %684, ptr %691, align 8
-  %692 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 3
-  store ptr %661, ptr %692, align 8
-  %693 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %474, i64 0, i32 5
-  store ptr null, ptr %693, align 8
-  br label %696
+693:                                              ; preds = %686
+  %694 = getelementptr inbounds nuw i8, ptr %688, i64 24
+  store ptr %477, ptr %694, align 8
+  store ptr %477, ptr %687, align 8
+  %695 = getelementptr inbounds nuw i8, ptr %477, i64 16
+  store ptr %688, ptr %695, align 8
+  %696 = getelementptr inbounds nuw i8, ptr %477, i64 24
+  store ptr %664, ptr %696, align 8
+  %697 = getelementptr inbounds nuw i8, ptr %477, i64 48
+  store ptr null, ptr %697, align 8
+  br label %700
 
-694:                                              ; preds = %682
-  call void @abort() #9
+698:                                              ; preds = %686
+  call void @abort() #11
   unreachable
 
-695:                                              ; preds = %473, %470
-  call void @abort() #9
+699:                                              ; preds = %473
+  call void @abort() #11
   unreachable
 
-696:                                              ; preds = %689, %677, %646, %614, %582
-  %697 = getelementptr inbounds i8, ptr %464, i64 16
-  br label %1198
+700:                                              ; preds = %693, %681, %649, %617, %585
+  %701 = getelementptr inbounds nuw i8, ptr %467, i64 16
+  br label %1178
 
-698:                                              ; preds = %466, %462, %423, %353, %351, %164, %85
-  %699 = phi i64 [ %355, %353 ], [ -1, %351 ], [ %44, %164 ], [ %44, %85 ], [ %355, %466 ], [ %355, %462 ], [ %355, %423 ]
-  %700 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %701 = icmp ugt i64 %699, %700
-  br i1 %701, label %722, label %702
-
-702:                                              ; preds = %698
-  %703 = sub i64 %700, %699
-  %704 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %705 = icmp ugt i64 %703, 31
-  br i1 %705, label %706, label %713
+702:                                              ; preds = %469, %465, %426, %355, %353, %164, %85
+  %703 = phi i64 [ -1, %353 ], [ %357, %355 ], [ %44, %85 ], [ %44, %164 ], [ %357, %469 ], [ %357, %465 ], [ %357, %426 ]
+  %704 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %705 = icmp ugt i64 %703, %704
+  br i1 %705, label %726, label %706
 
 706:                                              ; preds = %702
-  %707 = getelementptr inbounds i8, ptr %704, i64 %699
-  store ptr %707, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  store i64 %703, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %708 = or i64 %703, 1
-  %709 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %707, i64 0, i32 1
-  store i64 %708, ptr %709, align 8
-  %710 = getelementptr inbounds i8, ptr %704, i64 %700
-  store i64 %703, ptr %710, align 8
-  %711 = or i64 %699, 3
-  %712 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %704, i64 0, i32 1
-  store i64 %711, ptr %712, align 8
-  br label %720
+  %707 = sub nuw i64 %704, %703
+  %708 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %709 = icmp ugt i64 %707, 31
+  br i1 %709, label %710, label %717
 
-713:                                              ; preds = %702
-  store i64 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr null, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %714 = or i64 %700, 3
-  %715 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %704, i64 0, i32 1
-  store i64 %714, ptr %715, align 8
-  %716 = getelementptr inbounds i8, ptr %704, i64 %700
-  %717 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %716, i64 0, i32 1
-  %718 = load i64, ptr %717, align 8
-  %719 = or i64 %718, 1
-  store i64 %719, ptr %717, align 8
-  br label %720
+710:                                              ; preds = %706
+  %711 = getelementptr inbounds nuw i8, ptr %708, i64 %703
+  store ptr %711, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  store i64 %707, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %712 = or i64 %707, 1
+  %713 = getelementptr inbounds nuw i8, ptr %711, i64 8
+  store i64 %712, ptr %713, align 8
+  %714 = getelementptr inbounds nuw i8, ptr %708, i64 %704
+  store i64 %707, ptr %714, align 8
+  %715 = or i64 %703, 3
+  %716 = getelementptr inbounds nuw i8, ptr %708, i64 8
+  store i64 %715, ptr %716, align 8
+  br label %724
 
-720:                                              ; preds = %713, %706
-  %721 = getelementptr inbounds i8, ptr %704, i64 16
-  br label %1198
+717:                                              ; preds = %706
+  store i64 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr null, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %718 = or i64 %704, 3
+  %719 = getelementptr inbounds nuw i8, ptr %708, i64 8
+  store i64 %718, ptr %719, align 8
+  %720 = getelementptr inbounds nuw i8, ptr %708, i64 %704
+  %721 = getelementptr inbounds nuw i8, ptr %720, i64 8
+  %722 = load i64, ptr %721, align 8
+  %723 = or i64 %722, 1
+  store i64 %723, ptr %721, align 8
+  br label %724
 
-722:                                              ; preds = %698
-  %723 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %724 = icmp ult i64 %699, %723
-  br i1 %724, label %725, label %734
+724:                                              ; preds = %717, %710
+  %725 = getelementptr inbounds nuw i8, ptr %708, i64 16
+  br label %1178
 
-725:                                              ; preds = %722
-  %726 = sub i64 %723, %699
-  store i64 %726, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %727 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %728 = getelementptr inbounds i8, ptr %727, i64 %699
-  store ptr %728, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %729 = or i64 %726, 1
-  %730 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %728, i64 0, i32 1
-  store i64 %729, ptr %730, align 8
-  %731 = or i64 %699, 3
-  %732 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %727, i64 0, i32 1
-  store i64 %731, ptr %732, align 8
-  %733 = getelementptr inbounds i8, ptr %727, i64 16
-  br label %1198
+726:                                              ; preds = %702
+  %727 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %728 = icmp ult i64 %703, %727
+  br i1 %728, label %729, label %738
 
-734:                                              ; preds = %722
-  %735 = load i64, ptr @__temen_dl.mparams, align 8
-  %736 = icmp eq i64 %735, 0
-  br i1 %736, label %737, label %755
+729:                                              ; preds = %726
+  %730 = sub nuw i64 %727, %703
+  store i64 %730, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %731 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %732 = getelementptr inbounds nuw i8, ptr %731, i64 %703
+  store ptr %732, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %733 = or i64 %730, 1
+  %734 = getelementptr inbounds nuw i8, ptr %732, i64 8
+  store i64 %733, ptr %734, align 8
+  %735 = or i64 %703, 3
+  %736 = getelementptr inbounds nuw i8, ptr %731, i64 8
+  store i64 %735, ptr %736, align 8
+  %737 = getelementptr inbounds nuw i8, ptr %731, i64 16
+  br label %1178
 
-737:                                              ; preds = %734
-  %738 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
-  %739 = icmp eq i32 %738, 0
-  br i1 %739, label %747, label %740
+738:                                              ; preds = %726
+  %739 = load i64, ptr @__temen_dl.mparams, align 8
+  %740 = icmp eq i64 %739, 0
+  br i1 %740, label %741, label %759
 
-740:                                              ; preds = %746, %737
-  %741 = load volatile i32, ptr @__temen_dl.malloc_global_mutex, align 4
-  %742 = icmp eq i32 %741, 0
-  br i1 %742, label %743, label %746
+741:                                              ; preds = %738
+  %742 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
+  %743 = icmp eq i32 %742, 0
+  br i1 %743, label %751, label %744
 
-743:                                              ; preds = %740
-  %744 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
-  %745 = icmp eq i32 %744, 0
-  br i1 %745, label %747, label %746
+744:                                              ; preds = %750, %741
+  %745 = load volatile i32, ptr @__temen_dl.malloc_global_mutex, align 4
+  %746 = icmp eq i32 %745, 0
+  br i1 %746, label %747, label %750
 
-746:                                              ; preds = %743, %740
-  br label %740, !llvm.loop !5
+747:                                              ; preds = %744
+  %748 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
+  %749 = icmp eq i32 %748, 0
+  br i1 %749, label %751, label %750
 
-747:                                              ; preds = %743, %737
-  %748 = load i64, ptr @__temen_dl.mparams, align 8
-  %749 = icmp eq i64 %748, 0
-  br i1 %749, label %750, label %754
+750:                                              ; preds = %747, %744
+  br label %744, !llvm.loop !5
 
-750:                                              ; preds = %747
-  call void @llvm.lifetime.start.p0(i64 8, ptr nonnull %2) #8
-  store i64 65536, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 2), align 8
-  store i64 4096, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 1), align 8
-  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 3), i8 -1, i64 16, i1 false)
-  store i32 2, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 5), align 8
-  store i32 2, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  store i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), align 4
-  %751 = ptrtoint ptr %2 to i64
-  %752 = and i64 %751, -16
-  %753 = xor i64 %752, 1431655768
-  store volatile i64 %753, ptr @__temen_dl.mparams, align 8
-  call void @llvm.lifetime.end.p0(i64 8, ptr nonnull %2) #8
-  br label %754
+751:                                              ; preds = %747, %741
+  %752 = load i64, ptr @__temen_dl.mparams, align 8
+  %753 = icmp eq i64 %752, 0
+  br i1 %753, label %754, label %758
 
-754:                                              ; preds = %750, %747
+754:                                              ; preds = %751
+  call void @llvm.lifetime.start.p0(ptr nonnull %2) #10
+  store i64 65536, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
+  store i64 4096, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 8), align 8
+  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 24), i8 -1, i64 16, i1 false)
+  store i32 2, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 40), align 8
+  store i32 2, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  store i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
+  %755 = ptrtoint ptr %2 to i64
+  %756 = and i64 %755, -16
+  %757 = xor i64 %756, 1431655768
+  store volatile i64 %757, ptr @__temen_dl.mparams, align 8
+  call void @llvm.lifetime.end.p0(ptr nonnull %2) #10
+  br label %758
+
+758:                                              ; preds = %754, %751
   store atomic i32 0, ptr @__temen_dl.malloc_global_mutex release, align 4
-  br label %755
+  br label %759
 
-755:                                              ; preds = %754, %734
-  %756 = add i64 %699, 96
-  %757 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 2), align 8
-  %758 = add i64 %699, 95
-  %759 = add i64 %757, %758
-  %760 = sub i64 0, %757
-  %761 = and i64 %759, %760
-  %762 = icmp ugt i64 %761, %699
-  br i1 %762, label %763, label %1198
+759:                                              ; preds = %758, %738
+  %760 = add i64 %703, 96
+  %761 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
+  %762 = add i64 %703, 95
+  %763 = add i64 %761, %762
+  %764 = sub i64 0, %761
+  %765 = and i64 %763, %764
+  %766 = icmp ugt i64 %765, %703
+  br i1 %766, label %767, label %1178
 
-763:                                              ; preds = %755
-  %764 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 14), align 8
-  %765 = icmp eq i64 %764, 0
-  br i1 %765, label %772, label %766
+767:                                              ; preds = %759
+  %768 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 872), align 8
+  %769 = icmp eq i64 %768, 0
+  br i1 %769, label %776, label %770
 
-766:                                              ; preds = %763
-  %767 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 12), align 8
-  %768 = add i64 %767, %761
-  %769 = icmp ule i64 %768, %767
-  %770 = icmp ugt i64 %768, %764
-  %771 = or i1 %769, %770
-  br i1 %771, label %1198, label %772
+770:                                              ; preds = %767
+  %771 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 856), align 8
+  %772 = add i64 %771, %765
+  %773 = icmp ule i64 %772, %771
+  %774 = icmp ugt i64 %772, %768
+  %775 = or i1 %773, %774
+  br i1 %775, label %1178, label %776
 
-772:                                              ; preds = %766, %763
-  %773 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  %774 = and i32 %773, 4
-  %775 = icmp eq i32 %774, 0
-  br i1 %775, label %776, label %884
+776:                                              ; preds = %770, %767
+  %777 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %778 = and i32 %777, 4
+  %779 = icmp eq i32 %778, 0
+  br i1 %779, label %780, label %888
 
-776:                                              ; preds = %772
-  %777 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %778 = icmp eq ptr %777, null
-  br i1 %778, label %792, label %779
+780:                                              ; preds = %776
+  %781 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %782 = icmp eq ptr %781, null
+  br i1 %782, label %796, label %783
 
-779:                                              ; preds = %788, %776
-  %780 = phi ptr [ %790, %788 ], [ getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), %776 ]
-  %781 = load ptr, ptr %780, align 8
-  %782 = icmp ugt ptr %781, %777
-  br i1 %782, label %788, label %783
+783:                                              ; preds = %792, %780
+  %784 = phi ptr [ %794, %792 ], [ getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), %780 ]
+  %785 = load ptr, ptr %784, align 8
+  %786 = icmp ult ptr %781, %785
+  br i1 %786, label %792, label %787
 
-783:                                              ; preds = %779
-  %784 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %780, i64 0, i32 1
-  %785 = load i64, ptr %784, align 8
-  %786 = getelementptr inbounds i8, ptr %781, i64 %785
-  %787 = icmp ugt ptr %786, %777
-  br i1 %787, label %792, label %788
+787:                                              ; preds = %783
+  %788 = getelementptr inbounds nuw i8, ptr %784, i64 8
+  %789 = load i64, ptr %788, align 8
+  %790 = getelementptr inbounds nuw i8, ptr %785, i64 %789
+  %791 = icmp ult ptr %781, %790
+  br i1 %791, label %796, label %792
 
-788:                                              ; preds = %783, %779
-  %789 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %780, i64 0, i32 2
-  %790 = load ptr, ptr %789, align 8
-  %791 = icmp eq ptr %790, null
-  br i1 %791, label %792, label %779
+792:                                              ; preds = %787, %783
+  %793 = getelementptr inbounds nuw i8, ptr %784, i64 16
+  %794 = load ptr, ptr %793, align 8
+  %795 = icmp eq ptr %794, null
+  br i1 %795, label %796, label %783
 
-792:                                              ; preds = %788, %783, %776
-  %793 = phi ptr [ null, %776 ], [ %780, %783 ], [ null, %788 ]
-  %794 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
-  %795 = icmp eq i32 %794, 0
-  br i1 %795, label %803, label %796
+796:                                              ; preds = %792, %787, %780
+  %797 = phi ptr [ null, %780 ], [ %784, %787 ], [ null, %792 ]
+  %798 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
+  %799 = icmp eq i32 %798, 0
+  br i1 %799, label %807, label %800
 
-796:                                              ; preds = %802, %792
-  %797 = load volatile i32, ptr @__temen_dl.malloc_global_mutex, align 4
-  %798 = icmp eq i32 %797, 0
-  br i1 %798, label %799, label %802
+800:                                              ; preds = %806, %796
+  %801 = load volatile i32, ptr @__temen_dl.malloc_global_mutex, align 4
+  %802 = icmp eq i32 %801, 0
+  br i1 %802, label %803, label %806
 
-799:                                              ; preds = %796
-  %800 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
-  %801 = icmp eq i32 %800, 0
-  br i1 %801, label %803, label %802
+803:                                              ; preds = %800
+  %804 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
+  %805 = icmp eq i32 %804, 0
+  br i1 %805, label %807, label %806
 
-802:                                              ; preds = %799, %796
-  br label %796, !llvm.loop !5
+806:                                              ; preds = %803, %800
+  br label %800, !llvm.loop !5
 
-803:                                              ; preds = %799, %792
-  %804 = icmp eq ptr %793, null
-  br i1 %804, label %805, label %837
+807:                                              ; preds = %803, %796
+  %808 = icmp eq ptr %797, null
+  br i1 %808, label %809, label %841
 
-805:                                              ; preds = %803
-  %806 = call ptr @__temen_sbrk(i64 noundef 0) #8
-  %807 = icmp eq ptr %806, inttoptr (i64 -1 to ptr)
-  br i1 %807, label %877, label %808
+809:                                              ; preds = %807
+  %810 = call ptr @__temen_sbrk(i64 noundef 0) #10
+  %811 = icmp eq ptr %810, inttoptr (i64 -1 to ptr)
+  br i1 %811, label %881, label %812
 
-808:                                              ; preds = %805
-  %809 = ptrtoint ptr %806 to i64
-  %810 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 1), align 8
-  %811 = add i64 %810, -1
-  %812 = and i64 %811, %809
-  %813 = icmp eq i64 %812, 0
-  br i1 %813, label %820, label %814
+812:                                              ; preds = %809
+  %813 = ptrtoint ptr %810 to i64
+  %814 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 8), align 8
+  %815 = add i64 %814, -1
+  %816 = and i64 %815, %813
+  %817 = icmp eq i64 %816, 0
+  br i1 %817, label %824, label %818
 
-814:                                              ; preds = %808
-  %815 = add i64 %811, %809
-  %816 = sub i64 0, %810
-  %817 = and i64 %815, %816
-  %818 = sub i64 %761, %809
-  %819 = add i64 %818, %817
-  br label %820
-
-820:                                              ; preds = %814, %808
-  %821 = phi i64 [ %761, %808 ], [ %819, %814 ]
-  %822 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 12), align 8
+818:                                              ; preds = %812
+  %819 = add i64 %815, %813
+  %820 = sub i64 0, %814
+  %821 = and i64 %819, %820
+  %822 = sub i64 %765, %813
   %823 = add i64 %822, %821
-  %824 = icmp ugt i64 %821, %699
-  %825 = icmp ult i64 %821, 9223372036854775807
-  %826 = and i1 %824, %825
-  br i1 %826, label %827, label %877
+  br label %824
 
-827:                                              ; preds = %820
-  %828 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 14), align 8
-  %829 = icmp eq i64 %828, 0
-  br i1 %829, label %834, label %830
+824:                                              ; preds = %818, %812
+  %825 = phi i64 [ %765, %812 ], [ %823, %818 ]
+  %826 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 856), align 8
+  %827 = add i64 %826, %825
+  %828 = icmp ugt i64 %825, %703
+  %829 = icmp ult i64 %825, 9223372036854775807
+  %830 = and i1 %828, %829
+  br i1 %830, label %831, label %881
 
-830:                                              ; preds = %827
-  %831 = icmp ule i64 %823, %822
-  %832 = icmp ugt i64 %823, %828
-  %833 = or i1 %831, %832
-  br i1 %833, label %877, label %834
+831:                                              ; preds = %824
+  %832 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 872), align 8
+  %833 = icmp eq i64 %832, 0
+  br i1 %833, label %838, label %834
 
-834:                                              ; preds = %830, %827
-  %835 = call ptr @__temen_sbrk(i64 noundef %821) #8
-  %836 = icmp eq ptr %835, %806
-  br i1 %836, label %881, label %854
+834:                                              ; preds = %831
+  %835 = icmp ule i64 %827, %826
+  %836 = icmp ugt i64 %827, %832
+  %837 = or i1 %835, %836
+  br i1 %837, label %881, label %838
 
-837:                                              ; preds = %803
-  %838 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %839 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 2), align 8
-  %840 = sub i64 %758, %838
-  %841 = add i64 %840, %839
-  %842 = sub i64 0, %839
-  %843 = and i64 %841, %842
-  %844 = icmp ult i64 %843, 9223372036854775807
-  br i1 %844, label %845, label %877
+838:                                              ; preds = %834, %831
+  %839 = call ptr @__temen_sbrk(i64 noundef %825) #10
+  %840 = icmp eq ptr %839, %810
+  br i1 %840, label %885, label %858
 
-845:                                              ; preds = %837
-  %846 = call ptr @__temen_sbrk(i64 noundef %843) #8
-  %847 = load ptr, ptr %793, align 8
-  %848 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %793, i64 0, i32 1
-  %849 = load i64, ptr %848, align 8
-  %850 = getelementptr inbounds i8, ptr %847, i64 %849
-  %851 = icmp eq ptr %846, %850
-  br i1 %851, label %852, label %854
+841:                                              ; preds = %807
+  %842 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %843 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
+  %844 = sub i64 %762, %842
+  %845 = add i64 %844, %843
+  %846 = sub i64 0, %843
+  %847 = and i64 %845, %846
+  %848 = icmp ult i64 %847, 9223372036854775807
+  br i1 %848, label %849, label %881
 
-852:                                              ; preds = %845
-  %853 = icmp eq ptr %846, inttoptr (i64 -1 to ptr)
-  br i1 %853, label %877, label %881
+849:                                              ; preds = %841
+  %850 = call ptr @__temen_sbrk(i64 noundef %847) #10
+  %851 = load ptr, ptr %797, align 8
+  %852 = getelementptr inbounds nuw i8, ptr %797, i64 8
+  %853 = load i64, ptr %852, align 8
+  %854 = getelementptr inbounds nuw i8, ptr %851, i64 %853
+  %855 = icmp eq ptr %850, %854
+  br i1 %855, label %856, label %858
 
-854:                                              ; preds = %845, %834
-  %855 = phi i64 [ %843, %845 ], [ %821, %834 ]
-  %856 = phi ptr [ %846, %845 ], [ %835, %834 ]
-  %857 = sub nsw i64 0, %855
-  %858 = icmp ne ptr %856, inttoptr (i64 -1 to ptr)
-  %859 = icmp ult i64 %855, %756
-  %860 = and i1 %859, %858
-  br i1 %860, label %861, label %875
+856:                                              ; preds = %849
+  %857 = icmp eq ptr %850, inttoptr (i64 -1 to ptr)
+  br i1 %857, label %881, label %885
 
-861:                                              ; preds = %854
-  %862 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 2), align 8
-  %863 = sub i64 %758, %855
-  %864 = add i64 %863, %862
-  %865 = sub i64 0, %862
-  %866 = and i64 %864, %865
-  %867 = icmp ult i64 %866, 9223372036854775807
-  br i1 %867, label %868, label %881
+858:                                              ; preds = %849, %838
+  %859 = phi i64 [ %825, %838 ], [ %847, %849 ]
+  %860 = phi ptr [ %839, %838 ], [ %850, %849 ]
+  %861 = sub nsw i64 0, %859
+  %862 = icmp ne ptr %860, inttoptr (i64 -1 to ptr)
+  %863 = icmp ult i64 %859, %760
+  %864 = and i1 %863, %862
+  br i1 %864, label %865, label %879
 
-868:                                              ; preds = %861
-  %869 = call ptr @__temen_sbrk(i64 noundef %866) #8
-  %870 = icmp eq ptr %869, inttoptr (i64 -1 to ptr)
-  br i1 %870, label %873, label %871
+865:                                              ; preds = %858
+  %866 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
+  %867 = sub i64 %762, %859
+  %868 = add i64 %867, %866
+  %869 = sub i64 0, %866
+  %870 = and i64 %868, %869
+  %871 = icmp ult i64 %870, 9223372036854775807
+  br i1 %871, label %872, label %885
 
-871:                                              ; preds = %868
-  %872 = add nuw i64 %866, %855
+872:                                              ; preds = %865
+  %873 = call ptr @__temen_sbrk(i64 noundef %870) #10
+  %874 = icmp eq ptr %873, inttoptr (i64 -1 to ptr)
+  br i1 %874, label %877, label %875
+
+875:                                              ; preds = %872
+  %876 = add nuw i64 %870, %859
+  br label %885
+
+877:                                              ; preds = %872
+  %878 = call ptr @__temen_sbrk(i64 noundef %861) #10
   br label %881
 
-873:                                              ; preds = %868
-  %874 = call ptr @__temen_sbrk(i64 noundef %857) #8
-  br label %877
+879:                                              ; preds = %858
+  %880 = icmp eq ptr %860, inttoptr (i64 -1 to ptr)
+  br i1 %880, label %881, label %885
 
-875:                                              ; preds = %854
-  %876 = icmp eq ptr %856, inttoptr (i64 -1 to ptr)
-  br i1 %876, label %877, label %881
+881:                                              ; preds = %879, %877, %856, %841, %834, %824, %809
+  %882 = phi i64 [ 0, %879 ], [ %847, %856 ], [ 0, %877 ], [ 0, %834 ], [ 0, %809 ], [ 0, %824 ], [ 0, %841 ]
+  %883 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %884 = or i32 %883, 4
+  store i32 %884, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  br label %885
 
-877:                                              ; preds = %875, %873, %852, %837, %830, %820, %805
-  %878 = phi i64 [ 0, %875 ], [ 0, %873 ], [ %843, %852 ], [ 0, %820 ], [ 0, %830 ], [ 0, %805 ], [ 0, %837 ]
-  %879 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  %880 = or i32 %879, 4
-  store i32 %880, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  br label %881
-
-881:                                              ; preds = %877, %875, %871, %861, %852, %834
-  %882 = phi i64 [ %878, %877 ], [ %843, %852 ], [ %855, %875 ], [ %821, %834 ], [ %872, %871 ], [ %855, %861 ]
-  %883 = phi ptr [ inttoptr (i64 -1 to ptr), %877 ], [ %846, %852 ], [ %856, %875 ], [ %806, %834 ], [ %856, %871 ], [ %856, %861 ]
+885:                                              ; preds = %881, %879, %875, %865, %856, %838
+  %886 = phi i64 [ %847, %856 ], [ %882, %881 ], [ %859, %879 ], [ %825, %838 ], [ %876, %875 ], [ %859, %865 ]
+  %887 = phi ptr [ %850, %856 ], [ inttoptr (i64 -1 to ptr), %881 ], [ %860, %879 ], [ %810, %838 ], [ %860, %875 ], [ %860, %865 ]
   store atomic i32 0, ptr @__temen_dl.malloc_global_mutex release, align 4
-  br label %884
+  br label %888
 
-884:                                              ; preds = %881, %772
-  %885 = phi i64 [ 0, %772 ], [ %882, %881 ]
-  %886 = phi ptr [ inttoptr (i64 -1 to ptr), %772 ], [ %883, %881 ]
-  %887 = icmp eq ptr %886, inttoptr (i64 -1 to ptr)
-  %888 = icmp ult i64 %761, 9223372036854775807
-  %889 = and i1 %888, %887
-  br i1 %889, label %890, label %914
+888:                                              ; preds = %885, %776
+  %889 = phi i64 [ 0, %776 ], [ %886, %885 ]
+  %890 = phi ptr [ inttoptr (i64 -1 to ptr), %776 ], [ %887, %885 ]
+  %891 = icmp eq ptr %890, inttoptr (i64 -1 to ptr)
+  %892 = icmp ult i64 %765, 9223372036854775807
+  %893 = and i1 %892, %891
+  br i1 %893, label %894, label %918
 
-890:                                              ; preds = %884
-  %891 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
-  %892 = icmp eq i32 %891, 0
-  br i1 %892, label %900, label %893
+894:                                              ; preds = %888
+  %895 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
+  %896 = icmp eq i32 %895, 0
+  br i1 %896, label %904, label %897
 
-893:                                              ; preds = %899, %890
-  %894 = load volatile i32, ptr @__temen_dl.malloc_global_mutex, align 4
-  %895 = icmp eq i32 %894, 0
-  br i1 %895, label %896, label %899
+897:                                              ; preds = %903, %894
+  %898 = load volatile i32, ptr @__temen_dl.malloc_global_mutex, align 4
+  %899 = icmp eq i32 %898, 0
+  br i1 %899, label %900, label %903
 
-896:                                              ; preds = %893
-  %897 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
-  %898 = icmp eq i32 %897, 0
-  br i1 %898, label %900, label %899
+900:                                              ; preds = %897
+  %901 = atomicrmw xchg ptr @__temen_dl.malloc_global_mutex, i32 1 seq_cst, align 4
+  %902 = icmp eq i32 %901, 0
+  br i1 %902, label %904, label %903
 
-899:                                              ; preds = %896, %893
-  br label %893, !llvm.loop !5
+903:                                              ; preds = %900, %897
+  br label %897, !llvm.loop !5
 
-900:                                              ; preds = %896, %890
-  %901 = call ptr @__temen_sbrk(i64 noundef %761) #8
-  %902 = call ptr @__temen_sbrk(i64 noundef 0) #8
+904:                                              ; preds = %900, %894
+  %905 = call ptr @__temen_sbrk(i64 noundef %765) #10
+  %906 = call ptr @__temen_sbrk(i64 noundef 0) #10
   store atomic i32 0, ptr @__temen_dl.malloc_global_mutex release, align 4
-  %903 = icmp ne ptr %901, inttoptr (i64 -1 to ptr)
-  %904 = icmp ne ptr %902, inttoptr (i64 -1 to ptr)
-  %905 = select i1 %903, i1 %904, i1 false
-  %906 = icmp ult ptr %901, %902
-  %907 = select i1 %905, i1 %906, i1 false
-  br i1 %907, label %908, label %1196
+  %907 = icmp ne ptr %905, inttoptr (i64 -1 to ptr)
+  %908 = icmp ne ptr %906, inttoptr (i64 -1 to ptr)
+  %909 = select i1 %907, i1 %908, i1 false
+  %910 = icmp ult ptr %905, %906
+  %911 = select i1 %909, i1 %910, i1 false
+  br i1 %911, label %912, label %1176
 
-908:                                              ; preds = %900
-  %909 = ptrtoint ptr %902 to i64
-  %910 = ptrtoint ptr %901 to i64
-  %911 = sub i64 %909, %910
-  %912 = add i64 %699, 80
-  %913 = icmp ugt i64 %911, %912
-  br i1 %913, label %915, label %1196
+912:                                              ; preds = %904
+  %913 = ptrtoint ptr %906 to i64
+  %914 = ptrtoint ptr %905 to i64
+  %915 = sub i64 %913, %914
+  %916 = add i64 %703, 80
+  %917 = icmp ugt i64 %915, %916
+  br i1 %917, label %919, label %1176
 
-914:                                              ; preds = %884
-  br i1 %887, label %1196, label %915
+918:                                              ; preds = %888
+  br i1 %891, label %1176, label %919
 
-915:                                              ; preds = %914, %908
-  %916 = phi ptr [ %886, %914 ], [ %901, %908 ]
-  %917 = phi i64 [ %885, %914 ], [ %911, %908 ]
-  %918 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 12), align 8
-  %919 = add i64 %918, %917
-  store i64 %919, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 12), align 8
-  %920 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 13), align 8
-  %921 = icmp ugt i64 %919, %920
-  br i1 %921, label %922, label %923
+919:                                              ; preds = %918, %912
+  %920 = phi ptr [ %890, %918 ], [ %905, %912 ]
+  %921 = phi i64 [ %889, %918 ], [ %915, %912 ]
+  %922 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 856), align 8
+  %923 = add i64 %922, %921
+  store i64 %923, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 856), align 8
+  %924 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 864), align 8
+  %925 = icmp ugt i64 %923, %924
+  br i1 %925, label %926, label %927
 
-922:                                              ; preds = %915
-  store i64 %919, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 13), align 8
-  br label %923
+926:                                              ; preds = %919
+  store i64 %923, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 864), align 8
+  br label %927
 
-923:                                              ; preds = %922, %915
-  %924 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %925 = icmp eq ptr %924, null
-  br i1 %925, label %926, label %970
+927:                                              ; preds = %926, %919
+  %928 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %929 = icmp eq ptr %928, null
+  br i1 %929, label %930, label %950
 
-926:                                              ; preds = %923
-  %927 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %928 = icmp eq ptr %927, null
-  %929 = icmp ult ptr %916, %927
-  %930 = or i1 %928, %929
-  br i1 %930, label %931, label %932
+930:                                              ; preds = %927
+  %931 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %932 = icmp eq ptr %931, null
+  %933 = icmp ult ptr %920, %931
+  %934 = or i1 %932, %933
+  br i1 %934, label %935, label %936
 
-931:                                              ; preds = %926
-  store ptr %916, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  br label %932
+935:                                              ; preds = %930
+  store ptr %920, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  br label %936
 
-932:                                              ; preds = %931, %926
-  store ptr %916, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), align 8
-  store i64 %917, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17, i32 1), align 8
-  store i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17, i32 3), align 8
-  %933 = load i64, ptr @__temen_dl.mparams, align 8
-  store i64 %933, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 9), align 8
-  store i64 -1, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 8), align 8
-  br label %934
+936:                                              ; preds = %935, %930
+  store ptr %920, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), align 8
+  store i64 %921, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 896), align 8
+  store i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 912), align 8
+  %937 = load i64, ptr @__temen_dl.mparams, align 8
+  store i64 %937, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 64), align 8
+  store i64 -1, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 56), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 96), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 88), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 88), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 112), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 88), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 104), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 104), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 128), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 104), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 120), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 120), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 144), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 120), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 136), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 136), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 160), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 136), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 152), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 152), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 176), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 152), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 168), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 168), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 192), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 168), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 184), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 184), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 208), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 184), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 200), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 200), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 224), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 200), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 216), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 216), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 240), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 216), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 232), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 232), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 256), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 232), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 248), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 248), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 272), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 248), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 264), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 264), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 288), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 264), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 280), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 280), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 304), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 280), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 296), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 296), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 320), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 296), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 312), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 312), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 336), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 312), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 328), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 328), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 352), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 328), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 344), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 344), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 368), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 344), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 360), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 360), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 384), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 360), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 376), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 376), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 400), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 376), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 392), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 392), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 416), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 392), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 408), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 408), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 432), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 408), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 424), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 424), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 448), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 424), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 440), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 440), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 464), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 440), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 456), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 456), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 480), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 456), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 472), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 472), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 496), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 472), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 488), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 488), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 512), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 488), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 504), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 504), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 528), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 504), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 520), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 520), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 544), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 520), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 536), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 536), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 560), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 536), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 552), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 552), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 576), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 552), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 568), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 568), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 592), align 8
+  store ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 568), ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 584), align 8
+  %938 = add i64 %921, -80
+  %939 = getelementptr inbounds nuw i8, ptr %920, i64 16
+  %940 = ptrtoint ptr %939 to i64
+  %941 = sub i64 0, %940
+  %942 = and i64 %941, 15
+  %943 = getelementptr inbounds nuw i8, ptr %920, i64 %942
+  %944 = sub i64 %938, %942
+  store ptr %943, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  store i64 %944, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %945 = or i64 %944, 1
+  %946 = getelementptr inbounds nuw i8, ptr %943, i64 8
+  store i64 %945, ptr %946, align 8
+  %947 = getelementptr inbounds nuw i8, ptr %920, i64 %938
+  %948 = getelementptr inbounds nuw i8, ptr %947, i64 8
+  store i64 80, ptr %948, align 8
+  %949 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 32), align 8
+  store i64 %949, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 48), align 8
+  br label %1164
 
-934:                                              ; preds = %934, %932
-  %935 = phi i64 [ 0, %932 ], [ %955, %934 ]
-  %936 = shl nuw nsw i64 %935, 1
-  %937 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %936
-  %938 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %937, i64 0, i32 3
-  store ptr %937, ptr %938, align 8
-  %939 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %937, i64 0, i32 2
-  store ptr %937, ptr %939, align 8
-  %940 = shl nuw i64 %935, 1
-  %941 = or disjoint i64 %940, 2
-  %942 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %941
-  %943 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %942, i64 0, i32 3
-  store ptr %942, ptr %943, align 8
-  %944 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %942, i64 0, i32 2
-  store ptr %942, ptr %944, align 8
-  %945 = shl nuw i64 %935, 1
-  %946 = or disjoint i64 %945, 4
-  %947 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %946
-  %948 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %947, i64 0, i32 3
-  store ptr %947, ptr %948, align 8
-  %949 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %947, i64 0, i32 2
-  store ptr %947, ptr %949, align 8
-  %950 = shl nuw i64 %935, 1
-  %951 = or disjoint i64 %950, 6
-  %952 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %951
-  %953 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %952, i64 0, i32 3
-  store ptr %952, ptr %953, align 8
-  %954 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %952, i64 0, i32 2
-  store ptr %952, ptr %954, align 8
-  %955 = add nuw nsw i64 %935, 4
-  %956 = icmp eq i64 %955, 32
-  br i1 %956, label %957, label %934, !llvm.loop !17
+950:                                              ; preds = %957, %927
+  %951 = phi ptr [ %959, %957 ], [ getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), %927 ]
+  %952 = load ptr, ptr %951, align 8
+  %953 = getelementptr inbounds nuw i8, ptr %951, i64 8
+  %954 = load i64, ptr %953, align 8
+  %955 = getelementptr inbounds nuw i8, ptr %952, i64 %954
+  %956 = icmp eq ptr %920, %955
+  br i1 %956, label %961, label %957
 
-957:                                              ; preds = %934
-  %958 = add i64 %917, -80
-  %959 = getelementptr inbounds i8, ptr %916, i64 16
-  %960 = ptrtoint ptr %959 to i64
-  %961 = sub i64 0, %960
-  %962 = and i64 %961, 15
-  %963 = getelementptr inbounds i8, ptr %916, i64 %962
-  %964 = sub i64 %958, %962
-  store ptr %963, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  store i64 %964, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %965 = or i64 %964, 1
-  %966 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %963, i64 0, i32 1
-  store i64 %965, ptr %966, align 8
-  %967 = getelementptr inbounds i8, ptr %916, i64 %958
-  %968 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %967, i64 0, i32 1
-  store i64 80, ptr %968, align 8
-  %969 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 4), align 8
-  store i64 %969, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 7), align 8
-  br label %1184
+957:                                              ; preds = %950
+  %958 = getelementptr inbounds nuw i8, ptr %951, i64 16
+  %959 = load ptr, ptr %958, align 8
+  %960 = icmp eq ptr %959, null
+  br i1 %960, label %987, label %950, !llvm.loop !13
 
-970:                                              ; preds = %977, %923
-  %971 = phi ptr [ %979, %977 ], [ getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), %923 ]
-  %972 = load ptr, ptr %971, align 8
-  %973 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %971, i64 0, i32 1
-  %974 = load i64, ptr %973, align 8
-  %975 = getelementptr inbounds i8, ptr %972, i64 %974
-  %976 = icmp eq ptr %916, %975
-  br i1 %976, label %981, label %977
+961:                                              ; preds = %950
+  %962 = getelementptr inbounds nuw i8, ptr %951, i64 24
+  %963 = load i32, ptr %962, align 8
+  %964 = and i32 %963, 8
+  %965 = icmp eq i32 %964, 0
+  %966 = icmp uge ptr %928, %952
+  %967 = and i1 %966, %965
+  %968 = icmp ult ptr %928, %920
+  %969 = and i1 %968, %967
+  br i1 %969, label %970, label %987
 
-977:                                              ; preds = %970
-  %978 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %971, i64 0, i32 2
-  %979 = load ptr, ptr %978, align 8
-  %980 = icmp eq ptr %979, null
-  br i1 %980, label %1007, label %970, !llvm.loop !18
+970:                                              ; preds = %961
+  %971 = getelementptr inbounds nuw i8, ptr %951, i64 8
+  %972 = add i64 %954, %921
+  store i64 %972, ptr %971, align 8
+  %973 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %974 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %975 = add i64 %974, %921
+  %976 = getelementptr inbounds nuw i8, ptr %973, i64 16
+  %977 = ptrtoint ptr %976 to i64
+  %978 = sub i64 0, %977
+  %979 = and i64 %978, 15
+  %980 = getelementptr inbounds nuw i8, ptr %973, i64 %979
+  %981 = sub i64 %975, %979
+  store ptr %980, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  store i64 %981, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %982 = or i64 %981, 1
+  %983 = getelementptr inbounds nuw i8, ptr %980, i64 8
+  store i64 %982, ptr %983, align 8
+  %984 = getelementptr inbounds nuw i8, ptr %973, i64 %975
+  %985 = getelementptr inbounds nuw i8, ptr %984, i64 8
+  store i64 80, ptr %985, align 8
+  %986 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 32), align 8
+  store i64 %986, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 48), align 8
+  br label %1164
 
-981:                                              ; preds = %970
-  %982 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %971, i64 0, i32 3
-  %983 = load i32, ptr %982, align 8
-  %984 = and i32 %983, 8
-  %985 = icmp eq i32 %984, 0
-  %986 = icmp uge ptr %924, %972
-  %987 = and i1 %986, %985
-  %988 = icmp ult ptr %924, %916
-  %989 = and i1 %988, %987
-  br i1 %989, label %990, label %1007
+987:                                              ; preds = %961, %957
+  %988 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %989 = icmp ult ptr %920, %988
+  br i1 %989, label %990, label %991
 
-990:                                              ; preds = %981
-  %991 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %971, i64 0, i32 1
-  %992 = add i64 %974, %917
-  store i64 %992, ptr %991, align 8
-  %993 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %994 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %995 = add i64 %994, %917
-  %996 = getelementptr inbounds i8, ptr %993, i64 16
-  %997 = ptrtoint ptr %996 to i64
-  %998 = sub i64 0, %997
-  %999 = and i64 %998, 15
-  %1000 = getelementptr inbounds i8, ptr %993, i64 %999
-  %1001 = sub i64 %995, %999
-  store ptr %1000, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  store i64 %1001, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %1002 = or i64 %1001, 1
-  %1003 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1000, i64 0, i32 1
-  store i64 %1002, ptr %1003, align 8
-  %1004 = getelementptr inbounds i8, ptr %993, i64 %995
-  %1005 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1004, i64 0, i32 1
-  store i64 80, ptr %1005, align 8
-  %1006 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 4), align 8
-  store i64 %1006, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 7), align 8
-  br label %1184
+990:                                              ; preds = %987
+  store ptr %920, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  br label %991
 
-1007:                                             ; preds = %981, %977
-  %1008 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %1009 = icmp ult ptr %916, %1008
-  br i1 %1009, label %1010, label %1011
+991:                                              ; preds = %990, %987
+  %992 = getelementptr inbounds nuw i8, ptr %920, i64 %921
+  br label %993
 
-1010:                                             ; preds = %1007
-  store ptr %916, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  br label %1011
+993:                                              ; preds = %997, %991
+  %994 = phi ptr [ getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), %991 ], [ %999, %997 ]
+  %995 = load ptr, ptr %994, align 8
+  %996 = icmp eq ptr %995, %992
+  br i1 %996, label %1001, label %997
 
-1011:                                             ; preds = %1010, %1007
-  %1012 = getelementptr inbounds i8, ptr %916, i64 %917
-  br label %1013
+997:                                              ; preds = %993
+  %998 = getelementptr inbounds nuw i8, ptr %994, i64 16
+  %999 = load ptr, ptr %998, align 8
+  %1000 = icmp eq ptr %999, null
+  br i1 %1000, label %1006, label %993, !llvm.loop !14
 
-1013:                                             ; preds = %1017, %1011
-  %1014 = phi ptr [ getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), %1011 ], [ %1019, %1017 ]
-  %1015 = load ptr, ptr %1014, align 8
-  %1016 = icmp eq ptr %1015, %1012
-  br i1 %1016, label %1021, label %1017
+1001:                                             ; preds = %993
+  %1002 = getelementptr inbounds nuw i8, ptr %994, i64 24
+  %1003 = load i32, ptr %1002, align 8
+  %1004 = and i32 %1003, 8
+  %1005 = icmp eq i32 %1004, 0
+  br i1 %1005, label %1159, label %1006
 
-1017:                                             ; preds = %1013
-  %1018 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %1014, i64 0, i32 2
-  %1019 = load ptr, ptr %1018, align 8
-  %1020 = icmp eq ptr %1019, null
-  br i1 %1020, label %1026, label %1013, !llvm.loop !19
+1006:                                             ; preds = %1001, %997
+  br label %1007
 
-1021:                                             ; preds = %1013
-  %1022 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %1014, i64 0, i32 3
-  %1023 = load i32, ptr %1022, align 8
-  %1024 = and i32 %1023, 8
-  %1025 = icmp eq i32 %1024, 0
-  br i1 %1025, label %1179, label %1026
+1007:                                             ; preds = %1016, %1006
+  %1008 = phi ptr [ %1018, %1016 ], [ getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), %1006 ]
+  %1009 = load ptr, ptr %1008, align 8
+  %1010 = icmp ult ptr %928, %1009
+  br i1 %1010, label %1016, label %1011
 
-1026:                                             ; preds = %1021, %1017
-  br label %1027
+1011:                                             ; preds = %1007
+  %1012 = getelementptr inbounds nuw i8, ptr %1008, i64 8
+  %1013 = load i64, ptr %1012, align 8
+  %1014 = getelementptr inbounds nuw i8, ptr %1009, i64 %1013
+  %1015 = icmp ult ptr %928, %1014
+  br i1 %1015, label %1019, label %1016
 
-1027:                                             ; preds = %1036, %1026
-  %1028 = phi ptr [ %1038, %1036 ], [ getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), %1026 ]
-  %1029 = load ptr, ptr %1028, align 8
-  %1030 = icmp ugt ptr %1029, %924
-  br i1 %1030, label %1036, label %1031
+1016:                                             ; preds = %1011, %1007
+  %1017 = getelementptr inbounds nuw i8, ptr %1008, i64 16
+  %1018 = load ptr, ptr %1017, align 8, !nonnull !15, !noundef !15
+  br label %1007
 
-1031:                                             ; preds = %1027
-  %1032 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %1028, i64 0, i32 1
-  %1033 = load i64, ptr %1032, align 8
-  %1034 = getelementptr inbounds i8, ptr %1029, i64 %1033
-  %1035 = icmp ugt ptr %1034, %924
-  br i1 %1035, label %1039, label %1036
+1019:                                             ; preds = %1011
+  %1020 = getelementptr inbounds i8, ptr %1014, i64 -95
+  %1021 = getelementptr inbounds i8, ptr %1014, i64 -79
+  %1022 = ptrtoint ptr %1021 to i64
+  %1023 = sub i64 0, %1022
+  %1024 = and i64 %1023, 15
+  %1025 = getelementptr inbounds nuw i8, ptr %1020, i64 %1024
+  %1026 = getelementptr inbounds nuw i8, ptr %928, i64 32
+  %1027 = icmp ult ptr %1025, %1026
+  %1028 = select i1 %1027, ptr %928, ptr %1025
+  %1029 = getelementptr inbounds nuw i8, ptr %1028, i64 16
+  %1030 = getelementptr inbounds nuw i8, ptr %1028, i64 48
+  %1031 = add i64 %921, -80
+  %1032 = getelementptr inbounds nuw i8, ptr %920, i64 16
+  %1033 = ptrtoint ptr %1032 to i64
+  %1034 = sub i64 0, %1033
+  %1035 = and i64 %1034, 15
+  %1036 = getelementptr inbounds nuw i8, ptr %920, i64 %1035
+  %1037 = sub i64 %1031, %1035
+  store ptr %1036, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  store i64 %1037, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %1038 = or i64 %1037, 1
+  %1039 = getelementptr inbounds nuw i8, ptr %1036, i64 8
+  store i64 %1038, ptr %1039, align 8
+  %1040 = getelementptr inbounds nuw i8, ptr %920, i64 %1031
+  %1041 = getelementptr inbounds nuw i8, ptr %1040, i64 8
+  store i64 80, ptr %1041, align 8
+  %1042 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 32), align 8
+  store i64 %1042, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 48), align 8
+  %1043 = getelementptr inbounds nuw i8, ptr %1028, i64 8
+  store i64 51, ptr %1043, align 8
+  call void @llvm.memcpy.p0.p0.i64(ptr noundef nonnull align 8 dereferenceable(32) %1029, ptr noundef nonnull align 8 dereferenceable(32) getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), i64 32, i1 false)
+  store ptr %920, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 888), align 8
+  store i64 %921, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 896), align 8
+  store i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 912), align 8
+  store ptr %1029, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 904), align 8
+  br label %1044
 
-1036:                                             ; preds = %1031, %1027
-  %1037 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %1028, i64 0, i32 2
-  %1038 = load ptr, ptr %1037, align 8, !nonnull !20, !noundef !20
-  br label %1027
+1044:                                             ; preds = %1044, %1019
+  %1045 = phi ptr [ %1030, %1019 ], [ %1046, %1044 ]
+  %1046 = getelementptr inbounds nuw i8, ptr %1045, i64 8
+  store i64 11, ptr %1046, align 8
+  %1047 = getelementptr inbounds nuw i8, ptr %1045, i64 16
+  %1048 = icmp ult ptr %1047, %1014
+  br i1 %1048, label %1044, label %1049
 
-1039:                                             ; preds = %1031
-  %1040 = getelementptr inbounds i8, ptr %1034, i64 -95
-  %1041 = getelementptr inbounds i8, ptr %1034, i64 -79
-  %1042 = ptrtoint ptr %1041 to i64
-  %1043 = sub i64 0, %1042
-  %1044 = and i64 %1043, 15
-  %1045 = getelementptr inbounds i8, ptr %1040, i64 %1044
-  %1046 = getelementptr inbounds i8, ptr %924, i64 32
-  %1047 = icmp ult ptr %1045, %1046
-  %1048 = select i1 %1047, ptr %924, ptr %1045
-  %1049 = getelementptr inbounds i8, ptr %1048, i64 16
-  %1050 = getelementptr inbounds i8, ptr %1048, i64 48
-  %1051 = add i64 %917, -80
-  %1052 = getelementptr inbounds i8, ptr %916, i64 16
-  %1053 = ptrtoint ptr %1052 to i64
-  %1054 = sub i64 0, %1053
-  %1055 = and i64 %1054, 15
-  %1056 = getelementptr inbounds i8, ptr %916, i64 %1055
-  %1057 = sub i64 %1051, %1055
-  store ptr %1056, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  store i64 %1057, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %1058 = or i64 %1057, 1
-  %1059 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1056, i64 0, i32 1
-  store i64 %1058, ptr %1059, align 8
-  %1060 = getelementptr inbounds i8, ptr %916, i64 %1051
-  %1061 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1060, i64 0, i32 1
-  store i64 80, ptr %1061, align 8
-  %1062 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 4), align 8
-  store i64 %1062, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 7), align 8
-  %1063 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1048, i64 0, i32 1
-  store i64 51, ptr %1063, align 8
-  call void @llvm.memcpy.p0.p0.i64(ptr noundef nonnull align 8 dereferenceable(32) %1049, ptr noundef nonnull align 8 dereferenceable(32) getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), i64 32, i1 false)
-  store ptr %916, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17), align 8
-  store i64 %917, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17, i32 1), align 8
-  store i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17, i32 3), align 8
-  store ptr %1049, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 17, i32 2), align 8
-  br label %1064
+1049:                                             ; preds = %1044
+  %1050 = icmp eq ptr %1028, %928
+  br i1 %1050, label %1164, label %1051
 
-1064:                                             ; preds = %1064, %1039
-  %1065 = phi ptr [ %1050, %1039 ], [ %1066, %1064 ]
-  %1066 = getelementptr inbounds i8, ptr %1065, i64 8
-  store i64 11, ptr %1066, align 8
-  %1067 = getelementptr inbounds i8, ptr %1065, i64 16
-  %1068 = icmp ult ptr %1067, %1034
-  br i1 %1068, label %1064, label %1069
+1051:                                             ; preds = %1049
+  %1052 = ptrtoint ptr %1028 to i64
+  %1053 = ptrtoint ptr %928 to i64
+  %1054 = sub i64 %1052, %1053
+  %1055 = getelementptr inbounds nuw i8, ptr %928, i64 %1054
+  %1056 = getelementptr inbounds nuw i8, ptr %1055, i64 8
+  %1057 = load i64, ptr %1056, align 8
+  %1058 = and i64 %1057, -2
+  store i64 %1058, ptr %1056, align 8
+  %1059 = or i64 %1054, 1
+  %1060 = getelementptr inbounds nuw i8, ptr %928, i64 8
+  store i64 %1059, ptr %1060, align 8
+  store i64 %1054, ptr %1055, align 8
+  %1061 = icmp ult i64 %1054, 256
+  br i1 %1061, label %1062, label %1083
 
-1069:                                             ; preds = %1064
-  %1070 = icmp eq ptr %1048, %924
-  br i1 %1070, label %1184, label %1071
+1062:                                             ; preds = %1051
+  %1063 = lshr i64 %1054, 3
+  %1064 = trunc nuw nsw i64 %1063 to i32
+  %1065 = shl nuw nsw i64 %1063, 4
+  %1066 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %1065
+  %1067 = load i32, ptr @__temen_dl._gm_, align 8
+  %1068 = shl nuw i32 1, %1064
+  %1069 = and i32 %1067, %1068
+  %1070 = icmp eq i32 %1069, 0
+  br i1 %1070, label %1071, label %1073
 
-1071:                                             ; preds = %1069
-  %1072 = ptrtoint ptr %1048 to i64
-  %1073 = ptrtoint ptr %924 to i64
-  %1074 = sub i64 %1072, %1073
-  %1075 = getelementptr inbounds i8, ptr %924, i64 %1074
-  %1076 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1075, i64 0, i32 1
-  %1077 = load i64, ptr %1076, align 8
-  %1078 = and i64 %1077, -2
-  store i64 %1078, ptr %1076, align 8
-  %1079 = or i64 %1074, 1
-  %1080 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %924, i64 0, i32 1
-  store i64 %1079, ptr %1080, align 8
-  store i64 %1074, ptr %1075, align 8
-  %1081 = icmp ult i64 %1074, 256
-  br i1 %1081, label %1082, label %1105
+1071:                                             ; preds = %1062
+  %1072 = or i32 %1067, %1068
+  store i32 %1072, ptr @__temen_dl._gm_, align 8
+  br label %1079
 
-1082:                                             ; preds = %1071
-  %1083 = lshr i64 %1074, 3
-  %1084 = trunc i64 %1083 to i32
-  %1085 = shl nuw nsw i64 %1083, 1
-  %1086 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %1085
-  %1087 = load i32, ptr @__temen_dl._gm_, align 8
-  %1088 = shl nuw i32 1, %1084
-  %1089 = and i32 %1087, %1088
-  %1090 = icmp eq i32 %1089, 0
-  br i1 %1090, label %1091, label %1093
+1073:                                             ; preds = %1062
+  %1074 = getelementptr inbounds nuw i8, ptr %1066, i64 16
+  %1075 = load ptr, ptr %1074, align 8
+  %1076 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %1077 = icmp ult ptr %1075, %1076
+  br i1 %1077, label %1078, label %1079, !prof !7
 
-1091:                                             ; preds = %1082
-  %1092 = or i32 %1087, %1088
-  store i32 %1092, ptr @__temen_dl._gm_, align 8
+1078:                                             ; preds = %1073
+  call void @abort() #11
+  unreachable
+
+1079:                                             ; preds = %1073, %1071
+  %1080 = phi ptr [ %1066, %1071 ], [ %1075, %1073 ]
+  %1081 = getelementptr inbounds nuw i8, ptr %1066, i64 16
+  store ptr %928, ptr %1081, align 8
+  %1082 = getelementptr inbounds nuw i8, ptr %1080, i64 24
+  store ptr %928, ptr %1082, align 8
+  br label %1152
+
+1083:                                             ; preds = %1051
+  %1084 = lshr i64 %1054, 8
+  %1085 = trunc i64 %1084 to i32
+  %1086 = icmp eq i32 %1085, 0
+  br i1 %1086, label %1099, label %1087
+
+1087:                                             ; preds = %1083
+  %1088 = icmp ugt i32 %1085, 65535
+  br i1 %1088, label %1099, label %1089
+
+1089:                                             ; preds = %1087
+  %1090 = call range(i32 16, 33) i32 @llvm.ctlz.i32(i32 %1085, i1 true)
+  %1091 = shl nuw nsw i32 %1090, 1
+  %1092 = sub nuw nsw i32 38, %1090
+  %1093 = zext nneg i32 %1092 to i64
+  %1094 = lshr i64 %1054, %1093
+  %1095 = trunc i64 %1094 to i32
+  %1096 = and i32 %1095, 1
+  %1097 = or disjoint i32 %1096, %1091
+  %1098 = xor i32 %1097, 62
   br label %1099
 
-1093:                                             ; preds = %1082
-  %1094 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1086, i64 0, i32 2
-  %1095 = load ptr, ptr %1094, align 8
-  %1096 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %1097 = icmp ult ptr %1095, %1096
-  br i1 %1097, label %1098, label %1099, !prof !7
+1099:                                             ; preds = %1089, %1087, %1083
+  %1100 = phi i32 [ %1098, %1089 ], [ 0, %1083 ], [ 31, %1087 ]
+  %1101 = zext nneg i32 %1100 to i64
+  %1102 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %1101
+  %1103 = getelementptr inbounds nuw i8, ptr %928, i64 56
+  store i32 %1100, ptr %1103, align 8
+  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %1026, i8 0, i64 16, i1 false)
+  %1104 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %1105 = shl nuw i32 1, %1100
+  %1106 = and i32 %1104, %1105
+  %1107 = icmp eq i32 %1106, 0
+  br i1 %1107, label %1108, label %1111
 
-1098:                                             ; preds = %1093
-  call void @abort() #9
+1108:                                             ; preds = %1099
+  %1109 = or i32 %1104, %1105
+  store i32 %1109, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  store ptr %928, ptr %1102, align 8
+  %1110 = getelementptr inbounds nuw i8, ptr %928, i64 48
+  store ptr %1102, ptr %1110, align 8
+  br label %1152
+
+1111:                                             ; preds = %1099
+  %1112 = load ptr, ptr %1102, align 8
+  %1113 = icmp eq i32 %1100, 31
+  %1114 = lshr i32 %1100, 1
+  %1115 = add nuw nsw i32 %1114, 6
+  %1116 = zext nneg i32 %1115 to i64
+  %1117 = sub nuw nsw i64 63, %1116
+  %1118 = select i1 %1113, i64 0, i64 %1117
+  %1119 = shl i64 %1054, %1118
+  br label %1120
+
+1120:                                             ; preds = %1127, %1111
+  %1121 = phi ptr [ %1112, %1111 ], [ %1132, %1127 ]
+  %1122 = phi i64 [ %1119, %1111 ], [ %1131, %1127 ]
+  %1123 = getelementptr inbounds nuw i8, ptr %1121, i64 8
+  %1124 = load i64, ptr %1123, align 8
+  %1125 = and i64 %1124, -8
+  %1126 = icmp eq i64 %1125, %1054
+  br i1 %1126, label %1141, label %1127
+
+1127:                                             ; preds = %1120
+  %1128 = getelementptr inbounds nuw i8, ptr %1121, i64 32
+  %1129 = lshr i64 %1122, 63
+  %1130 = getelementptr inbounds nuw ptr, ptr %1128, i64 %1129
+  %1131 = shl i64 %1122, 1
+  %1132 = load ptr, ptr %1130, align 8
+  %1133 = icmp eq ptr %1132, null
+  br i1 %1133, label %1134, label %1120
+
+1134:                                             ; preds = %1127
+  %1135 = getelementptr inbounds nuw ptr, ptr %1128, i64 %1129
+  %1136 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %1137 = icmp ult ptr %1135, %1136
+  br i1 %1137, label %1140, label %1138, !prof !7
+
+1138:                                             ; preds = %1134
+  store ptr %928, ptr %1135, align 8
+  %1139 = getelementptr inbounds nuw i8, ptr %928, i64 48
+  store ptr %1121, ptr %1139, align 8
+  br label %1152
+
+1140:                                             ; preds = %1134
+  call void @abort() #11
   unreachable
 
-1099:                                             ; preds = %1093, %1091
-  %1100 = phi ptr [ %1086, %1091 ], [ %1095, %1093 ]
-  %1101 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1086, i64 0, i32 2
-  store ptr %924, ptr %1101, align 8
-  %1102 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1100, i64 0, i32 3
-  store ptr %924, ptr %1102, align 8
-  %1103 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %924, i64 0, i32 2
-  store ptr %1100, ptr %1103, align 8
-  %1104 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %924, i64 0, i32 3
-  store ptr %1086, ptr %1104, align 8
-  br label %1184
+1141:                                             ; preds = %1120
+  %1142 = getelementptr inbounds nuw i8, ptr %1121, i64 16
+  %1143 = load ptr, ptr %1142, align 8
+  %1144 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %1145 = icmp uge ptr %1121, %1144
+  %1146 = icmp uge ptr %1143, %1144
+  %1147 = select i1 %1145, i1 %1146, i1 false, !prof !8
+  br i1 %1147, label %1148, label %1151, !prof !8
 
-1105:                                             ; preds = %1071
-  %1106 = lshr i64 %1074, 8
-  %1107 = trunc i64 %1106 to i32
-  %1108 = icmp eq i32 %1107, 0
-  br i1 %1108, label %1121, label %1109
+1148:                                             ; preds = %1141
+  %1149 = getelementptr inbounds nuw i8, ptr %1143, i64 24
+  store ptr %928, ptr %1149, align 8
+  store ptr %928, ptr %1142, align 8
+  %1150 = getelementptr inbounds nuw i8, ptr %928, i64 16
+  store ptr %1143, ptr %1150, align 8
+  br label %1152
 
-1109:                                             ; preds = %1105
-  %1110 = icmp ugt i32 %1107, 65535
-  br i1 %1110, label %1121, label %1111
-
-1111:                                             ; preds = %1109
-  %1112 = call i32 @llvm.ctlz.i32(i32 %1107, i1 true), !range !13
-  %1113 = shl nuw nsw i32 %1112, 1
-  %1114 = sub nuw nsw i32 38, %1112
-  %1115 = zext nneg i32 %1114 to i64
-  %1116 = lshr i64 %1074, %1115
-  %1117 = trunc i64 %1116 to i32
-  %1118 = and i32 %1117, 1
-  %1119 = or disjoint i32 %1118, %1113
-  %1120 = xor i32 %1119, 62
-  br label %1121
-
-1121:                                             ; preds = %1111, %1109, %1105
-  %1122 = phi i32 [ %1120, %1111 ], [ 0, %1105 ], [ 31, %1109 ]
-  %1123 = zext nneg i32 %1122 to i64
-  %1124 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %1123
-  %1125 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 6
-  store i32 %1122, ptr %1125, align 8
-  call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %1046, i8 0, i64 16, i1 false)
-  %1126 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %1127 = shl nuw i32 1, %1122
-  %1128 = and i32 %1126, %1127
-  %1129 = icmp eq i32 %1128, 0
-  br i1 %1129, label %1130, label %1135
-
-1130:                                             ; preds = %1121
-  %1131 = or i32 %1126, %1127
-  store i32 %1131, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  store ptr %924, ptr %1124, align 8
-  %1132 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 5
-  store ptr %1124, ptr %1132, align 8
-  %1133 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 3
-  store ptr %924, ptr %1133, align 8
-  %1134 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 2
-  store ptr %924, ptr %1134, align 8
-  br label %1184
-
-1135:                                             ; preds = %1121
-  %1136 = load ptr, ptr %1124, align 8
-  %1137 = icmp eq i32 %1122, 31
-  %1138 = lshr i32 %1122, 1
-  %1139 = add nuw nsw i32 %1138, 6
-  %1140 = zext nneg i32 %1139 to i64
-  %1141 = sub nuw nsw i64 63, %1140
-  %1142 = select i1 %1137, i64 0, i64 %1141
-  %1143 = shl i64 %1074, %1142
-  br label %1144
-
-1144:                                             ; preds = %1151, %1135
-  %1145 = phi ptr [ %1136, %1135 ], [ %1155, %1151 ]
-  %1146 = phi i64 [ %1143, %1135 ], [ %1154, %1151 ]
-  %1147 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %1145, i64 0, i32 1
-  %1148 = load i64, ptr %1147, align 8
-  %1149 = and i64 %1148, -8
-  %1150 = icmp eq i64 %1149, %1074
-  br i1 %1150, label %1166, label %1151
-
-1151:                                             ; preds = %1144
-  %1152 = lshr i64 %1146, 63
-  %1153 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %1145, i64 0, i32 4, i64 %1152
-  %1154 = shl i64 %1146, 1
-  %1155 = load ptr, ptr %1153, align 8
-  %1156 = icmp eq ptr %1155, null
-  br i1 %1156, label %1157, label %1144
-
-1157:                                             ; preds = %1151
-  %1158 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %1145, i64 0, i32 4, i64 %1152
-  %1159 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %1160 = icmp ult ptr %1158, %1159
-  br i1 %1160, label %1165, label %1161, !prof !7
-
-1161:                                             ; preds = %1157
-  store ptr %924, ptr %1158, align 8
-  %1162 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 5
-  store ptr %1145, ptr %1162, align 8
-  %1163 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 3
-  store ptr %924, ptr %1163, align 8
-  %1164 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 2
-  store ptr %924, ptr %1164, align 8
-  br label %1184
-
-1165:                                             ; preds = %1157
-  call void @abort() #9
+1151:                                             ; preds = %1141
+  call void @abort() #11
   unreachable
 
-1166:                                             ; preds = %1144
-  %1167 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %1145, i64 0, i32 2
-  %1168 = load ptr, ptr %1167, align 8
-  %1169 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %1170 = icmp uge ptr %1145, %1169
-  %1171 = icmp uge ptr %1168, %1169
-  %1172 = select i1 %1170, i1 %1171, i1 false
-  br i1 %1172, label %1173, label %1178, !prof !8
+1152:                                             ; preds = %1148, %1138, %1108, %1079
+  %1153 = phi i64 [ 24, %1138 ], [ 16, %1079 ], [ 24, %1148 ], [ 24, %1108 ]
+  %1154 = phi ptr [ %928, %1138 ], [ %1080, %1079 ], [ %1121, %1148 ], [ %928, %1108 ]
+  %1155 = phi i64 [ 16, %1138 ], [ 24, %1079 ], [ 48, %1148 ], [ 16, %1108 ]
+  %1156 = phi ptr [ %928, %1138 ], [ %1066, %1079 ], [ null, %1148 ], [ %928, %1108 ]
+  %1157 = getelementptr inbounds nuw i8, ptr %928, i64 %1153
+  store ptr %1154, ptr %1157, align 8
+  %1158 = getelementptr inbounds nuw i8, ptr %928, i64 %1155
+  store ptr %1156, ptr %1158, align 8
+  br label %1164
 
-1173:                                             ; preds = %1166
-  %1174 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %1168, i64 0, i32 3
-  store ptr %924, ptr %1174, align 8
-  store ptr %924, ptr %1167, align 8
-  %1175 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 2
-  store ptr %1168, ptr %1175, align 8
-  %1176 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 3
-  store ptr %1145, ptr %1176, align 8
-  %1177 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %924, i64 0, i32 5
-  store ptr null, ptr %1177, align 8
+1159:                                             ; preds = %1001
+  store ptr %920, ptr %994, align 8
+  %1160 = getelementptr inbounds nuw i8, ptr %994, i64 8
+  %1161 = load i64, ptr %1160, align 8
+  %1162 = add i64 %1161, %921
+  store i64 %1162, ptr %1160, align 8
+  %1163 = call fastcc ptr @__temen_dl.prepend_alloc(ptr noundef %920, ptr noundef %995, i64 noundef range(i64 -1, -105) %703)
+  br label %1178
+
+1164:                                             ; preds = %1152, %1049, %970, %936
+  %1165 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %1166 = icmp ult i64 %703, %1165
+  br i1 %1166, label %1167, label %1176
+
+1167:                                             ; preds = %1164
+  %1168 = sub nuw i64 %1165, %703
+  store i64 %1168, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %1169 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %1170 = getelementptr inbounds nuw i8, ptr %1169, i64 %703
+  store ptr %1170, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %1171 = or i64 %1168, 1
+  %1172 = getelementptr inbounds nuw i8, ptr %1170, i64 8
+  store i64 %1171, ptr %1172, align 8
+  %1173 = or i64 %703, 3
+  %1174 = getelementptr inbounds nuw i8, ptr %1169, i64 8
+  store i64 %1173, ptr %1174, align 8
+  %1175 = getelementptr inbounds nuw i8, ptr %1169, i64 16
+  br label %1178
+
+1176:                                             ; preds = %1164, %918, %912, %904
+  %1177 = tail call ptr @__errno_location() #12
+  store i32 12, ptr %1177, align 4
+  br label %1178
+
+1178:                                             ; preds = %1176, %1167, %1159, %770, %759, %729, %724, %700, %351, %163, %124, %76
+  %1179 = phi ptr [ %725, %724 ], [ %737, %729 ], [ %701, %700 ], [ null, %770 ], [ null, %759 ], [ %1175, %1167 ], [ null, %1176 ], [ %1163, %1159 ], [ %102, %163 ], [ %102, %124 ], [ %352, %351 ], [ %60, %76 ]
+  %1180 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %1181 = and i32 %1180, 2
+  %1182 = icmp eq i32 %1181, 0
+  br i1 %1182, label %1184, label %1183
+
+1183:                                             ; preds = %1178
+  store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
   br label %1184
 
-1178:                                             ; preds = %1166
-  call void @abort() #9
-  unreachable
-
-1179:                                             ; preds = %1021
-  store ptr %916, ptr %1014, align 8
-  %1180 = getelementptr inbounds %__temen_dl.malloc_segment, ptr %1014, i64 0, i32 1
-  %1181 = load i64, ptr %1180, align 8
-  %1182 = add i64 %1181, %917
-  store i64 %1182, ptr %1180, align 8
-  %1183 = call fastcc ptr @__temen_dl.prepend_alloc(ptr noundef %916, ptr noundef %1012, i64 noundef %699)
-  br label %1198
-
-1184:                                             ; preds = %1173, %1161, %1130, %1099, %1069, %990, %957
-  %1185 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %1186 = icmp ugt i64 %1185, %699
-  br i1 %1186, label %1187, label %1196
-
-1187:                                             ; preds = %1184
-  %1188 = sub i64 %1185, %699
-  store i64 %1188, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %1189 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %1190 = getelementptr inbounds i8, ptr %1189, i64 %699
-  store ptr %1190, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %1191 = or i64 %1188, 1
-  %1192 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1190, i64 0, i32 1
-  store i64 %1191, ptr %1192, align 8
-  %1193 = or i64 %699, 3
-  %1194 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %1189, i64 0, i32 1
-  store i64 %1193, ptr %1194, align 8
-  %1195 = getelementptr inbounds i8, ptr %1189, i64 16
-  br label %1198
-
-1196:                                             ; preds = %1184, %914, %908, %900
-  %1197 = tail call ptr @__errno_location() #10
-  store i32 12, ptr %1197, align 4
-  br label %1198
-
-1198:                                             ; preds = %1196, %1187, %1179, %766, %755, %725, %720, %696, %349, %163, %124, %76
-  %1199 = phi ptr [ %721, %720 ], [ %733, %725 ], [ %697, %696 ], [ %1195, %1187 ], [ null, %1196 ], [ %1183, %1179 ], [ null, %755 ], [ null, %766 ], [ %350, %349 ], [ %102, %124 ], [ %102, %163 ], [ %60, %76 ]
-  %1200 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  %1201 = and i32 %1200, 2
-  %1202 = icmp eq i32 %1201, 0
-  br i1 %1202, label %1204, label %1203
-
-1203:                                             ; preds = %1198
-  store atomic i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16) release, align 4
-  br label %1204
-
-1204:                                             ; preds = %1203, %1198
-  ret ptr %1199
+1184:                                             ; preds = %1183, %1178
+  ret ptr %1179
 }
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #1
+declare void @llvm.lifetime.start.p0(ptr captures(none)) #1
 
-; Function Attrs: noreturn nounwind
+; Function Attrs: cold nofree noreturn nounwind
 declare void @abort() local_unnamed_addr #2
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #1
+declare void @llvm.lifetime.end.p0(ptr captures(none)) #1
 
 ; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
 declare i32 @llvm.cttz.i32(i32, i1 immarg) #3
 
-; Function Attrs: nounwind uwtable
-define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
+; Function Attrs: nofree nounwind uwtable
+define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   %2 = icmp eq ptr %0, null
-  br i1 %2, label %495, label %3
+  br i1 %2, label %499, label %3
 
 3:                                                ; preds = %1
   %4 = getelementptr inbounds i8, ptr %0, i64 -16
-  %5 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
+  %5 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
   %6 = and i32 %5, 2
   %7 = icmp eq i32 %6, 0
   br i1 %7, label %18, label %8
 
 8:                                                ; preds = %3
-  %9 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %9 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %10 = icmp eq i32 %9, 0
   br i1 %10, label %18, label %11
 
 11:                                               ; preds = %17, %8
-  %12 = load volatile i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), align 4
+  %12 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
   %13 = icmp eq i32 %12, 0
   br i1 %13, label %14, label %17
 
 14:                                               ; preds = %11
-  %15 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %15 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %16 = icmp eq i32 %15, 0
   br i1 %16, label %18, label %17
 
@@ -2022,41 +2060,41 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
   br label %11, !llvm.loop !5
 
 18:                                               ; preds = %14, %8, %3
-  %19 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %19 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %20 = icmp ult ptr %4, %19
-  br i1 %20, label %489, label %21, !prof !7
+  br i1 %20, label %493, label %21, !prof !7
 
 21:                                               ; preds = %18
   %22 = getelementptr inbounds i8, ptr %0, i64 -8
   %23 = load i64, ptr %22, align 8
   %24 = and i64 %23, 3
   %25 = icmp eq i64 %24, 1
-  br i1 %25, label %489, label %26, !prof !7
+  br i1 %25, label %493, label %26, !prof !7
 
 26:                                               ; preds = %21
   %27 = and i64 %23, -8
   %28 = getelementptr inbounds i8, ptr %4, i64 %27
   %29 = and i64 %23, 1
   %30 = icmp eq i64 %29, 0
-  br i1 %30, label %31, label %193
+  br i1 %30, label %31, label %195
 
 31:                                               ; preds = %26
   %32 = load i64, ptr %4, align 8
   %33 = and i64 %23, 2
   %34 = icmp eq i64 %33, 0
-  br i1 %34, label %490, label %35
+  br i1 %34, label %494, label %35
 
 35:                                               ; preds = %31
   %36 = sub i64 0, %32
   %37 = getelementptr inbounds i8, ptr %4, i64 %36
   %38 = add i64 %32, %27
   %39 = icmp ult ptr %37, %19
-  br i1 %39, label %489, label %40, !prof !7
+  br i1 %39, label %493, label %40, !prof !7
 
 40:                                               ; preds = %35
-  %41 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+  %41 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
   %42 = icmp eq ptr %37, %41
-  br i1 %42, label %183, label %43
+  br i1 %42, label %185, label %43
 
 43:                                               ; preds = %40
   %44 = icmp ult i64 %32, 256
@@ -2064,13 +2102,13 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
 
 45:                                               ; preds = %43
   %46 = lshr i64 %32, 3
-  %47 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %37, i64 0, i32 2
+  %47 = getelementptr inbounds nuw i8, ptr %37, i64 16
   %48 = load ptr, ptr %47, align 8
-  %49 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %37, i64 0, i32 3
+  %49 = getelementptr inbounds nuw i8, ptr %37, i64 24
   %50 = load ptr, ptr %49, align 8
-  %51 = trunc i64 %46 to i32
-  %52 = shl nuw nsw i64 %46, 1
-  %53 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %52
+  %51 = trunc nuw nsw i64 %46 to i32
+  %52 = shl nuw nsw i64 %46, 4
+  %53 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %52
   %54 = icmp eq ptr %48, %53
   br i1 %54, label %61, label %55
 
@@ -2079,7 +2117,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
   br i1 %56, label %80, label %57
 
 57:                                               ; preds = %55
-  %58 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %48, i64 0, i32 3
+  %58 = getelementptr inbounds nuw i8, ptr %48, i64 24
   %59 = load ptr, ptr %58, align 8
   %60 = icmp eq ptr %59, %37
   br i1 %60, label %61, label %80, !prof !8
@@ -2094,7 +2132,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
   %66 = load i32, ptr @__temen_dl._gm_, align 8
   %67 = and i32 %66, %65
   store i32 %67, ptr @__temen_dl._gm_, align 8
-  br label %193
+  br label %195
 
 68:                                               ; preds = %61
   %69 = icmp eq ptr %50, %53
@@ -2105,48 +2143,48 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
   br i1 %71, label %79, label %72
 
 72:                                               ; preds = %70
-  %73 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %50, i64 0, i32 2
+  %73 = getelementptr inbounds nuw i8, ptr %50, i64 16
   %74 = load ptr, ptr %73, align 8
   %75 = icmp eq ptr %74, %37
   br i1 %75, label %76, label %79, !prof !8
 
 76:                                               ; preds = %72, %68
-  %77 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %48, i64 0, i32 3
+  %77 = getelementptr inbounds nuw i8, ptr %48, i64 24
   store ptr %50, ptr %77, align 8
-  %78 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %50, i64 0, i32 2
+  %78 = getelementptr inbounds nuw i8, ptr %50, i64 16
   store ptr %48, ptr %78, align 8
-  br label %193
+  br label %195
 
 79:                                               ; preds = %72, %70
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 80:                                               ; preds = %57, %55
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 81:                                               ; preds = %43
-  %82 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 5
+  %82 = getelementptr inbounds nuw i8, ptr %37, i64 48
   %83 = load ptr, ptr %82, align 8
-  %84 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 3
+  %84 = getelementptr inbounds nuw i8, ptr %37, i64 24
   %85 = load ptr, ptr %84, align 8
   %86 = icmp eq ptr %85, %37
   br i1 %86, label %101, label %87
 
 87:                                               ; preds = %81
-  %88 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 2
+  %88 = getelementptr inbounds nuw i8, ptr %37, i64 16
   %89 = load ptr, ptr %88, align 8
   %90 = icmp ult ptr %89, %19
   br i1 %90, label %100, label %91, !prof !7
 
 91:                                               ; preds = %87
-  %92 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %89, i64 0, i32 3
+  %92 = getelementptr inbounds nuw i8, ptr %89, i64 24
   %93 = load ptr, ptr %92, align 8
   %94 = icmp eq ptr %93, %37
   br i1 %94, label %95, label %100, !prof !8
 
 95:                                               ; preds = %91
-  %96 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %85, i64 0, i32 2
+  %96 = getelementptr inbounds nuw i8, ptr %85, i64 16
   %97 = load ptr, ptr %96, align 8
   %98 = icmp eq ptr %97, %37
   br i1 %98, label %99, label %100, !prof !8
@@ -2157,30 +2195,30 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
   br label %129
 
 100:                                              ; preds = %95, %91, %87
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 101:                                              ; preds = %81
-  %102 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 4, i64 1
+  %102 = getelementptr inbounds nuw i8, ptr %37, i64 40
   %103 = load ptr, ptr %102, align 8
   %104 = icmp eq ptr %103, null
   br i1 %104, label %105, label %109
 
 105:                                              ; preds = %101
-  %106 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 4
+  %106 = getelementptr inbounds nuw i8, ptr %37, i64 32
   %107 = load ptr, ptr %106, align 8
   %108 = icmp eq ptr %107, null
   br i1 %108, label %129, label %109
 
 109:                                              ; preds = %105, %101
-  %110 = phi ptr [ %106, %105 ], [ %102, %101 ]
-  %111 = phi ptr [ %107, %105 ], [ %103, %101 ]
+  %110 = phi ptr [ %102, %101 ], [ %106, %105 ]
+  %111 = phi ptr [ %103, %101 ], [ %107, %105 ]
   br label %112
 
 112:                                              ; preds = %118, %109
   %113 = phi ptr [ %110, %109 ], [ %119, %118 ]
   %114 = phi ptr [ %111, %109 ], [ %120, %118 ]
-  %115 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %114, i64 0, i32 4, i64 1
+  %115 = getelementptr inbounds nuw i8, ptr %114, i64 40
   %116 = load ptr, ptr %115, align 8
   %117 = icmp eq ptr %116, null
   br i1 %117, label %121, label %118
@@ -2188,10 +2226,10 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
 118:                                              ; preds = %121, %112
   %119 = phi ptr [ %115, %112 ], [ %122, %121 ]
   %120 = phi ptr [ %116, %112 ], [ %123, %121 ]
-  br label %112, !llvm.loop !21
+  br label %112, !llvm.loop !16
 
 121:                                              ; preds = %112
-  %122 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %114, i64 0, i32 4
+  %122 = getelementptr inbounds nuw i8, ptr %114, i64 32
   %123 = load ptr, ptr %122, align 8
   %124 = icmp eq ptr %123, null
   br i1 %124, label %125, label %118
@@ -2205,19 +2243,19 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
   br label %129
 
 128:                                              ; preds = %125
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 129:                                              ; preds = %127, %105, %99
   %130 = phi ptr [ %85, %99 ], [ %114, %127 ], [ null, %105 ]
   %131 = icmp eq ptr %83, null
-  br i1 %131, label %193, label %132
+  br i1 %131, label %195, label %132
 
 132:                                              ; preds = %129
-  %133 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 6
+  %133 = getelementptr inbounds nuw i8, ptr %37, i64 56
   %134 = load i32, ptr %133, align 8
   %135 = zext i32 %134 to i64
-  %136 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %135
+  %136 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %135
   %137 = load ptr, ptr %136, align 8
   %138 = icmp eq ptr %37, %137
   br i1 %138, label %139, label %147
@@ -2225,632 +2263,644 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #0 {
 139:                                              ; preds = %132
   store ptr %130, ptr %136, align 8
   %140 = icmp eq ptr %130, null
-  br i1 %140, label %141, label %158
+  br i1 %140, label %141, label %160
 
 141:                                              ; preds = %139
   %142 = load i32, ptr %133, align 8
   %143 = shl nuw i32 1, %142
   %144 = xor i32 %143, -1
-  %145 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
+  %145 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
   %146 = and i32 %145, %144
-  store i32 %146, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %193
+  store i32 %146, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %195
 
 147:                                              ; preds = %132
-  %148 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %148 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %149 = icmp ult ptr %83, %148
   br i1 %149, label %157, label %150, !prof !7
 
 150:                                              ; preds = %147
-  %151 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %83, i64 0, i32 4
+  %151 = getelementptr inbounds nuw i8, ptr %83, i64 32
   %152 = load ptr, ptr %151, align 8
   %153 = icmp eq ptr %152, %37
-  %154 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %83, i64 0, i32 4, i64 1
-  %155 = select i1 %153, ptr %151, ptr %154
-  store ptr %130, ptr %155, align 8
-  %156 = icmp eq ptr %130, null
-  br i1 %156, label %193, label %158
+  br i1 %153, label %154, label %155
+
+154:                                              ; preds = %150
+  store ptr %130, ptr %151, align 8
+  br label %158
+
+155:                                              ; preds = %150
+  %156 = getelementptr inbounds nuw i8, ptr %83, i64 40
+  store ptr %130, ptr %156, align 8
+  br label %158
 
 157:                                              ; preds = %147
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
-158:                                              ; preds = %150, %139
-  %159 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %160 = icmp ult ptr %130, %159
-  br i1 %160, label %182, label %161, !prof !7
+158:                                              ; preds = %155, %154
+  %159 = icmp eq ptr %130, null
+  br i1 %159, label %195, label %160
 
-161:                                              ; preds = %158
-  %162 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %130, i64 0, i32 5
-  store ptr %83, ptr %162, align 8
-  %163 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 4
-  %164 = load ptr, ptr %163, align 8
-  %165 = icmp eq ptr %164, null
-  br i1 %165, label %172, label %166
+160:                                              ; preds = %158, %139
+  %161 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %162 = icmp ult ptr %130, %161
+  br i1 %162, label %184, label %163, !prof !7
 
-166:                                              ; preds = %161
-  %167 = icmp ult ptr %164, %159
-  br i1 %167, label %171, label %168, !prof !7
+163:                                              ; preds = %160
+  %164 = getelementptr inbounds nuw i8, ptr %130, i64 48
+  store ptr %83, ptr %164, align 8
+  %165 = getelementptr inbounds nuw i8, ptr %37, i64 32
+  %166 = load ptr, ptr %165, align 8
+  %167 = icmp eq ptr %166, null
+  br i1 %167, label %174, label %168
 
-168:                                              ; preds = %166
-  %169 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %130, i64 0, i32 4
-  store ptr %164, ptr %169, align 8
-  %170 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %164, i64 0, i32 5
-  store ptr %130, ptr %170, align 8
-  br label %172
+168:                                              ; preds = %163
+  %169 = icmp ult ptr %166, %161
+  br i1 %169, label %173, label %170, !prof !7
 
-171:                                              ; preds = %166
-  tail call void @abort() #9
+170:                                              ; preds = %168
+  %171 = getelementptr inbounds nuw i8, ptr %130, i64 32
+  store ptr %166, ptr %171, align 8
+  %172 = getelementptr inbounds nuw i8, ptr %166, i64 48
+  store ptr %130, ptr %172, align 8
+  br label %174
+
+173:                                              ; preds = %168
+  tail call void @abort() #11
   unreachable
 
-172:                                              ; preds = %168, %161
-  %173 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %37, i64 0, i32 4, i64 1
-  %174 = load ptr, ptr %173, align 8
-  %175 = icmp eq ptr %174, null
-  br i1 %175, label %193, label %176
+174:                                              ; preds = %170, %163
+  %175 = getelementptr inbounds nuw i8, ptr %37, i64 40
+  %176 = load ptr, ptr %175, align 8
+  %177 = icmp eq ptr %176, null
+  br i1 %177, label %195, label %178
 
-176:                                              ; preds = %172
-  %177 = icmp ult ptr %174, %159
-  br i1 %177, label %181, label %178, !prof !7
+178:                                              ; preds = %174
+  %179 = icmp ult ptr %176, %161
+  br i1 %179, label %183, label %180, !prof !7
 
-178:                                              ; preds = %176
-  %179 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %130, i64 0, i32 4, i64 1
-  store ptr %174, ptr %179, align 8
-  %180 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 5
-  store ptr %130, ptr %180, align 8
-  br label %193
+180:                                              ; preds = %178
+  %181 = getelementptr inbounds nuw i8, ptr %130, i64 40
+  store ptr %176, ptr %181, align 8
+  %182 = getelementptr inbounds nuw i8, ptr %176, i64 48
+  store ptr %130, ptr %182, align 8
+  br label %195
 
-181:                                              ; preds = %176
-  tail call void @abort() #9
+183:                                              ; preds = %178
+  tail call void @abort() #11
   unreachable
 
-182:                                              ; preds = %158
-  tail call void @abort() #9
+184:                                              ; preds = %160
+  tail call void @abort() #11
   unreachable
 
-183:                                              ; preds = %40
-  %184 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %28, i64 0, i32 1
-  %185 = load i64, ptr %184, align 8
-  %186 = and i64 %185, 3
-  %187 = icmp eq i64 %186, 3
-  br i1 %187, label %188, label %193
+185:                                              ; preds = %40
+  %186 = getelementptr inbounds nuw i8, ptr %28, i64 8
+  %187 = load i64, ptr %186, align 8
+  %188 = and i64 %187, 3
+  %189 = icmp eq i64 %188, 3
+  br i1 %189, label %190, label %195
 
-188:                                              ; preds = %183
-  store i64 %38, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %189 = load i64, ptr %184, align 8
-  %190 = and i64 %189, -2
-  store i64 %190, ptr %184, align 8
-  %191 = or i64 %38, 1
-  %192 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %37, i64 0, i32 1
-  store i64 %191, ptr %192, align 8
+190:                                              ; preds = %185
+  store i64 %38, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %191 = load i64, ptr %186, align 8
+  %192 = and i64 %191, -2
+  store i64 %192, ptr %186, align 8
+  %193 = or i64 %38, 1
+  %194 = getelementptr inbounds nuw i8, ptr %37, i64 8
+  store i64 %193, ptr %194, align 8
   store i64 %38, ptr %28, align 8
-  br label %490
+  br label %494
 
-193:                                              ; preds = %183, %178, %172, %150, %141, %129, %76, %63, %26
-  %194 = phi i64 [ %27, %26 ], [ %38, %129 ], [ %38, %172 ], [ %38, %178 ], [ %38, %150 ], [ %38, %76 ], [ %38, %63 ], [ %38, %183 ], [ %38, %141 ]
-  %195 = phi ptr [ %4, %26 ], [ %37, %129 ], [ %37, %172 ], [ %37, %178 ], [ %37, %150 ], [ %37, %76 ], [ %37, %63 ], [ %37, %183 ], [ %37, %141 ]
-  %196 = icmp ult ptr %195, %28
-  br i1 %196, label %197, label %489, !prof !8
+195:                                              ; preds = %185, %180, %174, %158, %141, %129, %76, %63, %26
+  %196 = phi i64 [ %27, %26 ], [ %38, %129 ], [ %38, %174 ], [ %38, %180 ], [ %38, %158 ], [ %38, %76 ], [ %38, %63 ], [ %38, %185 ], [ %38, %141 ]
+  %197 = phi ptr [ %4, %26 ], [ %37, %129 ], [ %37, %174 ], [ %37, %180 ], [ %37, %158 ], [ %37, %76 ], [ %37, %63 ], [ %37, %185 ], [ %37, %141 ]
+  %198 = icmp ult ptr %197, %28
+  br i1 %198, label %199, label %493, !prof !8
 
-197:                                              ; preds = %193
-  %198 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %28, i64 0, i32 1
-  %199 = load i64, ptr %198, align 8
-  %200 = and i64 %199, 1
-  %201 = icmp eq i64 %200, 0
-  br i1 %201, label %489, label %202, !prof !7
+199:                                              ; preds = %195
+  %200 = getelementptr inbounds nuw i8, ptr %28, i64 8
+  %201 = load i64, ptr %200, align 8
+  %202 = and i64 %201, 1
+  %203 = icmp eq i64 %202, 0
+  br i1 %203, label %493, label %204, !prof !7
 
-202:                                              ; preds = %197
-  %203 = and i64 %199, 2
-  %204 = icmp eq i64 %203, 0
-  br i1 %204, label %205, label %378
+204:                                              ; preds = %199
+  %205 = and i64 %201, 2
+  %206 = icmp eq i64 %205, 0
+  br i1 %206, label %207, label %382
 
-205:                                              ; preds = %202
-  %206 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %207 = icmp eq ptr %28, %206
-  br i1 %207, label %208, label %216
+207:                                              ; preds = %204
+  %208 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %209 = icmp eq ptr %28, %208
+  br i1 %209, label %210, label %218
 
-208:                                              ; preds = %205
-  %209 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %210 = add i64 %209, %194
-  store i64 %210, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  store ptr %195, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %211 = or i64 %210, 1
-  %212 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 1
-  store i64 %211, ptr %212, align 8
-  %213 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %214 = icmp eq ptr %195, %213
-  br i1 %214, label %215, label %490
+210:                                              ; preds = %207
+  %211 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %212 = add i64 %211, %196
+  store i64 %212, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  store ptr %197, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %213 = or i64 %212, 1
+  %214 = getelementptr inbounds nuw i8, ptr %197, i64 8
+  store i64 %213, ptr %214, align 8
+  %215 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %216 = icmp eq ptr %197, %215
+  br i1 %216, label %217, label %494
 
-215:                                              ; preds = %208
-  store ptr null, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  store i64 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  br label %490
+217:                                              ; preds = %210
+  store ptr null, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  store i64 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  br label %494
 
-216:                                              ; preds = %205
-  %217 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %218 = icmp eq ptr %28, %217
-  br i1 %218, label %219, label %225
+218:                                              ; preds = %207
+  %219 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %220 = icmp eq ptr %28, %219
+  br i1 %220, label %221, label %227
 
-219:                                              ; preds = %216
-  %220 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %221 = add i64 %220, %194
-  store i64 %221, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr %195, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %222 = or i64 %221, 1
-  %223 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 1
-  store i64 %222, ptr %223, align 8
-  %224 = getelementptr inbounds i8, ptr %195, i64 %221
-  store i64 %221, ptr %224, align 8
-  br label %490
+221:                                              ; preds = %218
+  %222 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %223 = add i64 %222, %196
+  store i64 %223, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr %197, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %224 = or i64 %223, 1
+  %225 = getelementptr inbounds nuw i8, ptr %197, i64 8
+  store i64 %224, ptr %225, align 8
+  %226 = getelementptr inbounds nuw i8, ptr %197, i64 %223
+  store i64 %223, ptr %226, align 8
+  br label %494
 
-225:                                              ; preds = %216
-  %226 = and i64 %199, -8
-  %227 = add i64 %226, %194
-  %228 = icmp ult i64 %199, 256
-  br i1 %228, label %229, label %267
+227:                                              ; preds = %218
+  %228 = and i64 %201, -8
+  %229 = add i64 %228, %196
+  %230 = icmp ult i64 %201, 256
+  br i1 %230, label %231, label %269
 
-229:                                              ; preds = %225
-  %230 = lshr i64 %199, 3
-  %231 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %28, i64 0, i32 2
-  %232 = load ptr, ptr %231, align 8
-  %233 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %28, i64 0, i32 3
+231:                                              ; preds = %227
+  %232 = lshr i64 %201, 3
+  %233 = getelementptr inbounds nuw i8, ptr %28, i64 16
   %234 = load ptr, ptr %233, align 8
-  %235 = trunc i64 %230 to i32
-  %236 = shl nuw nsw i64 %230, 1
-  %237 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %236
-  %238 = icmp eq ptr %232, %237
-  br i1 %238, label %246, label %239
+  %235 = getelementptr inbounds nuw i8, ptr %28, i64 24
+  %236 = load ptr, ptr %235, align 8
+  %237 = trunc nuw nsw i64 %232 to i32
+  %238 = shl nuw nsw i64 %232, 4
+  %239 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %238
+  %240 = icmp eq ptr %234, %239
+  br i1 %240, label %248, label %241
 
-239:                                              ; preds = %229
-  %240 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %241 = icmp ult ptr %232, %240
-  br i1 %241, label %266, label %242
+241:                                              ; preds = %231
+  %242 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %243 = icmp ult ptr %234, %242
+  br i1 %243, label %268, label %244
 
-242:                                              ; preds = %239
-  %243 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %232, i64 0, i32 3
-  %244 = load ptr, ptr %243, align 8
-  %245 = icmp eq ptr %244, %28
-  br i1 %245, label %246, label %266, !prof !8
+244:                                              ; preds = %241
+  %245 = getelementptr inbounds nuw i8, ptr %234, i64 24
+  %246 = load ptr, ptr %245, align 8
+  %247 = icmp eq ptr %246, %28
+  br i1 %247, label %248, label %268, !prof !8
 
-246:                                              ; preds = %242, %229
-  %247 = icmp eq ptr %234, %232
-  br i1 %247, label %248, label %253
+248:                                              ; preds = %244, %231
+  %249 = icmp eq ptr %236, %234
+  br i1 %249, label %250, label %255
 
-248:                                              ; preds = %246
-  %249 = shl nuw i32 1, %235
-  %250 = xor i32 %249, -1
-  %251 = load i32, ptr @__temen_dl._gm_, align 8
-  %252 = and i32 %251, %250
-  store i32 %252, ptr @__temen_dl._gm_, align 8
-  br label %371
+250:                                              ; preds = %248
+  %251 = shl nuw i32 1, %237
+  %252 = xor i32 %251, -1
+  %253 = load i32, ptr @__temen_dl._gm_, align 8
+  %254 = and i32 %253, %252
+  store i32 %254, ptr @__temen_dl._gm_, align 8
+  br label %375
 
-253:                                              ; preds = %246
-  %254 = icmp eq ptr %234, %237
-  br i1 %254, label %262, label %255
+255:                                              ; preds = %248
+  %256 = icmp eq ptr %236, %239
+  br i1 %256, label %264, label %257
 
-255:                                              ; preds = %253
-  %256 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %257 = icmp ult ptr %234, %256
-  br i1 %257, label %265, label %258
+257:                                              ; preds = %255
+  %258 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %259 = icmp ult ptr %236, %258
+  br i1 %259, label %267, label %260
 
-258:                                              ; preds = %255
-  %259 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %234, i64 0, i32 2
-  %260 = load ptr, ptr %259, align 8
-  %261 = icmp eq ptr %260, %28
-  br i1 %261, label %262, label %265, !prof !8
+260:                                              ; preds = %257
+  %261 = getelementptr inbounds nuw i8, ptr %236, i64 16
+  %262 = load ptr, ptr %261, align 8
+  %263 = icmp eq ptr %262, %28
+  br i1 %263, label %264, label %267, !prof !8
 
-262:                                              ; preds = %258, %253
-  %263 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %232, i64 0, i32 3
-  store ptr %234, ptr %263, align 8
-  %264 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %234, i64 0, i32 2
-  store ptr %232, ptr %264, align 8
-  br label %371
+264:                                              ; preds = %260, %255
+  %265 = getelementptr inbounds nuw i8, ptr %234, i64 24
+  store ptr %236, ptr %265, align 8
+  %266 = getelementptr inbounds nuw i8, ptr %236, i64 16
+  store ptr %234, ptr %266, align 8
+  br label %375
 
-265:                                              ; preds = %258, %255
-  tail call void @abort() #9
+267:                                              ; preds = %260, %257
+  tail call void @abort() #11
   unreachable
 
-266:                                              ; preds = %242, %239
-  tail call void @abort() #9
+268:                                              ; preds = %244, %241
+  tail call void @abort() #11
   unreachable
 
-267:                                              ; preds = %225
-  %268 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 5
-  %269 = load ptr, ptr %268, align 8
-  %270 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 3
+269:                                              ; preds = %227
+  %270 = getelementptr inbounds nuw i8, ptr %28, i64 48
   %271 = load ptr, ptr %270, align 8
-  %272 = icmp eq ptr %271, %28
-  br i1 %272, label %288, label %273
+  %272 = getelementptr inbounds nuw i8, ptr %28, i64 24
+  %273 = load ptr, ptr %272, align 8
+  %274 = icmp eq ptr %273, %28
+  br i1 %274, label %290, label %275
 
-273:                                              ; preds = %267
-  %274 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 2
-  %275 = load ptr, ptr %274, align 8
-  %276 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %277 = icmp ult ptr %275, %276
-  br i1 %277, label %287, label %278, !prof !7
+275:                                              ; preds = %269
+  %276 = getelementptr inbounds nuw i8, ptr %28, i64 16
+  %277 = load ptr, ptr %276, align 8
+  %278 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %279 = icmp ult ptr %277, %278
+  br i1 %279, label %289, label %280, !prof !7
 
-278:                                              ; preds = %273
-  %279 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %275, i64 0, i32 3
-  %280 = load ptr, ptr %279, align 8
-  %281 = icmp eq ptr %280, %28
-  br i1 %281, label %282, label %287, !prof !8
+280:                                              ; preds = %275
+  %281 = getelementptr inbounds nuw i8, ptr %277, i64 24
+  %282 = load ptr, ptr %281, align 8
+  %283 = icmp eq ptr %282, %28
+  br i1 %283, label %284, label %289, !prof !8
 
-282:                                              ; preds = %278
-  %283 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %271, i64 0, i32 2
-  %284 = load ptr, ptr %283, align 8
-  %285 = icmp eq ptr %284, %28
-  br i1 %285, label %286, label %287, !prof !8
+284:                                              ; preds = %280
+  %285 = getelementptr inbounds nuw i8, ptr %273, i64 16
+  %286 = load ptr, ptr %285, align 8
+  %287 = icmp eq ptr %286, %28
+  br i1 %287, label %288, label %289, !prof !8
 
-286:                                              ; preds = %282
-  store ptr %271, ptr %279, align 8
-  store ptr %275, ptr %283, align 8
-  br label %317
+288:                                              ; preds = %284
+  store ptr %273, ptr %281, align 8
+  store ptr %277, ptr %285, align 8
+  br label %319
 
-287:                                              ; preds = %282, %278, %273
-  tail call void @abort() #9
+289:                                              ; preds = %284, %280, %275
+  tail call void @abort() #11
   unreachable
 
-288:                                              ; preds = %267
-  %289 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 4, i64 1
-  %290 = load ptr, ptr %289, align 8
-  %291 = icmp eq ptr %290, null
-  br i1 %291, label %292, label %296
+290:                                              ; preds = %269
+  %291 = getelementptr inbounds nuw i8, ptr %28, i64 40
+  %292 = load ptr, ptr %291, align 8
+  %293 = icmp eq ptr %292, null
+  br i1 %293, label %294, label %298
 
-292:                                              ; preds = %288
-  %293 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 4
-  %294 = load ptr, ptr %293, align 8
-  %295 = icmp eq ptr %294, null
-  br i1 %295, label %317, label %296
+294:                                              ; preds = %290
+  %295 = getelementptr inbounds nuw i8, ptr %28, i64 32
+  %296 = load ptr, ptr %295, align 8
+  %297 = icmp eq ptr %296, null
+  br i1 %297, label %319, label %298
 
-296:                                              ; preds = %292, %288
-  %297 = phi ptr [ %293, %292 ], [ %289, %288 ]
-  %298 = phi ptr [ %294, %292 ], [ %290, %288 ]
-  br label %299
+298:                                              ; preds = %294, %290
+  %299 = phi ptr [ %291, %290 ], [ %295, %294 ]
+  %300 = phi ptr [ %292, %290 ], [ %296, %294 ]
+  br label %301
 
-299:                                              ; preds = %305, %296
-  %300 = phi ptr [ %297, %296 ], [ %306, %305 ]
-  %301 = phi ptr [ %298, %296 ], [ %307, %305 ]
-  %302 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %301, i64 0, i32 4, i64 1
-  %303 = load ptr, ptr %302, align 8
-  %304 = icmp eq ptr %303, null
-  br i1 %304, label %308, label %305
+301:                                              ; preds = %307, %298
+  %302 = phi ptr [ %299, %298 ], [ %308, %307 ]
+  %303 = phi ptr [ %300, %298 ], [ %309, %307 ]
+  %304 = getelementptr inbounds nuw i8, ptr %303, i64 40
+  %305 = load ptr, ptr %304, align 8
+  %306 = icmp eq ptr %305, null
+  br i1 %306, label %310, label %307
 
-305:                                              ; preds = %308, %299
-  %306 = phi ptr [ %302, %299 ], [ %309, %308 ]
-  %307 = phi ptr [ %303, %299 ], [ %310, %308 ]
-  br label %299, !llvm.loop !22
+307:                                              ; preds = %310, %301
+  %308 = phi ptr [ %304, %301 ], [ %311, %310 ]
+  %309 = phi ptr [ %305, %301 ], [ %312, %310 ]
+  br label %301, !llvm.loop !17
 
-308:                                              ; preds = %299
-  %309 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %301, i64 0, i32 4
-  %310 = load ptr, ptr %309, align 8
-  %311 = icmp eq ptr %310, null
-  br i1 %311, label %312, label %305
+310:                                              ; preds = %301
+  %311 = getelementptr inbounds nuw i8, ptr %303, i64 32
+  %312 = load ptr, ptr %311, align 8
+  %313 = icmp eq ptr %312, null
+  br i1 %313, label %314, label %307
 
-312:                                              ; preds = %308
-  %313 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %314 = icmp ult ptr %300, %313
-  br i1 %314, label %316, label %315, !prof !7
+314:                                              ; preds = %310
+  %315 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %316 = icmp ult ptr %302, %315
+  br i1 %316, label %318, label %317, !prof !7
 
-315:                                              ; preds = %312
-  store ptr null, ptr %300, align 8
-  br label %317
+317:                                              ; preds = %314
+  store ptr null, ptr %302, align 8
+  br label %319
 
-316:                                              ; preds = %312
-  tail call void @abort() #9
+318:                                              ; preds = %314
+  tail call void @abort() #11
   unreachable
 
-317:                                              ; preds = %315, %292, %286
-  %318 = phi ptr [ %271, %286 ], [ %301, %315 ], [ null, %292 ]
-  %319 = icmp eq ptr %269, null
-  br i1 %319, label %371, label %320
+319:                                              ; preds = %317, %294, %288
+  %320 = phi ptr [ %273, %288 ], [ %303, %317 ], [ null, %294 ]
+  %321 = icmp eq ptr %271, null
+  br i1 %321, label %375, label %322
 
-320:                                              ; preds = %317
-  %321 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 6
-  %322 = load i32, ptr %321, align 8
-  %323 = zext i32 %322 to i64
-  %324 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %323
-  %325 = load ptr, ptr %324, align 8
-  %326 = icmp eq ptr %28, %325
-  br i1 %326, label %327, label %335
+322:                                              ; preds = %319
+  %323 = getelementptr inbounds nuw i8, ptr %28, i64 56
+  %324 = load i32, ptr %323, align 8
+  %325 = zext i32 %324 to i64
+  %326 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %325
+  %327 = load ptr, ptr %326, align 8
+  %328 = icmp eq ptr %28, %327
+  br i1 %328, label %329, label %337
 
-327:                                              ; preds = %320
-  store ptr %318, ptr %324, align 8
-  %328 = icmp eq ptr %318, null
-  br i1 %328, label %329, label %346
+329:                                              ; preds = %322
+  store ptr %320, ptr %326, align 8
+  %330 = icmp eq ptr %320, null
+  br i1 %330, label %331, label %350
 
-329:                                              ; preds = %327
-  %330 = load i32, ptr %321, align 8
-  %331 = shl nuw i32 1, %330
-  %332 = xor i32 %331, -1
-  %333 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %334 = and i32 %333, %332
-  store i32 %334, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %371
+331:                                              ; preds = %329
+  %332 = load i32, ptr %323, align 8
+  %333 = shl nuw i32 1, %332
+  %334 = xor i32 %333, -1
+  %335 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %336 = and i32 %335, %334
+  store i32 %336, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %375
 
-335:                                              ; preds = %320
-  %336 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %337 = icmp ult ptr %269, %336
-  br i1 %337, label %345, label %338, !prof !7
+337:                                              ; preds = %322
+  %338 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %339 = icmp ult ptr %271, %338
+  br i1 %339, label %347, label %340, !prof !7
 
-338:                                              ; preds = %335
-  %339 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %269, i64 0, i32 4
-  %340 = load ptr, ptr %339, align 8
-  %341 = icmp eq ptr %340, %28
-  %342 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %269, i64 0, i32 4, i64 1
-  %343 = select i1 %341, ptr %339, ptr %342
-  store ptr %318, ptr %343, align 8
-  %344 = icmp eq ptr %318, null
-  br i1 %344, label %371, label %346
+340:                                              ; preds = %337
+  %341 = getelementptr inbounds nuw i8, ptr %271, i64 32
+  %342 = load ptr, ptr %341, align 8
+  %343 = icmp eq ptr %342, %28
+  br i1 %343, label %344, label %345
 
-345:                                              ; preds = %335
-  tail call void @abort() #9
+344:                                              ; preds = %340
+  store ptr %320, ptr %341, align 8
+  br label %348
+
+345:                                              ; preds = %340
+  %346 = getelementptr inbounds nuw i8, ptr %271, i64 40
+  store ptr %320, ptr %346, align 8
+  br label %348
+
+347:                                              ; preds = %337
+  tail call void @abort() #11
   unreachable
 
-346:                                              ; preds = %338, %327
-  %347 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %348 = icmp ult ptr %318, %347
-  br i1 %348, label %370, label %349, !prof !7
+348:                                              ; preds = %345, %344
+  %349 = icmp eq ptr %320, null
+  br i1 %349, label %375, label %350
 
-349:                                              ; preds = %346
-  %350 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %318, i64 0, i32 5
-  store ptr %269, ptr %350, align 8
-  %351 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 4
-  %352 = load ptr, ptr %351, align 8
-  %353 = icmp eq ptr %352, null
-  br i1 %353, label %360, label %354
+350:                                              ; preds = %348, %329
+  %351 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %352 = icmp ult ptr %320, %351
+  br i1 %352, label %374, label %353, !prof !7
 
-354:                                              ; preds = %349
-  %355 = icmp ult ptr %352, %347
-  br i1 %355, label %359, label %356, !prof !7
+353:                                              ; preds = %350
+  %354 = getelementptr inbounds nuw i8, ptr %320, i64 48
+  store ptr %271, ptr %354, align 8
+  %355 = getelementptr inbounds nuw i8, ptr %28, i64 32
+  %356 = load ptr, ptr %355, align 8
+  %357 = icmp eq ptr %356, null
+  br i1 %357, label %364, label %358
 
-356:                                              ; preds = %354
-  %357 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %318, i64 0, i32 4
-  store ptr %352, ptr %357, align 8
-  %358 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %352, i64 0, i32 5
-  store ptr %318, ptr %358, align 8
-  br label %360
+358:                                              ; preds = %353
+  %359 = icmp ult ptr %356, %351
+  br i1 %359, label %363, label %360, !prof !7
 
-359:                                              ; preds = %354
-  tail call void @abort() #9
+360:                                              ; preds = %358
+  %361 = getelementptr inbounds nuw i8, ptr %320, i64 32
+  store ptr %356, ptr %361, align 8
+  %362 = getelementptr inbounds nuw i8, ptr %356, i64 48
+  store ptr %320, ptr %362, align 8
+  br label %364
+
+363:                                              ; preds = %358
+  tail call void @abort() #11
   unreachable
 
-360:                                              ; preds = %356, %349
-  %361 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %28, i64 0, i32 4, i64 1
-  %362 = load ptr, ptr %361, align 8
-  %363 = icmp eq ptr %362, null
-  br i1 %363, label %371, label %364
+364:                                              ; preds = %360, %353
+  %365 = getelementptr inbounds nuw i8, ptr %28, i64 40
+  %366 = load ptr, ptr %365, align 8
+  %367 = icmp eq ptr %366, null
+  br i1 %367, label %375, label %368
 
-364:                                              ; preds = %360
-  %365 = icmp ult ptr %362, %347
-  br i1 %365, label %369, label %366, !prof !7
+368:                                              ; preds = %364
+  %369 = icmp ult ptr %366, %351
+  br i1 %369, label %373, label %370, !prof !7
 
-366:                                              ; preds = %364
-  %367 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %318, i64 0, i32 4, i64 1
-  store ptr %362, ptr %367, align 8
-  %368 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %362, i64 0, i32 5
-  store ptr %318, ptr %368, align 8
-  br label %371
+370:                                              ; preds = %368
+  %371 = getelementptr inbounds nuw i8, ptr %320, i64 40
+  store ptr %366, ptr %371, align 8
+  %372 = getelementptr inbounds nuw i8, ptr %366, i64 48
+  store ptr %320, ptr %372, align 8
+  br label %375
 
-369:                                              ; preds = %364
-  tail call void @abort() #9
+373:                                              ; preds = %368
+  tail call void @abort() #11
   unreachable
 
-370:                                              ; preds = %346
-  tail call void @abort() #9
+374:                                              ; preds = %350
+  tail call void @abort() #11
   unreachable
 
-371:                                              ; preds = %366, %360, %338, %329, %317, %262, %248
-  %372 = or i64 %227, 1
-  %373 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 1
-  store i64 %372, ptr %373, align 8
-  %374 = getelementptr inbounds i8, ptr %195, i64 %227
-  store i64 %227, ptr %374, align 8
-  %375 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %376 = icmp eq ptr %195, %375
-  br i1 %376, label %377, label %383
+375:                                              ; preds = %370, %364, %348, %331, %319, %264, %250
+  %376 = or i64 %229, 1
+  %377 = getelementptr inbounds nuw i8, ptr %197, i64 8
+  store i64 %376, ptr %377, align 8
+  %378 = getelementptr inbounds nuw i8, ptr %197, i64 %229
+  store i64 %229, ptr %378, align 8
+  %379 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %380 = icmp eq ptr %197, %379
+  br i1 %380, label %381, label %387
 
-377:                                              ; preds = %371
-  store i64 %227, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  br label %490
+381:                                              ; preds = %375
+  store i64 %229, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  br label %494
 
-378:                                              ; preds = %202
-  %379 = and i64 %199, -2
-  store i64 %379, ptr %198, align 8
-  %380 = or i64 %194, 1
-  %381 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 1
-  store i64 %380, ptr %381, align 8
-  %382 = getelementptr inbounds i8, ptr %195, i64 %194
-  store i64 %194, ptr %382, align 8
-  br label %383
+382:                                              ; preds = %204
+  %383 = and i64 %201, -2
+  store i64 %383, ptr %200, align 8
+  %384 = or i64 %196, 1
+  %385 = getelementptr inbounds nuw i8, ptr %197, i64 8
+  store i64 %384, ptr %385, align 8
+  %386 = getelementptr inbounds nuw i8, ptr %197, i64 %196
+  store i64 %196, ptr %386, align 8
+  br label %387
 
-383:                                              ; preds = %378, %371
-  %384 = phi i64 [ %194, %378 ], [ %227, %371 ]
-  %385 = icmp ult i64 %384, 256
-  br i1 %385, label %386, label %409
+387:                                              ; preds = %382, %375
+  %388 = phi i64 [ %196, %382 ], [ %229, %375 ]
+  %389 = icmp ult i64 %388, 256
+  br i1 %389, label %390, label %413
 
-386:                                              ; preds = %383
-  %387 = lshr i64 %384, 3
-  %388 = trunc i64 %387 to i32
-  %389 = shl nuw nsw i64 %387, 1
-  %390 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %389
-  %391 = load i32, ptr @__temen_dl._gm_, align 8
-  %392 = shl nuw i32 1, %388
-  %393 = and i32 %391, %392
-  %394 = icmp eq i32 %393, 0
-  br i1 %394, label %395, label %397
+390:                                              ; preds = %387
+  %391 = lshr i64 %388, 3
+  %392 = trunc nuw nsw i64 %391 to i32
+  %393 = shl nuw nsw i64 %391, 4
+  %394 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %393
+  %395 = load i32, ptr @__temen_dl._gm_, align 8
+  %396 = shl nuw i32 1, %392
+  %397 = and i32 %395, %396
+  %398 = icmp eq i32 %397, 0
+  br i1 %398, label %399, label %401
 
-395:                                              ; preds = %386
-  %396 = or i32 %391, %392
-  store i32 %396, ptr @__temen_dl._gm_, align 8
-  br label %403
+399:                                              ; preds = %390
+  %400 = or i32 %395, %396
+  store i32 %400, ptr @__temen_dl._gm_, align 8
+  br label %407
 
-397:                                              ; preds = %386
-  %398 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %390, i64 0, i32 2
-  %399 = load ptr, ptr %398, align 8
-  %400 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %401 = icmp ult ptr %399, %400
-  br i1 %401, label %402, label %403, !prof !7
+401:                                              ; preds = %390
+  %402 = getelementptr inbounds nuw i8, ptr %394, i64 16
+  %403 = load ptr, ptr %402, align 8
+  %404 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %405 = icmp ult ptr %403, %404
+  br i1 %405, label %406, label %407, !prof !7
 
-402:                                              ; preds = %397
-  tail call void @abort() #9
+406:                                              ; preds = %401
+  tail call void @abort() #11
   unreachable
 
-403:                                              ; preds = %397, %395
-  %404 = phi ptr [ %390, %395 ], [ %399, %397 ]
-  %405 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %390, i64 0, i32 2
-  store ptr %195, ptr %405, align 8
-  %406 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %404, i64 0, i32 3
-  store ptr %195, ptr %406, align 8
-  %407 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 2
-  store ptr %404, ptr %407, align 8
-  %408 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 3
-  store ptr %390, ptr %408, align 8
-  br label %490
+407:                                              ; preds = %401, %399
+  %408 = phi ptr [ %394, %399 ], [ %403, %401 ]
+  %409 = getelementptr inbounds nuw i8, ptr %394, i64 16
+  store ptr %197, ptr %409, align 8
+  %410 = getelementptr inbounds nuw i8, ptr %408, i64 24
+  store ptr %197, ptr %410, align 8
+  %411 = getelementptr inbounds nuw i8, ptr %197, i64 16
+  store ptr %408, ptr %411, align 8
+  %412 = getelementptr inbounds nuw i8, ptr %197, i64 24
+  store ptr %394, ptr %412, align 8
+  br label %494
 
-409:                                              ; preds = %383
-  %410 = lshr i64 %384, 8
-  %411 = trunc i64 %410 to i32
-  %412 = icmp eq i32 %411, 0
-  br i1 %412, label %425, label %413
+413:                                              ; preds = %387
+  %414 = lshr i64 %388, 8
+  %415 = trunc i64 %414 to i32
+  %416 = icmp eq i32 %415, 0
+  br i1 %416, label %429, label %417
 
-413:                                              ; preds = %409
-  %414 = icmp ugt i32 %411, 65535
-  br i1 %414, label %425, label %415
+417:                                              ; preds = %413
+  %418 = icmp ugt i32 %415, 65535
+  br i1 %418, label %429, label %419
 
-415:                                              ; preds = %413
-  %416 = tail call i32 @llvm.ctlz.i32(i32 %411, i1 true), !range !13
-  %417 = shl nuw nsw i32 %416, 1
-  %418 = sub nuw nsw i32 38, %416
-  %419 = zext nneg i32 %418 to i64
-  %420 = lshr i64 %384, %419
-  %421 = trunc i64 %420 to i32
-  %422 = and i32 %421, 1
-  %423 = or disjoint i32 %422, %417
-  %424 = xor i32 %423, 62
-  br label %425
+419:                                              ; preds = %417
+  %420 = tail call range(i32 16, 33) i32 @llvm.ctlz.i32(i32 %415, i1 true)
+  %421 = shl nuw nsw i32 %420, 1
+  %422 = sub nuw nsw i32 38, %420
+  %423 = zext nneg i32 %422 to i64
+  %424 = lshr i64 %388, %423
+  %425 = trunc i64 %424 to i32
+  %426 = and i32 %425, 1
+  %427 = or disjoint i32 %426, %421
+  %428 = xor i32 %427, 62
+  br label %429
 
-425:                                              ; preds = %415, %413, %409
-  %426 = phi i32 [ %424, %415 ], [ 0, %409 ], [ 31, %413 ]
-  %427 = zext nneg i32 %426 to i64
-  %428 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %427
-  %429 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 6
-  store i32 %426, ptr %429, align 8
-  %430 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 4
-  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %430, i8 0, i64 16, i1 false)
-  %431 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %432 = shl nuw i32 1, %426
-  %433 = and i32 %431, %432
-  %434 = icmp eq i32 %433, 0
-  br i1 %434, label %435, label %440
+429:                                              ; preds = %419, %417, %413
+  %430 = phi i32 [ %428, %419 ], [ 0, %413 ], [ 31, %417 ]
+  %431 = zext nneg i32 %430 to i64
+  %432 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %431
+  %433 = getelementptr inbounds nuw i8, ptr %197, i64 56
+  store i32 %430, ptr %433, align 8
+  %434 = getelementptr inbounds nuw i8, ptr %197, i64 32
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %434, i8 0, i64 16, i1 false)
+  %435 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %436 = shl nuw i32 1, %430
+  %437 = and i32 %435, %436
+  %438 = icmp eq i32 %437, 0
+  br i1 %438, label %439, label %441
 
-435:                                              ; preds = %425
-  %436 = or i32 %431, %432
-  store i32 %436, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  store ptr %195, ptr %428, align 8
-  %437 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 5
-  store ptr %428, ptr %437, align 8
-  %438 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 3
-  store ptr %195, ptr %438, align 8
-  %439 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 2
-  store ptr %195, ptr %439, align 8
-  br label %484
+439:                                              ; preds = %429
+  %440 = or i32 %435, %436
+  store i32 %440, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  store ptr %197, ptr %432, align 8
+  br label %480
 
-440:                                              ; preds = %425
-  %441 = load ptr, ptr %428, align 8
-  %442 = icmp eq i32 %426, 31
-  %443 = lshr i32 %426, 1
-  %444 = add nuw nsw i32 %443, 6
-  %445 = zext nneg i32 %444 to i64
-  %446 = sub nuw nsw i64 63, %445
-  %447 = select i1 %442, i64 0, i64 %446
-  %448 = shl i64 %384, %447
-  br label %449
+441:                                              ; preds = %429
+  %442 = load ptr, ptr %432, align 8
+  %443 = icmp eq i32 %430, 31
+  %444 = lshr i32 %430, 1
+  %445 = add nuw nsw i32 %444, 6
+  %446 = zext nneg i32 %445 to i64
+  %447 = sub nuw nsw i64 63, %446
+  %448 = select i1 %443, i64 0, i64 %447
+  %449 = shl i64 %388, %448
+  br label %450
 
-449:                                              ; preds = %456, %440
-  %450 = phi ptr [ %441, %440 ], [ %460, %456 ]
-  %451 = phi i64 [ %448, %440 ], [ %459, %456 ]
-  %452 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %450, i64 0, i32 1
-  %453 = load i64, ptr %452, align 8
-  %454 = and i64 %453, -8
-  %455 = icmp eq i64 %454, %384
-  br i1 %455, label %471, label %456
+450:                                              ; preds = %457, %441
+  %451 = phi ptr [ %442, %441 ], [ %462, %457 ]
+  %452 = phi i64 [ %449, %441 ], [ %461, %457 ]
+  %453 = getelementptr inbounds nuw i8, ptr %451, i64 8
+  %454 = load i64, ptr %453, align 8
+  %455 = and i64 %454, -8
+  %456 = icmp eq i64 %455, %388
+  br i1 %456, label %470, label %457
 
-456:                                              ; preds = %449
-  %457 = lshr i64 %451, 63
-  %458 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %450, i64 0, i32 4, i64 %457
-  %459 = shl i64 %451, 1
-  %460 = load ptr, ptr %458, align 8
-  %461 = icmp eq ptr %460, null
-  br i1 %461, label %462, label %449
+457:                                              ; preds = %450
+  %458 = getelementptr inbounds nuw i8, ptr %451, i64 32
+  %459 = lshr i64 %452, 63
+  %460 = getelementptr inbounds nuw ptr, ptr %458, i64 %459
+  %461 = shl i64 %452, 1
+  %462 = load ptr, ptr %460, align 8
+  %463 = icmp eq ptr %462, null
+  br i1 %463, label %464, label %450
 
-462:                                              ; preds = %456
-  %463 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %450, i64 0, i32 4, i64 %457
-  %464 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %465 = icmp ult ptr %463, %464
-  br i1 %465, label %470, label %466, !prof !7
+464:                                              ; preds = %457
+  %465 = getelementptr inbounds nuw ptr, ptr %458, i64 %459
+  %466 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %467 = icmp ult ptr %465, %466
+  br i1 %467, label %469, label %468, !prof !7
 
-466:                                              ; preds = %462
-  store ptr %195, ptr %463, align 8
-  %467 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 5
-  store ptr %450, ptr %467, align 8
-  %468 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 3
-  store ptr %195, ptr %468, align 8
-  %469 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 2
-  store ptr %195, ptr %469, align 8
-  br label %484
+468:                                              ; preds = %464
+  store ptr %197, ptr %465, align 8
+  br label %480
 
-470:                                              ; preds = %462
-  tail call void @abort() #9
+469:                                              ; preds = %464
+  tail call void @abort() #11
   unreachable
 
-471:                                              ; preds = %449
-  %472 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %450, i64 0, i32 2
-  %473 = load ptr, ptr %472, align 8
-  %474 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %475 = icmp uge ptr %450, %474
-  %476 = icmp uge ptr %473, %474
-  %477 = select i1 %475, i1 %476, i1 false, !prof !8
-  br i1 %477, label %478, label %483, !prof !8
+470:                                              ; preds = %450
+  %471 = getelementptr inbounds nuw i8, ptr %451, i64 16
+  %472 = load ptr, ptr %471, align 8
+  %473 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %474 = icmp uge ptr %451, %473
+  %475 = icmp uge ptr %472, %473
+  %476 = select i1 %474, i1 %475, i1 false, !prof !8
+  br i1 %476, label %477, label %479, !prof !8
 
-478:                                              ; preds = %471
-  %479 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %473, i64 0, i32 3
-  store ptr %195, ptr %479, align 8
-  store ptr %195, ptr %472, align 8
-  %480 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 2
-  store ptr %473, ptr %480, align 8
-  %481 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 3
-  store ptr %450, ptr %481, align 8
-  %482 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %195, i64 0, i32 5
-  store ptr null, ptr %482, align 8
-  br label %484
+477:                                              ; preds = %470
+  %478 = getelementptr inbounds nuw i8, ptr %472, i64 24
+  store ptr %197, ptr %478, align 8
+  store ptr %197, ptr %471, align 8
+  br label %480
 
-483:                                              ; preds = %471
-  tail call void @abort() #9
+479:                                              ; preds = %470
+  tail call void @abort() #11
   unreachable
 
-484:                                              ; preds = %478, %466, %435
-  %485 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 8), align 8
-  %486 = add i64 %485, -1
-  %487 = icmp eq i64 %486, 0
-  %488 = select i1 %487, i64 -1, i64 %486
-  store i64 %488, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 8), align 8
-  br label %490
+480:                                              ; preds = %477, %468, %439
+  %481 = phi i64 [ 48, %468 ], [ 16, %477 ], [ 48, %439 ]
+  %482 = phi ptr [ %451, %468 ], [ %472, %477 ], [ %432, %439 ]
+  %483 = phi ptr [ %197, %468 ], [ %451, %477 ], [ %197, %439 ]
+  %484 = phi i64 [ 16, %468 ], [ 48, %477 ], [ 16, %439 ]
+  %485 = phi ptr [ %197, %468 ], [ null, %477 ], [ %197, %439 ]
+  %486 = getelementptr inbounds nuw i8, ptr %197, i64 %481
+  store ptr %482, ptr %486, align 8
+  %487 = getelementptr inbounds nuw i8, ptr %197, i64 24
+  store ptr %483, ptr %487, align 8
+  %488 = getelementptr inbounds nuw i8, ptr %197, i64 %484
+  store ptr %485, ptr %488, align 8
+  %489 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 56), align 8
+  %490 = add i64 %489, -1
+  %491 = icmp eq i64 %490, 0
+  %492 = select i1 %491, i64 -1, i64 %490
+  store i64 %492, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 56), align 8
+  br label %494
 
-489:                                              ; preds = %197, %193, %35, %21, %18
-  tail call void @abort() #9
+493:                                              ; preds = %199, %195, %35, %21, %18
+  tail call void @abort() #11
   unreachable
 
-490:                                              ; preds = %484, %403, %377, %219, %215, %208, %188, %31
-  %491 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
-  %492 = and i32 %491, 2
-  %493 = icmp eq i32 %492, 0
-  br i1 %493, label %495, label %494
+494:                                              ; preds = %480, %407, %381, %221, %217, %210, %190, %31
+  %495 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %496 = and i32 %495, 2
+  %497 = icmp eq i32 %496, 0
+  br i1 %497, label %499, label %498
 
-494:                                              ; preds = %490
-  store atomic i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16) release, align 4
-  br label %495
+498:                                              ; preds = %494
+  store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
+  br label %499
 
-495:                                              ; preds = %494, %490, %1
+499:                                              ; preds = %498, %494, %1
   ret void
 }
 
@@ -2866,8 +2916,8 @@ define dso_local ptr @__temen_dl.dlcalloc(i64 noundef %0, i64 noundef %1) local_
   %5 = tail call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %0, i64 %1)
   %6 = extractvalue { i64, i1 } %5, 0
   %7 = or i64 %1, %0
-  %8 = icmp ult i64 %7, 65536
-  br i1 %8, label %12, label %9
+  %8 = icmp ugt i64 %7, 65535
+  br i1 %8, label %9, label %12
 
 9:                                                ; preds = %4
   %10 = extractvalue { i64, i1 } %5, 1
@@ -2896,7 +2946,7 @@ define dso_local ptr @__temen_dl.dlcalloc(i64 noundef %0, i64 noundef %1) local_
 }
 
 ; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
-declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #4
+declare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #5
 
 ; Function Attrs: nounwind uwtable
 define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local_unnamed_addr #0 {
@@ -2912,7 +2962,7 @@ define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local
   br i1 %7, label %8, label %10
 
 8:                                                ; preds = %6
-  %9 = tail call ptr @__errno_location() #10
+  %9 = tail call ptr @__errno_location() #12
   store i32 12, ptr %9, align 4
   br label %51
 
@@ -2922,23 +2972,23 @@ define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local
   %13 = and i64 %12, -16
   %14 = select i1 %11, i64 32, i64 %13
   %15 = getelementptr inbounds i8, ptr %0, i64 -16
-  %16 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
+  %16 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
   %17 = and i32 %16, 2
   %18 = icmp eq i32 %17, 0
   br i1 %18, label %29, label %19
 
 19:                                               ; preds = %10
-  %20 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %20 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %21 = icmp eq i32 %20, 0
   br i1 %21, label %29, label %22
 
 22:                                               ; preds = %28, %19
-  %23 = load volatile i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), align 4
+  %23 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
   %24 = icmp eq i32 %23, 0
   br i1 %24, label %25, label %28
 
 25:                                               ; preds = %22
-  %26 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %26 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %27 = icmp eq i32 %26, 0
   br i1 %27, label %29, label %28
 
@@ -2946,14 +2996,14 @@ define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local
   br label %22, !llvm.loop !5
 
 29:                                               ; preds = %25, %19, %10
-  %30 = tail call fastcc ptr @__temen_dl.try_realloc_chunk(ptr noundef nonnull %15, i64 noundef %14)
-  %31 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
+  %30 = tail call fastcc ptr @__temen_dl.try_realloc_chunk(ptr noundef %15, i64 noundef %14)
+  %31 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
   %32 = and i32 %31, 2
   %33 = icmp eq i32 %32, 0
   br i1 %33, label %35, label %34
 
 34:                                               ; preds = %29
-  store atomic i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16) release, align 4
+  store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
   br label %35
 
 35:                                               ; preds = %34, %29
@@ -2961,7 +3011,7 @@ define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local
   br i1 %36, label %39, label %37
 
 37:                                               ; preds = %35
-  %38 = getelementptr inbounds i8, ptr %30, i64 16
+  %38 = getelementptr inbounds nuw i8, ptr %30, i64 16
   br label %51
 
 39:                                               ; preds = %35
@@ -2988,29 +3038,29 @@ define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local
 }
 
 ; Function Attrs: mustprogress nofree nosync nounwind willreturn memory(none)
-declare ptr @__errno_location() local_unnamed_addr #5
+declare ptr @__errno_location() local_unnamed_addr #6
 
-; Function Attrs: nounwind uwtable
-define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0, i64 noundef %1) unnamed_addr #0 {
-  %3 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %0, i64 0, i32 1
+; Function Attrs: nofree nounwind uwtable
+define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef nonnull %0, i64 noundef range(i64 16, -105) %1) unnamed_addr #4 {
+  %3 = getelementptr inbounds nuw i8, ptr %0, i64 8
   %4 = load i64, ptr %3, align 8
   %5 = and i64 %4, -8
-  %6 = getelementptr inbounds i8, ptr %0, i64 %5
-  %7 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %8 = icmp ule ptr %7, %0
+  %6 = getelementptr inbounds nuw i8, ptr %0, i64 %5
+  %7 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %8 = icmp ult ptr %0, %7
   %9 = and i64 %4, 3
-  %10 = icmp ne i64 %9, 1
-  %11 = select i1 %8, i1 %10, i1 false
-  %12 = icmp sgt i64 %5, 0
-  %13 = select i1 %11, i1 %12, i1 false
-  br i1 %13, label %14, label %264, !prof !23
+  %10 = icmp eq i64 %9, 1
+  %11 = icmp eq i64 %5, 0
+  %12 = or i1 %10, %11
+  %13 = select i1 %8, i1 true, i1 %12, !prof !18
+  br i1 %13, label %266, label %14, !prof !19
 
 14:                                               ; preds = %2
-  %15 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %6, i64 0, i32 1
+  %15 = getelementptr inbounds nuw i8, ptr %6, i64 8
   %16 = load i64, ptr %15, align 8
   %17 = and i64 %16, 1
   %18 = icmp eq i64 %17, 0
-  br i1 %18, label %264, label %19, !prof !7
+  br i1 %18, label %266, label %19, !prof !7
 
 19:                                               ; preds = %14
   %20 = icmp eq i64 %9, 0
@@ -3018,7 +3068,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
 
 21:                                               ; preds = %19
   %22 = icmp ult i64 %1, 256
-  br i1 %22, label %265, label %23
+  br i1 %22, label %267, label %23
 
 23:                                               ; preds = %21
   %24 = add nuw i64 %1, 8
@@ -3026,92 +3076,92 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   br i1 %25, label %31, label %26
 
 26:                                               ; preds = %23
-  %27 = sub i64 %5, %1
-  %28 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_params, ptr @__temen_dl.mparams, i64 0, i32 2), align 8
+  %27 = sub nuw i64 %5, %1
+  %28 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
   %29 = shl i64 %28, 1
   %30 = icmp ugt i64 %27, %29
-  br i1 %30, label %31, label %265
+  br i1 %30, label %31, label %267
 
 31:                                               ; preds = %26, %23
-  br label %265
+  br label %267
 
 32:                                               ; preds = %19
   %33 = icmp ult i64 %5, %1
   br i1 %33, label %46, label %34
 
 34:                                               ; preds = %32
-  %35 = sub nsw i64 %5, %1
+  %35 = sub nuw i64 %5, %1
   %36 = icmp ugt i64 %35, 31
-  br i1 %36, label %37, label %265
+  br i1 %36, label %37, label %267
 
 37:                                               ; preds = %34
-  %38 = getelementptr inbounds i8, ptr %0, i64 %1
+  %38 = getelementptr inbounds nuw i8, ptr %0, i64 %1
   %39 = and i64 %4, 1
-  %40 = or i64 %39, %1
+  %40 = or i64 %1, %39
   %41 = or i64 %40, 2
   store i64 %41, ptr %3, align 8
-  %42 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %38, i64 0, i32 1
+  %42 = getelementptr inbounds nuw i8, ptr %38, i64 8
   %43 = or i64 %35, 3
   store i64 %43, ptr %42, align 8
   %44 = load i64, ptr %15, align 8
   %45 = or i64 %44, 1
   store i64 %45, ptr %15, align 8
-  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef %38, i64 noundef %35)
-  br label %265
+  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef nonnull %38, i64 noundef %35)
+  br label %267
 
 46:                                               ; preds = %32
-  %47 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
+  %47 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
   %48 = icmp eq ptr %6, %47
   br i1 %48, label %49, label %61
 
 49:                                               ; preds = %46
-  %50 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
+  %50 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
   %51 = add i64 %50, %5
   %52 = icmp ugt i64 %51, %1
-  br i1 %52, label %53, label %265
+  br i1 %52, label %53, label %267
 
 53:                                               ; preds = %49
-  %54 = sub i64 %51, %1
-  %55 = getelementptr inbounds i8, ptr %0, i64 %1
+  %54 = sub nuw i64 %51, %1
+  %55 = getelementptr inbounds nuw i8, ptr %0, i64 %1
   %56 = and i64 %4, 1
-  %57 = or i64 %56, %1
+  %57 = or i64 %1, %56
   %58 = or i64 %57, 2
   store i64 %58, ptr %3, align 8
-  %59 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %55, i64 0, i32 1
+  %59 = getelementptr inbounds nuw i8, ptr %55, i64 8
   %60 = or i64 %54, 1
   store i64 %60, ptr %59, align 8
-  store ptr %55, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  store i64 %54, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  br label %265
+  store ptr %55, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  store i64 %54, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  br label %267
 
 61:                                               ; preds = %46
-  %62 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+  %62 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
   %63 = icmp eq ptr %6, %62
   br i1 %63, label %64, label %93
 
 64:                                               ; preds = %61
-  %65 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
+  %65 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
   %66 = add i64 %65, %5
   %67 = icmp ult i64 %66, %1
-  br i1 %67, label %265, label %68
+  br i1 %67, label %267, label %68
 
 68:                                               ; preds = %64
-  %69 = sub i64 %66, %1
+  %69 = sub nuw i64 %66, %1
   %70 = icmp ugt i64 %69, 31
   br i1 %70, label %71, label %82
 
 71:                                               ; preds = %68
-  %72 = getelementptr inbounds i8, ptr %0, i64 %1
-  %73 = getelementptr inbounds i8, ptr %0, i64 %66
+  %72 = getelementptr inbounds nuw i8, ptr %0, i64 %1
+  %73 = getelementptr inbounds nuw i8, ptr %0, i64 %66
   %74 = and i64 %4, 1
-  %75 = or i64 %74, %1
+  %75 = or i64 %1, %74
   %76 = or i64 %75, 2
   store i64 %76, ptr %3, align 8
-  %77 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %72, i64 0, i32 1
+  %77 = getelementptr inbounds nuw i8, ptr %72, i64 8
   %78 = or i64 %69, 1
   store i64 %78, ptr %77, align 8
   store i64 %69, ptr %73, align 8
-  %79 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %73, i64 0, i32 1
+  %79 = getelementptr inbounds nuw i8, ptr %73, i64 8
   %80 = load i64, ptr %79, align 8
   %81 = and i64 %80, -2
   store i64 %81, ptr %79, align 8
@@ -3122,8 +3172,8 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   %84 = or i64 %83, %66
   %85 = or i64 %84, 2
   store i64 %85, ptr %3, align 8
-  %86 = getelementptr inbounds i8, ptr %0, i64 %66
-  %87 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %86, i64 0, i32 1
+  %86 = getelementptr inbounds nuw i8, ptr %0, i64 %66
+  %87 = getelementptr inbounds nuw i8, ptr %86, i64 8
   %88 = load i64, ptr %87, align 8
   %89 = or i64 %88, 1
   store i64 %89, ptr %87, align 8
@@ -3132,35 +3182,35 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
 90:                                               ; preds = %82, %71
   %91 = phi i64 [ 0, %82 ], [ %69, %71 ]
   %92 = phi ptr [ null, %82 ], [ %72, %71 ]
-  store i64 %91, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr %92, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  br label %265
+  store i64 %91, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr %92, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  br label %267
 
 93:                                               ; preds = %61
   %94 = and i64 %16, 2
   %95 = icmp eq i64 %94, 0
-  br i1 %95, label %96, label %265
+  br i1 %95, label %96, label %267
 
 96:                                               ; preds = %93
   %97 = and i64 %16, -8
   %98 = add i64 %97, %5
   %99 = icmp ult i64 %98, %1
-  br i1 %99, label %265, label %100
+  br i1 %99, label %267, label %100
 
 100:                                              ; preds = %96
-  %101 = sub i64 %98, %1
+  %101 = sub nuw i64 %98, %1
   %102 = icmp ult i64 %16, 256
   br i1 %102, label %103, label %139
 
 103:                                              ; preds = %100
   %104 = lshr i64 %16, 3
-  %105 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %6, i64 0, i32 2
+  %105 = getelementptr inbounds nuw i8, ptr %6, i64 16
   %106 = load ptr, ptr %105, align 8
-  %107 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %6, i64 0, i32 3
+  %107 = getelementptr inbounds nuw i8, ptr %6, i64 24
   %108 = load ptr, ptr %107, align 8
-  %109 = trunc i64 %104 to i32
-  %110 = shl nuw nsw i64 %104, 1
-  %111 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %110
+  %109 = trunc nuw nsw i64 %104 to i32
+  %110 = shl nuw nsw i64 %104, 4
+  %111 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %110
   %112 = icmp eq ptr %106, %111
   br i1 %112, label %119, label %113
 
@@ -3169,7 +3219,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   br i1 %114, label %138, label %115
 
 115:                                              ; preds = %113
-  %116 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %106, i64 0, i32 3
+  %116 = getelementptr inbounds nuw i8, ptr %106, i64 24
   %117 = load ptr, ptr %116, align 8
   %118 = icmp eq ptr %117, %6
   br i1 %118, label %119, label %138, !prof !8
@@ -3184,7 +3234,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   %124 = load i32, ptr @__temen_dl._gm_, align 8
   %125 = and i32 %124, %123
   store i32 %125, ptr @__temen_dl._gm_, align 8
-  br label %241
+  br label %243
 
 126:                                              ; preds = %119
   %127 = icmp eq ptr %108, %111
@@ -3195,48 +3245,48 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   br i1 %129, label %137, label %130
 
 130:                                              ; preds = %128
-  %131 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %108, i64 0, i32 2
+  %131 = getelementptr inbounds nuw i8, ptr %108, i64 16
   %132 = load ptr, ptr %131, align 8
   %133 = icmp eq ptr %132, %6
   br i1 %133, label %134, label %137, !prof !8
 
 134:                                              ; preds = %130, %126
-  %135 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %106, i64 0, i32 3
+  %135 = getelementptr inbounds nuw i8, ptr %106, i64 24
   store ptr %108, ptr %135, align 8
-  %136 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %108, i64 0, i32 2
+  %136 = getelementptr inbounds nuw i8, ptr %108, i64 16
   store ptr %106, ptr %136, align 8
-  br label %241
+  br label %243
 
 137:                                              ; preds = %130, %128
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 138:                                              ; preds = %115, %113
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 139:                                              ; preds = %100
-  %140 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 5
+  %140 = getelementptr inbounds nuw i8, ptr %6, i64 48
   %141 = load ptr, ptr %140, align 8
-  %142 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 3
+  %142 = getelementptr inbounds nuw i8, ptr %6, i64 24
   %143 = load ptr, ptr %142, align 8
   %144 = icmp eq ptr %143, %6
   br i1 %144, label %159, label %145
 
 145:                                              ; preds = %139
-  %146 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 2
+  %146 = getelementptr inbounds nuw i8, ptr %6, i64 16
   %147 = load ptr, ptr %146, align 8
   %148 = icmp ult ptr %147, %7
   br i1 %148, label %158, label %149, !prof !7
 
 149:                                              ; preds = %145
-  %150 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %147, i64 0, i32 3
+  %150 = getelementptr inbounds nuw i8, ptr %147, i64 24
   %151 = load ptr, ptr %150, align 8
   %152 = icmp eq ptr %151, %6
   br i1 %152, label %153, label %158, !prof !8
 
 153:                                              ; preds = %149
-  %154 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %143, i64 0, i32 2
+  %154 = getelementptr inbounds nuw i8, ptr %143, i64 16
   %155 = load ptr, ptr %154, align 8
   %156 = icmp eq ptr %155, %6
   br i1 %156, label %157, label %158, !prof !8
@@ -3247,30 +3297,30 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   br label %187
 
 158:                                              ; preds = %153, %149, %145
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 159:                                              ; preds = %139
-  %160 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 4, i64 1
+  %160 = getelementptr inbounds nuw i8, ptr %6, i64 40
   %161 = load ptr, ptr %160, align 8
   %162 = icmp eq ptr %161, null
   br i1 %162, label %163, label %167
 
 163:                                              ; preds = %159
-  %164 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 4
+  %164 = getelementptr inbounds nuw i8, ptr %6, i64 32
   %165 = load ptr, ptr %164, align 8
   %166 = icmp eq ptr %165, null
   br i1 %166, label %187, label %167
 
 167:                                              ; preds = %163, %159
-  %168 = phi ptr [ %164, %163 ], [ %160, %159 ]
-  %169 = phi ptr [ %165, %163 ], [ %161, %159 ]
+  %168 = phi ptr [ %160, %159 ], [ %164, %163 ]
+  %169 = phi ptr [ %161, %159 ], [ %165, %163 ]
   br label %170
 
 170:                                              ; preds = %176, %167
   %171 = phi ptr [ %168, %167 ], [ %177, %176 ]
   %172 = phi ptr [ %169, %167 ], [ %178, %176 ]
-  %173 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %172, i64 0, i32 4, i64 1
+  %173 = getelementptr inbounds nuw i8, ptr %172, i64 40
   %174 = load ptr, ptr %173, align 8
   %175 = icmp eq ptr %174, null
   br i1 %175, label %179, label %176
@@ -3278,10 +3328,10 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
 176:                                              ; preds = %179, %170
   %177 = phi ptr [ %173, %170 ], [ %180, %179 ]
   %178 = phi ptr [ %174, %170 ], [ %181, %179 ]
-  br label %170, !llvm.loop !24
+  br label %170, !llvm.loop !20
 
 179:                                              ; preds = %170
-  %180 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %172, i64 0, i32 4
+  %180 = getelementptr inbounds nuw i8, ptr %172, i64 32
   %181 = load ptr, ptr %180, align 8
   %182 = icmp eq ptr %181, null
   br i1 %182, label %183, label %176
@@ -3295,19 +3345,19 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
   br label %187
 
 186:                                              ; preds = %183
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 187:                                              ; preds = %185, %163, %157
   %188 = phi ptr [ %143, %157 ], [ %172, %185 ], [ null, %163 ]
   %189 = icmp eq ptr %141, null
-  br i1 %189, label %241, label %190
+  br i1 %189, label %243, label %190
 
 190:                                              ; preds = %187
-  %191 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 6
+  %191 = getelementptr inbounds nuw i8, ptr %6, i64 56
   %192 = load i32, ptr %191, align 8
   %193 = zext i32 %192 to i64
-  %194 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %193
+  %194 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %193
   %195 = load ptr, ptr %194, align 8
   %196 = icmp eq ptr %6, %195
   br i1 %196, label %197, label %205
@@ -3315,135 +3365,144 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef %0,
 197:                                              ; preds = %190
   store ptr %188, ptr %194, align 8
   %198 = icmp eq ptr %188, null
-  br i1 %198, label %199, label %216
+  br i1 %198, label %199, label %218
 
 199:                                              ; preds = %197
   %200 = load i32, ptr %191, align 8
   %201 = shl nuw i32 1, %200
   %202 = xor i32 %201, -1
-  %203 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
+  %203 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
   %204 = and i32 %203, %202
-  store i32 %204, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %241
+  store i32 %204, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %243
 
 205:                                              ; preds = %190
-  %206 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %206 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %207 = icmp ult ptr %141, %206
   br i1 %207, label %215, label %208, !prof !7
 
 208:                                              ; preds = %205
-  %209 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %141, i64 0, i32 4
+  %209 = getelementptr inbounds nuw i8, ptr %141, i64 32
   %210 = load ptr, ptr %209, align 8
   %211 = icmp eq ptr %210, %6
-  %212 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %141, i64 0, i32 4, i64 1
-  %213 = select i1 %211, ptr %209, ptr %212
-  store ptr %188, ptr %213, align 8
-  %214 = icmp eq ptr %188, null
-  br i1 %214, label %241, label %216
+  br i1 %211, label %212, label %213
+
+212:                                              ; preds = %208
+  store ptr %188, ptr %209, align 8
+  br label %216
+
+213:                                              ; preds = %208
+  %214 = getelementptr inbounds nuw i8, ptr %141, i64 40
+  store ptr %188, ptr %214, align 8
+  br label %216
 
 215:                                              ; preds = %205
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
-216:                                              ; preds = %208, %197
-  %217 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %218 = icmp ult ptr %188, %217
-  br i1 %218, label %240, label %219, !prof !7
+216:                                              ; preds = %213, %212
+  %217 = icmp eq ptr %188, null
+  br i1 %217, label %243, label %218
 
-219:                                              ; preds = %216
-  %220 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %188, i64 0, i32 5
-  store ptr %141, ptr %220, align 8
-  %221 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 4
-  %222 = load ptr, ptr %221, align 8
-  %223 = icmp eq ptr %222, null
-  br i1 %223, label %230, label %224
+218:                                              ; preds = %216, %197
+  %219 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %220 = icmp ult ptr %188, %219
+  br i1 %220, label %242, label %221, !prof !7
 
-224:                                              ; preds = %219
-  %225 = icmp ult ptr %222, %217
-  br i1 %225, label %229, label %226, !prof !7
+221:                                              ; preds = %218
+  %222 = getelementptr inbounds nuw i8, ptr %188, i64 48
+  store ptr %141, ptr %222, align 8
+  %223 = getelementptr inbounds nuw i8, ptr %6, i64 32
+  %224 = load ptr, ptr %223, align 8
+  %225 = icmp eq ptr %224, null
+  br i1 %225, label %232, label %226
 
-226:                                              ; preds = %224
-  %227 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %188, i64 0, i32 4
-  store ptr %222, ptr %227, align 8
-  %228 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %222, i64 0, i32 5
-  store ptr %188, ptr %228, align 8
-  br label %230
+226:                                              ; preds = %221
+  %227 = icmp ult ptr %224, %219
+  br i1 %227, label %231, label %228, !prof !7
 
-229:                                              ; preds = %224
-  tail call void @abort() #9
+228:                                              ; preds = %226
+  %229 = getelementptr inbounds nuw i8, ptr %188, i64 32
+  store ptr %224, ptr %229, align 8
+  %230 = getelementptr inbounds nuw i8, ptr %224, i64 48
+  store ptr %188, ptr %230, align 8
+  br label %232
+
+231:                                              ; preds = %226
+  tail call void @abort() #11
   unreachable
 
-230:                                              ; preds = %226, %219
-  %231 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %6, i64 0, i32 4, i64 1
-  %232 = load ptr, ptr %231, align 8
-  %233 = icmp eq ptr %232, null
-  br i1 %233, label %241, label %234
+232:                                              ; preds = %228, %221
+  %233 = getelementptr inbounds nuw i8, ptr %6, i64 40
+  %234 = load ptr, ptr %233, align 8
+  %235 = icmp eq ptr %234, null
+  br i1 %235, label %243, label %236
 
-234:                                              ; preds = %230
-  %235 = icmp ult ptr %232, %217
-  br i1 %235, label %239, label %236, !prof !7
+236:                                              ; preds = %232
+  %237 = icmp ult ptr %234, %219
+  br i1 %237, label %241, label %238, !prof !7
 
-236:                                              ; preds = %234
-  %237 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %188, i64 0, i32 4, i64 1
-  store ptr %232, ptr %237, align 8
-  %238 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %232, i64 0, i32 5
-  store ptr %188, ptr %238, align 8
-  br label %241
+238:                                              ; preds = %236
+  %239 = getelementptr inbounds nuw i8, ptr %188, i64 40
+  store ptr %234, ptr %239, align 8
+  %240 = getelementptr inbounds nuw i8, ptr %234, i64 48
+  store ptr %188, ptr %240, align 8
+  br label %243
 
-239:                                              ; preds = %234
-  tail call void @abort() #9
+241:                                              ; preds = %236
+  tail call void @abort() #11
   unreachable
 
-240:                                              ; preds = %216
-  tail call void @abort() #9
+242:                                              ; preds = %218
+  tail call void @abort() #11
   unreachable
 
-241:                                              ; preds = %236, %230, %208, %199, %187, %134, %121
-  %242 = icmp ult i64 %101, 32
-  br i1 %242, label %243, label %252
+243:                                              ; preds = %238, %232, %216, %199, %187, %134, %121
+  %244 = icmp ult i64 %101, 32
+  br i1 %244, label %245, label %254
 
-243:                                              ; preds = %241
-  %244 = load i64, ptr %3, align 8
-  %245 = and i64 %244, 1
-  %246 = or disjoint i64 %98, %245
-  %247 = or disjoint i64 %246, 2
-  store i64 %247, ptr %3, align 8
-  %248 = getelementptr inbounds i8, ptr %0, i64 %98
-  %249 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %248, i64 0, i32 1
-  %250 = load i64, ptr %249, align 8
-  %251 = or i64 %250, 1
-  store i64 %251, ptr %249, align 8
-  br label %265
+245:                                              ; preds = %243
+  %246 = load i64, ptr %3, align 8
+  %247 = and i64 %246, 1
+  %248 = or disjoint i64 %98, %247
+  %249 = or disjoint i64 %248, 2
+  store i64 %249, ptr %3, align 8
+  %250 = getelementptr inbounds nuw i8, ptr %0, i64 %98
+  %251 = getelementptr inbounds nuw i8, ptr %250, i64 8
+  %252 = load i64, ptr %251, align 8
+  %253 = or i64 %252, 1
+  store i64 %253, ptr %251, align 8
+  br label %267
 
-252:                                              ; preds = %241
-  %253 = getelementptr inbounds i8, ptr %0, i64 %1
-  %254 = load i64, ptr %3, align 8
-  %255 = and i64 %254, 1
-  %256 = or i64 %255, %1
-  %257 = or i64 %256, 2
-  store i64 %257, ptr %3, align 8
-  %258 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %253, i64 0, i32 1
-  %259 = or i64 %101, 3
-  store i64 %259, ptr %258, align 8
-  %260 = getelementptr inbounds i8, ptr %0, i64 %98
-  %261 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %260, i64 0, i32 1
-  %262 = load i64, ptr %261, align 8
-  %263 = or i64 %262, 1
-  store i64 %263, ptr %261, align 8
-  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef nonnull %253, i64 noundef %101)
-  br label %265
+254:                                              ; preds = %243
+  %255 = getelementptr inbounds nuw i8, ptr %0, i64 %1
+  %256 = load i64, ptr %3, align 8
+  %257 = and i64 %256, 1
+  %258 = or i64 %1, %257
+  %259 = or i64 %258, 2
+  store i64 %259, ptr %3, align 8
+  %260 = getelementptr inbounds nuw i8, ptr %255, i64 8
+  %261 = or i64 %101, 3
+  store i64 %261, ptr %260, align 8
+  %262 = getelementptr inbounds nuw i8, ptr %0, i64 %98
+  %263 = getelementptr inbounds nuw i8, ptr %262, i64 8
+  %264 = load i64, ptr %263, align 8
+  %265 = or i64 %264, 1
+  store i64 %265, ptr %263, align 8
+  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef nonnull %255, i64 noundef %101)
+  br label %267
 
-264:                                              ; preds = %14, %2
-  tail call void @abort() #9
+266:                                              ; preds = %14, %2
+  tail call void @abort() #11
   unreachable
 
-265:                                              ; preds = %252, %243, %96, %93, %90, %64, %53, %49, %37, %34, %31, %26, %21
-  %266 = phi ptr [ %0, %53 ], [ null, %49 ], [ null, %93 ], [ %0, %37 ], [ %0, %34 ], [ %0, %90 ], [ null, %64 ], [ null, %96 ], [ %0, %252 ], [ %0, %243 ], [ null, %31 ], [ null, %21 ], [ %0, %26 ]
-  ret ptr %266
+267:                                              ; preds = %254, %245, %96, %93, %90, %64, %53, %49, %37, %34, %31, %26, %21
+  %268 = phi ptr [ %0, %245 ], [ null, %64 ], [ %0, %53 ], [ null, %49 ], [ %0, %34 ], [ null, %93 ], [ %0, %37 ], [ %0, %90 ], [ null, %96 ], [ %0, %254 ], [ null, %31 ], [ null, %21 ], [ %0, %26 ]
+  ret ptr %268
 }
 
 ; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #6
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #7
 
 ; Function Attrs: nounwind uwtable
 define dso_local ptr @__temen_dl.dlmemalign(i64 noundef %0, i64 noundef %1) local_unnamed_addr #0 {
@@ -3464,26 +3523,26 @@ define dso_local ptr @__temen_dl.dlmemalign(i64 noundef %0, i64 noundef %1) loca
 }
 
 ; Function Attrs: nounwind uwtable
-define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 noundef %1) unnamed_addr #0 {
+define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef range(i64 17, 16) %0, i64 noundef %1) unnamed_addr #0 {
   %3 = tail call i64 @llvm.umax.i64(i64 %0, i64 32)
-  %4 = tail call i64 @llvm.ctpop.i64(i64 %3), !range !25
-  %5 = icmp ult i64 %4, 2
+  %4 = tail call range(i64 1, 65) i64 @llvm.ctpop.i64(i64 %3)
+  %5 = icmp samesign ult i64 %4, 2
   br i1 %5, label %10, label %6
 
 6:                                                ; preds = %6, %2
   %7 = phi i64 [ %9, %6 ], [ 32, %2 ]
   %8 = icmp ult i64 %7, %3
   %9 = shl i64 %7, 1
-  br i1 %8, label %6, label %10, !llvm.loop !26
+  br i1 %8, label %6, label %10, !llvm.loop !21
 
 10:                                               ; preds = %6, %2
   %11 = phi i64 [ %3, %2 ], [ %7, %6 ]
   %12 = sub i64 -128, %11
-  %13 = icmp ugt i64 %12, %1
+  %13 = icmp ult i64 %1, %12
   br i1 %13, label %16, label %14
 
 14:                                               ; preds = %10
-  %15 = tail call ptr @__errno_location() #10
+  %15 = tail call ptr @__errno_location() #12
   store i32 12, ptr %15, align 4
   br label %117
 
@@ -3500,23 +3559,23 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
 
 25:                                               ; preds = %16
   %26 = getelementptr inbounds i8, ptr %23, i64 -16
-  %27 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
+  %27 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
   %28 = and i32 %27, 2
   %29 = icmp eq i32 %28, 0
   br i1 %29, label %40, label %30
 
 30:                                               ; preds = %25
-  %31 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %31 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %32 = icmp eq i32 %31, 0
   br i1 %32, label %40, label %33
 
 33:                                               ; preds = %39, %30
-  %34 = load volatile i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), align 4
+  %34 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
   %35 = icmp eq i32 %34, 0
   br i1 %35, label %36, label %39
 
 36:                                               ; preds = %33
-  %37 = atomicrmw xchg ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16), i32 1 seq_cst, align 4
+  %37 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
   %38 = icmp eq i32 %37, 0
   br i1 %38, label %40, label %39
 
@@ -3531,7 +3590,7 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
   br i1 %44, label %89, label %45
 
 45:                                               ; preds = %40
-  %46 = getelementptr inbounds i8, ptr %23, i64 %11
+  %46 = getelementptr inbounds nuw i8, ptr %23, i64 %11
   %47 = getelementptr inbounds i8, ptr %46, i64 -1
   %48 = ptrtoint ptr %47 to i64
   %49 = sub i64 0, %11
@@ -3543,7 +3602,7 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
   %55 = sub i64 %53, %54
   %56 = icmp ugt i64 %55, 31
   %57 = select i1 %56, i64 0, i64 %11
-  %58 = getelementptr inbounds i8, ptr %52, i64 %57
+  %58 = getelementptr inbounds nuw i8, ptr %52, i64 %57
   %59 = ptrtoint ptr %58 to i64
   %60 = sub i64 %59, %54
   %61 = getelementptr inbounds i8, ptr %23, i64 -8
@@ -3558,19 +3617,19 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
   %68 = load i64, ptr %26, align 8
   %69 = add i64 %68, %60
   store i64 %69, ptr %58, align 8
-  %70 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %58, i64 0, i32 1
+  %70 = getelementptr inbounds nuw i8, ptr %58, i64 8
   store i64 %64, ptr %70, align 8
   br label %89
 
 71:                                               ; preds = %45
-  %72 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %58, i64 0, i32 1
+  %72 = getelementptr inbounds nuw i8, ptr %58, i64 8
   %73 = load i64, ptr %72, align 8
   %74 = and i64 %73, 1
   %75 = or i64 %64, %74
   %76 = or i64 %75, 2
   store i64 %76, ptr %72, align 8
-  %77 = getelementptr inbounds i8, ptr %58, i64 %64
-  %78 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %77, i64 0, i32 1
+  %77 = getelementptr inbounds nuw i8, ptr %58, i64 %64
+  %78 = getelementptr inbounds nuw i8, ptr %77, i64 8
   %79 = load i64, ptr %78, align 8
   %80 = or i64 %79, 1
   store i64 %80, ptr %78, align 8
@@ -3579,8 +3638,8 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
   %83 = or i64 %60, %82
   %84 = or i64 %83, 2
   store i64 %84, ptr %61, align 8
-  %85 = getelementptr inbounds i8, ptr %26, i64 %60
-  %86 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %85, i64 0, i32 1
+  %85 = getelementptr inbounds nuw i8, ptr %26, i64 %60
+  %86 = getelementptr inbounds nuw i8, ptr %85, i64 8
   %87 = load i64, ptr %86, align 8
   %88 = or i64 %87, 1
   store i64 %88, ptr %86, align 8
@@ -3589,7 +3648,7 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
 
 89:                                               ; preds = %71, %67, %40
   %90 = phi ptr [ %26, %40 ], [ %58, %71 ], [ %58, %67 ]
-  %91 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %90, i64 0, i32 1
+  %91 = getelementptr inbounds nuw i8, ptr %90, i64 8
   %92 = load i64, ptr %91, align 8
   %93 = and i64 %92, 3
   %94 = icmp eq i64 %93, 0
@@ -3603,16 +3662,16 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
 
 99:                                               ; preds = %95
   %100 = sub i64 %96, %20
-  %101 = getelementptr inbounds i8, ptr %90, i64 %20
+  %101 = getelementptr inbounds nuw i8, ptr %90, i64 %20
   %102 = and i64 %92, 1
   %103 = or disjoint i64 %20, %102
   %104 = or disjoint i64 %103, 2
   store i64 %104, ptr %91, align 8
-  %105 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %101, i64 0, i32 1
+  %105 = getelementptr inbounds nuw i8, ptr %101, i64 8
   %106 = or disjoint i64 %100, 3
   store i64 %106, ptr %105, align 8
-  %107 = getelementptr inbounds i8, ptr %90, i64 %96
-  %108 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %107, i64 0, i32 1
+  %107 = getelementptr inbounds nuw i8, ptr %90, i64 %96
+  %108 = getelementptr inbounds nuw i8, ptr %107, i64 8
   %109 = load i64, ptr %108, align 8
   %110 = or i64 %109, 1
   store i64 %110, ptr %108, align 8
@@ -3620,14 +3679,14 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
   br label %111
 
 111:                                              ; preds = %99, %95, %89
-  %112 = getelementptr inbounds i8, ptr %90, i64 16
-  %113 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 15), align 8
+  %112 = getelementptr inbounds nuw i8, ptr %90, i64 16
+  %113 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
   %114 = and i32 %113, 2
   %115 = icmp eq i32 %114, 0
   br i1 %115, label %117, label %116
 
 116:                                              ; preds = %111
-  store atomic i32 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 16) release, align 4
+  store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
   br label %117
 
 117:                                              ; preds = %116, %111, %16, %14
@@ -3636,7 +3695,7 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef %0, i64 nou
 }
 
 ; Function Attrs: nounwind uwtable
-define dso_local noundef i32 @__temen_dl.dlposix_memalign(ptr nocapture noundef writeonly %0, i64 noundef %1, i64 noundef %2) local_unnamed_addr #0 {
+define dso_local range(i32 0, 23) i32 @__temen_dl.dlposix_memalign(ptr noundef writeonly captures(none) %0, i64 noundef %1, i64 noundef %2) local_unnamed_addr #0 {
   %4 = icmp eq i64 %1, 16
   br i1 %4, label %5, label %7
 
@@ -3645,21 +3704,19 @@ define dso_local noundef i32 @__temen_dl.dlposix_memalign(ptr nocapture noundef 
   br label %22
 
 7:                                                ; preds = %3
-  %8 = and i64 %1, 7
-  %9 = icmp ne i64 %8, 0
-  %10 = icmp ult i64 %1, 8
-  %11 = or i1 %10, %9
-  br i1 %11, label %26, label %12
-
-12:                                               ; preds = %7
-  %13 = lshr i64 %1, 3
-  %14 = tail call i64 @llvm.ctpop.i64(i64 %13), !range !27
-  %15 = icmp ult i64 %14, 2
+  %8 = lshr i64 %1, 3
+  %9 = and i64 %1, 7
+  %10 = icmp eq i64 %9, 0
+  %11 = icmp ne i64 %8, 0
+  %12 = and i1 %10, %11
+  %13 = tail call range(i64 0, 62) i64 @llvm.ctpop.i64(i64 %8)
+  %14 = icmp samesign ult i64 %13, 2
+  %15 = select i1 %12, i1 %14, i1 false
   br i1 %15, label %16, label %26
 
-16:                                               ; preds = %12
+16:                                               ; preds = %7
   %17 = sub i64 -128, %1
-  %18 = icmp ult i64 %17, %2
+  %18 = icmp ugt i64 %2, %17
   br i1 %18, label %26, label %19
 
 19:                                               ; preds = %16
@@ -3676,70 +3733,70 @@ define dso_local noundef i32 @__temen_dl.dlposix_memalign(ptr nocapture noundef 
   store ptr %23, ptr %0, align 8
   br label %26
 
-26:                                               ; preds = %25, %22, %16, %12, %7
-  %27 = phi i32 [ 0, %25 ], [ 12, %22 ], [ 22, %7 ], [ 22, %12 ], [ 12, %16 ]
+26:                                               ; preds = %25, %22, %16, %7
+  %27 = phi i32 [ 12, %22 ], [ 0, %25 ], [ 22, %7 ], [ 12, %16 ]
   ret i32 %27
 }
 
-declare ptr @__temen_sbrk(i64 noundef) local_unnamed_addr #7
+declare ptr @__temen_sbrk(i64 noundef) local_unnamed_addr #8
 
-; Function Attrs: nounwind uwtable
-define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr noundef %1, i64 noundef %2) unnamed_addr #0 {
-  %4 = getelementptr inbounds i8, ptr %0, i64 16
+; Function Attrs: nofree nounwind uwtable
+define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr noundef %1, i64 noundef range(i64 -1, -105) %2) unnamed_addr #4 {
+  %4 = getelementptr inbounds nuw i8, ptr %0, i64 16
   %5 = ptrtoint ptr %4 to i64
   %6 = sub i64 0, %5
   %7 = and i64 %6, 15
-  %8 = getelementptr inbounds i8, ptr %0, i64 %7
-  %9 = getelementptr inbounds i8, ptr %1, i64 16
+  %8 = getelementptr inbounds nuw i8, ptr %0, i64 %7
+  %9 = getelementptr inbounds nuw i8, ptr %1, i64 16
   %10 = ptrtoint ptr %9 to i64
   %11 = sub i64 0, %10
   %12 = and i64 %11, 15
-  %13 = getelementptr inbounds i8, ptr %1, i64 %12
+  %13 = getelementptr inbounds nuw i8, ptr %1, i64 %12
   %14 = ptrtoint ptr %13 to i64
   %15 = ptrtoint ptr %8 to i64
-  %16 = getelementptr inbounds i8, ptr %8, i64 %2
-  %17 = add i64 %15, %2
+  %16 = getelementptr inbounds nuw i8, ptr %8, i64 %2
+  %17 = add i64 %2, %15
   %18 = sub i64 %14, %17
   %19 = or i64 %2, 3
-  %20 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %8, i64 0, i32 1
+  %20 = getelementptr inbounds nuw i8, ptr %8, i64 8
   store i64 %19, ptr %20, align 8
-  %21 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
+  %21 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
   %22 = icmp eq ptr %13, %21
   br i1 %22, label %23, label %28
 
 23:                                               ; preds = %3
-  %24 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
+  %24 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
   %25 = add i64 %24, %18
-  store i64 %25, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  store ptr %16, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
+  store i64 %25, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  store ptr %16, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
   %26 = or i64 %25, 1
-  %27 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %16, i64 0, i32 1
+  %27 = getelementptr inbounds nuw i8, ptr %16, i64 8
   store i64 %26, ptr %27, align 8
-  br label %300
+  br label %303
 
 28:                                               ; preds = %3
-  %29 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+  %29 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
   %30 = icmp eq ptr %13, %29
   br i1 %30, label %31, label %37
 
 31:                                               ; preds = %28
-  %32 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
+  %32 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
   %33 = add i64 %32, %18
-  store i64 %33, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr %16, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+  store i64 %33, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr %16, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
   %34 = or i64 %33, 1
-  %35 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %16, i64 0, i32 1
+  %35 = getelementptr inbounds nuw i8, ptr %16, i64 8
   store i64 %34, ptr %35, align 8
-  %36 = getelementptr inbounds i8, ptr %16, i64 %33
+  %36 = getelementptr inbounds nuw i8, ptr %16, i64 %33
   store i64 %33, ptr %36, align 8
-  br label %300
+  br label %303
 
 37:                                               ; preds = %28
-  %38 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %13, i64 0, i32 1
+  %38 = getelementptr inbounds nuw i8, ptr %13, i64 8
   %39 = load i64, ptr %38, align 8
   %40 = and i64 %39, 3
   %41 = icmp eq i64 %40, 1
-  br i1 %41, label %42, label %192
+  br i1 %41, label %42, label %194
 
 42:                                               ; preds = %37
   %43 = and i64 %39, -8
@@ -3748,23 +3805,23 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
 
 45:                                               ; preds = %42
   %46 = lshr i64 %39, 3
-  %47 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %13, i64 0, i32 2
+  %47 = getelementptr inbounds nuw i8, ptr %13, i64 16
   %48 = load ptr, ptr %47, align 8
-  %49 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %13, i64 0, i32 3
+  %49 = getelementptr inbounds nuw i8, ptr %13, i64 24
   %50 = load ptr, ptr %49, align 8
-  %51 = trunc i64 %46 to i32
-  %52 = shl nuw nsw i64 %46, 1
-  %53 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %52
+  %51 = trunc nuw nsw i64 %46 to i32
+  %52 = shl nuw nsw i64 %46, 4
+  %53 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %52
   %54 = icmp eq ptr %48, %53
   br i1 %54, label %62, label %55
 
 55:                                               ; preds = %45
-  %56 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %56 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %57 = icmp ult ptr %48, %56
   br i1 %57, label %82, label %58
 
 58:                                               ; preds = %55
-  %59 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %48, i64 0, i32 3
+  %59 = getelementptr inbounds nuw i8, ptr %48, i64 24
   %60 = load ptr, ptr %59, align 8
   %61 = icmp eq ptr %60, %13
   br i1 %61, label %62, label %82, !prof !8
@@ -3779,61 +3836,61 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   %67 = load i32, ptr @__temen_dl._gm_, align 8
   %68 = and i32 %67, %66
   store i32 %68, ptr @__temen_dl._gm_, align 8
-  br label %187
+  br label %189
 
 69:                                               ; preds = %62
   %70 = icmp eq ptr %50, %53
   br i1 %70, label %78, label %71
 
 71:                                               ; preds = %69
-  %72 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %72 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %73 = icmp ult ptr %50, %72
   br i1 %73, label %81, label %74
 
 74:                                               ; preds = %71
-  %75 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %50, i64 0, i32 2
+  %75 = getelementptr inbounds nuw i8, ptr %50, i64 16
   %76 = load ptr, ptr %75, align 8
   %77 = icmp eq ptr %76, %13
   br i1 %77, label %78, label %81, !prof !8
 
 78:                                               ; preds = %74, %69
-  %79 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %48, i64 0, i32 3
+  %79 = getelementptr inbounds nuw i8, ptr %48, i64 24
   store ptr %50, ptr %79, align 8
-  %80 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %50, i64 0, i32 2
+  %80 = getelementptr inbounds nuw i8, ptr %50, i64 16
   store ptr %48, ptr %80, align 8
-  br label %187
+  br label %189
 
 81:                                               ; preds = %74, %71
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 82:                                               ; preds = %58, %55
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 83:                                               ; preds = %42
-  %84 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 5
+  %84 = getelementptr inbounds nuw i8, ptr %13, i64 48
   %85 = load ptr, ptr %84, align 8
-  %86 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 3
+  %86 = getelementptr inbounds nuw i8, ptr %13, i64 24
   %87 = load ptr, ptr %86, align 8
   %88 = icmp eq ptr %87, %13
   br i1 %88, label %104, label %89
 
 89:                                               ; preds = %83
-  %90 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 2
+  %90 = getelementptr inbounds nuw i8, ptr %13, i64 16
   %91 = load ptr, ptr %90, align 8
-  %92 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %92 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %93 = icmp ult ptr %91, %92
   br i1 %93, label %103, label %94, !prof !7
 
 94:                                               ; preds = %89
-  %95 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %91, i64 0, i32 3
+  %95 = getelementptr inbounds nuw i8, ptr %91, i64 24
   %96 = load ptr, ptr %95, align 8
   %97 = icmp eq ptr %96, %13
   br i1 %97, label %98, label %103, !prof !8
 
 98:                                               ; preds = %94
-  %99 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %87, i64 0, i32 2
+  %99 = getelementptr inbounds nuw i8, ptr %87, i64 16
   %100 = load ptr, ptr %99, align 8
   %101 = icmp eq ptr %100, %13
   br i1 %101, label %102, label %103, !prof !8
@@ -3844,30 +3901,30 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %133
 
 103:                                              ; preds = %98, %94, %89
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 104:                                              ; preds = %83
-  %105 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 4, i64 1
+  %105 = getelementptr inbounds nuw i8, ptr %13, i64 40
   %106 = load ptr, ptr %105, align 8
   %107 = icmp eq ptr %106, null
   br i1 %107, label %108, label %112
 
 108:                                              ; preds = %104
-  %109 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 4
+  %109 = getelementptr inbounds nuw i8, ptr %13, i64 32
   %110 = load ptr, ptr %109, align 8
   %111 = icmp eq ptr %110, null
   br i1 %111, label %133, label %112
 
 112:                                              ; preds = %108, %104
-  %113 = phi ptr [ %109, %108 ], [ %105, %104 ]
-  %114 = phi ptr [ %110, %108 ], [ %106, %104 ]
+  %113 = phi ptr [ %105, %104 ], [ %109, %108 ]
+  %114 = phi ptr [ %106, %104 ], [ %110, %108 ]
   br label %115
 
 115:                                              ; preds = %121, %112
   %116 = phi ptr [ %113, %112 ], [ %122, %121 ]
   %117 = phi ptr [ %114, %112 ], [ %123, %121 ]
-  %118 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %117, i64 0, i32 4, i64 1
+  %118 = getelementptr inbounds nuw i8, ptr %117, i64 40
   %119 = load ptr, ptr %118, align 8
   %120 = icmp eq ptr %119, null
   br i1 %120, label %124, label %121
@@ -3875,16 +3932,16 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
 121:                                              ; preds = %124, %115
   %122 = phi ptr [ %118, %115 ], [ %125, %124 ]
   %123 = phi ptr [ %119, %115 ], [ %126, %124 ]
-  br label %115, !llvm.loop !28
+  br label %115, !llvm.loop !22
 
 124:                                              ; preds = %115
-  %125 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %117, i64 0, i32 4
+  %125 = getelementptr inbounds nuw i8, ptr %117, i64 32
   %126 = load ptr, ptr %125, align 8
   %127 = icmp eq ptr %126, null
   br i1 %127, label %128, label %121
 
 128:                                              ; preds = %124
-  %129 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %129 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %130 = icmp ult ptr %116, %129
   br i1 %130, label %132, label %131, !prof !7
 
@@ -3893,19 +3950,19 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %133
 
 132:                                              ; preds = %128
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 133:                                              ; preds = %131, %108, %102
   %134 = phi ptr [ %87, %102 ], [ %117, %131 ], [ null, %108 ]
   %135 = icmp eq ptr %85, null
-  br i1 %135, label %187, label %136
+  br i1 %135, label %189, label %136
 
 136:                                              ; preds = %133
-  %137 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 6
+  %137 = getelementptr inbounds nuw i8, ptr %13, i64 56
   %138 = load i32, ptr %137, align 8
   %139 = zext i32 %138 to i64
-  %140 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %139
+  %140 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %139
   %141 = load ptr, ptr %140, align 8
   %142 = icmp eq ptr %13, %141
   br i1 %142, label %143, label %151
@@ -3913,303 +3970,313 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
 143:                                              ; preds = %136
   store ptr %134, ptr %140, align 8
   %144 = icmp eq ptr %134, null
-  br i1 %144, label %145, label %162
+  br i1 %144, label %145, label %164
 
 145:                                              ; preds = %143
   %146 = load i32, ptr %137, align 8
   %147 = shl nuw i32 1, %146
   %148 = xor i32 %147, -1
-  %149 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
+  %149 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
   %150 = and i32 %149, %148
-  store i32 %150, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %187
+  store i32 %150, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %189
 
 151:                                              ; preds = %136
-  %152 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %152 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %153 = icmp ult ptr %85, %152
   br i1 %153, label %161, label %154, !prof !7
 
 154:                                              ; preds = %151
-  %155 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %85, i64 0, i32 4
+  %155 = getelementptr inbounds nuw i8, ptr %85, i64 32
   %156 = load ptr, ptr %155, align 8
   %157 = icmp eq ptr %156, %13
-  %158 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %85, i64 0, i32 4, i64 1
-  %159 = select i1 %157, ptr %155, ptr %158
-  store ptr %134, ptr %159, align 8
-  %160 = icmp eq ptr %134, null
-  br i1 %160, label %187, label %162
+  br i1 %157, label %158, label %159
+
+158:                                              ; preds = %154
+  store ptr %134, ptr %155, align 8
+  br label %162
+
+159:                                              ; preds = %154
+  %160 = getelementptr inbounds nuw i8, ptr %85, i64 40
+  store ptr %134, ptr %160, align 8
+  br label %162
 
 161:                                              ; preds = %151
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
-162:                                              ; preds = %154, %143
-  %163 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %164 = icmp ult ptr %134, %163
-  br i1 %164, label %186, label %165, !prof !7
+162:                                              ; preds = %159, %158
+  %163 = icmp eq ptr %134, null
+  br i1 %163, label %189, label %164
 
-165:                                              ; preds = %162
-  %166 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %134, i64 0, i32 5
-  store ptr %85, ptr %166, align 8
-  %167 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 4
-  %168 = load ptr, ptr %167, align 8
-  %169 = icmp eq ptr %168, null
-  br i1 %169, label %176, label %170
+164:                                              ; preds = %162, %143
+  %165 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %166 = icmp ult ptr %134, %165
+  br i1 %166, label %188, label %167, !prof !7
 
-170:                                              ; preds = %165
-  %171 = icmp ult ptr %168, %163
-  br i1 %171, label %175, label %172, !prof !7
+167:                                              ; preds = %164
+  %168 = getelementptr inbounds nuw i8, ptr %134, i64 48
+  store ptr %85, ptr %168, align 8
+  %169 = getelementptr inbounds nuw i8, ptr %13, i64 32
+  %170 = load ptr, ptr %169, align 8
+  %171 = icmp eq ptr %170, null
+  br i1 %171, label %178, label %172
 
-172:                                              ; preds = %170
-  %173 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %134, i64 0, i32 4
-  store ptr %168, ptr %173, align 8
-  %174 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %168, i64 0, i32 5
-  store ptr %134, ptr %174, align 8
-  br label %176
+172:                                              ; preds = %167
+  %173 = icmp ult ptr %170, %165
+  br i1 %173, label %177, label %174, !prof !7
 
-175:                                              ; preds = %170
-  tail call void @abort() #9
+174:                                              ; preds = %172
+  %175 = getelementptr inbounds nuw i8, ptr %134, i64 32
+  store ptr %170, ptr %175, align 8
+  %176 = getelementptr inbounds nuw i8, ptr %170, i64 48
+  store ptr %134, ptr %176, align 8
+  br label %178
+
+177:                                              ; preds = %172
+  tail call void @abort() #11
   unreachable
 
-176:                                              ; preds = %172, %165
-  %177 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %13, i64 0, i32 4, i64 1
-  %178 = load ptr, ptr %177, align 8
-  %179 = icmp eq ptr %178, null
-  br i1 %179, label %187, label %180
+178:                                              ; preds = %174, %167
+  %179 = getelementptr inbounds nuw i8, ptr %13, i64 40
+  %180 = load ptr, ptr %179, align 8
+  %181 = icmp eq ptr %180, null
+  br i1 %181, label %189, label %182
 
-180:                                              ; preds = %176
-  %181 = icmp ult ptr %178, %163
-  br i1 %181, label %185, label %182, !prof !7
+182:                                              ; preds = %178
+  %183 = icmp ult ptr %180, %165
+  br i1 %183, label %187, label %184, !prof !7
 
-182:                                              ; preds = %180
-  %183 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %134, i64 0, i32 4, i64 1
-  store ptr %178, ptr %183, align 8
-  %184 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %178, i64 0, i32 5
-  store ptr %134, ptr %184, align 8
-  br label %187
+184:                                              ; preds = %182
+  %185 = getelementptr inbounds nuw i8, ptr %134, i64 40
+  store ptr %180, ptr %185, align 8
+  %186 = getelementptr inbounds nuw i8, ptr %180, i64 48
+  store ptr %134, ptr %186, align 8
+  br label %189
 
-185:                                              ; preds = %180
-  tail call void @abort() #9
+187:                                              ; preds = %182
+  tail call void @abort() #11
   unreachable
 
-186:                                              ; preds = %162
-  tail call void @abort() #9
+188:                                              ; preds = %164
+  tail call void @abort() #11
   unreachable
 
-187:                                              ; preds = %182, %176, %154, %145, %133, %78, %64
-  %188 = getelementptr inbounds i8, ptr %13, i64 %43
-  %189 = add i64 %43, %18
-  %190 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %188, i64 0, i32 1
-  %191 = load i64, ptr %190, align 8
-  br label %192
+189:                                              ; preds = %184, %178, %162, %145, %133, %78, %64
+  %190 = getelementptr inbounds nuw i8, ptr %13, i64 %43
+  %191 = add i64 %43, %18
+  %192 = getelementptr inbounds nuw i8, ptr %190, i64 8
+  %193 = load i64, ptr %192, align 8
+  br label %194
 
-192:                                              ; preds = %187, %37
-  %193 = phi i64 [ %39, %37 ], [ %191, %187 ]
-  %194 = phi i64 [ %18, %37 ], [ %189, %187 ]
-  %195 = phi ptr [ %13, %37 ], [ %188, %187 ]
-  %196 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %195, i64 0, i32 1
-  %197 = and i64 %193, -2
-  store i64 %197, ptr %196, align 8
-  %198 = or i64 %194, 1
-  %199 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %16, i64 0, i32 1
-  store i64 %198, ptr %199, align 8
-  %200 = getelementptr inbounds i8, ptr %16, i64 %194
-  store i64 %194, ptr %200, align 8
-  %201 = icmp ult i64 %194, 256
-  br i1 %201, label %202, label %225
+194:                                              ; preds = %189, %37
+  %195 = phi i64 [ %39, %37 ], [ %193, %189 ]
+  %196 = phi i64 [ %18, %37 ], [ %191, %189 ]
+  %197 = phi ptr [ %13, %37 ], [ %190, %189 ]
+  %198 = getelementptr inbounds nuw i8, ptr %197, i64 8
+  %199 = and i64 %195, -2
+  store i64 %199, ptr %198, align 8
+  %200 = or i64 %196, 1
+  %201 = getelementptr inbounds nuw i8, ptr %16, i64 8
+  store i64 %200, ptr %201, align 8
+  %202 = getelementptr inbounds nuw i8, ptr %16, i64 %196
+  store i64 %196, ptr %202, align 8
+  %203 = icmp ult i64 %196, 256
+  br i1 %203, label %204, label %227
 
-202:                                              ; preds = %192
-  %203 = lshr i64 %194, 3
-  %204 = trunc i64 %203 to i32
-  %205 = shl nuw nsw i64 %203, 1
-  %206 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %205
-  %207 = load i32, ptr @__temen_dl._gm_, align 8
-  %208 = shl nuw i32 1, %204
-  %209 = and i32 %207, %208
-  %210 = icmp eq i32 %209, 0
-  br i1 %210, label %211, label %213
+204:                                              ; preds = %194
+  %205 = lshr i64 %196, 3
+  %206 = trunc nuw nsw i64 %205 to i32
+  %207 = shl nuw nsw i64 %205, 4
+  %208 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %207
+  %209 = load i32, ptr @__temen_dl._gm_, align 8
+  %210 = shl nuw i32 1, %206
+  %211 = and i32 %209, %210
+  %212 = icmp eq i32 %211, 0
+  br i1 %212, label %213, label %215
 
-211:                                              ; preds = %202
-  %212 = or i32 %207, %208
-  store i32 %212, ptr @__temen_dl._gm_, align 8
-  br label %219
+213:                                              ; preds = %204
+  %214 = or i32 %209, %210
+  store i32 %214, ptr @__temen_dl._gm_, align 8
+  br label %221
 
-213:                                              ; preds = %202
-  %214 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %206, i64 0, i32 2
-  %215 = load ptr, ptr %214, align 8
-  %216 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %217 = icmp ult ptr %215, %216
-  br i1 %217, label %218, label %219, !prof !7
+215:                                              ; preds = %204
+  %216 = getelementptr inbounds nuw i8, ptr %208, i64 16
+  %217 = load ptr, ptr %216, align 8
+  %218 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %219 = icmp ult ptr %217, %218
+  br i1 %219, label %220, label %221, !prof !7
 
-218:                                              ; preds = %213
-  tail call void @abort() #9
+220:                                              ; preds = %215
+  tail call void @abort() #11
   unreachable
 
-219:                                              ; preds = %213, %211
-  %220 = phi ptr [ %206, %211 ], [ %215, %213 ]
-  %221 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %206, i64 0, i32 2
-  store ptr %16, ptr %221, align 8
-  %222 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %220, i64 0, i32 3
-  store ptr %16, ptr %222, align 8
-  %223 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %16, i64 0, i32 2
-  store ptr %220, ptr %223, align 8
-  %224 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %16, i64 0, i32 3
-  store ptr %206, ptr %224, align 8
-  br label %300
+221:                                              ; preds = %215, %213
+  %222 = phi ptr [ %208, %213 ], [ %217, %215 ]
+  %223 = getelementptr inbounds nuw i8, ptr %208, i64 16
+  store ptr %16, ptr %223, align 8
+  %224 = getelementptr inbounds nuw i8, ptr %222, i64 24
+  store ptr %16, ptr %224, align 8
+  %225 = getelementptr inbounds nuw i8, ptr %16, i64 16
+  store ptr %222, ptr %225, align 8
+  %226 = getelementptr inbounds nuw i8, ptr %16, i64 24
+  store ptr %208, ptr %226, align 8
+  br label %303
 
-225:                                              ; preds = %192
-  %226 = lshr i64 %194, 8
-  %227 = trunc i64 %226 to i32
-  %228 = icmp eq i32 %227, 0
-  br i1 %228, label %241, label %229
+227:                                              ; preds = %194
+  %228 = lshr i64 %196, 8
+  %229 = trunc i64 %228 to i32
+  %230 = icmp eq i32 %229, 0
+  br i1 %230, label %243, label %231
 
-229:                                              ; preds = %225
-  %230 = icmp ugt i32 %227, 65535
-  br i1 %230, label %241, label %231
+231:                                              ; preds = %227
+  %232 = icmp ugt i32 %229, 65535
+  br i1 %232, label %243, label %233
 
-231:                                              ; preds = %229
-  %232 = tail call i32 @llvm.ctlz.i32(i32 %227, i1 true), !range !13
-  %233 = shl nuw nsw i32 %232, 1
-  %234 = sub nuw nsw i32 38, %232
-  %235 = zext nneg i32 %234 to i64
-  %236 = lshr i64 %194, %235
-  %237 = trunc i64 %236 to i32
-  %238 = and i32 %237, 1
-  %239 = or disjoint i32 %238, %233
-  %240 = xor i32 %239, 62
-  br label %241
+233:                                              ; preds = %231
+  %234 = tail call range(i32 16, 33) i32 @llvm.ctlz.i32(i32 %229, i1 true)
+  %235 = shl nuw nsw i32 %234, 1
+  %236 = sub nuw nsw i32 38, %234
+  %237 = zext nneg i32 %236 to i64
+  %238 = lshr i64 %196, %237
+  %239 = trunc i64 %238 to i32
+  %240 = and i32 %239, 1
+  %241 = or disjoint i32 %240, %235
+  %242 = xor i32 %241, 62
+  br label %243
 
-241:                                              ; preds = %231, %229, %225
-  %242 = phi i32 [ %240, %231 ], [ 0, %225 ], [ 31, %229 ]
-  %243 = zext nneg i32 %242 to i64
-  %244 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %243
-  %245 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 6
-  store i32 %242, ptr %245, align 8
-  %246 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 4
-  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %246, i8 0, i64 16, i1 false)
-  %247 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %248 = shl nuw i32 1, %242
-  %249 = and i32 %247, %248
-  %250 = icmp eq i32 %249, 0
-  br i1 %250, label %251, label %256
+243:                                              ; preds = %233, %231, %227
+  %244 = phi i32 [ %242, %233 ], [ 0, %227 ], [ 31, %231 ]
+  %245 = zext nneg i32 %244 to i64
+  %246 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %245
+  %247 = getelementptr inbounds nuw i8, ptr %16, i64 56
+  store i32 %244, ptr %247, align 8
+  %248 = getelementptr inbounds nuw i8, ptr %16, i64 32
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %248, i8 0, i64 16, i1 false)
+  %249 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %250 = shl nuw i32 1, %244
+  %251 = and i32 %249, %250
+  %252 = icmp eq i32 %251, 0
+  br i1 %252, label %253, label %258
 
-251:                                              ; preds = %241
-  %252 = or i32 %247, %248
-  store i32 %252, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  store ptr %16, ptr %244, align 8
-  %253 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 5
-  store ptr %244, ptr %253, align 8
-  %254 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 3
-  store ptr %16, ptr %254, align 8
-  %255 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 2
-  store ptr %16, ptr %255, align 8
-  br label %300
+253:                                              ; preds = %243
+  %254 = or i32 %249, %250
+  store i32 %254, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  store ptr %16, ptr %246, align 8
+  %255 = getelementptr inbounds nuw i8, ptr %16, i64 48
+  store ptr %246, ptr %255, align 8
+  %256 = getelementptr inbounds nuw i8, ptr %16, i64 24
+  store ptr %16, ptr %256, align 8
+  %257 = getelementptr inbounds nuw i8, ptr %16, i64 16
+  store ptr %16, ptr %257, align 8
+  br label %303
 
-256:                                              ; preds = %241
-  %257 = load ptr, ptr %244, align 8
-  %258 = icmp eq i32 %242, 31
-  %259 = lshr i32 %242, 1
-  %260 = add nuw nsw i32 %259, 6
-  %261 = zext nneg i32 %260 to i64
-  %262 = sub nuw nsw i64 63, %261
-  %263 = select i1 %258, i64 0, i64 %262
-  %264 = shl i64 %194, %263
-  br label %265
+258:                                              ; preds = %243
+  %259 = load ptr, ptr %246, align 8
+  %260 = icmp eq i32 %244, 31
+  %261 = lshr i32 %244, 1
+  %262 = add nuw nsw i32 %261, 6
+  %263 = zext nneg i32 %262 to i64
+  %264 = sub nuw nsw i64 63, %263
+  %265 = select i1 %260, i64 0, i64 %264
+  %266 = shl i64 %196, %265
+  br label %267
 
-265:                                              ; preds = %272, %256
-  %266 = phi ptr [ %257, %256 ], [ %276, %272 ]
-  %267 = phi i64 [ %264, %256 ], [ %275, %272 ]
-  %268 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %266, i64 0, i32 1
-  %269 = load i64, ptr %268, align 8
-  %270 = and i64 %269, -8
-  %271 = icmp eq i64 %270, %194
-  br i1 %271, label %287, label %272
+267:                                              ; preds = %274, %258
+  %268 = phi ptr [ %259, %258 ], [ %279, %274 ]
+  %269 = phi i64 [ %266, %258 ], [ %278, %274 ]
+  %270 = getelementptr inbounds nuw i8, ptr %268, i64 8
+  %271 = load i64, ptr %270, align 8
+  %272 = and i64 %271, -8
+  %273 = icmp eq i64 %272, %196
+  br i1 %273, label %290, label %274
 
-272:                                              ; preds = %265
-  %273 = lshr i64 %267, 63
-  %274 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %266, i64 0, i32 4, i64 %273
-  %275 = shl i64 %267, 1
-  %276 = load ptr, ptr %274, align 8
-  %277 = icmp eq ptr %276, null
-  br i1 %277, label %278, label %265
+274:                                              ; preds = %267
+  %275 = getelementptr inbounds nuw i8, ptr %268, i64 32
+  %276 = lshr i64 %269, 63
+  %277 = getelementptr inbounds nuw ptr, ptr %275, i64 %276
+  %278 = shl i64 %269, 1
+  %279 = load ptr, ptr %277, align 8
+  %280 = icmp eq ptr %279, null
+  br i1 %280, label %281, label %267
 
-278:                                              ; preds = %272
-  %279 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %266, i64 0, i32 4, i64 %273
-  %280 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %281 = icmp ult ptr %279, %280
-  br i1 %281, label %286, label %282, !prof !7
+281:                                              ; preds = %274
+  %282 = getelementptr inbounds nuw ptr, ptr %275, i64 %276
+  %283 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %284 = icmp ult ptr %282, %283
+  br i1 %284, label %289, label %285, !prof !7
 
-282:                                              ; preds = %278
-  store ptr %16, ptr %279, align 8
-  %283 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 5
-  store ptr %266, ptr %283, align 8
-  %284 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 3
-  store ptr %16, ptr %284, align 8
-  %285 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 2
-  store ptr %16, ptr %285, align 8
-  br label %300
-
-286:                                              ; preds = %278
-  tail call void @abort() #9
-  unreachable
-
-287:                                              ; preds = %265
-  %288 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %266, i64 0, i32 2
-  %289 = load ptr, ptr %288, align 8
-  %290 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %291 = icmp uge ptr %266, %290
-  %292 = icmp uge ptr %289, %290
-  %293 = select i1 %291, i1 %292, i1 false
-  br i1 %293, label %294, label %299, !prof !8
-
-294:                                              ; preds = %287
-  %295 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %289, i64 0, i32 3
-  store ptr %16, ptr %295, align 8
+285:                                              ; preds = %281
+  store ptr %16, ptr %282, align 8
+  %286 = getelementptr inbounds nuw i8, ptr %16, i64 48
+  store ptr %268, ptr %286, align 8
+  %287 = getelementptr inbounds nuw i8, ptr %16, i64 24
+  store ptr %16, ptr %287, align 8
+  %288 = getelementptr inbounds nuw i8, ptr %16, i64 16
   store ptr %16, ptr %288, align 8
-  %296 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 2
-  store ptr %289, ptr %296, align 8
-  %297 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 3
-  store ptr %266, ptr %297, align 8
-  %298 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %16, i64 0, i32 5
-  store ptr null, ptr %298, align 8
-  br label %300
+  br label %303
 
-299:                                              ; preds = %287
-  tail call void @abort() #9
+289:                                              ; preds = %281
+  tail call void @abort() #11
   unreachable
 
-300:                                              ; preds = %294, %282, %251, %219, %31, %23
-  %301 = getelementptr inbounds i8, ptr %8, i64 16
-  ret ptr %301
+290:                                              ; preds = %267
+  %291 = getelementptr inbounds nuw i8, ptr %268, i64 16
+  %292 = load ptr, ptr %291, align 8
+  %293 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %294 = icmp uge ptr %268, %293
+  %295 = icmp uge ptr %292, %293
+  %296 = select i1 %294, i1 %295, i1 false, !prof !8
+  br i1 %296, label %297, label %302, !prof !8
+
+297:                                              ; preds = %290
+  %298 = getelementptr inbounds nuw i8, ptr %292, i64 24
+  store ptr %16, ptr %298, align 8
+  store ptr %16, ptr %291, align 8
+  %299 = getelementptr inbounds nuw i8, ptr %16, i64 16
+  store ptr %292, ptr %299, align 8
+  %300 = getelementptr inbounds nuw i8, ptr %16, i64 24
+  store ptr %268, ptr %300, align 8
+  %301 = getelementptr inbounds nuw i8, ptr %16, i64 48
+  store ptr null, ptr %301, align 8
+  br label %303
+
+302:                                              ; preds = %290
+  tail call void @abort() #11
+  unreachable
+
+303:                                              ; preds = %297, %285, %253, %221, %31, %23
+  %304 = getelementptr inbounds nuw i8, ptr %8, i64 16
+  ret ptr %304
 }
 
-; Function Attrs: nounwind uwtable
-define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 noundef %1) unnamed_addr #0 {
+; Function Attrs: nofree nounwind uwtable
+define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 noundef %1) unnamed_addr #4 {
   %3 = getelementptr inbounds i8, ptr %0, i64 %1
-  %4 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %0, i64 0, i32 1
+  %4 = getelementptr inbounds nuw i8, ptr %0, i64 8
   %5 = load i64, ptr %4, align 8
   %6 = and i64 %5, 1
   %7 = icmp eq i64 %6, 0
-  br i1 %7, label %8, label %172
+  br i1 %7, label %8, label %174
 
 8:                                                ; preds = %2
   %9 = load i64, ptr %0, align 8
   %10 = and i64 %5, 2
   %11 = icmp eq i64 %10, 0
-  br i1 %11, label %458, label %12
+  br i1 %11, label %463, label %12
 
 12:                                               ; preds = %8
   %13 = sub i64 0, %9
   %14 = getelementptr inbounds i8, ptr %0, i64 %13
   %15 = add i64 %9, %1
-  %16 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %16 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %17 = icmp ult ptr %14, %16
-  br i1 %17, label %171, label %18, !prof !7
+  br i1 %17, label %173, label %18, !prof !7
 
 18:                                               ; preds = %12
-  %19 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
+  %19 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
   %20 = icmp eq ptr %14, %19
-  br i1 %20, label %161, label %21
+  br i1 %20, label %163, label %21
 
 21:                                               ; preds = %18
   %22 = icmp ult i64 %9, 256
@@ -4217,13 +4284,13 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
 
 23:                                               ; preds = %21
   %24 = lshr i64 %9, 3
-  %25 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %14, i64 0, i32 2
+  %25 = getelementptr inbounds nuw i8, ptr %14, i64 16
   %26 = load ptr, ptr %25, align 8
-  %27 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %14, i64 0, i32 3
+  %27 = getelementptr inbounds nuw i8, ptr %14, i64 24
   %28 = load ptr, ptr %27, align 8
-  %29 = trunc i64 %24 to i32
-  %30 = shl nuw nsw i64 %24, 1
-  %31 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %30
+  %29 = trunc nuw nsw i64 %24 to i32
+  %30 = shl nuw nsw i64 %24, 4
+  %31 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %30
   %32 = icmp eq ptr %26, %31
   br i1 %32, label %39, label %33
 
@@ -4232,7 +4299,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br i1 %34, label %58, label %35
 
 35:                                               ; preds = %33
-  %36 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %26, i64 0, i32 3
+  %36 = getelementptr inbounds nuw i8, ptr %26, i64 24
   %37 = load ptr, ptr %36, align 8
   %38 = icmp eq ptr %37, %14
   br i1 %38, label %39, label %58, !prof !8
@@ -4247,7 +4314,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   %44 = load i32, ptr @__temen_dl._gm_, align 8
   %45 = and i32 %44, %43
   store i32 %45, ptr @__temen_dl._gm_, align 8
-  br label %172
+  br label %174
 
 46:                                               ; preds = %39
   %47 = icmp eq ptr %28, %31
@@ -4258,48 +4325,48 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br i1 %49, label %57, label %50
 
 50:                                               ; preds = %48
-  %51 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %28, i64 0, i32 2
+  %51 = getelementptr inbounds nuw i8, ptr %28, i64 16
   %52 = load ptr, ptr %51, align 8
   %53 = icmp eq ptr %52, %14
   br i1 %53, label %54, label %57, !prof !8
 
 54:                                               ; preds = %50, %46
-  %55 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %26, i64 0, i32 3
+  %55 = getelementptr inbounds nuw i8, ptr %26, i64 24
   store ptr %28, ptr %55, align 8
-  %56 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %28, i64 0, i32 2
+  %56 = getelementptr inbounds nuw i8, ptr %28, i64 16
   store ptr %26, ptr %56, align 8
-  br label %172
+  br label %174
 
 57:                                               ; preds = %50, %48
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 58:                                               ; preds = %35, %33
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 59:                                               ; preds = %21
-  %60 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 5
+  %60 = getelementptr inbounds nuw i8, ptr %14, i64 48
   %61 = load ptr, ptr %60, align 8
-  %62 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 3
+  %62 = getelementptr inbounds nuw i8, ptr %14, i64 24
   %63 = load ptr, ptr %62, align 8
   %64 = icmp eq ptr %63, %14
   br i1 %64, label %79, label %65
 
 65:                                               ; preds = %59
-  %66 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 2
+  %66 = getelementptr inbounds nuw i8, ptr %14, i64 16
   %67 = load ptr, ptr %66, align 8
   %68 = icmp ult ptr %67, %16
   br i1 %68, label %78, label %69, !prof !7
 
 69:                                               ; preds = %65
-  %70 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %67, i64 0, i32 3
+  %70 = getelementptr inbounds nuw i8, ptr %67, i64 24
   %71 = load ptr, ptr %70, align 8
   %72 = icmp eq ptr %71, %14
   br i1 %72, label %73, label %78, !prof !8
 
 73:                                               ; preds = %69
-  %74 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %63, i64 0, i32 2
+  %74 = getelementptr inbounds nuw i8, ptr %63, i64 16
   %75 = load ptr, ptr %74, align 8
   %76 = icmp eq ptr %75, %14
   br i1 %76, label %77, label %78, !prof !8
@@ -4310,30 +4377,30 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %107
 
 78:                                               ; preds = %73, %69, %65
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 79:                                               ; preds = %59
-  %80 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 4, i64 1
+  %80 = getelementptr inbounds nuw i8, ptr %14, i64 40
   %81 = load ptr, ptr %80, align 8
   %82 = icmp eq ptr %81, null
   br i1 %82, label %83, label %87
 
 83:                                               ; preds = %79
-  %84 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 4
+  %84 = getelementptr inbounds nuw i8, ptr %14, i64 32
   %85 = load ptr, ptr %84, align 8
   %86 = icmp eq ptr %85, null
   br i1 %86, label %107, label %87
 
 87:                                               ; preds = %83, %79
-  %88 = phi ptr [ %84, %83 ], [ %80, %79 ]
-  %89 = phi ptr [ %85, %83 ], [ %81, %79 ]
+  %88 = phi ptr [ %80, %79 ], [ %84, %83 ]
+  %89 = phi ptr [ %81, %79 ], [ %85, %83 ]
   br label %90
 
 90:                                               ; preds = %96, %87
   %91 = phi ptr [ %88, %87 ], [ %97, %96 ]
   %92 = phi ptr [ %89, %87 ], [ %98, %96 ]
-  %93 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %92, i64 0, i32 4, i64 1
+  %93 = getelementptr inbounds nuw i8, ptr %92, i64 40
   %94 = load ptr, ptr %93, align 8
   %95 = icmp eq ptr %94, null
   br i1 %95, label %99, label %96
@@ -4341,10 +4408,10 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
 96:                                               ; preds = %99, %90
   %97 = phi ptr [ %93, %90 ], [ %100, %99 ]
   %98 = phi ptr [ %94, %90 ], [ %101, %99 ]
-  br label %90, !llvm.loop !29
+  br label %90, !llvm.loop !23
 
 99:                                               ; preds = %90
-  %100 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %92, i64 0, i32 4
+  %100 = getelementptr inbounds nuw i8, ptr %92, i64 32
   %101 = load ptr, ptr %100, align 8
   %102 = icmp eq ptr %101, null
   br i1 %102, label %103, label %96
@@ -4358,19 +4425,19 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %107
 
 106:                                              ; preds = %103
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
 107:                                              ; preds = %105, %83, %77
   %108 = phi ptr [ %63, %77 ], [ %92, %105 ], [ null, %83 ]
   %109 = icmp eq ptr %61, null
-  br i1 %109, label %172, label %110
+  br i1 %109, label %174, label %110
 
 110:                                              ; preds = %107
-  %111 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 6
+  %111 = getelementptr inbounds nuw i8, ptr %14, i64 56
   %112 = load i32, ptr %111, align 8
   %113 = zext i32 %112 to i64
-  %114 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %113
+  %114 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %113
   %115 = load ptr, ptr %114, align 8
   %116 = icmp eq ptr %14, %115
   br i1 %116, label %117, label %125
@@ -4378,636 +4445,657 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
 117:                                              ; preds = %110
   store ptr %108, ptr %114, align 8
   %118 = icmp eq ptr %108, null
-  br i1 %118, label %119, label %136
+  br i1 %118, label %119, label %138
 
 119:                                              ; preds = %117
   %120 = load i32, ptr %111, align 8
   %121 = shl nuw i32 1, %120
   %122 = xor i32 %121, -1
-  %123 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
+  %123 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
   %124 = and i32 %123, %122
-  store i32 %124, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %172
+  store i32 %124, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %174
 
 125:                                              ; preds = %110
-  %126 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
+  %126 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
   %127 = icmp ult ptr %61, %126
   br i1 %127, label %135, label %128, !prof !7
 
 128:                                              ; preds = %125
-  %129 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %61, i64 0, i32 4
+  %129 = getelementptr inbounds nuw i8, ptr %61, i64 32
   %130 = load ptr, ptr %129, align 8
   %131 = icmp eq ptr %130, %14
-  %132 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %61, i64 0, i32 4, i64 1
-  %133 = select i1 %131, ptr %129, ptr %132
-  store ptr %108, ptr %133, align 8
-  %134 = icmp eq ptr %108, null
-  br i1 %134, label %172, label %136
+  br i1 %131, label %132, label %133
+
+132:                                              ; preds = %128
+  store ptr %108, ptr %129, align 8
+  br label %136
+
+133:                                              ; preds = %128
+  %134 = getelementptr inbounds nuw i8, ptr %61, i64 40
+  store ptr %108, ptr %134, align 8
+  br label %136
 
 135:                                              ; preds = %125
-  tail call void @abort() #9
+  tail call void @abort() #11
   unreachable
 
-136:                                              ; preds = %128, %117
-  %137 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %138 = icmp ult ptr %108, %137
-  br i1 %138, label %160, label %139, !prof !7
+136:                                              ; preds = %133, %132
+  %137 = icmp eq ptr %108, null
+  br i1 %137, label %174, label %138
 
-139:                                              ; preds = %136
-  %140 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %108, i64 0, i32 5
-  store ptr %61, ptr %140, align 8
-  %141 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 4
-  %142 = load ptr, ptr %141, align 8
-  %143 = icmp eq ptr %142, null
-  br i1 %143, label %150, label %144
+138:                                              ; preds = %136, %117
+  %139 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %140 = icmp ult ptr %108, %139
+  br i1 %140, label %162, label %141, !prof !7
 
-144:                                              ; preds = %139
-  %145 = icmp ult ptr %142, %137
-  br i1 %145, label %149, label %146, !prof !7
+141:                                              ; preds = %138
+  %142 = getelementptr inbounds nuw i8, ptr %108, i64 48
+  store ptr %61, ptr %142, align 8
+  %143 = getelementptr inbounds nuw i8, ptr %14, i64 32
+  %144 = load ptr, ptr %143, align 8
+  %145 = icmp eq ptr %144, null
+  br i1 %145, label %152, label %146
 
-146:                                              ; preds = %144
-  %147 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %108, i64 0, i32 4
-  store ptr %142, ptr %147, align 8
-  %148 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %142, i64 0, i32 5
-  store ptr %108, ptr %148, align 8
-  br label %150
+146:                                              ; preds = %141
+  %147 = icmp ult ptr %144, %139
+  br i1 %147, label %151, label %148, !prof !7
 
-149:                                              ; preds = %144
-  tail call void @abort() #9
+148:                                              ; preds = %146
+  %149 = getelementptr inbounds nuw i8, ptr %108, i64 32
+  store ptr %144, ptr %149, align 8
+  %150 = getelementptr inbounds nuw i8, ptr %144, i64 48
+  store ptr %108, ptr %150, align 8
+  br label %152
+
+151:                                              ; preds = %146
+  tail call void @abort() #11
   unreachable
 
-150:                                              ; preds = %146, %139
-  %151 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %14, i64 0, i32 4, i64 1
-  %152 = load ptr, ptr %151, align 8
-  %153 = icmp eq ptr %152, null
-  br i1 %153, label %172, label %154
+152:                                              ; preds = %148, %141
+  %153 = getelementptr inbounds nuw i8, ptr %14, i64 40
+  %154 = load ptr, ptr %153, align 8
+  %155 = icmp eq ptr %154, null
+  br i1 %155, label %174, label %156
 
-154:                                              ; preds = %150
-  %155 = icmp ult ptr %152, %137
-  br i1 %155, label %159, label %156, !prof !7
+156:                                              ; preds = %152
+  %157 = icmp ult ptr %154, %139
+  br i1 %157, label %161, label %158, !prof !7
 
-156:                                              ; preds = %154
-  %157 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %108, i64 0, i32 4, i64 1
-  store ptr %152, ptr %157, align 8
-  %158 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %152, i64 0, i32 5
-  store ptr %108, ptr %158, align 8
-  br label %172
+158:                                              ; preds = %156
+  %159 = getelementptr inbounds nuw i8, ptr %108, i64 40
+  store ptr %154, ptr %159, align 8
+  %160 = getelementptr inbounds nuw i8, ptr %154, i64 48
+  store ptr %108, ptr %160, align 8
+  br label %174
 
-159:                                              ; preds = %154
-  tail call void @abort() #9
+161:                                              ; preds = %156
+  tail call void @abort() #11
   unreachable
 
-160:                                              ; preds = %136
-  tail call void @abort() #9
+162:                                              ; preds = %138
+  tail call void @abort() #11
   unreachable
 
-161:                                              ; preds = %18
-  %162 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %3, i64 0, i32 1
-  %163 = load i64, ptr %162, align 8
-  %164 = and i64 %163, 3
-  %165 = icmp eq i64 %164, 3
-  br i1 %165, label %166, label %172
+163:                                              ; preds = %18
+  %164 = getelementptr inbounds nuw i8, ptr %3, i64 8
+  %165 = load i64, ptr %164, align 8
+  %166 = and i64 %165, 3
+  %167 = icmp eq i64 %166, 3
+  br i1 %167, label %168, label %174
 
-166:                                              ; preds = %161
-  store i64 %15, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %167 = load i64, ptr %162, align 8
-  %168 = and i64 %167, -2
-  store i64 %168, ptr %162, align 8
-  %169 = or i64 %15, 1
-  %170 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %14, i64 0, i32 1
-  store i64 %169, ptr %170, align 8
+168:                                              ; preds = %163
+  store i64 %15, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %169 = load i64, ptr %164, align 8
+  %170 = and i64 %169, -2
+  store i64 %170, ptr %164, align 8
+  %171 = or i64 %15, 1
+  %172 = getelementptr inbounds nuw i8, ptr %14, i64 8
+  store i64 %171, ptr %172, align 8
   store i64 %15, ptr %3, align 8
-  br label %458
+  br label %463
 
-171:                                              ; preds = %12
-  tail call void @abort() #9
+173:                                              ; preds = %12
+  tail call void @abort() #11
   unreachable
 
-172:                                              ; preds = %161, %156, %150, %128, %119, %107, %54, %41, %2
-  %173 = phi i64 [ %1, %2 ], [ %15, %107 ], [ %15, %150 ], [ %15, %156 ], [ %15, %128 ], [ %15, %54 ], [ %15, %41 ], [ %15, %161 ], [ %15, %119 ]
-  %174 = phi ptr [ %0, %2 ], [ %14, %107 ], [ %14, %150 ], [ %14, %156 ], [ %14, %128 ], [ %14, %54 ], [ %14, %41 ], [ %14, %161 ], [ %14, %119 ]
-  %175 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %176 = icmp ult ptr %3, %175
-  br i1 %176, label %457, label %177, !prof !7
+174:                                              ; preds = %163, %158, %152, %136, %119, %107, %54, %41, %2
+  %175 = phi i64 [ %1, %2 ], [ %15, %163 ], [ %15, %41 ], [ %15, %54 ], [ %15, %136 ], [ %15, %158 ], [ %15, %152 ], [ %15, %107 ], [ %15, %119 ]
+  %176 = phi ptr [ %0, %2 ], [ %14, %163 ], [ %14, %41 ], [ %14, %54 ], [ %14, %136 ], [ %14, %158 ], [ %14, %152 ], [ %14, %107 ], [ %14, %119 ]
+  %177 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %178 = icmp ult ptr %3, %177
+  br i1 %178, label %462, label %179, !prof !7
 
-177:                                              ; preds = %172
-  %178 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %3, i64 0, i32 1
-  %179 = load i64, ptr %178, align 8
-  %180 = and i64 %179, 2
-  %181 = icmp eq i64 %180, 0
-  br i1 %181, label %182, label %351
+179:                                              ; preds = %174
+  %180 = getelementptr inbounds nuw i8, ptr %3, i64 8
+  %181 = load i64, ptr %180, align 8
+  %182 = and i64 %181, 2
+  %183 = icmp eq i64 %182, 0
+  br i1 %183, label %184, label %355
 
-182:                                              ; preds = %177
-  %183 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %184 = icmp eq ptr %3, %183
-  br i1 %184, label %185, label %193
+184:                                              ; preds = %179
+  %185 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %186 = icmp eq ptr %3, %185
+  br i1 %186, label %187, label %195
 
-185:                                              ; preds = %182
-  %186 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  %187 = add i64 %186, %173
-  store i64 %187, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 3), align 8
-  store ptr %174, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 6), align 8
-  %188 = or i64 %187, 1
-  %189 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %174, i64 0, i32 1
-  store i64 %188, ptr %189, align 8
-  %190 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %191 = icmp eq ptr %174, %190
-  br i1 %191, label %192, label %458
+187:                                              ; preds = %184
+  %188 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  %189 = add i64 %188, %175
+  store i64 %189, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
+  store ptr %176, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 40), align 8
+  %190 = or i64 %189, 1
+  %191 = getelementptr inbounds nuw i8, ptr %176, i64 8
+  store i64 %190, ptr %191, align 8
+  %192 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %193 = icmp eq ptr %176, %192
+  br i1 %193, label %194, label %463
 
-192:                                              ; preds = %185
-  store ptr null, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  store i64 0, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  br label %458
+194:                                              ; preds = %187
+  store ptr null, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  store i64 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  br label %463
 
-193:                                              ; preds = %182
-  %194 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %195 = icmp eq ptr %3, %194
-  br i1 %195, label %196, label %202
+195:                                              ; preds = %184
+  %196 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %197 = icmp eq ptr %3, %196
+  br i1 %197, label %198, label %204
 
-196:                                              ; preds = %193
-  %197 = load i64, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  %198 = add i64 %197, %173
-  store i64 %198, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  store ptr %174, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %199 = or i64 %198, 1
-  %200 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %174, i64 0, i32 1
-  store i64 %199, ptr %200, align 8
-  %201 = getelementptr inbounds i8, ptr %174, i64 %198
-  store i64 %198, ptr %201, align 8
-  br label %458
+198:                                              ; preds = %195
+  %199 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  %200 = add i64 %199, %175
+  store i64 %200, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  store ptr %176, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %201 = or i64 %200, 1
+  %202 = getelementptr inbounds nuw i8, ptr %176, i64 8
+  store i64 %201, ptr %202, align 8
+  %203 = getelementptr inbounds nuw i8, ptr %176, i64 %200
+  store i64 %200, ptr %203, align 8
+  br label %463
 
-202:                                              ; preds = %193
-  %203 = and i64 %179, -8
-  %204 = add i64 %203, %173
-  %205 = icmp ult i64 %179, 256
-  br i1 %205, label %206, label %242
+204:                                              ; preds = %195
+  %205 = and i64 %181, -8
+  %206 = add i64 %205, %175
+  %207 = icmp ult i64 %181, 256
+  br i1 %207, label %208, label %244
 
-206:                                              ; preds = %202
-  %207 = lshr i64 %179, 3
-  %208 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %3, i64 0, i32 2
-  %209 = load ptr, ptr %208, align 8
-  %210 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %3, i64 0, i32 3
+208:                                              ; preds = %204
+  %209 = lshr i64 %181, 3
+  %210 = getelementptr inbounds nuw i8, ptr %3, i64 16
   %211 = load ptr, ptr %210, align 8
-  %212 = trunc i64 %207 to i32
-  %213 = shl nuw nsw i64 %207, 1
-  %214 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %213
-  %215 = icmp eq ptr %209, %214
-  br i1 %215, label %222, label %216
+  %212 = getelementptr inbounds nuw i8, ptr %3, i64 24
+  %213 = load ptr, ptr %212, align 8
+  %214 = trunc nuw nsw i64 %209 to i32
+  %215 = shl nuw nsw i64 %209, 4
+  %216 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %215
+  %217 = icmp eq ptr %211, %216
+  br i1 %217, label %224, label %218
 
-216:                                              ; preds = %206
-  %217 = icmp ult ptr %209, %175
-  br i1 %217, label %241, label %218
+218:                                              ; preds = %208
+  %219 = icmp ult ptr %211, %177
+  br i1 %219, label %243, label %220
 
-218:                                              ; preds = %216
-  %219 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %209, i64 0, i32 3
-  %220 = load ptr, ptr %219, align 8
-  %221 = icmp eq ptr %220, %3
-  br i1 %221, label %222, label %241, !prof !8
+220:                                              ; preds = %218
+  %221 = getelementptr inbounds nuw i8, ptr %211, i64 24
+  %222 = load ptr, ptr %221, align 8
+  %223 = icmp eq ptr %222, %3
+  br i1 %223, label %224, label %243, !prof !8
 
-222:                                              ; preds = %218, %206
-  %223 = icmp eq ptr %211, %209
-  br i1 %223, label %224, label %229
+224:                                              ; preds = %220, %208
+  %225 = icmp eq ptr %213, %211
+  br i1 %225, label %226, label %231
 
-224:                                              ; preds = %222
-  %225 = shl nuw i32 1, %212
-  %226 = xor i32 %225, -1
-  %227 = load i32, ptr @__temen_dl._gm_, align 8
-  %228 = and i32 %227, %226
-  store i32 %228, ptr @__temen_dl._gm_, align 8
-  br label %344
+226:                                              ; preds = %224
+  %227 = shl nuw i32 1, %214
+  %228 = xor i32 %227, -1
+  %229 = load i32, ptr @__temen_dl._gm_, align 8
+  %230 = and i32 %229, %228
+  store i32 %230, ptr @__temen_dl._gm_, align 8
+  br label %348
 
-229:                                              ; preds = %222
-  %230 = icmp eq ptr %211, %214
-  br i1 %230, label %237, label %231
-
-231:                                              ; preds = %229
-  %232 = icmp ult ptr %211, %175
-  br i1 %232, label %240, label %233
+231:                                              ; preds = %224
+  %232 = icmp eq ptr %213, %216
+  br i1 %232, label %239, label %233
 
 233:                                              ; preds = %231
-  %234 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %211, i64 0, i32 2
-  %235 = load ptr, ptr %234, align 8
-  %236 = icmp eq ptr %235, %3
-  br i1 %236, label %237, label %240, !prof !8
+  %234 = icmp ult ptr %213, %177
+  br i1 %234, label %242, label %235
 
-237:                                              ; preds = %233, %229
-  %238 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %209, i64 0, i32 3
-  store ptr %211, ptr %238, align 8
-  %239 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %211, i64 0, i32 2
-  store ptr %209, ptr %239, align 8
-  br label %344
+235:                                              ; preds = %233
+  %236 = getelementptr inbounds nuw i8, ptr %213, i64 16
+  %237 = load ptr, ptr %236, align 8
+  %238 = icmp eq ptr %237, %3
+  br i1 %238, label %239, label %242, !prof !8
 
-240:                                              ; preds = %233, %231
-  tail call void @abort() #9
+239:                                              ; preds = %235, %231
+  %240 = getelementptr inbounds nuw i8, ptr %211, i64 24
+  store ptr %213, ptr %240, align 8
+  %241 = getelementptr inbounds nuw i8, ptr %213, i64 16
+  store ptr %211, ptr %241, align 8
+  br label %348
+
+242:                                              ; preds = %235, %233
+  tail call void @abort() #11
   unreachable
 
-241:                                              ; preds = %218, %216
-  tail call void @abort() #9
+243:                                              ; preds = %220, %218
+  tail call void @abort() #11
   unreachable
 
-242:                                              ; preds = %202
-  %243 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 5
-  %244 = load ptr, ptr %243, align 8
-  %245 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 3
+244:                                              ; preds = %204
+  %245 = getelementptr inbounds nuw i8, ptr %3, i64 48
   %246 = load ptr, ptr %245, align 8
-  %247 = icmp eq ptr %246, %3
-  br i1 %247, label %262, label %248
+  %247 = getelementptr inbounds nuw i8, ptr %3, i64 24
+  %248 = load ptr, ptr %247, align 8
+  %249 = icmp eq ptr %248, %3
+  br i1 %249, label %264, label %250
 
-248:                                              ; preds = %242
-  %249 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 2
-  %250 = load ptr, ptr %249, align 8
-  %251 = icmp ult ptr %250, %175
-  br i1 %251, label %261, label %252, !prof !7
+250:                                              ; preds = %244
+  %251 = getelementptr inbounds nuw i8, ptr %3, i64 16
+  %252 = load ptr, ptr %251, align 8
+  %253 = icmp ult ptr %252, %177
+  br i1 %253, label %263, label %254, !prof !7
 
-252:                                              ; preds = %248
-  %253 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %250, i64 0, i32 3
-  %254 = load ptr, ptr %253, align 8
-  %255 = icmp eq ptr %254, %3
-  br i1 %255, label %256, label %261, !prof !8
+254:                                              ; preds = %250
+  %255 = getelementptr inbounds nuw i8, ptr %252, i64 24
+  %256 = load ptr, ptr %255, align 8
+  %257 = icmp eq ptr %256, %3
+  br i1 %257, label %258, label %263, !prof !8
 
-256:                                              ; preds = %252
-  %257 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %246, i64 0, i32 2
-  %258 = load ptr, ptr %257, align 8
-  %259 = icmp eq ptr %258, %3
-  br i1 %259, label %260, label %261, !prof !8
+258:                                              ; preds = %254
+  %259 = getelementptr inbounds nuw i8, ptr %248, i64 16
+  %260 = load ptr, ptr %259, align 8
+  %261 = icmp eq ptr %260, %3
+  br i1 %261, label %262, label %263, !prof !8
 
-260:                                              ; preds = %256
-  store ptr %246, ptr %253, align 8
-  store ptr %250, ptr %257, align 8
-  br label %290
+262:                                              ; preds = %258
+  store ptr %248, ptr %255, align 8
+  store ptr %252, ptr %259, align 8
+  br label %292
 
-261:                                              ; preds = %256, %252, %248
-  tail call void @abort() #9
+263:                                              ; preds = %258, %254, %250
+  tail call void @abort() #11
   unreachable
 
-262:                                              ; preds = %242
-  %263 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 4, i64 1
-  %264 = load ptr, ptr %263, align 8
-  %265 = icmp eq ptr %264, null
-  br i1 %265, label %266, label %270
+264:                                              ; preds = %244
+  %265 = getelementptr inbounds nuw i8, ptr %3, i64 40
+  %266 = load ptr, ptr %265, align 8
+  %267 = icmp eq ptr %266, null
+  br i1 %267, label %268, label %272
 
-266:                                              ; preds = %262
-  %267 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 4
-  %268 = load ptr, ptr %267, align 8
-  %269 = icmp eq ptr %268, null
-  br i1 %269, label %290, label %270
+268:                                              ; preds = %264
+  %269 = getelementptr inbounds nuw i8, ptr %3, i64 32
+  %270 = load ptr, ptr %269, align 8
+  %271 = icmp eq ptr %270, null
+  br i1 %271, label %292, label %272
 
-270:                                              ; preds = %266, %262
-  %271 = phi ptr [ %267, %266 ], [ %263, %262 ]
-  %272 = phi ptr [ %268, %266 ], [ %264, %262 ]
-  br label %273
+272:                                              ; preds = %268, %264
+  %273 = phi ptr [ %265, %264 ], [ %269, %268 ]
+  %274 = phi ptr [ %266, %264 ], [ %270, %268 ]
+  br label %275
 
-273:                                              ; preds = %279, %270
-  %274 = phi ptr [ %271, %270 ], [ %280, %279 ]
-  %275 = phi ptr [ %272, %270 ], [ %281, %279 ]
-  %276 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %275, i64 0, i32 4, i64 1
-  %277 = load ptr, ptr %276, align 8
-  %278 = icmp eq ptr %277, null
-  br i1 %278, label %282, label %279
+275:                                              ; preds = %281, %272
+  %276 = phi ptr [ %273, %272 ], [ %282, %281 ]
+  %277 = phi ptr [ %274, %272 ], [ %283, %281 ]
+  %278 = getelementptr inbounds nuw i8, ptr %277, i64 40
+  %279 = load ptr, ptr %278, align 8
+  %280 = icmp eq ptr %279, null
+  br i1 %280, label %284, label %281
 
-279:                                              ; preds = %282, %273
-  %280 = phi ptr [ %276, %273 ], [ %283, %282 ]
-  %281 = phi ptr [ %277, %273 ], [ %284, %282 ]
-  br label %273, !llvm.loop !30
+281:                                              ; preds = %284, %275
+  %282 = phi ptr [ %278, %275 ], [ %285, %284 ]
+  %283 = phi ptr [ %279, %275 ], [ %286, %284 ]
+  br label %275, !llvm.loop !24
 
-282:                                              ; preds = %273
-  %283 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %275, i64 0, i32 4
-  %284 = load ptr, ptr %283, align 8
-  %285 = icmp eq ptr %284, null
-  br i1 %285, label %286, label %279
+284:                                              ; preds = %275
+  %285 = getelementptr inbounds nuw i8, ptr %277, i64 32
+  %286 = load ptr, ptr %285, align 8
+  %287 = icmp eq ptr %286, null
+  br i1 %287, label %288, label %281
 
-286:                                              ; preds = %282
-  %287 = icmp ult ptr %274, %175
-  br i1 %287, label %289, label %288, !prof !7
+288:                                              ; preds = %284
+  %289 = icmp ult ptr %276, %177
+  br i1 %289, label %291, label %290, !prof !7
 
-288:                                              ; preds = %286
-  store ptr null, ptr %274, align 8
-  br label %290
+290:                                              ; preds = %288
+  store ptr null, ptr %276, align 8
+  br label %292
 
-289:                                              ; preds = %286
-  tail call void @abort() #9
+291:                                              ; preds = %288
+  tail call void @abort() #11
   unreachable
 
-290:                                              ; preds = %288, %266, %260
-  %291 = phi ptr [ %246, %260 ], [ %275, %288 ], [ null, %266 ]
-  %292 = icmp eq ptr %244, null
-  br i1 %292, label %344, label %293
+292:                                              ; preds = %290, %268, %262
+  %293 = phi ptr [ %248, %262 ], [ %277, %290 ], [ null, %268 ]
+  %294 = icmp eq ptr %246, null
+  br i1 %294, label %348, label %295
 
-293:                                              ; preds = %290
-  %294 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 6
-  %295 = load i32, ptr %294, align 8
-  %296 = zext i32 %295 to i64
-  %297 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %296
-  %298 = load ptr, ptr %297, align 8
-  %299 = icmp eq ptr %3, %298
-  br i1 %299, label %300, label %308
+295:                                              ; preds = %292
+  %296 = getelementptr inbounds nuw i8, ptr %3, i64 56
+  %297 = load i32, ptr %296, align 8
+  %298 = zext i32 %297 to i64
+  %299 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %298
+  %300 = load ptr, ptr %299, align 8
+  %301 = icmp eq ptr %3, %300
+  br i1 %301, label %302, label %310
 
-300:                                              ; preds = %293
-  store ptr %291, ptr %297, align 8
-  %301 = icmp eq ptr %291, null
-  br i1 %301, label %302, label %319
+302:                                              ; preds = %295
+  store ptr %293, ptr %299, align 8
+  %303 = icmp eq ptr %293, null
+  br i1 %303, label %304, label %323
 
-302:                                              ; preds = %300
-  %303 = load i32, ptr %294, align 8
-  %304 = shl nuw i32 1, %303
-  %305 = xor i32 %304, -1
-  %306 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %307 = and i32 %306, %305
-  store i32 %307, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  br label %344
+304:                                              ; preds = %302
+  %305 = load i32, ptr %296, align 8
+  %306 = shl nuw i32 1, %305
+  %307 = xor i32 %306, -1
+  %308 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %309 = and i32 %308, %307
+  store i32 %309, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  br label %348
 
-308:                                              ; preds = %293
-  %309 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %310 = icmp ult ptr %244, %309
-  br i1 %310, label %318, label %311, !prof !7
+310:                                              ; preds = %295
+  %311 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %312 = icmp ult ptr %246, %311
+  br i1 %312, label %320, label %313, !prof !7
 
-311:                                              ; preds = %308
-  %312 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %244, i64 0, i32 4
-  %313 = load ptr, ptr %312, align 8
-  %314 = icmp eq ptr %313, %3
-  %315 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %244, i64 0, i32 4, i64 1
-  %316 = select i1 %314, ptr %312, ptr %315
-  store ptr %291, ptr %316, align 8
-  %317 = icmp eq ptr %291, null
-  br i1 %317, label %344, label %319
+313:                                              ; preds = %310
+  %314 = getelementptr inbounds nuw i8, ptr %246, i64 32
+  %315 = load ptr, ptr %314, align 8
+  %316 = icmp eq ptr %315, %3
+  br i1 %316, label %317, label %318
 
-318:                                              ; preds = %308
-  tail call void @abort() #9
+317:                                              ; preds = %313
+  store ptr %293, ptr %314, align 8
+  br label %321
+
+318:                                              ; preds = %313
+  %319 = getelementptr inbounds nuw i8, ptr %246, i64 40
+  store ptr %293, ptr %319, align 8
+  br label %321
+
+320:                                              ; preds = %310
+  tail call void @abort() #11
   unreachable
 
-319:                                              ; preds = %311, %300
-  %320 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %321 = icmp ult ptr %291, %320
-  br i1 %321, label %343, label %322, !prof !7
+321:                                              ; preds = %318, %317
+  %322 = icmp eq ptr %293, null
+  br i1 %322, label %348, label %323
 
-322:                                              ; preds = %319
-  %323 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %291, i64 0, i32 5
-  store ptr %244, ptr %323, align 8
-  %324 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 4
-  %325 = load ptr, ptr %324, align 8
-  %326 = icmp eq ptr %325, null
-  br i1 %326, label %333, label %327
+323:                                              ; preds = %321, %302
+  %324 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %325 = icmp ult ptr %293, %324
+  br i1 %325, label %347, label %326, !prof !7
 
-327:                                              ; preds = %322
-  %328 = icmp ult ptr %325, %320
-  br i1 %328, label %332, label %329, !prof !7
+326:                                              ; preds = %323
+  %327 = getelementptr inbounds nuw i8, ptr %293, i64 48
+  store ptr %246, ptr %327, align 8
+  %328 = getelementptr inbounds nuw i8, ptr %3, i64 32
+  %329 = load ptr, ptr %328, align 8
+  %330 = icmp eq ptr %329, null
+  br i1 %330, label %337, label %331
 
-329:                                              ; preds = %327
-  %330 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %291, i64 0, i32 4
-  store ptr %325, ptr %330, align 8
-  %331 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %325, i64 0, i32 5
-  store ptr %291, ptr %331, align 8
-  br label %333
+331:                                              ; preds = %326
+  %332 = icmp ult ptr %329, %324
+  br i1 %332, label %336, label %333, !prof !7
 
-332:                                              ; preds = %327
-  tail call void @abort() #9
+333:                                              ; preds = %331
+  %334 = getelementptr inbounds nuw i8, ptr %293, i64 32
+  store ptr %329, ptr %334, align 8
+  %335 = getelementptr inbounds nuw i8, ptr %329, i64 48
+  store ptr %293, ptr %335, align 8
+  br label %337
+
+336:                                              ; preds = %331
+  tail call void @abort() #11
   unreachable
 
-333:                                              ; preds = %329, %322
-  %334 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %3, i64 0, i32 4, i64 1
-  %335 = load ptr, ptr %334, align 8
-  %336 = icmp eq ptr %335, null
-  br i1 %336, label %344, label %337
+337:                                              ; preds = %333, %326
+  %338 = getelementptr inbounds nuw i8, ptr %3, i64 40
+  %339 = load ptr, ptr %338, align 8
+  %340 = icmp eq ptr %339, null
+  br i1 %340, label %348, label %341
 
-337:                                              ; preds = %333
-  %338 = icmp ult ptr %335, %320
-  br i1 %338, label %342, label %339, !prof !7
+341:                                              ; preds = %337
+  %342 = icmp ult ptr %339, %324
+  br i1 %342, label %346, label %343, !prof !7
 
-339:                                              ; preds = %337
-  %340 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %291, i64 0, i32 4, i64 1
-  store ptr %335, ptr %340, align 8
-  %341 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %335, i64 0, i32 5
-  store ptr %291, ptr %341, align 8
-  br label %344
+343:                                              ; preds = %341
+  %344 = getelementptr inbounds nuw i8, ptr %293, i64 40
+  store ptr %339, ptr %344, align 8
+  %345 = getelementptr inbounds nuw i8, ptr %339, i64 48
+  store ptr %293, ptr %345, align 8
+  br label %348
 
-342:                                              ; preds = %337
-  tail call void @abort() #9
+346:                                              ; preds = %341
+  tail call void @abort() #11
   unreachable
 
-343:                                              ; preds = %319
-  tail call void @abort() #9
+347:                                              ; preds = %323
+  tail call void @abort() #11
   unreachable
 
-344:                                              ; preds = %339, %333, %311, %302, %290, %237, %224
-  %345 = or i64 %204, 1
-  %346 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %174, i64 0, i32 1
-  store i64 %345, ptr %346, align 8
-  %347 = getelementptr inbounds i8, ptr %174, i64 %204
-  store i64 %204, ptr %347, align 8
-  %348 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 5), align 8
-  %349 = icmp eq ptr %174, %348
-  br i1 %349, label %350, label %356
+348:                                              ; preds = %343, %337, %321, %304, %292, %239, %226
+  %349 = or i64 %206, 1
+  %350 = getelementptr inbounds nuw i8, ptr %176, i64 8
+  store i64 %349, ptr %350, align 8
+  %351 = getelementptr inbounds nuw i8, ptr %176, i64 %206
+  store i64 %206, ptr %351, align 8
+  %352 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
+  %353 = icmp eq ptr %176, %352
+  br i1 %353, label %354, label %360
 
-350:                                              ; preds = %344
-  store i64 %204, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 2), align 8
-  br label %458
+354:                                              ; preds = %348
+  store i64 %206, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
+  br label %463
 
-351:                                              ; preds = %177
-  %352 = and i64 %179, -2
-  store i64 %352, ptr %178, align 8
-  %353 = or i64 %173, 1
-  %354 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %174, i64 0, i32 1
-  store i64 %353, ptr %354, align 8
-  %355 = getelementptr inbounds i8, ptr %174, i64 %173
-  store i64 %173, ptr %355, align 8
-  br label %356
+355:                                              ; preds = %179
+  %356 = and i64 %181, -2
+  store i64 %356, ptr %180, align 8
+  %357 = or i64 %175, 1
+  %358 = getelementptr inbounds nuw i8, ptr %176, i64 8
+  store i64 %357, ptr %358, align 8
+  %359 = getelementptr inbounds nuw i8, ptr %176, i64 %175
+  store i64 %175, ptr %359, align 8
+  br label %360
 
-356:                                              ; preds = %351, %344
-  %357 = phi i64 [ %173, %351 ], [ %204, %344 ]
-  %358 = icmp ult i64 %357, 256
-  br i1 %358, label %359, label %382
+360:                                              ; preds = %355, %348
+  %361 = phi i64 [ %175, %355 ], [ %206, %348 ]
+  %362 = icmp ult i64 %361, 256
+  br i1 %362, label %363, label %386
 
-359:                                              ; preds = %356
-  %360 = lshr i64 %357, 3
-  %361 = trunc i64 %360 to i32
-  %362 = shl nuw nsw i64 %360, 1
-  %363 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 10, i64 %362
-  %364 = load i32, ptr @__temen_dl._gm_, align 8
-  %365 = shl nuw i32 1, %361
-  %366 = and i32 %364, %365
-  %367 = icmp eq i32 %366, 0
-  br i1 %367, label %368, label %370
+363:                                              ; preds = %360
+  %364 = lshr i64 %361, 3
+  %365 = trunc nuw nsw i64 %364 to i32
+  %366 = shl nuw nsw i64 %364, 4
+  %367 = getelementptr inbounds nuw i8, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 72), i64 %366
+  %368 = load i32, ptr @__temen_dl._gm_, align 8
+  %369 = shl nuw i32 1, %365
+  %370 = and i32 %368, %369
+  %371 = icmp eq i32 %370, 0
+  br i1 %371, label %372, label %374
 
-368:                                              ; preds = %359
-  %369 = or i32 %364, %365
-  store i32 %369, ptr @__temen_dl._gm_, align 8
-  br label %376
+372:                                              ; preds = %363
+  %373 = or i32 %368, %369
+  store i32 %373, ptr @__temen_dl._gm_, align 8
+  br label %380
 
-370:                                              ; preds = %359
-  %371 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %363, i64 0, i32 2
-  %372 = load ptr, ptr %371, align 8
-  %373 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %374 = icmp ult ptr %372, %373
-  br i1 %374, label %375, label %376, !prof !7
+374:                                              ; preds = %363
+  %375 = getelementptr inbounds nuw i8, ptr %367, i64 16
+  %376 = load ptr, ptr %375, align 8
+  %377 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %378 = icmp ult ptr %376, %377
+  br i1 %378, label %379, label %380, !prof !7
 
-375:                                              ; preds = %370
-  tail call void @abort() #9
+379:                                              ; preds = %374
+  tail call void @abort() #11
   unreachable
 
-376:                                              ; preds = %370, %368
-  %377 = phi ptr [ %363, %368 ], [ %372, %370 ]
-  %378 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %363, i64 0, i32 2
-  store ptr %174, ptr %378, align 8
-  %379 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %377, i64 0, i32 3
-  store ptr %174, ptr %379, align 8
-  %380 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %174, i64 0, i32 2
-  store ptr %377, ptr %380, align 8
-  %381 = getelementptr inbounds %__temen_dl.malloc_chunk, ptr %174, i64 0, i32 3
-  store ptr %363, ptr %381, align 8
-  br label %458
+380:                                              ; preds = %374, %372
+  %381 = phi ptr [ %367, %372 ], [ %376, %374 ]
+  %382 = getelementptr inbounds nuw i8, ptr %367, i64 16
+  store ptr %176, ptr %382, align 8
+  %383 = getelementptr inbounds nuw i8, ptr %381, i64 24
+  store ptr %176, ptr %383, align 8
+  %384 = getelementptr inbounds nuw i8, ptr %176, i64 16
+  store ptr %381, ptr %384, align 8
+  %385 = getelementptr inbounds nuw i8, ptr %176, i64 24
+  store ptr %367, ptr %385, align 8
+  br label %463
 
-382:                                              ; preds = %356
-  %383 = lshr i64 %357, 8
-  %384 = trunc i64 %383 to i32
-  %385 = icmp eq i32 %384, 0
-  br i1 %385, label %398, label %386
+386:                                              ; preds = %360
+  %387 = lshr i64 %361, 8
+  %388 = trunc i64 %387 to i32
+  %389 = icmp eq i32 %388, 0
+  br i1 %389, label %402, label %390
 
-386:                                              ; preds = %382
-  %387 = icmp ugt i32 %384, 65535
-  br i1 %387, label %398, label %388
+390:                                              ; preds = %386
+  %391 = icmp ugt i32 %388, 65535
+  br i1 %391, label %402, label %392
 
-388:                                              ; preds = %386
-  %389 = tail call i32 @llvm.ctlz.i32(i32 %384, i1 true), !range !13
-  %390 = shl nuw nsw i32 %389, 1
-  %391 = sub nuw nsw i32 38, %389
-  %392 = zext nneg i32 %391 to i64
-  %393 = lshr i64 %357, %392
-  %394 = trunc i64 %393 to i32
-  %395 = and i32 %394, 1
-  %396 = or disjoint i32 %395, %390
-  %397 = xor i32 %396, 62
-  br label %398
+392:                                              ; preds = %390
+  %393 = tail call range(i32 16, 33) i32 @llvm.ctlz.i32(i32 %388, i1 true)
+  %394 = shl nuw nsw i32 %393, 1
+  %395 = sub nuw nsw i32 38, %393
+  %396 = zext nneg i32 %395 to i64
+  %397 = lshr i64 %361, %396
+  %398 = trunc i64 %397 to i32
+  %399 = and i32 %398, 1
+  %400 = or disjoint i32 %399, %394
+  %401 = xor i32 %400, 62
+  br label %402
 
-398:                                              ; preds = %388, %386, %382
-  %399 = phi i32 [ %397, %388 ], [ 0, %382 ], [ 31, %386 ]
-  %400 = zext nneg i32 %399 to i64
-  %401 = getelementptr inbounds %__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 11, i64 %400
-  %402 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 6
-  store i32 %399, ptr %402, align 8
-  %403 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 4
-  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %403, i8 0, i64 16, i1 false)
-  %404 = load i32, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  %405 = shl nuw i32 1, %399
-  %406 = and i32 %404, %405
-  %407 = icmp eq i32 %406, 0
-  br i1 %407, label %408, label %413
+402:                                              ; preds = %392, %390, %386
+  %403 = phi i32 [ %401, %392 ], [ 0, %386 ], [ 31, %390 ]
+  %404 = zext nneg i32 %403 to i64
+  %405 = getelementptr inbounds nuw ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 600), i64 %404
+  %406 = getelementptr inbounds nuw i8, ptr %176, i64 56
+  store i32 %403, ptr %406, align 8
+  %407 = getelementptr inbounds nuw i8, ptr %176, i64 32
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) %407, i8 0, i64 16, i1 false)
+  %408 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  %409 = shl nuw i32 1, %403
+  %410 = and i32 %408, %409
+  %411 = icmp eq i32 %410, 0
+  br i1 %411, label %412, label %417
 
-408:                                              ; preds = %398
-  %409 = or i32 %404, %405
-  store i32 %409, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 1), align 4
-  store ptr %174, ptr %401, align 8
-  %410 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 5
-  store ptr %401, ptr %410, align 8
-  %411 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 3
-  store ptr %174, ptr %411, align 8
-  %412 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 2
-  store ptr %174, ptr %412, align 8
-  br label %458
+412:                                              ; preds = %402
+  %413 = or i32 %408, %409
+  store i32 %413, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
+  store ptr %176, ptr %405, align 8
+  %414 = getelementptr inbounds nuw i8, ptr %176, i64 48
+  store ptr %405, ptr %414, align 8
+  %415 = getelementptr inbounds nuw i8, ptr %176, i64 24
+  store ptr %176, ptr %415, align 8
+  %416 = getelementptr inbounds nuw i8, ptr %176, i64 16
+  store ptr %176, ptr %416, align 8
+  br label %463
 
-413:                                              ; preds = %398
-  %414 = load ptr, ptr %401, align 8
-  %415 = icmp eq i32 %399, 31
-  %416 = lshr i32 %399, 1
-  %417 = add nuw nsw i32 %416, 6
-  %418 = zext nneg i32 %417 to i64
-  %419 = sub nuw nsw i64 63, %418
-  %420 = select i1 %415, i64 0, i64 %419
-  %421 = shl i64 %357, %420
-  br label %422
+417:                                              ; preds = %402
+  %418 = load ptr, ptr %405, align 8
+  %419 = icmp eq i32 %403, 31
+  %420 = lshr i32 %403, 1
+  %421 = add nuw nsw i32 %420, 6
+  %422 = zext nneg i32 %421 to i64
+  %423 = sub nuw nsw i64 63, %422
+  %424 = select i1 %419, i64 0, i64 %423
+  %425 = shl i64 %361, %424
+  br label %426
 
-422:                                              ; preds = %429, %413
-  %423 = phi ptr [ %414, %413 ], [ %433, %429 ]
-  %424 = phi i64 [ %421, %413 ], [ %432, %429 ]
-  %425 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %423, i64 0, i32 1
-  %426 = load i64, ptr %425, align 8
-  %427 = and i64 %426, -8
-  %428 = icmp eq i64 %427, %357
-  br i1 %428, label %444, label %429
+426:                                              ; preds = %433, %417
+  %427 = phi ptr [ %418, %417 ], [ %438, %433 ]
+  %428 = phi i64 [ %425, %417 ], [ %437, %433 ]
+  %429 = getelementptr inbounds nuw i8, ptr %427, i64 8
+  %430 = load i64, ptr %429, align 8
+  %431 = and i64 %430, -8
+  %432 = icmp eq i64 %431, %361
+  br i1 %432, label %449, label %433
 
-429:                                              ; preds = %422
-  %430 = lshr i64 %424, 63
-  %431 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %423, i64 0, i32 4, i64 %430
-  %432 = shl i64 %424, 1
-  %433 = load ptr, ptr %431, align 8
-  %434 = icmp eq ptr %433, null
-  br i1 %434, label %435, label %422
+433:                                              ; preds = %426
+  %434 = getelementptr inbounds nuw i8, ptr %427, i64 32
+  %435 = lshr i64 %428, 63
+  %436 = getelementptr inbounds nuw ptr, ptr %434, i64 %435
+  %437 = shl i64 %428, 1
+  %438 = load ptr, ptr %436, align 8
+  %439 = icmp eq ptr %438, null
+  br i1 %439, label %440, label %426
 
-435:                                              ; preds = %429
-  %436 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %423, i64 0, i32 4, i64 %430
-  %437 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %438 = icmp ult ptr %436, %437
-  br i1 %438, label %443, label %439, !prof !7
+440:                                              ; preds = %433
+  %441 = getelementptr inbounds nuw ptr, ptr %434, i64 %435
+  %442 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %443 = icmp ult ptr %441, %442
+  br i1 %443, label %448, label %444, !prof !7
 
-439:                                              ; preds = %435
-  store ptr %174, ptr %436, align 8
-  %440 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 5
-  store ptr %423, ptr %440, align 8
-  %441 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 3
-  store ptr %174, ptr %441, align 8
-  %442 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 2
-  store ptr %174, ptr %442, align 8
-  br label %458
+444:                                              ; preds = %440
+  store ptr %176, ptr %441, align 8
+  %445 = getelementptr inbounds nuw i8, ptr %176, i64 48
+  store ptr %427, ptr %445, align 8
+  %446 = getelementptr inbounds nuw i8, ptr %176, i64 24
+  store ptr %176, ptr %446, align 8
+  %447 = getelementptr inbounds nuw i8, ptr %176, i64 16
+  store ptr %176, ptr %447, align 8
+  br label %463
 
-443:                                              ; preds = %435
-  tail call void @abort() #9
+448:                                              ; preds = %440
+  tail call void @abort() #11
   unreachable
 
-444:                                              ; preds = %422
-  %445 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %423, i64 0, i32 2
-  %446 = load ptr, ptr %445, align 8
-  %447 = load ptr, ptr getelementptr inbounds (%__temen_dl.malloc_state, ptr @__temen_dl._gm_, i64 0, i32 4), align 8
-  %448 = icmp uge ptr %423, %447
-  %449 = icmp uge ptr %446, %447
-  %450 = select i1 %448, i1 %449, i1 false
-  br i1 %450, label %451, label %456, !prof !8
+449:                                              ; preds = %426
+  %450 = getelementptr inbounds nuw i8, ptr %427, i64 16
+  %451 = load ptr, ptr %450, align 8
+  %452 = load ptr, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 24), align 8
+  %453 = icmp uge ptr %427, %452
+  %454 = icmp uge ptr %451, %452
+  %455 = select i1 %453, i1 %454, i1 false, !prof !8
+  br i1 %455, label %456, label %461, !prof !8
 
-451:                                              ; preds = %444
-  %452 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %446, i64 0, i32 3
-  store ptr %174, ptr %452, align 8
-  store ptr %174, ptr %445, align 8
-  %453 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 2
-  store ptr %446, ptr %453, align 8
-  %454 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 3
-  store ptr %423, ptr %454, align 8
-  %455 = getelementptr inbounds %__temen_dl.malloc_tree_chunk, ptr %174, i64 0, i32 5
-  store ptr null, ptr %455, align 8
-  br label %458
+456:                                              ; preds = %449
+  %457 = getelementptr inbounds nuw i8, ptr %451, i64 24
+  store ptr %176, ptr %457, align 8
+  store ptr %176, ptr %450, align 8
+  %458 = getelementptr inbounds nuw i8, ptr %176, i64 16
+  store ptr %451, ptr %458, align 8
+  %459 = getelementptr inbounds nuw i8, ptr %176, i64 24
+  store ptr %427, ptr %459, align 8
+  %460 = getelementptr inbounds nuw i8, ptr %176, i64 48
+  store ptr null, ptr %460, align 8
+  br label %463
 
-456:                                              ; preds = %444
-  tail call void @abort() #9
+461:                                              ; preds = %449
+  tail call void @abort() #11
   unreachable
 
-457:                                              ; preds = %172
-  tail call void @abort() #9
+462:                                              ; preds = %174
+  tail call void @abort() #11
   unreachable
 
-458:                                              ; preds = %451, %439, %408, %376, %350, %196, %192, %185, %166, %8
+463:                                              ; preds = %456, %444, %412, %380, %354, %198, %194, %187, %168, %8
   ret void
 }
 
-; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
-declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #3
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #9
 
-; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
-declare i64 @llvm.umin.i64(i64, i64) #3
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umin.i64(i64, i64) #9
 
-; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
-declare i64 @llvm.umax.i64(i64, i64) #3
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #9
 
-; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
-declare i64 @llvm.ctpop.i64(i64) #3
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.ctpop.i64(i64) #9
 
 attributes #0 = { nounwind uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
 attributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }
-attributes #2 = { noreturn nounwind "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+attributes #2 = { cold nofree noreturn nounwind "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
 attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
-attributes #4 = { nocallback nofree nounwind willreturn memory(argmem: write) }
-attributes #5 = { mustprogress nofree nosync nounwind willreturn memory(none) "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
-attributes #6 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }
-attributes #7 = { "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
-attributes #8 = { nounwind }
-attributes #9 = { noreturn nounwind }
-attributes #10 = { nounwind willreturn memory(none) }
+attributes #4 = { nofree nounwind uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+attributes #5 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #6 = { mustprogress nofree nosync nounwind willreturn memory(none) "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+attributes #7 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }
+attributes #8 = { "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+attributes #9 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #10 = { nounwind }
+attributes #11 = { noreturn nounwind }
+attributes #12 = { nounwind willreturn memory(none) }
 
 !llvm.module.flags = !{!0, !1, !2, !3}
 !llvm.ident = !{!4}
@@ -5016,30 +5104,24 @@ attributes #10 = { nounwind willreturn memory(none) }
 !1 = !{i32 8, !"PIC Level", i32 2}
 !2 = !{i32 7, !"PIE Level", i32 2}
 !3 = !{i32 7, !"uwtable", i32 2}
-!4 = !{!"Ubuntu clang version 18.1.3 (1ubuntu1)"}
+!4 = !{!"Ubuntu clang version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1~20260714135019.80)"}
 !5 = distinct !{!5, !6}
 !6 = !{!"llvm.loop.mustprogress"}
-!7 = !{!"branch_weights", i32 1, i32 2000}
-!8 = !{!"branch_weights", i32 2000, i32 1}
-!9 = !{i32 2, i32 33}
-!10 = !{i32 0, i32 33}
+!7 = !{!"branch_weights", !"expected", i32 1, i32 2000}
+!8 = !{!"branch_weights", !"expected", i32 2000, i32 1}
+!9 = distinct !{!9, !6}
+!10 = distinct !{!10, !6}
 !11 = distinct !{!11, !6}
 !12 = distinct !{!12, !6}
-!13 = !{i32 16, i32 33}
-!14 = !{i32 1, i32 33}
-!15 = distinct !{!15, !6}
+!13 = distinct !{!13, !6}
+!14 = distinct !{!14, !6}
+!15 = !{}
 !16 = distinct !{!16, !6}
 !17 = distinct !{!17, !6}
-!18 = distinct !{!18, !6}
-!19 = distinct !{!19, !6}
-!20 = !{}
+!18 = !{!"branch_weights", i32 4001, i32 4000000}
+!19 = !{!"branch_weights", i32 6003000, i32 -294967296}
+!20 = distinct !{!20, !6}
 !21 = distinct !{!21, !6}
 !22 = distinct !{!22, !6}
-!23 = !{!"branch_weights", i32 -294967296, i32 6003000}
+!23 = distinct !{!23, !6}
 !24 = distinct !{!24, !6}
-!25 = !{i64 0, i64 65}
-!26 = distinct !{!26, !6}
-!27 = !{i64 0, i64 62}
-!28 = distinct !{!28, !6}
-!29 = distinct !{!29, !6}
-!30 = distinct !{!30, !6}
