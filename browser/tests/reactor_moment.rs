@@ -449,18 +449,19 @@ fn packed(s: &str) -> i64 {
     i64::from_le_bytes(b)
 }
 
-/// A reactor whose `tick` spawns a §14 child (func 2, a 64 KiB carve) with exactly one capability,
-/// `cap`, re-granted by name, joins it, and writes the low byte of the child's result to stdout (`?` if
-/// the child could not resolve `cap`). A grant the parent may not re-grant fails the spawn closed —
-/// op 17 traps `CapFault` on every engine. `child_body` runs in the child with the resolved handle in
-/// `vh2: i32` and returns an `i64`.
+/// A reactor whose `tick` spawns a §14 child (func 2, detached in a window of its own, paid from the
+/// by-name `"budget"`) with exactly one capability, `cap`, re-granted by name, joins it, and writes the
+/// low byte of the child's result to stdout (`?` if the child could not resolve `cap`). A grant the
+/// parent may not re-grant fails the spawn closed — op 17 traps `CapFault` on every engine.
+/// `child_body` runs in the child with the resolved handle in `vh2: i32` and returns an `i64`.
 fn regrant_reactor(cap: &str, child_body: &str) -> temen_ir::Module {
-    let (len, name) = (cap.len(), packed(cap));
+    let len = cap.len();
     let src = format!(
         r#"memory 20
 data 16384 "instantiator"
 data 16400 "{cap}"
 data 16416 "stdout"
+data 16496 "budget"
 export 0 func "_start" 0
 export 1 func "tick" 1
 
@@ -479,39 +480,33 @@ block 0 (vsp: i64) {{
   vcp = i64.const 16400
   vcl = i64.const {len}
   vcap = self.resolve vcp vcl
-  ; the grant record at 17472: {{name_off, name_len, handle, flags}}
-  vg0 = i64.const 17472
+  vbp0 = i64.const 16496
+  vbl = i64.const 6
+  vbud = self.resolve vbp0 vbl
+  ; the grant record at 17536: {{name_off, name_len, handle, flags}}
+  vg0 = i64.const 17536
   vgn = i32.const 16400
   i32.store vg0 vgn
-  vg1 = i64.const 17476
   vgl = i32.const {len}
-  i32.store vg1 vgl
-  vg2 = i64.const 17480
-  i32.store vg2 vcap
-  vg3 = i64.const 17484
+  i32.store vg0 vgl offset=4
+  i32.store vg0 vcap offset=8
   vgz = i32.const 0
-  i32.store vg3 vgz
-  ; the spawn record at 17408 (temen_ir::SpawnRec): entry 2, carve [64K, 128K), self module, one grant
+  i32.store vg0 vgz offset=12
+  ; the v1 spawn record at 17408 (temen_ir::SpawnRec): entry 2 of the running module (-1), its
+  ; declared window, no pager or pre-mapped region, paid from `budget`, one grant
   vr0 = i64.const 17408
-  vf0 = i64.const 8589934592
+  vf0 = i64.const 8589934593
   i64.store vr0 vf0
-  vr1 = i64.const 17416
-  voff = i64.const 65536
-  i64.store vr1 voff
-  vr2 = i64.const 17424
-  vf2 = i64.const -4294967280
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  vf3 = i64.const 4294967295
-  i64.store vr3 vf3
-  vr4 = i64.const 17440
-  vq = i64.const 0
-  i64.store vr4 vq
-  vr5 = i64.const 17448
-  i64.store vr5 vg0
-  vr6 = i64.const 17456
+  vf2 = i64.const -4294967296
+  i64.store vr0 vf2 offset=16
+  vself = i32.const -1
+  i32.store vr0 vself offset=24
+  i32.store vr0 vbud offset=28
+  i64.store vr0 vg0 offset=40
   vn = i64.const 1
-  i64.store vr6 vn
+  i64.store vr0 vn offset=48
+  vf9 = i64.const 4294967295
+  i64.store vr0 vf9 offset=72
   vh = call.cap 6 17 (i64) -> (i32) vinst (vr0)
   vgot = call.cap 6 1 (i32) -> (i64) vinst (vh)
   vbp = i64.const 16432
@@ -526,12 +521,10 @@ block 0 (vsp: i64) {{
   }}
 }}
 
-; the child: its carve starts zeroed, so it writes the capability's name itself before resolving it
+; the child: its window holds the module's data, so the capability's name is at 16400 there too
 func (i64) -> (i64) {{
 block 0 (va: i64) {{
   vcp = i64.const 16400
-  vname = i64.const {name}
-  i64.store vcp vname
   vcl = i64.const {len}
   vh = self.resolve vcp vcl
   vz = i32.const 0
