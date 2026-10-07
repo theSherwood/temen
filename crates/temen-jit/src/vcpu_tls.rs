@@ -47,6 +47,7 @@ pub fn serve_handlers() -> u32 {
 
 /// Set the current vCPU's serve-handler count.
 #[inline(never)]
-pub fn set_serve_handlers(n: u32) {
+#[cfg_attr(not(fiber_rt), allow(dead_code))] // its writers are the fiber_rt serve and task paths
+pub(crate) fn set_serve_handlers(n: u32) {
     SERVE_HANDLERS.with(|c| c.set(n));
 }

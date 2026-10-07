@@ -490,26 +490,6 @@ unsafe fn cap_thunk_impl(
     } else {
         (type_id, op, handle)
     };
-    // §3.6 / I36 slice 3 — the native JIT **serve loop**: `svc.poll` / `svc.wait` (the CAP_SELF
-    // ops 9/10, as in `module_serves`) serviced here rather than folding the whole module to the
-    // tree-walk oracle. Only serve-qualified modules reach this arm (the routing veto,
-    // `bytecode::serve_qualifies`, folds any module whose handlers could park). The I38 **timed**
-    // `svc.wait` (op 10 with the optional timeout arg) is oracle-only — the veto folds such
-    // modules; a stray dispatch falls through to the generic Host answer (probeable `-EINVAL`),
-    // never a bogus untimed serve. The `host` borrow above is dead on this path —
-    // `serve_native` re-derives from `ctx` in short scopes, because a handler's own `call.cap`s
-    // re-enter this thunk mid-serve.
-    if type_id == temen_ir::CAP_SELF_TYPE_ID && (op == 9 || (op == 10 && n_args == 0)) {
-        serve_native(
-            ctx as *mut Host,
-            op == 10,
-            mem_base,
-            results,
-            n_results,
-            trap_out,
-        );
-        return;
-    }
     // Guest-driven `Jit` (iface 11, DESIGN.md §22): serviced natively here, not in the generic
     // Host dispatch — `compile` must call into Cranelift (`define_extra` on the live
     // `CompiledModule`) and `invoke` must call the unit's trampoline over the live window,
@@ -718,18 +698,15 @@ pub unsafe extern "C" fn cap_thunk_locked(
     } else {
         (type_id, op, handle)
     };
-    // §3.6 / I36 slice 3: the native serve loop re-enters guest code, so it must never run under
-    // the lock — and it never needs to: a serve-qualified module has no thread ops (the routing
-    // veto), so it always runs the unlocked [`cap_thunk`]. A `svc.poll`/`svc.wait` that somehow
-    // reaches the concurrent path keeps the pre-slice answer: the generic dispatch's probeable
-    // `-EINVAL` (fail closed, never a self-deadlock).
+    // §3.6, #2166: a service point — the one serve loop, root or child. It re-enters guest code,
+    // so it takes the lock only in short scopes, never across a handler.
     if type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(op, 9 | 10) {
-        serve_locked_child(
+        serve_locked(
             m,
             op == 10,
             n_args,
             mem_base,
-            mem_size,
+            mem_reserved,
             results,
             n_results,
             trap_out,
@@ -903,98 +880,6 @@ unsafe fn jit_invoke_locked(
     {
         cap_fault(trap_out);
     }
-}
-
-/// §3.6 / I36 slice 3 — the **native JIT serve loop**: the `svc.poll` / `svc.wait` service point
-/// (CAP_SELF ops 9/10), served in the embedder instead of folding the whole module to the
-/// tree-walk oracle. Pops the domain's queued dispatches and invokes each handler's compiled
-/// buffer-ABI trampoline over the **live window** ([`CompiledModule::invoke_extra`]) — handlers
-/// run to completion or trap; a module whose handlers could park never reaches here (the routing
-/// veto, [`temen_interp::bytecode::serve_qualifies`], folds it). Semantics mirror the oracle's
-/// serve arm and the bytecode engine's `Op::SvcPoll`:
-/// - an arity-mismatched dispatch settles `-EINVAL` inline and serving continues (the dispatch's
-///   fault, never the domain's);
-/// - a serve op nested under a running handler answers `-EINVAL` and serves nothing (#2160);
-/// - a handler trap (incl. `Exit`) is left in the run's trap cell — terminal for the domain
-///   (one-world semantics);
-/// - a drained queue delivers the served count;
-/// - `svc.wait` with an empty queue and no progress **fails closed** (`ThreadFault`): caller-side
-///   parking is not yet native on the JIT (the op-14 fold stands), so no enqueuer can exist
-///   mid-run and the park could never be woken — the deterministic-deadlock answer, exactly the
-///   bytecode drive's. Completed replies ride the completion cells (no cross-domain caller can be
-///   ticket-parked on this backend yet), the tree-walker's unclaimed-result path.
-///
-/// # Safety
-/// `host_ptr` is the run's live `*mut Host` with **no `&mut Host` held by the caller across this
-/// call** (a handler's own `call.cap`s re-enter the thunk, re-deriving from the same pointer);
-/// `mem_base` is the live run's window base and `results`/`n_results`/`trap_out` honor the
-/// [`temen_jit::CapThunk`] contract.
-unsafe fn serve_native(
-    host_ptr: *mut Host,
-    wait: bool,
-    mem_base: *mut u8,
-    results: *mut i64,
-    n_results: u64,
-    trap_out: *mut i64,
-) {
-    let put = |v: i64, trap_out: *mut i64| {
-        if n_results != 0 {
-            *results = v;
-        }
-        *trap_out = 0;
-    };
-    if serve_is_nested() {
-        return put(EINVAL, trap_out);
-    }
-    let cm = (*host_ptr).serve_native_ctx() as *mut CompiledModule;
-    if cm.is_null() {
-        // No serve context registered (an embedder entry that never set one): keep the
-        // pre-slice answer — the generic dispatch's probeable `-EINVAL`.
-        return put(EINVAL, trap_out);
-    }
-    let mut count: i64 = 0;
-    loop {
-        let d = (*host_ptr).svc_pop();
-        let Some((export, op, args, ticket)) = d else {
-            break;
-        };
-        // The queue only holds servable dispatches (checked at enqueue), so a missing handler
-        // or trampoline here is host-state corruption: fail closed.
-        let Some(fidx) = (*host_ptr).svc_handler(export, op) else {
-            *trap_out = TrapKind::CapFault as i64;
-            return;
-        };
-        let Some((code, n_params, n_res)) = (*cm).handler_tramp(fidx) else {
-            *trap_out = TrapKind::CapFault as i64;
-            return;
-        };
-        if args.len() != n_params {
-            (*host_ptr).svc_settle(ticket, EINVAL);
-            continue;
-        }
-        let mut res = vec![0i64; n_res];
-        // SAFETY: `cm` is the in-flight run's CompiledModule (the guest is suspended in this
-        // synchronous `call.cap` on this thread); `code` is its finalized handler trampoline;
-        // arity checked above; no `&mut Host` is live (the scoped pops/settles above ended).
-        // The handler runs as the serving instance: the thunk's `trap_out` is its `VmCtx`.
-        let vm = trap_out as *const temen_jit::VmCtx;
-        if run_handler(|| CompiledModule::invoke_extra(cm, code, &args, &mut res, mem_base, vm))
-            .is_err()
-        {
-            *trap_out = TrapKind::CapFault as i64; // not in-flight — unreachable from a real run
-            return;
-        }
-        if *trap_out != 0 {
-            return; // handler trap (incl. Exit) — terminal for the domain, like the oracle
-        }
-        (*host_ptr).svc_settle(ticket, res.first().copied().unwrap_or(0));
-        count += 1;
-    }
-    if wait && count == 0 {
-        *trap_out = TrapKind::ThreadFault as i64;
-        return;
-    }
-    put(count, trap_out);
 }
 
 /// The §22 **seam-free leaf** gate for `Jit.invoke` on the native tier: whether a unit uses something
@@ -1750,7 +1635,7 @@ pub fn jit_cap_run(
     // identical either way — the serialization is an internal detail that can be made finer-grained
     // later without changing guest software. Thread-hosting forces the serialized path (a hosted
     // unit's spawned vCPUs are the concurrent callers, even when the top-level module is sequential).
-    if hosts_threads || m.funcs.iter().any(|f| f.uses_concurrency()) {
+    if hosts_threads || jit_proc::locked(m) {
         let node = run_node(host); // the node goes with the host into its lock
         let host_mutex = Mutex::new(std::mem::take(host));
         let cc = CapCtx::Locked(&host_mutex as *const Mutex<Host>);
@@ -1786,10 +1671,11 @@ pub fn jit_cap_run(
         if hosts_threads {
             cm.enable_thread_hosting()?;
         }
-        host_mutex
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+        {
+            let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            hg.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
+            hg.set_serve_ctx(&mut cm as *mut CompiledModule as usize);
+        }
         // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3), locked twin of the single-threaded path
         // below: re-compile any restore-rebuilt units into this fresh module. A no-op for a fresh run.
         {
@@ -1809,6 +1695,7 @@ pub fn jit_cap_run(
         {
             let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
             hg.set_jit_native_ctx(0);
+            hg.set_serve_ctx(0);
             jit_durable_leave(&mut cm, &mut hg);
         }
         hg_restore(host, host_mutex);
@@ -1845,15 +1732,12 @@ pub fn jit_cap_run(
     }
     let cm_ptr: *mut CompiledModule = &mut cm;
     host.set_jit_native_ctx(cm_ptr as usize);
-    // §3.6 / I36 slice 3: register for the native serve arm too (see `jit_proc::run_image`).
-    host.set_serve_native_ctx(cm_ptr as usize);
     // Reconstruct-on-thaw (DURABILITY.md §12.5 Slice 3): re-compile any units a restore rebuilt into
     // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
     // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
     reconstruct_jit_units(&mut cm, host)?;
     if let Err(e) = jit_durable_enter(&mut cm, host) {
         host.set_jit_native_ctx(0);
-        host.set_serve_native_ctx(0);
         return Err(e);
     }
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing — and, for a
@@ -1863,7 +1747,6 @@ pub fn jit_cap_run(
     let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18)) };
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
-    host.set_serve_native_ctx(0);
     jit_durable_leave(&mut cm, host);
     r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)))
 }
@@ -3342,7 +3225,7 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
         {
             let cell = &*(ctx as *const Mutex<Host>);
             let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
-            g.set_child_serve_ctx(0);
+            g.set_serve_ctx(0);
             g.set_jit_native_ctx(0); // #1296 — the child's module dies with its thread too
             if let Some(cv) = g.svc_cv() {
                 cv.notify_all();
@@ -3365,7 +3248,7 @@ pub unsafe extern "C" fn child_register_serve(child_ctx: *mut c_void, serve_ctx:
     if !child_ctx.is_null() {
         let cell = &*(child_ctx as *const Mutex<Host>);
         let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
-        g.set_child_serve_ctx(serve_ctx);
+        g.set_serve_ctx(serve_ctx);
         // #1296 — the registered address is the child's own `CompiledModule` (a §14 child compiles
         // to the root's shape), so it is also the native ctx of every `Jit` table re-granted into
         // the child: `jit_native_op` compiles / installs / invokes the child's units in *its*
@@ -3385,25 +3268,27 @@ unsafe fn blocked_wait_interrupted(epoch_cell: usize, trap_out: *mut i64) -> boo
     (*(trap_out as *const AtomicI64)).load(Ordering::Relaxed) != 0
 }
 
-/// CALLS.md 5c.1b — the **child side** of the JIT parked transport: a granted child's
-/// `svc.poll`/`svc.wait`, serviced on the child's own thread over its shared powerbox cell. Pops
-/// and serves queued dispatches through the child's registered serve context
-/// ([`temen_jit::child_handler_tramp`] / [`temen_jit::child_invoke_handler`] — the guard is **dropped**
-/// around every handler invoke, so the handler's own `call.cap`s relock freely and an enqueuing
-/// caller is never blocked out); each settle notifies the cell's Condvar (waking a thread-blocked
-/// caller). An empty-queue `svc.wait` **block-waits** on the same Condvar (the arm 5 park),
-/// bounded by 20ms re-checks of the epoch/trap cells — where the pre-5c.1 stub answered `-EINVAL`
-/// and `serve_native`'s wait arm `ThreadFault`ed. Non-child locked domains (no serve ctx / no
-/// Condvar) keep the old probeable `-EINVAL`: a multi-threaded top-level still never serves here.
-/// The timed `svc.wait` form (a timeout arg) stays `-EINVAL` on this tier, and a **nested** serve
-/// under a handler is refused the same way the interp refuses it (see the in-body guard).
+/// §3.6, CALLS.md 5c.1b, #2166 — the JIT's **one serve loop**: a domain's `svc.poll`/`svc.wait`,
+/// root or §14 child, serviced on its own thread over its locked powerbox cell (a serving root runs
+/// locked for this, [`jit_proc::locked`]). Pops and serves queued dispatches through the domain's
+/// registered serve context ([`temen_jit::handler_tramp_of`] / [`temen_jit::invoke_handler`] — the
+/// guard is **dropped** around every handler invoke, so the handler's own `call.cap`s relock freely
+/// and an enqueuing caller is never blocked out); each settle notifies the cell's Condvar (waking a
+/// thread-blocked caller).
+///
+/// An empty-queue `svc.wait` **block-waits** on that Condvar (the arm 5 park), bounded by 20ms
+/// re-checks of the epoch/trap cells, when the domain has one: a shared child cell, which a caller
+/// can enqueue on. Without one nothing can ever enqueue, so the wait fails closed (`ThreadFault`,
+/// the deterministic-deadlock answer; ISSUES.md I36). No serve context ⇒ the probeable `-EINVAL`;
+/// so is the timed `svc.wait` form (a timeout arg), and a **nested** serve under a handler, refused
+/// as the interp refuses it (#2160).
 #[allow(clippy::too_many_arguments)]
-unsafe fn serve_locked_child(
+unsafe fn serve_locked(
     m: &Mutex<Host>,
     wait: bool,
     n_args: u64,
     mem_base: *mut u8,
-    mem_size: u64,
+    mem_reserved: u64,
     results: *mut i64,
     n_results: u64,
     trap_out: *mut i64,
@@ -3416,21 +3301,19 @@ unsafe fn serve_locked_child(
     };
     // A nested serve under a handler; or the timed `svc.wait`, oracle-only (it needs deadline
     // machinery this tier doesn't host).
-    if serve_is_nested() || n_args != 0 {
+    if temen_jit::serve_handlers() != 0 || n_args != 0 {
         return put(EINVAL, trap_out);
     }
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
-    let (serve_ctx, cv, epoch) = (guard.child_serve_ctx(), guard.svc_cv(), guard.epoch_cell());
-    let (serve_ctx, cv) = match (serve_ctx, cv) {
-        (ctx, Some(cv)) if ctx != 0 => (ctx, cv),
-        // Not a serving child cell (a multi-threaded top-level, or the ctx already cleared):
-        // the pre-5c.1 probeable answer, never a block.
-        _ => return put(EINVAL, trap_out),
-    };
+    let (serve_ctx, cv, epoch) = (guard.serve_ctx(), guard.svc_cv(), guard.epoch_cell());
+    if serve_ctx == 0 {
+        // No serve context (an embedder entry that registers none, or a child already released).
+        return put(EINVAL, trap_out);
+    }
     let mut count: i64 = 0;
     loop {
         // CALLS.md 5c.2 — fold handoff settlements (§10.2: a handoff-served dispatch counts in
-        // THIS serve loop's accounting), and a handler trap under handoff is this child's own
+        // THIS serve loop's accounting), and a handler trap under handoff is this domain's own
         // death, exactly as if it had served the dispatch itself on the enqueue path.
         count += guard.take_handoff_served();
         let handoff_trap = guard.take_handoff_trap();
@@ -3441,8 +3324,12 @@ unsafe fn serve_locked_child(
             return;
         }
         if guard.handoff_claimed() {
-            // A claimer is running a handler inline over this child's window: neither pop nor
-            // exit (the window must stay alive under it) — wait for the release.
+            // A claimer is running a handler inline over this domain's window: neither pop nor
+            // exit (the window must stay alive under it) — wait for the release. Only a domain
+            // with a Condvar publishes an activation a claimer can take.
+            let cv = cv
+                .as_ref()
+                .expect("a claimed activation implies a shared cell");
             let (g, _) = cv
                 .wait_timeout(guard, std::time::Duration::from_millis(20))
                 .unwrap_or_else(|e| e.into_inner());
@@ -3455,7 +3342,7 @@ unsafe fn serve_locked_child(
                 return;
             };
             let Some((code, n_params, n_res)) =
-                temen_jit::child_handler_tramp(serve_ctx as *const c_void, fidx)
+                temen_jit::handler_tramp_of(serve_ctx as *const c_void, fidx)
             else {
                 *trap_out = temen_jit::TrapKind::CapFault as i64;
                 return;
@@ -3466,29 +3353,22 @@ unsafe fn serve_locked_child(
             }
             let mut res = vec![0i64; n_res];
             // Run the handler with the cell UNLOCKED (its own call.cap calls relock; an enqueuer
-            // never blocks behind a running handler). SAFETY: `serve_ctx` is the live
-            // module (cleared only at release, which runs after the child's guest code —
-            // including this serve — has returned); `[mem_base, +mem_size)` is this child's
-            // live window, handed to this very thunk call.
+            // never blocks behind a running handler). SAFETY: `serve_ctx` is the live module
+            // (cleared only after the domain's guest code — including this serve — has returned);
+            // `mem_base` is this domain's live window, handed to this very thunk call. Served on
+            // the domain's own thread, inside its own run: the thunk's `trap_out` is its `VmCtx`.
             drop(guard);
-            let faulted = run_handler(|| {
-                temen_jit::child_invoke_handler(
-                    serve_ctx as *const c_void,
-                    code,
-                    &args,
-                    &mut res,
-                    mem_base,
-                    mem_size,
-                    // Served on the child's own thread, inside its own run: the thunk's `trap_out`
-                    // is the child's `VmCtx`.
-                    trap_out as *const temen_jit::VmCtx,
-                )
-            });
-            if faulted {
-                return; // detect-and-kill: the fault trap is already in the cell
-            }
+            temen_jit::invoke_handler(
+                serve_ctx as *const c_void,
+                code,
+                &args,
+                &mut res,
+                mem_base,
+                mem_reserved,
+                trap_out as *const temen_jit::VmCtx,
+            );
             if *trap_out != 0 {
-                return; // handler trap (incl. Exit) — terminal for the domain, like the oracle
+                return; // a handler trap or fault (incl. Exit) — terminal for the domain
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
             guard.svc_settle(ticket, res.first().copied().unwrap_or(0));
@@ -3497,8 +3377,15 @@ unsafe fn serve_locked_child(
         if !wait || count != 0 {
             break;
         }
-        // Empty queue on `svc.wait` and nothing served yet: the arm-5 park — block on the
-        // cell's Condvar (released while waiting, so enqueuers get in), bounded re-checks.
+        // Empty queue on `svc.wait` and nothing served yet. With no Condvar nothing can enqueue:
+        // fail closed rather than park forever.
+        let Some(cv) = cv.as_ref() else {
+            drop(guard);
+            *trap_out = temen_jit::TrapKind::ThreadFault as i64;
+            return;
+        };
+        // The arm-5 park — block on the cell's Condvar (released while waiting, so enqueuers get
+        // in), bounded re-checks.
         if blocked_wait_interrupted(epoch, trap_out) {
             guard.set_serve_activation(None);
             drop(guard);
@@ -3508,10 +3395,10 @@ unsafe fn serve_locked_child(
             return;
         }
         // CALLS.md 5c.2 — publish the activation for the wait's duration: a caller finding it
-        // (under this same lock) may claim and serve inline over `[mem_base, +mem_size)`, which
-        // stays alive exactly because this frame sits in `wait_timeout` until the release (the
+        // (under this same lock) may claim and serve inline over `mem_base`'s window, which stays
+        // alive exactly because this frame sits in `wait_timeout` until the release (the
         // claimed-wait arm above). Cleared on every wake — the activation never outlives the park.
-        guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_size)));
+        guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
         let (g, _) = cv
             .wait_timeout(guard, std::time::Duration::from_millis(20))
             .unwrap_or_else(|e| e.into_inner());
@@ -3534,23 +3421,6 @@ thread_local! {
 }
 fn crossing_depth_ok() -> bool {
     CROSSING_DEPTH.with(|d| d.get() < CROSSING_DEPTH_MAX)
-}
-
-/// #2160 — run one serve handler's invoke counted in the running vCPU's serve-handler count
-/// ([`temen_jit::serve_handlers`]). A `svc.poll`/`svc.wait` reached under it (from the handler's
-/// code or its callees) is a nested serve ([`serve_is_nested`]), refused with a probeable `-EINVAL`
-/// as the oracle refuses it: the serve loop is the domain's outermost dispatcher. Per vCPU, not per
-/// domain: a multi-consumer domain's other vCPUs serve concurrently.
-fn run_handler<R>(invoke: impl FnOnce() -> R) -> R {
-    temen_jit::set_serve_handlers(temen_jit::serve_handlers() + 1);
-    let r = invoke();
-    temen_jit::set_serve_handlers(temen_jit::serve_handlers() - 1);
-    r
-}
-
-/// Whether a serve op on the running vCPU is nested under one of its handlers ([`run_handler`]).
-fn serve_is_nested() -> bool {
-    temen_jit::serve_handlers() != 0
 }
 
 /// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `call.cap`
@@ -3582,10 +3452,10 @@ unsafe fn live_impl_call(
     // bound (5c.3); every miss releases and declines to the parked transport below — toward the
     // slower correct transport, never a wrong answer (§9).
     if fast && crossing_depth_ok() {
-        if let Some((sctx, cbase, csize)) = guard.try_claim_handoff() {
+        if let Some((sctx, cbase, creserved)) = guard.try_claim_handoff() {
             let tramp = guard
                 .svc_handler(export, op)
-                .and_then(|f| temen_jit::child_handler_tramp(sctx as *const c_void, f));
+                .and_then(|f| temen_jit::handler_tramp_of(sctx as *const c_void, f));
             match tramp {
                 Some((code, n_params, n_res)) if args.len() == n_params => {
                     drop(guard);
@@ -3595,19 +3465,17 @@ unsafe fn live_impl_call(
                     // outcome (on the enqueue path the child would have died serving this dispatch):
                     // it lands in this context's own cell, never the caller's trap cell.
                     let child_vm =
-                        temen_jit::VmCtx::new(temen_jit::child_instance(sctx as *const c_void));
+                        temen_jit::VmCtx::new(temen_jit::instance_of(sctx as *const c_void));
                     CROSSING_DEPTH.with(|d| d.set(d.get() + 1));
-                    let _faulted = run_handler(|| {
-                        temen_jit::child_invoke_handler(
-                            sctx as *const c_void,
-                            code,
-                            args,
-                            &mut res,
-                            cbase as *mut u8,
-                            csize,
-                            &child_vm,
-                        )
-                    });
+                    temen_jit::invoke_handler(
+                        sctx as *const c_void,
+                        code,
+                        args,
+                        &mut res,
+                        cbase as *mut u8,
+                        creserved,
+                        &child_vm,
+                    );
                     CROSSING_DEPTH.with(|d| d.set(d.get() - 1));
                     let child_trap = child_vm.trap.load(std::sync::atomic::Ordering::Relaxed);
                     let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
@@ -3650,7 +3518,7 @@ unsafe fn live_impl_call(
         if let Some(r) = guard.svc_result(ticket) {
             return r;
         }
-        if guard.child_serve_ctx() == 0 {
+        if guard.serve_ctx() == 0 {
             // The child exited (release cleared the ctx) with our dispatch unserved — the
             // dead-callee edge, probeable, never a hang (D37 death-is-revocation).
             return CAP_REVOKED;
@@ -5319,13 +5187,11 @@ unsafe fn powerbox_run_prebuilt(
     // unlocked path does (`jit_proc::run_image`); cleared after the run so no stale ctx leaks
     // into the next one. The hooks / budget taker are installed once at compile time.
     host.set_jit_native_ctx(cm as *mut CompiledModule as usize);
-    host.set_serve_native_ctx(cm as *mut CompiledModule as usize);
     // `run_raw` allocates a fresh guest window and re-applies the module's data segments every call
     // (temen-jit `run_raw`), so successive runs over the same `cm` never share guest memory — each is
     // as independent as a fresh `run_powerbox`.
     let r = CompiledModule::run_raw(cm, slots, init_mem, None);
     host.set_jit_native_ctx(0);
-    host.set_serve_native_ctx(0);
     r.map(|(outcome, snapshot)| JitRun {
         outcome,
         backtrace: cm.last_trap_backtrace().to_vec(),
@@ -5492,10 +5358,11 @@ impl PowerboxProgram {
         // Refuse the shapes the one-shot path routes away from the single-threaded non-locked JIT
         // arm — the only arm this cache implements. Mirrors `Instance::run_with_caps`'s TreeWalk
         // fallback predicate plus the concurrency (locked-thunk) case.
-        if module.funcs.iter().any(|f| f.uses_concurrency()) {
+        if jit_proc::locked(&module) || module.funcs.iter().any(|f| f.uses_concurrency()) {
             return Err(
-                "PowerboxProgram: module uses §12 concurrency (cont.*/thread.*/futex); \
-                        use run_powerbox (per-call compile)"
+                "PowerboxProgram: module uses §12 concurrency (cont.*/thread.*/futex) or serves \
+                        (svc.poll/svc.wait), which run over the locked powerbox; use run_powerbox \
+                        (per-call compile)"
                     .into(),
             );
         }
@@ -5882,17 +5749,6 @@ fn diff_outcome(
     }
 }
 
-/// §3.6 — whether a module **statically serves**: it contains a service point (`svc.poll`/
-/// `svc.wait`, the reserved self ops 9/10) or mints a live-callee offer
-/// (`Instantiator.child_offer`, op 14). Since I36 slice 3 this is only half the routing: a
-/// **serve-qualified** module ([`temen_interp::bytecode::serve_qualifies`] — service points, no
-/// park-capable seams) runs its serve loop natively on both fast backends (the bytecode engine's
-/// serve ops; the JIT cap thunk's `serve_native` arm over compiled handler trampolines), so only
-/// the remainder folds to the tree-walk oracle: op-14 offer mints (caller-side wiring is not yet
-/// native on the JIT) and serving modules whose handlers could park (the oracle's serve arm has
-/// the fiber-park machinery). Runtime-granted live caps on a JIT run (an embedder wiring
-/// `wire_live_impl` into a compiled module) remain the embedder's choice and still answer
-/// `-EINVAL` — the static scan covers everything a guest can express in its bytes.
 /// CALLS.md 5c.1c — does the module spawn §14 children (any `Instantiator` `call.cap`)? A
 /// serving module that also **nests** is the child-serving shape the JIT now runs natively (the
 /// 5c.1 parked transport: the serve points live in granted children, not the root), so the
@@ -5934,7 +5790,9 @@ fn module_demand_spawns(m: &temen_ir::Module) -> bool {
     })
 }
 
-fn module_serves(m: &Module) -> bool {
+/// Whether `m` has a service point (`svc.poll` / `svc.wait`, the CAP_SELF ops 9/10): it serves its
+/// own queue, which the JIT does over the locked powerbox ([`jit_proc::locked`], #2166).
+fn has_service_point(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
@@ -5944,15 +5802,40 @@ fn module_serves(m: &Module) -> bool {
                         type_id: temen_ir::CAP_SELF_TYPE_ID,
                         op: 9 | 10,
                         ..
-                    } | temen_ir::Inst::CapCall {
-                        type_id: 6,
-                        op: 14,
-                        ..
                     }
                 )
             })
         })
     })
+}
+
+/// §3.6 — whether a module **statically serves**: it contains a service point (`svc.poll`/
+/// `svc.wait`, the reserved self ops 9/10) or mints a live-callee offer
+/// (`Instantiator.child_offer`, op 14). Since I36 slice 3 this is only half the routing: a
+/// **serve-qualified** module ([`temen_interp::bytecode::serve_qualifies`] — service points, no
+/// park-capable seams) runs its serve loop natively on both fast backends (the bytecode engine's
+/// serve ops; the JIT cap thunk's one serve loop over compiled handler trampolines, #2166), so
+/// only the remainder folds to the tree-walk oracle: op-14 offer mints (caller-side wiring is not
+/// yet native on the JIT) and serving modules whose handlers could park (the oracle's serve arm
+/// has the fiber-park machinery). Runtime-granted live caps on a JIT run (an embedder wiring
+/// `wire_live_impl` into a compiled module) remain the embedder's choice and still answer
+/// `-EINVAL` — the static scan covers everything a guest can express in its bytes.
+fn module_serves(m: &Module) -> bool {
+    has_service_point(m)
+        || m.funcs.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts.iter().any(|i| {
+                    matches!(
+                        i,
+                        temen_ir::Inst::CapCall {
+                            type_id: 6,
+                            op: 14,
+                            ..
+                        }
+                    )
+                })
+            })
+        })
 }
 
 /// The **one** definition of the JIT routing fold (INVARIANTS #9: a veto composition must not
@@ -6695,7 +6578,7 @@ fn jit_run(
             let ip = interrupt.map(std::sync::Arc::as_ptr);
             let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
             let r = unsafe {
-                jit_proc::with_cap_ctx(host, jit_proc::concurrent(m), |cc| {
+                jit_proc::with_cap_ctx(host, jit_proc::locked(m), |cc| {
                     jit_proc::compile_image(cc, m, func, ip, jit, fuel)
                         .and_then(|cm| jit_proc::run_image(cc, cm, ip, None, start))
                 })
@@ -7879,7 +7762,7 @@ impl Instance {
         // §3.6 behavioral parity (narrowed by I36 slice 3): a **serve-qualified** module (service
         // points, no park-capable seams — `bytecode::serve_qualifies`, the same predicate the
         // bytecode engine's compile veto applies) now runs its serve loop natively on the JIT
-        // (the cap thunk's `serve_native` arm). Everything else `folds_to_oracle` catches — op-14
+        // (the cap thunk's serve loop, #2166). Everything else `folds_to_oracle` catches — op-14
         // offer mints, park-capable servers, pager-capable spawners — leaves the JIT down the
         // ladder: bytecode first, whose compile gate falls the rest through to the tree-walker.
         let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
