@@ -56,6 +56,41 @@ pub(crate) struct ChildDone {
     /// #1361 step 4 — `Some` for a **durable detached** child: what a freeze of its parent needs to
     /// reach it and to keep it (see [`DurableCell`]). `None` for every other child.
     pub(crate) durable: Option<DurableCell>,
+    /// #1820 — `true` while this cell's joiner is counted in the run's `Domain::parked`
+    /// (`Domain::join_park`); settled by [`Self::publish`] or by the joiner leaving.
+    pub(crate) joiner_parked: AtomicBool,
+}
+
+impl ChildDone {
+    pub(crate) fn new(state: Option<(i64, i64)>, durable: Option<DurableCell>) -> ChildDone {
+        ChildDone {
+            state: Mutex::new(state),
+            cv: Condvar::new(),
+            durable,
+            joiner_parked: AtomicBool::new(false),
+        }
+    }
+
+    /// The child's outcome is known (its root's, for a task whose vCPUs run on): publish
+    /// `(result, trap)` unless an earlier publish stands, and wake its joiner. #1820 — a parked
+    /// joiner stops counting here, under the cell's lock, before the child leaves `live`
+    /// (`Domain::child_finished`), so no deadlock check sees it beside the dropped `live`. `dom` is
+    /// the run's domain (`None` ⇒ the run has none, and nothing counted the joiner).
+    pub(crate) fn publish(
+        &self,
+        result: i64,
+        trap: i64,
+        dom: Option<&crate::os_thread_rt::Domain>,
+    ) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.is_none() {
+            *st = Some((result, trap));
+            self.cv.notify_all();
+        }
+        if let Some(d) = dom {
+            d.join_settle(&self.joiner_parked);
+        }
+    }
 }
 
 /// #1361 step 4 — a durable detached child's freeze cell, shared by its join-table entry and its task.
@@ -170,11 +205,7 @@ impl Child {
     /// `(result, trap)`.
     fn finished(result: i64, trap: i64) -> Child {
         Child {
-            done: std::sync::Arc::new(ChildDone {
-                state: Mutex::new(Some((result, trap))),
-                cv: Condvar::new(),
-                durable: None,
-            }),
+            done: std::sync::Arc::new(ChildDone::new(Some((result, trap)), None)),
             joined: false,
             retained: 0,
             nested: None,
@@ -259,11 +290,7 @@ unsafe fn file_task(
         teardown(false);
         return Filed::AtCeiling;
     }
-    let done = std::sync::Arc::new(ChildDone {
-        state: Mutex::new(None),
-        cv: Condvar::new(),
-        durable,
-    });
+    let done = std::sync::Arc::new(ChildDone::new(None, durable));
     let task = unsafe {
         crate::child_exec::ChildTask::new(
             code,
@@ -2024,7 +2051,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
 /// - `version != 0` → `CapFault` (fail closed).
 /// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `temen-run` folds op-17 modules
 ///   **with** impl exports to the oracle, so a natively-running module has none — and the
-///   interpreter fails its pager validation (`self_module.impl_exports.get(..)`) identically.
+///   interpreter fails its pager validation (`Module::is_pager_export`) identically.
 /// - `budget != 0` → probeable `-EINVAL`: the Budget-funded spawn is an interpreter-first
 ///   feature (§3b); JIT parity is a follow-up (§3c.2), exactly like durable nesting above —
 ///   the interpreter is the reference. `budget` and `quota` are mutually exclusive either way.
@@ -3027,6 +3054,10 @@ unsafe fn join_or_wait(
     if let Some(d) = dom {
         d.lane_give_back(&lane);
     }
+    // #1820 — the run's domain, whose deadlock count this join takes part in (`None`: the durable
+    // nested nursery's, which has none). SAFETY: as `dom` above.
+    let hub = (rt.futex_sched != 0)
+        .then(|| unsafe { (*(rt.futex_sched as *const crate::os_thread_rt::Domain)).hub() });
     let result = (|| -> i64 {
         // Park on the completion cell until the child's OS thread fills it (S1c async children). A durable
         // child ran synchronously, so its cell is already `Some` and this returns without waiting; an
@@ -3034,18 +3065,22 @@ unsafe fn join_or_wait(
         // re-check so a §5 host interrupt on the parent's `epoch_addr` still unwinds a waiter (the child
         // bakes that same cell, so it unwinds too).
         let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut _pg = None;
         let (result, trap) = loop {
             if let Some(outcome) = *st {
                 break outcome;
             }
+            // #1820 — count this joiner as blocked, once, under the cell's lock with no result yet:
+            // the child's publish settles it before the child leaves `live` (`ChildDone::publish`).
+            if let (None, Some(h)) = (&_pg, hub) {
+                _pg = Some(h.join_park(&done.joiner_parked));
+            }
             // #1904 — a freeze reached this parent while it waits: it drives the child it is joining,
             // as the freeze drives a `thread.join`'s, by ringing the child's doorbell.
-            if let Some(d) = done.durable.as_ref() {
-                if rt.durable.load(Ordering::Acquire)
-                    && crate::fiber_rt::window_is_unwinding(mem_base)
-                {
-                    d.ring();
-                }
+            let freezing = rt.durable.load(Ordering::Acquire)
+                && crate::fiber_rt::window_is_unwinding(mem_base);
+            if let Some(d) = done.durable.as_ref().filter(|_| freezing) {
+                d.ring();
             }
             // §5 kill-path: the host set the parent's interrupt cell — stop waiting and **propagate
             // `OutOfFuel` right here** (the child bakes the same cell, so it unwinds too, and is joined at
@@ -3069,6 +3104,15 @@ unsafe fn join_or_wait(
                 .load(core::sync::atomic::Ordering::Relaxed)
                 != 0
             {
+                return 0;
+            }
+            // #1820 — the deadlock verdict, decided here as a futex wait decides it: with this
+            // join's own cell seen empty under its lock, no live vCPU left uncounted means nothing
+            // can ever end the child, so fail closed (`ThreadFault`, the oracle's answer) rather
+            // than wait forever. A task's join leaves the verdict to an OS vCPU's park, as every
+            // task park does; a freeze in flight is not a deadlock.
+            if task.is_none() && !freezing && hub.is_some_and(|h| !h.peers_live()) {
+                *trap_out = TrapKind::ThreadFault as i64;
                 return 0;
             }
             st = match &task {

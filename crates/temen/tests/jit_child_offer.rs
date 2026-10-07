@@ -305,6 +305,57 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
+/// #2160 — like [`JOIN_SRC`] but the handler first calls `svc.poll` itself, a serve nested under
+/// the running handler, and returns what that answered. The oracle refuses it with `-EINVAL`, so the
+/// parent sees `-22*100 + served(1)`.
+const NESTED_SRC: &str = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+
+func (i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32) {
+  vrb = i64.const 17564
+  i32.store vrb vbud
+  vrp = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vexp = i64.const 0
+  vh = call.cap 6 14 (i32, i64) -> (i32) vinst (vch, vexp)
+  vspin = i32.const 2000000
+  br 1(vspin, vh, vch, vinst)
+}
+block 1 (vk0: i32, vh1: i32, vch1: i32, vin1: i32) {
+  vone = i32.const 1
+  vk1 = i32.sub vk0 vone
+  br_if vk1 1(vk1, vh1, vch1, vin1) 2(vh1, vch1, vin1)
+}
+block 2 (vh2: i32, vch2: i32, vin2: i32) {
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)
+  vk = i64.const 100
+  vm = i64.mul vr vk
+  vs = i64.add vm vj
+  return vs
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vz = i32.const 0
+  vinner = call.cap 4294967295 9 () -> (i64) vz ()
+  return vinner
+  }
+}
+"#;
+
 /// Like [`JOIN_SRC`] but the handler **parks mid-serve** (a 2ms timed `atomic.wait` that times
 /// out) before returning — CALLS.md 5c.4: under handoff the *claimer's* thread blocks inside the
 /// inline invoke (the §10.2 arm-6 "thread-blocks (JIT)" flavor); under the parked transport the
@@ -390,4 +441,71 @@ fn direct_handoff_with_parking_handler_matches() {
         "JIT parked transport"
     );
     assert_eq!(run_jit_i64_knob(PARK_SRC, true), 4201, "JIT direct handoff");
+}
+
+/// #2160 — a serving child's handler that calls `svc.poll` gets `-EINVAL` on every transport: the
+/// child's own serve loop (the parked transport) and the caller's thread running the handler inline
+/// (direct handoff). Under handoff the nested poll used to wait on the claim its own thread held.
+#[test]
+fn a_childs_serve_nested_under_its_handler_is_refused() {
+    assert_eq!(
+        run_interp_i64(NESTED_SRC),
+        -2199,
+        "interp: -22*100 + served(1)"
+    );
+    assert_eq!(
+        run_jit_i64_knob(NESTED_SRC, false),
+        -2199,
+        "JIT parked transport"
+    );
+    assert_eq!(
+        run_jit_i64_knob(NESTED_SRC, true),
+        -2199,
+        "JIT direct handoff"
+    );
+}
+
+/// #2166 — like [`JOIN_SRC`], but the handler stores to `addr` before it answers, and the parent
+/// asks how the child ended with `Instantiator.wait` (op 18) rather than joining it. The parent
+/// returns `call * 100000 + wait`.
+fn faulting_handler_src(addr: u64) -> String {
+    JOIN_SRC
+        .replace(
+            "vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)\n  vk = i64.const 100\n",
+            "vj = call.cap 6 18 (i32) -> (i64) vin2 (vch2)\n  vk = i64.const 100000\n",
+        )
+        .replace(
+            "block 0 (va: i64, vb: i64) {\n  s = i64.add va vb\n",
+            &format!(
+                "block 0 (va: i64, vb: i64) {{\n  vbad = i64.const {addr}\n  i64.store vbad va\n  s = i64.add va vb\n"
+            ),
+        )
+}
+
+/// #2166 — a serving child whose handler faults dies of it on every transport, as the oracle's does:
+/// its caller's call answers the dead-callee errno (`CAP_REVOKED`, -9) and `wait` reports the
+/// child's `MemoryFault`. Both addresses fault: the NULL guard, and the first word past the child's
+/// mapped window (inside its reservation). The JIT's child routes used to lose the first fault (the
+/// child kept running) and not recover the second at all (the process died of SIGSEGV).
+#[test]
+fn a_childs_faulting_handler_kills_the_child_on_every_transport() {
+    let want = -9 * 100_000 + temen_interp::Trap::MemoryFault.code();
+    for addr in [8u64, (128 << 10) + 8] {
+        let src = faulting_handler_src(addr);
+        assert!(
+            src.contains("call.cap 6 18") && src.contains("i64.store vbad va"),
+            "the rewrites must apply"
+        );
+        assert_eq!(run_interp_i64(&src), want, "interp, store at {addr}");
+        assert_eq!(
+            run_jit_i64_knob(&src, false),
+            want,
+            "JIT parked transport, store at {addr}"
+        );
+        assert_eq!(
+            run_jit_i64_knob(&src, true),
+            want,
+            "JIT direct handoff, store at {addr}"
+        );
+    }
 }

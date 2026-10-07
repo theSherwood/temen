@@ -123,6 +123,26 @@ fn a_relinked_module_shifts_the_slots_it_holds() {
     assert_eq!(r, vec![Value::I64(42)]);
 }
 
+/// `synth_manifest_start` prepends `_start` as function 0, so every funcidx shifts up by one — the
+/// image's recorded slots included. It used to shift only code, exports and debug info, leaving the
+/// pointer naming the function below its target: here `_start` itself, so the call through it
+/// trapped `IndirectCallType` (#1746).
+#[test]
+fn a_prepended_start_shifts_the_slots_too() {
+    let linked = link(&units()).expect("link");
+    let main = linked.resolve_export("main").expect("main");
+    let wrapped = temen_ir::synth_manifest_start(linked, main, false).expect("wrap");
+    verify_module(&wrapped).expect("verifies");
+    assert_eq!(
+        data_funcref_targets(&wrapped),
+        vec![Some(1)],
+        "`twice` moved up past `_start`, and the image's index moved with it"
+    );
+    let mut fuel = 1_000_000;
+    let r = run(&wrapped, 0, &[], &mut fuel).expect("run _start");
+    assert_eq!(r, vec![Value::I64(42)]);
+}
+
 fn unit_of(module: Module) -> LinkUnit {
     LinkUnit {
         exports: module

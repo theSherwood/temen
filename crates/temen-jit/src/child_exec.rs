@@ -104,6 +104,9 @@ pub(crate) struct ChildTask {
     chain: Vec<(usize, i64)>,
     /// Saved `vcpu.tls` register between residencies (R2: task-level, not thread-level).
     tls: i64,
+    /// Saved serve-handler count between residencies (R2), so a handler that parks resumes nested
+    /// on whichever worker picks it up ([`vcpu_tls::serve_handlers`]).
+    serve_handlers: u32,
     done: Arc<ChildDone>,
     /// A **carve** child's copy-back: runs once at finish over the task's window image, before
     /// `teardown` — the parent (superset) then sees the child's writes. `None` for a detached child
@@ -239,6 +242,7 @@ impl ChildTask {
             _code: code,
             chain,
             tls: 0,
+            serve_handlers: 0,
             done,
             copy_back,
             teardown: Some(teardown),
@@ -358,6 +362,9 @@ struct Entry {
     deadline: Option<Instant>,
     /// A wake arrived (possibly while the task was still running toward its park).
     woken: bool,
+    /// #1820 — a kill reached it ([`ChildExec::kill`]); counted in the run's `Domain::killing`
+    /// until the task leaves the table.
+    killed: bool,
     /// #1469 — the task's own domain, reachable while a worker holds the task: a poisoned task's
     /// parked vCPUs must be woken to observe it.
     dom: Option<Arc<Domain>>,
@@ -508,6 +515,7 @@ impl ChildExec {
                 deadline: None,
                 counted: false,
                 woken: false,
+                killed: false,
                 dom,
                 vm,
             },
@@ -527,6 +535,12 @@ impl ChildExec {
         let Some(e) = g.tasks.get_mut(&id) else {
             return;
         };
+        // #1820 — the run is not quiescent until this task has ended.
+        if !std::mem::replace(&mut e.killed, true) {
+            if let Some(d) = self.domain() {
+                d.kill_in_flight(true);
+            }
+        }
         // The stop word ends it at its next poll, whatever its host calls do to the trap cell
         // (#2088); the trap cell ends the waits a parked vCPU of it re-checks. Never clobber a trap
         // the child already recorded.
@@ -742,6 +756,9 @@ impl ChildExec {
                 Outcome::Retiring if !task.threads_live() => Outcome::Finished,
                 o => o,
             };
+            // #1820 — a join counts itself through its completion cell, so it is not counted here.
+            let self_counted =
+                matches!(outcome, Outcome::Parked { .. }) && task.slot.parked_on().counts_itself();
             let mut task = Some(task);
             let mut g = lock(&self.state);
             match outcome {
@@ -776,7 +793,7 @@ impl ChildExec {
                         // #1631 — a park that wakes on its own deadline is a potential notifier, so
                         // it stays out of the deadlock predicate's count. It is still `parked` for
                         // the cadence sweep, which is what fires that deadline.
-                        if deadline.is_none() {
+                        if deadline.is_none() && !self_counted {
                             e.counted = true;
                             if let Some(d) = self.domain() {
                                 d.task_parked();
@@ -811,7 +828,12 @@ impl ChildExec {
                     }
                 }
                 Outcome::Finished => {
-                    g.tasks.remove(&id);
+                    // Every vCPU of a killed task has ended by now, its parks settled with it.
+                    if g.tasks.remove(&id).is_some_and(|e| e.killed) {
+                        if let Some(d) = self.domain() {
+                            d.kill_in_flight(false);
+                        }
+                    }
                     if g.tasks.is_empty() {
                         self.quiescent.notify_all();
                     }
@@ -842,6 +864,8 @@ impl ChildExec {
         });
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(task.tls);
+        let prev_handlers = vcpu_tls::serve_handlers();
+        vcpu_tls::set_serve_handlers(task.serve_handlers);
         // #1469 — the child's thread thunks act in its own domain for this residency.
         let prev_dom = os_thread_rt::set_current_domain(
             task.dom.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
@@ -871,6 +895,8 @@ impl ChildExec {
         os_thread_rt::set_current_domain(prev_dom);
         task.tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
+        task.serve_handlers = vcpu_tls::serve_handlers();
+        vcpu_tls::set_serve_handlers(prev_handlers);
         if let Some(s) = prev_shadow {
             crate::durable_shadow::seed(s);
         }
@@ -910,7 +936,7 @@ impl ChildExec {
         // #1469 — every vCPU the child spawned has ended (a retiring task waited for that): join
         // their OS threads before the window they ran on is freed.
         if let Some(d) = &task.dom {
-            d.join_all();
+            d.join_all(false);
         }
         let unwound = task.root_unwound();
         task.window.restore_rw();
@@ -993,13 +1019,7 @@ impl ChildExec {
         // A retiring task published at `settle`, unless its root unwound, whose capture this is.
         let trap = task.vm.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
-        {
-            let mut st = task.done.state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.is_none() {
-                *st = Some((result, trap));
-                task.done.cv.notify_all();
-            }
-        }
+        task.done.publish(result, trap, self.domain());
         let retiring = task.retiring;
         drop(task);
         // `settle` dropped a retiring task's live count when its root returned.
@@ -1032,9 +1052,7 @@ impl ChildExec {
             c(task.window.rw_mut());
         }
         if !task.root_unwound() {
-            let mut st = task.done.state.lock().unwrap_or_else(|e| e.into_inner());
-            *st = Some((result, trap));
-            task.done.cv.notify_all();
+            task.done.publish(result, trap, self.domain());
         }
         if let Some(d) = self.domain() {
             d.child_finished();

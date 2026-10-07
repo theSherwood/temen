@@ -42,6 +42,9 @@ use wasmi::{
     Module as WModule, Store, Table, TableType, Val,
 };
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 /// The coop session statics are process-global (single-threaded wasm by design) — serialize the tests
 /// in this binary across them.
 static FFI_LOCK: Mutex<()> = Mutex::new(());
@@ -5103,11 +5106,17 @@ fn coop_root_leaf_runs_a_chibicc_program_with_declared_caps() {
     let out = temen_browser::onramp_fs_exec(
         &chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"/in.c",
+        ],
         b"",
     );
     let ir = String::from_utf8(out.stdout).expect("IR utf8");
-    let m = temen_text::parse_module(&ir).expect("parse IR");
+    let m = pg_heap::link(&[], &temen_text::parse_module(&ir).expect("parse IR"));
     let bytes = temen_encode::encode_module(&m);
     let mut answer = |cap: &str, args: &[i64]| match cap {
         "ping" => 2 * args[0] + 1,

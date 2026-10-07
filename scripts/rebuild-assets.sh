@@ -17,10 +17,10 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nim_hello nim_card
-#           lua_snapshot
+#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth uxn nim_hello
+#           nim_card lua_snapshot
 #
-# Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
+# Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp/pg_heap need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
 # in-tree chibicc; nim_hello & nim_card need the nimony toolchain (Nim + nimony/bin, as
 # scripts/ci/provision-nimony.sh builds it).
@@ -109,6 +109,25 @@ if want pg_libc; then
   ( cd "$REPO/browser" && cargo run --release --bin genlibc ) \
     && note "pg_libc ✓ (web/assets/pg_libc.temeno)" \
     || note "pg_libc ✗ (chibicc.temen decodable? see output above)"
+fi
+
+# --- 2b') pg_heap.temeno (the playground's C heap, #2172) ------------------------------------------
+# clang, then `temen-llvm-translate --link-unit`: dlmalloc in the LLVM on-ramp's configuration
+# (`crates/temen-llvm/dlmalloc/temen_dlmalloc.c`) plus the playground's `sbrk` and `free()` checks
+# (`browser/playground-heap/pg_heap.c`). Every C card program links it beside pg_libc.temeno. A link
+# unit does not run alone, so no `validate`: `browser/tests/pg_libc_asset.rs` links it and runs it.
+if want pg_heap; then
+  echo "=== [pg_heap] clang + temen-llvm-translate --link-unit (browser/playground-heap/pg_heap.c) ==="
+  T="$(mktemp -d)"
+  if clang -O2 -g0 -fno-strict-aliasing -fno-vectorize -fno-slp-vectorize -Icrates/temen-llvm/dlmalloc \
+       -emit-llvm -S browser/playground-heap/pg_heap.c -o "$T/pg_heap.ll" \
+     && crates/temen-llvm/target/release/temen-llvm-translate "$T/pg_heap.ll" --link-unit \
+       --host-page 65536 -o browser/web/assets/pg_heap.temeno; then
+    note "pg_heap ✓ (web/assets/pg_heap.temeno)"
+  else
+    note "pg_heap SKIP/✗ (clang / temen-llvm-translate?)"
+  fi
+  rm -rf "$T"
 fi
 
 # --- 2c) coop_grow_past_window.temen (the #1312 coop-grow JS gate's guest, generated text IR) ---------

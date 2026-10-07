@@ -1179,7 +1179,7 @@ fn cross_thread_execute_fresh_code_agrees() {
 // ---------------------------------------------------------------------------
 // ISSUES.md I36 slice 3 — the **JIT serve loop** (formerly `jit_svc.rs`; merged here so the
 // branch adds no extra heavy-link test binary — ISSUES.md I30, the linker-OOM runner deaths):
-// `svc.poll`/`svc.wait` run natively on the JIT (the cap thunk's `serve_native` arm invoking
+// `svc.poll`/`svc.wait` run natively on the JIT (the cap thunk's serve loop invoking
 // compiled handler trampolines over the live window) instead of `module_serves` folding the
 // whole run to the tree-walk oracle. Differential: every scenario runs on the tree-walker and
 // the JIT with identical `Host` setups and must agree exactly — results, completion cells,
@@ -1399,6 +1399,28 @@ fn a_jit_svc_wait_with_queued_work_serves_and_returns() {
     let (vals, cells) = diff_serve(&m, &[(0, 0, vec![5]), (0, 0, vec![30])]);
     assert_eq!(vals, vec![2042]);
     assert_eq!(cells, vec![Some(7), Some(12)]);
+}
+
+/// #2160 — a `svc.poll` under a running handler is refused with `-EINVAL` and serves nothing, as
+/// the oracle refuses it: the outer poll serves both dispatches and settles each handler's own
+/// return. The JIT used to re-enter its serve loop from the handler and drain the queue there.
+#[test]
+fn a_jit_serve_nested_under_a_handler_is_refused() {
+    let src = SERVER.replace(
+        "block 0 (vx: i64) {\n  va = i64.const 16384",
+        "block 0 (vx: i64) {\n  vz = i32.const 0\n  vinner = call.cap 4294967295 9 () -> (i64) vz ()\n  va = i64.const 16384",
+    )
+    .replace("  return vold\n", "  return vinner\n");
+    assert_ne!(src, SERVER, "the handler now polls");
+    let m = svc_module(&src);
+    assert!(bytecode::serve_qualifies(&m.funcs));
+    let (vals, cells) = diff_serve(&m, &[(0, 0, vec![5]), (0, 0, vec![30])]);
+    assert_eq!(vals, vec![2042], "2 served by the outer poll, counter 42");
+    assert_eq!(
+        cells,
+        vec![Some(-22), Some(-22)],
+        "each nested poll refused"
+    );
 }
 
 /// `svc.wait` with an empty queue and no progress **fails closed** on the JIT (`ThreadFault`):

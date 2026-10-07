@@ -4089,9 +4089,10 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
 /// ([`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`], to the window's mapped boundary) when
 /// `seed_heap`, then calls the entry with `sp` = [`powerbox_entry_sp`]. The declared memory grows
 /// (never shrinks) to cover the data stack reserve. Every existing funcidx — in code, exports,
-/// impl-export ops, and debug info — shifts up by one as `_start` becomes function 0. (Funcref
-/// *values* already flowing through data or patched constants are the caller's to fix; synthesize
-/// before any [`Resolved::Slot`]-style patching.)
+/// impl-export ops, debug info, and the data image's recorded funcref slots
+/// ([`Module::data_funcref_slots`]) — shifts up by one as `_start` becomes function 0. (A funcref
+/// value in a patched constant is the caller's to fix; synthesize before any
+/// [`Resolved::Slot`]-style patching.)
 pub fn synth_manifest_start(
     module: Module,
     entry: FuncIdx,
@@ -4380,6 +4381,27 @@ impl Module {
                 .collect(),
             TypeEntry::Func(_) => None,
         }
+    }
+
+    /// CONSOLIDATION.md §2.2 — whether impl export `idx` can be a spawn record's **pager**: its
+    /// interface is exactly `{ page: (i64) -> (i64) }`, the one shape a page fault's dispatch can
+    /// serve (it sends op 0 the fault address and reads back where the page is). Spawn validation
+    /// checks it, and the native tiers' folds key on [`Module::declares_pager`], so a module with no
+    /// such export provably builds no pager record (#744).
+    pub fn is_pager_export(&self, idx: u32) -> bool {
+        let Some(e) = self.impl_exports.get(idx as usize) else {
+            return false;
+        };
+        let i64_ = [ValType::I64];
+        matches!(
+            self.interface_named_ops(e.interface).as_deref(),
+            Some([("page", ft)]) if ft.params == i64_ && ft.results == i64_
+        )
+    }
+
+    /// Whether any impl export can be a spawn record's pager ([`Module::is_pager_export`]).
+    pub fn declares_pager(&self) -> bool {
+        (0..self.impl_exports.len() as u32).any(|i| self.is_pager_export(i))
     }
 
     /// Resolve interface entry `idx` to its **named** op list `(name, signature)`, or `None`
@@ -6088,6 +6110,23 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
         }
         for n in &mut di.func_names {
             n.func += offset;
+        }
+    }
+    // A function index the data image holds at a slot [`link`] recorded (#1830) is a funcidx too: it
+    // shifts like `ref.func`, rewritten in every segment that lays the slot's bytes down. (Inside
+    // `link` the unit's list is empty by now; its slots were written already global.)
+    let targets = data_funcref_targets(m);
+    for (&at, target) in m.data_funcref_slots.iter().zip(targets) {
+        let Some(func) = target else {
+            continue; // an unlaid slot, which the verifier rejects
+        };
+        for (b, byte) in (func + offset).to_le_bytes().into_iter().enumerate() {
+            let x = at + b as u64;
+            for d in &mut m.data {
+                if x >= d.offset && x < d.offset + d.bytes.len() as u64 {
+                    d.bytes[(x - d.offset) as usize] = byte;
+                }
+            }
         }
     }
 }

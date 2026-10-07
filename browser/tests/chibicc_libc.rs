@@ -10,6 +10,9 @@ use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK,
 };
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 fn chibicc_temen() -> Option<temen_ir::Module> {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
@@ -25,7 +28,8 @@ fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
     )
 }
 
-/// Compile `src` with the seeded playground headers into a runnable module.
+/// Compile `src` with the seeded playground headers into a program unit, and link it against the heap
+/// unit into a runnable module.
 fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
@@ -35,7 +39,13 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     let compiled = onramp_fs_exec(
         chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"/in.c",
+        ],
         b"",
     );
     assert!(
@@ -47,7 +57,10 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
     assert!(ir.contains("func"), "expected Temen IR, got: {ir:.200}");
 
-    temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"))
+    pg_heap::link(
+        &[],
+        &temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}")),
+    )
 }
 
 /// **A release run pumped in slices** — the tier-up session with no regions (`COOP_NO_REGIONS`,
@@ -303,6 +316,35 @@ fn free_detects_a_double_free_and_an_invalid_pointer() {
         (134, "", "free(): double free detected\n"),
         "a realloc'd-away block"
     );
+}
+
+/// **Freed memory is reused** (#2172): the heap is dlmalloc, so a block freed and asked for again comes
+/// back rather than the heap growing, as the bump heap it replaced always did. `calloc` zeroes a reused
+/// block (`<sys/mman.h>`'s anonymous mappings rely on it).
+#[test]
+fn freed_memory_is_reused_and_calloc_zeroes_it() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let (status, out) = compile_and_run(
+        &chibicc,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+  char *a = malloc(1000);
+  for (int i = 0; i < 1000; i++) a[i] = 7;
+  free(a);
+  char *b = calloc(1000, 1);
+  int zero = 1;
+  for (int i = 0; i < 1000; i++) zero &= b[i] == 0;
+  printf("reused=%d zeroed=%d\n", a == b, zero);
+  return 0;
+}
+"#,
+    );
+    assert_eq!(status, STATUS_OK, "run status");
+    assert_eq!(out, "reused=1 zeroed=1\n");
 }
 
 /// A real ~90-line program: parse a delimited list of numbers, compute summary statistics (mean,

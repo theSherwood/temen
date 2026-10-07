@@ -1363,9 +1363,11 @@ fn importc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Len
 /// sees a clean failure (`-1` / EOF), never a silent wrong answer. Func order is fixed — see
 /// [`LIBC_CAP_STUB_NAMES`].
 ///
-/// The core's memory ops (`vm_map`, `vm_page_size`) are **not** stubbed: they are the program's own
-/// imports — its heap grows with them ([`HEAP_GROW`]) — and every host binds them to the program's
-/// window, so the libc's heap layer binds to the same ones. A stub exported under one of those names
+/// The libc's heap (`malloc`/`realloc`, for its streams and `strdup`) is stubbed the same way, to
+/// return NULL: nothing in [`LIBC_SERVED`] allocates, and the heap is the playground's heap unit
+/// (#2172), which a nim program does not link, since its own allocator owns the window's heap. The
+/// core's memory ops (`vm_map`, `vm_page_size`) are **never** stubbed: they are the program's own
+/// imports — its heap grows with them ([`HEAP_GROW`]) — and a stub exported under one of those names
 /// captured the heap hook's import at link: its `vm_map` answered success and committed nothing, so a
 /// program linked with the libc grew its heap onto pages that were never there (#763).
 const LIBC_CAP_STUBS: &str = "\
@@ -1375,7 +1377,9 @@ func (i64, i64, i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64, v3
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
 func (i32) -> () { block 0 (v0: i32) { return } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }
-func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }";
+func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }
+func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
+func (i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64) { v3 = i64.const 0 return v3 } }";
 
 /// The cap names [`LIBC_CAP_STUBS`] serves, in its func order.
 ///
@@ -1393,7 +1397,15 @@ func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, 
 /// manifest just as narrow while silently swallowing anything the libc ever writes. `stderr` (the
 /// libc's fd 2, temen#1915) is aliased the same way: a nim program has one output stream, so the libc's
 /// diagnostics reach it as they did before fd 2 got its own capability.
-const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "stream_read", "exit", "stream_write", "stderr"];
+const LIBC_CAP_STUB_NAMES: &[&str] = &[
+    "vm_fs",
+    "stream_read",
+    "exit",
+    "stream_write",
+    "stderr",
+    "malloc",
+    "realloc",
+];
 
 /// Build the **prebuilt guest-libc link units** for a nim program: the libc itself (its functions
 /// exported under the *nim* leaf symbols that import them, so the linker resolves them directly) plus

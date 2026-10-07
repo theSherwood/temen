@@ -213,6 +213,70 @@ fn a_park_seam_vetoes_the_native_serve_and_falls_back() {
     assert_eq!(rf, Ok(vec![Value::I64(2042)]));
 }
 
+/// As `SERVER`, but the handler first calls `svc.poll` itself — a serve nested under a running
+/// handler — and returns what that answered (the bump still lands).
+const NESTED_SERVER: &str = r#"
+memory 16
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 1 }
+
+func () -> (i64) {
+block 0 () {
+  va = i64.const 16384
+  vseed = i64.const 7
+  i64.store va vseed
+  vz = i32.const 0
+  vn = call.cap 4294967295 9 () -> (i64) vz ()
+  vafter = i64.load va
+  vk = i64.const 1000
+  vm = i64.mul vn vk
+  vr = i64.add vm vafter
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vz = i32.const 0
+  vinner = call.cap 4294967295 9 () -> (i64) vz ()
+  va = i64.const 16384
+  vold = i64.load va
+  vnew = i64.add vold vx
+  i64.store va vnew
+  return vinner
+  }
+}
+"#;
+
+/// #2160 — the oracle's rule: a `svc.poll` under a running handler is refused with `-EINVAL` and
+/// serves nothing, so the outer poll serves both dispatches and settles each handler's own
+/// return. The bytecode engine used to let the nested poll settle the outer ticket with a stale
+/// register and drain the queue itself (`42`, cells `[0, 0]`).
+#[test]
+fn a_serve_nested_under_a_handler_is_refused() {
+    let m = module(NESTED_SERVER);
+    assert!(
+        bytecode::compile_module(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow)).is_some(),
+        "the nested serve must run natively, or this only re-tests the fallback"
+    );
+    let dispatches: &[(u32, u32, Vec<i64>)] = &[(0, 0, vec![5]), (0, 0, vec![30])];
+    let (ri, ci, _) = scenario(&m, dispatches, run_with_host);
+    let (rf, cf, _) = scenario(&m, dispatches, run_with_host_fast);
+    let einval = -22;
+    assert_eq!(
+        ri,
+        Ok(vec![Value::I64(2042)]),
+        "oracle: 2 served, counter 42"
+    );
+    assert_eq!(
+        ci,
+        vec![Some(einval), Some(einval)],
+        "oracle: each nested poll refused"
+    );
+    assert_eq!((rf, cf), (ri, ci), "bytecode matches the oracle");
+}
+
 /// The §3.6 separate-module corpus: the parent spawns a serving child from a granted module, detached
 /// (`v1` the module, `v2` the `Budget` its window spends, patched into the v1 record [`sep_caller`]
 /// appends at 17408), mints a live offer over its export (op 14), calls through it (enqueue + park),

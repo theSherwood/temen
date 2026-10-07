@@ -30,5 +30,8 @@ void *__temen_sbrk(ptrdiff_t increment);
 #define LACKS_TIME_H 1
 #define NO_MALLOC_STATS 1
 #define NO_MALLINFO 1
+/* A failed allocation returns NULL and leaves `errno` alone: the on-ramp has no `errno` to set (its
+ * `__errno_location` traps), so the default `errno = ENOMEM` turned running out of memory into a trap. */
+#define MALLOC_FAILURE_ACTION
 
 #include "malloc.c"

@@ -1,20 +1,22 @@
-// **The chibicc card's separate-compilation path, in the wasm cdylib** (#1392) — the same exports
-// `web/play.js` calls, driven from Node so the *wasm* build of them is gated (the Rust
+// **The chibicc card's separate-compilation path, in the wasm cdylib** (#1392, #2172) — the same
+// exports `web/play.js` calls, driven from Node so the *wasm* build of them is gated (the Rust
 // `pg_libc_asset.rs` suite gates the native build).
 //
 // The card used to compile the seeded playground libc into every program on every Run — guest C,
 // identical every time, and nearly the whole compile cost. Now the libc's bodies are a committed
-// prebuilt unit (`web/assets/pg_libc.temeno`), resident for the life of the page, and the user's C is
-// compiled *decls-only* against the headers' prototypes and linked against it.
+// prebuilt unit (`web/assets/pg_libc.temeno`), resident for the life of the page beside the heap unit
+// (`web/assets/pg_heap.temeno`, the only definition of `malloc`), and the user's C is compiled
+// *decls-only* against the headers' prototypes and linked against both.
 //
-// This asserts the flow and prints the in-browser-engine numbers both ways:
-//   1. `temen_link_lib_open(pg_libc.temeno)`            — once
-//   2. `temen_run_onramp_fs(…, flags = -g | PROGRAM_UNIT)` — the user's TU → a small program unit
-//   3. `temen_link_encode_lib(h, unit, "main")`         — → runnable module bytes (no text round trip)
-//   4. `temen_run_onramp(module)`                       — it prints
-// …against the old path (`temen_run_onramp_fs` whole-program → `temen_parse` → `temen_run_onramp`).
+// This asserts the flow and prints the in-browser-engine numbers:
+//   1. `temen_link_lib_open(pg_libc.temeno)`, `(pg_heap.temeno)` — once
+//   2. `temen_run_onramp_fs(…, flags = -g | PROGRAM_UNIT)`      — the user's TU → a small program unit
+//   3. `temen_link_encode_libs([libc, heap], unit, "main")`     — → runnable module bytes (no text round trip)
+//   4. `temen_run_onramp(module)`                               — it prints
+// …and the compile it replaced (`temen_run_onramp_fs` with the libc's bodies compiled in), timed only:
+// without a link step that program has no heap, so it no longer runs.
 //
-// Run: node browser/browser-pg-libc-test.mjs   (needs the wasm32 cdylib + both assets; SKIPs otherwise)
+// Run: node browser/browser-pg-libc-test.mjs   (needs the wasm32 cdylib + the assets; SKIPs otherwise)
 import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +27,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WASM = join(HERE, 'target/wasm32-unknown-unknown/release/temen_browser.wasm');
 const CHIBICC = join(HERE, 'web/assets/chibicc.temen');
 const PG_LIBC = join(HERE, 'web/assets/pg_libc.temeno');
-for (const [p, what] of [[WASM, 'the wasm32 cdylib'], [CHIBICC, 'chibicc.temen'], [PG_LIBC, 'pg_libc.temeno']]) {
+const PG_HEAP = join(HERE, 'web/assets/pg_heap.temeno');
+for (const [p, what] of [[WASM, 'the wasm32 cdylib'], [CHIBICC, 'chibicc.temen'], [PG_LIBC, 'pg_libc.temeno'],
+  [PG_HEAP, 'pg_heap.temeno']]) {
   if (!existsSync(p)) {
     console.log(`SKIP: ${what} not built (${p})`);
     process.exit(0);
@@ -65,18 +69,31 @@ const load = (b) => { const p = Number(ex.temen_alloc(b.length)); u8().set(b, p)
 const outBytes = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + Number(ex.temen_stdout_len()));
 const outText = () => dec.decode(outBytes());
 const errText = () => dec.decode(u8().slice(Number(ex.temen_stderr_ptr()), Number(ex.temen_stderr_ptr()) + Number(ex.temen_stderr_len())));
+// The `i32` handle list the `temen_link_*_libs` entries take.
+const loadHandles = (hs) => {
+  const p = Number(ex.temen_alloc(4 * hs.length));
+  const dv = new DataView(memory.buffer);
+  hs.forEach((x, i) => dv.setInt32(p + 4 * i, x, true));
+  return p;
+};
 
 const chibicc = new Uint8Array(readFileSync(CHIBICC));
 const pgLibc = new Uint8Array(readFileSync(PG_LIBC));
+const pgHeap = new Uint8Array(readFileSync(PG_HEAP));
 const src = enc.encode(SRC);
 
-// 1 — the prebuilt unit goes resident, once per page.
+// 1 — the prebuilt units go resident, once per page.
 const tOpen = performance.now();
 const libP = load(pgLibc);
 const h = ex.temen_link_lib_open(libP, pgLibc.length);
+const heapP = load(pgHeap);
+const hh = ex.temen_link_lib_open(heapP, pgHeap.length);
 const openMs = performance.now() - tOpen;
-h >= 0 ? ok(`pg_libc.temeno resident (handle ${h}, ${pgLibc.length} B, ${openMs.toFixed(0)} ms once)`)
-       : fail(`temen_link_lib_open declined: status ${ex.temen_status()} — stale asset? see AGENTS.md`);
+h >= 0 && hh >= 0
+  ? ok(`pg_libc.temeno + pg_heap.temeno resident (handles ${h}, ${hh}; ${pgLibc.length} + ${pgHeap.length} B, ` +
+       `${openMs.toFixed(0)} ms once)`)
+  : fail(`temen_link_lib_open declined: status ${ex.temen_status()} — stale asset? see AGENTS.md`);
+const handles = [h, hh];
 
 // A helper for pass 1, either mode. Returns { ms, ir, status }.
 const compile = (flags) => {
@@ -101,21 +118,21 @@ const run = (moduleBytes) => {
   return { ms, rv: Number(rv), status, stdout };
 };
 
-// 2 + 3 — the new path: a program unit, linked against the resident libc straight to module bytes.
-if (h >= 0) {
+// 2 + 3 — a program unit, linked against the resident units straight to module bytes.
+if (h >= 0 && hh >= 0) {
   const c = compile(CHIBICC_DEBUG_INFO | CHIBICC_PROGRAM_UNIT);
   c.status === 0 || c.status === 5 ? ok(`compiled a program unit: ${c.ir.length} B IR in ${c.ms.toFixed(0)} ms`)
                                   : fail(`program-unit compile: status ${c.status} — ${errText()}`);
   const unitP = load(c.ir), entry = enc.encode('main');
-  const entryP = load(entry);
+  const entryP = load(entry), hP = loadHandles(handles);
   const tLink = performance.now();
-  const lok = ex.temen_link_encode_lib(h, unitP, c.ir.length, entryP, entry.length);
+  const lok = ex.temen_link_encode_libs(hP, handles.length, unitP, c.ir.length, entryP, entry.length);
   const linkMs = performance.now() - tLink;
   const module = lok === 0 ? outBytes() : new Uint8Array();
   ex.temen_dealloc(unitP, c.ir.length);
   ex.temen_dealloc(entryP, entry.length);
-  lok === 0 ? ok(`linked against the resident unit: ${module.length} B module in ${linkMs.toFixed(0)} ms`)
-            : fail(`temen_link_encode_lib: status ${ex.temen_status()}`);
+  lok === 0 ? ok(`linked against the resident units: ${module.length} B module in ${linkMs.toFixed(0)} ms`)
+            : fail(`temen_link_encode_libs: status ${ex.temen_status()}`);
 
   if (lok === 0) {
     const r = run(module);
@@ -124,31 +141,22 @@ if (h >= 0) {
       : fail(`run: ${JSON.stringify({ status: r.status, rv: r.rv, stdout: r.stdout })}`);
   }
 
-  // 4 — the old path, for the number that matters: the libc's bodies compiled into the program.
+  // 4 — the compile this replaced, for the number that matters: the libc's bodies compiled in.
   const w = compile(CHIBICC_DEBUG_INFO);
   const wIr = w.ir;
-  const irP = load(wIr);
-  const parsed = ex.temen_parse(irP, wIr.length) === 1
-    ? u8().slice(Number(ex.temen_parse_ptr()), Number(ex.temen_parse_ptr()) + Number(ex.temen_parse_len()))
-    : new Uint8Array();
-  ex.temen_dealloc(irP, wIr.length);
-  const wr = parsed.length ? run(parsed) : { stdout: '', rv: -1, status: -1, ms: 0 };
-  wr.stdout === EXPECT
-    ? ok('the whole-program path still agrees — same output either way')
-    : fail(`whole-program parity: ${JSON.stringify({ status: wr.status, rv: wr.rv, stdout: wr.stdout })}`);
 
   console.log(
     `\n#1392 in the wasm engine: whole program ${w.ms.toFixed(0)} ms / ${wIr.length} B IR  →  ` +
     `program unit ${c.ms.toFixed(0)} ms / ${c.ir.length} B IR + link ${linkMs.toFixed(0)} ms  ` +
     `(${(w.ms / (c.ms + linkMs)).toFixed(1)}x, libc resident in ${openMs.toFixed(0)} ms once)`,
   );
-  // 5 — the debugger's half (`temen_link_text_lib`): the linked program's IR *text*, carrying both
+  // 5 — the debugger's half (`temen_link_text_libs`): the linked program's IR *text*, carrying the
   // units' merged debug info, is what a DAP session launches from. Without the merge this text would
   // have no `debug.*` at all and stepping a separately-compiled program would be impossible.
   {
     const u = load(c.ir), e = load(enc.encode('main'));
     const tText = performance.now();
-    const tok = ex.temen_link_text_lib(h, u, c.ir.length, e, 4);
+    const tok = ex.temen_link_text_libs(hP, handles.length, u, c.ir.length, e, 4);
     const textMs = performance.now() - tText;
     const text = tok === 0 ? outText() : '';
     ex.temen_dealloc(u, c.ir.length);
@@ -156,7 +164,7 @@ if (h >= 0) {
     tok === 0 && text.includes('debug.loc') && text.includes('"/in.c"') && text.includes('__pg_stdio_impl.h')
       ? ok(`linked IR text for a debug session: ${text.length} B in ${textMs.toFixed(0)} ms, ` +
            'carrying both units\' debug info')
-      : fail(`temen_link_text_lib: status ${ex.temen_status()}, ` +
+      : fail(`temen_link_text_libs: status ${ex.temen_status()}, ` +
              `debug.loc=${text.includes('debug.loc')} in.c=${text.includes('"/in.c"')} ` +
              `libc=${text.includes('__pg_stdio_impl.h')}`);
   }
@@ -164,11 +172,14 @@ if (h >= 0) {
   ex.temen_link_lib_close(h);
   // A closed handle must decline rather than link against whatever is left in the slot.
   const entry2 = enc.encode('main'), e2 = load(entry2), u2 = load(c.ir);
-  ex.temen_link_encode_lib(h, u2, c.ir.length, e2, entry2.length) < 0
+  ex.temen_link_encode_libs(hP, handles.length, u2, c.ir.length, e2, entry2.length) < 0
     ? ok('a closed handle declines')
     : fail('a closed handle still linked');
+  ex.temen_link_lib_close(hh);
+  ex.temen_dealloc(hP, 4 * handles.length);
 }
 
 ex.temen_dealloc(libP, pgLibc.length);
+ex.temen_dealloc(heapP, pgHeap.length);
 console.log(failed ? '\nFAILED' : '\nAll pg_libc card-path checks passed.');
 process.exit(failed ? 1 : 0);

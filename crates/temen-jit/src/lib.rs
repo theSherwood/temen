@@ -114,7 +114,7 @@ mod os_thread_rt;
 #[cfg(not(loom))]
 pub use os_thread_rt::{
     park_host_call, region_canon_forget_window, region_canon_lookup, region_canon_new_owner,
-    region_canon_record, wake_host_parks, HostPark,
+    region_canon_record, wake_host_parks, wake_host_parks_in, HostPark,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -182,6 +182,7 @@ pub unsafe fn fiber_park_current() {
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
 // (substrate-independent), so a plain non-fiber root has a TLS word too.
 mod vcpu_tls;
+pub use vcpu_tls::serve_handlers;
 
 // #1768 — the per-instance context compiled code reaches through its threaded context pointer.
 mod vmctx;
@@ -1077,9 +1078,9 @@ pub struct GrantChildHooks {
     pub thunk: CapThunk,
     /// CALLS.md 5c.1b — register a spawned granted child's **serve context** on its shared
     /// powerbox: `(child_ctx, serve_ctx)` where `serve_ctx` is the live child `CompiledModule` address
-    /// (resolve handlers via [`child_handler_tramp`], invoke via [`child_invoke_handler`]).
+    /// (resolve handlers via [`handler_tramp_of`], invoke via [`invoke_handler`]).
     /// Called after compile, before the child thread starts; cleared by the releaser (host-side
-    /// `Host::set_child_serve_ctx(0)`) so a stale pointer is never read after child exit.
+    /// `Host::set_serve_ctx(0)`) so a stale pointer is never read after child exit.
     pub register_serve: ChildServeRegistrar,
     /// #1234 — the **parent host pointer these hooks decode**, in the shape *this* family expects.
     ///
@@ -4341,10 +4342,23 @@ impl CompiledModule {
         Self::run_code_raw(self, code, n_params, n_results, args, init_mem, None, None)
     }
 
-    /// I36 slice 3 — the buffer-ABI trampoline for impl-export handler `func`:
-    /// `(code, n_params, n_results)`, invocable over the live window via
-    /// [`Self::invoke_extra`] from the embedder's serve arm. `None` for a funcidx that is not
-    /// an impl-export handler of this module.
+    /// #2173 — the run's park hub: the address of its thread domain, whose futex table every park
+    /// of the run's vCPUs and §14 children keys into. A waker that holds no call's trap cell rings
+    /// those parks through it ([`wake_host_parks_in`]). `0` when the run has no domain — no threads,
+    /// fibers or children, so nothing else of the run can park.
+    pub fn park_hub(&self) -> usize {
+        #[cfg(fiber_rt)]
+        {
+            self.domain
+                .as_ref()
+                .map_or(0, |d| &**d as *const os_thread_rt::Domain as usize)
+        }
+        #[cfg(not(fiber_rt))]
+        {
+            0
+        }
+    }
+
     /// CALLS.md 5c.1c — install the granted-child host callbacks into this module's §14 nursery
     /// (the production twin of the `compile_and_run_*_ex` install; a module with no `Instantiator`
     /// has no nursery and this is a no-op). `None` leaves the granted spawns inert `CapFault`s.
@@ -5034,7 +5048,7 @@ impl CompiledModule {
             let freezing =
                 (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
             d.begin_teardown(freezing);
-            d.join_all();
+            d.join_all(true);
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
             // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
             // coordinator-wait (every child finished). Collect that residue now — after the join, so the
@@ -6001,33 +6015,34 @@ pub(crate) unsafe fn compile_child_and_run(
     Ok((results.first().copied().unwrap_or(0), trap_cell, unwound))
 }
 
-/// CALLS.md 5c.1a — invoke a §14 child's serve trampoline over the child's **live** window: the
-/// [`CompiledModule::invoke_extra`] serve twin, with the detect-and-kill fault range taken from the
-/// caller's own thunk parameters (`[mem_base, mem_base+mem_size)`) — the child serve arm runs
-/// *inside* the child's in-flight guarded entry call on the child's own thread, and the thunk was
-/// handed exactly that window. Returns `true` if the handler faulted (the caller reports
-/// `FAULT_TRAP`, the outer run's detect-and-kill shape).
+/// #2166 — invoke a serve handler's trampoline over its domain's **live** window: the one handler
+/// call of every JIT serve route — the domain's own serve loop (root or §14 child) and a caller's
+/// direct handoff (CALLS.md 5c.2). Arms detect-and-kill over the window's whole fault range
+/// (`[base, base + round_up(reserved) + guard)`, the range its own run arms), so a handler's fault is
+/// the domain's trap: written to `vmctx`'s trap cell, exactly as a guest trap. Counts the handler in
+/// the running vCPU's [`serve_handlers`] for its span, which is what refuses a nested serve (#2160).
 ///
 /// # Safety
-/// `cc` is the live [`CompiledModule`] the in-flight child was compiled from (registered at spawn,
-/// cleared at release); `code` is one of its finalized serve trampolines; `args`/`results` match
-/// the trampoline's arity; `[mem_base, mem_base+mem_size)` is the child's live mapped window;
-/// `vmctx` is the **child's** instance context — its own run's (the serve loop's thunk `trap_out`),
-/// or one minted from [`child_instance`] for a handler run on another thread (the handoff).
+/// `cc` is the live [`CompiledModule`] the serving domain runs (registered as its serve context);
+/// `code` is one of its finalized serve trampolines; `args`/`results` match the trampoline's arity;
+/// `mem_base` is the domain's live window with a `mem_reserved` reservation (what its `call.cap`
+/// thunk is handed); `vmctx` is the **domain's** instance context — its own run's (the serve loop's
+/// thunk `trap_out`), or one minted from [`instance_of`] for a handler run on another thread.
 #[cfg(fiber_rt)]
-pub unsafe fn child_invoke_handler(
+pub unsafe fn invoke_handler(
     cc: *const core::ffi::c_void,
     code: *const u8,
     args: &[i64],
     results: &mut [i64],
     mem_base: *mut u8,
-    mem_size: u64,
+    mem_reserved: u64,
     vmctx: *const VmCtx,
-) -> bool {
+) {
     let cc = cc as *const CompiledModule;
     let fn_table_ptr = (*cc).fn_table.as_ptr() as *const core::ffi::c_void;
-    let lo = mem_base as usize;
-    mem::run_guarded_range(
+    let (lo, hi) = mem::fault_range_of(mem_base, mem_reserved as usize);
+    vcpu_tls::set_serve_handlers(serve_handlers() + 1);
+    let faulted = mem::run_guarded_range(
         code,
         args.as_ptr(),
         results.as_mut_ptr(),
@@ -6035,29 +6050,33 @@ pub unsafe fn child_invoke_handler(
         fn_table_ptr,
         vmctx,
         lo,
-        lo + mem_size as usize,
-    )
+        hi,
+    );
+    vcpu_tls::set_serve_handlers(serve_handlers() - 1);
+    if faulted {
+        (*vmctx).trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
+    }
 }
 
-/// #1768 — the instance a registered §14 child runs as (its powerbox, and the kill-path and fuel
+/// #1768 — the instance a serving domain's module runs as (its powerbox, and the kill-path and fuel
 /// cells its compile was handed): what a caller running one of its handlers **on another thread**
 /// (the CALLS.md 5c.2 handoff) mints the handler's [`VmCtx`] from, so the handler's `call.cap`s reach
-/// the child's powerbox, never the caller's.
+/// the server's powerbox, never the caller's.
 ///
 /// # Safety
-/// `cc` is a live registered child module (see [`child_invoke_handler`]).
+/// `cc` is a live registered serve context (see [`invoke_handler`]).
 #[cfg(fiber_rt)]
-pub unsafe fn child_instance(cc: *const core::ffi::c_void) -> InstanceAddrs {
+pub unsafe fn instance_of(cc: *const core::ffi::c_void) -> InstanceAddrs {
     (*(cc as *const CompiledModule)).instance
 }
 
-/// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw child [`CompiledModule`]
-/// (the `Host::child_serve_ctx` registration, opaque outside this crate).
+/// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw serve-context
+/// [`CompiledModule`] (the `Host::serve_ctx` registration, opaque outside this crate).
 ///
 /// # Safety
-/// `cc` is a live registered child module (see [`child_invoke_handler`]).
+/// `cc` is a live registered serve context (see [`invoke_handler`]).
 #[cfg(fiber_rt)]
-pub unsafe fn child_handler_tramp(
+pub unsafe fn handler_tramp_of(
     cc: *const core::ffi::c_void,
     func: u32,
 ) -> Option<(*const u8, usize, usize)> {

@@ -1,16 +1,21 @@
-//! **The committed prebuilt libc unit** (`web/assets/pg_libc.temeno`, #1392) — the asset gate.
+//! **The committed prebuilt C units** — the libc (`web/assets/pg_libc.temeno`, #1392) and the heap
+//! (`web/assets/pg_heap.temeno`, #2172) — the asset gate.
 //!
 //! The card no longer compiles the seeded libc into every program: the bodies are compiled once into
-//! this unit (`src/genlibc.rs`, driven by `scripts/rebuild-assets.sh`) and a user's program is
-//! compiled decls-only against the headers' prototypes and linked against it. That makes the asset
-//! **doubly wire-coupled** — it was produced by the committed `chibicc.temen` and it is itself an
-//! encoded unit — so an IR / encoder / wire change invalidates it. These tests are what turns that
-//! drift red instead of letting the card fail in a browser: the asset must decode, still export the
-//! libc, and still *link and run* against a freshly compiled program unit.
+//! the libc unit (`src/genlibc.rs`, driven by `scripts/rebuild-assets.sh`) and a user's program is
+//! compiled decls-only against the headers' prototypes and linked against it and the heap unit, which
+//! alone defines `malloc`/`free`/`calloc`/`realloc`. That makes the libc **doubly wire-coupled** — it
+//! was produced by the committed `chibicc.temen` and it is itself an encoded unit — and the heap is an
+//! encoded unit too, so an IR / encoder / wire change invalidates both. These tests are what turns that
+//! drift red instead of letting the card fail in a browser: the assets must decode, still export the
+//! libc and the heap, and still *link and run* against a freshly compiled program unit.
 //!
 //! Fail-soft: SKIPs if the assets aren't built.
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
+
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
 
 fn asset(name: &str) -> Option<Vec<u8>> {
     std::fs::read(format!("{}/web/assets/{name}", env!("CARGO_MANIFEST_DIR"))).ok()
@@ -64,8 +69,8 @@ fn the_committed_unit_decodes_and_publishes_the_libc() {
     };
     // One name from each seeded header the unit carries: <stdio.h>, <stdlib.h>, <string.h>, <math.h>.
     for name in [
-        "printf", "fprintf", "puts", "snprintf", "malloc", "qsort", "strtod", "strlen", "memcpy",
-        "strtok", "strdup", "sqrt", "pow", "sin", "fabs",
+        "printf", "fprintf", "puts", "snprintf", "qsort", "strtod", "strlen", "memcpy", "strtok",
+        "strdup", "sqrt", "pow", "sin", "fabs",
     ] {
         assert!(
             lib.exports.iter().any(|e| e.name == name),
@@ -98,6 +103,27 @@ fn the_committed_unit_decodes_and_publishes_the_libc() {
     }
 }
 
+/// The heap unit (#2172) decodes the way the cdylib's `temen_link_lib_open` takes it, and is exactly
+/// the allocator: it exports the four names the headers declare and nothing else (dlmalloc's own
+/// entry points stay inside the unit), and asks the powerbox for only what it grows and aborts with.
+#[test]
+fn the_committed_heap_unit_is_the_allocator_and_nothing_more() {
+    let Some(bytes) = asset("pg_heap.temeno") else {
+        eprintln!("SKIP: pg_heap.temeno not built");
+        return;
+    };
+    let heap = temen_encode::decode_unit(&bytes)
+        .expect("decode pg_heap.temeno — stale asset? see AGENTS.md");
+    let mut exports: Vec<&str> = heap.exports.iter().map(|e| e.name.as_str()).collect();
+    exports.sort_unstable();
+    assert_eq!(exports, ["calloc", "free", "malloc", "realloc"]);
+    assert!(heap.data_exports.is_empty(), "{:?}", heap.data_exports);
+    let mut imports: Vec<&str> = heap.imports.iter().map(|i| i.name.as_str()).collect();
+    imports.sort_unstable();
+    imports.dedup();
+    assert_eq!(imports, ["exit", "stderr", "vm_map", "vm_page_size"]);
+}
+
 /// End to end, the way the card runs: a freshly compiled program unit links against the **committed**
 /// asset and prints. This is the one that catches a chibicc/IR change that leaves the asset decodable
 /// but no longer linkable.
@@ -127,7 +153,7 @@ int main(void) {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
         return;
     };
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert!(
         out.status == STATUS_OK || out.status == STATUS_EXIT,
         "link+run against the committed unit: status {} — {}",
@@ -151,21 +177,7 @@ fn the_linked_program_carries_both_units_debug_info() {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
         return;
     };
-    let lib_exports: Vec<(String, temen_ir::FuncIdx)> = lib
-        .exports
-        .iter()
-        .map(|e| (e.name.clone(), e.func))
-        .collect();
-    let linked = temen_browser::link_program(
-        temen_ir::LinkUnitRef {
-            module: &lib,
-            exports: &lib_exports,
-            data_exports: &lib.data_exports,
-        },
-        &prog,
-        "main",
-    )
-    .expect("links and verifies");
+    let linked = pg_heap::link(&[&lib], &prog);
     let di = linked.debug_info.as_ref().expect("merged debug info");
     assert!(
         di.files.iter().any(|f| f.contains("/in.c")),
@@ -188,15 +200,19 @@ fn the_linked_program_carries_both_units_debug_info() {
     }
 }
 
-/// **The card's own path**, end to end through the cdylib exports the browser calls (#1392): the
-/// committed unit goes resident, `temen_run_onramp_fs` compiles the user's C as a *program unit*
-/// (`CHIBICC_PROGRAM_UNIT` — `--emit-object` against declarations only), `temen_link_encode_lib` links
-/// it against the resident unit and hands back **runnable module bytes**, and those run. No IR text
-/// round trip for the linked libc, and the card's existing run passes need no change.
+/// **The card's own path**, end to end through the cdylib exports the browser calls (#1392, #2172):
+/// the committed libc and heap units go resident, `temen_run_onramp_fs` compiles the user's C as a
+/// *program unit* (`CHIBICC_PROGRAM_UNIT` — `--emit-object` against declarations only),
+/// `temen_link_encode_libs` links it against the resident units and hands back **runnable module
+/// bytes**, and those run. No IR text round trip for the linked libc.
 #[test]
 fn the_card_path_compiles_a_program_unit_and_links_it_through_the_cdylib() {
-    let (Some(chibicc), Some(lib_bytes)) = (asset("chibicc.temen"), asset("pg_libc.temeno")) else {
-        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+    let (Some(chibicc), Some(lib_bytes), Some(heap_bytes)) = (
+        asset("chibicc.temen"),
+        asset("pg_libc.temeno"),
+        asset("pg_heap.temeno"),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
         return;
     };
     const USER: &str = r#"#include <stdio.h>
@@ -207,7 +223,10 @@ int main(void) {
 }
 "#;
     let h = temen_browser::temen_link_lib_open(lib_bytes.as_ptr(), lib_bytes.len());
-    assert!(h >= 0, "the committed unit goes resident");
+    assert!(h >= 0, "the committed libc unit goes resident");
+    let hh = temen_browser::temen_link_lib_open(heap_bytes.as_ptr(), heap_bytes.len());
+    assert!(hh >= 0, "the committed heap unit goes resident");
+    let handles = [h, hh];
 
     // Pass 1 — compile, exactly as the card does (empty caller image; flags pick the program unit).
     let flags = temen_browser::CHIBICC_DEBUG_INFO | temen_browser::CHIBICC_PROGRAM_UNIT;
@@ -234,11 +253,18 @@ int main(void) {
         unit.len()
     );
 
-    // Pass 1b — link against the resident unit, straight to runnable module bytes.
+    // Pass 1b — link against the resident units, straight to runnable module bytes.
     assert_eq!(
-        temen_browser::temen_link_encode_lib(h, unit.as_ptr(), unit.len(), b"main".as_ptr(), 4),
+        temen_browser::temen_link_encode_libs(
+            handles.as_ptr(),
+            handles.len(),
+            unit.as_ptr(),
+            unit.len(),
+            b"main".as_ptr(),
+            4
+        ),
         0,
-        "link+encode against the resident unit"
+        "link+encode against the resident units"
     );
     let module = read_out();
     let m = temen_encode::decode_module(&module).expect("the linked module decodes as runnable");
@@ -258,6 +284,7 @@ int main(void) {
     assert_eq!(run.value, 7, "the card shows `main`'s return value");
 
     temen_browser::temen_link_lib_close(h);
+    temen_browser::temen_link_lib_close(hh);
 }
 
 /// The bytes the cdylib's stdout / stderr accessors currently hold.
@@ -291,17 +318,14 @@ fn the_linked_program_drops_what_it_cannot_reach() {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
         return;
     };
-    let lib_exports: Vec<(String, temen_ir::FuncIdx)> = lib
-        .exports
-        .iter()
-        .map(|e| (e.name.clone(), e.func))
-        .collect();
-    let unit = temen_ir::LinkUnitRef {
-        module: &lib,
-        exports: &lib_exports,
-        data_exports: &lib.data_exports,
+    let linked = pg_heap::link(&[&lib], &prog);
+    let heap = asset("pg_heap.temeno")
+        .map(|b| temen_encode::decode_unit(&b).expect("decode pg_heap.temeno"))
+        .expect("pg_heap.temeno");
+    let exports_of = |m: &temen_ir::Module| -> Vec<(String, temen_ir::FuncIdx)> {
+        m.exports.iter().map(|e| (e.name.clone(), e.func)).collect()
     };
-    let linked = temen_browser::link_program(unit, &prog, "main").expect("links");
+    let (lib_exports, heap_exports) = (exports_of(&lib), exports_of(&heap));
 
     // The uncollected shape, for comparison: the same units linked with every library export still a
     // root. The program's exports come from its own table (minus chibicc's whole-program `_start`
@@ -317,7 +341,16 @@ fn the_linked_program_drops_what_it_cannot_reach() {
         prog_exports.push(("main".to_string(), 0));
     }
     let whole = temen_ir::link_with_manifest_ref(&[
-        unit,
+        temen_ir::LinkUnitRef {
+            module: &lib,
+            exports: &lib_exports,
+            data_exports: &lib.data_exports,
+        },
+        temen_ir::LinkUnitRef {
+            module: &heap,
+            exports: &heap_exports,
+            data_exports: &heap.data_exports,
+        },
         temen_ir::LinkUnitRef {
             module: &prog,
             exports: &prog_exports,
@@ -384,18 +417,24 @@ fn the_linked_program_drops_what_it_cannot_reach() {
     );
 }
 
-/// **Several resident libraries at once** (#1408): the same program links against the prebuilt libc
-/// passed as a one-entry handle list, and an unknown handle anywhere in the list declines the whole
-/// call rather than linking against whatever occupies that slot.
+/// **Several resident libraries at once** (#1408): the program links against the prebuilt libc and
+/// heap passed as a handle list, and an unknown handle anywhere in the list declines the whole call
+/// rather than linking against whatever occupies that slot.
 #[test]
 fn the_multi_handle_entries_link_and_fail_closed() {
-    let (Some(chibicc), Some(lib_bytes)) = (asset("chibicc.temen"), asset("pg_libc.temeno")) else {
-        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+    let (Some(chibicc), Some(lib_bytes), Some(heap_bytes)) = (
+        asset("chibicc.temen"),
+        asset("pg_libc.temeno"),
+        asset("pg_heap.temeno"),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
         return;
     };
     const USER: &str = "#include <stdio.h>\nint main(void) { puts(\"multi\"); return 3; }\n";
     let h = temen_browser::temen_link_lib_open(lib_bytes.as_ptr(), lib_bytes.len());
     assert!(h >= 0, "resident");
+    let hh = temen_browser::temen_link_lib_open(heap_bytes.as_ptr(), heap_bytes.len());
+    assert!(hh >= 0, "resident");
 
     let flags = temen_browser::CHIBICC_DEBUG_INFO | temen_browser::CHIBICC_PROGRAM_UNIT;
     temen_browser::temen_run_onramp_fs(
@@ -410,7 +449,7 @@ fn the_multi_handle_entries_link_and_fail_closed() {
     assert_eq!(temen_browser::temen_status(), STATUS_OK, "compile");
     let unit = read_out();
 
-    let handles = [h];
+    let handles = [h, hh];
     let rv = temen_browser::temen_link_run_libs(
         handles.as_ptr(),
         handles.len(),
@@ -460,10 +499,11 @@ fn the_multi_handle_entries_link_and_fail_closed() {
     );
 
     temen_browser::temen_link_lib_close(h);
+    temen_browser::temen_link_lib_close(hh);
 }
 
 /// The playground's C `detached` card, down the page's own path: compiled as a program unit, linked
-/// against the committed libc, run by `link_run_units` (→ `onramp_exec`). It spawns detached, whose
+/// against the committed libc and heap, run by `onramp_exec`. It spawns detached, whose
 /// `"budget"` allowance cannot cross into a §14 child yet, so the on-ramp runs it at the root (#1720).
 #[test]
 fn the_c_detached_card_links_and_squares_through_its_region() {
@@ -477,7 +517,7 @@ fn the_c_detached_card_links_and_squares_through_its_region() {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
         return;
     };
-    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert_eq!(out.status, STATUS_OK, "trap: {:?}", out.trap);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

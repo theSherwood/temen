@@ -150,7 +150,7 @@ __PG_FN int strncasecmp(const char *a, const char *b, size_t n) {
 // program that prints strerror(errno) still compiles and runs; errno is never actually set).
 __PG_FN char *strerror(int e) { (void)e; return (char *)"error"; }
 
-// `strdup`/`strndup` allocate through the playground `<stdlib.h>` bump allocator.
+// `strdup`/`strndup` allocate on the playground heap (`malloc`, declared in `<stdlib.h>`).
 #include <stdlib.h>
 __PG_FN char *strdup(const char *s) {
   size_t n = strlen(s) + 1;

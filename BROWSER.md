@@ -438,11 +438,12 @@ graphics lesson, against 182 ms for an empty `main` with no headers).
 The seeded headers are now split so the libc can be compiled **once** as its own unit and linked:
 
 - `__pg_linkage.h` defines `__PG_FN` / `__PG_DATA` — the linkage of every seeded definition, in the
-  three ways it gets compiled. Whole program (the default, unchanged): `static inline`, which is what
+  three ways it gets compiled. Bodies in the program (the default): `static inline`, which is what
   lets chibicc's `mark_live` pass dead-strip an unused `snprintf`/`qsort` (external linkage instead
   costs +8% IR on a three-call `printf` program). The libc unit (`__PG_LIBC_UNIT`): external, so
   `--emit-object` publishes each body in the unit's export table. A program unit
-  (`__PG_LIBC_DECLS_ONLY`): the bodies are absent entirely.
+  (`__PG_LIBC_DECLS_ONLY`): the bodies are absent entirely. In no mode do the headers define the heap:
+  that is the heap unit's (below).
 - The bodies live in their **own files** (`__pg_stdio_impl.h`, `__pg_stdlib_impl.h`,
   `__pg_string_impl.h`, `__pg_math_impl.h`), included from the header only when the bodies are wanted —
   not behind an `#ifdef` in place. chibicc tokenizes a header in full before the preprocessor drops
@@ -477,7 +478,7 @@ decls-only against a prebuilt libc unit (~12x), with the emitted IR 353 KB → 1
 itself costs 13.6 s, paid *once*. The floor (a program with no headers at all) is 71 ms, so what is
 left in the 1.0 s is preprocessing the *declarations* — which no split removes.
 
-The unit is a **committed asset** — `browser/web/assets/pg_libc.temeno`, 174 KB, 119 function exports
+The unit is a **committed asset** — `browser/web/assets/pg_libc.temeno`, 268 KB, 157 function exports
 plus the `__pg_std` data symbol, built with `-g`. It carries `<stdio.h>`, `<stdlib.h>`, `<string.h>` and
 `<math.h>`; the rest of the seeded headers are small enough to stay inline. `browser/src/genlibc.rs` builds it by running the
 *committed* `chibicc.temen` over `__pg_libc.c` through the same on-ramp powerbox the card uses, so it
@@ -486,20 +487,22 @@ and `browser/tests/pg_libc_asset.rs` is the gate. It is doubly wire-coupled — 
 committed asset and itself an encoded unit — so it must be regenerated on any IR / encoder / wire
 change (`ONLY=pg_libc bash scripts/rebuild-assets.sh`).
 
-Both halves of the card are served from a **resident** libc unit: `temen_link_run_lib(handle, …)` to
-run, `temen_link_encode_lib(handle, prog, entry)` to get the linked program's **runnable module bytes**
+Both halves of the card are served from **resident** units — the libc and the heap — through the
+multi-library entries, which take the handles in link order: `temen_link_run_libs(handles, …)` to run,
+`temen_link_encode_libs(handles, prog, entry)` to get the linked program's **runnable module bytes**
 (what the card uses — it keeps the existing interpreter/wasm-JIT run passes and avoids a text round trip
-for the ~350 KB of linked libc), and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to
-hand a DAP session the linked program's IR *text*, carrying both units' debug info (the linker merges
+for the ~350 KB of linked libc), and `temen_link_text_libs(handles, prog, entry)` — the debugger twin —
+to hand a DAP session the linked program's IR *text*, carrying the units' debug info (the linker merges
 it, `temen_ir::link`). A resident library keeps its **data** symbols as well as its functions:
 `<stdio.h>`'s `stdout` is `&__pg_std[1]`, so a program unit resolves that array out of the library
 rather than owning a private copy, and the resident table used to drop those symbols on the floor.
 
-**The card, as wired.** `web/play.js` opens the unit once per page (`openPgLibc`) and compiles with
+**The card, as wired.** `web/play.js` opens both units once per page (`openPgUnits`) and compiles with
 `flags = -g | CHIBICC_PROGRAM_UNIT` — the second bit on `temen_run_onramp_fs` /
-`temen_onramp_jit_run_open_fs`, which adds `--emit-object` and `-include __pg_decls_only.h`. It is
-fail-soft in both directions: a missing asset, or a stale one that `temen_link_lib_open` declines, drops
-the card back to the whole-program compile — slow but correct. Measured in the *wasm* engine by
+`temen_onramp_jit_run_open_fs`, which adds `--emit-object` and `-include __pg_decls_only.h`. A missing
+asset, or a stale one that `temen_link_lib_open` declines, fails the run and names
+`scripts/rebuild-assets.sh`: there is no whole-program fallback, since a program compiled without a link
+step has no heap. Measured in the *wasm* engine by
 `browser/browser-pg-libc-test.mjs` (the gate for this path), on a `printf`/`snprintf`/`puts`/`fprintf`
 program with `-g`:
 
@@ -515,6 +518,22 @@ A *linked* program's merged debug-info file table starts with the **library's** 
 longer the user's source. `dapSourceName` therefore prefers the file the editor actually shows
 (`/in.c` for a chibicc card) over `debug.file 0` — aimed at file 0, breakpoints bound inside the
 prebuilt libc and never fired on a C line.
+
+**The heap unit (#2172).** `malloc`/`free`/`calloc`/`realloc` are the heap unit's: Doug Lea's
+dlmalloc, configured exactly as the LLVM on-ramp's heap (`crates/temen-llvm/dlmalloc/temen_dlmalloc.c`),
+built by clang and translated as a link unit (`temen-llvm-translate --link-unit`, LLVM.md §8b) from
+`browser/playground-heap/pg_heap.c` into the committed `browser/web/assets/pg_heap.temeno` (~28 KB). The
+seeded `<stdlib.h>` only declares the four. It replaced a bump allocator that never reused a freed byte,
+and it keeps what that one taught on stderr: a double free and a pointer `malloc` never returned abort
+with glibc's words (exit 134). Compiled by chibicc instead, the same dlmalloc was several times the code
+and a fraction of the speed.
+
+The unit exports those four names and nothing else, and imports only `vm_map`/`vm_page_size` (to grow)
+and `stderr`/`exit` (to abort). Its heap starts at 256 MiB in the window and grows by committing host
+pages. It is built by `scripts/rebuild-assets.sh`'s `pg_heap` step (clang + the release
+`temen-llvm-translate`) and gated by `browser/tests/pg_libc_asset.rs`. Every program the card runs links
+it after the libc unit; a native test does the same through `browser/tests/support/pg_heap.rs`. An
+embedder that links the libc unit must link the heap unit too, or `malloc` is left unresolved.
 
 **Running the playground's Chromium tests locally.** `browser-play-editor-test.mjs` (and the rest of
 the `browser-*.mjs` suite the real-browser job runs) needs the **threads** cdylib — `web/par.js`

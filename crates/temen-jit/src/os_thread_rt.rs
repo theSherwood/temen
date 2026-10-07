@@ -185,7 +185,7 @@ impl Done {
     fn publish(&self, dom: &Domain, result: i64, trap: i64) {
         let hub = dom.hub();
         let mut st = lock(&self.state);
-        cell_unpark(&self.joiner_parked, &hub.parked);
+        dom.join_settle(&self.joiner_parked);
         lock(&dom.threads).live -= 1;
         // #2001 — its `spawn` goes back with its live slot.
         dom.vcpu_ended();
@@ -289,7 +289,7 @@ pub unsafe fn park_host_call(
         dom.env().epoch_addr,
         unwind_base,
         &hub.parked,
-        || lock(&hub.threads).live > hub.parked.load(Ordering::Acquire),
+        || hub.peers_live(),
         || load_trap(trap_out) != 0,
     );
     let ended = || epoch_fired(dom.env().epoch_addr) || load_trap(trap_out) != 0;
@@ -314,10 +314,29 @@ pub unsafe fn park_host_call(
 #[cfg(not(loom))]
 pub unsafe fn wake_host_parks(trap_out: *mut i64, key: u64) {
     let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
-    if vm.sched.is_null() {
-        return;
+    if !vm.sched.is_null() {
+        wake_hub_parks(current_domain(vm.sched as *const Domain).hub(), key);
     }
-    let hub = current_domain(vm.sched as *const Domain).hub();
+}
+
+/// #2173 — [`wake_host_parks`] for a waker that holds the run's domain address rather than a call's
+/// trap cell ([`crate::CompiledModule::park_hub`]; `0` ⇒ the run has none, and nothing parks on it).
+///
+/// # Safety
+/// A nonzero `hub` is a live run's domain address, as `park_hub` returned it.
+#[cfg(not(loom))]
+pub unsafe fn wake_host_parks_in(hub: usize, key: u64) {
+    if hub != 0 {
+        wake_hub_parks((*(hub as *const Domain)).hub(), key);
+    }
+}
+
+/// Wake the parks on `key`: an OS vCPU's through its futex cell, which the claim stops counting
+/// at once (#1625); a task's by re-offering the parked tasks, which the executor stops counting as
+/// it re-offers them (#2173) — a task's park holds no futex cell, so until then it slept to the
+/// cadence sweep still counted, and the waker's own next park could read `live == parked`.
+#[cfg(not(loom))]
+fn wake_hub_parks(hub: &Domain, key: u64) {
     futex_notify(
         &hub.futex,
         &hub.futex_cv,
@@ -325,6 +344,7 @@ pub unsafe fn wake_host_parks(trap_out: *mut i64, key: u64) {
         u32::MAX,
         &hub.parked,
     );
+    hub.wake_child_tasks();
 }
 
 /// The per-run thread table + futex — the "scheduler address" baked into the `thread.*` thunks. It
@@ -399,6 +419,11 @@ pub(crate) struct Domain {
     /// `peers_live` (`live > parked`) then fails it closed (`ThreadFault`) instead of hanging — catching a
     /// **mutual** wait/join deadlock (two vCPUs each blocked on the other), not just a lone waiter.
     parked: AtomicUsize,
+    /// #1820 — §14 tasks a kill (`Instantiator.kill`) has reached that have not ended yet. A kill
+    /// guarantees its task's end, so a run with one in flight is not quiescent: the killed task's
+    /// parks are about to end but stay counted in [`Self::parked`] until its vCPUs run (the oracle
+    /// re-admits a killed vCPU at once). [`Self::peers_live`] answers `true` meanwhile.
+    killing: AtomicUsize,
     /// D66 — the child-domain executor whose parked tasks this domain's wakes must also reach
     /// ([`Domain::wake_child_tasks`]).
     child_exec: Mutex<Option<std::sync::Arc<crate::child_exec::ChildExec>>>,
@@ -702,6 +727,7 @@ impl Domain {
             quiesce_cv: Condvar::new(),
             concurrent_durable: AtomicBool::new(false),
             parked: AtomicUsize::new(0),
+            killing: AtomicUsize::new(0),
             child_exec: Mutex::new(None),
             lanes: Mutex::new(BTreeMap::new()),
             lane_cv: Condvar::new(),
@@ -845,6 +871,46 @@ impl Domain {
     /// child has finished.
     pub(crate) fn live_vcpus(&self) -> usize {
         lock(&self.threads).live
+    }
+
+    /// The deadlock predicate, asked of a hub: could some live vCPU of the run still end a park —
+    /// is one of them not counted in [`Self::parked`], or a killed task still ending
+    /// ([`Self::killing`])? `false` ⇒ every live vCPU is blocked on a park only another vCPU could
+    /// end (a lone or **mutual** deadlock), so an indefinite park can never be satisfied.
+    pub(crate) fn peers_live(&self) -> bool {
+        self.killing.load(Ordering::Acquire) > 0
+            || lock(&self.threads).live > self.parked.load(Ordering::Acquire)
+    }
+
+    /// #1820 — a kill reached a §14 task (`begun`), or that task ended (`!begun`); see
+    /// [`Self::killing`]. Asked of the run's domain, under the executor's lock.
+    pub(crate) fn kill_in_flight(&self, begun: bool) {
+        if begun {
+            self.killing.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.killing.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// #1820 — count a **join** as blocked in the run's [`Self::parked`], through the joined vCPU's
+    /// completion cell: `flag` is that cell's joiner flag, set here under the cell's lock, which the
+    /// caller holds, having seen no result. Every join counts this way — `thread.join` or
+    /// `Instantiator.join`, on an OS vCPU or a task — so the publisher settles it
+    /// ([`Self::join_settle`]) under the same lock before the joined vCPU leaves `live`, and no
+    /// deadlock check sees a joiner that is already runnable beside the `live` its joinee dropped.
+    /// The guard settles it on every other exit. (So the executor does not count a task's join
+    /// too: [`crate::fiber_rt::ParkOn::counts_itself`].)
+    pub(crate) fn join_park<'a>(&'a self, flag: &'a AtomicBool) -> CellParkGuard<'a> {
+        let parked = &self.hub().parked;
+        parked.fetch_add(1, Ordering::AcqRel);
+        flag.store(true, Ordering::Release);
+        CellParkGuard { flag, parked }
+    }
+
+    /// #1820 — the publisher's half of [`Self::join_park`]: the joiner counted on `flag` is
+    /// runnable now. Called under the completion cell's lock, before the joinee leaves `live`.
+    pub(crate) fn join_settle(&self, flag: &AtomicBool) {
+        cell_unpark(flag, &self.hub().parked);
     }
 
     /// The §14 child finished — drop it from the live count (see [`Self::child_started`]) and wake
@@ -1168,16 +1234,20 @@ impl Domain {
 
     /// Join every spawned OS thread (run teardown). After this returns no vCPU is still touching the
     /// window or executable code, so `run_inner` can free them.
-    pub(crate) fn join_all(&self) {
+    ///
+    /// `blocked` — whether the joining thread counts as blocked while it joins. A run's teardown
+    /// does (§12.8 concurrent-thaw stage 3): the thread calling `join_all` has finished its own guest
+    /// code, so it can never `notify` a still-parked vCPU — else a vCPU left parked in a genuine
+    /// deadlock (e.g. a sibling that unwound, propagating a trap, before the parked one's own
+    /// deadlock check fired) would see this joiner as a live, not-parked "potential notifier"
+    /// (`live > parked`) and wait forever, hanging `join_all` too. A §14 task's end does not
+    /// (#1820): its vCPUs have all ended, so the join waits on nothing, and counting the task — still
+    /// live until it publishes — let its joiner's deadlock check read it as blocked.
+    pub(crate) fn join_all(&self, blocked: bool) {
         // Drain handles out of the lock first (joining holds no lock; a joining child may still touch
         // `threads` via nested ops, though by teardown all guest code has returned).
         let joins: Vec<_> = std::mem::take(&mut lock(&self.threads).joins);
-        // §12.8 concurrent-thaw stage 3: the thread calling `join_all` has finished its own guest code
-        // (it's tearing down), so it can never `notify` a still-parked vCPU. Count it as blocked while it
-        // joins — else a vCPU left parked in a genuine deadlock (e.g. a sibling that unwound, propagating
-        // a trap, before the parked one's own deadlock check fired) would see this joiner as a live,
-        // not-parked "potential notifier" (`live > parked`) and wait forever, hanging `join_all` too.
-        let _pg = ParkGuard::new(&self.hub().parked);
+        let _pg = blocked.then(|| ParkGuard::new(&self.hub().parked));
         for j in joins {
             let _ = j.join();
         }
@@ -1374,6 +1444,7 @@ fn run_child(a: SpawnArgs) {
     set_current_domain(a.dom);
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
+    crate::vcpu_tls::set_serve_handlers(0);
     // §12.8 4A.5 stage (ii): a concurrent durable child points its durable shadow-base register at its
     // own region AND initialises that region's shadow-SP word to the empty frame base, so if a freeze
     // fires its instrumented code spills into *its* per-context region (concurrent with siblings, no
@@ -1832,6 +1903,8 @@ impl Domain {
         // restore the caller's afterward — a real OS-thread child gets its own thread-local in `run_child`.
         let prev_tls = crate::vcpu_tls::get();
         crate::vcpu_tls::seed(vcpu_id);
+        let prev_handlers = crate::vcpu_tls::serve_handlers();
+        crate::vcpu_tls::set_serve_handlers(0);
         // A child that uses `cont.*` gets its own fiber execution context over the domain-shared table
         // (D57 3b-ii), like `run_child`; publish it as the current runtime for the run.
         let mut frt = env.fiber_cfg.map(|(tid, mask)| {
@@ -1893,6 +1966,7 @@ impl Domain {
             fiber_rt::set_current(pr);
         }
         crate::vcpu_tls::seed(prev_tls); // restore the caller (root) vCPU's TLS id
+        crate::vcpu_tls::set_serve_handlers(prev_handlers);
 
         let (result, trap) = if faulted {
             // SAFETY: live trap cell.
@@ -2098,6 +2172,12 @@ impl Domain {
                 continue; // already-done: no re-run, no §15 live count, no context
             }
             lock(&self.threads).live += 1;
+            // A §14 child's vCPU also holds a slot of the run-wide count, as `thread_spawn` takes one
+            // and `Done::publish` gives both back. Without it the run read one live vCPU fewer while
+            // the thawed one ran, and a joiner's deadlock check saw quiescence (#1820).
+            if !std::ptr::eq(self.hub(), self) {
+                lock(&self.hub().threads).live += 1;
+            }
             // #2001 — it handed its `spawn` back as it unwound for the freeze, and lived before it.
             if let Some(n) = &self.node {
                 n.force_vcpu();
@@ -2287,14 +2367,9 @@ pub(crate) unsafe extern "C" fn thread_join(
         let mut st = lock(&done.state);
         // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
         // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
-        // Set under the cell's lock, so the child's [`Done::publish`] settles it before dropping `live`.
-        let parked = &dom.hub().parked;
-        parked.fetch_add(1, Ordering::AcqRel);
-        done.joiner_parked.store(true, Ordering::Release);
-        let _pg = CellParkGuard {
-            flag: &done.joiner_parked,
-            parked,
-        };
+        // Set under the cell's lock, so the child's [`Done::publish`] settles it before dropping `live`
+        // — and only while there is no result yet, which no publisher would settle.
+        let _pg = st.is_none().then(|| dom.join_park(&done.joiner_parked));
         loop {
             if let Some((result, trap)) = *st {
                 if trap != 0 {
@@ -2349,9 +2424,10 @@ pub(crate) unsafe extern "C" fn thread_join(
 }
 
 /// #1469 — `thread.join` at a child task's root: park the task on the one event park until the
-/// joined vCPU publishes. The executor counts the park as blocked for the deadlock predicate, gives
-/// back the task's lanes while it is parked, and re-offers it at the joined vCPU's exit broadcast
-/// (`run_child` → [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown.
+/// joined vCPU publishes. It counts as blocked for the deadlock predicate through the completion
+/// cell, as an OS joiner does ([`Domain::join_park`], #1820); the executor gives back the task's lanes while
+/// it is parked, and re-offers it at the joined vCPU's exit broadcast (`run_child` →
+/// [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown.
 ///
 /// #2010 — in a durable child it follows the OS-thread join's freeze rule: a freeze of the child's
 /// window ends the wait for re-issue on thaw, and a vCPU that unwound leaves its placeholder,
@@ -2367,16 +2443,23 @@ unsafe fn task_join(
 ) -> i64 {
     let env = dom.env();
     let unwind_base = if env.durable { env.mem_base } else { 0 };
+    let mut _pg = None;
     loop {
-        if let Some((result, trap)) = *lock(&done.state) {
-            if trap != 0 {
-                store_trap(trap_out as *mut i64, trap);
+        {
+            let st = lock(&done.state);
+            if let Some((result, trap)) = *st {
+                if trap != 0 {
+                    store_trap(trap_out as *mut i64, trap);
+                }
+                if done.unwound.load(Ordering::Relaxed) {
+                    // A vCPU unwinds only on a durable run, whose window is committed.
+                    mark_reissue(env.mem_base);
+                }
+                return result;
             }
-            if done.unwound.load(Ordering::Relaxed) {
-                // A vCPU unwinds only on a durable run, whose window is committed.
-                mark_reissue(env.mem_base);
+            if _pg.is_none() {
+                _pg = Some(dom.join_park(&done.joiner_parked));
             }
-            return result;
         }
         // Killed, or the child's domain is over: return; the join's trailing guards unwind.
         if epoch_fired(env.epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
@@ -2496,7 +2579,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
         // `live` counts the root + unfinished spawns (incl. this waiter); `parked` counts those blocked in
         // wait/join (incl. this waiter). `live > parked` ⇒ some live vCPU is still runnable and could
         // notify; `live == parked` ⇒ every live vCPU is blocked (a lone or **mutual** deadlock).
-        || lock(&hub.threads).live > hub.parked.load(Ordering::Acquire),
+        || hub.peers_live(),
         // Owner decision 2026-07-24 (domain teardown): return on a non-zero trap cell — the
         // **caller's own** cell (`trap_out`), i.e. the one this waiter's trailing guard checks, so
         // the wake always unwinds the right thread (a §14 child parked on the shared futex has its
@@ -2786,9 +2869,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // it closes that gap without a second predicate: a granted wake is picked up by the
                 // next `fiber_resume` and leaves this loop, while a genuine deadlock — nothing live
                 // to change the answer — still reads quiescent and fails closed, 20 ms later.
-                let quiescent = !self_resolving
-                    && !claimed
-                    && lock(&hub.threads).live <= hub.parked.load(Ordering::Acquire);
+                let quiescent = !self_resolving && !claimed && !hub.peers_live();
                 if quiescent && confirming {
                     drop(g);
                     store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
@@ -2862,7 +2943,7 @@ impl Drop for ParkGuard<'_> {
 /// exit from the park loop — woken, timed out, freeze, kill, teardown, deadlock — and on an unwind.
 /// A `notify` that claimed the cell first has already settled it; the `swap` inside makes the loser a
 /// no-op.
-struct CellParkGuard<'a> {
+pub(crate) struct CellParkGuard<'a> {
     flag: &'a AtomicBool,
     parked: &'a AtomicUsize,
 }

@@ -590,6 +590,9 @@ into the window's reserved tail by `vm_map`-committing pages on demand via the `
       own spin lock (atomics, `USE_SPIN_LOCKS`) serializes both allocation and `MORECORE`, so it is
       what keeps parallel vCPUs apart now (#1097) and `__temen_sbrk` takes no lock. `calloc` clears
       what it reuses; `realloc`, `memalign`, `aligned_alloc` and `posix_memalign` are dlmalloc's.
+      Running out of memory returns `NULL` (`heap_exhaustion_returns_null`): `MALLOC_FAILURE_ACTION`
+      is empty, because dlmalloc's default sets `errno` and the on-ramp's `__errno_location` traps.
+      The playground's C heap is the same configuration, built as a link unit (BROWSER.md, #2172).
 
 **Slice T (DONE) — multi-value struct returns.** A small by-value struct returned in registers (clang
 coerces it to e.g. `{ i64, i64 }` / `{ i64, ptr }`, as clay's `*Array_Allocate_Arena` and any C
@@ -3531,6 +3534,42 @@ into a fresh host on the tree-walker and on the JIT.
 
 ---
 
+## 8b. Link units: `--link-unit` (#1746)
+
+A whole translation fixes every global at a window address and refuses a call to a function it does
+not define. That is right for a program that runs alone. But it let a translated *library* link with
+other units only as the first unit, at data base 0, and only one per link (the JACL runtime's shape):
+two LLVM-translated units could not link each other at all.
+
+`temen-llvm-translate --link-unit` (`TranslateOptions::link_unit`) translates the same code as a link
+unit, which `temen_ir::link` can place anywhere among units from any frontend:
+
+- **Globals are addressed relative to the unit's own data:** `data.self` in code, a `data.ptr` slot
+  for a pointer in an initializer, a `data.funcref` (by exported name) for a function pointer in one.
+- **Undefined names are imports.** A call to a function the unit does not define is a `call.sym`
+  with the call site's signature, one import per name and shape. A reference to a global it only
+  declares is a `data.sym`.
+- **Only external-linkage names are exported:** functions, and globals as data symbols. A C `static`
+  stays private, so two units can each have their own `helper`.
+- **Calls between frontends agree** because chibicc and the on-ramp share the §3d convention: a
+  leading data-stack `sp`, pointers as `i64`. Variadic calls and small structs passed by value do
+  not agree between clang and chibicc; a mismatch fails the link's re-verification rather than
+  running.
+
+A link unit is a library. It may not define `main`, and translation fails closed on:
+
+- what still fixes a window address: thread-locals, the float-formatting scratch, the synthesized
+  ctype and locale tables, a durable shadow arena, a §14 child entry;
+- static constructors (no linked `_start` runs them);
+- a pointer to a `static` function stored in static data (a `data.funcref` names an exported
+  function);
+- taking the address of a function the unit does not define.
+
+Without the flag nothing changes: a whole translation is byte-identical. `tests/link_unit.rs` links
+two translated units in both orders and runs them on the interpreter and the JIT.
+
+---
+
 ## 9. Code map
 - Translator + frozen-subset chokepoint: `crates/temen-llvm/src/lib.rs` — `translate`/
   `translate_bc_path`, `val_type`/`operand_int_ty` (the §3b narrow-int collapse), `BlockCtx`
@@ -3540,6 +3579,9 @@ into a fresh host on the tree-walker and on the JIT.
 - Durable guests (§8a): `crates/temen-llvm/tests/durable_shadow_arena.rs` +
   `tests/fixtures/durable_probe.c`; the reserve cursor that places the arena is in `translate`
   (`float_scratch_base` / `eh_base` / `shadow_arena`).
+- Link units (§8b): `LinkCtx`/`SymImports` (the `call.sym` imports), `const_reloc` (a constant
+  that may be an address the linker places), and `globals_layout`'s `LinkData` (data relocations
+  and data exports) in `crates/temen-llvm/src/lib.rs`; `crates/temen-llvm/tests/link_unit.rs`.
 - Crate config + build prereqs: `crates/temen-llvm/Cargo.toml` (no libLLVM deps since the
   textual-reader flip — the in-house `.ll` reader lives in `crates/temen-llvm/src/ll/`; see §8
   Q1b/Q4); workspace exclusion in the root `Cargo.toml`.

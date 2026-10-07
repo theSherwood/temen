@@ -687,6 +687,7 @@ impl Parser {
         // `@g = … thread_local … global …` — a thread-local. Recorded so the translator can peel it
         // into the per-vCPU `vcpu.tls`-relative block (NIM.md §3d Tier-2) instead of the shared window.
         let mut thread_local = false;
+        let mut local = false;
         let is_constant = loop {
             match self.peek() {
                 Some(Token::Word(w)) if w == "global" => {
@@ -721,6 +722,7 @@ impl Parser {
                     if w == "external" || w == "extern_weak" {
                         is_declaration = true;
                     }
+                    local |= w == "internal" || w == "private";
                     self.pos += 1; // linkage / visibility / unnamed_addr / …
                 }
                 other => return self.err(format!("expected `global`/`constant`, found {other:?}")),
@@ -767,6 +769,7 @@ impl Parser {
             is_constant,
             alignment,
             thread_local,
+            local,
         });
         Ok(())
     }
@@ -868,7 +871,7 @@ impl Parser {
         // Skip linkage/visibility/cc/attribute barewords until the return type. The return type is the
         // first token that parses as a type; it's immediately followed by the `@name`. We find `@name`
         // by scanning, then re-parse the type just before it. Simpler: skip known pre-type keywords.
-        self.skip_pre_signature_attrs();
+        let local = self.skip_pre_signature_attrs();
         let return_type = self.type_()?;
         let name = match self.bump() {
             Some(Token::Global(s)) => s,
@@ -923,14 +926,17 @@ impl Parser {
             is_var_arg,
             return_type,
             basic_blocks,
+            local,
         })
     }
 
     /// Skip the optional linkage/visibility/dll/cc/attribute barewords between `define` and the return
     /// type (e.g. `dso_local`, `internal`, `noundef`). They're all `Word`s; the return type is also a
     /// `Word`/`Lt`/`LBracket`/`LBrace`, so we stop at the first token that begins a *type*. Since types
-    /// and these keywords are both barewords, we use a keyword allow-list to skip.
-    fn skip_pre_signature_attrs(&mut self) {
+    /// and these keywords are both barewords, we use a keyword allow-list to skip. Returns whether the
+    /// linkage was `internal`/`private` (a module-local name).
+    fn skip_pre_signature_attrs(&mut self) -> bool {
+        let mut local = false;
         const PRE: &[&str] = &[
             "dso_local",
             "dso_preemptable",
@@ -972,6 +978,7 @@ impl Parser {
             if !PRE.contains(&w.as_str()) {
                 break;
             }
+            local |= w == "internal" || w == "private";
             let is_align = w == "align";
             self.pos += 1;
             // Attributes with a payload: `dereferenceable(N)`/`range(…)`/`nofpclass(…)` → a balanced
@@ -982,6 +989,7 @@ impl Parser {
                 self.pos += 1;
             }
         }
+        local
     }
 
     /// Parse `( <ty> <%name>?, … , ...? )` — returns the params and whether it's varargs. Parameter
