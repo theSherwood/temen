@@ -2811,9 +2811,9 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
   scalarized to a packed `i64`.
 - **libc & the powerbox (Lane C).** A program that does I/O gets a synthesized `_start` powerbox
   entry; libc binds via **§7 named imports** the host resolves at load — `write`/`read`→`Stream`,
-  `exit`→`Exit`, `malloc`/`calloc`→a synthesized bump allocator that grows the heap into the reserved
-  window tail by `vm_map`-committing pages on demand via the `Memory` cap (the §1a sparse-address
-  win); the stdio output family (`puts`/`putc`/`fwrite`…) and constant-string `printf` lower to
+  `exit`→`Exit`, the `malloc` family→a merged-in dlmalloc that grows the heap into the reserved
+  window tail through a synthesized `sbrk`, `vm_map`-committing pages on demand via the `Memory` cap
+  (the §1a sparse-address win); the stdio output family (`puts`/`putc`/`fwrite`…) and constant-string `printf` lower to
   `Stream.write`. **All libc *logic* runs in the guest** as synthesized/translated IR; only the
   irreducible boundary primitives (`write`/`read`/`exit`/`vm_map`) are host capabilities.
 - **Proof (the D54 "matches native clang" exit criterion).** All **eight** chibicc corpus

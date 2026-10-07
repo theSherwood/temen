@@ -338,6 +338,11 @@ impl Types {
     pub fn named_struct_def(&self, name: &str) -> Option<&NamedStructDef> {
         self.named_struct_defs.get(name)
     }
+
+    /// Every named struct definition, by name (merging one module's types into another's).
+    pub fn named_struct_defs(&self) -> impl Iterator<Item = (&String, &NamedStructDef)> {
+        self.named_struct_defs.iter()
+    }
 }
 
 /// The translator's `Typed::get_type(types)` — the static type of a value. Mirrors `llvm_ir::types::Typed`.

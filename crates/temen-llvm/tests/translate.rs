@@ -5337,8 +5337,8 @@ fn demo_heapgrow_vs_native() {
 #[test]
 fn heap_malloc_calloc_free() {
     // The allocator directly: a `malloc` large enough to force `vm_map` growth past the initial
-    // window (filled/summed), a `free` (no-op), then a `calloc` that must read back as zero (freshly
-    // committed pages are zeroed and the bump heap never reuses). Exit code = (s + z) & 0xff vs native.
+    // window (filled/summed), a `free`, then a `calloc` that must read back as zero although it may
+    // reuse the freed, dirty block. Exit code = (s + z) & 0xff vs native.
     let src = "#include <stdlib.h>\n\
                int run(void){ int *a = (int*)malloc(300000 * sizeof(int)); \
                for (int i = 0; i < 300000; i++) a[i] = (i * 3 + 1) & 255; \
@@ -5348,6 +5348,42 @@ fn heap_malloc_calloc_free() {
                return (int)((s + z) & 0xff); } \
                int main(void){ return run(); }";
     check_powerbox_vs_native("heap_alloc", src, b"");
+}
+
+#[test]
+fn heap_reuses_freed_memory() {
+    // #1603: a freed block is reused, so the heap tracks the live set, not every byte ever allocated.
+    // 4096 rounds through 16 live slots, each round freeing a block and allocating up to 1 MiB (~2 GiB
+    // in all, at most 16 MiB live), run in a 64 MiB memory budget, which the bump heap this replaced,
+    // whose `free` did nothing, overran within a few dozen rounds. The blocks escape through the global
+    // pool so clang cannot delete the allocations.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               void *slot[16]; \
+               int main(void){ long sum = 0; \
+               for (int i = 0; i < 4096; i++) { int s = i % 16; \
+               if (slot[s]) { sum += *(char *)slot[s]; free(slot[s]); } \
+               long n = 16 + (i * 7919L) % (1 << 20); char *p = malloc(n); if (!p) return 1; \
+               p[0] = (char)i; p[n - 1] = 1; slot[s] = p; } \
+               printf(\"%ld\\n\", sum); return 0; }";
+    let Some(ll) = compile_to_ll("heap_reuse", src) else {
+        return;
+    };
+    let module = temen_llvm::translate_ll_path(&ll)
+        .expect("translate")
+        .module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let limits = temen_run::Limits {
+        mem: Some(64 << 20),
+        ..Default::default()
+    };
+    let run = temen_run::run_powerbox_cfg(&module, b"", &[], &[], limits).expect("powerbox run");
+    let sum: i64 = (0..4096 - 16).map(|i| i as i8 as i64).sum();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        format!("{sum}\n"),
+        "outcome {:?}",
+        run.outcome
+    );
 }
 
 #[test]
@@ -5543,7 +5579,7 @@ fn demo_steal_fibers_vs_chibicc() {
 /// The chibicc `malloc_threads` demo through the LLVM on-ramp: concurrent `malloc` from `NWORKERS`
 /// vCPUs, exercising the **thread-safe** guest allocator. Each worker `malloc`s 64 disjoint blocks
 /// and fills every byte with a `(worker, block, offset)`-unique pattern; after join, main re-checks
-/// every byte — a clobber from an overlapping allocation (the race a non-thread-safe bump allocator
+/// every byte — a clobber from an overlapping allocation (the race a non-thread-safe allocator
 /// would allow) would show as a corrupt block. Prints `0` (no corruption). Mirrors
 /// `c_frontend::c_guest_malloc_threads`.
 #[test]
@@ -5673,7 +5709,7 @@ fn vec4_float_scale() {
 fn demo_sortvec_vs_native() {
     // A growable int vector + insertion sort: 50 pseudo-random signed ints into a `realloc`-doubling
     // buffer (from `realloc(NULL,…)` ≡ malloc), sorted, printed 10/line via `printf("%d%c")`. Drives
-    // `realloc` (the header-bearing bump allocator: malloc + copy old contents) and signed `%d`.
+    // `realloc` (growing in place or moving the old contents) and signed `%d`.
     check_demo_vs_native("sortvec", "sortvec/sortvec.c", b"");
 }
 
@@ -7045,7 +7081,7 @@ fn printf_float_nonfinite() {
 
 #[test]
 fn realloc_grow_preserves() {
-    // `realloc` must preserve the old contents across a grow (the header gives the copy length). Push
+    // `realloc` must preserve the old contents across a grow. Push
     // 20 ints into a doubling buffer, then sum — exit code compared to native.
     let src = "#include <stdlib.h>\n\
                int run(int seed){ int *a = (int*)malloc(2 * sizeof(int)); int cap = 2, n = 0; \
@@ -7464,7 +7500,7 @@ long worker(long arg) {
 
 /// #1097 — vCPUs allocating at the same time never share a block. Four threads each `malloc` 2000
 /// blocks and tag them, then check every tag survived. Before the allocation lock, two vCPUs could read
-/// the same `HEAP_BRK` and be handed the same block. Runs on `drive_parallel`, one OS thread per vCPU,
+/// the same `HEAP_BRK` and be handed the same block. The lock is dlmalloc's own spin lock now (#1603). Runs on `drive_parallel`, one OS thread per vCPU,
 /// where the race is real: the nightly std lane's parallel atomic-counter smoke trapped on it about one
 /// run in four.
 #[test]
@@ -10029,7 +10065,7 @@ fn rust_alloc_native(name: &str, items: &str) -> Option<u8> {
 /// **Rust `alloc` / heap — `Vec` via a guest `#[global_allocator]`.** The headline for *real* Rust: a
 /// `no_std` + `alloc` crate whose global allocator routes to the guest `malloc`/`free`. Run through the
 /// powerbox (the on-ramp synthesizes `main` → `_start`, granting the `Memory` handle and the
-/// `vm_map`-growing bump allocator), `Vec::push` grows the heap (alloc + `memcpy` + free) and the sum
+/// `vm_map`-growing heap), `Vec::push` grows the heap (alloc + `memcpy` + free) and the sum
 /// is returned as the exit code — heap data structures from Rust, byte-identical to native `rustc`.
 #[test]
 fn rust_alloc_vec_via_global_allocator() {

@@ -14,8 +14,8 @@
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 
-// A child-entry Rust guest that allocates. `malloc`/`free` externs + a `GlobalAlloc` over them force the
-// on-ramp to synthesize the `vm_map`-backed bump allocator; the `Vec` growth exercises it. Returns
+// A child-entry Rust guest that allocates. `malloc`/`free` externs + a `GlobalAlloc` over them make the
+// on-ramp link its `vm_map`-backed heap; the `Vec` growth exercises it. Returns
 // `sum(0..100) = 4950`.
 const GUEST: &str = r##"
 #![no_std]

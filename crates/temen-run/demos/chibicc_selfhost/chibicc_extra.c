@@ -26,30 +26,14 @@ extern int close(int fd);
 extern long lseek(int fd, long off, int whence);
 
 /* ---- allocator ---------------------------------------------------------------------------------
- * `malloc`/`realloc` are intentionally NOT defined here: the on-ramp synthesizes its vm_map-growable
- * heap for any undefined `malloc`/`realloc` in a module with a `main` (temen-llvm `synth_malloc`/
- * `synth_realloc`), so chibicc's heap grows into the reserved tail instead of hitting a fixed cap —
- * the difference between compiling one source file and compiling the whole compiler. `calloc` wraps
- * the synth `malloc` (fresh vm_map pages are already zero, but zero explicitly for clarity); `free`
- * is a no-op (the bump-style synth heap does not reclaim). Only these two stay in C.
+ * The allocator is intentionally NOT defined here: the on-ramp links its dlmalloc heap for any
+ * undefined `malloc`/`free`/`calloc`/`realloc` in a module with a `main` (temen-llvm `link_heap`, #1603),
+ * growing it into the reserved tail instead of hitting a fixed cap — the difference between compiling
+ * one source file and compiling the whole compiler — and reusing what chibicc frees.
  *
- * Guarded for the **emit-object self-host** path (SELFHOST_C.md §7, task #20): when chibicc compiles
+ * The emit-object self-host path (SELFHOST_C.md §7, task #20) is unaffected: when chibicc compiles
  * this TU it resolves `<stdlib.h>` to its *bundled* header (`frontend/chibicc/include/stdlib.h`),
- * which already defines `static` `malloc`/`free`/`calloc`/`realloc` over the same `__vm_map` heap —
- * so defining `free`/`calloc` again here is a redefinition. `__TEMEN_STDLIB_H` (that header's guard)
- * tells the two regimes apart: the on-ramp's clang uses the *system* `<stdlib.h>` (guard undefined →
- * these stay, `malloc`/`realloc` synthesized by temen-llvm); emit-object uses the bundled one (guard
- * defined → skip, the whole allocator comes from the header). */
-#ifndef __TEMEN_STDLIB_H
-extern void *malloc(unsigned long n);
-void free(void *p) { (void)p; }
-void *calloc(unsigned long nm, unsigned long sz) {
-  unsigned long n = nm * sz;
-  unsigned char *p = (unsigned char *)malloc(n);
-  if (p) for (unsigned long i = 0; i < n; i++) p[i] = 0;
-  return p;
-}
-#endif
+ * which defines `static` `malloc`/`free`/`calloc`/`realloc` over the same `__vm_map` heap. */
 
 /* ---- trivial string/ctype gaps (Appendix A.5) ----------------------------------------------- */
 char *strchr(const char *s, int c) {
