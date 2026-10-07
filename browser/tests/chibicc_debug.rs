@@ -15,6 +15,9 @@
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 use temen_dap::{DapServer, Json};
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 fn chibicc_temen() -> Option<Vec<u8>> {
     std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -23,7 +26,9 @@ fn chibicc_temen() -> Option<Vec<u8>> {
     .ok()
 }
 
-/// Compile `src` with `-g` (debug info on) via the shipped compiler, returning the emitted TEMEN-IR text.
+/// Compile `src` with `-g` (debug info on) via the shipped compiler into a program unit and link it
+/// against the heap unit, returning the linked program's TEMEN-IR text — what the card's debugger
+/// launches, with the unit's debug info carried across the link.
 fn compile_g(chibicc: &temen_ir::Module, src: &str) -> String {
     let mut files = playground_include_files();
     files.push(("in.c".to_string(), src.as_bytes().to_vec()));
@@ -31,7 +36,14 @@ fn compile_g(chibicc: &temen_ir::Module, src: &str) -> String {
     let out = onramp_fs_exec(
         chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"-g", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"-g",
+            b"/in.c",
+        ],
         b"",
     );
     assert!(
@@ -39,7 +51,9 @@ fn compile_g(chibicc: &temen_ir::Module, src: &str) -> String {
         "compile status {}",
         out.status
     );
-    String::from_utf8(out.stdout).expect("IR utf8")
+    let unit = String::from_utf8(out.stdout).expect("IR utf8");
+    let prog = temen_text::parse_module_debug(&unit).expect("parse the program unit");
+    temen_text::print_module(&pg_heap::link(&[], &prog))
 }
 
 fn req(seq: i64, command: &str, args: Json) -> Json {

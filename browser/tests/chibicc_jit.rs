@@ -6,7 +6,8 @@
 //! `/include/*.h` and the powerbox `write` resolve). The emitted IR must be **byte-identical** to the
 //! interpreter path ([`onramp_fs_exec`], the oracle the shipped card is gated against in
 //! `chibicc_printf.rs`) — the JIT correctness contract for the compiler tier. Then it parses + runs the
-//! emitted IR and checks the program's own stdout, so the whole card pipeline is covered on the JIT.
+//! emitted program unit, links it against the heap unit (`support/pg_heap.rs`, #2172) and runs it,
+//! checking the program's own stdout, so the whole card pipeline is covered on the JIT.
 //!
 //! A second test covers the **RUN path** (#1153): a chibicc-compiled program whose `malloc` `vm_map`s
 //! its heap arena past the run window must, on the JIT, either match the interpreter or decline (trap →
@@ -18,6 +19,9 @@ use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, JitOnrampRun, STATUS_EXIT, STATUS_OK,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
+
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
 
 const WIN_LOG2: u8 = 25; // 32 MiB run window (JIT_RUN_WIN_LOG2); chibicc declares size_log2=21 and grows into it
 const WIN_SIZE: u64 = 1 << WIN_LOG2;
@@ -38,8 +42,16 @@ fn card_image(src: &str) -> Vec<u8> {
     temen_fs::encode_image(&files, &dirs)
 }
 
-/// The card's argv (mirrors `chibicc_printf.rs` + the shipped browser card).
-const ARGV: [&[u8]; 5] = [b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"];
+/// The card's argv (mirrors `chibicc_printf.rs` + the shipped browser card): a program unit, linked
+/// against the heap unit to run.
+const ARGV: [&[u8]; 6] = [
+    b"chibicc",
+    b"--data-page",
+    b"65536",
+    b"--emit-object",
+    b"-g0",
+    b"/in.c",
+];
 
 /// Compile `src` with chibicc on the **wasm-JIT** (emitted `f0` on `wasmi`, cross-tier helpers on the
 /// interpreter over the shared window). Returns the emitted TEMEN-IR text (chibicc's stdout).
@@ -237,9 +249,10 @@ int main(void) {
         "JIT-emitted IR must match the interpreter"
     );
 
-    // 2. The whole card pipeline on the JIT: parse the emitted IR + run it, check the program's stdout.
+    // 2. The whole card pipeline on the JIT: parse the emitted IR, link it against the heap and run it,
+    // checking the program's stdout.
     let m = temen_text::parse_module(&jit_ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
-    let run = onramp_exec(&m, b"");
+    let run = onramp_exec(&pg_heap::link(&[], &m), b"");
     assert_eq!(run.status, STATUS_OK, "compiled program run status");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
@@ -387,8 +400,11 @@ fn chibicc_compiled_malloc_program_matches_or_declines() {
         "chibicc compile status {}",
         compiled.status
     );
-    let m = temen_text::parse_module(&String::from_utf8(compiled.stdout).expect("ir utf8"))
-        .expect("parse produced IR");
+    let m = pg_heap::link(
+        &[],
+        &temen_text::parse_module(&String::from_utf8(compiled.stdout).expect("ir utf8"))
+            .expect("parse produced IR"),
+    );
 
     let interp_out = String::from_utf8_lossy(&onramp_exec(&m, b"").stdout).to_string();
     assert_eq!(

@@ -15,6 +15,9 @@
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 fn chibicc_temen() -> Option<temen_ir::Module> {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     let bytes = std::fs::read(p).ok()?;
@@ -126,12 +129,18 @@ int main(void) {
     let compiled = onramp_fs_exec(
         &chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"/in.c",
+        ],
         b"",
     );
     assert!(compiled.status == STATUS_OK || compiled.status == STATUS_EXIT);
     let ir = String::from_utf8(compiled.stdout).expect("IR utf8");
-    let m = temen_text::parse_module(&ir).expect("parse IR");
+    let m = pg_heap::link(&[], &temen_text::parse_module(&ir).expect("parse IR"));
     let run = onramp_exec(&m, b"");
     assert_eq!(run.status, STATUS_OK);
     assert_eq!(String::from_utf8_lossy(&run.stdout), "[0][1][4] len=9\n");

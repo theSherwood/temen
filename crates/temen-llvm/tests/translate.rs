@@ -5387,6 +5387,38 @@ fn heap_reuses_freed_memory() {
 }
 
 #[test]
+fn heap_exhaustion_returns_null() {
+    // A heap that cannot grow makes `malloc` return NULL, as C promises, rather than trap: 1 MiB
+    // blocks kept live in a 64 MiB memory budget run out after a few dozen. dlmalloc reports the
+    // failure through `errno`, which must not reach the on-ramp's trapping `__errno_location` stub.
+    let src = "#include <stdio.h>\n#include <stdlib.h>\n\
+               void *keep[4096]; \
+               int main(void){ for (int i = 0; i < 4096; i++) { \
+               keep[i] = malloc(1 << 20); \
+               if (!keep[i]) { printf(\"null after %d\\n\", i > 0); return 0; } \
+               ((char *)keep[i])[0] = 1; } \
+               return 1; }";
+    let Some(ll) = compile_to_ll("heap_exhaustion", src) else {
+        return;
+    };
+    let module = temen_llvm::translate_ll_path(&ll)
+        .expect("translate")
+        .module;
+    temen_verify::verify_module(&module).expect("verify translated IR");
+    let limits = temen_run::Limits {
+        mem: Some(64 << 20),
+        ..Default::default()
+    };
+    let run = temen_run::run_powerbox_cfg(&module, b"", &[], &[], limits).expect("powerbox run");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "null after 1\n",
+        "outcome {:?}",
+        run.outcome
+    );
+}
+
+#[test]
 fn ro_and_writable_global_page_isolation() {
     // A read-only global (string literal) next to a writable one (a mutable array) must not share a
     // protected page: a write to the writable global would otherwise fault on the read-only page

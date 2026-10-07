@@ -43,7 +43,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %18, label %19, label %23
 
 19:                                               ; preds = %16
-  call void @llvm.lifetime.start.p0(ptr nonnull %3) #10
+  call void @llvm.lifetime.start.p0(ptr nonnull %3) #9
   store i64 65536, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
   store i64 4096, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 8), align 8
   tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 24), i8 -1, i64 16, i1 false)
@@ -54,7 +54,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %21 = and i64 %20, -16
   %22 = xor i64 %21, 1431655768
   store volatile i64 %22, ptr @__temen_dl.mparams, align 8
-  call void @llvm.lifetime.end.p0(ptr nonnull %3) #10
+  call void @llvm.lifetime.end.p0(ptr nonnull %3) #9
   br label %23
 
 23:                                               ; preds = %19, %16
@@ -140,7 +140,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %76
 
 75:                                               ; preds = %70, %67
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 76:                                               ; preds = %74, %63
@@ -154,7 +154,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %83 = load i64, ptr %82, align 8
   %84 = or i64 %83, 1
   store i64 %84, ptr %82, align 8
-  br label %1178
+  br label %1176
 
 85:                                               ; preds = %40
   %86 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
@@ -206,7 +206,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %118
 
 117:                                              ; preds = %112, %109
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 118:                                              ; preds = %116, %105
@@ -225,7 +225,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %128 = load i64, ptr %127, align 8
   %129 = or i64 %128, 1
   store i64 %129, ptr %127, align 8
-  br label %1178
+  br label %1176
 
 130:                                              ; preds = %118
   %131 = or disjoint i64 %44, 3
@@ -266,7 +266,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %155, label %156, label %157, !prof !7
 
 156:                                              ; preds = %151
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 157:                                              ; preds = %151, %149
@@ -284,7 +284,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
 163:                                              ; preds = %157, %130
   store i64 %121, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 8), align 8
   store ptr %132, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 32), align 8
-  br label %1178
+  br label %1176
 
 164:                                              ; preds = %88
   %165 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 4), align 4
@@ -366,7 +366,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %248
 
 219:                                              ; preds = %214, %210, %206
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 220:                                              ; preds = %199
@@ -414,7 +414,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %248
 
 247:                                              ; preds = %244
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 248:                                              ; preds = %246, %224, %218
@@ -470,7 +470,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %279
 
 278:                                              ; preds = %268
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 279:                                              ; preds = %276, %275
@@ -502,7 +502,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %295
 
 294:                                              ; preds = %289
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 295:                                              ; preds = %291, %284
@@ -523,11 +523,11 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %306
 
 304:                                              ; preds = %299
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 305:                                              ; preds = %281
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 306:                                              ; preds = %301, %295, %279, %262, %248
@@ -585,7 +585,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %341, label %342, label %343, !prof !7
 
 342:                                              ; preds = %337
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 343:                                              ; preds = %337, %335
@@ -606,12 +606,12 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %351
 
 350:                                              ; preds = %196
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 351:                                              ; preds = %349, %308
   %352 = getelementptr inbounds nuw i8, ptr %178, i64 16
-  br label %1178
+  br label %1176
 
 353:                                              ; preds = %38
   %354 = icmp ugt i64 %0, -129
@@ -811,7 +811,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %525
 
 496:                                              ; preds = %491, %487, %483
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 497:                                              ; preds = %476
@@ -859,7 +859,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %525
 
 524:                                              ; preds = %521
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 525:                                              ; preds = %523, %501, %495
@@ -915,7 +915,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %556
 
 555:                                              ; preds = %545
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 556:                                              ; preds = %553, %552
@@ -947,7 +947,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %572
 
 571:                                              ; preds = %566
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 572:                                              ; preds = %568, %561
@@ -968,11 +968,11 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %583
 
 581:                                              ; preds = %576
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 582:                                              ; preds = %558
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 583:                                              ; preds = %578, %572, %556, %539, %525
@@ -1027,7 +1027,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %615, label %616, label %617, !prof !7
 
 616:                                              ; preds = %611
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 617:                                              ; preds = %611, %609
@@ -1136,7 +1136,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %700
 
 685:                                              ; preds = %677
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 686:                                              ; preds = %663
@@ -1161,16 +1161,16 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %700
 
 698:                                              ; preds = %686
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 699:                                              ; preds = %473
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 700:                                              ; preds = %693, %681, %649, %617, %585
   %701 = getelementptr inbounds nuw i8, ptr %467, i64 16
-  br label %1178
+  br label %1176
 
 702:                                              ; preds = %469, %465, %426, %355, %353, %164, %85
   %703 = phi i64 [ -1, %353 ], [ %357, %355 ], [ %44, %85 ], [ %44, %164 ], [ %357, %469 ], [ %357, %465 ], [ %357, %426 ]
@@ -1213,7 +1213,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
 
 724:                                              ; preds = %717, %710
   %725 = getelementptr inbounds nuw i8, ptr %708, i64 16
-  br label %1178
+  br label %1176
 
 726:                                              ; preds = %702
   %727 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
@@ -1233,7 +1233,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %736 = getelementptr inbounds nuw i8, ptr %731, i64 8
   store i64 %735, ptr %736, align 8
   %737 = getelementptr inbounds nuw i8, ptr %731, i64 16
-  br label %1178
+  br label %1176
 
 738:                                              ; preds = %726
   %739 = load i64, ptr @__temen_dl.mparams, align 8
@@ -1264,7 +1264,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %753, label %754, label %758
 
 754:                                              ; preds = %751
-  call void @llvm.lifetime.start.p0(ptr nonnull %2) #10
+  call void @llvm.lifetime.start.p0(ptr nonnull %2) #9
   store i64 65536, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 16), align 8
   store i64 4096, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 8), align 8
   call void @llvm.memset.p0.i64(ptr noundef nonnull align 8 dereferenceable(16) getelementptr inbounds nuw (i8, ptr @__temen_dl.mparams, i64 24), i8 -1, i64 16, i1 false)
@@ -1275,7 +1275,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %756 = and i64 %755, -16
   %757 = xor i64 %756, 1431655768
   store volatile i64 %757, ptr @__temen_dl.mparams, align 8
-  call void @llvm.lifetime.end.p0(ptr nonnull %2) #10
+  call void @llvm.lifetime.end.p0(ptr nonnull %2) #9
   br label %758
 
 758:                                              ; preds = %754, %751
@@ -1290,7 +1290,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %764 = sub i64 0, %761
   %765 = and i64 %763, %764
   %766 = icmp ugt i64 %765, %703
-  br i1 %766, label %767, label %1178
+  br i1 %766, label %767, label %1176
 
 767:                                              ; preds = %759
   %768 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 872), align 8
@@ -1303,7 +1303,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %773 = icmp ule i64 %772, %771
   %774 = icmp ugt i64 %772, %768
   %775 = or i1 %773, %774
-  br i1 %775, label %1178, label %776
+  br i1 %775, label %1176, label %776
 
 776:                                              ; preds = %770, %767
   %777 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
@@ -1359,7 +1359,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %808, label %809, label %841
 
 809:                                              ; preds = %807
-  %810 = call ptr @__temen_sbrk(i64 noundef 0) #10
+  %810 = call ptr @__temen_sbrk(i64 noundef 0) #9
   %811 = icmp eq ptr %810, inttoptr (i64 -1 to ptr)
   br i1 %811, label %881, label %812
 
@@ -1400,7 +1400,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %837, label %881, label %838
 
 838:                                              ; preds = %834, %831
-  %839 = call ptr @__temen_sbrk(i64 noundef %825) #10
+  %839 = call ptr @__temen_sbrk(i64 noundef %825) #9
   %840 = icmp eq ptr %839, %810
   br i1 %840, label %885, label %858
 
@@ -1415,7 +1415,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %848, label %849, label %881
 
 849:                                              ; preds = %841
-  %850 = call ptr @__temen_sbrk(i64 noundef %847) #10
+  %850 = call ptr @__temen_sbrk(i64 noundef %847) #9
   %851 = load ptr, ptr %797, align 8
   %852 = getelementptr inbounds nuw i8, ptr %797, i64 8
   %853 = load i64, ptr %852, align 8
@@ -1446,7 +1446,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %871, label %872, label %885
 
 872:                                              ; preds = %865
-  %873 = call ptr @__temen_sbrk(i64 noundef %870) #10
+  %873 = call ptr @__temen_sbrk(i64 noundef %870) #9
   %874 = icmp eq ptr %873, inttoptr (i64 -1 to ptr)
   br i1 %874, label %877, label %875
 
@@ -1455,7 +1455,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %885
 
 877:                                              ; preds = %872
-  %878 = call ptr @__temen_sbrk(i64 noundef %861) #10
+  %878 = call ptr @__temen_sbrk(i64 noundef %861) #9
   br label %881
 
 879:                                              ; preds = %858
@@ -1502,8 +1502,8 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %897, !llvm.loop !5
 
 904:                                              ; preds = %900, %894
-  %905 = call ptr @__temen_sbrk(i64 noundef %765) #10
-  %906 = call ptr @__temen_sbrk(i64 noundef 0) #10
+  %905 = call ptr @__temen_sbrk(i64 noundef %765) #9
+  %906 = call ptr @__temen_sbrk(i64 noundef 0) #9
   store atomic i32 0, ptr @__temen_dl.malloc_global_mutex release, align 4
   %907 = icmp ne ptr %905, inttoptr (i64 -1 to ptr)
   %908 = icmp ne ptr %906, inttoptr (i64 -1 to ptr)
@@ -1837,7 +1837,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br i1 %1077, label %1078, label %1079, !prof !7
 
 1078:                                             ; preds = %1073
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 1079:                                             ; preds = %1073, %1071
@@ -1933,7 +1933,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %1152
 
 1140:                                             ; preds = %1134
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 1141:                                             ; preds = %1120
@@ -1954,7 +1954,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   br label %1152
 
 1151:                                             ; preds = %1141
-  call void @abort() #11
+  call void @abort() #10
   unreachable
 
 1152:                                             ; preds = %1148, %1138, %1108, %1079
@@ -1975,7 +1975,7 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %1162 = add i64 %1161, %921
   store i64 %1162, ptr %1160, align 8
   %1163 = call fastcc ptr @__temen_dl.prepend_alloc(ptr noundef %920, ptr noundef %995, i64 noundef range(i64 -1, -105) %703)
-  br label %1178
+  br label %1176
 
 1164:                                             ; preds = %1152, %1049, %970, %936
   %1165 = load i64, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 16), align 8
@@ -1995,26 +1995,21 @@ define dso_local ptr @__temen_dl.dlmalloc(i64 noundef %0) local_unnamed_addr #0 
   %1174 = getelementptr inbounds nuw i8, ptr %1169, i64 8
   store i64 %1173, ptr %1174, align 8
   %1175 = getelementptr inbounds nuw i8, ptr %1169, i64 16
-  br label %1178
+  br label %1176
 
-1176:                                             ; preds = %1164, %918, %912, %904
-  %1177 = tail call ptr @__errno_location() #12
-  store i32 12, ptr %1177, align 4
-  br label %1178
+1176:                                             ; preds = %1167, %1164, %1159, %918, %912, %904, %770, %759, %729, %724, %700, %351, %163, %124, %76
+  %1177 = phi ptr [ %725, %724 ], [ %737, %729 ], [ %701, %700 ], [ null, %904 ], [ null, %759 ], [ %1175, %1167 ], [ null, %770 ], [ %1163, %1159 ], [ null, %1164 ], [ null, %918 ], [ null, %912 ], [ %102, %163 ], [ %102, %124 ], [ %352, %351 ], [ %60, %76 ]
+  %1178 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %1179 = and i32 %1178, 2
+  %1180 = icmp eq i32 %1179, 0
+  br i1 %1180, label %1182, label %1181
 
-1178:                                             ; preds = %1176, %1167, %1159, %770, %759, %729, %724, %700, %351, %163, %124, %76
-  %1179 = phi ptr [ %725, %724 ], [ %737, %729 ], [ %701, %700 ], [ null, %770 ], [ null, %759 ], [ %1175, %1167 ], [ null, %1176 ], [ %1163, %1159 ], [ %102, %163 ], [ %102, %124 ], [ %352, %351 ], [ %60, %76 ]
-  %1180 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
-  %1181 = and i32 %1180, 2
-  %1182 = icmp eq i32 %1181, 0
-  br i1 %1182, label %1184, label %1183
-
-1183:                                             ; preds = %1178
+1181:                                             ; preds = %1176
   store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
-  br label %1184
+  br label %1182
 
-1184:                                             ; preds = %1183, %1178
-  ret ptr %1179
+1182:                                             ; preds = %1181, %1176
+  ret ptr %1177
 }
 
 ; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)
@@ -2156,11 +2151,11 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %195
 
 79:                                               ; preds = %72, %70
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 80:                                               ; preds = %57, %55
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 81:                                               ; preds = %43
@@ -2195,7 +2190,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %129
 
 100:                                              ; preds = %95, %91, %87
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 101:                                              ; preds = %81
@@ -2243,7 +2238,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %129
 
 128:                                              ; preds = %125
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 129:                                              ; preds = %127, %105, %99
@@ -2295,7 +2290,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %158
 
 157:                                              ; preds = %147
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 158:                                              ; preds = %155, %154
@@ -2327,7 +2322,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %174
 
 173:                                              ; preds = %168
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 174:                                              ; preds = %170, %163
@@ -2348,11 +2343,11 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %195
 
 183:                                              ; preds = %178
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 184:                                              ; preds = %160
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 185:                                              ; preds = %40
@@ -2494,11 +2489,11 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %375
 
 267:                                              ; preds = %260, %257
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 268:                                              ; preds = %244, %241
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 269:                                              ; preds = %227
@@ -2534,7 +2529,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %319
 
 289:                                              ; preds = %284, %280, %275
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 290:                                              ; preds = %269
@@ -2583,7 +2578,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %319
 
 318:                                              ; preds = %314
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 319:                                              ; preds = %317, %294, %288
@@ -2635,7 +2630,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %348
 
 347:                                              ; preds = %337
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 348:                                              ; preds = %345, %344
@@ -2667,7 +2662,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %364
 
 363:                                              ; preds = %358
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 364:                                              ; preds = %360, %353
@@ -2688,11 +2683,11 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %375
 
 373:                                              ; preds = %368
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 374:                                              ; preds = %350
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 375:                                              ; preds = %370, %364, %348, %331, %319, %264, %250
@@ -2748,7 +2743,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br i1 %405, label %406, label %407, !prof !7
 
 406:                                              ; preds = %401
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 407:                                              ; preds = %401, %399
@@ -2845,7 +2840,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %480
 
 469:                                              ; preds = %464
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 470:                                              ; preds = %450
@@ -2864,7 +2859,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %480
 
 479:                                              ; preds = %470
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 480:                                              ; preds = %477, %468, %439
@@ -2887,7 +2882,7 @@ define dso_local void @__temen_dl.dlfree(ptr noundef %0) local_unnamed_addr #4 {
   br label %494
 
 493:                                              ; preds = %199, %195, %35, %21, %18
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 494:                                              ; preds = %480, %407, %381, %221, %217, %210, %190, %31
@@ -2955,90 +2950,82 @@ define dso_local ptr @__temen_dl.dlrealloc(ptr noundef %0, i64 noundef %1) local
 
 4:                                                ; preds = %2
   %5 = tail call ptr @__temen_dl.dlmalloc(i64 noundef %1)
-  br label %51
+  br label %49
 
 6:                                                ; preds = %2
   %7 = icmp ugt i64 %1, -129
-  br i1 %7, label %8, label %10
+  br i1 %7, label %49, label %8
 
 8:                                                ; preds = %6
-  %9 = tail call ptr @__errno_location() #12
-  store i32 12, ptr %9, align 4
-  br label %51
+  %9 = icmp ult i64 %1, 23
+  %10 = add nuw i64 %1, 23
+  %11 = and i64 %10, -16
+  %12 = select i1 %9, i64 32, i64 %11
+  %13 = getelementptr inbounds i8, ptr %0, i64 -16
+  %14 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %15 = and i32 %14, 2
+  %16 = icmp eq i32 %15, 0
+  br i1 %16, label %27, label %17
 
-10:                                               ; preds = %6
-  %11 = icmp ult i64 %1, 23
-  %12 = add nuw i64 %1, 23
-  %13 = and i64 %12, -16
-  %14 = select i1 %11, i64 32, i64 %13
-  %15 = getelementptr inbounds i8, ptr %0, i64 -16
-  %16 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
-  %17 = and i32 %16, 2
-  %18 = icmp eq i32 %17, 0
-  br i1 %18, label %29, label %19
+17:                                               ; preds = %8
+  %18 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
+  %19 = icmp eq i32 %18, 0
+  br i1 %19, label %27, label %20
 
-19:                                               ; preds = %10
-  %20 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
-  %21 = icmp eq i32 %20, 0
-  br i1 %21, label %29, label %22
+20:                                               ; preds = %26, %17
+  %21 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
+  %22 = icmp eq i32 %21, 0
+  br i1 %22, label %23, label %26
 
-22:                                               ; preds = %28, %19
-  %23 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
-  %24 = icmp eq i32 %23, 0
-  br i1 %24, label %25, label %28
+23:                                               ; preds = %20
+  %24 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
+  %25 = icmp eq i32 %24, 0
+  br i1 %25, label %27, label %26
 
-25:                                               ; preds = %22
-  %26 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
-  %27 = icmp eq i32 %26, 0
-  br i1 %27, label %29, label %28
+26:                                               ; preds = %23, %20
+  br label %20, !llvm.loop !5
 
-28:                                               ; preds = %25, %22
-  br label %22, !llvm.loop !5
+27:                                               ; preds = %23, %17, %8
+  %28 = tail call fastcc ptr @__temen_dl.try_realloc_chunk(ptr noundef %13, i64 noundef %12)
+  %29 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %30 = and i32 %29, 2
+  %31 = icmp eq i32 %30, 0
+  br i1 %31, label %33, label %32
 
-29:                                               ; preds = %25, %19, %10
-  %30 = tail call fastcc ptr @__temen_dl.try_realloc_chunk(ptr noundef %15, i64 noundef %14)
-  %31 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
-  %32 = and i32 %31, 2
-  %33 = icmp eq i32 %32, 0
-  br i1 %33, label %35, label %34
-
-34:                                               ; preds = %29
+32:                                               ; preds = %27
   store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
-  br label %35
+  br label %33
 
-35:                                               ; preds = %34, %29
-  %36 = icmp eq ptr %30, null
-  br i1 %36, label %39, label %37
+33:                                               ; preds = %32, %27
+  %34 = icmp eq ptr %28, null
+  br i1 %34, label %37, label %35
 
-37:                                               ; preds = %35
-  %38 = getelementptr inbounds nuw i8, ptr %30, i64 16
-  br label %51
+35:                                               ; preds = %33
+  %36 = getelementptr inbounds nuw i8, ptr %28, i64 16
+  br label %49
 
-39:                                               ; preds = %35
-  %40 = tail call ptr @__temen_dl.dlmalloc(i64 noundef %1)
-  %41 = icmp eq ptr %40, null
-  br i1 %41, label %51, label %42
+37:                                               ; preds = %33
+  %38 = tail call ptr @__temen_dl.dlmalloc(i64 noundef %1)
+  %39 = icmp eq ptr %38, null
+  br i1 %39, label %49, label %40
 
-42:                                               ; preds = %39
-  %43 = getelementptr inbounds i8, ptr %0, i64 -8
-  %44 = load i64, ptr %43, align 8
-  %45 = and i64 %44, -8
-  %46 = and i64 %44, 3
-  %47 = icmp eq i64 %46, 0
-  %48 = select i1 %47, i64 -16, i64 -8
-  %49 = add i64 %48, %45
-  %50 = tail call i64 @llvm.umin.i64(i64 %49, i64 %1)
-  tail call void @llvm.memcpy.p0.p0.i64(ptr nonnull align 1 %40, ptr nonnull align 1 %0, i64 %50, i1 false)
+40:                                               ; preds = %37
+  %41 = getelementptr inbounds i8, ptr %0, i64 -8
+  %42 = load i64, ptr %41, align 8
+  %43 = and i64 %42, -8
+  %44 = and i64 %42, 3
+  %45 = icmp eq i64 %44, 0
+  %46 = select i1 %45, i64 -16, i64 -8
+  %47 = add i64 %46, %43
+  %48 = tail call i64 @llvm.umin.i64(i64 %47, i64 %1)
+  tail call void @llvm.memcpy.p0.p0.i64(ptr nonnull align 1 %38, ptr nonnull align 1 %0, i64 %48, i1 false)
   tail call void @__temen_dl.dlfree(ptr noundef nonnull %0)
-  br label %51
+  br label %49
 
-51:                                               ; preds = %42, %39, %37, %8, %4
-  %52 = phi ptr [ %5, %4 ], [ null, %8 ], [ %38, %37 ], [ %40, %42 ], [ null, %39 ]
-  ret ptr %52
+49:                                               ; preds = %40, %37, %35, %6, %4
+  %50 = phi ptr [ %5, %4 ], [ null, %6 ], [ %36, %35 ], [ %38, %40 ], [ null, %37 ]
+  ret ptr %50
 }
-
-; Function Attrs: mustprogress nofree nosync nounwind willreturn memory(none)
-declare ptr @__errno_location() local_unnamed_addr #6
 
 ; Function Attrs: nofree nounwind uwtable
 define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef nonnull %0, i64 noundef range(i64 16, -105) %1) unnamed_addr #4 {
@@ -3258,11 +3245,11 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %243
 
 137:                                              ; preds = %130, %128
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 138:                                              ; preds = %115, %113
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 139:                                              ; preds = %100
@@ -3297,7 +3284,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %187
 
 158:                                              ; preds = %153, %149, %145
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 159:                                              ; preds = %139
@@ -3345,7 +3332,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %187
 
 186:                                              ; preds = %183
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 187:                                              ; preds = %185, %163, %157
@@ -3397,7 +3384,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %216
 
 215:                                              ; preds = %205
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 216:                                              ; preds = %213, %212
@@ -3429,7 +3416,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %232
 
 231:                                              ; preds = %226
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 232:                                              ; preds = %228, %221
@@ -3450,11 +3437,11 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %243
 
 241:                                              ; preds = %236
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 242:                                              ; preds = %218
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 243:                                              ; preds = %238, %232, %216, %199, %187, %134, %121
@@ -3493,7 +3480,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
   br label %267
 
 266:                                              ; preds = %14, %2
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 267:                                              ; preds = %254, %245, %96, %93, %90, %64, %53, %49, %37, %34, %31, %26, %21
@@ -3502,7 +3489,7 @@ define internal fastcc noundef ptr @__temen_dl.try_realloc_chunk(ptr noundef non
 }
 
 ; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #7
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #6
 
 ; Function Attrs: nounwind uwtable
 define dso_local ptr @__temen_dl.dlmemalign(i64 noundef %0, i64 noundef %1) local_unnamed_addr #0 {
@@ -3539,159 +3526,154 @@ define internal fastcc ptr @__temen_dl.internal_memalign(i64 noundef range(i64 1
   %11 = phi i64 [ %3, %2 ], [ %7, %6 ]
   %12 = sub i64 -128, %11
   %13 = icmp ult i64 %1, %12
-  br i1 %13, label %16, label %14
+  br i1 %13, label %14, label %115
 
 14:                                               ; preds = %10
-  %15 = tail call ptr @__errno_location() #12
-  store i32 12, ptr %15, align 4
-  br label %117
+  %15 = icmp ult i64 %1, 23
+  %16 = add i64 %1, 23
+  %17 = and i64 %16, -16
+  %18 = select i1 %15, i64 32, i64 %17
+  %19 = add i64 %18, 24
+  %20 = add i64 %19, %11
+  %21 = tail call ptr @__temen_dl.dlmalloc(i64 noundef %20)
+  %22 = icmp eq ptr %21, null
+  br i1 %22, label %115, label %23
 
-16:                                               ; preds = %10
-  %17 = icmp ult i64 %1, 23
-  %18 = add i64 %1, 23
-  %19 = and i64 %18, -16
-  %20 = select i1 %17, i64 32, i64 %19
-  %21 = add i64 %20, 24
-  %22 = add i64 %21, %11
-  %23 = tail call ptr @__temen_dl.dlmalloc(i64 noundef %22)
-  %24 = icmp eq ptr %23, null
-  br i1 %24, label %117, label %25
+23:                                               ; preds = %14
+  %24 = getelementptr inbounds i8, ptr %21, i64 -16
+  %25 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %26 = and i32 %25, 2
+  %27 = icmp eq i32 %26, 0
+  br i1 %27, label %38, label %28
 
-25:                                               ; preds = %16
-  %26 = getelementptr inbounds i8, ptr %23, i64 -16
-  %27 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
-  %28 = and i32 %27, 2
-  %29 = icmp eq i32 %28, 0
-  br i1 %29, label %40, label %30
+28:                                               ; preds = %23
+  %29 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
+  %30 = icmp eq i32 %29, 0
+  br i1 %30, label %38, label %31
 
-30:                                               ; preds = %25
-  %31 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
-  %32 = icmp eq i32 %31, 0
-  br i1 %32, label %40, label %33
+31:                                               ; preds = %37, %28
+  %32 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
+  %33 = icmp eq i32 %32, 0
+  br i1 %33, label %34, label %37
 
-33:                                               ; preds = %39, %30
-  %34 = load volatile i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), align 4
-  %35 = icmp eq i32 %34, 0
-  br i1 %35, label %36, label %39
+34:                                               ; preds = %31
+  %35 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
+  %36 = icmp eq i32 %35, 0
+  br i1 %36, label %38, label %37
 
-36:                                               ; preds = %33
-  %37 = atomicrmw xchg ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884), i32 1 seq_cst, align 4
-  %38 = icmp eq i32 %37, 0
-  br i1 %38, label %40, label %39
+37:                                               ; preds = %34, %31
+  br label %31, !llvm.loop !5
 
-39:                                               ; preds = %36, %33
-  br label %33, !llvm.loop !5
+38:                                               ; preds = %34, %28, %23
+  %39 = ptrtoint ptr %21 to i64
+  %40 = add i64 %11, -1
+  %41 = and i64 %40, %39
+  %42 = icmp eq i64 %41, 0
+  br i1 %42, label %87, label %43
 
-40:                                               ; preds = %36, %30, %25
-  %41 = ptrtoint ptr %23 to i64
-  %42 = add i64 %11, -1
-  %43 = and i64 %42, %41
-  %44 = icmp eq i64 %43, 0
-  br i1 %44, label %89, label %45
+43:                                               ; preds = %38
+  %44 = getelementptr inbounds nuw i8, ptr %21, i64 %11
+  %45 = getelementptr inbounds i8, ptr %44, i64 -1
+  %46 = ptrtoint ptr %45 to i64
+  %47 = sub i64 0, %11
+  %48 = and i64 %46, %47
+  %49 = inttoptr i64 %48 to ptr
+  %50 = getelementptr inbounds i8, ptr %49, i64 -16
+  %51 = ptrtoint ptr %50 to i64
+  %52 = ptrtoint ptr %24 to i64
+  %53 = sub i64 %51, %52
+  %54 = icmp ugt i64 %53, 31
+  %55 = select i1 %54, i64 0, i64 %11
+  %56 = getelementptr inbounds nuw i8, ptr %50, i64 %55
+  %57 = ptrtoint ptr %56 to i64
+  %58 = sub i64 %57, %52
+  %59 = getelementptr inbounds i8, ptr %21, i64 -8
+  %60 = load i64, ptr %59, align 8
+  %61 = and i64 %60, -8
+  %62 = sub i64 %61, %58
+  %63 = and i64 %60, 3
+  %64 = icmp eq i64 %63, 0
+  br i1 %64, label %65, label %69
 
-45:                                               ; preds = %40
-  %46 = getelementptr inbounds nuw i8, ptr %23, i64 %11
-  %47 = getelementptr inbounds i8, ptr %46, i64 -1
-  %48 = ptrtoint ptr %47 to i64
-  %49 = sub i64 0, %11
-  %50 = and i64 %48, %49
-  %51 = inttoptr i64 %50 to ptr
-  %52 = getelementptr inbounds i8, ptr %51, i64 -16
-  %53 = ptrtoint ptr %52 to i64
-  %54 = ptrtoint ptr %26 to i64
-  %55 = sub i64 %53, %54
-  %56 = icmp ugt i64 %55, 31
-  %57 = select i1 %56, i64 0, i64 %11
-  %58 = getelementptr inbounds nuw i8, ptr %52, i64 %57
-  %59 = ptrtoint ptr %58 to i64
-  %60 = sub i64 %59, %54
-  %61 = getelementptr inbounds i8, ptr %23, i64 -8
-  %62 = load i64, ptr %61, align 8
-  %63 = and i64 %62, -8
-  %64 = sub i64 %63, %60
-  %65 = and i64 %62, 3
-  %66 = icmp eq i64 %65, 0
-  br i1 %66, label %67, label %71
+65:                                               ; preds = %43
+  %66 = load i64, ptr %24, align 8
+  %67 = add i64 %66, %58
+  store i64 %67, ptr %56, align 8
+  %68 = getelementptr inbounds nuw i8, ptr %56, i64 8
+  store i64 %62, ptr %68, align 8
+  br label %87
 
-67:                                               ; preds = %45
-  %68 = load i64, ptr %26, align 8
-  %69 = add i64 %68, %60
-  store i64 %69, ptr %58, align 8
-  %70 = getelementptr inbounds nuw i8, ptr %58, i64 8
-  store i64 %64, ptr %70, align 8
-  br label %89
+69:                                               ; preds = %43
+  %70 = getelementptr inbounds nuw i8, ptr %56, i64 8
+  %71 = load i64, ptr %70, align 8
+  %72 = and i64 %71, 1
+  %73 = or i64 %62, %72
+  %74 = or i64 %73, 2
+  store i64 %74, ptr %70, align 8
+  %75 = getelementptr inbounds nuw i8, ptr %56, i64 %62
+  %76 = getelementptr inbounds nuw i8, ptr %75, i64 8
+  %77 = load i64, ptr %76, align 8
+  %78 = or i64 %77, 1
+  store i64 %78, ptr %76, align 8
+  %79 = load i64, ptr %59, align 8
+  %80 = and i64 %79, 1
+  %81 = or i64 %58, %80
+  %82 = or i64 %81, 2
+  store i64 %82, ptr %59, align 8
+  %83 = getelementptr inbounds nuw i8, ptr %24, i64 %58
+  %84 = getelementptr inbounds nuw i8, ptr %83, i64 8
+  %85 = load i64, ptr %84, align 8
+  %86 = or i64 %85, 1
+  store i64 %86, ptr %84, align 8
+  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef nonnull %24, i64 noundef %58)
+  br label %87
 
-71:                                               ; preds = %45
-  %72 = getelementptr inbounds nuw i8, ptr %58, i64 8
-  %73 = load i64, ptr %72, align 8
-  %74 = and i64 %73, 1
-  %75 = or i64 %64, %74
-  %76 = or i64 %75, 2
-  store i64 %76, ptr %72, align 8
-  %77 = getelementptr inbounds nuw i8, ptr %58, i64 %64
-  %78 = getelementptr inbounds nuw i8, ptr %77, i64 8
-  %79 = load i64, ptr %78, align 8
-  %80 = or i64 %79, 1
-  store i64 %80, ptr %78, align 8
-  %81 = load i64, ptr %61, align 8
-  %82 = and i64 %81, 1
-  %83 = or i64 %60, %82
-  %84 = or i64 %83, 2
-  store i64 %84, ptr %61, align 8
-  %85 = getelementptr inbounds nuw i8, ptr %26, i64 %60
-  %86 = getelementptr inbounds nuw i8, ptr %85, i64 8
-  %87 = load i64, ptr %86, align 8
-  %88 = or i64 %87, 1
-  store i64 %88, ptr %86, align 8
-  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef nonnull %26, i64 noundef %60)
-  br label %89
+87:                                               ; preds = %69, %65, %38
+  %88 = phi ptr [ %24, %38 ], [ %56, %69 ], [ %56, %65 ]
+  %89 = getelementptr inbounds nuw i8, ptr %88, i64 8
+  %90 = load i64, ptr %89, align 8
+  %91 = and i64 %90, 3
+  %92 = icmp eq i64 %91, 0
+  br i1 %92, label %109, label %93
 
-89:                                               ; preds = %71, %67, %40
-  %90 = phi ptr [ %26, %40 ], [ %58, %71 ], [ %58, %67 ]
-  %91 = getelementptr inbounds nuw i8, ptr %90, i64 8
-  %92 = load i64, ptr %91, align 8
-  %93 = and i64 %92, 3
-  %94 = icmp eq i64 %93, 0
-  br i1 %94, label %111, label %95
+93:                                               ; preds = %87
+  %94 = and i64 %90, -8
+  %95 = add i64 %18, 32
+  %96 = icmp ugt i64 %94, %95
+  br i1 %96, label %97, label %109
 
-95:                                               ; preds = %89
-  %96 = and i64 %92, -8
-  %97 = add i64 %20, 32
-  %98 = icmp ugt i64 %96, %97
-  br i1 %98, label %99, label %111
+97:                                               ; preds = %93
+  %98 = sub i64 %94, %18
+  %99 = getelementptr inbounds nuw i8, ptr %88, i64 %18
+  %100 = and i64 %90, 1
+  %101 = or disjoint i64 %18, %100
+  %102 = or disjoint i64 %101, 2
+  store i64 %102, ptr %89, align 8
+  %103 = getelementptr inbounds nuw i8, ptr %99, i64 8
+  %104 = or disjoint i64 %98, 3
+  store i64 %104, ptr %103, align 8
+  %105 = getelementptr inbounds nuw i8, ptr %88, i64 %94
+  %106 = getelementptr inbounds nuw i8, ptr %105, i64 8
+  %107 = load i64, ptr %106, align 8
+  %108 = or i64 %107, 1
+  store i64 %108, ptr %106, align 8
+  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef %99, i64 noundef %98)
+  br label %109
 
-99:                                               ; preds = %95
-  %100 = sub i64 %96, %20
-  %101 = getelementptr inbounds nuw i8, ptr %90, i64 %20
-  %102 = and i64 %92, 1
-  %103 = or disjoint i64 %20, %102
-  %104 = or disjoint i64 %103, 2
-  store i64 %104, ptr %91, align 8
-  %105 = getelementptr inbounds nuw i8, ptr %101, i64 8
-  %106 = or disjoint i64 %100, 3
-  store i64 %106, ptr %105, align 8
-  %107 = getelementptr inbounds nuw i8, ptr %90, i64 %96
-  %108 = getelementptr inbounds nuw i8, ptr %107, i64 8
-  %109 = load i64, ptr %108, align 8
-  %110 = or i64 %109, 1
-  store i64 %110, ptr %108, align 8
-  tail call fastcc void @__temen_dl.dispose_chunk(ptr noundef %101, i64 noundef %100)
-  br label %111
+109:                                              ; preds = %97, %93, %87
+  %110 = getelementptr inbounds nuw i8, ptr %88, i64 16
+  %111 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
+  %112 = and i32 %111, 2
+  %113 = icmp eq i32 %112, 0
+  br i1 %113, label %115, label %114
 
-111:                                              ; preds = %99, %95, %89
-  %112 = getelementptr inbounds nuw i8, ptr %90, i64 16
-  %113 = load i32, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 880), align 8
-  %114 = and i32 %113, 2
-  %115 = icmp eq i32 %114, 0
-  br i1 %115, label %117, label %116
-
-116:                                              ; preds = %111
+114:                                              ; preds = %109
   store atomic i32 0, ptr getelementptr inbounds nuw (i8, ptr @__temen_dl._gm_, i64 884) release, align 4
-  br label %117
+  br label %115
 
-117:                                              ; preds = %116, %111, %16, %14
-  %118 = phi ptr [ null, %14 ], [ null, %16 ], [ %112, %111 ], [ %112, %116 ]
-  ret ptr %118
+115:                                              ; preds = %114, %109, %14, %10
+  %116 = phi ptr [ null, %10 ], [ null, %14 ], [ %110, %109 ], [ %110, %114 ]
+  ret ptr %116
 }
 
 ; Function Attrs: nounwind uwtable
@@ -3738,7 +3720,7 @@ define dso_local range(i32 0, 23) i32 @__temen_dl.dlposix_memalign(ptr noundef w
   ret i32 %27
 }
 
-declare ptr @__temen_sbrk(i64 noundef) local_unnamed_addr #8
+declare ptr @__temen_sbrk(i64 noundef) local_unnamed_addr #7
 
 ; Function Attrs: nofree nounwind uwtable
 define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr noundef %1, i64 noundef range(i64 -1, -105) %2) unnamed_addr #4 {
@@ -3861,11 +3843,11 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %189
 
 81:                                               ; preds = %74, %71
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 82:                                               ; preds = %58, %55
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 83:                                               ; preds = %42
@@ -3901,7 +3883,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %133
 
 103:                                              ; preds = %98, %94, %89
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 104:                                              ; preds = %83
@@ -3950,7 +3932,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %133
 
 132:                                              ; preds = %128
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 133:                                              ; preds = %131, %108, %102
@@ -4002,7 +3984,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %162
 
 161:                                              ; preds = %151
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 162:                                              ; preds = %159, %158
@@ -4034,7 +4016,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %178
 
 177:                                              ; preds = %172
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 178:                                              ; preds = %174, %167
@@ -4055,11 +4037,11 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %189
 
 187:                                              ; preds = %182
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 188:                                              ; preds = %164
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 189:                                              ; preds = %184, %178, %162, %145, %133, %78, %64
@@ -4108,7 +4090,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br i1 %219, label %220, label %221, !prof !7
 
 220:                                              ; preds = %215
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 221:                                              ; preds = %215, %213
@@ -4217,7 +4199,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %303
 
 289:                                              ; preds = %281
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 290:                                              ; preds = %267
@@ -4242,7 +4224,7 @@ define internal fastcc nonnull ptr @__temen_dl.prepend_alloc(ptr noundef %0, ptr
   br label %303
 
 302:                                              ; preds = %290
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 303:                                              ; preds = %297, %285, %253, %221, %31, %23
@@ -4338,11 +4320,11 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %174
 
 57:                                               ; preds = %50, %48
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 58:                                               ; preds = %35, %33
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 59:                                               ; preds = %21
@@ -4377,7 +4359,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %107
 
 78:                                               ; preds = %73, %69, %65
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 79:                                               ; preds = %59
@@ -4425,7 +4407,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %107
 
 106:                                              ; preds = %103
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 107:                                              ; preds = %105, %83, %77
@@ -4477,7 +4459,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %136
 
 135:                                              ; preds = %125
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 136:                                              ; preds = %133, %132
@@ -4509,7 +4491,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %152
 
 151:                                              ; preds = %146
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 152:                                              ; preds = %148, %141
@@ -4530,11 +4512,11 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %174
 
 161:                                              ; preds = %156
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 162:                                              ; preds = %138
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 163:                                              ; preds = %18
@@ -4556,7 +4538,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %463
 
 173:                                              ; preds = %12
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 174:                                              ; preds = %163, %158, %152, %136, %119, %107, %54, %41, %2
@@ -4674,11 +4656,11 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %348
 
 242:                                              ; preds = %235, %233
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 243:                                              ; preds = %220, %218
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 244:                                              ; preds = %204
@@ -4713,7 +4695,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %292
 
 263:                                              ; preds = %258, %254, %250
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 264:                                              ; preds = %244
@@ -4761,7 +4743,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %292
 
 291:                                              ; preds = %288
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 292:                                              ; preds = %290, %268, %262
@@ -4813,7 +4795,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %321
 
 320:                                              ; preds = %310
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 321:                                              ; preds = %318, %317
@@ -4845,7 +4827,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %337
 
 336:                                              ; preds = %331
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 337:                                              ; preds = %333, %326
@@ -4866,11 +4848,11 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %348
 
 346:                                              ; preds = %341
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 347:                                              ; preds = %323
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 348:                                              ; preds = %343, %337, %321, %304, %292, %239, %226
@@ -4926,7 +4908,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br i1 %378, label %379, label %380, !prof !7
 
 379:                                              ; preds = %374
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 380:                                              ; preds = %374, %372
@@ -5035,7 +5017,7 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %463
 
 448:                                              ; preds = %440
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 449:                                              ; preds = %426
@@ -5060,11 +5042,11 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
   br label %463
 
 461:                                              ; preds = %449
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 462:                                              ; preds = %174
-  tail call void @abort() #11
+  tail call void @abort() #10
   unreachable
 
 463:                                              ; preds = %456, %444, %412, %380, %354, %198, %194, %187, %168, %8
@@ -5072,16 +5054,16 @@ define internal fastcc void @__temen_dl.dispose_chunk(ptr noundef %0, i64 nounde
 }
 
 ; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
-declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #9
+declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64) #8
 
 ; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
-declare i64 @llvm.umin.i64(i64, i64) #9
+declare i64 @llvm.umin.i64(i64, i64) #8
 
 ; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
-declare i64 @llvm.umax.i64(i64, i64) #9
+declare i64 @llvm.umax.i64(i64, i64) #8
 
 ; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
-declare i64 @llvm.ctpop.i64(i64) #9
+declare i64 @llvm.ctpop.i64(i64) #8
 
 attributes #0 = { nounwind uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
 attributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }
@@ -5089,13 +5071,11 @@ attributes #2 = { cold nofree noreturn nounwind "no-trapping-math"="true" "stack
 attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
 attributes #4 = { nofree nounwind uwtable "min-legal-vector-width"="0" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
 attributes #5 = { nocallback nofree nounwind willreturn memory(argmem: write) }
-attributes #6 = { mustprogress nofree nosync nounwind willreturn memory(none) "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
-attributes #7 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }
-attributes #8 = { "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
-attributes #9 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
-attributes #10 = { nounwind }
-attributes #11 = { noreturn nounwind }
-attributes #12 = { nounwind willreturn memory(none) }
+attributes #6 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }
+attributes #7 = { "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="x86-64" "target-features"="+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87" "tune-cpu"="generic" }
+attributes #8 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #9 = { nounwind }
+attributes #10 = { noreturn nounwind }
 
 !llvm.module.flags = !{!0, !1, !2, !3}
 !llvm.ident = !{!4}

@@ -590,6 +590,9 @@ into the window's reserved tail by `vm_map`-committing pages on demand via the `
       own spin lock (atomics, `USE_SPIN_LOCKS`) serializes both allocation and `MORECORE`, so it is
       what keeps parallel vCPUs apart now (#1097) and `__temen_sbrk` takes no lock. `calloc` clears
       what it reuses; `realloc`, `memalign`, `aligned_alloc` and `posix_memalign` are dlmalloc's.
+      Running out of memory returns `NULL` (`heap_exhaustion_returns_null`): `MALLOC_FAILURE_ACTION`
+      is empty, because dlmalloc's default sets `errno` and the on-ramp's `__errno_location` traps.
+      The playground's C heap is the same configuration, built as a link unit (BROWSER.md, #2172).
 
 **Slice T (DONE) — multi-value struct returns.** A small by-value struct returned in registers (clang
 coerces it to e.g. `{ i64, i64 }` / `{ i64, ptr }`, as clay's `*Array_Allocate_Arena` and any C

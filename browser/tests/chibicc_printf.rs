@@ -12,6 +12,9 @@ use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK,
 };
 
+#[path = "support/pg_heap.rs"]
+mod pg_heap;
+
 fn chibicc_temen() -> Option<Vec<u8>> {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/chibicc.temen");
     std::fs::read(p).ok()
@@ -25,12 +28,19 @@ fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
     let dirs = vec!["include".to_string()];
     let image = temen_fs::encode_image(&files, &dirs);
 
-    // Pass 1 — chibicc.temen emits TEMEN-IR text on stdout. `--data-page 65536` mirrors the browser card
-    // (D40 isolation at the 64 KiB wasm host page), so this exercises exactly the shipped path.
+    // Pass 1 — chibicc.temen emits a program unit's TEMEN-IR text on stdout. `--data-page 65536` mirrors
+    // the browser card (D40 isolation at the 64 KiB wasm host page), so this exercises the shipped path.
     let compiled = onramp_fs_exec(
         chibicc,
         &image,
-        &[b"chibicc", b"--data-page", b"65536", b"-g0", b"/in.c"],
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"-g0",
+            b"/in.c",
+        ],
         b"",
     );
     assert!(
@@ -41,9 +51,9 @@ fn compile_and_run(chibicc: &temen_ir::Module, src: &str) -> (i32, String) {
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
     assert!(ir.contains("func"), "expected Temen IR, got: {ir:.200}");
 
-    // Pass 2 — parse the IR into a module and run it under the powerbox.
+    // Pass 2 — parse the IR, link it against the heap unit and run it under the powerbox.
     let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}\n{ir}"));
-    let run = onramp_exec(&m, b"");
+    let run = onramp_exec(&pg_heap::link(&[], &m), b"");
     (
         run.status,
         String::from_utf8_lossy(&run.stdout).into_owned(),

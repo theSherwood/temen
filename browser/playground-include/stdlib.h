@@ -1,12 +1,11 @@
 #ifndef __STDLIB_H
 #define __STDLIB_H
 
-// <stdlib.h> for the playground. `malloc` is a **map-growing, thread-safe** bump allocator: it
-// claims bytes with a lock-free atomic fetch-add on a bump pointer in the reserved window tail and
-// commits fresh host pages on demand with `__vm_map` (the same allocator the frontend's own
-// stdlib.h ships, so a threaded lesson's pthread stacks — 256 KiB each — and any large malloc grow
-// past the modest initial window instead of hitting a fixed arena cap). `free` is a no-op (MVP:
-// no reclamation). No authority beyond the granted Memory capability, all guest C.
+// <stdlib.h> for the playground. `malloc`/`free`/`calloc`/`realloc` are declared here and defined by
+// the playground's heap unit, dlmalloc built by clang (`browser/playground-heap/pg_heap.c` →
+// `web/assets/pg_heap.temeno`, #2172), which every C card program links: freed memory is reused, and
+// the heap grows by committing host pages with `__vm_map`, so a threaded lesson's pthread stacks and any
+// large allocation fit. No authority beyond the granted Memory capability.
 #include <__pg_linkage.h>
 #include <stdarg.h>
 
@@ -18,9 +17,9 @@ void exit(int code);
 
 // The Memory-capability builtins (§3e/§4), lowered to `cap.call` on the granted Memory handle.
 // `__vm_map` commits `[off, off+len)` (prot READ|WRITE = 3), returning 0 or a negative errno;
-// `__vm_page_size` is the host MMU granularity `map` rounds to. The atomics make the bump pointer
-// thread-safe (a single-threaded program pays only an uncontended atomic and never pulls in the
-// thread runtime — only `thread.spawn`/`wait`/`notify` mark a module threaded).
+// `__vm_page_size` is the host MMU granularity `map` rounds to. The atomics are the VM's (a
+// single-threaded program pays only an uncontended atomic and never pulls in the thread runtime —
+// only `thread.spawn`/`wait`/`notify` mark a module threaded).
 long __vm_map(long off, long len, int prot);
 long __vm_page_size(void);
 long __vm_atomic_add(void *p, long v);                     // fetch-add (i64), returns old
@@ -29,23 +28,23 @@ void __vm_atomic_store(void *p, long v);                   // store (i64)
 int __vm_atomic_cas32(void *p, int expected, int desired); // CAS (i32), returns old
 void __vm_atomic_store32(void *p, int v);                  // store (i32)
 
-#define __PG_HEAP_BASE 268435456L // 256 MiB: above the backed prefix, in the reserved tail
-#define __PG_HDR 16L              // per-allocation header (holds the payload size; 16-byte aligned)
-
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;
 
-// ---- prototypes (a program unit, #1392) --------------------------------------------------
-// Same split as <stdio.h>: a translation unit compiled decls-only (`-include __pg_decls_only.h`)
-// sees these prototypes and links against the prebuilt libc unit that carries the bodies once,
-// instead of recompiling the allocator and the string/number conversions into every program. The
-// bodies are compiled in by default, where `__PG_FN` makes them `static inline` so an unused one is
-// dead-stripped — hence the guard around the prototypes, which would otherwise make them roots.
-#ifdef __PG_LIBC_DECLS_ONLY
+// The heap, defined by the heap unit every program links (see the top of this file): a declaration in
+// every compile mode, since no compile of these headers ever defines it.
 void *malloc(size_t n);
 void free(void *p);
 void *calloc(size_t nm, size_t sz);
 void *realloc(void *old, size_t n);
+
+// ---- prototypes (a program unit, #1392) --------------------------------------------------
+// Same split as <stdio.h>: a translation unit compiled decls-only (`-include __pg_decls_only.h`)
+// sees these prototypes and links against the prebuilt libc unit that carries the bodies once,
+// instead of recompiling the string/number conversions into every program. The
+// bodies are compiled in by default, where `__PG_FN` makes them `static inline` so an unused one is
+// dead-stripped — hence the guard around the prototypes, which would otherwise make them roots.
+#ifdef __PG_LIBC_DECLS_ONLY
 void abort(void);
 int abs(int x);
 long labs(long x);
