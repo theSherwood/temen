@@ -1766,7 +1766,8 @@ fn import_sig<'a>(m: &'a Module, imp: &temen_ir::Import) -> Option<(&'a [ValType
 /// Two link passes: the first (compute shim only) surfaces the retained syscall imports — their nim
 /// names (`sysWrite.0.` …) aren't known until link — then the adapter is bound onto them and the whole
 /// thing re-linked. The units link in [`link_order`], and the program ships through
-/// [`temen_opt::optimize_linked`] (its tiniest callees inlined, its blocks in reverse postorder). Re-verify
+/// [`temen_opt::optimize_linked`] (its tiniest callees inlined, each function cleaned up without folding
+/// floats, its blocks in reverse postorder). Re-verify
 /// the result like any linked output (the caller runs `run_powerbox`, which verifies).
 pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<Module, LengError> {
     let units = &link_order(units);

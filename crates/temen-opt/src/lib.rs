@@ -201,6 +201,11 @@ pub struct OptConfig {
     /// Cross-block redundant-load elimination (`temen_opt::load_elim`) — module-level, runs with the
     /// other whole-function passes before `optimize_func` (OPT.md Phase 4).
     pub load_elim: bool,
+    /// Fold float and vector ops: scalar float arithmetic, comparisons and conversions, and SIMD
+    /// lanes. Not a pass, so [`OptConfig::none`] keeps it on. [`optimize_linked`] turns it off: a
+    /// link must come out the same from a host linker and an in-guest one, and a float fold can
+    /// differ between them (a NaN's payload, or the libm ops an in-guest temen-opt cannot fold).
+    pub floats: bool,
 }
 
 impl OptConfig {
@@ -219,6 +224,7 @@ impl OptConfig {
             dfe: true,
             mem: true,
             load_elim: true,
+            floats: true,
         }
     }
     /// Every optional pass off — only the always-on intra-block canonicalization runs. The ablation
@@ -237,6 +243,7 @@ impl OptConfig {
             dfe: false,
             mem: false,
             load_elim: false,
+            floats: true,
         }
     }
 }
@@ -370,7 +377,7 @@ pub fn optimize_func_with(
     // below cannot see. It materializes constants and resolves constant branches; the fixpoint then
     // prunes the newly-unreachable blocks, DCEs the dead selector code, merges, and re-folds.
     let f = if cfg.sccp {
-        sccp::sccp(f, fn_results, types)
+        sccp::sccp(f, fn_results, types, cfg.floats)
     } else {
         f.clone()
     };
@@ -384,7 +391,7 @@ pub fn optimize_func_with(
     let mut blocks: Vec<Block> = f
         .blocks
         .iter()
-        .map(|b| fold_block(b, fn_results, types))
+        .map(|b| fold_block(b, fn_results, types, cfg.floats))
         .collect();
     for _ in 0..1000 {
         let before = blocks.clone();
@@ -423,7 +430,7 @@ pub fn optimize_func_with(
         // dropping params can expose new constants — both newly foldable here.
         blocks = blocks
             .iter()
-            .map(|b| fold_block(b, fn_results, types))
+            .map(|b| fold_block(b, fn_results, types, cfg.floats))
             .collect();
         // Jump threading: redirect an edge that reaches an empty conditional forwarder with a
         // constant selector straight to the resolved target (correlated branches). The next
@@ -444,7 +451,12 @@ pub fn optimize_func_with(
 
 /// Forward pass over one block: replace foldable instructions with constants in place, then
 /// resolve the terminator against the constants discovered. No value indices move.
-fn fold_block(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Block {
+fn fold_block(
+    b: &Block,
+    fn_results: &[usize],
+    types: &[temen_ir::TypeEntry],
+    floats: bool,
+) -> Block {
     // `known[i]` is the constant value (if any) of block-local value index `i`. Seed with the
     // block params (always unknown), then extend by each instruction's result arity in order.
     let mut known: Vec<Option<Known>> = vec![None; b.params.len()];
@@ -453,7 +465,7 @@ fn fold_block(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) ->
     for inst in insts.iter_mut() {
         let rc = inst.result_count(fn_results, types);
         if rc == 1 {
-            if let Some(k) = try_fold(inst, &known) {
+            if let Some(k) = try_fold(inst, &known, floats) {
                 *inst = k.to_const_inst();
                 known.push(Some(k));
             } else {
@@ -494,8 +506,21 @@ pub(crate) fn get(known: &[Option<Known>], idx: ValIdx) -> Option<Known> {
 /// Try to fold a pure, single-result integer instruction to a constant. Returns `None` when
 /// an operand is not known, the op is not foldable, or folding it would trap (div/rem by
 /// zero or signed overflow) — in which case the original instruction is kept so the residual
-/// traps identically to the source.
-pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>]) -> Option<Known> {
+/// traps identically to the source. Without `floats` ([`OptConfig::floats`]) only the integer
+/// ops and `select`, which evaluates nothing, fold.
+pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>], floats: bool) -> Option<Known> {
+    let integer = matches!(
+        inst,
+        Inst::IntBin { .. }
+            | Inst::IntCmp { .. }
+            | Inst::IntUn { .. }
+            | Inst::Eqz { .. }
+            | Inst::Convert { .. }
+            | Inst::Select { .. }
+    );
+    if !floats && !integer {
+        return None;
+    }
     match *inst {
         Inst::IntBin { ty, op, a, b } => {
             // Both operands known: the exact arithmetic fold.
@@ -2163,16 +2188,19 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
 }
 
 /// The passes a linker runs on a **whole program** before it ships it (temen-leng's link, #2147):
-/// inline direct calls to callees of at most [`LINKED_MAX_CALLEE`] instructions
-/// ([`interproc::inline_calls_with`]), then number every function's blocks in reverse postorder
-/// ([`order_blocks`]).
+/// 1. inline direct calls to callees of at most [`LINKED_MAX_CALLEE`] instructions
+///    ([`interproc::inline_calls_with`]);
+/// 2. canonicalize every function ([`optimize_func_with`] with every optional pass off): fold
+///    constants, resolve constant branches, prune dead blocks, merge straight-line chains, drop dead
+///    block parameters, propagate copies and drop dead values;
+/// 3. number every function's blocks in reverse postorder ([`order_blocks`]).
 ///
-/// Unlike [`optimize_module`] it folds nothing and runs no cleanup. That keeps it cheap enough for
-/// every link (milliseconds per 100k instructions), and since it evaluates nothing, a host linker
-/// and an in-guest one (whose temen-opt is built without `libm-floats`) produce the same module.
-/// Nearly every callee this small is a single block, so a splice leaves no threaded value for a
-/// cleanup to prune. The budget, half the program, only bounds a pathological cycle: the size limit
-/// keeps real growth to a few percent.
+/// Step 2 folds no float or vector op ([`OptConfig::floats`]), so a host linker and an in-guest one
+/// (whose temen-opt is built without `libm-floats`) still produce the same module, which the
+/// self-hosted lane's fixed point requires. It runs none of the optional passes (SCCP, CSE, memory
+/// forwarding, jump threading): on nimony's `hexer` they take four times as long and save 0.1% more
+/// instructions. The budget, half the program, only bounds a pathological cycle; the size limit keeps
+/// real growth small.
 pub fn optimize_linked(m: &Module) -> Module {
     let size: usize = m
         .funcs
@@ -2185,13 +2213,28 @@ pub fn optimize_linked(m: &Module) -> Module {
         budget: size / 2,
     };
     let mut out = interproc::inline_calls_with(m, limits);
+    let cfg = OptConfig {
+        floats: false,
+        ..OptConfig::none()
+    };
+    let fn_results: Vec<usize> = out.funcs.iter().map(|f| f.results.len()).collect();
+    let mut changed = vec![false; out.funcs.len()];
+    for (f, changed) in out.funcs.iter_mut().zip(&mut changed) {
+        let g = optimize_func_with(f, &fn_results, &out.types, &cfg);
+        *changed = g != *f;
+        *f = g;
+    }
+    out.debug_info = out
+        .debug_info
+        .as_ref()
+        .and_then(|d| drop_stale_debug(d, &changed));
     order_blocks(&mut out);
     out
 }
 
-/// The largest callee [`optimize_linked`] inlines. On nimony's `hexer` (#2147) callees of up to 6
-/// instructions take 46% of its calls, for 6% more code; up to 24 take 67%, for 59% more code, and
-/// left uncleaned the larger splices made it slower than inlining only up to 6.
+/// The largest callee [`optimize_linked`] inlines. On nimony's `hexer` (#2147), with the cleanup
+/// that follows, a limit of 12 runs 1.2% fewer instructions than 6 and 24 no fewer than 12, but at 12
+/// the program is 18% larger and Cranelift compiles it 19% slower.
 pub const LINKED_MAX_CALLEE: usize = 6;
 
 /// Number each function's blocks in **reverse postorder** from the entry, with the blocks the entry

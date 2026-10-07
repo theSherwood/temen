@@ -1,5 +1,6 @@
 //! libFuzzer target: the generic optimizer (SCCP + the cleanup fixpoint, `OPT.md` Phase 2) and the
-//! passes a linker runs (`optimize_linked`: tiny callees inlined, blocks in reverse postorder, #2147)
+//! passes a linker runs (`optimize_linked`: tiny callees inlined, a cleanup that folds no floats,
+//! blocks in reverse postorder, #2147)
 //! are semantics-preserving. The input bytes drive the structured generator (shared with `diff` /
 //! `jit_fuzz`) to synthesize a verifier-valid module; each pass must (1) produce IR that
 //! **re-verifies** — an optimizer bug is a clean verify error, never an escape — and (2) compute the
