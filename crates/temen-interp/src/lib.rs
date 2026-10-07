@@ -22121,13 +22121,13 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// already the ABI's non-grant space (`-errno` results; `can_regrant` refuses every negative), so the
 /// tag lives where nothing valid can collide; the `10` top bits keep it clear of the small-magnitude
 /// `-errno` range (top bits `11`). Honored ([`Host::can_grant`]) by the tree-walker's spawn arms for
-/// op 13, op 15 and the op-17 record (v0 and v1), and by the Cranelift JIT's detached spawns, whose
-/// spawner sits in a shared cell its child can call back through ([`Host::into_cell`]: a JIT root
-/// that can mint the grant runs locked, `temen_run::jit_proc::locked`, and so does every JIT child).
-/// `exec_module` and every other admission see a negative handle and refuse it fail-closed through
-/// `can_regrant`; the bytecode engine declines a serving module that spawns, so it meets no
-/// legitimate use there yet (#744). Non-durable (`callee_slot: None` — freeze refuses), the deferred
-/// durability story.
+/// op 13, op 15 and the op-17 record (v0 and v1), and by the detached spawns of the Cranelift JIT and
+/// the bytecode engine, whose spawner sits in a shared cell its child can call back through
+/// ([`Host::into_cell`]: a JIT root that can mint the grant runs locked,
+/// `temen_run::jit_proc::locked`, and so does every JIT child and every domain of the cooperative
+/// bytecode driver). `exec_module` and every other admission see a negative handle and refuse it
+/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_slot: None`
+/// — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
 /// The eval-loop spawn arms' authority check over a parsed grant list (ops 13, 15 and 17): every
@@ -23021,9 +23021,9 @@ pub struct Host {
     /// client's end. A waiter reads it under the lock, drops the lock, and parks on the run's one
     /// host-call park (`temen_jit::park_host_call`, keyed on the bell's address) until it moves; the
     /// waker bumps it and wakes that key. So the transport's waits are counted for the run's
-    /// deadlock verdict like every other park. `None` for hosts that are not a JIT run's shared
-    /// cells (interp domains, raw top-level runs): nothing rings them, and a caller reaching one is
-    /// refused. Armed by [`Host::into_cell`].
+    /// deadlock verdict like every other park. Armed by [`Host::into_cell`]; only the JIT parks on
+    /// it (the cooperative bytecode driver's cells carry one unused). `None` for a host in no cell:
+    /// nothing rings it, and a JIT caller reaching one is refused.
     svc_bell: Option<Arc<AtomicU64>>,
     /// #744 — the shared cell this host sits in ([`Host::into_cell`]): a JIT root that runs locked,
     /// or a JIT child. A detached spawn it builds mints a live self-serve grant
@@ -27877,16 +27877,22 @@ impl Host {
         std::mem::take(&mut self.client_gone)
     }
 
-    /// #744 — move this host into a JIT run's **shared cell**: what a JIT root that runs locked, and
-    /// every JIT child, runs over. The cell knows itself ([`Host::self_cell`]), so a child can be
-    /// granted a live offer back into it, and carries the parked transport's bell
-    /// ([`Host::svc_bell`]), so a call through such an offer can wake its serve loop.
-    /// [`Host::from_cell`] takes it back.
+    /// #744 — move this host into a **shared cell**: what a JIT root that runs locked, every JIT
+    /// child, and every domain of the cooperative bytecode driver run over. The cell knows itself
+    /// ([`Host::self_cell`]), so a child can be granted a live offer back into it, and carries the
+    /// JIT parked transport's bell ([`Host::svc_bell`]), so a call through such an offer can wake
+    /// its serve loop. [`Host::from_cell`] takes it back.
     pub fn into_cell(mut self) -> Arc<Mutex<Host>> {
         self.svc_bell = Some(Arc::new(AtomicU64::new(0)));
         let cell = Arc::new(Mutex::new(self));
         cell.lock_unpoisoned().self_cell = Some(Arc::downgrade(&cell));
         cell
+    }
+
+    /// #744 — the shared cell this host sits in ([`Host::into_cell`]), which a live self-serve grant
+    /// calls back through; `None` when it sits in none.
+    pub(crate) fn own_cell(&self) -> Option<Arc<Mutex<Host>>> {
+        self.self_cell.as_ref().and_then(Weak::upgrade)
     }
 
     /// Take a host back out of the cell [`Host::into_cell`] made, once its run is over: no longer a
@@ -30144,7 +30150,7 @@ impl Host {
         // another vCPU's spawn to take (#1972).
         // #744 — a live self-serve grant calls back into this host through its own shared cell, when
         // it sits in one (a JIT root that serves, or a JIT child); without one it is refused.
-        let cell = self.self_cell.as_ref().and_then(Weak::upgrade);
+        let cell = self.own_cell();
         let (mut ch, cinst, cas) = self.spawn_child_powerbox(
             grants,
             reservation,
