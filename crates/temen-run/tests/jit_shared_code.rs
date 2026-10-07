@@ -9,10 +9,14 @@
 //! the JIT the run compiles exactly two modules: the parent's program, which its twins run, and the
 //! command, which all three execs run.
 //!
+//! Runs handed one [`JitCodeCache`] share those compiles (#2145): a later run compiles neither, and
+//! each of its processes instances the earlier run's code over its own powerbox, cells and window.
+//!
 //! The only test in its binary, so the process-wide compile counter moves only for this run.
 
 use temen_run::{
-    instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig, SharedHostProc,
+    instantiate_with_imports, Backend, HostCap, Imports, JitCodeCache, Limits, Outcome, RunConfig,
+    SharedHostProc,
 };
 use temen_text::parse_module;
 
@@ -96,7 +100,7 @@ block 0 (v0: i64) {
 }
 "#;
 
-fn run_on(backend: Backend) -> Outcome {
+fn run_on(backend: Backend, cfg: &RunConfig) -> Outcome {
     let parent = parse_module(PARENT).expect("parse parent");
     let command = parse_module(COMMAND).expect("parse command");
     let cmd_wl = command.memory.expect("command window").size_log2;
@@ -120,21 +124,51 @@ fn run_on(backend: Backend) -> Outcome {
         let h = host.grant_module(&command);
         p.register_executable("/bin/c", h, cmd_wl);
     };
-    inst.run_with_caps_and_host(backend, &RunConfig::default(), &[], Some(&mut setup))
+    inst.run_with_caps_and_host(backend, cfg, &[], Some(&mut setup))
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"))
         .outcome
 }
 
+/// How many modules a JIT run under `cfg` compiles.
+fn jit_compiles(cfg: &RunConfig) -> u64 {
+    let before = temen_jit::module_compiles();
+    assert_eq!(run_on(Backend::Jit, cfg), Outcome::Exited(6), "Jit");
+    temen_jit::module_compiles() - before
+}
+
 #[test]
 fn a_tree_compiles_its_program_once_for_its_twins_and_a_command_once_for_its_execs() {
+    let plain = RunConfig::default();
     for backend in [Backend::TreeWalk, Backend::Bytecode] {
-        assert_eq!(run_on(backend), Outcome::Exited(6), "{backend:?}");
+        assert_eq!(run_on(backend, &plain), Outcome::Exited(6), "{backend:?}");
     }
-    let before = temen_jit::module_compiles();
-    assert_eq!(run_on(Backend::Jit), Outcome::Exited(6), "Jit");
     assert_eq!(
-        temen_jit::module_compiles() - before,
+        jit_compiles(&plain),
         2,
         "the parent's program and the command, each compiled once"
     );
+
+    // #2145 — runs handed one cache compile each program once between them, the root's included.
+    let cache = JitCodeCache::default();
+    let cached = RunConfig {
+        jit_code: Some(cache.clone()),
+        ..RunConfig::default()
+    };
+    assert_eq!(jit_compiles(&cached), 2, "the first run compiles both");
+    assert_eq!(jit_compiles(&cached), 0, "a later run compiles neither");
+    // Code for an unmetered run carries no fuel checks: it is not the metered runs' code.
+    let unmetered = RunConfig {
+        limits: Limits {
+            fuel: Some(u64::MAX),
+            ..Limits::default()
+        },
+        ..cached.clone()
+    };
+    assert_eq!(
+        jit_compiles(&unmetered),
+        2,
+        "unmetered code is compiled apart"
+    );
+    assert_eq!(jit_compiles(&unmetered), 0);
+    assert_eq!(cache.compiled(), 4);
 }

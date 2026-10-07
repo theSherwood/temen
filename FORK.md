@@ -981,7 +981,11 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   runs it instantiates (`temen_jit::SharedCode`), with its own powerbox, function table and run
   state: the process that compiled it, its twins, and every later `execve` of the same command. The
   tree finds a command's compile by what the code depends on besides the module: the grant, the
-  window, the entry, whether it polls the tree's kill-path cell, and its fork sites. Code that needs
+  window, the entry, whether it polls the tree's kill-path cell, whether it charges fuel, and its
+  fork sites. An embedder can keep these compiles past the run (`RunConfig::jit_code`, a
+  `JitCodeCache`, #2145). Every run handed the same cache compiles each program once, the root's
+  included. Each instance polls its own run's cells, which reach the code through the `vmctx`, so
+  code compiled in one run serves the next. Code that needs
   a runtime one instance owns (a §14 nursery, a `setjmp` table, the fiber and thread runtime), or
   that a program able to drive the §22 `Jit` could extend, is compiled per process. Code that only
   waits and notifies is shared: its futex sites load the thread domain from the `vmctx`, and each

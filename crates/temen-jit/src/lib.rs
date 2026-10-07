@@ -6095,14 +6095,19 @@ unsafe impl Send for SharedCode {}
 unsafe impl Sync for SharedCode {}
 
 impl SharedCode {
-    /// A new instance of the code, dispatching its `call.cap`s into `cap_ctx` — the instance's own
-    /// powerbox. It polls the kill-path, fuel and signal cells the code was compiled against, which
-    /// every instance of it shares.
-    pub fn instance(&self, cap_ctx: *mut core::ffi::c_void) -> CompiledModule {
-        self.0.instance(InstanceAddrs {
-            cap_ctx,
-            ..self.0.instance
-        })
+    /// A new instance of the code at `addrs`: `cap_ctx` is its own powerbox, and `epoch`, `fuel` and
+    /// `sig_armed` the cells its checks poll — its run's, which need not be the cells of the run that
+    /// compiled it (#2145). A cell is set exactly when the code was compiled with its check: code
+    /// without the check never reads it, and a check of a null cell would fault in the host.
+    pub fn instance(&self, addrs: InstanceAddrs) -> CompiledModule {
+        assert_eq!(addrs.epoch.is_null(), !self.0.epoch, "kill-path cell");
+        assert_eq!(addrs.fuel.is_null(), !self.0.fuel, "fuel cell");
+        assert_eq!(
+            addrs.sig_armed.is_null(),
+            self.0.instance.sig_armed.is_null(),
+            "signal cell"
+        );
+        self.0.instance(addrs)
     }
 }
 

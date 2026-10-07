@@ -11,9 +11,11 @@
 //! * code that only waits and notifies **is** shared: its sites load the thread domain from the
 //!   instance's context, and each instance gets one of its own. (Before, the sites baked the domain,
 //!   so a process that could sleep could not fork.)
+//! * an instance polls the cells it is given, not the compile's: shared code outlives the run that
+//!   compiled it (#2145).
 
 use core::ffi::c_void;
-use temen_jit::{CompiledModule, JitError, JitOutcome, INERT_CAP_THUNK};
+use temen_jit::{CompiledModule, FuelCell, InstanceAddrs, JitError, JitOutcome, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
 /// A `call.cap` whose answer is the powerbox's own: the thunk returns the `i64` its ctx points at.
@@ -72,6 +74,45 @@ fn compile(
     .expect("compile")
 }
 
+/// Answers 7, charging fuel when compiled with fuel checks.
+const SEVEN: &str = "memory 16
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 7
+  return v1
+  }
+}
+";
+
+/// `src` compiled with fuel checks against `cell`.
+fn compile_metered(src: &str, cell: *mut FuelCell) -> CompiledModule {
+    let m = parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    CompiledModule::compile(
+        &m,
+        0,
+        INERT_CAP_THUNK,
+        core::ptr::null_mut(),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        None,
+        None,
+        None,
+        Some(cell),
+        None,
+        None,
+        0,
+    )
+    .expect("compile")
+}
+
+/// An instance's addresses with only its powerbox: these compiles arm no kill-path, fuel or signals.
+fn powerbox(cap_ctx: *mut c_void) -> InstanceAddrs {
+    InstanceAddrs {
+        cap_ctx,
+        ..InstanceAddrs::NONE
+    }
+}
+
 fn answer(cm: &mut CompiledModule) -> i64 {
     match cm.run(&[0], None, None).expect("run").0 {
         JitOutcome::Returned(r) => r[0],
@@ -89,7 +130,7 @@ fn each_instance_answers_from_its_own_powerbox_while_the_others_run() {
         for ctx in [b, c] {
             let code = &code;
             s.spawn(move || {
-                let mut cm = code.instance(ctx as *mut c_void);
+                let mut cm = code.instance(powerbox(ctx as *mut c_void));
                 for _ in 0..200 {
                     assert_eq!(answer(&mut cm), unsafe { *(ctx as *const i64) });
                 }
@@ -112,7 +153,7 @@ fn no_instance_of_shared_code_can_extend_it() {
     let extends = |cm: &mut CompiledModule| cm.define_extra(&unit.funcs, &unit.types, None);
     let mut first = compile(ASKS_ITS_POWERBOX, INERT_CAP_THUNK, core::ptr::null_mut(), 4);
     let code = first.share().expect("only code");
-    let mut other = code.instance(core::ptr::null_mut());
+    let mut other = code.instance(powerbox(core::ptr::null_mut()));
     for cm in [&mut first, &mut other] {
         assert!(
             matches!(extends(cm), Err(JitError::Unsupported(_))),
@@ -175,7 +216,7 @@ block 0 (v0: i32) {
         for _ in 0..2 {
             let code = &code;
             s.spawn(move || {
-                let mut cm = code.instance(core::ptr::null_mut());
+                let mut cm = code.instance(powerbox(core::ptr::null_mut()));
                 for _ in 0..20 {
                     assert_eq!(answer(&mut cm), TIMED_OUT);
                 }
@@ -208,4 +249,29 @@ block 0 (v0: i64, v1: i64) {
     assert!(compile(spawns, INERT_CAP_THUNK, core::ptr::null_mut(), 0)
         .share()
         .is_none());
+}
+
+#[test]
+fn an_instance_charges_the_fuel_cell_it_is_given() {
+    // #2145: a later run instances code an earlier run compiled, and charges its own cell.
+    let mut compiled_with = FuelCell::fixed(100);
+    let first = compile_metered(SEVEN, &mut *compiled_with);
+    let code = first.share().expect("only code");
+    let mut later = FuelCell::fixed(100);
+    let mut cm = code.instance(InstanceAddrs {
+        fuel: &mut *later,
+        ..InstanceAddrs::NONE
+    });
+    assert_eq!(answer(&mut cm), 7);
+    assert!(later.left < 100, "the instance charged its own cell");
+    assert_eq!(compiled_with.left, 100, "and not the compile's");
+}
+
+#[test]
+#[should_panic(expected = "fuel cell")]
+fn an_instance_of_fuel_checked_code_needs_a_fuel_cell() {
+    let mut cell = FuelCell::fixed(100);
+    let first = compile_metered(SEVEN, &mut *cell);
+    let code = first.share().expect("only code");
+    let _ = code.instance(powerbox(core::ptr::null_mut()));
 }

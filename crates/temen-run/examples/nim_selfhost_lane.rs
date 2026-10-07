@@ -141,6 +141,7 @@ fn relower(
     cache: &str,
     main: &str,
     engine: temen_run::Backend,
+    jit_code: &temen_run::JitCodeCache,
 ) {
     let stems: Vec<String> = program_units(posix, cache, main)
         .into_iter()
@@ -179,6 +180,7 @@ fn relower(
             &argv,
             &temen_run::ExecGrants::default(),
             engine,
+            Some(jit_code),
         )
         .unwrap_or_else(|e| panic!("hexer on {stem}: {e}"));
         assert!(
@@ -237,7 +239,11 @@ fn expect_host_link(
 }
 
 /// Run the linked program on a fresh personality; its stdout.
-fn run_program(module: &temen_ir::Module, engine: temen_run::Backend) -> Vec<u8> {
+fn run_program(
+    module: &temen_ir::Module,
+    engine: temen_run::Backend,
+    jit_code: &temen_run::JitCodeCache,
+) -> Vec<u8> {
     let (run, make) = temen_posix::cap(0, 0, Vec::new());
     temen_run::nim_noc_run(
         module.clone(),
@@ -246,6 +252,7 @@ fn run_program(module: &temen_ir::Module, engine: temen_run::Backend) -> Vec<u8>
         &["prog".to_string()],
         &temen_run::ExecGrants::default(),
         engine,
+        Some(jit_code),
     )
     .unwrap_or_else(|e| panic!("the program failed on {engine:?}: {e}"));
     run.stdout()
@@ -472,6 +479,8 @@ fn main() {
         .map(|s| s.to_string())
         .collect();
     let t0 = std::time::Instant::now();
+    // One JIT code cache for every run below (#2145): hexer's reruns compile it once.
+    let jit_code = temen_run::JitCodeCache::default();
     // The toolchain may run what it builds (#763): nimony's compile-time evaluation builds a
     // program and execs it.
     let outcome = temen_run::nim_noc_run(
@@ -484,6 +493,7 @@ fn main() {
             built: true,
         },
         engine,
+        Some(&jit_code),
     );
     // The driver quits with `FAILURE: <cmd>` on any failed step; that is an ordinary exit, so ask
     // the memfs what was built: `nimcache/<main>.temen/<prog>.temen`, `<main>` named by the path
@@ -555,9 +565,9 @@ fn main() {
     let mut first: Option<Vec<u8>> = None;
     for (i, &e) in engines.iter().enumerate() {
         if i > 0 {
-            relower(&hexer, &posix, &make, &cache, &main_stem, e);
+            relower(&hexer, &posix, &make, &cache, &main_stem, e, &jit_code);
         }
-        let stdout = run_program(&module, e);
+        let stdout = run_program(&module, e, &jit_code);
         eprintln!(
             "✅ on {e:?}, the program ran: {} bytes of stdout",
             stdout.len()
