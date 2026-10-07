@@ -428,3 +428,86 @@ block 0 (v0: i32) {
         "expected a caught MemoryFault, got {out:?}"
     );
 }
+
+/// #2147 — loads and stores through one base share a bounds check (`temen-jit`'s `CheckedBases`):
+/// the first access through `v0` tests its own address, and later ones at a constant non-negative
+/// distance from it, within the guard page past the window's end, reuse that base. Sweep the base `n`
+/// so each access in turn is the first to cross the end, and below zero so the adds wrap: the JIT must
+/// fault where the interpreter does, after the same stores, and agree on every result.
+#[cfg(unix)]
+#[test]
+fn accesses_sharing_a_checked_base_fault_where_the_interpreter_does() {
+    // Access order, by address: `n+16` (8-byte store: the check point), `n+28` (8-byte load,
+    // `n+24` plus offset 4: shares it), `n+40` (1-byte store, `n` plus offset 40: before the check
+    // point's root offset, so it checks again and becomes the check point), `n` (8-byte load:
+    // shares that one).
+    let shared = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 16
+  v2 = i64.add v0 v1
+  v3 = i64.const 255
+  i64.store v2 v3
+  v4 = i64.const 24
+  v5 = i64.add v0 v4
+  v6 = i64.load v5 offset=4
+  v7 = i32.const 9
+  i32.store8 v0 v7 offset=40
+  v8 = i64.load v0
+  v9 = i64.add v6 v8
+  return v9
+  }
+}
+";
+    // Neither later access may share the check point at `n+20000`: `n+28192` lies more than a page
+    // past it (past the guard page, for `n` near the top), and `n+8` lies before it (for `n` just
+    // below zero, `n+20000` wraps into the window while `n+8` does not).
+    let unshared = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 20000
+  v2 = i64.add v0 v1
+  v3 = i64.load v2
+  v4 = i64.const 28192
+  v5 = i64.add v0 v4
+  v6 = i64.load v5
+  v7 = i64.load v0 offset=8
+  v8 = i64.add v3 v6
+  v9 = i64.add v8 v7
+  return v9
+  }
+}
+";
+    let top: i64 = 1 << 16;
+    let mut ns: Vec<i64> = vec![0, 8, 4096, i64::MAX, i64::MIN, top, top + 4096];
+    ns.extend((0..=48).map(|k| top - k));
+    ns.extend((0..=48).map(|k| -k)); // the adds wrap around zero
+    ns.extend([
+        top - 20008,
+        top - 28200,
+        top - 28192,
+        -20000 + 16384,
+        -16,
+        -3616,
+    ]);
+    let init: Vec<u8> = (0..top).map(|i| (i % 251) as u8).collect();
+    for src in [shared, unshared] {
+        for &n in &ns {
+            let (it, jo, imem, jmem) = both_reserved(src, &init, 0, n);
+            if it {
+                assert!(
+                    matches!(jo, JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault)),
+                    "n={n}: the interpreter faulted, the JIT gave {jo:?}\n{src}"
+                );
+            } else {
+                assert!(
+                    matches!(jo, JitOutcome::Returned(_)),
+                    "n={n}: the interpreter returned, the JIT gave {jo:?}\n{src}"
+                );
+            }
+            assert!(imem == jmem, "n={n}: the windows differ\n{src}");
+        }
+    }
+}

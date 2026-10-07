@@ -85,9 +85,9 @@ impl GuestWindow {
         let page = pal::page_size();
         let reserved = reserved.max(mapped);
         let rw = round_up(mapped, page);
-        let total = round_up(reserved, page) + page; // reserved + one guard page
-                                                     // SAFETY: a fresh inaccessible reservation (a huge `reserved` costs only virtual address
-                                                     // space until pages are committed/touched). Checked non-null below.
+        let total = round_up(reserved, page) + trailing_guard();
+        // SAFETY: a fresh inaccessible reservation (a huge `reserved` costs only virtual address
+        // space until pages are committed/touched). Checked non-null below.
         let base = unsafe { pal::reserve(total) };
         if base.is_null() {
             return None;
@@ -144,7 +144,7 @@ impl GuestWindow {
         if self.mapped == 0 || snap == 0 {
             return Vec::new();
         }
-        let max = self.total - pal::page_size(); // everything but the trailing guard page
+        let max = self.total - trailing_guard(); // everything but the trailing guard page
         let snap = snap.min(max);
         let commit = round_up(snap, pal::page_size()).min(max);
         // SAFETY: `[base, base+commit)` lies in the reservation (≤ total − guard); `commit_rw` makes
@@ -204,7 +204,7 @@ impl GuestWindow {
         }
         let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
         // Everything but the trailing guard page, as `read_low` bounds it.
-        let limit = (self.total - pal::page_size()) as u64;
+        let limit = (self.total - trailing_guard()) as u64;
         for (i, &p) in prots.iter().enumerate() {
             let off = i as u64 * page;
             if off >= mapped {
@@ -274,7 +274,7 @@ impl GuestWindow {
     /// No guest code runs on `self` during the call, and `prots` indexes only pages inside its
     /// reservation.
     pub(crate) unsafe fn fork_copy(&self, prots: &BTreeMap<usize, Prot>) -> Option<GuestWindow> {
-        let twin = GuestWindow::try_new(self.mapped, self.total - pal::page_size())?;
+        let twin = GuestWindow::try_new(self.mapped, self.total - trailing_guard())?;
         if self.mapped == 0 {
             return Some(twin);
         }
@@ -323,7 +323,7 @@ impl GuestWindow {
 pub(crate) fn fault_range_of(base: *mut u8, reserved: usize) -> (usize, usize) {
     let page = pal::page_size();
     let lo = base as usize;
-    (lo, lo + round_up(reserved, page) + page)
+    (lo, lo + round_up(reserved, page) + trailing_guard())
 }
 
 impl Drop for GuestWindow {
@@ -448,6 +448,14 @@ pub(crate) const FAULT_TRAP: i64 = TrapKind::MemoryFault as i64;
 /// The host page size — the §14 demand-paging granularity (what one fault supplies), and a fork
 /// copy's (#1768).
 pub(crate) fn page_size() -> usize {
+    pal::page_size()
+}
+
+/// The inaccessible guard a window reserves past `round_up(reserved, page)`: one page. An access
+/// that reaches up to this far past the reservation still faults, which the JIT leans on to let
+/// accesses near a checked base skip their own check (`trusted_reach ≤ guard_size`, DESIGN.md
+/// D61/D67): it reads its reach from here, so the guard cannot shrink under it.
+pub(crate) fn trailing_guard() -> usize {
     pal::page_size()
 }
 
