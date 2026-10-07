@@ -1613,6 +1613,7 @@ fn check_powerbox_vs_native(name: &str, src: &str, stdin: &[u8]) {
         return;
     };
     let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
+    std::fs::write(&c, src).expect("write C source");
     powerbox_diff(name, &bc, &c, stdin);
 }
 
