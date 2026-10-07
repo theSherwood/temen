@@ -10538,6 +10538,12 @@ fn guard_reach(lower: &Lower) -> u64 {
 /// first. Under misspeculation the check point's base is the guard page's, so every access derived
 /// from it stays on that page. A base is reused only in the CLIF block that computed it, so it always
 /// dominates its uses; a call's trap check or a safepoint starts a new block, and with it new checks.
+///
+/// A store that straddles `reserved` writes nothing before it faults only on hardware that never
+/// tears a faulting store: x86-64 guarantees it, Arm and RISC-V don't. [`mask_addr`] already relies
+/// on the same at `mapped` and at every page the guest protects (#2162). Stores share checks anyway:
+/// with a check of their own, a store's address is a different value from a load's at the same
+/// address, and Cranelift can no longer forward the stored value to the load.
 struct CheckedBases {
     /// [`guard_reach`]: `0` checks every access exactly.
     reach: i128,

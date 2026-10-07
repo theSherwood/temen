@@ -433,7 +433,7 @@ block 0 (v0: i32) {
 /// the first access through `v0` tests its own address, and later ones at a constant non-negative
 /// distance from it, within the guard page past the window's end, reuse that base. Sweep the base `n`
 /// so each access in turn is the first to cross the end, and below zero so the adds wrap: the JIT must
-/// fault where the interpreter does, after the same stores, and agree on every result.
+/// fault where the interpreter does, after the same stores, and return the same result.
 #[cfg(unix)]
 #[test]
 fn accesses_sharing_a_checked_base_fault_where_the_interpreter_does() {
@@ -494,18 +494,19 @@ block 0 (v0: i64) {
     ]);
     let init: Vec<u8> = (0..top).map(|i| (i % 251) as u8).collect();
     for src in [shared, unshared] {
+        let m = temen::text::parse_module(src).expect("parse");
+        temen::verify::verify_module(&m).expect("verify");
         for &n in &ns {
-            let (it, jo, imem, jmem) = both_reserved(src, &init, 0, n);
-            if it {
-                assert!(
-                    matches!(jo, JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault)),
-                    "n={n}: the interpreter faulted, the JIT gave {jo:?}\n{src}"
-                );
-            } else {
-                assert!(
-                    matches!(jo, JitOutcome::Returned(_)),
-                    "n={n}: the interpreter returned, the JIT gave {jo:?}\n{src}"
-                );
+            let mut fuel = 1_000_000u64;
+            let (ir, imem) = run_capture_reserved(&m, 0, &[Value::I64(n)], &mut fuel, &init, 0);
+            let (jo, jmem) = compile_and_run_capture_reserved(&m, 0, &[n], &init, 0).expect("jit");
+            match (&ir, &jo) {
+                (Ok(v), JitOutcome::Returned(r)) => {
+                    let r: Vec<Value> = r.iter().map(|&x| Value::I64(x)).collect();
+                    assert_eq!(v, &r, "n={n}: the results differ\n{src}");
+                }
+                (Err(_), JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault)) => {}
+                _ => panic!("n={n}: the interpreter gave {ir:?}, the JIT {jo:?}\n{src}"),
             }
             assert!(imem == jmem, "n={n}: the windows differ\n{src}");
         }
