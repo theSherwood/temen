@@ -5,6 +5,11 @@
 //! draws the next chunk from the budget chain the embedder accounts in ([`BudgetNode`]), and only a
 //! spent chain traps `OutOfFuel`. A cell with no source is a fixed allowance, refilled never — a
 //! carve child's, or a harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
+//!
+//! The refill is called through a `PreserveAll` trampoline ([`refill_trampoline`]), which clobbers
+//! no register. A plain call would clobber the caller-saved registers at every safepoint, so a value
+//! live across one would have to sit in a callee-saved register, which the function's prologue then
+//! saves and restores on every call, refill or not (#2147).
 
 use std::sync::{Arc, Mutex};
 
@@ -42,7 +47,8 @@ pub trait BudgetNode: Send + Sync {
 pub struct FuelCell {
     /// What is left of the last draw (or of a fixed allowance).
     pub left: u64,
-    refill: unsafe extern "C" fn(*mut FuelCell) -> u64,
+    /// [`refill_trampoline`]'s address: called with the cell, returns nothing, clobbers no register.
+    refill: usize,
     remaining: unsafe extern "C" fn(*const FuelCell) -> i64,
     /// The chain the next draw comes from; `None` for a fixed allowance (or once the chain proved
     /// unbounded). Locked by a refill, so the vCPUs of a domain sharing the cell draw one at a time.
@@ -69,7 +75,7 @@ impl FuelCell {
     fn with(left: u64, src: Option<Arc<dyn BudgetNode>>) -> Box<FuelCell> {
         Box::new(FuelCell {
             left,
-            refill: fuel_refill,
+            refill: refill_trampoline(),
             remaining: fuel_remaining,
             src: Mutex::new(src),
         })
@@ -109,21 +115,23 @@ impl Drop for FuelCell {
     }
 }
 
-/// A spent cell's refill, called by compiled code: the new `left` (at least 1), or `0` when the chain
-/// (or a fixed allowance) is spent — the caller then traps `OutOfFuel`. A domain's vCPUs share one
-/// cell, so a refill another vCPU made while this one waited for the lock is kept, not drawn again.
+/// A spent cell's refill, called by compiled code through [`refill_trampoline`]: it leaves the new
+/// allowance (at least 1) in `left`, or `left` at the `0` the caller saw when the chain (or a fixed
+/// allowance) is spent — the caller reads `left` back and then traps `OutOfFuel`. A domain's vCPUs
+/// share one cell, so a refill another vCPU made while this one waited for the lock is kept, not
+/// drawn again.
 ///
 /// # Safety
 /// `cell` is a live [`FuelCell`].
-unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) -> u64 {
+unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
     // Only the `src` field is borrowed: compiled code writes `left` through the raw cell pointer.
     let mut src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
     let left = core::ptr::addr_of_mut!((*cell).left);
     if core::ptr::read_volatile(left) > 0 {
-        return core::ptr::read_volatile(left);
+        return;
     }
     let drawn = match src.as_ref().map(|s| s.draw()) {
-        None | Some(Some(0)) => return 0,
+        None | Some(Some(0)) => return,
         Some(None) => {
             *src = None; // every level unbounded: nothing left to meter
             u64::MAX
@@ -131,7 +139,58 @@ unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) -> u64 {
         Some(Some(n)) => n,
     };
     core::ptr::write_volatile(left, drawn);
-    drawn
+}
+
+/// The address of [`fuel_refill`] behind a trampoline in Cranelift's `PreserveAll` convention, which
+/// every [`FuelCell`] calls through. The trampoline saves whatever the platform call to
+/// [`fuel_refill`] clobbers, so the safepoint that calls it clobbers nothing. Compiled once per
+/// process, by the same ISA configuration as every guest compile, and never freed: every cell points
+/// at it.
+fn refill_trampoline() -> usize {
+    static TRAMPOLINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TRAMPOLINE.get_or_init(|| {
+        compile_refill_trampoline().unwrap_or_else(|e| {
+            panic!("the fuel refill trampoline must compile wherever the JIT does: {e:?}")
+        })
+    })
+}
+
+fn compile_refill_trampoline() -> Result<usize, crate::JitError> {
+    use cranelift_codegen::ir::{types::I64, AbiParam, InstBuilder, Signature};
+    use cranelift_codegen::isa::CallConv;
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_module::{Linkage, Module};
+    let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
+    let mut module = crate::new_jit_module()?;
+    let mut sig = Signature::new(CallConv::PreserveAll);
+    sig.params.push(AbiParam::new(I64)); // the cell
+    let id = module
+        .declare_function("fuel_refill_trampoline", Linkage::Local, &sig)
+        .map_err(backend)?;
+    let mut ctx = module.make_context();
+    ctx.func.signature = sig;
+    let mut fctx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    b.seal_block(entry);
+    let cell = b.block_params(entry)[0];
+    let mut inner = Signature::new(module.isa().default_call_conv());
+    inner.params.push(AbiParam::new(I64));
+    let inner = b.import_signature(inner);
+    let refill = b
+        .ins()
+        .iconst(I64, fuel_refill as *const () as usize as i64);
+    b.ins().call_indirect(inner, refill, &[cell]);
+    b.ins().return_(&[]);
+    b.finalize();
+    module.define_function(id, &mut ctx).map_err(backend)?;
+    module.finalize_definitions().map_err(backend)?;
+    let code = module.get_finalized_function(id) as usize;
+    // The code lives in the module's memory, which must outlive every cell: keep it for the process.
+    std::mem::forget(module);
+    Ok(code)
 }
 
 /// `fuel.remaining` (self op 13) on a metered compile: [`FuelCell::can_burn`], `i64::MAX` unmetered.
@@ -151,3 +210,235 @@ const _: () = {
     assert!(core::mem::offset_of!(FuelCell, refill) == REFILL_OFF as usize);
     assert!(core::mem::offset_of!(FuelCell, remaining) == REMAINING_OFF as usize);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{BudgetNode, FuelCell};
+    use crate::{JitOutcome, RunOpts, TrapKind};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use temen_interp::Value;
+    use temen_ir::{
+        BinOp, Block, CastOp, CmpOp, FBinOp, FloatTy, Func, Inst, IntTy, Module, Terminator,
+        ValType,
+    };
+
+    /// A chain that hands out one unit per draw, `left` of them, then is spent: every safepoint
+    /// after the first runs the refill.
+    struct Drip {
+        left: AtomicU64,
+        draws: AtomicU64,
+    }
+
+    impl Drip {
+        fn new(units: u64) -> Arc<Drip> {
+            Arc::new(Drip {
+                left: AtomicU64::new(units),
+                draws: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl BudgetNode for Drip {
+        fn draw(&self) -> Option<u64> {
+            // Work the float registers, as a real chain's host code may: a trampoline that did not
+            // save them would hand the loop back clobbered floats.
+            let x: f64 = (0..16)
+                .map(|i| std::hint::black_box(f64::from(i)) * 1.5)
+                .sum();
+            std::hint::black_box(x);
+            self.draws.fetch_add(1, Ordering::Relaxed);
+            let had = self
+                .left
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            Some(u64::from(had.is_ok()))
+        }
+        fn give_back(&self, _: u64) {}
+        fn room(&self) -> i64 {
+            self.left.load(Ordering::Relaxed).min(i64::MAX as u64) as i64
+        }
+        fn charge_vcpu(&self) -> bool {
+            true
+        }
+        fn force_vcpu(&self) {}
+        fn vcpu_ended(&self) {}
+        fn charge_fiber(&self) -> bool {
+            true
+        }
+        fn force_fiber(&self) {}
+        fn fiber_ended(&self) {}
+    }
+
+    const INTS: u32 = 12;
+    const FLOATS: u32 = 8;
+
+    /// `f(n)`: `n` turns of a loop that carries 12 `i64`s and 8 `f64`s around its back edge, which
+    /// charges fuel. That is more values than the callee-saved registers hold (and every `xmm`
+    /// register is caller-saved on System V), so some ride across the refill in registers a platform
+    /// call would clobber. Returns all of them folded into one `i64`.
+    fn many_live_values() -> Module {
+        let (k, j) = (INTS, FLOATS);
+        let carried: Vec<ValType> = std::iter::once(ValType::I64)
+            .chain((0..k).map(|_| ValType::I64))
+            .chain((0..j).map(|_| ValType::F64))
+            .collect();
+        let all = |n: u32| (0..n).collect::<Vec<u32>>();
+        let p = 1 + k + j; // values a loop block's params take
+                           // b0(n): the starting values, then into the loop.
+        let mut b0 = vec![];
+        for x in 0..k {
+            b0.push(Inst::ConstI64(i64::from(x) + 1));
+        }
+        for x in 0..j {
+            b0.push(Inst::ConstF64((f64::from(x) + 1.0).to_bits()));
+        }
+        let b0 = Block {
+            params: vec![ValType::I64],
+            insts: b0,
+            term: Terminator::Br {
+                target: 1,
+                args: all(1 + k + j),
+            },
+        };
+        // b1(i, a.., f..): i != 0 ? b2 : b3.
+        let b1 = Block {
+            params: carried.clone(),
+            insts: vec![
+                Inst::ConstI64(0),
+                Inst::IntCmp {
+                    ty: IntTy::I64,
+                    op: CmpOp::Ne,
+                    a: 0,
+                    b: p,
+                },
+            ],
+            term: Terminator::BrIf {
+                cond: p + 1,
+                then_blk: 2,
+                then_args: all(p),
+                else_blk: 3,
+                else_args: (1..p).collect(),
+            },
+        };
+        // b2(i, a.., f..): i - 1, each a += its neighbour, each f += its neighbour; back to b1.
+        let mut b2 = vec![
+            Inst::ConstI64(1),
+            Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a: 0,
+                b: p,
+            },
+        ];
+        for x in 0..k {
+            b2.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: 1 + x,
+                b: 1 + (x + 1) % k,
+            });
+        }
+        for x in 0..j {
+            b2.push(Inst::FBin {
+                ty: FloatTy::F64,
+                op: FBinOp::Add,
+                a: 1 + k + x,
+                b: 1 + k + (x + 1) % j,
+            });
+        }
+        let b2 = Block {
+            params: carried.clone(),
+            insts: b2,
+            term: Terminator::Br {
+                target: 1,
+                args: (p + 1..p + 2 + k + j).collect(),
+            },
+        };
+        // b3(a.., f..): the sum of the ints and of the floats' bits.
+        let mut b3 = vec![];
+        for x in 0..j {
+            b3.push(Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: k + x,
+            });
+        }
+        let mut acc = 0;
+        for (n, x) in (1..k).chain(k + j..k + j + j).enumerate() {
+            b3.push(Inst::IntBin {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a: acc,
+                b: x,
+            });
+            acc = k + j + j + n as u32; // the sum so far: the add just pushed
+        }
+        let b3 = Block {
+            params: carried[1..].to_vec(),
+            insts: b3,
+            term: Terminator::Return(vec![acc]),
+        };
+        let m = Module {
+            funcs: vec![Func {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+                blocks: vec![b0, b1, b2, b3],
+            }],
+            ..Default::default()
+        };
+        temen_verify::verify_module(&m).expect("the fixture verifies");
+        m
+    }
+
+    fn run_jit(m: &Module, n: i64, cell: &mut FuelCell) -> JitOutcome {
+        crate::run_inner(
+            m,
+            0,
+            &[n],
+            crate::empty_cap_thunk,
+            core::ptr::null_mut(),
+            RunOpts {
+                fuel: Some(cell),
+                ..RunOpts::default()
+            },
+        )
+        .expect("compiles and runs")
+        .0
+    }
+
+    #[test]
+    fn values_live_across_a_refill_keep_their_registers() {
+        let m = many_live_values();
+        let n = 2000;
+        let mut fuel = u64::MAX;
+        let want = match temen_interp::run(&m, 0, &[Value::I64(n)], &mut fuel)
+            .expect("the interpreter runs it")[..]
+        {
+            [Value::I64(v)] => v,
+            ref other => panic!("one i64 result, got {other:?}"),
+        };
+        let drip = Drip::new(u64::MAX);
+        let mut cell = FuelCell::drawing(drip.clone());
+        assert_eq!(run_jit(&m, n, &mut cell), JitOutcome::Returned(vec![want]));
+        assert_eq!(
+            drip.draws.load(Ordering::Relaxed),
+            n as u64 + 1,
+            "the entry and every back edge refilled"
+        );
+    }
+
+    #[test]
+    fn a_spent_chain_still_traps_out_of_fuel() {
+        let m = many_live_values();
+        let drip = Drip::new(10);
+        let mut cell = FuelCell::drawing(drip.clone());
+        assert_eq!(
+            run_jit(&m, 100, &mut cell),
+            JitOutcome::Trapped(TrapKind::OutOfFuel)
+        );
+        assert_eq!(
+            drip.draws.load(Ordering::Relaxed),
+            11,
+            "ten draws of one unit, then the one that found the chain spent"
+        );
+    }
+}

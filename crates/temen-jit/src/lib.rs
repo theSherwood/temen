@@ -9640,21 +9640,23 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
     // Spent? (`fuel == 0` ⇒ the next charge would underflow) → refill before charging.
     b.ins()
         .brif(fuel, cont, &[BlockArg::from(fuel)], refill_blk, &[]);
-    // #1944 slice 3 — the cell's refill (word 1) draws the next chunk from the budget chain; `0` is a
-    // spent chain (or a spent fixed allowance), which traps as a spent counter always did.
+    // #1944 slice 3 — the cell's refill (word 1) draws the next chunk from the budget chain into
+    // `left`; a `left` still `0` is a spent chain (or a spent fixed allowance), which traps as a spent
+    // counter always did. #2147 — the refill is a `PreserveAll` trampoline, so this call clobbers no
+    // register: a value live across the safepoint keeps its register, and the function need not hold
+    // it in a callee-saved one (saved and restored on every call) just because a refill might happen.
     b.switch_to_block(refill_blk);
     b.set_cold_block(refill_blk);
     let sig = {
-        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+        let mut s = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
         s.params.push(AbiParam::new(I64)); // the cell
-        s.returns.push(AbiParam::new(I64)); // the refilled `left`, or 0
         b.import_signature(s)
     };
     let refill = b
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
-    let call = b.ins().call_indirect(sig, refill, &[addr]);
-    let drawn = b.inst_results(call)[0];
+    b.ins().call_indirect(sig, refill, &[addr]);
+    let drawn = b.ins().load(I64, MemFlags::trusted(), addr, 0);
     b.ins()
         .brif(drawn, cont, &[BlockArg::from(drawn)], trap_blk, &[]);
     b.switch_to_block(trap_blk);
