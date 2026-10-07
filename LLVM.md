@@ -578,6 +578,18 @@ into the window's reserved tail by `vm_map`-committing pages on demand via the `
 - [x] **Demo:** `demo_heapgrow_vs_native` — a guest allocating eight 128 KiB blocks (~16× its initial
       window), growing on demand via the `Memory` cap, byte-identical to native. Plus a focused
       `heap_malloc_calloc_free` check (a growth-forcing `malloc` + a zero-reading `calloc`).
+- [x] **dlmalloc replaces the bump allocator (#1603).** A bump heap's peak is every byte ever
+      allocated, not the live set: a compiler or a long-running server outgrew its window. The heap is
+      now Doug Lea's dlmalloc 2.8.6 (MIT-0), vendored in `crates/temen-llvm/dlmalloc/` and compiled once
+      by `gen.sh` to a committed `dlmalloc.ll` whose symbols all sit in the reserved `__temen_dl.`
+      namespace. When a program declares a `malloc`-family name it does not define, `link_heap` merges
+      that unit into the module and aliases the name onto it, as a static link against libc's
+      `malloc.o` would. dlmalloc grows through `MORECORE` = the synthesized `__temen_sbrk`: the grow
+      half of the old allocator (commit `[top, page_up(new))`, advance `HEAP_BRK`/`HEAP_TOP`), now
+      returning `MFAIL` when the window cannot grow instead of ignoring the `vm_map` result. dlmalloc's
+      own spin lock (atomics, `USE_SPIN_LOCKS`) serializes both allocation and `MORECORE`, so it is
+      what keeps parallel vCPUs apart now (#1097) and `__temen_sbrk` takes no lock. `calloc` clears
+      what it reuses; `realloc`, `memalign`, `aligned_alloc` and `posix_memalign` are dlmalloc's.
 
 **Slice T (DONE) — multi-value struct returns.** A small by-value struct returned in registers (clang
 coerces it to e.g. `{ i64, i64 }` / `{ i64, ptr }`, as clay's `*Array_Allocate_Arena` and any C
@@ -1966,7 +1978,7 @@ sub-slice), and **`Option::unwrap`** (its panic path traps via slice AI's recogn
 **Slice AK (DONE) — Rust `alloc` / heap (`Vec` via a guest `#[global_allocator]`).** The headline for
 *real* Rust: a `no_std` + `alloc` crate whose `#[global_allocator]` routes to the guest `malloc`/`free`
 runs byte-identical to native `rustc`, with `Vec::push` growing the heap (alloc + `memcpy` + free)
-through the on-ramp's `vm_map`-growing bump allocator. Because the allocator + `Memory` grant live in
+through the on-ramp's `vm_map`-growing heap. Because the allocator + `Memory` grant live in
 the powerbox `_start` (gated on `main`), the test runs **through the powerbox**: the on-ramp synthesizes
 `#[no_mangle] extern "C" fn main` calling `compute()`, the differential compares the `u8` exit/return
 code, and a pinned expected value keeps it non-vacuous. Three gaps closed:
@@ -3563,8 +3575,8 @@ a handful of `temen` leaf-arms + one allocator `imp`.
    gets its own `#[inline(always)]` wrapper with a literal op — never a shared `fn call(op)`); the payload
    is a fixed `(i64×4) -> i64`; errno is **in-band** (`-> n | -errno`, INVARIANTS §5 — negative returns map
    straight to `io::Error`, no `__errno_location`/errno TLS).
-2. **Named imports (secondary).** `malloc`/`free` left as external calls bind to the synthesized guest
-   **bump allocator** (`synth_malloc`) — zero host crossings per allocation.
+2. **Named imports (secondary).** `malloc`/`free` left as external calls bind to the on-ramp's guest
+   heap (dlmalloc, slice S) — zero host crossings per allocation.
 
 **ABI pins.**
 
@@ -3573,7 +3585,7 @@ a handful of `temen` leaf-arms + one allocator `imp`.
 | Panic strategy | `panic=abort` (target JSON + `-Zbuild-std=std,panic_abort`). Opt-in `panic=unwind` is deferred — #883 (the on-ramp's C++ Itanium EH substrate already supports it; no named guest consumer yet). |
 | Targets | Two specs: lean **`x86_64-unknown-temen`** (`singlethread=true`, `no_threads` std) and threaded **`x86_64-unknown-temen-threads`** (`singlethread=false`, `env=threads`, real atomic orderings + futex sync + Tier-2 per-vCPU TLS). The `no_threads` pin was the original v1 posture; threads landed via the #779 epic. |
 | Errno | In-band negative returns → `io::Error`; no errno TLS. |
-| Allocator | PAL `sys::alloc` → `extern "C" malloc/free` → synthesized guest bump allocator. |
+| Allocator | PAL `sys::alloc` → `extern "C" malloc/free` → the on-ramp's guest dlmalloc heap (slice S). |
 | `stat`/time layouts | temen-posix's, verbatim (`{st_mode, st_size}`; the Clock op's epoch/units) — the PAL is the only consumer, no reconciliation. |
 | HashMap seeding | Deterministic per-guest (`sys/random` leaf; address-derived seed on the fixed window/allocator layout). A real `getrandom` op is deferred (no consumer). |
 | Toolchain | One pinned **nightly** + `rust-src`; the PAL patch is applied onto the toolchain's `rust-src` (`rust-temen/apply-overlay.sh`, idempotent). The textual-`.ll` reader frees the *on-ramp* from LLVM-version pins (§3); the nightly pin is for build-std reproducibility only. |

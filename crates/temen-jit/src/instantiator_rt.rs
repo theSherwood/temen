@@ -2310,7 +2310,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 /
     // #773 — the interpreter twin at `instantiate_rec`'s `mod_ok`): a larger window is a safe
     // superset (confinement, invariant 2, still masks every access to the actual carve), and a
-    // malloc child *needs* it — its synthesized bump allocator's `heap_base` is `1<<declared` and
+    // malloc child *needs* it — its on-ramp heap's `heap_base` is `1<<declared` and
     // grows the heap up into `[1<<declared, carve)`, so a carve equal to the declared window leaves
     // no heap room. The child is compiled fully-mapped over the whole carve (`compile_child` /
     // `run_child_code_then`), so those heap pages are already committed and the allocator's `vm_map`

@@ -94,11 +94,12 @@
 //!   compiles to a table of 32-bit `&target − &table` offsets; `load.relative(P, off)` →
 //!   `P + sext_i32(*(i32*)(P+off))`. The table initializer (`trunc(sub(ptrtoint…))`) already folds via
 //!   the constexpr evaluator. Lands **jsmn** (a zero-alloc JSON parser) byte-identical to native.
-//! - **S — `malloc`/heap (the §1a sparse address space).** `malloc`/`calloc` lower to a synthesized
-//!   **bump allocator** (`__temen_malloc`) that grows the heap into the window's reserved tail by
-//!   `vm_map`-committing pages on demand via the `Memory` capability (a 4th powerbox handle); `free`
-//!   is a no-op and the heap never reuses, so freshly-committed (zeroed) pages make `calloc` ≡
-//!   `malloc`. Lands **heapgrow** (a guest growing past ~16× its initial window) byte-identical to native.
+//! - **S — `malloc`/heap (the §1a sparse address space).** The C heap is **dlmalloc** (vendored in
+//!   `dlmalloc/`), merged into any program that uses the `malloc` family ([`link_heap`]). It grows the
+//!   heap into the window's reserved tail through the synthesized `__temen_sbrk`, which `vm_map`-commits
+//!   pages on demand via the `Memory` capability (a 4th powerbox handle). (Until #1603 this was a bump
+//!   allocator whose `free` was a no-op, so a guest's peak tracked its total allocation.) Lands
+//!   **heapgrow** (a guest growing past ~16× its initial window) byte-identical to native.
 //! - **T — multi-value struct returns.** A small by-value struct returned in registers (clang coerces
 //!   it to e.g. `{ i64, i64 }` / `{ i64, ptr }`) maps to an Temen **multi-result** function (§3a):
 //!   `insertvalue`/`extractvalue`/`ret` and multi-result `call`s track the aggregate field-wise in a
@@ -125,12 +126,10 @@
 //!   (a buffer pre-fill) → `Stream.write`. Unsigned `%u`/`%x`, `%c`, `%%`, field width and the `0`
 //!   flag, and length modifiers (the LLVM arg carries the real width). All formatting runs **in the
 //!   guest**; only the bytes cross the boundary. Lands the **`hexdump`** demo byte-identical to native.
-//! - **X — `realloc` + signed `printf` (`%d`).** `malloc` now writes a 16-byte **size header** before
-//!   the data (keeping it 16-aligned), so `realloc(p, n)` recovers the old size, `malloc`s `n`, copies
-//!   `min(old, n)` bytes (`__temen_realloc` → `__temen_malloc` + `__temen_memcpy`; `realloc(NULL,…)` ≡
-//!   `malloc`). `printf` gains signed `%d`/`%i` (sign computed, magnitude via `__temen_utoa`, `-`
-//!   prepended) with plain/space-padded fields. Lands the **`sortvec`** demo (a `realloc`-doubling
-//!   vector + insertion sort) byte-identical to native.
+//! - **X — `realloc` + signed `printf` (`%d`).** `realloc` (dlmalloc's since #1603; a size-header copy
+//!   over the bump allocator before). `printf` gains signed `%d`/`%i` (sign computed, magnitude via
+//!   `__temen_utoa`, `-` prepended) with plain/space-padded fields. Lands the **`sortvec`** demo (a
+//!   `realloc`-doubling vector + insertion sort) byte-identical to native.
 //! - **Y — 128-bit SIMD (`<4 x float>` → native `v128`).** A 4-lane 32-bit vector maps to Temen's §17
 //!   `v128`: `load`/`store` → `v128.load`/`store`; `fadd`/`fmul`/… → `f32x4` `VFloatBin`;
 //!   `extractelement`/`insertelement` → extract/replace lane; `shufflevector` → an `i8x16.shuffle`
@@ -161,6 +160,7 @@
 //! as *external* libm calls (the program must supply it as guest code — see slice AB), other SIMD
 //! (`<2 x double>`, `<8 x i16>`, dynamic lanes), and `i33`.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -168,8 +168,9 @@ use std::path::Path;
 // The translator consumes our **owned** `ll` AST (LLVM.md §8 Q1b), produced by the in-house textual
 // `.ll` reader ([`ll`]). The `as LTerm`/`LModule` aliases keep the rest of this file unchanged.
 use crate::ll::ast::{
-    BasicBlock, Constant, DebugLoc, FPPredicate, FPType, Float, Function, HasDebugLoc, Instruction,
-    IntPredicate, Module as LModule, Name, Operand, Terminator as LTerm, Type, Typed, Types,
+    BasicBlock, Constant, ConstantRef, DebugLoc, FPPredicate, FPType, Float, Function, GlobalAlias,
+    HasDebugLoc, Instruction, IntPredicate, Module as LModule, Name, Operand, Terminator as LTerm,
+    Type, Typed, Types,
 };
 
 use temen_ir::{
@@ -502,7 +503,7 @@ pub fn translate_ll_str_with_options(
 ) -> Result<Translated, Error> {
     let (m, di, ba) =
         ll::parse::parse_module_with_debug(src).map_err(|e| Error::Parse(format!("{e:?}")))?;
-    translate_impl(&m, di.as_ref(), ba.as_ref(), opts)
+    translate_impl(Cow::Owned(m), di.as_ref(), ba.as_ref(), opts)
 }
 
 /// Translate an already-parsed [`ll`] module. The neutral core's source-line half is populated from
@@ -510,15 +511,16 @@ pub fn translate_ll_str_with_options(
 /// are only available via the string/file entries (they ride the parse — see [`translate_ll_str`]),
 /// so this entry passes neither.
 pub fn translate(m: &LModule) -> Result<Translated, Error> {
-    translate_impl(m, None, None, TranslateOptions::default())
+    translate_impl(Cow::Borrowed(m), None, None, TranslateOptions::default())
 }
 
 fn translate_impl(
-    m: &LModule,
+    m: Cow<'_, LModule>,
     di: Option<&di::LlvmDebug>,
     ba: Option<&blockaddr::BlockAddrs>,
     opts: TranslateOptions,
 ) -> Result<Translated, Error> {
+    let m = &*link_heap(m)?;
     // The RO/writable page-isolation granularity is a per-target knob (native 16 KiB, wasm 64 KiB).
     // Fail closed on a nonsensical value: it must be a power of two and leave room for the §3e args
     // buffer below the globals base (`globals_base == stack_page` for a powerbox program).
@@ -568,12 +570,11 @@ fn translate_impl(
     // §13/§14 SharedRegion builtins (`__vm_region_*`): register their imports; `__vm_region_create`
     // mints from the `AddressSpace` handle, so the program needs it granted (slot 4).
     let uses_vm_region = register_vm_region_imports(m, &defined_names, &mut imports, &mut caps);
-    // `realloc` is a synthesized helper built on `malloc` + `memcpy`, so it forces both on.
-    let need_realloc = calls_external(m, &defined_names, "realloc") && has_main;
-    let need_malloc = (needs_malloc(m, &defined_names) || need_realloc) && has_main;
-    // The `Memory` handle (4th powerbox grant) is needed by the allocator *and* the direct Memory
-    // builtins; the heap is seeded only for `malloc`.
-    let need_memory_cap = (need_malloc || uses_vm_memory) && has_main;
+    // The C heap is dlmalloc, merged in by `link_heap`; it grows through the synthesized `__temen_sbrk`.
+    let need_sbrk = calls_external(m, &defined_names, "__temen_sbrk") && has_main;
+    // The `Memory` handle (4th powerbox grant) is needed by the heap *and* the direct Memory
+    // builtins; the heap words are seeded only for the heap.
+    let need_memory_cap = (need_sbrk || uses_vm_memory) && has_main;
     // `printf` is lowered inline (a guest-side format engine → `Stream.write`); it pulls in the
     // `__temen_utoa` helper and (via `cap_import_name`) the `write` import, so it also forces a powerbox.
     let need_printf = calls_external(m, &defined_names, "printf") && has_main;
@@ -669,16 +670,16 @@ fn translate_impl(
     // and D40 page-granular protection makes `utoa`'s scratch writes fault. (`printf` already forces
     // this via its `write` import; `snprintf` has no import of its own, hence the explicit term.)
     let needs_powerbox_entry = !imports.is_empty()
-        || need_malloc
+        || need_sbrk
         || uses_blocking
         || has_global_ctors
         || need_getenv
         || need_snprintf
         || uses_fmt_float; // `__vm_fmt_*` writes the float scratch, reserved by the powerbox layout
     let synth = needs_powerbox_entry && has_main;
-    // The allocator grows the heap via `Memory.map`; register that import (the bump allocator emits a
+    // The heap grows via `Memory.map`; register that import (`__temen_sbrk` emits a
     // `CallImport "vm_map"`, resolved like any other §7 import at load).
-    if need_malloc {
+    if need_sbrk {
         caps.entry("vm_map".to_string()).or_insert_with(|| {
             let i = imports.len() as u32;
             imports.push(temen_ir::Import {
@@ -780,9 +781,9 @@ fn translate_impl(
     // functions and `_start` (index 0 when `synth`), at `base + defined.len()` onward — their indices
     // are fixed before translating call sites. The allocator references the `vm_map` import index.
     // Intrinsic `llvm.memcpy`/`memmove`/`memset` now lower to the bulk-memory ops (D62), not to
-    // byte-loop helpers. `__temen_memcpy` is still synthesized for realloc/snprintf/__vm_fmt (which copy
+    // byte-loop helpers. `__temen_memcpy` is still synthesized for snprintf/__vm_fmt (which copy
     // through it); the memset/memmove helpers had no other caller and are gone.
-    let need_memcpy = need_realloc || need_snprintf || uses_fmt_float;
+    let need_memcpy = need_snprintf || uses_fmt_float;
     // `memcmp`/`bcmp` (Rust slice equality + `BTreeMap` key ordering) → the synthesized `__temen_memcmp`.
     // A pure address helper (no capability), so unlike `malloc` it needs no powerbox/`has_main`.
     let need_memcmp =
@@ -798,7 +799,7 @@ fn translate_impl(
     // i128 `udiv`/`sdiv`/`urem`/`srem` lower to the synthesized 128÷128 long-division helper.
     let need_idiv128 = uses_i128_divrem(m);
     // Helper indices are assigned in a fixed order after the defined functions (and `_start`):
-    // memcpy, malloc, utoa, realloc — each present only if needed. The append order below must match.
+    // memcpy, sbrk, utoa, strlen, … — each present only if needed. The append order below must match.
     let mut next_helper = base + defined.len() as u32;
     let mut take = |needed: bool| {
         needed.then(|| {
@@ -825,12 +826,11 @@ fn translate_impl(
     });
     let helpers = Helpers {
         memcpy: take(need_memcpy),
-        malloc: take(need_malloc),
+        sbrk: take(need_sbrk),
         utoa: take(need_printf || need_snprintf),
         // `%s` needs a runtime strlen (synthesized alongside `utoa` for any `printf`); a direct
         // `strlen` call also routes here — `need_strlen` covers both (see above).
         strlen: take(need_strlen),
-        realloc: take(need_realloc),
         getenv: take(need_getenv),
         big_zero: take(need_dtoa),
         big_copy: take(need_dtoa),
@@ -1091,7 +1091,7 @@ fn translate_impl(
     });
     // The guest heap begins at the window's mapped boundary (the first reserved page) and grows up
     // into the reserved tail as the allocator `vm_map`-commits it (§1a sparse address space).
-    let heap_base = need_malloc
+    let heap_base = need_sbrk
         .then(|| memory.map(|mc| 1u64 << mc.size_log2))
         .flatten();
 
@@ -1126,26 +1126,20 @@ fn translate_impl(
         );
         funcs.insert(0, start);
     }
-    // Append the synthesized helpers in index order (memcpy, malloc, utoa, realloc) — matching the
+    // Append the synthesized helpers in index order (memcpy, sbrk, utoa, …) — matching the
     // indices assigned above.
     if need_memcpy {
         funcs.push(synth_memcpy());
     }
-    if need_malloc {
+    if need_sbrk {
         let map_sig = intern_sig(&sig_types, import_sig("vm_map")); // #922
-        funcs.push(synth_malloc(caps["vm_map"], stack_page, scratch, map_sig));
+        funcs.push(synth_sbrk(caps["vm_map"], stack_page, scratch, map_sig));
     }
     if need_printf || need_snprintf {
         funcs.push(synth_utoa());
     }
     if need_strlen {
         funcs.push(synth_strlen());
-    }
-    if need_realloc {
-        funcs.push(synth_realloc(
-            helpers.malloc.expect("realloc needs malloc"),
-            helpers.memcpy.expect("realloc needs memcpy"),
-        ));
     }
     if need_getenv {
         funcs.push(synth_getenv(scratch));
@@ -4099,8 +4093,8 @@ fn collect_cap_imports(
 
 /// The §7 import a `<temen.h>` **Memory-capability** builtin needs (`__vm_map`/`unmap`/`protect`/
 /// `page_size` → `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`), or `None` if `name` is not one of
-/// them. These reach `Memory` (the 4th powerbox handle, slot 12) — the same cap the bump allocator
-/// uses, exposed directly so a guest manages window pages itself (the §1a sparse-address-space path).
+/// them. These reach `Memory` (the 4th powerbox handle, slot 12) — the same cap the heap grows
+/// through, exposed directly so a guest manages window pages itself (the §1a sparse-address-space path).
 fn vm_memory_builtin_import(name: &str) -> Option<&'static str> {
     Some(match name {
         "__vm_map" => "vm_map",
@@ -4949,52 +4943,33 @@ fn synth_start_argv(
     }
 }
 
-/// Synthesize `__temen_malloc(size:i64) -> i64`: an on-demand **bump allocator** that grows the guest
-/// heap into the window's reserved tail by `vm_map`-committing pages as needed (§3e/§4 — the §1a
-/// "grow past the initial window" capability). State is two `i64`s in the low scratch: `HEAP_BRK` (the
-/// next free address) and `HEAP_TOP` (the committed boundary). `free` is a no-op and the heap never
-/// reuses, so every result is freshly `vm_map`-zeroed memory (hence `calloc` ≡ `malloc`).
+/// Synthesize `__temen_sbrk(increment:i64) -> i64`: the `MORECORE` the on-ramp's C heap grows through
+/// (dlmalloc, merged by [`link_heap`]; #1603). State is two `i64`s in the low scratch, both seeded by
+/// `_start` to the window's mapped boundary: `HEAP_BRK` (the break) and `HEAP_TOP` (the committed
+/// boundary). A break past `HEAP_TOP` commits the pages up to it through the `Memory` capability (§3e/§4
+/// — the §1a "grow past the initial window" capability). When the window cannot grow, the result is
+/// dlmalloc's `MFAIL` (`-1`) and nothing moves, so `malloc` returns NULL. Memory is never given back: a
+/// negative increment, which dlmalloc makes only to undo its own growth, just lowers the break.
 ///
-/// Bit 0 of `HEAP_BRK` is the **allocation lock**; the break itself is always 16-aligned. vCPUs running
-/// in parallel over one window (`drive_parallel`, the JIT's OS threads, browser Workers) would
-/// otherwise read the same break and hand out the same block (#1097). The vCPU whose `or` finds the bit
-/// clear owns the heap until `commit` stores the new, aligned break. That one store both publishes the
-/// allocation and releases the lock. Like any locking `malloc` it is not async-signal-safe: a signal
-/// handler that allocates while its own vCPU holds the lock spins until the fuel runs out.
+/// dlmalloc calls this only while it holds its global lock, which is also what keeps vCPUs sharing the
+/// heap apart (#1097), so the helper takes no lock of its own.
 ///
 /// ```text
-///   entry(size):                               → lock(size)
-///   lock(size):                                ; spin until this vCPU takes the lock bit
-///     old = atomic.rmw.or.i64 [HEAP_BRK] 1
-///     old & 1 == 0 → alloc(size, brk=old) : lock(size)
-///   alloc(size,brk):                           ; data=brk+16; new=align16(data+size)
-///     top = load.i64 [HEAP_TOP]
-///     grow? = new >u top   → grow(brk,size,new,top) : commit(brk,size,new)
-///   grow(brk,size,new,top):                    ; commit [top, page_up(new)) via the Memory cap
-///     vm_map(mem_handle, top, page_up(new) - top, RW); store.i64 [HEAP_TOP] = page_up(new)
-///     → commit(brk,size,new)
-///   commit(brk,size,new):                      ; now the page is mapped: write the header + publish
-///     store.i64 [brk] = size                   ; 16-byte size header (for realloc)
-///     atomic.store.i64 [HEAP_BRK] = new        ; the new break, lock bit clear
-///     return brk + 16                          ; the data pointer
+///   entry(inc):           brk = [HEAP_BRK]; new = brk + inc; top = [HEAP_TOP]
+///                         new >u top → grow(brk, new, top) : commit(brk, new, top)
+///   grow(brk, new, top):  limit = page_up(new)
+///                         vm_map(top, limit - top, RW) <s 0 → fail : commit(brk, new, limit)
+///   commit(brk, new, top): [HEAP_TOP] = top; [HEAP_BRK] = new; return brk
+///   fail:                 return -1
 /// ```
-/// The header is written in `commit` (not `alloc`) because on the first `malloc` `brk` is an
-/// *uncommitted* reserved page — only `grow` (or the prior commit) maps it.
-fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -> Func {
+fn synth_sbrk(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -> Func {
     use temen_ir::{LoadOp, StoreOp};
-    let i64add = |a: ValIdx, b: ValIdx| Inst::IntBin {
+    let i64bin = |op: BinOp, a: ValIdx, b: ValIdx| Inst::IntBin {
         ty: IntTy::I64,
-        op: BinOp::Add,
+        op,
         a,
         b,
     };
-    let i64and = |a: ValIdx, b: ValIdx| Inst::IntBin {
-        ty: IntTy::I64,
-        op: BinOp::And,
-        a,
-        b,
-    };
-
     let load_i64 = |addr: ValIdx| Inst::Load {
         op: LoadOp::I64,
         addr,
@@ -5007,135 +4982,89 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32)
         offset: 0,
     };
     let brk_addr = (scratch + HEAP_BRK) as i64;
+    let top_addr = (scratch + HEAP_TOP) as i64;
+    let page = stack_page as i64; // commit in host-page units (16 KiB native, 64 KiB wasm)
 
-    // entry(size=0) → lock(size). The spin loop gets a block of its own: no branch targets an entry.
+    // entry(inc=0)
     let entry = Block {
-        params: vec![ValType::I64], // size = v0
-        insts: vec![],
-        term: Terminator::Br {
-            target: 1,
-            args: vec![0],
-        },
-    };
-
-    // lock(size=0): set the lock bit. An `old` with the bit clear means this vCPU took the lock, and
-    // `old` is the break; otherwise another vCPU is allocating, so try again.
-    let lock = Block {
-        params: vec![ValType::I64], // size = v0
+        params: vec![ValType::I64],
         insts: vec![
             Inst::ConstI64(brk_addr), // v1
-            Inst::ConstI64(1),        // v2
-            Inst::AtomicRmw {
-                ty: IntTy::I64,
-                op: AtomicRmwOp::Or,
-                addr: 1,
-                value: 2,
-                offset: 0,
-            }, // v3 = old
-            i64and(3, 2),             // v4 = old & 1
-            Inst::ConstI64(0),        // v5
-            Inst::IntCmp {
-                ty: IntTy::I64,
-                op: CmpOp::Eq,
-                a: 4,
-                b: 5,
-            }, // v6 = took the lock
-        ],
-        term: Terminator::BrIf {
-            cond: 6,
-            then_blk: 2, // alloc(size=v0, brk=v3)
-            then_args: vec![0, 3],
-            else_blk: 1, // lock(size=v0)
-            else_args: vec![0],
-        },
-    };
-
-    // alloc(size=0, brk=1): new = align16(brk+16+size); branch on new > *HEAP_TOP. No heap write here
-    // — `brk` may be an uncommitted page until `grow` maps it.
-    let alloc = Block {
-        params: vec![ValType::I64, ValType::I64], // size, brk
-        insts: vec![
-            Inst::ConstI64(16),                          // v2
-            i64add(1, 2),                                // v3 = brk + 16
-            i64add(3, 0),                                // v4 = brk+16+size
-            Inst::ConstI64(15),                          // v5
-            i64add(4, 5),                                // v6
-            Inst::ConstI64(!15i64),                      // v7 = ~15
-            i64and(6, 7),                                // v8 = new (aligned)
-            Inst::ConstI64((scratch + HEAP_TOP) as i64), // v9
-            load_i64(9),                                 // v10 = top
+            load_i64(1),              // v2 = brk
+            i64bin(BinOp::Add, 2, 0), // v3 = new
+            Inst::ConstI64(top_addr), // v4
+            load_i64(4),              // v5 = top
             Inst::IntCmp {
                 ty: IntTy::I64,
                 op: CmpOp::GtU,
-                a: 8,
-                b: 10,
-            }, // v11 = new > top
+                a: 3,
+                b: 5,
+            }, // v6 = new > top
         ],
         term: Terminator::BrIf {
-            cond: 11,
-            then_blk: 3, // grow(brk=v1, size=v0, new=v8, top=v10)
-            then_args: vec![1, 0, 8, 10],
-            else_blk: 4, // commit(brk=v1, size=v0, new=v8)
-            else_args: vec![1, 0, 8],
+            cond: 6,
+            then_blk: 1,
+            then_args: vec![2, 3, 5],
+            else_blk: 2,
+            else_args: vec![2, 3, 5],
         },
     };
 
-    // grow(brk=0, size=1, new=2, top=3): commit [top, page_up(new)) via vm_map, update HEAP_TOP.
-    let page = stack_page as i64; // commit in host-page units (16 KiB native, 64 KiB wasm)
-    let g = Block {
-        params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64], // brk, size, new, top
+    // grow(brk=0, new=1, top=2): commit [top, page_up(new)).
+    let grow = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
-            Inst::ConstI64(page - 1),    // v4
-            i64add(2, 4),                // v5 = new + (PAGE-1)
-            Inst::ConstI64(!(page - 1)), // v6 = ~(PAGE-1)
-            i64and(5, 6),                // v7 = limit (page-aligned)
-            Inst::ConstI64(0),           // v8 (spacer — keeps the block's numbering)
-            Inst::ConstI32(0),           // v9 (spacer — keeps the block's numbering; ex-handle)
-            Inst::IntBin {
-                ty: IntTy::I64,
-                op: BinOp::Sub,
-                a: 7,
-                b: 3,
-            }, // v10 = limit - top (len)
-            Inst::ConstI32(PROT_RW),     // v11 = prot
+            Inst::ConstI64(page - 1),    // v3
+            i64bin(BinOp::Add, 1, 3),    // v4 = new + (PAGE-1)
+            Inst::ConstI64(!(page - 1)), // v5
+            i64bin(BinOp::And, 4, 5),    // v6 = limit
+            i64bin(BinOp::Sub, 6, 2),    // v7 = limit - top
+            Inst::ConstI32(PROT_RW),     // v8
             Inst::CallImport {
                 import: vm_map_import,
                 op: 0,
                 sig: map_sig, // #922: `vm_map`'s sig, pre-interned by the caller
-                args: vec![3, 10, 11],
-            }, // v12 = map result (ignored)
-            Inst::ConstI64((scratch + HEAP_TOP) as i64), // v13
-            store_i64(13, 7),            // *HEAP_TOP = limit
+                args: vec![2, 7, 8],
+            }, // v9 = 0 or -errno
+            Inst::ConstI64(0),           // v10
+            Inst::IntCmp {
+                ty: IntTy::I64,
+                op: CmpOp::LtS,
+                a: 9,
+                b: 10,
+            }, // v11 = the window cannot grow
         ],
-        term: Terminator::Br {
-            target: 4,
-            args: vec![0, 1, 2], // commit(brk, size, new)
+        term: Terminator::BrIf {
+            cond: 11,
+            then_blk: 3,
+            then_args: vec![],
+            else_blk: 2,
+            else_args: vec![0, 1, 6],
         },
     };
 
-    // commit(brk=0, size=1, new=2): the page is now mapped — write the size header at brk, publish the
-    // new break (which releases the lock), and return the data pointer brk+16.
-    let c = Block {
-        params: vec![ValType::I64, ValType::I64, ValType::I64], // brk, size, new
+    // commit(brk=0, new=1, top=2)
+    let commit = Block {
+        params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
-            store_i64(0, 1),          // *brk = size (header) — no value
-            Inst::ConstI64(brk_addr), // v3
-            Inst::AtomicStore {
-                ty: IntTy::I64,
-                addr: 3,
-                value: 2,
-                offset: 0,
-            }, // *HEAP_BRK = new, lock bit clear — no value
-            Inst::ConstI64(16),       // v4
-            i64add(0, 4),             // v5 = brk + 16 (data)
+            Inst::ConstI64(top_addr), // v3
+            store_i64(3, 2),          // [HEAP_TOP] = top — no value
+            Inst::ConstI64(brk_addr), // v4
+            store_i64(4, 1),          // [HEAP_BRK] = new — no value
         ],
-        term: Terminator::Return(vec![5]), // data
+        term: Terminator::Return(vec![0]),
+    };
+
+    let fail = Block {
+        params: vec![],
+        insts: vec![Inst::ConstI64(-1)], // v0 = MFAIL
+        term: Terminator::Return(vec![0]),
     };
 
     Func {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
-        blocks: vec![entry, lock, alloc, g, c],
+        blocks: vec![entry, grow, commit, fail],
     }
 }
 
@@ -5146,11 +5075,11 @@ fn synth_malloc(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32)
 #[derive(Clone, Default)]
 struct Helpers {
     /// `__temen_memcpy(dst:i64, src:i64, len:i64)` — copy `len` bytes `src`→`dst` (forward; no overlap).
-    /// Still synthesized for realloc/snprintf/__vm_fmt; the `llvm.memcpy` *intrinsic* lowers to
+    /// Still synthesized for snprintf/__vm_fmt; the `llvm.memcpy` *intrinsic* lowers to
     /// [`Inst::MemCopy`] (D62), not to this helper.
     memcpy: Option<u32>,
-    /// `__temen_malloc(size:i64) -> i64` — the `vm_map`-growing bump allocator (`malloc`/`calloc`).
-    malloc: Option<u32>,
+    /// `__temen_sbrk(increment:i64) -> i64` — the `vm_map`-growing break the dlmalloc heap grows through.
+    sbrk: Option<u32>,
     /// `__temen_utoa(value:i64, base:i64, bufend:i64) -> i64` — unsigned→ASCII for `printf`.
     utoa: Option<u32>,
     /// `__temen_strlen(p:i64) -> i64` — the NUL-terminated byte length, for `printf` `%s`.
@@ -5205,8 +5134,6 @@ struct Helpers {
     /// executed. A runtime format engine is a follow-on; the Lua core's own `snprintf` calls all use
     /// constant formats (`%lld`/`%.14g`).
     snprintf_rt: Option<u32>,
-    /// `__temen_realloc(p:i64, n:i64) -> i64` — `realloc` over the header-bearing bump allocator.
-    realloc: Option<u32>,
     /// `__temen_memcmp(a:i64, b:i64, len:i64) -> i32` — compare `len` bytes as unsigned; `0` if equal,
     /// else the signed first-mismatch difference (`a[i] - b[i]`). Backs `memcmp` *and* `bcmp` (Rust's
     /// `[u8]`/slice equality and `BTreeMap` key ordering emit these).
@@ -5336,6 +5263,101 @@ fn uses_i128_divrem(m: &LModule) -> bool {
             _ => false,
         })
     })
+}
+
+/// The on-ramp's C heap (#1603): dlmalloc 2.8.6, compiled to IR once by `dlmalloc/gen.sh` with every
+/// symbol it defines in the reserved `__temen_dl.` namespace. It grows through `__temen_sbrk`.
+const DLMALLOC_LL: &str = include_str!("../dlmalloc/dlmalloc.ll");
+
+/// The libc heap entry points the dlmalloc unit serves: each libc name → the unit's definition.
+const HEAP_API: [(&str, &str); 7] = [
+    ("malloc", "__temen_dl.dlmalloc"),
+    ("free", "__temen_dl.dlfree"),
+    ("calloc", "__temen_dl.dlcalloc"),
+    ("realloc", "__temen_dl.dlrealloc"),
+    ("memalign", "__temen_dl.dlmemalign"),
+    ("aligned_alloc", "__temen_dl.dlmemalign"),
+    ("posix_memalign", "__temen_dl.dlposix_memalign"),
+];
+
+/// Link the C heap into a program, as a static link against libc's `malloc.o` would: when the module
+/// declares any [`HEAP_API`] name without defining it, merge the dlmalloc unit in and alias each such
+/// name to the unit's definition, so its calls (and address-takes) resolve like calls to any defined
+/// function. A name the program defines itself stays its own. Only a program (one defining `main`)
+/// gets a heap: the heap's pages come from the powerbox `Memory` grant, which only `_start` holds.
+fn link_heap(m: Cow<'_, LModule>) -> Result<Cow<'_, LModule>, Error> {
+    let defines = |name: &str| {
+        m.functions.iter().any(|f| f.name == name)
+            || m.global_aliases
+                .iter()
+                .any(|a| matches!(&a.name, Name::Name(n) if **n == name))
+    };
+    if !defines("main") {
+        return Ok(m);
+    }
+    let wanted: Vec<(&str, &str)> = HEAP_API
+        .into_iter()
+        .filter(|(name, _)| !defines(name) && m.func_declarations.iter().any(|d| d.name == *name))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(m);
+    }
+    let unit = ll::parse::parse_module_with_debug(DLMALLOC_LL)
+        .map_err(|e| Error::Parse(format!("dlmalloc unit: {e:?}")))?
+        .0;
+    let mut m = m.into_owned();
+    // The unit's names are all `__temen_dl.*` (gen.sh); a program that uses that namespace is refused
+    // rather than silently linked against the wrong definition.
+    let clash = |name: &str| {
+        m.functions.iter().any(|f| f.name == name)
+            || m.func_declarations.iter().any(|d| d.name == name)
+            || m.global_vars
+                .iter()
+                .any(|g| matches!(&g.name, Name::Name(n) if **n == name))
+    };
+    for name in
+        unit.functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .chain(unit.global_vars.iter().filter_map(|g| match &g.name {
+                Name::Name(n) => Some(n.as_str()),
+                Name::Number(_) => None,
+            }))
+    {
+        if clash(name) {
+            return unsup(format!("`{name}` is reserved for the on-ramp's C heap"));
+        }
+    }
+    for (name, def) in unit.types.named_struct_defs() {
+        if m.types.named_struct_def(name).is_some() {
+            return unsup(format!(
+                "type `%{name}` is reserved for the on-ramp's C heap"
+            ));
+        }
+        m.types.add_named_struct_def(name.clone(), def.clone());
+    }
+    m.functions.extend(unit.functions);
+    m.global_vars.extend(unit.global_vars);
+    for d in unit.func_declarations {
+        if !m.func_declarations.iter().any(|x| x.name == d.name)
+            && !m.functions.iter().any(|f| f.name == d.name)
+        {
+            m.func_declarations.push(d);
+        }
+    }
+    for (name, target) in wanted {
+        m.func_declarations.retain(|d| d.name != name);
+        let ptr = m.types.pointer(0);
+        m.global_aliases.push(GlobalAlias {
+            name: Name::Name(Box::new(name.to_string())),
+            aliasee: ConstantRef::new(Constant::GlobalReference {
+                name: Name::Name(Box::new(target.to_string())),
+                ty: ptr.clone(),
+            }),
+            ty: ptr,
+        });
+    }
+    Ok(Cow::Owned(m))
 }
 
 fn calls_external(m: &LModule, defined: &HashMap<String, u32>, want: &str) -> bool {
@@ -5478,92 +5500,6 @@ fn build_eh_subtypes(
         v.dedup();
     }
     out
-}
-
-/// Does the module call the heap allocator (`malloc`/`calloc`)? (`free` is a no-op; `realloc` is
-/// still `Unsupported`.)
-fn needs_malloc(m: &LModule, defined: &HashMap<String, u32>) -> bool {
-    calls_external(m, defined, "malloc") || calls_external(m, defined, "calloc")
-}
-
-/// Synthesize `__temen_realloc(p:i64, n:i64) -> i64`: `realloc` over the header-bearing bump allocator.
-/// `realloc(NULL, n)` ≡ `malloc(n)`; otherwise allocate `n`, copy `min(old, n)` bytes (the old size
-/// is the 16-byte header at `p-16`), and return the new pointer (the old block is leaked — `free` is
-/// a no-op). The copy never overlaps: the fresh block sits above the old one by construction.
-fn synth_realloc(malloc_idx: u32, memcpy_idx: u32) -> Func {
-    use temen_ir::LoadOp;
-    // block0(p=0, n=1): p == 0 ? malloc(n) : copy from the old block.
-    let b0 = Block {
-        params: vec![ValType::I64, ValType::I64],
-        insts: vec![
-            Inst::ConstI64(0), // v2
-            Inst::IntCmp {
-                ty: IntTy::I64,
-                op: CmpOp::Eq,
-                a: 0,
-                b: 2,
-            }, // v3 = p == 0
-        ],
-        term: Terminator::BrIf {
-            cond: 3,
-            then_blk: 1, // null_case(n)
-            then_args: vec![1],
-            else_blk: 2, // have(p, n)
-            else_args: vec![0, 1],
-        },
-    };
-    // null_case(n=0): return malloc(n).
-    let null_case = Block {
-        params: vec![ValType::I64],
-        insts: vec![Inst::Call {
-            func: malloc_idx,
-            args: vec![0],
-        }], // v1 = q
-        term: Terminator::Return(vec![1]),
-    };
-    // have(p=0, n=1): old = *(p-16); q = malloc(n); memcpy(q, p, min(old, n)); return q.
-    let have = Block {
-        params: vec![ValType::I64, ValType::I64],
-        insts: vec![
-            Inst::ConstI64(16), // v2
-            Inst::IntBin {
-                ty: IntTy::I64,
-                op: BinOp::Sub,
-                a: 0,
-                b: 2,
-            }, // v3 = p - 16 (header)
-            Inst::Load {
-                op: LoadOp::I64,
-                addr: 3,
-                offset: 0,
-            }, // v4 = old size
-            Inst::Call {
-                func: malloc_idx,
-                args: vec![1],
-            }, // v5 = q
-            Inst::IntCmp {
-                ty: IntTy::I64,
-                op: CmpOp::LtU,
-                a: 4,
-                b: 1,
-            }, // v6 = old < n
-            Inst::Select {
-                cond: 6,
-                a: 4,
-                b: 1,
-            }, // v7 = min(old, n)
-            Inst::Call {
-                func: memcpy_idx,
-                args: vec![5, 0, 7],
-            }, // memcpy(q, p, min) — void
-        ],
-        term: Terminator::Return(vec![5]), // q
-    };
-    Func {
-        params: vec![ValType::I64, ValType::I64],
-        results: vec![ValType::I64],
-        blocks: vec![b0, null_case, have],
-    }
 }
 
 /// Synthesize `__temen_eh_destroy(sp:i64, exn:i64, dtor:i64)`: run an exception object's destructor on
@@ -13284,29 +13220,20 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             }
             Ok(true)
         }
-        // `malloc(size)` / `calloc(n, size)`: the synthesized `vm_map`-growing bump allocator. The heap
-        // never reuses and freshly-committed pages are zeroed, so returned memory is zero — hence
-        // `calloc` is just `malloc` of `n*size` with no explicit clear.
-        "malloc" | "calloc" => {
-            let Some(f) = ctx.helpers.malloc else {
-                return Ok(false); // no allocator synthesized (e.g. no powerbox entry) → fail-closed
+        // `__temen_sbrk(increment)`: the dlmalloc heap's `MORECORE` (`link_heap`) → the synthesized
+        // `vm_map`-growing break. `None` (no powerbox entry) → fail-closed.
+        "__temen_sbrk" => {
+            let Some(f) = ctx.helpers.sbrk else {
+                return Ok(false);
             };
-            let size = if name == "calloc" {
-                let n = ctx.operand(&c.arguments[0].0)?;
-                let sz = ctx.operand(&c.arguments[1].0)?;
-                ctx.mul_i64(n, sz)
-            } else {
-                ctx.operand(&c.arguments[0].0)?
-            };
+            let inc = ctx.operand(&c.arguments[0].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![size],
+                args: vec![inc],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // `free(ptr)`: the bump allocator never reclaims, so this is a no-op.
-        "free" => Ok(true),
         // `memcmp(a,b,n)` / `bcmp(a,b,n)`: the synthesized `__temen_memcmp` (counted unsigned byte
         // compare). `bcmp` shares it — callers only test `!= 0`, which the `0`-iff-equal result keeps.
         "memcmp" | "bcmp" => {
@@ -13319,20 +13246,6 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let r = ctx.push(Inst::Call {
                 func: f,
                 args: vec![a, b, n],
-            });
-            ctx.bind_dest(&c.dest, r);
-            Ok(true)
-        }
-        // `realloc(ptr, n)`: the synthesized `__temen_realloc` (malloc + header-sized copy).
-        "realloc" => {
-            let Some(f) = ctx.helpers.realloc else {
-                return Ok(false);
-            };
-            let p = ctx.operand(&c.arguments[0].0)?;
-            let n = ctx.operand(&c.arguments[1].0)?;
-            let r = ctx.push(Inst::Call {
-                func: f,
-                args: vec![p, n],
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)

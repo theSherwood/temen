@@ -1,7 +1,7 @@
 //! temen allocator `imp`: forward to the C `malloc` family. The temen-llvm on-ramp
-//! synthesizes `malloc`/`free`/`realloc`/`calloc` as an in-window guest bump
-//! allocator (`synth_malloc`, LLVM.md slice S), so `std`'s global allocator
-//! reaches the heap with no host crossing per call. Over-aligned requests
+//! links `malloc`/`free`/`realloc`/`calloc` to an in-window guest dlmalloc heap
+//! (LLVM.md slice S), so `std`'s global allocator reaches the heap with no host
+//! crossing per call. Over-aligned requests
 //! (`align > MIN_ALIGN`) are served by over-allocation with the base pointer
 //! stashed in the word before the returned block.
 use super::MIN_ALIGN;

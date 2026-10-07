@@ -52,7 +52,7 @@ struct Ctx<'a> {
     /// Bytes of the mapped window we run under, `1 << MAPPED_LOG2` (also the shared `back` size).
     win: u64,
     /// The on-ramp heap base — the declared window top (`1 << declared_size_log2`), where the guest's
-    /// bump allocator starts; seeded into `POWERBOX_HEAP_BRK`/`_TOP`. Heap grows from here into the
+    /// heap starts; seeded into `POWERBOX_HEAP_BRK`/`_TOP`. Heap grows from here into the
     /// (larger) mapped window.
     heap_base: u64,
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as every entry's `sp` arg.
@@ -70,7 +70,7 @@ fn window(size: usize) -> (Arc<Region>, *mut u8, Layout) {
     (back, base, layout)
 }
 
-/// Seed the on-ramp guest-heap bump-pointer words the synthesized `_start` writes with `seed_heap`: both
+/// Seed the on-ramp guest-heap break words the synthesized `_start` writes with `seed_heap`: both
 /// `POWERBOX_HEAP_BRK` and `_TOP` start at the window's mapped boundary (`ctx.win`), from which malloc
 /// grows the heap up (via `vm_map`) into the reserved tail — here, into `back` above the window. Only for
 /// a **fresh** window (cold / warmup); a restored snapshot already carries the warm allocator state.
@@ -207,7 +207,7 @@ fn main() {
     };
 
     // ---- Snapshot the warm runtime once: run `warmup` over a fresh, seeded window, then keep the
-    // **live prefix** — `[0, brk)`, where `brk` (the guest's bump-allocator high-water, at
+    // **live prefix** — `[0, brk)`, where `brk` (the guest heap's break, at
     // POWERBOX_HEAP_BRK) is how far the heap has grown. Everything above `brk` is still zero, so a
     // fresh `alloc_zeroed` restore target needs only this prefix copied in. This is the
     // program-independent post-init state. ----
