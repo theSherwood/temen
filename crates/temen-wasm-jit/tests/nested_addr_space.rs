@@ -12,6 +12,8 @@
 //! identically-granted `Host` — grants encode deterministically, so `sub`'s minted handle and every
 //! result must be byte-identical across tiers. The bounce counter is the non-vacuity guard.
 
+mod support;
+
 use temen_interp::{bytecode, Host, Value};
 use temen_wasm_jit::{compile_module_nested, outline_nested_cap_calls};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -20,6 +22,7 @@ const WIN_BASE: i32 = 0x1_0000;
 const ENV_PTR: i32 = 1024;
 const ENV_SCRATCH_OFF: usize = 16; // temen_wasm_jit's cross-tier scratch offset in the env cell
 const WIN: u64 = 1 << 17; // `memory 17`
+const REC_AT: u64 = 18432; // where [`composed`] builds its spawn record: above the #1094 NULL guard
 
 /// Entry `(address_space) -> i64`: `page_size` on the root, `sub`-carve a 64 KiB child at 64 KiB,
 /// `page_size` again **through the minted child handle** (the attenuation is a live `AddressSpace`),
@@ -40,23 +43,26 @@ block 0 (v0: i32) {
 }
 "#;
 
-/// Entry `(address_space, instantiator) -> i64`: the §14 story in one function — `sub`-carve the
-/// window (outlined bounce), then `instantiate` a child + `join` it (the dedicated import bounce),
-/// folding both results. The child (func 1) mirrors the driver contract (`(i64) -> (i64)`, ignores
-/// its attenuated-handle arg) and returns 9.
-const COMPOSED: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+/// Entry `(address_space, instantiator, budget) -> i64`: the §14 story in one function — `sub`-carve
+/// the window (outlined bounce), then spawn a child through a v1 record paid from `budget` + `join` it
+/// (the dedicated import bounce), folding both results. The child (func 1) mirrors the driver contract
+/// (`(i64) -> (i64)`, ignores its starter arg) and returns 9.
+fn composed() -> String {
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(1));
+    let budget_at = REC_AT + 28;
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
   vps = call.cap 5 3 () -> (i64) v0 ()
   voff = i64.const 65536
   vslog = i64.const 16
   vsub = call.cap 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
   vps2 = call.cap 5 3 () -> (i64) vsub ()
-  ventry = i64.const 1
-  vzoff = i64.const 16384
-  vzslog = i64.const 10
-  vquota = i64.const 0
-  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (ventry, vzoff, vzslog, vquota)
+{stores}  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const {REC_AT}
+  vch = call.cap 6 17 (i64) -> (i32) v1 (vrp)
   vjr = call.cap 6 1 (i32) -> (i64) v1 (vch)
   vk = i64.const 100000
   vjs = i64.mul vjr vk
@@ -65,15 +71,17 @@ block 0 (v0: i32, v1: i32) {
   vt2 = i64.add vps vt
   vr = i64.add vjs vt2
   return vr
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   vr = i64.const 9
   return vr
-  }
+  }}
+}}
+"#
+    )
 }
-"#;
 
 fn parse(src: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(src).expect("parse");
@@ -82,22 +90,26 @@ fn parse(src: &str) -> temen_ir::Module {
 }
 
 /// Grant the host exactly as both tiers must: AddressSpace over the whole window, then (iff the
-/// entry takes it) an Instantiator. Same order ⇒ identical handle encodings across hosts.
+/// entry takes them) an Instantiator and a Budget that pays for the child's window. Same order ⇒
+/// identical handle encodings across hosts.
 fn granted_host(with_inst: bool) -> (Host, Vec<Value>) {
     let mut h = Host::new();
     let a = h.grant_address_space(0, WIN);
     let mut args = vec![Value::I32(a)];
     if with_inst {
         let i = h.grant_instantiator(0, WIN);
-        args.push(Value::I32(i));
+        let b = h.grant_budget(-1, -1, -1);
+        args.extend([Value::I32(i), Value::I32(b)]);
     }
     (h, args)
 }
 
 /// The whole-entry oracle: the bytecode cooperative driver over an identically-granted host — it
-/// services the generic ADDRESS_SPACE dispatch *and* `instantiate`/`join` in one run.
+/// services the generic ADDRESS_SPACE dispatch *and* the spawn/`join` in one run. The host knows the
+/// running module, as an embedder registers it, so the record's `-1` names it.
 fn oracle(m: &temen_ir::Module, with_inst: bool) -> i64 {
     let (mut host, args) = granted_host(with_inst);
+    host.set_self_module(&std::sync::Arc::new(m.clone()));
     let mut fuel = 50_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host) {
         Some(Ok(v)) => match v.first() {
@@ -121,7 +133,7 @@ struct HostState {
 
 /// Run the emitted §14 entry under wasmi: outlined ADDRESS_SPACE wrappers bounce via
 /// `env.call_interp` (serviced on the bytecode interp against the persistent host);
-/// `instantiate`/`join` bounce via the dedicated imports (the child runs on the tree-walker).
+/// `instantiate_rec`/`join` bounce via the dedicated imports (the child runs on the tree-walker).
 fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
     let mut m = parse(src);
     outline_nested_cap_calls(&mut m);
@@ -201,25 +213,28 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
             },
         )
         .unwrap();
-    // The dedicated §14 spawn/join bounce (as in nested_vm.rs): run the child entry on the
-    // tree-walker (the confinement carve is the host's job; the child here is pure).
+    // The dedicated §14 spawn/join bounce (as in instantiate_rec.rs): read the record back out of
+    // the parent's window, decode it, and run the child entry detached on the tree-walker (the child
+    // here is pure). The op-0 import is part of every nested module's layout but never fires.
     linker
         .func_wrap(
             "env",
-            "instantiate",
-            |mut caller: Caller<'_, HostState>,
-             _win: i32,
-             _inst: i32,
-             entry: i64,
-             _off: i64,
-             _slog: i64,
-             _quota: i64|
-             -> i32 {
+            "instantiate_rec",
+            move |mut caller: Caller<'_, HostState>,
+                  win: i32,
+                  _inst: i32,
+                  record_ptr: i64|
+                  -> i32 {
+                let mut rec = [0u8; temen_ir::SPAWN_REC_LEN];
+                mem.read(&caller, (win as u64 + record_ptr as u64) as usize, &mut rec)
+                    .expect("record in-window");
+                let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
+                assert!(rec.detached && rec.modh == -1, "a v1 self-spawn: {rec:?}");
                 let st = caller.data_mut();
                 st.inst_bounces += 1;
                 let m = st.m.clone();
                 let mut fuel = u64::MAX;
-                let r = match temen_interp::run(&m, entry as u32, &[Value::I64(0)], &mut fuel) {
+                let r = match temen_interp::run(&m, rec.entry, &[Value::I64(0)], &mut fuel) {
                     Ok(v) => match v.first() {
                         Some(Value::I64(x)) => *x,
                         other => panic!("child result: {other:?}"),
@@ -230,6 +245,20 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
                 st.children.push(r);
                 (st.children.len() - 1) as i32
             },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "instantiate",
+            |_: Caller<'_, HostState>,
+             _win: i32,
+             _inst: i32,
+             _entry: i64,
+             _off: i64,
+             _slog: i64,
+             _quota: i64|
+             -> i32 { unreachable!("no op-0 spawn in this unit") },
         )
         .unwrap();
     linker
@@ -315,15 +344,16 @@ fn addr_space_bounce_matches_interp() {
     assert_eq!(got, want, "emitted AddressSpace entry != interpreter");
 }
 
-/// The composed §14 entry — `sub`-carve (outlined bounce) + `instantiate`/`join` (dedicated bounce)
-/// in one function ≡ the whole-entry cooperative oracle.
+/// The composed §14 entry — `sub`-carve (outlined bounce) + spawn/`join` (dedicated bounce) in one
+/// function ≡ the whole-entry cooperative oracle.
 #[test]
 fn sub_carve_then_instantiate_matches_interp() {
-    let m = parse(COMPOSED);
+    let src = composed();
+    let m = parse(&src);
     let want = oracle(&m, true);
-    let (got, leaves, insts) = emitted_run(COMPOSED, true);
+    let (got, leaves, insts) = emitted_run(&src, true);
     assert!(leaves >= 3, "expected 3 wrapper bounces, saw {leaves}");
-    assert_eq!(insts, 1, "expected exactly one instantiate bounce");
+    assert_eq!(insts, 1, "expected exactly one instantiate_rec bounce");
     assert_eq!(got, want, "emitted composed §14 entry != interpreter");
 }
 

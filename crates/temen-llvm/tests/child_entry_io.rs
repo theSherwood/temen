@@ -3,12 +3,16 @@
 //! spawn to the child's re-granted named caps (`Host::bind_child_manifest`). This proves that binding
 //! for an on-ramp child-entry module: a real Rust guest compiled `--child-entry` that calls `write(1,
 //! …)` is spawned (`temen_run::conductor`, its own window) with `stdout` re-granted, and its bytes land in the
-//! shared sink — the exact hand-off a JIT'd `nifler` uses to reach its `fs`. (The cooperative engine
-//! binds the child manifest inline; wiring the same into the resumable/tier-up path is a follow-up.)
+//! parent's stdout — the exact hand-off a JIT'd `nifler` uses to reach its `fs`. It runs on the
+//! tree-walk oracle and every bytecode driver ([`drivers::ALL`]): each binds the child manifest at the
+//! one admission they share, the resumable `Vcpu` (the engine a phase tiers up on) among them.
 
 #![cfg(target_os = "linux")]
 
-use temen_interp::{run_with_host, Host, StreamRole, Value};
+use temen_interp::{Host, StreamRole, Value};
+
+#[path = "../../temen-interp/tests/support/drivers.rs"]
+mod drivers;
 
 // A Rust guest that writes "hi" to fd 1. `write` lowers to a `Stream` manifest import, which (a) forces
 // a synthesized powerbox `_start` and (b) must bind to the re-granted `stdout` at spawn. Compiled
@@ -72,35 +76,25 @@ fn child_entry_writes_through_a_regranted_stdout() {
 
     // The parent spawns the child re-granting the `stdout` handle under that name.
     let parent = temen_run::conductor(&["stdout"], &[]);
-
-    let mut host = Host::new();
-    let sink = host.shared_stdout(); // the shared Out sink we read after the run
-    let out_h = host.grant_stream(StreamRole::Out);
-    let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
-
-    let mut fuel = 200_000_000u64;
-    let r = run_with_host(
-        &parent,
-        0,
-        &[
-            Value::I32(inst),
-            Value::I32(modh),
-            Value::I32(budget),
-            Value::I32(out_h),
-        ],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("parent run");
-
-    // The child's `main` returned 0, joined back.
-    assert!(
-        matches!(r.as_slice(), [Value::I64(0)] | [Value::I32(0)]),
-        "child status 0 joined back: {r:?}"
-    );
-    assert_eq!(
-        &*sink.lock().unwrap(),
-        b"hi",
-        "the child-entry guest's write bound to the re-granted stdout and reached the shared sink"
-    );
+    let powerbox = || {
+        let mut host = Host::new();
+        let out_h = host.grant_stream(StreamRole::Out);
+        let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
+        (host, [inst, modh, budget, out_h].map(Value::I32).to_vec())
+    };
+    for driver in drivers::ALL {
+        let ran = drivers::run_on(driver, &parent, &powerbox)
+            .unwrap_or_else(|| panic!("{driver:?} declined the conductor"));
+        // The child's `main` returned 0, joined back.
+        assert_eq!(
+            ran.result,
+            Ok(vec![Value::I64(0)]),
+            "{driver:?}: child status 0 joined back"
+        );
+        assert_eq!(
+            ran.stdout, b"hi",
+            "{driver:?}: the child-entry guest's write bound to the re-granted stdout and reached the \
+             parent's stdout"
+        );
+    }
 }

@@ -4,13 +4,12 @@
 //! present only when the module actually uses op 17 — so every existing nested-mode module
 //! keeps its exact import set and no driver changes until it loads an op-17 module.
 //!
-//! The proof mirrors `nested_vm.rs`: the emitted parent builds a v1 (detached) record in its window
-//! with ordinary stores, bounces, and the servicer reads the record back out of linear memory
-//! (the full marshalling round-trip), decodes it with the one shared [`temen_ir::SpawnRec::parse`],
-//! runs the child detached — the interpreter oracle, in a window of its own — and `env.join`
-//! returns its result. The conditional-import
-//! property is asserted from both sides: the op-17 module refuses to instantiate without the
-//! import defined, and the op-0 module from `nested_vm.rs`'s shape instantiates with a linker
+//! The proof: the emitted parent builds a v1 (detached) record in its window with ordinary stores,
+//! bounces, and the servicer reads the record back out of linear memory (the full marshalling
+//! round-trip), decodes it with the one shared [`temen_ir::SpawnRec::parse`], runs the child
+//! detached — the interpreter oracle, in a window of its own — and `env.join` returns its result.
+//! The conditional-import property is asserted from both sides: the op-17 module refuses to
+//! instantiate without the import defined, and a module with no op 17 instantiates with a linker
 //! that never defines it.
 
 mod support;
