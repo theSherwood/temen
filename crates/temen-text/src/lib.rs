@@ -73,7 +73,7 @@ pub fn print_module(m: &Module) -> String {
         );
     }
     // Data-image funcref slots (#1830): `data.funcref <at>`, where the image above holds a function
-    // index `link` baked.
+    // index — one `link` baked, or (in a unit) the index of one of the unit's own functions.
     for at in &m.data_funcref_slots {
         let _ = writeln!(s, "data.funcref {at}");
     }
@@ -95,6 +95,11 @@ pub fn print_module(m: &Module) -> String {
                 let _ = writeln!(s, "data.ptr {tls}{} sym {} {addend}", p.at, quote_str(name));
             }
         }
+    }
+    // Data-image funcref relocations (the data→code case): `data.funcref <at> sym "<name>"` writes
+    // the exported function `name`'s merged index at `at`. Like `data.ptr`, pre-link only.
+    for r in &m.data_funcrefs {
+        let _ = writeln!(s, "data.funcref {} sym {}", r.at, quote_str(&r.name));
     }
     if let Some(mem) = &m.memory {
         let _ = write!(s, "memory {}", mem.size_log2);
@@ -1258,6 +1263,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
     let mut data_ptrs: Vec<temen_ir::DataPtr> = Vec::new();
+    let mut data_funcrefs: Vec<temen_ir::DataFuncref> = Vec::new();
     let mut data_funcref_slots: Vec<u64> = Vec::new();
     let mut tls_data: Vec<Data> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
@@ -1572,10 +1578,20 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 }
             }
             // A data-image funcref slot (#1830): `data.funcref <at>` — the data image holds a
-            // function index at `at` (what `link` records as it bakes one).
+            // function index at `at` (what `link` records as it bakes one; in a unit, the index of
+            // one of its own functions). `data.funcref <at> sym "<name>"` is the relocation that
+            // writes the exported function `name`'s merged index there; `link` resolves it.
             Some(Tok::Ident(s)) if s == "data.funcref" => {
                 p.next()?;
-                data_funcref_slots.push(p.parse_u64()?);
+                let at = p.parse_u64()?;
+                if p.eat_ident("sym")? {
+                    let name = String::from_utf8(p.parse_str()?).map_err(|_| {
+                        ParseError("data.funcref sym name is not valid UTF-8".into())
+                    })?;
+                    data_funcrefs.push(temen_ir::DataFuncref { at, name });
+                } else {
+                    data_funcref_slots.push(at);
+                }
             }
             // Data-image pointer relocation (the data→data case, D-LINK): `data.ptr <at> self
             // <off>` writes this unit's own data address `dbase+off` at slot `at`; `data.ptr <at>
@@ -1724,10 +1740,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         memory,
         data,
         data_ptrs,
-        // `data.funcref` relocations (by name) have no text form — the nimony frontend attaches
-        // them to the parsed object module directly (they need the module stem, which the text
-        // layer lacks). The slots `link` resolves them into do: `data.funcref <at>`.
-        data_funcrefs: Vec::new(),
+        data_funcrefs,
         data_funcref_slots,
         tls: tls_data,
         imports: std::mem::take(&mut p.imports),
@@ -1802,10 +1815,13 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 p.parse_str()?;
             }
-            // `data.funcref <at>` — skip in the header prescan.
+            // `data.funcref <at> [sym "<name>"]` — skip in the header prescan.
             Some(Tok::Ident(s)) if s == "data.funcref" => {
                 p.next()?;
                 p.parse_int()?;
+                if p.eat_ident("sym")? {
+                    p.parse_str()?;
+                }
             }
             // `data.ptr <at> self <off>` / `data.ptr <at> sym "<name>" <addend>` — skip in the
             // header prescan (carries no function; lexes as its own ident, distinct from `data`).
@@ -3828,6 +3844,27 @@ block 0 (v0: i32) {
         let printed = print_module(&m);
         let m2 = parse_module(&printed).expect("reparse");
         assert_eq!(m, m2, "import syntax must round-trip");
+    }
+
+    /// Both data-image funcref forms (#2194): a slot whose bytes hold one of the unit's own
+    /// function indices, and a relocation naming another unit's function.
+    #[test]
+    fn data_funcrefs_round_trip() {
+        let src = "data 16 \"\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+                   data.funcref 16\n\
+                   data.funcref 24 sym \"add\"\n\
+                   data 24 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(m.data_funcref_slots, [16]);
+        assert_eq!(
+            m.data_funcrefs,
+            [temen_ir::DataFuncref {
+                at: 24,
+                name: "add".into()
+            }]
+        );
+        let printed = print_module(&m);
+        assert_eq!(parse_module(&printed).expect("reparse"), m, "{printed}");
     }
 
     #[test]

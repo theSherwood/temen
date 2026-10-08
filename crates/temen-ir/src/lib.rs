@@ -4307,7 +4307,10 @@ pub struct Module {
     /// refers to; [`link`] resolves the name to the merged funcidx and writes it as a 4-byte
     /// little-endian `i32` — the value `ref.func` would yield — then clears the list. The funcref
     /// twin of [`data_ptrs`](Module::data_ptrs): `ref.func` rides the instruction stream, but a
-    /// funcref stored in static data has no instruction to carry it. Empty for a runnable module.
+    /// funcref stored in static data has no instruction to carry it. A pointer to one of the unit's
+    /// own functions (a `static` one included) needs no name: the frontend writes the function's
+    /// index in the unit and records a [`data_funcref_slots`](Module::data_funcref_slots) entry
+    /// (#2194). Empty for a runnable module.
     pub data_funcrefs: Vec<DataFuncref>,
     /// The unit's **thread-local template** (#1715, D-LINK): the initial bytes of its thread-local
     /// variables (C `_Thread_local`), as segments at offsets within the unit's own per-thread block
@@ -4328,6 +4331,10 @@ pub struct Module {
     /// reach must know. The verifier checks each slot's four bytes are laid down by the data image
     /// and name a function of the module, so the record cannot name a function the image does not
     /// hold. Empty for a module whose data holds no function index.
+    ///
+    /// A link unit holds slots too: a module linked before, or a frontend's pointer to one of the
+    /// unit's own functions (#2194). Such a slot names the function by its index in the unit, and
+    /// [`link`] adds the unit's function base, as it does for `ref.func`.
     pub data_funcref_slots: Vec<u64>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
@@ -4841,6 +4848,7 @@ pub struct DataPtr {
 /// the slot and `call.dyn`-ing through it dispatches to `name`. The frontend emits placeholder
 /// bytes in a `data` segment covering `[at, at+4)` and one of these to fix them up; [`link`]
 /// overwrites the 4 bytes and fails closed ([`LinkError::Unresolved`]) if no unit exports `name`.
+/// A pointer to a function of the unit itself is a [`Module::data_funcref_slots`] entry instead.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DataFuncref {
     /// Byte offset within this unit's (un-relocated) data image where the 4-byte funcidx sits.
@@ -6178,17 +6186,18 @@ fn tls_span(m: &Module) -> u64 {
 /// case): for each [`DataFuncref`], resolve `name` to its merged funcidx via `funcs_tab` (fail-closed
 /// [`LinkError::Unresolved`] if unexported) and write it as a 4-byte little-endian `i32` into the
 /// covering data segment — the value `ref.func name` yields. A slot the unit already holds
-/// ([`Module::data_funcref_slots`], a module linked before) is rewritten shifted by the unit's
-/// `fbase`. A slot not covered by a segment (or one whose 4 bytes run past a segment end) fails
-/// closed ([`LinkError::BadDataPtr`]). Clears both lists and returns every slot written, unit-local
-/// and ascending — the linked module records them (#1830) where `data_ptrs` leaves nothing.
+/// ([`Module::data_funcref_slots`]: a module linked before, or a pointer to one of the unit's own
+/// functions) is rewritten shifted by the unit's `fbase`. A slot not covered by a segment (or one
+/// whose 4 bytes run past a segment end) fails closed ([`LinkError::BadDataPtr`]). Clears both
+/// lists and returns every slot written, unit-local and ascending — the linked module records them
+/// (#1830) where `data_ptrs` leaves nothing.
 fn apply_unit_data_funcrefs(
     m: &mut Module,
     funcs_tab: &alloc::collections::BTreeMap<String, FuncIdx>,
     fbase: FuncIdx,
 ) -> Result<Vec<u64>, LinkError> {
-    // A slot the unit already holds (a module linked before) names one of its own functions: it
-    // shifts with the unit's functions, as `offset_func_indices` shifts its code.
+    // A slot the unit already holds names one of its own functions: it shifts with the unit's
+    // functions, as `offset_func_indices` shifts its code.
     let held: Vec<(u64, FuncIdx)> = m
         .data_funcref_slots
         .iter()

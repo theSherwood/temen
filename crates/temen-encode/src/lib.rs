@@ -530,7 +530,8 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
     }
     // Data-image funcref slots (v13, #1830), in both dialects, directly after the image they
     // describe: count, then each slot's offset. What `link` recorded of the funcrefs it baked (a
-    // unit may hold them too, when it was linked before); the verifier checks them against the image.
+    // unit holds them too: one linked before, or a frontend's pointer to one of the unit's own
+    // functions, #2194); the verifier checks them against the image.
     write_uleb(&mut out, m.data_funcref_slots.len() as u64);
     for &at in &m.data_funcref_slots {
         write_uleb(&mut out, at);
