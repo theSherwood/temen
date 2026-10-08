@@ -6779,7 +6779,7 @@ fn journal_state(
     }
     let invertible = host.journal_invertible()
         && extra_envs.iter().all(|e| e.host.region_count() == 0)
-        && tasks.iter().all(|t| t.vt.active_invoke.is_none())
+        && tasks.iter().all(|t| t.vm.vt.active_invoke.is_none())
         && !any_event_parked(fibers.iter());
     if !invertible {
         return;
@@ -6797,10 +6797,10 @@ fn journal_state(
         tasks: tasks
             .iter()
             .map(|t| DbgTaskSnapshot {
-                active: t.vt.active.clone(),
-                active_id: t.vt.active_id,
-                chain: t.vt.chain.clone(),
-                root_shadow_sp: t.vt.root_shadow_sp,
+                active: t.vm.vt.active.clone(),
+                active_id: t.vm.vt.active_id,
+                chain: t.vm.vt.chain.clone(),
+                root_shadow_sp: t.vm.vt.root_shadow_sp,
                 threads: t.threads.clone(),
                 env: t.env,
                 state: t.state.clone(),
@@ -7202,7 +7202,7 @@ fn apply_due_writes(
                 if let Some(t) = tasks.get_mut(*task) {
                     {
                         let target = FrameReader {
-                            vm: &t.vt.active,
+                            vm: &t.vm.vt.active,
                             source,
                             mem: match t.env {
                                 None => &*mem,
@@ -7219,7 +7219,7 @@ fn apply_due_writes(
                             target,
                             *value,
                             *width,
-                            &mut t.vt.active.regs,
+                            &mut t.vm.vt.active.regs,
                             mem,
                             envs,
                             t.env,
@@ -7894,13 +7894,13 @@ fn record_sched(
 fn trace_depth(task: &TaskSlot) -> usize {
     match task.state {
         TaskState::Done(_) => 0,
-        _ => task.vt.active.stack.len() + 1,
+        _ => task.vm.vt.active.stack.len() + 1,
     }
 }
 
 /// The `(module, func)` of `task`'s frame `level` from the bottom (`0` = its entry function).
 fn trace_frame(task: &TaskSlot, level: usize) -> (usize, usize) {
-    let vm = &task.vt.active;
+    let vm = &task.vm.vt.active;
     match vm.stack.get(level) {
         Some(&(module, func, ..)) => (module, func),
         None => (vm.module, vm.cur),
@@ -8061,7 +8061,7 @@ fn dbg_spawn(
     tasks.push(TaskSlot::new(vt, env, live));
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
-    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+    tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
 
@@ -8081,11 +8081,11 @@ fn dbg_advance_task(
     host: &mut Host,
 ) -> FiberStep {
     match tasks[ti].env {
-        None => debug_advance_fiber(&mut tasks[ti].vt, fibers, source, table, fuel, mem, host),
+        None => debug_advance_fiber(&mut tasks[ti].vm.vt, fibers, source, table, fuel, mem, host),
         Some(k) => {
             let e = &mut extra_envs[k];
             debug_advance_fiber(
-                &mut tasks[ti].vt,
+                &mut tasks[ti].vm.vt,
                 &mut e.fibers,
                 source,
                 &e.table,
@@ -8223,7 +8223,7 @@ fn service_advance(
                         .flat_map(|e| e.fibers.fibers.iter_mut()),
                 );
                 woken += wake_fiber_waiters(regs, key, want - woken);
-                tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
+                tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
             // §14 confined children (ops 0, 5, 13, 17): the executor's admission, scheduled as a debug
             // task over its own `DbgEnv`, so a spawning guest stays steppable through its child.
@@ -8321,13 +8321,13 @@ fn service_advance(
                     None => &fibers.fibers,
                     Some(k) => &extra_envs[k].fibers.fibers,
                 };
-                let roots = gc_scan(&tasks[ti].vt, reg, source, lo, hi, mask);
+                let roots = gc_scan(&tasks[ti].vm.vt, reg, source, lo, hi, mask);
                 let m: &mut Option<Mem> = match tasks[ti].env {
                     None => mem,
                     Some(k) => &mut extra_envs[k].mem,
                 };
                 match gc_write(m, buf, cap, roots) {
-                    Ok(total) => tasks[ti].vt.active.set(dst, Reg::from_i64(total)),
+                    Ok(total) => tasks[ti].deliver(dst, Reg::from_i64(total)),
                     Err(t) => complete(tasks, ti, Err(t)),
                 }
             }
@@ -8365,14 +8365,11 @@ fn dbg_instantiate_confined(
         pm,
         pfuel.can_burn(),
         source,
-        &tasks[ti].vt.active,
+        &tasks[ti].vm.vt.active,
         spawn,
     )?
     else {
-        tasks[ti]
-            .vt
-            .active
-            .set(dst, Reg::from_i32(super::EINVAL as i32));
+        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
     dbg_start_child(
@@ -8439,7 +8436,7 @@ fn dbg_start_child(
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
-    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+    tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
 
@@ -8460,9 +8457,9 @@ fn dbg_instantiate_detached(
 ) -> Result<(), Trap> {
     // The spawning frame's module, which a child of its own program runs (#2076, #2143), and the
     // unit it is when the spawning domain installed it.
-    let spawner = spawner_module(source, &tasks[ti].vt.active);
+    let spawner = spawner_module(source, &tasks[ti].vm.vt.active);
     let table = tasks[ti].env.map_or(table, |k| &extra_envs[k].table);
-    let unit = table.jit_unit(tasks[ti].vt.active.module);
+    let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
         None => (shared_mem.as_ref(), &mut *host),
@@ -8472,10 +8469,7 @@ fn dbg_instantiate_detached(
         }
     };
     let Some(child) = admit_detached_in_process(owner, pm, spawn, spawner, unit)? else {
-        tasks[ti]
-            .vt
-            .active
-            .set(dst, Reg::from_i32(super::EINVAL as i32));
+        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
     let place = EnvPlace::Detached {
@@ -9244,7 +9238,7 @@ impl ScheduledDebugRun {
                             })
                         {
                             // The stop location is the call itself, falling back to the live pc.
-                            let pc = at.or_else(|| tasks[p].vt.debug_active().cur_ir_pc(source));
+                            let pc = at.or_else(|| tasks[p].vm.vt.debug_active().cur_ir_pc(source));
                             if let Some(pc) = pc {
                                 *stopped = Some(p);
                                 *focus = p;
@@ -9254,7 +9248,8 @@ impl ScheduledDebugRun {
                         let parked = tasks
                             .iter()
                             .position(|t| matches!(t.state, TaskState::BlockedStdin));
-                        let pc = parked.and_then(|p| tasks[p].vt.debug_active().cur_ir_pc(source));
+                        let pc =
+                            parked.and_then(|p| tasks[p].vm.vt.debug_active().cur_ir_pc(source));
                         return match (parked, pc) {
                             (Some(p), Some(pc)) => {
                                 *stopped = Some(p);
@@ -9279,7 +9274,7 @@ impl ScheduledDebugRun {
             // body on the right thread.
             if !tasks[ti].at_bp {
                 let hit = {
-                    let cur_vm = tasks[ti].vt.debug_active();
+                    let cur_vm = tasks[ti].vm.vt.debug_active();
                     match cur_vm.cur_ir_pc(source) {
                         Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
                         // A window-range watch (cross-thread) stops *before* the access; a value
@@ -9321,7 +9316,7 @@ impl ScheduledDebugRun {
                 // A budgeted run's turn is up: stop here, as a breakpoint would, so resuming steps off
                 // this op first.
                 if pause_at.is_some_and(|t| *turn >= t) {
-                    if let Some(pc) = tasks[ti].vt.debug_active().cur_ir_pc(source) {
+                    if let Some(pc) = tasks[ti].vm.vt.debug_active().cur_ir_pc(source) {
                         tasks[ti].at_bp = true;
                         *stopped = Some(ti);
                         *focus = ti;
@@ -9332,8 +9327,8 @@ impl ScheduledDebugRun {
                     }
                 }
                 if let Some((st, max_depth)) = step {
-                    if ti == st && max_depth.is_none_or(|m| tasks[st].vt.debug_depth() <= m) {
-                        if let Some(pc) = tasks[st].vt.debug_active().cur_ir_pc(source) {
+                    if ti == st && max_depth.is_none_or(|m| tasks[st].vm.vt.debug_depth() <= m) {
+                        if let Some(pc) = tasks[st].vm.vt.debug_active().cur_ir_pc(source) {
                             *stopped = Some(st);
                             *focus = st;
                             return SchedStop::Break {
@@ -9359,14 +9354,14 @@ impl ScheduledDebugRun {
             );
             // The sink observes the root's window only (#2076), as the journal below does.
             if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
-                let cur_vm = tasks[ti].vt.debug_active();
+                let cur_vm = tasks[ti].vm.vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
             // #1557: pre-images of what this op is about to overwrite, so a later `undo_to` can put
             // them back without replaying. Must precede the advance — the bytes are gone after it.
             journal_op(
                 journal,
-                tasks[ti].vt.debug_active(),
+                tasks[ti].vm.vt.debug_active(),
                 source,
                 funcs,
                 fn_block_base,
@@ -9493,7 +9488,7 @@ impl ScheduledDebugRun {
     /// frame while it is mid-coroutine or mid-invoke — [`VTask::debug_depth`]). Used by the depth-bounded verbs so
     /// they treat a coroutine `resume` boundary like an ordinary call.
     fn step_depth(&self, s: usize) -> usize {
-        self.tasks[s].vt.debug_depth()
+        self.tasks[s].vm.vt.debug_depth()
     }
 
     /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
@@ -9590,14 +9585,14 @@ impl ScheduledDebugRun {
             journal,
         );
         if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
-            let cur_vm = tasks[ti].vt.debug_active();
+            let cur_vm = tasks[ti].vm.vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
         }
         // #1557: the raw replay quantum journals too, so a `tick`-driven replay builds the identical
         // history a `drive`-driven run does (the two must not disagree — DEBUGGING.md, `service_advance`).
         journal_op(
             journal,
-            tasks[ti].vt.debug_active(),
+            tasks[ti].vm.vt.debug_active(),
             source,
             funcs,
             fn_block_base,
@@ -9736,7 +9731,7 @@ impl ScheduledDebugRun {
         };
         settle_host_cap(&mut self.host, id, value);
         let _ = self.host.completions().try_take(id);
-        self.tasks[ti].vt.active.set(dst, Reg::from_i64(value));
+        self.tasks[ti].deliver(dst, Reg::from_i64(value));
         self.tasks[ti].state = TaskState::Runnable;
         self.turn += 1;
         true
@@ -9781,7 +9776,7 @@ impl ScheduledDebugRun {
     /// carved beyond the parent's captured prefix.
     fn checkpointable(&self) -> Result<(), Refusal> {
         // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
-        if self.tasks.iter().any(|t| t.vt.active_invoke.is_some()) {
+        if self.tasks.iter().any(|t| t.vm.vt.active_invoke.is_some()) {
             return Err(Refusal::Invoke);
         }
         if any_event_parked(
@@ -9844,10 +9839,10 @@ impl ScheduledDebugRun {
                 .tasks
                 .iter()
                 .map(|t| DbgTaskSnapshot {
-                    active: t.vt.active.clone(),
-                    active_id: t.vt.active_id,
-                    chain: t.vt.chain.clone(),
-                    root_shadow_sp: t.vt.root_shadow_sp,
+                    active: t.vm.vt.active.clone(),
+                    active_id: t.vm.vt.active_id,
+                    chain: t.vm.vt.chain.clone(),
+                    root_shadow_sp: t.vm.vt.root_shadow_sp,
                     threads: t.threads.clone(),
                     env: t.env,
                     state: t.state.clone(),
@@ -9934,12 +9929,15 @@ impl ScheduledDebugRun {
             .tasks
             .iter()
             .map(|ts| TaskSlot {
-                vt: VTask {
-                    active: ts.active.clone(),
-                    active_id: ts.active_id,
-                    chain: ts.chain.clone(),
-                    root_shadow_sp: ts.root_shadow_sp,
-                    active_invoke: None, // never captured mid-invoke (`checkpointable`)
+                vm: TaskVm {
+                    vt: VTask {
+                        active: ts.active.clone(),
+                        active_id: ts.active_id,
+                        chain: ts.chain.clone(),
+                        root_shadow_sp: ts.root_shadow_sp,
+                        active_invoke: None, // never captured mid-invoke (`checkpointable`)
+                    },
+                    suspended: None,
                 },
                 threads: ts.threads.clone(),
                 env: ts.env,
@@ -9949,7 +9947,6 @@ impl ScheduledDebugRun {
                     }
                     (s, _) => s.clone(),
                 },
-                suspended: None,
                 at_bp: ts.at_bp,
                 lease: ts.lease,
                 // #2001 — a live thread is charged again; the task it replaces hands its charge
@@ -10032,7 +10029,7 @@ impl ScheduledDebugRun {
     /// A [`FrameReader`] over the **focused** thread's currently-stepping `Vm` (what `select_task` chose):
     /// the thread's own vCPU over its window (a confined `instantiate` child reads its `nested_view`).
     fn reader(&self) -> FrameReader<'_> {
-        let vm = self.tasks[self.focus].vt.debug_active();
+        let vm = self.tasks[self.focus].vm.vt.debug_active();
         FrameReader {
             vm,
             source: &self.source,
@@ -10102,7 +10099,7 @@ impl ScheduledDebugRun {
                     ValType::I64 => Value::I64(value),
                     _ => return false,
                 };
-                match self.tasks[focus].vt.active.regs.get_mut(reg) {
+                match self.tasks[focus].vm.vt.active.regs.get_mut(reg) {
                     Some(r) => {
                         *r = Reg::from_value(v);
                         true
@@ -10262,7 +10259,7 @@ fn spawn_task(
             (m, h, built.table, built.vt, state, built.leaf, live)
         }
         Err(_) => {
-            let mut vt = VTask::of(tasks[ti].vt.active.clone(), 0);
+            let mut vt = VTask::of(tasks[ti].vm.vt.active.clone(), 0);
             vt.release();
             let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
             let state = TaskState::Done(failed);
@@ -13165,13 +13162,15 @@ fn coop_start_child(
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
-    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+    tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
 
-/// A scheduled vCPU and its blocking state.
+/// A scheduled vCPU and its blocking state. What the scheduler keeps of it is its scheduling state;
+/// what runs it — its VM state — is [`TaskVm`], which only its executor touches, and the scheduler's
+/// rules hand it values only through [`TaskSlot::deliver`].
 struct TaskSlot {
-    vt: VTask,
+    vm: TaskVm,
     /// This vCPU's `thread.spawn` / `instantiate` children (handle = index → global task index).
     /// `None` = joined. (Both seams share one handle namespace, matching the tree-walker's `threads`.)
     threads: Vec<Option<usize>>,
@@ -13180,9 +13179,6 @@ struct TaskSlot {
     /// (and any threads it spawns, which share its window — they inherit the same env index).
     env: Option<usize>,
     state: TaskState,
-    /// #1896 — the rest of a call that parked in a bounce out of this task's emitted leaf, run once
-    /// the park clears.
-    suspended: Option<Box<Suspended>>,
     /// A detached child's window lease `(spawner env, budget, bytes)`, on the child's root task:
     /// once the task is `Done`, or the run is, the scheduler returns the bytes to the spawner's budget
     /// ([`refund_ended_windows`]).
@@ -13201,17 +13197,36 @@ impl TaskSlot {
     /// suspended, no window lease.
     fn new(vt: VTask, env: Option<usize>, live: LiveVcpu) -> TaskSlot {
         TaskSlot {
-            vt,
+            vm: TaskVm {
+                vt,
+                suspended: None,
+            },
             threads: Vec::new(),
             env,
             state: TaskState::Runnable,
-            suspended: None,
             lease: None,
             live,
             at_bp: false,
         }
     }
 
+    /// Hand the task `value` at register `dst` of the frame its parked call returns to
+    /// ([`TaskVm::parked_frame`]): a woken wait's status, a joined child's result, a call's reply. The
+    /// one way the scheduler's rules write a task's registers, its own included.
+    fn deliver(&mut self, dst: u32, value: Reg) {
+        self.vm.parked_frame().set(dst, value);
+    }
+}
+
+/// A task's VM state: what its executor steps, as opposed to what the scheduler decides about it.
+struct TaskVm {
+    vt: VTask,
+    /// #1896 — the rest of a call that parked in a bounce out of this task's emitted leaf, run once
+    /// the park clears.
+    suspended: Option<Box<Suspended>>,
+}
+
+impl TaskVm {
     /// Where the result of this task's parked call lands: the continuation of a call that parked in
     /// a bounce out of the task's emitted leaf ([`Suspended`], #1896), which the pump runs next, or
     /// else the task's own frame.
@@ -13475,7 +13490,7 @@ fn host_park_fiber(
         }
     };
     if let Some(k) = park_fiber_on_host(
-        &mut tasks[ti].vt,
+        &mut tasks[ti].vm.vt,
         fibers,
         fiber_sp,
         mem,
@@ -13587,8 +13602,7 @@ fn admit_parks(tasks: &mut [TaskSlot]) -> bool {
         }
         // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
         if let TaskState::BlockedWait { dst, .. } = t.state {
-            t.parked_frame()
-                .set(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
+            t.deliver(dst, Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN));
         }
         t.state = TaskState::Runnable;
         admitted = true;
@@ -14007,8 +14021,8 @@ impl CoopSched {
         // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
         // gate). `thread.spawn` children inherit the bitmap in `pump`'s `Spawn` arm (same-module only).
         if let Some(e) = &eligible {
-            tasks[0].vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
-            tasks[0].vt.active.jit_page_checked = page_checked;
+            tasks[0].vm.vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
+            tasks[0].vm.vt.active.jit_page_checked = page_checked;
         }
         // §14 `instantiate` children's confined environments (handle = `env` index). The root and its
         // `thread.spawn` siblings use the shared `mem`/`host`/`dom.table` instead (`env == None`).
@@ -14273,7 +14287,7 @@ impl CoopSched {
                     _ => None,
                 };
                 if let Some((v, dst)) = hit {
-                    t.vt.active.set(dst, Reg::from_i64(v));
+                    t.deliver(dst, Reg::from_i64(v));
                     t.state = TaskState::Runnable;
                 }
             }
@@ -14374,8 +14388,8 @@ impl CoopSched {
                 env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
                 env.fibers = FiberTables::default();
                 for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
-                    t.vt.release();
-                    t.suspended = None;
+                    t.vm.vt.release();
+                    t.vm.suspended = None;
                 }
             }
             // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
@@ -14394,7 +14408,7 @@ impl CoopSched {
                 })
                 .collect();
             for (ci, dst, status, pid) in reap_wakes {
-                tasks[ci].vt.active.set(dst, Reg::from_i64(status));
+                tasks[ci].deliver(dst, Reg::from_i64(status));
                 tasks[ci].state = TaskState::Runnable;
                 forked_twins.remove(&pid);
             }
@@ -14672,7 +14686,7 @@ impl CoopSched {
             last_pick = ti;
             // #1896 — a leaf's call that asked for a process in its bounce: start it, as the spawn
             // arm starts one for an interpreted caller, before the call runs on (below).
-            if let Some(ask) = tasks[ti].suspended.as_mut().and_then(|s| s.spawn.take()) {
+            if let Some(ask) = tasks[ti].vm.suspended.as_mut().and_then(|s| s.spawn.take()) {
                 let SpawnAsk { cmd, plan, dst } = *ask;
                 let (r, step) = spawn_task(
                     tasks,
@@ -14688,7 +14702,7 @@ impl CoopSched {
                     cmd,
                     plan,
                 );
-                if let Some(s) = tasks[ti].suspended.as_mut() {
+                if let Some(s) = tasks[ti].vm.suspended.as_mut() {
                     s.vm.set(dst, Reg::from_i64(r));
                 }
                 if let Some(step) = step {
@@ -14720,7 +14734,7 @@ impl CoopSched {
             };
 
             // Select this vCPU's environment and fiber registry: the shared ones (root + thread
-            // siblings), or its own confined `instantiate` env's. `tasks[ti].vt` and the chosen env
+            // siblings), or its own confined `instantiate` env's. `tasks[ti].vm.vt` and the chosen env
             // borrow disjoint storage (`tasks` vs `extra_envs` / the `mem`/`host`/`fuel` params), so the
             // split borrow is sound.
             //
@@ -14772,7 +14786,7 @@ impl CoopSched {
             // When it returns, its host resumes the leaf's suspended frames with its results; when
             // it parks again, the task waits again. A trap ends the process, whose frames the host
             // never resumes.
-            if let Some(s) = tasks[ti].suspended.take() {
+            if let Some(s) = tasks[ti].vm.suspended.take() {
                 let Suspended {
                     vm, dst, results, ..
                 } = *s;
@@ -14800,7 +14814,7 @@ impl CoopSched {
                     (Ok(_), Some((vm, handoff))) => {
                         let spawn =
                             hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
-                        tasks[ti].suspended = Some(Box::new(Suspended {
+                        tasks[ti].vm.suspended = Some(Box::new(Suspended {
                             vm,
                             dst,
                             results,
@@ -14816,7 +14830,7 @@ impl CoopSched {
                 continue;
             }
             let stop = step_vcpu(
-                &mut tasks[ti].vt,
+                &mut tasks[ti].vm.vt,
                 &mut fcell,
                 dom,
                 &mut ctx,
@@ -14857,7 +14871,7 @@ impl CoopSched {
                 // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
                 // past the call, so the task is resumable with just the result slots filled. Stash the
                 // delivery target — `(task, dst, result types)` — and surface the region to the driver;
-                // `deliver_tierup` writes the emitted results back into `tasks[ti].vt.active` and the next
+                // `deliver_tierup` writes the emitted results back into `tasks[ti].vm.vt.active` and the next
                 // `pump` resumes the task. At most one tier-up is outstanding (we return here), so the
                 // single `pending_tierup` slot suffices — no per-task field needed. On the native driver
                 // no task is eligible, so this arm is never reached (the bitmap is `None`).
@@ -14891,7 +14905,7 @@ impl CoopSched {
                     stop @ (VcpuStop::PipeRead { .. }
                     | VcpuStop::PipeWrite { .. }
                     | VcpuStop::StdinPark),
-                ) if tasks[ti].vt.active_id != ROOT_FIBER => {
+                ) if tasks[ti].vm.vt.active_id != ROOT_FIBER => {
                     host_park_fiber(tasks, ti, fibers, fiber_sp, mem, extra_envs, root, &stop);
                 }
                 Ok(VcpuStop::StdinPark) => {
@@ -14921,10 +14935,7 @@ impl CoopSched {
                     // already-torn-down callee can never be replied — complete with the probeable
                     // errno instead of parking forever (the tree-walker's dead-callee park probe).
                     if callee_env.flatten().is_some_and(|k| dead_envs.contains(&k)) {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i64(super::CAP_REVOKED));
+                        tasks[ti].deliver(dst, Reg::from_i64(super::CAP_REVOKED));
                         continue;
                     }
                     if let Some(env) = callee_env {
@@ -14948,13 +14959,16 @@ impl CoopSched {
                     // `instantiate` child (its completions live on ITS host; keeping the child
                     // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
                     let durable = root.lock_unpoisoned().is_durable();
-                    if tasks[ti].vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
+                    if tasks[ti].vm.vt.active_id != ROOT_FIBER
+                        && !durable
+                        && tasks[ti].env.is_none()
+                    {
                         let comps = root.lock_unpoisoned().completions();
-                        let k = tasks[ti].vt.active_id;
+                        let k = tasks[ti].vm.vt.active_id;
                         // The drain right after the park is the register-then-recheck: a completion
                         // that raced the park wakes the fiber at once.
                         if let Some(k) = park_running_fiber(
-                            &mut tasks[ti].vt,
+                            &mut tasks[ti].vm.vt,
                             fibers,
                             fiber_sp,
                             mem,
@@ -14992,7 +15006,7 @@ impl CoopSched {
                         // confined child's host never admits one; a durable run's freeze cannot
                         // meet a park.)
                         match comps.wait_unless_host_owned(id) {
-                            Some(r) => tasks[ti].vt.active.set(dst, Reg::from_i64(r)),
+                            Some(r) => tasks[ti].deliver(dst, Reg::from_i64(r)),
                             None => complete(tasks, ti, Err(Trap::CapFault)),
                         }
                     }
@@ -15017,10 +15031,7 @@ impl CoopSched {
                             .wire_live_impl(&callee, export, &names, &sigs)
                             .ok()
                     });
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
+                    tasks[ti].deliver(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
                 }
                 Ok(VcpuStop::CloneCaller {
                     reply_orig,
@@ -15038,7 +15049,7 @@ impl CoopSched {
                     let result: i64 = 'fork: {
                         // The running handler's dispatch ticket names the parked caller; outside a
                         // handler there is none → `-EINVAL`, exactly as the oracle.
-                        let Some((ticket, _)) = tasks[ti].vt.active.serve_ticket else {
+                        let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
                             break 'fork super::EINVAL;
                         };
                         // The server (this task) is the callee the caller parked on. In the fork
@@ -15064,7 +15075,7 @@ impl CoopSched {
                             if let Some(cti) = caller_ti {
                                 if let TaskState::BlockedTicket { dst: cdst, .. } = tasks[cti].state
                                 {
-                                    tasks[cti].vt.active.set(cdst, Reg::from_i64(fallback));
+                                    tasks[cti].deliver(cdst, Reg::from_i64(fallback));
                                     tasks[cti].state = TaskState::Runnable;
                                 }
                             }
@@ -15082,7 +15093,7 @@ impl CoopSched {
                         let caller_env = tasks[caller_ti].env;
                         // Only a bare root caller (no spawned children/threads, no live fiber chain)
                         // forks faithfully — the oracle's `bare` gate. Anything else degrades.
-                        let bare = fork_bare(&tasks[caller_ti].threads, &tasks[caller_ti].vt);
+                        let bare = fork_bare(&tasks[caller_ti].threads, &tasks[caller_ti].vm.vt);
                         // Duplicate the caller's window (private copy — fork does not share memory) and
                         // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
                         // or a non-forkable window/powerbox fails closed to a single reply.
@@ -15106,7 +15117,7 @@ impl CoopSched {
                         // The twin's continuation is the caller's, with `reply_twin` injected at the
                         // caller's reply slot.
                         let mut twin_vt =
-                            twin_task(&tasks[caller_ti].vt.active, caller_dst, reply_twin);
+                            twin_task(&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
                         // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                         // keep an inherited bitmap only if its private `fork_private` window is
                         // servable (flat; the owned-flat twin backing makes the tier-up shapes so
@@ -15142,15 +15153,12 @@ impl CoopSched {
                         // the ticket's completion cell, but the caller is now `Runnable` (not
                         // `BlockedTicket`), so the settle scan never claims it — harmless, no flag needed.
                         let orig_reply = reply_orig.unwrap_or(twin_ti as i64);
-                        tasks[caller_ti]
-                            .vt
-                            .active
-                            .set(caller_dst, Reg::from_i64(orig_reply));
+                        tasks[caller_ti].deliver(caller_dst, Reg::from_i64(orig_reply));
                         tasks[caller_ti].state = TaskState::Runnable;
                         twin_ti as i64
                     };
                     if has_result {
-                        tasks[ti].vt.active.set(dst, Reg::from_i64(result));
+                        tasks[ti].deliver(dst, Reg::from_i64(result));
                     }
                 }
                 Ok(VcpuStop::Reap {
@@ -15163,7 +15171,7 @@ impl CoopSched {
                     // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
                     // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
                     let result: i64 = 'reap: {
-                        let Some((ticket, _)) = tasks[ti].vt.active.serve_ticket else {
+                        let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
                             break 'reap super::EINVAL;
                         };
                         let Some(server_env) = tasks[ti].env else {
@@ -15201,10 +15209,7 @@ impl CoopSched {
                         if let TaskState::Done(res) = &tasks[pid_us].state {
                             let status = super::reap_status(res);
                             forked_twins.remove(&pid_us);
-                            tasks[caller_ti]
-                                .vt
-                                .active
-                                .set(caller_dst, Reg::from_i64(status));
+                            tasks[caller_ti].deliver(caller_dst, Reg::from_i64(status));
                             tasks[caller_ti].state = TaskState::Runnable;
                             status
                         } else {
@@ -15216,7 +15221,7 @@ impl CoopSched {
                         }
                     };
                     if has_result {
-                        tasks[ti].vt.active.set(dst, Reg::from_i64(result));
+                        tasks[ti].deliver(dst, Reg::from_i64(result));
                     }
                 }
                 Ok(VcpuStop::Exec {
@@ -15233,7 +15238,7 @@ impl CoopSched {
                     // failure); a success swaps this task's activation to the command and never returns.
                     macro_rules! refuse {
                         ($e:expr) => {{
-                            tasks[ti].vt.active.set(dst, Reg::from_i32($e as i32));
+                            tasks[ti].deliver(dst, Reg::from_i32($e as i32));
                             continue;
                         }};
                     }
@@ -15242,8 +15247,8 @@ impl CoopSched {
                     // (`env: None` — the shell / `bash -c` replacing itself) and a **fork-twin** exec
                     // (`env: Some` — bash forking then exec'ing an external command) are serviced; they
                     // differ only in where the rebuilt activation's window/host/table live.
-                    let clean = tasks[ti].vt.active.serve_ticket.is_none()
-                        && tasks[ti].vt.active_id == ROOT_FIBER
+                    let clean = tasks[ti].vm.vt.active.serve_ticket.is_none()
+                        && tasks[ti].vm.vt.active_id == ROOT_FIBER
                         && !root.lock_unpoisoned().is_durable();
                     if !clean {
                         refuse!(super::EINVAL);
@@ -15273,7 +15278,7 @@ impl CoopSched {
                             match built {
                                 Err(e) => refuse!(e),
                                 Ok(built) => {
-                                    tasks[ti].vt = built.vt;
+                                    tasks[ti].vm.vt = built.vt;
                                     // The driver window is released for the image's own.
                                     drop(mem.take());
                                     let eidx = extra_envs.len();
@@ -15285,7 +15290,7 @@ impl CoopSched {
                                         fibers: FiberTables::default(),
                                         spawner: None,
                                         nested: false,
-                                        program: tasks[ti].vt.active.module as u32,
+                                        program: tasks[ti].vm.vt.active.module as u32,
                                     });
                                     tasks[ti].env = Some(eidx);
                                     built.leaf
@@ -15315,11 +15320,11 @@ impl CoopSched {
                             match built {
                                 Err(e) => refuse!(e),
                                 Ok(built) => {
-                                    tasks[ti].vt = built.vt;
+                                    tasks[ti].vm.vt = built.vt;
                                     extra_envs[k].host = built.host.into_cell();
                                     extra_envs[k].table = built.table;
                                     extra_envs[k].mem = Some(built.mem);
-                                    extra_envs[k].program = tasks[ti].vt.active.module as u32;
+                                    extra_envs[k].program = tasks[ti].vm.vt.active.module as u32;
                                     built.leaf
                                 }
                             }
@@ -15335,15 +15340,12 @@ impl CoopSched {
                 Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
                     // A personality `posix_spawn` ([`spawn_task`]). The tree-walker's gate: a request
                     // from a fiber keeps its placeholder, and a serve handler is not a clean root.
-                    if tasks[ti].vt.active_id != ROOT_FIBER {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
+                    if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                        tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
                         continue;
                     }
-                    if tasks[ti].vt.active.serve_ticket.is_some() {
-                        tasks[ti].vt.active.set(dst, Reg::from_i64(super::EINVAL));
+                    if tasks[ti].vm.vt.active.serve_ticket.is_some() {
+                        tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
                         continue;
                     }
                     let (r, step) = spawn_task(
@@ -15360,7 +15362,7 @@ impl CoopSched {
                         cmd,
                         plan,
                     );
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(r));
+                    tasks[ti].deliver(dst, Reg::from_i64(r));
                     if let Some(step) = step {
                         return Ok(step);
                     }
@@ -15383,7 +15385,7 @@ impl CoopSched {
                     // as a thread would (#1944 slice 3). The live cap is checked first, as the oracle's
                     // `fork_vcpu` checks it (#2006).
                     let env = tasks[ti].env;
-                    let room = fork_bare(&tasks[ti].threads, &tasks[ti].vt)
+                    let room = fork_bare(&tasks[ti].threads, &tasks[ti].vm.vt)
                         && live_tasks(tasks) < super::MAX_VCPUS;
                     let forked = if room {
                         let win = match env {
@@ -15396,7 +15398,7 @@ impl CoopSched {
                     };
                     match forked {
                         None => {
-                            tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
+                            tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
                         }
                         Some((twin_mem, twin_host, live)) => {
                             // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
@@ -15404,7 +15406,7 @@ impl CoopSched {
                             // command), and its signal doors on the run's bell.
                             wire_process(&twin_host, root);
                             // The return-twice `0`; the parent keeps the twin's pid, set below.
-                            let mut twin_vt = twin_task(&tasks[ti].vt.active, dst, 0);
+                            let mut twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0);
                             // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
                             // may keep it only if its OWN private window (`fork_private`, pushed into
                             // `extra_envs` below) is servable — the driver then answers each of the
@@ -15444,7 +15446,7 @@ impl CoopSched {
                             );
                             tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
                             forked_twins.insert(twin_ti);
-                            tasks[ti].vt.active.set(dst, Reg::from_i64(twin_pid as i64));
+                            tasks[ti].deliver(dst, Reg::from_i64(twin_pid as i64));
                         }
                     }
                 }
@@ -15528,7 +15530,7 @@ impl CoopSched {
                     tasks.push(TaskSlot::new(child, env, live));
                     let handle = tasks[ti].threads.len() as i32;
                     tasks[ti].threads.push(Some(cidx));
-                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+                    tasks[ti].deliver(dst, Reg::from_i32(handle));
                 }
                 // §14 confined children (ops 0, 5, 13, 17): admitted by the one shared
                 // `admit_confined_child` against the spawning task's own window, fuel and powerbox
@@ -15544,7 +15546,7 @@ impl CoopSched {
                         None => fuel.can_burn(),
                         Some(k) => extra_envs[k].fuel.can_burn(),
                     };
-                    let spawner = &tasks[ti].vt.active;
+                    let spawner = &tasks[ti].vm.vt.active;
                     let admitted = admit_confined_child(
                         &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
                         pm,
@@ -15556,10 +15558,7 @@ impl CoopSched {
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
                             continue;
                         }
                         Err(t) => {
@@ -15615,9 +15614,9 @@ impl CoopSched {
                     // #2078 — a child of the spawning frame's own module runs it, as a same-module
                     // confined child does: no second compile (#2143: an installed unit's, from a
                     // frame of one).
-                    let spawner = spawner_module(&dom.source, &tasks[ti].vt.active);
+                    let spawner = spawner_module(&dom.source, &tasks[ti].vm.vt.active);
                     let table = tasks[ti].env.map_or(&*dom.table, |k| &extra_envs[k].table);
-                    let unit = table.jit_unit(tasks[ti].vt.active.module);
+                    let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
                     let admitted = admit_detached_in_process(
                         &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
                         pm,
@@ -15628,10 +15627,7 @@ impl CoopSched {
                     let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
-                            tasks[ti]
-                                .vt
-                                .active
-                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
                             continue;
                         }
                         Err(t) => {
@@ -15717,7 +15713,7 @@ impl CoopSched {
                             .flat_map(|e| e.fibers.fibers.iter_mut()),
                     );
                     woken += wake_fiber_waiters(regs, key, want - woken);
-                    tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
+                    tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
                 }
                 // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
                 // and its own dispatch table: a §14 child's is `extra_envs[k].table`, so its installs
@@ -15739,7 +15735,7 @@ impl CoopSched {
                         gen: table_gen,
                     };
                     let mirror = env.is_none().then_some(&mut mirror);
-                    let active = &mut tasks[ti].vt.active;
+                    let active = &mut tasks[ti].vm.vt.active;
                     if let Err(t) = jit_install(unit, &dom.source, table, mirror, active, dst) {
                         complete(tasks, ti, Err(t));
                         continue;
@@ -15757,7 +15753,7 @@ impl CoopSched {
                         gen: table_gen,
                     };
                     let mirror = env.is_none().then_some(&mut mirror);
-                    let active = &mut tasks[ti].vt.active;
+                    let active = &mut tasks[ti].vm.vt.active;
                     let cleared =
                         jit_uninstall(authority, &dom.source, table, slot, mirror, active, dst);
                     if let Err(t) = cleared {
@@ -15850,13 +15846,13 @@ impl CoopSched {
                                 fuel,
                                 mem,
                                 &mut HostCell::Shared(host),
-                                Some(&Beneath::task(&tasks[ti].vt, parked)),
+                                Some(&Beneath::task(&tasks[ti].vm.vt, parked)),
                             )
                         });
                     match ran {
                         Ok(vals) => {
                             let slots = vals.into_iter().map(val_to_slot);
-                            set_slot_results(&mut tasks[ti].vt.active, dst, &results, slots);
+                            set_slot_results(&mut tasks[ti].vm.vt.active, dst, &results, slots);
                         }
                         Err(t) => {
                             complete(tasks, ti, Err(t));
@@ -15887,6 +15883,7 @@ impl CoopSched {
             TierUpDst::Frame(dst) => {
                 for (i, v) in vals.enumerate() {
                     self.tasks[ti]
+                        .vm
                         .vt
                         .active
                         .set(dst as u32 + i as u32, Reg::from_value(v));
@@ -15922,7 +15919,7 @@ impl CoopSched {
             return;
         }
         for (i, ty) in results.iter().enumerate() {
-            self.tasks[ti].vt.active.set(
+            self.tasks[ti].vm.vt.active.set(
                 dst as u32 + i as u32,
                 Reg::from_value(slot_to_val(*ty, vals[i])),
             );
@@ -16349,7 +16346,7 @@ impl CoopRun {
             if let TaskState::BlockedHostCap { dst, .. } = t.state {
                 // #1954: a call that parked in a bounce out of an emitted leaf waits in the call's
                 // continuation, which the pump runs next; any other in the task's own frame.
-                t.parked_frame().set(dst, Reg::from_i64(value));
+                t.deliver(dst, Reg::from_i64(value));
             }
             t.state = TaskState::Runnable;
         }
@@ -16598,7 +16595,7 @@ impl CoopRun {
         // #1627: the view beneath this bounce — the paused task's Vms and the spilled words. The
         // run's fiber registry is the bounce's own (`bounce_fibers`), which the drive scans itself.
         let beneath = spill.filter(|_| !in_invoke).map(|words| {
-            let mut b = Beneath::task(&tasks[ti].vt, FiberRegRef::Owned(&[]));
+            let mut b = Beneath::task(&tasks[ti].vm.vt, FiberRegRef::Owned(&[]));
             b.words.push(words);
             b
         });
@@ -16649,7 +16646,7 @@ impl CoopRun {
         // emitted frames.
         let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
         let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
-        tasks[ti].suspended = Some(Box::new(Suspended {
+        tasks[ti].vm.suspended = Some(Box::new(Suspended {
             vm,
             dst,
             results,
@@ -18325,7 +18322,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
             }
             match out {
                 Ok(r) => {
-                    t.vt.active.set(dst, r);
+                    t.deliver(dst, r);
                     t.state = TaskState::Runnable;
                 }
                 Err(trap) => work.push((j, Err(trap))),
@@ -18350,7 +18347,7 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bo
                 tasks[ti].threads[slot] = None;
             }
             match out {
-                Ok(r) => tasks[ti].vt.active.set(dst, r),
+                Ok(r) => tasks[ti].deliver(dst, r),
                 Err(t) => complete(tasks, ti, Err(t)),
             }
         }
@@ -18402,7 +18399,7 @@ fn child_ctl(
             0
         }
     };
-    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
+    tasks[ti].deliver(dst, Reg::from_i32(answer));
 }
 
 /// `Instantiator.kill` (#2074): end every live task of env `k` with `ThreadFault`, wherever it is
@@ -18460,10 +18457,7 @@ fn wait_task(
     dst: u32,
 ) {
     if mem.map_or(0, |m| m.atomic_value(base, width)) != expected {
-        tasks[ti]
-            .vt
-            .active
-            .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+        tasks[ti].deliver(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
     } else {
         tasks[ti].state = TaskState::BlockedWait {
             addr: base,
@@ -18497,7 +18491,7 @@ fn futex_wait(
     timeout: Option<u64>,
     dst: u32,
 ) {
-    if tasks[ti].vt.active_id == ROOT_FIBER {
+    if tasks[ti].vm.vt.active_id == ROOT_FIBER {
         let mem = mem.as_ref();
         return wait_task(tasks, ti, mem, clock, base, expected, width, timeout, dst);
     }
@@ -18520,7 +18514,7 @@ fn futex_wait(
         real_deadline: timeout.map(sched_wall_deadline),
         woken,
     };
-    let vt = &mut tasks[ti].vt;
+    let vt = &mut tasks[ti].vm.vt;
     let durable = durable();
     let idle = park_running_fiber(vt, fibers, fiber_sp, mem, durable, can_idle, park, |_| {
         woken.is_some()
@@ -18620,7 +18614,7 @@ fn wake_waiters<'a>(
         } = t.state
         {
             if site_key_in(win(t.env), addr, site) == key {
-                t.parked_frame().set(dst, Reg::from_i32(super::WAIT_WOKEN));
+                t.deliver(dst, Reg::from_i32(super::WAIT_WOKEN));
                 t.state = TaskState::Runnable;
                 woken += 1;
             }
@@ -18653,8 +18647,7 @@ fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
         } = t.state
         {
             if deadline <= clock {
-                t.parked_frame()
-                    .set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                t.deliver(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
                 t.state = TaskState::Runnable;
             }
         }
@@ -18718,7 +18711,7 @@ fn teardown_domains(
                 if let TaskState::BlockedTicket { callee, dst, .. } = &t.state {
                     if std::sync::Arc::ptr_eq(callee, dying) {
                         let dst = *dst;
-                        t.vt.active.set(dst, Reg::from_i64(super::CAP_REVOKED));
+                        t.deliver(dst, Reg::from_i64(super::CAP_REVOKED));
                         t.state = TaskState::Runnable;
                     }
                 }
