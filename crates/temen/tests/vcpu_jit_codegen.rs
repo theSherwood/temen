@@ -122,15 +122,7 @@ fn run(guest_src: &str, unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> 
         bytecode::Vcpu::new_root(&prog, 0, &[Value::I32(jit), Value::I32(code)], back, &[])
             .expect("root");
 
-    let resolve_unit = |handle: i32, code: i32| -> Result<Arc<[temen_ir::Func]>, Trap> {
-        let g = pb.lock().unwrap();
-        let domain = g.resolve_jit_domain(handle)?;
-        let (cd, cu) = g.resolve_jit_code(code)?;
-        if cd != domain {
-            return Err(Trap::CapFault);
-        }
-        g.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)
-    };
+    let resolve_unit = |handle: i32, code: i32| pb.lock().unwrap().resolve_jit_unit(handle, code);
 
     loop {
         match vcpu.run() {
@@ -148,16 +140,13 @@ fn run(guest_src: &str, unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> 
                 // value a codegen host writes to the emitted unit's `"mapped"` global).
                 assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
                 match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(
-                        resolve_unit(handle, code),
-                        Arc::from(unit_m.types.clone()), // #922: the invoked unit's type section
-                    ),
+                    Mode::Interp => vcpu.deliver_jit_invoke(resolve_unit(handle, code)),
                     Mode::Codegen => {
                         // Authority still resolves through the powerbox (a forged handle must trap
                         // identically); then run the unit standalone over argv — what emitted `f0` computes.
                         match resolve_unit(handle, code) {
                             Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                            Ok(_funcs) => {
+                            Ok(_unit) => {
                                 let args: Vec<Value> =
                                     argv.iter().map(|&s| Value::I64(s)).collect();
                                 let mut fuel = u64::MAX;

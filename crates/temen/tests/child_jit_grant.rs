@@ -52,7 +52,9 @@ fn blob(zero_arg: bool) -> Vec<u8> {
 /// invoke `(3, 4)`, return the sum. `times == 2` is the quota probe: it returns the **second compile's**
 /// result instead (`-ENOMEM` when the child's table has one unit). Modes 5/6: the child `install`s
 /// its unit and returns the slot; in mode 5 the parent `call.dyn`s that slot (in its own table), in
-/// mode 6 it returns the slot as is.
+/// mode 6 it returns the slot as is. Mode 7: the parent installs a unit of its own first; the child
+/// installs one into its own table, at the same index, then uninstalls it; the parent returns
+/// `its slot << 16` plus the child's uninstall result.
 fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let blob_len = blob.len();
     let blob_data: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
@@ -68,20 +70,28 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let child_tail = match mode {
         2 => "  vc2 = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n  return vc2\n".to_string(),
         5 | 6 => "  vslot = call.cap 11 3 (i64) -> (i64) hj (vc)\n  return vslot\n".to_string(),
+        7 => "  vslot = call.cap 11 3 (i64) -> (i64) hj (vc)\n  vu = call.cap 11 4 (i64) -> (i64) hj (vslot)\n  return vu\n".to_string(),
         _ => "  va = i32.const 3\n  vb4 = i32.const 4\n  vr = call.cap 11 1 (i64, i32, i32) -> (i32) hj (vc, va, vb4)\n  vr64 = i64.extend_i32_s vr\n  return vr64\n".to_string(),
     };
     // Mode 5: the parent `call.dyn`s the slot the child installed — in the PARENT's table, which the
     // child's install never touched, so it must trap (the child's units are its own).
-    let parent_tail = if mode == 5 {
-        "  rs = i32.wrap_i64 r\n  rd = call.dyn () -> (i32) rs ()\n  rd64 = i64.extend_i32_s rd\n  return rd64\n"
+    let parent_pre = if mode == 7 {
+        format!(
+            "  pb = i64.const {BLOB_OFF}\n  pl = i64.const {blob_len}\n  pc = call.cap 11 0 (i64, i64) -> (i64) vjit (pb, pl)\n  pslot = call.cap 11 3 (i64) -> (i64) vjit (pc)\n"
+        )
     } else {
-        "  return r\n"
+        String::new()
+    };
+    let parent_tail = match mode {
+        5 => "  rs = i32.wrap_i64 r\n  rd = call.dyn () -> (i32) rs ()\n  rd64 = i64.extend_i32_s rd\n  return rd64\n",
+        7 => "  k16 = i64.const 65536\n  ps = i64.mul pslot k16\n  out = i64.add ps r\n  return out\n",
+        _ => "  return r\n",
     };
     format!(
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vjit: i32, vbud: i32) {{
-  a0 = i64.const 16384
+{parent_pre}  a0 = i64.const 16384
   n100 = i32.const 16484
   i32.store a0 n100
   a4 = i64.const 16388
@@ -110,6 +120,15 @@ data {BLOB_OFF} "{blob_data}"
     )
 }
 
+/// The `Jit` table reservation: 16 install slots for the install probes (modes 5–7).
+fn table_log2(mode: u32) -> u8 {
+    if mode >= 5 {
+        4
+    } else {
+        0
+    }
+}
+
 /// The parent's host for one run: an `Instantiator`, a `Jit` table (16 install slots for the install
 /// probe) with a `units` compile quota, and a `Budget` that pays for the child. The host knows the
 /// parent's module, which the child runs.
@@ -117,7 +136,7 @@ fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 128 << 10);
-    let jh = grant_jit(&mut host, m, if mode >= 5 { 4 } else { 0 });
+    let jh = grant_jit(&mut host, m, table_log2(mode));
     host.set_jit_quota(units, 1 << 20);
     let bh = host.grant_budget(-1, 1 << 20, -1);
     (host, [ih, jh, bh])
@@ -163,7 +182,7 @@ fn run_jit(grants_n: u32, mode: u32, units: u32) -> JitOutcome {
         &handles.map(i64::from),
         &MemLayout::image(Vec::new()),
         DEFAULT_RESERVED_LOG2,
-        0,
+        table_log2(mode), // the root's own table, as the grant reserves it
         &mut host,
         None,
     )
@@ -264,4 +283,36 @@ fn a_child_installs_into_its_own_reserved_table() {
     assert_eq!(bc, tw, "bytecode engine agrees on the slot");
     let jo = run_jit(1, 6, 4096);
     assert!(agrees(&tw, &jo), "native JIT agrees: {jo:?}");
+}
+
+#[test]
+fn a_childs_uninstall_leaves_the_parents_slot_mirror_alone() {
+    // Both tables fill slot 2 first (two natural functions); the child's uninstall clears its own.
+    let [tw, bc] = run_both(1, 7, 4096);
+    assert_eq!(
+        tw,
+        Ok(vec![Value::I64(2 << 16)]),
+        "tree-walker: the parent installed at slot 2, the child's uninstall answered 0"
+    );
+    assert_eq!(bc, tw, "bytecode engine agrees");
+    let jo = run_jit(1, 7, 4096);
+    assert!(agrees(&tw, &jo), "native JIT agrees: {jo:?}");
+
+    // The cooperative driver's B2 mirror is the root's emitted dispatch table: the child's
+    // uninstall of its own slot 2 must not empty the root's.
+    let b = blob(true);
+    let m = parse_module(&src(1, &b, 7)).expect("parse");
+    verify_module(&m).expect("verify");
+    let (host, handles) = setup(&m, 7, 4096);
+    let mut run = bytecode::CoopRun::new(&m, 0, &handles.map(Value::I32), 5_000_000, host, None)
+        .expect("bytecode coverage")
+        .expect("entry in range");
+    let bytecode::CoopEvent::Done(v) = run.run() else {
+        panic!("the run ends");
+    };
+    assert_eq!(v, vec![Value::I64(2 << 16)]);
+    assert!(
+        run.slot_unit(2).is_some(),
+        "the root's mirror still names its own unit at slot 2"
+    );
 }

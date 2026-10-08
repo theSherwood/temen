@@ -289,11 +289,7 @@ fn drive<'s, 'e>(
                 results: _,
                 mapped: _, // interpreted delivery below — the codegen sync value is unused
             } => {
-                let unit = orch.resolve_unit(handle, code);
-                let types = unit
-                    .as_ref()
-                    .map_or_else(|_| Arc::from(Vec::new()), |(_, t, _)| Arc::clone(t));
-                vcpu.deliver_jit_invoke(unit.map(|(f, _, _)| f), types);
+                vcpu.deliver_jit_invoke(orch.resolve_unit(handle, code));
             }
             // These kernels use only spawn/join + JIT; wait/notify/§14 never arise here.
             bytecode::VcpuEvent::Wait { .. }

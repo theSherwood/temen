@@ -2634,10 +2634,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                         par_resolve_unit_rt(&mut g, handle, code)
                     };
                     match resolved {
-                        Err(t) => v
-                            .inner
-                            .deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
-                        Ok((funcs, types, wasm, _)) => {
+                        Err(t) => v.inner.deliver_jit_invoke(Err(t)),
+                        Ok((funcs, types, wasm, id)) => {
                             let codegen = par_jit_codegen()
                                 && wasm.is_some()
                                 && ptypes.is_some()
@@ -2651,8 +2649,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                 v.jit_wasm = wasm;
                                 return PAR_JIT_INVOKE;
                             }
-                            // #922: deliver the unit's type section so its interned call sigs resolve.
-                            v.inner.deliver_jit_invoke(Ok(funcs), types);
+                            v.inner.deliver_jit_invoke(Ok((funcs, types, id)));
                         }
                     }
                 } else {
@@ -2676,22 +2673,11 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                                         v.jit_result_types = rtypes.unwrap();
                                         return PAR_JIT_INVOKE;
                                     }
-                                    Err(t) => v.inner.deliver_jit_invoke(
-                                        Err(t),
-                                        std::sync::Arc::from(Vec::new()),
-                                    ),
+                                    Err(t) => v.inner.deliver_jit_invoke(Err(t)),
                                 }
                             } else {
-                                // #922: split the resolved `(funcs, types)` for delivery.
-                                match pb.host.resolve_jit_unit(handle, code) {
-                                    Ok((funcs, types, _)) => {
-                                        v.inner.deliver_jit_invoke(Ok(funcs), types)
-                                    }
-                                    Err(t) => v.inner.deliver_jit_invoke(
-                                        Err(t),
-                                        std::sync::Arc::from(Vec::new()),
-                                    ),
-                                }
+                                v.inner
+                                    .deliver_jit_invoke(pb.host.resolve_jit_unit(handle, code));
                             }
                         }
                     }
