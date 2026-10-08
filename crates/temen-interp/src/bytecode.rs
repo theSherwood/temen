@@ -13046,7 +13046,7 @@ struct ChildEnv {
     fuel: Fuel,
     /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
-    /// per-domain [`ParDomain`] registry, here. The root domain's is [`CoopSched::fibers`].
+    /// per-domain [`ParDomain`] registry, here. The root domain's is [`SchedCore::fibers`].
     fibers: FiberTables,
     /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
     /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
@@ -13736,7 +13736,7 @@ enum CoopStep {
     },
 }
 
-/// Where a surfaced tier-up's results land ([`CoopSched::pending_tierup`]).
+/// Where a surfaced tier-up's results land ([`EmitTier::pending_tierup`]).
 #[derive(Clone, Copy)]
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
@@ -13752,7 +13752,7 @@ enum TierUpDst {
 struct Suspended {
     /// The call's interpreted continuation, its parked op rewound.
     vm: Vm,
-    /// Where the leaf's results land, and their types ([`CoopSched::pending_tierup`]).
+    /// Where the leaf's results land, and their types ([`EmitTier::pending_tierup`]).
     dst: TierUpDst,
     results: Box<[ValType]>,
     /// A process the call asked for ([`Handoff::Spawn`]), which the pump starts before the call runs
@@ -13852,13 +13852,10 @@ fn park_task(
     tasks[ti].state = state;
 }
 
-/// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
-/// resumable-across-FFI tier-up driver (#926 slice 2) can own it between host round-trips. `drive`
-/// builds one with [`new`](CoopSched::new) and runs it to completion with [`pump`](CoopSched::pump);
-/// the fields are exactly the run-shared locals `drive` used to hold — the task set, the run-shared
-/// §12 fiber registry (+ its durable parallel arrays), the §14 confined child environments, the
-/// fork/teardown bookkeeping, and the logical clock.
-struct CoopSched {
+/// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
+/// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
+/// child environments, the fork/teardown bookkeeping, and the logical clock.
+struct SchedCore {
     /// The live vCPUs: the root task (index 0) and its `thread.spawn`/`instantiate` descendants.
     tasks: Vec<TaskSlot>,
     /// §14 `instantiate` children's confined environments (handle = `env` index). The root and its
@@ -13888,6 +13885,12 @@ struct CoopSched {
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
+}
+
+/// The cooperative pump's state for the host's emitted tier (#926): which module-0 calls tier up,
+/// the leaf emitter, the one outstanding host round-trip, the JIT table mirror and an emitted
+/// invoke's fiber registry. Inert on the native `drive`.
+struct EmitTier {
     /// #926 slice 2: wasm-JIT tier-up eligibility for this run's **module-0** tasks (the root and its
     /// same-module `thread.spawn` descendants). `None` ⇒ everything interprets, exactly the native
     /// `drive` (which never sets it). When set, each qualifying task's `Vm` carries it, so a direct
@@ -13899,15 +13902,17 @@ struct CoopSched {
     page_checked: bool,
     /// #1896: the host's emitter for leaf images ([`TierUpConfig::leaf`]); `None` interprets them.
     leaf: Option<LeafEmitter>,
-    /// The task currently paused on a surfaced tier-up, awaiting [`deliver_tierup`](Self::deliver_tierup):
-    /// `(task index, where its results land, result types)`. At most one is ever outstanding —
-    /// the driver services one tier-up round-trip before pumping again — so a single slot suffices.
-    /// `None` between round-trips (and always, on the native driver).
+    /// The task currently paused on a surfaced tier-up, awaiting
+    /// [`deliver_tierup`](CoopSched::deliver_tierup): `(task index, where its results land, result
+    /// types)`. At most one is ever outstanding — the driver services one tier-up round-trip before
+    /// pumping again — so a single slot suffices. `None` between round-trips (and always, on the
+    /// native driver).
     pending_tierup: Option<(usize, TierUpDst, Box<[ValType]>)>,
     /// The task currently paused on a surfaced §22 `Jit.invoke`, awaiting
-    /// [`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals): `(task index, dst slot, result
-    /// types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a tier-up and an
-    /// invoke are never outstanding at once: each is one `pump` yield). `None` off the browser driver.
+    /// [`deliver_jit_invoke_vals`](CoopSched::deliver_jit_invoke_vals): `(task index, dst slot,
+    /// result types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a
+    /// tier-up and an invoke are never outstanding at once: each is one `pump` yield). `None` off
+    /// the browser driver.
     pending_jit: Option<(usize, usize, Box<[ValType]>)>,
     /// #926 slice 2f / #1233 — the driver-table **slot → unit-identity mirror** for the browser B2
     /// coop driver: `slot_units[s]` is the `(domain, unit)` a guest `Jit.install`ed at dispatch slot
@@ -13929,11 +13934,25 @@ struct CoopSched {
     /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
     /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
     /// fiber one callback parks is resumable by a later bounce of the *same* invoke), then it is cleared
-    /// when the invoke resolves ([`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals) / `_trap`) —
-    /// so an invoke's fibers die with it, exactly as the interpreted `run_invoke`'s loop-local registry
-    /// does. A tier-up region's bounces use the run-level `fibers` instead (a parked fiber persists for
-    /// the run to resume). Empty except during an outstanding invoke; always empty on the native `drive`.
+    /// when the invoke resolves ([`deliver_jit_invoke_vals`](CoopSched::deliver_jit_invoke_vals) /
+    /// `_trap`) — so an invoke's fibers die with it, exactly as the interpreted `run_invoke`'s
+    /// loop-local registry does. A tier-up region's bounces use the run-level `fibers` instead (a
+    /// parked fiber persists for the run to resume). Empty except during an outstanding invoke;
+    /// always empty on the native `drive`.
     invoke_fibers: FiberTables,
+    /// #1954 — the root program's leaf start, when the host's emitter took the root image
+    /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
+    root_leaf: Option<LeafStart>,
+}
+
+/// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
+/// resumable-across-FFI tier-up driver (#926 slice 2) can own it between host round-trips. `drive`
+/// builds one with [`new`](CoopSched::new) and runs it to completion with
+/// [`pump`](CoopSched::pump). It is the run's scheduling [`SchedCore`], the emitted tier's
+/// [`EmitTier`], and the session's flags.
+struct CoopSched {
+    core: SchedCore,
+    emit: EmitTier,
     /// #1122 route (a) — when set, an all-parked, externally-wakeable settle yields
     /// [`CoopStep::Idle`] to the driver instead of blocking on the #1122 doorbell (see
     /// [`CoopRun::set_suspend_on_idle`]). Off on the native `drive` and the blocking browser session.
@@ -13946,9 +13965,6 @@ struct CoopSched {
     /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
     /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
     freeze_on_quiesce: bool,
-    /// #1954 — the root program's leaf start, when the host's emitter took the root image
-    /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
-    root_leaf: Option<LeafStart>,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -14351,32 +14367,38 @@ impl CoopSched {
         }
 
         Ok(CoopSched {
-            tasks,
-            extra_envs,
-            fibers,
-            fiber_sp,
-            fiber_meta,
-            dead_envs,
-            forked_twins,
-            hooked_twins,
-            released_envs,
-            clock,
-            eligible,
-            page_checked,
-            leaf,
-            pending_tierup: None,
-            pending_jit: None,
-            // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
-            // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
-            slot_units: vec![None; 1usize << host.jit_table_log2()],
-            table_gen: 0,
-            // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
-            invoke_fibers: FiberTables::default(),
+            core: SchedCore {
+                tasks,
+                extra_envs,
+                fibers,
+                fiber_sp,
+                fiber_meta,
+                dead_envs,
+                forked_twins,
+                hooked_twins,
+                released_envs,
+                clock,
+            },
+            emit: EmitTier {
+                eligible,
+                page_checked,
+                leaf,
+                pending_tierup: None,
+                pending_jit: None,
+                // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a
+                // `Jit.install`'s returned slot always indexes it. `1 << 0 == 1` and unused on the
+                // native `drive`.
+                slot_units: vec![None; 1usize << host.jit_table_log2()],
+                table_gen: 0,
+                // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's
+                // bounces.
+                invoke_fibers: FiberTables::default(),
+                root_leaf: None,
+            },
             suspend_on_idle: false,
             slice_left: None,
             freeze_on_quiesce: host.is_durable()
                 && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
-            root_leaf: None,
         })
     }
 
@@ -14406,7 +14428,7 @@ impl CoopSched {
             Err(_) => true,
         };
         if ended {
-            refund_ended_windows(&mut self.tasks, root, &mut self.extra_envs, true);
+            refund_ended_windows(&mut self.core.tasks, root, &mut self.core.extra_envs, true);
         }
         step
     }
@@ -14421,30 +14443,36 @@ impl CoopSched {
         budget: u64,
     ) -> Result<CoopStep, Trap> {
         let CoopSched {
-            tasks,
-            extra_envs,
-            fibers,
-            fiber_sp,
-            fiber_meta,
-            dead_envs,
-            forked_twins,
-            hooked_twins,
-            released_envs,
-            clock,
-            eligible,
-            page_checked,
-            leaf,
-            pending_tierup,
-            pending_jit,
-            slot_units,
-            table_gen,
-            // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
-            // callbacks), never touched by the scheduler loop itself.
-            invoke_fibers: _,
+            core:
+                SchedCore {
+                    tasks,
+                    extra_envs,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    dead_envs,
+                    forked_twins,
+                    hooked_twins,
+                    released_envs,
+                    clock,
+                },
+            emit:
+                EmitTier {
+                    eligible,
+                    page_checked,
+                    leaf,
+                    pending_tierup,
+                    pending_jit,
+                    slot_units,
+                    table_gen,
+                    // The invoke-confined registry is threaded only by `CoopRun::bounce` (an
+                    // emitted invoke's callbacks), never touched by the scheduler loop itself.
+                    invoke_fibers: _,
+                    root_leaf,
+                },
             suspend_on_idle,
             slice_left,
             freeze_on_quiesce,
-            root_leaf,
         } = self;
         // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
         // (over a window one bound cannot describe it runs interpreted instead, as an exec'd leaf).
@@ -15895,18 +15923,19 @@ impl CoopSched {
     /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
     fn deliver_tierup(&mut self, vals: &[i64]) {
         let (ti, dst, results) = self
+            .emit
             .pending_tierup
             .take()
             .expect("deliver_tierup with no pending tier-up");
         if vals.len() < results.len() {
-            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            complete(&mut self.core.tasks, ti, Err(Trap::Malformed));
             return;
         }
         let vals = results.iter().zip(vals).map(|(ty, v)| slot_to_val(*ty, *v));
         match dst {
             TierUpDst::Frame(dst) => {
                 for (i, v) in vals.enumerate() {
-                    self.tasks[ti]
+                    self.core.tasks[ti]
                         .vm
                         .vt
                         .active
@@ -15914,7 +15943,7 @@ impl CoopSched {
                 }
             }
             // #1896: the process ran whole: it returned from its entry.
-            TierUpDst::Entry { .. } => complete(&mut self.tasks, ti, Ok(vals.collect())),
+            TierUpDst::Entry { .. } => complete(&mut self.core.tasks, ti, Ok(vals.collect())),
         }
     }
 
@@ -15922,10 +15951,11 @@ impl CoopSched {
     /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
     fn deliver_tierup_trap(&mut self, trap: Trap) {
         let (ti, _dst, _results) = self
+            .emit
             .pending_tierup
             .take()
             .expect("deliver_tierup_trap with no pending tier-up");
-        complete(&mut self.tasks, ti, Err(trap));
+        complete(&mut self.core.tasks, ti, Err(trap));
     }
 
     /// #926 slice 2e — deliver a surfaced `Jit.invoke`'s emitted `f0` result slots into the paused
@@ -15933,17 +15963,18 @@ impl CoopSched {
     /// the invoking task's frame via `pending_jit`). A short reply traps the task.
     fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
         // #926 slice 2g: the emitted invoke resolved — its bounce registry dies with it (Vcpu parity).
-        self.invoke_fibers = FiberTables::default();
+        self.emit.invoke_fibers = FiberTables::default();
         let (ti, dst, results) = self
+            .emit
             .pending_jit
             .take()
             .expect("deliver_jit_invoke_vals with no pending invoke");
         if vals.len() < results.len() {
-            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            complete(&mut self.core.tasks, ti, Err(Trap::Malformed));
             return;
         }
         for (i, ty) in results.iter().enumerate() {
-            self.tasks[ti].vm.vt.active.set(
+            self.core.tasks[ti].vm.vt.active.set(
                 dst as u32 + i as u32,
                 Reg::from_value(slot_to_val(*ty, vals[i])),
             );
@@ -15954,12 +15985,13 @@ impl CoopSched {
     /// [`deliver_tierup_trap`](Self::deliver_tierup_trap)).
     fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
         // #926 slice 2g: the emitted invoke resolved (trapped) — its bounce registry dies with it.
-        self.invoke_fibers = FiberTables::default();
+        self.emit.invoke_fibers = FiberTables::default();
         let (ti, _dst, _results) = self
+            .emit
             .pending_jit
             .take()
             .expect("deliver_jit_invoke_trap with no pending invoke");
-        complete(&mut self.tasks, ti, Err(trap));
+        complete(&mut self.core.tasks, ti, Err(trap));
     }
 }
 
@@ -16231,7 +16263,7 @@ impl CoopRun {
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
         let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
-        sched.root_leaf = root_leaf;
+        sched.emit.root_leaf = root_leaf;
         Ok(CoopRun {
             dom,
             mem,
@@ -16267,7 +16299,7 @@ impl CoopRun {
                 Ok(s) => s,
                 Err(e) => return Some(Err(e)),
             };
-        sched.root_leaf = root_leaf;
+        sched.emit.root_leaf = root_leaf;
         Some(Ok(CoopRun {
             dom,
             mem,
@@ -16290,10 +16322,11 @@ impl CoopRun {
 
     fn pending_ti(&self) -> Option<usize> {
         self.sched
+            .emit
             .pending_tierup
             .as_ref()
             .map(|(ti, ..)| *ti)
-            .or_else(|| self.sched.pending_jit.as_ref().map(|(ti, ..)| *ti))
+            .or_else(|| self.sched.emit.pending_jit.as_ref().map(|(ti, ..)| *ti))
     }
 
     /// #816: the window the outstanding round-trip's task runs over — `extra_envs[k].mem` for an
@@ -16302,8 +16335,11 @@ impl CoopRun {
     /// [`bounce`](Self::bounce)'s env dispatch, so the driver's reads and the bounced cap calls
     /// always agree on which window is live.
     fn pending_mem(&self) -> Option<&Mem> {
-        match self.pending_ti().and_then(|ti| self.sched.tasks[ti].env) {
-            Some(k) => self.sched.extra_envs[k].mem.as_ref(),
+        match self
+            .pending_ti()
+            .and_then(|ti| self.sched.core.tasks[ti].env)
+        {
+            Some(k) => self.sched.core.extra_envs[k].mem.as_ref(),
             None => self.mem.as_ref(),
         }
     }
@@ -16314,7 +16350,7 @@ impl CoopRun {
     /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
     pub fn pending_env(&self) -> i64 {
         self.pending_ti()
-            .and_then(|ti| self.sched.tasks[ti].env)
+            .and_then(|ti| self.sched.core.tasks[ti].env)
             .map_or(-1, |k| k as i64)
     }
 
@@ -16361,12 +16397,12 @@ impl CoopRun {
         if !settle_host_cap(&mut self.host.lock_unpoisoned(), id, value) {
             return false;
         }
-        let parked = self.sched.tasks.iter().position(
+        let parked = self.sched.core.tasks.iter().position(
             |t| matches!(t.state, TaskState::BlockedHostCap { id: pid, .. } if pid == id),
         );
         if let Some(ti) = parked {
             let _ = self.host.lock_unpoisoned().completions().try_take(id);
-            let t = &mut self.sched.tasks[ti];
+            let t = &mut self.sched.core.tasks[ti];
             if let TaskState::BlockedHostCap { dst, .. } = t.state {
                 // #1954: a call that parked in a bounce out of an emitted leaf waits in the call's
                 // continuation, which the pump runs next; any other in the task's own frame.
@@ -16391,9 +16427,14 @@ impl CoopRun {
     /// rebuilds its `WebAssembly.Table` when the generation moves (a slot at or past the program's
     /// `f{i}` prefix holds an installed unit's `f0`). Keyed on the unit index rather than the §22
     /// code handle so it survives the guest's `Jit.release` of that handle — see
-    /// [`CoopSched::slot_units`].
+    /// [`EmitTier::slot_units`].
     pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        self.sched.slot_units.get(slot as usize).copied().flatten()
+        self.sched
+            .emit
+            .slot_units
+            .get(slot as usize)
+            .copied()
+            .flatten()
     }
 
     /// #1009: the dispatch-table generation — bumped on each `Jit.install`/`Jit.uninstall` the
@@ -16401,7 +16442,7 @@ impl CoopRun {
     /// `WebAssembly.Table` at and rebuilds only when this advances (the single-shot pump's
     /// `temen_onramp_tierup_table_gen` twin).
     pub fn table_gen(&self) -> u32 {
-        self.sched.table_gen
+        self.sched.emit.table_gen
     }
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
@@ -16434,7 +16475,12 @@ impl CoopRun {
 
     /// What the run holds now ([`Footprint`]).
     pub fn footprint(&self) -> Footprint {
-        let children = self.sched.extra_envs.iter().filter(|e| e.mem.is_some());
+        let children = self
+            .sched
+            .core
+            .extra_envs
+            .iter()
+            .filter(|e| e.mem.is_some());
         Footprint {
             windows: usize::from(self.mem.is_some()) + children.count(),
             units: self.dom.source.snapshot().len(),
@@ -16564,7 +16610,7 @@ impl CoopRun {
         let ti = self.pending_ti().ok_or(Trap::Malformed)?;
         // Mid-invoke iff a `Jit.invoke` (not a tier-up) is the outstanding round-trip — never both at
         // once (the one-round-trip discipline). Selects the invoke-confined registry below.
-        let in_invoke = self.sched.pending_jit.is_some();
+        let in_invoke = self.sched.emit.pending_jit.is_some();
         let CoopRun {
             dom,
             mem,
@@ -16573,18 +16619,26 @@ impl CoopRun {
             sched,
         } = self;
         let CoopSched {
-            tasks,
-            extra_envs,
-            fibers,
-            fiber_sp,
-            fiber_meta,
-            invoke_fibers,
-            slot_units,
-            table_gen,
-            pending_tierup,
-            forked_twins,
-            hooked_twins,
-            clock,
+            core:
+                SchedCore {
+                    tasks,
+                    extra_envs,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    forked_twins,
+                    hooked_twins,
+                    clock,
+                    ..
+                },
+            emit:
+                EmitTier {
+                    invoke_fibers,
+                    slot_units,
+                    table_gen,
+                    pending_tierup,
+                    ..
+                },
             ..
         } = sched;
         // #1896: a leaf whose host suspends its frames can park in a bounce.
