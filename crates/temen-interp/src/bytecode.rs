@@ -6756,7 +6756,7 @@ fn journal_op(
 #[allow(clippy::too_many_arguments)]
 fn journal_state(
     journal: &mut super::journal::Journal,
-    tasks: &[DbgTask],
+    tasks: &[TaskSlot],
     extra_envs: &[DbgEnv],
     fibers: &[FiberState],
     source: &ModuleSource,
@@ -7265,7 +7265,7 @@ fn apply_due_writes(
     writes: &[(u64, ScheduledWrite)],
     cursor: &mut usize,
     turn: u64,
-    tasks: &mut [DbgTask],
+    tasks: &mut [TaskSlot],
     source: &ModuleSource,
     mem: &mut Option<Mem>,
     envs: &mut [DbgEnv],
@@ -7304,7 +7304,7 @@ fn apply_due_writes(
                             fn_block_base,
                             fn_block_types,
                             coro_debug: None,
-                            finished: matches!(t.state, DbgTaskState::Done(Ok(_))),
+                            finished: matches!(t.state, TaskState::Done(Ok(_))),
                         }
                         .write_target(*frame, name);
                         apply_target(
@@ -7582,77 +7582,6 @@ pub enum SchedBreak {
     Pause,
 }
 
-/// One scheduled vCPU under the multi-vCPU debugger. `Clone` for time-travel checkpointing (W1): a
-/// scheduled checkpoint captures each task's state so a reverse `seek` restarts from the nearest
-/// snapshot instead of turn 0.
-#[derive(Clone)]
-enum DbgTaskState {
-    Runnable,
-    /// Parked on `thread.join` of task `child` (handle `slot`); its result lands at `dst` on wake
-    /// (with `wait`, how it ended: [`super::join_delivery`]).
-    BlockedJoin {
-        child: usize,
-        slot: usize,
-        dst: u32,
-        wait: bool,
-    },
-    /// Parked on `memory.wait` at address `addr` of its own window until a `memory.notify` whose
-    /// futex key matches, or the logical `clock` reaches `deadline`; the status (`WAIT_WOKEN` /
-    /// `WAIT_TIMED_OUT`) lands at `dst`. The key is computed at notify time, from the windows as they
-    /// are then, so it survives a `restore` that rebuilds a child's window.
-    BlockedWait {
-        addr: u64,
-        /// Logical-clock deadline, or `None` for an infinite wait — which is therefore not a
-        /// clock-advance candidate in `dbg_pick_runnable` (#1638).
-        deadline: Option<u64>,
-        dst: u32,
-    },
-    /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
-    /// [`super::Host::set_stdin_blocking`] ([`Outcome::StdinPark`]); the read op was rewound and the
-    /// turn did not tick (the park is not a visible op — the re-issued read is). Woken explicitly by
-    /// [`ScheduledDebugRun::provide_stdin`]; a [`restore`](ScheduledDebugRun::restore) re-admits it
-    /// (a restored run is not parked — the re-executed read is served from the cap tape, or re-parks
-    /// at the frontier). The debug-scheduler twin of the cooperative driver's `TaskState::BlockedStdin`
-    /// — invariant 14's debugger axis.
-    BlockedStdin,
-    /// #1366 — parked on a **host-completed** cap call: the embedder services it asynchronously and
-    /// [`ScheduledDebugRun::deliver_cap`] resumes. `dst` is the awaiting result slot; `at` the call's
-    /// pc (the stop location). Not runnable until
-    /// delivered, and cleared to `Runnable` on a checkpoint restore (a replay serves the call from
-    /// the tape, exactly as a restored stdin park re-issues its read).
-    CapParked {
-        id: u64,
-        dst: u32,
-        at: Option<super::IrPc>,
-    },
-    /// Finished — result (or trap) retained for a joiner.
-    Done(Result<Vec<Value>, Trap>),
-}
-
-struct DbgTask {
-    /// The reified continuation of this vCPU: its active `Vm` plus its §12 fiber resume `chain` (a
-    /// `cont.resume` switches `vt.active` into a fiber; `suspend` / a fiber return switches back).
-    vt: VTask,
-    /// This vCPU's `thread.spawn` / `instantiate` children (handle = index → global task index; `None`
-    /// = joined). Both seams share one handle namespace, so `Instantiator.join` (→ `ThreadJoin`) joins
-    /// an `instantiate` child through the same machinery.
-    threads: Vec<Option<usize>>,
-    /// The runtime environment this vCPU steps against: `None` = the shared domain (root + its
-    /// `thread.spawn` siblings, over `self.mem`/`self.host`/`self.table`); `Some(k)` = the confined
-    /// [`extra_envs`](ScheduledDebugRun::extra_envs)`[k]` of a §14 `instantiate` child. The debug-engine
-    /// counterpart of the production [`TaskSlot::env`].
-    env: Option<usize>,
-    state: DbgTaskState,
-    /// Paused on a just-reported breakpoint — step one op past it before the next scan makes progress
-    /// (so a loop-body breakpoint re-fires each iteration).
-    at_bp: bool,
-    /// A detached child's window lease `(spawner env, budget, bytes)` — [`TaskSlot::lease`]'s
-    /// counterpart, returned by [`dbg_refund_ended_windows`] once this task is `Done`, or the run is.
-    lease: Option<(Option<usize>, i32, u64)>,
-    /// #2001 — [`TaskSlot::live`]'s counterpart: a thread's `spawn`, handed back when it completes.
-    live: LiveVcpu,
-}
-
 /// A §14 `instantiate` **confined executor child**'s runtime under the multi-vCPU debug scheduler — the
 /// debug-engine counterpart of the production [`ChildEnv`]. Its `mem` is a `nested_view` sub-window
 /// sharing the parent's backing (the confinement masking is the production primitive, unchanged — the
@@ -7666,13 +7595,13 @@ struct DbgTask {
 /// and exec), and it never replaces their powerboxes, so the child's is still here. `run_ended`: the
 /// run is over, which ends every child still live too, as the oracle's teardown reaps it (#2006).
 fn dbg_refund_ended_windows(
-    tasks: &mut [DbgTask],
+    tasks: &mut [TaskSlot],
     host: &mut Host,
     envs: &mut [DbgEnv],
     run_ended: bool,
 ) {
     for t in tasks.iter_mut() {
-        if run_ended || matches!(t.state, DbgTaskState::Done(_)) {
+        if run_ended || matches!(t.state, TaskState::Done(_)) {
             if let Some((env, budget, bytes)) = t.lease.take() {
                 match env {
                     None => host.release_detached(budget, bytes),
@@ -7689,7 +7618,7 @@ fn dbg_refund_ended_windows(
     for (k, e) in envs.iter_mut().enumerate() {
         let running = tasks
             .iter()
-            .any(|t| t.env == Some(k) && !matches!(t.state, DbgTaskState::Done(_)));
+            .any(|t| t.env == Some(k) && !matches!(t.state, TaskState::Done(_)));
         if run_ended || !running {
             e.fibers = FiberTables::default();
         }
@@ -7722,11 +7651,22 @@ enum EnvPlace {
     Detached { spawner: Option<usize> },
 }
 
+impl DbgEnv {
+    /// The env whose powerbox spawned this one — a detached child's spawner — for a `kill` to end
+    /// the subtree ([`kill_env`]). A carve child records none.
+    fn spawner(&self) -> Option<usize> {
+        match self.place {
+            EnvPlace::Detached { spawner } => spawner,
+            EnvPlace::Carve => None,
+        }
+    }
+}
+
 /// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
 /// finished, no live task's window lease is owed to its powerbox, and no live child env was spawned
 /// from it. A checkpoint carries such an env as spent rather than copying its window and powerbox.
-fn env_spent(tasks: &[DbgTask], envs: &[DbgEnv], k: usize) -> bool {
-    let live = |t: &&DbgTask| !matches!(t.state, DbgTaskState::Done(_));
+fn env_spent(tasks: &[TaskSlot], envs: &[DbgEnv], k: usize) -> bool {
+    let live = |t: &&TaskSlot| !matches!(t.state, TaskState::Done(_));
     !tasks
         .iter()
         .filter(live)
@@ -7751,7 +7691,7 @@ struct DbgTaskSnapshot {
     root_shadow_sp: u64,
     threads: Vec<Option<usize>>,
     env: Option<usize>,
-    state: DbgTaskState,
+    state: TaskState,
     at_bp: bool,
     lease: Option<(Option<usize>, i32, u64)>,
     /// #2001 — the task is a live thread holding a `spawn`, which a restore charges again.
@@ -7775,7 +7715,7 @@ pub struct ScheduledContinuation {
     /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs — a fiber migrates,
     /// D57), reconstructed verbatim on restore. The parked fiber `Vm`s share the run's window.
     fibers: Vec<FiberState>,
-    /// The §14 `instantiate`-child environments (handle = index; a task's [`DbgTask::env`] indexes this).
+    /// The §14 `instantiate`-child environments (handle = index; a task's [`TaskSlot::env`] indexes this).
     /// See [`EnvSnapshot`].
     extra_envs: Vec<EnvSnapshot>,
     /// The non-primary [`ModuleSource`] units (a §14 **separate-module** `instantiate_module` child's or
@@ -7877,8 +7817,8 @@ pub struct ScheduledDebugRun {
     table: SharedSlots,
     mem: Option<Mem>,
     host: Host,
-    tasks: Vec<DbgTask>,
-    /// §14 `instantiate` confined children's environments (handle = index; a task's [`DbgTask::env`] is
+    tasks: Vec<TaskSlot>,
+    /// §14 `instantiate` confined children's environments (handle = index; a task's [`TaskSlot::env`] is
     /// `Some(k)` into this). Grown as children spawn; rebuilt deterministically on a reverse-`seek`
     /// replay. Not torn down mid-run (a finished child's env is inert — revocation semantics deferred).
     extra_envs: Vec<DbgEnv>,
@@ -8043,15 +7983,15 @@ fn record_sched(
 
 /// How many call frames `task` has open: its active activation plus the suspended callers, or none
 /// once it has finished (#1981).
-fn trace_depth(task: &DbgTask) -> usize {
+fn trace_depth(task: &TaskSlot) -> usize {
     match task.state {
-        DbgTaskState::Done(_) => 0,
+        TaskState::Done(_) => 0,
         _ => task.vt.active.stack.len() + 1,
     }
 }
 
 /// The `(module, func)` of `task`'s frame `level` from the bottom (`0` = its entry function).
-fn trace_frame(task: &DbgTask, level: usize) -> (usize, usize) {
+fn trace_frame(task: &TaskSlot, level: usize) -> (usize, usize) {
     let vm = &task.vt.active;
     match vm.stack.get(level) {
         Some(&(module, func, ..)) => (module, func),
@@ -8060,19 +8000,27 @@ fn trace_frame(task: &DbgTask, level: usize) -> (usize, usize) {
 }
 
 /// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
-/// (aux = child), 2 = blocked-wait (aux = key), 3 = done, 4 = blocked-stdin (a park/wake the differ
+/// (aux = child), 2 = blocked-wait (aux = address), 3 = done, 4 = blocked-stdin (a park/wake the differ
 /// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act),
-/// 5 = cap-parked (aux = completion id; likewise no edge — the wake is the embedder's `deliver_cap`).
-fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
+/// 5 = cap-parked (aux = completion id; likewise no edge — the wake is the embedder's `deliver_cap`),
+/// 6 = a park only the cooperative pump makes (the debug scheduler declines the ops behind them).
+fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
     tasks
         .iter()
         .map(|t| match t.state {
-            DbgTaskState::Runnable => (0, 0),
-            DbgTaskState::BlockedJoin { child, .. } => (1, child as u64),
-            DbgTaskState::BlockedWait { addr, .. } => (2, addr),
-            DbgTaskState::Done(_) => (3, 0),
-            DbgTaskState::BlockedStdin => (4, 0),
-            DbgTaskState::CapParked { id, .. } => (5, id),
+            TaskState::Runnable => (0, 0),
+            TaskState::BlockedJoin { child, .. } => (1, child as u64),
+            TaskState::BlockedWait { addr, .. } => (2, addr),
+            TaskState::Done(_) => (3, 0),
+            TaskState::BlockedStdin => (4, 0),
+            TaskState::BlockedHostCap { id, .. } => (5, id),
+            TaskState::BlockedSvc
+            | TaskState::BlockedTicket { .. }
+            | TaskState::BlockedReap { .. }
+            | TaskState::BlockedReapPersonality { .. }
+            | TaskState::BlockedPipeRead { .. }
+            | TaskState::BlockedPipeWrite { .. }
+            | TaskState::BlockedOnFiber { .. } => (6, 0),
         })
         .collect()
 }
@@ -8083,7 +8031,7 @@ fn trace_diff(
     before: &[(u8, u64)],
     actor_depth: usize,
     actor_threads: &[Option<usize>],
-    tasks: &[DbgTask],
+    tasks: &[TaskSlot],
     turn: u64,
     actor: usize,
     out: &mut Vec<SchedTraceEvent>,
@@ -8163,7 +8111,7 @@ fn trace_diff(
 /// (`dbg_pick_runnable`'s clock advance), so any blocked-wait → runnable here is a `WakeTimeout`.
 fn trace_pick_diff(
     before: &[(u8, u64)],
-    tasks: &[DbgTask],
+    tasks: &[TaskSlot],
     turn: u64,
     out: &mut Vec<SchedTraceEvent>,
 ) {
@@ -8177,44 +8125,11 @@ fn trace_pick_diff(
     }
 }
 
-fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>) {
-    let mut work = vec![(ti, res)];
-    while let Some((done, res)) = work.pop() {
-        tasks[done].state = DbgTaskState::Done(res.clone());
-        tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
-        for (j, t) in tasks.iter_mut().enumerate() {
-            let DbgTaskState::BlockedJoin {
-                child,
-                slot,
-                dst,
-                wait,
-            } = t.state
-            else {
-                continue;
-            };
-            if child != done {
-                continue;
-            }
-            let (out, keep) = super::join_delivery(&res, wait);
-            if !keep {
-                t.threads[slot] = None;
-            }
-            match out {
-                Ok(r) => {
-                    t.vt.active.set(dst, r);
-                    t.state = DbgTaskState::Runnable;
-                }
-                Err(trap) => work.push((j, Err(trap))),
-            }
-        }
-    }
-}
-
 /// `thread.spawn`: add a child vCPU running `func(sp, arg)` (sharing the domain), write its handle to
 /// the spawner's `dst`. Mirrors the production `drive`'s `Spawn` arm for the debuggable subset.
 #[allow(clippy::too_many_arguments)]
 fn dbg_spawn(
-    tasks: &mut Vec<DbgTask>,
+    tasks: &mut Vec<TaskSlot>,
     ti: usize,
     func: u32,
     sp: i64,
@@ -8225,11 +8140,7 @@ fn dbg_spawn(
     node: NodeRef,
 ) -> Result<(), Trap> {
     let mut vt = thread_task(source, module, func, sp, arg)?;
-    let live = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
-        .count();
-    if live >= super::MAX_VCPUS {
+    if live_tasks(tasks) >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
     // #2001 — the thread is one `spawn` of its domain's node (`node`) while it lives: a full
@@ -8239,15 +8150,7 @@ fn dbg_spawn(
     let cidx = tasks.len();
     // §12: its `vcpu.tls` is its dense vCPU id, the task index, as the cooperative driver's.
     vt.active.tls = cidx as i64;
-    tasks.push(DbgTask {
-        vt,
-        threads: Vec::new(),
-        env,
-        state: DbgTaskState::Runnable,
-        at_bp: false,
-        lease: None,
-        live,
-    });
+    tasks.push(TaskSlot::new(vt, env, live));
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
@@ -8259,7 +8162,7 @@ fn dbg_spawn(
 /// unified `drive`/`tick` pumps stay a single call. Mirrors the production `drive`'s `RunCtx` selection.
 #[allow(clippy::too_many_arguments)]
 fn dbg_advance_task(
-    tasks: &mut [DbgTask],
+    tasks: &mut [TaskSlot],
     ti: usize,
     extra_envs: &mut [DbgEnv],
     fibers: &mut FiberTables,
@@ -8305,7 +8208,7 @@ enum Serviced {
 /// → tick its clock and stop the replay).
 #[allow(clippy::too_many_arguments)]
 fn service_advance(
-    tasks: &mut Vec<DbgTask>,
+    tasks: &mut Vec<TaskSlot>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     fibers: &mut FiberTables,
@@ -8326,18 +8229,18 @@ fn service_advance(
         FiberStep::Stepped => *turn += 1,
         FiberStep::Finished(vals) => {
             *turn += 1;
-            dbg_complete(tasks, ti, Ok(vals));
+            complete(tasks, ti, Ok(vals));
         }
         FiberStep::Trapped(t) => {
             *turn += 1;
-            dbg_complete(tasks, ti, Err(t));
+            complete(tasks, ti, Err(t));
         }
         // #1366 — a host-completed cap park: the call did not run and the turn holds (as a stdin
         // park); `drive` reports `SchedStop::CapPark` once nothing else can run, and `deliver_cap`
         // lands the value and re-admits the task. Until #1517 this engine failed closed here — and
         // could not in fact reach it, since it never admitted host-completed punts at all.
         FiberStep::CapParked { id, dst, at } => {
-            tasks[ti].state = DbgTaskState::CapParked { id, dst, at };
+            tasks[ti].state = TaskState::BlockedHostCap { id, dst, at };
         }
         // A scheduler seam: the ones this engine dispatches, else `Declined`.
         FiberStep::Other(outcome) => match outcome {
@@ -8354,16 +8257,17 @@ fn service_advance(
                     Some(k) => extra_envs[k].host.own_node(),
                 };
                 if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source, node) {
-                    dbg_complete(tasks, ti, Err(t));
+                    complete(tasks, ti, Err(t));
                 }
             }
             Outcome::ThreadJoin { handle, dst, wait } => {
                 *turn += 1;
-                dbg_join(tasks, ti, handle, dst, wait);
+                join_child(tasks, ti, handle, dst, wait);
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
-                dbg_child_ctl(tasks, extra_envs, ti, child, dst, ctl);
+                let spawners: Vec<_> = extra_envs.iter().map(DbgEnv::spawner).collect();
+                child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
             Outcome::MemoryWait {
                 base,
@@ -8374,11 +8278,14 @@ fn service_advance(
             } => {
                 *turn += 1;
                 let m = dbg_env_mem(mem, extra_envs, tasks[ti].env);
-                dbg_wait(tasks, ti, m, clock, base, expected, width, timeout, dst);
+                wait_task(tasks, ti, m, clock, base, expected, width, timeout, dst);
             }
             Outcome::MemoryNotify { base, count, dst } => {
                 *turn += 1;
-                dbg_notify(tasks, ti, mem, extra_envs, base, count, dst);
+                let win = |env| dbg_env_mem(mem, extra_envs, env);
+                let key = futex_key_in(win(tasks[ti].env), base);
+                let woken = wake_waiters(tasks, key, count as u32, win);
+                tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
             }
             // §14 confined children (ops 0, 5, 13, 17): the executor's admission, scheduled as a debug
             // task over its own `DbgEnv`, so a spawning guest stays steppable through its child.
@@ -8387,7 +8294,7 @@ fn service_advance(
                 if let Err(t) = dbg_instantiate_confined(
                     tasks, ti, extra_envs, source, mem, fuel, host, spawn, dst,
                 ) {
-                    dbg_complete(tasks, ti, Err(t));
+                    complete(tasks, ti, Err(t));
                 }
             }
             // §5 `instantiate_detached` (op 15): a fresh window of its own as a debug task — the
@@ -8398,13 +8305,13 @@ fn service_advance(
                 if let Err(t) = dbg_instantiate_detached(
                     tasks, ti, extra_envs, source, table, mem, host, spawn, dst,
                 ) {
-                    dbg_complete(tasks, ti, Err(t));
+                    complete(tasks, ti, Err(t));
                 }
             }
             // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds
             // `drive` reports `SchedStop::StdinPark` once nothing
             // else can run, and `provide_stdin` re-admits the task so the read re-issues.
-            Outcome::StdinPark => tasks[ti].state = DbgTaskState::BlockedStdin,
+            Outcome::StdinPark => tasks[ti].state = TaskState::BlockedStdin,
             // Everything this engine does **not** dispatch, named rather than caught by a `_`
             // (#1414). The debugger path is the one native driver whose event match had a wildcard;
             // `pump` and `run_vcpu_parallel` are already exhaustive, so a new `Outcome` variant fails
@@ -8483,7 +8390,7 @@ fn service_advance(
                 };
                 match gc_write(m, buf, cap, roots) {
                     Ok(total) => tasks[ti].vt.active.set(dst, Reg::from_i64(total)),
-                    Err(t) => dbg_complete(tasks, ti, Err(t)),
+                    Err(t) => complete(tasks, ti, Err(t)),
                 }
             }
         },
@@ -8497,7 +8404,7 @@ fn service_advance(
 /// un-lowerable module, an unreadable grant list, or the vCPU-count bomb.
 #[allow(clippy::too_many_arguments)]
 fn dbg_instantiate_confined(
-    tasks: &mut Vec<DbgTask>,
+    tasks: &mut Vec<TaskSlot>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
@@ -8550,7 +8457,7 @@ fn dbg_instantiate_confined(
 /// after its admission charges nothing ([`coop_start_child`], #2006).
 #[allow(clippy::too_many_arguments)]
 fn dbg_start_child(
-    tasks: &mut Vec<DbgTask>,
+    tasks: &mut Vec<TaskSlot>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     host: &mut Host,
@@ -8561,10 +8468,7 @@ fn dbg_start_child(
     place: EnvPlace,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
-    let live = tasks
-        .iter()
-        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
-        .count();
+    let room = live_tasks(tasks) < super::MAX_VCPUS;
     let BuiltChild {
         module,
         vt,
@@ -8573,15 +8477,10 @@ fn dbg_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(
-        source,
-        entry,
-        live < super::MAX_VCPUS,
-        |budget, bytes| match spawner {
-            None => host.release_detached(budget, bytes),
-            Some(k) => extra_envs[k].host.release_detached(budget, bytes),
-        },
-    )?;
+    } = child.build(source, entry, room, |budget, bytes| match spawner {
+        None => host.release_detached(budget, bytes),
+        Some(k) => extra_envs[k].host.release_detached(budget, bytes),
+    })?;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
         mem,
@@ -8596,14 +8495,9 @@ fn dbg_start_child(
         place,
     });
     let cidx = tasks.len();
-    tasks.push(DbgTask {
-        vt,
-        threads: Vec::new(),
-        env: Some(eidx),
-        state: DbgTaskState::Runnable,
-        at_bp: false,
+    tasks.push(TaskSlot {
         lease: lease.map(|(budget, bytes)| (spawner, budget, bytes)),
-        live: LiveVcpu::none(),
+        ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -8616,7 +8510,7 @@ fn dbg_start_child(
 /// (the executor's); the child is scheduled by [`dbg_start_child`], joined like a confined child.
 #[allow(clippy::too_many_arguments)]
 fn dbg_instantiate_detached(
-    tasks: &mut Vec<DbgTask>,
+    tasks: &mut Vec<TaskSlot>,
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
@@ -8660,97 +8554,6 @@ fn dbg_instantiate_detached(
         dst,
         place,
     )
-}
-
-/// `thread.join`: deliver a finished child's result now, else park the joiner. Mirrors `drive`'s `Join`.
-fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32, wait: bool) {
-    let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
-        Ok(s) => s,
-        Err(t) => {
-            dbg_complete(tasks, ti, Err(t));
-            return;
-        }
-    };
-    let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
-    match &tasks[child].state {
-        DbgTaskState::Done(res) => {
-            let (out, keep) = super::join_delivery(res, wait);
-            if !keep {
-                tasks[ti].threads[slot] = None;
-            }
-            match out {
-                Ok(r) => tasks[ti].vt.active.set(dst, r),
-                Err(t) => dbg_complete(tasks, ti, Err(t)),
-            }
-        }
-        _ => {
-            tasks[ti].state = DbgTaskState::BlockedJoin {
-                child,
-                slot,
-                dst,
-                wait,
-            }
-        }
-    }
-}
-
-/// PROCESS.md S3 `poll`/`detach`/`kill` under the debug engine, as the cooperative driver's arm.
-fn dbg_child_ctl(
-    tasks: &mut [DbgTask],
-    envs: &[DbgEnv],
-    ti: usize,
-    child: i32,
-    dst: u32,
-    ctl: ChildCtl,
-) {
-    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
-        Ok(s) => s,
-        Err(t) => {
-            dbg_complete(tasks, ti, Err(t));
-            return;
-        }
-    };
-    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
-    let answer = match ctl {
-        ChildCtl::Poll => match &tasks[c].state {
-            DbgTaskState::Done(Ok(_)) => 1,
-            DbgTaskState::Done(Err(_)) => 2,
-            _ => 0,
-        },
-        ChildCtl::Detach => {
-            tasks[ti].threads[slot] = None;
-            0
-        }
-        ChildCtl::Kill => {
-            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env) {
-                dbg_kill_env(tasks, envs, k);
-            }
-            0
-        }
-    };
-    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
-}
-
-/// `Instantiator.kill` (#2074) under the debug engine: [`coop_kill_env`]'s rule, descending through
-/// the detached children env `k` spawned. (A carve child's env records no spawner; the carve path
-/// is being deleted, #1867.)
-fn dbg_kill_env(tasks: &mut [DbgTask], envs: &[DbgEnv], k: usize) {
-    let live: Vec<usize> = (0..tasks.len())
-        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, DbgTaskState::Done(_)))
-        .collect();
-    if live.is_empty() {
-        return;
-    }
-    for i in live {
-        if !matches!(tasks[i].state, DbgTaskState::Done(_)) {
-            dbg_complete(tasks, i, Err(Trap::ThreadFault));
-        }
-    }
-    for j in 0..envs.len() {
-        if matches!(envs[j].place, EnvPlace::Detached { spawner: Some(s) } if s == k) {
-            dbg_kill_env(tasks, envs, j);
-        }
-    }
 }
 
 /// §22 `Jit.invoke` (op 1) **as a step-into** (both debug engines): arm [`VTask::active_invoke`] over
@@ -8847,77 +8650,6 @@ fn dbg_env_mem<'a>(
     }
 }
 
-/// The futex rendezvous key of `addr` in window `m` (#1731): backing identity plus address, as the
-/// cooperative driver keys it. Every detached window starts at base 0, so the address alone would
-/// rendezvous across windows (#1283).
-fn dbg_futex_key(m: Option<&Mem>, addr: u64) -> super::FutexKey {
-    m.map_or(super::FutexKey::Anon(0, addr), |m| m.futex_key(addr))
-}
-
-/// `memory.wait`: park the caller at `base` until a `notify` or the deadline, unless the value in its
-/// own window `mem` already changed (the compare-under-lock analogue). Mirrors `drive`'s `Wait`.
-#[allow(clippy::too_many_arguments)]
-fn dbg_wait(
-    tasks: &mut [DbgTask],
-    ti: usize,
-    mem: Option<&Mem>,
-    clock: u64,
-    base: u64,
-    expected: u64,
-    width: u32,
-    timeout: Option<u64>,
-    dst: u32,
-) {
-    let cur = mem.map(|m| m.atomic_value(base, width)).unwrap_or(0);
-    if cur != expected {
-        tasks[ti]
-            .vt
-            .active
-            .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
-    } else {
-        tasks[ti].state = DbgTaskState::BlockedWait {
-            addr: base,
-            // #1638: an infinite wait carries no deadline, so it is not a clock-advance
-            // candidate below — it ends by `notify` or not at all (the deadlock exit).
-            deadline: timeout.map(|t| clock.saturating_add(t)),
-            dst,
-        };
-    }
-}
-
-/// `memory.notify`: wake up to `count` waiters whose futex key matches `base` in the caller's window
-/// (lowest task index first, deterministic); the woken count lands at `dst`. Mirrors `drive`'s
-/// `Notify`.
-fn dbg_notify(
-    tasks: &mut [DbgTask],
-    ti: usize,
-    mem: &Option<Mem>,
-    envs: &[DbgEnv],
-    base: u64,
-    count: i32,
-    dst: u32,
-) {
-    let key = dbg_futex_key(dbg_env_mem(mem, envs, tasks[ti].env), base);
-    let want = count as u32;
-    let mut woken = 0u32;
-    for t in tasks.iter_mut() {
-        if woken >= want {
-            break;
-        }
-        if let DbgTaskState::BlockedWait {
-            addr, dst: wdst, ..
-        } = t.state
-        {
-            if dbg_futex_key(dbg_env_mem(mem, envs, t.env), addr) == key {
-                t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
-                t.state = DbgTaskState::Runnable;
-                woken += 1;
-            }
-        }
-    }
-    tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
-}
-
 /// SplitMix64 — the stateless mix behind the **seeded pick** (slice 7): the choice at a turn is a
 /// pure function of `(seed, turn)`, so any replay — full or from a checkpoint — reproduces the
 /// schedule with zero captured scheduler state (INVARIANTS.md #7: recovery never replays captured
@@ -8944,7 +8676,7 @@ fn forced_at(forced: &[(u64, usize)], turn: u64) -> Option<usize> {
 /// until the child yields / faults / returns and `active_coro` clears. At most one task is ever pinned
 /// (a task can only enter a coroutine while running, and a pinned task runs alone), so the first match
 /// is the pin.
-fn dbg_pinned_coro(tasks: &[DbgTask]) -> Option<usize> {
+fn dbg_pinned_coro(tasks: &[TaskSlot]) -> Option<usize> {
     let _ = tasks;
     None
 }
@@ -9024,14 +8756,13 @@ fn push_span(spans: &mut Vec<StepSpan>, span: StepSpan) {
 ///
 /// Every rule is a function of the arguments alone, so a replay picks exactly as the live run did.
 fn dbg_preview_pick(
-    tasks: &[DbgTask],
+    tasks: &[TaskSlot],
     seed: Option<u64>,
     forced: &[(u64, usize)],
     pref: Option<(usize, bool)>,
     turn: u64,
 ) -> Option<usize> {
-    let runnable =
-        |i: usize| matches!(tasks.get(i).map(|t| &t.state), Some(DbgTaskState::Runnable));
+    let runnable = |i: usize| matches!(tasks.get(i).map(|t| &t.state), Some(TaskState::Runnable));
     if let Some(f) = forced_at(forced, turn).filter(|&f| runnable(f)) {
         return Some(f);
     }
@@ -9057,7 +8788,7 @@ fn dbg_preview_pick(
 /// pure function of `(seed, forced, pref, turn, task states)`, so replay reproduces it exactly —
 /// which is why the live `drive` and the replaying `tick` both pick through here.
 fn dbg_pick_runnable(
-    tasks: &mut [DbgTask],
+    tasks: &mut [TaskSlot],
     clock: &mut u64,
     seed: Option<u64>,
     forced: &[(u64, usize)],
@@ -9073,27 +8804,8 @@ fn dbg_pick_runnable(
         // indefinite" yields `None` here and takes the `?` deadlock exit this function already
         // documented, instead of advancing the clock to a `MAX_WAIT` stand-in and handing the
         // guest a `WAIT_TIMED_OUT` it never asked for.
-        let next = tasks
-            .iter()
-            .filter_map(|t| match t.state {
-                DbgTaskState::BlockedWait { deadline, .. } => deadline,
-                _ => None,
-            })
-            .min()?;
-        *clock = (*clock).max(next);
-        for t in tasks.iter_mut() {
-            if let DbgTaskState::BlockedWait {
-                deadline: Some(deadline),
-                dst,
-                ..
-            } = t.state
-            {
-                if deadline <= *clock {
-                    t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
-                    t.state = DbgTaskState::Runnable;
-                }
-            }
-        }
+        *clock = (*clock).max(next_wait_deadline(tasks)?);
+        time_out_waits(tasks, *clock);
     }
 }
 
@@ -9135,15 +8847,7 @@ impl ScheduledDebugRun {
             table,
             mem,
             host,
-            tasks: vec![DbgTask {
-                vt,
-                threads: Vec::new(),
-                env: None,
-                state: DbgTaskState::Runnable,
-                at_bp: false,
-                lease: None,
-                live: LiveVcpu::none(),
-            }],
+            tasks: vec![TaskSlot::new(vt, None, LiveVcpu::none())],
             extra_envs: Vec::new(),
             fibers: FiberTables::default(),
             fn_block_base,
@@ -9468,7 +9172,7 @@ impl ScheduledDebugRun {
         self.tasks
             .iter()
             .enumerate()
-            .filter(|(_, t)| matches!(t.state, DbgTaskState::Runnable))
+            .filter(|(_, t)| matches!(t.state, TaskState::Runnable))
             .map(|(i, _)| i)
             .collect()
     }
@@ -9550,7 +9254,7 @@ impl ScheduledDebugRun {
         // `wait_unless_host_owned` never yields `None` and this engine could not park at all.
         host.completions().allow_host_completed();
         loop {
-            if let DbgTaskState::Done(res) = &tasks[0].state {
+            if let TaskState::Done(res) = &tasks[0].state {
                 let res = res.clone();
                 // #2006 — the run is over, and every child still live ends with it, as the oracle's
                 // teardown reaps it (not a run that froze: the cut carries them).
@@ -9585,7 +9289,7 @@ impl ScheduledDebugRun {
                         // stop on that thread (lowest-index), resumable via `deliver_cap`.
                         if let Some((p, id, at)) =
                             tasks.iter().enumerate().find_map(|(i, t)| match t.state {
-                                DbgTaskState::CapParked { id, at, .. } => Some((i, id, at)),
+                                TaskState::BlockedHostCap { id, at, .. } => Some((i, id, at)),
                                 _ => None,
                             })
                         {
@@ -9599,7 +9303,7 @@ impl ScheduledDebugRun {
                         }
                         let parked = tasks
                             .iter()
-                            .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
+                            .position(|t| matches!(t.state, TaskState::BlockedStdin));
                         let pc = parked.and_then(|p| tasks[p].vt.debug_active().cur_ir_pc(source));
                         return match (parked, pc) {
                             (Some(p), Some(pc)) => {
@@ -9780,7 +9484,7 @@ impl ScheduledDebugRun {
         let live = |i: usize| {
             self.tasks
                 .get(i)
-                .is_some_and(|t| !matches!(t.state, DbgTaskState::Done(_)))
+                .is_some_and(|t| !matches!(t.state, TaskState::Done(_)))
         };
         Some(if live(self.focus) { self.focus } else { st })
     }
@@ -9864,7 +9568,7 @@ impl ScheduledDebugRun {
     /// compute, one-op-per-turn, lowest-index pick), replaying `t` ticks from a fresh session reproduces
     /// the exact state at global turn `t`.
     pub fn tick(&mut self, fuel: &mut u64) -> bool {
-        if matches!(self.tasks[0].state, DbgTaskState::Done(_)) {
+        if matches!(self.tasks[0].state, TaskState::Done(_)) {
             return false;
         }
         // The shared tasks' counter is the caller's, lent for this call (#1944 slice 3).
@@ -9993,7 +9697,7 @@ impl ScheduledDebugRun {
             );
             record_sched(sched_trace, sched_sink, events);
         }
-        !matches!(tasks[0].state, DbgTaskState::Done(_))
+        !matches!(tasks[0].state, TaskState::Done(_))
     }
 
     /// The current global turn (visible ops replayed so far) — the reverse-`seek` coordinate.
@@ -10018,7 +9722,7 @@ impl ScheduledDebugRun {
     pub fn stdin_parked(&self) -> bool {
         self.tasks
             .iter()
-            .any(|t| matches!(t.state, DbgTaskState::BlockedStdin))
+            .any(|t| matches!(t.state, TaskState::BlockedStdin))
     }
 
     /// #1146 (deeper) — append stdin bytes for the parked blocking `read`s ([`Host::push_stdin`]) and
@@ -10029,8 +9733,8 @@ impl ScheduledDebugRun {
     pub fn provide_stdin(&mut self, bytes: &[u8]) {
         self.host.push_stdin(bytes);
         for t in self.tasks.iter_mut() {
-            if matches!(t.state, DbgTaskState::BlockedStdin) {
-                t.state = DbgTaskState::Runnable;
+            if matches!(t.state, TaskState::BlockedStdin) {
+                t.state = TaskState::Runnable;
             }
         }
     }
@@ -10040,7 +9744,7 @@ impl ScheduledDebugRun {
     /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it.
     pub fn cap_parked(&self) -> Option<u64> {
         self.tasks.iter().find_map(|t| match t.state {
-            DbgTaskState::CapParked { id, .. } => Some(id),
+            TaskState::BlockedHostCap { id, .. } => Some(id),
             _ => None,
         })
     }
@@ -10049,7 +9753,7 @@ impl ScheduledDebugRun {
     /// parked and the call had a source position.
     pub fn cap_park_pc(&self) -> Option<super::IrPc> {
         self.tasks.iter().find_map(|t| match t.state {
-            DbgTaskState::CapParked { at, .. } => at,
+            TaskState::BlockedHostCap { at, .. } => at,
             _ => None,
         })
     }
@@ -10065,7 +9769,7 @@ impl ScheduledDebugRun {
             .iter()
             .enumerate()
             .find_map(|(i, t)| match t.state {
-                DbgTaskState::CapParked { id: pid, dst, .. } if pid == id => Some((i, dst)),
+                TaskState::BlockedHostCap { id: pid, dst, .. } if pid == id => Some((i, dst)),
                 _ => None,
             })
         else {
@@ -10074,7 +9778,7 @@ impl ScheduledDebugRun {
         settle_host_cap(&mut self.host, id, value);
         let _ = self.host.completions().try_take(id);
         self.tasks[ti].vt.active.set(dst, Reg::from_i64(value));
-        self.tasks[ti].state = DbgTaskState::Runnable;
+        self.tasks[ti].state = TaskState::Runnable;
         self.turn += 1;
         true
     }
@@ -10270,7 +9974,7 @@ impl ScheduledDebugRun {
         self.tasks = c
             .tasks
             .iter()
-            .map(|ts| DbgTask {
+            .map(|ts| TaskSlot {
                 vt: VTask {
                     active: ts.active.clone(),
                     active_id: ts.active_id,
@@ -10281,11 +9985,12 @@ impl ScheduledDebugRun {
                 threads: ts.threads.clone(),
                 env: ts.env,
                 state: match (&ts.state, readmit_parks) {
-                    (DbgTaskState::BlockedStdin | DbgTaskState::CapParked { .. }, true) => {
-                        DbgTaskState::Runnable
+                    (TaskState::BlockedStdin | TaskState::BlockedHostCap { .. }, true) => {
+                        TaskState::Runnable
                     }
                     (s, _) => s.clone(),
                 },
+                suspended: None,
                 at_bp: ts.at_bp,
                 lease: ts.lease,
                 // #2001 — a live thread is charged again; the task it replaces hands its charge
@@ -10305,7 +10010,7 @@ impl ScheduledDebugRun {
     /// The run's result once the root has finished (`None` while still running).
     pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
         match &self.tasks[0].state {
-            DbgTaskState::Done(r) => Some(r),
+            TaskState::Done(r) => Some(r),
             _ => None,
         }
     }
@@ -10313,7 +10018,7 @@ impl ScheduledDebugRun {
     /// Every live (not-yet-finished) vCPU — one DAP thread each. The stopped thread is among them.
     pub fn threads(&self) -> Vec<u64> {
         (0..self.tasks.len())
-            .filter(|&i| !matches!(self.tasks[i].state, DbgTaskState::Done(_)))
+            .filter(|&i| !matches!(self.tasks[i].state, TaskState::Done(_)))
             .map(|i| i as u64)
             .collect()
     }
@@ -10327,8 +10032,8 @@ impl ScheduledDebugRun {
             .iter()
             .enumerate()
             .filter_map(|(i, t)| match t.state {
-                DbgTaskState::BlockedWait { addr, .. } => Some((i, BlockedOn::Futex(addr))),
-                DbgTaskState::BlockedJoin { child, .. } => Some((i, BlockedOn::Join(child))),
+                TaskState::BlockedWait { addr, .. } => Some((i, BlockedOn::Futex(addr))),
+                TaskState::BlockedJoin { child, .. } => Some((i, BlockedOn::Join(child))),
                 _ => None,
             })
             .collect()
@@ -10343,7 +10048,7 @@ impl ScheduledDebugRun {
     /// is not a live task. Resets to the stopped thread on the next `run_until_stop`.
     pub fn select_task(&mut self, id: u64) -> bool {
         let i = id as usize;
-        if i < self.tasks.len() && !matches!(self.tasks[i].state, DbgTaskState::Done(_)) {
+        if i < self.tasks.len() && !matches!(self.tasks[i].state, TaskState::Done(_)) {
             self.focus = i;
             true
         } else {
@@ -10380,7 +10085,7 @@ impl ScheduledDebugRun {
             // spawn); a same-module one leaves it `None` (its frames are module 0, read against the fields
             // above).
             coro_debug: None,
-            finished: matches!(self.tasks[self.focus].state, DbgTaskState::Done(Ok(_))),
+            finished: matches!(self.tasks[self.focus].state, TaskState::Done(Ok(_))),
         }
     }
 
@@ -10631,13 +10336,8 @@ fn spawn_task(
         program: vt.active.module as u32,
     });
     tasks.push(TaskSlot {
-        vt,
-        threads: Vec::new(),
-        env: Some(eidx),
         state,
-        suspended: None,
-        lease: None,
-        live,
+        ..TaskSlot::new(vt, Some(eidx), live)
     });
     forked_twins.insert(child_ti);
     let win = extra_envs[eidx].mem.as_ref();
@@ -12309,7 +12009,8 @@ fn drive_nested(
                         .and_then(|c| c.park.as_deref_mut())
                         .filter(|_| chain.is_empty())
                         .ok_or(Trap::CapFault)?;
-                    *slot = Some((active, Handoff::Park(TaskState::BlockedHostCap { id, dst })));
+                    let state = TaskState::BlockedHostCap { id, dst, at: None };
+                    *slot = Some((active, Handoff::Park(state)));
                     return Ok(Vec::new());
                 }
                 let r = comps.wait(id);
@@ -12337,8 +12038,15 @@ fn drive_nested(
                     active.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
                     continue;
                 }
-                let key = w.futex_key(base);
-                *slot = Some((active, Handoff::Wait { key, timeout, dst }));
+                *slot = Some((
+                    active,
+                    Handoff::Wait {
+                        addr: base,
+                        site: w.futex_site(base),
+                        timeout,
+                        dst,
+                    },
+                ));
                 return Ok(Vec::new());
             }
             Outcome::ContNew { funcref, sp, dst } => {
@@ -13426,30 +13134,6 @@ struct ChildEnv {
     program: u32,
 }
 
-/// `Instantiator.kill` (#2074), cooperative form: end every live task of env `k` with
-/// `ThreadFault`, wherever it is parked ([`complete`] overwrites any blocked state and wakes its
-/// joiners), then the child envs it spawned, as the tree-walker's kill ends a child and its subtree.
-/// An env with nothing left alive is left as it is, its children with it: killing a child that has
-/// ended does nothing.
-fn coop_kill_env(tasks: &mut [TaskSlot], envs: &[ChildEnv], k: usize) {
-    let live: Vec<usize> = (0..tasks.len())
-        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, TaskState::Done(_)))
-        .collect();
-    if live.is_empty() {
-        return;
-    }
-    for i in live {
-        if !matches!(tasks[i].state, TaskState::Done(_)) {
-            complete(tasks, i, Err(Trap::ThreadFault));
-        }
-    }
-    for j in 0..envs.len() {
-        if envs[j].spawner == Some(k) {
-            coop_kill_env(tasks, envs, j);
-        }
-    }
-}
-
 /// A domain's powerbox in the cooperative driver: the root's and every child env's sits in a cell
 /// ([`Host::into_cell`]), so a child can call back into any domain of the run through a live offer
 /// (#744). The pump locks a task's cell for the task's step.
@@ -13546,13 +13230,8 @@ fn coop_start_child(
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        vt,
-        threads: Vec::new(),
-        env: Some(eidx),
-        state: TaskState::Runnable,
-        suspended: None,
         lease: lease.map(|(budget, bytes)| (spawner, budget, bytes)),
-        live: LiveVcpu::none(),
+        ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -13582,9 +13261,27 @@ struct TaskSlot {
     /// ([`complete`]). None on the root and on a §14/§5 child's root (a detached child's lease
     /// holds its charge).
     live: LiveVcpu,
+    /// A debug session's: the task is paused on the breakpoint it just reported, so its next step
+    /// runs one op past it before a scan looks for the next stop.
+    at_bp: bool,
 }
 
 impl TaskSlot {
+    /// A runnable task `vt` over env `env`, holding its `live` charge: no children yet, nothing
+    /// suspended, no window lease.
+    fn new(vt: VTask, env: Option<usize>, live: LiveVcpu) -> TaskSlot {
+        TaskSlot {
+            vt,
+            threads: Vec::new(),
+            env,
+            state: TaskState::Runnable,
+            suspended: None,
+            lease: None,
+            live,
+            at_bp: false,
+        }
+    }
+
     /// Where the result of this task's parked call lands: the continuation of a call that parked in
     /// a bounce out of the task's emitted leaf ([`Suspended`], #1896), which the pump runs next, or
     /// else the task's own frame.
@@ -13625,6 +13322,7 @@ fn refund_ended_windows(
     }
 }
 
+#[derive(Clone)]
 enum TaskState {
     Runnable,
     /// Parked on `thread.join` of task `child`; deliver its result to `dst` and wake (with `wait`,
@@ -13635,13 +13333,15 @@ enum TaskState {
         dst: u32,
         wait: bool,
     },
-    /// Parked on `memory.wait` at futex `key` until notified or `deadline` (logical clock). The key is
-    /// **backing-identity canonical** ([`super::FutexKey`]): two confined `instantiate` children that
-    /// mapped the same `SharedRegion` into their separate windows park/wake on the same key (S1c), so a
-    /// pipe ring between concurrent stages rendezvous. A plain `thread.spawn` sibling (shared root
-    /// window, anonymous page) keys on its confined address — `FutexKey::Anon`, as before.
+    /// Parked on `memory.wait` at address `addr` of its own window until notified or `deadline`
+    /// (logical clock). It waits at `site`, taken at the park as the oracle takes its key; a `notify`
+    /// keys it through its window ([`site_key_in`]). The key is **backing-identity canonical**
+    /// ([`super::FutexKey`]), so two confined `instantiate` children that mapped the same
+    /// `SharedRegion` into their separate windows rendezvous (S1c). The site, unlike the key,
+    /// survives a debug `restore` that rebuilds a window and its regions ([`super::FutexSite`]).
     BlockedWait {
-        key: super::FutexKey,
+        addr: u64,
+        site: super::FutexSite,
         /// Logical-clock deadline, or `None` for an infinite wait — which is therefore not a
         /// clock-advance candidate at driver idle (#1638), so a run where every remaining
         /// waiter is indefinite reaches `drive`'s deadlock exit instead of being handed a
@@ -13698,6 +13398,9 @@ enum TaskState {
     /// takes `&mut Host`, which the run exclusively borrows, so no *concurrent* data feed can reach a
     /// coop stdin park today — the only live wake is the signal interrupt; the readiness re-admit is
     /// the correct contract kept for symmetry (and a future shared-Host feed), not a reachable path.
+    /// A debug session wakes it explicitly ([`ScheduledDebugRun::provide_stdin`]), and a checkpoint
+    /// `restore` re-admits it: the re-executed read is served from the cap tape, or parks again at
+    /// the frontier.
     BlockedStdin,
     /// I48 — parked in a blocking `cont.resume.block` on fiber `fiber` (event-parked, not yet woken).
     /// The resumer's cursor was rewound to the resume op; when `fiber` is woken (idle-timer, notify,
@@ -13711,10 +13414,13 @@ enum TaskState {
     /// embedder answers completion `id` ([`CoopRun::deliver_cap`]), whose value lands in `dst`.
     /// Only a [`CoopRun`] admits such calls, and only on its root powerbox; once nothing else can
     /// run, the pump surfaces the smallest outstanding id as [`CoopStep::CapPark`]. The task twin
-    /// of a fiber's [`FiberState::CapParked`], and of `ScheduledDebugRun`'s `CapParked` thread.
+    /// of a fiber's [`FiberState::CapParked`]. A debug session parks the same way and records the
+    /// call's own pc, `at`, as the stop location (#1366); the pump keeps none. A checkpoint `restore`
+    /// re-admits it, the replay serving the call from the tape.
     BlockedHostCap {
         id: u64,
         dst: u32,
+        at: Option<super::IrPc>,
     },
     /// Finished — its result (or trap) is retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
@@ -14127,7 +13833,8 @@ enum Handoff {
     /// #2050 — it waits on a futex word whose value it found unchanged: [`hand_off`] parks the task
     /// in [`TaskState::BlockedWait`], its deadline taken on the pump's clock.
     Wait {
-        key: super::FutexKey,
+        addr: u64,
+        site: super::FutexSite,
         timeout: Option<u64>,
         dst: u32,
     },
@@ -14151,11 +13858,21 @@ fn hand_off(
             park_task(tasks, forked_twins, hooked_twins, ti, state);
             None
         }
-        Handoff::Wait { key, timeout, dst } => {
+        Handoff::Wait {
+            addr,
+            site,
+            timeout,
+            dst,
+        } => {
             // The interpreted wait's park (the pump's `VcpuStop::Wait` arm): `None` for an
             // infinite wait (#1638).
             let deadline = timeout.map(|t| clock.saturating_add(t));
-            tasks[ti].state = TaskState::BlockedWait { key, deadline, dst };
+            tasks[ti].state = TaskState::BlockedWait {
+                addr,
+                site,
+                deadline,
+                dst,
+            };
             None
         }
         Handoff::Spawn(ask) => {
@@ -14354,15 +14071,8 @@ impl CoopSched {
         if !thaws(host, mem.as_ref()) {
             fuel.burn()?;
         }
-        let mut tasks: Vec<TaskSlot> = vec![TaskSlot {
-            vt: VTask::new(&dom.source.primary(), entry as usize, args)?,
-            threads: Vec::new(),
-            env: None,
-            state: TaskState::Runnable,
-            suspended: None,
-            lease: None,
-            live: LiveVcpu::none(),
-        }];
+        let root_vt = VTask::new(&dom.source.primary(), entry as usize, args)?;
+        let mut tasks = vec![TaskSlot::new(root_vt, None, LiveVcpu::none())];
         // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
         // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
         // gate). `thread.spawn` children inherit the bitmap in `pump`'s `Spawn` arm (same-module only).
@@ -14930,43 +14640,23 @@ impl CoopSched {
                 // function's own doc already promised ("or deadlocks → `ThreadFault`, matching
                 // the deterministic explorer"). That path was unreachable while the `MAX_WAIT`
                 // clamp gave every infinite wait a deadline to advance to.
-                let next = tasks
-                    .iter()
-                    .filter_map(|t| match t.state {
-                        TaskState::BlockedWait { deadline, .. } => deadline,
-                        _ => None,
-                    })
-                    .chain(
-                        fibers
-                            .iter()
-                            .chain(extra_envs.iter().flat_map(|e| e.fibers.fibers.iter()))
-                            .filter_map(|f| match f {
-                                FiberState::WaitParked {
-                                    deadline,
-                                    woken: None,
-                                    ..
-                                } => *deadline,
-                                _ => None,
-                            }),
-                    )
-                    .min();
-                match next {
+                let next = next_wait_deadline(tasks).into_iter().chain(
+                    fibers
+                        .iter()
+                        .chain(extra_envs.iter().flat_map(|e| e.fibers.fibers.iter()))
+                        .filter_map(|f| match f {
+                            FiberState::WaitParked {
+                                deadline,
+                                woken: None,
+                                ..
+                            } => *deadline,
+                            _ => None,
+                        }),
+                );
+                match next.min() {
                     Some(d) => {
                         *clock = (*clock).max(d);
-                        for t in tasks.iter_mut() {
-                            if let TaskState::BlockedWait {
-                                deadline: Some(deadline),
-                                dst,
-                                ..
-                            } = t.state
-                            {
-                                if deadline <= *clock {
-                                    t.parked_frame()
-                                        .set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
-                                    t.state = TaskState::Runnable;
-                                }
-                            }
-                        }
+                        time_out_waits(tasks, *clock);
                         // §3.6 slice 5a: a due fiber wait completes with `WAIT_TIMED_OUT` — the
                         // fiber becomes claimable (leaving the pending set, so this loop makes
                         // progress); its resumer's next `cont.resume` delivers the status. Every
@@ -15408,7 +15098,7 @@ impl CoopSched {
                         // #1953: a host-completed punt, which only a `CoopRun` admits (on its root
                         // powerbox): park the task until the embedder answers it. The pump surfaces
                         // the park once nothing else can run.
-                        tasks[ti].state = TaskState::BlockedHostCap { id, dst };
+                        tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
                     } else {
                         let comps = task_host(root, extra_envs, tasks[ti].env)
                             .lock_unpoisoned()
@@ -15558,15 +15248,7 @@ impl CoopSched {
                             program,
                         });
                         let twin_ti = tasks.len();
-                        tasks.push(TaskSlot {
-                            vt: twin_vt,
-                            threads: Vec::new(),
-                            env: Some(twin_eidx),
-                            state: TaskState::Runnable,
-                            suspended: None,
-                            lease: None,
-                            live,
-                        });
+                        tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
                         // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
                         // its exit status to the parent (FORK.md §8.6); retired when reaped.
                         forked_twins.insert(twin_ti);
@@ -15875,15 +15557,7 @@ impl CoopSched {
                                 twin_ti,
                                 "twin lands at its pre-read index"
                             );
-                            tasks.push(TaskSlot {
-                                vt: twin_vt,
-                                threads: Vec::new(),
-                                env: Some(twin_eidx),
-                                state: TaskState::Runnable,
-                                suspended: None,
-                                lease: None,
-                                live,
-                            });
+                            tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
                             forked_twins.insert(twin_ti);
                             tasks[ti].vt.active.set(dst, Reg::from_i64(twin_pid as i64));
                         }
@@ -15966,15 +15640,7 @@ impl CoopSched {
                     // (the shared domain for a root-spawned thread, or the same confined `instantiate`
                     // env for one spawned by a confined child).
                     let env = tasks[ti].env;
-                    tasks.push(TaskSlot {
-                        vt: child,
-                        threads: Vec::new(),
-                        env,
-                        state: TaskState::Runnable,
-                        suspended: None,
-                        lease: None,
-                        live,
-                    });
+                    tasks.push(TaskSlot::new(child, env, live));
                     let handle = tasks[ti].threads.len() as i32;
                     tasks[ti].threads.push(Some(cidx));
                     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
@@ -16117,68 +15783,11 @@ impl CoopSched {
                 // PROCESS.md S3 — `poll`/`detach`/`kill`, as the tree-walker's op 9/10/12 arms: a
                 // forged or spent handle is a `ThreadFault`, like `join`'s.
                 Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
-                    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
-                        Ok(s) => s,
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
-                    let answer = match ctl {
-                        ChildCtl::Poll => match &tasks[c].state {
-                            TaskState::Done(Ok(_)) => 1,
-                            TaskState::Done(Err(_)) => 2,
-                            _ => 0,
-                        },
-                        // The result dies with its env; its window lease is refunded once it is
-                        // done (`refund_ended_windows`); its lane went back at admission.
-                        ChildCtl::Detach => {
-                            tasks[ti].threads[slot] = None;
-                            0
-                        }
-                        // A `thread.spawn` handle shares this task's env: nothing to kill, as on
-                        // the tree-walker (no `child_kill` entry).
-                        ChildCtl::Kill => {
-                            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env)
-                            {
-                                coop_kill_env(tasks, extra_envs, k);
-                            }
-                            0
-                        }
-                    };
-                    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
+                    let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
+                    child_ctl(tasks, &spawners, ti, child, dst, ctl);
                 }
                 Ok(VcpuStop::Join { handle, dst, wait }) => {
-                    let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
-                        Ok(s) => s,
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
-                    match &tasks[child].state {
-                        TaskState::Done(res) => {
-                            // The child already finished: deliver now (a child trap propagates here).
-                            let (out, keep) = super::join_delivery(res, wait);
-                            if !keep {
-                                tasks[ti].threads[slot] = None;
-                            }
-                            match out {
-                                Ok(r) => tasks[ti].vt.active.set(dst, r),
-                                Err(t) => complete(tasks, ti, Err(t)),
-                            }
-                        }
-                        _ => {
-                            tasks[ti].state = TaskState::BlockedJoin {
-                                child,
-                                slot,
-                                dst,
-                                wait,
-                            };
-                        }
-                    }
+                    join_child(tasks, ti, handle, dst, wait)
                 }
                 Ok(VcpuStop::Wait {
                     base,
@@ -16235,71 +15844,28 @@ impl CoopSched {
                         }
                         continue;
                     }
-                    // Re-read the value (the cooperative analogue of the futex compare-under-lock): if it
-                    // already changed, return not-equal; else park until notified or timed out. Both the
-                    // value re-read and the rendezvous key are taken against THIS task's own memory: a
-                    // confined `instantiate` child steps against its `extra_envs` window, not the root
-                    // `mem`, and the key is backing-identity canonical (`futex_key`) so two children that
-                    // mapped the same `SharedRegion` into separate windows rendezvous (S1c). Reading the
-                    // root `mem` here instead would make a child's `wait` on its mapped ring flag re-read
-                    // an unrelated root byte and spin forever.
-                    let (cur, key) = {
-                        let tmem: Option<&Mem> = match tasks[ti].env {
-                            None => mem.as_ref(),
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                        };
-                        (
-                            tmem.map(|m| m.atomic_value(base, width)).unwrap_or(0),
-                            tmem.map(|m| m.futex_key(base))
-                                .unwrap_or(super::FutexKey::Anon(0, base)),
-                        )
+                    // The value re-read and the park are against THIS task's own window: a confined
+                    // `instantiate` child steps against its `extra_envs` window, not the root `mem`.
+                    // Reading the root `mem` here instead would make a child's `wait` on its mapped
+                    // ring flag re-read an unrelated root byte and spin forever.
+                    let tmem = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    if cur != expected {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
-                    } else {
-                        tasks[ti].state = TaskState::BlockedWait {
-                            key,
-                            // #1638: `None` for an infinite wait — see the fiber park above.
-                            deadline: timeout.map(|t| clock.saturating_add(t)),
-                            dst,
-                        };
-                    }
+                    wait_task(tasks, ti, tmem, *clock, base, expected, width, timeout, dst);
                 }
                 Ok(VcpuStop::Notify { base, count, dst }) => {
                     // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
                     // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
                     // from one child's window matches a waiter parked from another child's window on the
                     // same `SharedRegion` byte.
-                    let key = {
-                        let tmem: Option<&Mem> = match tasks[ti].env {
-                            None => mem.as_ref(),
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                        };
-                        tmem.map(|m| m.futex_key(base))
-                            .unwrap_or(super::FutexKey::Anon(0, base))
+                    let win = |env: Option<usize>| match env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
                     };
+                    let key = futex_key_in(win(tasks[ti].env), base);
                     let want = count as u32;
-                    let mut woken = 0u32;
-                    for t in tasks.iter_mut() {
-                        if woken >= want {
-                            break;
-                        }
-                        if let TaskState::BlockedWait {
-                            key: wkey,
-                            dst: wdst,
-                            ..
-                        } = t.state
-                        {
-                            if wkey == key {
-                                t.parked_frame().set(wdst, Reg::from_i32(super::WAIT_WOKEN));
-                                t.state = TaskState::Runnable;
-                                woken += 1;
-                            }
-                        }
-                    }
+                    let mut woken = wake_waiters(tasks, key, want, win);
                     // §3.6 slice 5a: also wake event-parked FIBER waiters, in every domain (the root's
                     // registry, then each child env's, lowest slot first — deterministic like the task
                     // scan), on the same canonical key. The status is delivered when a `cont.resume`
@@ -17526,18 +17092,14 @@ mod par_futex_tests {
 mod dbg_domain_end_tests {
     use super::*;
 
-    fn task(state: DbgTaskState) -> DbgTask {
+    fn task(state: TaskState) -> TaskSlot {
         let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
             .expect("parse");
         let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
-        DbgTask {
-            vt: VTask::new(&unit, 0, &[]).expect("task"),
-            threads: Vec::new(),
-            env: Some(0),
+        let vt = VTask::new(&unit, 0, &[]).expect("task");
+        TaskSlot {
             state,
-            at_bp: false,
-            lease: None,
-            live: LiveVcpu::none(),
+            ..TaskSlot::new(vt, Some(0), LiveVcpu::none())
         }
     }
 
@@ -17574,8 +17136,8 @@ mod dbg_domain_end_tests {
             place: EnvPlace::Detached { spawner: None },
         }];
         let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
-        let done = || DbgTaskState::Done(Ok(Vec::new()));
-        let mut tasks = vec![task(done()), task(DbgTaskState::Runnable)];
+        let done = || TaskState::Done(Ok(Vec::new()));
+        let mut tasks = vec![task(done()), task(TaskState::Runnable)];
         tasks[0].lease = Some((None, budget, WINDOW));
         dbg_refund_ended_windows(&mut tasks, &mut parent, &mut envs, false);
         assert_eq!(
@@ -17646,15 +17208,7 @@ mod live_cap_tests {
         let (host, child) = admitted();
         let root = host.into_cell();
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
-            .map(|_| TaskSlot {
-                vt: vtask(),
-                threads: Vec::new(),
-                env: None,
-                state: TaskState::Runnable,
-                suspended: None,
-                lease: None,
-                live: LiveVcpu::none(),
-            })
+            .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
         let source = ModuleSource::new(unit());
         let r = coop_start_child(
@@ -17680,16 +17234,8 @@ mod live_cap_tests {
     #[test]
     fn the_debug_scheduler_hands_a_refused_childs_window_back() {
         let (mut host, child) = admitted();
-        let mut tasks: Vec<DbgTask> = (0..crate::MAX_VCPUS)
-            .map(|_| DbgTask {
-                vt: vtask(),
-                threads: Vec::new(),
-                env: None,
-                state: DbgTaskState::Runnable,
-                at_bp: false,
-                lease: None,
-                live: LiveVcpu::none(),
-            })
+        let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
+            .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
         let source = ModuleSource::new(unit());
         let place = EnvPlace::Detached { spawner: None };
@@ -18953,6 +18499,206 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                     t.state = TaskState::Runnable;
                 }
                 Err(trap) => work.push((j, Err(trap))),
+            }
+        }
+    }
+}
+
+/// `thread.join` of child handle `handle` (`wait`: [`super::join_delivery`]'s mode). A child that
+/// already finished delivers its result into `dst` now, or its trap completes the joiner; else the
+/// joiner parks on it until [`complete`] wakes it. A bad handle completes the joiner with its trap.
+fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bool) {
+    let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
+        Ok(s) => s,
+        Err(t) => return complete(tasks, ti, Err(t)),
+    };
+    let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+    match &tasks[child].state {
+        TaskState::Done(res) => {
+            let (out, keep) = super::join_delivery(res, wait);
+            if !keep {
+                tasks[ti].threads[slot] = None;
+            }
+            match out {
+                Ok(r) => tasks[ti].vt.active.set(dst, r),
+                Err(t) => complete(tasks, ti, Err(t)),
+            }
+        }
+        _ => {
+            tasks[ti].state = TaskState::BlockedJoin {
+                child,
+                slot,
+                dst,
+                wait,
+            }
+        }
+    }
+}
+
+/// PROCESS.md S3 `poll`/`detach`/`kill` of child handle `child`, the answer at `dst`. `spawners`
+/// names each env's spawner, for a `kill` to end the subtree ([`kill_env`]). A bad handle completes
+/// the caller with its trap.
+fn child_ctl(
+    tasks: &mut [TaskSlot],
+    spawners: &[Option<usize>],
+    ti: usize,
+    child: i32,
+    dst: u32,
+    ctl: ChildCtl,
+) {
+    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
+        Ok(s) => s,
+        Err(t) => return complete(tasks, ti, Err(t)),
+    };
+    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
+    let answer = match ctl {
+        ChildCtl::Poll => match &tasks[c].state {
+            TaskState::Done(Ok(_)) => 1,
+            TaskState::Done(Err(_)) => 2,
+            _ => 0,
+        },
+        // The result dies with its env; a window lease is refunded once the child is done
+        // (`refund_ended_windows`); its lane went back at admission.
+        ChildCtl::Detach => {
+            tasks[ti].threads[slot] = None;
+            0
+        }
+        // A `thread.spawn` handle shares this task's env: nothing to kill, as on the tree-walker (no
+        // `child_kill` entry).
+        ChildCtl::Kill => {
+            if let Some(k) = tasks[c].env.filter(|_| tasks[c].env != tasks[ti].env) {
+                kill_env(tasks, spawners, k);
+            }
+            0
+        }
+    };
+    tasks[ti].vt.active.set(dst, Reg::from_i32(answer));
+}
+
+/// `Instantiator.kill` (#2074): end every live task of env `k` with `ThreadFault`, wherever it is
+/// parked ([`complete`] overwrites any blocked state and wakes its joiners), then the envs it spawned
+/// (`spawners[j] == Some(k)`), as the tree-walker's kill ends a child and its subtree. An env with
+/// nothing left alive is left as it is, its children with it: killing a child that has ended does
+/// nothing.
+fn kill_env(tasks: &mut [TaskSlot], spawners: &[Option<usize>], k: usize) {
+    let live: Vec<usize> = (0..tasks.len())
+        .filter(|&i| tasks[i].env == Some(k) && !matches!(tasks[i].state, TaskState::Done(_)))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for i in live {
+        if !matches!(tasks[i].state, TaskState::Done(_)) {
+            complete(tasks, i, Err(Trap::ThreadFault));
+        }
+    }
+    for (j, s) in spawners.iter().enumerate() {
+        if *s == Some(k) {
+            kill_env(tasks, spawners, j);
+        }
+    }
+}
+
+/// The futex rendezvous key of `addr` in window `m` (#1731): backing identity plus address, or a
+/// §13 region's identity plus offset ([`Mem::futex_key`]). Every detached window starts at base 0,
+/// so the address alone would rendezvous across windows (#1283).
+fn futex_key_in(m: Option<&Mem>, addr: u64) -> super::FutexKey {
+    m.map_or(super::FutexKey::Anon(0, addr), |m| m.futex_key(addr))
+}
+
+/// The rendezvous key of a task parked at `addr` and `site` of window `m`, through the backings `m`
+/// names now: the key [`futex_key_in`] gave at the park, or after a debug `restore` its equal in
+/// the rebuilt window ([`super::FutexSite`]).
+fn site_key_in(m: Option<&Mem>, addr: u64, site: super::FutexSite) -> super::FutexKey {
+    m.map_or(super::FutexKey::Anon(0, addr), |m| m.site_key(site))
+}
+
+/// `memory.wait` at `base` in task `ti`'s window `mem`: `WAIT_NOT_EQUAL` at `dst` now if the word
+/// already changed (the cooperative analogue of the futex compare-under-lock), else park the task at
+/// its address's site until a `notify` ([`wake_waiters`]) or the `deadline` on the logical `clock` —
+/// `None` for an infinite wait, which ends by `notify` or not at all (#1638).
+#[allow(clippy::too_many_arguments)] // the wait op's operands
+fn wait_task(
+    tasks: &mut [TaskSlot],
+    ti: usize,
+    mem: Option<&Mem>,
+    clock: u64,
+    base: u64,
+    expected: u64,
+    width: u32,
+    timeout: Option<u64>,
+    dst: u32,
+) {
+    if mem.map_or(0, |m| m.atomic_value(base, width)) != expected {
+        tasks[ti]
+            .vt
+            .active
+            .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+    } else {
+        tasks[ti].state = TaskState::BlockedWait {
+            addr: base,
+            site: mem.map_or(super::FutexSite::Anon(base), |m| m.futex_site(base)),
+            deadline: timeout.map(|t| clock.saturating_add(t)),
+            dst,
+        };
+    }
+}
+
+/// `memory.notify` on futex `key`: wake up to `count` waiting tasks whose key matches, lowest task
+/// index first (deterministic), each keyed through its own window, `win(env)` ([`site_key_in`]).
+/// Returns how many it woke.
+fn wake_waiters<'a>(
+    tasks: &mut [TaskSlot],
+    key: super::FutexKey,
+    count: u32,
+    win: impl Fn(Option<usize>) -> Option<&'a Mem>,
+) -> u32 {
+    let mut woken = 0u32;
+    for t in tasks.iter_mut() {
+        if woken >= count {
+            break;
+        }
+        if let TaskState::BlockedWait {
+            addr, site, dst, ..
+        } = t.state
+        {
+            if site_key_in(win(t.env), addr, site) == key {
+                t.parked_frame().set(dst, Reg::from_i32(super::WAIT_WOKEN));
+                t.state = TaskState::Runnable;
+                woken += 1;
+            }
+        }
+    }
+    woken
+}
+
+/// The earliest deadline among the tasks' futex waits — what the logical clock advances to when no
+/// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
+/// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
+fn next_wait_deadline(tasks: &[TaskSlot]) -> Option<u64> {
+    tasks
+        .iter()
+        .filter_map(|t| match t.state {
+            TaskState::BlockedWait { deadline, .. } => deadline,
+            _ => None,
+        })
+        .min()
+}
+
+/// Wake every task whose futex wait's deadline the logical `clock` has reached, `WAIT_TIMED_OUT` at
+/// its `dst`.
+fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
+    for t in tasks.iter_mut() {
+        if let TaskState::BlockedWait {
+            deadline: Some(deadline),
+            dst,
+            ..
+        } = t.state
+        {
+            if deadline <= clock {
+                t.parked_frame()
+                    .set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
+                t.state = TaskState::Runnable;
             }
         }
     }

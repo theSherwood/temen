@@ -5246,6 +5246,19 @@ enum FutexKey {
     Region(u64, u64),
 }
 
+/// Where a futex wait parks, in its window's own terms (#1414): an anonymous page's absolute address,
+/// or a §13-aliased page's region id and byte offset within the region. [`Mem::site_key`] turns it
+/// into the [`FutexKey`] through the backings the window names when asked. That is the key the park
+/// itself formed, because a live window never changes its backing or what a region id names. Only a
+/// debug restore rebuilds both, under the same addresses and ids, which is why a cooperative task
+/// parks on the site rather than the key. A page remapped under a parked waiter leaves its site as it
+/// was, as the key would be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FutexSite {
+    Anon(u64),
+    Region(u32, u64),
+}
+
 /// Why a vCPU yielded its worker (returned by [`VCpu::run`]).
 enum Blocked {
     /// Blocked in `thread.join` on child task `child` (the join handle's table slot is recorded in the
@@ -33895,26 +33908,42 @@ impl Mem {
     /// windows, which all start at base 0). This is the wait-queue/`notify` key; the value compare
     /// still uses the absolute address.
     fn futex_key(&self, base: u64) -> FutexKey {
+        self.site_key(self.futex_site(base))
+    }
+
+    /// Where a futex wait at confined absolute address `base` parks ([`FutexSite`]): the region id
+    /// and byte offset of a §13-aliased page, else the address.
+    fn futex_site(&self, base: u64) -> FutexSite {
         if self.has_regions.load(Ordering::Relaxed) {
             let rel = base.wrapping_sub(self.window.base());
-            let space = self.space_read();
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = space.prot.get(&(rel / self.page))
+            }) = self.space_read().prot.get(&(rel / self.page))
             {
-                // Cross-domain canonical identity (S1c residue): key on the backing
-                // *allocation*, not the per-window region id — two domains that map the same
-                // granted backing must produce the same key, or a concurrent pipe ring's
-                // notify misses its peer. The fat `dyn` pointer's data address is the identity.
-                let ident = space
-                    .regions
-                    .get(region)
-                    .map(|b| Weak::as_ptr(b) as *const u8 as u64)
-                    .unwrap_or(*region as u64);
-                return FutexKey::Region(ident, region_off + rel % self.page);
+                return FutexSite::Region(*region, region_off + rel % self.page);
             }
         }
-        FutexKey::Anon(self.backing_ident(), base)
+        FutexSite::Anon(base)
+    }
+
+    /// The rendezvous key of `site` in this window, through the backings it names now.
+    fn site_key(&self, site: FutexSite) -> FutexKey {
+        match site {
+            FutexSite::Anon(base) => FutexKey::Anon(self.backing_ident(), base),
+            // Cross-domain canonical identity (S1c residue): key on the backing *allocation*, not
+            // the per-window region id — two domains that map the same granted backing must produce
+            // the same key, or a concurrent pipe ring's notify misses its peer. The fat `dyn`
+            // pointer's data address is the identity.
+            FutexSite::Region(region, off) => {
+                let ident = self
+                    .space_read()
+                    .regions
+                    .get(&region)
+                    .map(|b| Weak::as_ptr(b) as *const u8 as u64)
+                    .unwrap_or(region as u64);
+                FutexKey::Region(ident, off)
+            }
+        }
     }
 
     /// The identity of this window's anonymous backing for the futex key (#1283): the `Arc<Region>`
