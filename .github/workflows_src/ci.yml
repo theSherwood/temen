@@ -856,6 +856,8 @@ jobs:
     # links against: it is doubly wire-coupled (built by the committed `chibicc.temen`, and itself an
     # encoded unit), so an IR / encoder / wire change must regenerate it via `scripts/rebuild-assets.sh`
     # (ONLY=pg_libc). Two of its three tests need no compile at all, so drift surfaces in ~1 s.
+    # `--lib` (the crate's own unit tests, ~3 s) and `exports_abi` (EXPORTS.md against the exports the
+    # JS calls, <1 s) ran only in the nightly full run, so #2175 merged with both red (#2183).
     name: browser host guests (runtime-invariant gate)
     runs-on: ubuntu-latest
     # Backstop against a liveness hang (mirrors the `check` job): the invariant set
@@ -876,7 +878,7 @@ jobs:
         working-directory: browser
         # -j 2 caps concurrent test-binary links (the OOM peak — ISSUES.md I30).
         run: |
-          cargo test -j 2 \
+          cargo test -j 2 --lib --test exports_abi \
             --test coop_tierup_driver --test par_tierup_driver \
             --test fork --test warm_grow --test mem_profile \
             --test onramp --test onramp_posix --test powerbox_cap_names \
