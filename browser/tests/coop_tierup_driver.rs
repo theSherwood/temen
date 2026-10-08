@@ -2367,11 +2367,13 @@ block 0 (vsp: i64, varg: i64) {{
     temen_coop_close();
 }
 
-/// Pump port (#845's closed half, driver-independent): a **futex**-using unit (`atomic.notify`) is
-/// still refused by the validator (`-EINVAL` from `vm_jit_compile`), so the guest's invoke of the
-/// bogus code handle traps — pinned on the oracle (both drivers inherit it).
+/// Pump port (#845's closed half, driver-independent): a **futex**-using unit (`atomic.notify`)
+/// compiles — the browser installs the same `Jit` gate as native (#2183), which admits threads and
+/// the futex — but `invoke` runs a unit as a seam-free leaf, so its futex op faults, as natively
+/// (`jit_cap.rs::invoked_threaded_unit_capfaults_native_agrees`); `install` is the supported path
+/// for such a unit. Pinned on the oracle (both drivers inherit it).
 #[test]
-fn coop_futex_unit_is_still_refused() {
+fn coop_futex_unit_compiles_but_invoking_it_faults() {
     let _g = ffi_guard();
     let unit_src = r#"memory 16
 func (i64) -> (i64) {
@@ -2386,12 +2388,16 @@ block 0 (v0: i64) {
     let unit = temen_text::parse_module(unit_src).expect("parse futex unit");
     temen_verify::verify_module(&unit).expect("verify futex unit");
     let blob = temen_encode::encode_module(&unit);
+    assert!(
+        temen_interp::jit_blob_validator(&blob, Some(16), &[]).is_ok(),
+        "the gate admits a futex unit"
+    );
     let m = temen_text::parse_module(&coop_jit_guest_text_with(&blob, "")).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let want = onramp_exec_root(&m, b"");
-    assert_ne!(
-        want.status, STATUS_OK,
-        "a futex unit must fail compile (-EINVAL) → the invoke of the bogus handle traps"
+    assert_eq!(
+        want.status, STATUS_TRAP,
+        "invoking a futex unit faults (a seam-free leaf)"
     );
 }
 

@@ -3315,16 +3315,18 @@ untrusted-input TCB and re-verification still gates everything.
 
 **Host-assisted resolve (op 5, every engine).** The design question — does the rewrite run guest-side
 or host-side — is **settled host-assisted**: `compile_linked` takes a guest-provided **symbol-table
-buffer** and links *before* verify (`temen_run::jit_blob_validator`: decode → `temen_ir::load_unit`, which
+buffer** and links *before* verify (`temen_interp::jit_blob_validator`: decode → `temen_ir::load_unit`, which
 binds the imports with `resolve_imports_with` and places a link unit's data → verify → the §22
 precondition gate). Simpler than a guest-side rewriter (none to load/trust) and equally safe. The symbol
 table is a small LEB128 wire form (`temen_encode::{encode,decode}_symbol_table`: `count`, then per entry
 `name` + `kind` — `0`=`Slot(uleb)`, `1`=`Cap(uleb type_id, uleb op)`, `2`=a data symbol's window address,
 `3`=the unit's own data placement, unnamed and at most once); its decoder is fail-closed and fuzzed (a new
-untrusted-input surface). The `JitValidator` seam carries the symtab bytes so resolution stays in
-`temen-run`; the closed `compile` op (0) is just the empty-table case. The validator hands back the
-unit's data image with its functions, and the host writes it in `Host::jit_compile_linked`, which every
-engine's `Jit` dispatch reaches.
+untrusted-input surface). The `JitValidator` seam carries the symtab bytes; the closed `compile` op (0) is
+just the empty-table case. The gate lives in `temen-interp`, beside the seam, and every engine and embedder
+installs that one function — temen-run's grants and the browser alike (#2183); a durable domain's gate is
+the same one with the durable transform passed in (`temen_interp::jit_validate`). The validator hands back
+the unit's data image with its functions, and the host writes it in `Host::jit_compile_linked`, which
+every engine's `Jit` dispatch reaches.
 
 **Security argument.** Resolution is rewrite-**then**-verify, so a missing name, a wrong import
 signature, or a non-const slot handle fails verification — nothing reaches Cranelift. The symbol
