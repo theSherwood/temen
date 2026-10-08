@@ -302,6 +302,10 @@ fn prefix(ty: ValType) -> &'static str {
 /// cross-module call coerces its args and result to the callee's real signature (#1400 / #1404).
 pub type ProcParamSig = (String, Vec<ValType>, Option<ValType>);
 
+/// Globals' descriptors under their stem-suffixed global names, as [`Translator::export_globals`]
+/// lists them for the units that reference them.
+pub type GlobalDescs = Vec<(String, TyDesc)>;
+
 /// A proc's TEMEN-visible signature, collected so calls can resolve names → indices.
 struct Sig {
     index: u32,
@@ -597,29 +601,24 @@ pub(crate) struct Translator {
     /// index (#2210). Identity is preserved: every unit referencing the same proc resolves to the
     /// one funcidx, which a per-unit forwarding wrapper would not do.
     xmod_funcrefs: HashSet<String>,
-    /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
-    /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
-    /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
-    /// `tvar` collapses to a plain global. The per-thread block itself is established by the runtime
-    /// (a `vcpu.tls.set` at thread entry), outside temen-leng, exactly as the C runtime sets fs/gs base.
+    /// **Thread-locals** (NIM.md §3d). Set when the program can start a thread — the linker saw a
+    /// `pthread_create` import ([`import_thread_locals`](Self::import_thread_locals)). A `tvar` then
+    /// lives in this unit's thread-local template (#1715) rather than the window, so every thread
+    /// reads its own copy: the address is this thread's block plus the variable's offset in it
+    /// ([`emit_tls_addr`](FnCtx::emit_tls_addr)). Unset, a `tvar` is a plain global, which is
+    /// exact for a program with one thread.
     tls_mode: bool,
-    /// Thread-vars → their offset **within the TLS block** (populated only in `tls_mode`). Holds both
-    /// a defining unit's local `tvar` names and, when linking, sibling units' stem-suffixed names —
-    /// both mapping to the *same* shared offset, so cross-module accesses agree (NIM.md §3d).
+    /// This unit's thread-locals (`tls_mode` only): each `tvar` → its offset in the unit's
+    /// thread-local template, and its type.
     tls_vars: HashMap<String, (u64, TyDesc)>,
-    /// Running size of the TLS block (bytes) in **single-module** `tls_mode`: the next `tvar`'s
-    /// offset. Unused when linking — there [`ext_tls_layout`] owns the offsets.
-    tls_block_size: u64,
-    /// The **shared cross-module TLS layout** (stem-suffixed `tvar` name → block offset), computed by
-    /// the linker's pre-pass over all units and injected by [`import_tls_layout`]. Empty for a
-    /// single-module `translate_tls`; when non-empty, a `tvar`'s offset comes from here, not the local
-    /// counter, so every unit bakes the same `vcpu.tls.get()+off` for a given thread-var.
-    ext_tls_layout: HashMap<String, u64>,
-    /// This unit's stem — used to map a local `tvar` name to its stem-suffixed key in
-    /// [`ext_tls_layout`]. Empty unless linking in `tls_mode`.
-    own_stem: String,
-    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_globals`],
-    /// [`export_tls_vars`]), which run [`collect_globals`](Self::collect_globals) on a *fresh,
+    /// The size of this unit's thread-local template: the next `tvar`'s offset.
+    tls_top: u64,
+    /// **Sibling units' thread-locals** under the stem-suffixed names this unit references them by,
+    /// with their types ([`export_globals`](Self::export_globals) pools them). Such a reference is a
+    /// `data.sym tls`, which the linker resolves to the variable's offset in the per-thread block.
+    ext_tls: HashMap<String, TyDesc>,
+    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_globals`]),
+    /// which run [`collect_globals`](Self::collect_globals) on a *fresh,
     /// import-less* translator purely to enumerate funcref/thread-var globals. Such a translator
     /// has no pooled sibling types, so an aggregate global whose constructor type is defined in
     /// another module (every `var s = "…"` — `string` lives in `system`) can't be materialized. In
@@ -670,19 +669,11 @@ impl Translator {
             xmod_funcrefs: HashSet::default(),
             tls_mode: false,
             tls_vars: HashMap::default(),
-            tls_block_size: 0,
-            ext_tls_layout: HashMap::default(),
-            own_stem: String::new(),
+            tls_top: 0,
+            ext_tls: HashMap::default(),
             scan_lenient: false,
             varargs_imports: HashMap::default(),
         }
-    }
-
-    /// Enable **Tier-2 TLS lowering** (NIM.md §3d): `tvar`s go to the per-vCPU TLS block rather than
-    /// collapsing to plain globals. Composes with either the runnable or the link-unit mode.
-    pub fn with_tls(mut self) -> Self {
-        self.tls_mode = true;
-        self
     }
 
     /// A translator that emits a **relocatable link unit** (`.temeno` shape) instead of a directly
@@ -752,7 +743,7 @@ impl Translator {
         let has_globals = self.globals_top > base;
         let mut out = String::new();
         // Data segments (globals) and loads/stores write the window, so declare `memory`.
-        if used_memory || has_globals {
+        if used_memory || has_globals || self.tls_top > 0 {
             out.push_str("memory 16\n\n");
         }
         let t = self.imports.borrow();
@@ -806,6 +797,14 @@ impl Translator {
                 out.push('\n');
             }
         }
+        // The unit's thread-local template (#1715): one segment over the whole block, since a gap is
+        // not part of it. All zero — a `tvar` has no initial value.
+        if self.tls_top > 0 {
+            out.push_str(&format!(
+                "data tls 0 \"{}\"\n\n",
+                escape_bytes(&vec![0u8; self.tls_top as usize])
+            ));
+        }
         out.push_str(&funcs);
         out
     }
@@ -828,15 +827,10 @@ impl Translator {
         let mut off = self.globals_base();
         for item in root.args() {
             match item.tag() {
-                // `gvar` (global) and `tvar` (Leng thread-var, nimony's `__thread`) lower the same:
-                // one plain, zero-initialized global at a fixed window offset. This is the committed
-                // **single-threaded** TLS model (NIM.md §3d) — every guest we target (each nimony
-                // compiler phase; each temen domain) runs single-threaded, so a thread-local has exactly
-                // one instance and a plain global *is* that instance. It mirrors the retired C on-ramp
-                // path, which stripped `__thread` before clang (NIM.md §3d). A genuinely
-                // multi-threaded Nim guest instead uses the real per-CPU-block scheme over `vcpu.tls`
-                // (NIM.md §3d Tier 2) — implemented behind `tls_mode` in the branch just below; this
-                // default Tier-1 collapse applies when TLS mode is off, sound only single-threaded.
+                // `gvar` (global) and `tvar` (Leng thread-var, nimony's `__thread`) lower the same
+                // unless the program can start a thread: one plain global at a fixed window offset.
+                // A program with one thread has one instance of each thread-local, so that global
+                // *is* it (NIM.md §3d).
                 Some(kind @ ("gvar" | "tvar")) => {
                     let a = item.args();
                     if a.len() < 3 {
@@ -844,11 +838,9 @@ impl Translator {
                     }
                     let name = sym_def(&a[0])?;
                     let desc = self.tydesc(&a[2])?;
-                    // Tier 2 (NIM.md §3d): in TLS mode a `tvar` lives in the per-vCPU TLS block, not
-                    // the window — assign it a block offset (accesses lower to `vcpu.tls.get() + off`)
-                    // and reserve no window slot or data segment. Zero-init only: the runtime that
-                    // allocates a per-thread block zeroes it; a non-zero `tvar` initializer would need
-                    // per-thread seeding by that runtime (a bounded follow-up) — fail-closed for now.
+                    // In a program that can start a thread, a `tvar` takes the next slot of the
+                    // unit's thread-local template instead of the window. The template is zeros:
+                    // nimony rejects a `threadvar` with an initial value, so one here is malformed.
                     if self.tls_mode && kind == "tvar" {
                         if let Some(init) = a.get(3) {
                             let nonzero = !init.is_empty_marker()
@@ -856,28 +848,15 @@ impl Translator {
                                 && int_literal(init) != Some(0);
                             if nonzero {
                                 return Err(LengError::Unsupported(format!(
-                                    "non-zero thread-var initializer for `{name}` in TLS mode \
-                                     (Tier 2 zeroes the per-thread block; non-zero seeding is a follow-up)"
+                                    "thread-var `{name}` with an initial value"
                                 )));
                             }
                         }
-                        let sz = self.sizeof(&desc);
-                        let off = if self.ext_tls_layout.is_empty() {
-                            // Single-module `translate_tls`: lay the block out locally.
-                            let o = self.tls_block_size;
-                            self.tls_block_size += global_slot(sz);
-                            o
-                        } else {
-                            // Linking: the shared layout (keyed by this tvar's stem-suffixed name)
-                            // owns the offset, so every unit agrees — the TLS analog of a relocated
-                            // cross-module global. A tvar the pre-pass didn't see is fail-closed.
-                            let key = format!("{}{}", name, self.own_stem);
-                            *self.ext_tls_layout.get(&key).ok_or_else(|| {
-                                LengError::Unsupported(format!(
-                                    "thread-var `{name}` missing from the shared TLS layout"
-                                ))
-                            })?
-                        };
+                        let off = self.tls_top;
+                        self.tls_top += global_slot(self.sizeof(&desc));
+                        if ty_is_unsigned(&a[2]) {
+                            self.unsigned_globals.insert(name.clone());
+                        }
                         self.tls_vars.insert(name, (off, desc));
                         continue;
                     }
@@ -972,7 +951,7 @@ impl Translator {
                                 // pre-scan (its type lives in a sibling module, not pooled here; in a
                                 // fresh translator the type name isn't even known to be an aggregate,
                                 // so `desc` is a scalar fallback — key off the init node). Only the
-                                // funcref/frame pre-passes (`export_globals`, `export_tls_vars`) set
+                                // funcref/frame pre-passes (`export_globals`) set
                                 // `scan_lenient`; they run `collect_globals` on a fresh, import-less
                                 // translator purely to enumerate funcref/tls globals, and erroring
                                 // here aborted the whole link for any program with a module-level
@@ -1140,15 +1119,23 @@ impl Translator {
     /// This unit's globals as **cross-module data exports** (NIM.md W2): each `gvar`'s global
     /// (stem-suffixed) name → its unit-local data offset, the counterpart of a proc export. Another
     /// unit's `data.sym "<name>"` binds here. A local `gvar` name ends in `.`, so `name + stem`
-    /// yields the same `<name>.<stem>` a referencing module emits.
+    /// yields the same `<name>.<stem>` a referencing module emits. A thread-local exports its offset
+    /// in the unit's template, for another unit's `data.sym tls`.
     pub fn global_exports(&self, stem: &str) -> Vec<temen_ir::DataExport> {
-        let mut out: Vec<temen_ir::DataExport> = self
+        let globals = self
             .globals
             .iter()
-            .map(|(name, (off, _))| temen_ir::DataExport {
+            .map(|(name, (off, _))| (name, off, false));
+        let tls = self
+            .tls_vars
+            .iter()
+            .map(|(name, (off, _))| (name, off, true));
+        let mut out: Vec<temen_ir::DataExport> = globals
+            .chain(tls)
+            .map(|(name, off, tls)| temen_ir::DataExport {
                 name: format!("{name}{stem}"),
                 offset: *off,
-                tls: false,
+                tls,
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
@@ -2230,52 +2217,14 @@ impl Translator {
         }
     }
 
-    /// Enable **Tier-2 TLS linking** with the whole program's **shared TLS layout** (NIM.md §3d):
-    /// `layout` maps each `tvar`'s stem-suffixed global name to its offset in the per-vCPU block,
-    /// computed once by [`export_tls_vars`] across all units. Registering the stem-suffixed names lets
-    /// a unit that *references* a sibling's `tvar` (`counter.0.<sys>`) emit `vcpu.tls.get()+off`
-    /// (scalar i64, as for a cross-module data symbol); the defining unit's own local name binds to
-    /// the same offset in [`collect_globals`], so both sides hit one slot.
-    pub fn import_tls_layout(&mut self, layout: &HashMap<String, u64>, own_stem: &str) {
+    /// Make this unit's `tvar`s **thread-locals** — the program can start a thread — and register the
+    /// siblings' (from [`export_globals`](Self::export_globals)) under the stem-suffixed names this
+    /// unit references them by. See [`tls_mode`](Self::tls_mode).
+    pub fn import_thread_locals(&mut self, ext: &[(String, TyDesc)]) {
         self.tls_mode = true;
-        self.own_stem = own_stem.to_string();
-        for (name, &off) in layout {
-            self.ext_tls_layout.insert(name.clone(), off);
-            self.tls_vars.insert(
-                name.clone(),
-                (
-                    off,
-                    TyDesc::Scalar {
-                        ty: ValType::I64,
-                        unsigned: false,
-                    },
-                ),
-            );
+        for (name, desc) in ext {
+            self.ext_tls.insert(name.clone(), desc.clone());
         }
-    }
-
-    /// Collect a module's **thread-vars** under their stem-suffixed global names, with each one's
-    /// size — the input to the linker's shared TLS layout. Mirrors [`export_globals`]: a throwaway
-    /// `tls_mode` translator resolves each `tvar`'s type (so the size is exact), then [`link_selected`]
-    /// pools these across units and assigns disjoint block offsets before translating any. (Aggregate
-    /// `tvar`s whose type lives in a *sibling* unit resolve only if that type is local here — a
-    /// bounded gap; scalar thread-vars, the allocator/exception state, always resolve.)
-    pub fn export_tls_vars(root: &Node, stem: &str) -> Result<Vec<(String, u64)>, LengError> {
-        let mut t = Translator::new().with_tls();
-        t.scan_lenient = true; // enumerating thread-vars; tolerate unresolvable cross-module aggregates
-        t.collect_types(root)?;
-        t.collect_globals(root)?;
-        let items: Vec<(String, TyDesc)> = t
-            .tls_vars
-            .iter()
-            .map(|(n, (_, d))| (n.clone(), d.clone()))
-            .collect();
-        let mut out: Vec<(String, u64)> = items
-            .iter()
-            .map(|(n, d)| (format!("{n}{stem}"), global_slot(t.sizeof(d))))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic layout
-        Ok(out)
     }
 
     /// Collect a module's globals' descriptors under their stem-suffixed global names — the form
@@ -2285,12 +2234,17 @@ impl Translator {
     /// it needs the `call.dyn` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
     /// [`export_types_pooled`]; [`link_selected`] pools these across its units before translating any.
+    ///
+    /// With `tls` (the program can start a thread), the second list is the unit's thread-locals, every
+    /// one of them: a sibling reaches each through a `data.sym tls`, never a plain `data.sym`.
     pub fn export_globals(
         root: &Node,
         stem: &str,
         pooled: &[(String, Layout)],
-    ) -> Result<Vec<(String, TyDesc)>, LengError> {
+        tls: bool,
+    ) -> Result<(GlobalDescs, GlobalDescs), LengError> {
         let mut t = Translator::new();
+        t.tls_mode = tls;
         t.scan_lenient = true; // enumerating globals; tolerate unresolvable cross-module aggregates
                                // The **pooled** cross-module layouts, as the real translation pass gets them — and, as there,
                                // before this unit's own types resolve against them (`array[1, string]` is sized by the pooled
@@ -2333,8 +2287,19 @@ impl Translator {
                 )
             })
             .collect();
+        let mut tls: Vec<(String, TyDesc)> = t
+            .tls_vars
+            .iter()
+            .map(|(name, (_, desc))| {
+                (
+                    format!("{name}{stem}"),
+                    rewrite_agg_names(desc, &local, stem),
+                )
+            })
+            .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
-        Ok(out)
+        tls.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((out, tls))
     }
 
     /// A module's **top-level scalar-int `const`s** — each folded to its integer value, under the
@@ -3791,12 +3756,17 @@ impl<'a> FuncGen<'a> {
                     let sp = self.cur[0];
                     return Ok((self.add_const_off(sp, off), desc));
                 }
-                // Tier 2 (NIM.md §3d): a thread-var's address is the per-vCPU TLS base plus its block
-                // offset — `vcpu.tls.get() + off`, the fs/gs-base recipe. Only in `tls_mode`; without
-                // it a `tvar` is an ordinary global handled just below.
+                // A thread-local's address is this thread's block plus the variable's offset in it:
+                // `data.self tls` for one this unit defines, `data.sym tls` for a sibling's. Only in a
+                // program that can start a thread; otherwise a `tvar` is a global, handled below.
                 if let Some((off, desc)) = self.t.tls_vars.get(name).cloned() {
-                    let base = self.emit_tls_base();
-                    return Ok((self.add_const_off(base, off), desc));
+                    let addr = self.emit_tls_addr(&format!("data.self tls {off}"));
+                    return Ok((addr, desc));
+                }
+                if let Some(desc) = self.t.ext_tls.get(name).cloned() {
+                    let addr =
+                        self.emit_tls_addr(&format!("data.sym tls \"{}\" 0", escape_str(name)));
+                    return Ok((addr, desc));
                 }
                 // An `importc` declaration of a global another unit defines: its address is the
                 // defining unit's, resolved by C name at link (see `ext_c_globals`).
@@ -4147,16 +4117,29 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
-    /// `base + off` (an unchanged base when `off == 0`).
-    /// The per-vCPU TLS block base — `vcpu.tls.get` (§12). Tier-2 `tvar` accesses add their block
-    /// offset to this. The runtime must have `vcpu.tls.set` a real block base before any such access
-    /// (the root vCPU's seed is its id, not a valid address).
-    fn emit_tls_base(&mut self) -> u32 {
+    /// The address of a thread-local (#1715): this thread's block plus `off`, the link form of the
+    /// variable's offset in it (`data.self tls` or `data.sym tls`). The block is the vCPU's `vcpu.tls`
+    /// word, or the root block while that word is 0 — the root thread never sets one, and a thread
+    /// the compute shim starts sets its own before it runs any nim code. chibicc's `_Thread_local`
+    /// reads the same way.
+    fn emit_tls_addr(&mut self, off: &str) -> u32 {
+        let w = self.fresh();
+        self.cur_buf.push_str(&format!("  v{w} = vcpu.tls.get\n"));
+        let root = self.emit_data_sym(temen_ir::TLS_ROOT_SYM, 0);
+        let z = self.fresh();
+        self.cur_buf.push_str(&format!("  v{z} = i64.eqz v{w}\n"));
+        let block = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{block} = select v{z} v{root} v{w}\n"));
+        let o = self.fresh();
+        self.cur_buf.push_str(&format!("  v{o} = {off}\n"));
         let id = self.fresh();
-        self.cur_buf.push_str(&format!("  v{id} = vcpu.tls.get\n"));
+        self.cur_buf
+            .push_str(&format!("  v{id} = i64.add v{block} v{o}\n"));
         id
     }
 
+    /// `base + off` (an unchanged base when `off == 0`).
     fn add_const_off(&mut self, base: u32, off: u64) -> u32 {
         if off == 0 {
             return base;
@@ -4242,6 +4225,9 @@ impl<'a> FuncGen<'a> {
                     return Some(d.clone());
                 }
                 if let Some((_, d)) = self.t.tls_vars.get(name) {
+                    return Some(d.clone());
+                }
+                if let Some(d) = self.t.ext_tls.get(name) {
                     return Some(d.clone());
                 }
                 if let Some(d) = self.t.ext_globals.get(name) {
