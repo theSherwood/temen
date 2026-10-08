@@ -1736,6 +1736,66 @@ struct AdmittedChild {
     lease: Option<(i32, u64)>,
 }
 
+/// An [`AdmittedChild`] ready to schedule ([`AdmittedChild::build`]): its program landed in the run's
+/// source as `module`, with its entry task and its own natural dispatch table.
+struct BuiltChild {
+    module: u32,
+    vt: VTask,
+    table: SharedSlots,
+    mem: Option<Mem>,
+    host: Host,
+    fuel: Fuel,
+    lease: Option<(i32, u64)>,
+}
+
+impl AdmittedChild {
+    /// Land the child's program in `source` and build its task at `entry` ([`child_task`]), for the
+    /// driver to schedule — or refuse it: with no `room` under the driver's vCPU ceiling (the
+    /// instantiate bomb, `ThreadFault`), or a program that does not land. A refused child hands its
+    /// window lease to `refund`, its spawner's budget, so a spawn refused after its admission charges
+    /// nothing (#1975, #2006), as the oracle's undo does.
+    fn build(
+        self,
+        source: &ModuleSource,
+        entry: i64,
+        room: bool,
+        refund: impl FnOnce(i32, u64),
+    ) -> Result<BuiltChild, Trap> {
+        let AdmittedChild {
+            mem,
+            host,
+            program,
+            args,
+            fuel,
+            lease,
+        } = self;
+        let built = match room {
+            false => Err(Trap::ThreadFault), // instantiate bomb
+            true => program.land(source).and_then(|(module, prog)| {
+                let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
+                Ok((module, vt, table))
+            }),
+        };
+        match built {
+            Ok((module, vt, table)) => Ok(BuiltChild {
+                module,
+                vt,
+                table,
+                mem,
+                host,
+                fuel,
+                lease,
+            }),
+            Err(t) => {
+                if let Some((budget, bytes)) = lease {
+                    refund(budget, bytes);
+                }
+                Err(t)
+            }
+        }
+    }
+}
+
 /// Admit a §14 confined spawn and build the child. `host` is the spawning task's own powerbox, where
 /// its handles resolve and its budget is charged (#1727); `pm` its window — the holder the carve is
 /// cut from, the grant list is read from and a module's data segments land in; `parent_fuel` what it
@@ -1908,10 +1968,38 @@ fn child_task(
     jit_table_log2: u8,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let mut vt = VTask::new(prog, entry as usize, args)?;
-    vt.active.module = module as usize;
-    vt.active.home = module as usize;
+    let vt = entry_task(prog, module as usize, entry as usize, args)?;
     Ok((vt, table))
+}
+
+/// A new vCPU's task, entered at `func` of `module` (`unit`, that module's program) with `args`, its
+/// frames homed there: a thread's, a §14/§5 child's, an exec'd image's or a host-built [`Vcpu`]'s
+/// first frame. `Malformed` for a function `unit` does not have.
+fn entry_task(unit: &Compiled, module: usize, func: usize, args: &[Value]) -> Result<VTask, Trap> {
+    let mut vt = VTask::new(unit, func, args)?;
+    vt.active.module = module;
+    vt.active.home = module;
+    Ok(vt)
+}
+
+/// A `thread.spawn` child's task: `func` of the spawning frame's `module` (an installed §22 unit spawns
+/// its own functions, CONSOLIDATION.md §11) entered with `(sp, arg)`. The driver seeds its `vcpu.tls`
+/// word with the dense vCPU id it numbers the thread by (§12; a root's is 0). `Malformed` for a module
+/// or function the run's source does not have.
+fn thread_task(
+    source: &ModuleSource,
+    module: usize,
+    func: u32,
+    sp: i64,
+    arg: i64,
+) -> Result<VTask, Trap> {
+    let cm = source.get(module).ok_or(Trap::Malformed)?;
+    entry_task(
+        &cm,
+        module,
+        func as usize,
+        &[Value::I64(sp), Value::I64(arg)],
+    )
 }
 
 /// An admitted detached child's window before it exists: a fresh window, never a carve of the
@@ -4537,12 +4625,7 @@ impl<'p> Vcpu<'p> {
             .source
             .get(module as usize)
             .ok_or(Trap::Malformed)?;
-        if func as usize >= cm.progs.len() {
-            return Err(Trap::Malformed);
-        }
-        let mut vt = VTask::new(&cm, func as usize, args)?;
-        vt.active.module = module as usize;
-        vt.active.home = module as usize;
+        let vt = entry_task(&cm, module as usize, func as usize, args)?;
         Ok(Vcpu {
             vt,
             fibers: Vec::new(),
@@ -8001,11 +8084,7 @@ fn dbg_spawn(
     source: &ModuleSource,
     node: NodeRef,
 ) -> Result<(), Trap> {
-    // Module-aware, as the drive arms: `func` is the spawning frame's module's index.
-    let cm = source.get(module).ok_or(Trap::Malformed)?;
-    if func as usize >= cm.progs.len() {
-        return Err(Trap::Malformed);
-    }
+    let mut vt = thread_task(source, module, func, sp, arg)?;
     let live = tasks
         .iter()
         .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
@@ -8016,11 +8095,10 @@ fn dbg_spawn(
     // #2001 — the thread is one `spawn` of its domain's node (`node`) while it lives: a full
     // ceiling refuses it as the live cap does.
     let live = LiveVcpu::charge(node).ok_or(Trap::ThreadFault)?;
-    let mut vt = VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
-    vt.active.module = module;
-    vt.active.home = module;
     let env = tasks[ti].env; // a thread inherits its spawner's environment (shares its window)
     let cidx = tasks.len();
+    // §12: its `vcpu.tls` is its dense vCPU id, the task index, as the cooperative driver's.
+    vt.active.tls = cidx as i64;
     tasks.push(DbgTask {
         vt,
         threads: Vec::new(),
@@ -8343,38 +8421,27 @@ fn dbg_start_child(
     place: EnvPlace,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
-    let AdmittedChild {
-        mem,
-        host: child_host,
-        program,
-        args,
-        fuel,
-        lease,
-    } = child;
     let live = tasks
         .iter()
         .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
         .count();
-    let built = if live >= super::MAX_VCPUS {
-        Err(Trap::ThreadFault) // instantiate bomb
-    } else {
-        program.land(source).and_then(|(module, prog)| {
-            let (vt, table) = child_task(module, &prog, entry, &args, child_host.jit_table_log2())?;
-            Ok((module, vt, table))
-        })
-    };
-    let (module, vt, table) = match built {
-        Ok(b) => b,
-        Err(t) => {
-            if let Some((budget, bytes)) = lease {
-                match spawner {
-                    None => host.release_detached(budget, bytes),
-                    Some(k) => extra_envs[k].host.release_detached(budget, bytes),
-                }
-            }
-            return Err(t);
-        }
-    };
+    let BuiltChild {
+        module,
+        vt,
+        table,
+        mem,
+        host: child_host,
+        fuel,
+        lease,
+    } = child.build(
+        source,
+        entry,
+        live < super::MAX_VCPUS,
+        |budget, bytes| match spawner {
+            None => host.release_detached(budget, bytes),
+            Some(k) => extra_envs[k].host.release_detached(budget, bytes),
+        },
+    )?;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
         mem,
@@ -10385,13 +10452,7 @@ fn spawn_task(
     let (child_mem, child_host, table, vt, state, start, live) = match built {
         Ok(built) => {
             // Its own park door and pump bell, as the fork arm wires a twin's.
-            built.host.wire_park_door();
-            let bell = root.lock_unpoisoned().external_wake();
-            if let Some(bell) = bell {
-                if let Some((_, source)) = built.host.signal_poll() {
-                    wire_pump_bell(&source, &bell);
-                }
-            }
+            wire_process(&built.host, root);
             let state = TaskState::Runnable;
             let (m, h) = (Some(built.mem), built.host);
             (m, h, built.table, built.vt, state, built.leaf, live)
@@ -10672,6 +10733,61 @@ fn image_pages(host: &Host, m: &Module) -> bool {
             .any(|i| matches!(*i, Inst::CapCall { type_id, op, .. } if pages(type_id, op)))
 }
 
+/// Whether a vCPU is the bare root a fork duplicates faithfully (the oracle's `fork_vcpu` gate): no
+/// live child or thread, on its root context with no fiber resume chain. Anything else is refused.
+fn fork_bare<T>(children: &[Option<T>], vt: &VTask) -> bool {
+    children.iter().all(Option::is_none) && vt.active_id == ROOT_FIBER && vt.chain.is_empty()
+}
+
+/// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
+/// node they share while it lives (#2001), a private copy of its window `mem`, and its powerbox
+/// `host` duplicated as process `pid`, which pays the node for the copy (#2106). `None` refuses the
+/// fork, with nothing left charged: a full ceiling, or a window or powerbox that cannot be duplicated.
+/// The window is copied outside the powerbox's lock.
+fn fork_process(
+    host: &std::sync::Mutex<Host>,
+    mem: Option<&Mem>,
+    pid: u64,
+) -> Option<(Option<Mem>, Host, LiveVcpu)> {
+    let live = LiveVcpu::charge(host.lock_unpoisoned().own_node())?;
+    let twin_mem = match mem {
+        Some(m) => Some(m.fork_private()?),
+        None => None,
+    };
+    let window = mem.map_or(0, Mem::mapped_size);
+    let twin_host = host.lock_unpoisoned().fork_powerbox(pid, window)?;
+    Some((twin_mem, twin_host, live))
+}
+
+/// Wire a new process's powerbox as the root's is: its own park door, which its personality's
+/// `fork()`/`waitpid()` park through (`fork_powerbox` and `spawn_powerbox` mint it with none), and its
+/// signal doors on the run's external-wake bell, so an embedder signal to it while every task is
+/// parked re-runs the settle (#1262: an interactive `^C` of a parked `cat`).
+fn wire_process(host: &Host, root: &DomainCell) {
+    host.wire_park_door();
+    let bell = root.lock_unpoisoned().external_wake();
+    if let Some(bell) = bell {
+        if let Some((_, source)) = host.signal_poll() {
+            wire_pump_bell(&source, &bell);
+        }
+    }
+}
+
+/// A fork twin's task: its parent's frame (`parent`, a bare root's, so no resume chain or invoke) at
+/// the post-fork resume point, answered `reply` at `dst` — the return-twice value.
+fn twin_task(parent: &Vm, dst: u32, reply: i64) -> VTask {
+    let mut active = parent.clone();
+    active.set(dst, Reg::from_i64(reply));
+    let root_shadow_sp = active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
+    VTask {
+        active,
+        active_id: ROOT_FIBER,
+        chain: Vec::new(),
+        root_shadow_sp,
+        active_invoke: None,
+    }
+}
+
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
 /// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
 /// window). Resolves + compiles the command, admits it (entry sig, command window `<=` the
@@ -10764,9 +10880,7 @@ fn exec_image_build(
     let child_host = img.host;
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
-    let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
-    new_vt.active.module = cm;
-    new_vt.active.home = cm;
+    let new_vt = entry_task(&cunit, cm, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
     let leaf = leaf.map(|(paged, parks)| LeafStart {
         module: cm as u32,
         entry: entry as u32,
@@ -13261,33 +13375,20 @@ fn coop_start_child(
     tierup: Option<(std::sync::Arc<[bool]>, bool)>,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
-    let AdmittedChild {
+    let room = live_tasks(tasks) < super::MAX_VCPUS;
+    let BuiltChild {
+        module,
+        mut vt,
+        table,
         mem,
         host: child_host,
-        program,
-        args,
         fuel,
         lease,
-    } = child;
-    let built = if live_tasks(tasks) >= super::MAX_VCPUS {
-        Err(Trap::ThreadFault) // instantiate bomb
-    } else {
-        program.land(source).and_then(|(module, prog)| {
-            let (vt, table) = child_task(module, &prog, entry, &args, child_host.jit_table_log2())?;
-            Ok((module, vt, table))
-        })
-    };
-    let (module, mut vt, table) = match built {
-        Ok(b) => b,
-        Err(t) => {
-            if let Some((budget, bytes)) = lease {
-                task_host(root, extra_envs, spawner)
-                    .lock_unpoisoned()
-                    .release_detached(budget, bytes);
-            }
-            return Err(t);
-        }
-    };
+    } = child.build(source, entry, room, |budget, bytes| {
+        task_host(root, extra_envs, spawner)
+            .lock_unpoisoned()
+            .release_detached(budget, bytes)
+    })?;
     if let Some((eligible, page_checked)) = tierup {
         vt.active.jit_eligible = Some(eligible);
         vt.active.jit_page_checked = page_checked;
@@ -15266,9 +15367,7 @@ impl CoopSched {
                         let caller_env = tasks[caller_ti].env;
                         // Only a bare root caller (no spawned children/threads, no live fiber chain)
                         // forks faithfully — the oracle's `bare` gate. Anything else degrades.
-                        let bare = tasks[caller_ti].threads.iter().all(|t| t.is_none())
-                            && tasks[caller_ti].vt.active_id == ROOT_FIBER
-                            && tasks[caller_ti].vt.chain.is_empty();
+                        let bare = fork_bare(&tasks[caller_ti].threads, &tasks[caller_ti].vt);
                         // Duplicate the caller's window (private copy — fork does not share memory) and
                         // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
                         // or a non-forkable window/powerbox fails closed to a single reply.
@@ -15278,17 +15377,9 @@ impl CoopSched {
                         // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
                         let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
                             caller_env.and_then(|ck| {
-                                let twin_mem = match &extra_envs[ck].mem {
-                                    Some(m) => Some(m.fork_private()?),
-                                    None => None,
-                                };
-                                let parent = extra_envs[ck].host.lock_unpoisoned();
-                                // #2001 — the twin is one `spawn` of the node it shares with its
-                                // parent while it lives: a full ceiling refuses the fork.
-                                let live = LiveVcpu::charge(parent.own_node())?;
-                                let window =
-                                    extra_envs[ck].mem.as_ref().map_or(0, Mem::mapped_size);
-                                let twin_host = parent.fork_powerbox(twin_pid, window)?;
+                                let env = &extra_envs[ck];
+                                let (twin_mem, twin_host, live) =
+                                    fork_process(&env.host, env.mem.as_ref(), twin_pid)?;
                                 Some((ck, twin_mem, twin_host, live))
                             })
                         } else {
@@ -15297,29 +15388,19 @@ impl CoopSched {
                         let Some((ck, twin_mem, twin_host, live)) = forked else {
                             break 'fork degrade(tasks, Some(caller_ti));
                         };
-                        // The twin's continuation is the caller's — a bare root `Vm` cloned at its
-                        // post-call resume point (`Vm` derives `Clone`; a bare caller carries no resume
-                        // chain / invoke) — with `reply_twin` injected at the caller's reply slot.
-                        let mut twin_active = tasks[caller_ti].vt.active.clone();
-                        twin_active.set(caller_dst, Reg::from_i64(reply_twin));
+                        // The twin's continuation is the caller's, with `reply_twin` injected at the
+                        // caller's reply slot.
+                        let mut twin_vt =
+                            twin_task(&tasks[caller_ti].vt.active, caller_dst, reply_twin);
                         // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                         // keep an inherited bitmap only if its private `fork_private` window is
                         // servable (flat; the owned-flat twin backing makes the tier-up shapes so
                         // on every target); a `Paged` twin window strips it and interprets,
                         // fail-closed.
                         if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                            twin_active.jit_eligible = None;
-                            twin_active.jit_page_checked = false;
+                            twin_vt.active.jit_eligible = None;
+                            twin_vt.active.jit_page_checked = false;
                         }
-                        let twin_root_sp =
-                            twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
-                        let twin_vt = VTask {
-                            active: twin_active,
-                            active_id: ROOT_FIBER,
-                            chain: Vec::new(),
-                            root_shadow_sp: twin_root_sp,
-                            active_invoke: None,
-                        };
                         // The twin is its own domain: a fresh env over the private window + duplicated
                         // powerbox, its own dispatch table seeded with the caller's installs (#1297),
                         // the caller's env fuel.
@@ -15589,49 +15670,20 @@ impl CoopSched {
                     // task index `pid - 1` (the reap settle below). `twin_ti` stays the raw task index.
                     let twin_ti = tasks.len();
                     let twin_pid = twin_ti as u64 + 1;
-                    let bare = tasks[ti].threads.iter().all(|t| t.is_none())
-                        && tasks[ti].vt.active_id == ROOT_FIBER
-                        && tasks[ti].vt.chain.is_empty();
                     // The window + powerbox to duplicate: a confined child from its `extra_env`, or a
                     // **root** caller (`env: None`, e.g. `bash -c` forking) from the driver window/host.
                     // The twin shares the caller's budget node (`fork_powerbox`), so it draws from it
-                    // as a thread would (#1944 slice 3).
-                    // #2001 — the twin is one `spawn` of the node it shares with its parent while it
-                    // lives: a full ceiling refuses the fork, as the live cap does, which is checked
-                    // first, as the oracle's `fork_vcpu` checks it (#2006).
-                    let node = task_host(root, extra_envs, tasks[ti].env)
-                        .lock_unpoisoned()
-                        .own_node();
-                    let room = bare && live_tasks(tasks) < super::MAX_VCPUS;
-                    let forked: Option<(Fuel, Option<Mem>, Host, LiveVcpu)> = if room {
-                        (|| {
-                            let live = LiveVcpu::charge(node)?;
-                            match tasks[ti].env {
-                                Some(k) => {
-                                    let tm = match &extra_envs[k].mem {
-                                        Some(m) => Some(m.fork_private()?),
-                                        None => None,
-                                    };
-                                    let window =
-                                        extra_envs[k].mem.as_ref().map_or(0, Mem::mapped_size);
-                                    let th = extra_envs[k]
-                                        .host
-                                        .lock_unpoisoned()
-                                        .fork_powerbox(twin_pid, window)?;
-                                    Some((extra_envs[k].fuel.for_thread(), tm, th, live))
-                                }
-                                None => {
-                                    let tm = match mem.as_ref() {
-                                        Some(m) => Some(m.fork_private()?),
-                                        None => None,
-                                    };
-                                    let window = mem.as_ref().map_or(0, Mem::mapped_size);
-                                    let th =
-                                        root.lock_unpoisoned().fork_powerbox(twin_pid, window)?;
-                                    Some((fuel.for_thread(), tm, th, live))
-                                }
-                            }
-                        })()
+                    // as a thread would (#1944 slice 3). The live cap is checked first, as the oracle's
+                    // `fork_vcpu` checks it (#2006).
+                    let env = tasks[ti].env;
+                    let room = fork_bare(&tasks[ti].threads, &tasks[ti].vt)
+                        && live_tasks(tasks) < super::MAX_VCPUS;
+                    let forked = if room {
+                        let win = match env {
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                            None => mem.as_ref(),
+                        };
+                        fork_process(task_host(root, extra_envs, env), win, twin_pid)
                     } else {
                         None
                     };
@@ -15639,33 +15691,13 @@ impl CoopSched {
                         None => {
                             tasks[ti].vt.active.set(dst, Reg::from_i64(super::EAGAIN));
                         }
-                        Some((twin_fuel, twin_mem, twin_host, live)) => {
-                            // #1080 pipeline rung — wire the twin's OWN park door. `fork_powerbox` mints
-                            // the twin's personality with `park_req: None` (the door "lands at mint");
-                            // the driver must install it, exactly as the tree-walker wires each child's
-                            // door at fork and as the root got it at run start. Without this a forked
-                            // twin's own `fork()`/`waitpid()` finds no park delegate and fails closed
-                            // (`-ENOSYS`/`-ECHILD`) — so a bash pipeline SUBSHELL (itself a twin) cannot
-                            // fork+wait its command, wedging `echo | cat` in a waitpid busy-loop.
-                            twin_host.wire_park_door();
-                            // #1262 — wire the twin's personality signal doors to the SAME external-wake
-                            // bell as the root. A foreground/background job is a twin, and an embedder
-                            // signal to it (a terminal `^C`/`^Z`, a `kill(1)`) while the pump is
-                            // all-parked must ring the bell so the settle re-runs — the #1215 kill sweep
-                            // then finalizes a terminated twin parked on its terminal read, and the reap
-                            // wakes the shell. Without it the twin's doors were unwired and the embedder
-                            // signal was slept through: interactive `^C` of a parked `cat` deadlocked.
-                            let bell = root.lock_unpoisoned().external_wake();
-                            if let Some(bell) = bell {
-                                if let Some((_, tsource)) = twin_host.signal_poll() {
-                                    wire_pump_bell(&tsource, &bell);
-                                }
-                            }
-                            // The twin's continuation is the parent's, at the post-fork resume point,
-                            // with the return-twice `0` (the parent keeps the twin's pid, set below). A
-                            // bare root carries no resume chain / invoke (`Vm` derives `Clone`).
-                            let mut twin_active = tasks[ti].vt.active.clone();
-                            twin_active.set(dst, Reg::from_i64(0));
+                        Some((twin_mem, twin_host, live)) => {
+                            // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
+                            // park (a bash pipeline subshell is a twin that forks and waits its
+                            // command), and its signal doors on the run's bell.
+                            wire_process(&twin_host, root);
+                            // The return-twice `0`; the parent keeps the twin's pid, set below.
+                            let mut twin_vt = twin_task(&tasks[ti].vt.active, dst, 0);
                             // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
                             // may keep it only if its OWN private window (`fork_private`, pushed into
                             // `extra_envs` below) is servable — the driver then answers each of the
@@ -15675,25 +15707,19 @@ impl CoopSched {
                             // reservation, allocation failure) is not: strip the bitmap so it
                             // interprets, fail-closed.
                             if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                                twin_active.jit_eligible = None;
-                                twin_active.jit_page_checked = false;
+                                twin_vt.active.jit_eligible = None;
+                                twin_vt.active.jit_page_checked = false;
                             }
-                            let twin_root_sp =
-                                twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
-                            let twin_vt = VTask {
-                                active: twin_active,
-                                active_id: ROOT_FIBER,
-                                chain: Vec::new(),
-                                root_shadow_sp: twin_root_sp,
-                                active_invoke: None,
-                            };
                             // #1297: the twin's own dispatch table, seeded with the caller's installs.
-                            let twin_table = match tasks[ti].env {
-                                Some(k) => extra_envs[k].table.fork(),
-                                None => dom.table.fork(),
+                            let (twin_table, twin_fuel, program) = match env {
+                                Some(k) => (
+                                    extra_envs[k].table.fork(),
+                                    extra_envs[k].fuel.for_thread(),
+                                    extra_envs[k].program,
+                                ),
+                                None => (dom.table.fork(), fuel.for_thread(), 0),
                             };
                             let twin_eidx = extra_envs.len();
-                            let program = tasks[ti].env.map_or(0, |k| extra_envs[k].program);
                             extra_envs.push(ChildEnv {
                                 mem: twin_mem,
                                 host: twin_host.into_cell(),
@@ -15745,16 +15771,13 @@ impl CoopSched {
                     dst,
                     module,
                 }) => {
-                    // `func` resolves in the SPAWNING FRAME's module (an installed §22 unit spawns its
-                    // own functions — CONSOLIDATION.md §11); the child's root frame starts there too.
-                    let Some(cm) = dom.source.get(module as usize) else {
-                        complete(tasks, ti, Err(Trap::Malformed));
-                        continue;
+                    let mut child = match thread_task(&dom.source, module as usize, func, sp, arg) {
+                        Ok(vt) => vt,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
                     };
-                    if func as usize >= cm.progs.len() {
-                        complete(tasks, ti, Err(Trap::Malformed));
-                        continue;
-                    }
                     if live_tasks(tasks) >= super::MAX_VCPUS {
                         complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                         continue;
@@ -15768,10 +15791,6 @@ impl CoopSched {
                         complete(tasks, ti, Err(Trap::ThreadFault));
                         continue;
                     };
-                    let mut child =
-                        VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)])?;
-                    child.active.module = module as usize;
-                    child.active.home = module as usize;
                     // #926 slice 2: a `thread.spawn` child running in **module 0** tiers up its own
                     // eligible calls too (the run's bitmap is per-module-0-function, shared across the
                     // root and its same-module threads). A child spawned in another module (a confined
@@ -18126,24 +18145,16 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 dst,
                 module,
             }) => {
-                // Module-aware, as the cooperative arm: `func` is the spawning frame's module's index.
-                let Some(cm) = dom.source.get(module as usize) else {
-                    return (Err(Trap::Malformed), mem);
+                let mut child_vt = match thread_task(&dom.source, module as usize, func, sp, arg) {
+                    Ok(vt) => vt,
+                    Err(t) => return (Err(t), mem),
                 };
-                if func as usize >= cm.progs.len() {
-                    return (Err(Trap::Malformed), mem);
-                }
                 // #2001 — the thread is one `spawn` of its domain's node while it lives, handed back
                 // before its result is published, so its joiner can spawn in its place.
                 let node = host.lock_unpoisoned().own_node();
                 let Some(live) = LiveVcpu::charge(node) else {
                     return (Err(Trap::ThreadFault), mem);
                 };
-                let mut child_vt =
-                    match VTask::new(&cm, func as usize, &[Value::I64(sp), Value::I64(arg)]) {
-                        Ok(v) => v,
-                        Err(t) => return (Err(t), mem),
-                    };
                 // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`), taken
                 // once nothing can fail before the thread holds it (#2006).
                 if !reg.try_start() {
@@ -18152,8 +18163,6 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 let id = reg
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                child_vt.active.module = module as usize;
-                child_vt.active.home = module as usize;
                 // §12 seed the child's `vcpu.tls` to its dense id (root = 0; ids start at 0 for the
                 // first child) — the cooperative `Spawn` arm's seeding.
                 child_vt.active.tls = id as i64 + 1;
@@ -18240,32 +18249,17 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 // parent keeps running with the twin's pid; the twin resumes at the same op (pc
                 // already advanced) with the return-twice `0`. Bare gate + `-EAGAIN` refusal mirror
                 // the cooperative arm (invariant 5: a value, never a hang).
-                let bare = threads.iter().all(|t| t.is_none())
-                    && vt.active_id == ROOT_FIBER
-                    && vt.chain.is_empty();
                 // Cross-thread anti-bomb gate (the `Spawn` arm's), released on any refusal.
-                let admitted = bare && reg.try_start();
-                let forked: Option<(Option<Mem>, Host, i64, LiveVcpu)> = if admitted {
+                let admitted = fork_bare(&threads, &vt) && reg.try_start();
+                let forked = if admitted {
                     let twin_pid = reg
                         .next_fork_pid
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let built = (|| {
-                        let tm = match mem.as_ref() {
-                            Some(m) => Some(m.fork_private()?),
-                            None => None,
-                        };
-                        let parent = host.lock_unpoisoned();
-                        // #2001 — the twin is one `spawn` of the node it shares with its parent
-                        // while it lives: a full ceiling refuses the fork.
-                        let live = LiveVcpu::charge(parent.own_node())?;
-                        let window = mem.as_ref().map_or(0, Mem::mapped_size);
-                        let th = parent.fork_powerbox(twin_pid as u64, window)?;
-                        Some((tm, th, twin_pid, live))
-                    })();
+                    let built = fork_process(&host, mem.as_ref(), twin_pid as u64);
                     if built.is_none() {
                         reg.end();
                     }
-                    built
+                    built.map(|(m, h, live)| (m, h, twin_pid, live))
                 } else {
                     None
                 };
@@ -18276,17 +18270,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         // personality with no park delegate, and without one the twin's own
                         // `fork()`/`waitpid()` cannot park (`-ENOSYS`/the ECHILD poll).
                         twin_host.wire_park_door();
-                        let mut twin_active = vt.active.clone();
-                        twin_active.set(dst, Reg::from_i64(0));
-                        let twin_root_sp =
-                            twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
-                        let twin_vt = VTask {
-                            active: twin_active,
-                            active_id: ROOT_FIBER,
-                            chain: Vec::new(),
-                            root_shadow_sp: twin_root_sp,
-                            active_invoke: None,
-                        };
+                        let twin_vt = twin_task(&vt.active, dst, 0);
                         let twin_host = std::sync::Arc::new(std::sync::Mutex::new(twin_host));
                         // The twin continues the SAME image as its parent, so it dispatches over the
                         // same table (post-exec parents included — cf. the coop arm's fresh primary
@@ -18727,36 +18711,24 @@ fn par_start_child<'scope, 'env>(
     child: AdmittedChild,
     entry: i64,
 ) -> Result<i32, Trap> {
-    let AdmittedChild {
+    let room = reg.try_start(); // the cross-thread vCPU ceiling, released below on a refusal
+    let built = child.build(&dom.source, entry, room, |budget, bytes| {
+        parent_host
+            .lock_unpoisoned()
+            .release_detached(budget, bytes)
+    });
+    if room && built.is_err() {
+        reg.end();
+    }
+    let BuiltChild {
+        vt,
+        table,
         mem,
         host,
-        program,
-        args,
         fuel,
         lease,
-    } = child;
-    let built = if reg.try_start() {
-        let built = program.land(&dom.source).and_then(|(module, prog)| {
-            child_task(module, &prog, entry, &args, host.jit_table_log2())
-        });
-        if built.is_err() {
-            reg.end();
-        }
-        built
-    } else {
-        Err(Trap::ThreadFault) // instantiate bomb
-    };
-    let (vt, table) = match built {
-        Ok(b) => b,
-        Err(t) => {
-            if let Some((budget, bytes)) = lease {
-                parent_host
-                    .lock_unpoisoned()
-                    .release_detached(budget, bytes);
-            }
-            return Err(t);
-        }
-    };
+        ..
+    } = built?;
     let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), table);
     let lease = lease.map(|(budget, bytes)| (std::sync::Arc::clone(parent_host), budget, bytes));
     let id = reg
