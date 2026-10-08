@@ -3296,6 +3296,11 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
       error_tok(tok, "redefinition of %s", name_str);
     if (!fn->is_static && attr->is_static)
       error_tok(tok, "static declaration follows a non-static declaration");
+    // The definition's type is the function's. An earlier `f();` (no prototype, which chibicc
+    // reads as variadic) must not stand for `f(void)`'s, or the body is emitted with a varargs
+    // area its parameters never declared (#2163).
+    if (equal(tok, "{"))
+      fn->ty = ty;
     fn->is_definition = fn->is_definition || equal(tok, "{");
     // #1524: a later declaration may be the one carrying the attribute (a call site that
     // includes the capability header after a bare forward declaration) — sticky, never cleared.

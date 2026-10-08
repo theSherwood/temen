@@ -2344,13 +2344,16 @@ static int gen_expr(Node *node) {
       spill_top = spillsave;
     }
 
-    bool variadic = node->func_ty && node->func_ty->is_variadic;
+    // A direct call to a function this unit defines takes the definition's signature, which a call
+    // parsed under an earlier unprototyped declaration (`f();`) did not see (#2163).
+    Type *fty = direct && node->lhs->var->is_definition ? node->lhs->var->ty : node->func_ty;
+    bool variadic = fty && fty->is_variadic;
     int nfixed = n;
     int vbuf = 0; // the marshalled-varargs buffer pointer (passed as the trailing arg)
     int extra = 0;
     if (variadic) {
       nfixed = 0;
-      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+      for (Type *pt = fty->params; pt; pt = pt->next)
         nfixed++;
       int nva = n - nfixed;
       // Marshal the variadic args into a buffer just above our frame (and below the
