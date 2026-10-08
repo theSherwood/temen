@@ -5283,6 +5283,12 @@ pub struct LinkUnitRef<'a> {
     pub exports: &'a [(String, FuncIdx)],
     /// See [`LinkUnit::data_exports`].
     pub data_exports: &'a [DataExport],
+    /// Which of the unit's functions the caller knows something can reach, by local index (#1373).
+    /// The link copies a trap in place of each `false` one — the body [`stub_unreachable_funcs`]
+    /// leaves — so a resident library's unreached bodies are never copied into each program linked
+    /// against it. `None` (and an index past the mask) copies the function. A function the mask
+    /// wrongly marks unreached traps when called; nothing else changes.
+    pub live: Option<&'a [bool]>,
 }
 
 impl<'a> From<&'a LinkUnit> for LinkUnitRef<'a> {
@@ -5291,6 +5297,7 @@ impl<'a> From<&'a LinkUnit> for LinkUnitRef<'a> {
             module: &u.module,
             exports: &u.exports,
             data_exports: &u.data_exports,
+            live: None,
         }
     }
 }
@@ -5299,6 +5306,45 @@ impl<'a> From<&'a LinkUnit> for LinkUnitRef<'a> {
 /// module; only the ownership of the inputs differs.
 pub fn link_with_manifest_ref(units: &[LinkUnitRef<'_>]) -> Result<Module, LinkError> {
     link_impl(units, true)
+}
+
+/// **Lay library units out once** (#1373): [`link_with_manifest_ref`] over them alone, as a base
+/// that every program linked against the same libraries starts from as unit 0. Linking the base and
+/// a program gives the module linking the libraries and the program together would: the base sits at
+/// function, type and data base 0 either way, so nothing in it moves, and an import it kept resolves
+/// against the program then as it would have before.
+///
+/// `None` when a later unit could change what the base resolved: a thread-local (the per-thread
+/// block is placed above *all* data), `data.top` (the top of all data), a reference to the
+/// thread-local symbols (placed with the block), or a reference only a later unit can satisfy (the
+/// link fails). Such libraries link with each program instead.
+pub fn link_base(units: &[LinkUnitRef<'_>]) -> Option<Module> {
+    let tls_sym = |name: &[u8]| {
+        [TLS_IMAGE_SYM, TLS_END_SYM, TLS_ROOT_SYM]
+            .iter()
+            .any(|s| s.as_bytes() == name)
+    };
+    let placed_alone = units.iter().all(|u| {
+        let m = u.module;
+        m.tls.is_empty()
+            && u.data_exports.iter().all(|e| !e.tls)
+            && m.data_ptrs.iter().all(|p| match &p.target {
+                DataPtrTarget::SelfOff(_) => !p.tls,
+                DataPtrTarget::Sym { name, .. } => !p.tls && !tls_sym(name.as_bytes()),
+            })
+            && !m
+                .funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .any(|i| match i {
+                    Inst::DataTop => true,
+                    Inst::DataSym { name, tls, .. } => *tls || tls_sym(name),
+                    Inst::DataSelf { tls, .. } => *tls,
+                    _ => false,
+                })
+    });
+    placed_alone.then(|| link_impl(units, true).ok()).flatten()
 }
 
 fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkError> {
@@ -5512,7 +5558,37 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         .zip(&disps)
         .zip(&tls_bases)
     {
-        let mut m = u.module.clone();
+        // The unit's working copy: what the steps below read and rewrite — its functions (a trap
+        // for each its `live` mask says nothing reaches) and its data image with the forms that
+        // patch it. Its exports, impl surface and debug info merge from the unit itself below, so
+        // they are not copied.
+        let live = |i: usize| u.live.is_none_or(|l| l.get(i).copied().unwrap_or(true));
+        let mut m = Module {
+            funcs: u
+                .module
+                .funcs
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    if live(i) {
+                        f.clone()
+                    } else {
+                        Func {
+                            params: f.params.clone(),
+                            results: f.results.clone(),
+                            blocks: trap_body(&f.params),
+                        }
+                    }
+                })
+                .collect(),
+            data: u.module.data.clone(),
+            data_ptrs: u.module.data_ptrs.clone(),
+            data_funcrefs: u.module.data_funcrefs.clone(),
+            data_funcref_slots: u.module.data_funcref_slots.clone(),
+            tls: u.module.tls.clone(),
+            imports: u.module.imports.clone(),
+            ..Module::default()
+        };
         offset_type_indices(&mut m, tbase);
         // Place this unit's data in its assigned window region: its `data.ptr`/`data.funcref` slots,
         // its segments, and its `data.self`/`data.sym`/`data.top` addresses. Every funcref slot is
@@ -6515,18 +6591,12 @@ pub fn stub_unreachable_funcs(
         .chain(extra_roots.iter().copied());
     let live = reachable_funcs(m, roots)?;
     // --- stub ---------------------------------------------------------------------------------
-    // The signature stays (the table's slot check reads it); the body becomes one diverging block, so
-    // the only way to arrive is a forged index, and arriving traps.
     let mut stubbed = 0;
     for (i, f) in m.funcs.iter_mut().enumerate() {
         if live[i] {
             continue;
         }
-        f.blocks = alloc::vec![Block {
-            params: f.params.clone(),
-            insts: Vec::new(),
-            term: Terminator::Unreachable,
-        }];
+        f.blocks = trap_body(&f.params);
         stubbed += 1;
     }
     if stubbed == 0 {
@@ -6542,6 +6612,18 @@ pub fn stub_unreachable_funcs(
         di.func_names.retain(|nm| live[nm.func as usize]);
     }
     Ok(StubbedFuncs { stubbed })
+}
+
+/// The body of a function nothing reaches: one diverging block with the function's parameters. The
+/// signature stays (the table's slot check reads it), so the only way to arrive is a forged index,
+/// and arriving traps. What [`stub_unreachable_funcs`] leaves, and what [`link`] copies in place of
+/// a function a unit's `live` mask excludes ([`LinkUnitRef::live`]).
+fn trap_body(params: &[ValType]) -> Vec<Block> {
+    alloc::vec![Block {
+        params: params.to_vec(),
+        insts: Vec::new(),
+        term: Terminator::Unreachable,
+    }]
 }
 
 /// The [`Module::imports`] slot an instruction names, if it names one.
