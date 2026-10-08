@@ -6,6 +6,11 @@
 //! nothing, so the run's `join_all` waited on it forever while the oracle returned. Each case here
 //! pairs a root that finishes with a sibling that never would — a `thread.spawn` thread or a §14
 //! child — and asks both engines for the root's answer.
+//!
+//! The oracle's fuel outlasts the deadline, so its run ends because the sibling stopped at its next
+//! safepoint, the end of its preemption quantum. With a small budget, a sibling spinning on forever
+//! still looks right: it runs out of fuel and the run ends. The tree-walker passed that way while it
+//! re-queued a running sibling indefinitely (#2202).
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -18,8 +23,10 @@ use temen_jit::{JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// A sibling's body: count forever, one back-edge per iteration, no calls.
-const SPIN: &str = r#"
+/// A sibling's body from the end of its entry block: count forever, one back-edge per iteration, no
+/// calls.
+const SPIN: &str = r#"  br 1(v0)
+}
 block 1 (vk: i64) {
   v1 = i64.const 1
   vk2 = i64.add vk v1
@@ -30,7 +37,10 @@ block 1 (vk: i64) {
 
 /// A sibling that never ends without a back-edge: funcs 2 and 3 tail-call each other forever. It
 /// polls at the entry of each (the functions that tail-call), where nothing else would stop it.
-const TAIL_LOOP: &str = r#"
+const TAIL_LOOP: &str = r#"  r = call 2 (v0)
+  return r
+  }
+}
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   return_call 3(v0)
@@ -45,10 +55,16 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The root spawns a `thread.spawn` spinner, then runs `tail`.
-fn thread_guest(tail: &str) -> String {
+/// Where a spawned sibling says it is running.
+const UP: u64 = 20480;
+
+/// The root spawns a `thread.spawn` sibling, waits until it is running, then runs `tail`. The
+/// sibling says it is up, then runs `body`. The wait is what makes the sibling a *running* one: a
+/// sibling still queued when the root finishes dies with the queue, and never reaches the safepoint
+/// these cases are about.
+fn thread_guest(body: &str, tail: &str) -> String {
     format!(
-        "memory 17\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vh = thread.spawn 1 v0 v0\n{tail}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  br 1(v0)\n}}{SPIN}"
+        "memory 17\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vh = thread.spawn 1 v0 v0\n  br 1()\n  }}\nblock 1 () {{\n  vu = i64.const {UP}\n  vup = i32.atomic.load vu\n  br_if vup 2() 1()\n  }}\nblock 2 () {{\n{tail}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  vu = i64.const {UP}\n  vone = i32.const 1\n  i32.atomic.store vu vone\n{body}"
     )
 }
 
@@ -56,7 +72,7 @@ fn thread_guest(tail: &str) -> String {
 /// 17408), then runs `tail`.
 fn child_guest(tail: &str) -> String {
     format!(
-        "memory 19\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  br 1(v0)\n}}{SPIN}{}",
+        "memory 19\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{SPIN}{}",
         rec::segment(17408, &SpawnRec::v1(1))
     )
 }
@@ -81,22 +97,33 @@ fn host(m: &temen_ir::Module) -> (Host, [i64; 2]) {
     (host, [ih, budget].map(i64::from))
 }
 
-fn oracle(src: &str) -> Result<Vec<Value>, Trap> {
-    let m = module(src);
-    let (mut host, args) = host(&m);
-    let mut fuel = 10_000_000u64;
-    temen_interp::run_with_host(&m, 0, &args.map(Value::I64), &mut fuel, &mut host)
-}
-
-/// The JIT's answer, or `None` if the run is still going after `DEADLINE` — a hang. The run is on
-/// its own thread so a hang fails this test instead of stalling the suite (the thread leaks).
-fn cranelift(src: &str) -> Option<JitOutcome> {
+/// `run`'s answer, or `None` if it is still going after `DEADLINE` — a hang. It runs on its own
+/// thread so a hang fails this test instead of stalling the suite (the thread leaks).
+fn by_deadline<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     const DEADLINE: Duration = Duration::from_secs(20);
-    let m = module(src);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let _ = tx.send(run());
+    });
+    rx.recv_timeout(DEADLINE).ok()
+}
+
+/// The tree-walker's answer, or `None` on a hang.
+fn oracle(src: &str) -> Option<Result<Vec<Value>, Trap>> {
+    let m = module(src);
+    by_deadline(move || {
         let (mut host, args) = host(&m);
-        let out = temen_run::jit_cap_run(
+        let mut fuel = 1u64 << 50;
+        temen_interp::run_with_host(&m, 0, &args.map(Value::I64), &mut fuel, &mut host)
+    })
+}
+
+/// The JIT's answer, or `None` on a hang.
+fn cranelift(src: &str) -> Option<JitOutcome> {
+    let m = module(src);
+    by_deadline(move || {
+        let (mut host, args) = host(&m);
+        temen_run::jit_cap_run(
             &m,
             0,
             &args,
@@ -107,16 +134,14 @@ fn cranelift(src: &str) -> Option<JitOutcome> {
             None,
         )
         .expect("jit run")
-        .0;
-        let _ = tx.send(out);
-    });
-    rx.recv_timeout(DEADLINE).ok()
+        .0
+    })
 }
 
 #[test]
 fn a_root_return_ends_a_running_thread() {
-    let src = thread_guest(RETURN_5);
-    assert_eq!(oracle(&src), Ok(vec![Value::I64(5)]), "oracle");
+    let src = thread_guest(SPIN, RETURN_5);
+    assert_eq!(oracle(&src), Some(Ok(vec![Value::I64(5)])), "oracle");
     let jit = cranelift(&src).expect("cranelift hung on the running thread");
     assert!(
         matches!(jit, JitOutcome::Returned(ref v) if v == &[5]),
@@ -126,8 +151,8 @@ fn a_root_return_ends_a_running_thread() {
 
 #[test]
 fn a_root_trap_ends_a_running_thread() {
-    let src = thread_guest(TRAP);
-    assert_eq!(oracle(&src), Err(Trap::Unreachable), "oracle");
+    let src = thread_guest(SPIN, TRAP);
+    assert_eq!(oracle(&src), Some(Err(Trap::Unreachable)), "oracle");
     let jit = cranelift(&src).expect("cranelift hung on the running thread");
     assert!(
         matches!(jit, JitOutcome::Trapped(TrapKind::Unreachable)),
@@ -138,10 +163,8 @@ fn a_root_trap_ends_a_running_thread() {
 /// The thread tail-calls around a two-function cycle instead of looping.
 #[test]
 fn a_root_return_ends_a_thread_in_a_tail_call_cycle() {
-    let src = format!(
-        "memory 17\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vh = thread.spawn 1 v0 v0\n{RETURN_5}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  r = call 2 (v0)\n  return r\n  }}\n}}{TAIL_LOOP}"
-    );
-    assert_eq!(oracle(&src), Ok(vec![Value::I64(5)]), "oracle");
+    let src = thread_guest(TAIL_LOOP, RETURN_5);
+    assert_eq!(oracle(&src), Some(Ok(vec![Value::I64(5)])), "oracle");
     let jit = cranelift(&src).expect("cranelift hung on the tail-calling thread");
     assert!(
         matches!(jit, JitOutcome::Returned(ref v) if v == &[5]),
@@ -152,7 +175,7 @@ fn a_root_return_ends_a_thread_in_a_tail_call_cycle() {
 #[test]
 fn a_root_return_ends_a_running_nested_child() {
     let src = child_guest(RETURN_5);
-    assert_eq!(oracle(&src), Ok(vec![Value::I64(5)]), "oracle");
+    assert_eq!(oracle(&src), Some(Ok(vec![Value::I64(5)])), "oracle");
     let jit = cranelift(&src).expect("cranelift hung on the running child");
     assert!(
         matches!(jit, JitOutcome::Returned(ref v) if v == &[5]),
@@ -163,7 +186,7 @@ fn a_root_return_ends_a_running_nested_child() {
 #[test]
 fn a_root_trap_ends_a_running_nested_child() {
     let src = child_guest(TRAP);
-    assert_eq!(oracle(&src), Err(Trap::Unreachable), "oracle");
+    assert_eq!(oracle(&src), Some(Err(Trap::Unreachable)), "oracle");
     let jit = cranelift(&src).expect("cranelift hung on the running child");
     assert!(
         matches!(jit, JitOutcome::Trapped(TrapKind::Unreachable)),
