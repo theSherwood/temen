@@ -572,6 +572,19 @@ against). The four policies are one act with different right-hand sides:
 | Wrap | parent's `impl` export calling its real cap | one domain crossing (§14's stated price) | ancestor-terminated |
 | Override | any other implementation | one crossing | ancestor-terminated |
 | Withhold | nothing | — | `required` ⇒ spawn fails; `rebindable` ⇒ empty |
+| Empty | an empty grant (`GRANT_EMPTY`) naming the import | — | the slot is empty: a call `CapFault`s |
+
+**Empty grants (#2219, owner 2026-10-08).** Withholding is strict: a `required` import that no grant
+satisfies refuses the spawn, and the run's notes name the import (`Host::take_notes`; `temen-run`
+prints them), since the guest only sees `-EINVAL`. A parent that means to leave an import out says so
+with an **empty grant**: a grant record whose handle is `GRANT_EMPTY` (`VM_EMPTY` in C's `<temen.h>`).
+The import binds empty and faults on use, as a `rebindable` slot nothing attached does.
+- The record's name is the import's, `*` (every import nothing else satisfies), or a prefix ending in
+  one `*` (`vm_jit_*`, `link.*`).
+- Only an empty grant may carry a pattern, so a pattern never grants authority.
+- A concrete grant beats an empty one whatever the order: an empty grant fills only an import nothing
+  else binds, and never unbinds one.
+- The child's name directory records it, so it rides a fork and a freeze to the thaw's re-bind.
 
 Child code is byte-identical under all four (the uniform convention is what
 makes interposition transparent), and the compile cache keeps hitting.

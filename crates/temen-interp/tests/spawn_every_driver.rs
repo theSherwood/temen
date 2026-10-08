@@ -1540,3 +1540,191 @@ fn a_child_live_at_the_runs_end_hands_its_window_back() {
         assert_eq!(held, (0, 0), "{d:?}: the run's end left the child charged");
     }
 }
+
+// ---- #2219 empty grants: a parent leaves an import empty on purpose ----
+
+/// A text `data` segment holding `bytes` at `at`.
+fn data_segment(at: u64, bytes: &[u8]) -> String {
+    let esc: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
+    format!("data {at} \"{esc}\"\n")
+}
+
+/// An op-17 parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` (the [`op15_setup`] powerbox):
+/// `module`'s entry 0, detached and paid from `budget`, with `grants` as its grant list. A `None`
+/// handle grants `out` under the name; `Some(h)` writes `h` as the record's handle, such as
+/// `GRANT_EMPTY`.
+fn op17_granting(grants: &[(&str, Option<u32>)]) -> String {
+    const REC: u64 = 17536;
+    const GRANTS: u64 = 17664;
+    const NAMES: u64 = 17920;
+    let rec = SpawnRec {
+        grants_ptr: GRANTS,
+        grants_n: grants.len() as u64,
+        ..SpawnRec::v1(0)
+    };
+    let mut segments = rec::segment(REC, &rec);
+    let mut stores = String::new();
+    for (i, (name, handle)) in grants.iter().enumerate() {
+        let at = GRANTS + 16 * i as u64;
+        let name_at = NAMES + 32 * i as u64;
+        let record = [
+            (name_at as u32).to_le_bytes(),
+            (name.len() as u32).to_le_bytes(),
+            handle.unwrap_or(0).to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        segments += &data_segment(at, &record);
+        segments += &data_segment(name_at, name.as_bytes());
+        if handle.is_none() {
+            stores += &format!("  vg{i} = i64.const {}\n  i32.store vg{i} vout\n", at + 8);
+        }
+    }
+    format!(
+        "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
+  vma = i64.const {ma}
+  i32.store vma vmod
+  vba = i64.const {ba}
+  i32.store vba vbud
+{stores}  vrp = i64.const {REC}
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+{JOIN_OR_ERRNO}{segments}",
+        ma = REC + rec::MODULE_AT,
+        ba = REC + rec::BUDGET_AT,
+    )
+}
+
+const EMPTY: Option<u32> = Some(temen_interp::GRANT_EMPTY);
+
+/// A detached child that calls its `exit` import, then returns 42.
+const DETACHED_CALLS_EXIT: &str = "memory 15
+import 0 \"exit\" (i32) -> ()
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vc = i32.const 7
+  call.import 0 (vc)
+  vr = i64.const 42
+  return vr
+  }
+}
+";
+
+/// A detached child that writes `M` through its `write` import and returns 42.
+const DETACHED_WRITES_M_BY_IMPORT: &str = "memory 15
+import 0 \"write\" (i64, i64) -> (i64)
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vb = i64.const 20100
+  vc = i32.const 77
+  i32.store8 vb vc
+  one = i64.const 1
+  vw = call.import 0 (vb, one)
+  vr = i64.const 42
+  return vr
+  }
+}
+";
+
+/// The child binds its manifest strictly (IMPORTS.md §3.3), so an import nothing grants refuses the
+/// spawn, unless the parent empties it: by its name, by `*`, or by a prefix ending in `*`. A prefix
+/// that doesn't cover the import leaves it refused.
+#[test]
+fn an_empty_grant_satisfies_an_import_nothing_else_does() {
+    let child = module(DETACHED_IMPORTS_EXIT);
+    let setup = op15_setup(&child, 1 << 20);
+    for (what, grants, want) in [
+        ("no grant", vec![], -22),
+        ("an exact empty grant", vec![("exit", EMPTY)], 42),
+        ("`*`", vec![("*", EMPTY)], 42),
+        ("a covering prefix", vec![("ex*", EMPTY)], 42),
+        ("a prefix that misses", vec![("vm_*", EMPTY)], -22),
+    ] {
+        let m = module(&op17_granting(&grants));
+        agree_on_every_driver(what, &m, &setup, &ok(want));
+    }
+}
+
+/// An emptied import is bound to nothing, so the child faults when it calls it, as a withheld slot
+/// does. The child's `CapFault` reaches the parent through its `join` (until #2066 makes `join`
+/// report it instead).
+#[test]
+fn an_emptied_import_faults_on_use() {
+    let child = module(DETACHED_CALLS_EXIT);
+    let setup = op15_setup(&child, 1 << 20);
+    let m = module(&op17_granting(&[("exit", EMPTY)]));
+    let faulted = Ran {
+        result: Err(Trap::CapFault),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    agree_on_every_driver("calls an emptied import", &m, &setup, &faulted);
+}
+
+/// A concrete grant beats an empty one, whatever the order: `write` binds to the granted `stdout`
+/// beside `*`, and an empty grant under `write` itself doesn't unbind it.
+#[test]
+fn a_concrete_grant_beats_an_empty_one() {
+    let child = module(DETACHED_WRITES_M_BY_IMPORT);
+    let setup = op15_setup(&child, 1 << 20);
+    let want = Ran {
+        result: Ok(vec![Value::I64(42)]),
+        stdout: b"M".to_vec(),
+        stderr: Vec::new(),
+    };
+    for (what, grants) in [
+        ("`*` before stdout", vec![("*", EMPTY), ("stdout", None)]),
+        ("stdout before `*`", vec![("stdout", None), ("*", EMPTY)]),
+        ("an empty `write`", vec![("write", EMPTY), ("stdout", None)]),
+    ] {
+        let m = module(&op17_granting(&grants));
+        agree_on_every_driver(what, &m, &setup, &want);
+    }
+}
+
+/// A pattern grants nothing, so it is allowed only with the empty tag: a real handle under one, or a
+/// `*` anywhere but at the end, fails the spawn closed, as a forged handle does.
+#[test]
+fn a_pattern_is_only_an_empty_grant() {
+    let child = module(DETACHED_IMPORTS_EXIT);
+    let setup = op15_setup(&child, 1 << 20);
+    let refused = Ran {
+        result: Err(Trap::CapFault),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    for (what, grants) in [
+        ("a real handle under a pattern", vec![("std*", None)]),
+        ("a `*` inside the name", vec![("e*t", EMPTY)]),
+        ("two `*`s", vec![("**", EMPTY)]),
+    ] {
+        let m = module(&op17_granting(&grants));
+        agree_on_every_driver(what, &m, &setup, &refused);
+    }
+}
+
+/// A refused spawn's guest sees `-EINVAL`; the run's notes name the import nothing satisfied, for the
+/// embedder to show, and an admitted spawn leaves none.
+#[test]
+fn a_refusal_notes_the_import_nothing_satisfied() {
+    let child = module(DETACHED_IMPORTS_EXIT);
+    let setup = op15_setup(&child, 1 << 20);
+    for (grants, want, noted) in [
+        (vec![], -22, true),
+        (vec![("exit", EMPTY)], 42, false),
+    ] {
+        let m = module(&op17_granting(&grants));
+        for d in drivers::ALL {
+            let Some((ran, notes)) = run_on_then(d, &m, &setup, &|h| h.take_notes()) else {
+                continue;
+            };
+            assert_eq!(ran, ok(want), "{d:?}");
+            assert_eq!(
+                notes.iter().any(|n| n.contains("`exit`")),
+                noted,
+                "{d:?}: {notes:?}"
+            );
+        }
+    }
+}

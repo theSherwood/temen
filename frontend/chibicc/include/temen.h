@@ -46,6 +46,13 @@ long __vm_instantiate_detached(int inst, long budget, long module, long grants_p
                                long entry, long size_log2, long args_ptr, long args_len, long region,
                                long child_off);
 long __vm_instantiate_join(int inst, long child);
+// A grant record is `{u32 name_off, u32 name_len, i32 handle, u32 flags}`, the name a string in your
+// window. A child binds its imports strictly: one that no record satisfies refuses the spawn
+// (-EINVAL), and the run's notes name it. `VM_EMPTY` as a record's handle grants nothing under the
+// name, so the child's import of that name binds empty and faults if called: you leave it out on
+// purpose. The name may also be `*`, every import nothing else satisfies, or a prefix ending in `*`
+// (`vm_jit_*`), and only an empty grant may use one (#2219).
+#define VM_EMPTY (-0x40000000) /* 0xC000_0000, temen_interp::GRANT_EMPTY */
 // `__vm_budget_read(budget, field)` — what remains of a `Budget` field: 0 fuel, 1 memory (bytes of
 // detached window you may still mint), 2 spawns. The powerbox's `"budget"` holds one window's worth.
 long __vm_budget_read(int budget, long field);

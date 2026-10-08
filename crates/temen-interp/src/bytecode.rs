@@ -2134,7 +2134,7 @@ fn admit_detached_child(
     let cell = host.own_cell();
     if !glist
         .iter()
-        .all(|(_, h)| host.can_grant(*h, cell.is_some()))
+        .all(|(n, h)| host.can_grant_entry(n, *h, cell.is_some()))
     {
         return Err(Trap::CapFault);
     }
@@ -2160,9 +2160,7 @@ fn admit_detached_child(
     // #1944 — the budget that paid for the window is the child's own.
     host.give_child_budget(s.budget, &mut child_host);
     for (name, gh) in &glist {
-        if let Some(cg) = host.grant_into_child(cell.as_ref(), *gh, &mut child_host) {
-            child_host.register_cap_name(name, cg);
-        }
+        let _ = host.grant_entry_into_child(cell.as_ref(), name, *gh, &mut child_host);
     }
     // The pre-mapped region rides the child's powerbox; the window build aliases it in.
     if let Some((r, o)) = s.premap {

@@ -33,7 +33,15 @@ int __vm_cap_at(int i, int *type_id_out);
 /* One named grant: the child resolves `name` (`self.resolve` / a named import) to a re-grant of the
  * parent's `handle`. The handle must be one this domain holds and that the host can re-grant
  * (a stream, pipe end, region, offer, forkable host proc, Module, Jit); a forged or non-grantable
- * one fails the whole spawn closed. */
+ * one fails the whole spawn closed.
+ *
+ * The child binds its imports strictly, so one no grant satisfies refuses the spawn. `VM_EMPTY` as
+ * the handle grants nothing: the child's import `name` binds empty and faults if called, a part the
+ * parent leaves out on purpose. `name` may also be `*` (every import nothing else satisfies) or a
+ * prefix ending in `*`, and only an empty grant may use one (#2219). */
+#ifndef VM_EMPTY
+#define VM_EMPTY (-0x40000000) /* 0xC000_0000, temen_interp::GRANT_EMPTY */
+#endif
 typedef struct {
   char *name;
   int handle;

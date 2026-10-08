@@ -247,6 +247,9 @@ fn try_main() -> Result<(), String> {
         out.flush().ok();
         let mut err = std::io::stderr().lock();
         err.write_all(&run.stderr).ok();
+        for note in &run.notes {
+            writeln!(err, "temen-run: {note}").ok();
+        }
         err.flush().ok();
         process::exit(exit_code(&run.outcome));
     } else {

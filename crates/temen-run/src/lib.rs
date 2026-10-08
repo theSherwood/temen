@@ -4905,6 +4905,9 @@ pub struct Run {
     pub outcome: Outcome,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// #2219 — what the run's domains left to say about a refusal the guest only saw as `-EINVAL`
+    /// ([`temen_interp::Host::take_notes`]): which import of a child no grant satisfied.
+    pub notes: Vec<String>,
 }
 
 /// The powerbox entry shape (IMPORTS.md phase 3+): a paramless `_start` (function 0) the frontend
@@ -5320,6 +5323,7 @@ impl PowerboxProgram {
             // guest that sandboxed anything reads back as silent.
             stdout: self.host.take_stdout(),
             stderr: self.host.take_stderr(),
+            notes: self.host.take_notes(),
         })
     }
 }
@@ -7681,6 +7685,7 @@ impl Instance {
             outcome,
             stdout: host.take_stdout(),
             stderr: host.take_stderr(),
+            notes: host.take_notes(),
         })
     }
 
@@ -7802,6 +7807,7 @@ impl Instance {
             outcome,
             stdout: host.take_stdout(),
             stderr: host.take_stderr(),
+            notes: host.take_notes(),
         })
     }
 
@@ -7857,6 +7863,7 @@ impl Instance {
             outcome,
             stdout: hi.take_stdout(),
             stderr: hi.take_stderr(),
+            notes: hi.take_notes(),
         })
     }
 
@@ -8073,6 +8080,7 @@ impl Instance {
             outcome,
             stdout: h.take_stdout(),
             stderr: h.take_stderr(),
+            notes: h.take_notes(),
         })
     }
 }

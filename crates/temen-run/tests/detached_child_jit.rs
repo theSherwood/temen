@@ -1338,3 +1338,89 @@ fn a_detached_child_maps_a_region_it_minted_on_the_jit_as_on_the_interpreter() {
     };
     assert_eq!(jit, interp, "the JIT matches the oracle (was -22, #1978)");
 }
+
+/// #2219 — `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child's entry 0
+/// detached by an op-17 record, with `grants` (each handle written as given) as its grant list. A
+/// refused spawn returns its `-errno`; an admitted one is joined.
+fn parent_granting(grants: &[(&str, u32)]) -> String {
+    const REC: u64 = 17536;
+    const GRANTS: u64 = 17664;
+    const NAMES: u64 = 17920;
+    let seg = |at: u64, bytes: &[u8]| {
+        let esc: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
+        format!("data {at} \"{esc}\"\n")
+    };
+    let rec = temen_ir::SpawnRec {
+        grants_ptr: GRANTS,
+        grants_n: grants.len() as u64,
+        ..temen_ir::SpawnRec::v1(0)
+    };
+    let mut segments = seg(REC, &rec.encode());
+    for (i, (name, handle)) in grants.iter().enumerate() {
+        let name_at = NAMES + 32 * i as u64;
+        let record = [
+            (name_at as u32).to_le_bytes(),
+            (name.len() as u32).to_le_bytes(),
+            handle.to_le_bytes(),
+            0u32.to_le_bytes(),
+        ]
+        .concat();
+        segments += &seg(GRANTS + 16 * i as u64, &record);
+        segments += &seg(name_at, name.as_bytes());
+    }
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const {ma}
+  i32.store vma v1
+  vba = i64.const {ba}
+  i32.store vba v2
+  vrp = i64.const {REC}
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vz32 = i32.const 0
+  vneg = i32.lt_s vh vz32
+  br_if vneg 1(vh) 2(v0, vh)
+}}
+block 1 (ve: i32) {{
+  vr = i64.extend_i32_s ve
+  return vr
+}}
+block 2 (vi: i32, vc: i32) {{
+  vr = call.cap 6 1 (i32) -> (i64) vi (vc)
+  return vr
+  }}
+}}
+{segments}"#,
+        ma = REC + 24,
+        ba = REC + 28,
+    )
+}
+
+/// #2219 — the JIT honors an empty grant as the interpreter does: a child whose `exit` nothing grants
+/// is refused, and noted by name, until the parent empties it, by name, by `*` or by a prefix.
+#[test]
+fn an_empty_grant_admits_a_child_on_the_jit_as_on_the_interpreter() {
+    let c = module(CHILD_IMPORTS_EXIT);
+    let empty = temen_interp::GRANT_EMPTY;
+    for (grants, want) in [
+        (vec![], -22),
+        (vec![("exit", empty)], 42),
+        (vec![("*", empty)], 42),
+        (vec![("ex*", empty)], 42),
+    ] {
+        let p = module(&parent_granting(&grants));
+        let (mut ih, h) = host(&c, 1 << 20);
+        let interp = interp_on(&p, &mut ih, h).expect("interp run");
+        assert_eq!(interp, vec![Value::I64(want)], "interpreter oracle, {grants:?}");
+        let (mut jh, h) = host(&c, 1 << 20);
+        let jit = jit_on(&p, &mut jh, h);
+        assert!(
+            matches!(jit, JitOutcome::Returned(ref v) if v == &[want]),
+            "the JIT, {grants:?}: {jit:?}"
+        );
+        let noted = |h: &Host| h.take_notes().iter().any(|n| n.contains("`exit`"));
+        assert_eq!(noted(&ih), want < 0, "the interpreter's note, {grants:?}");
+        assert_eq!(noted(&jh), want < 0, "the JIT's note, {grants:?}");
+    }
+}
