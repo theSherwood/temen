@@ -5669,7 +5669,7 @@ impl<'p> Vcpu<'p> {
             drive_nested(
                 &dom.source,
                 &dom.table,
-                vm,
+                VTask::of(vm, 0),
                 &mut self.fuel,
                 &mut self.mem,
                 &mut cell,
@@ -5677,7 +5677,9 @@ impl<'p> Vcpu<'p> {
                 &mut self.invoke_fibers.cell(),
                 None,
                 None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
+                false,
             )?
+            .done()
         } else {
             // The run-level registry: the run-shared one when attached (#1761), else this vCPU's.
             let mut fibers = match self.shared_fibers {
@@ -5691,7 +5693,7 @@ impl<'p> Vcpu<'p> {
             drive_nested(
                 &dom.source,
                 &dom.table,
-                vm,
+                VTask::of(vm, 0),
                 &mut self.fuel,
                 &mut self.mem,
                 &mut cell,
@@ -5701,7 +5703,9 @@ impl<'p> Vcpu<'p> {
                     park: None,
                 }),
                 None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
+                false,
             )?
+            .done()
         };
         for (i, v) in vals.iter().enumerate() {
             io[i] = val_to_slot(*v);
@@ -6761,7 +6765,7 @@ fn debug_advance_fiber(
     // Stepping *inside* a §22 `Jit.invoke`d unit (single-vCPU step-into): drive it one op over the
     // caller's shared window/table (the §22 counterpart of `active_coro`), so a breakpoint fires inside.
     if vt.active_invoke.is_some() {
-        return step_active_invoke(vt, source, table, fuel, mem, host);
+        return step_active_invoke(vt, fibers, source, table, fuel, mem, host);
     }
     // This engine never freezes: no fiber switch keeps a shadow-SP word.
     let mut cell = fibers.cell();
@@ -8334,12 +8338,10 @@ fn dbg_jit_step_into(
     dst: u32,
     results: Box<[ValType]>,
 ) -> Result<(), Trap> {
-    let cm = source.get(umod).ok_or(Trap::Malformed)?;
-    let mut vm = Vm::new(&cm, 0, args)?;
-    vm.module = umod;
     let parent_depth = vt.active.stack.len() + 1;
     vt.active_invoke = Some(Box::new(InvokeStep {
-        vm,
+        vt: VTask::of(invoke_entry(source, umod, args)?, 0),
+        fibers: FiberTables::default(),
         dst,
         results,
         parent_depth,
@@ -8347,58 +8349,58 @@ fn dbg_jit_step_into(
     Ok(())
 }
 
-/// Advance the **active §22 invoked unit** (`vt.active_invoke`) by exactly one op — the op-by-op,
-/// debugger-facing counterpart of [`run_invoke`]'s loop. The unit runs over the caller's shared
-/// `mem`/`host`/`source`/`table` (a seam-free leaf), so its `call.dyn` reaches installed units and
-/// any spawn/park/yield/re-invoke is an inert `CapFault` — exactly `run_invoke`'s `_ => CapFault`, only
-/// surfaced one op at a time so a breakpoint can fire inside the unit. On the unit's return the caller's
+/// Advance the **active §22 invoked unit** (`vt.active_invoke`) by one op: [`run_invoke`]'s nested
+/// drive, stepped ([`drive_nested`] with `step`), so a breakpoint can fire inside the unit and the
+/// unit runs what the production engine runs (#2192). It runs over the caller's shared
+/// `mem`/`host`/`source`/`table`, its fibers in its own registry, and a `gc.roots` inside it sees the
+/// stepping task beneath it (`fibers` is that task's registry). On the unit's return the caller's
 /// `dst…` slots are filled through the i64-slot ABI and control returns to the caller.
 fn step_active_invoke(
     vt: &mut VTask,
+    fibers: &FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
     fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
-    enum InvStep {
-        Ran,
-        Done(Vec<Value>),
-        Trap(Trap),
-    }
-    let step = {
-        let iv = vt.active_invoke.as_mut().expect("active invoke present");
-        match iv
-            .vm
-            .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
-        {
-            Ok(Outcome::Suspended) => InvStep::Ran, // budget boundary — one op done, keep stepping
-            Ok(Outcome::Done(vals)) => InvStep::Done(vals),
-            // F2 — a punted host call inside an invoked unit keeps the pre-F2 inline wait
-            // (`run_invoke`'s arm; the unit is a seam-free atomic leaf, DESIGN §22).
-            Ok(Outcome::CapPending { id, dst }) => {
-                let r = host.completions().wait(id);
-                iv.vm.set(dst, Reg::from_i64(r));
-                InvStep::Ran
-            }
-            // A seam op (spawn/park/yield/cont.*/re-invoke) inside an invoked unit is an inert CapFault,
-            // matching run_invoke's `_ => CapFault`.
-            Ok(_) => InvStep::Trap(Trap::CapFault),
-            Err(t) => InvStep::Trap(t),
-        }
-    };
-    match step {
-        InvStep::Ran => FiberStep::Stepped,
-        InvStep::Done(vals) => {
-            let iv = vt.active_invoke.take().expect("active invoke present");
-            let slots = vals.into_iter().map(val_to_slot);
-            set_slot_results(&mut vt.active, iv.dst, &iv.results, slots);
+    let iv = vt.active_invoke.take().expect("active invoke present");
+    let InvokeStep {
+        vt: unit,
+        fibers: mut unit_fibers,
+        dst,
+        results,
+        parent_depth,
+    } = *iv;
+    let stepped = drive_nested(
+        source,
+        table,
+        unit,
+        fuel,
+        mem,
+        &mut HostCell::Excl(host),
+        &mut unit_fibers.cell(),
+        None,
+        Some(&Beneath::task(vt, FiberRegRef::Owned(&fibers.fibers))),
+        true,
+    );
+    match stepped {
+        Ok(Nested::Stepped(unit)) => {
+            vt.active_invoke = Some(Box::new(InvokeStep {
+                vt: unit,
+                fibers: unit_fibers,
+                dst,
+                results,
+                parent_depth,
+            }));
             FiberStep::Stepped
         }
-        InvStep::Trap(t) => {
-            vt.active_invoke = None;
-            FiberStep::Trapped(t)
+        Ok(Nested::Done(vals)) => {
+            let slots = vals.into_iter().map(val_to_slot);
+            set_slot_results(&mut vt.active, dst, &results, slots);
+            FiberStep::Stepped
         }
+        Err(t) => FiberStep::Trapped(t),
     }
 }
 
@@ -11500,24 +11502,29 @@ struct VTask {
     root_shadow_sp: u64,
     /// Debug **step-into** of a §22 `Jit.invoke`d unit — `Some` while the debug engine
     /// ([`ScheduledDebugRun`], #1517 slice 3) is stepping inside one, `None` otherwise and always on a
-    /// production task (only [`debug_advance_fiber`] arms it). An invoked unit is seam-free (a
-    /// `cont.*`/`spawn`/re-invoke inside it `CapFault`s), so no scheduler seam can occur mid-invoke;
-    /// a checkpoint mid-invoke is refused on both engines (`checkpointable`), since the unit's
-    /// transient `Vm` + `source.push`ed module are not captured.
+    /// production task (only [`debug_advance_fiber`] arms it). An invoked unit is seam-free (it runs
+    /// its own fibers and nested invokes to their end, and a `spawn` or a park inside it `CapFault`s),
+    /// so no scheduler seam can occur mid-invoke; a checkpoint mid-invoke is refused on both engines
+    /// (`checkpointable`), since the unit's transient state + `source.push`ed module are not captured.
     active_invoke: Option<Box<InvokeStep>>,
 }
 
 /// While a debug engine steps *inside* a §22 `Jit.invoke`d unit, the active continuation
-/// is the invoked unit's [`Vm`], not [`VTask::active`]. Unlike a coroutine child (a confined domain with
+/// is the invoked unit's, not [`VTask::active`]. Unlike a coroutine child (a confined domain with
 /// its own `mem`/`host`/`table`), an invoked unit is a **seam-free leaf over the caller's** window /
-/// powerbox / dispatch table, so only its `Vm` is held here — the reader resolves its frames against the
-/// session `mem`/`source`/`table` (module ≥ 1 for its own funcs, dispatching installed units through the
-/// shared table like the production `run_invoke`). On completion the unit's returns marshal into the
-/// caller's `dst` slots through the i64-slot ABI; `parent_depth` is the caller's call depth at the
-/// invoke, so the stepping predicate sees a *cumulative* depth across the boundary (step-over of the
-/// `invoke` runs the unit to completion), exactly like [`VTask::active_coro`].
+/// powerbox / dispatch table, so only its own vCPU state and fibers are held here — the reader resolves
+/// its frames against the session `mem`/`source`/`table` (module ≥ 1 for its own funcs, dispatching
+/// installed units through the shared table like the production `run_invoke`). On completion the
+/// unit's returns marshal into the caller's `dst` slots through the i64-slot ABI; `parent_depth` is
+/// the caller's call depth at the invoke, so the stepping predicate sees a *cumulative* depth across
+/// the boundary (step-over of the `invoke` runs the unit to completion), exactly like
+/// [`VTask::active_coro`].
 struct InvokeStep {
-    vm: Vm,
+    /// The unit's [`drive_nested`] state between steps: its entry, or a fiber it resumed, and their
+    /// resumers.
+    vt: VTask,
+    /// The unit's own fibers, which die with the invoke, as [`run_invoke`]'s do.
+    fibers: FiberTables,
     dst: u32,
     results: Box<[ValType]>,
     parent_depth: usize,
@@ -11561,7 +11568,7 @@ impl VTask {
     /// breakpoints, stepping, and backtrace — resolve via `source`) or, normally, `active`.
     fn debug_active(&self) -> &Vm {
         match &self.active_invoke {
-            Some(iv) => &iv.vm,
+            Some(iv) => &iv.vt.active,
             None => &self.active,
         }
     }
@@ -11573,7 +11580,7 @@ impl VTask {
     /// active `Vm`'s own frame count when no invoke is being stepped.
     fn debug_depth(&self) -> usize {
         match &self.active_invoke {
-            Some(iv) => iv.parent_depth + iv.vm.stack.len() + 1,
+            Some(iv) => iv.parent_depth + iv.vt.active.stack.len() + 1,
             None => self.active.stack.len() + 1,
         }
     }
@@ -11970,34 +11977,31 @@ fn run_invoke(
     host: &mut HostCell,
     beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
-    let unit = source.get(module).ok_or(Trap::Malformed)?;
-    let mut active = Vm::new(&unit, 0, args)?;
-    active.module = module;
     // The interpreted invoke completes synchronously, so its fiber registry is loop-local; the
     // emitted-invoke bounce path threads the vCPU's persistent registry instead (`bounce_call`).
     drive_nested(
         source,
         table,
-        active,
+        VTask::of(invoke_entry(source, module, args)?, 0),
         fuel,
         mem,
         host,
-        &mut FiberCell::Excl {
-            fibers: &mut Vec::new(),
-            sp: &mut Vec::new(),
-            meta: &mut Vec::new(),
-        },
+        &mut FiberTables::default().cell(),
         None,
         beneath,
+        false,
     )
+    .map(Nested::done)
 }
 
-/// The shared nested-drive loop under [`run_invoke`] (an interpreted `Jit.invoke`) and
-/// [`Vcpu::bounce_call`] (#846 — one cross-tier callback out of an *emitted* unit): drive `active`
-/// to completion over the shared window/powerbox/dispatch-table, servicing fibers against `fibers`.
-/// The registry is caller-owned so the bounce path can persist it across the several bounces of one
-/// emitted invoke (a fiber parked by one callback is resumable by a later one — exactly the
-/// one-registry-per-invoke scope the interpreted loop has by construction).
+/// An invoked unit's entry frame: function 0 of the unit `module`, over `args`.
+fn invoke_entry(source: &ModuleSource, module: usize, args: &[Value]) -> Result<Vm, Trap> {
+    let unit = source.get(module).ok_or(Trap::Malformed)?;
+    let mut vm = Vm::new(&unit, 0, args)?;
+    vm.module = module;
+    Ok(vm)
+}
+
 /// The run-level context a **tier-up region** bounce threads into [`drive_nested`] (`None` for a
 /// `Jit.invoke`, whose registry is invoke-confined): its presence marks the drive's registry as the
 /// run's (#880 — a `cont.new` then keeps the registry's shadow-SP / freeze-metadata tables
@@ -12041,11 +12045,40 @@ impl JitMirror<'_> {
     }
 }
 
+/// What a nested drive ([`drive_nested`]) came back with.
+// Returned once per drive; boxing the state would add a heap allocation to every debugger step.
+#[allow(clippy::large_enum_variant)]
+enum Nested {
+    /// It ran to its end: the entry's results — none when a bounce parked or asked for a process,
+    /// which its park slot then holds.
+    Done(Vec<Value>),
+    /// A stepping drive ran one op: its state, to step again.
+    Stepped(VTask),
+}
+
+impl Nested {
+    /// The results of a drive that was not stepping, which always runs to its end.
+    fn done(self) -> Vec<Value> {
+        match self {
+            Nested::Done(vals) => vals,
+            Nested::Stepped(_) => unreachable!("only a stepping drive stops before its end"),
+        }
+    }
+}
+
+/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`Vcpu::bounce_call`]
+/// (#846 — one cross-tier callback out of an *emitted* unit): run `vt` — the unit's entry or the
+/// callback, and the fibers it resumes — to its end over the shared window, powerbox and dispatch
+/// table, servicing fibers against `fibers`. The registry is caller-owned so the bounce path can
+/// persist it across the several bounces of one emitted invoke (a fiber parked by one callback is
+/// resumable by a later one — exactly the one-registry-per-invoke scope the interpreted loop has by
+/// construction). With `step` it runs one op instead and hands its state back: the debugger's step
+/// into an invoked unit (#2192), which keeps that state in the unit's [`InvokeStep`] between steps.
 #[allow(clippy::too_many_arguments)] // the nested-drive seam: window + registry halves, all borrowed
 fn drive_nested(
     source: &ModuleSource,
     table: &SharedSlots,
-    active: Vm,
+    mut vt: VTask,
     fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
@@ -12060,16 +12093,22 @@ fn drive_nested(
     // #1660 — everything paused beneath this drive, for a `gc.roots` inside it; `None` when that is
     // not fully in view (a bounce out of emitted wasm), which fails the op closed.
     beneath: Option<&Beneath<'_>>,
-) -> Result<Vec<Value>, Trap> {
-    // The drive's vCPU state: `active` is the entry or a fiber it resumed, its resumers in `chain`.
-    // A bounce host is never a durable run (the pump), so no shadow-SP word follows a fiber switch.
-    let mut vt = VTask::of(active, 0);
+    step: bool,
+) -> Result<Nested, Trap> {
+    // `vt.active` is the entry or a fiber it resumed, its resumers in `vt.chain`. A nested drive is
+    // never a durable run's (a bounce host never is), so no shadow-SP word follows a fiber switch.
+    let budget = if step { 1 } else { u64::MAX };
+    let mut ran = false;
     loop {
-        match vt.active.resume(source, table, fuel, mem, host, u64::MAX)? {
+        if step && ran {
+            return Ok(Nested::Stepped(vt));
+        }
+        ran = true;
+        match vt.active.resume(source, table, fuel, mem, host, budget)? {
             Outcome::Done(vals) => {
                 // The entry finished — the bounce's or the invoke's results — or a fiber returned.
                 if let Some(vals) = return_from_fiber(&mut vt, fibers, mem, false, vals) {
-                    return Ok(vals);
+                    return Ok(Nested::Done(vals));
                 }
             }
             Outcome::Suspended => {}
@@ -12093,7 +12132,7 @@ fn drive_nested(
                         .ok_or(Trap::CapFault)?;
                     let state = TaskState::BlockedHostCap { id, dst, at: None };
                     *slot = Some((vt.active, Handoff::Park(state)));
-                    return Ok(Vec::new());
+                    return Ok(Nested::Done(Vec::new()));
                 }
                 let r = comps.wait(id);
                 vt.active.set(dst, Reg::from_i64(r));
@@ -12129,7 +12168,7 @@ fn drive_nested(
                         dst,
                     },
                 ));
-                return Ok(Vec::new());
+                return Ok(Nested::Done(Vec::new()));
             }
             Outcome::ContNew { funcref, sp, dst } => {
                 let h = new_fiber(fibers, source, mem, host, funcref, sp)?;
@@ -12253,7 +12292,7 @@ fn drive_nested(
                     _ => Handoff::Park(TaskState::BlockedStdin),
                 };
                 *slot = Some((vt.active, handoff));
-                return Ok(Vec::new());
+                return Ok(Nested::Done(Vec::new()));
             }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
             // whole `Instantiator` is unavailable inside it — named here rather than left to the
@@ -14595,14 +14634,16 @@ impl CoopSched {
                 let done = drive_nested(
                     &dom.source,
                     ctx.table,
-                    vm,
+                    VTask::of(vm, 0),
                     ctx.fuel,
                     ctx.mem,
                     &mut ctx.host,
                     &mut fcell,
                     Some(meta),
                     None,
-                );
+                    false,
+                )
+                .map(Nested::done);
                 charge_slice(slice_left, ctx.fuel.can_burn());
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
@@ -16600,8 +16641,18 @@ fn coop_bounce(
     vm.module = ts.module as usize;
     // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
     let vals = drive_nested(
-        source, table, vm, fuel, mem, host, fibers, fiber_meta, beneath,
-    )?;
+        source,
+        table,
+        VTask::of(vm, 0),
+        fuel,
+        mem,
+        host,
+        fibers,
+        fiber_meta,
+        beneath,
+        false,
+    )?
+    .done();
     for (i, v) in vals.iter().enumerate() {
         io[i] = val_to_slot(*v);
     }

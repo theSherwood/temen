@@ -417,3 +417,214 @@ fn undo_declines_across_a_compile() {
         "undo to {after}, then on"
     );
 }
+
+// #2192 — the debugger steps into an invoked unit through the engines' own nested drive
+// (`drive_nested`, one op at a time), so a unit runs under the debugger what it runs on the engines.
+// Before, the step-into was a second loop that handled a plain op, the unit's return and a punted cap
+// call, and faulted on everything else.
+
+/// A host holding the `Jit` cap with `units` compiled into it: `(host, jit, code handles)`.
+fn compiled(m: &temen_ir::Module, units: &[&str]) -> (Host, i32, Vec<i32>) {
+    let mut host = Host::new();
+    let jit = grant_jit(&mut host, m, 0);
+    let codes = units
+        .iter()
+        .map(|src| {
+            host.jit_compile(jit, &blob(src))
+                .expect("no trap")
+                .expect("compile ok")
+                .handle
+        })
+        .collect();
+    (host, jit, codes)
+}
+
+/// `guest`'s function 0 on the tree-walker, the cooperative pump and the debugger, each over a host
+/// with `units` compiled and the arguments `args(jit, codes)`.
+fn three_ways(
+    guest: &str,
+    units: &[&str],
+    args: impl Fn(i32, &[i32]) -> Vec<Value>,
+) -> [Result<Vec<Value>, Trap>; 3] {
+    let m = parse_module(guest).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    let (mut host, jit, codes) = compiled(&m, units);
+    let mut fuel = 50_000_000u64;
+    let tree = run_with_host(&m, 0, &args(jit, &codes), &mut fuel, &mut host);
+    let (mut host, jit, codes) = compiled(&m, units);
+    let mut fuel = 50_000_000u64;
+    let pump = temen_interp::bytecode::compile_and_run_with_host(
+        &m,
+        0,
+        &args(jit, &codes),
+        &mut fuel,
+        &mut host,
+    )
+    .expect("the bytecode engine runs the module");
+    let (host, jit, codes) = compiled(&m, units);
+    let mut run = ScheduledDebugRun::new_with_host(&m, 0, &args(jit, &codes), host)
+        .expect("the debugger runs the module");
+    let mut fuel = 50_000_000u64;
+    let debug = sched_to_end(&mut run, &mut fuel);
+    [tree, pump, debug]
+}
+
+/// A unit that invokes a second unit (#1334): the guest invokes unit 1 with `(jit, unit 2)`, and unit
+/// 1 invokes unit 2 with `(6, 7)`, which adds them. The debugger steps over the inner invoke, as a
+/// step over any call: its frames are the inner unit's, run to its end in one step.
+#[test]
+fn a_unit_the_debugger_steps_into_can_invoke_another() {
+    let guest = "memory 16
+func (i32, i32, i32) -> (i64) {
+block 0 (vj: i32, vc1: i32, vc2: i32) {
+  vj64 = i64.extend_i32_u vj
+  vc164 = i64.extend_i32_u vc1
+  vc264 = i64.extend_i32_u vc2
+  vr = call.cap 11 1 (i64, i64, i64) -> (i64) vj (vc164, vj64, vc264)
+  return vr
+  }
+}
+";
+    let outer = "memory 16
+func (i64, i64) -> (i64) {
+block 0 (vj: i64, vc2: i64) {
+  vj32 = i32.wrap_i64 vj
+  v6 = i64.const 6
+  v7 = i64.const 7
+  vr = call.cap 11 1 (i64, i64, i64) -> (i64) vj32 (vc2, v6, v7)
+  return vr
+  }
+}
+";
+    let inner = "memory 16
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vr = i64.add va vb
+  return vr
+  }
+}
+";
+    let ran = three_ways(guest, &[outer, inner], |jit, codes| {
+        vec![Value::I32(jit), Value::I32(codes[0]), Value::I32(codes[1])]
+    });
+    assert_eq!(
+        ran,
+        [
+            Ok(vec![Value::I64(13)]),
+            Ok(vec![Value::I64(13)]),
+            Ok(vec![Value::I64(13)])
+        ]
+    );
+}
+
+/// A unit that hosts a fiber (#845, the unit `invoke_fibers.rs` pins on the engines): it starts a
+/// fiber over program function 1 by its natural-table slot and resumes it twice. The fiber suspends
+/// `5 + 777` and then returns the second resume's `5`, so the unit returns 787.
+#[test]
+fn a_unit_the_debugger_steps_into_can_host_a_fiber() {
+    let guest = "memory 16
+func (i32, i32) -> (i64) {
+block 0 (vj: i32, vc: i32) {
+  vc64 = i64.extend_i32_u vc
+  vx = i64.const 5
+  vr = call.cap 11 1 (i64, i64) -> (i64) vj (vc64, vx)
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vk = i64.const 777
+  vs = i64.add varg vk
+  vv = suspend vs
+  return vv
+  }
+}
+";
+    let unit = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vf = i32.const 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs1, vv1 = cont.resume vk v0
+  vs2, vv2 = cont.resume vk v0
+  vr = i64.add vv1 vv2
+  return vr
+  }
+}
+";
+    let ran = three_ways(guest, &[unit], |jit, codes| {
+        vec![Value::I32(jit), Value::I32(codes[0])]
+    });
+    assert_eq!(
+        ran,
+        [
+            Ok(vec![Value::I64(787)]),
+            Ok(vec![Value::I64(787)]),
+            Ok(vec![Value::I64(787)])
+        ]
+    );
+}
+
+/// A host-completed cap call inside an invoked unit: only the embedder completes it, and nothing can
+/// while the unit runs, so the pump declines it with `CapFault` (#1954). The debugger used to wait on
+/// it forever; it now declines as the pump does. The debug run happens on a thread with a bounded
+/// wait, so a regression fails instead of hanging the suite.
+#[test]
+fn a_host_completed_call_in_a_unit_the_debugger_steps_into_declines() {
+    let guest = "memory 16
+func (i32, i32, i32) -> (i64) {
+block 0 (vj: i32, vc: i32, vh: i32) {
+  vc64 = i64.extend_i32_u vc
+  vh64 = i64.extend_i32_u vh
+  vr = call.cap 11 1 (i64, i64) -> (i64) vj (vc64, vh64)
+  return vr
+  }
+}
+";
+    let unit = "memory 16
+func (i64) -> (i64) {
+block 0 (vh: i64) {
+  vh32 = i32.wrap_i64 vh
+  v7 = i64.const 7
+  vr = call.cap 13 1 (i64) -> (i64) vh32 (v7)
+  return vr
+  }
+}
+";
+    let m = parse_module(guest).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+    // The `Jit` cap and an offloadable host procedure whose op 1 only the embedder completes.
+    let setup = |m: &temen_ir::Module| {
+        let (mut host, jit, codes) = compiled(m, &[unit]);
+        let proc = host.grant_host_proc_offloadable(
+            Box::new(|_, _| temen_interp::OffloadOutcome::Host(Box::new(|_| ()))),
+            temen_interp::CapState::Stateless,
+        );
+        let args = vec![Value::I32(jit), Value::I32(codes[0]), Value::I32(proc)];
+        (host, args)
+    };
+    let (mut host, args) = setup(&m);
+    let mut fuel = 50_000_000u64;
+    let pump =
+        temen_interp::bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
+            .expect("the bytecode engine runs the module");
+    assert_eq!(pump, Err(Trap::CapFault), "the pump declines");
+
+    let (done, debugged) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (host, args) = setup(&m);
+        let mut run =
+            ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("the debugger runs it");
+        let mut fuel = 50_000_000u64;
+        let _ = done.send(sched_to_end(&mut run, &mut fuel));
+    });
+    let debug = debugged
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the debugger answers instead of waiting on a call nothing can complete");
+    assert_eq!(
+        debug,
+        Err(Trap::CapFault),
+        "the debugger declines as the pump does"
+    );
+}
