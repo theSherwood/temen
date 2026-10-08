@@ -138,6 +138,7 @@ pub fn callprof_op_snapshot() -> Vec<((u32, u32, u32), u64)> {
 /// parallel move that permutes/swaps params), must gather into `scratch` then scatter, so a value
 /// isn't clobbered before it is read. Classifying once at compile time keeps the value off the hot
 /// path (the `scratch` `push`+read per copy is only paid where correctness needs it).
+#[derive(Clone)]
 struct Copies {
     pairs: Box<[(u32, u32)]>,
     aliasing: bool,
@@ -167,6 +168,7 @@ pub(crate) enum ChildCtl {
 /// One resolved operation. Operands and results are **frame-window-relative slot indices** (added
 /// to the activation's `base` at run time); branch targets are op indices (`pc`) within the same
 /// function. Edge copies are `(src_slot, dst_slot)` pairs applied on a taken branch.
+#[derive(Clone)]
 enum Op {
     Const {
         dst: u32,
@@ -709,6 +711,7 @@ enum Op {
 /// by a real block/inst count, so masking it off recovers the stored index.
 pub const SRC_TERM: u32 = 1 << 31;
 
+#[derive(Clone)]
 struct Program {
     ops: Vec<Op>,
     nslots: u32,
@@ -1535,6 +1538,7 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
         true,
         m.memory.and_then(|x| x.shadow),
         escape,
+        None,
     )
 }
 
@@ -1824,7 +1828,7 @@ fn admit_confined_child(
             let g = host.resolve_module(mh)?;
             // A module this engine cannot lower is the one place a guest-provided program outruns
             // coverage (no tree-walker fallback mid-run) — a `Malformed` trap, as for `Jit.install`.
-            let c = compile_module(&g.funcs, &g.types, g.shadow).ok_or(Trap::Malformed)?;
+            let c = compile_granted(host, &g.funcs, &g.types, g.shadow).ok_or(Trap::Malformed)?;
             let granted = (
                 g.memory_log2,
                 g.data.clone(),
@@ -2093,9 +2097,9 @@ fn admit_detached_child(
         s.module == super::SELF_MODULE || (unit.is_none() && host.is_self_module(s.module));
     let program = match spawner {
         Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
-        _ => {
-            ChildProgram::Granted(compile_module(&cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?)
-        }
+        _ => ChildProgram::Granted(
+            compile_granted(host, &cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?,
+        ),
     };
     let sig = match &program {
         ChildProgram::Spawner(_, p) => p.sigs.get(s.entry as usize),
@@ -2219,12 +2223,37 @@ fn admit_detached_in_process(
     Ok(Some(child))
 }
 
+/// Compile a module `host` granted, for a child: through the host's memo when its embedder handed it
+/// one ([`Host::set_compile_memo`]), else afresh. The same program either way.
+fn compile_granted(
+    host: &Host,
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    shadow: Option<super::ShadowArena>,
+) -> Option<Compiled> {
+    match host.compile_memo() {
+        Some(memo) => compile_module_memo(funcs, types, shadow, &mut memo.lock_unpoisoned()),
+        None => compile_module(funcs, types, shadow),
+    }
+}
+
 pub fn compile_module(
     funcs: &[Func],
     types: &[temen_ir::TypeEntry],
     shadow: Option<super::ShadowArena>,
 ) -> Option<Compiled> {
-    compile_module_with(funcs, types, true, shadow, false)
+    compile_module_with(funcs, types, true, shadow, false, None)
+}
+
+/// [`compile_module`] through `memo` (#2168): a function compiled for the same position before is
+/// reused when nothing it read has changed ([`FuncMemo`]). The same program [`compile_module`] gives.
+pub fn compile_module_memo(
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    shadow: Option<super::ShadowArena>,
+    memo: &mut FuncMemo,
+) -> Option<Compiled> {
+    compile_module_with(funcs, types, true, shadow, false, Some(memo))
 }
 
 /// Unfused lowering — one op per source instruction, so the step/location trace stays
@@ -2236,7 +2265,7 @@ pub fn compile_module_unfused(
     types: &[temen_ir::TypeEntry],
     shadow: Option<super::ShadowArena>,
 ) -> Option<Compiled> {
-    compile_module_with(funcs, types, false, shadow, false)
+    compile_module_with(funcs, types, false, shadow, false, None)
 }
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset. `serves_children`:
@@ -2248,6 +2277,7 @@ fn compile_module_with(
     fuse: bool,
     shadow: Option<super::ShadowArena>,
     serves_children: bool,
+    mut memo: Option<&mut FuncMemo>,
 ) -> Option<Compiled> {
     // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
     // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
@@ -2290,9 +2320,17 @@ fn compile_module_with(
     }
 
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
+    let view = ModuleView {
+        arities: &arities,
+        types,
+        sigs: core::cell::RefCell::new(Vec::new()),
+    };
     let mut progs = Vec::with_capacity(funcs.len());
-    for f in funcs {
-        progs.push(compile_func(f, &arities, types, fuse)?);
+    for (i, f) in funcs.iter().enumerate() {
+        progs.push(match memo.as_deref_mut() {
+            Some(memo) => memo.compile(i, f, &view, fuse)?,
+            None => compile_func(f, &view, fuse)?,
+        });
     }
     let table_mask = funcs.len().next_power_of_two().max(1) - 1;
     Some(Compiled {
@@ -2307,12 +2345,113 @@ fn compile_module_with(
     })
 }
 
-fn compile_func(
-    f: &Func,
-    arities: &[usize],
-    types: &[temen_ir::TypeEntry],
+/// The module a function compiles against — its functions' result arities and its type section — as
+/// [`compile_func`] reads it: an instruction's result count ([`ModuleView::results`]) and a call
+/// signature by type index ([`ModuleView::sig`]), which is all a compile reads beside the function.
+/// The signatures read are logged (`sigs`), so a [`FuncMemo`] knows what to check before reusing it.
+struct ModuleView<'a> {
+    arities: &'a [usize],
+    types: &'a [temen_ir::TypeEntry],
+    sigs: core::cell::RefCell<Vec<u32>>,
+}
+
+impl<'a> ModuleView<'a> {
+    fn results(&self, inst: &Inst) -> usize {
+        inst.result_count(self.arities, self.types)
+    }
+
+    fn sig(&self, t: u32) -> &'a temen_ir::FuncType {
+        self.sigs.borrow_mut().push(t);
+        super::call_sig(self.types, t)
+    }
+}
+
+/// #2168 — compiled functions kept across compiles of modules that hold the same functions at the
+/// same positions: a program linked against the same resident libraries holds their functions at
+/// the same indices, run after run. [`compile_module_memo`] reuses what it compiled for position `i`
+/// when the function there is identical and everything its compile read of the module — each
+/// instruction's result count, and the call signatures it looked up — reads the same. Those are all
+/// a compile reads ([`ModuleView`]), so the reused program is the one a fresh compile would give.
+/// Anything else compiles afresh and takes the position over.
+#[derive(Default)]
+pub struct FuncMemo {
+    entries: Vec<Option<MemoEntry>>,
+    reused: usize,
+}
+
+struct MemoEntry {
+    func: Func,
     fuse: bool,
-) -> Option<Program> {
+    /// Each instruction's result count, in block order.
+    counts: Vec<usize>,
+    /// Each call signature the compile read, by type index.
+    sigs: Vec<(u32, temen_ir::FuncType)>,
+    prog: Program,
+}
+
+impl FuncMemo {
+    /// How many function compiles it has saved so far.
+    pub fn reused(&self) -> usize {
+        self.reused
+    }
+
+    /// The program for `f` at position `i`: the kept one when nothing it read has changed, else a
+    /// fresh compile, which is kept for next time.
+    fn compile(
+        &mut self,
+        i: usize,
+        f: &Func,
+        view: &ModuleView<'_>,
+        fuse: bool,
+    ) -> Option<Program> {
+        if let Some(e) = self.entries.get(i).and_then(Option::as_ref) {
+            let same_counts = || {
+                let mut counts = e.counts.iter();
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .all(|inst| counts.next() == Some(&view.results(inst)))
+            };
+            if e.fuse == fuse
+                && e.func == *f
+                && same_counts()
+                && e.sigs
+                    .iter()
+                    .all(|(t, sig)| super::call_sig(view.types, *t) == sig)
+            {
+                self.reused += 1;
+                return Some(e.prog.clone());
+            }
+        }
+        view.sigs.borrow_mut().clear();
+        let prog = compile_func(f, view, fuse)?;
+        let mut read = view.sigs.take();
+        read.sort_unstable();
+        read.dedup();
+        let entry = MemoEntry {
+            func: f.clone(),
+            fuse,
+            counts: f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .map(|inst| view.results(inst))
+                .collect(),
+            sigs: read
+                .into_iter()
+                .map(|t| (t, super::call_sig(view.types, t).clone()))
+                .collect(),
+            prog: prog.clone(),
+        };
+        if self.entries.len() <= i {
+            self.entries.resize_with(i + 1, || None);
+        }
+        self.entries[i] = Some(entry);
+        Some(prog)
+    }
+}
+
+fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> {
     // Global slot per value: each block's params then its value-producing insts, in order.
     let mut base = Vec::with_capacity(f.blocks.len());
     let mut nslots = 0u32;
@@ -2320,7 +2459,7 @@ fn compile_func(
         base.push(nslots);
         nslots += b.params.len() as u32;
         for inst in &b.insts {
-            nslots += inst.result_count(arities, types) as u32;
+            nslots += view.results(inst) as u32;
         }
     }
     let mut block_pc = vec![0u32; f.blocks.len()];
@@ -2339,8 +2478,8 @@ fn compile_func(
         let mut local = b.params.len() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = base[bi] + local;
-            local += inst.result_count(arities, types) as u32;
-            ops.push(compile_inst(inst, dst, base[bi], types, &g)?);
+            local += view.results(inst) as u32;
+            ops.push(compile_inst(inst, dst, base[bi], view, &g)?);
             src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
@@ -2447,8 +2586,8 @@ fn compile_func(
             Terminator::ReturnCallIndirect { ty, idx, args } => ops.push(Op::TailCallIndirect {
                 idx: g(*idx),
                 args: args.iter().map(|a| g(*a)).collect(),
-                want_params: super::call_sig(types, *ty).params.clone().into(),
-                want_results: super::call_sig(types, *ty).results.clone().into(),
+                want_params: view.sig(*ty).params.clone().into(),
+                want_results: view.sig(*ty).results.clone().into(),
             }),
         }
         // Exactly one terminator op was pushed above (fused `BrIfCmp` or a plain terminator); pair it
@@ -2498,7 +2637,7 @@ fn compile_inst(
     inst: &Inst,
     dst: u32,
     block_base: u32,
-    types: &[temen_ir::TypeEntry],
+    view: &ModuleView<'_>,
     g: &impl Fn(u32) -> u32,
 ) -> Option<Op> {
     Some(match inst {
@@ -2692,8 +2831,8 @@ fn compile_inst(
             idx: g(*idx),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            want_params: super::call_sig(types, *ty).params.clone().into(),
-            want_results: super::call_sig(types, *ty).results.clone().into(),
+            want_params: view.sig(*ty).params.clone().into(),
+            want_results: view.sig(*ty).results.clone().into(),
         },
         // Synchronous capability call: the generic powerbox path (guest suspended, host computes,
         // same activation continues) is driven here via `host.cap_dispatch_slots`. The
@@ -2817,14 +2956,15 @@ fn compile_inst(
                     args: args[1..].iter().map(|a| g(*a)).collect(),
                     dst,
                     // The call.cap sig is `(i64 code, params…) -> (results…)`; the unit entry's
-                    // params are super::call_sig(types, *sig).params without the leading code-handle.
-                    params: super::call_sig(types, *sig)
+                    // params are view.sig(*sig).params without the leading code-handle.
+                    params: view
+                        .sig(*sig)
                         .params
                         .get(1..)
                         .unwrap_or(&[])
                         .to_vec()
                         .into(),
-                    results: super::call_sig(types, *sig).results.clone().into(),
+                    results: view.sig(*sig).results.clone().into(),
                 },
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
@@ -2839,7 +2979,7 @@ fn compile_inst(
                 // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
                 // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
                 (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10))
-                    if super::call_sig(types, *sig).results.len() == 1 && args.is_empty() =>
+                    if view.sig(*sig).results.len() == 1 && args.is_empty() =>
                 {
                     Op::SvcPoll {
                         dst,
@@ -2853,12 +2993,12 @@ fn compile_inst(
                 (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    has_result: !super::call_sig(types, *sig).results.is_empty(),
+                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
                     pid: args.first().map(|a| g(*a)),
                     dst,
-                    has_result: !super::call_sig(types, *sig).results.is_empty(),
+                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
                 // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
@@ -2888,10 +3028,10 @@ fn compile_inst(
                     type_id: *type_id,
                     op: *op,
                     handle: g(*handle),
-                    params: super::call_sig(types, *sig).params.clone().into(),
+                    params: view.sig(*sig).params.clone().into(),
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    results: super::call_sig(types, *sig).results.clone().into(),
+                    results: view.sig(*sig).results.clone().into(),
                 },
             }
         }
@@ -2994,10 +3134,10 @@ fn compile_inst(
             // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
             op: *import | (*op << 16),
             handle: u32::MAX, // no operand (v8); the exec passes 0, the dispatch ignores it
-            params: super::call_sig(types, *sig).params.clone().into(),
+            params: view.sig(*sig).params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            results: super::call_sig(types, *sig).results.clone().into(),
+            results: view.sig(*sig).results.clone().into(),
         },
         // §7/§22 symbolic call: when bound at instantiation it is a flat import dispatch
         // (op 0); the legacy handle operand is a live register the dispatch ignores.
@@ -3007,10 +3147,10 @@ fn compile_inst(
             type_id: temen_ir::CAP_IMPORT_TYPE_ID,
             op: *import,
             handle: u32::MAX,
-            params: super::call_sig(types, *sig).params.clone().into(),
+            params: view.sig(*sig).params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            results: super::call_sig(types, *sig).results.clone().into(),
+            results: view.sig(*sig).results.clone().into(),
         },
         // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
         // `(type_idx | op << 16)`; the handle register is live.
@@ -3024,10 +3164,10 @@ fn compile_inst(
             type_id: temen_ir::CAP_DYN_TYPE_ID,
             op: *ty | (*op << 16),
             handle: g(*handle),
-            params: super::call_sig(types, *sig).params.clone().into(),
+            params: view.sig(*sig).params.clone().into(),
             args: args.iter().map(|a| g(*a)).collect(),
             dst,
-            results: super::call_sig(types, *sig).results.clone().into(),
+            results: view.sig(*sig).results.clone().into(),
         },
         // §3.5 self-namespace extensions (see `Op::CapSelfExt`).
         Inst::ExportHandle { export } => Op::CapSelfExt {
@@ -20904,5 +21044,98 @@ impl Vm {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod func_memo_tests {
+    use super::*;
+    use temen_ir::{Block, FuncType, Terminator, TypeEntry, ValType};
+
+    fn func(results: Vec<ValType>, insts: Vec<Inst>, term: Terminator) -> Func {
+        Func {
+            params: Vec::new(),
+            results,
+            blocks: vec![Block {
+                params: Vec::new(),
+                insts,
+                term,
+            }],
+        }
+    }
+
+    /// `n` constants, returned.
+    fn consts(n: u32) -> Func {
+        func(
+            vec![ValType::I32; n as usize],
+            (0..n).map(|_| Inst::ConstI32(7)).collect(),
+            Terminator::Return((0..n).collect()),
+        )
+    }
+
+    /// Function 0 calls function 1 and drops what it returns, so it is the same function whatever
+    /// function 1 returns — but its compile gives each result a slot, so a memo reusing it across a
+    /// change there would run it with the wrong frame.
+    #[test]
+    fn a_memo_reuses_a_function_only_while_the_callees_it_reads_are_the_same() {
+        let caller = func(
+            Vec::new(),
+            vec![Inst::Call {
+                func: 1,
+                args: Vec::new(),
+            }],
+            Terminator::Return(Vec::new()),
+        );
+        let one = [caller.clone(), consts(1)];
+        let two = [caller, consts(2)];
+        let mut memo = FuncMemo::default();
+        compile_module_memo(&one, &[], None, &mut memo).unwrap();
+        let again = compile_module_memo(&one, &[], None, &mut memo).unwrap();
+        assert_eq!(
+            memo.reused(),
+            2,
+            "the same module again reuses both functions"
+        );
+        assert_eq!(again.progs[0].nslots, 1);
+        let changed = compile_module_memo(&two, &[], None, &mut memo).unwrap();
+        assert_eq!(
+            memo.reused(),
+            2,
+            "neither function is reused across the change"
+        );
+        let fresh = compile_module(&two, &[], None).unwrap();
+        assert_eq!(changed.progs[0].nslots, fresh.progs[0].nslots);
+        assert_eq!(changed.progs[0].nslots, 2);
+    }
+
+    /// A `call.dyn` whose signature's parameters change keeps its result count, so only the logged
+    /// signature read can tell the two compiles apart.
+    #[test]
+    fn a_memo_reuses_a_function_only_while_the_signatures_it_reads_are_the_same() {
+        let call = func(
+            vec![ValType::I32],
+            vec![
+                Inst::ConstI32(0),
+                Inst::CallIndirect {
+                    ty: 0,
+                    idx: 0,
+                    args: Vec::new(),
+                },
+            ],
+            Terminator::Return(vec![1]),
+        );
+        let sig = |params: Vec<ValType>| {
+            vec![TypeEntry::Func(FuncType {
+                params,
+                results: vec![ValType::I32],
+            })]
+        };
+        let funcs = [call];
+        let mut memo = FuncMemo::default();
+        compile_module_memo(&funcs, &sig(Vec::new()), None, &mut memo).unwrap();
+        compile_module_memo(&funcs, &sig(Vec::new()), None, &mut memo).unwrap();
+        assert_eq!(memo.reused(), 1);
+        compile_module_memo(&funcs, &sig(vec![ValType::I64]), None, &mut memo).unwrap();
+        assert_eq!(memo.reused(), 1, "a changed signature is compiled afresh");
     }
 }

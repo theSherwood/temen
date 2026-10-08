@@ -22957,6 +22957,10 @@ pub struct Host {
     /// `self.covers`, and `export.handle` resolve through one host-side entry on all three
     /// backends. `None` until registered (the ops then fail closed, probeable).
     self_module: Option<Arc<Module>>,
+    /// #2168 — the embedder's bytecode compile memo ([`Host::set_compile_memo`]): a module this host
+    /// grants a child is compiled through it, so functions a previous run compiled at the same
+    /// positions are reused. `None` compiles every child afresh.
+    compile_memo: Option<Arc<std::sync::Mutex<bytecode::FuncMemo>>>,
     /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, built at the
     /// first resolve and reset by [`Host::set_self_module_opt`], its one writer. Lazily, because
     /// every fork, spawn and exec sets the self module, and a grant copies the module's code and
@@ -23848,6 +23852,7 @@ impl Host {
             import_remaps: Vec::new(),
             import_reqs: Vec::new(),
             self_module: None,
+            compile_memo: None,
             self_grant: std::sync::OnceLock::new(),
             self_instance: None,
             self_reified: BTreeMap::new(),
@@ -27823,6 +27828,19 @@ impl Host {
             policy,
         });
         Some(self.grant(type_id, Binding::Offer(idx)))
+    }
+
+    /// #2168 — hand this host a bytecode compile memo ([`bytecode::FuncMemo`]): a module it grants a
+    /// child is compiled through it, reusing what an earlier compile at the same positions produced.
+    /// An embedder that runs program after program linked against the same libraries keeps one memo
+    /// across those runs.
+    pub fn set_compile_memo(&mut self, memo: Arc<std::sync::Mutex<bytecode::FuncMemo>>) {
+        self.compile_memo = Some(memo);
+    }
+
+    /// The memo [`Host::set_compile_memo`] handed this host, if any.
+    pub(crate) fn compile_memo(&self) -> Option<&Arc<std::sync::Mutex<bytecode::FuncMemo>>> {
+        self.compile_memo.as_ref()
     }
 
     /// §3.5: register the running module's self-referential surface (type-section interfaces,
