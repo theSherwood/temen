@@ -450,14 +450,16 @@ enum Op {
         ctl: ChildCtl,
     },
     /// §3.6 (I36 slice 2) — `Instantiator.child_offer` (op 14): mint a live-callee offer over a
-    /// running child's impl-export into the wirer's table. The authority check (the Instantiator
-    /// handle) runs in the op exec; the mint itself needs the child's env/host, so it surfaces to
-    /// the driver ([`Outcome::ChildOffer`]).
+    /// running child's impl-export `arg` into the wirer's table; with `grant`, #2220's
+    /// `Instantiator.grant` (op 19): grant capability `arg` into the child's powerbox. The authority
+    /// check (the Instantiator handle) runs in the op exec; the rest needs the child's env/host, so
+    /// it surfaces to the driver ([`Outcome::ChildOffer`]).
     ChildOffer {
         handle: u32,
         child: u32,
-        export: u32,
+        arg: u32,
         dst: u32,
+        grant: bool,
     },
     // §7/§6 capability reflection `self.count`/`get`/`resolve`/`label`/`attest` are no longer
     // dedicated bytecode ops — they arrive as `call.cap CAP_SELF op 0/1/2/3/4` and compile to the
@@ -1405,15 +1407,16 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
                 match inst {
                     // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
                     // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec,
-                    // op 18 = wait, ops 9/10/12 = poll/detach/kill (all executor children,
-                    // scheduler-driven — the grant-carrying spawns re-grant caps but spawn the same
-                    // kind of confined task); every other INSTANTIATOR op is a deleted one (#2069). Classifying the named spawns as `has_instantiate` (not `has_coro`) is
+                    // op 18 = wait, ops 9/10/12 = poll/detach/kill, ops 14/19 = child_offer/grant
+                    // (all executor children, scheduler-driven — the grant-carrying spawns re-grant
+                    // caps but spawn the same kind of confined task); every other INSTANTIATOR op is
+                    // a deleted one (#2069). Classifying the named spawns as `has_instantiate` (not `has_coro`) is
                     // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
                     // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18,
+                        op: 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18 | 19,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -2916,9 +2919,6 @@ fn compile_inst(
                     rec: g(args[0]),
                     dst,
                 },
-                // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
-                // child's export. The mint needs the child's live env, so the op surfaces to the
-                // driver; the compile only marshals `(child, export)`.
                 (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if !args.is_empty() => Op::ChildCtl {
                     handle: g(*handle),
                     child: g(args[0]),
@@ -2929,11 +2929,16 @@ fn compile_inst(
                         _ => ChildCtl::Kill,
                     },
                 },
-                (cap_id::INSTANTIATOR, 14) if args.len() >= 2 => Op::ChildOffer {
+                // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
+                // child's export; #2220 — grant (op 19): grant a capability into it. Both need the
+                // child's live env, so the op surfaces to the driver; the compile only marshals
+                // `(child, arg)`.
+                (cap_id::INSTANTIATOR, op @ (14 | 19)) if args.len() >= 2 => Op::ChildOffer {
                     handle: g(*handle),
                     child: g(args[0]),
-                    export: g(args[1]),
+                    arg: g(args[1]),
                     dst,
+                    grant: op == 19,
                 },
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
@@ -5107,7 +5112,9 @@ impl<'p> Vcpu<'p> {
                 // cooperative scheduler keeps; this driver has none. "Unavailable" is the `-EINVAL`
                 // the oracle gives a child it has nothing to offer over, as on the parallel driver
                 // and the Cranelift nursery: a value, not a trap (INVARIANTS #5, #9).
-                Ok(VcpuStop::ChildOffer { dst, .. }) => {
+                Ok(VcpuStop::ChildOffer {
+                    grant: false, dst, ..
+                }) => {
                     self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
                 }
                 // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and its
@@ -5155,10 +5162,14 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::BlockOnFiber { .. })
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
                 | Ok(VcpuStop::Preempted)
-                // `poll`/`detach`/`kill` need the child's run, which this vCPU's host owns and has no
-                // surface to answer yet (#2083): fail closed when one runs, like `Exec`. Compiling
-                // still admits a module that merely contains one (every JACL program links a kill).
-                | Ok(VcpuStop::ChildCtl { .. }) => return VcpuEvent::Trapped(Trap::ThreadFault),
+                // `poll`/`detach`/`kill` need the child's run, and `grant` (#2220) its powerbox, which
+                // this vCPU's host owns and has no surface to answer yet (#2083): fail closed when one
+                // runs, like `Exec`. Compiling still admits a module that merely contains one (every
+                // JACL program links a kill).
+                | Ok(VcpuStop::ChildCtl { .. })
+                | Ok(VcpuStop::ChildOffer { grant: true, .. }) => {
+                    return VcpuEvent::Trapped(Trap::ThreadFault)
+                }
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
                     let froze = durable
@@ -8175,6 +8186,18 @@ fn service_advance(
                 let spawners: Vec<_> = extra_envs.iter().map(DbgEnv::spawner).collect();
                 child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
+            Outcome::ChildOffer {
+                grant: true,
+                child,
+                arg,
+                dst,
+            } => {
+                *turn += 1;
+                match dbg_grant(tasks, ti, extra_envs, host, child, arg as i32) {
+                    Ok(h) => tasks[ti].deliver(dst, Reg::from_i32(h as i32)),
+                    Err(t) => complete(tasks, ti, Err(t)),
+                }
+            }
             Outcome::MemoryWait {
                 base,
                 expected,
@@ -8278,7 +8301,7 @@ fn service_advance(
             Outcome::CapPending { .. }
             | Outcome::LiveCall { .. }
             | Outcome::SvcWait
-            | Outcome::ChildOffer { .. }
+            | Outcome::ChildOffer { grant: false, .. }
             | Outcome::CloneCaller { .. } => return Serviced::Declined,
 
             // Process / POSIX seams: fork, exec, reap and pipes are the personality's, driven by the
@@ -8484,6 +8507,31 @@ fn dbg_instantiate_detached(
         dst,
         place,
     )
+}
+
+/// #2220 — `Instantiator.grant` (op 19) from task `ti` into the child handle `child` names
+/// ([`grant_target`]), on the debug scheduler: both powerboxes are plain hosts this single-threaded
+/// driver owns, the spawner's `host` (the root's) or its env's, and the child's env's. They sit in
+/// no cell, so a live self-serve grant is refused, as at this driver's spawn.
+fn dbg_grant(
+    tasks: &[TaskSlot],
+    ti: usize,
+    envs: &mut [DbgEnv],
+    host: &mut Host,
+    child: i32,
+    handle: i32,
+) -> Result<i64, Trap> {
+    match (tasks[ti].env, grant_target(tasks, ti, child)) {
+        (None, k) => host.grant_running_child(None, handle, k.map(|k| &mut envs[k].host)),
+        (Some(p), Some(k)) => match envs.get_disjoint_mut([p, k]) {
+            Ok([pe, ke]) => pe
+                .host
+                .grant_running_child(None, handle, Some(&mut ke.host)),
+            // Unreachable: `grant_target` names an env other than the spawner's own.
+            Err(_) => envs[p].host.grant_running_child(None, handle, None),
+        },
+        (Some(p), None) => envs[p].host.grant_running_child(None, handle, None),
+    }
 }
 
 /// §22 `Jit.invoke` (op 1) **as a step-into** (both debug engines): arm [`VTask::active_invoke`] over
@@ -10825,12 +10873,14 @@ enum Outcome {
         dst: u32,
         ctl: ChildCtl,
     },
-    /// §3.6 (I36 slice 2) — `child_offer`: mint a live offer over child `child`'s export
-    /// `export` (driver-side — it owns the child envs); the handle (or `-EINVAL`) lands at `dst`.
+    /// §3.6 (I36 slice 2) — `child_offer`: mint a live offer over child `child`'s export `arg`; with
+    /// `grant` (#2220), grant capability `arg` into it (driver-side — it owns the child envs). The
+    /// handle (or an errno) lands at `dst`.
     ChildOffer {
         child: i32,
-        export: u32,
+        arg: i64,
         dst: u32,
+        grant: bool,
     },
     /// FORK.md §9.2 — `clone_caller`: fork the caller parked on the running handler's dispatch into a
     /// twin. Driver-side (it owns the task/env set + the parked caller). `reply_orig` = `Some` in the
@@ -12533,11 +12583,13 @@ enum VcpuStop {
         dst: u32,
         ctl: ChildCtl,
     },
-    /// §3.6 (I36 slice 2): mint a live offer over child `child`'s export ([`Outcome::ChildOffer`]).
+    /// §3.6 (I36 slice 2): mint a live offer over child `child`'s export, or (#2220) grant into it
+    /// ([`Outcome::ChildOffer`]).
     ChildOffer {
         child: i32,
-        export: u32,
+        arg: i64,
         dst: u32,
+        grant: bool,
     },
     /// FORK.md §9.2 — `clone_caller`: fork the caller parked on this handler's dispatch into a twin
     /// ([`Outcome::CloneCaller`]). The driver reads the running handler's `serve_ticket` to name it.
@@ -12877,8 +12929,18 @@ fn step_vcpu(
             Outcome::ChildCtl { child, dst, ctl } => {
                 return Ok(VcpuStop::ChildCtl { child, dst, ctl })
             }
-            Outcome::ChildOffer { child, export, dst } => {
-                return Ok(VcpuStop::ChildOffer { child, export, dst })
+            Outcome::ChildOffer {
+                child,
+                arg,
+                dst,
+                grant,
+            } => {
+                return Ok(VcpuStop::ChildOffer {
+                    child,
+                    arg,
+                    dst,
+                    grant,
+                })
             }
             Outcome::CloneCaller {
                 reply_orig,
@@ -15175,13 +15237,34 @@ impl SchedCore {
                     }
                 }
             }
-            Ok(VcpuStop::ChildOffer { child, export, dst }) => {
+            // #2220 — grant into a running child: the spawner's cell and the child's, locked
+            // together for the grant once the step has let go of the spawner's.
+            Ok(VcpuStop::ChildOffer {
+                grant: true,
+                child,
+                arg,
+                dst,
+            }) => {
+                let callee = grant_target(tasks, ti, child).map(|k| &extra_envs[k].host);
+                let parent = task_host(root, extra_envs, tasks[ti].env);
+                match super::grant_into_running(parent, callee, arg as i32) {
+                    Ok(h) => tasks[ti].deliver(dst, Reg::from_i32(h as i32)),
+                    Err(t) => complete(tasks, ti, Err(t)),
+                }
+            }
+            Ok(VcpuStop::ChildOffer {
+                grant: false,
+                child,
+                arg,
+                dst,
+            }) => {
                 // Mint a live-callee offer over a running child's export: shape from the
                 // CALLEE's module (fetched before the wirer's lock — the tree-walker's lock
                 // order), interned structurally into the wirer's table. A bad child handle /
                 // no such export is a probeable -EINVAL, matching the oracle — and so is a
                 // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
                 // offer into itself, so a step never locks its own cell twice.
+                let export = arg as u32;
                 let callee = usize::try_from(child)
                     .ok()
                     .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
@@ -17233,12 +17316,18 @@ struct ParDomain {
     fibers: SharedFibers,
     dead: std::sync::Mutex<Option<Trap>>,
     /// #2074 — the §14 children this domain's vCPUs spawned, by their id in its registry: the domain
-    /// each runs in and the registry its own vCPUs join through. A kill reaches them through it.
+    /// each runs in, the registry its own vCPUs join through and its powerbox. A kill reaches them
+    /// through it, and so does a grant (#2220).
     kids: std::sync::Mutex<std::collections::BTreeMap<u64, ParChild>>,
 }
 
-/// A §14 child of a [`ParDomain`]: its own domain, and the registry its vCPUs join through.
-type ParChild = (std::sync::Arc<ParDomain>, std::sync::Arc<ThreadRegistry>);
+/// A §14 child of a [`ParDomain`]: its own domain, the registry its vCPUs join through, and its
+/// powerbox, which its OS thread runs over.
+type ParChild = (
+    std::sync::Arc<ParDomain>,
+    std::sync::Arc<ThreadRegistry>,
+    DomainCell,
+);
 
 impl ParDomain {
     /// This domain's trap, once a member has died.
@@ -17271,7 +17360,7 @@ impl ParDomain {
     fn kill_tree(&self, reg: &ThreadRegistry) {
         self.kill(&Trap::ThreadFault, reg);
         let kids: Vec<ParChild> = self.kids.lock_unpoisoned().values().cloned().collect();
-        for (d, r) in kids {
+        for (d, r, _) in kids {
             d.kill_tree(&r);
         }
     }
@@ -17686,10 +17775,9 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // reachable here: the qualification veto that keeps a serving module off this driver
             // covers the svc ops, and `child_offer` is an `Instantiator` op, so a single-vCPU guest
             // that never spawns a thread reaches it with nothing refusing first. The capability
-            // itself is genuinely unavailable — minting a live offer needs the CALLEE's powerbox,
-            // and this driver moves each child's `Host` into that child's own OS thread, publishing
-            // only its result through `reg`, so the parent has no path to it (the same reason the
-            // browser's per-Worker driver fails closed on a stashed powerbox).
+            // itself is genuinely unavailable — a live offer is served through the cooperative
+            // driver's call transport, so a call through one fails closed here (`LiveCall`, below),
+            // though this driver keeps each child's powerbox, for a grant (#2220).
             //
             // But "unavailable" is a value, not a trap. The cooperative driver answers `-EINVAL`
             // for a child it cannot resolve, so this answers the same: one op, one answer, whichever
@@ -17697,8 +17785,28 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // killed for the driver it happened to land on (#5 — errors are values, traps are for
             // forgery). It used to be grouped into the fail-closed trap below on the premise that it
             // could not arrive.
-            Ok(VcpuStop::ChildOffer { dst, .. }) => {
+            Ok(VcpuStop::ChildOffer {
+                grant: false, dst, ..
+            }) => {
                 vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            }
+            // #2220 — grant into a running child, through the powerbox the spawner's domain keeps
+            // for it. A `thread.spawn` handle names no child domain. The child's thread marks it
+            // ended before it publishes, so a child a `wait` or `poll` saw end is refused.
+            Ok(VcpuStop::ChildOffer {
+                grant: true,
+                child,
+                arg,
+                dst,
+            }) => {
+                let callee = super::resolve_thread(&threads, child)
+                    .ok()
+                    .and_then(|slot| threads[slot])
+                    .and_then(|id| domain.kids.lock_unpoisoned().get(&id).map(|k| k.2.clone()));
+                match super::grant_into_running(&host, callee.as_ref(), arg as i32) {
+                    Ok(h) => vt.active.set(dst, Reg::from_i32(h as i32)),
+                    Err(t) => return (Err(t), mem),
+                }
             }
             // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and this
             // vCPU's resumer runs on (the driver cannot idle a blocking resume: the `FIBER_PARKED`
@@ -17834,7 +17942,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     // A `thread.spawn` handle names no child domain: nothing to kill.
                     ChildCtl::Kill => {
                         let kid = domain.kids.lock_unpoisoned().get(&id).cloned();
-                        if let Some((d, r)) = kid {
+                        if let Some((d, r, _)) = kid {
                             d.kill_tree(&r);
                         }
                         0
@@ -18353,11 +18461,13 @@ fn par_start_child<'scope, 'env>(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let child_reg = reg.child();
     let child_par = std::sync::Arc::new(ParDomain::default());
+    let child_host = std::sync::Arc::new(std::sync::Mutex::new(host));
     parent_domain.kids.lock_unpoisoned().insert(
         id,
         (
             std::sync::Arc::clone(&child_par),
             std::sync::Arc::clone(&child_reg),
+            std::sync::Arc::clone(&child_host),
         ),
     );
     // A kill that reached the spawner while this child was being filed missed it: it dies too.
@@ -18365,7 +18475,6 @@ fn par_start_child<'scope, 'env>(
         child_par.kill_tree(&child_reg);
     }
     scope.spawn(move || {
-        let child_host = std::sync::Arc::new(std::sync::Mutex::new(host));
         let (r, _m) = std::thread::scope(|cscope| {
             run_vcpu_parallel(
                 cscope,
@@ -18464,6 +18573,19 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bo
             }
         }
     }
+}
+
+/// #2220 — the env of the child that handle `child` names, for an `Instantiator.grant` (op 19) from
+/// task `ti`: `None` for a bad or spent handle, a `thread.spawn` handle (it shares this task's env),
+/// or a child whose root task is done, which has ended — what `poll` reports — though its env is
+/// released only once its threads are done too.
+fn grant_target(tasks: &[TaskSlot], ti: usize, child: i32) -> Option<usize> {
+    let slot = super::resolve_thread(&tasks[ti].threads, child).ok()?;
+    let c = tasks[ti].threads[slot]?;
+    if matches!(tasks[c].state, TaskState::Done(_)) {
+        return None;
+    }
+    tasks[c].env.filter(|&k| Some(k) != tasks[ti].env)
 }
 
 /// PROCESS.md S3 `poll`/`detach`/`kill` of child handle `child`, the answer at `dst`. `spawners`
@@ -20371,21 +20493,27 @@ impl Vm {
                 Op::ChildOffer {
                     handle,
                     child,
-                    export,
+                    arg,
                     dst,
+                    grant,
                 } => {
                     // The family-level authority check (as the tree-walker's Instantiator arm):
                     // a forged/wrong-type handle is a CapFault before the op logic runs.
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
                     let child = r!(*child).i32();
-                    let export = r!(*export).i64() as u32;
-                    let dst = *dst;
+                    let arg = r!(*arg).i64();
+                    let (dst, grant) = (*dst, *grant);
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ChildOffer { child, export, dst });
+                    return Ok(Outcome::ChildOffer {
+                        child,
+                        arg,
+                        dst,
+                        grant,
+                    });
                 }
                 Op::CloneCaller {
                     args,

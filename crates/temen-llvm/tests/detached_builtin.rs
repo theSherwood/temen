@@ -155,3 +155,52 @@ fn poll_kill_and_detach_lower_to_their_ops() {
         "poll, kill, detach"
     );
 }
+
+const LL_GRANT: &str = r#"
+declare i64 @__vm_grant(i32, i64, i64)
+
+define i64 @hand_down(i32 %inst, i64 %child, i64 %region) {
+  %g = call i64 @__vm_grant(i32 %inst, i64 %child, i64 %region)
+  ret i64 %g
+}
+"#;
+
+/// #2220 — a spawner grants a capability into its running child: `__vm_grant` lowers to
+/// `call.cap INSTANTIATOR` op 19 on the `Instantiator` in its first argument, with the child handle
+/// and then the handle it grants — `@hand_down`'s last three parameters, in order.
+#[test]
+fn grant_lowers_to_op_19_with_the_child_then_the_handle() {
+    let t = temen_llvm::translate_ll_str(LL_GRANT).expect("translate");
+    temen_verify::verify_module(&t.module).expect("verify");
+    let caps: Vec<(u32, u32, u32, Vec<u32>, u32)> = t
+        .module
+        .funcs
+        .iter()
+        .flat_map(|f| {
+            let n = f.blocks[0].params.len() as u32;
+            f.blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .map(move |i| (n, i))
+        })
+        .filter_map(|(n, i)| match i {
+            Inst::CapCall {
+                type_id,
+                op,
+                handle,
+                args,
+                ..
+            } => Some((*type_id, *op, *handle, args.clone(), n)),
+            _ => None,
+        })
+        .collect();
+    let [(ty, op, inst, args, n)] = caps.as_slice() else {
+        panic!("one call.cap, not {caps:?}");
+    };
+    assert_eq!((*ty, *op), (6, 19), "Instantiator op 19");
+    assert_eq!(
+        (*inst, args.as_slice()),
+        (n - 3, &[n - 2, n - 1][..]),
+        "inst, then (child, handle)"
+    );
+}
