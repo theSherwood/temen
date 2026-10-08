@@ -140,7 +140,8 @@ fn selector_edges(t: &Terminator, lat: &[Lat], n_edges: usize) -> Vec<usize> {
 
 /// Run SCCP on a function and return the rewritten function (constants materialized, constant
 /// branches resolved). Semantics-preserving; meant to be followed by the ordinary cleanup fixpoint.
-pub fn sccp(f: &Func, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Func {
+/// `floats` is [`crate::OptConfig::floats`]: without it no float or vector op folds.
+pub fn sccp(f: &Func, fn_results: &[usize], types: &[temen_ir::TypeEntry], floats: bool) -> Func {
     let mut s = to_ssa(f, fn_results, types);
     let nblocks = s.blocks.len();
     if nblocks == 0 {
@@ -237,7 +238,7 @@ pub fn sccp(f: &Func, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> Fu
         }
         // All operands constant: fold exactly like the interpreter, or mark varying if it can't fold
         // (a trapping op, a load, a call — anything `try_fold` declines).
-        match try_fold(inst, known) {
+        match try_fold(inst, known, floats) {
             Some(k) => Lat::Const(k),
             None => Lat::Bottom,
         }

@@ -47,6 +47,7 @@ pub use temen_opt::instrument::MemHookStats;
 pub mod exec;
 pub mod fs;
 mod jit_proc;
+pub use jit_proc::JitCodeCache;
 pub mod posix;
 use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
@@ -6030,6 +6031,10 @@ pub struct ExecGrants<'a> {
 /// `exec` is what the run's processes may `execve` ([`ExecGrants`]): its registered commands, and
 /// whether they may run the programs they build.
 ///
+/// `jit_code`, on [`Backend::Jit`]: where the run's programs are compiled, when the caller keeps them
+/// across runs ([`RunConfig::jit_code`], #2145) — a toolchain run once per phase or per build then
+/// compiles each program once.
+///
 /// `backend` is honoured or refused, never quietly swapped: [`Backend::Bytecode`] normally falls
 /// back to the tree-walker for a module outside its subset, which would turn an engine
 /// differential into the oracle checked against itself. So a module the bytecode engine does not
@@ -6047,6 +6052,7 @@ pub fn nim_noc_run(
     argv: &[String],
     exec: &ExecGrants,
     backend: Backend,
+    jit_code: Option<&JitCodeCache>,
 ) -> Result<(), String> {
     if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits_reserved(&module) {
         return Err(
@@ -6067,6 +6073,7 @@ pub fn nim_noc_run(
             ..Limits::default()
         },
         args: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        jit_code: jit_code.cloned(),
         ..RunConfig::default()
     };
     let inst =
@@ -6546,6 +6553,9 @@ pub struct RunConfig {
     /// semantics are pinned handoff-on ≡ handoff-off by the `direct_handoff` differential tests; turn
     /// off to force the queued transport (e.g. when diagnosing scheduling itself).
     pub handoff: bool,
+    /// #2145 — where the JIT keeps the programs this run compiles, when the embedder keeps them past
+    /// it: every run handed the same cache compiles each program once. `None`: the run's own.
+    pub jit_code: Option<JitCodeCache>,
 }
 
 impl Default for RunConfig {
@@ -6557,6 +6567,7 @@ impl Default for RunConfig {
             args: Vec::new(),
             env: Vec::new(),
             handoff: true,
+            jit_code: None,
         }
     }
 }
@@ -6617,7 +6628,8 @@ fn with_deadline<T>(
 /// process tree whose personality `fork`/`execve`/`posix_spawn`/blocking `waitpid` the JIT serves
 /// (#1768, [`jit_proc`]). Backs both the run-once [`run_jit`] (`func` 0, no snapshot, a process) and
 /// the reactor per-call capture ([`run_capture_on`]'s `Jit` arm: an export `func`,
-/// `REACTOR_SNAP_CAP` snapshot, not a process).
+/// `REACTOR_SNAP_CAP` snapshot, not a process). A process tree compiles into `code` when the embedder
+/// keeps one (#2145).
 #[allow(clippy::too_many_arguments)]
 fn jit_run(
     m: &Module,
@@ -6628,6 +6640,7 @@ fn jit_run(
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
     process: bool,
+    code: Option<&JitCodeCache>,
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // #1944 slice 3, #2113 — `Limits.fuel` is the root budget's fuel ceiling on the JIT too (#1705),
     // the default grant's when it names none: the root's cell draws from the host's own node, which
@@ -6652,6 +6665,7 @@ fn jit_run(
                     init_mem,
                     snapshot_cap,
                     fuel,
+                    code,
                 )
             }
         } else {
@@ -6695,8 +6709,9 @@ fn run_jit(
     host: &mut Host,
     limits: &Limits,
     init_mem: Option<&[u8]>,
+    code: Option<&JitCodeCache>,
 ) -> Result<(JitOutcome, Vec<ValType>), String> {
-    jit_run(m, 0, slots, host, limits, init_mem, None, true)
+    jit_run(m, 0, slots, host, limits, init_mem, None, true, code)
         .map(|(outcome, _snap, results)| (outcome, results))
 }
 
@@ -7871,7 +7886,14 @@ impl Instance {
                 trap_bt = bt;
                 outcome_from_interp(r)
             }
-            Backend::Jit => match run_jit(m, &[], &mut host, &config.limits, init_mem.as_deref()) {
+            Backend::Jit => match run_jit(
+                m,
+                &[],
+                &mut host,
+                &config.limits,
+                init_mem.as_deref(),
+                config.jit_code.as_ref(),
+            ) {
                 Ok((jit, results)) => outcome_from_jit(&results, jit),
                 Err(e) => Err(e),
             },
@@ -8049,7 +8071,14 @@ impl Instance {
             &mut hi,
         );
 
-        let (jit, results) = run_jit(m, &[], &mut hj, &config.limits, init_mem.as_deref())?;
+        let (jit, results) = run_jit(
+            m,
+            &[],
+            &mut hj,
+            &config.limits,
+            init_mem.as_deref(),
+            config.jit_code.as_ref(),
+        )?;
 
         let outcome = diff_outcome(&results, interp, jit)?;
         if hi.stdout_bytes() != hj.stdout_bytes() {
@@ -8365,6 +8394,7 @@ fn run_capture_on(
                 Some(init_mem),
                 Some(REACTOR_SNAP_CAP),
                 false,
+                None,
             )?;
             Ok((outcome_from_jit(&m.funcs[fidx as usize].results, jo)?, snap))
         }

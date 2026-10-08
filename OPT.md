@@ -275,10 +275,20 @@ tracked enhancement, not a blocker.
     full-pipeline devirt→inline→DFE), all re-verified; the peval differential suite + `opt_sccp` fuzz
     target now exercise it on real residuals.
   - [x] **Linked programs** (`temen_opt::optimize_linked`, #2147): what temen-leng's link runs on every
-    nim program it ships. It inlines callees of at most `LINKED_MAX_CALLEE` (6) instructions, then
-    numbers each function's blocks in **reverse postorder** (`order_blocks`). No folding and no
-    cleanup: it is cheap enough for every link, and a host linker and the in-guest one (built without
-    `libm-floats`) produce the same module, which the self-hosted lane's fixed point requires.
+    nim program it ships. It inlines callees of at most `LINKED_MAX_CALLEE` (6) instructions,
+    canonicalizes every function (the always-on fixpoint of `optimize_func_with`, every optional pass
+    off), then numbers each function's blocks in **reverse postorder** (`order_blocks`).
+    - **The cleanup folds no floats** (`OptConfig::floats` off): a host linker and the in-guest one
+      (built without `libm-floats`) must produce the same module, which the self-hosted lane's fixed
+      point requires, and a float fold can differ between them.
+    - **What it buys** (#2147): leng's output carries many single-predecessor blocks, block
+      parameters fed constants and dead values. On `hexer` the cleanup removes 14% of the
+      instructions and a third of the blocks; `hexer d` runs 20% faster on the bytecode engine and
+      3% faster on Cranelift, which compiles it 7% faster. On the host, a card program links up to
+      0.05 s slower and comes out 20–27% smaller.
+    - **Why not more.** SCCP, CSE, memory forwarding and jump threading take four times as long
+      and save 0.1% more instructions. With the cleanup, an inline limit of 12 saves 1.2% more
+      instructions but makes `hexer` 18% larger and slower to compile, and 24 saves no more than 12.
     Fuel is charged per taken back edge (INVARIANTS #9), which every engine reads off the block
     indices: a branch to an equal-or-earlier block. In reverse postorder that is exactly a loop's back
     edge, while leng's own order puts an `if`'s join before its arms; on `hexer` that was 63% of its

@@ -2,13 +2,13 @@
 //! blocks in reverse postorder, so the only branch to an equal-or-earlier block is a loop's back
 //! edge — the branch every engine charges fuel on (INVARIANTS #9). The inliner's one-pass driver
 //! inlines what its splices bring in, and stops at its size limit. [`optimize_linked`] runs the two
-//! together. Every transform is checked against the reference interpreter: same results, output that
-//! re-verifies.
+//! with a cleanup between them that folds no floats. Every transform is checked against the reference
+//! interpreter: same results, output that re-verifies.
 
 use temen_interp::Value;
 use temen_ir::{
-    BinOp, Block, CmpOp, DebugInfo, Func, FuncName, Inst, IntTy, Loc, Module, SsaLoc, Terminator,
-    ValType, VarInfo, VarLoc,
+    BinOp, Block, CmpOp, DebugInfo, FBinOp, FloatTy, Func, FuncName, Inst, IntTy, Loc, Module,
+    SsaLoc, Terminator, ValType, VarInfo, VarLoc,
 };
 use temen_opt::cfg::{successors, Cfg};
 use temen_opt::interproc::{inline_calls, inline_calls_with, InlineLimits};
@@ -489,4 +489,123 @@ fn optimize_linked_inlines_tiny_callees_and_orders_blocks() {
             "a={a}: neither the call's entry nor the branch to the join charges"
         );
     }
+}
+
+#[test]
+fn optimize_linked_cleans_up_after_its_splices() {
+    // entry(a) = abs(-5) + a. Inlining threads -5 into `abs`'s branch; the cleanup resolves the
+    // branch, prunes the arm it never takes and merges what is left into one block.
+    let abs = func(
+        1,
+        vec![
+            block(
+                1,
+                vec![Inst::ConstI32(0), cmp(CmpOp::LtS, 0, 1)],
+                br_if(2, (1, vec![0]), (2, vec![0])),
+            ),
+            block(
+                1,
+                vec![Inst::ConstI32(0), sub(1, 0)],
+                Terminator::Return(vec![2]),
+            ),
+            block(1, vec![], Terminator::Return(vec![0])),
+        ],
+    );
+    let entry = func(
+        1,
+        vec![block(
+            1,
+            vec![Inst::ConstI32(-5), call(1, vec![1]), add(2, 0)],
+            Terminator::Return(vec![3]),
+        )],
+    );
+    // The uncalled leaf makes the program big enough for the inline budget, half the program, to
+    // cover the splice.
+    let m = module(vec![entry, abs, leaf_of(8)]);
+    let o = optimize_linked(&m);
+    verify_module(&o).expect("linked output verifies");
+    assert_eq!(n_calls(&o), 0, "abs is inlined");
+    assert_eq!(
+        o.funcs[0].blocks.len(),
+        1,
+        "the branch on a constant is gone"
+    );
+    for a in [-3, 0, 4] {
+        assert_eq!(
+            run(&o, 0, &[Value::I32(a)]).0,
+            run(&m, 0, &[Value::I32(a)]).0,
+            "a={a}"
+        );
+    }
+}
+
+#[test]
+fn optimize_linked_folds_no_floats() {
+    // f() = (1.5 + 2.25, 2 + 3): the link folds the integer add and leaves the float add, because a
+    // host linker and an in-guest one must produce the same module and a float fold need not.
+    let f = Func {
+        params: vec![],
+        results: vec![ValType::F64, ValType::I32],
+        blocks: vec![Block {
+            params: vec![],
+            insts: vec![
+                Inst::ConstF64(1.5f64.to_bits()),
+                Inst::ConstF64(2.25f64.to_bits()),
+                Inst::FBin {
+                    ty: FloatTy::F64,
+                    op: FBinOp::Add,
+                    a: 0,
+                    b: 1,
+                },
+                Inst::ConstI32(2),
+                Inst::ConstI32(3),
+                add(3, 4),
+            ],
+            term: Terminator::Return(vec![2, 5]),
+        }],
+    };
+    let m = module(vec![f]);
+    let o = optimize_linked(&m);
+    verify_module(&o).expect("linked output verifies");
+    let insts = &o.funcs[0].blocks[0].insts;
+    assert!(
+        insts.iter().any(|i| matches!(i, Inst::FBin { .. })),
+        "the float add stays: {insts:?}"
+    );
+    assert!(
+        !insts.iter().any(|i| matches!(i, Inst::IntBin { .. })),
+        "the integer add folds: {insts:?}"
+    );
+    assert_eq!(run(&o, 0, &[]).0, run(&m, 0, &[]).0);
+}
+
+#[test]
+fn the_cleanup_drops_only_the_positions_it_made_stale() {
+    // f0 folds `2 + 3`, so its positions go stale; nothing in f1 changes, so its stay.
+    let folds = func(
+        1,
+        vec![block(
+            1,
+            vec![Inst::ConstI32(2), Inst::ConstI32(3), add(1, 2)],
+            Terminator::Return(vec![3]),
+        )],
+    );
+    let mut m = module(vec![folds, leaf_of(3)]);
+    let loc = |func: u32, line: u32| Loc {
+        func,
+        block: 0,
+        inst: 0,
+        file: 0,
+        line,
+        col: 1,
+    };
+    m.debug_info = Some(DebugInfo {
+        files: vec!["p.nim".into()],
+        locs: vec![loc(0, 1), loc(1, 2)],
+        ..Default::default()
+    });
+    let o = optimize_linked(&m);
+    let d = o.debug_info.as_ref().expect("debug info kept");
+    let lines: Vec<u32> = d.locs.iter().map(|l| l.line).collect();
+    assert_eq!(lines, vec![2], "only f0's position went stale");
 }
