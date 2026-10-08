@@ -4131,6 +4131,94 @@ pub fn synth_manifest_child_start(
     synth_start(module, entry, seed_heap, true)
 }
 
+/// The export a program names its **child entry** under (#2219): the function a copy of the program
+/// starts at when it runs as a §14 child. A host builds the program's [`child_image`] from it.
+pub const CHILD_EXPORT: &str = "_child";
+
+/// #2219 — a program's **child image**: the program with its root entry, function 0, replaced by a
+/// bootstrap that passes its starter handles to the function the program exports as [`CHILD_EXPORT`]
+/// and returns that function's status. A §14 child starts at its module's function 0, so this is the
+/// module a host grants a program that spawns copies of itself.
+///
+/// Every other function keeps its index, so the program's calls mean the same in the image, its
+/// `call.dyn` slot numbers included. The image also keeps the program's memory (its window and shadow
+/// arena) and data, so a child runs in the window the program declares. It exports neither `_child`
+/// nor anything naming function 0.
+///
+/// `None` when the program exports no `_child`. `Err` when the entry is function 0 itself, has no §14
+/// child-entry shape ([`child_entry_ok`]), or when the program references function 0 anywhere but an
+/// export: replacing it must not change what the rest of the program calls.
+pub fn child_image(program: &Module) -> Option<Result<Module, String>> {
+    let entry = program
+        .exports
+        .iter()
+        .find(|e| e.name == CHILD_EXPORT)?
+        .func;
+    Some(child_image_at(program, entry))
+}
+
+fn child_image_at(program: &Module, entry: FuncIdx) -> Result<Module, String> {
+    let ef = program
+        .funcs
+        .get(entry as usize)
+        .ok_or_else(|| format!("`{CHILD_EXPORT}` names function {entry}, which does not exist"))?;
+    if entry == 0 {
+        return Err(format!(
+            "`{CHILD_EXPORT}` names function 0, the root entry its bootstrap replaces"
+        ));
+    }
+    if !child_entry_ok(&ef.params, &ef.results) {
+        return Err(format!(
+            "`{CHILD_EXPORT}` must have a §14 child-entry shape, got {:?} -> {:?}",
+            ef.params, ef.results
+        ));
+    }
+    if references_func(program, 0) {
+        return Err("the program references function 0, which the child bootstrap replaces".into());
+    }
+    let mut image = program.clone();
+    let n = ef.params.len() as ValIdx;
+    image.funcs[0] = Func {
+        params: ef.params.clone(),
+        results: ef.results.clone(),
+        blocks: vec![Block {
+            params: ef.params.clone(),
+            insts: vec![Inst::Call {
+                func: entry,
+                args: (0..n).collect(),
+            }],
+            term: Terminator::Return((n..n + ef.results.len() as ValIdx).collect()),
+        }],
+    };
+    image
+        .exports
+        .retain(|e| e.func != 0 && e.name != CHILD_EXPORT);
+    if let Some(di) = &mut image.debug_info {
+        di.locs.retain(|l| l.func != 0);
+        di.vars.retain(|v| v.func != 0);
+        di.func_names.retain(|n| n.func != 0);
+    }
+    Ok(image)
+}
+
+/// Whether anything in `m` other than an export names function `f` statically: a `call`, `ref.func`,
+/// `thread.spawn` or `return_call`, an impl-export op, or a recorded data funcref slot — the places
+/// `offset_func_indices` rewrites.
+fn references_func(m: &Module, f: FuncIdx) -> bool {
+    let in_code = m.funcs.iter().flat_map(|func| &func.blocks).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                Inst::Call { func, .. } | Inst::RefFunc { func } | Inst::ThreadSpawn { func, .. }
+                    if *func == f
+            )
+        }) || matches!(&b.term, Terminator::ReturnCall { func, .. } if *func == f)
+    });
+    in_code
+        || m.impl_exports.iter().any(|e| e.ops.contains(&f))
+        || data_funcref_targets(m).contains(&Some(f))
+}
+
 fn synth_start(
     mut module: Module,
     entry: FuncIdx,
