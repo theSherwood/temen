@@ -2334,6 +2334,62 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
     );
 }
 
+/// #2178: closing a mapped file gives its pages back. `memfiles.close` unmaps it, and the next file
+/// mapped reuses the pages, zeroed past that file's own end. While `munmap` was a stub, every file a
+/// program read stayed in its heap, and silently: the stub's `-1` came with `errno` 0, which nim's
+/// `pcall` reads as success.
+#[test]
+fn nim_unmapping_a_file_gives_its_pages_back() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nim_unmapping_a_file_gives_its_pages_back (no toolchain)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\
+         import std/memfiles\n\
+         try:\n\
+         \x20 var a = memfiles.open(\"/a.txt\")\n\
+         \x20 let first = cast[int](a.mem)\n\
+         \x20 var closed = \"closed\"\n\
+         \x20 try:\n\
+         \x20   a.close()\n\
+         \x20 except:\n\
+         \x20   closed = \"close raised\"\n\
+         \x20 var b = memfiles.open(\"/b.txt\")\n\
+         \x20 let bytes = cast[ptr UncheckedArray[char]](b.mem)\n\
+         \x20 var s = newString(b.size)\n\
+         \x20 for i in 0 ..< b.size:\n\
+         \x20   s[i] = bytes[i]\n\
+         \x20 let pages = if cast[int](b.mem) == first: \"same pages\" else: \"new pages\"\n\
+         \x20 let tail = if bytes[b.size] == '\\0': \"zero tail\" else: \"stale tail\"\n\
+         \x20 write(stdout, closed & \"|\" & pages & \"|\" & s & \"|\" & tail)\n\
+         \x20 b.close()\n\
+         except:\n\
+         \x20 write(stdout, \"MMAP FAILED\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None, false)
+        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    for backend in [temen_run::Backend::TreeWalk, temen_run::Backend::Jit] {
+        let posix = run_io_capture(
+            &m,
+            backend,
+            &temen_run::RunConfig::default(),
+            &[("/a.txt", b"first file"), ("/b.txt", b"second")],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            "closed|same pages|second|zero tail",
+            "{backend:?}"
+        );
+    }
+}
+
 #[path = "../../temen/tests/support/chibicc.rs"]
 mod chibicc_mod;
 
