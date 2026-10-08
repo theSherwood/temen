@@ -1,20 +1,32 @@
 //! Enum / distinct / opaque named-type tests (NIM.md Phase 2, W1 Leng totality). A named type is an
 //! aggregate only when it is a locally-declared `(object …)`/`(array …)`; every *other* named type —
-//! an `(enum …)`, a `distinct` int, a `proctype`, or a type external to the module — is an integer
-//! scalar (its values are plain integers, `Red`/`Green`/`Blue` = `0`/`1`/`2`). This is the piece
+//! an `(enum …)`, a `distinct` int, a `proctype`, or a type external to the module — is a scalar (its
+//! values are plain integers, `Red`/`Green`/`Blue` = `0`/`1`/`2`). An enum is as wide as its base type,
+//! as it is in C (#2201): a `(u 8)` enum is an `i32` value and a one-byte field. This is the piece
 //! nimony's exception ABI needs (its `ErrorCode` field is an enum). Both engines, hand-written and
 //! against genuine nimony `toNum`/`roundtrip` bytes.
 
 use temen_interp::Value;
 
+/// Run func `idx` on both engines with `args`, each passed at its parameter's own width; the result,
+/// widened to `i64`.
 fn run(module: &temen_ir::Module, idx: u32, args: &[i64]) -> i64 {
     temen_verify::verify_module(module).unwrap_or_else(|e| panic!("verify: {e:?}"));
-    let ivals: Vec<Value> = args.iter().map(|&n| Value::I64(n)).collect();
+    let params = &module.funcs[idx as usize].params;
+    let ivals: Vec<Value> = args
+        .iter()
+        .zip(params)
+        .map(|(&n, t)| match t {
+            temen_ir::ValType::I32 => Value::I32(n as i32),
+            _ => Value::I64(n),
+        })
+        .collect();
     let mut fuel = u64::MAX;
     let interp = temen_interp::run(module, idx, &ivals, &mut fuel).expect("interp run");
     let interp_n = match interp.as_slice() {
         [Value::I64(n)] => *n,
-        other => panic!("expected i64, got {other:?}"),
+        [Value::I32(n)] => *n as i64,
+        other => panic!("expected an integer, got {other:?}"),
     };
     let jit = match temen_jit::compile_and_run(module, idx, args).expect("jit compile") {
         temen_jit::JitOutcome::Returned(v) => v,
@@ -27,8 +39,8 @@ fn run(module: &temen_ir::Module, idx: u32, args: &[i64]) -> i64 {
 #[test]
 fn enum_param_is_scalar() {
     // classify(c: Color): int — Color is an enum (scalar); comparing/branching on its integer value.
-    // A proc taking a bare-symbol enum type must lower to a plain `(i64)` param, not a by-address
-    // aggregate.
+    // A proc taking a bare-symbol enum type must lower to a plain scalar param, as wide as the enum's
+    // `(u 8)` base, not a by-address aggregate.
     let leng = "\
 (stmts
  (type :Color.0. . (enum (u 8) (efld :Red.0. 0) (efld :Green.0. 1) (efld :Blue.0. 2)))
@@ -42,8 +54,8 @@ fn enum_param_is_scalar() {
     let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
     let text = temen_leng::translate_to_text(leng).unwrap();
     assert!(
-        text.contains("func (i64) -> (i64)"),
-        "enum param is a scalar i64:\n{text}"
+        text.contains("func (i32) -> (i64)"),
+        "enum param is a scalar i32:\n{text}"
     );
     assert_eq!(run(&m, 0, &[1]), 10, "Green → 10");
     assert_eq!(run(&m, 0, &[0]), 100, "Red → 0+100");
@@ -93,7 +105,7 @@ fn real_nimony_enum_compare() {
 }
 
 /// Real nimony `hexer` output for `roundtrip(c: Color): Color` — an enum-in, enum-out passthrough
-/// (`var d = c; result = d`). Because `Color` is a scalar, this is a plain `(i64) -> (i64)`, *not*
+/// (`var d = c; result = d`). Because `Color` is a scalar, this is a plain `(i32) -> (i32)`, *not*
 /// an sret aggregate return.
 #[test]
 fn real_nimony_enum_passthrough() {
@@ -102,7 +114,7 @@ fn real_nimony_enum_passthrough() {
         .unwrap_or_else(|e| panic!("translate real roundtrip: {e}"));
     let text = temen_leng::translate_proc_to_text(REAL, "roundtrip.0.").unwrap();
     assert!(
-        text.contains("func (i64) -> (i64)"),
+        text.contains("func (i32) -> (i32)"),
         "enum return is scalar, not sret:\n{text}"
     );
     assert_eq!(run(&m, 0, &[2]), 2);

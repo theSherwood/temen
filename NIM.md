@@ -288,6 +288,7 @@ imports, `cast`/pointers. Deep-then-broaden: the real seam works; each construct
       frame-resident (default-zeroed). Tested on hand fixtures (object field set/get, array `at`,
       pointer `pat`, a framed local array) **and real nimony object bytes** (`dot2`, `p.x*p.x+…`),
       interp == JIT. Whole-aggregate copy/`oconstr`/`aconstr` and C-ABI (SysV) field offsets remain.
+      (C field offsets, sizes and alignment, with enums at their base width: #2201.)
     - **✅ whole-module: globals + multi-proc — DONE 2026-07-28.** `gvar`/`tvar` module globals live
       at fixed window offsets (below the caller-passed stack) and are shared across calls; scalar
       `const`s inline; `gvar`/`const`/`type` top-levels are accepted, and a module's procs are
