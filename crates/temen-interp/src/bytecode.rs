@@ -5674,11 +5674,7 @@ impl<'p> Vcpu<'p> {
                 &mut self.mem,
                 &mut cell,
                 // Invoke fibers live as long as the invoke, across its bounces.
-                &mut FiberCell::Excl {
-                    fibers: &mut self.invoke_fibers.fibers,
-                    sp: &mut self.invoke_fibers.sp,
-                    meta: &mut self.invoke_fibers.meta,
-                },
+                &mut self.invoke_fibers.cell(),
                 None,
                 None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
             )?
@@ -6767,155 +6763,63 @@ fn debug_advance_fiber(
     if vt.active_invoke.is_some() {
         return step_active_invoke(vt, source, table, fuel, mem, host);
     }
-    // This engine never freezes, so a fiber's shadow-SP is never read; its `meta` holds its charge.
-    let FiberTables {
-        fibers,
-        sp: fiber_sp,
-        meta,
-    } = fibers;
+    // This engine never freezes: no fiber switch keeps a shadow-SP word.
+    let mut cell = fibers.cell();
     match vt
         .active
         .resume(source, table, fuel, mem, &mut HostCell::Excl(host), 1)
     {
         Ok(Outcome::Suspended) => FiberStep::Stepped,
-        Ok(Outcome::Done(vals)) => match vt.chain.pop() {
-            // The root activation finished — the run's result.
-            None => FiberStep::Finished(vals),
-            // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer.
-            Some((rid, resumer, rdst)) => {
-                fibers[vt.active_id] = FiberState::Done;
-                if let Some(m) = meta.get_mut(vt.active_id) {
-                    m.charge = LiveFiber::none(); // #2112: its charge goes back
-                }
-                let retval = vals.first().copied().unwrap_or(Value::I64(0));
-                // `vcpu.tls` is the vCPU's word: it follows execution (as in `step_vcpu`).
-                let tls = vt.active.tls;
-                vt.active = resumer;
-                vt.active.tls = tls;
-                vt.active_id = rid;
-                vt.active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
-                vt.active.set(rdst + 1, Reg::from_value(retval));
-                FiberStep::Stepped
-            }
+        // The root activation finished — the run's result — or a fiber returned to its resumer.
+        Ok(Outcome::Done(vals)) => match return_from_fiber(vt, &mut cell, mem, false, vals) {
+            Some(vals) => FiberStep::Finished(vals),
+            None => FiberStep::Stepped,
         },
         Ok(Outcome::ContNew { funcref, sp, dst }) => {
-            // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
-            let Some(charge) = host.fiber_charge() else {
-                return FiberStep::Trapped(Trap::FiberFault);
-            };
-            if fibers.len() + 1 >= super::MAX_FIBERS {
-                return FiberStep::Trapped(Trap::FiberFault);
-            }
-            let h = fibers.len() as i32;
-            fibers.push(FiberState::Pending {
+            match new_fiber(
+                &mut cell,
+                source,
+                mem,
+                &mut HostCell::Excl(host),
                 funcref,
                 sp,
-                consumed: false,
-            });
-            fiber_sp.push(0);
-            meta.push(FiberMeta {
-                func: funcref,
-                sp,
-                charge,
-            });
-            vt.active.set(dst, Reg::from_i32(h));
-            FiberStep::Stepped
-        }
-        // This stepper runs where fibers never event-park (it traps on `WaitParked`/`CapParked`
-        // below), so the I48 `blocking` flag is a no-op here — a blocking resume of a fiber that
-        // only ever suspends/returns behaves exactly like `cont.resume`.
-        Ok(Outcome::ContResume {
-            kh,
-            arg,
-            dst,
-            blocking: _,
-            resume_ip: _,
-        }) => {
-            let k = kh as usize;
-            let target = match fibers.get_mut(k) {
-                Some(slot @ FiberState::Pending { .. }) => {
-                    let (funcref, sp, consumed) = match std::mem::replace(
-                        slot,
-                        FiberState::Running {
-                            blocking_ip: None,
-                            pending: None,
-                        },
-                    ) {
-                        FiberState::Pending {
-                            funcref,
-                            sp,
-                            consumed,
-                        } => (funcref, sp, consumed),
-                        _ => unreachable!(),
-                    };
-                    if consumed {
-                        *slot = FiberState::Running {
-                            blocking_ip: None,
-                            pending: Some(arg), // #1538
-                        };
-                    }
-                    let Some((tmod, tfunc, tm)) = resolve_fiber_entry(source, table, funcref)
-                    else {
-                        return FiberStep::Trapped(Trap::FiberFault);
-                    };
-                    match Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)]) {
-                        Ok(mut v) => {
-                            v.module = tmod;
-                            v
-                        }
-                        Err(t) => return FiberStep::Trapped(t),
-                    }
+            ) {
+                Ok(h) => {
+                    vt.active.set(dst, Reg::from_i32(h));
+                    FiberStep::Stepped
                 }
-                Some(slot @ FiberState::Parked { .. }) => {
-                    match std::mem::replace(
-                        slot,
-                        FiberState::Running {
-                            blocking_ip: None,
-                            pending: None,
-                        },
-                    ) {
-                        FiberState::Parked {
-                            mut vm,
-                            suspend_dst,
-                            consumed: _,
-                        } => {
-                            vm.set(suspend_dst, Reg::from_i64(arg));
-                            vm
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                _ => return FiberStep::Trapped(Trap::FiberFault), // forged / Running / Done
-            };
-            let mut target = target;
-            target.tls = vt.active.tls; // `vcpu.tls` follows execution (as in `step_vcpu`)
-            let resumer = std::mem::replace(&mut vt.active, target);
-            vt.chain.push((vt.active_id, resumer, dst));
-            vt.active_id = k;
-            FiberStep::Stepped
-        }
-        Ok(Outcome::FiberSuspend { value, dst }) => {
-            // #1538: a thawed consumed fiber's rewound `suspend` returns the queued argument.
-            if let Some(arg) = take_pending(fibers, vt.active_id) {
-                vt.active.set(dst, Reg::from_i64(arg));
-                return FiberStep::Stepped;
+                Err(t) => FiberStep::Trapped(t),
             }
-            // Pop the resumer to switch back to; an empty chain means the root tried to `suspend`.
-            let Some((rid, resumer, rdst)) = vt.chain.pop() else {
-                return FiberStep::Trapped(Trap::FiberFault);
-            };
-            let mut resumer = resumer;
-            resumer.tls = vt.active.tls; // `vcpu.tls` follows execution (as in `step_vcpu`)
-            let suspended = std::mem::replace(&mut vt.active, resumer);
-            fibers[vt.active_id] = FiberState::Parked {
-                vm: suspended,
-                suspend_dst: dst,
-                consumed: !is_unwinding(mem),
-            };
-            vt.active_id = rid;
-            vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
-            vt.active.set(rdst + 1, Reg::from_i64(value));
+        }
+        // A park here blocks the whole task, never a fiber, so `cont.resume.block` behaves like
+        // `cont.resume`, and only a fiber parked elsewhere could answer the poll.
+        Ok(Outcome::ContResume { kh, arg, dst, .. }) => {
+            let k = kh as usize;
+            let target =
+                match claim_fiber(&mut cell, &mut HostCell::Excl(host), k, arg, None, false) {
+                    Ok(Claim::Continue(vm)) => vm,
+                    Ok(Claim::Start { funcref, sp }) => {
+                        match start_fiber(source, table, mem, k, funcref, sp, arg) {
+                            Ok(vm) => vm,
+                            Err(t) => return FiberStep::Trapped(t),
+                        }
+                    }
+                    Ok(Claim::Block | Claim::Poll) => {
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
+                        vt.active.set(dst + 1, Reg::from_i64(0));
+                        return FiberStep::Stepped;
+                    }
+                    Err(t) => return FiberStep::Trapped(t),
+                };
+            enter_fiber(vt, &mut cell, mem, false, k, target, dst);
             FiberStep::Stepped
+        }
+        // The root has no resumer to `suspend` to.
+        Ok(Outcome::FiberSuspend { value, dst }) => {
+            match suspend_fiber(vt, &mut cell, mem, false, value, dst, Trap::FiberFault) {
+                Ok(()) => FiberStep::Stepped,
+                Err(t) => FiberStep::Trapped(t),
+            }
         }
         // §22 guest-JIT install / uninstall / invoke: self-contained host-side ops (they mutate only
         // `vt.active` + the shared dispatch table, spawning no scheduler task), so — like the coroutine
@@ -10163,13 +10067,7 @@ fn spawn_task(
             (m, h, built.table, built.vt, state, built.leaf, live)
         }
         Err(_) => {
-            let mut vt = VTask {
-                active: tasks[ti].vt.active.clone(),
-                active_id: ROOT_FIBER,
-                chain: Vec::new(),
-                root_shadow_sp: 0,
-                active_invoke: None,
-            };
+            let mut vt = VTask::of(tasks[ti].vt.active.clone(), 0);
             vt.release();
             let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
             let state = TaskState::Done(failed);
@@ -10479,13 +10377,7 @@ fn twin_task(parent: &Vm, dst: u32, reply: i64) -> VTask {
     let mut active = parent.clone();
     active.set(dst, Reg::from_i64(reply));
     let root_shadow_sp = active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
-    VTask {
-        active,
-        active_id: ROOT_FIBER,
-        chain: Vec::new(),
-        root_shadow_sp,
-        active_invoke: None,
-    }
+    VTask::of(active, root_shadow_sp)
 }
 
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
@@ -11041,6 +10933,15 @@ struct FiberTables {
 }
 
 impl FiberTables {
+    /// These tables, owned by the caller, as the registry a fiber transition runs over.
+    fn cell(&mut self) -> FiberCell<'_> {
+        FiberCell::Excl {
+            fibers: &mut self.fibers,
+            sp: &mut self.sp,
+            meta: &mut self.meta,
+        }
+    }
+
     /// #2112 — the debugger's registry rebuilt from `fibers`, a checkpoint's copy of its slots: each
     /// fiber not yet done takes its charge on `host`'s node again, past any ceiling, as a thaw's
     /// re-created fiber does. The restore then puts back the budget tree as the checkpoint saw it,
@@ -11129,12 +11030,19 @@ impl FiberCell<'_> {
         }
     }
 
-    /// [`shadow_switch`] through the cell. Only a durable run keeps shadow-SP words, so a
+    /// [`shadow_switch`] through the cell. Only a `durable` run keeps shadow-SP words, so a
     /// non-durable one never takes a shared registry's lock for a switch.
     #[inline]
-    fn shadow_switch(&mut self, ctx: &mut RunCtx, vt: &mut VTask, out_ctx: usize, in_ctx: usize) {
-        if ctx.durable {
-            let (mem, root) = (&mut *ctx.mem, &mut vt.root_shadow_sp);
+    fn shadow_switch(
+        &mut self,
+        mem: &mut Option<Mem>,
+        durable: bool,
+        vt: &mut VTask,
+        out_ctx: usize,
+        in_ctx: usize,
+    ) {
+        if durable {
+            let root = &mut vt.root_shadow_sp;
             self.with(|_, sp, _| shadow_switch(mem, sp, root, true, out_ctx, in_ctx));
         }
     }
@@ -11149,7 +11057,8 @@ enum FiberRegRef<'a> {
     Shared(&'a SharedFibers),
 }
 
-/// What a `cont.resume` claim decided under the registry lock; [`step_vcpu`] acts on it outside.
+/// What a `cont.resume` claim ([`claim_fiber`]) decided under the registry lock; the driver acts on
+/// it outside.
 // A transient on the stack between the claim and the switch; boxing the `Vm` would add a heap
 // allocation to every fiber switch.
 #[allow(clippy::large_enum_variant)]
@@ -11178,6 +11087,335 @@ fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
 /// `NORMAL` is consumed by the resumer that runs on.
 fn is_unwinding(mem: &Option<Mem>) -> bool {
     mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
+}
+
+// The §12 fiber transitions (#1414): `cont.new`, the `cont.resume` claim and switch, `suspend`, and a
+// fiber's return — one definition for every bytecode loop that runs fibers: [`step_vcpu`] (the pump,
+// the parallel driver, `Vcpu`, the freeze unwind), [`drive_nested`] and [`debug_advance_fiber`]. Each
+// takes the vCPU's state ([`VTask`]) and its registry ([`FiberCell`]); `durable` is set only where the
+// run keeps durable shadow-SP words (§12.8), which only `step_vcpu` can. What a driver does with a
+// fiber it cannot claim yet ([`Claim::Block`], [`Claim::Poll`]) stays the driver's.
+
+/// `cont.new`: register a pending fiber for `funcref(sp, …)` and return its handle, charged to
+/// `host`'s domain while it lives (#2112). Fiber `h` is shadow context `h + 1`, its saved shadow-SP at
+/// its region's frame base (an empty shadow stack, DURABILITY.md §12.8 4A.5). Its freeze re-entry
+/// metadata is its **resolved** entry function (the natural-table lookup `cont.resume` does, so a
+/// `FrozenFiber.func` matches the tree-walker's `Frame::func`) and its data-stack base. A full registry,
+/// or a domain that cannot pay for another fiber, is a `FiberFault`.
+fn new_fiber(
+    fibers: &mut FiberCell,
+    source: &ModuleSource,
+    mem: &Option<Mem>,
+    host: &mut HostCell,
+    funcref: i32,
+    sp: i64,
+) -> Result<i32, Trap> {
+    let arena = mem
+        .as_ref()
+        .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
+    let func = (funcref as u32 as usize & source.primary().table_mask) as i32;
+    let charge = host.with(|h| h.fiber_charge()).ok_or(Trap::FiberFault)?;
+    fibers
+        .with(|f, fsp, meta| {
+            if f.len() + 1 >= super::MAX_FIBERS {
+                return None;
+            }
+            let h = f.len();
+            f.push(FiberState::Pending {
+                funcref,
+                sp,
+                consumed: false,
+            });
+            fsp.push(arena.frame_base(h + 1));
+            meta.push(FiberMeta { func, sp, charge });
+            Some(h as i32)
+        })
+        .ok_or(Trap::FiberFault)
+}
+
+/// `cont.resume`'s claim of fiber `k`, `arg` its resume value. The claim is the arbiter: only the state
+/// transition runs under a shared registry's lock (#1761), so exactly one resumer wins, and a fiber
+/// suspended on another vCPU can be claimed here (D57 migration).
+///
+/// A pending fiber starts; a parked one continues, `arg` its `suspend`'s result. An event-parked fiber
+/// continues once its event has fired, with the event's result instead of `arg` (the oracle's
+/// `LiveWoken`); until then its resumer polls it, or blocks on it under a blocking resume
+/// (`blocking_ip`) on a driver that can idle the task (`may_block`, I48). Anything else (forged,
+/// running, done) is a `FiberFault`. `blocking_ip` also tags the fiber while it runs, so a park inside
+/// it idles the task instead of answering the poll.
+fn claim_fiber(
+    fibers: &mut FiberCell,
+    host: &mut HostCell,
+    k: usize,
+    arg: i64,
+    blocking_ip: Option<usize>,
+    may_block: bool,
+) -> Result<Claim, Trap> {
+    // #1952 — a poll of a host-parked fiber asks whether its op can proceed now, over this task's
+    // powerbox (read here: the claim below runs under the registry).
+    let host_ready = fibers
+        .with(|f, _, _| match f.get(k) {
+            Some(FiberState::HostParked { on, .. }) => Some(on.clone()),
+            _ => None,
+        })
+        .is_some_and(|on| host.with(|h| on.ready(h)));
+    // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the ordered drain first (so a busy
+    // resume-poll loop observes its completion without waiting for driver idle — the WaitParked
+    // `real_deadline` shape, completion form). The drain, not a direct `try_take`, so a poll of a
+    // LATER id never lets its ready result overtake an earlier outstanding park (the §18 pin).
+    if fibers.with(|f, _, _| matches!(f.get(k), Some(FiberState::CapParked { woken: None, .. }))) {
+        let comps = host.with(|p| p.completions());
+        fibers.with(|f, _, _| drain_cap_parked(f, &comps));
+    }
+    let blocked = || match blocking_ip {
+        Some(_) if may_block => Claim::Block,
+        _ => Claim::Poll,
+    };
+    let running = || FiberState::Running {
+        blocking_ip,
+        pending: None,
+    };
+    fibers.with(|f, _, _| match f.get_mut(k) {
+        Some(slot @ FiberState::Pending { .. }) => {
+            let FiberState::Pending {
+                funcref,
+                sp,
+                consumed,
+            } = std::mem::replace(slot, running())
+            else {
+                unreachable!()
+            };
+            if consumed {
+                *slot = FiberState::Running {
+                    blocking_ip,
+                    pending: Some(arg), // #1538
+                };
+            }
+            Ok(Claim::Start { funcref, sp })
+        }
+        Some(slot @ FiberState::Parked { .. }) => {
+            let FiberState::Parked {
+                mut vm,
+                suspend_dst,
+                consumed: _,
+            } = std::mem::replace(slot, running())
+            else {
+                unreachable!()
+            };
+            vm.set(suspend_dst, Reg::from_i64(arg));
+            Ok(Claim::Continue(vm))
+        }
+        // §3.6 slice 5a: an event-parked fiber (blocked in `memory.wait`). Woken — or with its real
+        // deadline passed (the timeout fires at the poll, so a cooperative resume-poll loop
+        // terminates) — the resume delivers the wait's status into the fiber and continues it.
+        Some(slot @ FiberState::WaitParked { .. }) => {
+            let FiberState::WaitParked {
+                woken,
+                real_deadline,
+                ..
+            } = slot
+            else {
+                unreachable!()
+            };
+            let fired = woken.take().or_else(|| {
+                // #1638: an infinite wait has no real deadline to poll against, so a busy
+                // resume-poll loop over one never fabricates a timeout here — it runs until the
+                // poller itself `notify`s the fiber, or until fuel runs out. That is the answer, not
+                // a gap (#1642): the poller is live guest code, so whether it will ever notify is
+                // undecidable and no engine may call the loop a deadlock. Fuel bounds it like any
+                // other guest loop, at the identical safepoint on all three engines (`jit_fuel.rs`).
+                // Before #1638 this engine alone ended it, with a `WAIT_TIMED_OUT` at 10 s that the
+                // guest never asked for.
+                real_deadline
+                    .filter(|dl| sched_wall_now() >= *dl)
+                    .map(|_| super::WAIT_TIMED_OUT)
+            });
+            // Still blocked: its deadline is already in the idle scan, and a notify wakes it too.
+            let Some(st) = fired else {
+                return Ok(blocked());
+            };
+            let FiberState::WaitParked {
+                mut vm, wait_dst, ..
+            } = std::mem::replace(slot, running())
+            else {
+                unreachable!()
+            };
+            vm.set(wait_dst, Reg::from_i32(st));
+            Ok(Claim::Continue(vm))
+        }
+        // #1952 — a host-parked fiber: once its op can proceed, the resume continues it, and its
+        // rewound op re-executes (nothing is delivered).
+        Some(slot @ FiberState::HostParked { .. }) => {
+            if !host_ready {
+                return Ok(blocked());
+            }
+            let FiberState::HostParked { vm, .. } = std::mem::replace(slot, running()) else {
+                unreachable!()
+            };
+            Ok(Claim::Continue(vm))
+        }
+        // F2 — a cap-parked fiber (blocked on its punt completion). Claimed by the drain above
+        // (`woken`), the resume delivers the scalar into the `call.cap`'s result register and
+        // continues it.
+        Some(slot @ FiberState::CapParked { .. }) => {
+            let FiberState::CapParked { woken, .. } = slot else {
+                unreachable!()
+            };
+            let Some(r) = woken.take() else {
+                return Ok(blocked());
+            };
+            let FiberState::CapParked {
+                mut vm,
+                dst: cap_dst,
+                ..
+            } = std::mem::replace(slot, running())
+            else {
+                unreachable!()
+            };
+            vm.set(cap_dst, Reg::from_i64(r));
+            Ok(Claim::Continue(vm))
+        }
+        _ => Err(Trap::FiberFault), // forged / Running / Done
+    })
+}
+
+/// The first frame of fiber `k`, claimed pending: `funcref(sp, arg)`, resolved through the shared
+/// dispatch table (module-aware, as `Op::CallIndirect`, the tree-walker's `dispatch_indirect` and the
+/// JIT's `fn_table` resolve it), so a fiber may start on an **installed §22 unit** function, not only a
+/// module-0 one (#1226, DESIGN.md §22 "Concurrency"). A forged or mistyped funcref is a `FiberFault`.
+/// The fiber spills into its own durable shadow region (slot `k` = context `k + 1`, §12.8 4A.5).
+fn start_fiber(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    mem: &Option<Mem>,
+    k: usize,
+    funcref: i32,
+    sp: i64,
+    arg: i64,
+) -> Result<Vm, Trap> {
+    let (module, func, unit) =
+        resolve_fiber_entry(source, table, funcref).ok_or(Trap::FiberFault)?;
+    let mut vm = Vm::new(&unit, func, &[Value::I64(sp), Value::I64(arg)])?;
+    vm.module = module;
+    vm.durable_region_base = mem
+        .as_ref()
+        .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
+        .region_base(k + 1);
+    Ok(vm)
+}
+
+/// Switch `vt` into fiber `k`, which runs `target`; its resumer waits in the chain for the
+/// `(status, value)` at `dst`. On a `durable` run the active shadow-SP word follows the switch. The
+/// fiber runs with this vCPU's `vcpu.tls` word, wherever it last ran: the op reads the executing vCPU's.
+fn enter_fiber(
+    vt: &mut VTask,
+    fibers: &mut FiberCell,
+    mem: &mut Option<Mem>,
+    durable: bool,
+    k: usize,
+    mut target: Vm,
+    dst: u32,
+) {
+    let out = vt.active_id;
+    fibers.shadow_switch(mem, durable, vt, out, k);
+    target.tls = vt.active.tls;
+    let resumer = std::mem::replace(&mut vt.active, target);
+    vt.chain.push((vt.active_id, resumer, dst));
+    vt.active_id = k;
+}
+
+/// `suspend` of `value` in the running fiber: park it, its next resume value due at `dst`, and switch
+/// back to its resumer, which receives `(FIBER_SUSPENDED, value)`. A thawed consumed fiber's rewound
+/// `suspend` returns the argument its claim queued instead (#1538). A park under a freeze's
+/// `UNWINDING` is fresh: the resumer's trailing poll unwinds before it observes the value. With no
+/// resumer (the task's root, or an invoked unit's entry) it is `no_resumer`.
+fn suspend_fiber(
+    vt: &mut VTask,
+    fibers: &mut FiberCell,
+    mem: &mut Option<Mem>,
+    durable: bool,
+    value: i64,
+    dst: u32,
+    no_resumer: Trap,
+) -> Result<(), Trap> {
+    let id = vt.active_id;
+    if let Some(arg) = fibers.with(|f, _, _| take_pending(f, id)) {
+        vt.active.set(dst, Reg::from_i64(arg));
+        return Ok(());
+    }
+    let (rid, mut resumer, rdst) = vt.chain.pop().ok_or(no_resumer)?;
+    fibers.shadow_switch(mem, durable, vt, id, rid);
+    // `vcpu.tls` goes back to the resumer with execution (the fiber may have set it).
+    resumer.tls = vt.active.tls;
+    let suspended = std::mem::replace(&mut vt.active, resumer);
+    let consumed = !is_unwinding(mem);
+    fibers.with(|f, _, _| {
+        f[id] = FiberState::Parked {
+            vm: suspended,
+            suspend_dst: dst,
+            consumed,
+        }
+    });
+    vt.active_id = rid;
+    vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
+    vt.active.set(rdst + 1, Reg::from_i64(value));
+    Ok(())
+}
+
+/// The running code returned `vals`. At the task's root that is its result, handed back. In a fiber,
+/// the fiber is done, its charge going back (#2112), and its resumer receives
+/// `(FIBER_RETURNED, retval)` — unless a `durable` run's freeze unwound it (#1835). An instrumented
+/// fiber always unwinds at a poll before a genuine return, so a return under `UNWINDING` that spilled
+/// frames (its shadow-SP past its frame base) is the freeze's: the fiber is residue, back in the
+/// `Pending` state a thaw seeds it in, and the resumer gets `FIBER_FROZEN`, which its thaw re-issues.
+/// Nothing was consumed: with no mid-run trigger, every park in a freeze run was made under
+/// `UNWINDING`.
+fn return_from_fiber(
+    vt: &mut VTask,
+    fibers: &mut FiberCell,
+    mem: &mut Option<Mem>,
+    durable: bool,
+    vals: Vec<Value>,
+) -> Option<Vec<Value>> {
+    let Some((rid, resumer, rdst)) = vt.chain.pop() else {
+        return Some(vals);
+    };
+    let id = vt.active_id;
+    fibers.shadow_switch(mem, durable, vt, id, rid);
+    let base = mem
+        .as_ref()
+        .map_or(0, |m| m.shadow_arena().frame_base(id + 1));
+    let unwinding = durable && is_unwinding(mem);
+    let frozen = fibers.with(|f, sp, meta| {
+        let frozen = unwinding && sp[id] > base;
+        f[id] = if frozen {
+            FiberState::Pending {
+                funcref: meta[id].func,
+                sp: meta[id].sp,
+                consumed: false,
+            }
+        } else {
+            if let Some(m) = meta.get_mut(id) {
+                m.charge = LiveFiber::none(); // #2112: its charge goes back
+            }
+            FiberState::Done
+        };
+        frozen
+    });
+    let retval = vals.first().copied().unwrap_or(Value::I64(0));
+    // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
+    let tls = vt.active.tls;
+    vt.active = resumer;
+    vt.active.tls = tls;
+    vt.active_id = rid;
+    let status = if frozen {
+        super::FIBER_FROZEN
+    } else {
+        super::FIBER_RETURNED
+    };
+    vt.active.set(rdst, Reg::from_i32(status));
+    vt.active.set(rdst + 1, Reg::from_value(retval));
+    None
 }
 
 /// #1952 — what a [`FiberState::HostParked`] fiber waits on.
@@ -11287,13 +11525,21 @@ struct InvokeStep {
 
 impl VTask {
     fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<VTask, Trap> {
-        Ok(VTask {
-            active: Vm::new(c, entry, args)?,
+        // §12.8 4A.5: an empty root shadow stack sits at its context's frame base.
+        let root_shadow_sp = c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0);
+        Ok(VTask::of(Vm::new(c, entry, args)?, root_shadow_sp))
+    }
+
+    /// A task running `active` as its root activation, in no fiber, with `root_shadow_sp` as its root
+    /// context's saved shadow-SP (§12.8; read only on a durable run).
+    fn of(active: Vm, root_shadow_sp: u64) -> VTask {
+        VTask {
+            active,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
-            root_shadow_sp: c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0), // §12.8 4A.5: empty root = frame base
+            root_shadow_sp,
             active_invoke: None,
-        })
+        }
     }
 
     /// Free a finished task's frames: its register file, call stack and parked fibers. It never
@@ -11500,13 +11746,7 @@ fn freeze_drive(
         // immediately after the park). `step_vcpu` runs the active `Vm` to completion in one call, and
         // the unwind does no fiber/thread ops, so the run-shared registries are untouched and the only
         // stop is `Done`.
-        let mut sub = VTask {
-            active: vm,
-            active_id: ROOT_FIBER,
-            chain: Vec::new(),
-            root_shadow_sp: root_sp,
-            active_invoke: None,
-        };
+        let mut sub = VTask::of(vm, root_sp);
         let mut cell = FiberCell::Excl {
             fibers: &mut *fibers,
             sp: &mut *fiber_sp,
@@ -11805,7 +12045,7 @@ impl JitMirror<'_> {
 fn drive_nested(
     source: &ModuleSource,
     table: &SharedSlots,
-    mut active: Vm,
+    active: Vm,
     fuel: &mut Fuel,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
@@ -11814,42 +12054,24 @@ fn drive_nested(
     fibers: &mut FiberCell,
     // #880 — `Some` when `fibers` is the vCPU's **run-level** registry (a bounce out of a TIERUP
     // region: the callback's fibers must persist for the run to resume later, exactly as the same
-    // call inline would register them). `ContNew` then mirrors `step_vcpu`'s parallel-array pushes
-    // so the run's bookkeeping stays index-aligned; the durability `shadow_switch` is deliberately
-    // absent — a bounce host is never a durable run (the pump), and the interpreted invoke path
-    // passes `None` (invoke-confined registry).
+    // call inline would register them, through the same transitions as `step_vcpu`). The
+    // interpreted invoke path passes `None` (invoke-confined registry).
     mut run_meta: Option<BounceRunCtx<'_>>,
     // #1660 — everything paused beneath this drive, for a `gc.roots` inside it; `None` when that is
     // not fully in view (a bounce out of emitted wasm), which fails the op closed.
     beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
-    // The resumer chain (`(resumer's fiber id, resumer, dst)`). Invariant: `chain` is non-empty
-    // iff `active` is a fiber (`active_id` then indexes `fibers`).
-    let mut chain: Vec<(usize, Vm, u32)> = Vec::new();
-    let mut active_id = usize::MAX; // sentinel while the root frame is active
+    // The drive's vCPU state: `active` is the entry or a fiber it resumed, its resumers in `chain`.
+    // A bounce host is never a durable run (the pump), so no shadow-SP word follows a fiber switch.
+    let mut vt = VTask::of(active, 0);
     loop {
-        match active.resume(source, table, fuel, mem, host, u64::MAX)? {
-            Outcome::Done(vals) => match chain.pop() {
-                // The unit entry finished — the invoke's results.
-                None => return Ok(vals),
-                // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` back.
-                Some((rid, resumer, rdst)) => {
-                    fibers.with(|f, _, meta| {
-                        f[active_id] = FiberState::Done;
-                        if let Some(m) = meta.get_mut(active_id) {
-                            m.charge = LiveFiber::none(); // #2112: its charge goes back
-                        }
-                    });
-                    let retval = vals.first().copied().unwrap_or(Value::I64(0));
-                    // `vcpu.tls` is the vCPU's word: it follows execution (as in `step_vcpu`).
-                    let tls = active.tls;
-                    active = resumer;
-                    active.tls = tls;
-                    active_id = rid;
-                    active.set(rdst, Reg::from_i32(super::FIBER_RETURNED));
-                    active.set(rdst + 1, Reg::from_value(retval));
+        match vt.active.resume(source, table, fuel, mem, host, u64::MAX)? {
+            Outcome::Done(vals) => {
+                // The entry finished — the bounce's or the invoke's results — or a fiber returned.
+                if let Some(vals) = return_from_fiber(&mut vt, fibers, mem, false, vals) {
+                    return Ok(vals);
                 }
-            },
+            }
             Outcome::Suspended => {}
             // F2 — a punted host call inside an invoked unit keeps the pre-F2 inline wait
             // (the unit is a seam-free atomic leaf, DESIGN §22: no park surface exists here,
@@ -11867,14 +12089,14 @@ fn drive_nested(
                     let slot = run_meta
                         .as_mut()
                         .and_then(|c| c.park.as_deref_mut())
-                        .filter(|_| chain.is_empty())
+                        .filter(|_| vt.chain.is_empty())
                         .ok_or(Trap::CapFault)?;
                     let state = TaskState::BlockedHostCap { id, dst, at: None };
-                    *slot = Some((active, Handoff::Park(state)));
+                    *slot = Some((vt.active, Handoff::Park(state)));
                     return Ok(Vec::new());
                 }
                 let r = comps.wait(id);
-                active.set(dst, Reg::from_i64(r));
+                vt.active.set(dst, Reg::from_i64(r));
             }
             // #2050 — a futex wait in a bounce out of a leaf whose host suspends its emitted frames
             // parks as an interpreted task's does (the pump's `VcpuStop::Wait` arm): the value is
@@ -11891,15 +12113,15 @@ fn drive_nested(
                 let slot = run_meta
                     .as_mut()
                     .and_then(|c| c.park.as_deref_mut())
-                    .filter(|_| chain.is_empty())
+                    .filter(|_| vt.chain.is_empty())
                     .ok_or(Trap::CapFault)?;
                 let w = mem.as_ref().ok_or(Trap::CapFault)?;
                 if w.atomic_value(base, width) != expected {
-                    active.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
+                    vt.active.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
                     continue;
                 }
                 *slot = Some((
-                    active,
+                    vt.active,
                     Handoff::Wait {
                         addr: base,
                         site: w.futex_site(base),
@@ -11910,131 +12132,31 @@ fn drive_nested(
                 return Ok(Vec::new());
             }
             Outcome::ContNew { funcref, sp, dst } => {
-                // The registry's parallel arrays stay index-aligned (`step_vcpu`'s ContNew arm,
-                // minus the durable shadow bookkeeping — see the `run_meta` doc above).
-                let arena = mem
-                    .as_ref()
-                    .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
-                let func_idx = (funcref as u32 as usize & source.primary().table_mask) as i32;
-                // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
-                let charge = host.with(|h| h.fiber_charge()).ok_or(Trap::FiberFault)?;
-                let h = fibers
-                    .with(|f, fsp, meta| {
-                        if f.len() + 1 >= super::MAX_FIBERS {
-                            return None;
-                        }
-                        let h = f.len();
-                        f.push(FiberState::Pending {
-                            funcref,
-                            sp,
-                            consumed: false,
-                        });
-                        fsp.push(arena.frame_base(h + 1));
-                        meta.push(FiberMeta {
-                            func: func_idx,
-                            sp,
-                            charge,
-                        });
-                        Some(h as i32)
-                    })
-                    .ok_or(Trap::FiberFault)?;
-                active.set(dst, Reg::from_i32(h));
+                let h = new_fiber(fibers, source, mem, host, funcref, sp)?;
+                vt.active.set(dst, Reg::from_i32(h));
             }
-            // Fibers here never event-park (every park surface faults or waits inline above), so
-            // the I48 `blocking` flag is a no-op — `cont.resume.block` behaves like `cont.resume`.
-            Outcome::ContResume {
-                kh,
-                arg,
-                dst,
-                blocking: _,
-                resume_ip: _,
-            } => {
+            // No park here can idle the task (every park surface faults or waits inline above), so
+            // `cont.resume.block` behaves like `cont.resume`: a fiber still event-parked — one the
+            // pump parked, resumed from a bounce over the run's registry — answers the poll.
+            Outcome::ContResume { kh, arg, dst, .. } => {
                 let k = kh as usize;
-                let running = || FiberState::Running {
-                    blocking_ip: None,
-                    pending: None,
-                };
-                // The claim, under a shared registry's lock (#1761); a started fiber's `Vm` is built
-                // after it.
-                let claim = fibers.with(|f, _, _| match f.get_mut(k) {
-                    Some(slot @ FiberState::Pending { .. }) => {
-                        let FiberState::Pending {
-                            funcref,
-                            sp,
-                            consumed,
-                        } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        if consumed {
-                            *slot = FiberState::Running {
-                                blocking_ip: None,
-                                pending: Some(arg), // #1538
-                            };
-                        }
-                        Ok(Claim::Start { funcref, sp })
-                    }
-                    Some(slot @ FiberState::Parked { .. }) => {
-                        let FiberState::Parked {
-                            mut vm,
-                            suspend_dst,
-                            consumed: _,
-                        } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        vm.set(suspend_dst, Reg::from_i64(arg));
-                        Ok(Claim::Continue(vm))
-                    }
-                    _ => Err(Trap::FiberFault), // forged / Running / Done
-                })?;
-                let target = match claim {
+                let target = match claim_fiber(fibers, host, k, arg, None, false)? {
                     Claim::Continue(vm) => vm,
                     Claim::Start { funcref, sp } => {
-                        // Resolve through the shared dispatch table (module-aware, exactly as
-                        // `Op::CallIndirect`), so a fiber over an installed §22 unit runs (#1226).
-                        let Some((tmod, tfunc, tm)) = resolve_fiber_entry(source, table, funcref)
-                        else {
-                            return Err(Trap::FiberFault);
-                        };
-                        let mut fvm = Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)])?;
-                        fvm.module = tmod;
-                        fvm
+                        start_fiber(source, table, mem, k, funcref, sp, arg)?
                     }
-                    // Fibers here never event-park (see above), so a claim never polls or blocks.
-                    Claim::Block | Claim::Poll => unreachable!(),
+                    Claim::Block | Claim::Poll => {
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
+                        vt.active.set(dst + 1, Reg::from_i64(0));
+                        continue;
+                    }
                 };
-                let mut target = target;
-                target.tls = active.tls; // `vcpu.tls` follows execution (as in `step_vcpu`)
-                let resumer = std::mem::replace(&mut active, target);
-                chain.push((active_id, resumer, dst));
-                active_id = k;
+                enter_fiber(&mut vt, fibers, mem, false, k, target, dst);
             }
+            // An empty chain means the entry itself tried to `suspend` — that would park the
+            // synchronous invoke, the seam the §22 contract forbids.
             Outcome::FiberSuspend { value, dst } => {
-                // #1538: a thawed consumed fiber's rewound `suspend` returns the queued argument.
-                if let Some(arg) = fibers.with(|f, _, _| take_pending(f, active_id)) {
-                    active.set(dst, Reg::from_i64(arg));
-                    continue;
-                }
-                // An empty chain means the unit entry itself tried to `suspend` — that would park
-                // the synchronous invoke, the seam the §22 contract forbids.
-                let Some((rid, resumer, rdst)) = chain.pop() else {
-                    return Err(Trap::CapFault);
-                };
-                let mut resumer = resumer;
-                resumer.tls = active.tls; // `vcpu.tls` follows execution (as in `step_vcpu`)
-                let suspended = std::mem::replace(&mut active, resumer);
-                let consumed = !is_unwinding(mem);
-                fibers.with(|f, _, _| {
-                    f[active_id] = FiberState::Parked {
-                        vm: suspended,
-                        suspend_dst: dst,
-                        consumed,
-                    }
-                });
-                active_id = rid;
-                active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
-                active.set(rdst + 1, Reg::from_i64(value));
+                suspend_fiber(&mut vt, fibers, mem, false, value, dst, Trap::CapFault)?
             }
             // #1233: a §22 `Jit.install`/`uninstall` reached from a bounced **tier-up region** — the
             // interpreted-inline-call territory (`run_meta` is `Some`) where the pump's own install arm
@@ -12047,12 +12169,12 @@ fn drive_nested(
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
                 let mirror = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut());
-                jit_install(unit, source, table, mirror, &mut active, dst)?;
+                jit_install(unit, source, table, mirror, &mut vt.active, dst)?;
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
                 let authority = host.with(|p| p.resolve_jit_domain(h)).map(drop);
                 let mirror = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut());
-                jit_uninstall(authority, source, table, slot, mirror, &mut active, dst)?;
+                jit_uninstall(authority, source, table, slot, mirror, &mut vt.active, dst)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
             // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
@@ -12072,10 +12194,10 @@ fn drive_nested(
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
                 let (umod, args) = jit_invoke_unit(unit, source, &argv, &params, &results)?;
                 // #1660: this drive is paused beneath the unit — hand it on, if our own view is whole.
-                let view = beneath.map(|b| b.with_drive(&active, &chain, fibers.view()));
+                let view = beneath.map(|b| b.with_drive(&vt.active, &vt.chain, fibers.view()));
                 let vals = run_invoke(source, table, umod, &args, fuel, mem, host, view.as_ref())?;
                 let slots = vals.into_iter().map(val_to_slot);
-                set_slot_results(&mut active, dst, &results, slots);
+                set_slot_results(&mut vt.active, dst, &results, slots);
             }
             // §GC `gc.roots` inside a nested drive (#1660): scan what this drive holds — its active
             // Vm, its resumer chain, the registry it runs over — and everything paused beneath it.
@@ -12090,14 +12212,15 @@ fn drive_nested(
                 dst,
             } => {
                 let roots = {
-                    let view =
-                        beneath
-                            .ok_or(Trap::CapFault)?
-                            .with_drive(&active, &chain, fibers.view());
+                    let view = beneath.ok_or(Trap::CapFault)?.with_drive(
+                        &vt.active,
+                        &vt.chain,
+                        fibers.view(),
+                    );
                     gc_scan_beneath(&view, source, lo, hi, mask)
                 };
                 let total = gc_write(mem, buf, cap, roots)?;
-                active.set(dst, Reg::from_i64(total));
+                vt.active.set(dst, Reg::from_i64(total));
             }
             // #1896 — a call parks, or asks for a process, in a bounce out of a leaf whose host
             // suspends the emitted frames beneath this drive. The drive stops here and hands back its
@@ -12112,7 +12235,7 @@ fn drive_nested(
                 let slot = run_meta
                     .as_mut()
                     .and_then(|c| c.park.as_deref_mut())
-                    .filter(|_| chain.is_empty())
+                    .filter(|_| vt.chain.is_empty())
                     .ok_or(Trap::CapFault)?;
                 let handoff = match stop {
                     Outcome::PipeRead { pipe } => {
@@ -12129,7 +12252,7 @@ fn drive_nested(
                     }
                     _ => Handoff::Park(TaskState::BlockedStdin),
                 };
-                *slot = Some((active, handoff));
+                *slot = Some((vt.active, handoff));
                 return Ok(Vec::new());
             }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
@@ -12426,95 +12549,14 @@ fn step_vcpu(
                     return Ok(VcpuStop::Preempted);
                 }
             }
-            Outcome::Done(vals) => match vt.chain.pop() {
-                // The vCPU's root activation finished.
-                None => return Ok(VcpuStop::Done(vals)),
-                // A fiber's function returned: mark it Done, hand `(RETURNED, retval)` to its resumer —
-                // unless the freeze unwound it (#1835). An instrumented fiber always unwinds at a poll
-                // before a genuine return, so a return under `UNWINDING` that spilled frames (its
-                // shadow-SP past its frame base) is the freeze's: the fiber is residue, back to the
-                // `Pending` state a thaw seeds it in, and the resumer gets `FIBER_FROZEN`, which its
-                // thaw re-issues. Nothing was consumed: with no mid-run trigger, every park in a freeze run
-                // was made under `UNWINDING`.
-                Some((rid, resumer, rdst)) => {
-                    let id = vt.active_id;
-                    // Fiber switch (returning fiber → its resumer): re-point the durable shadow-SP.
-                    fibers.shadow_switch(ctx, vt, id, rid);
-                    let base = ctx
-                        .mem
-                        .as_ref()
-                        .map_or(0, |m| m.shadow_arena().frame_base(id + 1));
-                    let frozen = ctx.durable && is_unwinding(ctx.mem);
-                    let frozen = fibers.with(|f, sp, meta| {
-                        let frozen = frozen && sp[id] > base;
-                        f[id] = if frozen {
-                            FiberState::Pending {
-                                funcref: meta[id].func,
-                                sp: meta[id].sp,
-                                consumed: false,
-                            }
-                        } else {
-                            if let Some(m) = meta.get_mut(id) {
-                                m.charge = LiveFiber::none(); // #2112: its charge goes back
-                            }
-                            FiberState::Done
-                        };
-                        frozen
-                    });
-                    let retval = vals.first().copied().unwrap_or(Value::I64(0));
-                    // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
-                    let tls = vt.active.tls;
-                    vt.active = resumer;
-                    vt.active.tls = tls;
-                    vt.active_id = rid;
-                    let status = if frozen {
-                        super::FIBER_FROZEN
-                    } else {
-                        super::FIBER_RETURNED
-                    };
-                    vt.active.set(rdst, Reg::from_i32(status));
-                    vt.active.set(rdst + 1, Reg::from_value(retval));
+            Outcome::Done(vals) => {
+                // The vCPU's root activation finished, or a fiber returned to its resumer.
+                if let Some(vals) = return_from_fiber(vt, fibers, ctx.mem, ctx.durable, vals) {
+                    return Ok(VcpuStop::Done(vals));
                 }
-            },
+            }
             Outcome::ContNew { funcref, sp, dst } => {
-                // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
-                // starts at its region base (empty shadow stack) — so a later switch into it points
-                // the active word there (DURABILITY.md §12.8; 4A.5: empty = frame base, past the
-                // in-region SP + thaw words).
-                let arena = ctx
-                    .mem
-                    .as_ref()
-                    .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
-                // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
-                // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
-                // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
-                // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
-                let func_idx = (funcref as u32 as usize & dom.source.primary().table_mask) as i32;
-                // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
-                let charge = ctx
-                    .host
-                    .with(|h| h.fiber_charge())
-                    .ok_or(Trap::FiberFault)?;
-                let h = fibers
-                    .with(|f, fsp, meta| {
-                        if f.len() + 1 >= super::MAX_FIBERS {
-                            return None;
-                        }
-                        let h = f.len();
-                        f.push(FiberState::Pending {
-                            funcref,
-                            sp,
-                            consumed: false,
-                        });
-                        fsp.push(arena.frame_base(h + 1));
-                        meta.push(FiberMeta {
-                            func: func_idx,
-                            sp,
-                            charge,
-                        });
-                        Some(h as i32)
-                    })
-                    .ok_or(Trap::FiberFault)?;
+                let h = new_fiber(fibers, &dom.source, ctx.mem, &mut ctx.host, funcref, sp)?;
                 vt.active.set(dst, Reg::from_i32(h));
             }
             Outcome::ContResume {
@@ -12525,243 +12567,39 @@ fn step_vcpu(
                 resume_ip,
             } => {
                 let k = kh as usize;
-                // I48: if this resume is `cont.resume.block`, tag the switched-in fiber so a park
-                // inside it idles this task (rewinding to `resume_ip`) instead of the FIBER_PARKED
-                // poll. `None` for a plain `cont.resume`.
                 let blocking_ip = blocking.then_some(resume_ip);
-                // #1952 — a poll of a host-parked fiber asks whether its op can proceed now, over
-                // this task's powerbox (read here: the claim below runs under the registry).
-                let host_ready = fibers
-                    .with(|f, _, _| match f.get(k) {
-                        Some(FiberState::HostParked { on, .. }) => Some(on.clone()),
-                        _ => None,
-                    })
-                    .is_some_and(|on| ctx.host.with(|h| on.ready(h)));
-                // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the ordered drain
-                // first (so a busy resume-poll loop observes its completion without waiting
-                // for driver idle — the WaitParked `real_deadline` shape, completion form).
-                // The drain, not a direct `try_take`, so a poll of a LATER id never lets its
-                // ready result overtake an earlier outstanding park (the §18 pin).
-                if fibers.with(|f, _, _| {
-                    matches!(f.get(k), Some(FiberState::CapParked { woken: None, .. }))
-                }) {
-                    let comps = ctx.host.with(|p| p.completions());
-                    fibers.with(|f, _, _| drain_cap_parked(f, &comps));
-                }
-                let running = || FiberState::Running {
-                    blocking_ip,
-                    pending: None,
-                };
-                // Claim fiber `k` from the **run-shared** registry: a pending fiber starts (call
-                // `funcref(sp, arg)`), a parked one continues (the new `arg` becomes its `suspend`'s
-                // result) — possibly one suspended on *another* vCPU (D57 migration). Anything else
-                // (forged / already running on a vCPU / done) is inert. Only the state transition
-                // happens under a shared registry's lock (#1761); a started fiber's `Vm` is built
-                // after it.
-                let claim = fibers.with(|f, _, _| match f.get_mut(k) {
-                    Some(slot @ FiberState::Pending { .. }) => {
-                        let FiberState::Pending {
-                            funcref,
-                            sp,
-                            consumed,
-                        } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        if consumed {
-                            *slot = FiberState::Running {
-                                blocking_ip,
-                                pending: Some(arg), // #1538
-                            };
+                let target =
+                    match claim_fiber(fibers, &mut ctx.host, k, arg, blocking_ip, cooperative)? {
+                        Claim::Continue(vm) => vm,
+                        Claim::Start { funcref, sp } => {
+                            start_fiber(&dom.source, ctx.table, ctx.mem, k, funcref, sp, arg)?
                         }
-                        Ok(Claim::Start { funcref, sp })
-                    }
-                    Some(slot @ FiberState::Parked { .. }) => {
-                        let FiberState::Parked {
-                            mut vm,
-                            suspend_dst,
-                            consumed: _,
-                        } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        vm.set(suspend_dst, Reg::from_i64(arg));
-                        Ok(Claim::Continue(vm))
-                    }
-                    // §3.6 slice 5a: an event-parked fiber (blocked in `memory.wait`). Woken —
-                    // or with its real deadline passed (the timeout fires at the poll, so a
-                    // cooperative resume-poll loop terminates) — the resume delivers the wait's
-                    // status into the fiber and continues it (the resume `arg` is deliberately
-                    // NOT delivered, matching the oracle's `LiveWoken`); still blocked, the
-                    // resumer gets `(FIBER_PARKED, 0)` without a switch (the cooperative poll).
-                    Some(slot @ FiberState::WaitParked { .. }) => {
-                        let FiberState::WaitParked {
-                            woken,
-                            real_deadline,
-                            ..
-                        } = slot
-                        else {
-                            unreachable!()
-                        };
-                        let fired = woken.take().or_else(|| {
-                            // #1638: an infinite wait has no real deadline to poll against, so
-                            // a busy resume-poll loop over one never fabricates a timeout here —
-                            // it runs until the poller itself `notify`s the fiber, or until fuel
-                            // runs out. That is the answer, not a gap (#1642): the poller is live
-                            // guest code, so whether it will ever notify is undecidable and no
-                            // engine may call the loop a deadlock. Fuel bounds it like any other
-                            // guest loop, at the identical safepoint on all three engines
-                            // (`jit_fuel.rs`). Before #1638 this engine alone ended it, with a
-                            // `WAIT_TIMED_OUT` at 10 s that the guest never asked for.
-                            real_deadline
-                                .filter(|dl| sched_wall_now() >= *dl)
-                                .map(|_| super::WAIT_TIMED_OUT)
-                        });
-                        // I48: a blocking resume of a still-parked fiber idles this task on the
-                        // fiber (its deadline is already in the idle scan; notify wakes it too).
-                        // A plain resume returns the FIBER_PARKED poll (guest loops).
-                        let Some(st) = fired else {
-                            return Ok(if blocking && cooperative {
-                                Claim::Block
-                            } else {
-                                Claim::Poll
-                            });
-                        };
-                        let FiberState::WaitParked {
-                            mut vm, wait_dst, ..
-                        } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        vm.set(wait_dst, Reg::from_i32(st));
-                        Ok(Claim::Continue(vm))
-                    }
-                    // F2 — a cap-parked fiber (blocked on its punt completion). Claimed by
-                    // the drain above (`woken`), the resume delivers the scalar into the
-                    // `call.cap`'s result register and continues it (the resume `arg` is
-                    // deliberately NOT delivered — the oracle's `LiveWoken`); still in
-                    // flight, the resumer gets `(FIBER_PARKED, 0)` without a switch (I48: a
-                    // blocking resume idles until the ordered completion drain wakes it).
-                    // #1952 — a host-parked fiber: once its op can proceed, the resume continues it,
-                    // and its rewound op re-executes (nothing is delivered); until then the resumer
-                    // gets `(FIBER_PARKED, 0)` without a switch, or idles under a blocking resume.
-                    Some(slot @ FiberState::HostParked { .. }) => {
-                        if !host_ready {
-                            return Ok(if blocking && cooperative {
-                                Claim::Block
-                            } else {
-                                Claim::Poll
-                            });
+                        // The oracle's rule: a durable run whose freeze is unwinding takes the
+                        // advisory downgrade (the poll status), so the resumer reaches its trailing
+                        // poll instead of re-idling (#1904).
+                        Claim::Block if !(ctx.durable && is_unwinding(ctx.mem)) => {
+                            // Rewind the resumer's cursor so the wake re-executes the resume.
+                            vt.active.pc = resume_ip;
+                            return Ok(VcpuStop::BlockOnFiber { fiber: k });
                         }
-                        let FiberState::HostParked { vm, .. } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        Ok(Claim::Continue(vm))
-                    }
-                    Some(slot @ FiberState::CapParked { .. }) => {
-                        let FiberState::CapParked { woken, .. } = slot else {
-                            unreachable!()
-                        };
-                        let Some(r) = woken.take() else {
-                            return Ok(if blocking && cooperative {
-                                Claim::Block
-                            } else {
-                                Claim::Poll
-                            });
-                        };
-                        let FiberState::CapParked {
-                            mut vm,
-                            dst: cap_dst,
-                            ..
-                        } = std::mem::replace(slot, running())
-                        else {
-                            unreachable!()
-                        };
-                        vm.set(cap_dst, Reg::from_i64(r));
-                        Ok(Claim::Continue(vm))
-                    }
-                    _ => Err(Trap::FiberFault), // forged / Running / Done
-                })?;
-                let target = match claim {
-                    Claim::Continue(vm) => vm,
-                    // The oracle's rule: a durable run whose freeze is unwinding takes the
-                    // advisory downgrade (the poll status), so the resumer reaches its trailing
-                    // poll instead of re-idling (#1904).
-                    Claim::Block if !(ctx.durable && is_unwinding(ctx.mem)) => {
-                        // Rewind the resumer's cursor so the wake re-executes the resume.
-                        vt.active.pc = resume_ip;
-                        return Ok(VcpuStop::BlockOnFiber { fiber: k });
-                    }
-                    Claim::Block | Claim::Poll => {
-                        vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
-                        vt.active.set(dst + 1, Reg::from_i64(0));
-                        continue;
-                    }
-                    Claim::Start { funcref, sp } => {
-                        // Resolve the fiber entry through the shared dispatch table (module-aware,
-                        // exactly as `Op::CallIndirect` / the tree-walker's `dispatch_indirect` / the
-                        // JIT's shared `fn_table`): a fiber may start on an **installed §22 unit**
-                        // function (a module ≥ 1 entry), not only a module-0-natural one — a
-                        // forged/mistyped funcref is still a `FiberFault` (#1226, DESIGN.md §22
-                        // "Concurrency", renegotiated 2026-07-30). Resolve against `ctx.table`, the
-                        // same table the fiber's own `call.dyn`s dispatch through (paired with
-                        // `dom.source` in the `resume` above).
-                        let Some((tmod, tfunc, tm)) =
-                            resolve_fiber_entry(&dom.source, ctx.table, funcref)
-                        else {
-                            return Err(Trap::FiberFault);
-                        };
-                        let mut fvm = Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)])?;
-                        fvm.module = tmod;
-                        // §12.8 4A.5: this fiber spills into its own region (slot `k` = context `k + 1`).
-                        fvm.durable_region_base = ctx
-                            .mem
-                            .as_ref()
-                            .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
-                            .region_base(k + 1);
-                        fvm
-                    }
-                };
-                // Fiber switch (resumer → fiber `k`): re-point the durable shadow-SP before the swap.
-                let out = vt.active_id;
-                fibers.shadow_switch(ctx, vt, out, k);
-                // `vcpu.tls` is read at the executing vCPU (the op's spec): the fiber runs with this
-                // vCPU's word, wherever it last ran.
-                let mut target = target;
-                target.tls = vt.active.tls;
-                let resumer = std::mem::replace(&mut vt.active, target);
-                vt.chain.push((vt.active_id, resumer, dst));
-                vt.active_id = k;
+                        Claim::Block | Claim::Poll => {
+                            vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
+                            vt.active.set(dst + 1, Reg::from_i64(0));
+                            continue;
+                        }
+                    };
+                enter_fiber(vt, fibers, ctx.mem, ctx.durable, k, target, dst);
             }
-            Outcome::FiberSuspend { value, dst } => {
-                let id = vt.active_id;
-                // #1538: a thawed consumed fiber's rewound `suspend` returns the queued argument.
-                if let Some(arg) = fibers.with(|f, _, _| take_pending(f, id)) {
-                    vt.active.set(dst, Reg::from_i64(arg));
-                    continue;
-                }
-                // Pop the resumer to switch back to; an empty chain means the root tried to
-                // `suspend`, which is a `FiberFault` (the root has no resumer).
-                let (rid, resumer, rdst) = vt.chain.pop().ok_or(Trap::FiberFault)?;
-                // Fiber switch (suspending fiber → its resumer): re-point the durable shadow-SP.
-                fibers.shadow_switch(ctx, vt, id, rid);
-                // `vcpu.tls` goes back to the resumer with execution (the fiber may have set it).
-                let mut resumer = resumer;
-                resumer.tls = vt.active.tls;
-                let suspended = std::mem::replace(&mut vt.active, resumer);
-                let consumed = !is_unwinding(ctx.mem);
-                fibers.with(|f, _, _| {
-                    f[id] = FiberState::Parked {
-                        vm: suspended,
-                        suspend_dst: dst,
-                        consumed,
-                    }
-                });
-                vt.active_id = rid;
-                vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
-                vt.active.set(rdst + 1, Reg::from_i64(value));
-            }
+            // The root has no resumer to `suspend` to.
+            Outcome::FiberSuspend { value, dst } => suspend_fiber(
+                vt,
+                fibers,
+                ctx.mem,
+                ctx.durable,
+                value,
+                dst,
+                Trap::FiberFault,
+            )?,
             Outcome::TierUp {
                 func,
                 argv,
@@ -14728,11 +14566,7 @@ impl CoopSched {
                             durable,
                             host: HostCell::Excl(&mut guard),
                         },
-                        FiberCell::Excl {
-                            fibers: &mut e.fibers.fibers,
-                            sp: &mut e.fibers.sp,
-                            meta: &mut e.fibers.meta,
-                        },
+                        e.fibers.cell(),
                     )
                 }
             };
@@ -16610,14 +16444,7 @@ impl CoopRun {
         // which lives as long as the invoke, across its bounces) during an emitted `Jit.invoke`, else
         // the run-level registry. One of the two `match` arms below moves it.
         let (mut bounce_fibers, bounce_meta): (FiberCell, Option<BounceRunCtx<'_>>) = if in_invoke {
-            (
-                FiberCell::Excl {
-                    fibers: &mut invoke_fibers.fibers,
-                    sp: &mut invoke_fibers.sp,
-                    meta: &mut invoke_fibers.meta,
-                },
-                None,
-            )
+            (invoke_fibers.cell(), None)
         } else {
             (
                 FiberCell::Excl {
