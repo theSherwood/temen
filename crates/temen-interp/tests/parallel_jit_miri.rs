@@ -14,7 +14,7 @@
 //! Run: `cargo +nightly miri test -p temen-interp --test parallel_jit_miri`
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Region, Value};
+use temen_interp::{bytecode, Host, JitValidated, Region, Value};
 use temen_text::parse_module;
 
 /// The unit every worker drives: `service() -> 7` — pure compute, no host/memory use.
@@ -33,9 +33,13 @@ fn jit_validator(
     _bytes: &[u8],
     _mem_log2: Option<u8>,
     _symtab: &[u8],
-) -> Result<Arc<[temen_ir::Func]>, i64> {
+) -> Result<JitValidated, i64> {
     match parse_module(SERVICE) {
-        Ok(m) => Ok(m.funcs.into()),
+        Ok(m) => Ok(JitValidated {
+            funcs: m.funcs.into(),
+            types: m.types.into(),
+            data: None,
+        }),
         Err(_) => Err(-22),
     }
 }

@@ -356,7 +356,9 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (`call.import "clock"`) is resolved by a guest-provided symbol table to a host capability (Clock,
   iface 2) *before* verify — lowering it to a real `call.cap 2 0` — so a plugin reaches a host service
   by name → 777; an empty table leaves the import unresolved and `compile_linked` fails closed. The
-  symtab codec + resolution run in wasm (own minimal wire form). wasm64 `run_dynlink() == 777`.
+  symtab codec (`temen-encode`'s) + resolution run in wasm. wasm64 `run_dynlink() == 777`. A link
+  unit's own globals (#2167) are placed and written the same way as natively, and run on the emitted
+  wasm (`coop_link_unit_globals_match_the_oracle`).
 - [x] **Durability** (freeze / thaw, single-fiber, IR-driven). The `temen-durable` transform instruments
   a program (two clock reads = unwind points); over a durable window the bytecode engine drives:
   a NORMAL run (→ 2001), an UNWINDING **freeze** (a byte-identical 128 KiB snapshot wasm vs native),

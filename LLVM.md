@@ -1876,8 +1876,8 @@ runtime built on LLVM bitcode drives many concurrent blocking I/Os from one park
 **Slice AE (DONE) — guest-driven JIT (§22).** The `Jit` capability now lowers on the on-ramp, so a
 guest that emits serialized Temen IR at runtime (a language runtime accelerating its own bytecode)
 reaches it from LLVM bitcode: `__vm_jit_compile`/`invoke2`/`release`/`install`/`uninstall`/
-`compile_linked` → `CallImport` on the stashed `Jit` handle (slot 7; imports `vm_jit_*` → `Jit` ops
-0/1/2/3/4/5). A JIT-using program is granted the **full 8-handle powerbox** (`Jit` is the last
+`compile_linked`/`unit_info` → `CallImport` on the stashed `Jit` handle (slot 7; imports `vm_jit_*` →
+`Jit` ops 0/1/2/3/4/5/6). A JIT-using program is granted the **full 8-handle powerbox** (`Jit` is the last
 `VM_CAP_*` index; `synth_start`'s contiguous prefix now reaches 8, so `run_powerbox` grants `Jit` with
 its validator + call.dyn table). The host verifies + Cranelift-compiles the submitted blob into
 *this* domain — same window, same powerbox; verification, not isolation, is the boundary (§2a).

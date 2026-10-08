@@ -224,7 +224,8 @@ The system is four ideas wearing many names:
   of indirect calls. Type-checked at dispatch via the interned signature id.
 - **jit_link / `compile_linked`** — compile a submission whose *named imports* resolve
   against previously installed units through a guest-built symbol table: guest-side
-  dynamic linking (`vm_dlopen`/`vm_dlsym` in guest C).
+  dynamic linking (`vm_dlopen`/`vm_dlsym` in guest C). A link unit's own globals go in a
+  room the guest names in the same table (`unit_info` says how much it needs).
 
 ## Trust & identity
 

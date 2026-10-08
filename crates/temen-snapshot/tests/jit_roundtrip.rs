@@ -4,10 +4,8 @@
 //! Section 5 (canonical byte-identical re-serialize; fail-closed on a tampered unit) plus the
 //! handle-index bounds gate.
 
-use std::sync::Arc;
-
-use temen_interp::{DurableJitTable, DurableJitUnit, Host, JitRestoreError};
-use temen_ir::{Func, Module};
+use temen_interp::{DurableJitTable, DurableJitUnit, Host, JitRestoreError, JitValidated};
+use temen_ir::Module;
 use temen_snapshot::{freeze, restore, RestoreError};
 
 const SIZE_LOG2: u8 = 18;
@@ -16,10 +14,14 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 /// A minimal `Jit` validator (the embedder-injected decode+verify gate): decode the submitted
 /// blob as a module, re-verify, hand back its funcs. Mirrors the real `jit_blob_validator` shape
 /// without pulling in `temen-run` — the codec test only needs *some* validated unit in a domain.
-fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<Arc<[Func]>, i64> {
+fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<JitValidated, i64> {
     let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
     temen_verify::verify_module(&m).map_err(|_| -22i64)?;
-    Ok(Arc::from(m.funcs))
+    Ok(JitValidated {
+        funcs: m.funcs.into(),
+        types: m.types.into(),
+        data: None,
+    })
 }
 
 /// The module whose window/digest gates the artifact (a plain memory-18 module — the guest that

@@ -21,13 +21,12 @@
 //! test that leaves the carve (#1867) spawns through op 15's scalar form instead, as
 //! `durable_detached_jit.rs` does.
 
-use std::sync::Arc;
 use temen_durable::{
     arm_freeze_after, arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state,
     transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, Trap, Value};
-use temen_ir::{Func, Module};
+use temen_ir::Module;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -293,7 +292,7 @@ fn durable_domain_refuses_guest_jit_compile() {
         _bytes: &[u8],
         _mem: Option<u8>,
         _symtab: &[u8],
-    ) -> Result<Arc<[Func]>, i64> {
+    ) -> Result<temen_interp::JitValidated, i64> {
         let m = parse_module(
             "func () -> (i64) {
 block 0 () {
@@ -304,7 +303,11 @@ block 0 () {
 ",
         )
         .expect("parse unit");
-        Ok(m.funcs.into())
+        Ok(temen_interp::JitValidated {
+            funcs: m.funcs.into(),
+            types: m.types.into(),
+            data: None,
+        })
     }
 
     // Control: the same validator + grant on a NON-durable host compiles.

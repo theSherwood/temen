@@ -721,7 +721,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
                   = primary, `mods[k≥1]` = installed units; runtime dispatch table replacing the
                   compile-time natural table). `Vm` activations carry a `module`, re-bound only at
                   cross-module call/return so the per-op hot loop is unchanged. `compile`/
-                  `compile_linked` (JIT ops 0/5) ride the generic `cap_dispatch_slots` (free);
+                  `compile_linked`/`unit_info` (JIT ops 0/5/6) ride the generic `cap_dispatch_slots` (free);
                   `install`/`uninstall` (ops 3/4) escape to `drive` (owns the mutable `Domain`):
                   install compiles the unit to bytecode + fills a padding slot, uninstall clears one.
                   Coroutine children keep their own natural table (no installed units), matching the

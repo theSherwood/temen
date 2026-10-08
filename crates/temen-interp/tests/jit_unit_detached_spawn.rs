@@ -18,7 +18,7 @@
 //! temen-interp suite with no Cranelift dependency.
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Trap, Value};
+use temen_interp::{bytecode, Host, JitValidated, Trap, Value};
 use temen_text::parse_module;
 
 /// What the detached child returns — read back through the unit's `join`.
@@ -151,14 +151,14 @@ fn unit_blob(src: &str) -> Vec<u8> {
 }
 
 /// The canonical validator shape: decode + verify the guest's blob, hand back its functions.
-fn validator(
-    bytes: &[u8],
-    _mem_log2: Option<u8>,
-    _symtab: &[u8],
-) -> Result<Arc<[temen_ir::Func]>, i64> {
+fn validator(bytes: &[u8], _mem_log2: Option<u8>, _symtab: &[u8]) -> Result<JitValidated, i64> {
     let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
     temen_verify::verify_module(&m).map_err(|_| -22i64)?;
-    Ok(m.funcs.into())
+    Ok(JitValidated {
+        funcs: m.funcs.into(),
+        types: m.types.into(),
+        data: None,
+    })
 }
 
 /// A reference-powerbox-shaped host: the running module registered and a named `"instantiator"`

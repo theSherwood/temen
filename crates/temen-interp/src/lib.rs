@@ -23380,21 +23380,50 @@ impl BoundImport {
     }
 }
 
+/// Write a placed unit's data image into the window (#2167): its room zeroed, then each segment,
+/// through the window's own checked accessor — so it lands only where the guest could write itself,
+/// and an unmapped, read-only or out-of-window room is `None`. The room is zeroed in bounded chunks:
+/// its size is the unit's to choose, but the host's allocation is not.
+fn write_data_image(mem: &mut dyn GuestMem, image: &temen_ir::DataImage) -> Option<()> {
+    static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+    let end = image.base.checked_add(image.span)?;
+    let mut at = image.base;
+    while at < end {
+        let n = (end - at).min(ZEROS.len() as u64);
+        mem.write_bytes(at, &ZEROS[..n as usize])?;
+        at += n;
+    }
+    for d in &image.data {
+        mem.write_bytes(d.offset, &d.bytes)?;
+    }
+    Some(())
+}
+
 /// The host-injected validation gate for guest-submitted `Jit` blobs (DESIGN.md §22 "Security
-/// argument"): `(blob bytes, expected declared memory)` → the verified functions, or a
-/// negative errno. The embedder's implementation must run the full hinge —
-/// `decode_module` + `verify_module` + the **memory-match precondition** (declared memory ==
-/// the parent window) + reject data segments and §12 concurrency ops
-/// ([`Func::uses_concurrency`]) — and the *same* function must be installed for the
-/// interpreter and JIT runs of a differential pair, so both backends accept/reject
-/// identically (`temen-run` provides the canonical one).
+/// argument"): `(blob bytes, expected declared memory)` → the admitted unit ([`JitValidated`]), or
+/// a negative errno. The embedder's implementation must run the full hinge — decode, link the unit
+/// against its symbol table (`temen_ir::load_unit`), `verify_module`, and the **memory-match
+/// precondition** (declared memory == the parent window) — and the *same* function must be
+/// installed for the interpreter and JIT runs of a differential pair, so both backends
+/// accept/reject identically (`temen-run` provides the canonical one).
 ///
 /// The third argument is the **symbol-table bytes** for host-assisted dynamic linking
-/// (DESIGN.md §22): a guest-provided `name → slot | capability` table the validator resolves the
-/// unit's §7 imports against *before* verify (rewrite-then-verify). It is empty (`&[]`) for the
-/// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
-/// fails closed — and carries the guest's table only for the `compile_linked` op.
-pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>;
+/// (DESIGN.md §22, `temen_encode::decode_symbol_table`): the guest's slots, capabilities and data
+/// addresses the unit's imports and data symbols bind to *before* verify (rewrite-then-verify), and
+/// where its own data goes. It is empty (`&[]`) for the ordinary closed-blob `compile` op — an empty
+/// table resolves nothing and places nothing, so a unit with imports or data of its own fails closed
+/// — and carries the guest's table only for the `compile_linked` op.
+pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<JitValidated, i64>;
+
+/// A unit a [`JitValidator`] admitted: its verified functions (the entry is `funcs[0]`), its type
+/// section, and its data image — a link unit's globals, placed where the guest's symbol table said
+/// (#2167). The host writes the image into the window before it installs the unit
+/// ([`Host::jit_compile_linked`]), the same way for every engine.
+pub struct JitValidated {
+    pub funcs: Arc<[Func]>,
+    pub types: Arc<[temen_ir::TypeEntry]>,
+    pub data: Option<temen_ir::DataImage>,
+}
 
 /// The host-injected decode+verify gate for `ModuleLoader.from_bytes` (iface 7): given a
 /// wire-encoded module blob from the guest window, return the decoded+**verified** [`Module`]
@@ -24196,6 +24225,7 @@ impl Host {
             "vm_jit_release",
             "vm_jit_install",
             "vm_jit_uninstall",
+            "vm_jit_unit_info",
         ];
         let policy = |name: &str| {
             CHILD_BINDABLE
@@ -29272,8 +29302,35 @@ impl Host {
         handle: i32,
         bytes: &[u8],
     ) -> Result<Result<JitCompiled, i64>, Trap> {
-        // The closed-blob path: no symbol table, so a unit with §7 imports fails closed.
-        self.jit_compile_linked(handle, bytes, &[])
+        // The closed-blob path: no symbol table, so a unit with §7 imports or data of its own fails
+        // closed, and there is no data image to write.
+        self.jit_compile_linked(handle, bytes, &[], None)
+    }
+
+    /// `Jit.unit_info(ir, ir_len, buf, cap) -> len | -errno` (op 6, DESIGN.md §22, #2167): what a
+    /// guest loader needs to place a link unit's data — the room it needs and its data exports
+    /// ([`temen_encode::unit_info`]). The reply is written to `[buf, buf + cap)` only when it fits,
+    /// and its length is returned either way, so a loader with too small a buffer can retry. Every
+    /// engine's `Jit` dispatch comes through here. A malformed blob is `-EINVAL`; a buffer the guest
+    /// could not read or write is `-EFAULT`; a handle that is not a `Jit` table traps.
+    pub fn jit_unit_info(
+        &mut self,
+        handle: i32,
+        mem: &mut dyn GuestMem,
+        args: &[i64],
+    ) -> Result<i64, Trap> {
+        self.resolve_jit_domain(handle)?;
+        let arg = |i: usize| *args.get(i).unwrap_or(&0) as u64;
+        let Some(ir) = mem.read_bytes(arg(0), arg(1)) else {
+            return Ok(EFAULT);
+        };
+        let Ok(info) = temen_encode::unit_info(&ir) else {
+            return Ok(EINVAL);
+        };
+        if info.len() as u64 <= arg(3) && mem.write_bytes(arg(2), &info).is_none() {
+            return Ok(EFAULT);
+        }
+        Ok(info.len() as i64)
     }
 
     /// Like [`Self::jit_compile`], but the unit's §7 imports are resolved against the
@@ -29281,11 +29338,19 @@ impl Host {
     /// (DESIGN.md §22). The `compile_linked` op routes here; `compile` routes here with an empty
     /// table. The validator does the resolve-then-verify, so the symbol table stays
     /// guest-controlled yet a mis-link can never escape (it fails re-verification, `-EINVAL`).
+    ///
+    /// A link unit's own data (#2167) is placed where the table says, and its image is written into
+    /// `mem` here, through the window's own checked accessor, once every other check has passed (a
+    /// refused unit writes nothing). It lands only where the guest could write itself: a room that is
+    /// not writable fails the compile `-EFAULT` with nothing installed — and a room only partly
+    /// writable may have had that part zeroed, so the guest's room is then unspecified. Every engine's
+    /// `Jit` dispatch comes through here, so a unit's data is written by one path wherever it runs.
     pub fn jit_compile_linked(
         &mut self,
         handle: i32,
         bytes: &[u8],
         symtab: &[u8],
+        mem: Option<&mut dyn GuestMem>,
     ) -> Result<Result<JitCompiled, i64>, Trap> {
         let domain = self.resolve_jit_domain(handle)?;
         // §4 (DURABILITY.md §12.5): *a durable domain admits only freezable modules* — and a §22
@@ -29333,18 +29398,14 @@ impl Host {
             return Ok(Err(ENOMEM));
         }
         d.bytes_left -= bytes.len() as u64;
-        let funcs = match validate(bytes, mem_log2, symtab) {
-            Ok(f) if !f.is_empty() => f,
+        // FuncType interning (#922): the unit's type section rides the validated unit (linking is
+        // source-to-source and never changes it), so the durable gate below can resolve interned
+        // call type indices.
+        let JitValidated { funcs, types, data } = match validate(bytes, mem_log2, symtab) {
+            Ok(v) if !v.funcs.is_empty() => v,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
         };
-        // FuncType interning (#922): the unit's type section. Re-decode the already-validated
-        // `bytes` (linking is source-to-source and never changes the type section, so this holds
-        // for `compile_linked` too); a decode failure is impossible here (validation just passed).
-        // Decoded before the durable fence so the gate can resolve interned call type indices.
-        let types: Arc<[temen_ir::TypeEntry]> = temen_encode::decode_module(bytes)
-            .map(|m| Arc::from(m.types))
-            .unwrap_or_else(|_| Arc::from(Vec::new()));
         // Durable install fence (DURABILITY.md §12.5, R8 fork-critical case): in a durable run, a
         // *suspendable* unit whose entry signature the program does not taint is rejected — else a
         // `call.dyn` reaching an installed slot at an un-instrumented site would silently lose
@@ -29353,6 +29414,13 @@ impl Host {
         if let Some(gate) = durable_gate {
             if gate(&funcs, &types, durable_tainted) {
                 return Ok(Err(EINVAL));
+            }
+        }
+        // The unit's data image, last of all: every check above has passed, so a refused unit never
+        // writes into the window.
+        if let Some(image) = &data {
+            if mem.and_then(|m| write_data_image(m, image)).is_none() {
+                return Ok(Err(EFAULT));
             }
         }
         d.units_left -= 1;
@@ -31851,10 +31919,20 @@ impl Host {
                     let Some(symtab) = mem.read_bytes(st_ptr, st_len) else {
                         return Ok(vec![EFAULT]);
                     };
-                    Ok(vec![match self.jit_compile_linked(handle, &ir, &symtab)? {
-                        Ok(c) => c.handle as i64,
-                        Err(e) => e,
-                    }])
+                    Ok(vec![
+                        match self.jit_compile_linked(handle, &ir, &symtab, Some(mem))? {
+                            Ok(c) => c.handle as i64,
+                            Err(e) => e,
+                        },
+                    ])
+                }
+                6 => {
+                    // unit_info(ir, ir_len, buf, cap) -> len | -errno (#2167): what a loader needs to
+                    // place a link unit's data. No window, nothing to read (-EFAULT, like op 0).
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    Ok(vec![self.jit_unit_info(handle, mem, args)?])
                 }
                 _ => Ok(vec![EINVAL]),
             },
@@ -35798,10 +35876,14 @@ mod fiber_charge_tests {
 mod spawn_module_tests {
     use super::*;
 
-    fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<Arc<[Func]>, i64> {
+    fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<JitValidated, i64> {
         let m = temen_encode::decode_module(bytes).map_err(|_| EINVAL)?;
         temen_verify::verify_module(&m).map_err(|_| EINVAL)?;
-        Ok(m.funcs.into())
+        Ok(JitValidated {
+            funcs: m.funcs.into(),
+            types: m.types.into(),
+            data: None,
+        })
     }
 
     /// #2143 — from an installed unit's frame, `-1` names the unit's program as a module: its
@@ -35952,10 +36034,14 @@ mod fork_powerbox_tests {
         // A validator that decodes+verifies and hands back the funcs (the real durable validator's
         // instrumentation is exercised by temen-durable's own tests; here we only need the hosting +
         // fence plumbing on the `Host`).
-        fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<Arc<[Func]>, i64> {
+        fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<JitValidated, i64> {
             let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
             temen_verify::verify_module(&m).map_err(|_| -22i64)?;
-            Ok(Arc::from(m.funcs))
+            Ok(JitValidated {
+                funcs: m.funcs.into(),
+                types: m.types.into(),
+                data: None,
+            })
         }
         // The fence rejects a unit whose entry signature the program does not taint — so with an empty
         // tainted set every unit is refused, and admission proves the taint was resolved.

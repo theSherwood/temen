@@ -1890,6 +1890,114 @@ pub fn write_sleb(out: &mut Vec<u8>, mut v: i64) {
 }
 
 // ----------------------------------------------------------------------------
+// A guest loader's wire forms (DESIGN.md §22): the symbol table it hands `compile_linked`, and
+// the `unit_info` reply it places a link unit's data by
+// ----------------------------------------------------------------------------
+
+/// Encode a guest loader's **symbol table** for `compile_linked` — what a loader (`<vm_dl.h>`) or a
+/// test builds. LEB128 throughout: a row `count`, then per row a `name` (uleb length + UTF-8 bytes),
+/// a `kind` byte and its payload: `0` a `call.dyn` table slot, `1` a host capability
+/// `(type_id, op)`, `2` a data symbol's window address, `3` the unit's own data placement (unnamed,
+/// at most one). [`temen_ir::Resolved::Func`], the static-link case, is not deliverable.
+pub fn encode_symbol_table(table: &temen_ir::SymbolTable) -> Vec<u8> {
+    let mut out = Vec::new();
+    let rows = table.funcs.len() + table.data.len() + usize::from(table.place.is_some());
+    write_uleb(&mut out, rows as u64);
+    let row = |out: &mut Vec<u8>, name: &str, kind: u8| {
+        write_uleb(out, name.len() as u64);
+        out.extend_from_slice(name.as_bytes());
+        out.push(kind);
+    };
+    for (name, r) in &table.funcs {
+        match r {
+            temen_ir::Resolved::Slot(slot) => {
+                row(&mut out, name, 0);
+                write_uleb(&mut out, *slot as u64);
+            }
+            temen_ir::Resolved::Cap(cap) => {
+                row(&mut out, name, 1);
+                write_uleb(&mut out, cap.type_id as u64);
+                write_uleb(&mut out, cap.op as u64);
+            }
+            temen_ir::Resolved::Func(_) => {
+                panic!("a Func binding is not deliverable through a guest symbol table")
+            }
+        }
+    }
+    for (name, addr) in &table.data {
+        row(&mut out, name, 2);
+        write_uleb(&mut out, *addr);
+    }
+    if let Some(base) = table.place {
+        row(&mut out, "", 3);
+        write_uleb(&mut out, base);
+    }
+    out
+}
+
+/// Decode an [`encode_symbol_table`] buffer. Untrusted input: `None` on any malformation (an unknown
+/// kind, a named or second placement, trailing bytes), before any IR is touched. Empty bytes are the
+/// empty table — what the closed `compile` op passes, so a unit with imports fails closed. A name
+/// given twice keeps its last row.
+pub fn decode_symbol_table(bytes: &[u8]) -> Option<temen_ir::SymbolTable> {
+    let mut table = temen_ir::SymbolTable::default();
+    if bytes.is_empty() {
+        return Some(table);
+    }
+    let mut c = Cursor::new(bytes);
+    let u32_of = |v: u64| u32::try_from(v).ok();
+    for _ in 0..c.count().ok()? {
+        let len = c.count().ok()?;
+        let name = core::str::from_utf8(c.take(len).ok()?).ok()?.to_owned();
+        match c.byte().ok()? {
+            0 => {
+                let slot = u32_of(c.uleb().ok()?)?;
+                table.funcs.insert(name, temen_ir::Resolved::Slot(slot));
+            }
+            1 => {
+                let type_id = u32_of(c.uleb().ok()?)?;
+                let op = u32_of(c.uleb().ok()?)?;
+                let cap = temen_ir::ResolvedCap { type_id, op };
+                table.funcs.insert(name, temen_ir::Resolved::Cap(cap));
+            }
+            2 => {
+                table.data.insert(name, c.uleb().ok()?);
+            }
+            3 if name.is_empty() && table.place.is_none() => {
+                table.place = Some(c.uleb().ok()?);
+            }
+            _ => return None,
+        }
+    }
+    c.at_end().then_some(table)
+}
+
+/// The `Jit` op `unit_info` reply for an encoded unit (DESIGN.md §22): what a guest loader needs to
+/// place its data. LEB128: the room the data needs ([`temen_ir::unit_data_span`]), then its data
+/// exports, a `count` and per export a `name` (uleb length + UTF-8 bytes) and its `offset` in that
+/// room. A runnable module has no placeable data, so its reply is empty room and no exports. Fails
+/// as [`decode_unit`] does on a malformed blob.
+pub fn unit_info(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    let object = wire::sniff_kind(bytes) == Some(wire::KIND_OBJECT);
+    let m = decode_unit(bytes)?;
+    let mut out = Vec::new();
+    if !object {
+        write_uleb(&mut out, 0);
+        write_uleb(&mut out, 0);
+        return Ok(out);
+    }
+    write_uleb(&mut out, temen_ir::unit_data_span(&m));
+    let exports: Vec<&DataExport> = m.data_exports.iter().filter(|e| !e.tls).collect();
+    write_uleb(&mut out, exports.len() as u64);
+    for e in exports {
+        write_uleb(&mut out, e.name.len() as u64);
+        out.extend_from_slice(e.name.as_bytes());
+        write_uleb(&mut out, e.offset);
+    }
+    Ok(out)
+}
+
+// ----------------------------------------------------------------------------
 // Decoding (untrusted-input-facing)
 // ----------------------------------------------------------------------------
 
@@ -3630,5 +3738,180 @@ mod leb_tests {
         let mut bytes = [0x80u8; 10].to_vec();
         bytes.push(0x00);
         assert_eq!(Cursor::new(&bytes).sleb(), Err(DecodeError::LebOverflow));
+    }
+}
+
+#[cfg(test)]
+mod symbol_table_tests {
+    //! The `compile_linked` symbol table is an untrusted-input surface (guest-controlled bytes the
+    //! host decodes). Like the IR decoder it must be fail-closed: never panic, over-read or hang on
+    //! arbitrary bytes — only `Some(table)` or `None`. These pin the round-trip with the encoder and
+    //! sweep adversarial bytes through the decoder.
+    use super::*;
+    use temen_ir::{Resolved, ResolvedCap, SymbolTable};
+
+    #[test]
+    fn encode_decode_round_trips() {
+        let mut table = SymbolTable::default();
+        table.funcs.insert("sq".into(), Resolved::Slot(0));
+        table
+            .funcs
+            .insert("a_longer_name".into(), Resolved::Slot(1234));
+        let io = ResolvedCap { type_id: 3, op: 7 };
+        table.funcs.insert("io".into(), Resolved::Cap(io));
+        table.funcs.insert("".into(), Resolved::Slot(u32::MAX)); // empty name + boundary slot
+        table.data.insert("counter".into(), 0x1_0000);
+        table.data.insert("far".into(), u64::MAX);
+        table.place = Some(0x2_0000);
+        let bytes = encode_symbol_table(&table);
+        assert_eq!(decode_symbol_table(&bytes), Some(table));
+    }
+
+    #[test]
+    fn empty_buffer_and_explicit_zero_count_are_both_the_empty_table() {
+        // `&[]` (the closed `compile` op) and `[0]` (encode of no rows) both mean "no symbols".
+        let empty = Some(SymbolTable::default());
+        assert_eq!(decode_symbol_table(&[]), empty);
+        assert_eq!(decode_symbol_table(&[0]), empty);
+        let encoded = encode_symbol_table(&SymbolTable::default());
+        assert_eq!(decode_symbol_table(&encoded), empty);
+    }
+
+    #[test]
+    fn a_name_given_twice_keeps_its_last_row() {
+        let table = decode_symbol_table(&[2, 1, b'F', 0, 1, 1, b'F', 0, 2]).expect("decodes");
+        assert_eq!(table.funcs.get("F"), Some(&Resolved::Slot(2)));
+    }
+
+    #[test]
+    fn malformations_fail_closed_without_panicking() {
+        // Each of these is structurally broken in a different way; all must be `None`, never a panic.
+        let cases: &[&[u8]] = &[
+            &[1],                                           // count 1, but no row bytes
+            &[1, 1],                                        // count 1, namelen 1, but no name byte
+            &[1, 1, b'F'],                                  // name present, but no kind byte
+            &[1, 1, b'F', 9],                               // unknown kind 9
+            &[1, 1, b'F', 0],                               // Slot kind, but no slot value
+            &[1, 1, b'D', 2],                               // Data kind, but no address
+            &[1, 1, 0xff, 0, 0],                            // a non-UTF-8 name byte
+            &[1, 0x80],                                     // a truncated LEB128 namelen
+            &[0xff, 0xff, 0xff, 0xff], // a huge count (must fail fast as bytes exhaust, not hang)
+            &[0, 0],                   // count 0 but a trailing byte (length mismatch)
+            &[1, 1, b'F', 0, 0, 0],    // a valid row plus trailing bytes
+            &[1, 1, b'F', 0, 0x80, 0x80, 0x80, 0x80, 0x10], // a slot past u32
+            &[1, 1, b'P', 3, 0],       // a named placement
+            &[2, 0, 3, 0, 0, 3, 0],    // a second placement
+        ];
+        for &c in cases {
+            assert_eq!(
+                decode_symbol_table(c),
+                None,
+                "malformed {c:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn never_panics_on_arbitrary_bytes() {
+        // A deterministic adversarial sweep: every byte string up to length 3, plus a pseudo-random
+        // tail of longer inputs. The decoder must always *return* (Some or None), never panic/hang.
+        for len in 0..=3usize {
+            let mut buf = vec![0u8; len];
+            loop {
+                let _ = decode_symbol_table(&buf);
+                // Odometer over [0,256)^len; stop after the most-significant digit wraps.
+                let mut i = 0;
+                while i < len {
+                    if buf[i] == 255 {
+                        buf[i] = 0;
+                        i += 1;
+                    } else {
+                        buf[i] += 1;
+                        break;
+                    }
+                }
+                if i == len {
+                    break; // wrapped around (or len == 0): done.
+                }
+            }
+        }
+        // Longer pseudo-random inputs (xorshift) for breadth past the exhaustive region.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 96) as usize;
+            let mut buf = Vec::with_capacity(n);
+            let mut s = state;
+            for _ in 0..n {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                buf.push((s >> 33) as u8);
+            }
+            let _ = decode_symbol_table(&buf);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_info_tests {
+    use super::*;
+
+    /// Read a [`unit_info`] reply back: the room, then each data export's name and offset.
+    fn read(reply: &[u8]) -> (u64, Vec<(String, u64)>) {
+        let mut c = Cursor::new(reply);
+        let span = c.uleb().unwrap();
+        let exports = (0..c.count().unwrap())
+            .map(|_| {
+                let len = c.count().unwrap();
+                let name = String::from_utf8(c.take(len).unwrap().to_vec()).unwrap();
+                (name, c.uleb().unwrap())
+            })
+            .collect();
+        assert!(c.at_end(), "no trailing bytes");
+        (span, exports)
+    }
+
+    fn data(offset: u64, bytes: Vec<u8>) -> Data {
+        Data {
+            offset,
+            readonly: false,
+            bytes,
+        }
+    }
+
+    fn export(name: &str, offset: u64, tls: bool) -> DataExport {
+        DataExport {
+            name: name.into(),
+            offset,
+            tls,
+        }
+    }
+
+    #[test]
+    fn a_link_unit_reports_its_room_and_its_plain_data_exports() {
+        // An initialized word at 0 and a zero-initialized 8 bytes ending the data at 24; the
+        // thread-local export has no place in the window, so it is not reported.
+        let m = Module {
+            data: vec![data(0, vec![1, 2, 3, 4]), data(16, vec![0; 8])],
+            data_exports: vec![
+                export("x", 0, false),
+                export("buf", 16, false),
+                export("t", 0, true),
+            ],
+            ..Module::default()
+        };
+        let want = (24, vec![("x".to_owned(), 0), ("buf".to_owned(), 16)]);
+        assert_eq!(read(&unit_info(&encode_unit(&m)).unwrap()), want);
+    }
+
+    #[test]
+    fn a_runnable_module_has_no_room_to_place() {
+        let m = Module {
+            data: vec![data(64, vec![9; 4])],
+            ..Module::default()
+        };
+        assert_eq!(read(&unit_info(&encode_module(&m)).unwrap()), (0, vec![]));
+        assert!(unit_info(b"not a unit").is_err());
     }
 }

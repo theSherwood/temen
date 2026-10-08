@@ -12,8 +12,7 @@
 //! The blob validator is stubbed inline (the `parallel_jit_miri.rs` pattern) so this stays in the
 //! temen-interp suite with no Cranelift dep.
 
-use std::sync::Arc;
-use temen_interp::{bytecode, Host, Value};
+use temen_interp::{bytecode, Host, JitValidated, Value};
 use temen_text::parse_module;
 
 /// What the fiber body adds to its first yield.
@@ -81,13 +80,17 @@ fn stub_validator(
     bytes: &[u8],
     _mem_log2: Option<u8>,
     _symtab: &[u8],
-) -> Result<Arc<[temen_ir::Func]>, i64> {
+) -> Result<JitValidated, i64> {
     let src = match bytes.first() {
         Some(1) => ROOT_SUSPEND_UNIT,
         _ => FIBER_UNIT,
     };
     match parse_module(src) {
-        Ok(m) => Ok(m.funcs.into()),
+        Ok(m) => Ok(JitValidated {
+            funcs: m.funcs.into(),
+            types: m.types.into(),
+            data: None,
+        }),
         Err(_) => Err(-22),
     }
 }

@@ -2,7 +2,7 @@
 //! host-assisted resolve path). The companion `dynlink_runtime.rs` resolves an *in-memory* `Module`
 //! with `resolve_imports_with` inside the test harness; here the plugin is **serialized to bytes
 //! while its symbol is still unresolved** (a `.so` with an undefined reference), and the *host's*
-//! compile path — [`temen_run::jit_resolve_and_validate`] — decodes it, binds the import by name
+//! compile path — [`temen_run::jit_blob_validator`] — decodes it, binds the import by name
 //! against a guest-controlled symbol table, re-verifies, and only then compiles. This is what
 //! `vm_dlopen` will call: the loader ships an IR blob + a symbol table, the host does the rewrite.
 //!
@@ -10,10 +10,10 @@
 //! (so a unit can be serialized *unresolved*), and the resolve runs **before** verification, so a
 //! mis-link is caught by re-verification rather than trusted ("rewrite-then-verify").
 
-use temen_encode::{decode_module, encode_module};
-use temen_ir::{Inst, Resolved, ResolvedCap, DEFAULT_RESERVED_LOG2};
+use temen_encode::{decode_module, encode_module, encode_symbol_table};
+use temen_ir::{Inst, Resolved, ResolvedCap, SymbolTable, DEFAULT_RESERVED_LOG2};
 use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
-use temen_run::{encode_symbol_table, jit_blob_validator, jit_resolve_and_validate};
+use temen_run::jit_blob_validator;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -35,6 +35,16 @@ fn compile_host(src: &str) -> CompiledModule {
         0,
     )
     .expect("compile host program")
+}
+
+/// The guest's symbol table binding each name to `funcs`' resolution, as the bytes `compile_linked`
+/// hands the host.
+fn symtab(funcs: &[(&str, Resolved)]) -> Vec<u8> {
+    let mut table = SymbolTable::default();
+    for &(name, r) in funcs {
+        table.funcs.insert(name.to_owned(), r);
+    }
+    encode_symbol_table(&table)
 }
 
 /// A plugin authored against host `F` purely **by name** — its import handle is the `ConstI32`
@@ -81,16 +91,14 @@ fn host_assisted_resolve_links_a_serialized_plugin_by_name() {
 
     // The host's resolving compile path: decode → bind "F" → host slot 0 (the guest's symbol table)
     // → re-verify → funcs. No `resolve_imports_with` in the harness; the host did the rewrite.
-    let funcs = jit_resolve_and_validate(&blob, None, |n| (n == "F").then_some(Resolved::Slot(0)))
+    let unit = jit_blob_validator(&blob, None, &symtab(&[("F", Resolved::Slot(0))]))
         .expect("host resolves the plugin's import by name");
-    // #922: resolution is source-to-source and preserves the type section, so the plugin's decoded
-    // types resolve the interned call sigs in the resolved funcs.
-    let types = decode_module(&blob).expect("decode plugin").types;
 
     // Compile the resolved unit at runtime against the host's live table, then call it: it dispatches
-    // through the shared table to the host's F — F(10,3) = 23.
+    // through the shared table to the host's F — F(10,3) = 23. #922: resolution is source-to-source
+    // and preserves the type section, so the unit's types resolve the interned call sigs.
     let ptrs = cm
-        .define_extra(&funcs, &types, None)
+        .define_extra(&unit.funcs, &unit.types, None)
         .expect("define_extra (compile the plugin)");
     let (out, _) =
         unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[10, 3], None) }.expect("run plugin");
@@ -106,7 +114,7 @@ fn host_assisted_resolve_links_a_serialized_plugin_by_name() {
 fn unresolved_symbol_fails_closed() {
     let blob = encode_module(&parse_module(PLUGIN_SRC).expect("parse plugin"));
     // The guest's symbol table has no "F".
-    let r = jit_resolve_and_validate(&blob, None, |_| None);
+    let r = jit_blob_validator(&blob, None, &symtab(&[]));
     assert_eq!(r.err(), Some(-22), "an unresolved import must fail closed");
 }
 
@@ -114,7 +122,8 @@ fn unresolved_symbol_fails_closed() {
 /// resolution, so a forged byte string can never reach the verifier or a backend.
 #[test]
 fn malformed_blob_fails_closed() {
-    let r = jit_resolve_and_validate(&[0xde, 0xad, 0xbe, 0xef], None, |_| Some(Resolved::Slot(0)));
+    let table = symtab(&[("F", Resolved::Slot(0))]);
+    let r = jit_blob_validator(&[0xde, 0xad, 0xbe, 0xef], None, &table);
     assert_eq!(r.err(), Some(-22), "a malformed blob must fail closed");
 }
 
@@ -136,13 +145,12 @@ fn symbol_table_resolves_a_capability_import_by_name() {
     let blob = encode_module(&parse_module(unit).expect("parse cap-importing unit"));
 
     // The loader binds "write" to a host capability (type_id 5, op 1) via the symbol table's Cap kind.
-    let symtab =
-        encode_symbol_table(&[("write", Resolved::Cap(ResolvedCap { type_id: 5, op: 1 }))]);
-    let funcs = jit_blob_validator(&blob, None, &symtab)
+    let write = Resolved::Cap(ResolvedCap { type_id: 5, op: 1 });
+    let unit = jit_blob_validator(&blob, None, &symtab(&[("write", write)]))
         .expect("the capability import resolves by name and re-verifies");
 
     // Resolution lowered `call.sym "write"` to a concrete `call.cap 5 1` (no import survives).
-    let lowered_to_cap_call = funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
+    let lowered_to_cap_call = unit.funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(
             i,
             Inst::CapCall {

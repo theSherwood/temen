@@ -4378,11 +4378,12 @@ fn import_sig(import: &str) -> temen_ir::FuncType {
         "vm_page_size" => ft(vec![], vec![I64]),
         // §22 guest-driven JIT (`Jit`): submit serialized IR → code handle (op 0) / call a compiled
         // `(i64,i64)->(i64)` unit (op 1) / release (op 2) / install into the call.dyn table (op 3)
-        // / uninstall a slot (op 4) / compile against a guest symbol table (op 5). All return an `i64`.
+        // / uninstall a slot (op 4) / compile against a guest symbol table (op 5) / describe a link
+        // unit's data (op 6). All return an `i64`.
         "vm_jit_compile" => ft(vec![I64, I64], vec![I64]),
         "vm_jit_invoke2" => ft(vec![I64, I64, I64], vec![I64]),
         "vm_jit_release" | "vm_jit_install" | "vm_jit_uninstall" => ft(vec![I64], vec![I64]),
-        "vm_jit_compile_linked" => ft(vec![I64, I64, I64, I64], vec![I64]),
+        "vm_jit_compile_linked" | "vm_jit_unit_info" => ft(vec![I64, I64, I64, I64], vec![I64]),
         // §13/§14 SharedRegion: mint a region from `AddressSpace` (`create`, op 5 on the AddressSpace
         // handle) → a region handle; `map`/`unmap`/`page_size` (ops 0/1/3 on that *region* handle) then
         // alias its bytes into the window (the magic ring buffer / zero-copy child data plane).
@@ -4546,6 +4547,7 @@ fn vm_jit_builtin_import(name: &str) -> Option<&'static str> {
         "__vm_jit_install" => "vm_jit_install",
         "__vm_jit_uninstall" => "vm_jit_uninstall",
         "__vm_jit_compile_linked" => "vm_jit_compile_linked",
+        "__vm_jit_unit_info" => "vm_jit_unit_info",
         _ => return None,
     })
 }
@@ -12784,7 +12786,8 @@ fn lower_vm_builtin(
         | "__vm_jit_release"
         | "__vm_jit_install"
         | "__vm_jit_uninstall"
-        | "__vm_jit_compile_linked" => {
+        | "__vm_jit_compile_linked"
+        | "__vm_jit_unit_info" => {
             let import = vm_jit_builtin_import(name).expect("jit builtin");
             let imp = ctx.import_of(import)?;
             let argc = import_sig(import).params.len();

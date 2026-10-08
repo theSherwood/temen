@@ -4495,6 +4495,136 @@ fn coop_compile_linked_invoke_matches_the_oracle() {
     }
 }
 
+// ---- #2167: a link unit with globals of its own, invoked on the emitted tier --------------------
+//
+// The guest names a room in its window for the unit's data (the symbol table's place row) and binds
+// the unit's `base` to a global of its own (a data row). The host relocates the unit to the room and
+// writes its data image there; the emitted wasm then reaches the unit's globals at their relocated
+// addresses, and they keep their state from one invoke to the next — as on the oracle.
+
+/// The guest's own global the unit references by name.
+const DATA_BASE: i64 = 32768 + 3072;
+/// The room the guest names for the unit's data.
+const DATA_ROOM: i64 = 49152;
+
+/// A link unit `bump(by)`: add `by` to its own `count` (initially 41) through a pointer-valued
+/// initializer (`slot = &count`), and return it plus the guest's `base`.
+fn data_unit_blob() -> Vec<u8> {
+    let src = r#"memory 16
+data 16 "\x29\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+data.ptr 24 self 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = data.self 24
+  v2 = i64.load v1
+  v3 = i64.load v2
+  v4 = i64.add v3 v0
+  i64.store v2 v4
+  v5 = data.sym "base" 0
+  v6 = i64.load v5
+  v7 = i64.add v4 v6
+  return v7
+  }
+}
+export 0 data "count" 16
+"#;
+    temen_encode::encode_unit(&temen_text::parse_module(src).expect("unit parse"))
+}
+
+/// The threaded `vm_jit_compile_linked` + `vm_jit_invoke2` guest (as [`coop_linked_guest_text`]):
+/// stage the unit and a symbol table placing its data at [`DATA_ROOM`] and binding `base` to
+/// [`DATA_BASE`] (= 1000), link, invoke `bump(1)` then `bump(2)`, and stream `r1 * 10000 + r2`.
+fn coop_data_unit_guest_text(blob: &[u8]) -> String {
+    let (out_h, _mem_h) = onramp_out_mem_handles();
+    let mut table = temen_ir::SymbolTable {
+        place: Some(DATA_ROOM as u64),
+        ..temen_ir::SymbolTable::default()
+    };
+    table.data.insert("base".into(), DATA_BASE as u64);
+    let symtab = temen_encode::encode_symbol_table(&table);
+    let blob_stores = word_stores("b", BLOB_BASE, blob);
+    let st_stores = word_stores("s", LINK_SYMTAB_BASE, &symtab);
+    format!(
+        r#"memory 17
+import 0 "vm_jit_compile_linked" (i64, i64, i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+{blob_stores}{st_stores}  vba = i64.const {DATA_BASE}
+  vbv = i64.const 1000
+  i64.store vba vbv
+  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vsp = i64.const {LINK_SYMTAB_BASE}
+  vsn = i64.const {st_len}
+  vcode = call.import 0 (vbp, vbl, vsp, vsn)
+  vone = i64.const 1
+  vr1 = call.import 1 (vcode, vone)
+  vtwo = i64.const 2
+  vr2 = call.import 1 (vcode, vtwo)
+  vj = thread.join vt
+  vk = i64.const 10000
+  vm1 = i64.mul vr1 vk
+  vs0 = i64.add vm1 vr2
+  vsum = i64.add vs0 vj
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  return vz
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        blob_len = blob.len(),
+        st_len = symtab.len(),
+    )
+}
+
+#[test]
+fn coop_link_unit_globals_match_the_oracle() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&coop_data_unit_guest_text(&data_unit_blob())).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    // count: 41 + 1 = 42, then + 2 = 44; each call adds base (1000).
+    assert_eq!(want.value, 1042 * 10000 + 1044, "oracle value");
+
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let (_d, _tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
+    assert_eq!(temen_status(), want.status, "status parity");
+    assert_eq!(temen_coop_value(), want.value, "value parity");
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity");
+    // Non-vacuity: both invokes ran the unit's emitted wasm.
+    assert_eq!(invokes, 2, "two emitted Jit.invokes");
+    temen_coop_close();
+}
+
 /// [`drive_coop_b2_session_allow_trap`] that also counts the JIT_INVOKE events it serviced.
 fn drive_coop_b2_session_allow_trap_counting(m: &temen_ir::Module) -> (CoopB2Driver, u32, u32) {
     let mut d = CoopB2Driver::new();
