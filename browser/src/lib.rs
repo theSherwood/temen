@@ -3817,7 +3817,7 @@ pub fn onramp_exec_with_tee(
     env: &[Vec<u8>],
     tee: Option<temen_interp::StdoutTee>,
 ) -> PbOutcome {
-    onramp_run(m, stdin, env, tee, true)
+    onramp_run(m, stdin, env, tee, true, None)
 }
 
 /// [`onramp_exec`] at the **root** position — the oracle for a tier that still runs a card at the root
@@ -3825,7 +3825,7 @@ pub fn onramp_exec_with_tee(
 /// capabilities by name runs identically either way; one that hardcodes the §3e prefix's handle
 /// numbers (a driver fixture) only at the root.
 pub fn onramp_exec_root(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
-    onramp_run(m, stdin, &[], None, false)
+    onramp_run(m, stdin, &[], None, false, None)
 }
 
 /// The on-ramp run behind [`onramp_exec_with_tee`] and [`onramp_exec_root`]: `nested` runs `m` as a
@@ -3836,6 +3836,7 @@ fn onramp_run(
     env: &[Vec<u8>],
     tee: Option<temen_interp::StdoutTee>,
     nested: bool,
+    memo: Option<std::sync::Arc<std::sync::Mutex<temen_interp::bytecode::FuncMemo>>>,
 ) -> PbOutcome {
     let unsupported = || PbOutcome {
         trap: None,
@@ -3853,6 +3854,11 @@ fn onramp_run(
     let mut host = Host::new();
     if let Some(t) = tee {
         host.set_stdout_tee(t);
+    }
+    // #2168 — a program linked against resident libraries compiles through their memo: the root
+    // grants it, so its compile as the nested child goes through this host.
+    if let Some(memo) = memo {
+        host.set_compile_memo(memo);
     }
     host.stdin = stdin.to_vec();
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
@@ -4119,18 +4125,25 @@ fn bash_run_over_compiled(
     }
 }
 
-/// #1144 — the cross-Run **bash program cache**: the decoded `Module` + its `Arc<Compiled>` bytecode
-/// program, keyed by a cheap content hash of the module bytes ([`module_key`]). The browser card
-/// passes the same ~2.2 MB `bash.temen` every Run, so decoding (~100 ms wasm) and compiling (~120 ms
-/// wasm) it each time is pure waste — cache both and reuse on every later Run. Single-threaded wasm ⇒
-/// a plain static; one slot (the card runs one bash). A rebuilt asset changes the key and
-/// re-decodes+re-compiles.
-struct BashProgramCache {
+/// #1144 — a cross-Run **program cache** slot: the decoded, verified `Module` + its `Arc<Compiled>`
+/// bytecode program, keyed by a cheap content hash of the module bytes ([`module_key`]). A card passes
+/// the same module every Run — the bash card its ~2.2 MB `bash.temen` (~100 ms wasm to decode, ~120 ms
+/// to compile), the C card and the self-host card `chibicc.temen` — so decoding, verifying and
+/// compiling it each time is pure waste: [`cached_program`] does it once and every later Run reuses it.
+/// Single-threaded wasm ⇒ plain statics; one slot per program. A rebuilt asset changes the key and
+/// fills the slot again.
+struct ProgramCache {
     key: u64,
     module: temen_ir::Module,
-    compiled: std::sync::Arc<temen_interp::bytecode::Compiled>,
+    /// Its bytecode program, compiled on the first run that needs one: a wasm-JIT run takes only the
+    /// module. `None` inside for a module outside the bytecode subset.
+    compiled: std::sync::OnceLock<Option<std::sync::Arc<temen_interp::bytecode::Compiled>>>,
+    /// Its wasm-JIT emit over a shared memory ([`JitOnrampRun::emit_for_run`]), made on the first
+    /// wasm-JIT run: what a run opens around besides its window and powerbox, which are its own.
+    emit: std::sync::OnceLock<Result<CachedEmit, i32>>,
 }
-static mut BASH_PROGRAM: Option<BashProgramCache> = None;
+static mut BASH_PROGRAM: Option<ProgramCache> = None;
+static mut CHIBICC_PROGRAM: Option<ProgramCache> = None;
 
 /// A cheap content key for module bytes: FNV-1a over the length plus the first and last 4 KiB.
 /// Distinct committed `.temen` assets differ in length or head/tail, so this keys a cache without
@@ -4150,30 +4163,83 @@ fn module_key(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Decode + compile `bytes` as bash, or reuse the cached program when the content key matches. `None`
-/// if it doesn't decode or isn't the bytecode subset. Returns borrows into the static cache (valid
-/// until the next miss repopulates it — single-threaded, one Run at a time).
-#[allow(static_mut_refs)]
-fn cached_bash_program(
+/// Decode and verify `bytes` into `slot` ([`ProgramCache`]), or reuse what the slot holds when the
+/// content key matches. Fails with the status the uncached path would set: a module that doesn't
+/// decode ([`STATUS_DECODE_ERR`]) or doesn't verify ([`STATUS_VERIFY_ERR`]); the slot keeps what it
+/// held. Returns a borrow of the static slot (valid until the next miss refills it — single-threaded,
+/// one Run at a time).
+fn cached_module(
+    slot: &'static mut Option<ProgramCache>,
     bytes: &[u8],
-) -> Option<(
-    &'static temen_ir::Module,
-    std::sync::Arc<temen_interp::bytecode::Compiled>,
-)> {
+) -> Result<&'static ProgramCache, i32> {
     let key = module_key(bytes);
-    // SAFETY: single-threaded wasm; the cache is touched only here and only while no run borrows it.
-    let slot = unsafe { &mut *core::ptr::addr_of_mut!(BASH_PROGRAM) };
     if slot.as_ref().map(|c| c.key) != Some(key) {
-        let m = temen_encode::decode_module(bytes).ok()?;
-        let compiled = bytecode::compile_reserved(&m)?;
-        *slot = Some(BashProgramCache {
+        let m = temen_encode::decode_module(bytes).map_err(|_| STATUS_DECODE_ERR)?;
+        temen_verify::verify_module(&m).map_err(|_| STATUS_VERIFY_ERR)?;
+        *slot = Some(ProgramCache {
             key,
             module: m,
-            compiled,
+            compiled: std::sync::OnceLock::new(),
+            emit: std::sync::OnceLock::new(),
         });
     }
-    let c = slot.as_ref()?;
-    Some((&c.module, std::sync::Arc::clone(&c.compiled)))
+    slot.as_ref().ok_or(STATUS_UNSUPPORTED)
+}
+
+/// [`cached_module`] and its bytecode program, compiled on the slot's first bytecode run.
+/// [`STATUS_UNSUPPORTED`] for a module outside the bytecode subset.
+fn cached_program(
+    slot: &'static mut Option<ProgramCache>,
+    bytes: &[u8],
+) -> Result<
+    (
+        &'static temen_ir::Module,
+        std::sync::Arc<temen_interp::bytecode::Compiled>,
+    ),
+    i32,
+> {
+    let c = cached_module(slot, bytes)?;
+    let compiled = c
+        .compiled
+        .get_or_init(|| bytecode::compile_reserved(&c.module))
+        .clone()
+        .ok_or(STATUS_UNSUPPORTED)?;
+    Ok((&c.module, compiled))
+}
+
+/// A slot's module and its wasm-JIT emit over a shared memory (the play threads build), emitted on the
+/// slot's first wasm-JIT run. [`STATUS_UNSUPPORTED`] when the module does not emit.
+fn cached_emit(c: &'static ProgramCache) -> Result<(&'static temen_ir::Module, CachedEmit), i32> {
+    let emit = c
+        .emit
+        .get_or_init(|| JitOnrampRun::emit_for_run(&c.module, true))
+        .clone()?;
+    Ok((&c.module, emit))
+}
+
+/// The bash card's [`cached_program`] slot.
+fn cached_bash_program(
+    bytes: &[u8],
+) -> Result<
+    (
+        &'static temen_ir::Module,
+        std::sync::Arc<temen_interp::bytecode::Compiled>,
+    ),
+    i32,
+> {
+    // SAFETY: single-threaded wasm; the slot is touched only here and only while no run borrows it.
+    cached_program(
+        unsafe { &mut *core::ptr::addr_of_mut!(BASH_PROGRAM) },
+        bytes,
+    )
+}
+
+/// The chibicc slot, which the C card and the self-host card share on both tiers: decoded and
+/// verified once ([`cached_module`]), its bytecode program compiled on its first interpreter run.
+fn chibicc_slot() -> &'static mut Option<ProgramCache> {
+    // SAFETY: single-threaded wasm; the slot is touched only by the chibicc entries, one at a time,
+    // and only while no run borrows it.
+    unsafe { &mut *core::ptr::addr_of_mut!(CHIBICC_PROGRAM) }
 }
 
 /// A POSIX process the browser runs, besides its module: what [`posix_host_build`] gives it.
@@ -4503,6 +4569,18 @@ pub fn onramp_fs_exec(
     argv: &[&[u8]],
     stdin: &[u8],
 ) -> PbOutcome {
+    onramp_fs_run(m, None, image, argv, stdin)
+}
+
+/// [`onramp_fs_exec`] over `m`'s already-compiled program (a [`cached_program`] slot's, #1144), or
+/// compiling it here when `compiled` is `None`.
+fn onramp_fs_run(
+    m: &temen_ir::Module,
+    compiled: Option<std::sync::Arc<temen_interp::bytecode::Compiled>>,
+    image: &[u8],
+    argv: &[&[u8]],
+    stdin: &[u8],
+) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
         trap: None,
         fault_addr: None,
@@ -4518,9 +4596,13 @@ pub fn onramp_fs_exec(
         Err(status) => return unsupported(status),
     };
     host.stdin = stdin.to_vec();
+    let Some(compiled) = compiled.or_else(|| bytecode::compile_reserved(m)) else {
+        return unsupported(STATUS_UNSUPPORTED);
+    };
     let mut fuel = DEFAULT_FUEL;
-    let (status, value, exit_code) = match bytecode::compile_and_run_capture_reserved_with_host(
+    let (status, value, exit_code) = match bytecode::run_capture_reserved_over_compiled_with_host(
         m,
+        compiled,
         0,
         &[],
         &mut fuel,
@@ -4966,17 +5048,14 @@ pub extern "C" fn temen_run_onramp_fs(
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
+    // #1144 — the compiler is the same `chibicc.temen` every Run: decode, verify and compile it once.
+    let (m, compiled) = match cached_program(chibicc_slot(), bytes) {
+        Ok(p) => p,
+        Err(status) => {
+            set(status);
             return 0;
         }
     };
-    if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return 0;
-    }
     let image = match chibicc_card_image(img_ptr, img_len, src) {
         Ok(image) => image,
         Err(status) => {
@@ -4985,7 +5064,7 @@ pub extern "C" fn temen_run_onramp_fs(
         }
     };
     let argv = chibicc_card_argv(flags);
-    let out = onramp_fs_exec(&m, &image, &argv, &[]);
+    let out = onramp_fs_run(m, Some(compiled), &image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -5021,19 +5100,16 @@ pub extern "C" fn temen_selfhost_emit_object_fs(
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
     let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
+    // The C card's compiler slot (#1144): one decode, verify and compile across the card's TUs.
+    let (m, compiled) = match cached_program(chibicc_slot(), bytes) {
+        Ok(p) => p,
+        Err(status) => {
+            set(status);
             return 0;
         }
     };
-    if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return 0;
-    }
     let argv = chibicc_selfhost_argv(tu, debug_info != 0);
-    let out = onramp_fs_exec(&m, image, &argv, &[]);
+    let out = onramp_fs_run(m, Some(compiled), image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -6189,13 +6265,16 @@ impl JitOnrampRun {
         shared_memory: bool,
         stdin: Vec<u8>,
     ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with(m, win_log2, shared_memory, RunInput::Stdin(stdin))
+        Self::open_owned_run_with(m, win_log2, shared_memory, RunInput::Stdin(stdin), None)
     }
 
     /// Like [`open_owned_run`](Self::open_owned_run), but the guest reads its input from a seeded
     /// **memfs** `image` (mounted on the `fs` cap) with `argv` seeded at `POWERBOX_ARGS_BASE` — the
     /// single-shot JIT twin of [`onramp_fs_exec`]. This is the chibicc-in-the-browser card's fast tier:
-    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits TEMEN-IR text on stdout.
+    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits TEMEN-IR text on stdout. `cached` is `m`'s emit
+    /// for `shared_memory` from an earlier run ([`JitOnrampRun::emit_for_run`]), which the card keeps
+    /// with the compiler (#1144); `None` emits here.
+    #[allow(clippy::too_many_arguments)] // the run's input, plus the emit a caller kept
     pub fn open_owned_run_fs(
         m: &temen_ir::Module,
         win_log2: u8,
@@ -6203,6 +6282,7 @@ impl JitOnrampRun {
         image: &[u8],
         argv: &[&[u8]],
         stdin: Vec<u8>,
+        cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
         Self::open_owned_run_with(
             m,
@@ -6213,6 +6293,7 @@ impl JitOnrampRun {
                 argv: argv.iter().map(|a| a.to_vec()).collect(),
                 stdin,
             },
+            cached,
         )
     }
 
@@ -6239,6 +6320,7 @@ impl JitOnrampRun {
                 entry_sp: 0,
                 entry_as: 0,
             },
+            None,
         )
     }
 
@@ -6359,6 +6441,7 @@ impl JitOnrampRun {
         win_log2: u8,
         shared_memory: bool,
         input: RunInput,
+        cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
         // The owned backing must equal the size the emitter masks: the module's declared window is the
         // floor.
@@ -6379,7 +6462,7 @@ impl JitOnrampRun {
             win_log2,
             shared_memory,
             input,
-            None,
+            cached,
         )
     }
 
@@ -8226,11 +8309,15 @@ pub extern "C" fn temen_run_bash(
             unsafe { core::slice::from_raw_parts(p, n) }
         }
     };
-    // #1144 — decode+compile the ~2.2 MB bash module once and reuse across Runs (the card re-sends the
-    // same bytes every Run). A miss (first Run, or a rebuilt asset) decodes+compiles; hits are free.
-    let Some((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
-        set(STATUS_DECODE_ERR);
-        return 0;
+    // #1144 — decode+verify+compile the ~2.2 MB bash module once and reuse across Runs (the card
+    // re-sends the same bytes every Run). A miss (first Run, or a rebuilt asset) fills the slot; hits
+    // are free.
+    let (m, compiled) = match cached_bash_program(slice(mod_ptr, mod_len)) {
+        Ok(p) => p,
+        Err(status) => {
+            set(status);
+            return 0;
+        }
     };
     let cmd = slice(cmd_ptr, cmd_len);
     let stdin = slice(stdin_ptr, stdin_len);
@@ -8304,7 +8391,7 @@ pub extern "C" fn temen_bash_session(
         }
     };
     // #1144 — reuse the decoded+compiled bash program across sessions (same cache as `temen_run_bash`).
-    let Some((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
+    let Ok((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
@@ -8483,7 +8570,7 @@ pub extern "C" fn temen_bash_coop_open(
             unsafe { core::slice::from_raw_parts(p, n) }
         }
     };
-    let Some((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
+    let Ok((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
         return -1;
     };
     let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
@@ -8672,18 +8759,20 @@ pub extern "C" fn temen_link_run(
         }
     };
     let lib_exports = link_lib_exports(&lib);
-    link_run_against(
-        temen_ir::LinkUnitRef {
-            module: &lib,
-            exports: &lib_exports,
-            data_exports: &lib.data_exports,
-        },
+    let unit = temen_ir::LinkUnitRef {
+        module: &lib,
+        exports: &lib_exports,
+        data_exports: &lib.data_exports,
+        live: None,
+    };
+    link_run_stash(
         prog_ptr,
         prog_len,
         entry_ptr,
         entry_len,
         stdin_ptr,
         stdin_len,
+        |program, entry| link_program(unit, program, entry).map(|m| (m, None)),
     )
 }
 
@@ -8699,6 +8788,26 @@ struct LinkLib {
 }
 
 static mut LINK_LIBS: Vec<Option<LinkLib>> = Vec::new();
+
+/// #1373 / #2168 — what the engine keeps for one list of resident libraries a host links programs
+/// against ([`temen_link_lib_open`] handles, in linking order): the libraries **laid out once**
+/// ([`temen_ir::link_base`]), so a run copies only what its program reaches ([`base_live`]); and the
+/// bytecode compile memo their programs share ([`temen_interp::bytecode::FuncMemo`]) — each program
+/// holds the libraries' functions at the same positions, so what one run compiled the next reuses.
+/// Built on the list's first link, dropped when a library in it closes.
+struct LinkSet {
+    handles: Vec<i32>,
+    /// The base and its exports, or `None` when the libraries can't be laid out on their own: each
+    /// program then links against the libraries themselves.
+    base: Option<(temen_ir::Module, Vec<(String, temen_ir::FuncIdx)>)>,
+    memo: std::sync::Arc<std::sync::Mutex<temen_interp::bytecode::FuncMemo>>,
+}
+
+static mut LINK_SETS: Vec<LinkSet> = Vec::new();
+
+/// How many handle lists keep a [`LinkSet`] — jacl links against two resident runtimes in turn. The
+/// oldest goes when a new list would pass this.
+const LINK_SETS_MAX: usize = 4;
 
 /// Decode a **library** unit (text or binary, sniffed like [`temen_link_run`]'s params) and keep it
 /// resident for [`temen_link_run_lib`]. Returns its handle (`>= 0`; the lowest free slot) or `-1` on a
@@ -8747,6 +8856,10 @@ pub extern "C" fn temen_link_lib_close(handle: i32) {
     if let Some(slot) = usize::try_from(handle).ok().and_then(|h| libs.get_mut(h)) {
         *slot = None;
     }
+    // A handle is reused for the next library opened, so nothing laid out from this one may outlive it.
+    // SAFETY: single-threaded wasm; exclusive access to the link sets.
+    let sets = unsafe { &mut *core::ptr::addr_of_mut!(LINK_SETS) };
+    sets.retain(|set| !set.handles.contains(&handle));
 }
 
 /// [`temen_link_run`] against the **resident** library `handle` ([`temen_link_lib_open`]): load only
@@ -8763,22 +8876,8 @@ pub extern "C" fn temen_link_run_lib(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    // SAFETY: single-threaded wasm; the resident library is read (never mutated) for the link.
-    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
-    let Some(lib) = usize::try_from(handle)
-        .ok()
-        .and_then(|h| libs.get(h))
-        .and_then(Option::as_ref)
-    else {
-        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
-        return 0;
-    };
-    link_run_against(
-        temen_ir::LinkUnitRef {
-            module: &lib.module,
-            exports: &lib.exports,
-            data_exports: &lib.module.data_exports,
-        },
+    link_run_handles(
+        &[handle],
         prog_ptr,
         prog_len,
         entry_ptr,
@@ -8853,6 +8952,7 @@ pub extern "C" fn temen_link_text(
         module: &lib,
         exports: &lib_exports,
         data_exports: &lib.data_exports,
+        live: None,
     };
     match link_program(unit, &program, entry) {
         Ok(m) => {
@@ -8880,41 +8980,9 @@ pub extern "C" fn temen_link_text_lib(
     entry_ptr: *const u8,
     entry_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
-    let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
-        return fail(STATUS_DECODE_ERR);
-    };
-    // SAFETY: single-threaded wasm; the resident library is read (never mutated) for the link.
-    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
-    let Some(lib) = usize::try_from(handle)
-        .ok()
-        .and_then(|h| libs.get(h))
-        .and_then(Option::as_ref)
-    else {
-        return fail(STATUS_UNSUPPORTED);
-    };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
-    };
-    let unit = temen_ir::LinkUnitRef {
-        module: &lib.module,
-        exports: &lib.exports,
-        data_exports: &lib.module.data_exports,
-    };
-    match link_program(unit, &program, entry) {
-        Ok(m) => {
-            let text = temen_text::print_module(&m);
-            // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
-            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), text.into_bytes()) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => fail(status),
-    }
+    link_lib_stash(&[handle], prog_ptr, prog_len, entry_ptr, entry_len, |m| {
+        temen_text::print_module(m).into_bytes()
+    })
 }
 
 /// Resolve a host-passed list of resident-library handles to borrowed link units (#1408). `None` if
@@ -8934,6 +9002,7 @@ fn resident_units(handles: &[i32]) -> Option<Vec<temen_ir::LinkUnitRef<'static>>
             module: &lib.module,
             exports: &lib.exports,
             data_exports: &lib.module.data_exports,
+            live: None,
         });
     }
     Some(out)
@@ -8968,12 +9037,14 @@ pub extern "C" fn temen_link_run_libs(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let Some(units) = resident_units(handle_slice(handles_ptr, handles_len)) else {
-        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
-        return 0;
-    };
-    link_run_against_multi(
-        &units, prog_ptr, prog_len, entry_ptr, entry_len, stdin_ptr, stdin_len,
+    link_run_handles(
+        handle_slice(handles_ptr, handles_len),
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
     )
 }
 
@@ -9126,14 +9197,11 @@ fn link_lib_stash(
     let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
         return fail(STATUS_DECODE_ERR);
     };
-    let Some(units) = resident_units(handles) else {
-        return fail(STATUS_UNSUPPORTED);
-    };
     let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
         return fail(STATUS_DECODE_ERR);
     };
-    match link_program_multi(&units, &program, entry) {
-        Ok(m) => {
+    match resident_link(handles, &program, entry) {
+        Ok((m, _)) => {
             let bytes = render(&m);
             // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
             unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
@@ -9159,41 +9227,14 @@ pub extern "C" fn temen_link_encode_lib(
     entry_ptr: *const u8,
     entry_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
-    let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
-        return fail(STATUS_DECODE_ERR);
-    };
-    // SAFETY: single-threaded wasm; the resident library is read (never mutated) for the link.
-    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
-    let Some(lib) = usize::try_from(handle)
-        .ok()
-        .and_then(|h| libs.get(h))
-        .and_then(Option::as_ref)
-    else {
-        return fail(STATUS_UNSUPPORTED);
-    };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
-    };
-    let unit = temen_ir::LinkUnitRef {
-        module: &lib.module,
-        exports: &lib.exports,
-        data_exports: &lib.module.data_exports,
-    };
-    match link_program(unit, &program, entry) {
-        Ok(m) => {
-            let bytes = temen_encode::encode_module(&m);
-            // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
-            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => fail(status),
-    }
+    link_lib_stash(
+        &[handle],
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        temen_encode::encode_module,
+    )
 }
 
 /// Link `program` (unit 1) against `lib` (unit 0), take `entry` as the program's entry, wrap it in
@@ -9259,6 +9300,7 @@ pub fn link_program_multi(
         module: program,
         exports: &prog_exports,
         data_exports: &program.data_exports,
+        live: None,
     });
     let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
     // The frontend bootstrap when the program unit had one, else `entry` itself — a hand-written unit
@@ -9320,6 +9362,7 @@ pub fn link_run_units(
         module: lib,
         exports: &lib_exports,
         data_exports: &lib.data_exports,
+        live: None,
     };
     match link_program(unit, program, entry) {
         Ok(m) => onramp_exec(&m, stdin),
@@ -9336,40 +9379,19 @@ pub fn link_run_units(
     }
 }
 
-/// The shared half of [`temen_link_run`] / [`temen_link_run_lib`]: load the program unit, link it as
-/// unit 1 against `lib` (unit 0), synthesize the powerbox `_start` around `entry_name`, verify, run,
+/// The shared half of the link-and-run entries: load the program unit, `link` it — which also says
+/// what compile memo its run uses — synthesize the powerbox `_start` around `entry_name`, verify, run,
 /// and stash the outcome in the result slots. Returns the entry's value (`0` on any failure, with
 /// [`LAST_STATUS`] saying which).
-fn link_run_against(
-    lib: temen_ir::LinkUnitRef<'_>,
+#[allow(clippy::too_many_arguments)] // the FFI's three ranges, plus how to link
+fn link_run_stash(
     prog_ptr: *const u8,
     prog_len: usize,
     entry_ptr: *const u8,
     entry_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
-) -> i64 {
-    link_run_against_multi(
-        &[lib],
-        prog_ptr,
-        prog_len,
-        entry_ptr,
-        entry_len,
-        stdin_ptr,
-        stdin_len,
-    )
-}
-
-/// [`link_run_against`] over several library units (#1408) — the shared body; one library is the
-/// common case and has its own name above.
-fn link_run_against_multi(
-    libs: &[temen_ir::LinkUnitRef<'_>],
-    prog_ptr: *const u8,
-    prog_len: usize,
-    entry_ptr: *const u8,
-    entry_len: usize,
-    stdin_ptr: *const u8,
-    stdin_len: usize,
+    link: impl FnOnce(&temen_ir::Module, &str) -> Result<(temen_ir::Module, Option<Memo>), i32>,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
@@ -9387,15 +9409,15 @@ fn link_run_against_multi(
             return 0;
         }
     };
-    let module = match link_program_multi(libs, &program, entry_name) {
-        Ok(m) => m,
+    let (module, memo) = match link(&program, entry_name) {
+        Ok(linked) => linked,
         Err(status) => {
             set(status);
             return 0;
         }
     };
 
-    let out = onramp_exec_with_tee(&module, stdin, &run_env(), None);
+    let out = onramp_run(&module, stdin, &run_env(), None, true, memo);
     set(out.status);
     // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
     unsafe {
@@ -9406,6 +9428,109 @@ fn link_run_against_multi(
         FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
+}
+
+/// A [`LinkSet`]'s compile memo, as a run takes it.
+type Memo = std::sync::Arc<std::sync::Mutex<temen_interp::bytecode::FuncMemo>>;
+
+/// [`link_run_stash`] against the resident libraries `handles` ([`resident_link`]), compiling
+/// through their memo — what [`temen_link_run_lib`] and [`temen_link_run_libs`] run.
+fn link_run_handles(
+    handles: &[i32],
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    link_run_stash(
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+        |program, entry| {
+            resident_link(handles, program, entry)
+                .map(|(m, set)| (m, Some(std::sync::Arc::clone(&set.memo))))
+        },
+    )
+}
+
+/// The [`LinkSet`] for `handles`, built on its first use: the libraries laid out together when they
+/// can be ([`temen_ir::link_base`]), and a fresh compile memo. `None` if a handle is unknown or closed.
+fn link_set(handles: &[i32]) -> Option<&'static LinkSet> {
+    // SAFETY: single-threaded wasm; the sets are mutated only here and by `temen_link_lib_close`, and
+    // no reference into them outlives the link it serves.
+    let sets = unsafe { &mut *core::ptr::addr_of_mut!(LINK_SETS) };
+    if let Some(i) = sets.iter().position(|set| set.handles == handles) {
+        return sets.get(i);
+    }
+    let units = resident_units(handles)?;
+    let base = temen_ir::link_base(&units).map(|m| {
+        let exports = link_lib_exports(&m);
+        (m, exports)
+    });
+    if sets.len() == LINK_SETS_MAX {
+        sets.remove(0);
+    }
+    sets.push(LinkSet {
+        handles: handles.to_vec(),
+        base,
+        memo: Default::default(),
+    });
+    sets.last()
+}
+
+/// Link `program` against the resident libraries `handles` ([`link_program_multi`]) — against their
+/// laid-out base when there is one, copying only what the program reaches ([`base_live`]) — and
+/// return it with the [`LinkSet`] whose memo compiles it. [`STATUS_UNSUPPORTED`] for an unknown or
+/// closed handle (fail-closed: a stale handle never links against what now occupies its slot), or a
+/// link that fails.
+fn resident_link(
+    handles: &[i32],
+    program: &temen_ir::Module,
+    entry: &str,
+) -> Result<(temen_ir::Module, &'static LinkSet), i32> {
+    let set = link_set(handles).ok_or(STATUS_UNSUPPORTED)?;
+    let linked = match &set.base {
+        Some((base, exports)) => {
+            let live = base_live(base, exports, program);
+            let unit = temen_ir::LinkUnitRef {
+                module: base,
+                exports,
+                data_exports: &base.data_exports,
+                live: Some(&live),
+            };
+            link_program_multi(&[unit], program, entry)
+        }
+        None => {
+            let units = resident_units(handles).ok_or(STATUS_UNSUPPORTED)?;
+            link_program_multi(&units, program, entry)
+        }
+    };
+    linked.map(|m| (m, set))
+}
+
+/// Which of a laid-out base's functions `program` can reach (#1373): what the base's data image and
+/// offers name — live in any program, as [`temen_ir::stub_unreachable_funcs`] roots them — and the
+/// exports the program calls or points its data at, closed over the base's own calls. The base's
+/// exports are no roots of their own: [`link_program_multi`] drops a library's exports before it
+/// collects, so what only they name is stubbed either way, and the link need not copy it.
+fn base_live(
+    base: &temen_ir::Module,
+    exports: &[(String, temen_ir::FuncIdx)],
+    program: &temen_ir::Module,
+) -> Vec<bool> {
+    let export = |name: &str| exports.iter().find(|(n, _)| n == name).map(|&(_, f)| f);
+    let roots = temen_ir::data_funcref_targets(base)
+        .into_iter()
+        .flatten()
+        .chain(base.impl_exports.iter().flat_map(|e| e.ops.iter().copied()))
+        .chain(program.imports.iter().filter_map(|i| export(&i.name)))
+        .chain(program.data_funcrefs.iter().filter_map(|r| export(&r.name)));
+    temen_ir::reachable_funcs(base, roots).unwrap_or_else(|_| vec![true; base.funcs.len()])
 }
 
 /// Pointer / length of the RGBA framebuffer the most recent [`temen_run_onramp`] guest presented via
@@ -10623,17 +10748,14 @@ pub extern "C" fn temen_onramp_jit_run_open_fs(
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
+    // #1144 — the compiler is the same `chibicc.temen` every Run: decode, verify and emit it once.
+    let (m, emit) = match cached_module(chibicc_slot(), bytes).and_then(cached_emit) {
+        Ok(p) => p,
+        Err(status) => {
+            set(status);
+            return -status;
         }
     };
-    if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return -STATUS_VERIFY_ERR;
-    }
     let image = match chibicc_card_image(img_ptr, img_len, src) {
         Ok(image) => image,
         Err(status) => {
@@ -10643,7 +10765,15 @@ pub extern "C" fn temen_onramp_jit_run_open_fs(
     };
     let argv = chibicc_card_argv(flags);
     // The play threads build imports a **shared** memory, so the emitted module must too.
-    match JitOnrampRun::open_owned_run_fs(&m, JIT_RUN_WIN_LOG2, true, &image, &argv, Vec::new()) {
+    match JitOnrampRun::open_owned_run_fs(
+        m,
+        JIT_RUN_WIN_LOG2,
+        true,
+        &image,
+        &argv,
+        Vec::new(),
+        Some(emit),
+    ) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
@@ -10685,19 +10815,24 @@ pub extern "C" fn temen_selfhost_jit_emit_object_fs(
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
     let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
+    // The C card's compiler slot (#1144): decoded, verified and emitted once across the card's TUs.
+    let (m, emit) = match cached_module(chibicc_slot(), bytes).and_then(cached_emit) {
+        Ok(p) => p,
+        Err(status) => {
+            set(status);
+            return -status;
         }
     };
-    if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return -STATUS_VERIFY_ERR;
-    }
     let argv = chibicc_selfhost_argv(tu, debug_info != 0);
-    match JitOnrampRun::open_owned_run_fs(&m, SELFHOST_WIN_LOG2, true, image, &argv, Vec::new()) {
+    match JitOnrampRun::open_owned_run_fs(
+        m,
+        SELFHOST_WIN_LOG2,
+        true,
+        image,
+        &argv,
+        Vec::new(),
+        Some(emit),
+    ) {
         Ok(r) => {
             // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
             unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
@@ -15558,6 +15693,7 @@ int main(void) {
             module: &heap,
             exports: &exports,
             data_exports: &heap.data_exports,
+            live: None,
         };
         Some(link_program_multi(&[unit], &prog, "main").expect("link the heap unit"))
     }

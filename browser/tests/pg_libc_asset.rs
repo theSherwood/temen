@@ -14,6 +14,8 @@
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
+#[path = "support/ffi.rs"]
+mod ffi;
 #[path = "support/pg_heap.rs"]
 mod pg_heap;
 
@@ -33,6 +35,12 @@ fn pg_libc() -> Option<temen_ir::Module> {
 /// Compile `src` as a **program unit**: decls-only against the seeded headers, so it carries no libc
 /// bodies and resolves them against the prebuilt unit at link time.
 fn program_unit(src: &str) -> Option<temen_ir::Module> {
+    let ir = program_unit_text(src)?;
+    Some(temen_text::parse_module(&ir).expect("the program unit parses"))
+}
+
+/// [`program_unit`]'s IR text, as chibicc emits it: what the card hands the link entries.
+fn program_unit_text(src: &str) -> Option<String> {
     let chibicc =
         temen_encode::decode_module(&asset("chibicc.temen")?).expect("decode chibicc.temen");
     let mut files = playground_include_files();
@@ -55,9 +63,47 @@ fn program_unit(src: &str) -> Option<temen_ir::Module> {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    let ir = String::from_utf8(out.stdout).expect("IR is utf8");
-    Some(temen_text::parse_module(&ir).expect("the program unit parses"))
+    Some(String::from_utf8(out.stdout).expect("IR is utf8"))
 }
+
+/// A program that reaches much of the libc and the heap — formatted output, strings, math — with a
+/// dispatch table of function pointers in its static data.
+const TABLE_PROGRAM: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+static int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int (*ops[2])(int, int) = { add, sub };
+int main(void) {
+  printf("printf %d\n", 42);
+  fprintf(stdout, "fprintf %s\n", "shared-stdout");
+  char *buf = malloc(32);
+  snprintf(buf, 32, "snprintf %.2f", 1.5);
+  puts(buf);
+  char *dup = strdup("strdup");
+  printf("%s len=%d\n", dup, (int)strlen(dup));
+  printf("sqrt=%g pow=%g\n", sqrt(169.0), pow(2.0, 10.0));
+  printf("ops %d %d\n", ops[0](2, 3), ops[1](9, 4));
+  return 0;
+}
+"#;
+/// What [`TABLE_PROGRAM`] prints.
+const TABLE_OUT: &str =
+    "printf 42\nfprintf shared-stdout\nsnprintf 1.50\nstrdup len=6\nsqrt=13 pow=1024\nops 5 5\n";
+
+/// And one that reaches little of either.
+const SMALL_PROGRAM: &str = r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {
+  char *s = malloc(8);
+  strcpy(s, "small");
+  puts(s);
+  free(s);
+  return 3;
+}
+"#;
 
 /// The shape the asset exists for: it decodes, it publishes the libc, and it carries the debug info a
 /// debug session steps into. Cheap — no compile at all, so this is the first thing to go red on drift.
@@ -130,31 +176,7 @@ fn the_committed_heap_unit_is_the_allocator_and_nothing_more() {
 /// a program unit could not until #2194.
 #[test]
 fn a_program_unit_links_against_the_committed_asset_and_runs() {
-    let (Some(lib), Some(prog)) = (
-        pg_libc(),
-        program_unit(
-            r#"#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-static int add(int a, int b) { return a + b; }
-int sub(int a, int b) { return a - b; }
-int (*ops[2])(int, int) = { add, sub };
-int main(void) {
-  printf("printf %d\n", 42);
-  fprintf(stdout, "fprintf %s\n", "shared-stdout");
-  char *buf = malloc(32);
-  snprintf(buf, 32, "snprintf %.2f", 1.5);
-  puts(buf);
-  char *dup = strdup("strdup");
-  printf("%s len=%d\n", dup, (int)strlen(dup));
-  printf("sqrt=%g pow=%g\n", sqrt(169.0), pow(2.0, 10.0));
-  printf("ops %d %d\n", ops[0](2, 3), ops[1](9, 4));
-  return 0;
-}
-"#,
-        ),
-    ) else {
+    let (Some(lib), Some(prog)) = (pg_libc(), program_unit(TABLE_PROGRAM)) else {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
         return;
     };
@@ -165,10 +187,7 @@ int main(void) {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "printf 42\nfprintf shared-stdout\nsnprintf 1.50\nstrdup len=6\nsqrt=13 pow=1024\nops 5 5\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), TABLE_OUT);
 }
 
 /// And the debugger half: the linked program's IR text carries **both** units' debug info, so a DAP
@@ -212,6 +231,7 @@ fn the_linked_program_carries_both_units_debug_info() {
 /// bytes**, and those run. No IR text round trip for the linked libc.
 #[test]
 fn the_card_path_compiles_a_program_unit_and_links_it_through_the_cdylib() {
+    let _exports = ffi::lock();
     let (Some(chibicc), Some(lib_bytes), Some(heap_bytes)) = (
         asset("chibicc.temen"),
         asset("pg_libc.temeno"),
@@ -350,16 +370,19 @@ fn the_linked_program_drops_what_it_cannot_reach() {
             module: &lib,
             exports: &lib_exports,
             data_exports: &lib.data_exports,
+            live: None,
         },
         temen_ir::LinkUnitRef {
             module: &heap,
             exports: &heap_exports,
             data_exports: &heap.data_exports,
+            live: None,
         },
         temen_ir::LinkUnitRef {
             module: &prog,
             exports: &prog_exports,
             data_exports: &[],
+            live: None,
         },
     ])
     .expect("links");
@@ -427,6 +450,7 @@ fn the_linked_program_drops_what_it_cannot_reach() {
 /// rather than linking against whatever occupies that slot.
 #[test]
 fn the_multi_handle_entries_link_and_fail_closed() {
+    let _exports = ffi::lock();
     let (Some(chibicc), Some(lib_bytes), Some(heap_bytes)) = (
         asset("chibicc.temen"),
         asset("pg_libc.temeno"),
@@ -505,6 +529,179 @@ fn the_multi_handle_entries_link_and_fail_closed() {
 
     temen_browser::temen_link_lib_close(h);
     temen_browser::temen_link_lib_close(hh);
+}
+
+/// A library as [`temen_browser::temen_link_lib_open`] keeps it resident: without the variables its
+/// debug info scopes globally, which stay out of a linked program's debug vars.
+fn resident(mut lib: temen_ir::Module) -> temen_ir::Module {
+    if let Some(di) = lib.debug_info.as_mut() {
+        di.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
+    }
+    lib
+}
+
+/// The resident libc and heap ([`temen_browser::temen_link_lib_open`]), in the card's link order.
+fn open_pg_units(libc: &[u8], heap: &[u8]) -> [i32; 2] {
+    [libc, heap].map(|bytes| {
+        let h = temen_browser::temen_link_lib_open(bytes.as_ptr(), bytes.len());
+        assert!(h >= 0, "the committed unit goes resident");
+        h
+    })
+}
+
+/// The program unit `ir` linked against `handles` at `main`, as the module bytes
+/// [`temen_browser::temen_link_encode_libs`] hands back.
+fn link_encode_libs(handles: &[i32], ir: &str) -> Vec<u8> {
+    let rc = temen_browser::temen_link_encode_libs(
+        handles.as_ptr(),
+        handles.len(),
+        ir.as_ptr(),
+        ir.len(),
+        b"main".as_ptr(),
+        4,
+    );
+    assert_eq!(
+        rc,
+        0,
+        "link+encode: status {}",
+        temen_browser::temen_status()
+    );
+    read_out()
+}
+
+/// The program unit `ir` linked against `handles` and run ([`temen_browser::temen_link_run_libs`]):
+/// `main`'s value, the status, and what it printed.
+fn link_run_libs(handles: &[i32], ir: &str) -> (i64, i32, String) {
+    let rv = temen_browser::temen_link_run_libs(
+        handles.as_ptr(),
+        handles.len(),
+        ir.as_ptr(),
+        ir.len(),
+        b"main".as_ptr(),
+        4,
+        core::ptr::null(),
+        0,
+    );
+    let out = String::from_utf8_lossy(&read_out()).into_owned();
+    (rv, temen_browser::temen_status(), out)
+}
+
+/// **The libraries laid out once** (#1373). The link entries start from the resident libraries'
+/// laid-out base and copy only the library functions the program reaches, and the module they hand
+/// back is, byte for byte, the one linking against the libraries themselves gives. Checked for a
+/// program that reaches much of the libc and one that reaches little, in turn, against one base.
+#[test]
+fn a_program_links_against_the_laid_out_libraries_as_against_the_libraries() {
+    let _exports = ffi::lock();
+    let (Some(libc), Some(heap), Some(table), Some(small)) = (
+        asset("pg_libc.temeno"),
+        asset("pg_heap.temeno"),
+        program_unit_text(TABLE_PROGRAM),
+        program_unit_text(SMALL_PROGRAM),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
+        return;
+    };
+    let libs = [&libc, &heap].map(|b| resident(temen_encode::decode_unit(b).expect("decode")));
+    let exports: Vec<Vec<(String, temen_ir::FuncIdx)>> = libs
+        .iter()
+        .map(|m| m.exports.iter().map(|e| (e.name.clone(), e.func)).collect())
+        .collect();
+    let units: Vec<temen_ir::LinkUnitRef<'_>> = libs
+        .iter()
+        .zip(&exports)
+        .map(|(m, exports)| temen_ir::LinkUnitRef {
+            module: m,
+            exports,
+            data_exports: &m.data_exports,
+            live: None,
+        })
+        .collect();
+    let handles = open_pg_units(&libc, &heap);
+    for ir in [&table, &small, &table] {
+        let prog = temen_text::parse_module(ir).expect("the program unit parses");
+        let plain = temen_browser::link_program_multi(&units, &prog, "main").expect("links");
+        let plain = temen_encode::encode_module(&plain);
+        let laid_out = link_encode_libs(&handles, ir);
+        assert!(
+            laid_out == plain,
+            "linked against the base: {} B; against the libraries: {} B",
+            laid_out.len(),
+            plain.len()
+        );
+    }
+    for h in handles {
+        temen_browser::temen_link_lib_close(h);
+    }
+}
+
+/// **The libraries compiled once per page** (#2168). Programs run against the same resident libraries
+/// compile through one memo, which hands a run the functions an earlier run compiled, and only while
+/// everything the compile read is unchanged: a library function the same, a program function at the
+/// same position compiled anew. Two programs in turn, twice over, each printing what it prints alone.
+#[test]
+fn programs_run_in_turn_against_the_resident_libraries_print_their_own_output() {
+    let _exports = ffi::lock();
+    let (Some(libc), Some(heap), Some(table), Some(small)) = (
+        asset("pg_libc.temeno"),
+        asset("pg_heap.temeno"),
+        program_unit_text(TABLE_PROGRAM),
+        program_unit_text(SMALL_PROGRAM),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
+        return;
+    };
+    let handles = open_pg_units(&libc, &heap);
+    for _ in 0..2 {
+        assert_eq!(
+            link_run_libs(&handles, &table),
+            (0, STATUS_OK, TABLE_OUT.to_string())
+        );
+        assert_eq!(
+            link_run_libs(&handles, &small),
+            (3, STATUS_OK, "small\n".to_string())
+        );
+    }
+    for h in handles {
+        temen_browser::temen_link_lib_close(h);
+    }
+}
+
+/// What the engine keeps for a list of resident libraries goes when one of them closes. The list
+/// declines, and a library opened into the freed handle links as itself: here the libc a second time,
+/// whose symbols collide with the first's, so the link declines where the heap's base would have run.
+#[test]
+fn a_closed_library_takes_its_laid_out_base_with_it() {
+    let _exports = ffi::lock();
+    let (Some(libc), Some(heap), Some(small)) = (
+        asset("pg_libc.temeno"),
+        asset("pg_heap.temeno"),
+        program_unit_text(SMALL_PROGRAM),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
+        return;
+    };
+    let handles = open_pg_units(&libc, &heap);
+    assert_eq!(
+        link_run_libs(&handles, &small),
+        (3, STATUS_OK, "small\n".to_string())
+    );
+    temen_browser::temen_link_lib_close(handles[1]);
+    assert_eq!(
+        link_run_libs(&handles, &small).1,
+        temen_browser::STATUS_UNSUPPORTED,
+        "a closed handle declines the list"
+    );
+    let again = temen_browser::temen_link_lib_open(libc.as_ptr(), libc.len());
+    assert_eq!(again, handles[1], "the freed handle is the next one opened");
+    assert_eq!(
+        link_run_libs(&handles, &small).1,
+        temen_browser::STATUS_UNSUPPORTED,
+        "the libc twice is a duplicate-symbol link"
+    );
+    for h in handles {
+        temen_browser::temen_link_lib_close(h);
+    }
 }
 
 /// The playground's C `detached` card, down the page's own path: compiled as a program unit, linked

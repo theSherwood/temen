@@ -100,6 +100,7 @@ fn linking_an_uncalled_library_leaves_the_manifest_unchanged() {
         module: &gfx,
         exports: &gfx_exports,
         data_exports: &[],
+        live: None,
     };
 
     let without = temen_browser::link_program_multi(&[], &prog, "main").expect("links without gfx");
@@ -157,6 +158,7 @@ fn a_capability_reached_through_a_library_survives_and_still_dispatches() {
         module: &gfx,
         exports: &gfx_exports,
         data_exports: &[],
+        live: None,
     };
     let linked =
         temen_browser::link_program_multi(&[gfx_unit], &prog, "main").expect("links and verifies");

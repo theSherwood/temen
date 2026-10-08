@@ -12,6 +12,8 @@
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
+#[path = "support/ffi.rs"]
+mod ffi;
 #[path = "support/pg_heap.rs"]
 mod pg_heap;
 
@@ -154,6 +156,7 @@ fn the_linked_programs_ir_text_carries_both_units_debug_info() {
             module: &lib,
             exports: &lib_exports,
             data_exports: &[],
+            live: None,
         },
         &prog,
         "main",
@@ -342,6 +345,7 @@ int main(void) {
 /// all, so the whole seeded-libc path would have failed the moment it went through a handle).
 #[test]
 fn the_resident_libc_unit_serves_both_running_and_stepping() {
+    let _exports = ffi::lock();
     let Some(chibicc) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen not built");
         return;
@@ -445,6 +449,7 @@ int main(void) {
 /// library's own function locals and line table (a step into `printf` still resolves), all stay.
 #[test]
 fn a_resident_librarys_globals_stay_out_of_the_programs_debug_vars() {
+    let _exports = ffi::lock();
     let Some(chibicc) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen not built");
         return;
