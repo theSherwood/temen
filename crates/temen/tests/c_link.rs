@@ -535,6 +535,113 @@ fn function_pointers_in_static_data_link_and_run() {
     }
 }
 
+/// A link unit's symbol tables by reference, for the borrowed linker entries.
+fn unit_ref(u: &LinkUnit) -> temen_ir::LinkUnitRef<'_> {
+    temen_ir::LinkUnitRef::from(u)
+}
+
+/// **Libraries laid out once** (#1373): the libraries linked to each other alone, then a program
+/// linked against that base, give the module linking all of them together does — so a host keeps the
+/// base resident and links each program against it. Library `a` holds a pointer to its own global and
+/// a table pointing at its own `static` function; `b` calls `a`, reads its global and points its data
+/// at `a`'s function by name; the program calls `b` and reads its global.
+#[test]
+fn a_laid_out_base_links_like_its_libraries() {
+    let a = object_unit(
+        "basea",
+        "int counter = 5;\n\
+         int *pc = &counter;\n\
+         static int twice(int x) { return 2 * x; }\n\
+         int (*ops[1])(int) = { twice };\n\
+         int bump(int by) { *pc += by; return ops[0](counter); }\n",
+    );
+    let b = object_unit(
+        "baseb",
+        "extern int bump(int);\n\
+         extern int counter;\n\
+         int calls = 0;\n\
+         int (*hook)(int) = bump;\n\
+         int run(int by) { calls++; return hook(by) + counter; }\n",
+    );
+    let prog = object_unit(
+        "baseprog",
+        "extern int run(int);\n\
+         extern int calls;\n\
+         int main(void) { return run(1) + run(2) + calls; }\n",
+    );
+    let base = temen_ir::link_base(&[unit_ref(&a), unit_ref(&b)])
+        .expect("libraries with no thread-locals and no `data.top` lay out on their own");
+    let base = LinkUnit {
+        exports: base
+            .exports
+            .iter()
+            .map(|e| (e.name.clone(), e.func))
+            .collect(),
+        data_exports: base.data_exports.clone(),
+        module: base,
+    };
+    let together =
+        temen_ir::link_with_manifest_ref(&[unit_ref(&a), unit_ref(&b), unit_ref(&prog)]).unwrap();
+    let on_base = temen_ir::link_with_manifest_ref(&[unit_ref(&base), unit_ref(&prog)]).unwrap();
+    assert_eq!(on_base, together);
+}
+
+/// A base is refused when a later unit would move what it resolved: a thread-local (the per-thread
+/// block goes above all data), `data.top` (a program unit's bootstrap puts the data stack above all
+/// data), and a symbol only a later unit defines.
+#[test]
+fn a_base_refuses_libraries_a_later_unit_would_move() {
+    let tls = object_unit(
+        "basetls",
+        "_Thread_local int t = 1;\nint get(void) { return t; }\n",
+    );
+    assert!(temen_ir::link_base(&[unit_ref(&tls)]).is_none());
+    let main = object_unit("basemain", "int main(void) { return 0; }\n");
+    assert!(temen_ir::link_base(&[unit_ref(&main)]).is_none());
+    let later = object_unit(
+        "baselater",
+        "extern int later;\nint get(void) { return later; }\n",
+    );
+    assert!(temen_ir::link_base(&[unit_ref(&later)]).is_none());
+}
+
+/// A unit's `live` mask (#1373): the functions it marks unreached link as traps, with their
+/// signatures, and the rest of the linked module is what linking without the mask gives.
+#[test]
+fn a_live_mask_links_a_trap_for_each_function_it_excludes() {
+    let lib = object_unit(
+        "livelib",
+        "int one(void) { return 1; }\nint two(void) { return 2; }\n",
+    );
+    let prog = object_unit(
+        "liveprog",
+        "extern int one(void);\nint main(void) { return one(); }\n",
+    );
+    let two = lib.exports.iter().find(|(n, _)| n == "two").unwrap().1 as usize;
+    let mut live = vec![true; lib.module.funcs.len()];
+    live[two] = false;
+    let masked = temen_ir::LinkUnitRef {
+        live: Some(&live),
+        ..unit_ref(&lib)
+    };
+    let full = temen_ir::link_with_manifest_ref(&[unit_ref(&lib), unit_ref(&prog)]).unwrap();
+    let linked = temen_ir::link_with_manifest_ref(&[masked, unit_ref(&prog)]).unwrap();
+    for (i, (f, g)) in linked.funcs.iter().zip(&full.funcs).enumerate() {
+        if i == two {
+            assert_eq!((&f.params, &f.results), (&g.params, &g.results));
+            assert_eq!(f.blocks.len(), 1);
+            assert_eq!(f.blocks[0].term, temen_ir::Terminator::Unreachable);
+        } else {
+            assert_eq!(f, g, "function {i}");
+        }
+    }
+    let bodiless = |m: temen_ir::Module| temen_ir::Module {
+        funcs: Vec::new(),
+        ..m
+    };
+    assert_eq!(bodiless(linked), bodiless(full));
+}
+
 /// Fail-closed for **data**: a unit reading an `extern` global that no unit exports fails the link
 /// with `Unresolved` (the same guarantee as an unresolved call), not a read of uninitialized memory.
 #[test]

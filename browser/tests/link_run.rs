@@ -8,6 +8,9 @@ use temen_browser::{
 };
 use temen_ir::{Block, Func, Inst, Memory, Module, Terminator, ValType};
 
+#[path = "support/ffi.rs"]
+mod ffi;
+
 /// A minimal unit: one `(i64) -> (i64)` kernel returning `val` (the `i64` param is the data-stack
 /// pointer the synthesized powerbox `_start` passes — the §3e entry shape), with a window.
 fn unit(val: i64) -> Module {
@@ -31,6 +34,7 @@ fn unit(val: i64) -> Module {
 
 #[test]
 fn link_run_accepts_binary_object_units() {
+    let _exports = ffi::lock();
     let prog_bytes = temen_encode::encode_unit(&unit(42)); // binary object (v9 flag set)
     let lib_text = temen_text::print_module(&unit(7)); // text unit
     let entry = b"run";
@@ -54,6 +58,7 @@ fn link_run_accepts_binary_object_units() {
 /// to its own value; closing (or never opening) declines cleanly instead of faulting.
 #[test]
 fn resident_libraries_link_many_programs_by_handle() {
+    let _exports = ffi::lock();
     let entry = b"run";
     let run = |h: i32, val: i64| -> (i64, i32) {
         let prog_text = temen_text::print_module(&unit(val));

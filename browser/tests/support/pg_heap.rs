@@ -30,6 +30,7 @@ pub fn link(libs: &[&temen_ir::Module], prog: &temen_ir::Module) -> temen_ir::Mo
             module: m,
             exports,
             data_exports: &m.data_exports,
+            live: None,
         })
         .collect();
     temen_browser::link_program_multi(&units, prog, "main").expect("link the program and the heap")

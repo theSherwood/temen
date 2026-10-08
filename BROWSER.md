@@ -425,10 +425,25 @@ libraries can be resident — jacl keeps its program runtime and its macro-stagi
 prog, entry, stdin)` then links each program against it through the borrowed-unit linker entry
 (`temen_ir::link_with_manifest_ref`, same merged module as the owned one — `borrowed_units_link_
 identically_to_owned`) with the same result accessors: **7.2 ms/run** (1.5×). `temen_link_lib_close(handle)`
-drops it. `browser/bench_link_lib.mjs` is the measurement. What remains per run is the link's copy +
-relocation of the library's functions, `_start` synthesis, whole-module verify, and execution; the
-next cut is a pre-laid-out unit 0 (relocate the library once, append only the program's functions
-and re-resolve its edges) — a linker refactor, tracked on #1373.
+drops it. `browser/bench_link_lib.mjs` is the measurement.
+
+**Laid out once, compiled once per page (#1373, #2168).** The first link against a list of handles
+lays the libraries out together (`temen_ir::link_base`) and keeps that base with the list, and every
+later link starts from it as unit 0. Linking the base and a program gives the module that linking the
+libraries and the program together gives: the base sits at function, type and data base 0 either way,
+so nothing in it moves and a guest cannot tell (a host cache under static-link semantics, #2168's
+ruling). The link copies only the base functions the program can reach (the unit's `live` mask,
+`LinkUnitRef::live`), and the rest go in as the trap bodies the collection after the link leaves
+anyway. `link_base` declines libraries that a later unit could move: thread-locals, `data.top`, the
+thread-local symbols, or a reference that only a later unit satisfies. Those link with each program,
+as before.
+
+The list also keeps a bytecode compile memo (`bytecode::FuncMemo`). Every program linked against the
+base holds the libraries' functions at the same positions, so a run compiles through the memo and
+reuses what an earlier run compiled. Each reused function is checked against everything its compile
+read: its IR, and the result counts and signatures of what it calls. When any of that changed, the
+function compiles anew. Closing any library in the list drops what was kept for it, and at most four
+lists are kept (jacl links against two runtimes in turn).
 
 ## Separate compilation for the chibicc card: a prebuilt libc unit (#1392)
 
@@ -490,10 +505,10 @@ committed asset and itself an encoded unit — so it must be regenerated on any 
 change (`ONLY=pg_libc bash scripts/rebuild-assets.sh`).
 
 Both halves of the card are served from **resident** units — the libc and the heap — through the
-multi-library entries, which take the handles in link order: `temen_link_run_libs(handles, …)` to run,
-`temen_link_encode_libs(handles, prog, entry)` to get the linked program's **runnable module bytes**
-(what the card uses — it keeps the existing interpreter/wasm-JIT run passes and avoids a text round trip
-for the ~350 KB of linked libc), and `temen_link_text_libs(handles, prog, entry)` — the debugger twin —
+multi-library entries, which take the handles in link order: `temen_link_run_libs(handles, …)` to run
+(the card's interpreter tier), `temen_link_encode_libs(handles, prog, entry)` to get the linked
+program's **runnable module bytes** (what its wasm-JIT tier runs, with no text round trip for the
+linked libc), and `temen_link_text_libs(handles, prog, entry)` — the debugger twin —
 to hand a DAP session the linked program's IR *text*, carrying the units' debug info (the linker merges
 it, `temen_ir::link`). A resident library keeps its **data** symbols as well as its functions:
 `<stdio.h>`'s `stdout` is `&__pg_std[1]`, so a program unit resolves that array out of the library
@@ -515,6 +530,21 @@ program with `-g`:
 
 **11.6x**, with the libc unit resident in 7 ms once. What is left in the 458 ms is preprocessing the
 *declarations*; the floor (a program with no headers at all) is ~70 ms.
+
+**The compiler, once per page (#2168).** The card hands the engine the same `chibicc.temen` every Run,
+so the engine keeps it in one slot that the C and self-host cards share (`ProgramCache`, the bash
+card's cache generalized). It decodes and verifies the compiler on the first Run, compiles its
+bytecode program on the first interpreter Run, and emits it for the wasm-JIT on the first wasm-JIT Run
+(`JitOnrampRun::emit_for_run`). Later Runs start at the run itself, and a rebuilt asset changes the
+slot's key and fills it again. The card's interpreter tier links and runs the program in one call
+(`temen_link_run_libs`), against the libraries laid out once and through their compile memo (#1373,
+above). Measured in the wasm engine under Node on a `printf`/`snprintf`/`puts` program:
+
+| | every Run, before | a later Run, now |
+|---|---|---|
+| compile on the interpreter | 274 ms | 201 ms |
+| wasm-JIT open of the compiler | 62 ms | 1.5 ms |
+| link + run on the interpreter | 7.3 ms (link + encode, then `temen_run_onramp`) | 6.0 ms |
 
 A *linked* program's merged debug-info file table starts with the **library's** files, so file 0 is no
 longer the user's source. `dapSourceName` therefore prefers the file the editor actually shows

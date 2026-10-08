@@ -2848,9 +2848,10 @@ async function openPgUnits(rec, c) {
 }
 
 // Link a program unit (`unit`, chibicc's emitted IR text as bytes) against the resident C units, entering
-// at `main`, with one of the multi-library entries: `temen_link_encode_libs` (module bytes, to run) or
-// `temen_link_text_libs` (IR text, to debug). The result is on the stdout stash; returns its status
-// (0 = linked).
+// at `main`, with one of the multi-library entries: `temen_link_encode_libs` (module bytes, for the
+// wasm-JIT) or `temen_link_text_libs` (IR text, to debug), which return their status (0 = linked) and
+// leave the result on the stdout stash; or `temen_link_run_libs`, which runs the program on the
+// interpreter with no stdin (its last two params; the other entries take six) and returns `main`'s value.
 function linkPgProgram(link, handles, unit) {
   const entry = new TextEncoder().encode('main');
   const hp = eng.ex.temen_alloc(4 * handles.length);
@@ -2861,7 +2862,7 @@ function linkPgProgram(link, handles, unit) {
   const view = new Uint8Array(eng.memory.buffer);
   view.set(unit, up);
   view.set(entry, ep);
-  const r = link(hp, handles.length, up, unit.length, ep, entry.length);
+  const r = link(hp, handles.length, up, unit.length, ep, entry.length, 0, 0);
   eng.ex.temen_dealloc(hp, 4 * handles.length);
   eng.ex.temen_dealloc(up, unit.length);
   eng.ex.temen_dealloc(ep, entry.length);
@@ -2871,9 +2872,9 @@ function linkPgProgram(link, handles, unit) {
 // The in-browser C compiler (SELFHOST_C.md §7 step 5) — two Temen passes in the sandbox:
 //   1. compile: run `chibicc.temen` over the editor's C, seeded on an `fs` cap at `/in.c`
 //      (`temen_run_onramp_fs`), and capture the emitted TEMEN-IR *text* on stdout;
-//   2. link + run: `temen_link_encode_libs` links the emitted program unit against the resident prebuilt
-//      C units straight to module bytes, then runs it (`moduleInterp`) — the result is `main`'s return
-//      value.
+//   2. link + run: the emitted program unit links against the resident prebuilt C units and runs — on
+//      the wasm-JIT as module bytes (`temen_link_encode_libs`), on the interpreter in one call
+//      (`temen_link_run_libs`) — and the result is `main`'s return value.
 // Pass 1 (running chibicc) is the slow part, so it takes the "wasm-JIT" toggle: chibicc's whole
 // `_start` emits to wasm (333 funcs; the cap-call/float helpers bounce cross-tier), running the compile
 // several× faster than the bytecode interpreter — with a fallback to `temen_run_onramp_fs` if the emit is
@@ -2965,26 +2966,32 @@ async function runChibicc(c) {
     return;
   }
 
-  // Pass 2 — **link** the emitted program unit against the resident units into a runnable module
-  // (`temen_link_encode_libs`: `_start` synthesized, verified, encoded). It stays binary throughout — no
-  // text round trip for the ~350 KB of linked libc.
-  const tEncode = performance.now();
-  if (linkPgProgram(eng.ex.temen_link_encode_libs, units, new TextEncoder().encode(ir)) !== 0) {
-    setState(c, 'error', `link failed: status ${eng.ex.temen_status()}`);
-    runEnd(rec, { ok: false });
-    return;
+  // Pass 2 — for the wasm-JIT, **link** the emitted program unit against the resident units into a
+  // runnable module (`temen_link_encode_libs`: `_start` synthesized, verified, encoded). It stays binary
+  // throughout — no text round trip for the linked libc.
+  const unit = new TextEncoder().encode(ir);
+  let parsed = null;
+  if (useJit) {
+    const tEncode = performance.now();
+    if (linkPgProgram(eng.ex.temen_link_encode_libs, units, unit) !== 0) {
+      setState(c, 'error', `link failed: status ${eng.ex.temen_status()}`);
+      runEnd(rec, { ok: false });
+      return;
+    }
+    parsed = readModuleStdoutBytes();
+    runStage(rec, 'link', performance.now() - tEncode);
+    runNote(rec, { moduleBytes: parsed.length });
   }
-  const parsed = readModuleStdoutBytes();
-  runStage(rec, 'link', performance.now() - tEncode);
-  runNote(rec, { moduleBytes: parsed.length });
 
   // Pass 3 — run the compiled .temen artifact. It rides the wasm-JIT too (not just the compiler): the
   // runner now reports the guest's returned value (`temen_run_value`, matching the interpreter oracle) and
   // reports a trap as a trap — so `runJitModule` throws on a trap and we fall back to the interpreter,
-  // which runs it correctly. A clean JIT run is byte-identical to the oracle (INVARIANT 9).
+  // which runs it correctly. A clean JIT run is byte-identical to the oracle (INVARIANT 9). The
+  // interpreter links and runs in one call (`temen_link_run_libs`, so its stage includes the link): the
+  // engine keeps the resident units laid out and their compiled functions for the page (#2168).
   const tRun = performance.now();
   let r, runTierName = 'interpreter';
-  if (useJit) {
+  if (parsed) {
     try {
       const status = await runJitModule(eng.ex, eng.memory, parsed, null);
       r = { rv: Number(eng.ex.temen_run_value()), status, stdout: readModuleStdout() };
@@ -2994,7 +3001,10 @@ async function runChibicc(c) {
       runNote(rec, { runJitDeclined: e.message });
     }
   }
-  if (!r) r = moduleInterp(parsed, null);
+  if (!r) {
+    const rv = linkPgProgram(eng.ex.temen_link_run_libs, units, unit);
+    r = { rv, status: eng.ex.temen_status(), stdout: readModuleStdout() };
+  }
   const runMs = runStage(rec, `run:${runTierName}`, performance.now() - tRun);
   runNote(rec, { runTier: runTierName, compileMs: +compileMs.toFixed(1), runMs: +runMs.toFixed(1), progStdoutBytes: (r.stdout || '').length });
   c.el.result.textContent = `${r.rv}`;
