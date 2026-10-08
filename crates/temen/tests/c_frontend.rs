@@ -2942,6 +2942,7 @@ fn c_guest_jit_hotreload_demo() {
 
 /// A C link unit (`--emit-object`) as the bytes a guest `vm_dlopen`s — the object dialect — written
 /// as a C array initializer.
+#[cfg(all(unix, target_arch = "x86_64"))]
 fn c_object_init(src: &str) -> String {
     let ir = c_to_ir_with(src, &["--emit-object"]);
     let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse unit: {e:?}\n{ir}"));
@@ -2955,6 +2956,7 @@ fn c_object_init(src: &str) -> String {
 
 /// The counter library [`c_guest_dlopen_units_carry_their_own_globals`] loads: an initialized
 /// global, a zero-initialized array, a pointer-valued initializer, and the program's `bias` by name.
+#[cfg(all(unix, target_arch = "x86_64"))]
 const DL_COUNTER: &str = "int count = @START@;\n\
      static long hist[4];\n\
      static long *slot = &hist[2];\n\
@@ -2966,6 +2968,7 @@ const DL_COUNTER: &str = "int count = @START@;\n\
      }\n";
 
 /// The program that `vm_dlopen`s [`DL_COUNTER`] twice and a reader of its `count` (#2167).
+#[cfg(all(unix, target_arch = "x86_64"))]
 const DL_GLOBALS_MAIN: &str = r#"
 #include <vm_dl.h>
 int write(int fd, char *buf, long n);
