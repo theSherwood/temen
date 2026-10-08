@@ -56,7 +56,6 @@
 //! stay `Unaudited` here exactly as they do on the debugger and concurrency columns.
 
 mod support;
-use std::sync::Arc;
 use support::capability_probe::{
     probe_module_with, rows, unit_module_with, Row, MAX_ARGC, PROBE_BEYOND,
 };
@@ -135,10 +134,14 @@ fn validate_unit(
     bytes: &[u8],
     _mode: Option<u8>,
     _sigs: &[u8],
-) -> Result<Arc<[temen_ir::Func]>, i64> {
+) -> Result<temen_interp::JitValidated, i64> {
     let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
     temen_verify::verify_module(&m).map_err(|_| -22i64)?;
-    Ok(m.funcs.into())
+    Ok(temen_interp::JitValidated {
+        funcs: m.funcs.into(),
+        types: m.types.into(),
+        data: None,
+    })
 }
 
 /// Grant the `Jit` and compile the probe's unit, returning `(jit handle, code handle)`. Run on

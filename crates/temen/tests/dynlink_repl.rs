@@ -7,7 +7,7 @@
 //! This is exactly what a guest-side `vm_dlopen`/`vm_dlsym` REPL will do — the symbol table *is* the
 //! dlopen registry, `define` *is* `vm_dlopen` (resolve → verify → compile → install → record), and an
 //! `eval` is a `vm_dlsym` + call. It runs **today** on the C1 host-assisted primitives
-//! (`temen_run::jit_resolve_and_validate` + the guest-JIT `define_extra`/`install`), with no new cap-op
+//! (`temen_run::jit_blob_validator` + the guest-JIT `define_extra`/`install`), with no new cap-op
 //! plumbing — so it serves as the *executable spec* for the C `compile_linked` op and the dlopen
 //! surface that will turn this harness into a real guest program.
 //!
@@ -17,10 +17,10 @@
 
 use std::collections::HashMap;
 
-use temen_encode::{decode_module, encode_module};
-use temen_ir::{Resolved, DEFAULT_RESERVED_LOG2};
+use temen_encode::{encode_module, encode_symbol_table};
+use temen_ir::{Resolved, SymbolTable, DEFAULT_RESERVED_LOG2};
 use temen_jit::{CompiledModule, JitOutcome, INERT_CAP_THUNK};
-use temen_run::jit_resolve_and_validate;
+use temen_run::jit_blob_validator;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -68,18 +68,18 @@ impl Repl {
         // Serialize the unit with its symbols still unresolved (the `.so` a guest would ship), then
         // let the host bind them — no `resolve_imports_with` in this harness; the host does it.
         let blob = encode_module(&parse_module(src).expect("parse definition"));
-        let table = self.symbols.clone();
-        let funcs = jit_resolve_and_validate(&blob, None, |n| {
-            table.get(n).map(|&(slot, _)| Resolved::Slot(slot))
-        })
-        .expect("resolve the definition's imports against the REPL symbol table");
-        // #922: resolution preserves the type section, so the decoded blob's types resolve the
-        // interned call sigs in the resolved funcs.
-        let types = decode_module(&blob).expect("decode definition").types;
+        let mut table = SymbolTable::default();
+        for (n, &(slot, _)) in &self.symbols {
+            table.funcs.insert(n.clone(), Resolved::Slot(slot));
+        }
+        let unit = jit_blob_validator(&blob, None, &encode_symbol_table(&table))
+            .expect("resolve the definition's imports against the REPL symbol table");
 
+        // #922: resolution preserves the type section, so the unit's types resolve the interned
+        // call sigs in the resolved funcs.
         let defs = self
             .cm
-            .define_extra(&funcs, &types, None)
+            .define_extra(&unit.funcs, &unit.types, None)
             .expect("compile the definition");
         let slot = self
             .cm

@@ -4971,6 +4971,7 @@ pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
         "vm_jit_release" => (cap_id::JIT, 2),
         "vm_jit_install" => (cap_id::JIT, 3),
         "vm_jit_uninstall" => (cap_id::JIT, 4),
+        "vm_jit_unit_info" => (cap_id::JIT, 6),
         _ => return None,
     };
     Some(ResolvedCap { type_id, op })
@@ -5221,6 +5222,9 @@ pub enum LinkError {
     /// A thread-local reference named a plain data export, or a plain data reference named a
     /// thread-local export (#1715) — the units disagree on whether the variable is `_Thread_local`.
     TlsMismatch(String),
+    /// A unit placed into a running window ([`place_loaded_unit`]) carries something only a
+    /// whole-program link can lay out; the payload names it.
+    NotLoadable(&'static str),
 }
 
 /// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
@@ -5309,14 +5313,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         ftotal += u.module.funcs.len() as u32;
         let dbase = page_align(dtotal);
         dbases.push(dbase);
-        let span = u
-            .module
-            .data
-            .iter()
-            .map(|d| d.offset + d.bytes.len() as u64)
-            .max()
-            .unwrap_or(0);
-        dtotal = dbase + span;
+        dtotal = dbase + unit_data_span(u.module);
     }
     // Thread-local layout (#1715): each unit's template ([`Module::tls`]) takes `[tbase, tbase +
     // span)` of the one per-thread block, 16-byte aligned so every unit keeps its own alignment.
@@ -5504,24 +5501,20 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
     {
         let mut m = u.module.clone();
         offset_type_indices(&mut m, tbase);
-        // Patch this unit's data-image pointers (`data.ptr`, the data→data case) while segment
-        // offsets are still unit-local: overwrite the 8 placeholder bytes at each slot with the
-        // resolved absolute window address. Must precede the segment shift below so `at` and the
-        // covering segment share one coordinate frame; the address written is already absolute
-        // (`dbase`-relative for `self`, the symbol's window address for `sym`).
-        apply_unit_data_ptrs(&mut m, dbase, &data_tab, &tls_tab)?;
-        // Patch this unit's data-image funcrefs (`data.funcref`, the data→code case): overwrite the
-        // 4 placeholder bytes at each slot with the resolved merged funcidx. Like `data.ptr`, this
-        // runs while segment offsets are still unit-local (`at` and its covering segment share a
-        // frame). The funcidx is already global (`funcs_tab` holds `fbase + local`), so it needs no
-        // later shift by this unit's `offset_func_indices`. Every slot is recorded (#1830), at the
-        // window offset the segment shift below gives it.
-        let slots = apply_unit_data_funcrefs(&mut m, &funcs_tab, fbase)?;
-        data_funcref_slots.extend(slots.into_iter().map(|at| at + dbase));
-        // Relocate this unit's data segments into its assigned window region…
-        for d in &mut m.data {
-            d.offset += dbase;
-        }
+        // Place this unit's data in its assigned window region: its `data.ptr`/`data.funcref` slots,
+        // its segments, and its `data.self`/`data.sym`/`data.top` addresses. Every funcref slot is
+        // recorded (#1830) at its window offset.
+        let env = DataEnv {
+            data: &data_tab,
+            tls: &tls_tab,
+            funcs: &funcs_tab,
+            fbase,
+            tls_base,
+            entry_sp,
+        };
+        let (data_top, slots) = place_unit_data(&mut m, dbase, &env)?;
+        has_data_top |= data_top;
+        data_funcref_slots.extend(slots);
         // …and its thread-local template into both copies of the merged block (#1715).
         for t in core::mem::take(&mut m.tls) {
             let at = tls_base + t.offset;
@@ -5536,12 +5529,6 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
                 bytes: t.bytes,
             });
         }
-        // …and rewrite its link-form data addresses to concrete `ConstI64`s, now that the window
-        // layout is fixed: `data.self <off>` → `dbase + off` (own data), `data.sym "name" +addend`
-        // → `addr(name) + addend` (a cross-unit symbol, fail-closed if unexported). This is the
-        // data twin of the `call.sym → call` rewrite below — a 1:1, position-independent edit.
-        has_data_top |=
-            resolve_unit_data_addrs(&mut m, dbase, tls_base, entry_sp, &data_tab, &tls_tab)?;
         offset_func_indices(&mut m, fbase);
         rewrite_unit_imports(&mut m, disp)?;
         funcs.extend(m.funcs);
@@ -5844,6 +5831,218 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
     }
     m.imports.clear();
     Ok(())
+}
+
+/// The high-water mark of a unit's own (un-relocated) data: the end of its last data segment. A
+/// frontend that ends its data in zero-initialized globals marks the top with a segment, so this is
+/// the room the unit's data needs wherever it is placed.
+pub fn unit_data_span(m: &Module) -> u64 {
+    m.data
+        .iter()
+        .map(|d| d.offset.saturating_add(d.bytes.len() as u64))
+        .max()
+        .unwrap_or(0)
+}
+
+/// What a unit's link-form data references resolve against when its data is placed: data symbols
+/// (window addresses), thread-locals (per-thread block offsets), the exported functions a
+/// `data.funcref` names (at their merged indices, the unit's own shifted by `fbase`), and where the
+/// unit's thread-locals and a `data.top` sit.
+struct DataEnv<'a> {
+    data: &'a alloc::collections::BTreeMap<String, u64>,
+    tls: &'a alloc::collections::BTreeMap<String, u64>,
+    funcs: &'a alloc::collections::BTreeMap<String, FuncIdx>,
+    fbase: FuncIdx,
+    tls_base: u64,
+    entry_sp: u64,
+}
+
+/// Place one unit's data at window address `dbase`: patch its `data.ptr` and `data.funcref` slots
+/// (while segment offsets are still unit-local, so a slot and its covering segment share one frame),
+/// shift its segments into place, and rewrite its `data.self`/`data.sym`/`data.top` to constant
+/// addresses — the data twin of the `call.sym → call` rewrite, 1:1 and position-independent. [`link`]
+/// takes this step for every unit it lays out, and [`place_loaded_unit`] for a unit a guest places
+/// in its own window (#2167), so a unit's data is relocated by one path wherever it lands. Returns
+/// whether the unit uses `data.top`, and the window offsets of the funcrefs it baked, ascending.
+fn place_unit_data(
+    m: &mut Module,
+    dbase: u64,
+    env: &DataEnv<'_>,
+) -> Result<(bool, Vec<u64>), LinkError> {
+    apply_unit_data_ptrs(m, dbase, env.data, env.tls)?;
+    let slots = apply_unit_data_funcrefs(m, env.funcs, env.fbase)?;
+    for d in &mut m.data {
+        d.offset += dbase;
+    }
+    let data_top =
+        resolve_unit_data_addrs(m, dbase, env.tls_base, env.entry_sp, env.data, env.tls)?;
+    Ok((data_top, slots.into_iter().map(|at| at + dbase).collect()))
+}
+
+/// Place a unit a guest loads into its **running** window (DESIGN.md §22, #2167): the guest chose
+/// `base`, an address in its window with [`unit_data_span`] bytes of room, and the unit's data is
+/// relocated there by the same step [`link`] takes for every unit ([`place_unit_data`]). A
+/// `data.sym` resolves to the unit's own data export first (at `base + offset`), else to `data_syms`
+/// — the window addresses the guest names, such as another loaded unit's data. On success the unit
+/// carries no link form: its data segments sit at window offsets in `[base, base + span)`, ready to
+/// be written there, and its code holds their addresses as constants.
+///
+/// Refused ([`LinkError::NotLoadable`]) is what only a whole-program link can lay out: thread-locals
+/// (the program has one per-thread block), function indices baked into data (the unit's functions
+/// have no table slots until an engine installs them), and `data.top` (the program's data stack).
+/// The caller checks that `[base, base + span)` does not wrap, so nothing here overflows.
+pub fn place_loaded_unit(
+    m: &mut Module,
+    base: u64,
+    data_syms: &alloc::collections::BTreeMap<String, u64>,
+) -> Result<(), LinkError> {
+    let tls_inst = m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .any(|i| {
+            matches!(
+                i,
+                Inst::DataSelf { tls: true, .. } | Inst::DataSym { tls: true, .. }
+            )
+        });
+    if tls_inst
+        || !m.tls.is_empty()
+        || m.data_ptrs.iter().any(|p| p.tls)
+        || m.data_exports.iter().any(|e| e.tls)
+    {
+        return Err(LinkError::NotLoadable("thread-local data"));
+    }
+    if !m.data_funcrefs.is_empty() || !m.data_funcref_slots.is_empty() {
+        return Err(LinkError::NotLoadable("function indices in data"));
+    }
+    let data_top = m
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::DataTop));
+    if data_top {
+        return Err(LinkError::NotLoadable("data.top"));
+    }
+    let mut data = data_syms.clone();
+    for e in &m.data_exports {
+        data.insert(e.name.clone(), base.wrapping_add(e.offset));
+    }
+    let none = alloc::collections::BTreeMap::new();
+    let env = DataEnv {
+        data: &data,
+        tls: &none,
+        funcs: &alloc::collections::BTreeMap::new(),
+        fbase: 0,
+        tls_base: 0,
+        entry_sp: 0,
+    };
+    place_unit_data(m, base, &env)?;
+    m.data_exports.clear();
+    Ok(())
+}
+
+/// A guest's **symbol table** for a unit it loads into its running window (DESIGN.md §22,
+/// `compile_linked`): everything the unit links against. The guest builds it and the host decodes it
+/// (`temen_encode::decode_symbol_table`), then links the unit against it before verifying
+/// ([`load_unit`]). Every value is guest-chosen and confers no authority: a slot is masked and
+/// type-checked at the call, a data address is confined at every access, and the place names room the
+/// guest could write itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SymbolTable {
+    /// Function symbols: a name → a `call.dyn` table slot or a host capability.
+    pub funcs: alloc::collections::BTreeMap<String, Resolved>,
+    /// Data symbols: a name → the window address of a datum the guest placed (another loaded unit's
+    /// global, or one of the program's own).
+    pub data: alloc::collections::BTreeMap<String, u64>,
+    /// Where the unit's own data goes: a window address with [`unit_data_span`] bytes of room.
+    pub place: Option<u64>,
+}
+
+/// A loaded unit's data, relocated to the window: it occupies `[base, base + span)`, which starts out
+/// zero (its zero-initialized data) under `data`, each segment at its window offset. Written whole, so
+/// the unit starts from its initial image whatever the guest's allocator left in the room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataImage {
+    pub base: u64,
+    pub span: u64,
+    pub data: Vec<Data>,
+}
+
+/// Why [`load_unit`] refused a unit. Fail-closed: the host reports `-EFAULT` for
+/// [`LoadError::OutOfWindow`] and `-EINVAL` for the rest, and nothing is installed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LoadError {
+    /// A §7 import found no binding, or a malformed one.
+    Import(ImportError),
+    /// The unit's data could not be placed ([`place_loaded_unit`]).
+    Link(LinkError),
+    /// The unit has data of its own, and the symbol table names no place for it.
+    Unplaced,
+    /// The room `[base, base + span)` runs past the end of the address space, so no window holds it.
+    OutOfWindow,
+    /// A runnable module (not a link unit) carries data: its offsets are fixed window addresses,
+    /// which a unit joining a running window would write over.
+    ModuleData,
+    /// A link unit declares more memory than the window it joins.
+    Memory,
+}
+
+/// Link a unit a guest submits to its running window (DESIGN.md §22): bind its §7 imports against
+/// `table.funcs`, and for a **link unit** (`object`, the pre-link dialect) place its data at
+/// `table.place` ([`place_loaded_unit`]). A runnable module may carry no data, since its data offsets
+/// are absolute. `mem_log2` is the window's declared memory. A link unit's own declaration is only
+/// what it needs, as [`link`] reads it when it merges units into one window, so it must fit and the
+/// unit takes the window's; a runnable module's must equal it (the caller checks, after verify).
+///
+/// Returns the unit, now with no import, link form or data, ready to verify; and its data image, if
+/// it has data. Whether the image's room lies inside the window is the host's check, made when it
+/// writes the image through the window's own accessor. The host runs this the same way for every
+/// engine, so a unit is linked by one path wherever it runs (invariant 15).
+pub fn load_unit(
+    m: &Module,
+    object: bool,
+    table: &SymbolTable,
+    mem_log2: Option<u8>,
+) -> Result<(Module, Option<DataImage>), LoadError> {
+    let mut m = resolve_imports_with(m, |name| table.funcs.get(name).copied())
+        .map_err(LoadError::Import)?;
+    if !object {
+        return if m.data.is_empty() {
+            Ok((m, None))
+        } else {
+            Err(LoadError::ModuleData)
+        };
+    }
+    if m.memory.map(|mc| mc.size_log2) > mem_log2 {
+        return Err(LoadError::Memory);
+    }
+    let shadow = m.memory.and_then(|mc| mc.shadow);
+    m.memory = mem_log2.map(|size_log2| Memory { size_log2, shadow });
+    let span = unit_data_span(&m);
+    let own_data = span > 0
+        || !m.data_exports.is_empty()
+        || m.data_ptrs
+            .iter()
+            .any(|p| matches!(p.target, DataPtrTarget::SelfOff(_)))
+        || m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::DataSelf { .. }));
+    let base = match table.place {
+        Some(base) => base,
+        None if !own_data => 0,
+        None => return Err(LoadError::Unplaced),
+    };
+    if base.checked_add(span).is_none() {
+        return Err(LoadError::OutOfWindow);
+    }
+    place_loaded_unit(&mut m, base, &table.data).map_err(LoadError::Link)?;
+    let data = core::mem::take(&mut m.data);
+    Ok((m, (span > 0).then_some(DataImage { base, span, data })))
 }
 
 /// Resolve a unit's **link-form data addresses** to concrete `ConstI64`s, now that the linker has
@@ -7071,6 +7270,189 @@ mod link_layout_tests {
             "window grew past the declared 64 KiB to hold the reserves (got 2^{})",
             mem.size_log2
         );
+    }
+}
+
+#[cfg(test)]
+mod load_unit_tests {
+    //! [`load_unit`]: a link unit a guest loads into its running window is placed and relocated by the
+    //! linker's own per-unit step, and refused when it carries what only a whole-program link can lay
+    //! out (#2167).
+    use super::*;
+
+    const ROOM: u64 = 0x1_0000;
+
+    /// A link unit with two data segments (`[16, 24)`: a pointer slot, `[40, 48)`: an exported
+    /// global `g`) and one function returning the addresses it names: `data.self 40`, its own `g`,
+    /// and the guest's `ext + 4`.
+    fn unit() -> Module {
+        Module {
+            memory: Some(Memory {
+                size_log2: 17,
+                shadow: None,
+            }),
+            data: vec![
+                Data {
+                    offset: 16,
+                    readonly: false,
+                    bytes: vec![0; 8],
+                },
+                Data {
+                    offset: 40,
+                    readonly: false,
+                    bytes: vec![7, 0, 0, 0, 0, 0, 0, 0],
+                },
+            ],
+            data_ptrs: vec![DataPtr {
+                at: 16,
+                tls: false,
+                target: DataPtrTarget::SelfOff(40),
+            }],
+            data_exports: vec![DataExport {
+                name: "g".into(),
+                offset: 40,
+                tls: false,
+            }],
+            funcs: vec![Func {
+                params: vec![],
+                results: vec![ValType::I64, ValType::I64, ValType::I64],
+                blocks: vec![Block {
+                    params: vec![],
+                    insts: vec![
+                        Inst::DataSelf {
+                            offset: 40,
+                            tls: false,
+                        },
+                        Inst::DataSym {
+                            name: b"g".to_vec(),
+                            addend: 0,
+                            tls: false,
+                        },
+                        Inst::DataSym {
+                            name: b"ext".to_vec(),
+                            addend: 4,
+                            tls: false,
+                        },
+                    ],
+                    term: Terminator::Return(vec![0, 1, 2]),
+                }],
+            }],
+            ..Module::default()
+        }
+    }
+
+    fn table(place: Option<u64>) -> SymbolTable {
+        let mut t = SymbolTable {
+            place,
+            ..SymbolTable::default()
+        };
+        t.data.insert("ext".into(), 0x5000);
+        t
+    }
+
+    fn consts(m: &Module) -> Vec<i64> {
+        m.funcs[0].blocks[0]
+            .insts
+            .iter()
+            .map(|i| match i {
+                Inst::ConstI64(v) => *v,
+                other => panic!("a link form survived: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_link_unit_is_relocated_to_its_room() {
+        let (m, image) = load_unit(&unit(), true, &table(Some(ROOM)), Some(20)).expect("loads");
+        let g = (ROOM + 40) as i64;
+        assert_eq!(consts(&m), [g, g, 0x5004]);
+        assert!(m.data.is_empty() && m.data_ptrs.is_empty() && m.data_exports.is_empty());
+        // It runs in the window it joins: its declared 2^17 fits the 2^20 window, which it takes.
+        assert_eq!(m.memory.map(|mc| mc.size_log2), Some(20));
+        let image = image.expect("the unit has data");
+        assert_eq!((image.base, image.span), (ROOM, 48));
+        // The segments sit at their window offsets, and the pointer slot holds `&g`.
+        let at: Vec<u64> = image.data.iter().map(|d| d.offset).collect();
+        assert_eq!(at, [ROOM + 16, ROOM + 40]);
+        assert_eq!(image.data[0].bytes, (ROOM + 40).to_le_bytes());
+    }
+
+    #[test]
+    fn the_units_own_export_wins_over_the_guests_name() {
+        let mut t = table(Some(ROOM));
+        t.data.insert("g".into(), 0x9000);
+        let (m, _) = load_unit(&unit(), true, &t, Some(20)).expect("loads");
+        assert_eq!(consts(&m)[1], (ROOM + 40) as i64);
+    }
+
+    #[test]
+    fn a_unit_without_data_needs_no_room() {
+        let mut m = unit();
+        m.data.clear();
+        m.data_ptrs.clear();
+        m.data_exports.clear();
+        m.funcs[0].blocks[0].insts.clear();
+        m.funcs[0].blocks[0].term = Terminator::Return(vec![]);
+        m.funcs[0].results.clear();
+        let (_, image) = load_unit(&m, true, &table(None), Some(20)).expect("loads");
+        assert_eq!(image, None);
+    }
+
+    #[test]
+    fn what_a_running_window_cannot_take_is_refused() {
+        let t = table(Some(ROOM));
+        // No room named for the unit's data.
+        assert_eq!(
+            load_unit(&unit(), true, &table(None), Some(20)).err(),
+            Some(LoadError::Unplaced)
+        );
+        // A room that wraps the address space.
+        let wraps = table(Some(u64::MAX - 8));
+        assert_eq!(
+            load_unit(&unit(), true, &wraps, Some(20)).err(),
+            Some(LoadError::OutOfWindow)
+        );
+        // A unit declaring more memory than the window.
+        assert_eq!(
+            load_unit(&unit(), true, &t, Some(16)).err(),
+            Some(LoadError::Memory)
+        );
+        // A runnable module's data offsets are absolute: it may carry none.
+        assert_eq!(
+            load_unit(&unit(), false, &t, Some(17)).err(),
+            Some(LoadError::ModuleData)
+        );
+        // A data symbol nobody defines.
+        let mut no_ext = t.clone();
+        no_ext.data.clear();
+        assert_eq!(
+            load_unit(&unit(), true, &no_ext, Some(20)).err(),
+            Some(LoadError::Link(LinkError::Unresolved("ext".into())))
+        );
+        // Only a whole-program link lays out thread-locals, function indices in data and `data.top`.
+        let mut tls = unit();
+        tls.tls.push(Data {
+            offset: 0,
+            readonly: false,
+            bytes: vec![1],
+        });
+        let mut funcref = unit();
+        funcref.data_funcrefs.push(DataFuncref {
+            at: 16,
+            name: "f".into(),
+        });
+        let mut top = unit();
+        top.funcs[0].blocks[0].insts[0] = Inst::DataTop;
+        for (m, what) in [
+            (tls, "thread-local data"),
+            (funcref, "function indices in data"),
+            (top, "data.top"),
+        ] {
+            assert_eq!(
+                load_unit(&m, true, &t, Some(20)).err(),
+                Some(LoadError::Link(LinkError::NotLoadable(what)))
+            );
+        }
     }
 }
 

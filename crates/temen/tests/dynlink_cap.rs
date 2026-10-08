@@ -8,11 +8,11 @@
 //! JIT (with a byte-identical powerbox), and the outcomes + final memory must agree — the op behaves
 //! identically on both backends, like every other `Jit` op.
 
-use temen_encode::encode_module;
+use temen_encode::{encode_module, encode_symbol_table};
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
-use temen_ir::{Resolved, DEFAULT_RESERVED_LOG2};
+use temen_ir::{Resolved, SymbolTable, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitOutcome, TrapKind};
-use temen_run::{encode_symbol_table, grant_jit, jit_cap_run};
+use temen_run::{grant_jit, jit_cap_run};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -216,7 +216,7 @@ fn seed_unit_and_symtab(unit: &[u8], symtab: &[u8]) -> Vec<u8> {
 #[test]
 fn compile_linked_unresolved_symbol_fails_closed() {
     let unit = unresolved_blob(UNIT);
-    let symtab = encode_symbol_table(&[]); // a single `0` count byte
+    let symtab = encode_symbol_table(&SymbolTable::default()); // a single `0` count byte
     let init = seed_unit_and_symtab(&unit, &symtab);
     let guest = compile_linked_only(unit.len(), symtab.len());
     let (out, _) = diff(&guest, &init, &[], 0);
@@ -248,7 +248,9 @@ fn compile_linked_malformed_symtab_fails_closed() {
 #[test]
 fn compile_linked_with_a_resolvable_table_returns_a_handle() {
     let unit = unresolved_blob(UNIT);
-    let symtab = encode_symbol_table(&[("F", Resolved::Slot(1))]);
+    let mut table = SymbolTable::default();
+    table.funcs.insert("F".into(), Resolved::Slot(1));
+    let symtab = encode_symbol_table(&table);
     let init = seed_unit_and_symtab(&unit, &symtab);
     let guest = compile_linked_only(unit.len(), symtab.len());
     // Reserve a table (log2=4) so Slot(1) is a valid index the verifier/compile accept.
@@ -257,4 +259,273 @@ fn compile_linked_with_a_resolvable_table_returns_a_handle() {
         matches!(out, JitOutcome::Returned(ref s) if s[0] >= 0),
         "a resolvable import compiles to a handle on both backends, got {out:?}"
     );
+}
+
+// ---- A link unit with globals of its own (#2167) ------------------------------------------------
+// The guest names a room in its window for the unit's data; the host relocates the unit there and
+// writes its initial data image through the window's checked accessor. The guests below declare a
+// 2^17 window, larger than the unit's own 2^16, which the unit then runs in (the linker's rule).
+
+/// Where the guest keeps a global of its own (`base`, an `i32`) that the unit references by name.
+const BASE_OFF: usize = 26624;
+/// Where the guest takes the `unit_info` reply.
+const INFO_OFF: usize = 28672;
+/// The room the guest names for the unit's data.
+const ROOM: u64 = 32768;
+/// A room past the window's backed prefix, never mapped.
+const UNMAPPED: u64 = 1 << 20;
+
+/// `bump(_, by)`: add `by` to the unit's own `count` (initially 41) through a pointer-valued
+/// initializer (`slot = &count`), and return it plus the guest's `base` — an initialized global, a
+/// relocated data pointer and a data symbol of the guest's, in one 32-byte data image.
+const DATA_UNIT: &str = "memory 16\n\
+    data 16 \"\\x29\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+    data.ptr 24 self 16\n\
+    func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n\
+    \x20 v2 = data.self 24\n  v3 = i64.load v2\n  v4 = i32.load v3\n  v5 = i32.wrap_i64 v1\n\
+    \x20 v6 = i32.add v4 v5\n  i32.store v3 v6\n  v7 = data.sym \"base\" 0\n  v8 = i32.load v7\n\
+    \x20 v9 = i32.add v6 v8\n  v10 = i64.extend_i32_s v9\n  return v10\n  }\n}\n\
+    export 0 data \"count\" 16\n";
+
+/// A link unit as its object-dialect bytes (the pre-link form a loader submits).
+fn object(src: &str) -> Vec<u8> {
+    temen_encode::encode_unit(&parse_module(src).expect("parse link unit"))
+}
+
+/// The guest's symbol table for [`DATA_UNIT`]: `base` and the unit's room.
+fn data_symtab(place: Option<u64>) -> Vec<u8> {
+    let mut table = SymbolTable {
+        place,
+        ..SymbolTable::default()
+    };
+    table.data.insert("base".into(), BASE_OFF as u64);
+    encode_symbol_table(&table)
+}
+
+/// An init image with the unit at [`UNIT_OFF`], the symbol table at [`SYMTAB_OFF`] and the guest's
+/// `base = 1000` at [`BASE_OFF`].
+fn seed_data_unit(unit: &[u8], symtab: &[u8]) -> Vec<u8> {
+    let mut init = seed_unit_and_symtab(unit, symtab);
+    init.resize(INFO_OFF, 0);
+    init[BASE_OFF..BASE_OFF + 4].copy_from_slice(&1000i32.to_le_bytes());
+    init
+}
+
+/// A 2^17-window guest that `compile_linked`s the unit against the table and returns the result;
+/// with `invoke`, it then calls the unit with `by = 1` and `by = 2` and returns `r1 * 10000 + r2`.
+fn data_guest(unit_len: usize, symtab_len: usize, invoke: bool) -> String {
+    let tail = if invoke {
+        "  v6 = i64.const 0\n  v7 = i64.const 1\n\
+         \x20 v8 = call.cap 11 1 (i64, i64, i64) -> (i64) v0 (v5, v6, v7)\n\
+         \x20 v9 = i64.const 2\n\
+         \x20 v10 = call.cap 11 1 (i64, i64, i64) -> (i64) v0 (v5, v6, v9)\n\
+         \x20 v11 = i64.const 10000\n  v12 = i64.mul v8 v11\n  v13 = i64.add v12 v10\n\
+         \x20 return v13\n"
+    } else {
+        "  return v5\n"
+    };
+    format!(
+        "memory 17\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n\
+         \x20 v1 = i64.const {UNIT_OFF}\n  v2 = i64.const {unit_len}\n\
+         \x20 v3 = i64.const {SYMTAB_OFF}\n  v4 = i64.const {symtab_len}\n\
+         \x20 v5 = call.cap 11 5 (i64, i64, i64, i64) -> (i64) v0 (v1, v2, v3, v4)\n\
+         {tail}  }}\n}}\n"
+    )
+}
+
+/// The returned scalar of a differential run.
+fn result(out: &JitOutcome) -> i64 {
+    match out {
+        JitOutcome::Returned(s) if s.len() == 1 => s[0],
+        other => panic!("expected one result, got {other:?}"),
+    }
+}
+
+/// The unit's globals live in the room the guest named, initialized from its data image, and its
+/// code reaches them — and the guest's own `base` — at their relocated addresses, identically on
+/// both backends down to the last byte of the window.
+#[test]
+fn a_link_units_globals_live_in_the_room_the_guest_names() {
+    let unit = object(DATA_UNIT);
+    let symtab = data_symtab(Some(ROOM));
+    let init = seed_data_unit(&unit, &symtab);
+    let (out, mem) = diff(&data_guest(unit.len(), symtab.len(), true), &init, &[], 0);
+    // count: 41 + 1 = 42, then + 2 = 44; each call adds base (1000).
+    assert_eq!(result(&out), 1042 * 10000 + 1044);
+    let room = ROOM as usize;
+    let mut want = [0u8; 32];
+    want[16..20].copy_from_slice(&44i32.to_le_bytes());
+    want[24..32].copy_from_slice(&(ROOM + 16).to_le_bytes());
+    assert_eq!(
+        mem[room..room + 32],
+        want,
+        "the room holds the unit's data, relocated"
+    );
+}
+
+/// The room is the guest's to name, but the host writes it only where the guest could write itself:
+/// an unmapped room is `-EFAULT` with nothing installed or written, and a room that wraps the address
+/// space is refused before anything runs.
+#[test]
+fn a_room_the_guest_cannot_write_fails_closed() {
+    let unit = object(DATA_UNIT);
+    for place in [UNMAPPED, u64::MAX - 8] {
+        let symtab = data_symtab(Some(place));
+        let init = seed_data_unit(&unit, &symtab);
+        let (out, _) = diff(&data_guest(unit.len(), symtab.len(), false), &init, &[], 0);
+        assert_eq!(result(&out), -14, "room {place:#x}");
+    }
+}
+
+/// What a running window cannot take is refused (`-EINVAL`), identically on both backends: a unit
+/// with data and no room, a unit declaring a larger window, a runnable module carrying data (its
+/// offsets are absolute), function indices baked into data, and thread-locals.
+#[test]
+fn what_a_running_window_cannot_take_is_refused() {
+    let module_with_data = blob(
+        "memory 17\ndata 16400 \"\\x29\"\nfunc (i64, i64) -> (i64) {\n\
+         block 0 (v0: i64, v1: i64) {\n  return v1\n  }\n}\n",
+    );
+    let cases = [
+        (object(DATA_UNIT), data_symtab(None)),
+        (
+            object(&DATA_UNIT.replace("memory 16", "memory 18")),
+            data_symtab(Some(ROOM)),
+        ),
+        (module_with_data, data_symtab(Some(ROOM))),
+        (
+            object(&format!("data.funcref 16\n{DATA_UNIT}")),
+            data_symtab(Some(ROOM)),
+        ),
+        (
+            object(&format!("data tls 0 \"\\x01\"\n{DATA_UNIT}")),
+            data_symtab(Some(ROOM)),
+        ),
+    ];
+    for (i, (unit, symtab)) in cases.iter().enumerate() {
+        let init = seed_data_unit(unit, symtab);
+        let (out, _) = diff(&data_guest(unit.len(), symtab.len(), false), &init, &[], 0);
+        assert_eq!(result(&out), -22, "case {i}");
+    }
+}
+
+/// `unit_info` (op 6) tells a loader what to place: the room (32 bytes) and the exported `count` at
+/// offset 16. The reply is written only when it fits, and its length is returned either way; a
+/// malformed unit is `-EINVAL` and a buffer the guest cannot write is `-EFAULT`.
+#[test]
+fn unit_info_describes_a_link_units_data() {
+    let unit = object(DATA_UNIT);
+    let init = seed_data_unit(&unit, &[]);
+    let reply = [32u8, 1, 5, b'c', b'o', b'u', b'n', b't', 16];
+    let info = |ir_len: usize, buf: u64, cap: i64| {
+        let guest = format!(
+            "memory 17\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n\
+             \x20 v1 = i64.const {UNIT_OFF}\n  v2 = i64.const {ir_len}\n\
+             \x20 v3 = i64.const {buf}\n  v4 = i64.const {cap}\n\
+             \x20 v5 = call.cap 11 6 (i64, i64, i64, i64) -> (i64) v0 (v1, v2, v3, v4)\n\
+             \x20 return v5\n  }}\n}}\n"
+        );
+        let (out, mem) = diff(&guest, &init, &[], 0);
+        (result(&out), mem[INFO_OFF..INFO_OFF + reply.len()].to_vec())
+    };
+    let none = vec![0u8; reply.len()];
+    assert_eq!(
+        info(unit.len(), INFO_OFF as u64, 0),
+        (9, none.clone()),
+        "too small: the length"
+    );
+    assert_eq!(info(unit.len(), INFO_OFF as u64, 64), (9, reply.to_vec()));
+    assert_eq!(
+        info(3, INFO_OFF as u64, 64),
+        (-22, none.clone()),
+        "malformed"
+    );
+    assert_eq!(
+        info(unit.len(), UNMAPPED, 64),
+        (-14, none),
+        "unwritable buffer"
+    );
+}
+
+/// Where the freeze/thaw guest keeps the unit's code handle between its two phases.
+const CODE_SLOT: usize = 30720;
+
+/// The freeze/thaw guest: func 0 links [`DATA_UNIT`], keeps its code handle at [`CODE_SLOT`] and
+/// calls `bump(1)`; func 1 calls `bump(2)` through the kept handle.
+fn freeze_thaw_guest(unit_len: usize, symtab_len: usize) -> String {
+    format!(
+        "memory 17\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n\
+         \x20 v1 = i64.const {UNIT_OFF}\n  v2 = i64.const {unit_len}\n\
+         \x20 v3 = i64.const {SYMTAB_OFF}\n  v4 = i64.const {symtab_len}\n\
+         \x20 v5 = call.cap 11 5 (i64, i64, i64, i64) -> (i64) v0 (v1, v2, v3, v4)\n\
+         \x20 v6 = i64.const {CODE_SLOT}\n  i64.store v6 v5\n\
+         \x20 v7 = i64.const 0\n  v8 = i64.const 1\n\
+         \x20 v9 = call.cap 11 1 (i64, i64, i64) -> (i64) v0 (v5, v7, v8)\n\
+         \x20 return v9\n  }}\n}}\n\
+         func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n\
+         \x20 v1 = i64.const {CODE_SLOT}\n  v2 = i64.load v1\n\
+         \x20 v3 = i64.const 0\n  v4 = i64.const 2\n\
+         \x20 v5 = call.cap 11 1 (i64, i64, i64) -> (i64) v0 (v2, v3, v4)\n\
+         \x20 return v5\n  }}\n}}\n"
+    )
+}
+
+/// A loaded unit's globals survive freeze → restore: its code persists in the linked form (its data
+/// addresses are constants), and its data lives in the window, so a thawed domain carries on where it
+/// stopped — on the tree-walker and on the JIT alike.
+#[test]
+fn a_link_units_globals_survive_freeze_and_thaw() {
+    let unit = object(DATA_UNIT);
+    let symtab = data_symtab(Some(ROOM));
+    let mut init = seed_data_unit(&unit, &symtab);
+    init.resize(1 << 17, 0);
+    let m = parse_module(&freeze_thaw_guest(unit.len(), symtab.len())).expect("parse guest");
+    verify_module(&m).expect("verify guest");
+
+    let mut host = Host::new();
+    let h = grant_jit(&mut host, &m, 0);
+    let mut fuel = 50_000_000u64;
+    let (r1, window) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(h)],
+        &mut fuel,
+        &init,
+        DEFAULT_RESERVED_LOG2,
+        &mut host,
+    );
+    assert_eq!(r1.expect("phase 1"), [Value::I64(1042)]);
+    let artifact = temen_snapshot::freeze(&m, &window, &host).expect("freeze");
+
+    let thaw = || {
+        let mut thost = Host::new();
+        let window = temen_snapshot::restore(&artifact, &m, &mut thost).expect("restore");
+        (thost, window)
+    };
+    // count was 42 at the freeze: 42 + 2 + base.
+    let (mut thost, restored) = thaw();
+    let mut fuel = 50_000_000u64;
+    let (r2, _) = run_capture_reserved_with_host(
+        &m,
+        1,
+        &[Value::I32(h)],
+        &mut fuel,
+        &restored,
+        DEFAULT_RESERVED_LOG2,
+        &mut thost,
+    );
+    assert_eq!(r2.expect("phase 2 on the tree-walker"), [Value::I64(1044)]);
+    let (mut jhost, restored) = thaw();
+    let (out, _) = jit_cap_run(
+        &m,
+        1,
+        &[h as i64],
+        &MemLayout::image(restored),
+        DEFAULT_RESERVED_LOG2,
+        0,
+        &mut jhost,
+        None,
+    )
+    .expect("jit run");
+    assert_eq!(result(&out), 1044, "phase 2 on the JIT");
 }

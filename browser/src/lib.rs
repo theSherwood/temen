@@ -12063,120 +12063,13 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
-// The **canonical** §22 `compile_linked` symbol-table wire form (mirrors `temen-run::decode_symbol_table`,
-// DESIGN.md §22): a LEB128 stream `count`, then per entry `name` (uleb len + UTF-8 bytes), a `kind`
-// byte, and its payload — `0` = `Slot(uleb)` (a shared `call.dyn` table slot: the *dynamic*-link
-// case a guest loader uses to bind a submitted unit's imports to functions of the host program it runs
-// inside — e.g. the JACL self-hosted compiler-guest binding a staged macro's `call.sym` imports to its
-// own `jaclrt` runtime funcs), `1` = `Cap(uleb type_id, uleb op)` (a host capability). Empty bytes ⇒
-// the closed-blob `compile` op (no bindings), so a unit with imports fails closed. This must match the
-// producer (the on-ramp/`temen-llvm` guest loader) byte-for-byte, so it is NOT a browser-private form.
-
-/// A minimal fail-closed LEB128 cursor for [`decode_symtab`] (never panics / over-reads).
-struct SymCursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl SymCursor<'_> {
-    fn byte(&mut self) -> Option<u8> {
-        let b = *self.bytes.get(self.pos)?;
-        self.pos += 1;
-        Some(b)
-    }
-    /// Unsigned LEB128 → `u64` (max 10 bytes; rejects overflow / truncation).
-    fn uleb(&mut self) -> Option<u64> {
-        let (mut result, mut shift) = (0u64, 0u32);
-        loop {
-            let b = self.byte()?;
-            if shift >= 64 || (shift == 63 && b & 0x7f > 1) {
-                return None;
-            }
-            result |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                return Some(result);
-            }
-            shift += 7;
-        }
-    }
-    fn u32(&mut self) -> Option<u32> {
-        u32::try_from(self.uleb()?).ok()
-    }
-    fn string(&mut self) -> Option<String> {
-        let n = usize::try_from(self.uleb()?).ok()?;
-        let end = self.pos.checked_add(n)?;
-        let s = core::str::from_utf8(self.bytes.get(self.pos..end)?).ok()?;
-        self.pos = end;
-        Some(s.to_string())
-    }
-}
-
-/// Build a `compile_linked` symbol table (canonical wire form; used by the reference `Jit` tests).
-fn encode_symtab(entries: &[(&str, temen_ir::Resolved)]) -> Vec<u8> {
-    fn uleb(out: &mut Vec<u8>, mut v: u64) {
-        loop {
-            let b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(b);
-                break;
-            }
-            out.push(b | 0x80);
-        }
-    }
-    let mut out = Vec::new();
-    uleb(&mut out, entries.len() as u64);
-    for (name, r) in entries {
-        uleb(&mut out, name.len() as u64);
-        out.extend_from_slice(name.as_bytes());
-        match r {
-            temen_ir::Resolved::Slot(slot) => {
-                out.push(0);
-                uleb(&mut out, *slot as u64);
-            }
-            temen_ir::Resolved::Cap(cap) => {
-                out.push(1);
-                uleb(&mut out, cap.type_id as u64);
-                uleb(&mut out, cap.op as u64);
-            }
-            temen_ir::Resolved::Func(_) => {
-                unreachable!("Func is not deliverable via the symbol table")
-            }
-        }
-    }
-    out
-}
-
-/// Decode a canonical `compile_linked` symbol table; `None` (fail-closed) on any malformation.
-fn decode_symtab(bytes: &[u8]) -> Option<Vec<(String, temen_ir::Resolved)>> {
-    // The closed-blob `compile` op passes no table (`&[]`) — the empty table (resolves nothing).
-    if bytes.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut c = SymCursor { bytes, pos: 0 };
-    let count = c.uleb()?;
-    let mut out = Vec::new();
-    for _ in 0..count {
-        let name = c.string()?;
-        let resolved = match c.byte()? {
-            0 => temen_ir::Resolved::Slot(c.u32()?),
-            1 => temen_ir::Resolved::Cap(temen_ir::ResolvedCap {
-                type_id: c.u32()?,
-                op: c.u32()?,
-            }),
-            _ => return None, // unknown kind
-        };
-        out.push((name, resolved));
-    }
-    // Trailing bytes ⇒ a length mismatch — reject rather than silently ignore (fail-closed).
-    (c.pos == bytes.len()).then_some(out)
-}
-
 /// The browser's [`temen_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
-/// cap: decode the symbol table → `decode_module` (fail-closed) → resolve named imports against the
-/// table (`Slot`/`Cap`) → `verify_module` (the escape-freedom gate) → the memory-match precondition →
-/// reject data segments and threads/futex ops. A pure-Rust replica of `temen-run`'s canonical validator
-/// (same symtab wire form), so it builds for wasm with no Cranelift dep.
+/// cap: decode the symbol table (`temen_encode::decode_symbol_table`) → decode the unit (a runnable
+/// module or a link unit; fail-closed) → link it against the table ([`temen_ir::load_unit`]: bind its
+/// named imports, place a link unit's data where the table says) → `verify_module` (the
+/// escape-freedom gate) → the memory-match precondition → reject threads/futex ops. A replica of
+/// `temen-run`'s canonical validator over the same shared steps, so it builds for wasm with no
+/// Cranelift dep. A room for the unit's data that wraps the address space is `-EFAULT`, as there.
 ///
 /// **Fibers are admitted** (#845 — the §22 renegotiated 2026-07-30 split, matching the canonical
 /// gate in `temen-run`): `cont.*`/`suspend` switch stacks within the domain on the caller's thread,
@@ -12188,19 +12081,20 @@ fn browser_jit_validator(
     bytes: &[u8],
     mem_log2: Option<u8>,
     symtab: &[u8],
-) -> Result<std::sync::Arc<[temen_ir::Func]>, i64> {
+) -> Result<temen_interp::JitValidated, i64> {
     const EINVAL: i64 = -22;
-    let Some(table) = decode_symtab(symtab) else {
+    const EFAULT: i64 = -14;
+    let Some(table) = temen_encode::decode_symbol_table(symtab) else {
         return Err(EINVAL);
     };
-    let Ok(m) = temen_encode::decode_module(bytes) else {
+    let object = temen_encode::wire::sniff_kind(bytes) == Some(temen_encode::wire::KIND_OBJECT);
+    let Ok(m) = temen_encode::decode_unit(bytes) else {
         return Err(EINVAL);
     };
-    // Bind named imports via the table (a Slot → `call.dyn`, a Cap → `call.cap`); an unresolved
-    // import ⇒ fail closed (the module is re-verified after the rewrite).
-    let resolve = |name: &str| table.iter().find(|(n, _)| n == name).map(|(_, r)| *r);
-    let Ok(m) = temen_ir::resolve_imports_with(&m, resolve) else {
-        return Err(EINVAL);
+    let (m, data) = match temen_ir::load_unit(&m, object, &table, mem_log2) {
+        Ok(linked) => linked,
+        Err(temen_ir::LoadError::OutOfWindow) => return Err(EFAULT),
+        Err(_) => return Err(EINVAL),
     };
     if temen_verify::verify_module(&m).is_err() {
         return Err(EINVAL);
@@ -12208,13 +12102,14 @@ fn browser_jit_validator(
     if m.memory.map(|mc| mc.size_log2) != mem_log2 {
         return Err(EINVAL); // declared memory must equal the parent window
     }
-    if !m.data.is_empty()
-        || m.funcs.is_empty()
-        || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex())
-    {
+    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
         return Err(EINVAL);
     }
-    Ok(m.funcs.into())
+    Ok(temen_interp::JitValidated {
+        funcs: m.funcs.into(),
+        types: m.types.into(),
+        data,
+    })
 }
 
 /// The wasm-JIT emitter the runtime-`Jit.compile` path installs ([`temen_par_powerbox_jit_runtime`],
@@ -12320,15 +12215,15 @@ pub fn dynlink_exec(m: &temen_ir::Module, link: bool) -> (i32, i64) {
     host.set_jit_validator(browser_jit_validator);
     let clock = host.grant_clock();
     // Bind "clock" → the Clock cap (iface 2, op 0) iff linking; otherwise an empty table (fail-closed).
-    let symtab = if link {
-        encode_symtab(&[(
-            "clock",
-            temen_ir::Resolved::Cap(temen_ir::ResolvedCap { type_id: 2, op: 0 }),
-        )])
-    } else {
-        Vec::new()
-    };
-    let code = match host.jit_compile_linked(jit, &unit, &symtab) {
+    let mut table = temen_ir::SymbolTable::default();
+    if link {
+        let clock = temen_ir::ResolvedCap { type_id: 2, op: 0 };
+        table
+            .funcs
+            .insert("clock".into(), temen_ir::Resolved::Cap(clock));
+    }
+    let symtab = temen_encode::encode_symbol_table(&table);
+    let code = match host.jit_compile_linked(jit, &unit, &symtab, None) {
         Ok(Ok(c)) => c.handle,
         _ => return (STATUS_TRAP, 0), // unresolved import ⇒ compile_linked fails closed
     };

@@ -116,11 +116,24 @@ long __vm_jit_compile(void *blob, long len);
 // Like `__vm_jit_compile`, but the unit may carry **unresolved imports** (`call.import "name"`):
 // the host binds each by name against the guest-provided **symbol table** before verify
 // (host-assisted dynamic linking, DESIGN.md §22). `symtab`/`symtab_len` is a buffer the guest builds
-// — `count` (uleb), then per entry `name` (uleb len + bytes), a `kind` byte (`0` = a table slot
-// from `__vm_jit_install`, `1` = a capability), and its payload (`Slot`: uleb slot). A mis-link
+// — `count` (uleb), then per entry `name` (uleb len + bytes), a `kind` byte and its uleb payload:
+// `0` a table slot from `__vm_jit_install`, `1` a capability (`type_id`, `op`), `2` the address of a
+// global the unit references by name, `3` (unnamed) where a link unit's own data goes. A mis-link
 // (unknown name, wrong signature) is caught by re-verification: `-22`, nothing installed. This is
 // the `vm_dlopen` primitive — resolve a separately-compiled `.so`-shaped unit against a registry.
+//
+// A **link unit** (chibicc `--emit-object`) may carry globals of its own (#2167): the host places
+// its data at the kind-3 address, relocates the unit there, and writes the data's initial image —
+// `__vm_jit_unit_info` says how much room it needs. A room the guest could not write itself is `-14`,
+// and a unit with data and no room is `-22`; either way nothing is written or installed.
 long __vm_jit_compile_linked(void *ir, long ir_len, void *symtab, long symtab_len);
+
+// Describe a unit's data, so a loader can place it before `__vm_jit_compile_linked`: the reply is
+// the room its data needs (uleb), then its exported globals — a `count` (uleb) and per global a
+// `name` (uleb len + bytes) and its offset in that room (uleb). A runnable module has no data to
+// place (`0`, `0`). The reply is written to `buf` only when it fits in `cap` bytes, and its length is
+// returned either way (`snprintf`'s convention), or `-22` for a malformed unit.
+long __vm_jit_unit_info(void *ir, long ir_len, void *buf, long cap);
 
 // Call a compiled unit's entry, which must be exactly the **raw** shape `(i64, i64) -> (i64)`
 // (no C frame — the args go straight to the entry's block params; the strict-arity MVP shape,

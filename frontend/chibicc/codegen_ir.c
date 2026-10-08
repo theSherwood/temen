@@ -1360,24 +1360,25 @@ static int gen_builtin_jit_compile(Node *node) {
   return r;
 }
 
-// `__vm_jit_compile_linked(ir, ir_len, symtab, symtab_len) -> code | -errno` (iface 11 op 5,
-// DESIGN.md §22): like `compile`, but the unit may carry unresolved §7 imports, bound by name against
-// the guest-provided symbol-table buffer before verify (host-assisted dynamic linking). The
-// rewrite precedes verification, so a mis-link is caught by re-verification, never trusted.
-static int gen_builtin_jit_compile_linked(Node *node) {
+// The two four-argument `Jit` ops (iface 11, DESIGN.md §22), `import` naming which:
+// `__vm_jit_compile_linked(ir, ir_len, symtab, symtab_len) -> code | -errno` (op 5) is like
+// `compile`, but the unit may carry unresolved §7 imports, bound by name against the guest-provided
+// symbol-table buffer before verify (host-assisted dynamic linking) — the rewrite precedes
+// verification, so a mis-link is caught by re-verification, never trusted; and
+// `__vm_jit_unit_info(ir, ir_len, buf, cap) -> len | -errno` (op 6) describes a link unit's data, so
+// a loader can place it.
+static int gen_builtin_jit4(Node *node, char *import) {
   Node *a = node->args;
   if (!a || !a->next || !a->next->next || !a->next->next->next || a->next->next->next->next)
-    error_tok(node->tok, "codegen_ir: __vm_jit_compile_linked(ir, ir_len, symtab, symtab_len) "
-                         "expects 4 arguments");
-  int ir = widen_i64(gen_expr(a), a->ty);
-  int ir_len = widen_i64(gen_expr(a->next), a->next->ty);
-  int st = widen_i64(gen_expr(a->next->next), a->next->next->ty);
-  int st_len = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
+    error_tok(node->tok, "codegen_ir: __%s expects 4 arguments", import);
+  int p0 = widen_i64(gen_expr(a), a->ty);
+  int p1 = widen_i64(gen_expr(a->next), a->next->ty);
+  int p2 = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int p3 = widen_i64(gen_expr(a->next->next->next), a->next->next->next->ty);
   int h = dummy_handle();
   int r = nv++;
-  cg("  v%d = call.sym \"vm_jit_compile_linked\" (i64, i64, i64, i64) -> (i64) v%d (v%d, "
-     "v%d, v%d, v%d)\n",
-     r, h, ir, ir_len, st, st_len);
+  cg("  v%d = call.sym \"%s\" (i64, i64, i64, i64) -> (i64) v%d (v%d, v%d, v%d, v%d)\n", r,
+     import, h, p0, p1, p2, p3);
   return r;
 }
 
@@ -2248,7 +2249,9 @@ static int gen_expr(Node *node) {
         if (!strcmp(fname, "__vm_jit_compile"))
           return gen_builtin_jit_compile(node);
         if (!strcmp(fname, "__vm_jit_compile_linked"))
-          return gen_builtin_jit_compile_linked(node);
+          return gen_builtin_jit4(node, "vm_jit_compile_linked");
+        if (!strcmp(fname, "__vm_jit_unit_info"))
+          return gen_builtin_jit4(node, "vm_jit_unit_info");
         if (!strcmp(fname, "__vm_jit_invoke2"))
           return gen_builtin_jit_invoke2(node);
         if (!strcmp(fname, "__vm_jit_release"))

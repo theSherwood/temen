@@ -117,6 +117,18 @@ use chibicc_mod::chibicc;
 
 /// Compile a C source string to our text IR via the frontend.
 fn c_to_ir(src: &str) -> String {
+    c_to_ir_with(src, &["--emit-ir"])
+}
+
+/// Like [`c_to_ir`] but with `-g`: emit the debug-info section (and, as `-Og`, disable SSA
+/// promotion so locals keep stable window slots — DEBUGGING.md §6/W6).
+fn c_to_ir_g(src: &str) -> String {
+    c_to_ir_with(src, &["--emit-ir", "-g"])
+}
+
+/// Compile a C source string to text IR with the frontend's `flags` (`--emit-ir` for a program,
+/// `--emit-object` for a link unit).
+fn c_to_ir_with(src: &str, flags: &[&str]) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -126,9 +138,9 @@ fn c_to_ir(src: &str) -> String {
     std::fs::write(&cfile, src).unwrap();
 
     let status = Command::new(chibicc())
+        .arg("-cc1")
+        .args(flags)
         .args([
-            "-cc1",
-            "--emit-ir",
             "-cc1-input",
             cfile.to_str().unwrap(),
             "-cc1-output",
@@ -137,34 +149,7 @@ fn c_to_ir(src: &str) -> String {
         ])
         .status()
         .expect("run chibicc");
-    assert!(status.success(), "chibicc failed on:\n{src}");
-    std::fs::read_to_string(&irfile).unwrap()
-}
-
-/// Like [`c_to_ir`] but with `-g`: emit the debug-info section (and, as `-Og`, disable SSA
-/// promotion so locals keep stable window slots — DEBUGGING.md §6/W6).
-fn c_to_ir_g(src: &str) -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let id = N.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!("temen_cfeg_{}_{id}", std::process::id()));
-    let cfile = base.with_extension("c");
-    let irfile = base.with_extension("temen");
-    std::fs::write(&cfile, src).unwrap();
-    let status = Command::new(chibicc())
-        .args([
-            "-cc1",
-            "--emit-ir",
-            "-g",
-            "-cc1-input",
-            cfile.to_str().unwrap(),
-            "-cc1-output",
-            irfile.to_str().unwrap(),
-            cfile.to_str().unwrap(),
-        ])
-        .status()
-        .expect("run chibicc");
-    assert!(status.success(), "chibicc -g failed on:\n{src}");
+    assert!(status.success(), "chibicc {flags:?} failed on:\n{src}");
     std::fs::read_to_string(&irfile).unwrap()
 }
 
@@ -2952,6 +2937,143 @@ fn c_guest_jit_hotreload_demo() {
     assert!(
         out.contains("g(5) = 105") && out.contains("h(5) = 205"),
         "an old caller must keep its binding across a hot reload, on both backends:\n{out}"
+    );
+}
+
+/// A C link unit (`--emit-object`) as the bytes a guest `vm_dlopen`s — the object dialect — written
+/// as a C array initializer.
+fn c_object_init(src: &str) -> String {
+    let ir = c_to_ir_with(src, &["--emit-object"]);
+    let m = parse_module(&ir).unwrap_or_else(|e| panic!("parse unit: {e:?}\n{ir}"));
+    let bytes = temen_encode::encode_unit(&m);
+    bytes
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The counter library [`c_guest_dlopen_units_carry_their_own_globals`] loads: an initialized
+/// global, a zero-initialized array, a pointer-valued initializer, and the program's `bias` by name.
+const DL_COUNTER: &str = "int count = @START@;\n\
+     static long hist[4];\n\
+     static long *slot = &hist[2];\n\
+     extern int bias;\n\
+     long tick(long by) {\n\
+       count += by;\n\
+       *slot += 1;\n\
+       return count * 1000 + hist[2] * 10 + bias;\n\
+     }\n";
+
+/// The program that `vm_dlopen`s [`DL_COUNTER`] twice and a reader of its `count` (#2167).
+const DL_GLOBALS_MAIN: &str = r#"
+#include <vm_dl.h>
+int write(int fd, char *buf, long n);
+static void put(char *s) {
+  long n = 0;
+  while (s[n])
+    n++;
+  write(1, s, n);
+}
+static void put_i64(long v) {
+  char t[24];
+  int i = 0;
+  if (v < 0) {
+    write(1, "-", 1);
+    v = -v;
+  }
+  do
+    t[i++] = '0' + v % 10;
+  while (v /= 10);
+  while (i)
+    write(1, &t[--i], 1);
+}
+static void say(char *what, long v) {
+  put(what);
+  put(" = ");
+  put_i64(v);
+  put("\n");
+}
+int bias = 7;
+static const char COUNTER1[] = {@COUNTER1@};
+static const char COUNTER2[] = {@COUNTER2@};
+static const char READER[] = {@READER@};
+static const char TLS[] = {@TLS@};
+typedef long (*fn1)(long);
+int main(void) {
+  vm_dl_export("bias", &bias);
+  fn1 tick1 = (fn1)vm_dlopen("tick", COUNTER1, sizeof COUNTER1);
+  say("v1 tick(1)", tick1(1));
+  say("v1 tick(2)", tick1(2));
+  fn1 read1 = (fn1)vm_dlopen("read", READER, sizeof READER);
+  say("read(1) of v1", read1(1));
+  fn1 tick2 = (fn1)vm_dlopen("tick", COUNTER2, sizeof COUNTER2);
+  say("v2 tick(1)", tick2(1));
+  say("v1 tick(1) after the reload", tick1(1));
+  say("old read(1)", read1(1));
+  fn1 read2 = (fn1)vm_dlopen("read", READER, sizeof READER);
+  say("new read(1)", read2(1));
+  say("count via dlsym", *(int *)vm_dlsym_data("count"));
+  say("tls unit", vm_dlopen("tls", TLS, sizeof TLS));
+  say("dlclose", vm_dlclose("tick"));
+  say("tick after dlclose", vm_dlsym("tick"));
+  say("count after dlclose", vm_dlsym_data("count") == 0);
+  return 0;
+}
+"#;
+
+/// **A loaded unit carries globals of its own** (#2167, DESIGN.md §22): `vm_dlopen` asks the host
+/// how much room a link unit's data needs, `malloc`s it, and the host relocates the unit there and
+/// writes its initial data. The counter library has an initialized global, a zero-initialized array,
+/// a pointer-valued initializer, and a reference to the program's own `bias`; a reader unit links to
+/// its `count` by name. Hot-reloading the counter gives the new version its own globals while the old
+/// one keeps counting in its own, and the reader binds to whichever version was current when it was
+/// loaded. A thread-local in a unit is refused (`-22`), and `vm_dlclose` drops the unit's globals
+/// with it. Runs the tree-walker against Cranelift
+/// (`run_c_full`) and on the bytecode engine, which must print the same.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_dlopen_units_carry_their_own_globals() {
+    let src = DL_GLOBALS_MAIN
+        .replace(
+            "@COUNTER1@",
+            &c_object_init(&DL_COUNTER.replace("@START@", "40")),
+        )
+        .replace(
+            "@COUNTER2@",
+            &c_object_init(&DL_COUNTER.replace("@START@", "500")),
+        )
+        .replace(
+            "@READER@",
+            &c_object_init("extern int count;\nlong read(long k) { return count * k; }\n"),
+        )
+        .replace(
+            "@TLS@",
+            &c_object_init("_Thread_local long t;\nlong get(long x) { return t + x; }\n"),
+        );
+    let want = "v1 tick(1) = 41017\n\
+                v1 tick(2) = 43027\n\
+                read(1) of v1 = 43\n\
+                v2 tick(1) = 501017\n\
+                v1 tick(1) after the reload = 44037\n\
+                old read(1) = 44\n\
+                new read(1) = 501\n\
+                count via dlsym = 501\n\
+                tls unit = -22\n\
+                dlclose = 0\n\
+                tick after dlclose = -1\n\
+                count after dlclose = 1\n";
+    let full = run_c_full(&src);
+    assert_eq!(
+        String::from_utf8_lossy(&full.stdout),
+        want,
+        "tree-walker ≡ Cranelift"
+    );
+    let bytecode = run_c_bytecode(&src);
+    assert_eq!(
+        String::from_utf8_lossy(&bytecode.stdout),
+        want,
+        "bytecode engine"
     );
 }
 
