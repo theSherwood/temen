@@ -370,7 +370,7 @@ fn run_all_mem(
     }
 
     let mut cm = compile(m, 0).unwrap();
-    let (out, jmem) = cm.run(&[], Some(init), None).unwrap();
+    let (out, jmem) = cm.run(&[], Some(init), Some(0)).unwrap(); // the backed prefix
     match out {
         JitOutcome::Returned(slots) => check(Ok(&slots), &jmem[..init.len().min(jmem.len())]),
         JitOutcome::Trapped(TrapKind::MemoryFault) => check(Err(()), init), // window unchecked on JIT trap

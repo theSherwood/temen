@@ -247,3 +247,16 @@ block 0 () {
 ";
     assert_eq!(run_all(src), Err(()));
 }
+
+/// #2177: the JIT copies a constant length up to 64 bytes with loads and stores; such a copy faults
+/// where the libcall would: a span that starts in the #1094 NULL guard `[0, 16384)` and ends past it
+/// (either span), or a source that runs past `mapped`.
+#[test]
+fn short_copies_into_a_guard_fault() {
+    for (dst, src) in [(16376, 20480), (20480, 16376), (16384, 65528)] {
+        let text = format!(
+            "memory 16\nfunc () -> (i64) {{\nblock 0 () {{\n  v0 = i64.const {dst}\n  v1 = i64.const {src}\n  v2 = i64.const 16\n  mem.copy v0 v1 v2\n  v3 = i64.const 0\n  return v3\n  }}\n}}\n"
+        );
+        assert_eq!(run_all(&text), Err(()), "dst={dst} src={src}");
+    }
+}

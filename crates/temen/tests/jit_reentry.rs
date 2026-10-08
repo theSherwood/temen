@@ -116,7 +116,7 @@ fn mid_run_define_and_invoke_over_live_window() {
     let (ctx, _cm) = setup(extra_src);
     let cm_ptr: *mut CompiledModule = ctx.cm.get();
     let (out, final_mem) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[7, 35], None, None) }.expect("run");
+        unsafe { CompiledModule::run_raw(cm_ptr, &[7, 35], None, Some(0)) }.expect("run");
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[1042]),
         "{out:?}"
@@ -128,7 +128,7 @@ fn mid_run_define_and_invoke_over_live_window() {
 
     // The module survives: run again — the unit is already defined (cached), invoke again.
     let (out, final_mem) =
-        unsafe { CompiledModule::run_raw(cm_ptr, &[1, 1], None, None) }.expect("re-run");
+        unsafe { CompiledModule::run_raw(cm_ptr, &[1, 1], None, Some(0)) }.expect("re-run");
     assert!(matches!(out, JitOutcome::Returned(ref s) if s == &[1002]));
     assert_eq!(final_mem[16448], 0xab);
 }
