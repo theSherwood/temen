@@ -701,7 +701,7 @@ fn a_nim_program_links_to_the_same_module_in_any_order() {
         }
         u
     };
-    let posix = |reverse| temen_leng::link_nim_posix(&units(reverse), px_vtable(), None);
+    let posix = |reverse| temen_leng::link_nim_posix(&units(reverse), px_vtable(), None, false);
     assert!(
         posix(false).expect("link") == posix(true).expect("link"),
         "link_nim_posix: the order the modules were listed in changed the module"
@@ -746,7 +746,7 @@ fn a_nim_programs_heap_grows_past_its_window() {
         .collect();
     let want = format!("grew:{}\n", N + 7);
 
-    let posix = temen_leng::link_nim_posix(&units, px_vtable(), Some(&libc)).expect("link");
+    let posix = temen_leng::link_nim_posix(&units, px_vtable(), Some(&libc), false).expect("link");
     let window = 1u64 << posix.memory.expect("a window").size_log2;
     assert!(
         window < N * 8,
@@ -895,7 +895,7 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // the link) keeps the program's `data.funcref` gvar initializers valid — the funcref-carrying
     // at-exit flush this very program registers would otherwise dispatch through a stale, off-by-one
     // index.
-    let m = temen_leng::link_nim_posix(&units, px_vtable(), None)
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None, false)
         .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The merged module carries the §3e powerbox entry shape: a paramless `_start` at function 0
@@ -2318,7 +2318,7 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_posix(&units, px_vtable(), None)
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None, false)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
@@ -2386,7 +2386,7 @@ fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_posix(&units, px_vtable(), None).expect("link");
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None, false).expect("link");
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let unbound = posix_unbound(&m);
     assert!(unbound.is_empty(), "a linked program imports {unbound:?}");
@@ -2819,7 +2819,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_posix(&units, px_vtable(), None)
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None, false)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
@@ -3022,7 +3022,7 @@ fn nifler2_links_through_leng() {
     // cannot work on it at all. The POSIX runtime forwards the true syscalls to the personality's own
     // op names, which `run_io_capture` binds to `temen_posix`'s real fd ops over an in-memory
     // filesystem — the same route `run_io_program` already uses for stdout, with files.
-    match temen_leng::link_nim_posix(&units, px_vtable(), guest_libc().as_deref()) {
+    match temen_leng::link_nim_posix(&units, px_vtable(), guest_libc().as_deref(), false) {
         Ok(m) => {
             dump_module("nifler2", &m);
             let v = temen_verify::verify_module(&m);

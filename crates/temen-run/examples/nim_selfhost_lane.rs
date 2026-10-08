@@ -225,7 +225,7 @@ fn expect_host_link(
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     let (names, sigs) = temen_posix::cap_vtable();
-    let host = temen_leng::link_nim_posix(&units, (&names, &sigs), libc)
+    let host = temen_leng::link_nim_posix(&units, (&names, &sigs), libc, false)
         .unwrap_or_else(|e| panic!("the host link: {e}"));
     assert!(
         temen_encode::encode_module(&host) == linked,

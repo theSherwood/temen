@@ -42,7 +42,8 @@ fn main() {
 
     // `-g`: the unit carries its own debug info, which the linker merges into every program linked
     // against it — that is what lets a DAP session step *into* `printf` (`temen_link_text_lib`). A
-    // release run ignores it.
+    // release link drops it: `temen-link` links a nim program's release build unless asked for `-g`
+    // (#2186), since the Cranelift JIT captures every trap's backtrace in a module with debug info.
     let t = std::time::Instant::now();
     let compiled = onramp_fs_exec(
         &chibicc,
