@@ -473,6 +473,68 @@ fn cross_tu_data_ptr_sym() {
     let _ = n_owner;
 }
 
+/// **Function pointers in static data** (#2194): the issue's program as a unit, with a third entry
+/// in its table pointing at another unit's function, and that unit's table pointing at its own. A
+/// pointer to a function the unit defines, `static` or not, holds the function's index in the unit
+/// and is recorded as a slot (`data.funcref <at>`), which the linker shifts with the unit's
+/// functions; a pointer to another unit's function is a named relocation (`data.funcref <at> sym`),
+/// resolved like a call. The program unit goes first (its `_start` is the entry) and the other two
+/// swap, so each lands at two function bases. `main` prints through the emit-object libc.
+#[test]
+fn function_pointers_in_static_data_link_and_run() {
+    use temen_run::{instantiate, Outcome, RunConfig, Value};
+
+    let prog = object_unit(
+        "fpprog",
+        "int printf(const char *, ...);\n\
+         extern int mul(int, int);\n\
+         extern int (*lib_ops[2])(int, int);\n\
+         static int add(int a, int b) { return a + b; }\n\
+         int sub(int a, int b) { return a - b; }\n\
+         int (*ops[3])(int, int) = { add, sub, mul };\n\
+         int main(void) {\n\
+         \x20 printf(\"%d %d %d %d %d\\n\", ops[0](2, 3), ops[1](9, 4), ops[2](6, 7),\n\
+         \x20        lib_ops[0](6, 7), lib_ops[1](9, 4));\n\
+         \x20 return ops[0](2, 3) + ops[1](9, 4);\n\
+         }\n",
+    );
+    let lib = object_unit(
+        "fplib",
+        "static int rem(int a, int b) { return a % b; }\n\
+         int mul(int a, int b) { return a * b; }\n\
+         int (*lib_ops[2])(int, int) = { mul, rem };\n",
+    );
+    assert_eq!(prog.module.data_funcref_slots.len(), 2, "add and sub");
+    assert_eq!(
+        prog.module.data_funcrefs,
+        [temen_ir::DataFuncref {
+            at: prog.module.data_funcref_slots[0] + 16,
+            name: "mul".into()
+        }]
+    );
+    assert_eq!(lib.module.data_funcref_slots.len(), 2, "mul and rem");
+    assert!(lib.module.data_funcrefs.is_empty());
+
+    let libc = object_unit_file("crates/temen/tests/fixtures/emit_libc/mini_libc.c");
+    for units in [[&prog, &lib, &libc], [&prog, &libc, &lib]] {
+        let units: Vec<LinkUnit> = units.into_iter().cloned().collect();
+        let linked = temen_ir::link_with_manifest(&units).expect("link");
+        assert!(linked.data_funcrefs.is_empty());
+        assert_eq!(
+            linked.data_funcref_slots.len(),
+            5,
+            "every function pointer is recorded"
+        );
+        temen_verify::verify_module(&linked).expect("verify");
+        let run = instantiate(linked)
+            .expect("instantiate")
+            .run_diff(&RunConfig::default())
+            .expect("run _start on interp+jit");
+        assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(10)]));
+        assert_eq!(run.stdout, b"5 5 42 42 1\n");
+    }
+}
+
 /// Fail-closed for **data**: a unit reading an `extern` global that no unit exports fails the link
 /// with `Unresolved` (the same guarantee as an unresolved call), not a read of uninitialized memory.
 #[test]

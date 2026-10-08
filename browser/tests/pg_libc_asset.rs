@@ -126,7 +126,8 @@ fn the_committed_heap_unit_is_the_allocator_and_nothing_more() {
 
 /// End to end, the way the card runs: a freshly compiled program unit links against the **committed**
 /// asset and prints. This is the one that catches a chibicc/IR change that leaves the asset decodable
-/// but no longer linkable.
+/// but no longer linkable. The program's dispatch table holds function pointers in static data, which
+/// a program unit could not until #2194.
 #[test]
 fn a_program_unit_links_against_the_committed_asset_and_runs() {
     let (Some(lib), Some(prog)) = (
@@ -136,6 +137,9 @@ fn a_program_unit_links_against_the_committed_asset_and_runs() {
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+static int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+int (*ops[2])(int, int) = { add, sub };
 int main(void) {
   printf("printf %d\n", 42);
   fprintf(stdout, "fprintf %s\n", "shared-stdout");
@@ -145,6 +149,7 @@ int main(void) {
   char *dup = strdup("strdup");
   printf("%s len=%d\n", dup, (int)strlen(dup));
   printf("sqrt=%g pow=%g\n", sqrt(169.0), pow(2.0, 10.0));
+  printf("ops %d %d\n", ops[0](2, 3), ops[1](9, 4));
   return 0;
 }
 "#,
@@ -162,7 +167,7 @@ int main(void) {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "printf 42\nfprintf shared-stdout\nsnprintf 1.50\nstrdup len=6\nsqrt=13 pow=1024\n"
+        "printf 42\nfprintf shared-stdout\nsnprintf 1.50\nstrdup len=6\nsqrt=13 pow=1024\nops 5 5\n"
     );
 }
 

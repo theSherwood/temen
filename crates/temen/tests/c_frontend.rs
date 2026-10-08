@@ -863,6 +863,40 @@ fn c_function_calls_end_to_end() {
     );
 }
 
+/// #2163: a function declared without a prototype (`f();`, which chibicc reads as variadic) and
+/// defined with one. The definition's type is the function's, and a call parsed under the
+/// declaration, before or after the definition, takes the definition's signature.
+#[test]
+fn c_unprototyped_declaration_then_definition() {
+    assert_eq!(
+        i32_of("long f(); long f(void) { return 40; } int main(void) { return (int)f(); }"),
+        40
+    );
+    assert_eq!(
+        i32_of("long f(); int main(void) { return (int)f(); } long f(void) { return 40; }"),
+        40
+    );
+    // Arguments through the declaration, to fixed parameters and to a variadic definition.
+    assert_eq!(
+        i32_of(
+            "#include <stdarg.h>\n\
+             long g();\n\
+             int h();\n\
+             int main(void) { return (int)g(6, 7) + h(3, 10, 20, 30); }\n\
+             long g(int a, int b) { return a * b; }\n\
+             int h(int n, ...) {\n\
+             \x20 va_list ap;\n\
+             \x20 va_start(ap, n);\n\
+             \x20 int s = 0;\n\
+             \x20 for (int i = 0; i < n; i++) s += va_arg(ap, int);\n\
+             \x20 va_end(ap);\n\
+             \x20 return s;\n\
+             }\n"
+        ),
+        102
+    );
+}
+
 #[test]
 fn c_recursion_end_to_end() {
     // Recursion is the real test of per-call frames (§3d data stack): each activation of

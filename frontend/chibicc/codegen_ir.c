@@ -2344,13 +2344,16 @@ static int gen_expr(Node *node) {
       spill_top = spillsave;
     }
 
-    bool variadic = node->func_ty && node->func_ty->is_variadic;
+    // A direct call to a function this unit defines takes the definition's signature, which a call
+    // parsed under an earlier unprototyped declaration (`f();`) did not see (#2163).
+    Type *fty = direct && node->lhs->var->is_definition ? node->lhs->var->ty : node->func_ty;
+    bool variadic = fty && fty->is_variadic;
     int nfixed = n;
     int vbuf = 0; // the marshalled-varargs buffer pointer (passed as the trailing arg)
     int extra = 0;
     if (variadic) {
       nfixed = 0;
-      for (Type *pt = node->func_ty->params; pt; pt = pt->next)
+      for (Type *pt = fty->params; pt; pt = pt->next)
         nfixed++;
       int nva = n - nfixed;
       // Marshal the variadic args into a buffer just above our frame (and below the
@@ -3250,8 +3253,8 @@ static void emit_tls_block(Obj *prog) {
       check_reloc_target(prog, r);
       Obj *t = find_symbol(prog, *r->label);
       if (opt_emit_object && t && t->is_function)
-        error("codegen_ir: `--emit-object` cannot relocate a function pointer in static data "
-              "(`%s`); it needs a cross-TU funcref relocation the link model does not carry",
+        error("codegen_ir: `--emit-object` cannot relocate a function pointer in a thread-local "
+              "initializer (`%s`)",
               *r->label);
       unsigned long val =
           opt_emit_object ? 0 : (unsigned long)(symbol_value(prog, *r->label) + r->addend);
@@ -3288,7 +3291,8 @@ static void emit_tls_block(Obj *prog) {
 // Pointer initializers (`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and
 // arrays/structs of them) become **relocations** (§3a): each writes the 8-byte little-endian
 // window address of its target symbol + addend into the image, computed here since all
-// offsets/indices are known.
+// offsets/indices are known. A function pointer is the function's index, and its slot is recorded
+// (`data.funcref <at>`, #1830) so the module says which data bytes name a function.
 static void emit_data_segments(Obj *prog) {
   long span_top = 0;    // high-water of every defined global's window extent (`--emit-object` span)
   long covered_top = 0; // high-water of the bytes an actual `data` segment writes
@@ -3312,26 +3316,21 @@ static void emit_data_segments(Obj *prog) {
     memcpy(buf, g->init_data, size);
     // Pointer initializers become relocations. Whole-program (`--emit-ir`): bake the target's
     // absolute window value now — every offset/index is fixed. Separate compilation
-    // (`--emit-object`): leave a zero placeholder and emit a link-form `data.ptr` slot the linker
-    // patches once the window layout is known (below), the data→data twin of `data.self`/`data.sym`.
+    // (`--emit-object`): bake a function this unit defines as its index in the unit, which the
+    // linker shifts with the unit's functions, as it does `ref.func`; leave a zero placeholder for
+    // the rest, which the linker fills in once it has placed every unit (the link forms below).
     for (Relocation *r = g->rel; r; r = r->next) {
       check_reloc_target(prog, r);
-      if (opt_emit_object) {
-        Obj *t = find_symbol(prog, *r->label);
-        if (t && t->is_function)
-          // A function pointer baked into static data would need the *reindexed* funcref, which the
-          // linker rewrites only for `ref.func`/`call` operands, not opaque data bytes. No unit in
-          // the chibicc cc1 set does this; fail closed rather than emit a stale index.
-          error("codegen_ir: `--emit-object` cannot relocate a function pointer in static data "
-                "(`%s`); it needs a cross-TU funcref relocation the link model does not carry",
-                *r->label);
-        for (int i = 0; i < 8 && r->offset + i < size; i++)
-          buf[r->offset + i] = 0; // placeholder; the linker overwrites [at, at+8)
-      } else {
-        unsigned long val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
-        for (int i = 0; i < 8 && r->offset + i < size; i++)
-          buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
-      }
+      Obj *t = find_symbol(prog, *r->label);
+      if (opt_emit_object && t && t->is_function && r->addend)
+        error("codegen_ir: `--emit-object` cannot relocate an offset from function `%s` in static "
+              "data",
+              *r->label);
+      unsigned long val = 0; // placeholder; the linker overwrites it
+      if (!opt_emit_object || (t && t->is_function && t->is_definition))
+        val = (unsigned long)(symbol_value(prog, *r->label) + r->addend);
+      for (int i = 0; i < 8 && r->offset + i < size; i++)
+        buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
     }
     cg("data %s%d ", is_rodata(g) ? "ro " : "", g->offset);
     emit_data_bytes(buf, size);
@@ -3340,16 +3339,24 @@ static void emit_data_segments(Obj *prog) {
       long ct = (long)g->offset + size;
       if (ct > covered_top)
         covered_top = ct;
-      // Emit the `data.ptr` slots now that the segment covering `[at, at+8)` exists: `self` for a
-      // target defined in this unit (relocated with our data), `sym` for a cross-TU data symbol.
-      for (Relocation *r = g->rel; r; r = r->next) {
-        Obj *t = find_symbol(prog, *r->label);
-        long at = (long)g->offset + r->offset;
-        if (t && t->is_definition)
-          cg("data.ptr %ld self %ld\n", at, (long)t->offset + r->addend);
-        else
-          cg("data.ptr %ld sym \"%s\" %ld\n", at, *r->label, r->addend);
-      }
+    }
+    // Each pointer's slot, now that the segment covering it exists. A function this unit defines:
+    // `data.funcref <at>`, in either mode (the bytes hold its index). `--emit-object` also emits
+    // the link forms: `data.funcref <at> sym` for another unit's function, and `data.ptr` `self`
+    // for data defined here (relocated with ours) or `sym` for another unit's data symbol.
+    for (Relocation *r = g->rel; r; r = r->next) {
+      Obj *t = find_symbol(prog, *r->label);
+      long at = (long)g->offset + r->offset;
+      if (t && t->is_function && t->is_definition && !r->addend)
+        cg("data.funcref %ld\n", at);
+      else if (!opt_emit_object)
+        continue;
+      else if (t && t->is_function)
+        cg("data.funcref %ld sym \"%s\"\n", at, *r->label);
+      else if (t && t->is_definition)
+        cg("data.ptr %ld self %ld\n", at, (long)t->offset + r->addend);
+      else
+        cg("data.ptr %ld sym \"%s\" %ld\n", at, *r->label, r->addend);
     }
   }
   // `--emit-object`: if the unit's top-most global is BSS (no segment reached `span_top`), emit a

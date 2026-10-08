@@ -13,10 +13,10 @@ use temen_interp::Value;
 use temen_ir::LinkUnit;
 
 /// The library: a counter it increments on every `lib_add`, a table holding a pointer to that
-/// counter and to `lib_add` itself, and a `static` helper of its own.
+/// counter, to `lib_add` itself and to a `static` helper of its own.
 const LIB: &str = r#"
 @lib_counter = global i64 0
-@lib_table = global [2 x ptr] [ptr @lib_counter, ptr @lib_add]
+@lib_table = global [3 x ptr] [ptr @lib_counter, ptr @lib_add, ptr @helper]
 
 define i64 @lib_add(i64 %a, i64 %b) {
 entry:
@@ -42,12 +42,13 @@ entry:
 
 /// The program side: calls into the library, reads its counter directly and through a pointer stored
 /// in its own data, calls through the library's function-pointer table, and has a `static` `helper`
-/// of the same name as the library's.
+/// of the same name as the library's, which it calls through a table of its own.
 const APP: &str = r#"
 @lib_counter = external global i64
-@lib_table = external global [2 x ptr]
+@lib_table = external global [3 x ptr]
 @app_state = global i64 5
 @app_counter_ptr = global ptr @lib_counter
+@app_ops = global [1 x ptr] [ptr @helper]
 
 declare i64 @lib_add(i64, i64)
 declare i64 @lib_helped(i64)
@@ -65,14 +66,19 @@ entry:
   %c = load i64, ptr @lib_counter
   %p = load ptr, ptr @app_counter_ptr
   %c2 = load i64, ptr %p
-  %fslot = getelementptr [2 x ptr], ptr @lib_table, i64 0, i64 1
+  %fslot = getelementptr [3 x ptr], ptr @lib_table, i64 0, i64 1
   %f = load ptr, ptr %fslot
   %d = call i64 %f(i64 100, i64 1)
-  %cslot = getelementptr [2 x ptr], ptr @lib_table, i64 0, i64 0
+  %cslot = getelementptr [3 x ptr], ptr @lib_table, i64 0, i64 0
   %cp = load ptr, ptr %cslot
   %c3 = load i64, ptr %cp
   %h = call i64 @helper(i64 7)
   %hl = call i64 @lib_helped(i64 4)
+  %gslot = getelementptr [3 x ptr], ptr @lib_table, i64 0, i64 2
+  %g = load ptr, ptr %gslot
+  %e = call i64 %g(i64 5)
+  %af = load ptr, ptr @app_ops
+  %ae = call i64 %af(i64 11)
   %s = load i64, ptr @app_state
   %t1 = mul i64 %c, 100
   %t2 = mul i64 %c2, 1000
@@ -80,6 +86,8 @@ entry:
   %t4 = mul i64 %h, 100000
   %t5 = mul i64 %s, 10000000
   %t6 = mul i64 %d, 100000000
+  %t7 = mul i64 %e, 100000000000
+  %t8 = mul i64 %ae, 1000000000000000
   %u1 = add i64 %b, %t1
   %u2 = add i64 %u1, %t2
   %u3 = add i64 %u2, %t3
@@ -87,16 +95,27 @@ entry:
   %u5 = add i64 %u4, %t5
   %u6 = add i64 %u5, %t6
   %u7 = add i64 %u6, %hl
-  ret i64 %u7
+  %u8 = add i64 %u7, %t7
+  %u9 = add i64 %u8, %t8
+  ret i64 %u9
 }
 "#;
 
 /// `run`'s value: `b = 15`; the counter is 2 after two `lib_add`s, read directly (`c`) and through the
 /// app's pointer (`c2`); 3 after the call through the table (`c3`, which reads it through the
 /// library's own pointer); `d = 101`; the app's own `helper(7) = 21`; `lib_helped(4)` reaches the
-/// library's `helper` (1004); `app_state = 5`.
-const EXPECT: i64 =
-    15 + 2 * 100 + 2 * 1000 + 3 * 10000 + 21 * 100000 + 5 * 10000000 + 101 * 100000000 + 1004;
+/// library's `helper` (1004), and so does its table (`e = 1005`); `app_state = 5`; and the app's
+/// table reaches its own `helper` (`ae = 33`).
+const EXPECT: i64 = 15
+    + 2 * 100
+    + 2 * 1000
+    + 3 * 10000
+    + 21 * 100000
+    + 5 * 10000000
+    + 101 * 100000000
+    + 1004
+    + 1005 * 100000000000
+    + 33 * 1000000000000000;
 
 fn link_unit(src: &str) -> temen_ir::Module {
     let opts = temen_llvm::TranslateOptions {
@@ -157,14 +176,22 @@ fn a_link_unit_exports_only_external_names() {
     let data: Vec<&str> = lib.data_exports.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(data, ["lib_counter", "lib_table"]);
 
-    // The table's two slots are link-form: a pointer to the unit's own counter, and `lib_add`'s index.
+    // The table's slots are link-form: a pointer to the unit's own counter, then the indices in the
+    // unit of `lib_add` and of the `static` `helper` (#2194), which the linker shifts with the unit's
+    // functions.
     assert_eq!(lib.data_ptrs.len(), 1);
     assert!(matches!(
         lib.data_ptrs[0].target,
         temen_ir::DataPtrTarget::SelfOff(_)
     ));
-    assert_eq!(lib.data_funcrefs.len(), 1);
-    assert_eq!(lib.data_funcrefs[0].name, "lib_add");
+    assert!(lib.data_funcrefs.is_empty(), "{:?}", lib.data_funcrefs);
+    let targets = temen_ir::data_funcref_targets(&lib);
+    assert_eq!(targets.len(), 2, "{targets:?}");
+    assert_eq!(targets[0], lib.resolve_export("lib_add"));
+    assert!(
+        targets[1].is_some_and(|f| !lib.exports.iter().any(|e| e.func == f)),
+        "the static helper: {targets:?}"
+    );
 
     // The app imports what it calls and reads, rather than failing on it.
     let app = link_unit(APP);
@@ -189,6 +216,7 @@ fn without_the_option_a_unit_is_unchanged() {
     assert!(
         lib.data_exports.is_empty() && lib.data_ptrs.is_empty() && lib.data_funcrefs.is_empty()
     );
+    assert!(lib.data_funcref_slots.is_empty());
 }
 
 /// A link unit reaches the powerbox like any unit: its `vm_page_size` import is bound when the
@@ -228,17 +256,17 @@ fn a_link_unit_refuses_what_it_cannot_relocate() {
         Err(e) => format!("{e:?}"),
     };
 
-    // A pointer to a `static` function in static data: a `data.funcref` names an exported function.
+    // An offset from a function's address in static data: a funcref slot holds an index.
     let e = refusal(
         r#"
-@table = global [1 x ptr] [ptr @f]
-define internal i64 @f() {
+@table = global [1 x ptr] [ptr getelementptr (i8, ptr @f, i64 1)]
+define i64 @f() {
 entry:
   ret i64 1
 }
 "#,
     );
-    assert!(e.contains("static function `@f`"), "{e}");
+    assert!(e.contains("arithmetic on the address of `@f`"), "{e}");
 
     // A program: a link unit is a library.
     let e = refusal(

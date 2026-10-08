@@ -8,8 +8,7 @@
 
 use temen_interp::{run, Value};
 use temen_ir::{
-    data_funcref_targets, link, taken_funcs, Data, DataFuncref, LinkUnit, Module,
-    POWERBOX_STACK_ALIGN,
+    data_funcref_targets, link, taken_funcs, Data, LinkUnit, Module, POWERBOX_STACK_ALIGN,
 };
 use temen_verify::{verify_module, VerifyError};
 
@@ -38,11 +37,12 @@ block 0 (x: i64) {
 export 0 func "twice" 0
 "#;
 
-/// Unit 1, the program: a global function pointer at `16384` whose initializer is `twice`
-/// (attached as a `data.funcref`, which has no text form), and `main`, which calls through it.
+/// Unit 1, the program: a global function pointer at `16384` whose initializer is `twice` (a
+/// `data.funcref` relocation), and `main`, which calls through it.
 const PROG: &str = r#"
 memory 16
 data 16384 "\x00\x00\x00\x00"
+data.funcref 16384 sym "twice"
 func () -> (i64) {
 block 0 () {
   p = data.self 16384
@@ -57,12 +57,7 @@ export 0 func "main" 0
 
 /// The two units, the program's pointer initialized to `twice`.
 fn units() -> Vec<LinkUnit> {
-    let mut prog = unit(PROG);
-    prog.module.data_funcrefs = vec![DataFuncref {
-        at: 16384,
-        name: "twice".to_string(),
-    }];
-    vec![unit(LIB), prog]
+    vec![unit(LIB), unit(PROG)]
 }
 
 /// The window offset the program unit's data starts at: unit 0 has no data, so the program's is
