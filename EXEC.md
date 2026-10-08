@@ -17,7 +17,7 @@ interposition-invisibility property the import model already guarantees:
 | `host_exec(allowlist)` | a real host OS process, attenuated by an explicit program allowlist (the capability *is* the list, as `host_fs`'s *is* the root) | **BUILT 2026-07-22** (`temen-run/src/exec.rs`) |
 | `scripted_exec(table)` | no process at all: a `(argv-prefix → {stdout, stderr, exit})` table — the `mem_fs` analog; what differential tests and wasm/browser embedders grant | **BUILT 2026-07-22** (wasm-safe `temen-exec` crate) |
 | `domain_exec` | a **child temen domain** (host-served: the embedder implements the same ops over the Instantiator machinery it already has) | **BUILT 2026-07-23** (`temen-run/src/exec.rs`) |
-| guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | **BUILT** (#744): a detached spawn's live self-serve grant (`GRANT_SERVE_LIVE_TAG`), served natively by the tree-walker, the Cranelift JIT and the cooperative bytecode driver; the other bytecode drivers (parallel, debug, `Vcpu`, the browser's `CoopRun`) decline it for now |
+| guest-served | a parent domain serves its child's `"exec"` with **its own code** — the none-the-wiser nested shell | **BUILT** (#744): a detached spawn's live self-serve grant (`GRANT_SERVE_LIVE_TAG`), served natively by the tree-walker, the Cranelift JIT and the cooperative bytecode driver (`drive`, and the browser's `CoopRun`, whose tier-up regions end before a spawn, `svc.wait` or live call); the parallel, debug and `Vcpu` drivers decline it until #1414 gives them the cooperative pump |
 
 This is how "a shell that manages real host processes" and "the same
 shell nested, its parent handling process-like domains, none the wiser"

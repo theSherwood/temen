@@ -1555,17 +1555,44 @@ fn func_uses_indirect(f: &Func) -> bool {
 /// instead lets the emit fixpoint cascade its callers off, so a region is never emitted into a bounce
 /// that cannot complete — and the rest of the module still tiers up.
 ///
+/// A fifth seed, [`needs_its_task`] (#744), has the threads seed's reason: a spawn, a `svc.wait`
+/// or a live call needs a scheduler, and a bounce has none.
+///
 /// **Keep the seeds in lockstep with `drive_nested`'s match arms.** Widening that loop to service an
 /// op (e.g. over #1359's yielding bounce) is what earns dropping a seed here — not the reverse.
 fn bounce_serviceable(m: &Module, gc_spill: bool) -> Vec<bool> {
     // #1627: in spill mode every emitted frame beneath a bounce has pushed its live words, so a
     // bounce into `gc.roots` scans them (`CoopRun::bounce`'s `spill`) and the fourth seed drops.
     reaches(m, |f| {
-        f.uses_threads() || f.uses_futex() || f.uses_suspend() || (!gc_spill && f.uses_gc_roots())
+        f.uses_threads()
+            || f.uses_futex()
+            || f.uses_suspend()
+            || (!gc_spill && f.uses_gc_roots())
+            || needs_its_task(f)
     })
     .into_iter()
     .map(|b| !b)
     .collect()
+}
+
+/// #744 — whether `f` makes a call only its task's scheduler can serve. Every `Instantiator` op is
+/// the scheduler's: it starts a child, or joins, polls, detaches or kills one; `svc.wait` parks its
+/// task until a client calls; a call through a guest-declared interface may reach a live offer, and
+/// then parks its task until the serving domain replies. A bounce has no task to start, or to park,
+/// so `drive_nested` refuses all three.
+/// `svc.poll` does complete in a bounce, but it must refuse beneath a running handler (#2160), and
+/// a bounce cannot see a handler beneath it. A guest interface is one interned at or above
+/// [`cap_id::GUEST_IMPL_BASE`]; a guest that serves a built-in shape still falls to the bounce's
+/// refusal, as before.
+fn needs_its_task(f: &Func) -> bool {
+    f.blocks.iter().flat_map(|b| &b.insts).any(|i| match *i {
+        Inst::CapCall { type_id, op, .. } => {
+            type_id == cap_id::INSTANTIATOR
+                || temen_ir::durable_abi::is_serve_op(type_id, op)
+                || (cap_id::GUEST_IMPL_BASE..temen_ir::CAP_DYN_TYPE_ID).contains(&type_id)
+        }
+        _ => false,
+    })
 }
 
 /// `out[i]` ⇔ function `i` can transitively reach a function satisfying `seed`: through a direct

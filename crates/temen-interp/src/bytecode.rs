@@ -1424,9 +1424,9 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 /// the one `&Module` admission (INVARIANTS.md §9) — so it is also each driver's routing.
 ///
 /// `serves_children`: the caller's driver serves the children a module spawns — the cooperative
-/// `drive`, whose every domain sits in a cell its children can call back into (#744). The
-/// [`bytecode_serves_children`] escape applies to it alone; every other driver declines such a
-/// module to the tree-walk oracle.
+/// scheduler, `drive` and [`CoopRun`] alike, whose every domain sits in a cell its children can
+/// call back into (#744). The [`bytecode_serves_children`] escape applies to it alone; every other
+/// driver declines such a module to the tree-walk oracle.
 ///
 /// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
 /// pager-shaped export ([`Module::declares_pager`]) could build a pager record, which only the
@@ -3182,7 +3182,7 @@ pub fn compile_and_run_over_shared_with_host(
     host: &mut Host,
     seed_data: bool,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module_for(m, false)?;
+    let c = compile_module_for(m, true)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -3223,7 +3223,7 @@ pub struct SharedProgram {
 impl SharedProgram {
     /// Compile `m` once (`None` if it uses an op outside the engine's subset).
     pub fn compile(m: &Module) -> Option<SharedProgram> {
-        let c = compile_module_for(m, false)?;
+        let c = compile_module_for(m, true)?;
         let n_funcs = c.progs.len();
         Some(SharedProgram {
             source: std::sync::Arc::new(ModuleSource::new(c)),
@@ -16839,7 +16839,7 @@ impl CoopRun {
         tierup: Option<TierUpConfig>,
         mut mem: Option<Mem>,
     ) -> Option<Result<CoopRun, Trap>> {
-        let c = compile_module_for(m, false)?;
+        let c = compile_module_for(m, true)?;
         if entry as usize >= c.progs.len() {
             return Some(Err(Trap::Malformed));
         }

@@ -440,6 +440,19 @@ block 0 (vx: i64) {{
 
 const WAIT: &str = "  vn = call.cap 4294967295 10 () -> (i64) vz ()";
 
+/// Whether each entry onto the cooperative scheduler admits `m`: the plain run, a `CoopRun`, and
+/// the shared program the browser's warm and reactor sessions run. They take one escape, so they
+/// agree.
+fn cooperative_entries_admit(m: &temen_ir::Module) -> bool {
+    let entries = [
+        bytecode::admits(m),
+        bytecode::CoopRun::new(m, 0, &[], u64::MAX, Host::new(), None).is_some(),
+        bytecode::SharedProgram::compile(m).is_some(),
+    ];
+    assert!(entries.iter().all(|&e| e == entries[0]), "{entries:?}");
+    entries[0]
+}
+
 /// #744 — the serve-children escape: the cooperative driver runs a serving module that spawns
 /// natively exactly while nothing a handler reaches can park. The oracle runs each handler as a
 /// fiber and serves on past one that parks; this engine serves on the handler's own task, so such a
@@ -447,7 +460,10 @@ const WAIT: &str = "  vn = call.cap 4294967295 10 () -> (i64) vz ()";
 /// whose callee is unknown until it runs counts as a park.
 #[test]
 fn a_spawning_server_runs_natively_only_while_its_handlers_cannot_park() {
-    assert!(bytecode::admits(&spawning_server(WAIT, "  return vx")));
+    assert!(cooperative_entries_admit(&spawning_server(
+        WAIT,
+        "  return vx"
+    )));
     for helper in [
         // a join
         "  vz = i32.const 0\n  vj = call.cap 6 1 (i32) -> (i64) vz (vz)\n  return vj",
@@ -459,13 +475,16 @@ fn a_spawning_server_runs_natively_only_while_its_handlers_cannot_park() {
         "  vh = i32.const 0\n  vr = call.cap 13 0 (i64) -> (i64) vh (vx)\n  return vr",
     ] {
         assert!(
-            !bytecode::admits(&spawning_server(WAIT, helper)),
+            !cooperative_entries_admit(&spawning_server(WAIT, helper)),
             "{helper}"
         );
     }
     // A timed `svc.wait` is the oracle's alone, wherever it is.
     let timed = "  vt = i64.const 1000\n  vn = call.cap 4294967295 10 (i64) -> (i64) vz (vt)";
-    assert!(!bytecode::admits(&spawning_server(timed, "  return vx")));
+    assert!(!cooperative_entries_admit(&spawning_server(
+        timed,
+        "  return vx"
+    )));
 }
 
 /// A detached child (func 1, its `Instantiator` its entry argument) spawns a thread and asks for a
