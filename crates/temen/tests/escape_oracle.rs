@@ -528,3 +528,95 @@ block 0 (v0: i64) {
         }
     }
 }
+
+/// #2177 — a module with a `1 << log2`-byte window that seeds `[0, 96)` with distinct bytes, then
+/// `op`s `n` bytes from `src` to `dst`. With `loaded`, each address is read back from memory, so no
+/// bound proof elides its check; otherwise both are constants. In a page-aligned window (8 KiB on a
+/// 4 KiB-page host) a checked span shares its bounds check with the guard page past the window
+/// (`CheckedBases`); in a 256-byte one it is checked whole.
+fn short_copy(op: &str, log2: u32, dst: u64, src: u64, n: u64, loaded: bool) -> String {
+    let mut s = format!("memory {log2}\nfunc (i32) -> (i32) {{\nblock 0 (v0: i32) {{\n");
+    for k in 0..12u64 {
+        let word = u64::from_le_bytes(std::array::from_fn(|i| (8 * k + i as u64 + 1) as u8));
+        s += &format!(
+            "  va{k} = i64.const {}\n  vw{k} = i64.const {}\n  i64.store va{k} vw{k}\n",
+            8 * k,
+            word as i64
+        );
+    }
+    for (name, at, cell) in [("vd", dst, 240), ("vs", src, 248)] {
+        if loaded {
+            s += &format!(
+                "  {name}c = i64.const {cell}\n  {name}k = i64.const {at}\n  i64.store {name}c {name}k\n  {name} = i64.load {name}c\n"
+            );
+        } else {
+            s += &format!("  {name} = i64.const {at}\n");
+        }
+    }
+    s + &format!("  vn = i64.const {n}\n  {op} vd vs vn\n  return v0\n  }}\n}}\n")
+}
+
+/// #2177: the JIT copies a constant 1..=64 bytes with loads and stores, and 65 with the libcall.
+/// Every length, both ops, constant and loaded addresses, both window shapes: it leaves the
+/// interpreter's window, byte for byte.
+#[test]
+fn short_copies_leave_the_interpreters_window() {
+    for log2 in [8, 13] {
+        for op in ["mem.copy", "mem.move"] {
+            for loaded in [false, true] {
+                for n in 1..=65 {
+                    let text = short_copy(op, log2, 120, 8, n, loaded);
+                    let (imem, jmem) = both_windows(&text, &vec![0; 1 << log2]);
+                    let n = n as usize;
+                    let case = format!("memory {log2} {op} n={n} loaded={loaded}");
+                    assert!(imem == jmem, "{case}: the windows differ");
+                    assert_eq!(imem[120..120 + n], imem[8..8 + n], "{case}: nothing copied");
+                }
+            }
+        }
+    }
+}
+
+/// #2177: an inline `mem.move` reads its whole source before it writes, so overlapping spans move as
+/// the interpreter moves them: forward and back, by less than a word and by more.
+#[test]
+fn short_overlapping_moves_leave_the_interpreters_window() {
+    for n in [3, 8, 13, 24, 64] {
+        for shift in [-13i64, -8, -3, -1, 1, 3, 8, 13] {
+            for loaded in [false, true] {
+                let text = short_copy("mem.move", 8, (24 + shift) as u64, 24, n, loaded);
+                let (imem, jmem) = both_windows(&text, &[0; 256]);
+                assert!(
+                    imem == jmem,
+                    "n={n} shift={shift} loaded={loaded}: the windows differ"
+                );
+            }
+        }
+    }
+}
+
+/// #2177: an inline copy whose span runs past the window faults on both backends, whichever span
+/// runs over, whether its address is constant or loaded, and whether the window is checked whole or
+/// shares its check with the guard page; and it writes nothing first. In the shared case the
+/// destination's first word is in the window, so only the probe of its last byte keeps that word
+/// from being written before the second store faults.
+#[test]
+fn a_short_copy_past_the_window_faults_identically() {
+    for log2 in [8, 13] {
+        let end = 1u64 << log2;
+        for (dst, src) in [(end - 8, 8), (120, end - 8)] {
+            for loaded in [false, true] {
+                let text = short_copy("mem.copy", log2, dst, src, 16, loaded);
+                let (itrapped, jo, imem, jmem) =
+                    both_windows_disposition(&text, &vec![0; 1 << log2]);
+                let case = format!("memory {log2} dst={dst} src={src} loaded={loaded}");
+                assert!(itrapped, "{case}: the interpreter returned");
+                assert!(
+                    matches!(jo, JitOutcome::Trapped(temen_jit::TrapKind::MemoryFault)),
+                    "{case}: the JIT gave {jo:?}"
+                );
+                assert!(imem == jmem, "{case}: the windows differ");
+            }
+        }
+    }
+}

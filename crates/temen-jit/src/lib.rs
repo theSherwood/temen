@@ -9034,23 +9034,29 @@ fn lower_block(
             // Bulk-memory ops (D62). Each span is confined once (single range check + base clamp),
             // then the copy/fill is the platform libcall — `memory.copy`-class lowering, not a
             // per-byte confined loop. `MemCopy`/`MemMove` differ only in the libcall (overlap safety).
-            Inst::MemCopy { dst, src, len } => {
+            // #2177: a short copy of one of this block's constant lengths is loads and stores instead
+            // ([`copy_inline`]); a zero-length one is inert, as the libcall path makes it.
+            Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
+                let short = checked.consts.get(len).copied();
+                if let Some(n) =
+                    short.filter(|n| lower.mask != 0 && (0..=INLINE_COPY_MAX).contains(n))
+                {
+                    if n > 0 {
+                        copy_inline(b, lower, &mut checked, &ubs, &vals, *dst, *src, n as u32)?;
+                    }
+                    continue;
+                }
                 let n = get(&vals, *len)?;
                 let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
                 let sphys = confine_span(b, lower, get(&vals, *src)?, n);
                 // I21: fault an overrun before the libcall (no partial write; catches `dst==src`).
                 probe_span(b, dphys, n);
                 probe_span(b, sphys, n);
-                b.call_memcpy(lower.frontend_config, dphys, sphys, n);
-                continue;
-            }
-            Inst::MemMove { dst, src, len } => {
-                let n = get(&vals, *len)?;
-                let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
-                let sphys = confine_span(b, lower, get(&vals, *src)?, n);
-                probe_span(b, dphys, n);
-                probe_span(b, sphys, n);
-                b.call_memmove(lower.frontend_config, dphys, sphys, n);
+                if matches!(inst, Inst::MemCopy { .. }) {
+                    b.call_memcpy(lower.frontend_config, dphys, sphys, n);
+                } else {
+                    b.call_memmove(lower.frontend_config, dphys, sphys, n);
+                }
                 continue;
             }
             Inst::MemFill { dst, val, len } => {
@@ -10866,6 +10872,59 @@ fn probe_span(b: &mut FunctionBuilder, phys: Value, len: Value) {
 
     b.switch_to_block(after);
     b.seal_block(after);
+}
+
+/// #2177 — the most bytes a constant-length `mem.copy`/`mem.move` copies inline ([`copy_inline`]).
+const INLINE_COPY_MAX: i64 = 64;
+
+/// #2177 — a `mem.copy`/`mem.move` of a constant `n` bytes, `0 < n ≤` [`INLINE_COPY_MAX`], as loads and
+/// stores: what gcc makes of a small struct copy, where the libcall path costs a call that clobbers
+/// every caller-saved register. Each span is confined as one `n`-byte access, exactly as a load or
+/// store of that width is ([`CheckedBases`], or no check where the bound proof elides one). Every
+/// source byte is loaded, and the destination's first and last bytes are probed, before the first
+/// store. So overlapping spans copy as `mem.move` does, and a span that faults faults before anything
+/// is written (I21, as [`probe_span`] keeps the libcall path): `n` is under a page, so each span
+/// touches at most two pages, and those reads reach both.
+#[allow(clippy::too_many_arguments)]
+fn copy_inline(
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    checked: &mut CheckedBases,
+    ubs: &[u64],
+    vals: &[Value],
+    dst: u32,
+    src: u32,
+    n: u32,
+) -> Result<(), JitError> {
+    let size = lower.mask.wrapping_add(1);
+    let mut confine = |b: &mut FunctionBuilder, idx: u32| -> Result<Value, JitError> {
+        let a = get(vals, idx)?;
+        Ok(if in_window(ub_at(ubs, idx), 0, n, size) {
+            mask_addr(b, lower, a, 0, true, n)
+        } else {
+            checked.confine(b, lower, idx, a, 0, n)
+        })
+    };
+    let s = confine(b, src)?;
+    let d = confine(b, dst)?;
+    // Widest words first: 8 bytes, then the 4/2/1-byte tail.
+    let mut words = Vec::new();
+    let mut off = 0;
+    for w in [8, 4, 2, 1] {
+        while n - off >= w {
+            words.push((
+                off as i32,
+                b.ins().load(width_ty(w), mem_flags(), s, off as i32),
+            ));
+            off += w;
+        }
+    }
+    b.ins().load(I8, mem_flags(), d, 0);
+    b.ins().load(I8, mem_flags(), d, (n - 1) as i32);
+    for (off, word) in words {
+        b.ins().store(mem_flags(), word, d, off);
+    }
+    Ok(())
 }
 
 /// Confine a **dynamic-length span** `[ptr, ptr+len)` to the reserved domain `[0, reserved)` and
