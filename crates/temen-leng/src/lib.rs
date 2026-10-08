@@ -567,8 +567,8 @@ fn link_selected_with_extra(
             units.len() + 2
         )));
     }
-    // Pooled **non-scalar globals** across all units (stem-suffixed name → descriptor): the type of
-    // every foreign symbol a unit might call through or index into. See `Translator::ext_globals`.
+    // Pooled **globals' descriptors** across all units (stem-suffixed name → descriptor): the type
+    // of every foreign symbol but a signed `i64`. See `Translator::ext_globals`.
     let mut pooled_globals: Vec<(String, translate::TyDesc)> = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();

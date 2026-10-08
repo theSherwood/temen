@@ -493,10 +493,10 @@ pub(crate) struct Translator {
     link_mode: bool,
     /// Cross-module callees lowered to Temen imports (discovered during emission).
     imports: RefCell<ImportTable>,
-    /// **External non-scalar globals** — another unit's `gvar`/`const` whose type is a `proctype` or
-    /// an aggregate, under the stem-suffixed name this module references it by ([`export_globals`]).
-    /// A cross-module symbol with no entry here falls back to a bare `data.sym` + `Scalar(I64)`,
-    /// which is right for a scalar and wrong for everything else:
+    /// **External globals' descriptors** — another unit's `gvar`/`const` of any type but a signed
+    /// `i64`, under the stem-suffixed name this module references it by ([`export_globals`]). A
+    /// cross-module symbol with no entry here falls back to a bare `data.sym` + `Scalar(I64)`, which
+    /// is right for a signed `i64` and wrong for everything else:
     ///
     /// - a `proctype` global — `(call oomHandler.0.<sys> …)` targets a function-*pointer* data
     ///   symbol, not a proc, so `lvalue_type`/`lvalue_addr` must see `FnPtr` for `indirect_callee`
@@ -504,7 +504,10 @@ pub(crate) struct Translator {
     /// - an **aggregate** global — `x in Digits` compiles to `(at Digits.0.<strutils> (shr … 3))`,
     ///   a byte index into a sibling's `set[char]` (an `array[uint8, 32]`). Without the layout here
     ///   that is "`at` on a non-array": the data symbol resolves at link, but the *descriptor* the
-    ///   indexing needs does not cross the unit boundary on its own.
+    ///   indexing needs does not cross the unit boundary on its own;
+    /// - a **narrower, unsigned or float scalar** — since #2201 an enum, a `distinct` number and a
+    ///   `bool` are narrower than a word: `system`'s `ATOMIC_SEQ_CST`, a `distinct cint`, read as an
+    ///   `i64` failed verification where an atomic takes an `i32`.
     ///
     /// One table rather than two, because both cases are the same question — what is this foreign
     /// symbol's type? — and a second parallel list would be one more thing to keep in step.
@@ -2173,10 +2176,10 @@ impl Translator {
         }
     }
 
-    /// Pre-register **external non-scalar globals** — another module's `gvar`s/`const`s whose type
-    /// is a `proctype` or an aggregate, under the stem-suffixed names this module references them by
+    /// Pre-register **external globals' descriptors** — another module's `gvar`s/`const`s of any
+    /// type but a signed `i64`, under the stem-suffixed names this module references them by
     /// ([`export_globals`]). See the [`ext_globals`](Self::ext_globals) field for why a bare
-    /// `data.sym` is not enough for either kind.
+    /// `data.sym` is not enough for them.
     pub fn import_globals(&mut self, ext: &[(String, TyDesc)]) {
         for (name, desc) in ext {
             self.ext_globals.insert(name.clone(), desc.clone());
@@ -2293,8 +2296,9 @@ impl Translator {
         Ok(out)
     }
 
-    /// Collect a module's **funcref globals** under their stem-suffixed global names — the form
-    /// *other* modules reference them by. A `gvar`/`tvar` whose type is a `proctype` (e.g. the
+    /// Collect a module's globals' descriptors under their stem-suffixed global names — the form
+    /// *other* modules reference them by — for every global a bare `data.sym` would misread: all but
+    /// a signed `i64`. A `gvar`/`tvar` whose type is a `proctype` (e.g. the
     /// stdlib's `oomHandler`) is a function-*pointer* data symbol; a sibling unit that calls through
     /// it needs the `call.dyn` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
@@ -2325,13 +2329,19 @@ impl Translator {
         let mut out: Vec<(String, TyDesc)> = t
             .globals
             .iter()
-            // Scalars are deliberately absent: the `data.sym` + `Scalar(I64)` fallback already reads
-            // one correctly, and a scalar `const` never reaches here at all (`export_consts` inlines
-            // it). What needs the real descriptor is a symbol you *index into* or *call through*.
+            // Only a signed `i64` is absent: the `data.sym` + `Scalar(I64)` fallback reads one
+            // correctly, and a scalar `const` never reaches here at all (`export_consts` inlines it).
+            // Every other descriptor travels. A symbol you *index into* or *call through* needs it,
+            // and so does any scalar the fallback would misread: an unsigned or float word, and one
+            // narrower than a word, which since #2201 includes an enum, a `distinct` number and a
+            // `bool` (`system`'s `ATOMIC_SEQ_CST`, a `distinct cint`, passed where an `i32` goes).
             .filter(|(_, (_, desc))| {
-                matches!(
+                !matches!(
                     desc,
-                    TyDesc::FnPtr(_) | TyDesc::Agg(_) | TyDesc::FlexArray(_) | TyDesc::Ptr(_)
+                    TyDesc::Scalar {
+                        ty: ValType::I64,
+                        unsigned: false
+                    }
                 )
             })
             .map(|(name, (_, desc))| {
@@ -4269,7 +4279,7 @@ impl<'a> FuncGen<'a> {
                     return Some(d.clone());
                 }
                 if let Some(d) = self.t.ext_globals.get(name) {
-                    // A cross-module funcref or aggregate global (see `ext_globals`).
+                    // A cross-module global's own descriptor (see `ext_globals`).
                     return Some(d.clone());
                 }
                 self.local_desc.get(name).cloned()
