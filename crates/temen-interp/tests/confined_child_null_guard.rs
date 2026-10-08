@@ -115,7 +115,7 @@ fn parallel(
         &args,
         &mut fuel,
         &[],
-        back,
+        Some(back),
         &mut host,
     )
     .expect("bytecode subset");

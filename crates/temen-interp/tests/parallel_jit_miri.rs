@@ -223,7 +223,7 @@ fn run_parallel(src: &str) -> Result<Vec<Value>, temen_interp::Trap> {
         &[Value::I32(jit), Value::I32(code)],
         &mut f,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .expect("bytecode engine drives §22 JIT (parallel)")

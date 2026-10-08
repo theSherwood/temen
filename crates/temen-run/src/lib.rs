@@ -7734,10 +7734,9 @@ impl Instance {
     /// oracle — so it is used for **smoke** coverage (assert the outcome, not the schedule) of the
     /// threaded `std` programs the cooperative entries pin exactly.
     ///
-    /// The parallel driver takes a caller-owned `Region` as the window backing (unlike the cooperative
-    /// engines, which `mmap` their own). A `std` guest's heap and its 1 MiB-per-thread stacks live
-    /// *above* the committed window in the reserved tail, so the backing is sized to `window + 64 MiB`
-    /// of headroom. `instantiate`/JIT-install fail closed under this driver; the pure threads +
+    /// The driver reserves the window itself, as the cooperative engines do, so a guest's heap and
+    /// thread stacks in the reserved tail (chibicc's heap starts at 256 MiB) hold what is stored to
+    /// them (#2196). `instantiate`/JIT-install fail closed under this driver; the pure threads +
     /// futex + atomics + host-I/O subset (what these tests use) runs.
     pub fn run_with_caps_parallel(
         &self,
@@ -7759,20 +7758,6 @@ impl Instance {
             host.register_cap_name(name, handle);
         }
 
-        // The shared window backing: the committed window plus heap/stack headroom, page-rounded.
-        let page = 4096u64;
-        let size = (win + (64u64 << 20)).next_multiple_of(page).max(page) as usize;
-        let layout = std::alloc::Layout::from_size_align(size, page as usize)
-            .map_err(|e| format!("parallel window layout: {e}"))?;
-        // SAFETY: non-zero, page-aligned layout; `base` owns `size` zeroed bytes freed below, after
-        // the parallel run has joined every vCPU (so no borrow of the region outlives it).
-        let base = unsafe { std::alloc::alloc_zeroed(layout) };
-        if base.is_null() {
-            return Err("parallel window allocation failed".into());
-        }
-        // SAFETY: `base` is `size` valid page-aligned bytes, exclusively this window's until freed.
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, size as u64) });
-
         let mut fuel = config.limits.fuel();
         let cap = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
             m,
@@ -7780,12 +7765,9 @@ impl Instance {
             &[],
             &mut fuel,
             init_mem.as_deref().unwrap_or(&[]),
-            std::sync::Arc::clone(&back),
+            None,
             &mut host,
         );
-        drop(back);
-        // SAFETY: same layout; every vCPU joined and the region (and all its borrows) is dropped.
-        unsafe { std::alloc::dealloc(base, layout) };
 
         let (res, _snap) = cap.ok_or("module is outside the parallel engine's subset")?;
         let outcome = match outcome_from_interp(res) {

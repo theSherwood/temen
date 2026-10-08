@@ -108,7 +108,7 @@ fn run_parallel(src: &str) -> Result<Vec<Value>, temen_interp::Trap> {
         &[Value::I32(inst)],
         &mut f,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .expect("bytecode engine drives §14 instantiate (parallel)")
@@ -190,7 +190,7 @@ fn run_parallel_mod() -> Result<Vec<Value>, temen_interp::Trap> {
         &[Value::I32(inst), Value::I32(mh)],
         &mut f,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .expect("bytecode engine drives §14 instantiate_module (parallel)")

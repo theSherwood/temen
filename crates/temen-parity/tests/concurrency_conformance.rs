@@ -112,7 +112,7 @@ fn parallel(
         &[Value::I32(handle)],
         &mut fuel,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     );
     drop(back);

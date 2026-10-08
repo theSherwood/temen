@@ -277,15 +277,6 @@ fn run_bytecode_parallel_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> 
     extra(&mut ih, &iposix);
     verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
     bind_shim(&raw, &mut ih, ipx);
-    // An 8-aligned zeroed buffer + a `Region::shared` over it (the bytecode_parallel.rs harness
-    // shape): the root runs over this shared backing; each fork twin copies off it (`fork_private`).
-    let layout = std::alloc::Layout::from_size_align(win as usize, 8).unwrap();
-    // SAFETY: non-zero layout; the buffer is `win` valid 8-aligned bytes owned here, used only as
-    // this run's window until freed below, after the region (and every vCPU borrow) is dropped.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null());
-    // SAFETY: `base` is `win` valid 8-aligned bytes, exclusively this window's, freed only after.
-    let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, win) });
     let mut fuel = 200_000_000u64;
     let ran = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
         &raw,
@@ -293,13 +284,10 @@ fn run_bytecode_parallel_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> 
         &[],
         &mut fuel,
         &[],
-        std::sync::Arc::clone(&back),
+        None,
         &mut ih,
     )
     .expect("the bytecode engine compiles this module (no declining op)");
-    drop(back);
-    // SAFETY: same layout; the region and all borrows of `base` are gone (the scope joined all vCPUs).
-    unsafe { std::alloc::dealloc(base, layout) };
     let (result, exited) = match ran.0 {
         Ok(v) => (v, None),
         Err(Trap::Exit(c)) => (Vec::new(), Some(c)),
@@ -1326,13 +1314,6 @@ int main(void) {{
         let posix = build(&mut ih);
         let done = std::sync::Arc::new(AtomicBool::new(false));
         let terminal = spawn_terminal(posix.clone(), std::sync::Arc::clone(&done));
-        let layout = std::alloc::Layout::from_size_align(win as usize, 8).unwrap();
-        // SAFETY: non-zero layout; the buffer is `win` valid 8-aligned bytes owned here, used only
-        // as this run's window until freed below, after the region (and every vCPU borrow) is dropped.
-        let base = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!base.is_null());
-        // SAFETY: `base` is `win` valid 8-aligned bytes, exclusively this window's, freed only after.
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, win) });
         let mut fuel = 200_000_000u64;
         let ran = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
             &raw,
@@ -1340,13 +1321,10 @@ int main(void) {{
             &[],
             &mut fuel,
             &[],
-            std::sync::Arc::clone(&back),
+            None,
             &mut ih,
         )
         .expect("the bytecode engine compiles this module (no declining op)");
-        drop(back);
-        // SAFETY: same layout; the region and all borrows of `base` are gone (the scope joined all vCPUs).
-        unsafe { std::alloc::dealloc(base, layout) };
         done.store(true, Ordering::Relaxed);
         terminal.join().expect("terminal thread");
         match ran.0 {

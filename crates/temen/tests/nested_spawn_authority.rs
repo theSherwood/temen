@@ -209,7 +209,7 @@ fn run(driver: Driver, spawn: impl Fn(Unheld) -> Spawn) -> Result<Vec<Value>, Tr
                 &args,
                 &mut fuel,
                 &[],
-                Arc::clone(&back),
+                Some(Arc::clone(&back)),
                 &mut host,
             )
             .expect("the parallel driver compiles this module");
