@@ -13987,6 +13987,251 @@ fn wire_pump_bell(
     }));
 }
 
+/// The wake half of a pump round, run before the pick: every parked task whose event has come is
+/// made runnable, with what it waited for delivered. Live-call replies, kills, finished child
+/// domains (their pipe ends, memory and services released, a fork twin's exit hooks fired), reaps,
+/// personality `waitpid`s, pipe and stdin readiness, window refunds and blocking-resume idlers, in
+/// that order. Every wake source feeds the one pass, so a task woken during the previous step is
+/// seen this round.
+fn settle_wakes(
+    tasks: &mut [TaskSlot],
+    extra_envs: &mut [ChildEnv],
+    fibers: &[FiberState],
+    forked_twins: &mut std::collections::BTreeSet<usize>,
+    hooked_twins: &mut std::collections::BTreeSet<usize>,
+    released_envs: &mut std::collections::BTreeSet<usize>,
+    root: &DomainCell,
+) {
+    // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
+    // callee's serve loop completed its dispatch; claiming the completion cell delivers the
+    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
+    for t in tasks.iter_mut() {
+        let hit = match &t.state {
+            TaskState::BlockedTicket {
+                ticket,
+                callee,
+                dst,
+            } => callee
+                .lock_unpoisoned()
+                .svc_results
+                .remove(ticket)
+                .map(|v| (v, *dst)),
+            _ => None,
+        };
+        if let Some((v, dst)) = hit {
+            t.deliver(dst, Reg::from_i64(v));
+            t.state = TaskState::Runnable;
+        }
+    }
+    // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
+    // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
+    // `term_sig` set) must DIE. The tree-walker benches every vCPU of the domain at its per-op
+    // `term_flag` safepoint and traps it; the cooperative driver has no per-op poll, so finalize
+    // each task of a killed domain HERE — running, stopped (#1198-benched), or parked — as a
+    // fatal completion. Because the driver is single-threaded round-robin, a killed task is never
+    // mid-step when its signaller ran, so finalizing at the loop top loses no work; and it runs
+    // before the exit-hook step below, so the twin retires (WIFSIGNALED via `term_sig`) and the
+    // signaller's `waitpid` reaps it in the same settle. Domain-scoped (invariant 12).
+    let killed: Vec<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(ti2, t)| {
+            if matches!(t.state, TaskState::Done(_)) {
+                return None;
+            }
+            let dead = task_host(root, extra_envs, t.env)
+                .lock_unpoisoned()
+                .signal_poll()
+                .is_some_and(|(_, s)| s.killed());
+            dead.then_some(ti2)
+        })
+        .collect();
+    for ti2 in killed {
+        complete(tasks, ti2, Err(Trap::ThreadFault));
+    }
+    // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its env done, cleanly
+    // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
+    // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
+    // parked producer to `-EPIPE`. What its window grew goes back with them (#1909).
+    let mut live = vec![false; extra_envs.len()];
+    let mut seen = vec![false; extra_envs.len()];
+    for t in tasks.iter() {
+        if let Some(k) = t.env {
+            seen[k] = true;
+            live[k] |= !matches!(t.state, TaskState::Done(_));
+        }
+    }
+    let mut finished: Vec<usize> = Vec::new();
+    for k in 0..extra_envs.len() {
+        if seen[k] && !live[k] && released_envs.insert(k) {
+            let mut h = extra_envs[k].host.lock_unpoisoned();
+            h.release_memory();
+            h.release_pipe_ends();
+            // #1217 — a §14 child's end releases every service it held a live offer to: it
+            // can no longer call one, so a `svc.wait` there answers `0` instead of waiting
+            // for it (a token, when no serve loop is parked yet), as on the oracle.
+            let services = if extra_envs[k].nested {
+                h.live_offer_providers()
+            } else {
+                Vec::new()
+            };
+            drop(h);
+            for service in services {
+                service.lock_unpoisoned().set_client_gone();
+                if let Some(env) = domain_of(root, extra_envs, &service) {
+                    wake_serve_loops(tasks, env);
+                }
+            }
+            finished.push(k);
+        }
+    }
+    // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
+    // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
+    // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
+    // already retired. Gated on the twin registry + a not-yet-hooked marker; a twin is always
+    // its own env, so its host is `extra_envs[k]`. Two-phase (gather host + status, then fire).
+    let to_hook: Vec<(usize, i64, usize)> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(ti2, t)| match (&t.state, t.env) {
+            (TaskState::Done(res), Some(k))
+                if forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
+            {
+                Some((ti2, super::reap_status(res), k))
+            }
+            _ => None,
+        })
+        .collect();
+    for (ti2, status, k) in to_hook {
+        // Its pipe ends were released above, with every finished domain's.
+        let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
+        for h in hooks {
+            h(status);
+        }
+        hooked_twins.insert(ti2);
+    }
+    // A finished domain gives back what it held — its window, its powerbox, its frames — now
+    // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
+    // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
+    // build that forks and execs a compiler per module grew by a window per process.
+    for k in finished {
+        let env = &mut extra_envs[k];
+        env.mem = None;
+        env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+        env.fibers = FiberTables::default();
+        for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
+            t.vm.vt.release();
+            t.vm.suspended = None;
+        }
+    }
+    // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
+    // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
+    // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
+    // then deliver) so the caller and the twin task are not borrowed at once.
+    let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, t)| match &t.state {
+            TaskState::BlockedReap { pid, dst } => match &tasks[*pid].state {
+                TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), *pid)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for (ci, dst, status, pid) in reap_wakes {
+        tasks[ci].deliver(dst, Reg::from_i64(status));
+        tasks[ci].state = TaskState::Runnable;
+        forked_twins.remove(&pid);
+    }
+    // #799/#1080 — personality `waitpid` wakes: a task parked in [`TaskState::BlockedReapPersonality`]
+    // re-admits (its rewound `waitpid` re-executes) once the named child completes — `Some(pid)`
+    // that specific twin, `None` any forked child. No status is delivered here: the re-executed op
+    // asks the personality, which serves the exit of the twin its exit hooks (fired above) retired.
+    let reap_p_wakes: Vec<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, t)| match &t.state {
+            TaskState::BlockedReapPersonality { child } => {
+                let done = match child {
+                    // Personality pid → task index is `pid - 1` (the fork convention above).
+                    Some(pid) => matches!(
+                        pid.checked_sub(1)
+                            .and_then(|i| tasks.get(i))
+                            .map(|c| &c.state),
+                        Some(TaskState::Done(_))
+                    ),
+                    None => tasks.iter().enumerate().any(|(j, c)| {
+                        forked_twins.contains(&j) && matches!(c.state, TaskState::Done(_))
+                    }),
+                };
+                done.then_some(ci)
+            }
+            _ => None,
+        })
+        .collect();
+    for ci in reap_p_wakes {
+        tasks[ci].state = TaskState::Runnable;
+    }
+    // #1080 rung 4 — pipe wakes: the cooperative driver has no scheduler-side `pipe_waiters`, so
+    // it POLLS each parked reader/writer's shared FIFO here and re-admits (the rewound read/write
+    // re-executes) once ready. A reader/writer is usually a forked command (`env: Some`); a root
+    // task (`env: None`, a bash builtin over a pipe) checks the driver host.
+    let pipe_wakes: Vec<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, t)| {
+            // #1171 — a STOPPED reader/writer is not re-admitted by an input/room wake: a
+            // stopped process makes no progress, so a suspended foreground `cat` must not steal
+            // the bytes the shell should read (it re-admits at its `SIGCONT`). Domain-scoped.
+            let h = task_host(root, extra_envs, t.env).lock_unpoisoned();
+            if h.signal_poll().is_some_and(|(_, s)| s.stopped()) {
+                return None;
+            }
+            let ready = match &t.state {
+                TaskState::BlockedPipeRead { pipe } => h.pipe_read_ready(*pipe),
+                TaskState::BlockedPipeWrite { pipe } => h.pipe_write_ready(*pipe),
+                // #1146 (deeper) — a blocking stdin park re-admits once its own host's stdin
+                // buffer has bytes (the stdin twin of the pipe poll; domain-scoped like the rest).
+                TaskState::BlockedStdin => h.stdin_ready(),
+                _ => return None,
+            };
+            ready.then_some(ci)
+        })
+        .collect();
+    for ci in pipe_wakes {
+        tasks[ci].state = TaskState::Runnable;
+    }
+    refund_ended_windows(tasks, root, extra_envs, false);
+    // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
+    // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
+    // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
+    // the next step re-executes it and claims the now-woken fiber. Centralized here so every
+    // wake source feeds it uniformly (no per-site wiring). Runs before the pick so a fiber
+    // woken during the previous step is seen this iteration.
+    for t in tasks.iter_mut() {
+        if let TaskState::BlockedOnFiber { fiber } = t.state {
+            let reg = match t.env {
+                None => fibers,
+                Some(k) => &extra_envs[k].fibers.fibers,
+            };
+            let woken = match reg.get(fiber) {
+                Some(
+                    FiberState::WaitParked { woken: Some(_), .. }
+                    | FiberState::CapParked { woken: Some(_), .. },
+                ) => true,
+                Some(FiberState::HostParked { on, .. }) => {
+                    on.ready(&task_host(root, extra_envs, t.env).lock_unpoisoned())
+                }
+                _ => false,
+            };
+            if woken {
+                t.state = TaskState::Runnable;
+            }
+        }
+    }
+}
+
 impl CoopSched {
     /// Build the initial scheduler state: the root task at `entry`, plus any fibers a durable freeze
     /// left to re-seed (taken from `host.frozen_fibers`). This is `drive`'s former preamble verbatim
@@ -14270,234 +14515,15 @@ impl CoopSched {
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
                 return res.map(CoopStep::Done);
             }
-            // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
-            // callee's serve loop completed its dispatch; claiming the completion cell delivers the
-            // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
-            for t in tasks.iter_mut() {
-                let hit = match &t.state {
-                    TaskState::BlockedTicket {
-                        ticket,
-                        callee,
-                        dst,
-                    } => callee
-                        .lock_unpoisoned()
-                        .svc_results
-                        .remove(ticket)
-                        .map(|v| (v, *dst)),
-                    _ => None,
-                };
-                if let Some((v, dst)) = hit {
-                    t.deliver(dst, Reg::from_i64(v));
-                    t.state = TaskState::Runnable;
-                }
-            }
-            // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
-            // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
-            // `term_sig` set) must DIE. The tree-walker benches every vCPU of the domain at its per-op
-            // `term_flag` safepoint and traps it; the cooperative driver has no per-op poll, so finalize
-            // each task of a killed domain HERE — running, stopped (#1198-benched), or parked — as a
-            // fatal completion. Because the driver is single-threaded round-robin, a killed task is never
-            // mid-step when its signaller ran, so finalizing at the loop top loses no work; and it runs
-            // before the exit-hook step below, so the twin retires (WIFSIGNALED via `term_sig`) and the
-            // signaller's `waitpid` reaps it in the same settle. Domain-scoped (invariant 12).
-            let killed: Vec<usize> = tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(ti2, t)| {
-                    if matches!(t.state, TaskState::Done(_)) {
-                        return None;
-                    }
-                    let dead = task_host(root, extra_envs, t.env)
-                        .lock_unpoisoned()
-                        .signal_poll()
-                        .is_some_and(|(_, s)| s.killed());
-                    dead.then_some(ti2)
-                })
-                .collect();
-            for ti2 in killed {
-                complete(tasks, ti2, Err(Trap::ThreadFault));
-            }
-            // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its env done, cleanly
-            // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
-            // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
-            // parked producer to `-EPIPE`. What its window grew goes back with them (#1909).
-            let mut live = vec![false; extra_envs.len()];
-            let mut seen = vec![false; extra_envs.len()];
-            for t in tasks.iter() {
-                if let Some(k) = t.env {
-                    seen[k] = true;
-                    live[k] |= !matches!(t.state, TaskState::Done(_));
-                }
-            }
-            let mut finished: Vec<usize> = Vec::new();
-            for k in 0..extra_envs.len() {
-                if seen[k] && !live[k] && released_envs.insert(k) {
-                    let mut h = extra_envs[k].host.lock_unpoisoned();
-                    h.release_memory();
-                    h.release_pipe_ends();
-                    // #1217 — a §14 child's end releases every service it held a live offer to: it
-                    // can no longer call one, so a `svc.wait` there answers `0` instead of waiting
-                    // for it (a token, when no serve loop is parked yet), as on the oracle.
-                    let services = if extra_envs[k].nested {
-                        h.live_offer_providers()
-                    } else {
-                        Vec::new()
-                    };
-                    drop(h);
-                    for service in services {
-                        service.lock_unpoisoned().set_client_gone();
-                        if let Some(env) = domain_of(root, extra_envs, &service) {
-                            wake_serve_loops(tasks, env);
-                        }
-                    }
-                    finished.push(k);
-                }
-            }
-            // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
-            // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
-            // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
-            // already retired. Gated on the twin registry + a not-yet-hooked marker; a twin is always
-            // its own env, so its host is `extra_envs[k]`. Two-phase (gather host + status, then fire).
-            let to_hook: Vec<(usize, i64, usize)> = tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(ti2, t)| match (&t.state, t.env) {
-                    (TaskState::Done(res), Some(k))
-                        if forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
-                    {
-                        Some((ti2, super::reap_status(res), k))
-                    }
-                    _ => None,
-                })
-                .collect();
-            for (ti2, status, k) in to_hook {
-                // Its pipe ends were released above, with every finished domain's.
-                let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
-                for h in hooks {
-                    h(status);
-                }
-                hooked_twins.insert(ti2);
-            }
-            // A finished domain gives back what it held — its window, its powerbox, its frames — now
-            // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
-            // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
-            // build that forks and execs a compiler per module grew by a window per process.
-            for k in finished {
-                let env = &mut extra_envs[k];
-                env.mem = None;
-                env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
-                env.fibers = FiberTables::default();
-                for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
-                    t.vm.vt.release();
-                    t.vm.suspended = None;
-                }
-            }
-            // FORK.md §9.2 — reap wakes: a caller parked in `wait(pid)` wakes when fork twin `pid`
-            // finishes, with the twin's exit status ([`super::reap_status`]; a trapped twin reaps as a
-            // crash status, never a propagated trap — reap ≠ join). Two-phase (read the twin's outcome,
-            // then deliver) so the caller and the twin task are not borrowed at once.
-            let reap_wakes: Vec<(usize, u32, i64, usize)> = tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(ci, t)| match &t.state {
-                    TaskState::BlockedReap { pid, dst } => match &tasks[*pid].state {
-                        TaskState::Done(res) => Some((ci, *dst, super::reap_status(res), *pid)),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-            for (ci, dst, status, pid) in reap_wakes {
-                tasks[ci].deliver(dst, Reg::from_i64(status));
-                tasks[ci].state = TaskState::Runnable;
-                forked_twins.remove(&pid);
-            }
-            // #799/#1080 — personality `waitpid` wakes: a task parked in [`TaskState::BlockedReapPersonality`]
-            // re-admits (its rewound `waitpid` re-executes) once the named child completes — `Some(pid)`
-            // that specific twin, `None` any forked child. No status is delivered here: the re-executed op
-            // asks the personality, which serves the exit of the twin its exit hooks (fired above) retired.
-            let reap_p_wakes: Vec<usize> = tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(ci, t)| match &t.state {
-                    TaskState::BlockedReapPersonality { child } => {
-                        let done = match child {
-                            // Personality pid → task index is `pid - 1` (the fork convention above).
-                            Some(pid) => matches!(
-                                pid.checked_sub(1)
-                                    .and_then(|i| tasks.get(i))
-                                    .map(|c| &c.state),
-                                Some(TaskState::Done(_))
-                            ),
-                            None => tasks.iter().enumerate().any(|(j, c)| {
-                                forked_twins.contains(&j) && matches!(c.state, TaskState::Done(_))
-                            }),
-                        };
-                        done.then_some(ci)
-                    }
-                    _ => None,
-                })
-                .collect();
-            for ci in reap_p_wakes {
-                tasks[ci].state = TaskState::Runnable;
-            }
-            // #1080 rung 4 — pipe wakes: the cooperative driver has no scheduler-side `pipe_waiters`, so
-            // it POLLS each parked reader/writer's shared FIFO here and re-admits (the rewound read/write
-            // re-executes) once ready. A reader/writer is usually a forked command (`env: Some`); a root
-            // task (`env: None`, a bash builtin over a pipe) checks the driver host.
-            let pipe_wakes: Vec<usize> = tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(ci, t)| {
-                    // #1171 — a STOPPED reader/writer is not re-admitted by an input/room wake: a
-                    // stopped process makes no progress, so a suspended foreground `cat` must not steal
-                    // the bytes the shell should read (it re-admits at its `SIGCONT`). Domain-scoped.
-                    let h = task_host(root, extra_envs, t.env).lock_unpoisoned();
-                    if h.signal_poll().is_some_and(|(_, s)| s.stopped()) {
-                        return None;
-                    }
-                    let ready = match &t.state {
-                        TaskState::BlockedPipeRead { pipe } => h.pipe_read_ready(*pipe),
-                        TaskState::BlockedPipeWrite { pipe } => h.pipe_write_ready(*pipe),
-                        // #1146 (deeper) — a blocking stdin park re-admits once its own host's stdin
-                        // buffer has bytes (the stdin twin of the pipe poll; domain-scoped like the rest).
-                        TaskState::BlockedStdin => h.stdin_ready(),
-                        _ => return None,
-                    };
-                    ready.then_some(ci)
-                })
-                .collect();
-            for ci in pipe_wakes {
-                tasks[ci].state = TaskState::Runnable;
-            }
-            refund_ended_windows(tasks, root, extra_envs, false);
-            // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
-            // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
-            // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
-            // the next step re-executes it and claims the now-woken fiber. Centralized here so every
-            // wake source feeds it uniformly (no per-site wiring). Runs before the pick so a fiber
-            // woken during the previous step is seen this iteration.
-            for t in tasks.iter_mut() {
-                if let TaskState::BlockedOnFiber { fiber } = t.state {
-                    let reg = match t.env {
-                        None => &*fibers,
-                        Some(k) => &extra_envs[k].fibers.fibers,
-                    };
-                    let woken = match reg.get(fiber) {
-                        Some(
-                            FiberState::WaitParked { woken: Some(_), .. }
-                            | FiberState::CapParked { woken: Some(_), .. },
-                        ) => true,
-                        Some(FiberState::HostParked { on, .. }) => {
-                            on.ready(&task_host(root, extra_envs, t.env).lock_unpoisoned())
-                        }
-                        _ => false,
-                    };
-                    if woken {
-                        t.state = TaskState::Runnable;
-                    }
-                }
-            }
+            settle_wakes(
+                tasks,
+                extra_envs,
+                fibers,
+                forked_twins,
+                hooked_twins,
+                released_envs,
+                root,
+            );
             // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
             // SIGCONT) must not be stepped: a stopped process makes no progress. The tree-walker won't
             // run a stopped process; the coop pick must skip it too, or a background job whose read
