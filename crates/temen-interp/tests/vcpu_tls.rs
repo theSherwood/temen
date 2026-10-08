@@ -105,7 +105,7 @@ fn a_spawned_thread_is_seeded_with_its_vcpu_id_on_every_driver() {
     let back = std::sync::Arc::new(temen_interp::Region::new(1 << 16, 4096));
     let mut fuel = u64::MAX;
     let parallel =
-        bytecode::compile_and_run_capture_over_parallel(&m, 0, &[], &mut fuel, &[], back)
+        bytecode::compile_and_run_capture_over_parallel(&m, 0, &[], &mut fuel, &[], Some(back))
             .expect("parallel driver supports the module")
             .0;
     assert_eq!(parallel, want, "parallel driver");

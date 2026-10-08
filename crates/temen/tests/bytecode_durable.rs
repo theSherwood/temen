@@ -289,7 +289,7 @@ block 0 (v0: i64, v1: i64) {
             &[],
             &mut fuel,
             &window_with(STATE_NORMAL),
-            back(),
+            Some(back()),
             &mut h,
         )
         .is_none(),

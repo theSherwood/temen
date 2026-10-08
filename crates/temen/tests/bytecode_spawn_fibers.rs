@@ -128,7 +128,13 @@ fn parallel(parent: &Module, child: &Module) -> Result<Vec<Value>, Trap> {
     let init = vec![0u8; 1 << PARENT_LOG2];
     let back = std::sync::Arc::new(Region::owned_zeroed(1 << PARENT_LOG2, 4096).expect("backing"));
     bytecode::compile_and_run_capture_over_parallel_with_host(
-        parent, 0, &args, &mut fuel, &init, back, &mut host,
+        parent,
+        0,
+        &args,
+        &mut fuel,
+        &init,
+        Some(back),
+        &mut host,
     )
     .expect("the parallel driver lowers it")
     .0

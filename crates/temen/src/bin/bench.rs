@@ -118,19 +118,8 @@ fn concurrency() {
     }
 }
 
-/// `m`'s function 0 on the parallel driver over a fresh zeroed window, as `temen-run`'s
-/// `run_with_caps_parallel` drives it.
+/// `m`'s function 0 on the parallel driver, as `temen-run`'s `run_with_caps_parallel` drives it.
 fn run_parallel(m: &ir::Module, n: i32) -> Vec<Value> {
-    let size = 1usize
-        << m.memory
-            .expect("a threaded kernel declares memory")
-            .size_log2;
-    let layout = std::alloc::Layout::from_size_align(size, 4096).expect("layout");
-    // SAFETY: a non-zero, page-aligned layout, freed below once the run has joined every vCPU.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null(), "window allocation");
-    // SAFETY: `base` owns `size` zeroed bytes and outlives the run.
-    let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, size as u64) });
     let mut host = temen_interp::Host::new();
     let mut fuel = u64::MAX;
     let (r, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
@@ -139,13 +128,10 @@ fn run_parallel(m: &ir::Module, n: i32) -> Vec<Value> {
         &[Value::I32(n)],
         &mut fuel,
         &[],
-        std::sync::Arc::clone(&back),
+        None,
         &mut host,
     )
     .expect("the parallel driver drives the kernel");
-    drop(back);
-    // SAFETY: the same layout; every vCPU joined and dropped its view of the region.
-    unsafe { std::alloc::dealloc(base, layout) };
     r.expect("the kernel runs to completion")
 }
 

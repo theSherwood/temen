@@ -120,7 +120,7 @@ fn run_parallel() -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>) {
         &[Value::I32(h)],
         &mut f,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .unwrap()

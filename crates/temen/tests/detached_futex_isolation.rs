@@ -148,7 +148,7 @@ fn run(driver: Driver, root_src: &str) -> Result<Vec<Value>, Trap> {
                 &args,
                 &mut fuel,
                 &[],
-                Arc::clone(&back),
+                Some(Arc::clone(&back)),
                 &mut host,
             )
             .expect("the parallel driver compiles this module");
