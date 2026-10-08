@@ -288,10 +288,7 @@ fn drive<'s, 'e>(
             }
             bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
                 let unit = jit_unit(win, &mut vcpu, handle, code);
-                let types = unit
-                    .as_ref()
-                    .map_or_else(|_| Arc::from(Vec::new()), |(_, t, _)| Arc::clone(t));
-                vcpu.deliver_jit_invoke(unit.map(|(f, _, _)| f), types);
+                vcpu.deliver_jit_invoke(unit);
             }
             // Named, not `_`: a new event fails to build here as in every driver (#1414).
             bytecode::VcpuEvent::TierUp { .. } => unorchestrated("TierUp"),

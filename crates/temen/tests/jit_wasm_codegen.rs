@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
-use temen_ir::{Func, Module, ValType};
+use temen_ir::{Module, ValType};
 use temen_run::grant_jit;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -212,19 +212,16 @@ fn window() -> Arc<Region> {
     Arc::new(unsafe { Region::shared(base, size as u64) })
 }
 
-/// A resolved unit: its validated funcs and (when the wasm emitter fired) its emitted wasm.
-type ResolvedUnit = (Arc<[Func]>, Option<Arc<[u8]>>);
+/// A resolved unit and (when the wasm emitter fired) its emitted wasm.
+type ResolvedUnit = (temen_interp::ResolvedJitUnit, Option<Arc<[u8]>>);
 
 /// Resolve a `JitInvoke` event's authority against the vCPU's own host (compile minted the handle
-/// there) — mirroring the browser's `par_resolve_unit` — and hand back the unit's funcs + emitted wasm.
+/// there) — mirroring the browser's `par_resolve_unit` — and hand back the unit + its emitted wasm.
 fn resolve(h: &mut Host, handle: i32, code: i32) -> Result<ResolvedUnit, Trap> {
-    let domain = h.resolve_jit_domain(handle)?;
-    let (cd, cu) = h.resolve_jit_code(code)?;
-    if cd != domain {
-        return Err(Trap::CapFault);
-    }
-    let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
-    Ok((funcs, h.jit_unit_wasm_or_emit(cd, cu))) // the one (lazy) emit site, #1346
+    let unit = h.resolve_jit_unit(handle, code)?;
+    let (cd, cu) = unit.2;
+    let wasm = h.jit_unit_wasm_or_emit(cd, cu); // the one (lazy) emit site, #1346
+    Ok((unit, wasm))
 }
 
 /// How a `JitInvoke` is serviced.
@@ -302,13 +299,10 @@ fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                 assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
                 let resolved = resolve(vcpu.host_mut(), handle, code);
                 match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(
-                        resolved.map(|(f, _)| f),
-                        Arc::from(unit_m.types.clone()), // #922: invoked unit's type section
-                    ),
+                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(unit, _)| unit)),
                     Mode::Wasm => match resolved {
                         Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                        Ok((_funcs, wasm)) => {
+                        Ok((_unit, wasm)) => {
                             let wasm =
                                 wasm.expect("emitter must produce wasm for an in-subset unit");
                             emitted_ran = true;
@@ -522,13 +516,10 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                     resolve(&mut g, handle, code)
                 };
                 match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(
-                        resolved.map(|(f, _)| f),
-                        Arc::from(unit_m.types.clone()), // #922: invoked unit's type section
-                    ),
+                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(unit, _)| unit)),
                     Mode::Wasm => match resolved {
                         Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                        Ok((_funcs, wasm)) => {
+                        Ok((_unit, wasm)) => {
                             let wasm =
                                 wasm.expect("emitter must produce wasm for an in-subset unit");
                             emitted_ran = true;

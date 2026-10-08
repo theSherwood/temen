@@ -774,7 +774,7 @@ pub struct SharedSlots {
 impl SharedSlots {
     /// `2^table_log2` (at least `next_power_of_two(n_funcs)`) slots: the first `n_funcs` map to
     /// `(module, i)` (module 0 for the primary's natural table; a `k≥1` for a §14 separate-module
-    /// child), the rest are trapping padding (fillable by [`Domain::install`]).
+    /// child), the rest are trapping padding (fillable by [`jit_install`]).
     fn new(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
         let len = (1usize << table_log2)
             .max(n_funcs.next_power_of_two())
@@ -813,7 +813,7 @@ impl SharedSlots {
         }
     }
 
-    /// Dispatch-path read: one `Acquire` load, paired with [`Domain::install`]'s `Release` store.
+    /// Dispatch-path read: one `Acquire` load, paired with [`jit_install_into`]'s `Release` store.
     #[inline]
     fn slot(&self, i: usize) -> super::TableSlot {
         super::unpack_slot(self.slots[i].load(std::sync::atomic::Ordering::Acquire))
@@ -877,8 +877,9 @@ impl ModuleSource {
         self.mods.lock_unpoisoned().code.get(i).cloned()
     }
 
-    /// Append a module (a §14 `instantiate_module` child's program) and return its index. (§22
-    /// `Jit.install` instead goes through [`Domain::install`], which also fills a dispatch slot.)
+    /// Append a module (a §14 `instantiate_module` child's program, or a §22 `Jit.invoke`d unit) and
+    /// return its index. (§22 `Jit.install` instead goes through [`jit_install_into`], which also
+    /// fills a dispatch slot.)
     fn push(&self, unit: Compiled) -> usize {
         let mut mods = self.mods.lock_unpoisoned();
         mods.code.push(std::sync::Arc::new(unit));
@@ -1114,28 +1115,107 @@ impl Domain {
             table: std::sync::Arc::new(table),
         }
     }
+}
 
-    /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
-    /// `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit is not
-    /// appended). `&self` (interior-mutable) so a shared `&Domain` can install. See [`jit_install_into`].
-    fn install(&self, unit: Compiled, id: (u32, u32)) -> Option<usize> {
-        jit_install_into(&self.source, &self.table, unit, id)
+/// §22 `Jit.install` (op 3), as every bytecode driver services it. `unit` is the host's resolution of
+/// the op's `(jit, code)` pair ([`Host::resolve_jit_unit`]: a forged or cross-table handle is its
+/// `CapFault`). The unit compiles to bytecode, `Malformed` if it uses an op outside the engine's
+/// coverage (the one place a guest-provided unit can outrun it, with no tree-walker fallback
+/// mid-run), and lands in the task's own `table`: a §14 child's installs stay out of its parent's
+/// `call.dyn` (#1296). The guest gets the slot at `active`'s `dst`, or `-ENOSPC` when the table is
+/// full; `mirror`, the driver's emitted dispatch table when this task has one, records the slot.
+/// Returns the slot filled.
+fn jit_install(
+    unit: Result<super::ResolvedJitUnit, Trap>,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    mirror: Option<&mut JitMirror<'_>>,
+    active: &mut Vm,
+    dst: u32,
+) -> Result<Option<usize>, Trap> {
+    let (funcs, types, id) = unit?;
+    let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
+    let slot = jit_install_into(source, table, unit, id);
+    if let (Some(slot), Some(m)) = (slot, mirror) {
+        m.set(slot, Some(id));
     }
+    active.set(dst, Reg::from_i64(slot.map_or(super::ENOSPC, |s| s as i64)));
+    Ok(slot)
+}
 
-    /// `Jit.uninstall`: clear a filled padding slot (`≥ n_real`) back to trapping. See
-    /// [`jit_uninstall_from`].
-    fn uninstall(&self, slot: usize, n_real: usize) -> bool {
-        jit_uninstall_from(&self.source, &self.table, slot, n_real)
+/// §22 `Jit.uninstall` (op 4), as every bytecode driver services it. `authority` is the host's check
+/// of the op's `Jit` handle ([`Host::resolve_jit_domain`]: a forged one is its `CapFault`). A filled
+/// padding slot of the task's own `table` clears back to trapping (`0` at `active`'s `dst`); a
+/// real-function, out-of-range or empty slot is `-EINVAL`. `mirror` forgets a cleared slot. Returns
+/// the slot cleared.
+fn jit_uninstall(
+    authority: Result<(), Trap>,
+    source: &ModuleSource,
+    table: &SharedSlots,
+    slot: i64,
+    mirror: Option<&mut JitMirror<'_>>,
+    active: &mut Vm,
+    dst: u32,
+) -> Result<Option<usize>, Trap> {
+    authority?;
+    let n_real = source.primary().progs.len();
+    let cleared = jit_uninstall_from(source, table, slot as usize, n_real).then_some(slot as usize);
+    if let (Some(slot), Some(m)) = (cleared, mirror) {
+        m.set(slot, None);
+    }
+    active.set(dst, Reg::from_i64(cleared.map_or(super::EINVAL, |_| 0)));
+    Ok(cleared)
+}
+
+/// §22 `Jit.invoke` (op 1), as every bytecode driver prepares it. `unit` is the host's resolution of
+/// the op's `(jit, code)` pair, as for [`jit_install`]. The unit compiles (`Malformed` outside
+/// coverage); its entry (func 0) must take and return as many values as the call's code-stripped
+/// signature (`CapFault` otherwise); `argv` is marshalled through the i64-slot ABI. The unit is pushed
+/// to `source` as a transient module, and its module index and entry args returned: the driver runs
+/// it ([`run_invoke`]) or steps into it (the debugger), then hands its results back with
+/// [`set_slot_results`].
+fn jit_invoke_unit(
+    unit: Result<super::ResolvedJitUnit, Trap>,
+    source: &ModuleSource,
+    argv: &[i64],
+    params: &[ValType],
+    results: &[ValType],
+) -> Result<(usize, Vec<Value>), Trap> {
+    let (funcs, types, _) = unit?;
+    let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
+    let arity_ok = unit
+        .sigs
+        .first()
+        .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+    if !arity_ok {
+        return Err(Trap::CapFault);
+    }
+    let args = params
+        .iter()
+        .zip(argv)
+        .map(|(ty, s)| slot_to_val(*ty, *s))
+        .collect();
+    Ok((source.push(unit), args))
+}
+
+/// A §22 unit's results, as i64 slots, into the caller's `dst…`, retagged by the call's `results`
+/// types: what the guest sees whether the unit ran interpreted or on emitted wasm.
+fn set_slot_results(
+    active: &mut Vm,
+    dst: u32,
+    results: &[ValType],
+    slots: impl IntoIterator<Item = i64>,
+) {
+    for (i, (ty, s)) in results.iter().zip(slots).enumerate() {
+        active.set(dst + i as u32, Reg::from_value(slot_to_val(*ty, s)));
     }
 }
 
-/// `Jit.install` over a raw `(source, table)` pair — the shared body of [`Domain::install`] and the
-/// debug engines' `dbg_jit_install` (`DebugRun`/`ScheduledDebugRun` hold `source`/`table` as separate
-/// fields, not a wrapped [`Domain`]). Append `unit` to the shared source and fill the first padding
-/// slot with `(module, 0)`, returning the slot — or `None` if the table is full (`-ENOSPC`; the unit
-/// is not appended). The whole op serializes under the source lock, and the slot store is `Release`,
-/// so a reader that observes the slot also observes the pushed unit. `id` is the unit's `(table,
-/// unit)` on the installing host, which the table records ([`SharedSlots::jit_unit`]).
+/// `Jit.install`'s table half, under [`jit_install`]: append `unit` to the shared source and fill the
+/// first padding slot with `(module, 0)`, returning the slot — or `None` if the table is full (the
+/// unit is not appended). The whole op serializes under the source lock, and the slot store is
+/// `Release`, so a reader that observes the slot also observes the pushed unit. `id` is the unit's
+/// `(table, unit)` on the installing host, which the table records ([`SharedSlots::jit_unit`]).
 fn jit_install_into(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -1158,11 +1238,10 @@ fn jit_install_into(
     Some(slot)
 }
 
-/// `Jit.uninstall` over a raw `(source, table)` pair — the shared body of [`Domain::uninstall`] and
-/// the debug engines' `dbg_jit_uninstall`. Clear a filled padding slot (`≥ n_real`) back to trapping,
-/// returning success. A real-function slot (`< n_real`), out-of-range, or already-empty slot is
-/// rejected. The unit stays in `source` (append-only); only the slot is reclaimed. Serialized under
-/// the source lock.
+/// `Jit.uninstall`'s table half, under [`jit_uninstall`]: clear a filled padding slot (`≥ n_real`)
+/// back to trapping, returning success. A real-function slot (`< n_real`), out-of-range, or
+/// already-empty slot is rejected. The unit stays in `source` (append-only); only the slot is
+/// reclaimed. Serialized under the source lock.
 fn jit_uninstall_from(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -3456,11 +3535,10 @@ impl SharedProgram {
 /// **deterministic oracle** (differential-tested in `bytecode_parallel.rs`).
 ///
 /// Scope: the **full threads model** — `thread.spawn`/`join`, the `memory.wait`/`notify` futex
-/// (a genuine cross-thread [`Futex`], not a single-thread park queue), and atomics — plus pure compute.
-/// The `Domain` is shared `&`-immutably across threads, so the two events that need a `&mut
-/// Domain`/shared powerbox — §14 `instantiate` and §22 JIT install — **fail closed**
-/// (`Trap::ThreadFault`) here rather than run wrong; they are the remaining follow-ons. Returns `None`
-/// only if the module is outside the engine's subset, same as the cooperative entry.
+/// (a genuine cross-thread [`Futex`], not a single-thread park queue), and atomics — plus pure compute,
+/// §14 confined children and the §22 guest JIT (installs land in the shared, interior-mutable
+/// [`Domain`] table). Returns `None` only if the module is outside the engine's subset, same as the
+/// cooperative entry.
 pub fn compile_and_run_capture_over_parallel(
     m: &Module,
     func: FuncIdx,
@@ -5305,11 +5383,10 @@ impl<'p> Vcpu<'p> {
         }
     }
 
-    /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]): `Err` (forged /
-    /// cross-domain / wrong-type handle) propagates as a trap; `Ok` is compiled and installed into
-    /// the **shared** [`Domain`] (so every vCPU/Worker can `call.dyn` it), the
-    /// slot — or `-ENOSPC` if the table is full / `Malformed` if the unit is outside engine coverage —
-    /// written to the awaiting dst.
+    /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]) and install it into
+    /// this vCPU's domain ([`jit_install`]): the **shared** [`Domain`] for a root, so every
+    /// vCPU/Worker can `call.dyn` it, or a §14 child's own. An `Err` resolution traps, as does a unit
+    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst.
     ///
     /// Returns `Some(slot)` iff the unit was actually installed (the slot the guest received), else
     /// `None` (trap / `-ENOSPC`). A wasm-tier host uses this to mirror the shared `Domain` slot into a
@@ -5323,36 +5400,24 @@ impl<'p> Vcpu<'p> {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
         };
-        let (funcs, types, id) = match unit {
-            Ok(u) => u,
-            Err(t) => {
-                self.trap = Some(t);
-                return None;
-            }
-        };
-        let (res, slot) = match compile_module(&funcs, &types, None) {
-            // Install into THIS vCPU's domain (== the shared one for a root; a §14 confined child —
-            // which can't hold a Jit cap anyway — would only ever fill its own table).
-            Some(unit) => match self
-                .own_dom
-                .as_ref()
-                .unwrap_or(&self.prog.dom)
-                .install(unit, id)
-            {
-                Some(slot) => (slot as i64, Some(slot)),
-                None => (super::ENOSPC, None),
-            },
-            None => {
-                self.trap = Some(Trap::Malformed); // unit op outside coverage
-                return None;
-            }
-        };
-        self.vt.active.set(dst, Reg::from_i64(res));
-        slot
+        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+        jit_install(
+            unit,
+            &dom.source,
+            &dom.table,
+            None,
+            &mut self.vt.active,
+            dst,
+        )
+        .unwrap_or_else(|t| {
+            self.trap = Some(t);
+            None
+        })
     }
 
     /// Deliver the authority check for a `JitUninstall`: `Err` propagates as a trap; `Ok(())` clears the
-    /// shared table `slot` (`0` on success, `EINVAL` for a real-func / out-of-range / already-empty slot).
+    /// table `slot` ([`jit_uninstall`]: `0` on success, `EINVAL` for a real-func / out-of-range /
+    /// already-empty slot).
     ///
     /// Returns `Some(slot)` iff a slot was actually cleared, so a wasm-tier host can null the matching
     /// per-Worker `WebAssembly.Table` slot (the `deliver_jit_install` counterpart) — keeping each
@@ -5361,29 +5426,28 @@ impl<'p> Vcpu<'p> {
         let Some(PendingJit::Uninstall { slot, dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_uninstall with no pending uninstall");
         };
-        if let Err(t) = authorized {
-            self.trap = Some(t);
-            return None;
-        }
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        let n_real = dom.source.primary().progs.len();
-        let cleared = dom.uninstall(slot as usize, n_real);
-        self.vt
-            .active
-            .set(dst, Reg::from_i64(if cleared { 0 } else { super::EINVAL }));
-        cleared.then_some(slot as usize)
+        let cleared = jit_uninstall(
+            authorized,
+            &dom.source,
+            &dom.table,
+            slot,
+            None,
+            &mut self.vt.active,
+            dst,
+        );
+        cleared.unwrap_or_else(|t| {
+            self.trap = Some(t);
+            None
+        })
     }
 
-    /// Deliver the resolved unit funcs for a `JitInvoke`: `Err` propagates as a trap; `Ok(funcs)` is
-    /// compiled, arity-checked against the call signature (`CapFault` on mismatch), then run
-    /// synchronously over this vCPU's window — its results marshalled to the awaiting dst. The invoked
-    /// unit runs over this vCPU's (deny-all) powerbox, so a unit that itself makes a `call.cap` faults;
-    /// a powerbox-backed unit is the orchestrator's responsibility (see [`Vcpu`]).
-    pub fn deliver_jit_invoke(
-        &mut self,
-        funcs: Result<std::sync::Arc<[Func]>, Trap>,
-        types: std::sync::Arc<[temen_ir::TypeEntry]>,
-    ) {
+    /// Deliver the resolved unit for a `JitInvoke` ([`Host::resolve_jit_unit`], as for
+    /// [`deliver_jit_install`](Vcpu::deliver_jit_install)) and run it synchronously over this vCPU's
+    /// window ([`jit_invoke_unit`], [`run_invoke`]), its results marshalled to the awaiting dst. An
+    /// `Err` resolution, a unit outside coverage, an arity mismatch (`CapFault`) or the unit's own trap
+    /// traps the vCPU.
+    pub fn deliver_jit_invoke(&mut self, unit: Result<super::ResolvedJitUnit, Trap>) {
         let Some(PendingJit::Invoke {
             argv,
             params,
@@ -5393,37 +5457,9 @@ impl<'p> Vcpu<'p> {
         else {
             panic!("deliver_jit_invoke with no pending invoke");
         };
-        let funcs = match funcs {
-            Ok(f) => f,
-            Err(t) => {
-                self.trap = Some(t);
-                return;
-            }
-        };
-        let unit = match compile_module(&funcs, &types, None) {
-            Some(u) => u,
-            None => {
-                self.trap = Some(Trap::Malformed);
-                return;
-            }
-        };
-        let arity_ok = unit
-            .sigs
-            .first()
-            .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
-        if !arity_ok {
-            self.trap = Some(Trap::CapFault);
-            return;
-        }
-        let child_args: Vec<Value> = params
-            .iter()
-            .zip(argv.iter())
-            .map(|(ty, s)| slot_to_val(*ty, *s))
-            .collect();
         // The effective domain borrows only `self.own_dom`/`self.prog` (shared) — disjoint from the
         // `&mut self.fuel/mem/host` fields the invoke needs, so the borrows split.
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        let umod = dom.source.push(unit);
         // The invoked unit runs over the run's powerbox — the shared one when attached (its
         // `call.cap`s then serialize per-call like every other vCPU's, matching `drive_parallel`),
         // else this vCPU's owned (default deny-all) host.
@@ -5437,22 +5473,27 @@ impl<'p> Vcpu<'p> {
             Some(s) => FiberRegRef::Shared(s),
             None => FiberRegRef::Owned(&self.fibers),
         };
-        match run_invoke(
-            &dom.source,
-            &dom.table,
-            umod,
-            &child_args,
-            &mut self.fuel,
-            &mut self.mem,
-            &mut cell,
-            Some(&Beneath::task(&self.vt, parked)),
-        ) {
-            Ok(vals) => {
-                for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
-                    let re = slot_to_val(*ty, val_to_slot(*v));
-                    self.vt.active.set(dst + i as u32, Reg::from_value(re));
-                }
-            }
+        let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results).and_then(
+            |(umod, args)| {
+                run_invoke(
+                    &dom.source,
+                    &dom.table,
+                    umod,
+                    &args,
+                    &mut self.fuel,
+                    &mut self.mem,
+                    &mut cell,
+                    Some(&Beneath::task(&self.vt, parked)),
+                )
+            },
+        );
+        match ran {
+            Ok(vals) => set_slot_results(
+                &mut self.vt.active,
+                dst,
+                &results,
+                vals.into_iter().map(val_to_slot),
+            ),
             Err(t) => self.trap = Some(t),
         }
     }
@@ -5473,11 +5514,7 @@ impl<'p> Vcpu<'p> {
             self.trap = Some(Trap::Malformed);
             return;
         }
-        for (i, ty) in results.iter().enumerate() {
-            self.vt
-                .active
-                .set(dst + i as u32, Reg::from_value(slot_to_val(*ty, vals[i])));
-        }
+        set_slot_results(&mut self.vt.active, dst, &results, vals.iter().copied());
     }
 
     /// #846 slice 1 — service **one cross-tier bounce** out of an emitted §22 unit: the codegen host
@@ -6804,14 +6841,16 @@ fn debug_advance_fiber(
         // into it — matching production `run_invoke`). A forged handle / out-of-coverage unit traps the
         // vCPU (`CapFault`/`Malformed`), exactly as the production `drive`. (DESIGN.md §22 debug tier.)
         Ok(Outcome::JitInstall { h, code, dst }) => {
-            match dbg_jit_install(vt, host, source, table, h, code, dst) {
-                Ok(()) => FiberStep::Stepped,
+            let unit = host.resolve_jit_unit(h, code);
+            match jit_install(unit, source, table, None, &mut vt.active, dst) {
+                Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
         }
         Ok(Outcome::JitUninstall { h, slot, dst }) => {
-            match dbg_jit_uninstall(vt, host, source, table, h, slot, dst) {
-                Ok(()) => FiberStep::Stepped,
+            let authority = host.resolve_jit_domain(h).map(drop);
+            match jit_uninstall(authority, source, table, slot, None, &mut vt.active, dst) {
+                Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
         }
@@ -6826,7 +6865,9 @@ fn debug_advance_fiber(
             // Both debug engines step *into* the invoked unit (#1517 slice 3): this arms
             // `active_invoke` and the next advance steps the unit's first op, so a breakpoint fires
             // inside it and the backtrace descends into its module-≥1 frames.
-            match dbg_jit_invoke_step_into(vt, host, source, h, code, &argv, dst, &params, &results)
+            let unit = host.resolve_jit_unit(h, code);
+            match jit_invoke_unit(unit, source, &argv, &params, &results)
+                .and_then(|(umod, args)| dbg_jit_step_into(vt, source, umod, &args, dst, results))
             {
                 Ok(()) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
@@ -8505,126 +8546,28 @@ fn dbg_kill_env(tasks: &mut [DbgTask], envs: &[DbgEnv], k: usize) {
     }
 }
 
-/// §22 `Jit.install` (op 3) under the debug engine: resolve authority + the unit's funcs from the host
-/// (a forged/cross-domain handle is an inert `CapFault` → trap), compile the unit to bytecode, and
-/// install it into the debug run's shared `(source, table)` — the debug-engine counterpart of the
-/// production `drive`'s `JitInstall` arm. Serviced inline in [`debug_advance_fiber`] (it mutates only
-/// `vt.active` + the shared table, spawning no scheduler task). Writes the slot (or `-ENOSPC`, an ordinary value) to `dst`; `Err`
-/// traps the vCPU (`CapFault` forged handle, `Malformed` unit outside bytecode coverage — the one place
-/// a guest-provided unit can outrun coverage, with no tree-walker fallback mid-run).
-fn dbg_jit_install(
+/// §22 `Jit.invoke` (op 1) **as a step-into** (both debug engines): arm [`VTask::active_invoke`] over
+/// the unit [`jit_invoke_unit`] pushed (module `umod`, entered with `args`), so
+/// [`debug_advance_fiber`] steps the invoked unit op-by-op (breakpoints fire inside it) instead of
+/// running it opaquely — the §22 counterpart of coroutine step-into. The unit runs over the caller's
+/// shared window/table; `dst`/`results` marshal its returns back to the caller on completion
+/// ([`step_active_invoke`]).
+fn dbg_jit_step_into(
     vt: &mut VTask,
-    host: &mut Host,
     source: &ModuleSource,
-    table: &SharedSlots,
-    h: i32,
-    code: i32,
+    umod: usize,
+    args: &[Value],
     dst: u32,
+    results: Box<[ValType]>,
 ) -> Result<(), Trap> {
-    let (funcs, types, id) = host.resolve_jit_unit(h, code)?;
-    let res = match compile_module(&funcs, &types, None) {
-        Some(unit) => match jit_install_into(source, table, unit, id) {
-            Some(slot) => slot as i64,
-            None => super::ENOSPC,
-        },
-        None => return Err(Trap::Malformed), // unit op outside coverage
-    };
-    vt.active.set(dst, Reg::from_i64(res));
-    Ok(())
-}
-
-/// §22 `Jit.uninstall` (op 4) under the debug engine: authority-check the domain handle, then clear the
-/// installed table slot (`0`/`-EINVAL` to `dst`). Mirrors `drive`'s `JitUninstall` arm; serviced inline
-/// in [`debug_advance_fiber`].
-fn dbg_jit_uninstall(
-    vt: &mut VTask,
-    host: &mut Host,
-    source: &ModuleSource,
-    table: &SharedSlots,
-    h: i32,
-    slot: i64,
-    dst: u32,
-) -> Result<(), Trap> {
-    host.resolve_jit_domain(h)?; // authority (forged handle → CapFault)
-    let n_real = source.primary().progs.len();
-    let res = if jit_uninstall_from(source, table, slot as usize, n_real) {
-        0
-    } else {
-        super::EINVAL
-    };
-    vt.active.set(dst, Reg::from_i64(res));
-    Ok(())
-}
-
-/// Shared prep for §22 `Jit.invoke` on the debug engines (both step into the unit):
-/// resolve authority + the unit's funcs from the host (forged/cross-domain → `CapFault`), compile the
-/// unit (out-of-coverage → `Malformed`), arity-check its entry (func 0) against the call's
-/// (code-stripped) signature (`CapFault` on mismatch), and marshal the args through the i64-slot ABI.
-/// Returns the compiled unit + its entry args; the caller pushes it to `source` and runs/steps it.
-fn dbg_jit_invoke_unit(
-    host: &mut Host,
-    h: i32,
-    code: i32,
-    argv: &[i64],
-    params: &[ValType],
-    results: &[ValType],
-) -> Result<(Compiled, Vec<Value>), Trap> {
-    let (funcs, types) = host.resolve_jit_domain(h).and_then(|domain| {
-        let (cd, cu) = host.resolve_jit_code(code)?;
-        if cd != domain {
-            return Err(Trap::CapFault);
-        }
-        host.jit_unit_funcs(cd, cu)
-            .ok_or(Trap::CapFault)
-            .and_then(|f| {
-                host.jit_unit_types(cd, cu)
-                    .ok_or(Trap::CapFault)
-                    .map(|t| (f, t))
-            })
-    })?;
-    let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
-    let arity_ok = unit
-        .sigs
-        .first()
-        .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
-    if !arity_ok {
-        return Err(Trap::CapFault);
-    }
-    let child_args: Vec<Value> = params
-        .iter()
-        .zip(argv.iter())
-        .map(|(ty, s)| slot_to_val(*ty, *s))
-        .collect();
-    Ok((unit, child_args))
-}
-
-/// §22 `Jit.invoke` (op 1) **as a step-into** (both debug engines): compile + push the unit, then
-/// arm [`VTask::active_invoke`] so [`debug_advance_fiber`] steps the invoked unit op-by-op (breakpoints
-/// fire inside it) instead of running it opaquely — the §22 counterpart of coroutine step-into. The
-/// unit runs over the caller's shared window/table; `dst`/`results` marshal its returns back to the
-/// caller on completion ([`step_active_invoke`]). `Err` traps the caller (forged handle / bad unit).
-#[allow(clippy::too_many_arguments)]
-fn dbg_jit_invoke_step_into(
-    vt: &mut VTask,
-    host: &mut Host,
-    source: &ModuleSource,
-    h: i32,
-    code: i32,
-    argv: &[i64],
-    dst: u32,
-    params: &[ValType],
-    results: &[ValType],
-) -> Result<(), Trap> {
-    let (unit, child_args) = dbg_jit_invoke_unit(host, h, code, argv, params, results)?;
-    let umod = source.push(unit);
     let cm = source.get(umod).ok_or(Trap::Malformed)?;
-    let mut vm = Vm::new(&cm, 0, &child_args)?;
+    let mut vm = Vm::new(&cm, 0, args)?;
     vm.module = umod;
     let parent_depth = vt.active.stack.len() + 1;
     vt.active_invoke = Some(Box::new(InvokeStep {
         vm,
         dst,
-        results: results.into(),
+        results,
         parent_depth,
     }));
     Ok(())
@@ -8674,10 +8617,8 @@ fn step_active_invoke(
         InvStep::Ran => FiberStep::Stepped,
         InvStep::Done(vals) => {
             let iv = vt.active_invoke.take().expect("active invoke present");
-            for (i, (v, ty)) in vals.iter().zip(iv.results.iter()).enumerate() {
-                let re = slot_to_val(*ty, val_to_slot(*v));
-                vt.active.set(iv.dst + i as u32, Reg::from_value(re));
-            }
+            let slots = vals.into_iter().map(val_to_slot);
+            set_slot_results(&mut vt.active, iv.dst, &iv.results, slots);
             FiberStep::Stepped
         }
         InvStep::Trap(t) => {
@@ -12036,6 +11977,16 @@ pub struct JitMirror<'a> {
     pub gen: &'a mut u32,
 }
 
+impl JitMirror<'_> {
+    /// `slot` now holds `unit` (`None`: it traps again); the driver re-syncs at the next generation.
+    fn set(&mut self, slot: usize, unit: Option<(u32, u32)>) {
+        if let Some(e) = self.units.get_mut(slot) {
+            *e = unit;
+        }
+        *self.gen = self.gen.wrapping_add(1);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // the nested-drive seam: window + registry halves, all borrowed
 fn drive_nested(
     source: &ModuleSource,
@@ -12272,40 +12223,14 @@ fn drive_nested(
             // `None`) it stays the §22 contract's inert `CapFault`: a unit never re-installs. (A
             // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
-                let _ = code; // the mirror keys on the unit identity, not the (revocable) handle
-                let (funcs, types, unit_id) = host.with(|p| p.resolve_jit_unit(h, code))?;
-                let res = match compile_module(&funcs, &types, None) {
-                    Some(unit) => match jit_install_into(source, table, unit, unit_id) {
-                        Some(slot) => {
-                            if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
-                                if let Some(e) = m.units.get_mut(slot) {
-                                    *e = Some(unit_id);
-                                }
-                                *m.gen = m.gen.wrapping_add(1); // slot mirror changed → re-sync
-                            }
-                            slot as i64
-                        }
-                        None => super::ENOSPC,
-                    },
-                    None => return Err(Trap::Malformed), // unit op outside coverage
-                };
-                active.set(dst, Reg::from_i64(res));
+                let unit = host.with(|p| p.resolve_jit_unit(h, code));
+                let mirror = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut());
+                jit_install(unit, source, table, mirror, &mut active, dst)?;
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
-                host.with(|p| p.resolve_jit_domain(h))?; // authority (forged handle → CapFault)
-                let n_real = source.primary().progs.len();
-                let res = if jit_uninstall_from(source, table, slot as usize, n_real) {
-                    if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
-                        if let Some(e) = m.units.get_mut(slot as usize) {
-                            *e = None; // a freed slot must trap in the driver's table too
-                        }
-                        *m.gen = m.gen.wrapping_add(1);
-                    }
-                    0
-                } else {
-                    super::EINVAL
-                };
-                active.set(dst, Reg::from_i64(res));
+                let authority = host.with(|p| p.resolve_jit_domain(h)).map(drop);
+                let mirror = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut());
+                jit_uninstall(authority, source, table, slot, mirror, &mut active, dst)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
             // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
@@ -12322,37 +12247,13 @@ fn drive_nested(
                 params,
                 results,
             } => {
-                let (funcs, types, _) = host.with(|p| p.resolve_jit_unit(h, code))?;
-                let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
-                let arity_ok = unit
-                    .sigs
-                    .first()
-                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
-                if !arity_ok {
-                    return Err(Trap::CapFault);
-                }
-                let child_args: Vec<Value> = params
-                    .iter()
-                    .zip(argv.iter())
-                    .map(|(ty, s)| slot_to_val(*ty, *s))
-                    .collect();
-                let umod = source.push(unit);
+                let unit = host.with(|p| p.resolve_jit_unit(h, code));
+                let (umod, args) = jit_invoke_unit(unit, source, &argv, &params, &results)?;
                 // #1660: this drive is paused beneath the unit — hand it on, if our own view is whole.
                 let view = beneath.map(|b| b.with_drive(&active, &chain, fibers.view()));
-                let vals = run_invoke(
-                    source,
-                    table,
-                    umod,
-                    &child_args,
-                    fuel,
-                    mem,
-                    host,
-                    view.as_ref(),
-                )?;
-                for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
-                    let re = slot_to_val(*ty, val_to_slot(*v));
-                    active.set(dst + i as u32, Reg::from_value(re));
-                }
+                let vals = run_invoke(source, table, umod, &args, fuel, mem, host, view.as_ref())?;
+                let slots = vals.into_iter().map(val_to_slot);
+                set_slot_results(&mut active, dst, &results, slots);
             }
             // §GC `gc.roots` inside a nested drive (#1660): scan what this drive holds — its active
             // Vm, its resumer chain, the registry it runs over — and everything paused beneath it.
@@ -16266,87 +16167,51 @@ impl CoopSched {
                     }
                     tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
                 }
+                // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
+                // and its own dispatch table: a §14 child's is `extra_envs[k].table`, so its installs
+                // stay out of the parent's `call.dyn` (#1296). #926 slice 2f / #1233: the B2 mirror
+                // (`slot → (domain, unit)`, keyed on the unit so it survives the guest's `release`)
+                // lets the browser driver rebuild its `WebAssembly.Table` when it moves; it is the
+                // ROOT's emitted dispatch table, so only a root task's ops move it. The op itself
+                // always runs interpreted (a unit with a `call.cap` never emits): here between host
+                // events, or inside a tier-up region's bounce via `drive_nested`'s twin of these
+                // arms, after which the driver re-syncs before the emitted frame resumes.
                 Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                    // Resolve authority + the unit's funcs from the TASK's host (a forged/cross-table
-                    // handle is an inert CapFault → trap), compile the unit to bytecode, and install it
-                    // into the task's own dispatch table (a §14 child's `extra_envs[k].table` — its
-                    // installs are invisible to the parent's `call.dyn`, #1296). Compiling the unit can
-                    // fail only if it uses an op the bytecode engine doesn't lower yet — the one place a
-                    // guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
-                    let resolved = task_host(root, extra_envs, tasks[ti].env)
+                    let env = tasks[ti].env;
+                    let unit = task_host(root, extra_envs, env)
                         .lock_unpoisoned()
                         .resolve_jit_unit(h, code);
-                    let (funcs, types, unit_id) = match resolved {
-                        Ok(f) => f,
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
+                    let table = env.map_or(&*dom.table, |k| &extra_envs[k].table);
+                    let mut mirror = JitMirror {
+                        units: slot_units,
+                        gen: table_gen,
                     };
-                    let res = match compile_module(&funcs, &types, None) {
-                        Some(unit) => match match tasks[ti].env {
-                            None => dom.install(unit, unit_id),
-                            Some(k) => {
-                                jit_install_into(&dom.source, &extra_envs[k].table, unit, unit_id)
-                            }
-                        } {
-                            Some(slot) => {
-                                // #926 slice 2f: mirror `slot → (domain, unit)` so the browser B2
-                                // driver can rebuild its `WebAssembly.Table` when the mirror moves.
-                                // The install itself always runs interpreted (a unit with a `call.cap`
-                                // never emits) — here between host events, or (#1233) inside a tier-up
-                                // region's bounce via `drive_nested`'s twin of this arm, after which
-                                // the driver re-syncs before the emitted frame resumes. Inert on the
-                                // native drive (no shared table).
-                                // The mirror is the ROOT's emitted dispatch table: a §14 child's
-                                // install stays in the child's own table (#1296) — mirroring it here
-                                // would publish the child's unit into the parent's `call.dyn` slots.
-                                if tasks[ti].env.is_none() {
-                                    if let Some(e) = slot_units.get_mut(slot) {
-                                        *e = Some(unit_id); // #1233: survives the guest's `release`
-                                    }
-                                    *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
-                                }
-                                slot as i64
-                            }
-                            None => super::ENOSPC,
-                        },
-                        None => {
-                            complete(tasks, ti, Err(Trap::Malformed)); // unit op outside coverage
-                            continue;
-                        }
-                    };
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(res));
-                }
-                Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                    let authority = task_host(root, extra_envs, tasks[ti].env)
-                        .lock_unpoisoned()
-                        .resolve_jit_domain(h);
-                    if let Err(t) = authority {
-                        complete(tasks, ti, Err(t)); // authority check
+                    let mirror = env.is_none().then_some(&mut mirror);
+                    let active = &mut tasks[ti].vt.active;
+                    if let Err(t) = jit_install(unit, &dom.source, table, mirror, active, dst) {
+                        complete(tasks, ti, Err(t));
                         continue;
                     }
-                    let n_real = dom.source.primary().progs.len();
-                    let cleared = match tasks[ti].env {
-                        None => dom.uninstall(slot as usize, n_real),
-                        Some(k) => jit_uninstall_from(
-                            &dom.source,
-                            &extra_envs[k].table,
-                            slot as usize,
-                            n_real,
-                        ),
+                }
+                Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                    let env = tasks[ti].env;
+                    let authority = task_host(root, extra_envs, env)
+                        .lock_unpoisoned()
+                        .resolve_jit_domain(h)
+                        .map(drop);
+                    let table = env.map_or(&*dom.table, |k| &extra_envs[k].table);
+                    let mut mirror = JitMirror {
+                        units: slot_units,
+                        gen: table_gen,
                     };
-                    let res = if cleared {
-                        // Keep the B2 mirror exact — a freed slot must trap in the JS table too.
-                        if let Some(e) = slot_units.get_mut(slot as usize) {
-                            *e = None;
-                        }
-                        *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
-                        0
-                    } else {
-                        super::EINVAL
-                    };
-                    tasks[ti].vt.active.set(dst, Reg::from_i64(res));
+                    let mirror = env.is_none().then_some(&mut mirror);
+                    let active = &mut tasks[ti].vt.active;
+                    let cleared =
+                        jit_uninstall(authority, &dom.source, table, slot, mirror, active, dst);
+                    if let Err(t) = cleared {
+                        complete(tasks, ti, Err(t));
+                        continue;
+                    }
                 }
                 Ok(VcpuStop::JitInvoke {
                     h,
@@ -16403,82 +16268,43 @@ impl CoopSched {
                             mapped,
                         });
                     }
-                    // Resolve unit funcs (authority + cross-table) against the task's host, as for
-                    // install, and compile.
-                    let resolved = task_host(root, extra_envs, tasks[ti].env)
+                    // Interpreted ([`jit_invoke_unit`], [`run_invoke`]) over the TASK's window, table
+                    // and host: the root's, or a §14 child's own (`extra_envs[k]`) — a child's unit
+                    // never sees the parent's window.
+                    let env = tasks[ti].env;
+                    let unit = task_host(root, extra_envs, env)
                         .lock_unpoisoned()
                         .resolve_jit_unit(h, code);
-                    let (funcs, types) = match resolved {
-                        Ok((f, t, _)) => (f, t),
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    let unit = match compile_module(&funcs, &types, None) {
-                        Some(u) => u,
-                        None => {
-                            complete(tasks, ti, Err(Trap::Malformed));
-                            continue;
-                        }
-                    };
-                    // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
-                    let arity_ok = unit.sigs.first().is_some_and(|(ep, er)| {
-                        ep.len() == params.len() && er.len() == results.len()
-                    });
-                    if !arity_ok {
-                        complete(tasks, ti, Err(Trap::CapFault));
-                        continue;
-                    }
-                    // Marshal args via the slot ABI, push the unit as a transient module, run it.
-                    let child_args: Vec<Value> = params
-                        .iter()
-                        .zip(argv.iter())
-                        .map(|(ty, s)| slot_to_val(*ty, *s))
-                        .collect();
-                    let umod = dom.source.push(unit);
-                    // The unit runs over the TASK's window, table and host: the root's, or a §14
-                    // child's own (`extra_envs[k]`) — a child's unit never sees the parent's window.
-                    let ran = match tasks[ti].env {
-                        None => run_invoke(
-                            &dom.source,
-                            &dom.table,
-                            umod,
-                            &child_args,
-                            fuel,
-                            mem,
-                            &mut HostCell::Shared(root),
-                            Some(&Beneath::task(&tasks[ti].vt, FiberRegRef::Owned(fibers))),
-                        ),
+                    let (table, mem, host, parked) = match env {
+                        None => (&*dom.table, &mut *mem, &**root, FiberRegRef::Owned(fibers)),
                         Some(k) => {
                             let ChildEnv {
-                                mem: cmem,
-                                host: chost,
-                                table: ctable,
-                                fibers: cfibers,
+                                mem,
+                                host,
+                                table,
+                                fibers,
                                 ..
                             } = &mut extra_envs[k];
-                            run_invoke(
-                                &dom.source,
-                                ctable,
-                                umod,
-                                &child_args,
-                                fuel,
-                                cmem,
-                                &mut HostCell::Shared(chost),
-                                Some(&Beneath::task(
-                                    &tasks[ti].vt,
-                                    FiberRegRef::Owned(&cfibers.fibers),
-                                )),
-                            )
+                            (&*table, mem, &**host, FiberRegRef::Owned(&fibers.fibers))
                         }
                     };
+                    let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results)
+                        .and_then(|(umod, args)| {
+                            run_invoke(
+                                &dom.source,
+                                table,
+                                umod,
+                                &args,
+                                fuel,
+                                mem,
+                                &mut HostCell::Shared(host),
+                                Some(&Beneath::task(&tasks[ti].vt, parked)),
+                            )
+                        });
                     match ran {
                         Ok(vals) => {
-                            for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
-                                let re = slot_to_val(*ty, val_to_slot(*v));
-                                tasks[ti].vt.active.set(dst + i as u32, Reg::from_value(re));
-                            }
+                            let slots = vals.into_iter().map(val_to_slot);
+                            set_slot_results(&mut tasks[ti].vt.active, dst, &results, slots);
                         }
                         Err(t) => {
                             complete(tasks, ti, Err(t));
@@ -18749,38 +18575,21 @@ fn run_vcpu_parallel_body<'scope, 'env>(
             // on the other vCPUs stay lock-free. The result (slot / `-ENOSPC` / value) is
             // schedule-independent for the disciplined guest the oracle is differentially run against.
             Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                // Resolve authority + the unit's funcs under the host lock (a forged/cross-domain
-                // handle is an inert CapFault → trap), then compile + install. Compiling can fail only
-                // if the unit uses an op the engine doesn't lower yet (the one place a guest unit can
-                // outrun coverage — no tree-walker fallback mid-run).
-                let resolved = host.lock_unpoisoned().resolve_jit_unit(h, code);
-                let (funcs, types, id) = match resolved {
-                    Ok(u) => u,
-                    Err(t) => return (Err(t), mem),
-                };
-                let res = match compile_module(&funcs, &types, None) {
-                    Some(unit) => match dom.install(unit, id) {
-                        Some(slot) => slot as i64,
-                        None => super::ENOSPC,
-                    },
-                    None => return (Err(Trap::Malformed), mem), // unit op outside coverage
-                };
-                vt.active.set(dst, Reg::from_i64(res));
+                let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
+                if let Err(t) =
+                    jit_install(unit, &dom.source, &dom.table, None, &mut vt.active, dst)
+                {
+                    return (Err(t), mem);
+                }
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                let authority = host.lock_unpoisoned().resolve_jit_domain(h).map(drop);
+                let active = &mut vt.active;
+                if let Err(t) =
+                    jit_uninstall(authority, &dom.source, &dom.table, slot, None, active, dst)
                 {
-                    let g = host.lock_unpoisoned();
-                    if let Err(t) = g.resolve_jit_domain(h) {
-                        return (Err(t), mem); // authority check
-                    }
+                    return (Err(t), mem);
                 }
-                let n_real = dom.source.primary().progs.len();
-                let res = if dom.uninstall(slot as usize, n_real) {
-                    0
-                } else {
-                    super::EINVAL
-                };
-                vt.active.set(dst, Reg::from_i64(res));
             }
             Ok(VcpuStop::JitInvoke {
                 h,
@@ -18790,63 +18599,28 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 params,
                 results,
             }) => {
-                // Resolve unit funcs (authority + cross-domain) and compile, as for install.
-                let (funcs, types) = {
-                    let g = host.lock_unpoisoned();
-                    match g.resolve_jit_domain(h).and_then(|domain| {
-                        let (cd, cu) = g.resolve_jit_code(code)?;
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        g.jit_unit_funcs(cd, cu)
-                            .ok_or(Trap::CapFault)
-                            .and_then(|f| {
-                                g.jit_unit_types(cd, cu)
-                                    .ok_or(Trap::CapFault)
-                                    .map(|t| (f, t))
-                            })
-                    }) {
-                        Ok(f) => f,
-                        Err(t) => return (Err(t), mem),
-                    }
-                };
-                let unit = match compile_module(&funcs, &types, None) {
-                    Some(u) => u,
-                    None => return (Err(Trap::Malformed), mem),
-                };
-                // Arity-check the unit entry (func 0) against the call's (code-stripped) signature.
-                let arity_ok = unit
-                    .sigs
-                    .first()
-                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
-                if !arity_ok {
-                    return (Err(Trap::CapFault), mem);
-                }
-                // Marshal args via the slot ABI, push the unit as a transient module, run it over the
-                // **shared** powerbox (its `call.cap`s serialize per-call, like every other vCPU's).
-                let child_args: Vec<Value> = params
-                    .iter()
-                    .zip(argv.iter())
-                    .map(|(ty, s)| slot_to_val(*ty, *s))
-                    .collect();
-                let umod = dom.source.push(unit);
-                // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660) — the shared
-                // registry, locked only while such a scan reads it.
-                match run_invoke(
-                    &dom.source,
-                    &dom.table,
-                    umod,
-                    &child_args,
-                    &mut fuel,
-                    &mut mem,
-                    &mut HostCell::Shared(&host),
-                    Some(&Beneath::task(&vt, FiberRegRef::Shared(&domain.fibers))),
-                ) {
+                // The unit runs over the **shared** powerbox (its `call.cap`s serialize per-call, like
+                // every other vCPU's), and its `gc.roots` sees the run's parked fibers beneath it
+                // (#1660) — the shared registry, locked only while such a scan reads it.
+                let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
+                let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results).and_then(
+                    |(umod, args)| {
+                        run_invoke(
+                            &dom.source,
+                            &dom.table,
+                            umod,
+                            &args,
+                            &mut fuel,
+                            &mut mem,
+                            &mut HostCell::Shared(&host),
+                            Some(&Beneath::task(&vt, FiberRegRef::Shared(&domain.fibers))),
+                        )
+                    },
+                );
+                match ran {
                     Ok(vals) => {
-                        for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
-                            let re = slot_to_val(*ty, val_to_slot(*v));
-                            vt.active.set(dst + i as u32, Reg::from_value(re));
-                        }
+                        let slots = vals.into_iter().map(val_to_slot);
+                        set_slot_results(&mut vt.active, dst, &results, slots);
                     }
                     Err(t) => return (Err(t), mem),
                 }

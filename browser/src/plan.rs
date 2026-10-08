@@ -416,10 +416,9 @@ pub(crate) fn drive_op13<'p>(
                 let _ = vcpu.deliver_jit_uninstall(authorized);
             }
             bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
-                match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code) {
-                    Ok((funcs, types, _wasm, _id)) => vcpu.deliver_jit_invoke(Ok(funcs), types),
-                    Err(t) => vcpu.deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
-                }
+                let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
+                    .map(|(f, t, _wasm, id)| (f, t, id));
+                vcpu.deliver_jit_invoke(unit);
             }
             // The children this loop drives are single-threaded and non-interactive: no threads, no
             // tier-up (this is the interpreter path), no cap or stdin park. The driver's decline — a

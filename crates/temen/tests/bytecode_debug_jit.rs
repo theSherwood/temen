@@ -246,8 +246,8 @@ fn debug_invoke_step_into_breakpoint() {
 }
 
 /// **Fail-closed under the debugger.** A `Jit.install` / `Jit.invoke` of a **forged** code handle
-/// (never minted by `compile`) resolves no unit — the authority arm in `dbg_jit_install`/`dbg_jit_invoke`
-/// returns a trap, exactly as the production `drive`. The debug engines must trap identically to the
+/// (never minted by `compile`) resolves no unit — `Host::resolve_jit_unit`, which every driver's
+/// `Jit` service starts from, returns a trap, exactly as on the production `drive`. The debug engines must trap identically to the
 /// tree-walker oracle (not decline, not diverge). Pins the error path the happy-path tests don't reach.
 #[test]
 fn debug_forged_handle_traps_identically() {
