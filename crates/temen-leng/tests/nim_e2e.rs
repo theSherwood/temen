@@ -2402,28 +2402,33 @@ fn posix_sh() -> temen_ir::Module {
         .map(|f| std::fs::read_to_string(format!("{demo}{f}")).expect("read shell source"))
         .collect::<Vec<_>>()
         .join("\n");
-    let dir = std::env::temp_dir().join(format!("posix_sh_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mk sh dir");
-    let (c, ir) = (dir.join("sh.c"), dir.join("sh.ir"));
-    std::fs::write(&c, src).expect("write sh.c");
+    chibicc_child("sh", &src, &["-DTEMEN_SHELL_POSIX"])
+}
+
+/// `src` compiled by the in-tree chibicc as a `--child-entry` program (func 0 is a spawnable
+/// `(i64) -> (i64)` that runs `main`), verified.
+fn chibicc_child(name: &str, src: &str, flags: &[&str]) -> temen_ir::Module {
+    let dir = std::env::temp_dir().join(format!("chibicc_{name}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk chibicc dir");
+    let (c, ir) = (
+        dir.join(format!("{name}.c")),
+        dir.join(format!("{name}.ir")),
+    );
+    std::fs::write(&c, src).expect("write the C source");
     let st = Command::new(chibicc_mod::chibicc())
-        .args([
-            "-cc1",
-            "--emit-ir",
-            "--child-entry",
-            "-DTEMEN_SHELL_POSIX",
-            "-cc1-input",
-        ])
+        .args(["-cc1", "--emit-ir", "--child-entry"])
+        .args(flags)
+        .arg("-cc1-input")
         .arg(&c)
         .arg("-cc1-output")
         .arg(&ir)
         .arg(&c)
         .status()
         .expect("run chibicc");
-    assert!(st.success(), "chibicc failed on the POSIX shell");
-    let m = temen_text::parse_module(&std::fs::read_to_string(&ir).expect("read sh.ir"))
-        .expect("parse sh.ir");
-    temen_verify::verify_module(&m).expect("verify sh.ir");
+    assert!(st.success(), "chibicc failed on {name}.c");
+    let m = temen_text::parse_module(&std::fs::read_to_string(&ir).expect("read the IR"))
+        .expect("parse the IR");
+    temen_verify::verify_module(&m).expect("verify the IR");
     m
 }
 
@@ -3290,4 +3295,254 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             elide(&String::from_utf8_lossy(&want))
         ),
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// #2202: a Nim domain and a C domain share a ring in a region, as a Nim guest beside other domains
+// would. Each runs in a window of its own, and the region is the only memory they share.
+// -------------------------------------------------------------------------------------------------
+
+/// The messages the ring carries, which both sources spell out as `Count`/`COUNT`.
+const RING_COUNT: i64 = 10_000;
+
+/// The Nim producer. It publishes `Count` messages into a 16-slot ring in the region, which the
+/// parent maps at `RingAt` in its window, through `system`'s atomics (the compute shim's leaves).
+/// A message is three words that must agree, and both sides count `inflight` with atomic adds, so a
+/// torn message, a lost one and a lost update each show. When the ring is full it parks on the
+/// consumer's counter, through a futex pair the test serves ([`RING_GLUE`]). nimony also links the
+/// program natively, where that pair has no definition; the native binary never runs, so its linker
+/// is told to leave them unresolved.
+const RING_PRODUCER: &str = r#"
+const
+  RingAt = 0x800000
+  Slots = 16
+  Count = 10000
+
+type
+  Msg = object
+    seq, inv, sq: int
+  Ring = object
+    head, tail, inflight: int
+    msgs: array[Slots, Msg]
+
+{.passL: "-Wl,--unresolved-symbols=ignore-all".}
+proc ringWait(p: ptr int; seen: int) {.importc.}
+proc ringWake(p: ptr int) {.importc.}
+
+proc produce(x: int): int {.exportc.} =
+  let r = cast[ptr Ring](RingAt)
+  for i in 0 ..< Count:
+    var t = atomicLoadN(addr r.tail, ATOMIC_ACQUIRE)
+    while i - t >= Slots:
+      ringWait(addr r.tail, t)
+      t = atomicLoadN(addr r.tail, ATOMIC_ACQUIRE)
+    let m = addr r.msgs[i mod Slots]
+    m.seq = i
+    m.inv = not i
+    m.sq = i * i
+    discard atomicAddFetch(addr r.inflight, 1, ATOMIC_SEQ_CST)
+    atomicStoreN(addr r.head, i + 1, ATOMIC_RELEASE)
+    ringWake(addr r.head)
+  result = Count
+"#;
+
+/// The producer's futex pair, and its child entry: `produce` on a stack at `data.top`, as the
+/// powerbox `_start` gives `main` one. Each side re-checks before it waits, so no wake is lost; a
+/// wait that still runs 30 s traps (the consumer returns -1), so a broken wake fails rather than
+/// hangs.
+const RING_GLUE: &str = r#"import 0 "produce" (i64, i64) -> (i64)
+func (i64, i64) -> () {
+block 0 (p: i64, seen: i64) {
+  e = i32.wrap_i64 seen
+  t = i64.const 30000000000
+  st = i32.atomic.wait p e t
+  two = i32.const 2
+  late = i32.eq st two
+  br_if late 1() 2()
+  }
+block 1 () {
+  unreachable
+  }
+block 2 () {
+  return
+  }
+}
+func (i64) -> () {
+block 0 (p: i64) {
+  one = i32.const 1
+  n = atomic.notify p one
+  return
+  }
+}
+func (i64) -> (i64) {
+block 0 (x: i64) {
+  sp = data.top
+  r = call.import 0 (sp, x)
+  return r
+  }
+}
+"#;
+
+/// The C consumer, a chibicc `--child-entry` program. It takes the messages in order from the ring,
+/// which the parent maps at `RING_AT` in its window, and returns how many were wrong, plus a
+/// million if `inflight` did not come back to 0; -1 if a wait ran 30 s.
+const RING_CONSUMER: &str = r#"
+#define RING_AT 0x10000L
+#define SLOTS 16
+#define COUNT 10000
+struct msg { long seq, inv, sq; };
+struct ring { long head, tail, inflight; struct msg msgs[SLOTS]; };
+int __vm_wait32(void *p, int expected, long timeout_ns);
+int __vm_notify(void *p, int count);
+long __vm_atomic_load(void *p);
+void __vm_atomic_store(void *p, long v);
+long __vm_atomic_add(void *p, long v);
+
+int main(void) {
+  struct ring *r = (struct ring *)RING_AT;
+  long bad = 0;
+  for (long i = 0; i < COUNT; i++) {
+    long h = __vm_atomic_load(&r->head);
+    while (h <= i) {
+      if (__vm_wait32(&r->head, (int)h, 30000000000L) == 2) return -1;
+      h = __vm_atomic_load(&r->head);
+    }
+    struct msg *m = &r->msgs[i % SLOTS];
+    if (m->seq != i || m->inv != ~i || m->sq != i * i) bad++;
+    __vm_atomic_add(&r->inflight, -1);
+    __vm_atomic_store(&r->tail, i + 1);
+    __vm_notify(&r->tail, 1);
+  }
+  if (__vm_atomic_load(&r->inflight) != 0) bad += 1000000;
+  return bad;
+}
+"#;
+
+/// The parent, over `(Instantiator, AddressSpace, Nim module, C module, Budget)`: it mints a 64 KiB
+/// region, spawns the Nim child (entry `nim_entry`, its 16 MiB window, the region at 8 MiB) and the
+/// C child (entry 0, its 128 KiB window, the region at 64 KiB, above its data and stack), each
+/// detached with the region pre-mapped, and returns both children's results. A pre-map must lie
+/// inside the window the child's module declares.
+fn ring_parent(nim_entry: u32) -> temen_ir::Module {
+    let text = format!(
+        "memory 17
+func (i32, i32, i32, i32, i32) -> (i64, i64) {{
+block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {{
+  len = i64.const 65536
+  region = call.cap 5 5 (i64) -> (i64) aspace (len)
+  b = i64.extend_i32_u budget
+  z = i64.const 0
+  nm = i64.extend_i32_u nim
+  ne = i64.const {nim_entry}
+  nl = i64.const 24
+  no = i64.const 8388608
+  pn = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, nm, z, z, ne, nl, z, z, z, region, no)
+  cm = i64.extend_i32_u c
+  cl = i64.const 17
+  co = i64.const 65536
+  pc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, cm, z, z, z, cl, z, z, z, region, co)
+  jn = call.cap 6 1 (i32) -> (i64) inst (pn)
+  jc = call.cap 6 1 (i32) -> (i64) inst (pc)
+  return jn, jc
+  }}
+}}
+"
+    );
+    let m = temen_text::parse_module(&text).expect("parse the parent");
+    temen_verify::verify_module(&m).expect("verify the parent");
+    m
+}
+
+/// #2202's acceptance: a Nim domain and a C domain move 10,000 messages through a 16-slot ring in a
+/// region they share, on the tree-walker, the bytecode engine and the JIT. Both sides wait and wake
+/// each other as the ring fills and drains. No message may be lost or torn, and `inflight`, which
+/// each side updates with atomic adds, must come back to 0. On the tree-walker and the JIT the two
+/// domains run on threads of their own, at the same time.
+#[test]
+fn a_nim_domain_and_a_c_domain_share_a_ring() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(&path, RING_PRODUCER);
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let shim = temen_leng::nim_compute_shim_unit(&units).expect("compute shim unit");
+    // nimony names a C import `<name>.0.`.
+    let glue = temen_ir::LinkUnit {
+        module: temen_text::parse_module(RING_GLUE).expect("parse the glue"),
+        exports: vec![
+            ("ringWait.0.".into(), 0),
+            ("ringWake.0.".into(), 1),
+            ("ringProducer".into(), 2),
+        ],
+        ..Default::default()
+    };
+    let nim = temen_leng::link_whole_with_runtime(&units, vec![shim, glue])
+        .unwrap_or_else(|e| panic!("link the producer: {e}"));
+    dump_module("ring_producer", &nim);
+    temen_verify::verify_module(&nim).unwrap_or_else(|e| panic!("verify the producer: {e:?}"));
+    let entry = nim
+        .exports
+        .iter()
+        .find(|e| e.name == "ringProducer")
+        .expect("the producer's entry")
+        .func;
+    let c = chibicc_child("ring_consumer", RING_CONSUMER, &[]);
+    let parent = ring_parent(entry);
+    let host = || {
+        let mut host = temen_interp::Host::new();
+        let inst = host.grant_instantiator(0, 1 << 17);
+        let aspace = host.grant_address_space(0, 1 << 17);
+        let nim = host.grant_module(&nim);
+        let c = host.grant_module(&c);
+        let budget = host.grant_budget(-1, (1 << 24) + (1 << 17), -1);
+        (host, [inst, aspace, nim, c, budget])
+    };
+    let want = vec![Value::I64(RING_COUNT), Value::I64(0)];
+
+    let (mut h, args) = host();
+    let mut fuel = 1_000_000_000u64;
+    let tw = temen_interp::run_with_host(&parent, 0, &args.map(Value::I32), &mut fuel, &mut h);
+    assert_eq!(
+        tw,
+        Ok(want.clone()),
+        "tree-walker: (sent, wrong at the consumer)"
+    );
+
+    let (mut h, args) = host();
+    let mut fuel = 1_000_000_000u64;
+    let bc = temen_interp::bytecode::compile_and_run_with_host(
+        &parent,
+        0,
+        &args.map(Value::I32),
+        &mut fuel,
+        &mut h,
+    )
+    .expect("the bytecode engine runs the ring, not the tree-walker for it");
+    assert_eq!(bc, Ok(want), "bytecode: (sent, wrong at the consumer)");
+
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let (mut h, args) = host();
+    // The JIT maps the region into each child's window for real, so it must be OS shared memory.
+    h.set_region_factory(temen_run::new_shared_region);
+    let (jit, _) = temen_run::jit_cap_run(
+        &parent,
+        0,
+        &args.map(i64::from),
+        &temen_interp::MemLayout::image(Vec::new()),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        0,
+        &mut h,
+        None,
+    )
+    .expect("jit");
+    assert!(
+        matches!(&jit, temen_jit::JitOutcome::Returned(v) if v[..] == [RING_COUNT, 0]),
+        "JIT: (sent, wrong at the consumer): {jit:?}"
+    );
 }
