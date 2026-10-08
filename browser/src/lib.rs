@@ -9339,7 +9339,7 @@ pub fn link_program_multi(
     // which reads the table this reports.
     let _ = temen_ir::prune_unused_imports(&mut linked);
     let module =
-        temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;
+        temen_ir::synth_manifest_start(linked, entry_idx, true).map_err(|_| STATUS_UNSUPPORTED)?;
     // Verify before handing it on: a program that references an undefined proc links to an
     // unresolvable manifest import / out-of-range target, which would otherwise fault deep in the
     // engine. Reject it cleanly so a typo can't take down the playground's wasm instance.

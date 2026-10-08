@@ -3132,12 +3132,16 @@ static bool is_rodata(Obj *g) {
 static bool layout_globals(Obj *prog) {
   // A `main(int, char**)` program shifts its writable globals past the §3e args buffer at
   // `[POWERBOX_ARGS_BASE, POWERBOX_ARGS_END)`, so seeded argv/env never collides with a global.
+  // So does every `--emit-object` unit (temen-llvm's rule since #1777). It cannot see the program it
+  // is linked into, whose `_start` seeds the heap words in that page and whose host may seed argv/env
+  // there, and the first unit linked keeps its offsets, so its globals would sit under those writes.
   // Everything sits one `POWERBOX_NULL_GUARD` up so `[0, guard)` stays empty for the NULL trap
   // (#964/#1059): the args buffer is at `guard + POWERBOX_ARGS_BASE` (= `temen_ir::module_args_base`).
-  int off = POWERBOX_NULL_GUARD + (needs_argv ? POWERBOX_ARGS_END : RESERVED_BYTES);
+  int off =
+      POWERBOX_NULL_GUARD + (needs_argv || opt_emit_object ? POWERBOX_ARGS_END : RESERVED_BYTES);
   bool any = false;
   // Pass 1: writable globals (and BSS) packed from `off` (guard + the reserved handle region, or
-  // guard + the args buffer for an argv program).
+  // guard + the args buffer for an argv program or a unit).
   for (Obj *g = prog; g; g = g->next) {
     if (g->is_function || g->is_tls || is_rodata(g))
       continue;

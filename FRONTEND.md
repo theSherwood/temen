@@ -253,6 +253,11 @@ does `ref.func`. One to another unit's function is `data.funcref <at> sym "name"
 call (#2194). A thread-local initializer holding a function pointer, and an offset from a
 function's address, are refused.
 
+A unit's globals start above the scratch page, at `guard + POWERBOX_ARGS_END`, whatever its `main`
+(a whole-program build starts there only for `main(int, char **)`). The unit linked first keeps its
+offsets, and the scratch page is where the linked program's `_start` seeds the heap words and its
+host seeds the args.
+
 ### Indirect calls (function pointers)
 A function designator decays to its `ref.func` index (an i32 funcref, §3c) widened to the 8-byte
 C pointer rep (`irty(TY_FUNC)`=i64, `by_address` true so a "load" is a no-op returning the
