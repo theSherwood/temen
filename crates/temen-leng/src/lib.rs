@@ -918,7 +918,7 @@ pub fn link_whole_powerbox_manifest(
 ///
 /// **The page allocator.** `mmap` hands out whole pages, zeroed as an anonymous mapping is, and
 /// `munmap` takes them back (#2178):
-/// - `munmap` adds the pages to a **free list** in the shim's own data (the word after `errno`), kept
+/// - `munmap` adds the pages to a **free list** in the shim's own data (its second word), kept
 ///   in address order with neighbouring runs merged. Each free run holds its link and its length in
 ///   its first two words.
 /// - `mmap` takes the first run long enough, zeroed: a longer run gives up its last pages, so its
@@ -929,6 +929,11 @@ pub fn link_whole_powerbox_manifest(
 ///
 /// nim's own allocator never unmaps, so what comes back is the mappings `memfiles` makes to read a
 /// file ([`POSIX_MMAP_ADAPTER`]): before, every file read added its size to the heap for good.
+///
+/// **One lock** (#1884). `mmap` and `munmap` hold a spin lock, the shim's third data word, around
+/// the allocator itself (funcs 89 and 90), so vCPUs sharing a heap are never handed the same pages;
+/// the heap grows inside it. A waiting vCPU spins, which ends on every engine: the cooperative
+/// scheduler preempts a spinning task after its quantum.
 ///
 /// A request that would bump the `mmap` past [`temen_ir::POWERBOX_HEAP_TOP`] asks
 /// [`HEAP_GROW_HOOK`] for more heap first — the shim's one import, which the runtime a program links
@@ -1199,8 +1204,8 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // 0) would be exactly the silent-wrong-answer this table is careful about everywhere else: the
     // call would succeed and quietly produce a wrong port number. Row 84 does the swap.
     ("htons", ANY, 84),
-    // **`errnoLocation` returns a real, writable word** (row 85, the shim's own 8-byte data
-    // segment), not 0. `std/posix` reaches libc's `errno` through the address-returning accessor
+    // **`errnoLocation` returns a real, writable word** (row 85, the first word of the shim's own
+    // data), not 0. `std/posix` reaches libc's `errno` through the address-returning accessor
     // (`__errno_location`, `__error` on Darwin) and both *reads and writes* through it —
     // `readdir` must zero errno at end-of-directory or a consumer misreads a stale value as a
     // failure. A 0 here would not be a stub, it would be a store to the #1094 NULL guard: a trap,
@@ -2882,6 +2887,39 @@ mod tests {
     const WORDS: u64 = 2 * temen_ir::POWERBOX_NULL_GUARD;
     const PAGE: i64 = 4096;
 
+    /// `driver` linked as the first unit against the compute shim's `mmap`, `munmap` and
+    /// `errnoLocation`, with the heap seeded to `[BASE, window top)`.
+    fn link_over_shim(driver: &str) -> Module {
+        let unit = |src: &str, exports: Vec<(String, u32)>| temen_ir::LinkUnit {
+            module: temen_text::parse_module(src).expect("parses"),
+            exports,
+            ..Default::default()
+        };
+        let mut m = temen_ir::link(&[
+            unit(driver, vec![]),
+            unit(
+                POWERBOX_COMPUTE_SHIM,
+                vec![
+                    ("mmap".into(), 6),
+                    ("munmap".into(), 36),
+                    ("errnoLocation".into(), 85),
+                    (HEAP_GROW_HOOK.into(), SHIM_HEAP_FIXED),
+                ],
+            ),
+        ])
+        .expect("links");
+        let top = 1u64 << m.memory.expect("a window").size_log2;
+        let mut heap = (BASE as u64).to_le_bytes().to_vec();
+        heap.extend_from_slice(&top.to_le_bytes());
+        m.data.push(temen_ir::Data {
+            offset: temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK,
+            readonly: false,
+            bytes: heap,
+        });
+        temen_verify::verify_module(&m).expect("verifies");
+        m
+    }
+
     /// Run `steps` in one call over the compute shim, its heap seeded to `[BASE, window top)`, on the
     /// interpreter and the JIT; the word each step leaves. The engines must agree on the whole window.
     fn run_heap_steps(steps: &[Step]) -> Vec<i64> {
@@ -2940,52 +2978,9 @@ mod tests {
              v2 = i32.const 3\n  v3 = i32.const 34\n  v4 = i32.const -1\n{body}  return\n  }}\n}}\n",
             "\\x00".repeat(8 * steps.len())
         );
-        let unit = |src: &str, exports: Vec<(String, u32)>| temen_ir::LinkUnit {
-            module: temen_text::parse_module(src).expect("parses"),
-            exports,
-            ..Default::default()
-        };
-        let mut m = temen_ir::link(&[
-            temen_ir::LinkUnit {
-                data_exports: vec![temen_ir::DataExport {
-                    name: "words".into(),
-                    offset: WORDS,
-                    tls: false,
-                }],
-                ..unit(&driver, vec![("scenario".into(), 0)])
-            },
-            unit(
-                POWERBOX_COMPUTE_SHIM,
-                vec![
-                    ("mmap".into(), 6),
-                    ("munmap".into(), 36),
-                    ("errnoLocation".into(), 85),
-                    (HEAP_GROW_HOOK.into(), SHIM_HEAP_FIXED),
-                ],
-            ),
-        ])
-        .expect("links");
-        let top = 1u64 << m.memory.expect("a window").size_log2;
-        let mut heap = (BASE as u64).to_le_bytes().to_vec();
-        heap.extend_from_slice(&top.to_le_bytes());
-        m.data.push(temen_ir::Data {
-            offset: temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK,
-            readonly: false,
-            bytes: heap,
-        });
-        temen_verify::verify_module(&m).expect("verifies");
-        let f = m
-            .exports
-            .iter()
-            .find(|e| e.name == "scenario")
-            .unwrap()
-            .func;
-        let at = m
-            .data_exports
-            .iter()
-            .find(|e| e.name == "words")
-            .unwrap()
-            .offset as usize;
+        let m = link_over_shim(&driver);
+        // The driver is the first unit: its func 0 and its data are placed first.
+        let (f, at) = (0, WORDS as usize);
         // The interpreter captures as much of the window as it was seeded with: the heap's first MiB.
         let seed = vec![0; 2 * BASE as usize];
         let (ir, mem) = temen_interp::run_capture(&m, f, &[], &mut 1_000_000, &seed);
@@ -3064,6 +3059,174 @@ mod tests {
         assert_eq!(words[13], BASE + 6 * PAGE);
         assert_eq!(words[14], 0, "a partial unmap frees its pages");
         assert_eq!(words[15], BASE + 7 * PAGE);
+    }
+
+    /// The parallel test's worker: `(sp, tag) -> faults`. It takes 512 pages, tagging each with
+    /// `(tag, i)`, frees every other one, takes those back, and counts the pages whose tag is no
+    /// longer its own: a page another vCPU was handed too.
+    #[cfg(unix)]
+    const WORKER: &str = "\
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  v3 = i64.const 4096
+  v4 = i32.const 3
+  v5 = i32.const 34
+  v6 = i32.const -1
+  v7 = call.import 0 (v2, v3, v4, v5, v6, v2)
+  br 1(v1, v7, v2)
+  }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 512
+  v4 = i64.lt_u v2 v3
+  br_if v4 2(v0, v1, v2) 3(v0, v1)
+  }
+block 2 (v0: i64, v1: i64, v2: i64) {
+  v3 = call 2 (v0, v2)
+  v4 = i64.const 3
+  v5 = i64.shl v2 v4
+  v6 = i64.add v1 v5
+  i64.store v6 v3
+  v7 = i64.const 1
+  v8 = i64.add v2 v7
+  br 1(v0, v1, v8)
+  }
+block 3 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  br 4(v0, v1, v2)
+  }
+block 4 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 512
+  v4 = i64.lt_u v2 v3
+  br_if v4 5(v0, v1, v2) 6(v0, v1)
+  }
+block 5 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 3
+  v4 = i64.shl v2 v3
+  v5 = i64.add v1 v4
+  v6 = i64.load v5
+  v7 = i64.const 4096
+  v8 = call.import 1 (v6, v7)
+  v9 = i64.const 2
+  v10 = i64.add v2 v9
+  br 4(v0, v1, v10)
+  }
+block 6 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  br 7(v0, v1, v2)
+  }
+block 7 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 512
+  v4 = i64.lt_u v2 v3
+  br_if v4 8(v0, v1, v2) 9(v0, v1)
+  }
+block 8 (v0: i64, v1: i64, v2: i64) {
+  v3 = call 2 (v0, v2)
+  v4 = i64.const 3
+  v5 = i64.shl v2 v4
+  v6 = i64.add v1 v5
+  i64.store v6 v3
+  v7 = i64.const 2
+  v8 = i64.add v2 v7
+  br 7(v0, v1, v8)
+  }
+block 9 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  br 10(v0, v1, v2, v2)
+  }
+block 10 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.const 512
+  v5 = i64.lt_u v2 v4
+  br_if v5 11(v0, v1, v2, v3) 12(v3)
+  }
+block 11 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.const 3
+  v5 = i64.shl v2 v4
+  v6 = i64.add v1 v5
+  v7 = i64.load v6
+  v8 = i64.load v7
+  v9 = i64.load v7 offset=8
+  v10 = i64.ne v8 v0
+  v11 = i64.ne v9 v2
+  v12 = i32.or v10 v11
+  v13 = i64.extend_i32_u v12
+  v14 = i64.add v3 v13
+  v15 = i64.const 1
+  v16 = i64.add v2 v15
+  br 10(v0, v1, v16, v14)
+  }
+block 12 (v0: i64) {
+  return v0
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  v3 = i64.const 4096
+  v4 = i32.const 3
+  v5 = i32.const 34
+  v6 = i32.const -1
+  v7 = call.import 0 (v2, v3, v4, v5, v6, v2)
+  i64.store v7 v0
+  i64.store v7 v1 offset=8
+  return v7
+  }
+}
+";
+
+    /// #1884: vCPUs taking and freeing pages at the same time are never handed the same page. Four
+    /// threads, one OS thread each on the parallel driver, run [`WORKER`] over one heap.
+    #[test]
+    #[cfg(unix)]
+    fn parallel_threads_are_never_handed_the_same_page() {
+        use std::fmt::Write;
+        const THREADS: usize = 4;
+        let mut main = String::from(
+            "func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  v1 = i64.const 65536\n  \
+             v2 = i32.const 3\n  v3 = i32.const 34\n  v4 = i32.const -1\n",
+        );
+        // Each thread's stack is pages of its own, its `sp` their top.
+        for t in 0..THREADS {
+            let v = 10 + 4 * t;
+            let _ = write!(
+                main,
+                "  v{v} = call.import 0 (v0, v1, v2, v3, v4, v0)\n  v{} = i64.add v{v} v1\n  \
+                 v{} = i64.const {}\n  v{} = thread.spawn 1 v{} v{}\n",
+                v + 1,
+                v + 2,
+                t + 1,
+                v + 3,
+                v + 1,
+                v + 2
+            );
+        }
+        let mut sum = 0;
+        for t in 0..THREADS {
+            let (h, r) = (10 + 4 * t + 3, 100 + 2 * t);
+            let _ = write!(
+                main,
+                "  v{r} = thread.join v{h}\n  v{} = i64.add v{sum} v{r}\n",
+                r + 1
+            );
+            sum = r + 1;
+        }
+        let _ = write!(main, "  return v{sum}\n  }}\n}}\n");
+        // The driver's data, unused, places the shim's after it, above the NULL guard.
+        let driver = format!(
+            "import 0 \"mmap\" (i64, i64, i32, i32, i32, i64) -> (i64)\n\
+             import 1 \"munmap\" (i64, i64) -> (i32)\n\
+             data {WORDS} \"\\x00\"\n{main}{WORKER}"
+        );
+        let m = link_over_shim(&driver);
+        let run = temen_run::instantiate(m)
+            .expect("instantiates")
+            .run_with_caps_parallel(&temen_run::RunConfig::default(), &[])
+            .map(|r| r.outcome);
+        // A shared page shows as a wrong tag, or as a trap: a tag written over a free run's link.
+        assert!(
+            matches!(&run, Ok(temen_run::Outcome::Returned(v)) if v[..] == [temen_interp::Value::I64(0)]),
+            "vCPUs were handed the same pages: {run:?}"
+        );
     }
 
     /// `munmap` refuses what it cannot free (an unaligned address, an empty or overflowing length,
