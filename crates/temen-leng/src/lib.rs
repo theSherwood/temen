@@ -567,8 +567,8 @@ fn link_selected_with_extra(
             units.len() + 2
         )));
     }
-    // Pooled **non-scalar globals** across all units (stem-suffixed name → descriptor): the type of
-    // every foreign symbol a unit might call through or index into. See `Translator::ext_globals`.
+    // Pooled **globals' descriptors** across all units (stem-suffixed name → descriptor): the type
+    // of every foreign symbol but a signed `i64`. See `Translator::ext_globals`.
     let mut pooled_globals: Vec<(String, translate::TyDesc)> = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
@@ -936,8 +936,20 @@ pub fn link_whole_powerbox_manifest(
 ///
 /// **One lock** (#1884). `mmap` and `munmap` hold a spin lock, the shim's third data word, around
 /// the allocator itself (funcs 89 and 90), so vCPUs sharing a heap are never handed the same pages;
-/// the heap grows inside it. A waiting vCPU spins, which ends on every engine: the cooperative
-/// scheduler preempts a spinning task after its quantum.
+/// the heap grows inside it. A waiting vCPU spins, which ends on every engine, since the holder runs
+/// on and nothing parks inside the lock: the tree-walker runs a vCPU on a pool thread until it
+/// parks, the JIT gives each vCPU an OS thread, and the bytecode engine preempts a spinning task
+/// after its quantum.
+///
+/// **Atomics** (#2202). The `atomic*` and `builtin*` leaves are the IR's atomics, so a ring in a
+/// region that a peer on another core writes sees nim's operations whole and in order:
+/// - Each is sequentially consistent, whatever order nim asks for. That is never weaker than asked,
+///   and the IR's atomics carry no other order. A fence is `atomic.fence`.
+/// - The IR's atomics are 32- and 64-bit, and `testAndSet`/`clear` work on C's one-byte `bool`. They
+///   `or` and `and` the byte's bits in the aligned word that holds it, which leaves its neighbours as
+///   they were.
+/// - Like C's, an atomic traps on a misaligned address. Objects are laid out as C lays them out
+///   (#2201), so a field is aligned.
 ///
 /// A request that would bump the `mmap` past [`temen_ir::POWERBOX_HEAP_TOP`] asks
 /// [`HEAP_GROW_HOOK`] for more heap first — the shim's one import, which the runtime a program links
@@ -1118,12 +1130,11 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("syscall", ANY, 58),
     // **The rest of `std/atomics`' builtin family** (#1443). The other six atomics were already here
     // under nim's `atomic*` spelling; these four are what `std/atomics` itself calls, and they were
-    // the only thing left once the `cpuRelax` `{.emit.}` stopped failing the link. Same
-    // single-vCPU-guest posture as their neighbours (§3d): with one vCPU an atomic is just the
-    // load/modify/store, and a fence has nothing to order against.
+    // the only thing left once the `cpuRelax` `{.emit.}` stopped failing the link. Each is the IR's
+    // atomic, as its neighbours are (#2202, [`POWERBOX_COMPUTE_SHIM`]).
     //
-    // `testAndSet`/`clear` operate on C's `bool` flag object — one byte, hence `load8_u`/`store8`,
-    // *not* the word-width the other atomics use.
+    // `testAndSet`/`clear` operate on C's `bool` flag object, one byte. The IR has no byte-wide
+    // atomic, so they `or` and `and` its bits in the aligned word that holds it.
     ("builtinTestAndSet", ANY, 59),
     ("builtinClear", ANY, 60),
     ("builtinThreadFence", ANY, 61),
@@ -1138,7 +1149,7 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // `i32` slots and present this same `i32` signature, so the machine type cannot distinguish it
     // and the `i32` shim's 4-byte access would over-read a 1-byte cell — but nimony does not
     // instantiate those (the byte-wide atomics are `testAndSet`/`clear`, which are non-generic and
-    // served at rows 59/60 with `load8_u`/`store8`). An instance whose signature matches no row
+    // served at rows 59/60). An instance whose signature matches no row
     // here stays **unbound** and fails the link loudly, which is the point: a missing width is a
     // visible gap, never a silent wrong-width bind.
     //
@@ -2657,8 +2668,8 @@ pub fn link_units_tls_with_runtime(
 /// `7` `__atomic_sub_fetch(p,v)->new` · `8` `__atomic_fetch_add(p,v)->old` ·
 /// `9` `__atomic_exchange(p,v)->old` · `10` `__atomic_load(p)->v` · `11` `__atomic_store(p,v)` ·
 /// `12` `memcmp(a,b,n)` (first differing unsigned byte's `a[i]-b[i]`, or `0`).
-/// Atomics are single-threaded lowerings (plain load/modify/store) — correct for a single-vCPU guest
-/// (NIM.md §3d); a threaded ARC guest would bind the `rmw.*` ops instead.
+/// The atomics are the IR's atomics, sequentially consistent (#2202), as in
+/// [`POWERBOX_COMPUTE_SHIM`].
 const BOTTOM_EDGE_RUNTIME: &str = r#"
 func (i64, i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64, v2: i64) {
@@ -2729,44 +2740,39 @@ block 0 (v0: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.load v0
+  v2 = i64.atomic.rmw.add v0 v1
   v3 = i64.add v2 v1
-  i64.store v0 v3
   return v3
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.load v0
+  v2 = i64.atomic.rmw.sub v0 v1
   v3 = i64.sub v2 v1
-  i64.store v0 v3
   return v3
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.load v0
-  v3 = i64.add v2 v1
-  i64.store v0 v3
+  v2 = i64.atomic.rmw.add v0 v1
   return v2
   }
 }
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i64.load v0
-  i64.store v0 v1
+  v2 = i64.atomic.rmw.xchg v0 v1
   return v2
   }
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.load v0
+  v1 = i64.atomic.load v0
   return v1
   }
 }
 func (i64, i64) -> () {
 block 0 (v0: i64, v1: i64) {
-  i64.store v0 v1
+  i64.atomic.store v0 v1
   return
   }
 }
@@ -2891,25 +2897,30 @@ mod tests {
     const WORDS: u64 = 2 * temen_ir::POWERBOX_NULL_GUARD;
     const PAGE: i64 = 4096;
 
-    /// `driver` linked as the first unit against the compute shim's `mmap`, `munmap` and
-    /// `errnoLocation`, with the heap seeded to `[BASE, window top)`.
+    /// `driver` linked as the first unit over the compute shim, each of its imports bound to the leaf
+    /// [`COMPUTE_LEAVES`] routes it to, with the heap seeded to `[BASE, window top)`.
     fn link_over_shim(driver: &str) -> Module {
-        let unit = |src: &str, exports: Vec<(String, u32)>| temen_ir::LinkUnit {
-            module: temen_text::parse_module(src).expect("parses"),
-            exports,
-            ..Default::default()
-        };
+        let driver = temen_text::parse_module(driver).expect("parses");
+        let mut exports: Vec<(String, u32)> = driver
+            .imports
+            .iter()
+            .map(|imp| {
+                let leaf = compute_leaf_index(&imp.name, import_sig(&driver, imp));
+                (imp.name.clone(), leaf.expect("a leaf serves each import"))
+            })
+            .collect();
+        exports.push((HEAP_GROW_HOOK.into(), SHIM_HEAP_FIXED));
+        let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM).expect("parses");
         let mut m = temen_ir::link(&[
-            unit(driver, vec![]),
-            unit(
-                POWERBOX_COMPUTE_SHIM,
-                vec![
-                    ("mmap".into(), 6),
-                    ("munmap".into(), 36),
-                    ("errnoLocation".into(), 85),
-                    (HEAP_GROW_HOOK.into(), SHIM_HEAP_FIXED),
-                ],
-            ),
+            temen_ir::LinkUnit {
+                module: driver,
+                ..Default::default()
+            },
+            temen_ir::LinkUnit {
+                module: shim,
+                exports,
+                ..Default::default()
+            },
         ])
         .expect("links");
         let top = 1u64 << m.memory.expect("a window").size_log2;
@@ -3230,6 +3241,329 @@ block 0 (v0: i64, v1: i64) {
         assert!(
             matches!(&run, Ok(temen_run::Outcome::Returned(v)) if v[..] == [temen_interp::Value::I64(0)]),
             "vCPUs were handed the same pages: {run:?}"
+        );
+    }
+
+    /// The atomics test's driver (#2202): four threads each take `n` turns over all eighteen atomic
+    /// leaves, and main returns a mask of the cells that came out wrong. Each turn:
+    /// - adds 1 to a counter, or takes 1 from one, through each read-modify-write leaf;
+    /// - adds 1 to a counter through a compare-exchange loop, at each width;
+    /// - adds 1 to a plain counter under a lock: an exchange lock at each width, and two
+    ///   `testAndSet` flags in bytes 1 and 2 of a word whose bytes 0 and 3 must survive.
+    ///
+    /// A plain exchange can leave a lock held with no holder: a waiter's write of 1 lands after the
+    /// holder's release. So a lock gives up after 2^20 tries and its thread returns 1, which sets
+    /// the mask's bit 15. The test fails instead of hanging.
+    #[cfg(unix)]
+    fn atomics_driver(n: i64) -> String {
+        use std::fmt::Write;
+        // The cells, from WORDS: (offset, 32-bit, the value 4 threads × n turns leave).
+        let t = 4 * n;
+        let cells: [(u64, bool, i64); 15] = [
+            (0, false, t),
+            (8, false, -t),
+            (16, false, t),
+            (24, false, -t),
+            (32, true, t),
+            (36, true, -t),
+            (40, false, t),
+            (48, true, t),
+            (56, false, 0),
+            (64, false, t),
+            (72, true, 0),
+            (80, false, t),
+            (88, true, 0x5a00_00a5),
+            (96, false, t),
+            (104, false, t),
+        ];
+        let c = WORDS;
+        let mut data = [0u8; 192];
+        data[88] = 0xa5;
+        data[91] = 0x5a;
+        let data: String = data.iter().map(|b| format!("\\x{b:02x}")).collect();
+        let mut s = format!(
+            "import 0 \"atomicLoadN\" (i64, i32) -> (i64)\n\
+             import 1 \"atomicStoreN\" (i64, i64, i32) -> ()\n\
+             import 2 \"atomicCompareExchangeN\" (i64, i64, i64, i32, i32, i32) -> (i32)\n\
+             import 3 \"atomicExchangeN\" (i64, i64, i32) -> (i64)\n\
+             import 4 \"atomicAddFetch\" (i64, i64, i32) -> (i64)\n\
+             import 5 \"atomicSubFetch\" (i64, i64, i32) -> (i64)\n\
+             import 6 \"builtinTestAndSet\" (i64, i32) -> (i32)\n\
+             import 7 \"builtinClear\" (i64, i32) -> ()\n\
+             import 8 \"builtinThreadFence\" (i32) -> ()\n\
+             import 9 \"builtinSignalFence\" (i32) -> ()\n\
+             import 10 \"builtinLoadN.32\" (i64, i32) -> (i32)\n\
+             import 11 \"builtinStoreN.32\" (i64, i32, i32) -> ()\n\
+             import 12 \"builtinCompareExchangeN.32\" (i64, i64, i32, i32, i32, i32) -> (i32)\n\
+             import 13 \"builtinExchangeN.32\" (i64, i32, i32) -> (i32)\n\
+             import 14 \"builtinFetchAdd.32\" (i64, i32, i32) -> (i32)\n\
+             import 15 \"builtinFetchSub.32\" (i64, i32, i32) -> (i32)\n\
+             import 16 \"builtinFetchAdd.64\" (i64, i64, i32) -> (i64)\n\
+             import 17 \"builtinFetchSub.64\" (i64, i64, i32) -> (i64)\n\
+             data {c} \"{data}\"\n\
+             func () -> (i64) {{\nblock 0 () {{\n  sp = i64.const 0\n"
+        );
+        // Each thread's scratch (its compare-exchange's expected values) is 16 bytes past the cells.
+        for k in 0..4 {
+            let _ = write!(
+                s,
+                "  e{k} = i64.const {}\n  h{k} = thread.spawn 1 sp e{k}\n",
+                c + 128 + 16 * k
+            );
+        }
+        for k in 0..4 {
+            let _ = writeln!(s, "  j{k} = thread.join h{k}");
+        }
+        s.push_str("  m0 = i64.const 0\n");
+        for (k, (off, narrow, want)) in cells.iter().enumerate() {
+            let ty = if *narrow { "i32" } else { "i64" };
+            let _ = write!(
+                s,
+                "  a{k} = i64.const {}\n  x{k} = {ty}.load a{k}\n  w{k} = {ty}.const {want}\n  \
+                 d{k} = {ty}.ne x{k} w{k}\n  b{k} = i64.extend_i32_u d{k}\n  k{k} = i64.const {k}\n  \
+                 s{k} = i64.shl b{k} k{k}\n  m{} = i64.or m{k} s{k}\n",
+                c + off,
+                k + 1
+            );
+        }
+        // A thread returns 1 when a lock never came free: a plain exchange can leave one held.
+        let _ = write!(
+            s,
+            "  j01 = i64.or j0 j1\n  j23 = i64.or j2 j3\n  j = i64.or j01 j23\n  \
+             kj = i64.const {n}\n  sj = i64.shl j kj\n  m = i64.or m{n} sj\n  return m\n  }}\n}}\n",
+            n = cells.len()
+        );
+        let _ = write!(
+            s,
+            "func (i64, i64) -> (i64) {{
+block 0 (sp: i64, e: i64) {{
+  i = i64.const 0
+  br 1(e, i)
+  }}
+block 1 (e: i64, i: i64) {{
+  n = i64.const {n}
+  more = i64.lt_u i n
+  br_if more 2(e, i) 14()
+  }}
+block 2 (e: i64, i: i64) {{
+  mo = i32.const 5
+  one = i64.const 1
+  one32 = i32.const 1
+  a = i64.const {c0}
+  ra = call.import 4 (a, one, mo)
+  b = i64.const {c8}
+  rb = call.import 5 (b, one, mo)
+  p = i64.const {c16}
+  rp = call.import 16 (p, one, mo)
+  q = i64.const {c24}
+  rq = call.import 17 (q, one, mo)
+  u = i64.const {c32}
+  ru = call.import 14 (u, one32, mo)
+  w = i64.const {c36}
+  rw = call.import 15 (w, one32, mo)
+  call.import 8 (mo)
+  call.import 9 (mo)
+  g = i64.const {c40}
+  x = call.import 0 (g, mo)
+  i64.store e x
+  br 3(e, i)
+  }}
+block 3 (e: i64, i: i64) {{
+  mo = i32.const 5
+  g = i64.const {c40}
+  x = i64.load e
+  one = i64.const 1
+  y = i64.add x one
+  weak = i32.const 0
+  ok = call.import 2 (g, e, y, weak, mo, mo)
+  br_if ok 4(e, i) 3(e, i)
+  }}
+block 4 (e: i64, i: i64) {{
+  mo = i32.const 5
+  h = i64.const {c48}
+  x = call.import 10 (h, mo)
+  eight = i64.const 8
+  e32 = i64.add e eight
+  i32.store e32 x
+  br 5(e, i)
+  }}
+block 5 (e: i64, i: i64) {{
+  mo = i32.const 5
+  h = i64.const {c48}
+  eight = i64.const 8
+  e32 = i64.add e eight
+  x = i32.load e32
+  one = i32.const 1
+  y = i32.add x one
+  weak = i32.const 0
+  ok = call.import 12 (h, e32, y, weak, mo, mo)
+  zero = i64.const 0
+  br_if ok 6(e, i, zero) 5(e, i)
+  }}
+block 6 (e: i64, i: i64, s: i64) {{
+  mo = i32.const 5
+  l = i64.const {c56}
+  one = i64.const 1
+  was = call.import 3 (l, one, mo)
+  zero = i64.const 0
+  held = i64.ne was zero
+  br_if held 15(e, i, s) 7(e, i)
+  }}
+block 7 (e: i64, i: i64) {{
+  p = i64.const {c64}
+  x = i64.load p
+  one = i64.const 1
+  y = i64.add x one
+  i64.store p y
+  mo = i32.const 5
+  l = i64.const {c56}
+  zero = i64.const 0
+  call.import 1 (l, zero, mo)
+  br 8(e, i, zero)
+  }}
+block 8 (e: i64, i: i64, s: i64) {{
+  mo = i32.const 5
+  l = i64.const {c72}
+  one = i32.const 1
+  was = call.import 13 (l, one, mo)
+  br_if was 16(e, i, s) 9(e, i)
+  }}
+block 9 (e: i64, i: i64) {{
+  p = i64.const {c80}
+  x = i64.load p
+  one = i64.const 1
+  y = i64.add x one
+  i64.store p y
+  mo = i32.const 5
+  l = i64.const {c72}
+  zero = i32.const 0
+  call.import 11 (l, zero, mo)
+  s = i64.const 0
+  br 10(e, i, s)
+  }}
+block 10 (e: i64, i: i64, s: i64) {{
+  mo = i32.const 5
+  f = i64.const {c89}
+  was = call.import 6 (f, mo)
+  br_if was 17(e, i, s) 11(e, i)
+  }}
+block 11 (e: i64, i: i64) {{
+  p = i64.const {c96}
+  x = i64.load p
+  one = i64.const 1
+  y = i64.add x one
+  i64.store p y
+  mo = i32.const 5
+  f = i64.const {c89}
+  call.import 7 (f, mo)
+  s = i64.const 0
+  br 12(e, i, s)
+  }}
+block 12 (e: i64, i: i64, s: i64) {{
+  mo = i32.const 5
+  f = i64.const {c90}
+  was = call.import 6 (f, mo)
+  br_if was 18(e, i, s) 13(e, i)
+  }}
+block 13 (e: i64, i: i64) {{
+  p = i64.const {c104}
+  x = i64.load p
+  one = i64.const 1
+  y = i64.add x one
+  i64.store p y
+  mo = i32.const 5
+  f = i64.const {c90}
+  call.import 7 (f, mo)
+  ni = i64.add i one
+  br 1(e, ni)
+  }}
+block 14 () {{
+  r = i64.const 0
+  return r
+  }}
+block 15 (e: i64, i: i64, s: i64) {{
+  one = i64.const 1
+  t = i64.add s one
+  cap = i64.const {spin}
+  stuck = i64.lt_u cap t
+  br_if stuck 19() 6(e, i, t)
+  }}
+block 16 (e: i64, i: i64, s: i64) {{
+  one = i64.const 1
+  t = i64.add s one
+  cap = i64.const {spin}
+  stuck = i64.lt_u cap t
+  br_if stuck 19() 8(e, i, t)
+  }}
+block 17 (e: i64, i: i64, s: i64) {{
+  one = i64.const 1
+  t = i64.add s one
+  cap = i64.const {spin}
+  stuck = i64.lt_u cap t
+  br_if stuck 19() 10(e, i, t)
+  }}
+block 18 (e: i64, i: i64, s: i64) {{
+  one = i64.const 1
+  t = i64.add s one
+  cap = i64.const {spin}
+  stuck = i64.lt_u cap t
+  br_if stuck 19() 12(e, i, t)
+  }}
+block 19 () {{
+  r = i64.const 1
+  return r
+  }}
+}}
+",
+            c0 = c,
+            c8 = c + 8,
+            c16 = c + 16,
+            c24 = c + 24,
+            c32 = c + 32,
+            c36 = c + 36,
+            c40 = c + 40,
+            c48 = c + 48,
+            c56 = c + 56,
+            c64 = c + 64,
+            c72 = c + 72,
+            c80 = c + 80,
+            c89 = c + 89,
+            c90 = c + 90,
+            c96 = c + 96,
+            c104 = c + 104,
+            spin = 1 << 20,
+        );
+        s
+    }
+
+    /// #2202: threads that run at the same time lose no atomic update, on any engine. The
+    /// interpreters run a thread until it parks, so they pin the arithmetic. The parallel driver
+    /// runs each thread on an OS thread of its own, where a plain read-modify-write loses updates
+    /// and a plain lock lets two threads in. Each bit of a failure's mask is a cell of
+    /// [`atomics_driver`], in its order.
+    #[test]
+    #[cfg(unix)]
+    fn parallel_threads_lose_no_atomic_update() {
+        use temen_interp::Value;
+        use temen_run::{Backend, Outcome, RunConfig};
+        let m = link_over_shim(&atomics_driver(500));
+        for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+            let run = temen_run::instantiate(m.clone())
+                .expect("instantiates")
+                .run(backend, &RunConfig::default())
+                .map(|r| r.outcome);
+            assert!(
+                matches!(&run, Ok(Outcome::Returned(v)) if v[..] == [Value::I64(0)]),
+                "{backend:?}: cells came out wrong: {run:?}"
+            );
+        }
+        let run = temen_run::instantiate(link_over_shim(&atomics_driver(100_000)))
+            .expect("instantiates")
+            .run_with_caps_parallel(&RunConfig::default(), &[])
+            .map(|r| r.outcome);
+        assert!(
+            matches!(&run, Ok(Outcome::Returned(v)) if v[..] == [Value::I64(0)]),
+            "parallel: cells came out wrong: {run:?}"
         );
     }
 

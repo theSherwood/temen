@@ -751,7 +751,7 @@ at? Measured directly from `hexer`-compiled `sysvq0asl.x.nif`, the runtime's **e
 | Allocator | `mmap`, `munmap` | the **Memory cap** (Phase 1 seam) |
 | Syscalls / process | `write`, `_exit`, `getpid`, `kill` | the **POSIX personality** (Phase 1 seam) |
 | libc mem | `memcpy`, `memset`, `memcmp` | host cap, or lower to `mem.copy`/`mem.fill` |
-| Atomics | `__atomic_{load,store,add_fetch,sub_fetch,exchange,compare_exchange}_n` (+ `__ATOMIC_*` order consts) | single-threaded guest → plain loads/stores |
+| Atomics | `__atomic_{load,store,add_fetch,sub_fetch,exchange,compare_exchange}_n` (+ `__ATOMIC_*` order consts) | the IR's atomics, sequentially consistent (#2202) |
 | Builtins | `__builtin_{bswap64,clzll,ctzll}` | direct temen ops (`bswap`/`clz`/`ctz`) |
 | Dynamic linking | `dlopen`, `dlsym`, `dlclose`, `dlerror` | unused by a static program → stub / fail-closed |
 
@@ -765,8 +765,8 @@ already lowers a named import to a host capability (`Cap`) — that's the seam.
 edge needs **no** host authority, so it binds as ordinary linked Temen functions instead of caps —
 keeping the runtime inside the pure-IR / both-engines model. `temen_leng::bottom_edge_runtime()` is a
 link unit providing `memcpy`/`memset` (→ `mem.copy`/`mem.fill`), `__builtin_bswap64`/`clzll`/`ctzll`/
-`popcountll` (→ `bswap` byte-shuffle / `clz`/`ctz`/`popcnt`), and the single-thread `__atomic_*` family
-(→ plain load/modify/store — correct for a single-vCPU guest, §3d); `bottom_edge_index` maps a C leaf
+`popcountll` (→ `bswap` byte-shuffle / `clz`/`ctz`/`popcnt`), and the `__atomic_*` family
+(→ the IR's atomics, #2202); `bottom_edge_index` maps a C leaf
 name (or nimony's stem-qualified spelling) to its function. Pinned by `crates/temen-leng/tests/bottom_edge.rs`
 — each leaf **interp == JIT == native**, plus a link test binding a user module's imports to the runtime.
 Remaining for #761: `memcmp` (a byte loop), and emitting the import under its `importc` C name so the
