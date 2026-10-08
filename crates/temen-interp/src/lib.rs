@@ -23163,15 +23163,14 @@ pub struct Host {
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
     /// valid for the whole run.
     jit_tables: Vec<JitTableState>,
-    /// The host-injected validation gate for guest-submitted `Jit` blobs ([`JitValidator`]) —
-    /// injected (like [`Host::region_factory`]) rather than implemented here so this crate keeps
-    /// its tiny dependency set *and* both backends run the **identical** decode+verify gate.
-    /// `None` (the default) fail-closes every `compile` (`-EINVAL`).
+    /// The validation gate for guest-submitted `Jit` blobs ([`JitValidator`]) — the canonical
+    /// [`jit_blob_validator`], or a durable domain's instrumented gate, or a test's stub. Injected
+    /// (like [`Host::region_factory`]) so a grant chooses it. `None` (the default) fail-closes every
+    /// `compile` (`-EINVAL`).
     jit_validator: Option<JitValidator>,
-    /// The host-injected decode+verify gate for `ModuleLoader.from_bytes` ([`ModuleValidator`]) —
-    /// injected for the same reason as [`Host::jit_validator`] (the verifier lives in the injecting
-    /// tier, keeping this crate's dependency set tiny). `None` (the default) fail-closes every
-    /// `from_bytes` (`-EINVAL`).
+    /// The decode+verify gate for `ModuleLoader.from_bytes` ([`ModuleValidator`]) — the canonical
+    /// [`module_blob_validator`], injected like [`Host::jit_validator`]. `None` (the default)
+    /// fail-closes every `from_bytes` (`-EINVAL`).
     module_validator: Option<ModuleValidator>,
     /// The durable-JIT install fence (DURABILITY.md §12.5, R8): an injected predicate — set only by
     /// a durable grant — that returns `true` to **reject** a just-validated unit whose entry
@@ -23405,7 +23404,9 @@ fn write_data_image(mem: &mut dyn GuestMem, image: &temen_ir::DataImage) -> Opti
 /// against its symbol table (`temen_ir::load_unit`), `verify_module`, and the **memory-match
 /// precondition** (declared memory == the parent window) — and the *same* function must be
 /// installed for the interpreter and JIT runs of a differential pair, so both backends
-/// accept/reject identically (`temen-run` provides the canonical one).
+/// accept/reject identically. The canonical one is [`jit_blob_validator`], which every engine and
+/// embedder installs; the seam stays so a durable domain can add its instrumentation
+/// ([`jit_validate`]) and a test can stub the gate.
 ///
 /// The third argument is the **symbol-table bytes** for host-assisted dynamic linking
 /// (DESIGN.md §22, `temen_encode::decode_symbol_table`): the guest's slots, capabilities and data
@@ -23429,10 +23430,115 @@ pub struct JitValidated {
 /// wire-encoded module blob from the guest window, return the decoded+**verified** [`Module`]
 /// (the trusted floor — the same `temen_verify::verify_module` a host-granted module passed) or a
 /// fail-closed `-errno` (`-EINVAL` for a malformed / unverifiable blob). Injected as a bare `fn`
-/// like [`JitValidator`] so this TCB crate keeps no `temen-verify` dependency — the verifier lives
-/// in the injecting tier (`temen-run`'s [`module_blob_validator`]). Without one installed, every
-/// `from_bytes` is `-EINVAL` (fail closed).
+/// like [`JitValidator`]; the canonical one is [`module_blob_validator`], which every embedder
+/// installs. Without one installed, every `from_bytes` is `-EINVAL` (fail closed).
 pub type ModuleValidator = fn(&[u8]) -> Result<Module, i64>;
+
+/// The canonical [`JitValidator`] — the **security hinge** of the guest-driven `Jit` capability
+/// (DESIGN.md §22 "Security argument") — for a domain that is not durable: [`jit_validate`] with no
+/// instrumentation. Every engine and embedder installs this one function (`temen-run`'s grants and
+/// the browser alike), so a unit is admitted or refused the same way wherever it runs (#2183).
+pub fn jit_blob_validator(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    symtab: &[u8],
+) -> Result<JitValidated, i64> {
+    jit_validate(bytes, mem_log2, symtab, Some)
+}
+
+/// The `Jit` gate: decode the unit (untrusted-input-facing, fail-closed; a runnable module or a
+/// link unit), link it against the guest's symbol table ([`temen_ir::load_unit`]: bind its §7
+/// imports, place a link unit's data where the table says), apply `instrument`, then
+/// `verify_module` (the escape-freedom gate) and the **memory-match precondition** (declared memory
+/// must equal the parent window, so verified bounds and the runtime mask agree; a link unit's must
+/// fit it, and `load_unit` gives the unit the window). A room for the unit's data that wraps the
+/// address space is `-EFAULT` (whether it lies in the window is checked as the host writes it);
+/// every other failure is `-EINVAL` (guest-visible, non-fatal, nothing installed).
+///
+/// The guest's symbol table (`temen_encode::decode_symbol_table`; empty for the closed `compile`
+/// op, which then resolves and places nothing, so a unit with imports or data of its own fails
+/// closed) is decoded fail-closed before any IR is touched. Its *values* are guest-chosen by design:
+/// a forged slot confers no authority (the resolved `call.dyn` is masked and `type_id`-checked at
+/// the call, like a slot the guest already controls), a data address is confined at every access,
+/// and the unit's data lands only where the guest could write itself (the host writes it through
+/// the window's checked accessor). Linking is a source-to-source rewrite that runs *before*
+/// `verify_module`, so a mis-link — an unknown name, a wrong import signature — is caught by
+/// re-verification and never trusted (DESIGN.md §22 "rewrite-then-verify").
+///
+/// `instrument` is a durable domain's transform of the linked unit (`temen-run`'s
+/// `jit_blob_validator_durable*`, the §4 "host runs the pass on submitted IR" composition,
+/// DURABILITY.md §12.5): ordinary verifier-passing IR, so the verify after it is the safety
+/// re-check, and `None` (a unit outside the transform's scope) fails closed. It is a parameter so
+/// this crate keeps no `temen-durable` dependency, like the install fence ([`JitDurableGate`]).
+pub fn jit_validate(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    symtab: &[u8],
+    instrument: impl FnOnce(Module) -> Option<Module>,
+) -> Result<JitValidated, i64> {
+    let Some(table) = temen_encode::decode_symbol_table(symtab) else {
+        return Err(EINVAL);
+    };
+    let object = temen_encode::wire::sniff_kind(bytes) == Some(temen_encode::wire::KIND_OBJECT);
+    let Ok(m) = temen_encode::decode_unit(bytes) else {
+        return Err(EINVAL);
+    };
+    let (m, data) = match temen_ir::load_unit(&m, object, &table, mem_log2) {
+        Ok(linked) => linked,
+        Err(temen_ir::LoadError::OutOfWindow) => return Err(EFAULT),
+        Err(_) => return Err(EINVAL),
+    };
+    let Some(m) = instrument(m) else {
+        return Err(EINVAL);
+    };
+    if temen_verify::verify_module(&m).is_err() {
+        return Err(EINVAL);
+    }
+    if m.memory.map(|mc| mc.size_log2) != mem_log2 {
+        return Err(EINVAL);
+    }
+    // A submitted unit MAY host §12 **fibers** (`cont.*`) — they switch stacks within the domain on
+    // the caller's thread, so a unit running its own scheduler to completion never parks across the
+    // synchronous `call.cap` it runs inside; the parent domain stands up the fiber runtime (see
+    // `CompiledModule::enable_fiber_hosting`, and the interpreter's `INVOKE_MODULE` fiber support).
+    // **Threads** (`thread.spawn`/`join`) and the **futex** (`wait`/`notify`) are admitted too
+    // (renegotiated 2026-08-04, owner-directed — CONSOLIDATION.md §11; was: rejected here since
+    // 2026-07-30). The old compile-time veto guarded an *invoke*-shaped hazard — a spawned vCPU
+    // outliving the synchronous `call.cap` — and that hazard is enforced where it is real:
+    // `invoke` of a unit that spawns/parks still fails at runtime (the nested `run_invoke` is
+    // seam-free, CapFault). The supported path for a threaded unit is **install** + dispatch:
+    // installed code runs in the calling vCPU's own frames, where a spawn is an ordinary
+    // module-aware `thread.spawn` (the spawned root frame lives in the unit's module).
+    if m.funcs.is_empty() {
+        return Err(EINVAL);
+    }
+    // A submitted unit's `call.dyn` (the new→old path) is allowed: on the JIT it dispatches through
+    // the parent `fn_table`; the reference interpreter mirrors this with its module-aware dispatch
+    // table (a unit runs as a module ≥ 1 whose indirect calls resolve into module 0). Both backends
+    // therefore reach the original program's functions identically (DESIGN.md §22 new→old). The
+    // unit's types resolve its interned call signatures (#922).
+    Ok(JitValidated {
+        funcs: m.funcs.into(),
+        types: m.types.into(),
+        data,
+    })
+}
+
+/// The canonical [`ModuleValidator`] — the decode+verify gate for `ModuleLoader.from_bytes` (§14
+/// run-in-guest). Unlike [`jit_blob_validator`] (which compiles a unit into the caller's own domain,
+/// so the unit's data can only go where the guest's symbol table places it, and its memory is the
+/// parent window), this promotes a **whole, self-contained module** — its own memory declaration,
+/// data segments, and `_start` are exactly what the `Instantiator`'s module ops want (the child
+/// runs it confined to a carve, data materialized into that carve). So the gate is just
+/// `decode_module` (untrusted-input-facing, fail-closed) → `verify_module` (the escape-freedom
+/// floor — the same trusted verifier a host-granted module passed); the carve/memory sizing is
+/// enforced later, at the op-13 spawn (`cm.memory_log2 <= size_log2`). All failures are `-EINVAL`
+/// (guest-visible, non-fatal; nothing minted).
+pub fn module_blob_validator(bytes: &[u8]) -> Result<Module, i64> {
+    let m = temen_encode::decode_module(bytes).map_err(|_| EINVAL)?;
+    temen_verify::verify_module(&m).map_err(|_| EINVAL)?;
+    Ok(m)
+}
 
 /// The durable-JIT install fence predicate ([`Host::set_jit_durable_gate`]): given a just-validated
 /// unit's functions and the program's tainted signatures, return `true` to **reject** the unit

@@ -1153,7 +1153,7 @@ pub extern "C" fn temen_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> 
     };
     let mut host = Host::new();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
-    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_validator(temen_interp::jit_blob_validator);
     let code = match host.jit_compile(jit, &service) {
         Ok(Ok(c)) => c.handle,
         _ => return 0,
@@ -1287,7 +1287,7 @@ pub extern "C" fn temen_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len
     let service = temen_encode::encode_module(&service_m);
     let mut host = Host::new();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
-    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_validator(temen_interp::jit_blob_validator);
     let code = match host.jit_compile(jit, &service) {
         Ok(Ok(c)) => c.handle,
         _ => return 0,
@@ -1769,12 +1769,13 @@ struct ParJitCfg {
 static PAR_JIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Publish the runtime-`Jit.compile` powerbox: a fresh `Host` granted `Jit` (memory-match precondition
-/// from the guest's declared memory) with [`browser_jit_validator`] + [`browser_jit_wasm_emitter`]
-/// installed, wrapped in the shared `Mutex` the vCPU dispatches `call.cap` through. The root is seeded
-/// `[jit]` ([`temen_par_root`]); the guest builds an IR blob, `compile`s it (emitting wasm), and
-/// `invoke`s it on the emitted region. Codegen on by default (flip with [`temen_par_jit_set_codegen`] to
-/// run the interpreter path for a differential). Call once (on the main thread) before the run; the
-/// other run recipes are cleared (last-published-wins). Returns `1`, or `0` on a bad guest module.
+/// from the guest's declared memory) with the `Jit` gate ([`temen_interp::jit_blob_validator`]) and
+/// [`browser_jit_wasm_emitter`] installed, wrapped in the shared `Mutex` the vCPU dispatches `call.cap`
+/// through. The root is seeded `[jit]` ([`temen_par_root`]); the guest builds an IR blob, `compile`s
+/// it (emitting wasm), and `invoke`s it on the emitted region. Codegen on by default (flip with
+/// [`temen_par_jit_set_codegen`] to run the interpreter path for a differential). Call once (on the
+/// main thread) before the run; the other run recipes are cleared (last-published-wins). Returns `1`,
+/// or `0` on a bad guest module.
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len: usize) -> i32 {
     par_run_gen_bump(); // I22: one bump per run
@@ -1784,7 +1785,7 @@ pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len
         return 0;
     };
     let mut host = Host::new();
-    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_validator(temen_interp::jit_blob_validator);
     host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
     let cfg = Box::into_raw(Box::new(ParJitCfg {
@@ -3617,11 +3618,11 @@ fn grant_onramp_caps(
     // compiler uses it to expand macros in-guest. Match temen-run's powerbox grant so a self-hosted
     // guest behaves identically: a 1024-slot dispatch table (a staged unit's `Slot` imports call back
     // into the host program's ~800 functions by index) and fiber hosting (a staged macro runs on the
-    // compiler's scheduler root, which suspends). `browser_jit_validator` verifies every submitted
-    // unit — the security hinge, so this stays "as secure as wasm".
+    // compiler's scheduler root, which suspends). `temen_interp::jit_blob_validator` verifies every
+    // submitted unit — the security hinge, so this stays "as secure as wasm".
     if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
         let h = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), ONRAMP_JIT_TABLE_LOG2);
-        host.set_jit_validator(browser_jit_validator);
+        host.set_jit_validator(temen_interp::jit_blob_validator);
         host.set_jit_hosts_fibers(true);
         // #1234: name it too, so a §14 child can be spawned with `jit` re-granted by name (the
         // Forth kernel's `sandbox` nests a copy of itself, which needs a Jit to compile its words).
@@ -4270,7 +4271,7 @@ fn posix_host_build(
         }
     }
     if run.loader {
-        host.set_module_validator(module_blob_validator);
+        host.set_module_validator(temen_interp::module_blob_validator);
         host.grant_module_loader();
     }
     for (name, value) in run.env {
@@ -4285,15 +4286,6 @@ fn posix_host_build(
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
     Some((host, posix, init_mem))
-}
-
-/// The decode+verify gate a `ModuleLoader` promotes a program through (temen-run's
-/// `module_blob_validator`): bytes that do not decode, or a module that does not verify, are
-/// `-EINVAL` and nothing is minted.
-fn module_blob_validator(bytes: &[u8]) -> Result<temen_ir::Module, i64> {
-    let m = temen_encode::decode_module(bytes).map_err(|_| temen_ir::errno::EINVAL)?;
-    temen_verify::verify_module(&m).map_err(|_| temen_ir::errno::EINVAL)?;
-    Ok(m)
 }
 
 /// bash's environment: `PATH=/bin` resolves an external command (`seq` → `/bin/seq`) for fork →
@@ -11079,7 +11071,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
     // name `"jit"`, so a driver program may re-grant it into an op-13 child by name; the child then
     // compiles / installs / invokes units on its own fresh table (see `op13jit_child_jit.rs`). The
     // built-in mini driver never names it — nothing changes for it.
-    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_validator(temen_interp::jit_blob_validator);
     host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
     let jit_h =
         host.grant_jit_with_table(driver.memory.map(|mc| mc.size_log2), OP13_JIT_TABLE_LOG2);
@@ -12063,61 +12055,15 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
     }
 }
 
-/// The browser's [`temen_interp::JitValidator`] — the §22 security hinge for the guest-driven `Jit`
-/// cap: decode the symbol table (`temen_encode::decode_symbol_table`) → decode the unit (a runnable
-/// module or a link unit; fail-closed) → link it against the table ([`temen_ir::load_unit`]: bind its
-/// named imports, place a link unit's data where the table says) → `verify_module` (the
-/// escape-freedom gate) → the memory-match precondition → reject threads/futex ops. A replica of
-/// `temen-run`'s canonical validator over the same shared steps, so it builds for wasm with no
-/// Cranelift dep. A room for the unit's data that wraps the address space is `-EFAULT`, as there.
-///
-/// **Fibers are admitted** (#845 — the §22 renegotiated 2026-07-30 split, matching the canonical
-/// gate in `temen-run`): `cont.*`/`suspend` switch stacks within the domain on the caller's thread,
-/// so a unit that runs its own scheduler to completion never parks across the synchronous invoke.
-/// *Emitted* execution of a fiber-using unit stays fail-closed with no gate here: `compile_jit`'s
-/// `reachable_concurrency` guard never yields `WasmDriven` for one, so both wasm emitters return
-/// `None` and the invoke runs on the interpreter (whose nested eval services the fiber ops).
-fn browser_jit_validator(
-    bytes: &[u8],
-    mem_log2: Option<u8>,
-    symtab: &[u8],
-) -> Result<temen_interp::JitValidated, i64> {
-    const EINVAL: i64 = -22;
-    const EFAULT: i64 = -14;
-    let Some(table) = temen_encode::decode_symbol_table(symtab) else {
-        return Err(EINVAL);
-    };
-    let object = temen_encode::wire::sniff_kind(bytes) == Some(temen_encode::wire::KIND_OBJECT);
-    let Ok(m) = temen_encode::decode_unit(bytes) else {
-        return Err(EINVAL);
-    };
-    let (m, data) = match temen_ir::load_unit(&m, object, &table, mem_log2) {
-        Ok(linked) => linked,
-        Err(temen_ir::LoadError::OutOfWindow) => return Err(EFAULT),
-        Err(_) => return Err(EINVAL),
-    };
-    if temen_verify::verify_module(&m).is_err() {
-        return Err(EINVAL);
-    }
-    if m.memory.map(|mc| mc.size_log2) != mem_log2 {
-        return Err(EINVAL); // declared memory must equal the parent window
-    }
-    if m.funcs.is_empty() || m.funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
-        return Err(EINVAL);
-    }
-    Ok(temen_interp::JitValidated {
-        funcs: m.funcs.into(),
-        types: m.types.into(),
-        data,
-    })
-}
-
 /// The wasm-JIT emitter the runtime-`Jit.compile` path installs ([`temen_par_powerbox_jit_runtime`],
 /// via [`Host::set_jit_wasm_emitter`]): emit a **validated closed unit**'s entry as `f0(win, env,
 /// args…)` against **shared** memory (the browser's `SharedArrayBuffer`), or `None` if it is outside
 /// the emitter subset — then `invoke` runs on the interpreter, fail-closed. A bare `fn`
 /// (`temen_interp::JitWasmEmitter`), so the core stores only the opaque bytes. The unit was already
-/// decode+verify+precondition-gated by [`browser_jit_validator`]; this re-decodes those same bytes.
+/// decode+verify+precondition-gated by the `Jit` gate ([`temen_interp::jit_blob_validator`]); this
+/// re-decodes those same bytes. A unit that uses fibers, threads or the futex, which the gate admits
+/// as it does natively, never runs emitted on the batch path: `compile_jit`'s `reachable_concurrency`
+/// guard never yields `WasmDriven` for one, so its invoke runs on the interpreter.
 fn browser_jit_wasm_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     let m = temen_encode::decode_module(blob).ok()?;
     if par_jit_b2() {
@@ -12161,7 +12107,7 @@ pub fn jit_exec(m: &temen_ir::Module) -> (i32, i64) {
     };
     let mut host = Host::new();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), 4); // 2^4 = 16-slot table
-    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_validator(temen_interp::jit_blob_validator);
     let code = match host.jit_compile(jit, &service) {
         Ok(Ok(c)) => c.handle,
         _ => return (STATUS_TRAP, 0),
@@ -12212,7 +12158,7 @@ pub fn dynlink_exec(m: &temen_ir::Module, link: bool) -> (i32, i64) {
     };
     let mut host = Host::new();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), 4);
-    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_validator(temen_interp::jit_blob_validator);
     let clock = host.grant_clock();
     // Bind "clock" → the Clock cap (iface 2, op 0) iff linking; otherwise an empty table (fail-closed).
     let mut table = temen_ir::SymbolTable::default();

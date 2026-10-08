@@ -869,8 +869,8 @@ inside the wasm sandbox — the browser stays safe (wasm bounds hold), but Temen
 story doesn't. Mitigations are this repo's home turf: the masking/bounds codegen is a handful of
 auditable patterns (not a general optimizer); the full corpus differential runs emitted-wasm vs
 interp (a mismatch is a `MISCOMPILE`, same as the `temen-bytecode-wasm` bench row); fuzz the emitter
-alongside the existing escape-TCB targets. The §22 `browser_jit_validator` already encodes the
-"JIT-eligible subset" concept this tier generalizes.
+alongside the existing escape-TCB targets. The §22 guest-JIT path already has the "JIT-eligible
+subset" concept this tier generalizes: a unit outside the emitter's subset invokes on the interpreter.
 
 ### Slice plan (each its own PR, oracle-gated like everything above)
 
