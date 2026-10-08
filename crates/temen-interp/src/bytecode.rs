@@ -3845,8 +3845,20 @@ impl VcpuReactor {
                             Err(t) => vcpu.deliver_tierup_trap(t),
                         }
                     }
-                    // Single-vCPU reactor: no spawn/join/wait/JIT-install events.
-                    _ => break Err(Trap::Malformed),
+                    // A reactor frame is one vCPU over one window, serviced only for tier-up: it
+                    // runs no threads or futex waits, spawns no §14 children, hosts no §22 guest
+                    // JIT, and has no embedder to complete a host call or feed a blocking stdin.
+                    VcpuEvent::Spawn { .. }
+                    | VcpuEvent::Join { .. }
+                    | VcpuEvent::Wait { .. }
+                    | VcpuEvent::Notify { .. }
+                    | VcpuEvent::Instantiate { .. }
+                    | VcpuEvent::InstantiateDetached { .. }
+                    | VcpuEvent::JitInstall { .. }
+                    | VcpuEvent::JitUninstall { .. }
+                    | VcpuEvent::JitInvoke { .. }
+                    | VcpuEvent::CapPending { .. }
+                    | VcpuEvent::StdinPark => break Err(Trap::Malformed),
                 }
             };
             reclaimed = vcpu.take_mem();

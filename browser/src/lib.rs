@@ -8581,8 +8581,14 @@ pub extern "C" fn temen_bash_coop_pump() -> i32 {
             s.exit = Some(-2);
             BASH_COOP_TRAP
         }
-        // Tier-up / invoke surfacing is never enabled on a session (no eligibility set).
-        _ => {
+        // None of these surface on a session: `run` never slices, the powerbox declares no
+        // host-completed cap, and neither tier-up nor invoke surfacing is enabled (no eligibility
+        // set, no leaf).
+        bytecode::CoopEvent::Paused
+        | bytecode::CoopEvent::CapPark { .. }
+        | bytecode::CoopEvent::TierUp { .. }
+        | bytecode::CoopEvent::Resume { .. }
+        | bytecode::CoopEvent::JitInvoke { .. } => {
             s.exit = Some(-2);
             BASH_COOP_TRAP
         }
