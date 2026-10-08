@@ -1710,10 +1710,7 @@ fn a_pattern_is_only_an_empty_grant() {
 fn a_refusal_notes_the_import_nothing_satisfied() {
     let child = module(DETACHED_IMPORTS_EXIT);
     let setup = op15_setup(&child, 1 << 20);
-    for (grants, want, noted) in [
-        (vec![], -22, true),
-        (vec![("exit", EMPTY)], 42, false),
-    ] {
+    for (grants, want, noted) in [(vec![], -22, true), (vec![("exit", EMPTY)], 42, false)] {
         let m = module(&op17_granting(&grants));
         for d in drivers::ALL {
             let Some((ran, notes)) = run_on_then(d, &m, &setup, &|h| h.take_notes()) else {

@@ -24125,7 +24125,8 @@ impl Host {
         }
         twin.region_hook = self.region_hook.clone();
         twin.region_factory = self.region_factory;
-        twin.notes = Arc::clone(&self.notes); // #2219: one run, one list of notes
+        // #2219: one run, one list of notes.
+        twin.notes = Arc::clone(&self.notes);
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
         // forking caller is always parked inside a call through one, so it holds at least this.
         twin.live_impls = self.live_impls.clone();

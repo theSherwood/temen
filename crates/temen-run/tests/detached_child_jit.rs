@@ -1412,7 +1412,11 @@ fn an_empty_grant_admits_a_child_on_the_jit_as_on_the_interpreter() {
         let p = module(&parent_granting(&grants));
         let (mut ih, h) = host(&c, 1 << 20);
         let interp = interp_on(&p, &mut ih, h).expect("interp run");
-        assert_eq!(interp, vec![Value::I64(want)], "interpreter oracle, {grants:?}");
+        assert_eq!(
+            interp,
+            vec![Value::I64(want)],
+            "interpreter oracle, {grants:?}"
+        );
         let (mut jh, h) = host(&c, 1 << 20);
         let jit = jit_on(&p, &mut jh, h);
         assert!(
