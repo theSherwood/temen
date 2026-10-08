@@ -912,9 +912,23 @@ pub fn link_whole_powerbox_manifest(
 }
 
 /// The **pure-compute C bottom edge** as TEMEN-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
-/// the `atomic*` family, `bswap64`/`ctz64`/`clz64`, and a **bump `mmap`** (serves from the powerbox
-/// heap-brk word) — plus stubbed `exit`/`getpid`/`kill`/`cWriteErr`/`dl*`. Linked into a nim program
-/// so those leaves resolve to compiled code; only the true syscalls are left for the host.
+/// the `atomic*` family, `bswap64`/`ctz64`/`clz64`, and the page allocator `mmap`/`munmap` (below)
+/// — plus stubbed `exit`/`getpid`/`kill`/`cWriteErr`/`dl*`. Linked into a nim program so those
+/// leaves resolve to compiled code; only the true syscalls are left for the host.
+///
+/// **The page allocator.** `mmap` hands out whole pages, zeroed as an anonymous mapping is, and
+/// `munmap` takes them back (#2178):
+/// - `munmap` adds the pages to a **free list** in the shim's own data (the word after `errno`), kept
+///   in address order with neighbouring runs merged. Each free run holds its link and its length in
+///   its first two words.
+/// - `mmap` takes the first run long enough, zeroed: a longer run gives up its last pages, so its
+///   header stays put. With no such run it bumps the powerbox heap-brk word.
+/// - `munmap` refuses (`-1`, `errno` `EINVAL`) an unaligned address, a zero length, pages past the
+///   heap and pages already free, so a bad call cannot corrupt the list. An address below the heap is
+///   the caller's.
+///
+/// nim's own allocator never unmaps, so what comes back is the mappings `memfiles` makes to read a
+/// file ([`POSIX_MMAP_ADAPTER`]): before, every file read added its size to the heap for good.
 ///
 /// A request that would bump the `mmap` past [`temen_ir::POWERBOX_HEAP_TOP`] asks
 /// [`HEAP_GROW_HOOK`] for more heap first — the shim's one import, which the runtime a program links
@@ -1063,6 +1077,8 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("getcwd", ANY, 33),
     ("readlink", ANY, 34),
     ("ftruncate", ANY, 35),
+    // `munmap` is real, not a stub: it hands pages back to the shim's `mmap` (#2178), which is all
+    // it needs, since the pages are the guest's own.
     ("munmap", ANY, 36),
     ("c_rename", ANY, 37),
     ("c_getenv", ANY, 38),
@@ -1621,10 +1637,10 @@ const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
 /// sandbox disagree, after [`POSIX_OPEN_ADAPTER`].
 ///
 /// nim reads a file by **mapping** it: `nifreader.open` → `vfsOpenMmap` → `memfiles.open`, which is
-/// `open` + `fstat` + `mmap(fd)`. The compute shim's `mmap` is the guest **heap bump allocator**
-/// (hands out `[brk, brk+len)`, advancing `POWERBOX_HEAP_BRK`) and ignores `fd` entirely, so a
-/// file-backed mapping came back as uninitialized heap. With `fstat` also stubbed to 0 the result
-/// was an empty buffer, and hexer asserted in `jumpTo` on a zero-length file (#1595).
+/// `open` + `fstat` + `mmap(fd)`. The compute shim's `mmap` is the guest's **page allocator** and
+/// ignores `fd` entirely, so a file-backed mapping came back as uninitialized heap. With `fstat` also
+/// stubbed to 0 the result was an empty buffer, and hexer asserted in `jumpTo` on a zero-length file
+/// (#1595).
 ///
 /// This unit owns the `mmap` name on the POSIX route and **composes what already works**: it calls
 /// the shim's allocator through [`MMAP_ANON_ALIAS`] for the pages, then — when `fd` is a real
@@ -1635,6 +1651,11 @@ const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
 /// capability beyond the personality and its own window; the heap ceiling check (#1060) stays in the
 /// shim. A §13 `SharedRegion` premap is the zero-copy upgrade behind this same symbol when a copy
 /// stops being cheap enough.
+///
+/// **`munmap` gives the pages back** (#2178). They are the shim's pages and `munmap` is the shim's,
+/// so `memfiles.close` returns a file's pages to the allocator and the next mapping reuses them,
+/// zeroed past the file's end as a mapping's last page is. While `munmap` was a stub, every file a
+/// program read added its size to the heap for good, in fresh pages that each faulted in.
 ///
 /// **Fails closed on a short read.** A partial fill is indistinguishable downstream from a truncated
 /// file, so anything other than exactly `len` bytes returns `MAP_FAILED` (-1) and nim's
@@ -2030,7 +2051,7 @@ pub fn nim_posix_runtime(
         ..Default::default()
     };
     // **`mmap` changes hands** (#1595). nim maps files to read them, and the shim's `mmap` is the
-    // heap bump allocator — it ignores `fd`, so a file-backed mapping is uninitialized heap. Hand
+    // page allocator — it ignores `fd`, so a file-backed mapping is uninitialized heap. Hand
     // the name to `POSIX_MMAP_ADAPTER` and re-export the shim's func to it under a private alias,
     // so the allocator itself is still the one the shim owns.
     let mmaps: Vec<(String, u32)> = compute_exports
@@ -2835,5 +2856,248 @@ mod tests {
         let grow = heap_grow_unit().expect("heap grow parses");
         let f = &grow.module.funcs[0];
         assert_eq!((f.params.clone(), f.results.clone()), hook);
+    }
+
+    /// One step of a scenario against the compute shim's page allocator ([`run_heap_steps`]). Each
+    /// step leaves one word: an address, a return code, or what a load read.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// `mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`.
+        Map(i64),
+        /// `munmap(step i's address + off, len)`.
+        Unmap(usize, i64, i64),
+        /// Store `val` at step i's address + off. Leaves 0.
+        Poke(usize, i64, i64),
+        /// The word at step i's address + off.
+        Peek(usize, i64),
+        /// The shim's `errno`.
+        Errno,
+    }
+    use Step::*;
+
+    /// The scenarios' heap: the break is seeded here, above the units' data.
+    const BASE: i64 = 1 << 20;
+    /// Where the driver unit keeps the steps' words, above the NULL guard and its scratch page (the
+    /// driver is the first unit, so its data is placed at the window's start).
+    const WORDS: u64 = 2 * temen_ir::POWERBOX_NULL_GUARD;
+    const PAGE: i64 = 4096;
+
+    /// Run `steps` in one call over the compute shim, its heap seeded to `[BASE, window top)`, on the
+    /// interpreter and the JIT; the word each step leaves. The engines must agree on the whole window.
+    fn run_heap_steps(steps: &[Step]) -> Vec<i64> {
+        use std::fmt::Write;
+        let mut body = String::new();
+        let mut n = 5;
+        let mut val = |body: &mut String, rhs: String| {
+            let _ = writeln!(body, "  v{n} = {rhs}");
+            n += 1;
+            n - 1
+        };
+        for (k, step) in steps.iter().enumerate() {
+            let mut addr = |body: &mut String, i: usize, off: i64| {
+                let b = val(body, format!("i64.load v0 offset={}", 8 * i));
+                let o = val(body, format!("i64.const {off}"));
+                val(body, format!("i64.add v{b} v{o}"))
+            };
+            let word = match *step {
+                Map(len) => {
+                    let l = val(&mut body, format!("i64.const {len}"));
+                    val(
+                        &mut body,
+                        format!("call.import 0 (v1, v{l}, v2, v3, v4, v1)"),
+                    )
+                }
+                Unmap(i, off, len) => {
+                    let p = addr(&mut body, i, off);
+                    let l = val(&mut body, format!("i64.const {len}"));
+                    let r = val(&mut body, format!("call.import 1 (v{p}, v{l})"));
+                    val(&mut body, format!("i64.extend_i32_s v{r}"))
+                }
+                Poke(i, off, x) => {
+                    let p = addr(&mut body, i, off);
+                    let x = val(&mut body, format!("i64.const {x}"));
+                    let _ = writeln!(body, "  i64.store v{p} v{x}");
+                    1
+                }
+                Peek(i, off) => {
+                    let p = addr(&mut body, i, off);
+                    val(&mut body, format!("i64.load v{p}"))
+                }
+                Errno => {
+                    let p = val(&mut body, "call.import 2 ()".into());
+                    let e = val(&mut body, format!("i32.load v{p}"));
+                    val(&mut body, format!("i64.extend_i32_s v{e}"))
+                }
+            };
+            let _ = writeln!(body, "  i64.store v0 v{word} offset={}", 8 * k);
+        }
+        let driver = format!(
+            "import 0 \"mmap\" (i64, i64, i32, i32, i32, i64) -> (i64)\n\
+             import 1 \"munmap\" (i64, i64) -> (i32)\n\
+             import 2 \"errnoLocation\" () -> (i64)\n\
+             data {WORDS} \"{}\"\n\
+             func () -> () {{\nblock 0 () {{\n  v0 = data.self {WORDS}\n  v1 = i64.const 0\n  \
+             v2 = i32.const 3\n  v3 = i32.const 34\n  v4 = i32.const -1\n{body}  return\n  }}\n}}\n",
+            "\\x00".repeat(8 * steps.len())
+        );
+        let unit = |src: &str, exports: Vec<(String, u32)>| temen_ir::LinkUnit {
+            module: temen_text::parse_module(src).expect("parses"),
+            exports,
+            ..Default::default()
+        };
+        let mut m = temen_ir::link(&[
+            temen_ir::LinkUnit {
+                data_exports: vec![temen_ir::DataExport {
+                    name: "words".into(),
+                    offset: WORDS,
+                    tls: false,
+                }],
+                ..unit(&driver, vec![("scenario".into(), 0)])
+            },
+            unit(
+                POWERBOX_COMPUTE_SHIM,
+                vec![
+                    ("mmap".into(), 6),
+                    ("munmap".into(), 36),
+                    ("errnoLocation".into(), 85),
+                    (HEAP_GROW_HOOK.into(), SHIM_HEAP_FIXED),
+                ],
+            ),
+        ])
+        .expect("links");
+        let top = 1u64 << m.memory.expect("a window").size_log2;
+        let mut heap = (BASE as u64).to_le_bytes().to_vec();
+        heap.extend_from_slice(&top.to_le_bytes());
+        m.data.push(temen_ir::Data {
+            offset: temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK,
+            readonly: false,
+            bytes: heap,
+        });
+        temen_verify::verify_module(&m).expect("verifies");
+        let f = m
+            .exports
+            .iter()
+            .find(|e| e.name == "scenario")
+            .unwrap()
+            .func;
+        let at = m
+            .data_exports
+            .iter()
+            .find(|e| e.name == "words")
+            .unwrap()
+            .offset as usize;
+        // The interpreter captures as much of the window as it was seeded with: the heap's first MiB.
+        let seed = vec![0; 2 * BASE as usize];
+        let (ir, mem) = temen_interp::run_capture(&m, f, &[], &mut 1_000_000, &seed);
+        ir.expect("the interpreter runs the scenario");
+        let (jit, jmem) = temen_jit::compile_and_run_capture(&m, f, &[], &seed).expect("compiles");
+        assert!(
+            matches!(jit, temen_jit::JitOutcome::Returned(_)),
+            "the JIT runs the scenario: {jit:?}"
+        );
+        assert!(
+            mem.len() == seed.len() && jmem.starts_with(&mem),
+            "the engines leave different windows"
+        );
+        (0..steps.len())
+            .map(|k| i64::from_le_bytes(mem[at + 8 * k..at + 8 * k + 8].try_into().unwrap()))
+            .collect()
+    }
+
+    /// #2178: a mapping `munmap` frees is handed out again, zeroed as a fresh anonymous mapping is.
+    #[test]
+    fn munmap_gives_pages_back_to_mmap() {
+        let words = run_heap_steps(&[
+            Map(3 * PAGE),
+            Poke(0, 8, 7),
+            Poke(0, 2 * PAGE + 16, 9),
+            Unmap(0, 0, 3 * PAGE),
+            Map(0),
+            Map(3 * PAGE),
+            Peek(5, 8),
+            Peek(5, 2 * PAGE + 16),
+            Map(PAGE),
+            Errno,
+        ]);
+        assert_eq!(words[0], BASE);
+        assert_eq!(words[3], 0, "munmap succeeds");
+        assert_eq!(words[4], BASE + 3 * PAGE, "a zero-length map takes nothing");
+        assert_eq!(words[5], BASE, "the freed pages come back");
+        assert_eq!(&words[6..8], [0, 0], "zeroed");
+        assert_eq!(words[8], BASE + 3 * PAGE, "the run was taken whole");
+        assert_eq!(words[9], 0, "no errno");
+    }
+
+    /// Freed runs split from their end to serve a smaller mapping, and merge with free neighbours on
+    /// either side, so a later mapping as large as all of them fits again.
+    #[test]
+    fn freed_runs_split_and_merge() {
+        let words = run_heap_steps(&[
+            Map(4 * PAGE),
+            Map(PAGE),
+            Poke(0, 3 * PAGE + 8, 5),
+            Unmap(0, 0, 4 * PAGE),
+            Map(PAGE),
+            Peek(4, 8),
+            Map(3 * PAGE),
+            Map(PAGE),
+            Unmap(6, 0, PAGE),
+            Unmap(6, 2 * PAGE, PAGE),
+            Unmap(4, 0, PAGE),
+            Unmap(6, PAGE, PAGE),
+            Map(4 * PAGE),
+            Map(3 * PAGE),
+            Unmap(13, PAGE, 100),
+            Map(PAGE),
+        ]);
+        assert_eq!(words[1], BASE + 4 * PAGE);
+        assert_eq!(
+            words[4],
+            BASE + 3 * PAGE,
+            "a small mapping takes the run's end"
+        );
+        assert_eq!(words[5], 0, "zeroed");
+        assert_eq!(words[6], BASE, "and the rest is taken whole");
+        assert_eq!(words[7], BASE + 5 * PAGE, "then the heap grows");
+        assert_eq!(&words[8..12], [0; 4]);
+        assert_eq!(words[12], BASE, "four freed pages merged into one run");
+        assert_eq!(words[13], BASE + 6 * PAGE);
+        assert_eq!(words[14], 0, "a partial unmap frees its pages");
+        assert_eq!(words[15], BASE + 7 * PAGE);
+    }
+
+    /// `munmap` refuses what it cannot free (an unaligned address, an empty or overflowing length,
+    /// pages past the heap, pages already free) with `EINVAL`, and leaves the free list as it was.
+    /// The `errno` is what tells nim: its `pcall` reads a `-1` as `-errno`, so a `-1` with `errno` 0
+    /// would read as success.
+    #[test]
+    fn munmap_refuses_what_it_cannot_free() {
+        let words = run_heap_steps(&[
+            Map(2 * PAGE),
+            Map(PAGE),
+            Unmap(0, 8, PAGE),
+            Unmap(0, 0, 0),
+            Unmap(0, 0, -1),
+            Unmap(1, PAGE, PAGE),
+            Unmap(0, 0, 2 * PAGE),
+            Unmap(0, PAGE, PAGE),
+            Unmap(0, -PAGE, 2 * PAGE),
+            Map(2 * PAGE),
+            Unmap(1, 0, PAGE),
+            Unmap(1, 0, PAGE),
+            Map(PAGE),
+            Errno,
+        ]);
+        assert_eq!(
+            &words[2..6],
+            [-1; 4],
+            "unaligned, empty, overflowing, past the heap"
+        );
+        assert_eq!(words[6], 0);
+        assert_eq!(&words[7..9], [-1; 2], "overlapping a free run");
+        assert_eq!(words[9], BASE, "the run survived the refusals");
+        assert_eq!(&words[10..12], [0, -1], "a double unmap is refused");
+        assert_eq!(words[12], BASE + 2 * PAGE);
+        assert_eq!(words[13], 22, "EINVAL");
     }
 }
