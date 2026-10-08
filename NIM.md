@@ -763,15 +763,12 @@ already lowers a named import to a host capability (`Cap`) — that's the seam.
 
 **✅ Pure-IR compute leaves — DONE 2026-08-11 (#761, slice 1).** The *compute* half of the bottom
 edge needs **no** host authority, so it binds as ordinary linked Temen functions instead of caps —
-keeping the runtime inside the pure-IR / both-engines model. `temen_leng::bottom_edge_runtime()` is a
-link unit providing `memcpy`/`memset` (→ `mem.copy`/`mem.fill`), `__builtin_bswap64`/`clzll`/`ctzll`/
-`popcountll` (→ `bswap` byte-shuffle / `clz`/`ctz`/`popcnt`), and the `__atomic_*` family
-(→ the IR's atomics, #2202); `bottom_edge_index` maps a C leaf
-name (or nimony's stem-qualified spelling) to its function. Pinned by `crates/temen-leng/tests/bottom_edge.rs`
-— each leaf **interp == JIT == native**, plus a link test binding a user module's imports to the runtime.
-Remaining for #761: `memcmp` (a byte loop), and emitting the import under its `importc` C name so the
-real `system` module binds without a name map (wired in #762, where the real names are in hand). The
-allocator (`mmap`/`munmap`) + syscalls stay on the Memory cap / POSIX seam — not pure IR.
+keeping the runtime inside the pure-IR / both-engines model. Those leaves are now the compute shim
+every nim program links (`POWERBOX_COMPUTE_SHIM`, each leaf routed by `COMPUTE_LEAVES`):
+`c_memcpy`/`c_memset` (→ `mem.copy`/`mem.fill`), `c_memcmp` (a byte loop), `bswap64`/`clz64`/`ctz64`
+(→ a byte shuffle / `clz`/`ctz`) and the atomics (→ the IR's atomics, #2202). The first unit of this
+kind, `bottom_edge_runtime()`, served the same leaves under their C names until the shim superseded it,
+and is deleted. The syscalls stay on the POSIX seam, and the heap grows through the Memory cap.
 
 **Two paths to the near-term milestone (run one real program):**
 
