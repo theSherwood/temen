@@ -15,13 +15,13 @@ use temen_spec::Enc;
 #[test]
 fn structural_rows_verify_roundtrip_and_pin_encoding() {
     for row in struct_rows() {
-        // The v9 link-form data addresses exist only in the **object dialect** — their rows
-        // (and their baselines, so the byte-pin divergence isn't the header flag) ride
+        // The link forms exist only in the **object dialect** — their rows (and their
+        // baselines, so the byte-pin divergence isn't the header flag) ride
         // `encode_unit`/`decode_unit`; every other row rides the runnable path.
         let object = !row.is_term
             && matches!(
                 row.module.funcs[0].blocks[0].insts[0],
-                Inst::DataSelf { .. } | Inst::DataSym { .. } | Inst::DataTop
+                Inst::DataSelf { .. } | Inst::DataSym { .. } | Inst::DataTop | Inst::RefSym { .. }
             );
         let enc = |m: &Module| {
             if object {

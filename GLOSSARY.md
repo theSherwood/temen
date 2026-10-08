@@ -34,7 +34,7 @@ The system is four ideas wearing many names:
   the **runnable** binary (wire v9 flag 0): the untrusted-input path, decoded by the
   escape-TCB `decode_module`, never contains link scaffolding. `.temeno` is the binary
   **object / link unit** (v9 flag bit 0, `decode_unit`): a pre-link unit that may carry
-  `data.ptr` relocations, data exports, and `data.self`/`data.sym`/`data.top`; the
+  `data.ptr` relocations, data exports, and `data.self`/`data.sym`/`data.top`/`ref.sym`; the
   linker (`temen_ir::link`, `temen-run --link`) resolves it into a runnable module.
 - **domain** — one isolated unit of execution: a module's code + its window + its
   powerbox. The root program is a domain; every §14 child and every provider instance is

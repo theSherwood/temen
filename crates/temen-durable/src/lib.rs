@@ -605,9 +605,12 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
         | Swizzle { a, b, .. } => vec![*a, *b],
         VShift { a, amt, .. } => vec![*a, *amt],
         Bitselect { a, b, mask } => vec![*a, *b, *mask],
-        DataSym { .. } | DataSelf { .. } | DataTop | CapSelfTypeId { .. } | ExportHandle { .. } => {
-            vec![]
-        }
+        DataSym { .. }
+        | DataSelf { .. }
+        | DataTop
+        | RefSym { .. }
+        | CapSelfTypeId { .. }
+        | ExportHandle { .. } => vec![],
         CapSelfCovers { handle, .. } => vec![*handle],
         MemCopy { dst, src, len } | MemMove { dst, src, len } => vec![*dst, *src, *len],
         MemFill { dst, val, len } => vec![*dst, *val, *len],
@@ -2198,6 +2201,7 @@ fn result_types(
         Fma { ty, .. } => vec![ty.val()],
         // Address constants and §3.5 reflection: pure, one scalar each.
         DataSym { .. } | DataSelf { .. } | DataTop => vec![ValType::I64],
+        RefSym { .. } => vec![ValType::I32],
         CapSelfTypeId { .. } | CapSelfCovers { .. } | ExportHandle { .. } => vec![ValType::I32],
         // Bulk memory ops: no results (guest-memory ops — the strict gate refuses them, the
         // confined path admits them, like `load`/`store`).

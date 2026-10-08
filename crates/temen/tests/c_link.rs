@@ -535,6 +535,68 @@ fn function_pointers_in_static_data_link_and_run() {
     }
 }
 
+/// **Another unit's function as a value in code** (#2203): the issue's `apply(sin, 0.0)` shape. A
+/// function the unit defines decays to `ref.func` of its index in the unit; one another unit
+/// defines decays to `ref.sym "name"`, which the linker resolves to that function's merged index.
+/// The program passes the library's `square` to the library's `apply`; the library compares what
+/// it is handed against the program's `negate`, taken by name the other way, so a pointer means
+/// the same function whichever unit took it. Both link orders put the library at two function
+/// bases; `main` prints through the emit-object libc.
+#[test]
+fn another_units_function_as_a_value_in_code_links_and_runs() {
+    use temen_run::{instantiate, Outcome, RunConfig, Value};
+
+    let prog = object_unit(
+        "fvprog",
+        "int printf(const char *, ...);\n\
+         int apply(int (*f)(int), int x);\n\
+         int square(int x);\n\
+         int negate(int x) { return -x; }\n\
+         int main(void) {\n\
+         \x20 int (*f)(int) = square;\n\
+         \x20 printf(\"%d %d %d\\n\", apply(f, 7), apply(negate, 5), f == square);\n\
+         \x20 return apply(square, 3);\n\
+         }\n",
+    );
+    let lib = object_unit(
+        "fvlib",
+        "int negate(int x);\n\
+         int square(int x) { return x * x; }\n\
+         int apply(int (*f)(int), int x) { return f(x) + (f == negate ? 100 : 0); }\n",
+    );
+    let ref_syms = |u: &LinkUnit| {
+        let mut names: Vec<String> = u
+            .module
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                temen_ir::Inst::RefSym { name } => Some(String::from_utf8_lossy(name).into()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    assert_eq!(ref_syms(&prog), ["square"], "`negate` is the program's own");
+    assert_eq!(ref_syms(&lib), ["negate"], "`square` is the library's own");
+
+    let libc = object_unit_file("crates/temen/tests/fixtures/emit_libc/mini_libc.c");
+    for units in [[&prog, &lib, &libc], [&prog, &libc, &lib]] {
+        let units: Vec<LinkUnit> = units.into_iter().cloned().collect();
+        let linked = temen_ir::link_with_manifest(&units).expect("link");
+        temen_verify::verify_module(&linked).expect("verify");
+        let run = instantiate(linked)
+            .expect("instantiate")
+            .run_diff(&RunConfig::default())
+            .expect("run _start on interp+jit");
+        assert_eq!(run.outcome, Outcome::Returned(vec![Value::I32(9)]));
+        assert_eq!(run.stdout, b"49 95 1\n");
+    }
+}
+
 /// A link unit's symbol tables by reference, for the borrowed linker entries.
 fn unit_ref(u: &LinkUnit) -> temen_ir::LinkUnitRef<'_> {
     temen_ir::LinkUnitRef::from(u)

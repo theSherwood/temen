@@ -783,6 +783,9 @@ fn type_inst<'a>(
         // before anything runs; if one ever survives into an executed module the backends fail
         // closed (they never reach a legitimate execution path).
         Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => ValType::I64,
+        // The link-form function reference (#2203) likewise types as the `i32` funcref `link`
+        // rewrites it to (`ref.func`).
+        Inst::RefSym { .. } => ValType::I32,
         // §7 executable named import (IMPORTS.md phase 1): the index must name a declared import
         // and the call's self-describing `sig` must equal the manifest's — the canonical-interface
         // check `call.cap` cannot have (its sig is self-asserted). No handle operand (v8): the slot

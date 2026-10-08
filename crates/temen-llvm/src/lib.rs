@@ -1468,7 +1468,7 @@ fn translate_impl(
             // initializer pointers for the linker to fill in (#1746).
             data_exports: link_data.exports,
             data_ptrs: link_data.ptrs,
-            data_funcrefs: Vec::new(),
+            data_funcrefs: link_data.funcrefs,
             data_funcref_slots: link_data.funcref_slots,
             tls: Vec::new(),
             funcs,
@@ -1691,8 +1691,11 @@ enum CBase {
     SelfData,
     /// A global another unit defines (`data.sym`).
     DataSym(String),
-    /// A function's funcref (`ref.func`).
+    /// A function this unit defines: its funcref (`ref.func`).
     Func(String),
+    /// A function another unit defines: its funcref, which the linker resolves by name (`ref.sym`
+    /// in code, a named `data.funcref` in data, #2203).
+    FuncSym(String),
 }
 
 /// A folded constant: `base + off`, or just `off` when there is no `base`.
@@ -1754,6 +1757,9 @@ fn const_reloc(
                 })
             } else if link.is_some_and(|ext| ext.contains(&n)) {
                 Ok(reloc(CBase::DataSym(n), 0))
+            } else if link.is_some() {
+                // Neither data nor a function the unit defines: a function another unit does.
+                Ok(reloc(CBase::FuncSym(n), 0))
             } else {
                 unsup(format!("constexpr reference to `@{n}`"))
             }
@@ -2063,6 +2069,8 @@ struct LinkData {
     /// Where initializers hold a function pointer: the slot holds the function's index in the unit,
     /// which the linker shifts with the unit's functions (#2194).
     funcref_slots: Vec<u64>,
+    /// Where initializers hold a pointer to a function another unit defines, by name (#2203).
+    funcrefs: Vec<temen_ir::DataFuncref>,
 }
 
 /// The per-vCPU thread-local (TLS) block layout (NIM.md §3d Tier-2). Thread-local globals are peeled
@@ -2284,8 +2292,8 @@ fn globals_layout(
                     tls: false,
                     target: temen_ir::DataPtrTarget::Sym { name, addend },
                 }),
-                // A function this unit defines (`const_reloc` refuses any other), `static` or
-                // not: the slot holds its index in the unit, which the linker shifts.
+                // A function this unit defines, `static` or not: the slot holds its index in the
+                // unit, which the linker shifts.
                 CBase::Func(name) => {
                     let Some(&func) = name2idx.get(&name).filter(|_| addend == 0) else {
                         return unsup(format!(
@@ -2295,6 +2303,16 @@ fn globals_layout(
                     };
                     bytes[off as usize..off as usize + 4].copy_from_slice(&func.to_le_bytes());
                     link_data.funcref_slots.push(at);
+                }
+                // A function another unit defines: a named relocation, resolved like a call.
+                CBase::FuncSym(name) => {
+                    if addend != 0 {
+                        return unsup(format!(
+                            "arithmetic on the address of `@{name}` in `@{}`'s initializer",
+                            name_str(&g.name)
+                        ));
+                    }
+                    link_data.funcrefs.push(temen_ir::DataFuncref { at, name });
                 }
             }
         }
@@ -17802,6 +17820,18 @@ impl<'a> BlockCtx<'a> {
                     a: r,
                 })
             }
+            Some(CBase::FuncSym(name)) => {
+                if v.off != 0 {
+                    return unsup(format!("arithmetic on the address of `@{name}`"));
+                }
+                let r = self.push(Inst::RefSym {
+                    name: name.into_bytes(),
+                });
+                self.push(Inst::Convert {
+                    op: ConvOp::ExtendI32U,
+                    a: r,
+                })
+            }
         };
         let Some(t) = narrow else { return Ok(wide) };
         let low = self.push(Inst::Convert {
@@ -18190,7 +18220,7 @@ impl<'a> BlockCtx<'a> {
                         }))
                     } else if let Some(link) = self.link {
                         // A link unit reaches a global another unit defines through the linker
-                        // (#1746). A function it does not define it can call, not take the address of.
+                        // (#1746), and the address of a function another unit defines (#2203).
                         if link.extern_data.contains(&n) {
                             Ok(self.push(Inst::DataSym {
                                 name: n.into_bytes(),
@@ -18198,10 +18228,13 @@ impl<'a> BlockCtx<'a> {
                                 tls: false,
                             }))
                         } else {
-                            unsup(format!(
-                                "the address of undefined function `@{n}`: a link unit imports calls \
-                                 to it, not its address"
-                            ))
+                            let r = self.push(Inst::RefSym {
+                                name: n.into_bytes(),
+                            });
+                            Ok(self.push(Inst::Convert {
+                                op: ConvOp::ExtendI32U,
+                                a: r,
+                            }))
                         }
                     } else {
                         unsup(format!("reference to `@{n}` (undefined/external global)"))

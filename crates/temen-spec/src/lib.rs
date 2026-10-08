@@ -1720,11 +1720,12 @@ pub fn coverage(inst: &Inst) -> Class {
         | Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
-        // Link-form data addresses: resolved by the linker, never executed by the spec —
-        // typing + encoding rows in `structural` (object dialect, v9), no `eval`.
+        // Link forms: resolved by the linker, never executed by the spec — typing + encoding
+        // rows in `structural` (object dialect), no `eval`.
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
         | Inst::DataTop
+        | Inst::RefSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfTypeId { .. }

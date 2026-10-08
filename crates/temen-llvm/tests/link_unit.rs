@@ -279,20 +279,85 @@ entry:
     );
     assert!(e.contains("`main`"), "{e}");
 
-    // The address of a function the unit does not define (it can call it, not take its address).
+    // An offset from the address of a function another unit defines: the linker resolves a name to
+    // an index, nothing more.
     let e = refusal(
         r#"
 declare i64 @elsewhere()
-@slot = global ptr null
-define void @take() {
-entry:
-  store ptr @elsewhere, ptr @slot
-  ret void
-}
+@table = global [1 x ptr] [ptr getelementptr (i8, ptr @elsewhere, i64 1)]
 "#,
     );
     assert!(
-        e.contains("address of undefined function `@elsewhere`"),
+        e.contains("arithmetic on the address of `@elsewhere`"),
         "{e}"
     );
+}
+
+/// A library with a function another unit takes the address of, and one that calls through a
+/// pointer it is handed.
+const APPLY_LIB: &str = r#"
+define i64 @lib_add(i64 %a, i64 %b) {
+entry:
+  %r = add i64 %a, %b
+  ret i64 %r
+}
+
+define i64 @lib_apply(ptr %f, i64 %a, i64 %b) {
+entry:
+  %r = call i64 %f(i64 %a, i64 %b)
+  ret i64 %r
+}
+"#;
+
+/// A unit that takes `@lib_add`'s address, which it does not define, in code (an argument to
+/// `@lib_apply`) and in data (`@ops`), and calls through both.
+const TAKER: &str = r#"
+@ops = global [1 x ptr] [ptr @lib_add]
+
+declare i64 @lib_add(i64, i64)
+declare i64 @lib_apply(ptr, i64, i64)
+
+define i64 @take() {
+entry:
+  %a = call i64 @lib_apply(ptr @lib_add, i64 40, i64 2)
+  %f = load ptr, ptr @ops
+  %b = call i64 %f(i64 1, i64 2)
+  %s = mul i64 %a, 100
+  %r = add i64 %s, %b
+  ret i64 %r
+}
+"#;
+
+/// **Another unit's function as a value** (#2203): code takes its address with `ref.sym`, data
+/// holds it as a named `data.funcref`, and the linker resolves both as it resolves a call, in either
+/// link order.
+#[test]
+fn a_link_unit_takes_the_address_of_another_units_function() {
+    let taker = link_unit(TAKER);
+    let in_code = taker
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, temen_ir::Inst::RefSym { name } if name == b"lib_add"));
+    assert!(in_code, "the argument is a `ref.sym`");
+    assert_eq!(
+        taker.data_funcrefs.len(),
+        1,
+        "the initializer is a named funcref"
+    );
+    assert_eq!(taker.data_funcrefs[0].name, "lib_add");
+    for taker_first in [true, false] {
+        let (taker, lib) = (unit(taker.clone()), unit(link_unit(APPLY_LIB)));
+        let units = if taker_first {
+            vec![taker, lib]
+        } else {
+            vec![lib, taker]
+        };
+        assert_eq!(
+            link_and_run(units, "take"),
+            temen_run::Outcome::Returned(vec![Value::I64(4203)]),
+            "taker first: {taker_first}"
+        );
+    }
 }

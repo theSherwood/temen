@@ -325,14 +325,16 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         // tree-walk oracle today. Classify by `(type_id, op)`. (INVARIANTS.md #9; FORK.md §8.5;
         // ISSUES.md I36.)
         Inst::CapCall { type_id, op, .. } => parity_capcall(*type_id, *op),
-        // Other host-boundary calls / link-form data addresses: Cranelift emits a thunk (or `link`
-        // rewrites the data-sym to an `i64.const`); the wasm-JIT leaf-folds every cap op underneath.
+        // Other host-boundary calls / link forms: Cranelift emits a thunk (or `link` rewrites the
+        // data-sym to an `i64.const` and the ref-sym to a `ref.func`); the wasm-JIT leaf-folds
+        // every cap op underneath.
         Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
         | Inst::DataTop
+        | Inst::RefSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => row(F, cell(Status::Declines, LEAF)),
 

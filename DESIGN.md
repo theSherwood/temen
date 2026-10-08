@@ -487,7 +487,8 @@ version splits the container: the **runnable module** (`.temen`, flag 0 — the
 untrusted-input TCB path, `decode_module`) and the **object / link unit** (`.temeno`,
 flag bit 0 — `decode_unit`, the linker's binary input). Only the object dialect
 carries the D-LINK scaffolding: the `data.ptr` relocation section, the data-export
-section, and the link-form `data.self`/`data.sym`/`data.top` opcodes.
+section, and the link-form `data.self`/`data.sym`/`data.top` opcodes (and `ref.sym`, another
+unit's function as a value in code, #2203).
 `decode_module` rejects the object flag **at the header**, so link scaffolding stays
 unreachable from the runtime load path — the fused decode+verify pass is unchanged;
 reserved flag bits fail closed. Both dialects are one linear pass with no fixups
