@@ -380,13 +380,14 @@ fn jit_run_module(m: &temen_ir::Module) -> (Vec<u8>, bool) {
 }
 
 /// #1153 run-path guard (the `chibicc libc`/`memstream` play cards, `browser-play-editor-test.mjs`):
-/// chibicc compiles a program whose `malloc` `vm_map`s its heap arena at a high address (256 MiB, well
-/// past the 32-MiB run window); running the produced IR on the JIT must either MATCH the interpreter or
-/// DECLINE (trap → the browser falls back), never *complete* with divergent output. The regression this
-/// pins: a cross-tier reservation clamped to the window turned that high `vm_map` into `-EINVAL`, so
-/// `malloc` returned null and the run finished printing `(null)` instead of declining.
+/// chibicc compiles a program whose `malloc` `vm_map`s its heap arena; running the produced IR on the
+/// JIT must MATCH the interpreter. #1153 pinned that it never *completes* with divergent output (a
+/// cross-tier reservation clamped to the window turned a high `vm_map` into `-EINVAL`, so `malloc`
+/// returned null and the run printed `(null)`). While the heap started at a fixed 256 MiB, past the
+/// 32 MiB run window, the run could only decline. It now starts at the window's mapped boundary, which
+/// the link's `_start` seeds, and grows contiguously, so the emitted tier runs it (#2212).
 #[test]
-fn chibicc_compiled_malloc_program_matches_or_declines() {
+fn chibicc_compiled_malloc_program_matches_on_the_jit() {
     let Some(chibicc) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen absent (run build-onramp-assets.mjs)");
         return;
@@ -413,8 +414,9 @@ fn chibicc_compiled_malloc_program_matches_or_declines() {
     );
     let (jit_bytes, declined) = jit_run_module(&m);
     let jit_out = String::from_utf8_lossy(&jit_bytes).to_string();
-    assert!(
-        declined || jit_out == interp_out,
-        "JIT run must match the interpreter or decline, not diverge (#1153): got {jit_out:?} declined={declined}"
+    assert!(!declined, "the emitted tier runs a program that allocates");
+    assert_eq!(
+        jit_out, interp_out,
+        "and prints what the interpreter does (#1153)"
     );
 }

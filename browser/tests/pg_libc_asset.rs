@@ -32,6 +32,20 @@ fn pg_libc() -> Option<temen_ir::Module> {
     )
 }
 
+/// `unit` lays no data in the scratch page below `guard + POWERBOX_ARGS_END`. The unit linked first
+/// keeps its offsets, and that page is where the program's `_start` seeds the heap words and the host
+/// seeds the args, so a global there would be overwritten.
+fn assert_above_the_scratch_page(unit: &temen_ir::Module, what: &str) {
+    let end = temen_ir::module_args_end();
+    for d in &unit.data {
+        assert!(
+            d.offset >= end,
+            "{what}: a data segment at {} lies in the scratch page, below {end}",
+            d.offset
+        );
+    }
+}
+
 /// Compile `src` as a **program unit**: decls-only against the seeded headers, so it carries no libc
 /// bodies and resolves them against the prebuilt unit at link time.
 fn program_unit(src: &str) -> Option<temen_ir::Module> {
@@ -144,6 +158,7 @@ fn the_committed_unit_decodes_and_publishes_the_libc() {
         "the unit must publish `__pg_std` as a data symbol; got {:?}",
         lib.data_exports.iter().map(|d| &d.name).collect::<Vec<_>>()
     );
+    assert_above_the_scratch_page(&lib, "pg_libc.temeno");
     let di = lib
         .debug_info
         .as_ref()
@@ -181,6 +196,7 @@ fn the_committed_heap_unit_is_the_allocator_and_nothing_more() {
     imports.sort_unstable();
     imports.dedup();
     assert_eq!(imports, ["exit", "stderr", "vm_map", "vm_page_size"]);
+    assert_above_the_scratch_page(&heap, "pg_heap.temeno");
 }
 
 /// End to end, the way the card runs: a freshly compiled program unit links against the **committed**

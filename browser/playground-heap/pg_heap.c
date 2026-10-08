@@ -11,28 +11,34 @@ long __vm_page_size(void);
 long __vm_write_stderr(long buf, long len);
 void exit(int code);
 
-/* The heap starts at 256 MiB, above everything else in a playground program's window, and grows by
- * committing host pages with `__vm_map`. */
-#define PG_HEAP_BASE (256L << 20)
-
-static long pg_brk = PG_HEAP_BASE;       /* the break: the end of what dlmalloc has been given */
-static long pg_committed = PG_HEAP_BASE; /* the first byte past the committed pages */
+/* The heap's two words in the powerbox scratch page above the NULL guard (`temen_ir::POWERBOX_HEAP_BRK`
+ * and `POWERBOX_HEAP_TOP`): the break, the end of what dlmalloc has been given, and the first byte past
+ * the committed pages. The program's `_start` seeds both to the window's mapped boundary, and the heap
+ * grows from there by committing host pages with `__vm_map`, so the committed window stays one range
+ * from 0: the shape the wasm-JIT tier's bounds check follows. */
+#define PG_HEAP_BRK ((volatile long *)(16384 + 32))
+#define PG_HEAP_TOP ((volatile long *)(16384 + 40))
+static long pg_base; /* where the heap starts: the first break, once dlmalloc has asked */
 
 /* dlmalloc's `MORECORE`: move the break up by `inc`, committing the pages it crosses, and return the
  * old break, or `(void *)-1` when the window cannot grow (so `malloc` returns NULL). dlmalloc calls it
  * only under its global lock, and never with a negative `inc` (`MORECORE_CANNOT_TRIM`). */
 static void *__temen_sbrk(ptrdiff_t inc) {
-  long old = pg_brk, end = old + inc;
-  if (end > pg_committed) {
+  long old = *PG_HEAP_BRK, end = old + inc, top = *PG_HEAP_TOP;
+  if (!old)
+    return (void *)-1; /* no `_start` seeded the heap */
+  if (!pg_base)
+    pg_base = old;
+  if (end > top) {
     long page = __vm_page_size();
     if (page <= 0)
       page = 4096;
-    long need = (end - pg_committed + page - 1) & ~(page - 1);
-    if (__vm_map(pg_committed, need, 3) != 0)
+    long need = (end - top + page - 1) & ~(page - 1);
+    if (__vm_map(top, need, 3) != 0)
       return (void *)-1;
-    pg_committed += need;
+    *PG_HEAP_TOP = top + need;
   }
-  pg_brk = end;
+  *PG_HEAP_BRK = end;
   return (void *)old;
 }
 
@@ -60,8 +66,8 @@ static size_t dlmalloc_usable_size(void *mem);
  * has no lower bound until the heap is first used, so a stack pointer freed before any `malloc` would
  * otherwise be taken for a chunk. */
 static void pg_check_block(void *p) {
-  long a = (long)p;
-  if (p && (a < PG_HEAP_BASE || a >= pg_brk || (a & 15)))
+  long a = (long)p, brk = *PG_HEAP_BRK;
+  if (p && (a < (pg_base ? pg_base : brk) || a >= brk || (a & 15)))
     pg_bad_free(0);
 }
 

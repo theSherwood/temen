@@ -561,10 +561,16 @@ with glibc's words (exit 134). Compiled by chibicc instead, the same dlmalloc wa
 and a fraction of the speed.
 
 The unit exports those four names and nothing else, and imports only `vm_map`/`vm_page_size` (to grow)
-and `stderr`/`exit` (to abort). Its heap starts at 256 MiB in the window and grows by committing host
-pages. It is built by `scripts/rebuild-assets.sh`'s `pg_heap` step (clang + the release
-`temen-llvm-translate`) and gated by `browser/tests/pg_libc_asset.rs`. Every program the card runs links
-it after the libc unit; a native test does the same through `browser/tests/support/pg_heap.rs`. An
+and `stderr`/`exit` (to abort). Its heap starts at the window's mapped boundary and grows by committing
+host pages above it. The program's `_start` sets the two heap words (`POWERBOX_HEAP_BRK`/`TOP`, in the
+scratch page above the NULL guard) to that boundary, and the link's synthesized `_start` does so for
+every card program. No unit's data lies in that page: chibicc's `--emit-object` starts a unit's globals
+above it. The committed window then stays one range from 0, the shape the wasm-JIT tier's bounds check
+follows, so a program that allocates runs on the emitted tier. While the heap started at a fixed
+256 MiB, past the 32 MiB wasm-JIT run window, every such program declined to the interpreter. The unit
+is built by `scripts/rebuild-assets.sh`'s `pg_heap` step (clang + the release `temen-llvm-translate`)
+and gated by `browser/tests/pg_libc_asset.rs`. Every program the card runs links it after the libc
+unit; a native test does the same through `browser/tests/support/pg_heap.rs`. An
 embedder that links the libc unit must link the heap unit too, or `malloc` is left unresolved.
 
 **Running the playground's Chromium tests locally.** `browser-play-editor-test.mjs` (and the rest of
