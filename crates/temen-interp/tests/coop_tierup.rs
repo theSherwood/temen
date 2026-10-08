@@ -317,6 +317,113 @@ fn coop_tierup_bounce_matches_pure_interp() {
     assert_eq!(bounces, 1, "expected exactly one cross-tier bounce");
 }
 
+// #1414 slice 3d — a bounce resumes a fiber the pump parked. The root starts a fiber that parks in
+// `memory.wait` (its resumer gets `(FIBER_PARKED, 0)`), then calls the eligible leaf `L(k)`, whose
+// emitted body bounces to `C(k)`. `C` resumes the parked fiber over the run's registry: still parked,
+// it answers the poll again, as the same resume does interpreted. Then the root notifies the word and
+// resumes the fiber to its return. Returns `C's status * 10 + the last resume's status`.
+const SRC_BOUNCE_POLLS_A_PARKED_FIBER: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 3
+  v1 = i64.const 0
+  vk = cont.new v0 v1
+  vz = i64.const 0
+  vs1, vv1 = cont.resume vk vz
+  vpoll = call 1 (vk)
+  vaddr = i64.const 16384
+  vcnt = i32.const 1
+  vw = atomic.notify vaddr vcnt
+  vs3, vv3 = cont.resume vk vz
+  vs364 = i64.extend_i32_s vs3
+  v10 = i64.const 10
+  vhi = i64.mul vpoll v10
+  vr = i64.add vhi vs364
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vk: i64) {
+  vr = call 2 (vk)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vk: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  vs64 = i64.extend_i32_s vs
+  return vs64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+"#;
+
+/// The bounce used to fault on the parked fiber (`FiberFault`): the nested drive claimed only
+/// pending and suspended fibers, where the pump claims every state.
+#[test]
+fn a_bounce_polls_a_fiber_the_pump_parked() {
+    let m = parse_module(SRC_BOUNCE_POLLS_A_PARKED_FIBER).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    // func 1 (L) is the eligible leaf; func 2 (C) is the interpreted callee its emitted body bounces to.
+    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, true, false, false]);
+
+    // FIBER_PARKED (3) from the bounce's resume, then FIBER_RETURNED (1).
+    let want = oracle(&m);
+    assert_eq!(want, Ok(vec![Value::I64(31)]), "oracle value");
+
+    let tierup = TierUpConfig {
+        eligible,
+        page_checked: false,
+        leaf: None,
+    };
+    let mut run = bytecode::CoopRun::new(&m, 0, &[], FUEL, Host::new(), Some(tierup))
+        .expect("supported")
+        .expect("entry in range");
+    let mut bounces = 0u32;
+    let got = loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => break Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                assert_eq!(func, 1, "only func 1 (L) is eligible / tiers up");
+                // Emulate L's emitted body: `call_interp(func 2, argv)`, the cross-tier bounce.
+                let mut io: Vec<i64> = argv.to_vec();
+                match run.bounce(2, &mut io, None) {
+                    Ok(n) => {
+                        let n = n.expect("the call returns: nothing here parks");
+                        run.deliver_tierup(&io[..n]);
+                    }
+                    Err(t) => run.deliver_tierup_trap(t),
+                }
+                bounces += 1;
+            }
+            bytecode::CoopEvent::Idle
+            | bytecode::CoopEvent::Paused
+            | bytecode::CoopEvent::CapPark { .. }
+            | bytecode::CoopEvent::Resume { .. }
+            | bytecode::CoopEvent::JitInvoke { .. } => {
+                panic!("unexpected event: only the leaf's tier-up pauses this run")
+            }
+        }
+    };
+    assert_eq!(
+        got, want,
+        "the bounce's resume diverged from the interpreted one"
+    );
+    assert_eq!(bounces, 1, "expected exactly one cross-tier bounce");
+}
+
 // #926 differential (the issue's "Differentials" list): a **self-hosted fiber scheduler** whose worker
 // fibers each call the eligible leaf, plus the root — proving tier-up fires and marshals correctly amid
 // the scheduler's fiber servicing (`cont.new`/`cont.resume`), not only across `thread.spawn` vCPUs. The
