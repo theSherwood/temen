@@ -8185,14 +8185,44 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                let m = dbg_env_mem(mem, extra_envs, tasks[ti].env);
-                wait_task(tasks, ti, m, clock, base, expected, width, timeout, dst);
+                // The task's domain: the root's registry and window, or its `DbgEnv`'s. No blocking
+                // resume idles here (this engine claims with `may_block` off), so a fiber's park
+                // hands its resumer `FIBER_PARKED`.
+                let (fibers, mem) = match tasks[ti].env {
+                    None => (&mut *fibers, &mut *mem),
+                    Some(k) => {
+                        let e = &mut extra_envs[k];
+                        (&mut e.fibers, &mut e.mem)
+                    }
+                };
+                futex_wait(
+                    tasks,
+                    ti,
+                    &mut fibers.fibers,
+                    &mut fibers.sp,
+                    mem,
+                    || false,
+                    false,
+                    clock,
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                );
             }
             Outcome::MemoryNotify { base, count, dst } => {
                 *turn += 1;
                 let win = |env| dbg_env_mem(mem, extra_envs, env);
                 let key = futex_key_in(win(tasks[ti].env), base);
-                let woken = wake_waiters(tasks, key, count as u32, win);
+                let want = count as u32;
+                let mut woken = wake_waiters(tasks, key, want, win);
+                let regs = fibers.fibers.iter_mut().chain(
+                    extra_envs
+                        .iter_mut()
+                        .flat_map(|e| e.fibers.fibers.iter_mut()),
+                );
+                woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
             }
             // §14 confined children (ops 0, 5, 13, 17): the executor's admission, scheduled as a debug
@@ -8693,8 +8723,11 @@ fn dbg_preview_pick(
 /// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
 /// pure function of `(seed, forced, pref, turn, task states)`, so replay reproduces it exactly —
 /// which is why the live `drive` and the replaying `tick` both pick through here.
+#[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks a clock advance wakes
 fn dbg_pick_runnable(
     tasks: &mut [TaskSlot],
+    fibers: &mut FiberTables,
+    envs: &mut [DbgEnv],
     clock: &mut u64,
     seed: Option<u64>,
     forced: &[(u64, usize)],
@@ -8705,13 +8738,15 @@ fn dbg_pick_runnable(
         if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, turn) {
             return Some(i);
         }
-        // #1638 — only a waiter with a REAL deadline is a clock-advance candidate. `flatten`
-        // drops the indefinite ones, so "nothing runnable and every remaining waiter is
-        // indefinite" yields `None` here and takes the `?` deadlock exit this function already
-        // documented, instead of advancing the clock to a `MAX_WAIT` stand-in and handing the
-        // guest a `WAIT_TIMED_OUT` it never asked for.
-        *clock = (*clock).max(next_wait_deadline(tasks)?);
-        time_out_waits(tasks, *clock);
+        // #1638 — only a waiter with a REAL deadline is a clock-advance candidate, so "nothing
+        // runnable and every remaining waiter is indefinite" is the deadlock exit, not a
+        // `WAIT_TIMED_OUT` the guest never asked for.
+        let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut fibers.fibers)
+            .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
+            .collect();
+        if !fire_next_timeout(tasks, &mut regs, clock) {
+            return None;
+        }
     }
 }
 
@@ -9185,7 +9220,16 @@ impl ScheduledDebugRun {
             let ti = if let Some(p) = dbg_pinned_coro(tasks) {
                 p
             } else {
-                match dbg_pick_runnable(tasks, clock, *sched_seed, forced, pref, *turn) {
+                match dbg_pick_runnable(
+                    tasks,
+                    fibers,
+                    extra_envs,
+                    clock,
+                    *sched_seed,
+                    forced,
+                    pref,
+                    *turn,
+                ) {
                     Some(i) => i,
                     // Nothing runnable and no timed waiter: a thread parked in a blocking-stdin
                     // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
@@ -9514,7 +9558,16 @@ impl ScheduledDebugRun {
         let pre_pick = (sched_trace.is_some() || sched_sink.is_some()).then(|| trace_tags(tasks));
         let Some(ti) = dbg_pinned_coro(tasks).or_else(|| {
             let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
-            dbg_pick_runnable(tasks, clock, *sched_seed, forced, pref, *turn)
+            dbg_pick_runnable(
+                tasks,
+                fibers,
+                extra_envs,
+                clock,
+                *sched_seed,
+                forced,
+                pref,
+                *turn,
+            )
         }) else {
             return false; // no runnable thread and no waiter (deadlock) — can't advance
         };
@@ -14509,152 +14562,109 @@ impl CoopSched {
                     continue;
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
-                // event-parked fiber waiters alike (§3.6 slice 5a) — else it is a deadlock.
-                //
-                // #1638 — only a waiter with a REAL deadline is a candidate. An infinite wait
-                // carries `None` and is dropped here, so a run whose every remaining waiter is
-                // indefinite falls through to the `None` arm and reaches the deadlock this
-                // function's own doc already promised ("or deadlocks → `ThreadFault`, matching
-                // the deterministic explorer"). That path was unreachable while the `MAX_WAIT`
-                // clamp gave every infinite wait a deadline to advance to.
-                let next = next_wait_deadline(tasks).into_iter().chain(
-                    fibers
-                        .iter()
-                        .chain(extra_envs.iter().flat_map(|e| e.fibers.fibers.iter()))
-                        .filter_map(|f| match f {
-                            FiberState::WaitParked {
-                                deadline,
-                                woken: None,
-                                ..
-                            } => *deadline,
-                            _ => None,
-                        }),
-                );
-                match next.min() {
-                    Some(d) => {
-                        *clock = (*clock).max(d);
-                        time_out_waits(tasks, *clock);
-                        // §3.6 slice 5a: a due fiber wait completes with `WAIT_TIMED_OUT` — the
-                        // fiber becomes claimable (leaving the pending set, so this loop makes
-                        // progress); its resumer's next `cont.resume` delivers the status. Every
-                        // domain's registry: a child's fibers wait on the same clock.
-                        for f in fibers.iter_mut().chain(
-                            extra_envs
-                                .iter_mut()
-                                .flat_map(|e| e.fibers.fibers.iter_mut()),
-                        ) {
-                            if let FiberState::WaitParked {
-                                deadline: Some(deadline),
-                                woken: w @ None,
-                                ..
-                            } = f
-                            {
-                                if *deadline <= *clock {
-                                    *w = Some(super::WAIT_TIMED_OUT);
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        // #1146 slice 2 — before blocking, interrupt the parks if a deliverable
-                        // signal reached this all-parked run (e.g. a `^C` the terminal line
-                        // discipline raised, which rang the doorbell but deposited no bytes, so the
-                        // readiness poll above found nothing runnable). Set each pipe-parked task's
-                        // host EINTR flag and re-admit it: the rewound read/write re-runs and
-                        // completes `-EINTR` at the park site, and the caught handler is delivered
-                        // at that task's next safepoint (slice 1). The tree-walker drives this from
-                        // its `set_wake` closure; the cooperative pump polls it here, at the would-be
-                        // block. `interrupt_pending` is a non-consuming peek — delivery still fires.
-                        // #1171 — DOMAIN-SCOPED (invariant 12): a parked task is interrupted only when
-                        // ITS OWN domain has a deliverable signal pending, never because some other
-                        // domain does. Before this a single root-host pending signal swept EVERY
-                        // pipe-parked task across all domains — so a shell's `SIGCHLD` (raised when a
-                        // foreground job stopped) wrongly `-EINTR`'d that job's own blocked read,
-                        // running it off the end instead of leaving it stopped (the browser `^Z` gap).
-                        // A pipe read/write re-runs `-EINTR`; a personality `waitpid` (BlockedReap-
-                        // Personality) re-runs and serves whatever its table now reports — a fresh
-                        // `WUNTRACED` stop, an exit, or re-parks if still nothing — so the shell's
-                        // `SIGCHLD` on a child's stop/continue transition wakes its blocked `waitpid`,
-                        // matching the tree-walker (whose `Blocked::Stopped` insert drains the reap
-                        // waiters). The caught handler itself is delivered at that task's next safepoint.
-                        let mut woke = false;
-                        for t in tasks.iter_mut() {
-                            // A pipe read/write OR a blocking stdin read (#1146 deeper) — the interruptible
-                            // blocking-I/O parks whose rewound op completes `-EINTR` on a signal.
-                            let is_pipe = matches!(
-                                t.state,
-                                TaskState::BlockedPipeRead { .. }
-                                    | TaskState::BlockedPipeWrite { .. }
-                                    | TaskState::BlockedStdin
-                            );
-                            let is_reap =
-                                matches!(t.state, TaskState::BlockedReapPersonality { .. });
-                            if !is_pipe && !is_reap {
-                                continue;
-                            }
-                            // A pipe/reap park is interrupted by a deliverable (async) signal on its
-                            // OWN domain. A **reap** park is ALSO re-admitted by the one-shot
-                            // child-transition edge (#1171 `reap_pending`, read-and-clear) — so a
-                            // blocking `waitpid(WUNTRACED/WCONTINUED)` wakes when a child stops/continues
-                            // even with no async SIGCHLD delivery (bash: no sigaltstack). The re-run
-                            // `waitpid` reports the fresh stop/continue (report-once) and returns.
-                            let mut h = task_host(root, extra_envs, t.env).lock_unpoisoned();
-                            let signals = h.signal_poll();
-                            let interrupt =
-                                signals.as_ref().is_some_and(|(_, s)| s.interrupt_pending());
-                            let reap = is_reap && signals.is_some_and(|(_, s)| s.reap_pending());
-                            if !interrupt && !reap {
-                                continue;
-                            }
-                            // Only a pipe park interrupted by a signal needs the EINTR latch (its
-                            // rewound read/write completes `-EINTR`); a re-run `waitpid` re-consults the
-                            // personality with no flag.
-                            if is_pipe && interrupt {
-                                h.set_sig_interrupt();
-                            }
-                            t.state = TaskState::Runnable;
-                            woke = true;
-                        }
-                        if woke {
+                // event-parked fiber waiters alike (§3.6 slice 5a), in every domain — else it is a
+                // deadlock.
+                let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
+                    .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
+                    .collect();
+                if !fire_next_timeout(tasks, &mut regs, clock) {
+                    // #1146 slice 2 — before blocking, interrupt the parks if a deliverable
+                    // signal reached this all-parked run (e.g. a `^C` the terminal line
+                    // discipline raised, which rang the doorbell but deposited no bytes, so the
+                    // readiness poll above found nothing runnable). Set each pipe-parked task's
+                    // host EINTR flag and re-admit it: the rewound read/write re-runs and
+                    // completes `-EINTR` at the park site, and the caught handler is delivered
+                    // at that task's next safepoint (slice 1). The tree-walker drives this from
+                    // its `set_wake` closure; the cooperative pump polls it here, at the would-be
+                    // block. `interrupt_pending` is a non-consuming peek — delivery still fires.
+                    // #1171 — DOMAIN-SCOPED (invariant 12): a parked task is interrupted only when
+                    // ITS OWN domain has a deliverable signal pending, never because some other
+                    // domain does. Before this a single root-host pending signal swept EVERY
+                    // pipe-parked task across all domains — so a shell's `SIGCHLD` (raised when a
+                    // foreground job stopped) wrongly `-EINTR`'d that job's own blocked read,
+                    // running it off the end instead of leaving it stopped (the browser `^Z` gap).
+                    // A pipe read/write re-runs `-EINTR`; a personality `waitpid` (BlockedReap-
+                    // Personality) re-runs and serves whatever its table now reports — a fresh
+                    // `WUNTRACED` stop, an exit, or re-parks if still nothing — so the shell's
+                    // `SIGCHLD` on a child's stop/continue transition wakes its blocked `waitpid`,
+                    // matching the tree-walker (whose `Blocked::Stopped` insert drains the reap
+                    // waiters). The caught handler itself is delivered at that task's next safepoint.
+                    let mut woke = false;
+                    for t in tasks.iter_mut() {
+                        // A pipe read/write OR a blocking stdin read (#1146 deeper) — the interruptible
+                        // blocking-I/O parks whose rewound op completes `-EINTR` on a signal.
+                        let is_pipe = matches!(
+                            t.state,
+                            TaskState::BlockedPipeRead { .. }
+                                | TaskState::BlockedPipeWrite { .. }
+                                | TaskState::BlockedStdin
+                        );
+                        let is_reap = matches!(t.state, TaskState::BlockedReapPersonality { .. });
+                        if !is_pipe && !is_reap {
                             continue;
                         }
-                        // #1122 — every task is parked and no internal wake can come. With an
-                        // armed doorbell and at least one task parked on a PIPE — the state an
-                        // embedder can feed from outside the run (the interactive terminal) —
-                        // BLOCK for the next ring instead of declaring deadlock, then re-settle
-                        // (the readiness poll above sees the deposit). The `bell_gen` snapshot
-                        // predates that poll, so a feed racing this park is never lost. Without
-                        // a doorbell, or with only internally-wakeable parks (a join cycle),
-                        // this is the deadlock it always was.
-                        let external = tasks.iter().any(|t| {
-                            matches!(
-                                t.state,
-                                TaskState::BlockedPipeRead { .. }
-                                    | TaskState::BlockedPipeWrite { .. }
-                                    // #1146 (deeper) — a blocking stdin park is externally wakeable
-                                    // too (an embedder signal rings the bell); without this an
-                                    // all-parked stdin run would fault as a deadlock instead of
-                                    // blocking for the `^C`.
-                                    | TaskState::BlockedStdin
-                            )
-                        });
-                        // #1122 route (a) — a suspend/resume session: hand the idle state back to the
-                        // driver (it feeds the terminal and pumps again; the loop-top settle then sees
-                        // the deposit / the signal) instead of sleeping this thread on the bell.
-                        if *suspend_on_idle && external {
-                            return Ok(CoopStep::Idle);
+                        // A pipe/reap park is interrupted by a deliverable (async) signal on its
+                        // OWN domain. A **reap** park is ALSO re-admitted by the one-shot
+                        // child-transition edge (#1171 `reap_pending`, read-and-clear) — so a
+                        // blocking `waitpid(WUNTRACED/WCONTINUED)` wakes when a child stops/continues
+                        // even with no async SIGCHLD delivery (bash: no sigaltstack). The re-run
+                        // `waitpid` reports the fresh stop/continue (report-once) and returns.
+                        let mut h = task_host(root, extra_envs, t.env).lock_unpoisoned();
+                        let signals = h.signal_poll();
+                        let interrupt =
+                            signals.as_ref().is_some_and(|(_, s)| s.interrupt_pending());
+                        let reap = is_reap && signals.is_some_and(|(_, s)| s.reap_pending());
+                        if !interrupt && !reap {
+                            continue;
                         }
-                        let bell = root.lock_unpoisoned().external_wake();
-                        match bell.filter(|_| external) {
-                            Some(bell) => {
-                                let (gen, cv) = &*bell;
-                                let mut g = gen.lock().unwrap_or_else(|e| e.into_inner());
-                                while *g == bell_gen {
-                                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                                }
+                        // Only a pipe park interrupted by a signal needs the EINTR latch (its
+                        // rewound read/write completes `-EINTR`); a re-run `waitpid` re-consults the
+                        // personality with no flag.
+                        if is_pipe && interrupt {
+                            h.set_sig_interrupt();
+                        }
+                        t.state = TaskState::Runnable;
+                        woke = true;
+                    }
+                    if woke {
+                        continue;
+                    }
+                    // #1122 — every task is parked and no internal wake can come. With an
+                    // armed doorbell and at least one task parked on a PIPE — the state an
+                    // embedder can feed from outside the run (the interactive terminal) —
+                    // BLOCK for the next ring instead of declaring deadlock, then re-settle
+                    // (the readiness poll above sees the deposit). The `bell_gen` snapshot
+                    // predates that poll, so a feed racing this park is never lost. Without
+                    // a doorbell, or with only internally-wakeable parks (a join cycle),
+                    // this is the deadlock it always was.
+                    let external = tasks.iter().any(|t| {
+                        matches!(
+                            t.state,
+                            TaskState::BlockedPipeRead { .. }
+                                | TaskState::BlockedPipeWrite { .. }
+                                // #1146 (deeper) — a blocking stdin park is externally wakeable
+                                // too (an embedder signal rings the bell); without this an
+                                // all-parked stdin run would fault as a deadlock instead of
+                                // blocking for the `^C`.
+                                | TaskState::BlockedStdin
+                        )
+                    });
+                    // #1122 route (a) — a suspend/resume session: hand the idle state back to the
+                    // driver (it feeds the terminal and pumps again; the loop-top settle then sees
+                    // the deposit / the signal) instead of sleeping this thread on the bell.
+                    if *suspend_on_idle && external {
+                        return Ok(CoopStep::Idle);
+                    }
+                    let bell = root.lock_unpoisoned().external_wake();
+                    match bell.filter(|_| external) {
+                        Some(bell) => {
+                            let (gen, cv) = &*bell;
+                            let mut g = gen.lock().unwrap_or_else(|e| e.into_inner());
+                            while *g == bell_gen {
+                                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
                             }
-                            None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
                         }
+                        None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
                     }
                 }
                 continue;
@@ -15671,63 +15681,21 @@ impl CoopSched {
                     timeout,
                     dst,
                 }) => {
-                    // §3.6 slice 5a: a wait issued INSIDE a fiber parks the FIBER, not this vCPU
-                    // (the tree-walk oracle's fiber-park routing — DESIGN.md "blocks the fiber,
-                    // never the domain"; `fiber_parks.rs`). Unwind one chain link to the resumer
-                    // with `(FIBER_PARKED, 0)` and set the fiber aside; the park-time value recheck
-                    // closes the park-vs-store race (a store that already landed wakes it with
-                    // `WAIT_NOT_EQUAL` — after the one transient `FIBER_PARKED`, like the oracle).
-                    if tasks[ti].vt.active_id != ROOT_FIBER {
-                        let durable = root.lock_unpoisoned().is_durable();
-                        // The fiber lives in its task's domain: the root's registry and window, or its
-                        // confined `instantiate` env's.
-                        let (fibers, fiber_sp, mem) = match tasks[ti].env {
-                            None => (&mut *fibers, &mut *fiber_sp, &mut *mem),
-                            Some(e) => {
-                                let e = &mut extra_envs[e];
-                                (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
-                            }
-                        };
-                        let (cur, key) = mem
-                            .as_ref()
-                            .map_or((0, super::FutexKey::Anon(0, base)), |m| {
-                                (m.atomic_value(base, width), m.futex_key(base))
-                            });
-                        let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
-                        let park = |vm| FiberState::WaitParked {
-                            vm,
-                            wait_dst: dst,
-                            key,
-                            // #1638: an infinite wait arms neither clock. It ends by `notify`,
-                            // by the park-time recheck, or not at all — and "not at all" is the
-                            // driver's deadlock exit, not a fabricated `WAIT_TIMED_OUT`.
-                            deadline: timeout.map(|t| clock.saturating_add(t)),
-                            real_deadline: timeout.map(sched_wall_deadline),
-                            woken,
-                        };
-                        if let Some(k) = park_running_fiber(
-                            &mut tasks[ti].vt,
-                            fibers,
-                            fiber_sp,
-                            mem,
-                            durable,
-                            true,
-                            park,
-                            |_| woken.is_some(),
-                        ) {
-                            tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+                    let durable = || root.lock_unpoisoned().is_durable();
+                    // The wait is against THIS task's domain: the root's registry and window, or its
+                    // confined `instantiate` env's. A child's `wait` on its mapped ring flag must not
+                    // re-read an unrelated root byte.
+                    let (fibers, fiber_sp, mem) = match tasks[ti].env {
+                        None => (&mut *fibers, &mut *fiber_sp, &mut *mem),
+                        Some(e) => {
+                            let e = &mut extra_envs[e];
+                            (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
                         }
-                        continue;
-                    }
-                    // The value re-read and the park are against THIS task's own window: a confined
-                    // `instantiate` child steps against its `extra_envs` window, not the root `mem`.
-                    // Reading the root `mem` here instead would make a child's `wait` on its mapped
-                    // ring flag re-read an unrelated root byte and spin forever.
-                    let tmem = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    wait_task(tasks, ti, tmem, *clock, base, expected, width, timeout, dst);
+                    futex_wait(
+                        tasks, ti, fibers, fiber_sp, mem, durable, true, *clock, base, expected,
+                        width, timeout, dst,
+                    );
                 }
                 Ok(VcpuStop::Notify { base, count, dst }) => {
                     // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
@@ -15741,30 +15709,14 @@ impl CoopSched {
                     let key = futex_key_in(win(tasks[ti].env), base);
                     let want = count as u32;
                     let mut woken = wake_waiters(tasks, key, want, win);
-                    // §3.6 slice 5a: also wake event-parked FIBER waiters, in every domain (the root's
-                    // registry, then each child env's, lowest slot first — deterministic like the task
-                    // scan), on the same canonical key. The status is delivered when a `cont.resume`
-                    // claims the fiber.
-                    for f in fibers.iter_mut().chain(
+                    // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
+                    // registry, then each child env's.
+                    let regs = fibers.iter_mut().chain(
                         extra_envs
                             .iter_mut()
                             .flat_map(|e| e.fibers.fibers.iter_mut()),
-                    ) {
-                        if woken >= want {
-                            break;
-                        }
-                        if let FiberState::WaitParked {
-                            key: fkey,
-                            woken: w @ None,
-                            ..
-                        } = f
-                        {
-                            if *fkey == key {
-                                *w = Some(super::WAIT_WOKEN);
-                                woken += 1;
-                            }
-                        }
-                    }
+                    );
+                    woken += wake_fiber_waiters(regs, key, want - woken);
                     tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
                 }
                 // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
@@ -18520,6 +18472,133 @@ fn wait_task(
             dst,
         };
     }
+}
+
+/// `memory.wait` by task `ti` over its domain's window `mem` and fiber registry (`fibers`,
+/// `fiber_sp`). Outside a fiber it is [`wait_task`]. Inside one it parks the FIBER, not the task
+/// (§3.6 slice 5a, the oracle's routing; DESIGN.md "blocks the fiber, never the domain"): the
+/// resumer gets `FIBER_PARKED` and runs on — or, under a blocking resume on a driver that
+/// `can_idle`, idles on the fiber (`BlockedOnFiber`) — until a `notify` ([`wake_fiber_waiters`]),
+/// the deadline ([`fire_next_timeout`]) or the park-time value recheck wakes it. `durable` is asked
+/// only for a fiber's park. The one wait rule of the pump and the debugger (#2215).
+#[allow(clippy::too_many_arguments)] // the wait op's operands
+fn futex_wait(
+    tasks: &mut [TaskSlot],
+    ti: usize,
+    fibers: &mut [FiberState],
+    fiber_sp: &mut [u64],
+    mem: &mut Option<Mem>,
+    durable: impl FnOnce() -> bool,
+    can_idle: bool,
+    clock: u64,
+    base: u64,
+    expected: u64,
+    width: u32,
+    timeout: Option<u64>,
+    dst: u32,
+) {
+    if tasks[ti].vt.active_id == ROOT_FIBER {
+        let mem = mem.as_ref();
+        return wait_task(tasks, ti, mem, clock, base, expected, width, timeout, dst);
+    }
+    let (cur, key) = mem
+        .as_ref()
+        .map_or((0, super::FutexKey::Anon(0, base)), |m| {
+            (m.atomic_value(base, width), m.futex_key(base))
+        });
+    // The park-time recheck closes the park-vs-store race: a store that already landed wakes the
+    // fiber with `WAIT_NOT_EQUAL`, after the one transient `FIBER_PARKED`, like the oracle.
+    let woken = (cur != expected).then_some(super::WAIT_NOT_EQUAL);
+    let park = |vm| FiberState::WaitParked {
+        vm,
+        wait_dst: dst,
+        key,
+        // #1638: an infinite wait arms neither clock. It ends by `notify`, by the park-time
+        // recheck, or not at all — and "not at all" is the driver's deadlock exit, not a
+        // fabricated `WAIT_TIMED_OUT`.
+        deadline: timeout.map(|t| clock.saturating_add(t)),
+        real_deadline: timeout.map(sched_wall_deadline),
+        woken,
+    };
+    let vt = &mut tasks[ti].vt;
+    let durable = durable();
+    let idle = park_running_fiber(vt, fibers, fiber_sp, mem, durable, can_idle, park, |_| {
+        woken.is_some()
+    });
+    if let Some(k) = idle {
+        tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+    }
+}
+
+/// `memory.notify`'s fiber half: after the task waiters ([`wake_waiters`]), wake up to `want`
+/// event-parked fibers on `key`, in `fibers` order — each domain's registry in turn, lowest slot
+/// first, so the wake order is deterministic like the task scan. Returns how many it woke; a woken
+/// fiber's status is delivered when a `cont.resume` claims it.
+fn wake_fiber_waiters<'a>(
+    fibers: impl IntoIterator<Item = &'a mut FiberState>,
+    key: super::FutexKey,
+    want: u32,
+) -> u32 {
+    let mut woken = 0u32;
+    for f in fibers {
+        if woken >= want {
+            break;
+        }
+        if let FiberState::WaitParked {
+            key: fkey,
+            woken: w @ None,
+            ..
+        } = f
+        {
+            if *fkey == key {
+                *w = Some(super::WAIT_WOKEN);
+                woken += 1;
+            }
+        }
+    }
+    woken
+}
+
+/// Nothing is runnable: advance the logical `clock` to the earliest futex-wait deadline — a task's,
+/// or an event-parked fiber's in any domain's registry (`fibers`) — and time out every wait it
+/// reaches (`WAIT_TIMED_OUT` at a task's `dst`; a fiber made claimable with it). `false` when no
+/// wait has a deadline, which is the driver's deadlock (#1638: an infinite wait never times out).
+fn fire_next_timeout(
+    tasks: &mut [TaskSlot],
+    fibers: &mut [&mut Vec<FiberState>],
+    clock: &mut u64,
+) -> bool {
+    let fiber_deadline = |f: &FiberState| match f {
+        FiberState::WaitParked {
+            deadline,
+            woken: None,
+            ..
+        } => *deadline,
+        _ => None,
+    };
+    let next = fibers
+        .iter()
+        .flat_map(|reg| reg.iter().filter_map(fiber_deadline))
+        .chain(next_wait_deadline(tasks))
+        .min();
+    let Some(next) = next else {
+        return false;
+    };
+    *clock = (*clock).max(next);
+    time_out_waits(tasks, *clock);
+    for f in fibers.iter_mut().flat_map(|reg| reg.iter_mut()) {
+        if let FiberState::WaitParked {
+            deadline: Some(deadline),
+            woken: w @ None,
+            ..
+        } = f
+        {
+            if *deadline <= *clock {
+                *w = Some(super::WAIT_TIMED_OUT);
+            }
+        }
+    }
+    true
 }
 
 /// `memory.notify` on futex `key`: wake up to `count` waiting tasks whose key matches, lowest task
