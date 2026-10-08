@@ -3845,8 +3845,20 @@ impl VcpuReactor {
                             Err(t) => vcpu.deliver_tierup_trap(t),
                         }
                     }
-                    // Single-vCPU reactor: no spawn/join/wait/JIT-install events.
-                    _ => break Err(Trap::Malformed),
+                    // A reactor frame is one vCPU over one window, serviced only for tier-up: it
+                    // runs no threads or futex waits, spawns no §14 children, hosts no §22 guest
+                    // JIT, and has no embedder to complete a host call or feed a blocking stdin.
+                    VcpuEvent::Spawn { .. }
+                    | VcpuEvent::Join { .. }
+                    | VcpuEvent::Wait { .. }
+                    | VcpuEvent::Notify { .. }
+                    | VcpuEvent::Instantiate { .. }
+                    | VcpuEvent::InstantiateDetached { .. }
+                    | VcpuEvent::JitInstall { .. }
+                    | VcpuEvent::JitUninstall { .. }
+                    | VcpuEvent::JitInvoke { .. }
+                    | VcpuEvent::CapPending { .. }
+                    | VcpuEvent::StdinPark => break Err(Trap::Malformed),
                 }
             };
             reclaimed = vcpu.take_mem();
@@ -17365,10 +17377,18 @@ fn coop_bounce(
 /// (the std-sync analogue of the kernel's per-bucket futex lock) — no lost wakeups. In real wasm this
 /// role is played by `memory.atomic.wait`/`notify` directly; here it serves the cooperative oracle's
 /// same `wait`/`notify` semantics for genuinely parallel vCPUs.
+///
+/// #2189 — one table for the whole run, keyed as the cooperative driver keys its waits
+/// ([`super::FutexKey`]): a §13 region word that a parent and its child both map is one key in both
+/// domains, so a notify in either reaches a waiter in the other, while anonymous pages key on their
+/// backing and stay apart.
 #[derive(Default)]
 struct Futex {
     buckets: std::sync::Mutex<
-        std::collections::HashMap<u64, std::collections::VecDeque<std::sync::Arc<Waiter>>>,
+        std::collections::HashMap<
+            super::FutexKey,
+            std::collections::VecDeque<std::sync::Arc<Waiter>>,
+        >,
     >,
 }
 
@@ -17403,6 +17423,7 @@ impl Futex {
         width: u32,
         timeout: Option<u64>,
     ) -> i32 {
+        let key = mem.futex_key(base);
         let waiter = {
             let mut buckets = self.buckets.lock().unwrap();
             // A domain that died since this vCPU's last safepoint: its kill scanned the buckets
@@ -17421,7 +17442,7 @@ impl Futex {
                 domain: domain as *const ParDomain as usize,
             });
             buckets
-                .entry(base)
+                .entry(key)
                 .or_default()
                 .push_back(std::sync::Arc::clone(&w));
             w
@@ -17440,20 +17461,21 @@ impl Futex {
             debug_assert!(res.timed_out());
             // Timed out: de-enqueue our (possibly still-parked) token so a later `notify` skips it.
             let mut buckets = self.buckets.lock().unwrap();
-            if let Some(q) = buckets.get_mut(&base) {
+            if let Some(q) = buckets.get_mut(&key) {
                 q.retain(|x| !std::sync::Arc::ptr_eq(x, &waiter));
             }
             super::WAIT_TIMED_OUT
         }
     }
 
-    /// `memory.notify`: wake up to `count` waiters parked on `base`, FIFO, and return how many were
-    /// woken (mirrors the cooperative `Notify` arm's count; the guest typically ignores it).
-    fn notify(&self, base: u64, count: i32) -> i32 {
+    /// `memory.notify`: wake up to `count` waiters parked on `base` in `mem`, FIFO, and return how
+    /// many were woken (mirrors the cooperative `Notify` arm's count; the guest typically ignores it).
+    fn notify(&self, mem: Option<&Mem>, base: u64, count: i32) -> i32 {
+        let key = mem.map_or(super::FutexKey::Anon(0, base), |m| m.futex_key(base));
         let want = count as u32;
         let mut buckets = self.buckets.lock().unwrap();
         let mut woken = 0u32;
-        if let Some(q) = buckets.get_mut(&base) {
+        if let Some(q) = buckets.get_mut(&key) {
             while woken < want {
                 let Some(w) = q.pop_front() else { break };
                 *w.woken.lock().unwrap() = true;
@@ -17807,7 +17829,8 @@ struct ThreadRegistry {
     /// `MAX_VCPUS` anti-bomb gate counts, as the cooperative driver counts its tasks (#2006). Taken by
     /// [`Self::try_start`], given back by [`Self::end`].
     live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    futex: Futex,
+    /// The run's futex, shared by every domain's registry like `live` (#2189).
+    futex: std::sync::Arc<Futex>,
     /// #748 — the personality **fork-twin table** for the parallel driver's `ForkSelf`/`ReapWait`
     /// arms: `(exited pids, generation)`. Exited pids are permanent (never removed — pids are
     /// per-run unique), so a `waitpid(pid)` waiter can never miss its wake. The generation bumps
@@ -17829,22 +17852,31 @@ struct ThreadRegistry {
 impl ThreadRegistry {
     /// A run's root registry: its live count starts at one, the root vCPU.
     fn new() -> std::sync::Arc<ThreadRegistry> {
-        Self::counting(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)))
+        Self::counting(
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            std::sync::Arc::default(),
+        )
     }
 
-    /// A child domain's registry: its own join table, futex and fork table, counted in the run's live
-    /// vCPUs.
+    /// A child domain's registry: its own join table and fork table, counted in the run's live
+    /// vCPUs, waiting in the run's futex.
     fn child(&self) -> std::sync::Arc<ThreadRegistry> {
-        Self::counting(std::sync::Arc::clone(&self.live))
+        Self::counting(
+            std::sync::Arc::clone(&self.live),
+            std::sync::Arc::clone(&self.futex),
+        )
     }
 
-    fn counting(live: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> std::sync::Arc<Self> {
+    fn counting(
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        futex: std::sync::Arc<Futex>,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new_cyclic(|me| ThreadRegistry {
             done: std::sync::Mutex::new(std::collections::HashMap::new()),
             woken: std::sync::Condvar::new(),
             next_id: std::sync::atomic::AtomicU64::new(0),
             live,
-            futex: Futex::default(),
+            futex,
             fork_exits: std::sync::Mutex::new((std::collections::HashSet::new(), 0)),
             fork_woken: std::sync::Condvar::new(),
             next_fork_pid: std::sync::atomic::AtomicI64::new(2),
@@ -18708,7 +18740,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 vt.active.set(dst, Reg::from_i32(r));
             }
             Ok(VcpuStop::Notify { base, count, dst }) => {
-                let woken = reg.futex.notify(base, count);
+                let woken = reg.futex.notify(mem.as_ref(), base, count);
                 vt.active.set(dst, Reg::from_i32(woken));
             }
             // §22 guest-JIT (THREADS.md 4c-domain): install/uninstall/invoke against the **shared**
