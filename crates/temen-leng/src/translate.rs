@@ -397,14 +397,21 @@ impl TyDesc {
     }
 }
 
-/// The in-memory layout of a named aggregate type (`(type :Name … Body)`).
+/// The in-memory layout of a named type (`(type :Name … Body)`): an aggregate, or a named scalar.
+///
+/// **Laid out as C lays it out** (#2201), since native nimony's C compiler is what lays out the
+/// objects nim code shares with C, Rust and the wire: each field at its type's alignment, each object
+/// as large as its last field rounded up to its own alignment. `{.packed.}` is the one exception, as
+/// it is in C.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Layout {
-    /// `(object … (fld :f … T)*)` — fields packed at natural size (consistent within temen-leng;
-    /// C-ABI/SysV offsets are a later refinement for host interop).
+    /// `(object … (fld :f … T)*)` or a C-style `(union …)`.
     Object {
         fields: Vec<(String, u64, TyDesc)>, // (name, byte offset, type)
         size: u64,
+        /// The object's alignment: its most-aligned field's, or 1 for `{.packed.}`. Carried because a
+        /// sibling unit that embeds the object cannot recompute it from the fields of a packed one.
+        align: u64,
     },
     /// `(array Elem Count)` — `Count` elements of `Elem`.
     Array {
@@ -412,6 +419,11 @@ pub(crate) enum Layout {
         elem_size: u64,
         size: u64,
     },
+    /// A **named scalar**: an enum, whose width is its base type's (`(enum (u 8) …)`), or a named
+    /// integer such as a `distinct uint32` or `cchar`. A field of the type is that wide in C, so it
+    /// is here; it was an 8-byte `i64` slot. Pooled across units with the aggregates, because a value
+    /// of the type crosses modules as a field, a parameter and a result.
+    Scalar(TyDesc),
 }
 
 pub(crate) struct Translator {
@@ -425,8 +437,10 @@ pub(crate) struct Translator {
     types: HashMap<String, Layout>,
     /// Names of locally-declared `object`/`array` aggregate types. A bare-symbol type is treated as
     /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
-    /// type (`enum`, `distinct` int, `proctype`, opaque/external) is an integer scalar.
+    /// type (`enum`, `distinct` int, `proctype`, opaque/external) is a scalar.
     agg_names: HashSet<String>,
+    /// This unit's `{.packed.}` types: laid out with no padding, as C's `__attribute__((packed))`.
+    packed_types: HashSet<String>,
     /// Named-type **pointer aliases** — a `(type :RootRef … (ptr T))` declares `RootRef` as an alias
     /// for a typed pointer. Without this, a bare-symbol type not in `agg_names` falls back to a plain
     /// `i64` scalar, so a param typed `RootRef` wouldn't `deref`. Records the resolved `TyDesc::Ptr`
@@ -635,6 +649,7 @@ impl Translator {
             proc_names: HashSet::default(),
             types: HashMap::default(),
             agg_names: HashSet::default(),
+            packed_types: HashSet::default(),
             ty_aliases: HashMap::default(),
             proctypes: HashMap::default(),
             data_inits: Vec::new(),
@@ -855,7 +870,7 @@ impl Translator {
                         let off = if self.ext_tls_layout.is_empty() {
                             // Single-module `translate_tls`: lay the block out locally.
                             let o = self.tls_block_size;
-                            self.tls_block_size += sz.max(8);
+                            self.tls_block_size += global_slot(sz);
                             o
                         } else {
                             // Linking: the shared layout (keyed by this tvar's stem-suffixed name)
@@ -953,7 +968,7 @@ impl Translator {
                                     self.funcref_inits.push((off + rel_at, sym));
                                 }
                                 self.globals.insert(name, (off, adesc));
-                                off += n.max(self.sizeof(&desc)).max(8);
+                                off += global_slot(n.max(self.sizeof(&desc)));
                                 continue;
                             } else if self.scan_lenient
                                 && matches!(init.tag(), Some("oconstr") | Some("aconstr"))
@@ -982,7 +997,7 @@ impl Translator {
                         self.unsigned_globals.insert(name.clone());
                     }
                     self.globals.insert(name, (off, desc));
-                    off += sz.max(8);
+                    off += global_slot(sz);
                 }
                 Some("const") => {
                     let a = item.args();
@@ -1008,7 +1023,7 @@ impl Translator {
                                 self.funcref_inits.push((off + rel_at, sym));
                             }
                             self.globals.insert(name, (off, desc));
-                            off += sz.max(8);
+                            off += global_slot(sz);
                         } else {
                             // A non-scalar const we still can't materialize — reserve an addressable,
                             // opaque placeholder global so `(addr name)` yields a valid window address.
@@ -1114,7 +1129,7 @@ impl Translator {
                             self.funcref_inits.push((*off + rel_at, sym));
                         }
                         self.globals.insert(name, (*off, desc));
-                        *off += sz.max(8);
+                        *off += global_slot(sz);
                     }
                 }
             }
@@ -1333,7 +1348,7 @@ impl Translator {
             None => return Ok(None),
         };
         let (fields, base_size) = match self.types.get(tyname) {
-            Some(Layout::Object { fields, size }) => (fields.clone(), *size),
+            Some(Layout::Object { fields, size, .. }) => (fields.clone(), *size),
             _ => return Ok(None),
         };
         let mut bytes = vec![0u8; base_size as usize];
@@ -1458,6 +1473,28 @@ impl Translator {
         )))
     }
 
+    /// The C alignment of a value of type `d`: a scalar's size, an array's element's, an object's own.
+    fn alignof(&self, d: &TyDesc) -> u64 {
+        match d {
+            TyDesc::Scalar {
+                ty: ValType::I32 | ValType::F32,
+                ..
+            } => 4,
+            TyDesc::Scalar {
+                ty: ValType::V128, ..
+            } => 16,
+            TyDesc::Scalar { .. } | TyDesc::Ptr(_) | TyDesc::FnPtr(_) => 8,
+            TyDesc::Narrow { bytes, .. } => *bytes as u64,
+            TyDesc::FlexArray(elem) => self.alignof(elem),
+            TyDesc::Agg(name) => match self.types.get(name) {
+                Some(Layout::Object { align, .. }) => *align,
+                Some(Layout::Array { elem, .. }) => self.alignof(elem),
+                Some(Layout::Scalar(d)) => self.alignof(d),
+                None => 8,
+            },
+        }
+    }
+
     /// Byte size of a type descriptor.
     fn sizeof(&self, d: &TyDesc) -> u64 {
         match d {
@@ -1472,6 +1509,7 @@ impl Translator {
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::Agg(name) => match self.types.get(name) {
                 Some(Layout::Object { size, .. }) | Some(Layout::Array { size, .. }) => *size,
+                Some(Layout::Scalar(d)) => self.sizeof(d),
                 None => 8,
             },
         }
@@ -1535,7 +1573,7 @@ impl Translator {
                 if let Some(callee) = node.args().first().and_then(|c| c.as_atom()) {
                     if let Some(&fixed) = self.varargs_imports.get(callee) {
                         let nargs = node.args().len() - 1;
-                        total += (nargs.saturating_sub(fixed) as u64) * 8;
+                        total += frame_slot((nargs.saturating_sub(fixed) as u64) * 8);
                     }
                 }
                 for arg in node.args().iter().skip(1) {
@@ -1545,7 +1583,7 @@ impl Translator {
                         // `oconstr`/`aconstr` *argument*'s temp is reserved by the constructor clause
                         // below — a call arg is a materializing position — so it is not double-counted.)
                         if let Some(d) = arg.args().first().and_then(|c| self.sret_return(c)) {
-                            total += self.sizeof(&d);
+                            total += frame_slot(self.sizeof(&d));
                         }
                     }
                 }
@@ -1559,7 +1597,7 @@ impl Translator {
                 for stmt in node.args() {
                     if is_call_tag(stmt.tag()) {
                         if let Some(d) = stmt.args().first().and_then(|c| self.sret_return(c)) {
-                            total += self.sizeof(&d);
+                            total += frame_slot(self.sizeof(&d));
                         }
                     }
                 }
@@ -1569,7 +1607,7 @@ impl Translator {
         // Reserve for an aggregate constructor **only** in a materializing position (#990).
         if materializes && matches!(node.tag(), Some("oconstr") | Some("aconstr")) {
             if let Some(Ok(d @ TyDesc::Agg(_))) = node.args().first().map(|t| self.tydesc(t)) {
-                total += self.sizeof(&d);
+                total += frame_slot(self.sizeof(&d));
             }
         }
         if let Node::List(items) = node {
@@ -1649,15 +1687,21 @@ impl Translator {
                     }),
                 }
             }
+            // `bool` is one byte, as it is in C; its value is an `i32` 0/1 like any narrow integer's.
+            Some("bool") => Ok(TyDesc::Narrow {
+                bytes: 1,
+                signed: false,
+            }),
             Some(_) => Ok(TyDesc::Scalar {
                 ty: int_ty(node)?,
                 unsigned: false,
             }),
             None => match node.as_atom() {
-                // A bare-symbol type is an aggregate only if it's a declared object/array; any other
-                // named type (enum, distinct int, proctype, opaque external) is an integer scalar —
-                // unless it's a declared pointer alias (`(type :RootRef … (ptr T))`), which carries a
-                // typed pointee so `deref` works.
+                // A bare-symbol type is an aggregate only if it's a declared object/array, a
+                // function pointer if it's a proctype, and a typed pointer if it's a declared pointer
+                // alias (`(type :RootRef … (ptr T))`), which carries a pointee so `deref` works. An
+                // enum or named integer is its base type ([`Layout::Scalar`]); anything else (an
+                // opaque external) is a word.
                 Some(name) if self.agg_names.contains(name) => Ok(TyDesc::Agg(name.to_string())),
                 Some(name) if self.proctypes.contains_key(name) => {
                     Ok(TyDesc::FnPtr(Box::new(self.proctypes[name].clone())))
@@ -1665,10 +1709,14 @@ impl Translator {
                 Some(name) if self.ty_aliases.contains_key(name) => {
                     Ok(self.ty_aliases[name].clone())
                 }
-                Some(_) => Ok(TyDesc::Scalar {
-                    ty: ValType::I64,
-                    unsigned: false,
-                }),
+                Some(name) => match self.types.get(name) {
+                    // A named scalar (an enum, a named integer) is as wide as its base type.
+                    Some(Layout::Scalar(d)) => Ok(d.clone()),
+                    _ => Ok(TyDesc::Scalar {
+                        ty: ValType::I64,
+                        unsigned: false,
+                    }),
+                },
                 None => Err(LengError::Malformed("expected a type".into())),
             },
         }
@@ -1731,7 +1779,18 @@ impl Translator {
         if matches!(self.tydesc(t)?, TyDesc::FnPtr(_)) {
             return Ok(ValType::I32);
         }
-        val_ty(t)
+        self.val_ty(t)
+    }
+
+    /// The value type of a type node, as [`val_ty`] gives it, but a **named scalar** (an enum, a
+    /// named integer) is its base's: a `(u 8)` enum is an `i32`, as its narrow field is. Every
+    /// signature, local and conversion asks this, so a proc and a `proctype` naming the same type
+    /// agree on it, which `call.dyn` checks.
+    fn val_ty(&self, t: &Node) -> Result<ValType, LengError> {
+        match t.as_atom().and_then(|n| self.types.get(n)) {
+            Some(Layout::Scalar(d)) => Ok(d.scalar_ty().unwrap_or(ValType::I32)),
+            _ => val_ty(t),
+        }
     }
 
     /// Collect all `(type :Name … Body)` top-level declarations into the layout registry, resolving
@@ -1742,7 +1801,13 @@ impl Translator {
             if item.tag() == Some("type") {
                 let a = item.args();
                 if a.len() >= 3 {
-                    raw.insert(sym_def(&a[0])?, &a[2]);
+                    let name = sym_def(&a[0])?;
+                    if a[1].tag() == Some("pragmas")
+                        && a[1].args().iter().any(|p| p.tag() == Some("packed"))
+                    {
+                        self.packed_types.insert(name.clone());
+                    }
+                    raw.insert(name, &a[2]);
                 }
             }
         }
@@ -1761,6 +1826,39 @@ impl Translator {
                 })
                 .map(|(n, _)| n.clone()),
         );
+        // Named scalars first, since a field, a parameter or a result of one is as wide as its base:
+        // an enum is its `(enum Base …)`, a named integer its body. Before the proctypes, whose
+        // signatures `call.dyn` checks against the procs' own, and before any object is laid out. A
+        // fixpoint resolves a name given as another named scalar's.
+        loop {
+            let mut progress = false;
+            for (name, &body) in &raw {
+                if self.types.contains_key(name) {
+                    continue;
+                }
+                let base = match body.tag() {
+                    Some("enum" | "distinct") => body.args().first(),
+                    Some("i" | "u" | "c" | "f" | "bool") => Some(body),
+                    None => body
+                        .as_atom()
+                        .filter(|s| matches!(self.types.get(*s), Some(Layout::Scalar(_))))
+                        .map(|_| body),
+                    _ => None,
+                };
+                // A `distinct` object or pointer is not a scalar; only a number is.
+                let d = match base {
+                    Some(base) => self.tydesc(base)?,
+                    None => continue,
+                };
+                if matches!(d, TyDesc::Scalar { .. } | TyDesc::Narrow { .. }) {
+                    self.types.insert(name.clone(), Layout::Scalar(d));
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
         // Record `proctype` signatures next — after `agg_names` (so an aggregate return classifies as
         // sret) but before object layouts resolve (so a `(ptr proctype)` field lowers to `FnPtr`). A
         // fixpoint handles a proctype whose signature references another proctype (higher-order).
@@ -1813,21 +1911,35 @@ impl Translator {
         Ok(())
     }
 
-    /// Lay out one `(fld :name pragmas Type)` member: returns `(name, desc, advance)`, where
+    /// Lay out one `(fld :name pragmas Type)` member: returns `(name, desc, advance, align)`, where
     /// `advance` is the bytes the field occupies (0 for a flexible-array tail — `uarray`/`flexarray`,
     /// an `UncheckedArray` like `LongString.data`, whose own address is the array base and which
-    /// stops the object's fixed size). Shared by the plain-object loop and the variant-object
-    /// `union`-branch layout, so both classify nested aggregate fields and flex tails identically.
+    /// stops the object's fixed size) and `align` its C alignment: its type's, raised by an
+    /// `{.align: N.}` pragma as C's `NIM_ALIGN` raises it (nimony's allocator aligns its chunks' data
+    /// tails so). Shared by the plain-object loop and the variant-object `union`-branch layout, so
+    /// both classify nested aggregate fields and flex tails identically.
     fn layout_field(
         &mut self,
         fld: &Node,
         raw: &HashMap<String, &Node>,
-    ) -> Result<(String, TyDesc, u64), LengError> {
+    ) -> Result<(String, TyDesc, u64, u64), LengError> {
         let fa = fld.args();
         if fa.len() < 3 {
             return Err(LengError::Malformed("fld needs :name pragmas type".into()));
         }
         let fname = sym_def(&fa[0])?;
+        let pragma_align = if fa[1].tag() == Some("pragmas") {
+            fa[1]
+                .args()
+                .iter()
+                .filter(|p| p.tag() == Some("align"))
+                .filter_map(|p| p.args().first().and_then(|n| n.as_atom()))
+                .filter_map(|n| n.trim_start_matches('+').parse::<u64>().ok())
+                .max()
+                .unwrap_or(1)
+        } else {
+            1
+        };
         if matches!(fa[2].tag(), Some("uarray") | Some("flexarray")) {
             let elem = fa[2]
                 .args()
@@ -1838,14 +1950,16 @@ impl Translator {
                     bytes: 1,
                     signed: false,
                 });
-            return Ok((fname, TyDesc::FlexArray(Box::new(elem)), 0));
+            let align = self.alignof(&elem).max(pragma_align);
+            return Ok((fname, TyDesc::FlexArray(Box::new(elem)), 0, align));
         }
         let fdesc = self.tydesc(&fa[2])?;
         if let TyDesc::Agg(n) = &fdesc {
             self.resolve_type(n, raw)?;
         }
         let fsize = self.sizeof(&fdesc);
-        Ok((fname, fdesc, fsize))
+        let align = self.alignof(&fdesc).max(pragma_align);
+        Ok((fname, fdesc, fsize, align))
     }
 
     fn resolve_type(&mut self, name: &str, raw: &HashMap<String, &Node>) -> Result<(), LengError> {
@@ -1865,21 +1979,34 @@ impl Translator {
             // "`dot` field `ptr.0` on a non-object base".
             Some("union") => {
                 let mut fields = Vec::new();
-                let mut size = 0u64;
+                let (mut size, mut align) = (0u64, 1u64);
                 for fld in body.args() {
                     if fld.tag() != Some("fld") {
                         continue;
                     }
-                    let (fname, fdesc, fsize) = self.layout_field(fld, raw)?;
+                    let (fname, fdesc, fsize, falign) = self.layout_field(fld, raw)?;
                     fields.push((fname, 0, fdesc));
                     size = size.max(fsize);
+                    align = align.max(falign);
                 }
-                Layout::Object { fields, size }
+                if self.packed_types.contains(name) {
+                    align = 1;
+                }
+                Layout::Object {
+                    fields,
+                    size: size.next_multiple_of(align),
+                    align,
+                }
             }
             Some("object") => {
-                // `(object [Empty|Base] (fld :f pragmas Type)*)` — packed at natural size.
+                // `(object [Empty|Base] (fld :f pragmas Type)*)`, laid out as C lays out the struct
+                // nimony's C backend emits for it: each field at its alignment (`{.packed.}`: 1), the
+                // object rounded up to its own.
+                let packed = self.packed_types.contains(name);
+                let place = |align: u64| if packed { 1 } else { align };
                 let mut fields = Vec::new();
                 let mut off = 0u64;
+                let mut align = 1u64;
                 // The first son is the base: `.` = no base; a symbol = inheritance. An inheritable
                 // object carries a leading vtable/type-header pointer (the positional slot an
                 // `(oconstr T <vtable> …)` fills), then the base's fields, then its own — so the base
@@ -1888,12 +2015,16 @@ impl Translator {
                     if base != "." {
                         self.resolve_type(base, raw)?;
                         match self.types.get(base).cloned() {
+                            // C embeds the base as the leading member, so the derived fields
+                            // start past its padded size.
                             Some(Layout::Object {
                                 fields: bf,
                                 size: bsize,
+                                align: balign,
                             }) => {
                                 fields.extend(bf);
                                 off = bsize;
+                                align = balign;
                             }
                             // External inheritable root (`RootObj`/`Exception`) whose own layout
                             // isn't in scope here — `export_types_pooled` with an empty pool runs per-module with no
@@ -1914,6 +2045,7 @@ impl Translator {
                                     },
                                 ));
                                 off = 8;
+                                align = 8;
                             }
                         }
                     }
@@ -1921,28 +2053,34 @@ impl Translator {
                 for fld in body.args() {
                     match fld.tag() {
                         Some("fld") => {
-                            let (fname, fdesc, fsize) = self.layout_field(fld, raw)?;
+                            let (fname, fdesc, fsize, falign) = self.layout_field(fld, raw)?;
+                            let falign = place(falign);
+                            off = off.next_multiple_of(falign);
                             fields.push((fname, off, fdesc));
                             off += fsize;
+                            align = align.max(falign);
                         }
                         Some("union") => {
                             // A **variant/case object**: `(union (object (fld…))+)` — each `of`
-                            // branch is a sub-object whose fields **overlap** at the same base
-                            // (Nim's tagged union; the discriminant field precedes the union). Lay
-                            // every branch out starting at the current offset, and advance past the
-                            // largest branch. All branch fields join the one flat field list, so a
-                            // `foo.y` access or a `Foo(x: …, y: …)` constructor resolves any
-                            // branch's field — which variant is *live* is guarded by the
-                            // discriminant at run time (nimony emits those checks; overlapping
-                            // storage is the correct layout regardless).
-                            let union_base = off;
-                            let mut union_max = 0u64;
+                            // branch is a sub-object whose fields **overlap** (Nim's tagged union;
+                            // the discriminant field precedes the union). All branch fields join the
+                            // one flat field list, so a `foo.y` access or a `Foo(x: …, y: …)`
+                            // constructor resolves any branch's field — which variant is *live* is
+                            // guarded by the discriminant at run time (nimony emits those checks;
+                            // overlapping storage is the correct layout regardless).
+                            //
+                            // C lays the union out as nimony's C backend emits it: an anonymous
+                            // union of one anonymous struct per branch. So each branch is laid out
+                            // as a struct of its own, the union is as aligned as its most-aligned
+                            // branch and as large as its largest, and it starts at its alignment.
+                            let mut branches = Vec::new();
+                            let (mut union_size, mut union_align) = (0u64, 1u64);
                             for branch in fld.args() {
                                 // v0.6.2 wraps each branch in its `of` clause —
                                 // `(union (of (ranges N…) (object (fld…)))+)` — where v0.4.0 listed
                                 // the branch objects bare. The `ranges` are the discriminant values
                                 // that select the branch, which the layout does not depend on: every
-                                // branch still overlaps at `union_base`. So unwrap the clause and lay
+                                // branch still overlaps in the union. So unwrap the clause and lay
                                 // the object out exactly as before. Unwrapping (rather than matching
                                 // `object` at one fixed depth) keeps both spellings working, which is
                                 // what the pooled type table needs — a module compiled by either
@@ -1961,23 +2099,39 @@ impl Translator {
                                     }
                                     _ => continue,
                                 };
-                                let mut boff = union_base;
+                                let (mut boff, mut balign) = (0u64, 1u64);
                                 for bf in branch.args() {
                                     if bf.tag() != Some("fld") {
                                         continue;
                                     }
-                                    let (fname, fdesc, fsize) = self.layout_field(bf, raw)?;
-                                    fields.push((fname, boff, fdesc));
+                                    let (fname, fdesc, fsize, falign) =
+                                        self.layout_field(bf, raw)?;
+                                    boff = boff.next_multiple_of(falign);
+                                    branches.push((fname, boff, fdesc));
                                     boff += fsize;
+                                    balign = balign.max(falign);
                                 }
-                                union_max = union_max.max(boff - union_base);
+                                union_size = union_size.max(boff.next_multiple_of(balign));
+                                union_align = union_align.max(balign);
                             }
-                            off = union_base + union_max;
+                            let union_base = off.next_multiple_of(place(union_align));
+                            fields.extend(
+                                branches
+                                    .into_iter()
+                                    .map(|(fname, boff, fdesc)| (fname, union_base + boff, fdesc)),
+                            );
+                            off = union_base + union_size.next_multiple_of(union_align);
+                            align = align.max(place(union_align));
                         }
                         _ => {} // the base/Empty slot (an atom), or anything else
                     }
                 }
-                Layout::Object { fields, size: off }
+                let align = place(align);
+                Layout::Object {
+                    fields,
+                    size: off.next_multiple_of(align),
+                    align,
+                }
             }
             Some("array") => {
                 // `(array Elem Count)`.
@@ -2012,7 +2166,9 @@ impl Translator {
     /// before `collect_types`, whose `resolve_type` skips already-registered names.
     pub fn import_types(&mut self, ext: &[(String, Layout)]) {
         for (name, layout) in ext {
-            self.agg_names.insert(name.clone());
+            if !matches!(layout, Layout::Scalar(_)) {
+                self.agg_names.insert(name.clone());
+            }
             self.types.insert(name.clone(), layout.clone());
         }
     }
@@ -2131,7 +2287,7 @@ impl Translator {
             .collect();
         let mut out: Vec<(String, u64)> = items
             .iter()
-            .map(|(n, d)| (format!("{n}{stem}"), t.sizeof(d).max(8)))
+            .map(|(n, d)| (format!("{n}{stem}"), global_slot(t.sizeof(d))))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic layout
         Ok(out)
@@ -2228,10 +2384,21 @@ impl Translator {
     /// [`proc_frame_nodes`]. A proc is sret iff its return type is a known aggregate ([`ret_sret`]);
     /// the returned type name is stem-suffixed exactly as [`export_types_pooled`] suffixes a local type, so
     /// the importing unit resolves the same pooled layout when it sizes the result temp.
-    pub fn export_sret_procs(root: &Node, stem: &str) -> Result<Vec<(String, TyDesc)>, LengError> {
+    pub fn export_sret_procs(
+        root: &Node,
+        stem: &str,
+        pooled: &[(String, Layout)],
+    ) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
+        t.import_types(pooled);
+        let imported: HashSet<String> = pooled.iter().map(|(n, _)| n.clone()).collect();
         t.collect_types(root)?;
-        let local: HashSet<String> = t.types.keys().cloned().collect();
+        let local: HashSet<String> = t
+            .types
+            .keys()
+            .filter(|n| !imported.contains(*n))
+            .cloned()
+            .collect();
         let suffix = |d: &TyDesc| match d {
             TyDesc::Agg(n) if local.contains(n) => TyDesc::Agg(format!("{n}{stem}")),
             other => other.clone(),
@@ -2301,14 +2468,22 @@ impl Translator {
     /// (#1404), both failing to verify post-link. Only real procs are listed (`importc` procs are true
     /// libc imports whose signature the shim, not a sibling unit, defines — leave those to call-site
     /// typing).
-    pub fn export_proc_params(root: &Node, stem: &str) -> Result<Vec<ProcParamSig>, LengError> {
+    pub fn export_proc_params(
+        root: &Node,
+        stem: &str,
+        pooled: &[(String, Layout)],
+    ) -> Result<Vec<ProcParamSig>, LengError> {
         // Resolve named types (proctypes, enums, distinct ints) exactly as the real per-unit
         // translation does, so `param_val_ty` classifies a funcref param as `i32` (not the `i64` a
         // bare named-type atom collapses to) — matching the callee's actually-emitted signature. This
         // is why `export_sret_procs` collects types too; omitting it here declared a funcref param as
-        // `i64` and a call site then widened the `ref.func` to `i64` (a fresh mismatch).
+        // `i64` and a call site then widened the `ref.func` to `i64` (a fresh mismatch). The pool too,
+        // as the translation gets it: a `.raises` proc returns `system`'s `ErrorCode`, an enum another
+        // unit declares, and without its width the signature exported here said `i64` where the
+        // callee returns `i32`.
         let mut t = Translator::new();
         t.scan_lenient = true; // tolerate cross-unit aggregate/proctype refs while enumerating
+        t.import_types(pooled);
         t.collect_types(root)?;
         let mut out: Vec<(String, Vec<ValType>, Option<ValType>)> = Vec::new();
         for item in root.args() {
@@ -2486,13 +2661,19 @@ impl Translator {
             .filter(|(name, _)| !imported.contains(*name))
             .map(|(name, layout)| {
                 let l = match layout {
-                    Layout::Object { fields, size } => Layout::Object {
+                    Layout::Object {
+                        fields,
+                        size,
+                        align,
+                    } => Layout::Object {
                         fields: fields
                             .iter()
                             .map(|(f, off, d)| (f.clone(), *off, rewrite(d)))
                             .collect(),
                         size: *size,
+                        align: *align,
                     },
+                    Layout::Scalar(d) => Layout::Scalar(rewrite(d)),
                     Layout::Array {
                         elem,
                         elem_size,
@@ -3029,7 +3210,7 @@ impl Translator {
         if node.tag() == Some("void") || node.is_empty_marker() {
             return Ok(None);
         }
-        Ok(Some(val_ty(node)?))
+        Ok(Some(self.val_ty(node)?))
     }
 
     /// `Some(desc)` if the return type is a named aggregate (object/array) — returned by sret rather
@@ -3100,7 +3281,8 @@ impl Translator {
             .collect();
 
         // A var is frame-resident if it is an aggregate (indexed by `at`/`dot`) or address-taken;
-        // the rest are SSA slots. Frame locals get natural-size byte offsets.
+        // the rest are SSA slots. Frame locals sit at their C alignment, as on a C stack: an object a
+        // local holds is laid out as C lays it out, and an atomic on a field needs the field aligned.
         let mut mem: HashMap<String, (u64, TyDesc)> = HashMap::default();
         let mut frame_size = 0u64;
         let mut ssa_vars: Vec<(String, ValType)> = Vec::new();
@@ -3110,6 +3292,7 @@ impl Translator {
             if framed {
                 if !mem.contains_key(vn) {
                     let sz = self.sizeof(desc);
+                    frame_size = frame_size.next_multiple_of(self.alignof(desc));
                     mem.insert(vn.clone(), (frame_size, desc.clone()));
                     frame_size += sz;
                 }
@@ -3133,16 +3316,21 @@ impl Translator {
                     unsigned: false,
                 });
                 let sz = self.sizeof(&desc);
+                frame_size = frame_size.next_multiple_of(8);
                 mem.insert(pn.clone(), (frame_size, desc));
                 frame_size += sz.max(8);
             }
         }
         // Reserve scratch frame space above the named locals for **aggregate rvalue temps** (an
         // `(oconstr T …)` passed as a call argument is constructed here and passed by-address).
-        let temp_base = frame_size;
+        let temp_base = frame_size.next_multiple_of(FRAME_ALIGN);
+        frame_size = temp_base;
         if let Some(b) = body {
             frame_size += self.agg_temp_bytes(b);
         }
+        // A whole frame is a multiple of [`FRAME_ALIGN`], so the callee's, at `sp + frame_size`, starts
+        // aligned as the entry stack does.
+        let frame_size = frame_size.next_multiple_of(FRAME_ALIGN);
         // A proc is frame-needing if it holds a frame/temp *or* its (propagated) sig says so — i.e.
         // it calls a frame-needing proc and must own an `$sp` to hand down (`propagate_frames`).
         let sig_framed = self
@@ -4387,7 +4575,7 @@ impl<'a> FuncGen<'a> {
                         };
                     }
                 }
-                let ty = val_ty(&a[2])?;
+                let ty = self.t.val_ty(&a[2])?;
                 let v = match a.get(3) {
                     Some(init) if !init.is_empty_marker() => self.expr_typed(init, ty)?,
                     _ => self.emit_const(ty, 0),
@@ -5011,7 +5199,7 @@ impl<'a> FuncGen<'a> {
                 }
                 Some("neg") => {
                     let a = e.args();
-                    let ty = val_ty(&a[0])?;
+                    let ty = self.t.val_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
                     if is_float(ty) {
                         // `fN.neg` (a proper negate — handles signed zero).
@@ -5027,7 +5215,7 @@ impl<'a> FuncGen<'a> {
                 Some("conv") => {
                     // Value-preserving numeric conversion (int width, int↔float, f32↔f64).
                     let a = e.args();
-                    let ty = val_ty(&a[0])?;
+                    let ty = self.t.val_ty(&a[0])?;
                     let u = self.operand_unsigned(&a[1]);
                     let x = self.expr(&a[1])?;
                     let v = self.convert(x, ty, u);
@@ -5037,7 +5225,7 @@ impl<'a> FuncGen<'a> {
                     // A C-style cast — for the scalar/pointer subset, a width reinterpretation
                     // (pointer↔pointer and same-width are no-ops; i32↔i64 extend/wrap).
                     let a = e.args();
-                    let ty = val_ty(&a[0])?;
+                    let ty = self.t.val_ty(&a[0])?;
                     let u = self.operand_unsigned(&a[1]);
                     let x = self.expr(&a[1])?;
                     let v = self.convert(x, ty, u);
@@ -5778,10 +5966,11 @@ impl<'a> FuncGen<'a> {
         Ok(())
     }
 
-    /// Allocate `size` bytes of aggregate-rvalue scratch (`sp + temp_next`) and bump the pointer.
+    /// Allocate `size` bytes of aggregate-rvalue scratch (`sp + temp_next`) and bump the pointer, a
+    /// [`frame_slot`] at a time, as [`Translator::agg_temp_bytes`] reserved them.
     fn alloc_temp(&mut self, size: u64) -> u32 {
         let off = self.temp_next;
-        self.temp_next += size;
+        self.temp_next += frame_slot(size);
         let sp = self.cur[0];
         self.add_const_off(sp, off)
     }
@@ -6388,6 +6577,22 @@ fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
 }
 
 /// Parse an integer Leng type `(i N)`/`(u N)`/`(c N)`/`(bool)` to a ValType; error on non-int.
+/// The window bytes a module global (or thread-local) of `size` bytes takes: at least a word, in
+/// whole words, so every global starts 8-aligned, as each scalar's alignment and an atomic need.
+fn global_slot(size: u64) -> u64 {
+    size.max(8).next_multiple_of(8)
+}
+
+/// A data-stack frame's alignment, and each aggregate temp's: the 16 of C's stack, which covers a
+/// vector and an `{.align: 16.}` field, so everything a frame holds can sit aligned.
+const FRAME_ALIGN: u64 = 16;
+
+/// The frame bytes an aggregate temp of `size` bytes takes: whole [`FRAME_ALIGN`] units, so the next
+/// one starts aligned.
+fn frame_slot(size: u64) -> u64 {
+    size.next_multiple_of(FRAME_ALIGN)
+}
+
 fn int_ty(node: &Node) -> Result<ValType, LengError> {
     int_ty_signed(node).map(|(t, _, _)| t)
 }
@@ -6611,5 +6816,100 @@ fn suf_val_ty(s: &str) -> ValType {
         "f64" => ValType::F64,
         t if t.ends_with("64") => ValType::I64,
         _ => ValType::I32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2201: a unit's objects are laid out as C lays them out, so as native nimony's are. Each
+    /// expectation is what native nimony prints for the same types (`tests/nim_diff/objects_layout.nim`,
+    /// which checks them end to end against a native build where the toolchain is installed).
+    #[test]
+    fn objects_are_laid_out_as_c_lays_them_out() {
+        let src = "\
+(stmts
+ (type :Kind.0. . (enum (u 8) (efld :kA.0. 0) (efld :kB.0. 1)))
+ (type :Padded.0. . (object . (fld :a.0 . (u 8)) (fld :b.0 . (i 32)) (fld :c.0 . (i 64))))
+ (type :Nested.0. . (object . (fld :x.0 . (u 8)) (fld :p.0 . Padded.0.) (fld :y.0 . (u 16))))
+ (type :Scalars.0. . (object . (fld :b.0 . (bool)) (fld :c.0 . (c 8)) (fld :k.0 . Kind.0.)
+   (fld :s.0 . (u 16)) (fld :i.0 . (i 32))))
+ (type :Arr.0. . (array (u 16) 3))
+ (type :U.0. . (union (fld :a.0 . (u 8)) (fld :b.0 . (i 64)) (fld :c.0 . Arr.0.)))
+ (type :Variant.0. . (object . (fld :tag.0 . (u 8)) (fld :kind.0 . Kind.0.)
+   (union (of (ranges 0) (object . (fld :x.0 . (u 8))))
+          (of (ranges 1) (object . (fld :y.0 . (i 64)))))))
+ (type :Packed.0. (pragmas (packed)) (object . (fld :a.0 . (u 8)) (fld :b.0 . (i 32))
+   (fld :c.0 . (i 64))))
+ (type :Aligned.0. . (object . (fld :a.0 . (u 8)) (fld :b.0 (pragmas (align 16)) (i 32))))
+ (type :Base.0. . (object RootObj.0.sys (fld :a.0 . (u 8))))
+ (type :Derived.0. . (object Base.0. (fld :b.0 . (u 8))))
+ (type :Tail.0. . (object . (fld :n.0 . (i 32)) (fld :data.0 . (uarray (i 64))))))";
+        let mut t = Translator::new();
+        t.collect_types(&crate::nif::parse(src).expect("parses"))
+            .expect("lays out");
+        let layout = |name: &str| match &t.types[name] {
+            Layout::Object {
+                fields,
+                size,
+                align,
+            } => (
+                *size,
+                *align,
+                fields
+                    .iter()
+                    .map(|(f, off, _)| (f.trim_end_matches(".0").to_string(), *off))
+                    .collect::<Vec<_>>(),
+            ),
+            other => panic!("{name} is {other:?}"),
+        };
+        let fields = |l: &[(&str, u64)]| -> Vec<(String, u64)> {
+            l.iter().map(|(f, o)| (f.to_string(), *o)).collect()
+        };
+        assert_eq!(
+            layout("Padded.0."),
+            (16, 8, fields(&[("a", 0), ("b", 4), ("c", 8)]))
+        );
+        assert_eq!(
+            layout("Nested.0."),
+            (32, 8, fields(&[("x", 0), ("p", 8), ("y", 24)]))
+        );
+        // An enum is its base's width, and a `bool` a byte.
+        assert_eq!(
+            layout("Scalars.0."),
+            (
+                12,
+                4,
+                fields(&[("b", 0), ("c", 1), ("k", 2), ("s", 4), ("i", 8)])
+            )
+        );
+        assert_eq!(
+            layout("U.0."),
+            (8, 8, fields(&[("a", 0), ("b", 0), ("c", 0)]))
+        );
+        // The discriminant, then the union of the branches at the union's alignment.
+        assert_eq!(
+            layout("Variant.0."),
+            (
+                16,
+                8,
+                fields(&[("tag", 0), ("kind", 1), ("x", 8), ("y", 8)])
+            )
+        );
+        assert_eq!(
+            layout("Packed.0."),
+            (13, 1, fields(&[("a", 0), ("b", 1), ("c", 5)]))
+        );
+        assert_eq!(
+            layout("Aligned.0."),
+            (32, 16, fields(&[("a", 0), ("b", 16)]))
+        );
+        // A base from another unit is the RTTI header; the derived fields follow its padded size.
+        assert_eq!(layout("Base.0.").0, 16);
+        assert_eq!(layout("Derived.0.").2.last(), Some(&("b".to_string(), 16)));
+        assert_eq!(layout("Derived.0.").0, 24);
+        // A flexible tail starts at its element's alignment and adds nothing to the size.
+        assert_eq!(layout("Tail.0."), (8, 8, fields(&[("n", 0), ("data", 8)])));
     }
 }

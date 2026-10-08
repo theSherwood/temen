@@ -602,8 +602,12 @@ fn link_selected_with_extra(
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled_globals.extend(translate::Translator::export_globals(&root, stem, &pooled)?);
-        pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
-        pooled_proc_params.extend(translate::Translator::export_proc_params(&root, stem)?);
+        pooled_sret.extend(translate::Translator::export_sret_procs(
+            &root, stem, &pooled,
+        )?);
+        pooled_proc_params.extend(translate::Translator::export_proc_params(
+            &root, stem, &pooled,
+        )?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
         pooled_c_global_defs.extend(translate::Translator::export_c_global_names(&root));
         if tls {
