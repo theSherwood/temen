@@ -256,7 +256,9 @@ function's address, are refused.
 ### Indirect calls (function pointers)
 A function designator decays to its `ref.func` index (an i32 funcref, §3c) widened to the 8-byte
 C pointer rep (`irty(TY_FUNC)`=i64, `by_address` true so a "load" is a no-op returning the
-funcref). A call through a value lowers to `call.dyn (i64 sp, params…[, i64 va]) -> (ret)
+funcref). Under `--emit-object` a function another unit defines decays to `ref.sym "name"`
+instead, which the linker resolves to that function's index, so `apply(sin, x)` compiles in a unit
+(#2203). A call through a value lowers to `call.dyn (i64 sp, params…[, i64 va]) -> (ret)
 <i32-wrapped idx>(csp, args…)`; the signature **must include the leading data-SP `i64`** so the
 runtime type-id check (`table_lookup`) matches the target. A type-confused/forged index is inert —
 it traps `IndirectCallType` on both backends (I2; see

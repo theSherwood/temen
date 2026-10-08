@@ -765,9 +765,14 @@ static int gen_addr(Node *node) {
     if (node->var->is_function) {
       // A function designator decays to its funcref index (§3c): `ref.func` yields the
       // i32 function-table index; widen it to the 8-byte C pointer representation
-      // (function pointers are stored as integers in memory, §3d).
+      // (function pointers are stored as integers in memory, §3d). A unit (`--emit-object`)
+      // names a function another unit defines by symbol, `ref.sym`, which the linker resolves
+      // to that function's index (#2203).
       int rf = nv++;
-      cg("  v%d = ref.func %d\n", rf, func_index(node->var));
+      if (opt_emit_object && !node->var->is_definition)
+        cg("  v%d = ref.sym \"%s\"\n", rf, node->var->name);
+      else
+        cg("  v%d = ref.func %d\n", rf, func_index(node->var));
       int r = nv++;
       cg("  v%d = i64.extend_i32_u v%d\n", r, rf);
       return r;

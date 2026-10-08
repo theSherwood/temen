@@ -3550,7 +3550,9 @@ unit, which `temen_ir::link` can place anywhere among units from any frontend:
   functions (#2194).
 - **Undefined names are imports.** A call to a function the unit does not define is a `call.sym`
   with the call site's signature, one import per name and shape. A reference to a global it only
-  declares is a `data.sym`.
+  declares is a `data.sym`. The address of a function it does not define is a `ref.sym` in code and
+  a named `data.funcref` in an initializer, which the linker resolves to that function's index
+  (#2203).
 - **Only external-linkage names are exported:** functions, and globals as data symbols. A C `static`
   stays private, so two units can each have their own `helper`.
 - **Calls between frontends agree** because chibicc and the on-ramp share the §3d convention: a
@@ -3563,8 +3565,8 @@ A link unit is a library. It may not define `main`, and translation fails closed
 - what still fixes a window address: thread-locals, the float-formatting scratch, the synthesized
   ctype and locale tables, a durable shadow arena, a §14 child entry;
 - static constructors (no linked `_start` runs them);
-- an offset from a function's address stored in static data (a funcref slot holds an index);
-- taking the address of a function the unit does not define.
+- an offset from a function's address, the unit's own or another's (the linker resolves a function
+  to an index, nothing more).
 
 Without the flag nothing changes: a whole translation is byte-identical. `tests/link_unit.rs` links
 two translated units in both orders and runs them on the interpreter and the JIT.
