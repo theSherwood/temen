@@ -239,10 +239,19 @@ addend}`). `emit_data_segments` resolves each at compile time — every global's
 (`layout_globals`) and function's funcref index (`funcs[]`) is already assigned — and patches the
 8-byte little-endian value (`symbol_value(target) + addend`) into the data image, emitted as an
 ordinary `data`/`data ro` segment. A function-pointer target resolves to its funcref index (§3c),
-so global dispatch tables compose with `call.dyn`. No runtime relocation step; nothing
-relocation-specific reaches the IR/verifier/JIT (it's just bytes). Tests: interp↔JIT differential
+so global dispatch tables compose with `call.dyn`, and its slot is recorded (`data.funcref <at>`,
+#1830): the verifier checks the bytes name a function, and an analysis of what a `call.dyn` can
+reach counts the function as taken. No runtime relocation step. Tests: interp↔JIT differential
 + native-`cc` oracle (pointer-to-global, array-element addend, pointer-to-pointer,
 struct-with-pointer-member, global fn-ptr tables, string-literal `char*`, array-of-`char*`).
+
+Under `--emit-object` the linker places the data, so a pointer becomes a link form instead:
+`data.ptr <at> self <off>` for this unit's data and `data.ptr <at> sym "name" <addend>` for another
+unit's. A function pointer to a function this unit defines, `static` or not, keeps its index in the
+unit and its `data.funcref <at>` slot, and the linker shifts it with the unit's functions as it
+does `ref.func`. One to another unit's function is `data.funcref <at> sym "name"`, resolved like a
+call (#2194). A thread-local initializer holding a function pointer, and an offset from a
+function's address, are refused.
 
 ### Indirect calls (function pointers)
 A function designator decays to its `ref.func` index (an i32 funcref, §3c) widened to the 8-byte
