@@ -1468,8 +1468,8 @@ fn translate_impl(
             // initializer pointers for the linker to fill in (#1746).
             data_exports: link_data.exports,
             data_ptrs: link_data.ptrs,
-            data_funcrefs: link_data.funcrefs,
-            data_funcref_slots: Vec::new(),
+            data_funcrefs: Vec::new(),
+            data_funcref_slots: link_data.funcref_slots,
             tls: Vec::new(),
             funcs,
             memory,
@@ -2060,8 +2060,9 @@ struct LinkData {
     exports: Vec<temen_ir::DataExport>,
     /// Pointers stored in initializers, to this unit's data or to another unit's global.
     ptrs: Vec<temen_ir::DataPtr>,
-    /// Function pointers stored in initializers, by the function's exported name.
-    funcrefs: Vec<temen_ir::DataFuncref>,
+    /// Where initializers hold a function pointer: the slot holds the function's index in the unit,
+    /// which the linker shifts with the unit's functions (#2194).
+    funcref_slots: Vec<u64>,
 }
 
 /// The per-vCPU thread-local (TLS) block layout (NIM.md §3d Tier-2). Thread-local globals are peeled
@@ -2259,7 +2260,7 @@ fn globals_layout(
         let mut feed = labels.iter().copied();
         let mut relocs = Vec::new();
         let extern_data = link.then_some(&link_data.extern_data);
-        let bytes = const_bytes(
+        let mut bytes = const_bytes(
             init.as_ref(),
             &m.types,
             &addr,
@@ -2283,18 +2284,17 @@ fn globals_layout(
                     tls: false,
                     target: temen_ir::DataPtrTarget::Sym { name, addend },
                 }),
-                // A `data.funcref` slot names an exported function, so a pointer to a `static` one
-                // has no link-time form yet.
+                // A function this unit defines (`const_reloc` refuses any other), `static` or
+                // not: the slot holds its index in the unit, which the linker shifts.
                 CBase::Func(name) => {
-                    let local = m.functions.iter().any(|f| f.name == name && f.local);
-                    if local || addend != 0 {
+                    let Some(&func) = name2idx.get(&name).filter(|_| addend == 0) else {
                         return unsup(format!(
-                            "a pointer to static function `@{name}` in the initializer of `@{}` \
-                             (a link unit can relocate only a pointer to an exported function)",
+                            "arithmetic on the address of `@{name}` in `@{}`'s initializer",
                             name_str(&g.name)
                         ));
-                    }
-                    link_data.funcrefs.push(temen_ir::DataFuncref { at, name });
+                    };
+                    bytes[off as usize..off as usize + 4].copy_from_slice(&func.to_le_bytes());
+                    link_data.funcref_slots.push(at);
                 }
             }
         }
@@ -2359,6 +2359,9 @@ fn globals_layout(
             });
         }
     }
+    // Globals are visited in declaration order, not address order (read-only ones sit on a later
+    // page), and a funcref slot list ascends.
+    link_data.funcref_slots.sort_unstable();
     Ok((addr, segs, off, cstrs, gbytes, syms, tls, link_data))
 }
 

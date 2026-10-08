@@ -3545,7 +3545,9 @@ two LLVM-translated units could not link each other at all.
 unit, which `temen_ir::link` can place anywhere among units from any frontend:
 
 - **Globals are addressed relative to the unit's own data:** `data.self` in code, a `data.ptr` slot
-  for a pointer in an initializer, a `data.funcref` (by exported name) for a function pointer in one.
+  for a pointer in an initializer. A function pointer in one holds the function's index in the unit,
+  `static` or not, and is recorded as a funcref slot, which the linker shifts with the unit's
+  functions (#2194).
 - **Undefined names are imports.** A call to a function the unit does not define is a `call.sym`
   with the call site's signature, one import per name and shape. A reference to a global it only
   declares is a `data.sym`.
@@ -3561,8 +3563,7 @@ A link unit is a library. It may not define `main`, and translation fails closed
 - what still fixes a window address: thread-locals, the float-formatting scratch, the synthesized
   ctype and locale tables, a durable shadow arena, a §14 child entry;
 - static constructors (no linked `_start` runs them);
-- a pointer to a `static` function stored in static data (a `data.funcref` names an exported
-  function);
+- an offset from a function's address stored in static data (a funcref slot holds an index);
 - taking the address of a function the unit does not define.
 
 Without the flag nothing changes: a whole translation is byte-identical. `tests/link_unit.rs` links
