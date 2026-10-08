@@ -216,16 +216,16 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `link`
 
-- `temen_link_encode_lib`
-- `temen_link_encode_libs` — *unreferenced*
+- `temen_link_encode_lib` — *unreferenced*
+- `temen_link_encode_libs`
 - `temen_link_lib_close`
 - `temen_link_lib_open`
 - `temen_link_run`
 - `temen_link_run_lib`
 - `temen_link_run_libs` — *unreferenced*
 - `temen_link_text` — *unreferenced*
-- `temen_link_text_lib`
-- `temen_link_text_libs` — *unreferenced*
+- `temen_link_text_lib` — *unreferenced*
+- `temen_link_text_libs`
 
 ### `mem`
 

@@ -15564,20 +15564,41 @@ int main(void) {
 }
 "#;
 
+    /// Compile `src` as a program unit and link the playground's heap unit after it, as the card does
+    /// (#2172): the headers only declare `malloc`/`realloc`, and `printf`'s stream writer can `realloc`.
     fn compile(src: &str) -> Option<temen_ir::Module> {
-        let bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/web/assets/chibicc.temen"
-        ))
-        .ok()?;
-        let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
+        let asset = |name: &str| {
+            std::fs::read(format!("{}/web/assets/{name}", env!("CARGO_MANIFEST_DIR"))).ok()
+        };
+        let chibicc =
+            temen_encode::decode_module(&asset("chibicc.temen")?).expect("decode chibicc.temen");
+        let heap =
+            temen_encode::decode_unit(&asset("pg_heap.temeno")?).expect("decode pg_heap.temeno");
         let mut files = playground_include_files();
         files.push(("in.c".to_string(), src.as_bytes().to_vec()));
         let image = temen_fs::encode_image(&files, &["include".to_string()]);
-        let argv: [&[u8]; 5] = [b"chibicc", b"--data-page", b"65536", b"-g", b"/in.c"];
+        let argv: [&[u8]; 6] = [
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"-g",
+            b"/in.c",
+        ];
         let out = onramp_fs_exec(&chibicc, &image, &argv, b"");
         let ir = String::from_utf8(out.stdout).expect("IR utf8");
-        Some(temen_text::parse_module(&ir).expect("parse IR"))
+        let prog = temen_text::parse_module(&ir).expect("parse IR");
+        let exports: Vec<_> = heap
+            .exports
+            .iter()
+            .map(|e| (e.name.clone(), e.func))
+            .collect();
+        let unit = temen_ir::LinkUnitRef {
+            module: &heap,
+            exports: &exports,
+            data_exports: &heap.data_exports,
+        };
+        Some(link_program_multi(&[unit], &prog, "main").expect("link the heap unit"))
     }
 
     /// How a run ended: its result, its stdout, the parks it surfaced, its tier-ups and resumes.
