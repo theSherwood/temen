@@ -400,3 +400,142 @@ fn a_native_svc_wait_with_queued_work_serves_and_returns() {
     assert_eq!(ci, cf);
     assert_eq!(rf, Ok(vec![Value::I64(2042)]));
 }
+
+/// #744 — a serving module that spawns: func 0 serves (`svc.wait`) and joins a child, the handler
+/// (func 1) calls func 2, whose body is `helper`. The root's own `svc.wait` and `join` are no park of
+/// the handler's.
+fn spawning_server(serve: &str, helper: &str) -> Arc<temen_ir::Module> {
+    module(&format!(
+        r#"
+memory 16
+type 0 func (i64) -> (i64)
+type 1 interface {{ bump: 0 }}
+export 0 interface "counter" 1 {{ bump: 1 }}
+
+func () -> (i64) {{
+block 0 () {{
+  vz = i32.const 0
+{serve}
+  vj = call.cap 6 1 (i32) -> (i64) vz (vz)
+  vr = i64.add vn vj
+  return vr
+  }}
+}}
+
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  vy = call 2 (vx)
+  return vy
+  }}
+}}
+
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+{helper}
+  }}
+}}
+"#
+    ))
+}
+
+const WAIT: &str = "  vn = call.cap 4294967295 10 () -> (i64) vz ()";
+
+/// #744 — the serve-children escape: the cooperative driver runs a serving module that spawns
+/// natively exactly while nothing a handler reaches can park. The oracle runs each handler as a
+/// fiber and serves on past one that parks; this engine serves on the handler's own task, so such a
+/// module declines to the oracle. The closure follows direct calls (func 1 → func 2), and a call
+/// whose callee is unknown until it runs counts as a park.
+#[test]
+fn a_spawning_server_runs_natively_only_while_its_handlers_cannot_park() {
+    assert!(bytecode::admits(&spawning_server(WAIT, "  return vx")));
+    for helper in [
+        // a join
+        "  vz = i32.const 0\n  vj = call.cap 6 1 (i32) -> (i64) vz (vz)\n  return vj",
+        // an indirect call
+        "  vf = ref.func 2\n  vr = call.dyn (i64) -> (i64) vf (vx)\n  return vr",
+        // a call through a live offer
+        "  vh = i32.const 0\n  vr = call.cap 268435456 0 (i64) -> (i64) vh (vx)\n  return vr",
+        // an embedder's capability, which can punt
+        "  vh = i32.const 0\n  vr = call.cap 13 0 (i64) -> (i64) vh (vx)\n  return vr",
+    ] {
+        assert!(
+            !bytecode::admits(&spawning_server(WAIT, helper)),
+            "{helper}"
+        );
+    }
+    // A timed `svc.wait` is the oracle's alone, wherever it is.
+    let timed = "  vt = i64.const 1000\n  vn = call.cap 4294967295 10 (i64) -> (i64) vz (vt)";
+    assert!(!bytecode::admits(&spawning_server(timed, "  return vx")));
+}
+
+/// A detached child (func 1, its `Instantiator` its entry argument) spawns a thread and asks for a
+/// live offer over it (op 14). A thread runs the caller's own domain, not a child's, so the mint is
+/// refused `-EINVAL` — on the oracle, and on the cooperative driver, where an offer into the caller's
+/// own domain would have a call lock the cell its step already holds.
+const OFFER_OVER_A_THREAD: &str = r#"
+memory 17
+type 0 func (i64) -> (i64)
+type 1 interface { op: 0 }
+export 0 interface "svc" 1 { op: 3 }
+
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  vrb = i64.const 17436
+  i32.store vrb v1
+  vrp = i64.const 17408
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  return vj
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  vinst = i32.wrap_i64 v0
+  voff = call.cap 6 14 (i32, i64) -> (i32) vinst (vt, vz)
+  vjt = thread.join vt
+  vr = i64.extend_i32_s voff
+  return vr
+  }
+}
+
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  return va
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  return vx
+  }
+}
+"#;
+
+#[test]
+fn a_live_offer_over_a_thread_is_refused() {
+    let m = module(&format!(
+        "{OFFER_OVER_A_THREAD}{}",
+        rec::segment(17408, &temen_ir::SpawnRec::v1(1))
+    ));
+    let run = |entry: Entry| {
+        let mut host = Host::new();
+        host.set_self_module(&m);
+        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hb = host.grant_budget(-1, 1 << 20, -1);
+        let mut fuel = 5_000_000u64;
+        entry(
+            &m,
+            0,
+            &[Value::I32(hi), Value::I32(hb)],
+            &mut fuel,
+            &mut host,
+        )
+    };
+    let einval = Ok(vec![Value::I64(-22)]);
+    assert_eq!(run(run_with_host), einval, "the oracle refuses the mint");
+    assert!(bytecode::admits(&m), "the cooperative driver runs it");
+    assert_eq!(run(run_with_host_fast), einval, "and refuses it too");
+}

@@ -14058,7 +14058,7 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             bytecode::CoopEvent::Done(_) | bytecode::CoopEvent::Trapped(_)
         )
     {
-        let host = s.run.host_mut();
+        let mut host = s.run.host_mut();
         let (out, err) = (host.take_stdout(), host.take_stderr());
         // SAFETY: single-threaded wasm; the capture slots are read back only via the accessors.
         unsafe {
@@ -14175,13 +14175,13 @@ fn coop_pump(budget: Option<u64>) -> i32 {
         }
     }
     // The files the run ended with, for an embedder's file view after it closes the session.
-    let fs = temen_fs::vm_fs_image(s.run.host_mut());
+    let fs = temen_fs::vm_fs_image(&s.run.host_mut());
     // #1896: a nimony build's output is its personality's, and its memfs outlives the run for
     // `temen_nim_file` to read.
     let (stdout, stderr) = match s.nim.take() {
         Some(nim) => nimony::finish(nim),
         None => {
-            let host = s.run.host_mut();
+            let mut host = s.run.host_mut();
             (
                 std::mem::take(&mut host.stdout),
                 std::mem::take(&mut host.stderr),
@@ -14284,7 +14284,7 @@ pub extern "C" fn temen_coop_take_output() {
     if !s.sliced {
         return;
     }
-    let host = s.run.host_mut();
+    let mut host = s.run.host_mut();
     let (out, err) = (host.take_stdout(), host.take_stderr());
     // SAFETY: as above; the capture slots are read back only via the accessors.
     unsafe {
@@ -14304,7 +14304,7 @@ pub extern "C" fn temen_coop_fs_image() -> usize {
         if let Some(s) = (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() {
             stash(
                 &mut *core::ptr::addr_of_mut!(FS_IMAGE),
-                temen_fs::vm_fs_image(s.run.host_mut()),
+                temen_fs::vm_fs_image(&s.run.host_mut()),
             );
         }
         (*core::ptr::addr_of!(FS_IMAGE)).1
@@ -14780,7 +14780,7 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_len(code: i32) -> usize {
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 0;
     };
-    let h = s.run.host_mut();
+    let mut h = s.run.host_mut();
     s.jit_wasm_by_handle = h
         .resolve_jit_code(code)
         .ok()
@@ -14825,7 +14825,7 @@ pub extern "C" fn temen_coop_jit_wasm_by_slot_len(slot: u32) -> usize {
         return 0;
     };
     let unit = s.run.slot_unit(slot);
-    let h = s.run.host_mut();
+    let mut h = s.run.host_mut();
     s.jit_wasm_by_handle = unit.and_then(|(cd, cu)| h.jit_unit_wasm_or_emit(cd, cu)); // #1301
     s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
 }

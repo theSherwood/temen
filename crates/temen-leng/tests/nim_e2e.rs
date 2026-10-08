@@ -2459,6 +2459,7 @@ fn nim_shells_out_through_the_posix_sh() {
                 built: false,
             },
             engine,
+            None,
         );
         // The tree-walker and the JIT record twin traps (#1665); a bytecode crash shows in the output.
         let crashed = temen_interp::last_twin_traps();
@@ -2552,6 +2553,7 @@ fn a_nim_process_that_polls_its_child_sleeps() {
                 built: false,
             },
             engine,
+            None,
         );
         assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
         let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
@@ -2642,6 +2644,7 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
                 built: false,
             },
             engine,
+            None,
         );
         let crashed = temen_interp::last_twin_traps();
         assert!(
@@ -2712,6 +2715,7 @@ fn nim_reads_a_commands_output_through_execcmdex() {
                 built: false,
             },
             engine,
+            None,
         );
         assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
         assert_eq!(
@@ -2783,6 +2787,7 @@ fn nim_forks_and_execs_a_nim_program() {
                 built: false,
             },
             engine,
+            None,
         );
         assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
         assert_eq!(

@@ -4386,8 +4386,8 @@ impl Module {
     /// CONSOLIDATION.md §2.2 — whether impl export `idx` can be a spawn record's **pager**: its
     /// interface is exactly `{ page: (i64) -> (i64) }`, the one shape a page fault's dispatch can
     /// serve (it sends op 0 the fault address and reads back where the page is). Spawn validation
-    /// checks it; the native tiers' folds are to key on it too, so that a module with no such
-    /// export provably builds no pager record (#744).
+    /// checks it, and the native tiers' folds key on [`Module::declares_pager`], so a module with no
+    /// such export provably builds no pager record (#744).
     pub fn is_pager_export(&self, idx: u32) -> bool {
         let Some(e) = self.impl_exports.get(idx as usize) else {
             return false;
@@ -4397,6 +4397,11 @@ impl Module {
             self.interface_named_ops(e.interface).as_deref(),
             Some([("page", ft)]) if ft.params == i64_ && ft.results == i64_
         )
+    }
+
+    /// Whether any impl export can be a spawn record's pager ([`Module::is_pager_export`]).
+    pub fn declares_pager(&self) -> bool {
+        (0..self.impl_exports.len() as u32).any(|i| self.is_pager_export(i))
     }
 
     /// Resolve interface entry `idx` to its **named** op list `(name, signature)`, or `None`
@@ -6400,6 +6405,48 @@ pub fn taken_funcs(m: &Module) -> Vec<bool> {
     taken
 }
 
+/// The functions reachable from `roots`: `out[f]` is whether a direct edge path leads from a root
+/// to `f`. The edges are [`Inst::Call`], [`Inst::RefFunc`], [`Inst::ThreadSpawn`] and
+/// [`Terminator::ReturnCall`] — the set [`offset_func_indices`] rewrites, and the two must stay in
+/// step. An indirect call names no function, so it is no edge: a caller asking what code can run
+/// treats one as reaching anything. Link-time dead-code elimination ([`stub_unreachable_funcs`])
+/// and the bytecode engine's serve-handler closure (#744) both walk this. `Err(BadRoot)` for a root
+/// or target out of range — the verifier's job, not this walk's.
+pub fn reachable_funcs(
+    m: &Module,
+    roots: impl IntoIterator<Item = FuncIdx>,
+) -> Result<Vec<bool>, GcError> {
+    fn push(f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>) -> Result<(), GcError> {
+        let seen = live.get_mut(f as usize).ok_or(GcError::BadRoot(f))?;
+        if !*seen {
+            *seen = true;
+            work.push(f);
+        }
+        Ok(())
+    }
+    let mut live = alloc::vec![false; m.funcs.len()];
+    let mut work: Vec<FuncIdx> = Vec::new();
+    for f in roots {
+        push(f, &mut live, &mut work)?;
+    }
+    while let Some(f) = work.pop() {
+        for b in &m.funcs[f as usize].blocks {
+            for inst in &b.insts {
+                if let Inst::Call { func, .. }
+                | Inst::RefFunc { func }
+                | Inst::ThreadSpawn { func, .. } = inst
+                {
+                    push(*func, &mut live, &mut work)?;
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &b.term {
+                push(*func, &mut live, &mut work)?;
+            }
+        }
+    }
+    Ok(live)
+}
+
 /// **Replace the body of every function nothing can reach with a trap** — link-time dead-code
 /// elimination (#1407).
 ///
@@ -6435,66 +6482,29 @@ pub fn taken_funcs(m: &Module) -> Vec<bool> {
 /// [`ImplExport`] op — the functions its data image names ([`data_funcref_targets`], a static
 /// initializer's function pointer: live from the start, like the data), plus `extra_roots`, for a
 /// funcidx the caller invokes directly (the entry it is about to hand [`synth_manifest_start`], say).
-/// Edges are followed from a live body: [`Inst::Call`], [`Inst::RefFunc`], [`Inst::ThreadSpawn`]
-/// and [`Terminator::ReturnCall`] — the same set [`offset_func_indices`] rewrites, and the two must
-/// stay in step. A [`Inst::CallImport`] names an import slot, not a function, so it is not an edge;
-/// a [`Inst::CallIndirect`] names no function at all, which is the whole reason indices are
-/// preserved.
+/// Edges are [`reachable_funcs`]'. A [`Inst::CallImport`] names an import slot, not a function, so
+/// it is not an edge; a [`Inst::CallIndirect`] names no function at all, which is the whole reason
+/// indices are preserved.
 pub fn stub_unreachable_funcs(
     m: &mut Module,
     extra_roots: &[FuncIdx],
 ) -> Result<StubbedFuncs, GcError> {
-    let n = m.funcs.len();
     if !m.data_funcrefs.is_empty() {
         return Err(GcError::DataFuncrefs);
     }
     // --- mark ---------------------------------------------------------------------------------
-    let mut live = alloc::vec![false; n];
-    let mut work: Vec<FuncIdx> = Vec::new();
-    let push = |f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>| -> Result<(), GcError> {
-        let i = f as usize;
-        if i >= live.len() {
-            return Err(GcError::BadRoot(f));
-        }
-        if !live[i] {
-            live[i] = true;
-            work.push(f);
-        }
-        Ok(())
-    };
-    for e in &m.exports {
-        push(e.func, &mut live, &mut work)?;
-    }
-    for e in &m.impl_exports {
-        for &f in &e.ops {
-            push(f, &mut live, &mut work)?;
-        }
-    }
-    for f in data_funcref_targets(m) {
-        push(f.ok_or(GcError::BadDataFuncref)?, &mut live, &mut work)?;
-    }
-    for &f in extra_roots {
-        push(f, &mut live, &mut work)?;
-    }
-    while let Some(f) = work.pop() {
-        let mut edges: Vec<FuncIdx> = Vec::new();
-        for b in &m.funcs[f as usize].blocks {
-            for inst in &b.insts {
-                match inst {
-                    Inst::Call { func, .. }
-                    | Inst::RefFunc { func }
-                    | Inst::ThreadSpawn { func, .. } => edges.push(*func),
-                    _ => {}
-                }
-            }
-            if let Terminator::ReturnCall { func, .. } = &b.term {
-                edges.push(*func);
-            }
-        }
-        for e in edges {
-            push(e, &mut live, &mut work)?;
-        }
-    }
+    let data_roots: Vec<FuncIdx> = data_funcref_targets(m)
+        .into_iter()
+        .collect::<Option<_>>()
+        .ok_or(GcError::BadDataFuncref)?;
+    let roots = m
+        .exports
+        .iter()
+        .map(|e| e.func)
+        .chain(m.impl_exports.iter().flat_map(|e| e.ops.iter().copied()))
+        .chain(data_roots)
+        .chain(extra_roots.iter().copied());
+    let live = reachable_funcs(m, roots)?;
     // --- stub ---------------------------------------------------------------------------------
     // The signature stays (the table's slot check reads it); the body becomes one diverging block, so
     // the only way to arrive is a forged index, and arriving traps.
@@ -6528,7 +6538,7 @@ pub fn stub_unreachable_funcs(
 /// The [`Module::imports`] slot an instruction names, if it names one.
 ///
 /// The **single definition** of "which IR forms carry an index into the import table" — the import
-/// twin of the edge set [`offset_func_indices`] and [`stub_unreachable_funcs`] share. Every pass that
+/// twin of the edge set [`offset_func_indices`] and [`reachable_funcs`] share. Every pass that
 /// renumbers or counts import references goes through here, so adding an import-bearing form is one
 /// edit rather than a hunt (INVARIANTS #15): miss a site and the failure is a silently mis-dispatched
 /// capability call, the #1524 shape.

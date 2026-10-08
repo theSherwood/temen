@@ -881,13 +881,13 @@ so the real work is turning the JIT call into a reifiable park. The four items, 
    of exactly this — `pending = CapResult(reply)` on the live vCPU.)
 2. **Suspendable `call.cap` on the JIT — the load-bearing re-architecture** (`temen-jit` lowering +
    `temen-run` serve path). *Why it is unavoidable:* in **both** live-offer transports the caller's
-   continuation is a **native Rust frame**, unreifiable — the enqueue path thread-blocks the caller on
-   the `live_impl_call` Condvar (`temen-run:2270`), and the handoff path runs the handler on the caller's
+   continuation is a **native Rust frame**, unreifiable — the enqueue path parks the caller's native
+   frame on the run's host-call park (`live_impl_call`, #2173), and the handoff path runs the handler on the caller's
    own thread with the caller's guest continuation suspended *below* it on the native C stack. A servicer
    in another frame/thread cannot reify either. The fix: a live-offer `call.cap` from a durable guest,
    when the reply is withheld, must **durable-unwind the caller's shadow stack (pre-result) back to the
    window and return control** — parking the guest as a reified cap-reply-pending continuation — instead
-   of ever entering the native thread-block. This is caller-side parking on the JIT (the I36 slice never
+   of ever entering the native park. This is caller-side parking on the JIT (the I36 slice never
    built for the JIT), realized via durable unwind. It is a **new JIT execution mode for cross-domain
    calls**, the sensitive change (handoff fast path + confinement-adjacent serve loop); gate it to
    durable-instrumented forking guests so ordinary cross-domain calls keep the thunk fast path.
@@ -981,7 +981,11 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   runs it instantiates (`temen_jit::SharedCode`), with its own powerbox, function table and run
   state: the process that compiled it, its twins, and every later `execve` of the same command. The
   tree finds a command's compile by what the code depends on besides the module: the grant, the
-  window, the entry, whether it polls the tree's kill-path cell, and its fork sites. Code that needs
+  window, the entry, whether it polls the tree's kill-path cell, whether it charges fuel, and its
+  fork sites. An embedder can keep these compiles past the run (`RunConfig::jit_code`, a
+  `JitCodeCache`, #2145). Every run handed the same cache compiles each program once, the root's
+  included. Each instance polls its own run's cells, which reach the code through the `vmctx`, so
+  code compiled in one run serves the next. Code that needs
   a runtime one instance owns (a §14 nursery, a `setjmp` table, the fiber and thread runtime), or
   that a program able to drive the §22 `Jit` could extend, is compiled per process. Code that only
   waits and notifies is shared: its futex sites load the thread domain from the `vmctx`, and each
