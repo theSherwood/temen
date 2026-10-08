@@ -303,7 +303,7 @@ fn io_link(mods: &[(String, String)]) -> Result<Module, Stage> {
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     let (names, sigs) = temen_posix::cap_vtable();
-    temen_leng::link_nim_posix(&units, (&names, &sigs), None).map_err(|_| Stage::Translate)
+    temen_leng::link_nim_posix(&units, (&names, &sigs), None, false).map_err(|_| Stage::Translate)
 }
 
 /// Run the linked program's powerbox `_start` on `backend`, bound as every no-C driver binds one

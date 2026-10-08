@@ -2119,23 +2119,34 @@ pub fn nim_posix_runtime(
 /// [`link_whole_powerbox_manifest`] in [`link_order`], then [`temen_opt::optimize_linked`]. Every caller
 /// links through this, so a phase built on the host and a program built in-guest by the self-hosted
 /// lane are one link.
+///
+/// `debug` links a **debug build**, which keeps the units' debug info. A **release build** drops it, so
+/// no engine pays for it (#2186): nim code carries none, but the prebuilt libc carries its own, for a
+/// debugger to step into, and the Cranelift JIT captures every explicit trap's backtrace in a module
+/// that has any.
 pub fn link_nim_posix(
     units: &[WholeModule],
     personality: PersonalityVtable,
     libc: Option<&[u8]>,
+    debug: bool,
 ) -> Result<Module, LengError> {
     let units = &link_order(units);
     let mut runtime = nim_posix_runtime(units, personality)?;
     if let Some(libc) = libc {
         runtime.extend(nim_libc_units(libc, units)?);
     }
-    link_whole_powerbox_manifest(units, runtime).map(|m| temen_opt::optimize_linked(&m))
+    let mut m = link_whole_powerbox_manifest(units, runtime)?;
+    if !debug {
+        m.debug_info = None;
+    }
+    Ok(temen_opt::optimize_linked(&m))
 }
 
-/// **`temen-link -o:<out.temen> [--libc:<path>] <main.c.nif> <dep.c.nif>...`**, the command nimony's
-/// Temen backend plans after dead-code elimination (#1609): link a program's `.c.nif` modules with
-/// [`link_nim_posix`], against the prebuilt guest libc (`/lib/temen/libc.temeno` unless `--libc:`
-/// names another; linked without one if it is absent), and write the encoded module.
+/// **`temen-link -o:<out.temen> [-g] [--libc:<path>] <main.c.nif> <dep.c.nif>...`**, the command
+/// nimony's Temen backend plans after dead-code elimination (#1609): link a program's `.c.nif` modules
+/// with [`link_nim_posix`], against the prebuilt guest libc (`/lib/temen/libc.temeno` unless `--libc:`
+/// names another; linked without one if it is absent), and write the encoded module. A release build
+/// unless `-g` asks for a debug build, as `cc -g` does.
 ///
 /// It reaches files only through `read` and `write`. The in-guest `temen-link` passes the
 /// personality's file ops; an embedder that serves the command natively passes its filesystem. Either
@@ -2151,12 +2162,15 @@ pub fn link_command(
 ) -> i32 {
     let mut out = None;
     let mut libc_path = "/lib/temen/libc.temeno";
+    let mut debug = false;
     let mut inputs = Vec::new();
     for &a in args {
         if let Some(o) = a.strip_prefix("-o:") {
             out = Some(o);
         } else if let Some(l) = a.strip_prefix("--libc:") {
             libc_path = l;
+        } else if a == "-g" {
+            debug = true;
         } else {
             inputs.push(a);
         }
@@ -2177,7 +2191,7 @@ pub fn link_command(
         .map(|(stem, src)| WholeModule { stem, src })
         .collect();
     let libc = read(libc_path);
-    let Ok(module) = link_nim_posix(&units, personality, libc.as_deref()) else {
+    let Ok(module) = link_nim_posix(&units, personality, libc.as_deref(), debug) else {
         return 3;
     };
     if !write(out, &temen_encode::encode_module(&module)) {

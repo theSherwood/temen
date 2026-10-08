@@ -160,7 +160,7 @@ fn main() {
         .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("read libc {p:?}: {e}")));
     let module = if posix {
         let (px_names, px_sigs) = temen_posix::cap_vtable();
-        temen_leng::link_nim_posix(&units, (&px_names, &px_sigs), libc.as_deref())
+        temen_leng::link_nim_posix(&units, (&px_names, &px_sigs), libc.as_deref(), false)
             .unwrap_or_else(|e| panic!("nim→posix bridge: {e}"))
     } else {
         temen_leng::link_nim_powerbox(&units, libc.as_deref())
