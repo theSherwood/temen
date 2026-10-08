@@ -50,6 +50,10 @@ pub struct FuelCell {
     /// [`refill_trampoline`]'s address: called with the cell, returns nothing, clobbers no register.
     refill: usize,
     remaining: unsafe extern "C" fn(*const FuelCell) -> i64,
+    /// What the last refill handed its caller to charge from: the allowance it drew or found, `0`
+    /// when the chain is spent. Compiled code reads it after a refill instead of `left`, which a
+    /// sibling vCPU's plain store can have overwritten ([`fuel_refill`]).
+    granted: u64,
     /// The chain the next draw comes from; `None` for a fixed allowance (or once the chain proved
     /// unbounded). Locked by a refill, so the vCPUs of a domain sharing the cell draw one at a time.
     src: Mutex<Option<Arc<dyn BudgetNode>>>,
@@ -77,6 +81,7 @@ impl FuelCell {
             left,
             refill: refill_trampoline(),
             remaining: fuel_remaining,
+            granted: 0,
             src: Mutex::new(src),
         })
     }
@@ -115,11 +120,17 @@ impl Drop for FuelCell {
     }
 }
 
-/// A spent cell's refill, called by compiled code through [`refill_trampoline`]: it leaves the new
-/// allowance (at least 1) in `left`, or `left` at the `0` the caller saw when the chain (or a fixed
-/// allowance) is spent — the caller reads `left` back and then traps `OutOfFuel`. A domain's vCPUs
-/// share one cell, so a refill another vCPU made while this one waited for the lock is kept, not
-/// drawn again.
+/// A spent cell's refill, called by compiled code through [`refill_trampoline`]: it puts the new
+/// allowance (at least 1) in `left`, and in [`FuelCell::granted`] what the caller charges from: that
+/// allowance, or `0` when the chain (or a fixed allowance) is spent, on which the caller traps
+/// `OutOfFuel`. A domain's vCPUs share one cell, so a refill another vCPU made while this one waited
+/// for the lock is kept, not drawn again: what it left is granted.
+///
+/// The caller charges from `granted`, never from a reload of `left`. The vCPUs charge the shared
+/// cell with plain loads and stores, so a sibling that loaded `1` before a refill can store its `0`
+/// just after it. A reload of `left` that read that `0` trapped `OutOfFuel` with the chain still
+/// full (#2202: five threads in a loop trapped within milliseconds). Only a refill writes `granted`,
+/// under the lock, and it writes `0` only when the chain is spent.
 ///
 /// # Safety
 /// `cell` is a live [`FuelCell`].
@@ -127,11 +138,14 @@ unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
     // Only the `src` field is borrowed: compiled code writes `left` through the raw cell pointer.
     let mut src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
     let left = core::ptr::addr_of_mut!((*cell).left);
-    if core::ptr::read_volatile(left) > 0 {
+    let granted = core::ptr::addr_of_mut!((*cell).granted);
+    let refilled = core::ptr::read_volatile(left);
+    if refilled > 0 {
+        core::ptr::write_volatile(granted, refilled);
         return;
     }
     let drawn = match src.as_ref().map(|s| s.draw()) {
-        None | Some(Some(0)) => return,
+        None | Some(Some(0)) => 0,
         Some(None) => {
             *src = None; // every level unbounded: nothing left to meter
             u64::MAX
@@ -139,6 +153,7 @@ unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
         Some(Some(n)) => n,
     };
     core::ptr::write_volatile(left, drawn);
+    core::ptr::write_volatile(granted, drawn);
 }
 
 /// The address of [`fuel_refill`] behind a trampoline in Cranelift's `PreserveAll` convention, which
@@ -204,11 +219,13 @@ unsafe extern "C" fn fuel_remaining(cell: *const FuelCell) -> i64 {
 /// Word offsets compiled code uses.
 pub(crate) const REFILL_OFF: i32 = 8;
 pub(crate) const REMAINING_OFF: i32 = 16;
+pub(crate) const GRANTED_OFF: i32 = 24;
 
 const _: () = {
     assert!(core::mem::offset_of!(FuelCell, left) == 0);
     assert!(core::mem::offset_of!(FuelCell, refill) == REFILL_OFF as usize);
     assert!(core::mem::offset_of!(FuelCell, remaining) == REMAINING_OFF as usize);
+    assert!(core::mem::offset_of!(FuelCell, granted) == GRANTED_OFF as usize);
 };
 
 #[cfg(test)]
