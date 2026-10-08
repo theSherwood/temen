@@ -506,6 +506,72 @@ fn the_futex_gate_does_not_narrow_the_888_widening() {
     );
 }
 
+/// [`CASCADE`]'s shape with f2's cap call replaced by `call`, which binds `vw`.
+fn cascade_into(call: &str) -> String {
+    format!(
+        r#"
+memory 16
+func () -> (i64) {{
+block 0 () {{
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vh = i32.const 0
+  vw = {call}
+  return v0
+  }}
+}}
+"#
+    )
+}
+
+/// #744, the fifth seed: a callee that spawns or joins a child, serves, or calls through a guest
+/// interface (a live offer may answer it) needs its task's scheduler, which a bounce does not have.
+/// So it is not a widened cross-tier leaf and its caller cascades off, as for a futex — while a
+/// stream write, the control row, still leaves f1 emitted.
+#[test]
+fn a_callee_that_needs_its_task_is_not_a_widened_cross_tier_leaf() {
+    for (what, call, f1_emits) in [
+        ("a join", "call.cap 6 1 (i32) -> (i64) vh (vh)", false),
+        (
+            "svc.wait",
+            "call.cap 4294967295 10 () -> (i64) vh ()",
+            false,
+        ),
+        ("svc.poll", "call.cap 4294967295 9 () -> (i64) vh ()", false),
+        (
+            "a guest-interface call",
+            "call.cap 268435456 0 (i64) -> (i64) vh (v0)",
+            false,
+        ),
+        (
+            "a stream write",
+            "call.cap 0 1 (i64, i64) -> (i64) vh (v0, v0)",
+            true,
+        ),
+    ] {
+        let m = build(&cascade_into(call));
+        let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 emit");
+        assert_eq!(widened, vec![false, f1_emits, false], "{what}");
+    }
+}
+
 /// #1370, transitivity: inside a bounce every callee runs on the same nested drive, so it is not
 /// enough for the leaf's own body to be clean. Here `f2` (the candidate leaf) is pure arithmetic and
 /// only its *callee* `f3` touches the futex — before the closure was taken, `f2` was admitted as a

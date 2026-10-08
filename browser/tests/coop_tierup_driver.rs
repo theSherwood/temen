@@ -44,6 +44,8 @@ use wasmi::{
 
 #[path = "support/pg_heap.rs"]
 mod pg_heap;
+#[path = "../../crates/temen-interp/tests/support/rec.rs"]
+mod rec;
 
 /// The coop session statics are process-global (single-threaded wasm by design) — serialize the tests
 /// in this binary across them.
@@ -3630,6 +3632,214 @@ fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     temen_coop_close();
 }
 
+// ---- #744: a parent serves its child's calls on the coop tier -----------------------------------
+
+/// The #744 guest (EXEC.md row 4) on the coop tier. `_start` resolves `"instantiator"` and
+/// `"budget"`, spawns a same-module child at f1 through the v1 record at 17408, granting it an
+/// `"exec"` capability backed by its own impl export (`GRANT_SERVE_LIVE_TAG`), serves one call with
+/// `svc.wait`, joins the child and returns `join*100 + served`. The child calls `exec.run(40, 2)`
+/// through the helper f3, then the leaf f4 on the reply. The handler f2 answers `f4(a) + b`. f4,
+/// `3x + 7`, tiers up twice: from the parent's handler and from the child. f3 is never emitted: its
+/// live call parks the child, and only the pump can park a task. Result: f4(f4(40) + 2) * 100 + 1 =
+/// 394 * 100 + 1 = 39401.
+fn coop_serve_guest_text() -> String {
+    let child = temen_ir::SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..temen_ir::SpawnRec::v1(1)
+    };
+    format!(
+        r#"memory 17
+data 16384 "instantiator"
+data 16400 "budget"
+data 16416 "exec"
+{rec}type 0 func (i64, i64) -> (i64)
+type 1 interface {{ run: 0 }}
+export 0 interface "exec" 1 {{ run: 2 }}
+func () -> (i64) {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 12
+  vh = self.resolve vp vl
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vg = i64.const 16640
+  vgn = i32.const 16416
+  i32.store vg vgn
+  vgl = i32.const 4
+  i32.store vg vgl offset=4
+  vgh = i32.const {tag}
+  i32.store vg vgh offset=8
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vz = i32.const 0
+  vneg = i32.lt_s vch vz
+  br_if vneg 2(vch) 1(vh, vch)
+}}
+block 1 (vh1: i32, vch1: i32) {{
+  vz1 = i32.const 0
+  vn = svc.wait vz1
+  vj = call.cap 6 1 (i32) -> (i64) vh1 (vch1)
+  vk = i64.const 100
+  vt = i64.mul vj vk
+  vs = i64.add vt vn
+  return vs
+}}
+block 2 (verr: i32) {{
+  ve = i64.extend_i32_s verr
+  return ve
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  va = i64.const 40
+  vr = call 3 (va)
+  vx = call 4 (vr)
+  return vx
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  vl = call 4 (va)
+  vs = i64.add vl vb
+  return vs
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vnp = i64.const 16416
+  vl4 = i64.const 4
+  vexec = self.resolve vnp vl4
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) vexec (va, vb)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  vr = i64.add vm v7
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        rec = rec::segment(17408, &child),
+        budget_at = 17408 + rec::BUDGET_AT,
+        tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
+    )
+}
+
+/// #744 — the coop tier serves a parent's children, natively, with tier-up on. Each of f4's two
+/// regions runs on its task's window: the parent's from inside a serve dispatch, the child's after
+/// its live call has been answered. The spawn, the `svc.wait` and the live call all run on the
+/// pump, so the run completes with the oracle's result instead of trapping in a bounce.
+#[test]
+fn coop_tierup_serves_a_parents_children() {
+    let _g = instantiator_guard();
+    let m = temen_text::parse_module(&coop_serve_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(
+        (want.status, want.value),
+        (STATUS_OK, 39401),
+        "oracle: the handler answered 129, the child returned 394, one call was served"
+    );
+
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let mut events: Vec<usize> = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(events.len() < 50, "runaway tier-ups");
+                assert_eq!(
+                    temen_coop_func(),
+                    4,
+                    "only the leaf tiers up: the live call's helper stays on the interpreter"
+                );
+                events.push(temen_coop_tierup_win_ptr() as usize);
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    // The handler's region first (the child is parked on its call), then the child's.
+    let [handler_win, child_win] = events[..] else {
+        panic!("expected the handler's tier-up then the child's, got {events:?}");
+    };
+    assert_eq!(
+        handler_win,
+        temen_coop_win_ptr() as usize,
+        "the handler runs on the parent's window"
+    );
+    assert_ne!(
+        child_win, handler_win,
+        "the child's region runs on its own window"
+    );
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the oracle"
+    );
+    temen_coop_close();
+
+    // The interpreted session serves too, pumped one fuel unit at a time.
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        COOP_NO_REGIONS,
+    );
+    assert_eq!(
+        opened,
+        0,
+        "open with no regions (status {})",
+        temen_status()
+    );
+    let mut pauses = 0u32;
+    loop {
+        match temen_coop_run_for(1) {
+            COOP_RUN_PAUSED => {
+                pauses += 1;
+                assert!(pauses < 100_000, "runaway slices");
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    assert!(pauses > 0, "non-vacuity: the run was sliced");
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the oracle, sliced"
+    );
+    temen_coop_close();
+}
+
 // ---- #1151: a §14 child page-op traps in REAL emitted wasm over its own window --------------------
 
 /// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
@@ -5059,7 +5269,10 @@ export 0 func "_start" 0
         )
         .expect("opens");
         assert_eq!(leaf.value, interpreted.value, "budget {budget:?}");
-        assert_eq!(leaf.tierups, 1, "budget {budget:?}: the root ran whole as a leaf");
+        assert_eq!(
+            leaf.tierups, 1,
+            "budget {budget:?}: the root ran whole as a leaf"
+        );
     }
 }
 

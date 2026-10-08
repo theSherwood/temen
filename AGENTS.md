@@ -121,6 +121,8 @@ not from micro-optimizing hot code. Default to:
 
 **Always open a PR whenever you have changes** — every branch with commits gets a PR, no exceptions. Open it as soon as you have changes rather than waiting for the work to feel finished. If you have multiple slices queued to implement, you can put them on the same PR until the PR exceeds 1000 loc. When you complete slices after opening a PR, check for merge conflicts and address them.
 
+**Put decisions in chat, never in the `AskUserQuestion` tool.** When the owner has to decide, write the options and your recommendation in your reply, and wait for theirs.
+
 **Don't subscribe to PR activity / auto-watch a PR unless explicitly asked.** Open the PR and report it; leave CI-watching, autofix-on-red, and merge-conflict babysitting to the owner. Only call `subscribe_pr_activity` (or set up scheduled CI check-ins) when the owner specifically requests it for that PR.
 
 **Editing CI:** the session token can't push under `.github/workflows/` (needs the `workflow` scope). If you need to change a workflow but can't commit it there, edit the mirror in `.github/workflows_src/` instead and describe the change in the PR description (do **not** log it in that dir's README — the per-change ledger there caused merge conflicts between concurrent PRs and is frozen; the `workflows_src == workflows` check is the to-do list) — the owner copies it over. See `.github/workflows_src/README.md`.

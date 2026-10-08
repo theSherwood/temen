@@ -858,7 +858,7 @@ Three classes, all with existing precedent in this repo:
 | fibers / suspend / durable unwind | interp fallback (`Unsupported`, temen-jit precedent) | n/a |
 | `gc.roots` | coop shared-table emit: **spill** live values around calls that can reach it (#1627); otherwise interp fallback, **module-granular** (#1546) | a push/pop per such call |
 | debug / single-step | interp tier | n/a |
-| `thread.spawn`/`join`/`wait` | end region, return to the vCPU event loop | boundary only |
+| `thread.spawn`/`join`/`wait`, §14 spawn/join, `svc.wait`, live calls | end region, return to the vCPU event loop | boundary only |
 
 ### TCB posture
 
