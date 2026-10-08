@@ -3,8 +3,8 @@
 //! must still see everything the invoker holds — its frames, its parked fibers, and, under a nested
 //! invoke, every invoker below that (GC.md §3.1: the caller's whole live stack).
 //!
-//! Each case runs on the tree-walk oracle, the bytecode engine and Cranelift, and requires every
-//! root on every one. Roots arrive as **arguments**, not constants: a constant is not a heap root,
+//! Each case runs on the tree-walk oracle, the bytecode engine, Cranelift and the debugger (which
+//! steps into the invoked unit, #2192), and requires every root on every one. Roots arrive as **arguments**, not constants: a constant is not a heap root,
 //! and a compiler may rematerialize it after a call rather than keep it live.
 //!
 //! Before the fix the oracle missed the invoker's roots (unsound — an under-approximation) and the
@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 
+use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
 use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::JitOutcome;
@@ -53,14 +54,16 @@ fn setup(guest: &temen_ir::Module, units: &[&str]) -> (Host, i32, Vec<i32>) {
     (host, jit, codes)
 }
 
-fn roots_in(snap: &[u8]) -> BTreeSet<u64> {
-    (0..64)
-        .map(|i| u64::from_le_bytes(snap[16384 + i * 8..16384 + i * 8 + 8].try_into().unwrap()))
+/// The roots the collector wrote: the words of `buf`, its 64-word buffer at 16384, in range.
+fn roots_in(buf: &[u8]) -> BTreeSet<u64> {
+    buf.chunks_exact(8)
+        .take(64)
+        .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
         .filter(|w| (4096..8192).contains(w))
         .collect()
 }
 
-/// Run `guest` (args: the jit handle, every code handle, then `roots`) on all three backends and
+/// Run `guest` (args: the jit handle, every code handle, then `roots`) on all four backends and
 /// require each to complete and to report every root in `roots` plus the collector's own 4096.
 fn check(guest: &str, units: &[&str], roots: &[i64]) {
     let m = parse_module(guest).expect("parse guest");
@@ -93,7 +96,7 @@ fn check(guest: &str, units: &[&str], roots: &[i64]) {
         &mut h,
     );
     assert!(res.is_ok(), "tree-walker: {res:?}");
-    let got = roots_in(&snap);
+    let got = roots_in(&snap[16384..]);
     assert!(
         want.is_subset(&got),
         "tree-walker missed a root: want {want:?}, got {got:?}"
@@ -112,7 +115,7 @@ fn check(guest: &str, units: &[&str], roots: &[i64]) {
     )
     .expect("the bytecode engine accepts the module");
     assert!(res.is_ok(), "bytecode engine: {res:?}");
-    let got = roots_in(&snap);
+    let got = roots_in(&snap[16384..]);
     assert!(
         want.is_subset(&got),
         "bytecode engine missed a root: want {want:?}, got {got:?}"
@@ -131,10 +134,28 @@ fn check(guest: &str, units: &[&str], roots: &[i64]) {
     )
     .expect("jit run");
     assert!(matches!(out, JitOutcome::Returned(_)), "cranelift: {out:?}");
-    let got = roots_in(snap.bytes());
+    let got = roots_in(&snap.bytes()[16384..]);
     assert!(
         want.is_subset(&got),
         "cranelift missed a root: want {want:?}, got {got:?}"
+    );
+
+    let (h, jit, codes) = setup(&m, units);
+    let mut run = ScheduledDebugRun::new_with_host(&m, 0, &values(jit, &codes), h)
+        .expect("the debugger runs the module");
+    let mut fuel = 1_000_000u64;
+    let res = loop {
+        match run.run_until_stop(&mut fuel) {
+            SchedStop::Finished(r) => break r,
+            SchedStop::Break { .. } => continue,
+            other => panic!("the debugger stopped early: {other:?}"),
+        }
+    };
+    assert!(res.is_ok(), "debugger: {res:?}");
+    let got = roots_in(&run.read_window(16384, 512).expect("the collector's buffer"));
+    assert!(
+        want.is_subset(&got),
+        "debugger missed a root: want {want:?}, got {got:?}"
     );
 }
 
