@@ -3754,11 +3754,16 @@ impl SharedProgram {
 
 /// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
 /// `thread.spawn`ed vCPUs on **separate OS threads** (the native stand-in for per-vCPU wasm Workers)
-/// over the **one** caller-owned shared window, instead of cooperatively multiplexing them onto one
-/// thread. Every vCPU executes over the same `Region::shared` backing — `thread.spawn`/`join` +
-/// hardware `atomic.*` are genuine cross-core operations, not a single-thread interleaving. This is
-/// the host-selected `Parallel` mode; the cooperative [`compile_and_run_capture_over`] is its
-/// **deterministic oracle** (differential-tested in `bytecode_parallel.rs`).
+/// over the **one** shared window, instead of cooperatively multiplexing them onto one thread. Every
+/// vCPU executes over the same backing — `thread.spawn`/`join` + hardware `atomic.*` are genuine
+/// cross-core operations, not a single-thread interleaving. This is the host-selected `Parallel` mode;
+/// the cooperative [`compile_and_run_capture_over`] is its **deterministic oracle**
+/// (differential-tested in `bytecode_parallel.rs`).
+///
+/// `back` is the window's backing. `None` reserves it here, as every other driver does, so a page the
+/// guest maps anywhere in its reservation holds what is stored to it. `Some` runs over a caller-owned
+/// backing (Miri, which cannot reserve the full window), and an access past that backing's end reads
+/// zero and drops its store (#1191) — #2196 was every caller sizing it to the declared window.
 ///
 /// Scope: the **full threads model** — `thread.spawn`/`join`, the `memory.wait`/`notify` futex
 /// (a genuine cross-thread [`Futex`], not a single-thread park queue), and atomics — plus pure compute,
@@ -3771,7 +3776,7 @@ pub fn compile_and_run_capture_over_parallel(
     args: &[Value],
     fuel: &mut u64,
     init_mem: &[u8],
-    back: std::sync::Arc<super::Region>,
+    back: Option<std::sync::Arc<super::Region>>,
 ) -> Option<Capture> {
     let c = compile_module_for(m, false)?;
     if func as usize >= c.progs.len() {
@@ -3794,7 +3799,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     args: &[Value],
     fuel: &mut u64,
     init_mem: &[u8],
-    back: std::sync::Arc<super::Region>,
+    back: Option<std::sync::Arc<super::Region>>,
     host: &mut Host,
 ) -> Option<Capture> {
     // #1694 — the parallel driver keeps no per-fiber shadow-SP swap and has no freeze driver, so a
@@ -3812,12 +3817,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
     // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` arms below never surface.
     host.wire_park_door();
-    let mem = Mem::root(
-        m,
-        DEFAULT_RESERVED_LOG2,
-        Some(std::sync::Arc::clone(&back)),
-        init_mem,
-    );
+    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, back, init_mem);
     let (r, mem) = drive_parallel(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()

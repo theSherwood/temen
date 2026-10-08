@@ -129,10 +129,16 @@ fn run_parallel(src: &str) -> Result<Vec<Value>, temen_interp::Trap> {
     // SAFETY: `base` is `size` valid 8-aligned bytes, exclusively this window's, freed only after.
     let back = Arc::new(unsafe { Region::shared(base, size as u64) });
     let mut f = u64::MAX;
-    let r =
-        bytecode::compile_and_run_capture_over_parallel(&m, 0, &[], &mut f, &[], Arc::clone(&back))
-            .unwrap()
-            .0;
+    let r = bytecode::compile_and_run_capture_over_parallel(
+        &m,
+        0,
+        &[],
+        &mut f,
+        &[],
+        Some(Arc::clone(&back)),
+    )
+    .unwrap()
+    .0;
     drop(back);
     // SAFETY: same layout; the region (and all borrows) are gone (the scope joined every vCPU).
     unsafe { std::alloc::dealloc(base, layout) };
@@ -283,7 +289,7 @@ fn parallel_shared_host_capcall_race_free_under_miri() {
         &[Value::I32(h)],
         &mut f,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .unwrap()

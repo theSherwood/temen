@@ -322,6 +322,18 @@ fn run_c_bytecode(src: &str) -> CRun {
     }
 }
 
+/// `src` on the bytecode **parallel** driver (one OS thread per vCPU), through `temen-run`'s
+/// `run_with_caps_parallel`; returns what it printed.
+fn run_c_parallel(src: &str) -> Vec<u8> {
+    let ir = c_to_ir(src);
+    let m =
+        parse_module(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let inst = temen_run::instantiate(m).unwrap_or_else(|e| panic!("instantiate failed: {e}"));
+    inst.run_with_caps_parallel(&temen_run::RunConfig::default(), &[])
+        .unwrap_or_else(|e| panic!("the parallel driver failed: {e}\n{src}"))
+        .stdout
+}
+
 /// Run a normally-returning fiber program (interpreter-only) and return its single i32.
 fn fiber_i32(src: &str) -> i32 {
     match run_c_interp(src).outcome {
@@ -3266,6 +3278,32 @@ fn c_guest_steal_fibers_demo() {
         run.stdout, b"256\n121920\n",
         "the stackful work-stealing scheduler must produce both invariant totals on both backends"
     );
+}
+
+/// #2196: the three guest-scheduler demos on the bytecode **parallel** driver. chibicc's heap starts
+/// at 256 MiB, past the window-sized backing this driver used to be handed, so every
+/// `pthread_create` start record read back as zeros and the thread's `call.dyn` landed on function 0
+/// (`IndirectCallType`).
+#[test]
+#[cfg(unix)]
+fn c_guest_scheduler_demos_run_on_the_parallel_driver() {
+    let demos: [(&str, &[u8]); 3] = [
+        (
+            include_str!("../../temen-run/demos/mn_sched/mn_sched.c"),
+            b"1024\n",
+        ),
+        (
+            include_str!("../../temen-run/demos/work_stealing/work_stealing.c"),
+            b"256\n",
+        ),
+        (
+            include_str!("../../temen-run/demos/steal_fibers/steal_fibers.c"),
+            b"256\n121920\n",
+        ),
+    ];
+    for (src, want) in demos {
+        assert_eq!(run_c_parallel(src), want);
+    }
 }
 
 /// The §3d **thread-safe guest `malloc`** (`include/stdlib.h`): 4 vCPUs each `malloc` 64 blocks and

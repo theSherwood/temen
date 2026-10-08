@@ -91,7 +91,7 @@ fn run(engine: Engine, src: &str, grant: fn(&mut Host) -> Vec<i32>) -> Answer {
                     &vals,
                     &mut fuel,
                     &win,
-                    backing(),
+                    Some(backing()),
                     &mut h,
                 )
                 .expect("the parallel driver runs the module")

@@ -1541,6 +1541,60 @@ fn a_child_live_at_the_runs_end_hands_its_window_back() {
     }
 }
 
+/// #2196: the root maps 64 KiB past its declared 64 KiB window, stores 77 there and loads it back,
+/// then spawns a thread that loads the same word and joins it. Returns `own * 1000 + thread`, plus a
+/// million if the `map` failed. The parallel driver ran over a backing the size of the declared
+/// window, so the store was dropped and both loads read 0. The `Vcpu`'s host builds a thread's window
+/// from its own page map, so the thread faults there: #2196's other half, B6 of #1414.
+const MAP_PAST_THE_WINDOW: &str = "memory 16
+func (i32) -> (i64) {
+block 0 (vas: i32) {
+  voff = i64.const 65536
+  vlen = i64.const 65536
+  vprot = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vsev = i64.const 77
+  i64.store voff vsev
+  vown = i64.load voff
+  vz = i64.const 0
+  vt = thread.spawn 1 vz voff
+  vth = thread.join vt
+  vk = i64.const 1000
+  vhi = i64.mul vown vk
+  vsum = i64.add vhi vth
+  vbad = i64.ne vr vz
+  vbad64 = i64.extend_i32_u vbad
+  vm = i64.const 1000000
+  vpen = i64.mul vbad64 vm
+  vres = i64.add vsum vpen
+  return vres
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vaddr: i64) {
+  vx = i64.load vaddr
+  return vx
+  }
+}
+";
+
+#[test]
+fn a_thread_reads_a_page_its_spawner_mapped_past_the_declared_window() {
+    let m = module(MAP_PAST_THE_WINDOW);
+    let setup = || {
+        let mut host = Host::new();
+        let asl = host.grant_memory();
+        (host, vec![Value::I32(asl)])
+    };
+    agree_on(
+        &SCHEDULING,
+        "a page mapped past the window",
+        &m,
+        &setup,
+        &ok(77_077),
+    );
+}
+
 // ---- #2219 empty grants: a parent leaves an import empty on purpose ----
 
 /// A text `data` segment holding `bytes` at `at`.

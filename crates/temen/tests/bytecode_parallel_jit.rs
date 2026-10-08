@@ -274,7 +274,7 @@ fn run_parallel_unit(src: &str, unit_src: &str) -> Result<Vec<Value>, temen_inte
         &[Value::I32(jit), Value::I32(code)],
         &mut f,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .expect("bytecode engine drives §22 JIT (parallel)")
@@ -475,7 +475,7 @@ fn run_parallel_runtime_compile() -> Result<Vec<Value>, temen_interp::Trap> {
         &[Value::I32(jit)],
         &mut f,
         &init,
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut host,
     )
     .expect("bytecode engine drives §22 runtime compile (parallel)")

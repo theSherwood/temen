@@ -166,7 +166,7 @@ fn the_parallel_driver_spawns_and_joins_a_detached_child() {
             &args,
             &mut fuel,
             &[],
-            Arc::clone(&back),
+            Some(Arc::clone(&back)),
             &mut host,
         )
         .expect("the parallel driver runs this module");
@@ -313,7 +313,7 @@ fn on_every_runner(
         &args,
         &mut fuel,
         &[],
-        Arc::clone(&back),
+        Some(Arc::clone(&back)),
         &mut h,
     )
     .expect("the parallel driver runs this module");

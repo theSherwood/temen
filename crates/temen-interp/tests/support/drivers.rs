@@ -19,7 +19,8 @@ pub enum Driver {
     Oracle,
     /// The cooperative executor (`bytecode::compile_and_run_with_host`).
     Coop,
-    /// The OS-thread parallel driver (`compile_and_run_capture_over_parallel_with_host`).
+    /// The OS-thread parallel driver (`compile_and_run_capture_over_parallel_with_host`), over a
+    /// window it reserves itself.
     Parallel,
     /// The debug scheduler (`ScheduledDebugRun`), run to completion through its breakpoints.
     Debug,
@@ -85,20 +86,15 @@ pub fn run_on_then<R>(
             done(r, &host)
         }
         Driver::Parallel => {
-            let (back, base, layout) = window(m);
-            let r = bytecode::compile_and_run_capture_over_parallel_with_host(
+            let (r, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
                 m,
                 0,
                 &args,
                 &mut fuel,
                 &[],
-                Arc::clone(&back),
+                None,
                 &mut host,
-            );
-            drop(back);
-            // SAFETY: the layout `window` allocated; the run joined every vCPU and dropped every view.
-            unsafe { std::alloc::dealloc(base, layout) };
-            let (r, _image) = r?;
+            )?;
             done(r, &host)
         }
         Driver::Debug => {

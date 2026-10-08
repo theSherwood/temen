@@ -329,7 +329,7 @@ fn bytecode_parallel(src: &str) -> Result<i64, Trap> {
         &[],
         &mut f,
         &[],
-        std::sync::Arc::clone(&back),
+        Some(std::sync::Arc::clone(&back)),
     )
     .expect("bytecode compiles the fixture");
     drop(back);

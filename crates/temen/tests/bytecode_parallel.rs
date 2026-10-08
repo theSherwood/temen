@@ -290,9 +290,15 @@ fn run_parallel(src: &str) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>) 
     let m = parse_module(src).unwrap();
     let (back, base, layout) = shared_window(1 << 16);
     let mut f = u64::MAX;
-    let cap =
-        bytecode::compile_and_run_capture_over_parallel(&m, 0, &[], &mut f, &[], Arc::clone(&back))
-            .unwrap();
+    let cap = bytecode::compile_and_run_capture_over_parallel(
+        &m,
+        0,
+        &[],
+        &mut f,
+        &[],
+        Some(Arc::clone(&back)),
+    )
+    .unwrap();
     drop(back);
     // SAFETY: same layout; the region (and all borrows of `base`) are gone (the scope joined all vCPUs).
     unsafe { std::alloc::dealloc(base, layout) };
