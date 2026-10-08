@@ -234,6 +234,12 @@ fn run(backend: Backend, src: &str) -> Result<i32, String> {
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
+/// #744 — whether the cooperative bytecode driver runs `src` itself, serving its children, rather
+/// than declining it to the tree-walker: a `Backend::Bytecode` run of it then pins that driver.
+fn runs_on_bytecode(src: &str) -> bool {
+    temen_interp::bytecode::admits(&parse_module(src).expect("parse"))
+}
+
 /// The record spelling of a plain op-0 spawn produces the identical result.
 #[test]
 fn record_spawn_matches_legacy_plain_spawn() {
@@ -333,8 +339,7 @@ block 0 (v0: i64) {{
 }
 
 /// [`granted_client_program`] in both spawn spellings: the op-17 records, and op 15's positional
-/// form (retiring, #2067), which every engine runs natively today — the Cranelift JIT included, where
-/// the record spelling of a module with impl-exports still folds to the tree-walker (#744).
+/// form (retiring, #2067). Every engine runs both natively (#744).
 fn granted_client_programs(guest: &str) -> [String; 2] {
     let rec = granted_client_program(guest);
     // `dst = instantiate_detached(budget, self, grants_ptr, grants_n, entry, 17, 0)`, its operands
@@ -376,6 +381,7 @@ fn granted_client_that_calls_once_is_served() {
   vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
   return vr",
     ) {
+        assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
         for b in BACKENDS {
             assert_eq!(run_detached(b, &src).expect("run"), 1, "{b:?}");
         }
@@ -387,6 +393,7 @@ fn granted_client_that_calls_once_is_served() {
 #[test]
 fn granted_client_that_dies_before_calling_releases_the_server() {
     for src in granted_client_programs("  unreachable") {
+        assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
         for b in BACKENDS {
             assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
         }
@@ -399,9 +406,9 @@ fn granted_client_that_dies_before_calling_releases_the_server() {
 /// forever. With its only client gone and the root `join`ing it, the run is a genuine
 /// join-deadlock: the root parked in `join`, the daemon parked in `svc.wait`, nothing else live
 /// and no external wake source. INVARIANTS.md #9 forbids a hang, so the run must **trap**
-/// `ThreadFault`. The cooperative bytecode driver already does; this pins the tree-walk executor
-/// (#1228) and the Cranelift JIT, whose `svc.wait` park and `join` count for its deadlock verdict
-/// (#2173, #1820), to the identical outcome.
+/// `ThreadFault`. This pins the tree-walk executor (#1228), the cooperative bytecode driver, which
+/// serves the shape itself (#744), and the Cranelift JIT, whose `svc.wait` park and `join` count
+/// for its deadlock verdict (#2173, #1820), to the identical outcome.
 #[test]
 fn joined_daemon_whose_client_is_gone_deadlocks_to_threadfault() {
     for base in granted_client_programs("  unreachable") {
@@ -414,6 +421,7 @@ fn joined_daemon_whose_client_is_gone_deadlocks_to_threadfault() {
             src.contains("block 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()"),
             "the daemon rewrite must apply"
         );
+        assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
         for b in BACKENDS {
             let e = run_detached(b, &src).expect_err("the join-deadlock must trap, not hang");
             assert!(
@@ -1294,11 +1302,12 @@ block 0 (va: i64, vb: i64) {{
 /// **The #744 pin**: the child's `exec.run(40, 2)` is answered by the PARENT's own handler over the
 /// parent's live world — `join*100 + served` = `4201` — the guest-served exec backend (EXEC.md row 4)
 /// end to end: mint-at-spawn into the child only, caller parks, parent serves, reply, join. Every
-/// backend agrees: the Cranelift JIT runs the parent itself, serving the child's call over the root's
-/// shared cell; the bytecode engine still declines it to the tree-walker.
+/// backend agrees, and each runs the parent itself, serving the child's call over the root's shared
+/// cell: the Cranelift JIT and the cooperative bytecode driver.
 #[test]
 fn a_parent_serves_its_childs_exec_with_its_own_code() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false);
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
     for b in BACKENDS {
         // Both transports: the child's call queued for the parent's serve loop, and (handoff on,
         // the default) run inline on the child's thread when it finds the parent parked.
@@ -1328,6 +1337,7 @@ fn a_child_that_never_calls_releases_its_parents_wait() {
         "  v7 = i64.const 7\n  return v7\n",
     );
     assert!(src.contains("return v7"), "the rewrite must apply");
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
     for b in BACKENDS {
         assert_eq!(
             run_detached(b, &src),
@@ -1343,6 +1353,10 @@ fn a_child_that_never_calls_releases_its_parents_wait() {
 #[test]
 fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
     let src = serve_live_program((temen_interp::GRANT_SERVE_LIVE_TAG | 7) as i32, false);
+    assert!(
+        runs_on_bytecode(&src),
+        "the cooperative driver refuses it itself"
+    );
     for b in BACKENDS {
         let r = run_detached(b, &src);
         assert!(
@@ -1353,11 +1367,12 @@ fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
 }
 
 /// Op 15's positional form (retiring, #2067) carries the tag too: every detached spawn follows one
-/// rule. The Cranelift JIT runs this serving parent natively over a shared cell it can be called
-/// back through; the bytecode engine declines it to the tree-walker.
+/// rule. The Cranelift JIT and the cooperative bytecode driver run this serving parent natively, over
+/// a shared cell it can be called back through.
 #[test]
 fn op_15_carries_a_live_self_serve_grant_too() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, true);
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
     for b in BACKENDS {
         assert_eq!(
             run_detached(b, &src).expect("run"),

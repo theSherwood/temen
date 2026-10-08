@@ -1,10 +1,9 @@
-//! §3.6 **behavioral parity** — a serving domain behaves identically on all three backends.
-//! The serve loop is a single implementation on the reference interpreter (the oracle);
-//! bytecode reaches it by declining the serving ops at compile and falling back, and the JIT
-//! by the `module_serves` fold in temen-run. This pins the end-to-end §3.6 story — spawn a
-//! serving child, mint a live-callee offer (`Instantiator.child_offer`), call through it
-//! (park), serve (`svc.wait`), reply-wake, join — producing the SAME observable on
-//! TreeWalk, Bytecode, and Jit.
+//! §3.6 **behavioral parity** — a serving domain behaves identically on all three backends,
+//! each of which runs it itself: the reference interpreter (the oracle), the cooperative bytecode
+//! driver and the Cranelift JIT, which serve the children a domain spawns (#744). This pins the
+//! end-to-end §3.6 story — spawn a serving child, mint a live-callee offer
+//! (`Instantiator.child_offer`), call through it (park), serve (`svc.wait`), reply-wake, join —
+//! producing the SAME observable on TreeWalk, Bytecode, and Jit.
 
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
@@ -75,6 +74,10 @@ block 0 (va: i64, vb: i64) {
 fn a_serving_domain_behaves_identically_on_all_three_backends() {
     let m = parse_module(SERVING_PROGRAM).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
+    assert!(
+        temen_interp::bytecode::admits(&m),
+        "the cooperative bytecode driver serves it, not the tree-walker"
+    );
     let registry = Imports::new().provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(m, registry).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {

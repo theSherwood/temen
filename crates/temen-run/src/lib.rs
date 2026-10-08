@@ -8874,6 +8874,51 @@ block 0 (va: i64, vb: i64) {
         assert!(!module_demand_spawns(&m), "so the record cannot name one");
         assert!(!folds_to_oracle(&m), "and the JIT runs the parent itself");
     }
+
+    /// #744 — `svc_parity.rs`'s shape: a parent that calls a serving child through a
+    /// `child_offer` (op 14) and joins it. It serves and spawns, with an export that is not
+    /// pager-shaped, so the JIT runs it.
+    #[test]
+    fn a_parent_calling_its_serving_child_runs_on_the_jit() {
+        let src = r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface "adder" 1 { add: 2 }
+
+func 0 (i32) -> (i64) {
+block 0 (vh: i32) {
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vz = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) vh (vch, vz)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) voff (va, vb)
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vs = i64.add vr vj
+  return vs
+  }
+}
+
+func 1 (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+
+func 2 (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+"#;
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        assert!(!folds_to_oracle(&m), "the JIT runs it");
+    }
 }
 
 #[cfg(test)]
