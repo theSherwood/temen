@@ -964,6 +964,13 @@ fn a_siblings_proc_taken_as_a_funcref() {
         42,
         "dbl(21) called through a funcref to a sibling unit's proc"
     );
+    // The sibling's proc is named in code (`ref.sym`, #2210), so no data holds a function index:
+    // `b` has no hidden slot for the linker to write `dbl`'s index into.
+    assert!(
+        m.data_funcref_slots.is_empty(),
+        "a function index in data: {:?}",
+        m.data_funcref_slots
+    );
 }
 
 #[test]

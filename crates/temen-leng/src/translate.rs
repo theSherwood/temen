@@ -591,19 +591,12 @@ pub(crate) struct Translator {
     /// (a proc funcref'd in a sibling unit must still carry `$sp`). See [`funcref_value`] /
     /// [`emit_call.dyn`].
     funcref_targets: HashSet<String>,
-    /// **Cross-module funcref slots** — a sibling unit's proc taken as a *value* (stored into a
-    /// dispatch record, passed as a callback), mapped to a hidden 8-byte slot in this unit's data.
-    /// `Inst::RefFunc` takes a func **index** immediate, and this unit has no index for another
-    /// unit's proc, so the instruction stream cannot name one. The data image can: the slot carries
-    /// a [`temen_ir::DataFuncref`] reloc under the callee's global name, the linker writes the
-    /// merged funcidx into it when it places this unit, and [`funcref_value`] loads the `i32` back.
-    /// Identity is preserved — every unit referencing the same proc resolves to the one funcidx,
-    /// which a per-unit forwarding wrapper would not do.
-    xmod_funcref_slots: HashMap<String, u64>,
-    /// [`xmod_funcref_slots`] as `(offset, already-global name)` reloc requests. Kept apart from
-    /// [`funcref_inits`](Self::funcref_inits), whose names are *local* and get this unit's stem
-    /// appended; these are already stem-suffixed by the module that wrote them.
-    xmod_funcref_inits: Vec<(u64, String)>,
+    /// **Sibling units' procs taken as values** (stored into a dispatch record, passed as a
+    /// callback), under their global names. This unit has no func index for one, so
+    /// [`funcref_value`] names it with `ref.sym`, which the linker resolves to the proc's merged
+    /// index (#2210). Identity is preserved: every unit referencing the same proc resolves to the
+    /// one funcidx, which a per-unit forwarding wrapper would not do.
+    xmod_funcrefs: HashSet<String>,
     /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
     /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
     /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
@@ -674,8 +667,7 @@ impl Translator {
             ext_proc_params: HashMap::default(),
             ext_proc_rets: HashMap::default(),
             funcref_targets: HashSet::default(),
-            xmod_funcref_slots: HashMap::default(),
-            xmod_funcref_inits: Vec::new(),
+            xmod_funcrefs: HashSet::default(),
             tls_mode: false,
             tls_vars: HashMap::default(),
             tls_block_size: 0,
@@ -1174,16 +1166,6 @@ impl Translator {
                 at: *at,
                 name: format!("{sym}{stem}"),
             })
-            // Cross-module funcref slots: the name already carries the *defining* unit's stem, so
-            // appending this unit's would name a proc nothing exports.
-            .chain(
-                self.xmod_funcref_inits
-                    .iter()
-                    .map(|(at, sym)| temen_ir::DataFuncref {
-                        at: *at,
-                        name: sym.clone(),
-                    }),
-            )
             .collect()
     }
 
@@ -2877,28 +2859,12 @@ impl Translator {
         scan.extend(self.ext_proc_params.keys().cloned());
         let mut found: HashSet<String> = HashSet::default();
         collect_funcref_targets(root, &scan, &mut found);
-        // Deterministic slot order: `found` is a hash set, and a data offset that moved with hash
-        // iteration would make the emitted module non-reproducible.
-        let mut xmod: Vec<String> = Vec::new();
         for name in found {
             if proc_names.contains(&name) {
                 self.funcref_targets.insert(name);
             } else {
-                xmod.push(name);
+                self.xmod_funcrefs.insert(name);
             }
-        }
-        xmod.sort();
-        for name in xmod {
-            if self.xmod_funcref_slots.contains_key(&name) {
-                continue;
-            }
-            // One 8-byte slot per distinct callee, past the globals `collect_globals` just laid out
-            // (it runs first and leaves the cursor in `globals_top`). The link-mode data image is
-            // `vec![0u8; globals_top]`, so widening the cursor reserves zero-filled space for free.
-            let off = self.globals_top;
-            self.globals_top += 8;
-            self.xmod_funcref_slots.insert(name.clone(), off);
-            self.xmod_funcref_inits.push((off, name));
         }
         Ok(())
     }
@@ -4473,15 +4439,12 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  v{id} = ref.func {idx}\n"));
                 return Ok(id);
             }
-            // A **sibling unit's** proc as a value. No local func index exists for it and
-            // `ref.func` takes an index immediate, so read the funcidx the linker wrote into this
-            // unit's hidden slot (`xmod_funcref_slots`) instead.
-            if let Some(&off) = self.t.xmod_funcref_slots.get(name) {
-                let addr = self.emit_data_self(off);
+            // A **sibling unit's** proc as a value. No local func index exists for it, so name it
+            // by its global name: the linker resolves `ref.sym` to the proc's merged index.
+            if self.t.xmod_funcrefs.contains(name) {
                 let id = self.fresh();
-                self.used_memory = true;
                 self.cur_buf
-                    .push_str(&format!("  v{id} = i32.load v{addr}\n"));
+                    .push_str(&format!("  v{id} = ref.sym \"{}\"\n", escape_str(name)));
                 return Ok(id);
             }
         }
@@ -5156,10 +5119,10 @@ impl<'a> FuncGen<'a> {
                 // handlers, callback tables). Without this the name fell to the `data.sym` path
                 // below and failed to resolve (a proc exports as a *func*, not data). Frame-needing
                 // procs still fail closed inside `funcref_value` (no `$sp` to hand an indirect call).
-                // A **sibling unit's** proc is a funcref too, read from its `xmod_funcref_slots`
-                // slot: `sort(xs, cmpNames)` binds the comparator to a local first, and nimony
-                // keeps that comparator's proctype in the one module that instantiated it.
-                if self.t.procs.contains_key(a) || self.t.xmod_funcref_slots.contains_key(a) {
+                // A **sibling unit's** proc is a funcref too, named by `ref.sym`:
+                // `sort(xs, cmpNames)` binds the comparator to a local first, and nimony keeps that
+                // comparator's proctype in the one module that instantiated it.
+                if self.t.procs.contains_key(a) || self.t.xmod_funcrefs.contains(a) {
                     let id = self.funcref_value(e)?;
                     return Ok(Val {
                         id,
