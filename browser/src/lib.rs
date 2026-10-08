@@ -9515,21 +9515,32 @@ fn resident_link(
 
 /// Which of a laid-out base's functions `program` can reach (#1373): what the base's data image and
 /// offers name — live in any program, as [`temen_ir::stub_unreachable_funcs`] roots them — and the
-/// exports the program calls or points its data at, closed over the base's own calls. The base's
-/// exports are no roots of their own: [`link_program_multi`] drops a library's exports before it
-/// collects, so what only they name is stubbed either way, and the link need not copy it.
+/// exports the program calls, points its data at, or takes the address of in code (`ref.sym`,
+/// #2203), closed over the base's own calls. The base's exports are no roots of their own:
+/// [`link_program_multi`] drops a library's exports before it collects, so what only they name is
+/// stubbed either way, and the link need not copy it.
 fn base_live(
     base: &temen_ir::Module,
     exports: &[(String, temen_ir::FuncIdx)],
     program: &temen_ir::Module,
 ) -> Vec<bool> {
     let export = |name: &str| exports.iter().find(|(n, _)| n == name).map(|&(_, f)| f);
+    let ref_syms = program
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| match i {
+            temen_ir::Inst::RefSym { name } => core::str::from_utf8(name).ok(),
+            _ => None,
+        });
     let roots = temen_ir::data_funcref_targets(base)
         .into_iter()
         .flatten()
         .chain(base.impl_exports.iter().flat_map(|e| e.ops.iter().copied()))
         .chain(program.imports.iter().filter_map(|i| export(&i.name)))
-        .chain(program.data_funcrefs.iter().filter_map(|r| export(&r.name)));
+        .chain(program.data_funcrefs.iter().filter_map(|r| export(&r.name)))
+        .chain(ref_syms.filter_map(export));
     temen_ir::reachable_funcs(base, roots).unwrap_or_else(|_| vec![true; base.funcs.len()])
 }
 

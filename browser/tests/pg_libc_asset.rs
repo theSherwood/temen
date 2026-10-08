@@ -105,6 +105,19 @@ int main(void) {
 }
 "#;
 
+/// And one that passes libc functions as pointers (#2203): it takes `sqrt` and `fabs` by name in
+/// code (`ref.sym`), and nothing else in it calls them.
+const APPLY_PROGRAM: &str = r#"#include <stdio.h>
+#include <math.h>
+static double apply(double (*f)(double), double x) { return f(x); }
+int main(void) {
+  printf("%g %g\n", apply(sqrt, 16.0), apply(fabs, -2.5));
+  return (int)apply(sqrt, 49.0);
+}
+"#;
+/// What [`APPLY_PROGRAM`] prints.
+const APPLY_OUT: &str = "4 2.5\n";
+
 /// The shape the asset exists for: it decodes, it publishes the libc, and it carries the debug info a
 /// debug session steps into. Cheap — no compile at all, so this is the first thing to go red on drift.
 #[test]
@@ -188,6 +201,37 @@ fn a_program_unit_links_against_the_committed_asset_and_runs() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), TABLE_OUT);
+}
+
+/// **A libc function passed as a pointer** (#2203): since every card program is a unit, `sqrt` lives
+/// in another unit, so taking its address is a `ref.sym` the link resolves to the libc's `sqrt`.
+#[test]
+fn a_program_unit_passes_a_libc_function_as_a_pointer() {
+    let (Some(lib), Some(prog)) = (pg_libc(), program_unit(APPLY_PROGRAM)) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+        return;
+    };
+    let mut taken: Vec<&[u8]> = prog
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| match i {
+            temen_ir::Inst::RefSym { name } => Some(name.as_slice()),
+            _ => None,
+        })
+        .collect();
+    taken.sort_unstable();
+    taken.dedup();
+    assert_eq!(
+        taken,
+        [&b"fabs"[..], b"sqrt"],
+        "the libc functions it takes by name"
+    );
+    let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
+    assert_eq!(out.status, STATUS_OK, "trap: {:?}", out.trap);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), APPLY_OUT);
+    assert_eq!(out.value, 7);
 }
 
 /// And the debugger half: the linked program's IR text carries **both** units' debug info, so a DAP
@@ -589,15 +633,17 @@ fn link_run_libs(handles: &[i32], ir: &str) -> (i64, i32, String) {
 /// **The libraries laid out once** (#1373). The link entries start from the resident libraries'
 /// laid-out base and copy only the library functions the program reaches, and the module they hand
 /// back is, byte for byte, the one linking against the libraries themselves gives. Checked for a
-/// program that reaches much of the libc and one that reaches little, in turn, against one base.
+/// program that reaches much of the libc, one that reaches little, and one that reaches two libc
+/// functions only by taking their addresses, in turn, against one base.
 #[test]
 fn a_program_links_against_the_laid_out_libraries_as_against_the_libraries() {
     let _exports = ffi::lock();
-    let (Some(libc), Some(heap), Some(table), Some(small)) = (
+    let (Some(libc), Some(heap), Some(table), Some(small), Some(apply)) = (
         asset("pg_libc.temeno"),
         asset("pg_heap.temeno"),
         program_unit_text(TABLE_PROGRAM),
         program_unit_text(SMALL_PROGRAM),
+        program_unit_text(APPLY_PROGRAM),
     ) else {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
         return;
@@ -618,7 +664,7 @@ fn a_program_links_against_the_laid_out_libraries_as_against_the_libraries() {
         })
         .collect();
     let handles = open_pg_units(&libc, &heap);
-    for ir in [&table, &small, &table] {
+    for ir in [&table, &small, &apply, &table] {
         let prog = temen_text::parse_module(ir).expect("the program unit parses");
         let plain = temen_browser::link_program_multi(&units, &prog, "main").expect("links");
         let plain = temen_encode::encode_module(&plain);
@@ -638,15 +684,17 @@ fn a_program_links_against_the_laid_out_libraries_as_against_the_libraries() {
 /// **The libraries compiled once per page** (#2168). Programs run against the same resident libraries
 /// compile through one memo, which hands a run the functions an earlier run compiled, and only while
 /// everything the compile read is unchanged: a library function the same, a program function at the
-/// same position compiled anew. Two programs in turn, twice over, each printing what it prints alone.
+/// same position compiled anew. Three programs in turn, twice over, each printing what it prints
+/// alone.
 #[test]
 fn programs_run_in_turn_against_the_resident_libraries_print_their_own_output() {
     let _exports = ffi::lock();
-    let (Some(libc), Some(heap), Some(table), Some(small)) = (
+    let (Some(libc), Some(heap), Some(table), Some(small), Some(apply)) = (
         asset("pg_libc.temeno"),
         asset("pg_heap.temeno"),
         program_unit_text(TABLE_PROGRAM),
         program_unit_text(SMALL_PROGRAM),
+        program_unit_text(APPLY_PROGRAM),
     ) else {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
         return;
@@ -660,6 +708,10 @@ fn programs_run_in_turn_against_the_resident_libraries_print_their_own_output() 
         assert_eq!(
             link_run_libs(&handles, &small),
             (3, STATUS_OK, "small\n".to_string())
+        );
+        assert_eq!(
+            link_run_libs(&handles, &apply),
+            (7, STATUS_OK, APPLY_OUT.to_string())
         );
     }
     for h in handles {
