@@ -1498,6 +1498,7 @@ pub fn compile_and_run_capture_reserved(
         RunOpts {
             init_mem: Some(init_mem),
             reserved_log2,
+            snapshot_cap: Some(0), // the backed prefix
             ..RunOpts::default()
         },
     )
@@ -1531,6 +1532,7 @@ pub fn compile_and_run_capture_sub(
             // fully-mapped child (reserved == size); the parent is fully backed
             reserved_log2: 0,
             sub: Some(SubWindow { base, parent_bytes }),
+            snapshot_cap: Some(0), // the backed prefix: the whole parent
             ..RunOpts::default()
         },
     )
@@ -2235,7 +2237,8 @@ struct RunOpts<'a> {
     init_mem: Option<&'a [u8]>,
     /// Reservation policy: mask domain is `[0, 2^reserved_log2)`; `0` ⇒ fully mapped (reserved == size).
     reserved_log2: u8,
-    /// Bytes of window to snapshot back for the capture (vs. just the backed prefix).
+    /// What of the window to snapshot back ([`CompiledModule::run`]): `None`, nothing; `Some(cap)`,
+    /// the backed prefix, widened to `cap` bytes.
     snapshot_cap: Option<usize>,
     /// §14 nested sub-window confinement `[base, base+size)` of a larger parent.
     sub: Option<SubWindow>,
@@ -4056,8 +4059,9 @@ impl CompiledModule {
     /// Run the compiled entry over a **fresh guest window** on slot-encoded `args` (the run half
     /// of the old one-shot `compile_and_run*`): allocate + seed the window (init bytes, data
     /// segments, RO protection), seed the per-run runtime env, execute under the §5
-    /// detect-and-kill guard, snapshot, and tear the window down. The executable code and the
-    /// runtimes stay alive in `self`, so `run` can be called again (and
+    /// detect-and-kill guard, copy back what `snapshot_cap` asks for (`None`: nothing;
+    /// `Some(cap)`: the backed prefix, widened to `cap` bytes), and tear the window down. The
+    /// executable code and the runtimes stay alive in `self`, so `run` can be called again (and
     /// [`Self::define_extra`]-d code stays valid across runs).
     pub fn run(
         &mut self,
@@ -4323,8 +4327,9 @@ impl CompiledModule {
 
     /// Run an **incrementally defined** function (a trampoline pointer returned by
     /// [`Self::define_extra`]) over a fresh guest window, exactly like [`Self::run`] runs the
-    /// entry. This is the test/demo surface; the Phase-2 `Jit` capability instead uses
-    /// [`Self::invoke_extra`] over the *live* window of an in-flight run.
+    /// entry, and return the window's backed prefix with the outcome. This is the test/demo
+    /// surface; the Phase-2 `Jit` capability instead uses [`Self::invoke_extra`] over the *live*
+    /// window of an in-flight run.
     ///
     /// # Safety
     /// `code` must be a trampoline pointer returned by `define_extra` **on this module**, and
@@ -4339,7 +4344,16 @@ impl CompiledModule {
         args: &[i64],
         init_mem: Option<&[u8]>,
     ) -> Result<(JitOutcome, Vec<u8>), JitError> {
-        Self::run_code_raw(self, code, n_params, n_results, args, init_mem, None, None)
+        Self::run_code_raw(
+            self,
+            code,
+            n_params,
+            n_results,
+            args,
+            init_mem,
+            Some(0),
+            None,
+        )
     }
 
     /// #2173 — the run's park hub: the address of its thread domain, whose futex table every park
@@ -4503,6 +4517,8 @@ impl CompiledModule {
 
     /// The shared run body: window setup → guarded call → snapshot → teardown. `code` is a
     /// buffer-ABI trampoline owned by the module (the entry's, or an extra function's).
+    /// `snapshot_cap` is what of the window the run copies back: `None`, nothing; `Some(cap)`, the
+    /// backed prefix, widened to `cap` bytes (so `Some(0)` is the backed prefix alone).
     ///
     /// Structured for **mid-run re-entry**: every reference into `*this` is derived
     /// transiently and dropped before the guarded call (raw pointers extracted up front), so a
@@ -5089,26 +5105,36 @@ impl CompiledModule {
         if faulted {
             trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
         }
-        // Snapshot the in-window bytes (escape-oracle). The guest may have made pages non-readable
-        // via the Memory cap (unmap/protect), so restore RW first — else this read faults outside the
-        // guarded call and crashes the host.
-        window.restore_rw();
-        // `snapshot_cap` (the `_with_host` capture) widens the snapshot past the backed prefix to also
-        // cover reserved-tail pages the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the
-        // read sees zero/their content instead of faulting. `read_low` clamps to the reservation.
-        // #1810: a durable run's capture also reaches the guest's high-water, while the window lives.
-        let high = match (*this).high_water {
-            Some((f, ctx)) => f(ctx, mem_base as usize) as usize,
-            None => 0,
-        };
-        let snap = match snapshot_cap {
-            Some(cap) if win_size > 0 => cap.max(high).min((mask + 1) as usize).max(win_size),
-            _ => win_size,
-        };
-        let final_mem = if snap > win_size {
-            window.read_low(snap)
-        } else {
-            window.rw_mut()[..win_size].to_vec()
+        // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
+        // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
+        // bytes no one reads.
+        let final_mem = match snapshot_cap {
+            None => Vec::new(),
+            Some(cap) => {
+                // The guest may have made pages non-readable via the Memory cap (unmap/protect), so
+                // restore RW first — else this read faults outside the guarded call and crashes the
+                // host.
+                window.restore_rw();
+                // `cap` widens the snapshot past the backed prefix to also cover reserved-tail pages
+                // the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the read sees
+                // zero/their content instead of faulting. `read_low` clamps to the reservation.
+                // #1810: a durable run's capture also reaches the guest's high-water, while the window
+                // lives.
+                let high = match (*this).high_water {
+                    Some((f, ctx)) => f(ctx, mem_base as usize) as usize,
+                    None => 0,
+                };
+                let snap = if win_size > 0 {
+                    cap.max(high).min((mask + 1) as usize).max(win_size)
+                } else {
+                    win_size
+                };
+                if snap > win_size {
+                    window.read_low(snap)
+                } else {
+                    window.rw_mut()[..win_size].to_vec()
+                }
+            }
         };
         // The window dies with this run; the code, function table, and runtimes stay alive in
         // `*this` for the next `run` / `define_extra` / drop.

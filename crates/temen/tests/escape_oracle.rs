@@ -8,7 +8,7 @@
 //! path reflects guest stores.
 
 use temen_interp::{run_capture, run_capture_reserved, Value};
-use temen_jit::{compile_and_run_capture, compile_and_run_capture_reserved, JitOutcome};
+use temen_jit::{compile, compile_and_run_capture, compile_and_run_capture_reserved, JitOutcome};
 
 #[path = "support/detached_probe.rs"]
 mod detached_probe;
@@ -136,6 +136,40 @@ block 0 (v0: i32) {
     let (imem, jmem) = both_windows(src, &init);
     assert_eq!(imem, init, "interp did not preserve the seeded window");
     assert_eq!(jmem, init, "jit did not preserve the seeded window");
+}
+
+/// #2176: a JIT run copies its window back only when asked. Asked for nothing, it returns nothing:
+/// copying a large window costs a page fault per page, for bytes nobody reads. Asked for the backed
+/// prefix (`Some(0)`, what the capture entries above ask for), it returns the whole window, the
+/// guest's store included.
+#[test]
+fn a_jit_run_copies_its_window_back_only_when_asked() {
+    let src = "\
+memory 8
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 171
+  i64.store v0 v1
+  return v1
+  }
+}
+";
+    let m = temen::text::parse_module(src).expect("parse");
+    temen::verify::verify_module(&m).expect("verify");
+    let mut cm = compile(&m, 0).expect("compile");
+    let init = [0u8; 256];
+    let returned = |out: &JitOutcome| matches!(out, JitOutcome::Returned(s) if s == &[171]);
+    let (out, mem) = cm.run(&[8], Some(&init), None).expect("run");
+    assert!(returned(&out), "{out:?}");
+    assert!(
+        mem.is_empty(),
+        "asked for nothing, copied {} bytes",
+        mem.len()
+    );
+    let (out, mem) = cm.run(&[8], Some(&init), Some(0)).expect("run");
+    assert!(returned(&out), "{out:?}");
+    assert_eq!(mem.len(), init.len(), "the backed prefix");
+    assert_eq!(mem[8], 171, "the guest's store");
 }
 
 /// The JIT elides the bounds check when the address is *provably* in-window (the §1a
