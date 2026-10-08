@@ -7,6 +7,10 @@
 
 use std::time::Duration;
 
+#[path = "support/drivers.rs"]
+mod drivers;
+
+use drivers::{agree_on, Driver, Ran};
 use temen_interp::{run_with_host, Host, OffloadOutcome, StreamRole, Value};
 
 /// Futex park: the fiber `atomic.wait`s on a zero cell (forever). The root sees
@@ -291,6 +295,98 @@ fn a_resume_poll_loop_observes_the_passed_deadline() {
         vec![Value::I64(2)],
         "the poll itself fires the due timeout: WAIT_TIMED_OUT delivered"
     );
+}
+
+/// A fiber parks on a word on the root; the root spawns a thread that notifies the word and resumes
+/// the fiber itself, so it continues on another vCPU. The thread returns `woken * 100 + status * 10
+/// + value`, the root `first status * 1000 + that`: 3*1000 + 1*100 + 1*10 + 0 = 3110.
+const PARK_THEN_MIGRATE: &str = r#"
+memory 16 shadow 16448 65536
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  vz = i64.const 0
+  vk = cont.new v0 vz
+  vs1, vv1 = cont.resume vk vz
+  vt = thread.spawn 2 vz vk
+  vr = thread.join vt
+  vk1 = i64.const 1000
+  vs1e = i64.extend_i32_s vs1
+  va = i64.mul vs1e vk1
+  vres = i64.add va vr
+  return vres
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vk: i64) {
+  vaddr = i64.const 16384
+  vcnt = i32.const 1
+  vw = atomic.notify vaddr vcnt
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  vk100 = i64.const 100
+  vwe = i64.extend_i32_s vw
+  va = i64.mul vwe vk100
+  vk10 = i64.const 10
+  vse = i64.extend_i32_s vs
+  vb = i64.mul vse vk10
+  vab = i64.add va vb
+  vr = i64.add vab vv
+  return vr
+  }
+}
+"#;
+
+/// #2215 — the fiber park routing above on every driver that has it: a wait inside a fiber parks
+/// the fiber and its thread runs on, and a notify from that thread or another, the park-time
+/// recheck, the idle timer and a poll past the deadline each wake it. The parallel driver and
+/// `Vcpu` still park the whole thread there (#1414 slice 3e).
+#[test]
+fn a_fiber_futex_park_parks_the_fiber_on_every_driver() {
+    const DRIVERS: [Driver; 3] = [Driver::Oracle, Driver::Coop, Driver::Debug];
+    let cases = [
+        ("the same thread wakes it", FUTEX_FIBER_PARK, 331_100),
+        (
+            "another thread wakes and resumes it",
+            PARK_THEN_MIGRATE,
+            3110,
+        ),
+        (
+            "the park-time recheck wakes it",
+            NOT_EQUAL_INSTA_WAKE,
+            30_101,
+        ),
+        (
+            "its deadline fires while the root waits",
+            TIMED_WAIT_TIMES_OUT,
+            30_102,
+        ),
+        (
+            "a resume poll fires its passed deadline",
+            POLL_LOOP_TIMES_OUT,
+            2,
+        ),
+    ];
+    for (what, src, want) in cases {
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let want = Ran {
+            result: Ok(vec![Value::I64(want)]),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        agree_on(&DRIVERS, what, &m, &|| (Host::new(), Vec::new()), &want);
+    }
 }
 
 // ----- F1 (FIBER_PARK.md) — a punted host call parks the FIBER, not the vCPU ------------------
