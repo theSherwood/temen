@@ -6096,8 +6096,8 @@ pub struct JitOnrampRun {
     /// as the interpreter oracle does, so a `vm_map` that lands past the window yields the same result the
     /// oracle gives and the emitted access then declines (see [`run_cross_tier`](Self::run_cross_tier)).
     /// `grow` gates all of this: the single-shot on-ramp path sets it (no pre-size, real growth); the
-    /// warm+JIT path leaves it `false` and keeps its pre-sized `run_over` bounce byte-for-byte, so this
-    /// slice touches only the single-shot tier.
+    /// warm+JIT path leaves it `false`, keeps its pre-sized window, and carries no page state
+    /// between bounces.
     grow: bool,
     /// The page map carried forward between cross-tier bounces: the on-ramp's `protect`ed rodata and
     /// any `vm_map`-grown tail, together with the committed prefix those entries are relative to (the
@@ -6123,6 +6123,10 @@ pub struct JitOnrampRun {
     /// frame, so a `Jit.install` a child makes in one bounce is reachable from the next. Sized by the
     /// host's `jit_table_log2` (the reservation a re-granted `Jit` carried in; `0` ⇒ natural).
     table: std::sync::Arc<bytecode::SharedSlots>,
+    /// #1734 — warm+JIT: the end of the highest page a bounce committed past the emitted window
+    /// ([`committed_end`](fn@committed_end)). Such a commit stops the run, and the next restore
+    /// zeroes the page. Reset per eval by [`reset_warm`](Self::reset_warm).
+    committed_end: u64,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -6606,6 +6610,7 @@ impl JitOnrampRun {
             paged,
             pagestate,
             table,
+            committed_end: 0,
         })
     }
 
@@ -6693,14 +6698,16 @@ impl JitOnrampRun {
             exited: false,
             returned_value: 0,
             trapped: false,
-            // Warm+JIT keeps its pre-sized window and the prior `run_over` bounce (`grow: false`), so the
-            // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
+            // Warm+JIT keeps its pre-sized window and carries no page state between bounces
+            // (`grow: false`), so `prots` is inert here. `mapped` is the window the eval was
+            // emitted over: a bounce that commits a page past it stops the run (#1734).
             grow: false,
             prots: Some(temen_interp::PageMap::empty()),
             mapped: 1u64 << win_log2,
             paged: false,
             pagestate: Vec::new(),
             table,
+            committed_end: 0,
         })
     }
 
@@ -6724,6 +6731,7 @@ impl JitOnrampRun {
         self.returned_value = 0;
         self.trapped = false;
         self.last_trap = None;
+        self.committed_end = 0;
     }
 
     /// The emitted wasm (the host compiles + instantiates it, then calls `f0(win, env, ...slots)` once).
@@ -6820,15 +6828,31 @@ impl JitOnrampRun {
             }
             r
         } else {
-            // Warm+JIT (pre-sized window): the exact prior bounce — no persisted page state, no re-sync.
-            self.program.run_over(
+            // Warm+JIT (pre-sized window): no persisted page state, no re-sync. A page a bounce
+            // commits past the window the eval was emitted over is one its emitted code cannot
+            // address: it masks to the window, whose base the grow may also have moved. So the run
+            // stops there, before emitted code runs again, the eval falls back to the interpreter,
+            // and the next restore zeroes the page (#1734). A commit inside the window records no
+            // page-map entry, and needs none: a guest maps a page before it reads it, and a map
+            // zero-fills.
+            let (r, pages, _) = self.program.run_over_grown(
                 func,
                 args,
                 &mut fuel,
                 self.back.clone(),
                 &mut self.host,
                 false,
-            )
+                temen_ir::DEFAULT_RESERVED_LOG2,
+                None,
+            );
+            // `None`: the bounce aliased a §13 page, which a WasmDriven eval never does. Fail
+            // closed.
+            let end = pages.as_deref().map_or(u64::MAX, committed_end);
+            self.committed_end = self.committed_end.max(end);
+            if end > self.mapped {
+                return Err(Trap::MemoryFault);
+            }
+            r
         };
         if let Err(Trap::Exit(code)) = &r {
             self.exit_code = *code;
@@ -6843,6 +6867,11 @@ impl JitOnrampRun {
     /// coop tier's `temen_coop_mapped`.
     pub fn mapped(&self) -> u64 {
         self.mapped
+    }
+
+    /// #1734 — warm+JIT: the end of the highest page this eval's bounces left committed.
+    fn committed_end(&self) -> u64 {
+        self.committed_end
     }
 
     /// #1201 — whether the run emitted **paged** (the module `unmap`s/`protect`s); the driver then
@@ -7310,6 +7339,24 @@ impl WarmSession {
         }
     }
 
+    /// Raise [`dirty_end`](Self::dirty_end) over what the eval that just ended may have written:
+    /// the brk it advanced, and every page it left committed, up to `committed_end`
+    /// ([`committed_end`](fn@committed_end)). One body for the three warm tiers (#1734).
+    fn note_eval(&mut self, committed_end: u64) {
+        let win = self.win() as usize;
+        // SAFETY: `win_ptr` owns `win` bytes; the eval has ended, so no run is in flight.
+        let brk = unsafe {
+            warm_read_brk(
+                core::slice::from_raw_parts(self.win_ptr(), win),
+                self.scratch,
+            )
+        };
+        self.dirty_end = self
+            .dirty_end
+            .max(brk.min(win))
+            .max(committed_end.min(win as u64) as usize);
+    }
+
     /// The window's base address **right now**. A `vm_map` grow inside an eval reallocates the
     /// backing, so this can differ from one call to the next (#1312) — never cache it across a run.
     fn win_ptr(&self) -> *mut u8 {
@@ -7352,6 +7399,17 @@ static mut WARM_SESSION: Option<WarmSession> = None;
 fn warm_read_brk(win: &[u8], scratch: u64) -> usize {
     let o = (scratch + temen_ir::POWERBOX_HEAP_BRK) as usize;
     i64::from_le_bytes(win[o..o + 8].try_into().unwrap()) as usize
+}
+
+/// #1734 — the end of the highest page a run left committed (`Rw`, kind 1) in `entries`, a
+/// `Mem::map_info` page map: how far past its brk an eval may have written.
+fn committed_end(entries: &[(u64, u8)]) -> u64 {
+    entries
+        .iter()
+        .filter(|&&(_, kind)| kind == 1)
+        .map(|&(off, _)| off.saturating_add(temen_interp::host_page_size()))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Open a warm session over the two-phase driver module at `[mod_ptr, mod_len)`: run `warmup` once and
@@ -7480,7 +7538,11 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
             eval_fn,
             back,
             warm,
-            dirty_end: live,
+            // #1734: the pages warmup left committed above its brk are part of the image's
+            // geometry, so an eval can write them and the next eval read them without mapping them
+            // first. Every restore zeroes them, on every tier: the interpreter's eval reports them
+            // in its page map, but a warm+JIT bounce cannot.
+            dirty_end: live.max(committed_end(&prots).min(win) as usize),
             scratch,
             jit: None,
             jit_win_base: 0,
@@ -7549,28 +7611,10 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
             _ => (STATUS_OK, 0, 0),
         },
     };
-    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied — both
-    // the brk it advanced and any page it `vm_map`-grew past the warm extent (freshly-mapped pages
-    // are zeroed at map time, but the guest may have written them).
-    // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
-    unsafe {
-        let w = core::slice::from_raw_parts(s.win_ptr(), s.win() as usize);
-        // Any page the eval left committed (`Rw`, kind 1) may carry its writes — zero to the top
-        // of the highest one on the next restore (page size from the engine's map_info encoding).
-        let grown = eval_pages
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter(|&&(_, kind)| kind == 1)
-            .map(|&(off, _)| off.saturating_add(temen_interp::host_page_size()))
-            .max()
-            .unwrap_or(0)
-            .min(s.win()) as usize;
-        s.dirty_end = s
-            .dirty_end
-            .max(warm_read_brk(w, s.scratch).min(s.win() as usize))
-            .max(grown);
-    }
+    // Track the eval's high-water so the next restore zeroes exactly what it dirtied — both the brk
+    // it advanced and any page it `vm_map`-grew past the warm extent (freshly-mapped pages are
+    // zeroed at map time, but the guest may have written them).
+    s.note_eval(committed_end(eval_pages.as_deref().unwrap_or(&[])));
     set(status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -7845,15 +7889,10 @@ pub extern "C" fn temen_warm_jit_finish() -> i32 {
     } else {
         (STATUS_OK, 0, run.returned_value())
     };
-    // Track the eval's heap high-water so the next restore zeroes exactly what it dirtied (mirrors
-    // [`temen_warm_eval`]).
-    // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
-    unsafe {
-        let w = core::slice::from_raw_parts(s.win_ptr(), s.win() as usize);
-        s.dirty_end = s
-            .dirty_end
-            .max(warm_read_brk(w, s.scratch).min(s.win() as usize));
-    }
+    // Track the eval's high-water so the next restore zeroes what it dirtied: its brk, and any page
+    // a bounce committed past the window (#1734).
+    let end = run.committed_end();
+    s.note_eval(end);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
         stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
@@ -14259,24 +14298,8 @@ fn coop_pump(budget: Option<u64>) -> i32 {
         // SAFETY: single-threaded wasm; the warm session outlives its armed coop run by
         // construction (`temen_warm_close` drops the run first), and no engine run is in flight.
         if let Some(ws) = unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() } {
-            let w = unsafe { core::slice::from_raw_parts(ws.win_ptr(), ws.win() as usize) };
-            let grown = s
-                .run
-                .mem_map_info()
-                .map(|(_, _, _, entries)| {
-                    entries
-                        .iter()
-                        .filter(|&&(_, kind)| kind == 1)
-                        .map(|&(off, _)| off.saturating_add(temen_interp::host_page_size()))
-                        .max()
-                        .unwrap_or(0)
-                        .min(ws.win())
-                })
-                .unwrap_or(0) as usize;
-            ws.dirty_end = ws
-                .dirty_end
-                .max(warm_read_brk(w, ws.scratch).min(ws.win() as usize))
-                .max(grown);
+            let info = s.run.mem_map_info();
+            ws.note_eval(info.map_or(0, |(_, _, _, entries)| committed_end(&entries)));
         }
     }
     // The files the run ended with, for an embedder's file view after it closes the session.
