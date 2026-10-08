@@ -809,3 +809,46 @@ block 0 (v0: i64, v1: i64) {
 fn a_thawed_thread_is_charged_to_its_childs_budget_again() {
     check_child(CHILD_THREAD_ROOM, Out::Ret(2));
 }
+
+/// #2219 — [`PARENT`] with one grant record: an empty grant ([`temen_interp::GRANT_EMPTY`]) under
+/// `exit`, above the shadow arena.
+fn parent_empties_exit() -> String {
+    const REC: u64 = 131072;
+    const NAME: u64 = 131200;
+    let record = [
+        (NAME as u32).to_le_bytes(),
+        4u32.to_le_bytes(),
+        temen_interp::GRANT_EMPTY.to_le_bytes(),
+        0u32.to_le_bytes(),
+    ]
+    .concat();
+    let esc: String = record.iter().map(|b| format!("\\x{b:02x}")).collect();
+    format!(
+        "memory 18 shadow 16448 65536
+data {REC} \"{esc}\"
+data {NAME} \"exit\"
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vgp = i64.const {REC}
+  vgn = i64.const 1
+  vlog = i64.const 17
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  return vr
+  }}
+}}
+"
+    )
+}
+
+/// #2219: an empty grant survives a freeze. The child imports `exit`, which nothing grants, so only
+/// the parent's empty grant lets its strict bind admit it. A thaw re-binds the captured child, and the
+/// empty grant rides its name directory through the codec, so the thaw admits it again.
+#[test]
+fn a_thawed_detached_child_keeps_its_empty_grant() {
+    let src = child("  pr = i64.const 42\n").replacen('\n', "\nimport 0 \"exit\" (i32) -> ()\n", 1);
+    check_with(&parent_of(&parent_empties_exit()), &src, Out::Ret(42));
+}

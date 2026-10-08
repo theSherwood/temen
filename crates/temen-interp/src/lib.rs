@@ -14786,17 +14786,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // S2 named grant list (op 11): install each re-granted cap into the child
                                 // **under its name** (so the child resolves it by `self.resolve`).
                                 // Empty for every other op.
-                                let mut named_child: Vec<i32> = Vec::new();
                                 for (name, gh) in &named {
-                                    let cg = host.lock_unpoisoned().grant_into_child(
+                                    let _ = host.lock_unpoisoned().grant_entry_into_child(
                                         Some(host),
+                                        name,
                                         *gh,
                                         &mut ch,
                                     );
-                                    if let Some(cg) = cg {
-                                        ch.register_cap_name(name, cg);
-                                        named_child.push(cg);
-                                    }
                                 }
                                 // #863 slice 3 — a child that inherited a personality signal door
                                 // via the re-grant above gets its own **domain-scoped, weak**
@@ -15409,14 +15405,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // #1944 — the budget that paid for the window is the child's own.
                                 host.lock_unpoisoned().give_child_budget(budget, &mut ch);
                                 for (name, gh) in &glist {
-                                    let cg = host.lock_unpoisoned().grant_into_child(
+                                    let _ = host.lock_unpoisoned().grant_entry_into_child(
                                         Some(host),
+                                        name,
                                         *gh,
                                         &mut ch,
                                     );
-                                    if let Some(cg) = cg {
-                                        ch.register_cap_name(name, cg);
-                                    }
                                 }
                                 // #1975 — every exit from here that spawns nothing hands back what
                                 // the admission took, so the spawn charges nothing.
@@ -22145,11 +22139,35 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
+/// #2219 — the **empty grant** on a §14 named-grant record's `handle` field: the parent grants
+/// *nothing* under the record's name, and the child's import of that name binds to an empty slot
+/// that `CapFault`s on use where it would otherwise refuse the spawn. The child binds its manifest
+/// strictly, so this is how a parent says on purpose what it leaves out (owner, 2026-10-08).
+///
+/// The name is an import name (`read`), `*` (every import nothing else satisfies), or a prefix
+/// ending in one `*` (`vm_jit_*`, `link.*`). A pattern is allowed only with this tag, so a pattern
+/// never grants authority, and a concrete grant beats a pattern whatever the order: an empty grant
+/// fills an import nothing binds, and never unbinds one. It lives in the handle field for the reason
+/// [`GRANT_SERVE_LIVE_TAG`] does. Its top bits are `11`, like an `-errno`'s, but it lies far outside
+/// that small range, so a failed lookup passed as a handle by mistake is still refused. The child's
+/// name directory records it as `(name, GRANT_EMPTY)`, which carries it through a fork and a freeze
+/// to the thaw's re-bind.
+pub const GRANT_EMPTY: u32 = 0xC000_0000;
+
+/// #2219 — the grant-list rule for a record's name: an empty grant's ([`GRANT_EMPTY`]) is an import
+/// name, `*`, or a prefix ending in one `*`; any other grant's holds no `*` at all.
+fn grant_name_ok(name: &str, handle: i32) -> bool {
+    match name.find('*') {
+        None => true,
+        Some(at) => handle as u32 == GRANT_EMPTY && at + 1 == name.len(),
+    }
+}
+
 /// The eval-loop spawn arms' authority check over a parsed grant list (ops 13, 15 and 17): every
-/// entry must pass [`Host::can_grant`]. The tree-walker's powerbox always sits in a cell its child
-/// can call back through.
+/// entry must pass [`Host::can_grant_entry`]. The tree-walker's powerbox always sits in a cell its
+/// child can call back through.
 fn authorize_eval_grants(host: &Host, list: &[(String, i32)]) -> Result<(), Trap> {
-    if list.iter().all(|(_, h)| host.can_grant(*h, true)) {
+    if list.iter().all(|(n, h)| host.can_grant_entry(n, *h, true)) {
         Ok(())
     } else {
         Err(Trap::CapFault)
@@ -23321,7 +23339,15 @@ pub struct Host {
     /// dynamic counterpart to load-time name binding. Populated by the powerbox layer at grant time
     /// (`temen_run`); empty for a bare `Host` (resolution then finds nothing — fail-closed). First match
     /// wins on a duplicate name. A side table only — it never affects handle values or grant order.
+    /// #2219: a §14 child's **empty grant** sits here as `(name, GRANT_EMPTY)`; it names no
+    /// capability, so every lookup of a handle by name skips it, and only the binder reads it
+    /// ([`Host::emptied`]).
     cap_names: Vec<(String, i32)>,
+    /// #2219 — what the run's domains leave their embedder to say about a refusal, in words a
+    /// guest's `-EINVAL` can't carry: which import of a child had no grant. Every domain of a run
+    /// shares one list (a child's host is made from its parent's, [`Host::child_host`]), which the
+    /// embedder drains with [`Host::take_notes`].
+    notes: Arc<Mutex<Vec<String>>>,
     /// #1455 — the embedder's thaw-side re-granter for named host capabilities, consulted by
     /// [`Host::restore_durable_named`]. `None` on every host that is not restoring one (which is
     /// every host in a normal run), and never consulted outside a restore.
@@ -23933,6 +23959,7 @@ impl Host {
             thaw_names: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
+            notes: Arc::default(),
             named_cap_registrar: None,
             budget_thaw_hook: None,
             import_bindings: Vec::new(),
@@ -24098,6 +24125,8 @@ impl Host {
         }
         twin.region_hook = self.region_hook.clone();
         twin.region_factory = self.region_factory;
+        // #2219: one run, one list of notes.
+        twin.notes = Arc::clone(&self.notes);
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
         // forking caller is always parked inside a call through one, so it holds at least this.
         twin.live_impls = self.live_impls.clone();
@@ -24294,7 +24323,28 @@ impl Host {
         self.bind_manifest(imports, tsec, true)
     }
 
+    /// [`Self::bind_manifest_slots`], and on a refusal, a note naming the import nothing satisfied
+    /// (#2219), since the guest only sees `-EINVAL`.
     fn bind_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        tsec: &[temen_ir::TypeEntry],
+        lenient: bool,
+    ) -> Result<(), u32> {
+        let bound = self.bind_manifest_slots(imports, tsec, lenient);
+        if let Err(i) = bound {
+            if let Some(im) = imports.get(i as usize) {
+                self.note(format!(
+                    "refused a child: no grant satisfies its import `{}` \
+                     (grant it, or leave it empty on purpose with a VM_EMPTY grant)",
+                    im.name
+                ));
+            }
+        }
+        bound
+    }
+
+    fn bind_manifest_slots(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
@@ -24538,7 +24588,9 @@ impl Host {
                     bindings.push(BoundImport::required(tid, iop, c));
                     remaps.push(None);
                 }
-                None if soft => {
+                // #2219: nothing binds it, and the parent emptied it on purpose — an empty grant
+                // fills only an import no grant reached, so a concrete one beats it.
+                None if soft || self.emptied(&im.name) => {
                     bindings.push(unmet());
                     remaps.push(None);
                 }
@@ -25592,8 +25644,20 @@ impl Host {
     pub fn resolve_cap_name(&self, name: &str) -> Option<i32> {
         self.cap_names
             .iter()
-            .find(|(n, _)| n == name)
+            .find(|(n, h)| n == name && *h as u32 != GRANT_EMPTY)
             .map(|(_, h)| *h)
+    }
+
+    /// #2219 — whether an empty grant ([`GRANT_EMPTY`]) covers import `name`: one recorded under that
+    /// exact name, `*`, or a prefix ending in `*` that `name` starts with.
+    fn emptied(&self, name: &str) -> bool {
+        self.cap_names.iter().any(|(p, h)| {
+            *h as u32 == GRANT_EMPTY
+                && match p.strip_suffix('*') {
+                    Some(prefix) => name.starts_with(prefix),
+                    None => p == name,
+                }
+        })
     }
 
     /// The human-readable **label** registered for `handle` (the reverse of [`Host::resolve_cap_name`]),
@@ -25603,7 +25667,7 @@ impl Host {
     pub fn cap_label(&self, handle: i32) -> Option<&str> {
         self.cap_names
             .iter()
-            .find(|(_, h)| *h == handle)
+            .find(|(_, h)| *h == handle && *h as u32 != GRANT_EMPTY)
             .map(|(n, _)| n.as_str())
     }
 
@@ -26538,7 +26602,7 @@ impl Host {
     fn cap_name_of_slot(&self, slot: usize) -> Option<&str> {
         self.cap_names
             .iter()
-            .find(|(_, h)| (*h as u32 as usize) & (CAP - 1) == slot)
+            .find(|(_, h)| *h as u32 != GRANT_EMPTY && (*h as u32 as usize) & (CAP - 1) == slot)
             .map(|(n, _)| n.as_str())
     }
 
@@ -29808,7 +29872,19 @@ impl Host {
     pub(crate) fn child_host(&self) -> Host {
         let mut child = Host::new();
         child.region_factory = self.region_factory;
+        child.notes = Arc::clone(&self.notes);
         child
+    }
+
+    /// #2219 — leave the embedder a note ([`Host::notes`]).
+    fn note(&self, note: String) {
+        self.notes.lock_unpoisoned().push(note);
+    }
+
+    /// #2219 — drain the notes every domain of this run has left: why a spawn was refused, which a
+    /// guest only sees as `-EINVAL`. An embedder shows them beside the run's output.
+    pub fn take_notes(&self) -> Vec<String> {
+        core::mem::take(&mut *self.notes.lock_unpoisoned())
     }
 
     /// Install the backing factory for **guest-minted** regions (`AddressSpace.create_region`,
@@ -29958,6 +30034,34 @@ impl Host {
             Some(k) => callable && self.offer_shape(k).is_some(),
             None => self.can_regrant(handle),
         }
+    }
+
+    /// The spawn's check for one grant record, which every engine's spawn asks: its name passes
+    /// [`grant_name_ok`], and its handle passes [`Self::can_grant`] or is an empty grant
+    /// ([`GRANT_EMPTY`]), which grants nothing and so needs no authority.
+    fn can_grant_entry(&self, name: &str, handle: i32, callable: bool) -> bool {
+        grant_name_ok(name, handle)
+            && (handle as u32 == GRANT_EMPTY || self.can_grant(handle, callable))
+    }
+
+    /// Grant one record [`Self::can_grant_entry`] passed into `child` under its name: a handle as
+    /// [`Self::grant_into_child`] grants it, or an empty grant, which grants nothing and is recorded
+    /// in the child's name directory for its binder ([`Self::emptied`]). The one step every engine's
+    /// spawn takes per record, so a child's directory is the same on each.
+    fn grant_entry_into_child(
+        &mut self,
+        cell: Option<&Arc<Mutex<Host>>>,
+        name: &str,
+        handle: i32,
+        child: &mut Host,
+    ) -> Option<()> {
+        let cg = if handle as u32 == GRANT_EMPTY {
+            handle
+        } else {
+            self.grant_into_child(cell, handle, child)?
+        };
+        child.register_cap_name(name, cg);
+        Some(())
     }
 
     /// Grant one entry [`Self::can_grant`] passed into `child`: a table handle as any spawn
@@ -30387,7 +30491,7 @@ impl Host {
         // anything (a partially-built child would leak a promoted sink / installed pipe).
         if !grants
             .iter()
-            .all(|(_, h)| self.can_grant(*h, cell.is_some()))
+            .all(|(n, h)| self.can_grant_entry(n, *h, cell.is_some()))
         {
             return None;
         }
@@ -30406,8 +30510,7 @@ impl Host {
         for (name, handle) in grants {
             // Pre-checked above, so this cannot fail: each entry is granted into the child under its
             // name, a live self-serve grant as an offer over this host's own cell.
-            let cg = self.grant_into_child(cell, *handle, &mut ch)?;
-            ch.register_cap_name(name, cg);
+            self.grant_entry_into_child(cell, name, *handle, &mut ch)?;
         }
         Some((ch, cinst, cas))
     }
