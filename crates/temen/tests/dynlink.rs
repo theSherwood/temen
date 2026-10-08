@@ -252,6 +252,79 @@ fn link_duplicate_symbol_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A function's address across units, in code (#2203): `ref.sym "name"` is the `ref.func` of the
+// function another unit exports as `name` — the code twin of `data.funcref <at> sym`, rewritten
+// 1:1 by the linker to `ref.func` at the function's merged index.
+// ---------------------------------------------------------------------------------------------
+
+/// `app` takes the address of `add`, which another unit defines, and calls through it.
+const APP_TAKES_ADD: &str = "\
+func (i32, i32) -> (i32) {
+block 0 (v0: i32, v1: i32) {
+  v2 = ref.sym \"add\"
+  v3 = call.dyn (i32, i32) -> (i32) v2 (v0, v1)
+  return v3
+  }
+}
+";
+
+/// Linked after an unrelated unit, `add` sits at merged index 1, and the reference follows it there.
+#[test]
+fn cross_unit_function_reference_resolves() {
+    let pad = "\
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  return v0
+  }
+}
+";
+    let linked = link(&[
+        unit(pad, &[("pad", 0)]),
+        unit(MATH_UNIT, &[("add", 0)]),
+        unit(APP_TAKES_ADD, &[]),
+    ])
+    .expect("link");
+    assert_eq!(
+        linked.funcs[2].blocks[0].insts[0],
+        temen_ir::Inst::RefFunc { func: 1 },
+        "`ref.sym \"add\"` becomes `ref.func` of `add`'s merged index"
+    );
+    temen_verify::verify_module(&linked).expect("verify");
+    assert_eq!(run_entry(&linked, 2, &[40, 2]), 42);
+}
+
+/// A reference to a function no unit exports is fail-closed.
+#[test]
+fn unresolved_function_reference_fails_closed() {
+    assert_eq!(
+        link(&[unit(APP_TAKES_ADD, &[])]),
+        Err(temen_ir::LinkError::Unresolved("add".into()))
+    );
+}
+
+/// `ref.sym` prints and re-parses identically, and rides the object dialect of the wire.
+#[test]
+fn function_reference_round_trips() {
+    let m = temen_text::parse_module(APP_TAKES_ADD).expect("parse");
+    let printed = temen_text::print_module(&m);
+    assert!(printed.contains("ref.sym \"add\""), "{printed}");
+    assert_eq!(temen_text::parse_module(&printed).expect("re-parse"), m);
+    let bytes = temen::encode::encode_unit(&m);
+    assert_eq!(temen::encode::decode_unit(&bytes).expect("decode"), m);
+}
+
+/// A unit a guest loads into its running window has no table slots for its references to name
+/// yet (#2182), so it refuses one, as it refuses a function index in its data.
+#[test]
+fn a_loaded_unit_refuses_a_function_reference() {
+    let mut m = temen_text::parse_module(APP_TAKES_ADD).expect("parse");
+    assert_eq!(
+        temen_ir::place_loaded_unit(&mut m, 0, &Default::default()),
+        Err(temen_ir::LinkError::NotLoadable("ref.sym"))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Milestone 2: cross-unit data symbols via the **self-describing** link forms — `export … data`
 // (provider), `data.sym "name" <addend>` / `data.self <offset>` (consumer). No relocation
 // side-table: the symbol rides in the instruction, so the linker rewrites it 1:1 to `i64.const`.

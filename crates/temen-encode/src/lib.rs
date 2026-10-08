@@ -130,6 +130,9 @@ mod op {
     pub const DATA_SELF: u8 = 0x07; // uleb offset -> i64 (own-data address)
     pub const DATA_SYM: u8 = 0x08; // length-prefixed name bytes, sleb addend -> i64 (cross-unit)
     pub const DATA_TOP: u8 = 0x09; // (no payload) -> i64 (post-link top-of-data)
+                                   // The link-form function reference (#2203), object dialect only like the three above: `link`
+                                   // rewrites it to `ref.func`.
+    pub const REF_SYM: u8 = 0x0A; // length-prefixed name bytes -> i32 funcref (cross-unit)
 
     // Memory ops. Each carries: address operand, [value operand for stores], and an
     // immediate uleb offset. (The wire-rev cut dropped the write-only alignment-hint byte;
@@ -335,6 +338,9 @@ pub mod wire {
 // each `data.funcref`. A linked module otherwise keeps no record of which of its data bytes are
 // function indices, and an analysis of the functions a `call.dyn` can reach (the JIT's fork
 // instrumentation, link-time DCE) must know. Every committed asset is regenerated.
+// The object dialect gained the `ref.sym` opcode (#2203) within v13: it changes no existing
+// encoding, so every earlier v13 stream decodes as before, the runnable dialect is unchanged, and
+// a decoder that predates it rejects a unit carrying one (`BadOpcode`).
 // v12 (#1715) adds **thread-local templates** to the object dialect: a section of the unit's
 // `_Thread_local` initial bytes (after `data.funcref`), and a `tls` flag byte on `data.ptr` entries,
 // data exports, and the `data.self`/`data.sym` opcodes. The runnable dialect is unchanged byte for
@@ -914,6 +920,15 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
                 "data.top is link-form; resolve via link before encode_module"
             );
             out.push(self::op::DATA_TOP);
+        }
+        Inst::RefSym { name } => {
+            assert!(
+                object,
+                "ref.sym is link-form; resolve via link before encode_module"
+            );
+            out.push(self::op::REF_SYM);
+            write_uleb(out, name.len() as u64);
+            out.extend_from_slice(name);
         }
         // v7 dynamic-mode dispatch by type-section reference (§3.5): interface index, op,
         // self-describing sig, runtime handle operand, args.
@@ -2588,6 +2603,12 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             }
         }
         op::DATA_TOP if object => Inst::DataTop,
+        op::REF_SYM if object => {
+            let len = c.count()?;
+            Inst::RefSym {
+                name: c.take(len)?.to_vec(),
+            }
+        }
         op::CALL_IMPORT_DYN => Inst::CallImportDyn {
             ty: c.idx()?,
             op: c.idx()?,
@@ -3066,7 +3087,7 @@ mod object_tests {
     use super::*;
 
     /// A representative link unit: data with placeholder pointer bytes, both `data.ptr` target
-    /// kinds, a data export, and a function body carrying all three link-form instructions.
+    /// kinds, a data export, and a function body carrying every link-form instruction.
     fn unit() -> Module {
         Module {
             memory: Some(Memory {
@@ -3142,6 +3163,9 @@ mod object_tests {
                             name: b"t_other".to_vec(),
                             addend: 0,
                             tls: true,
+                        },
+                        Inst::RefSym {
+                            name: b"f_other".to_vec(),
                         },
                     ],
                     term: Terminator::Return(vec![2]),

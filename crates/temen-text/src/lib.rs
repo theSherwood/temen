@@ -567,6 +567,8 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         ),
         Inst::Call { func, args } => format!("call {func}{}", arglist(args)),
         Inst::RefFunc { func } => format!("ref.func {func}"),
+        // Link-form function reference (resolved to `ref.func` by `link`, #2203).
+        Inst::RefSym { name } => format!("ref.sym \"{}\"", escape_bytes(name)),
         Inst::CallIndirect { ty, idx, args } => {
             let s = sig_of(m, *ty);
             format!(
@@ -2811,6 +2813,12 @@ impl<'a> Parser<'a> {
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             return Ok(Inst::RefFunc { func });
+        }
+        // Link-form function reference: `ref.sym "<name>"`, the function another unit exports as
+        // `name` (#2203). Yields an `i32` funcref; `link` rewrites it to `ref.func`.
+        if op == "ref.sym" {
+            let name = self.parse_str()?;
+            return Ok(Inst::RefSym { name });
         }
         // Link-form data addresses: `data.sym "<name>" <addend>` (a cross-unit data symbol) and
         // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites

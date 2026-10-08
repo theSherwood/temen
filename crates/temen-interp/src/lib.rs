@@ -18118,12 +18118,14 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // `CallSym` (the v8 link-form placeholder) never verifies, so it can never execute.
         // `DataSym`/`DataSelf` are the data-side link forms — `link` rewrites them to `i64.const`
         // before a module runs, so reaching one here is a malformed (unlinked) module: fail closed.
+        // So is `RefSym`, which `link` rewrites to `ref.func`.
         Inst::CallImport { .. }
         | Inst::CallImportDyn { .. }
         | Inst::CallSym { .. }
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
         | Inst::DataTop
+        | Inst::RefSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. } => return Err(Trap::Malformed),
         // §3.5 reflection intrinsics need the host table, so they're serviced in the eval loop

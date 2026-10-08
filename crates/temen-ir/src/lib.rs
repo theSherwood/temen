@@ -2334,6 +2334,18 @@ pub enum Inst {
     RefFunc {
         func: FuncIdx,
     },
+    /// A **link-form function reference** (#2203): `ref.func` of the function another unit
+    /// exports as `name`, for code that takes the address of a function its unit does not define
+    /// (passing `sin` where a function pointer goes). The code twin of a named `data.funcref`, and
+    /// the function twin of [`Inst::DataSym`]. [`link`] rewrites it **1:1** to [`Inst::RefFunc`]
+    /// at the function's merged index; an unexported name fails the link
+    /// ([`LinkError::Unresolved`]), and a unit a guest loads into its running window refuses it
+    /// ([`place_loaded_unit`]). Object dialect only, like the data link forms: a runnable module
+    /// never carries one, and a backend that meets one fails closed. Result is one `i32`. The
+    /// name is a `Vec<u8>` for the reason [`Inst::DataSym`]'s is.
+    RefSym {
+        name: alloc::vec::Vec<u8>,
+    },
     /// Indirect call through the function table (§3c): mask `idx` into the table,
     /// runtime-check the selected function's signature against `ty`, then call.
     /// `idx` is an `i32` table index; results are `ty.results`.
@@ -3034,6 +3046,8 @@ impl Inst {
             | Inst::Cast { .. }
             | Inst::Fma { .. }
             | Inst::RefFunc { .. }
+            // A link-form function reference: pure (a to-be-`ref.func`), like `ref.func` itself.
+            | Inst::RefSym { .. }
             // Link-form address materialization: pure (a to-be-`ConstI64`), no fault/mem/effect.
             // CSE/DCE on them is sound (same name+addend ⇒ same address); the linker rewrites them
             // to real consts before any backend runs.
@@ -3164,6 +3178,7 @@ impl Inst {
             | Inst::DataSelf { .. }
             | Inst::DataTop
             | Inst::RefFunc { .. }
+            | Inst::RefSym { .. }
             | Inst::CapSelfTypeId { .. }
             | Inst::ExportHandle { .. }
             | Inst::VcpuTlsGet
@@ -5619,6 +5634,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
             });
         }
         offset_func_indices(&mut m, fbase);
+        resolve_unit_func_syms(&mut m, &funcs_tab)?;
         rewrite_unit_imports(&mut m, disp)?;
         funcs.extend(m.funcs);
         data.extend(m.data);
@@ -5868,6 +5884,31 @@ fn resolved_import_shape(m: &Module, shape: ImportShape) -> Option<ResolvedShape
 }
 
 /// Rewrite one unit's import references per its dispositions — the [`link_impl`] counterpart of
+/// Resolve a unit's [`Inst::RefSym`]s to [`Inst::RefFunc`] at the merged index the function
+/// exported as `name` sits at (`funcs_tab`, the table a named `data.funcref` resolves through).
+/// Runs after [`offset_func_indices`] has shifted the unit's own indices, so a resolved index is
+/// not shifted again. Fail-closed on an unexported name ([`LinkError::Unresolved`]).
+fn resolve_unit_func_syms(
+    m: &mut Module,
+    funcs_tab: &alloc::collections::BTreeMap<String, FuncIdx>,
+) -> Result<(), LinkError> {
+    let insts = m
+        .funcs
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.insts);
+    for inst in insts {
+        if let Inst::RefSym { name } = inst {
+            let func = core::str::from_utf8(name)
+                .ok()
+                .and_then(|name| funcs_tab.get(name))
+                .ok_or_else(|| LinkError::Unresolved(String::from_utf8_lossy(name).into_owned()))?;
+            *inst = Inst::RefFunc { func: *func };
+        }
+    }
+    Ok(())
+}
+
 /// [`resolve_imports_with`]'s `Func` case, extended with slot **retention**. A link-resolved name
 /// lowers 1:1 to a direct [`Inst::Call`] (`call.sym`'s unused handle operand is dropped, no value
 /// renumbering — the same rewrite [`resolve_imports_with`] does; a manifest-form `call.import`
@@ -5978,7 +6019,8 @@ fn place_unit_data(
 ///
 /// Refused ([`LinkError::NotLoadable`]) is what only a whole-program link can lay out: thread-locals
 /// (the program has one per-thread block), function indices baked into data (the unit's functions
-/// have no table slots until an engine installs them), and `data.top` (the program's data stack).
+/// have no table slots until an engine installs them), a `ref.sym` (likewise, a function index in
+/// code — #2182), and `data.top` (the program's data stack).
 /// The caller checks that `[base, base + span)` does not wrap, so nothing here overflows.
 pub fn place_loaded_unit(
     m: &mut Module,
@@ -6006,13 +6048,16 @@ pub fn place_loaded_unit(
     if !m.data_funcrefs.is_empty() || !m.data_funcref_slots.is_empty() {
         return Err(LinkError::NotLoadable("function indices in data"));
     }
-    let data_top = m
-        .funcs
-        .iter()
-        .flat_map(|f| &f.blocks)
-        .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::DataTop));
-    if data_top {
+    let insts = || {
+        m.funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+    };
+    if insts().any(|i| matches!(i, Inst::RefSym { .. })) {
+        return Err(LinkError::NotLoadable("ref.sym"));
+    }
+    if insts().any(|i| matches!(i, Inst::DataTop)) {
         return Err(LinkError::NotLoadable("data.top"));
     }
     let mut data = data_syms.clone();

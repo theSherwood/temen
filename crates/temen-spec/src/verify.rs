@@ -244,6 +244,8 @@ fn check_inst(
         Inst::ConstF64(_) => vec![V::F64],
         // Link-form data addresses append their resolved-to `i64`; immediates only, no operands.
         Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => vec![V::I64],
+        // The link-form function reference appends the `i32` funcref it resolves to (#2203).
+        Inst::RefSym { .. } => vec![V::I32],
         Inst::IntBin { ty, a, b, .. } => {
             w(*a, ty.val())?;
             w(*b, ty.val())?;

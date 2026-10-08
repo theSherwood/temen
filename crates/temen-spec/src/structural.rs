@@ -402,6 +402,21 @@ pub fn struct_rows() -> Vec<StructRow> {
         is_term: false,
         module: inst_module(vec![], Inst::DataTop, false, vec![]),
     });
+    // #2203: the link-form function reference, the code twin of a named `data.funcref` (an `i32`).
+    rows.push(StructRow {
+        id: "ref_sym".into(),
+        encoding: Enc::Byte(0x0A),
+        verifies: true,
+        is_term: false,
+        module: inst_module(
+            vec![],
+            Inst::RefSym {
+                name: b"f".to_vec(),
+            },
+            false,
+            vec![],
+        ),
+    });
 
     // Phase-2 `import.attach` (IMPORTS.md): like `call_import`, the row module carries no
     // manifest, so the op fails verification (out-of-range import) — round-trip + byte pin
@@ -772,6 +787,7 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::DataSym { .. }
         | Inst::DataSelf { .. }
         | Inst::DataTop
+        | Inst::RefSym { .. }
         | Inst::ExportHandle { .. }
         | Inst::ImportAttach { .. }
         | Inst::CapSelfTypeId { .. }
@@ -799,7 +815,7 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 39, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 40, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();
