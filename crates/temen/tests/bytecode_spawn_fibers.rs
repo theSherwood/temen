@@ -259,8 +259,7 @@ fn region_powerbox(child: &Module) -> (Host, [Value; 4]) {
 
 /// A child domain's fiber parked on a shared-region word is woken by a notify from ANOTHER domain's
 /// window: fiber parks key on the region's canonical identity, and a notify scans every domain's
-/// registry. On the oracle and the cooperative driver; the parallel driver does not yet rendezvous a
-/// parent and a detached child on a region byte at all, fibers or not (#1787).
+/// registry. On the oracle, the cooperative driver and the parallel driver (#1787).
 #[test]
 fn a_notify_from_another_domain_wakes_a_childs_parked_fiber() {
     let (parent, child) = (parse(NOTIFIER), parse(WAITER));
@@ -279,5 +278,21 @@ fn a_notify_from_another_domain_wakes_a_childs_parked_fiber() {
         let got = bytecode::compile_and_run_with_host(&parent, 0, &args, &mut fuel, &mut host)
             .expect("lowers");
         assert_eq!(got, want, "cooperative");
+    }
+    {
+        let (mut host, args) = region_powerbox(&child);
+        let mut fuel = 50_000_000u64;
+        let got = bytecode::compile_and_run_capture_over_parallel_with_host(
+            &parent,
+            0,
+            &args,
+            &mut fuel,
+            &[],
+            None,
+            &mut host,
+        )
+        .expect("lowers")
+        .0;
+        assert_eq!(got, want, "parallel");
     }
 }

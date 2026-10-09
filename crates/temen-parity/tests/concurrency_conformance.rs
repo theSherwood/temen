@@ -1,10 +1,11 @@
 //! **The honesty pin for the frontier matrix's `concurrency` column (#1413 slice 3).**
 //!
 //! INVARIANTS #14's third axis asks whether a capability is "carried by both the cooperative
-//! multiplex driver and the genuinely-parallel driver". Natively those are `bytecode::drive` (one
-//! thread multiplexing every vCPU) and `bytecode::run_vcpu_parallel` (a real OS thread per vCPU,
-//! the `temen_par_*` per-Worker driver's native twin). This test drives **both** with the same
-//! generated call and fails when the manifest disagrees with what they do.
+//! multiplex driver and the genuinely-parallel driver". Natively this drives `bytecode::drive` (one
+//! thread multiplexing every vCPU) and the parallel driver (a real OS thread per task) with the same
+//! generated call, and fails when the manifest disagrees with what they do. Since #1414 3e the
+//! parallel driver runs the pump's own scheduling rules, so it no longer stands in for the
+//! `temen_par_*` per-Worker driver; #2230 is pointing the column at the engine that driver runs.
 //!
 //! ## What the predicate is, and why it is not "does it trap"
 //!

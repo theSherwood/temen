@@ -1647,7 +1647,7 @@ pub extern "C" fn temen_par_root_call_interp(v: *mut ParVcpu, func: u32, args_pt
 // THREADS.md 4d: one `Mutex<Host>`, leaked into the shared linear memory (the same cross-Worker
 // sharing as `PAR_PB`/`PAR_INST`), attached to **every** vCPU of the run
 // ([`bytecode::Vcpu::with_shared_host`]) — so a worker vCPU's `call.cap` (host I/O) dispatches
-// in-engine under the lock, `drive_parallel`'s 4c-host model, with no JS in the loop at all: the
+// in-engine under the lock, the native parallel driver's 4c-host model, with no JS in the loop at all: the
 // `Host` is fully virtual (stdout is an in-memory buffer the page reads back after the run).
 
 /// The shared I/O powerbox: the `Mutex<Host>` every vCPU dispatches through, plus the handles the

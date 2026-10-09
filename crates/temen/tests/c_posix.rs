@@ -251,8 +251,8 @@ fn run_bytecode_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> Effects {
 }
 
 /// The **parallel-driver** twin of [`run_bytecode_only`] (#748): the same guest + personality wiring,
-/// driven by `drive_parallel` — every fork twin a real OS thread over a private window copy, blocking
-/// `waitpid` a real condvar wait. The cooperative engine and the tree-walker are its oracles: on these
+/// driven by the parallel driver — every fork twin's task a real OS thread over its own window, a
+/// blocking `waitpid` a parked thread. The cooperative engine and the tree-walker are its oracles: on these
 /// deterministic-output guests the results must be identical (the dual-driver principle — every
 /// fork/wait-using program runs correctly under both coop and parallel, though scheduling interleaves
 /// differ).
@@ -386,7 +386,7 @@ int main(void) {
         "the async handler ran during the compute loop (no poll) and set `fired = SIGINT`"
     );
     // #1146 — the same async delivery now runs on the bytecode engine's per-op safepoint, on BOTH the
-    // cooperative driver (the browser tier) and `drive_parallel`. Each redirects the running vCPU into
+    // cooperative driver (the browser tier) and the parallel driver. Each redirects the running vCPU into
     // `handler` mid-compute-loop and returns 2, byte-identical to the tree-walker oracle above.
     let b = run_bytecode_only(src, |_| {});
     assert_eq!(
@@ -926,10 +926,10 @@ fn c_a_caught_signal_interrupts_a_blocked_capability_read_with_eintr() {
         vec![Value::I32(42)],
         "tree-walker: a caught, delivered SIGINT interrupted the guest's blocked capability read"
     );
-    // #1146 slice 2 (parallel) — the `drive_parallel` twin: the raiser is a real OS thread raising
-    // SIGINT concurrently while `main`'s thread blocks in the pipe-read poll loop. The loop observes
-    // the deliverable, non-SA_RESTART signal (`park_interrupted`), sets its host EINTR flag, and
-    // breaks; the re-run completes `-EINTR` at the park site and the handler fires (slice 1) — 42.
+    // #1146 slice 2 (parallel) — the parallel-driver twin: the raiser is a real OS thread raising
+    // SIGINT concurrently while `main`'s task is parked on its pipe read. The next settle sees the
+    // deliverable, non-SA_RESTART signal (`interrupt_parks`), sets its host EINTR flag, and
+    // re-admits it; the re-run completes `-EINTR` at the park site and the handler fires (slice 1) — 42.
     // Before this the parked read polled forever with no writer and the run deadlocked.
     //
     // #1173 — this leg used to need a bounded retry: the dispatch's per-op park flags live on the
@@ -1217,7 +1217,7 @@ int main(void) {{
 }
 
 /// #1146 (deeper) — **the same interactive-stdin `^C` on both scheduler drivers** (invariant 14: the
-/// tree-walker's `Blocked::CapRead` stdin park, carried to the cooperative pump and `drive_parallel`).
+/// tree-walker's `Blocked::CapRead` stdin park, carried to the cooperative pump and the parallel driver).
 /// A blocking `Stream{In}` read was `unreachable!` on both scheduler drivers. Now the coop pump parks
 /// it as `BlockedStdin` — blocking on the #1122 doorbell while all-parked, re-admitted by the signal
 /// sweep — and the parallel driver polls it, breaking on the interrupt; on both, the rewound read then
@@ -1644,9 +1644,8 @@ int main(void) {
 }
 
 /// #748 rung 1 — the **any-child** blocking wait (`waitpid(-1)`) on the parallel driver: the wake is
-/// the exit-generation condvar ([`ThreadRegistry::wait_fork_exit`]), whose newer-than-consumed
-/// protocol is the condvar analogue of the cooperative driver's consumed-Done-twin prune (the #1112
-/// livelock class must not re-appear here). Both engines return 42.
+/// the settle that fires the twin's exit hooks, under the same consumed-Done-twin prune as the
+/// cooperative driver (the #1112 livelock class must not re-appear here). Both engines return 42.
 #[test]
 fn c_a_personality_fork_and_waitpid_any_child_on_parallel_driver() {
     let src = r#"

@@ -1799,8 +1799,9 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   (`fiber_resume_block`) and re-resumes, woken by any `notify`/teardown broadcast and
   bounded by the `KILL_RECHECK` re-poll (so a timed wait's deadline, a kill, or a freeze
   is observed with no timer thread). The deterministic explorer keeps the `FIBER_PARKED`
-  downgrade (the guest loop absorbs it — determinism untouched), as do the bytecode/JIT
-  **OS-thread-parallel** driver variants (their idle is a small remaining follow-up). A
+  downgrade (the guest loop absorbs it — determinism untouched), as does the JIT
+  **OS-thread-parallel** driver variant (its idle is a small remaining follow-up); the bytecode
+  parallel driver idles as the cooperative one does, on the pump's rules (#1414 3e). A
   **durable** run idles like any other and takes the downgrade only while its freeze is
   unwinding, where the resumer must reach its trailing poll rather than re-park (#1584). The
   oracle used to downgrade durable runs unconditionally — the other two tiers never did — and
@@ -1943,9 +1944,10 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
 *Measured (F4, `fiber_overlap_bench.rs`, n=8 × block=2 ms, K=4):* fiber lane ~4.8–5.3 ms/batch
 on all three engines (JIT net of its per-run compile floor) vs ~19 ms serialized root — the
 ring's own overlap range, restored on one vCPU. **Inline-by-design postures (enumerated, not
-debt):** the bytecode parallel + browser-`Vcpu` drivers (I45 — fiber delivery through the real
-cross-thread futex is its own slice), the debug drivers (sanctioned whole-vCPU tiering;
-checkpointing excludes cap-parked fibers like futex-parked ones), the §22 invoke leaves
+debt):** the browser-`Vcpu` driver (I45 — fiber delivery through the real cross-thread futex is
+its own slice; the native parallel driver takes the cooperative driver's postures since #1414 3e),
+the debug drivers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers like
+futex-parked ones), the §22 invoke leaves
 (seam-free atomic), confined `instantiate` children on the cooperative driver (their
 completions live on their own host), durable runs everywhere (a punted completion has no freeze
 rule yet, #1902), and zero/multi-result punts (the degenerate wait). Residue: the

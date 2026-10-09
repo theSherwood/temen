@@ -824,7 +824,9 @@ holder is the domain that implements them:
   shared-dispatch addition there rather than a five-executor one. With no concrete
   consumer forcing it today (caps already cross *into* and *between* domains via
   offer arguments), the prime directive says wait: build it at the §3.6 seam, not
-  across the interim schedulers it dissolves.
+  across the interim schedulers it dissolves. (#1414 3e has since folded the
+  true-parallel one into the cooperative pump's rules: the parallel driver is
+  executor 2, `drive_threads`, and its per-child closure is gone.)
 - **What offer calls run over — as built (v2) vs the end state (§3.6).** As
   built, offers execute over a **passive provider instance**: a second
   window + powerbox distinct from the live run — own lock, provider-pays

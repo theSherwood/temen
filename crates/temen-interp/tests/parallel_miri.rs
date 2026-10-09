@@ -1,7 +1,7 @@
 //! THREADS.md step 4c — **Miri** verification of the parallel driver. The differential tests in
 //! `temen/tests/bytecode_parallel.rs` prove the parallel driver agrees with the cooperative oracle; this
 //! proves the genuinely-parallel machinery (the per-thread `fork_for_thread` views of one
-//! `Region::shared` backing, the cross-thread `Futex` park/wake, the `thread.spawn`/`join` registry)
+//! `Region::shared` backing, the run's lock and its task threads' parks and wakes)
 //! is **free of data races / UB / provenance errors** when the *real interpreter* drives concurrent
 //! atomic + non-atomic accesses over the shared window — Miri's checker, not the iteration count, is
 //! the point, so the kernels and repeats are small (Miri runs ~100× slower and lives in the `temen`

@@ -1,7 +1,7 @@
 //! THREADS.md 4d — **host I/O (`call.cap`) from every vCPU of a host-orchestrated resumable run**,
 //! the way the JS/Worker host will drive it in the browser. Each `Vcpu` attaches the run's shared
 //! powerbox ([`Vcpu::with_shared_host`], a `Mutex<Host>`), so a worker vCPU's `call.cap` dispatches
-//! in-engine under the lock — the resumable counterpart of `drive_parallel`'s 4c-host model, with the
+//! in-engine under the lock — the resumable counterpart of the parallel driver's 4c-host model, with the
 //! same property: each call locks only for its own dispatch, compute/atomics between calls stay
 //! lock-free, and the host never services (or even sees) a capability event.
 //!
